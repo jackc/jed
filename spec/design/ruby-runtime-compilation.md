@@ -113,6 +113,22 @@ nominal expression. Explicit COLLATE
 nodes, text functions/concatenation, text-returning CASE, text aggregate reductions,
 and text sort comparators remain unsupported by this extension.
 
+When a comparison and both immediate text leaves have admitted static C labels,
+the leaves may use private plain strings inside that comparison. A canonical
+frozen literal already owned by the pool needs no temporary wrapper. An exact
+String or CollatedText column or parameter is copied with `String.new` at the
+original wrapping point, before reading the next operand. This preserves the byte snapshot and
+removes singleton methods just as the transient C wrapper did. An existing
+CollatedText label would have been replaced by the child's static C label too.
+Other runtime classes retain ordinary wrapping. If an unexpected value needs the comparison
+helper, each private plain string is relabeled with its own child's original
+C-label constants first, without rereading either operand. NULL decisions and
+charges retain their original order. Mixed/unlabeled operands, cast boundaries,
+and all escaping text values keep the previous wrapping path; in particular an
+unlabeled host String's custom comparison cannot observe a changed operand class.
+This substitutes cheaper snapshots for column wrappers; it does not eliminate
+all string allocation or alter the retained pool/cache limits.
+
 Array pipelines preserve the existing bulk scan charge before the loop and bulk
 output charge after successful completion. Streaming pipelines preserve source
 pull, scan-row charge, predicate, accepted-row OFFSET, projection, output charge,

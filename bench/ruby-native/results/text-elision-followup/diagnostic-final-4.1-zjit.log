@@ -1,0 +1,838 @@
+select@<internal:array>:266
+map@<internal:array>:240
+gemspec_stubs_in@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:808
+data@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:114
+each@<internal:array>:222
+block (2 levels) in <module:FileUtils>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2591
+block in <module:FileUtils>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2591
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:Verbose>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2666
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:NoWrite>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2689
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:DryRun>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2713
+block in map_stubs@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification_record.rb:257
+valid_ruby_abi?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/content_address.rb:41
+glob_files_in_dir@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/util.rb:86
+readline@<internal:io>:133
+canonical_segments@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:423
+block in visit@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1949
+search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:928
+block in search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:929
+block in update@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:888
+search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1958
+visit@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1948
+require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:37
+block in require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:40
+find_default_spec@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:1350
+block in digest@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/source.rb:16
+satisfied_by?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:250
+block in satisfied_by?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:251
+block in <class:Requirement>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:18
+<=>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:367
+block (2 levels) in require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:55
+create@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:56
+unresolved_deps@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:1275
+default_specifications_dir@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/defaults.rb:63
+block in <module:Functions>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/functions.rb:19
+block in <module:Functions>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/functions.rb:19
+block in <class:RegexText>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex.rb:8
+block in <class:Parser>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:20
+block in <class:Parser>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:21
+block (2 levels) in <class:FileFormat>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/file_format.rb:139
+block (2 levels) in <class:FileFormat>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/file_format.rb:139
+block in <class:FileFormat>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/file_format.rb:137
+times@<internal:numeric>:257
+block in <class:FileFormat>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/file_format.rb:145
+block in <class:FileFormat>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/file_format.rb:146
+block (2 levels) in <module:ChecksumKernels>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/checksum_kernels.rb:12
+block (2 levels) in <module:ChecksumKernels>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/checksum_kernels.rb:12
+block (2 levels) in <module:ChecksumKernels>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/checksum_kernels.rb:17
+block (2 levels) in <module:ChecksumKernels>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/checksum_kernels.rb:18
+initialize@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:134
+version@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:185
+load_path_insert_index@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:616
+requirement@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/dependency.rb:117
+version@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:198
+name@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:173
+new@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/platform.rb:65
+env_requirement@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:926
+runtime_dependencies@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:2305
+block (2 levels) in <class:Delegator>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:52
+synchronize@<internal:thread_sync>:557
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:399
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:405
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:405
+block (2 levels) in <module:PageServiceWire>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/page_service_wire.rb:21
+block (3 levels) in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block (2 levels) in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:15
+block (2 levels) in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:14
+block (2 levels) in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:16
+block (2 levels) in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block (2 levels) in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:16
+block in <module:ScalarCursorPlanning>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_cursor.rb:19
+block in <class:CompiledExpression>@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:26
+token@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:95
+at?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:99
+block in generated_log_entries@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:186
+line@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:169
+block in label_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:64
+collatable_type?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:104
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:56
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_expressions.rb:25
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:174
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:25
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:30
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:56
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/cursors.rb:66
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:79
+memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:85
+memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:61
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:99
+wrap@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:31
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+call@(jed compiled expression):2
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/error.rb:8
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+block in evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:179
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1414
+block in value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:71
+expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:80
+block in expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:81
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:174
+block in evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:177
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+block (3 levels) in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:137
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:174
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:41
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:46
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:214
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1414
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:174
+call@(jed compiled expression):2
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+scalar_work@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_work.rb:19
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+block (2 levels) in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:136
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1414
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:214
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:695
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/subqueries.rb:32
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1414
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+compare@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:53
+label@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:26
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+combine@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:11
+compare@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:653
+block in combine@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:21
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:132
+c_label_source@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:198
+now@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:23
+emit@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+block in emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:353
+block in emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:360
+block in emit_c_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:414
+block in emit_c_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:433
+pooled@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:177
+emit@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:105
+prepare_many@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:146
+begin_method@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:157
+block in prepare_many@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:148
+emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+children@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:269
+block in emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:351
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:275
+emit@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+integer?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:190
+emit_c_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:406
+block in prepare_many@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:149
+finish_method@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:163
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:68
+materialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:74
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:34
+block in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:230
+block in jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:42
+reseed_memory@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:86
+reseed_memory@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:74
+stat@<internal:gc>:324
+at?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:99
+current@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:92
+block in fixture@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:49
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/cursors.rb:66
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:79
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+call@(jed compiled relation):1
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:99
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:56
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/cursors.rb:66
+call@(jed compiled relation):1
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:79
+block in outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:103
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:89
+call@(jed compiled relation):1
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:89
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+emit@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+prepare_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:19
+emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+block in emit_c_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:433
+prepare_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:275
+boolean?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:194
+emit_c_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:406
+begin_rows@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:64
+finish_rows@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:76
+materialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:13
+block (2 levels) in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:248
+sample@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:165
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:130
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:159
+alpha?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:86
+accept@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:105
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+call@(jed compiled relation):1
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:79
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+call@(jed compiled relation):1
+collatable_type?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:104
+evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+call@(jed compiled relation):1
+block in outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:104
+generate@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/json/common.rb:370
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:68
+emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+emit_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+child@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:265
+emit_boolean@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:443
+call@(jed compiled relation):1
+block (2 levels) in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:245
+loop@<internal:kernel>:153
+block in query_memory_row_bytes@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:241
+payload@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/logical_memory.rb:12
+block in memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:65
+query_memory_row_bytes@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:238
+query_memory_release@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:263
+release@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:22
+memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:61
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:10
+reserve@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:15
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+call@(jed compiled relation):1
+reserve@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:15
+outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:99
+call@(jed compiled relation):1
+query_memory_release@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:263
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:84
+call@(jed compiled relation):1
+query_memory_release@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_memory.rb:263
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:84
+prepare_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+prepare_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+block in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:230
+now@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:32
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+prepare_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+reseed_memory@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:74
+call@(jed compiled relation):1
+sample@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:165
+space?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:94
+digit?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:90
+block in compute_parenthesized_queries@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:647
+block in compute_parenthesized_queries@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:653
+token@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:95
+normalize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:454
+block in compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1333
+skip_space@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:98
+block in skip_space@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:98
+block (2 levels) in compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_relations.rb:58
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:25
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:110
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:17
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:78
+block in binary_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:65
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+check_integer@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:621
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:72
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:46
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:170
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/timezones.rb:169
+enabled?@<internal:yjit>:13
+expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:80
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+call@(jed compiled relation):1
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+block (2 levels) in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:92
+block in evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1475
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:92
+label@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:26
+block in evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1475
+block in evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1475
+call@(jed compiled relation):1
+block in evaluate@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1475
+call@(jed compiled relation):1
+integer?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:190
+pooled@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:177
+emit_case_branch@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:540
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+prepare_keys@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:25
+block in prepare_keys@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:56
+emit_case@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:529
+block in emit_case@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:533
+prepare_keys@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_relation.rb:54
+enabled?@<internal:zjit>:24
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:149
+jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:24
+jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:35
+advance@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:115
+accept@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:105
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_functions.rb:132
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_expressions.rb:10
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/opaque_definitions.rb:26
+require_parsed_definition@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/opaque_definitions.rb:22
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_resolution.rb:65
+needed?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_resolution.rb:9
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:8
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:6
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:8
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/temporal_modifiers.rb:33
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/width_bucket.rb:8
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:127
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/argument_resolution.rb:46
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/datetime_functions.rb:179
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/range_constructors.rb:6
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/timezones.rb:98
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/body_pushdown.rb:6
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_kernels.rb:220
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:9
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/subqueries.rb:17
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/ctes.rb:51
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/views.rb:120
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_datetime.rb:189
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/formatting_number.rb:381
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_images.rb:10
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_text.rb:68
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_operations.rb:81
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_sql.rb:8
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:45
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex_functions.rb:193
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/bindings.rb:638
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/aggregates.rb:281
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/windows.rb:16
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:6
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1317
+prepare_many@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:99
+label_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:63
+block (2 levels) in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:128
+call@(jed compiled expression):2
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:170
+wrap@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:31
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:72
+emit_cast@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:287
+block in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:243
+block (2 levels) in expression@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:676
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1291
+cast@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:494
+base@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:468
+format@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:803
+call@(jed compiled expression):2
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:170
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/timezones.rb:169
+call@(jed compiled expression):2
+scalar_work@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_work.rb:19
+binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:695
+compare@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:53
+compare@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/types.rb:653
+c_label_source@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:198
+child@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_expression.rb:265
+block in normalize_privileges@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/capabilities.rb:58
+block in normalize_privileges@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/capabilities.rb:59
+block in quoted@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:130
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:31
+identifier_length@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:281
+block in prefix@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:775
+block (3 levels) in expression@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:693
+expression@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:671
+nested@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:139
+block in expression@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:673
+prefix@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:763
+primary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:805
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/timezones.rb:98
+block in compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:154
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1317
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_expressions.rb:10
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/subqueries.rb:17
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/json_operations.rb:81
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:45
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:6
+block in compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:150
+contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:54
+contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:47
+contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:24
+contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/date_clock.rb:15
+contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:75
+binary_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:66
+binary_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:65
+binary_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/datetime_arithmetic.rb:42
+binary_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:96
+identifier_token?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:125
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/regex_functions.rb:193
+block in compute_parenthesized_queries@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:647
+literal@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:667
+collation_label@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:109
+resolve_collation@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:92
+ensure_comparable_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:155
+block (2 levels) in expression@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:676
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:31
+literal_adapts?@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:44
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/timezones.rb:98
+default_collation@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:85
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+block in compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_relations.rb:58
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:127
+complexity!@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:663
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:110
+primary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:805
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/timezones.rb:98
+common_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/query_composition.rb:9
+common_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1285
+block in memory_snapshot@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:312
+block in tokens@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:66
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:31
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/function_relations.rb:56
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:72
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1291
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/cursors.rb:66
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:323
+call@(jed compiled relation):1
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:42
+initialize@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:19
+tokens@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:26
+compute_parenthesized_queries@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:644
+downto@<internal:numeric>:339
+parse_expression@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/parser.rb:60
+call@(jed compiled relation):1
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:323
+resolve@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:28
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:127
+default_collation@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:85
+mark_filter_conjunction@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/filter_predicates.rb:29
+quoted@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/lexer.rb:127
+validate_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:71
+validate_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:143
+validate_comparison@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:142
+call@(jed compiled relation):1
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:110
+ensure_comparable_type@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/resolution.rb:155
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/collations.rb:127
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/strict_context.rb:31
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+call@(jed compiled relation):1
+compile_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/filter_predicates.rb:13
+compile_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1310
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+cached_kernel@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:275
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/composite_values.rb:72
+cast_value@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1291
+native_compiled_relation_filter@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_plans.rb:120
+native_relation_program_kernel@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_plans.rb:148
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1317
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/engine.rb:1317
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:319
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/expressions.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+native_relation_program_kernel@/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native/lib/jed_native/compiled_plans.rb:148
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:328
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:328
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:332
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:333
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:333
+scalar_snapshot?@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:337
+block in main@bench/ruby-native/elision_diagnostics.rb:84
+to_json@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/json/common.rb:887

@@ -1,0 +1,832 @@
+select@<internal:array>:266
+map@<internal:array>:240
+gemspec_stubs_in@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:808
+data@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:114
+each@<internal:array>:222
+block (2 levels) in <module:FileUtils>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2591
+block in <module:FileUtils>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2591
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:Verbose>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2666
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:NoWrite>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2689
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:DryRun>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2713
+block in map_stubs@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification_record.rb:257
+valid_ruby_abi?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/content_address.rb:41
+glob_files_in_dir@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/util.rb:86
+readline@<internal:io>:133
+canonical_segments@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:423
+block in visit@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1949
+search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:928
+block in search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:929
+block in update@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:888
+search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1958
+visit@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1948
+require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:37
+block in require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:40
+find_default_spec@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:1350
+block in digest@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/source.rb:16
+satisfied_by?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:250
+block in satisfied_by?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:251
+block in <class:Requirement>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:18
+<=>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:367
+block (2 levels) in require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:55
+create@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:56
+unresolved_deps@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:1275
+default_specifications_dir@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/defaults.rb:63
+block in <module:Functions>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/functions.rb:19
+block in <module:Functions>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/functions.rb:19
+block in <class:RegexText>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex.rb:8
+block in <class:Parser>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:20
+block in <class:Parser>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:21
+block (2 levels) in <class:FileFormat>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/file_format.rb:139
+block (2 levels) in <class:FileFormat>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/file_format.rb:139
+block in <class:FileFormat>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/file_format.rb:137
+times@<internal:numeric>:257
+block in <class:FileFormat>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/file_format.rb:145
+block in <class:FileFormat>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/file_format.rb:146
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:12
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:12
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:17
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:18
+initialize@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:134
+version@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:185
+load_path_insert_index@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:616
+requirement@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/dependency.rb:117
+version@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:198
+name@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:173
+new@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/platform.rb:65
+env_requirement@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:926
+runtime_dependencies@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:2305
+block (2 levels) in <class:Delegator>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:52
+synchronize@<internal:thread_sync>:557
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:399
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:405
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:405
+block (2 levels) in <module:PageServiceWire>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/page_service_wire.rb:21
+block (3 levels) in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:15
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:14
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:16
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:16
+block in <module:ScalarCursorPlanning>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:19
+block in <class:CompiledExpression>@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:26
+token@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:95
+at?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:99
+block in generated_log_entries@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:186
+block in label_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:64
+collatable_type?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:104
+wrap@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:31
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:56
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_expressions.rb:25
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:174
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:25
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:30
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:56
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/cursors.rb:66
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:79
+memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:85
+memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:61
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:99
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+call@(jed compiled expression):2
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/error.rb:8
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:46
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+block in evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:179
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+block in value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:71
+expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:80
+block in expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:81
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:174
+block in evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:177
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+block (3 levels) in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:137
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:174
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:214
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:174
+call@(jed compiled expression):2
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+scalar_work@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_work.rb:19
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+block (2 levels) in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:136
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:214
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:695
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/subqueries.rb:32
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+compare@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:53
+label@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:26
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+combine@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:11
+compare@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:653
+block in combine@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:21
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:132
+line@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:169
+c_label_source@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:198
+now@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:23
+emit@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+block in emit_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:335
+child@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:247
+block in emit_c_comparison@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:387
+pooled@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:177
+emit@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+emit@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+emit@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:105
+prepare_many@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:146
+begin_method@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:157
+block in prepare_many@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:148
+integer?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:190
+emit_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:326
+children@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:251
+block in emit_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:333
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:257
+emit_c_comparison@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:379
+block in prepare_many@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:149
+finish_method@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:163
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:68
+materialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:74
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:34
+block in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:230
+block in jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:42
+reseed_memory@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:86
+reseed_memory@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:74
+stat@<internal:gc>:324
+at?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:99
+current@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:92
+block in fixture@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:49
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/cursors.rb:66
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:79
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+call@(jed compiled relation):1
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:99
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:56
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/cursors.rb:66
+call@(jed compiled relation):1
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:79
+block in outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:103
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:89
+call@(jed compiled relation):1
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:89
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+prepare_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:19
+child@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:247
+prepare_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+boolean?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:194
+begin_rows@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:64
+finish_rows@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:76
+materialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:13
+block (2 levels) in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:248
+sample@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:165
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:130
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:159
+alpha?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:86
+accept@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:105
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+call@(jed compiled relation):1
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:79
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+call@(jed compiled relation):1
+collatable_type?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:104
+evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+call@(jed compiled relation):1
+block in outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:104
+generate@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/json/common.rb:370
+emit_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:326
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:257
+emit_c_comparison@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:379
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:68
+emit_boolean@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:407
+call@(jed compiled relation):1
+block (2 levels) in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:245
+loop@<internal:kernel>:153
+block in query_memory_row_bytes@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:241
+payload@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/logical_memory.rb:12
+block in memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:65
+query_memory_row_bytes@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:238
+query_memory_release@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:263
+release@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:22
+memory_state@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:61
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:10
+reserve@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:15
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:89
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+call@(jed compiled relation):1
+reserve@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:15
+outcome@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:99
+call@(jed compiled relation):1
+query_memory_release@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:263
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:84
+call@(jed compiled relation):1
+query_memory_release@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_memory.rb:263
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:84
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+prepare_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+prepare_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+prepare_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+reseed_memory@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:74
+call@(jed compiled relation):1
+sample@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:165
+space?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:94
+digit?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:90
+block in compute_parenthesized_queries@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:647
+block in compute_parenthesized_queries@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:653
+token@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:95
+normalize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:454
+block in compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1333
+skip_space@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:98
+block in skip_space@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:98
+block (2 levels) in compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_relations.rb:58
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:25
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:17
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:78
+block in binary_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:65
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+check_integer@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:621
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:72
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:46
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:170
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/timezones.rb:169
+enabled?@<internal:yjit>:13
+expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:80
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+call@(jed compiled relation):1
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+block (2 levels) in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:92
+block in evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1475
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:92
+label@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:26
+block in evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1475
+block in evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1475
+call@(jed compiled relation):1
+block in evaluate@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1475
+call@(jed compiled relation):1
+pooled@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:177
+integer?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:190
+emit_case_branch@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:504
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+prepare_keys@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:25
+block in prepare_keys@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:56
+emit_case@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:493
+block in emit_case@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:497
+prepare_keys@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:54
+enabled?@<internal:zjit>:24
+block in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:149
+jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:24
+jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:35
+advance@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:115
+accept@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:105
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_functions.rb:132
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_expressions.rb:10
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/opaque_definitions.rb:26
+require_parsed_definition@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/opaque_definitions.rb:22
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_resolution.rb:65
+needed?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_resolution.rb:9
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:8
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:6
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:8
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/temporal_modifiers.rb:33
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/width_bucket.rb:8
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:127
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/argument_resolution.rb:46
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/datetime_functions.rb:179
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/range_constructors.rb:6
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/body_pushdown.rb:6
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:220
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:9
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/subqueries.rb:17
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/ctes.rb:51
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/views.rb:120
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:189
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/formatting_number.rb:381
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_images.rb:10
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_text.rb:68
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_operations.rb:81
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_sql.rb:8
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:45
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex_functions.rb:193
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/bindings.rb:638
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/aggregates.rb:281
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/windows.rb:16
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+prepare_many@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:99
+label_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:63
+block (2 levels) in validate@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:128
+call@(jed compiled expression):2
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:170
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:72
+block in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:230
+now@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:32
+emit_cast@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:269
+block in run_job@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:243
+block (2 levels) in expression@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:676
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1291
+cast@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:494
+base@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:468
+format@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:803
+call@(jed compiled expression):2
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:170
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/timezones.rb:169
+call@(jed compiled expression):2
+scalar_work@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_work.rb:19
+binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:695
+compare@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:53
+compare@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/types.rb:653
+c_label_source@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:198
+block in normalize_privileges@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/capabilities.rb:58
+block in normalize_privileges@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/capabilities.rb:59
+block in quoted@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:130
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:31
+identifier_length@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:281
+block in prefix@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:775
+block (3 levels) in expression@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:693
+expression@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:671
+nested@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:139
+block in expression@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:673
+prefix@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:763
+primary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:805
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+block in compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:154
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_expressions.rb:10
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/subqueries.rb:17
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/json_operations.rb:81
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:45
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+block in compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:150
+contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:54
+contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:47
+contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:24
+contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/date_clock.rb:15
+contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:75
+binary_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:66
+binary_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:65
+binary_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/datetime_arithmetic.rb:42
+binary_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:96
+identifier_token?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:125
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/regex_functions.rb:193
+block in compute_parenthesized_queries@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:647
+literal@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:667
+collation_label@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:109
+resolve_collation@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:92
+ensure_comparable_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:155
+block (2 levels) in expression@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:676
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:31
+literal_adapts?@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:44
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+default_collation@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:85
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+block in compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_relations.rb:58
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:127
+complexity!@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:663
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+primary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:805
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+common_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/query_composition.rb:9
+common_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1285
+block in memory_snapshot@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:312
+block in tokens@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:66
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:31
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:72
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1291
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/cursors.rb:66
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:323
+call@(jed compiled relation):1
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:42
+initialize@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:19
+tokens@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:26
+compute_parenthesized_queries@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:644
+downto@<internal:numeric>:339
+parse_expression@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/parser.rb:60
+call@(jed compiled relation):1
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:323
+resolve@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:28
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:127
+default_collation@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:85
+mark_filter_conjunction@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:29
+quoted@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/lexer.rb:127
+validate_comparison@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:71
+validate_comparison@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:143
+validate_comparison@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:142
+call@(jed compiled relation):1
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+ensure_comparable_type@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/resolution.rb:155
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/collations.rb:127
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/strict_context.rb:31
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+call@(jed compiled relation):1
+compile_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:13
+compile_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1310
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+cached_kernel@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:275
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/composite_values.rb:72
+cast_value@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1291
+native_compiled_relation_filter@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_plans.rb:120
+native_relation_program_kernel@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_plans.rb:148
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:319
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+compile@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+native_relation_program_kernel@/tmp/jed-text-elision-before/impl/ruby-native/lib/jed_native/compiled_plans.rb:148
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+call@(jed compiled relation):1
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:328
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:328
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:332
+block (2 levels) in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:333
+block in populate_cache@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:333
+scalar_snapshot?@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:337
+block in main@bench/ruby-native/elision_diagnostics.rb:84
+to_json@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/json/common.rb:887
