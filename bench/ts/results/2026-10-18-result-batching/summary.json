@@ -1,0 +1,178 @@
+{
+  "config": {
+    "warmups": 3,
+    "samples": 7,
+    "responseSamples": 3,
+    "decimalRows": 1000000,
+    "tableRows": 100000,
+    "sortRows": 800000,
+    "typedRows": 200000,
+    "cases": [
+      "typed-output"
+    ]
+  },
+  "validated": {
+    "rows": 200000,
+    "fingerprint": "ee3bf2c6ac80465a",
+    "columnNames": [
+      "id",
+      "exact",
+      "bytes",
+      "pair",
+      "absent"
+    ],
+    "columnTypes": [
+      "i64",
+      "decimal",
+      "bytea",
+      "i64[]",
+      "text"
+    ],
+    "rowsAffected": null,
+    "cost": "18000000"
+  },
+  "groups": {
+    "browser-after": {
+      "direct": {
+        "runMediansMs": [
+          378,
+          375.8999999985099,
+          368
+        ],
+        "medianMs": 375.8999999985099,
+        "timerMaxMedianMs": 376.5,
+        "timerMaxWorstMs": 411.79999999701977,
+        "frameMaxMedianMs": 387.70000000298023,
+        "frameMaxWorstMs": 412.20000000298023,
+        "longTasks": 9
+      },
+      "worker": {
+        "runMediansMs": [
+          659,
+          675.6000000014901,
+          683.6000000014901
+        ],
+        "medianMs": 675.6000000014901,
+        "timerMaxMedianMs": 9.800000004470348,
+        "timerMaxWorstMs": 14,
+        "frameMaxMedianMs": 20.5,
+        "frameMaxWorstMs": 26.200000002980232,
+        "longTasks": 0
+      },
+      "overheadPercent": 79.72865123814002
+    },
+    "browser-before": {
+      "direct": {
+        "runMediansMs": [
+          369.5,
+          360.29999999701977,
+          380.29999999701977
+        ],
+        "medianMs": 369.5,
+        "timerMaxMedianMs": 368.6000000014901,
+        "timerMaxWorstMs": 418.90000000596046,
+        "frameMaxMedianMs": 373.5,
+        "frameMaxWorstMs": 429.1000000014901,
+        "longTasks": 9
+      },
+      "worker": {
+        "runMediansMs": [
+          726.8999999985099,
+          735.2999999970198,
+          773.8999999985099
+        ],
+        "medianMs": 735.2999999970198,
+        "timerMaxMedianMs": 10.200000002980232,
+        "timerMaxWorstMs": 13.100000001490116,
+        "frameMaxMedianMs": 19.899999998509884,
+        "frameMaxWorstMs": 21.100000001490116,
+        "longTasks": 0
+      },
+      "overheadPercent": 98.99864681922051
+    },
+    "node-after": {
+      "direct": {
+        "runMediansMs": [
+          323.3074109999998,
+          334.6345020000008,
+          333.25368400000025
+        ],
+        "medianMs": 333.25368400000025,
+        "timerMaxMedianMs": 361.34487699999954,
+        "timerMaxWorstMs": 437.6744469999994
+      },
+      "worker": {
+        "runMediansMs": [
+          496.72829099999944,
+          521.5308830000013,
+          505.6786000000011
+        ],
+        "medianMs": 505.6786000000011,
+        "timerMaxMedianMs": 7.937486999999237,
+        "timerMaxWorstMs": 17.081733000000895
+      },
+      "overheadPercent": 51.73983793079411
+    },
+    "node-before": {
+      "direct": {
+        "runMediansMs": [
+          337.3507490000002,
+          329.47543399999995,
+          339.895767
+        ],
+        "medianMs": 337.3507490000002,
+        "timerMaxMedianMs": 347.52933699999994,
+        "timerMaxWorstMs": 383.77113400000053
+      },
+      "worker": {
+        "runMediansMs": [
+          617.4282050000002,
+          643.2963770000006,
+          666.598747
+        ],
+        "medianMs": 643.2963770000006,
+        "timerMaxMedianMs": 7.148999000000913,
+        "timerMaxWorstMs": 11.769099000001006
+      },
+      "overheadPercent": 90.69066213930364
+    }
+  },
+  "changes": {
+    "browser": {
+      "beforeMs": 735.2999999970198,
+      "afterMs": 675.6000000014901,
+      "deltaMs": -59.69999999552965,
+      "percentChange": -8.119135046344573
+    },
+    "node": {
+      "beforeMs": 643.2963770000006,
+      "afterMs": 505.6786000000011,
+      "deltaMs": -137.61777699999948,
+      "percentChange": -21.39259319969703
+    }
+  },
+  "tunedBrowser": {
+    "direct": {
+      "runMediansMs": [
+        382.8999999985099,
+        384.79999999701977,
+        402.70000000298023
+      ],
+      "medianMs": 384.79999999701977,
+      "frameMaxMedianMs": 401.8999999985099,
+      "frameMaxWorstMs": 449.1000000014901,
+      "longTasks": 9
+    },
+    "worker": {
+      "runMediansMs": [
+        613.3000000044703,
+        614.6000000014901,
+        612.3000000044703
+      ],
+      "medianMs": 613.3000000044703,
+      "frameMaxMedianMs": 19.600000001490116,
+      "frameMaxWorstMs": 23.100000001490116,
+      "longTasks": 0
+    }
+  }
+}
