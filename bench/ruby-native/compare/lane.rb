@@ -9,6 +9,9 @@ db = database.respond_to?(:session) ? database.session : database
 disable_ordering = ARGV.include?('--disable-ordering')
 abort 'Source has no ordering compiler to disable' if disable_ordering && !defined?(JedNative::CompiledOrdering)
 db.engine.instance_variable_set(:@native_ordering_disabled, true) if disable_ordering
+disable_aggregate = ARGV.include?('--disable-aggregate')
+abort 'Source has no aggregate compiler to disable' if disable_aggregate && !defined?(JedNative::CompiledAggregate)
+db.engine.instance_variable_set(:@native_aggregate_disabled, true) if disable_aggregate
 repetitions = validation_iterations = 0
 verify_only = ARGV.include?('--verify-only')
 File.foreach(ARGV.fetch(0)) do |line|
@@ -58,7 +61,7 @@ File.foreach(ARGV.fetch(0)) do |line|
     end
     puts JSON.generate(workload: name, checksum: format('%016x', checksum), validation_rows: validation_rows,
                        samples_ns: samples, rows_total: total_rows, iterations: iterations, warmup: warmup,
-                       runtime: RUBY_DESCRIPTION, ordering_disabled: disable_ordering)
+                       runtime: RUBY_DESCRIPTION, ordering_disabled: disable_ordering, aggregate_disabled: disable_aggregate)
     STDOUT.flush
   end
 end

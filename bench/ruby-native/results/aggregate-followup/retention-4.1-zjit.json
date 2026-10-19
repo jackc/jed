@@ -1,0 +1,106 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T17:26:22Z",
+  "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+  "jit": "zjit",
+  "options": {
+    "churn": 256,
+    "churn_calls": 200,
+    "jit": "zjit",
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/aggregate-followup/retention-4.1-zjit.json"
+  },
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "script_sha256": "75ad7b188860223dc360e91e9c700eb6525696e8d9b7e73b2dcb8514d36bc3bd",
+  "helper_sha256": "33f64e9f8c58bd3f28c061a1a7fc4d8b24d5e8fceda61b9a6dd101e6664ca16e",
+  "before": {
+    "rss_bytes": 45187072,
+    "live_slots": 55848,
+    "jit": {
+      "compiled_iseq_count": 72,
+      "compile_time_ns": 13233734,
+      "compiled_side_exit_count": 926,
+      "jit_frame_region_bytes": 12288,
+      "code_region_bytes": 122880,
+      "zjit_alloc_bytes": 161420,
+      "total_mem_bytes": 296588
+    },
+    "live_kernels": 0,
+    "anonymous_kernel_classes": 0
+  },
+  "while_cache_retained": {
+    "rss_bytes": 56635392,
+    "live_slots": 62143,
+    "jit": {
+      "compiled_iseq_count": 480,
+      "compile_time_ns": 278300594,
+      "compiled_side_exit_count": 24379,
+      "jit_frame_region_bytes": 143360,
+      "code_region_bytes": 4096000,
+      "zjit_alloc_bytes": 3577508,
+      "total_mem_bytes": 7816868
+    },
+    "live_kernels": 64,
+    "anonymous_kernel_classes": 256,
+    "cache_entries": 64,
+    "retained_source_bytes": 44608,
+    "retained_pool_entries": 320
+  },
+  "after_helper_return_and_gc": [
+    {
+      "rss_bytes": 56639488,
+      "live_slots": 62002,
+      "jit": {
+        "compiled_iseq_count": 482,
+        "compile_time_ns": 278575521,
+        "compiled_side_exit_count": 24390,
+        "jit_frame_region_bytes": 143360,
+        "code_region_bytes": 4100096,
+        "zjit_alloc_bytes": 3579332,
+        "total_mem_bytes": 7822788
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 256,
+      "gc_after_return": 1
+    },
+    {
+      "rss_bytes": 56639488,
+      "live_slots": 62004,
+      "jit": {
+        "compiled_iseq_count": 482,
+        "compile_time_ns": 278575521,
+        "compiled_side_exit_count": 24390,
+        "jit_frame_region_bytes": 143360,
+        "code_region_bytes": 4100096,
+        "zjit_alloc_bytes": 3579332,
+        "total_mem_bytes": 7822788
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 256,
+      "gc_after_return": 2
+    },
+    {
+      "rss_bytes": 56639488,
+      "live_slots": 62006,
+      "jit": {
+        "compiled_iseq_count": 482,
+        "compile_time_ns": 278575521,
+        "compiled_side_exit_count": 24390,
+        "jit_frame_region_bytes": 143360,
+        "code_region_bytes": 4100096,
+        "zjit_alloc_bytes": 3579332,
+        "total_mem_bytes": 7822788
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 256,
+      "gc_after_return": 3
+    }
+  ],
+  "notes": [
+    "Same source/pool LRU, second-use admission, 256 generated kernels, and 200 calls per kernel as the main direct diagnostic.",
+    "The cache-populating helper returns only scalar snapshots. These collections run after its engine/cache/kernel local variables leave scope.",
+    "VM-retained anonymous classes and JIT code may outlive generated instances. This probe does not require RSS or JIT code counters to fall."
+  ],
+  "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170"
+}

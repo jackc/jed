@@ -1,0 +1,25 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "bench/ruby-native/query_profile.rb",
+    "--api",
+    "execute",
+    "--report",
+    "bench/ruby-native/results/aggregate-followup/before-profile.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 66068480,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 3.012013797997497,
+  "source": "/tmp/jed-aggregate-before/impl/ruby-native",
+  "source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "final_source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "execute scalar: 5134.1ns; 39.0 allocations\nexecute aggregate: 250038.8ns; 909.0 allocations\nexecute group: 633316.9ns; 5176.1 allocations\nexecute aggregate_argument: 588403.6ns; 2403.0 allocations\nexecute aggregate_multi: 843365.4ns; 7248.0 allocations\nexecute aggregate_filter: 971327.3ns; 3357.0 allocations\nexecute aggregate_bool_bits: 869740.6ns; 6105.0 allocations\nexecute aggregate_many_groups: 1553561.9ns; 10116.0 allocations\nexecute aggregate_distinct: 613238.3ns; 2637.0 allocations\n",
+  "stderr": ""
+}

@@ -1,0 +1,21 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "impl/ruby-native/test/compiled_aggregate_test.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 54370304,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 3.753773046002607,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "ruby-native compiled aggregate: admission, two-phase reduction, guard prefixes, warmed APIs, callbacks and cursor lifetimes passed\n",
+  "stderr": ""
+}

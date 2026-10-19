@@ -28,6 +28,7 @@ OptionParser.new do |parser|
   parser.on('--verify-only') { options[:verify_only] = true }
   parser.on('--disable-pipeline') { options[:disable_pipeline] = true }
   parser.on('--disable-ordering') { options[:disable_ordering] = true }
+  parser.on('--disable-aggregate') { options[:disable_aggregate] = true }
 end.parse!
 abort 'Specify --output PATH' unless options[:output]
 abort 'Unknown lane' unless (options[:lanes] - %w[wrapper native-prepared native-query native-eager]).empty?
@@ -46,7 +47,7 @@ source_hashes = lambda do
     rust: Digest::SHA256.hexdigest(Dir[File.join(root, 'impl/rust/src/**/*.rs')].sort.map { |path| File.binread(path) }.join),
     wrapper_library: Digest::SHA256.file(wrapper_library).hexdigest,
     worker: Digest::SHA256.file(File.join(__dir__, 'binding_compare_lane.rb')).hexdigest,
-    plans: %w[plan.json compiled-plan.json pipeline-plan.json ordering-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
+    plans: %w[plan.json compiled-plan.json pipeline-plan.json ordering-plan.json aggregate-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
     database: options[:file] && Digest::SHA256.file(options[:file]).hexdigest
   }
 end
@@ -72,6 +73,7 @@ options[:lanes].each do |lane|
   command << '--fresh-sql' if options[:fresh_sql]
   command << '--disable-pipeline' if options[:disable_pipeline]
   command << '--disable-ordering' if options[:disable_ordering]
+  command << '--disable-aggregate' if options[:disable_aggregate]
   result = JedNativeTools::BoundedProcess.run(command, timeout: 300,
     memory_bytes: 512 * 1024**2, address_space_bytes: 2 * 1024**3,
     env: { 'RUBYOPT' => nil, 'RUBY_YJIT_ENABLE' => nil, 'RUBY_ZJIT_ENABLE' => nil,

@@ -393,6 +393,8 @@ module JedNative
     end
 
     def compute_aggregate(expression, group)
+      kernel = native_compiled_aggregate(expression)
+      return kernel.call(self, group, @params) if kernel
       return ordered_aggregate(expression, group) if expression.extra[:within_group]
       rows = aggregate_inputs(expression, group)
       name = expression.value

@@ -96,6 +96,12 @@ the existing heap, full-sort, and spill algorithms keep their original execution
 and resource checkpoints. Other key types use the existing comparator. Ordering
 methods share the same plan source limit and compile only after reuse.
 
+On memory hosts, reused integer and boolean aggregates can compile their input
+and reduction loops too. Input evaluation still finishes before reduction, so
+errors and cost-limit failures retain their original order. DISTINCT, ordered
+aggregates, unsupported types, and file-host aggregation use their existing
+execution. See the [aggregate follow-up](AGGREGATE_FOLLOWUP.md) for measurements.
+
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;
 explicit options to `db.session` override the defaults. Sessions expose

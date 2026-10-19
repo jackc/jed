@@ -1,0 +1,907 @@
+{
+  "schema": 1,
+  "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "statistic": "Ratio of medians of five alternating samples. Each sample performs 100 group vectors; each vector contains 512 rows across 1 or 16 pre-existing groups. Allocations are median allocated Ruby objects per aggregate call. Compilation uses the median of 30 independent emission/materialization samples.",
+  "runtimes": {
+    "4.0-none": {
+      "peak_rss_mib": 49.4765625,
+      "elapsed_seconds": 6.193096649003564,
+      "jobs": {
+        "count_star": {
+          "ordinary": {
+            "us_per_group_vector": 93.75166,
+            "allocated_per_call": 517.0,
+            "raw_us_per_group_vector": [
+              102.92881,
+              93.75166,
+              91.51339999999999,
+              94.7736,
+              92.59228999999999
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 46.76246,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              46.76246,
+              46.92119,
+              46.40174,
+              46.053309999999996,
+              48.43432
+            ]
+          },
+          "speedup": 2.0048487611644044,
+          "compile_median_us": 10.4035,
+          "first_compile_us": 60.267,
+          "first_call_us": 46.065,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "source_bytes": 200,
+          "pool_entries": 0
+        },
+        "nullable_integer_sum": {
+          "ordinary": {
+            "us_per_group_vector": 201.607,
+            "allocated_per_call": 517.0,
+            "raw_us_per_group_vector": [
+              204.57845999999998,
+              201.02214,
+              201.607,
+              202.25406,
+              199.62863000000002
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 64.04966,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              64.04966,
+              64.49119999999999,
+              63.74307,
+              64.70408,
+              60.70665
+            ]
+          },
+          "speedup": 3.147666982151037,
+          "compile_median_us": 27.7685,
+          "first_compile_us": 134.016,
+          "first_call_us": 63.917,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "source_bytes": 493,
+          "pool_entries": 2
+        },
+        "computed_filtered_sum": {
+          "ordinary": {
+            "us_per_group_vector": 1237.1175,
+            "allocated_per_call": 112.0,
+            "raw_us_per_group_vector": [
+              1240.58777,
+              1237.1175,
+              1242.46415,
+              1235.75281,
+              1236.35601
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 202.25262,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              202.25262,
+              202.7189,
+              203.02475,
+              201.45832000000001,
+              198.25239000000002
+            ]
+          },
+          "speedup": 6.116694557529094,
+          "compile_median_us": 89.299,
+          "first_compile_us": 165.075,
+          "first_call_us": 220.756,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "source_bytes": 1369,
+          "pool_entries": 9
+        },
+        "nullable_boolean_groups": {
+          "ordinary": {
+            "us_per_group_vector": 129.80339,
+            "allocated_per_call": 37.0,
+            "raw_us_per_group_vector": [
+              179.36359,
+              130.61524,
+              129.11731,
+              129.80339,
+              128.97978
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 64.37197,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              64.37197,
+              64.91178,
+              65.22771,
+              62.86882,
+              63.94128
+            ]
+          },
+          "speedup": 2.0164582503844453,
+          "compile_median_us": 21.3225,
+          "first_compile_us": 107.483,
+          "first_call_us": 6.838,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "source_bytes": 386,
+          "pool_entries": 0
+        },
+        "nullable_bit_groups": {
+          "ordinary": {
+            "us_per_group_vector": 138.67278,
+            "allocated_per_call": 39.0,
+            "raw_us_per_group_vector": [
+              177.25875,
+              138.67278,
+              137.37659,
+              137.57071,
+              141.24716
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 61.61694,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              63.52724,
+              61.61694,
+              62.357510000000005,
+              60.719300000000004,
+              61.371230000000004
+            ]
+          },
+          "speedup": 2.250562588794575,
+          "compile_median_us": 19.735,
+          "first_compile_us": 93.478,
+          "first_call_us": 5.773,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "source_bytes": 385,
+          "pool_entries": 0
+        }
+      },
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 84822409,
+        "before": {
+          "rss_bytes": 47255552,
+          "live_slots": 60988,
+          "jit": {},
+          "live_kernels": 2,
+          "anonymous_kernel_classes": 2
+        },
+        "after_eviction_and_gc": {
+          "rss_bytes": 47386624,
+          "live_slots": 63789,
+          "jit": {},
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 64,
+          "retained_kernels": 64,
+          "retained_source_bytes": 44608,
+          "retained_pool_entries": 320
+        },
+        "after_release_and_gc": {
+          "rss_bytes": 47386624,
+          "live_slots": 62290,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 0
+        },
+        "note": "Uses the engine's actual source/pool LRU and second-use admission. Live generated objects and whole-process JIT counters have different lifetimes; RSS need not fall after GC."
+      }
+    },
+    "4.0-yjit": {
+      "peak_rss_mib": 75.6328125,
+      "elapsed_seconds": 2.352594110008795,
+      "jobs": {
+        "count_star": {
+          "ordinary": {
+            "us_per_group_vector": 30.03491,
+            "allocated_per_call": 517.0,
+            "raw_us_per_group_vector": [
+              35.57024,
+              30.85902,
+              29.843529999999998,
+              30.03491,
+              29.91179
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 8.789639999999999,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              8.89321,
+              9.82175,
+              8.789639999999999,
+              8.684899999999999,
+              8.697799999999999
+            ]
+          },
+          "speedup": 3.417080790567077,
+          "compile_median_us": 10.1185,
+          "first_compile_us": 67.078,
+          "first_call_us": 331.93,
+          "yjit_instructions": 82,
+          "zjit_entries": 0,
+          "source_bytes": 200,
+          "pool_entries": 0
+        },
+        "nullable_integer_sum": {
+          "ordinary": {
+            "us_per_group_vector": 64.79758,
+            "allocated_per_call": 517.0,
+            "raw_us_per_group_vector": [
+              64.41446,
+              66.36263000000001,
+              64.09504,
+              64.79758,
+              66.56347
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 15.72227,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              17.042540000000002,
+              14.997489999999999,
+              17.87254,
+              14.95415,
+              15.72227
+            ]
+          },
+          "speedup": 4.12138832369626,
+          "compile_median_us": 28.1875,
+          "first_compile_us": 1796.894,
+          "first_call_us": 125.595,
+          "yjit_instructions": 264,
+          "zjit_entries": 0,
+          "source_bytes": 493,
+          "pool_entries": 2
+        },
+        "computed_filtered_sum": {
+          "ordinary": {
+            "us_per_group_vector": 319.375,
+            "allocated_per_call": 112.0,
+            "raw_us_per_group_vector": [
+              319.375,
+              320.22039,
+              318.91886999999997,
+              319.75147,
+              319.22451
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 41.15396,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              41.786519999999996,
+              41.00456,
+              41.15396,
+              41.02888,
+              41.30465
+            ]
+          },
+          "speedup": 7.760492550413132,
+          "compile_median_us": 85.0795,
+          "first_compile_us": 767.437,
+          "first_call_us": 186.26,
+          "yjit_instructions": 772,
+          "zjit_entries": 0,
+          "source_bytes": 1369,
+          "pool_entries": 9
+        },
+        "nullable_boolean_groups": {
+          "ordinary": {
+            "us_per_group_vector": 42.10313,
+            "allocated_per_call": 37.0,
+            "raw_us_per_group_vector": [
+              93.33443,
+              41.39002,
+              42.10313,
+              42.33846,
+              41.10797
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 11.436200000000001,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              11.31491,
+              11.436200000000001,
+              11.39105,
+              11.47826,
+              12.55717
+            ]
+          },
+          "speedup": 3.6815664294083694,
+          "compile_median_us": 15.863,
+          "first_compile_us": 561.671,
+          "first_call_us": 4.432,
+          "yjit_instructions": 286,
+          "zjit_entries": 0,
+          "source_bytes": 386,
+          "pool_entries": 0
+        },
+        "nullable_bit_groups": {
+          "ordinary": {
+            "us_per_group_vector": 48.7828,
+            "allocated_per_call": 39.0,
+            "raw_us_per_group_vector": [
+              54.94194,
+              67.51113000000001,
+              47.04685,
+              48.7828,
+              48.13453
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 13.44957,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              18.10773,
+              23.62794,
+              12.40595,
+              13.44957,
+              12.572149999999999
+            ]
+          },
+          "speedup": 3.6270899367042966,
+          "compile_median_us": 15.8515,
+          "first_compile_us": 522.487,
+          "first_call_us": 4.369,
+          "yjit_instructions": 273,
+          "zjit_entries": 0,
+          "source_bytes": 385,
+          "pool_entries": 0
+        }
+      },
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 452527330,
+        "before": {
+          "rss_bytes": 57229312,
+          "live_slots": 61128,
+          "jit": {
+            "inline_code_size": 315994,
+            "outlined_code_size": 425614,
+            "freed_code_size": 0,
+            "code_region_size": 1196032,
+            "compiled_iseq_entry": 146,
+            "compiled_iseq_count": 292,
+            "compiled_blockid_count": 5742,
+            "compiled_block_count": 8341,
+            "compiled_branch_count": 12811,
+            "compile_time_ns": 77018756
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 15
+        },
+        "after_eviction_and_gc": {
+          "rss_bytes": 79310848,
+          "live_slots": 64046,
+          "jit": {
+            "inline_code_size": 1554338,
+            "outlined_code_size": 2400013,
+            "freed_code_size": 0,
+            "code_region_size": 8368128,
+            "compiled_iseq_entry": 417,
+            "compiled_iseq_count": 569,
+            "compiled_blockid_count": 26695,
+            "compiled_block_count": 55307,
+            "compiled_branch_count": 85746,
+            "compile_time_ns": 464291009
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 84,
+          "retained_kernels": 64,
+          "retained_source_bytes": 44608,
+          "retained_pool_entries": 320
+        },
+        "after_release_and_gc": {
+          "rss_bytes": 79310848,
+          "live_slots": 62650,
+          "jit": {
+            "inline_code_size": 1554926,
+            "outlined_code_size": 2401053,
+            "freed_code_size": 0,
+            "code_region_size": 8368128,
+            "compiled_iseq_entry": 418,
+            "compiled_iseq_count": 570,
+            "compiled_blockid_count": 26699,
+            "compiled_block_count": 55321,
+            "compiled_branch_count": 85776,
+            "compile_time_ns": 464466377
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 25
+        },
+        "note": "Uses the engine's actual source/pool LRU and second-use admission. Live generated objects and whole-process JIT counters have different lifetimes; RSS need not fall after GC."
+      }
+    },
+    "4.1-zjit": {
+      "peak_rss_mib": 60.546875,
+      "elapsed_seconds": 2.716015148005681,
+      "jobs": {
+        "count_star": {
+          "ordinary": {
+            "us_per_group_vector": 38.93011,
+            "allocated_per_call": 517.0,
+            "raw_us_per_group_vector": [
+              42.08838,
+              43.31352,
+              38.93011,
+              38.86806,
+              38.6976
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 9.438469999999999,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              9.44373,
+              9.403360000000001,
+              9.495959999999998,
+              9.438469999999999,
+              9.309479999999999
+            ]
+          },
+          "speedup": 4.124620833673255,
+          "compile_median_us": 9.824,
+          "first_compile_us": 43.729,
+          "first_call_us": 456.556,
+          "yjit_instructions": null,
+          "zjit_entries": 1,
+          "source_bytes": 200,
+          "pool_entries": 0
+        },
+        "nullable_integer_sum": {
+          "ordinary": {
+            "us_per_group_vector": 66.65553,
+            "allocated_per_call": 517.0,
+            "raw_us_per_group_vector": [
+              112.92916000000001,
+              66.91957000000001,
+              66.05405,
+              66.65553,
+              65.95299
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 14.80872,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              15.00412,
+              14.80872,
+              15.24992,
+              14.31079,
+              14.63559
+            ]
+          },
+          "speedup": 4.501100027551335,
+          "compile_median_us": 24.2555,
+          "first_compile_us": 278.859,
+          "first_call_us": 861.992,
+          "yjit_instructions": null,
+          "zjit_entries": 1,
+          "source_bytes": 493,
+          "pool_entries": 2
+        },
+        "computed_filtered_sum": {
+          "ordinary": {
+            "us_per_group_vector": 440.71864,
+            "allocated_per_call": 112.0,
+            "raw_us_per_group_vector": [
+              440.71864,
+              439.70015,
+              444.53682000000003,
+              440.41123,
+              441.44910999999996
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 57.11068,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              56.378260000000004,
+              57.11068,
+              56.84081,
+              57.2783,
+              57.200019999999995
+            ]
+          },
+          "speedup": 7.716921598552144,
+          "compile_median_us": 118.845,
+          "first_compile_us": 148.337,
+          "first_call_us": 477.98,
+          "yjit_instructions": null,
+          "zjit_entries": 4,
+          "source_bytes": 1369,
+          "pool_entries": 9
+        },
+        "nullable_boolean_groups": {
+          "ordinary": {
+            "us_per_group_vector": 61.887809999999995,
+            "allocated_per_call": 37.0,
+            "raw_us_per_group_vector": [
+              65.24066,
+              61.887809999999995,
+              58.627489999999995,
+              61.93532,
+              58.8761
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 12.656709999999999,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              12.656709999999999,
+              12.55013,
+              12.61068,
+              12.69786,
+              12.69981
+            ]
+          },
+          "speedup": 4.889723316722908,
+          "compile_median_us": 12.536,
+          "first_compile_us": 102.97,
+          "first_call_us": 4.423,
+          "yjit_instructions": null,
+          "zjit_entries": 1,
+          "source_bytes": 386,
+          "pool_entries": 0
+        },
+        "nullable_bit_groups": {
+          "ordinary": {
+            "us_per_group_vector": 68.56317,
+            "allocated_per_call": 39.0,
+            "raw_us_per_group_vector": [
+              108.39152,
+              68.89519,
+              66.80515,
+              66.67063,
+              68.56317
+            ]
+          },
+          "compiled": {
+            "us_per_group_vector": 13.808440000000001,
+            "allocated_per_call": 1.0,
+            "raw_us_per_group_vector": [
+              13.65941,
+              13.973049999999999,
+              13.808440000000001,
+              13.57426,
+              13.93018
+            ]
+          },
+          "speedup": 4.965308898036273,
+          "compile_median_us": 12.4315,
+          "first_compile_us": 83.911,
+          "first_call_us": 4.527,
+          "yjit_instructions": null,
+          "zjit_entries": 1,
+          "source_bytes": 385,
+          "pool_entries": 0
+        }
+      },
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 291278422,
+        "before": {
+          "rss_bytes": 59891712,
+          "live_slots": 60033,
+          "jit": {
+            "compiled_iseq_count": 369,
+            "compile_time_ns": 156832715,
+            "compiled_side_exit_count": 12636,
+            "jit_frame_region_bytes": 135168,
+            "code_region_bytes": 2207744,
+            "zjit_alloc_bytes": 1447597,
+            "total_mem_bytes": 3790509
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 10
+        },
+        "after_eviction_and_gc": {
+          "rss_bytes": 63832064,
+          "live_slots": 65843,
+          "jit": {
+            "compiled_iseq_count": 685,
+            "compile_time_ns": 381212026,
+            "compiled_side_exit_count": 32666,
+            "jit_frame_region_bytes": 233472,
+            "code_region_bytes": 5656576,
+            "zjit_alloc_bytes": 4113149,
+            "total_mem_bytes": 10003197
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 266,
+          "retained_kernels": 64,
+          "retained_source_bytes": 44608,
+          "retained_pool_entries": 320
+        },
+        "after_release_and_gc": {
+          "rss_bytes": 63832064,
+          "live_slots": 66233,
+          "jit": {
+            "compiled_iseq_count": 686,
+            "compile_time_ns": 381797685,
+            "compiled_side_exit_count": 32671,
+            "jit_frame_region_bytes": 233472,
+            "code_region_bytes": 5656576,
+            "zjit_alloc_bytes": 4114525,
+            "total_mem_bytes": 10004573
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 266
+        },
+        "note": "Uses the engine's actual source/pool LRU and second-use admission. Live generated objects and whole-process JIT counters have different lifetimes; RSS need not fall after GC."
+      }
+    }
+  },
+  "retention_probes": {
+    "4.0-none": {
+      "peak_rss_mib": 41.3046875,
+      "before": {
+        "rss_bytes": 40747008,
+        "live_slots": 56968,
+        "jit": {},
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 0
+      },
+      "while_cache_retained": {
+        "rss_bytes": 43311104,
+        "live_slots": 60292,
+        "jit": {},
+        "live_kernels": 64,
+        "anonymous_kernel_classes": 64,
+        "cache_entries": 64,
+        "retained_source_bytes": 44608,
+        "retained_pool_entries": 320
+      },
+      "after_helper_return_and_gc": [
+        {
+          "rss_bytes": 43311104,
+          "live_slots": 58791,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 0,
+          "gc_after_return": 1
+        },
+        {
+          "rss_bytes": 43311104,
+          "live_slots": 58734,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 0,
+          "gc_after_return": 2
+        },
+        {
+          "rss_bytes": 43311104,
+          "live_slots": 58736,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 0,
+          "gc_after_return": 3
+        }
+      ]
+    },
+    "4.0-yjit": {
+      "peak_rss_mib": 71.390625,
+      "before": {
+        "rss_bytes": 41926656,
+        "live_slots": 56973,
+        "jit": {
+          "inline_code_size": 37392,
+          "outlined_code_size": 35726,
+          "freed_code_size": 0,
+          "code_region_size": 110592,
+          "compiled_iseq_entry": 61,
+          "compiled_iseq_count": 74,
+          "compiled_blockid_count": 604,
+          "compiled_block_count": 749,
+          "compiled_branch_count": 1091,
+          "compile_time_ns": 8180028
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 0
+      },
+      "while_cache_retained": {
+        "rss_bytes": 72921088,
+        "live_slots": 60504,
+        "jit": {
+          "inline_code_size": 1429157,
+          "outlined_code_size": 2507844,
+          "freed_code_size": 0,
+          "code_region_size": 7843840,
+          "compiled_iseq_entry": 368,
+          "compiled_iseq_count": 484,
+          "compiled_blockid_count": 24633,
+          "compiled_block_count": 51620,
+          "compiled_branch_count": 80136,
+          "compile_time_ns": 432410460
+        },
+        "live_kernels": 64,
+        "anonymous_kernel_classes": 80,
+        "cache_entries": 64,
+        "retained_source_bytes": 44608,
+        "retained_pool_entries": 320
+      },
+      "after_helper_return_and_gc": [
+        {
+          "rss_bytes": 72921088,
+          "live_slots": 59123,
+          "jit": {
+            "inline_code_size": 1429745,
+            "outlined_code_size": 2508884,
+            "freed_code_size": 0,
+            "code_region_size": 7843840,
+            "compiled_iseq_entry": 369,
+            "compiled_iseq_count": 485,
+            "compiled_blockid_count": 24637,
+            "compiled_block_count": 51634,
+            "compiled_branch_count": 80166,
+            "compile_time_ns": 432570218
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 21,
+          "gc_after_return": 1
+        },
+        {
+          "rss_bytes": 72921088,
+          "live_slots": 59068,
+          "jit": {
+            "inline_code_size": 1429745,
+            "outlined_code_size": 2508884,
+            "freed_code_size": 0,
+            "code_region_size": 7843840,
+            "compiled_iseq_entry": 369,
+            "compiled_iseq_count": 485,
+            "compiled_blockid_count": 24637,
+            "compiled_block_count": 51634,
+            "compiled_branch_count": 80166,
+            "compile_time_ns": 432570218
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 21,
+          "gc_after_return": 2
+        },
+        {
+          "rss_bytes": 72921088,
+          "live_slots": 59070,
+          "jit": {
+            "inline_code_size": 1429745,
+            "outlined_code_size": 2508884,
+            "freed_code_size": 0,
+            "code_region_size": 7843840,
+            "compiled_iseq_entry": 369,
+            "compiled_iseq_count": 485,
+            "compiled_blockid_count": 24637,
+            "compiled_block_count": 51634,
+            "compiled_branch_count": 80166,
+            "compile_time_ns": 432570218
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 21,
+          "gc_after_return": 3
+        }
+      ]
+    },
+    "4.1-zjit": {
+      "peak_rss_mib": 53.66796875,
+      "before": {
+        "rss_bytes": 45187072,
+        "live_slots": 55848,
+        "jit": {
+          "compiled_iseq_count": 72,
+          "compile_time_ns": 13233734,
+          "compiled_side_exit_count": 926,
+          "jit_frame_region_bytes": 12288,
+          "code_region_bytes": 122880,
+          "zjit_alloc_bytes": 161420,
+          "total_mem_bytes": 296588
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 0
+      },
+      "while_cache_retained": {
+        "rss_bytes": 56635392,
+        "live_slots": 62143,
+        "jit": {
+          "compiled_iseq_count": 480,
+          "compile_time_ns": 278300594,
+          "compiled_side_exit_count": 24379,
+          "jit_frame_region_bytes": 143360,
+          "code_region_bytes": 4096000,
+          "zjit_alloc_bytes": 3577508,
+          "total_mem_bytes": 7816868
+        },
+        "live_kernels": 64,
+        "anonymous_kernel_classes": 256,
+        "cache_entries": 64,
+        "retained_source_bytes": 44608,
+        "retained_pool_entries": 320
+      },
+      "after_helper_return_and_gc": [
+        {
+          "rss_bytes": 56639488,
+          "live_slots": 62002,
+          "jit": {
+            "compiled_iseq_count": 482,
+            "compile_time_ns": 278575521,
+            "compiled_side_exit_count": 24390,
+            "jit_frame_region_bytes": 143360,
+            "code_region_bytes": 4100096,
+            "zjit_alloc_bytes": 3579332,
+            "total_mem_bytes": 7822788
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 256,
+          "gc_after_return": 1
+        },
+        {
+          "rss_bytes": 56639488,
+          "live_slots": 62004,
+          "jit": {
+            "compiled_iseq_count": 482,
+            "compile_time_ns": 278575521,
+            "compiled_side_exit_count": 24390,
+            "jit_frame_region_bytes": 143360,
+            "code_region_bytes": 4100096,
+            "zjit_alloc_bytes": 3579332,
+            "total_mem_bytes": 7822788
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 256,
+          "gc_after_return": 2
+        },
+        {
+          "rss_bytes": 56639488,
+          "live_slots": 62006,
+          "jit": {
+            "compiled_iseq_count": 482,
+            "compile_time_ns": 278575521,
+            "compiled_side_exit_count": 24390,
+            "jit_frame_region_bytes": 143360,
+            "code_region_bytes": 4100096,
+            "zjit_alloc_bytes": 3579332,
+            "total_mem_bytes": 7822788
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 256,
+          "gc_after_return": 3
+        }
+      ]
+    }
+  },
+  "zjit_log_audit": {
+    "per_job_proof_entries": 8,
+    "captured_generated_entries": 264,
+    "final_generated_entries": 264,
+    "snapshot_sha256": "1822d448fae3563fd24d6e36a544a795886b66996dfd3c82b2845e25289cdb9b",
+    "final_sha256": "8e59570a02a85aeffda6872c8c0bc6814ca8a732c48960089132e64b7c2e32e6",
+    "captured_prefix_and_all_job_windows_present": true
+  },
+  "caveats": [
+    "Direct aggregate kernels over pre-existing groups exclude SQL parsing, row scanning, grouping, projection and storage; these speedups are not complete-query speedups.",
+    "The control retains the existing compiled-expression argument tier and disables only the new aggregate tier. Values, types, errors, exact costs, every small-case budget prefix, fixture signatures and generated source hashes agree across all three runtimes.",
+    "Compilation/first-call measurements include runtime warmup effects; first-call latency varies markedly. Warmup checkpoints occur after semantic validation and are not pristine cold-method trajectories.",
+    "The original in-method churn observes 64 final cache kernels after nil assignments under ZJIT, versus zero under interpreter/YJIT. Separate probes return from the cache-populating helper before GC and observe zero live kernels on all three runtimes. This supports temporary JIT frame retention, not a persistent engine cache leak.",
+    "VM class/code retention remains: after helper return the separate probes retain 0 anonymous aggregate classes in the interpreter, 21 under YJIT, and 256 under ZJIT. No immediate machine-code reclamation or whole-engine memory ceiling is claimed.",
+    "The ZJIT diagnostic records an in-process log hash before JSON serialization; later JIT activity appends more log entries. The final hash here covers the complete file. Every captured generated-entry prefix and per-job proof window is present in that final file.",
+    "Ruby 4.0.7 and 4.1.0-preview1 are different runtimes; comparisons between YJIT and ZJIT do not isolate JIT implementation effects."
+  ]
+}

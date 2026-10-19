@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/aggregate_retention.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "bench/ruby-native/results/aggregate-followup/retention-4.0-yjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 74858496,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 0.7612198619899573,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/aggregate-followup/retention-4.0-yjit.json\",\"source_sha256\":\"04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170\",\"jit\":\"yjit\",\"before_kernels\":0,\"retained_kernels\":64,\"after_return_kernels\":[0,0,0],\"after_return_classes\":[21,21,21]}\n",
+  "stderr": ""
+}

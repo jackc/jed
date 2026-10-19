@@ -1,0 +1,5013 @@
+{
+  "created_at": "2026-10-19T17:16:15Z",
+  "options": {
+    "ruby": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "jit": "none",
+    "lanes": [
+      "native-prepared",
+      "native-query",
+      "native-eager"
+    ],
+    "workloads": [
+      "scalar",
+      "aggregate",
+      "group",
+      "aggregate_argument",
+      "aggregate_multi",
+      "aggregate_filter",
+      "aggregate_bool_bits",
+      "aggregate_many_groups",
+      "aggregate_distinct"
+    ],
+    "disable_aggregate": true,
+    "output": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/aggregate-followup/control-4.0-none-1-disabled.json"
+  },
+  "git_commit": "8243d0bc660c116dc3ae77928328ea61e09037be",
+  "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+  "source_sha256": {
+    "native": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+    "wrapper": "758334a5e5e3c16ec239a3e0185677253ec15136c062e3b524dd353f7dd580b5",
+    "rust": "bf85a2b7feaad510d97bc244ecc6108023d2bd8090dd9fcccd013580fcda938f",
+    "wrapper_library": "2218b17c826093137bd0b12a4f1db904adb6f25834673b1b297dfea8592e62f6",
+    "worker": "1d6c03eab4cdc3039c17410b32491fdb7acedcb15d2797a4311a78a205dfb6ce",
+    "plans": {
+      "plan.json": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+      "compiled-plan.json": "42c25ee0a0fd81e2fd1727c0da93f32261dc6b1586a4980cc540f3d572cd3ea3",
+      "pipeline-plan.json": "d309733d558cbb1c6a2b82fa2a444b2fad2359e5abd960a47d31916decfd8ba2",
+      "ordering-plan.json": "c9d1709b39f6dc5373232b7b73e65be4b4d0f775c8e7564e7288192e76d433d0",
+      "aggregate-plan.json": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7"
+    },
+    "database": null
+  },
+  "lanes": {
+    "native-prepared": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 60493824,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--disable-yjit",
+        "--disable-zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "native-prepared",
+        "--workloads",
+        "scalar,aggregate,group,aggregate_argument,aggregate_multi,aggregate_filter,aggregate_bool_bits,aggregate_many_groups,aggregate_distinct",
+        "--disable-aggregate"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "native-prepared",
+        "verify_only": false,
+        "created_at": "2026-10-19T17:16:22Z",
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "ruby_executable_sha256": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf",
+        "yjit": false,
+        "zjit": null,
+        "jit": {
+          "yjit": false,
+          "zjit": false
+        },
+        "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+        "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+        "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+        "native_library": null,
+        "native_library_sha256": null,
+        "script_sha256": "1d6c03eab4cdc3039c17410b32491fdb7acedcb15d2797a4311a78a205dfb6ce",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "additional_plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/aggregate-plan.json",
+        "additional_plan_sha256": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7",
+        "additional_plans": {
+          "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/pipeline-plan.json": "d309733d558cbb1c6a2b82fa2a444b2fad2359e5abd960a47d31916decfd8ba2",
+          "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/aggregate-plan.json": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7"
+        },
+        "storage": "memory",
+        "file": null,
+        "fresh_sql": false,
+        "pipeline_disabled": false,
+        "ordering_disabled": false,
+        "aggregate_disabled": true,
+        "dataset_rows": 1000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Expression/pipeline/ordering/aggregate shapes require an explicit --workloads selection; existing workload schedules remain unchanged.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "scalar",
+            "sql": "SELECT abs($1::i64) + 7",
+            "kind": "original",
+            "validation_parameters": [
+              [
+                -999
+              ],
+              [
+                -982
+              ],
+              [
+                -965
+              ],
+              [
+                -948
+              ],
+              [
+                -931
+              ],
+              [
+                -914
+              ],
+              [
+                -897
+              ],
+              [
+                -880
+              ],
+              [
+                -863
+              ],
+              [
+                -846
+              ],
+              [
+                -829
+              ],
+              [
+                -812
+              ],
+              [
+                -795
+              ],
+              [
+                -778
+              ],
+              [
+                -761
+              ],
+              [
+                -744
+              ],
+              [
+                -727
+              ],
+              [
+                -710
+              ],
+              [
+                -693
+              ],
+              [
+                -676
+              ],
+              [
+                -659
+              ],
+              [
+                -642
+              ],
+              [
+                -625
+              ],
+              [
+                -608
+              ],
+              [
+                -591
+              ],
+              [
+                -574
+              ],
+              [
+                -557
+              ],
+              [
+                -540
+              ],
+              [
+                -523
+              ],
+              [
+                -506
+              ],
+              [
+                -489
+              ],
+              [
+                -472
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4
+            ],
+            "validation_columns": [
+              "?column?"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "dd2a48b279dbc34ed87f183a7d466c7a3c54fd9db1c51668f8fd8fbb9b756443",
+            "answer_sha256": "6ee55f0b3c1df4311965e74ee176604aba37d507ebac085df2ff69c17006876f",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 300,
+            "iterations": 2000,
+            "samples_ns": [
+              26171015,
+              25044135,
+              25089698,
+              25220959,
+              25116361
+            ],
+            "median_ns": 12558.1805,
+            "rows_per_sample": [
+              2000,
+              2000,
+              2000,
+              2000,
+              2000
+            ]
+          },
+          {
+            "name": "aggregate",
+            "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+            "kind": "original",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107
+            ],
+            "validation_columns": [
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "cc03768aa49d23e0775c5c175f6d81bb711a3058d27ae49a8b2550960ed071c9",
+            "answer_sha256": "9f3aca7904764ef896d1ce8c38c56773de1e5bd183881c76ea0e78356de4a648",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              38374706,
+              38353639,
+              38186966,
+              38173214,
+              39167590
+            ],
+            "median_ns": 767072.78,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "group",
+            "sql": "SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket",
+            "kind": "original",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10
+            ],
+            "validation_costs": [
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016
+            ],
+            "validation_columns": [
+              "bucket",
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i32",
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "7ce4d1e9c9eeac8cd1fcea5ee1ec15f2af6d7757050eab3157dc2d1c28d128e7",
+            "answer_sha256": "0164ce5b4173c53ba2c2b66aa74c2359584c0273d0c2580be042226bbc76e305",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              72053191,
+              72741647,
+              72507241,
+              72587128,
+              72779146
+            ],
+            "median_ns": 1451742.56,
+            "rows_per_sample": [
+              500,
+              500,
+              500,
+              500,
+              500
+            ]
+          },
+          {
+            "name": "aggregate_argument",
+            "sql": "SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1",
+            "kind": "compiled_pipeline",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507
+            ],
+            "validation_columns": [
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "19645aa48748f4bbeeab23b7d4ea1be042e3fde37c7efa9884609f0c1d57451e",
+            "answer_sha256": "409ab0c7de31b7261c941e887b50e7b1214969c82c6e011a4fbebbb55b509780",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              88676354,
+              88183436,
+              88804251,
+              88741326,
+              88704346
+            ],
+            "median_ns": 1774086.92,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_multi",
+            "sql": "SELECT count(*), count(score), min(score), max(score), sum(score), bit_xor(score) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007
+            ],
+            "validation_columns": [
+              "count",
+              "count",
+              "min",
+              "max",
+              "sum",
+              "bit_xor"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64",
+              "i32",
+              "i32",
+              "i64",
+              "i32"
+            ],
+            "validation_sha256": "9ca04ab6f6d22b678af9787c668aeeeb59126818e4e9b09039761449e2a201e1",
+            "answer_sha256": "2420b81f2a5e95d9bd35566f420a9b7dc667b4172e29f580c983810b3ea3ff87",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              122612327,
+              122801299,
+              123333618,
+              124492004,
+              123317430
+            ],
+            "median_ns": 2466348.6,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_filter",
+            "sql": "SELECT sum(CASE WHEN bucket = 0 THEN NULL ELSE score END) FILTER (WHERE bucket >= $1), min(CASE WHEN bucket = 0 THEN NULL ELSE score END) FILTER (WHERE bucket >= $1) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407
+            ],
+            "validation_columns": [
+              "sum",
+              "min"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32"
+            ],
+            "validation_sha256": "77c91227da1bb80f95b9d5103b3af5760d44c281eab80cac90838fbe2c85c358",
+            "answer_sha256": "61d9821d1b8e18f49f6c8c3f98e58043f49d0890b57fca035f66cd10134c673f",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              133936781,
+              133765435,
+              133997251,
+              135511838,
+              133995921
+            ],
+            "median_ns": 2679918.42,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_bool_bits",
+            "sql": "SELECT CASE WHEN bool_and(score >= 0) THEN 1 ELSE 0 END, CASE WHEN bool_or(score > 5000) THEN 1 ELSE 0 END, bit_and(score), bit_or(score), bit_xor(score) FROM items WHERE bucket >= $1",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309
+            ],
+            "validation_columns": [
+              "?column?",
+              "?column?",
+              "bit_and",
+              "bit_or",
+              "bit_xor"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64",
+              "i32",
+              "i32",
+              "i32"
+            ],
+            "validation_sha256": "0fb7a7ca90e2601957970d29a21fd039ce7ba9dda453adb3b34b010d3b97622b",
+            "answer_sha256": "4f128582effa4b01a16a60670b04696d4c3c137ccbe2886e5e8bf26bfa4e14c6",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              122135301,
+              122434652,
+              122589544,
+              122277766,
+              121783391
+            ],
+            "median_ns": 2445555.32,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_many_groups",
+            "sql": "SELECT score % 100, count(*), sum(score) FROM items GROUP BY score % 100 ORDER BY 1",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "validation_costs": [
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106
+            ],
+            "validation_columns": [
+              "?column?",
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i32",
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "a9bf913353514a2b8a7df16a2774a08306463148a58dba0721203a79e2009a4f",
+            "answer_sha256": "acc82dda6921ba9ca84025592a624bef4d2df997415d04b0b64b71b9ce21bc3e",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              180456982,
+              180563885,
+              181047737,
+              180741385,
+              181830828
+            ],
+            "median_ns": 3614827.7,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          },
+          {
+            "name": "aggregate_distinct",
+            "sql": "SELECT count(DISTINCT bucket), sum(DISTINCT bucket) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007
+            ],
+            "validation_columns": [
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "42f08b48b884b3ce8fa79df1974ca8ff31ae06070f0593fc2a66c7378ff5341b",
+            "answer_sha256": "ce1480a1b731c82c219054ac614fc571c6e19baf32760da6452262d594e328ae",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              57369554,
+              57482501,
+              57169800,
+              57339199,
+              57179571
+            ],
+            "median_ns": 1146783.98,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          }
+        ]
+      }
+    },
+    "native-query": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 60301312,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--disable-yjit",
+        "--disable-zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "native-query",
+        "--workloads",
+        "scalar,aggregate,group,aggregate_argument,aggregate_multi,aggregate_filter,aggregate_bool_bits,aggregate_many_groups,aggregate_distinct",
+        "--disable-aggregate"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "native-query",
+        "verify_only": false,
+        "created_at": "2026-10-19T17:16:29Z",
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "ruby_executable_sha256": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf",
+        "yjit": false,
+        "zjit": null,
+        "jit": {
+          "yjit": false,
+          "zjit": false
+        },
+        "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+        "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+        "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+        "native_library": null,
+        "native_library_sha256": null,
+        "script_sha256": "1d6c03eab4cdc3039c17410b32491fdb7acedcb15d2797a4311a78a205dfb6ce",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "additional_plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/aggregate-plan.json",
+        "additional_plan_sha256": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7",
+        "additional_plans": {
+          "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/pipeline-plan.json": "d309733d558cbb1c6a2b82fa2a444b2fad2359e5abd960a47d31916decfd8ba2",
+          "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/aggregate-plan.json": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7"
+        },
+        "storage": "memory",
+        "file": null,
+        "fresh_sql": false,
+        "pipeline_disabled": false,
+        "ordering_disabled": false,
+        "aggregate_disabled": true,
+        "dataset_rows": 1000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Expression/pipeline/ordering/aggregate shapes require an explicit --workloads selection; existing workload schedules remain unchanged.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "scalar",
+            "sql": "SELECT abs($1::i64) + 7",
+            "kind": "original",
+            "validation_parameters": [
+              [
+                -999
+              ],
+              [
+                -982
+              ],
+              [
+                -965
+              ],
+              [
+                -948
+              ],
+              [
+                -931
+              ],
+              [
+                -914
+              ],
+              [
+                -897
+              ],
+              [
+                -880
+              ],
+              [
+                -863
+              ],
+              [
+                -846
+              ],
+              [
+                -829
+              ],
+              [
+                -812
+              ],
+              [
+                -795
+              ],
+              [
+                -778
+              ],
+              [
+                -761
+              ],
+              [
+                -744
+              ],
+              [
+                -727
+              ],
+              [
+                -710
+              ],
+              [
+                -693
+              ],
+              [
+                -676
+              ],
+              [
+                -659
+              ],
+              [
+                -642
+              ],
+              [
+                -625
+              ],
+              [
+                -608
+              ],
+              [
+                -591
+              ],
+              [
+                -574
+              ],
+              [
+                -557
+              ],
+              [
+                -540
+              ],
+              [
+                -523
+              ],
+              [
+                -506
+              ],
+              [
+                -489
+              ],
+              [
+                -472
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4
+            ],
+            "validation_columns": [
+              "?column?"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "dd2a48b279dbc34ed87f183a7d466c7a3c54fd9db1c51668f8fd8fbb9b756443",
+            "answer_sha256": "6ee55f0b3c1df4311965e74ee176604aba37d507ebac085df2ff69c17006876f",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 300,
+            "iterations": 2000,
+            "samples_ns": [
+              28036070,
+              32593054,
+              27978293,
+              27452721,
+              27640915
+            ],
+            "median_ns": 13989.1465,
+            "rows_per_sample": [
+              2000,
+              2000,
+              2000,
+              2000,
+              2000
+            ]
+          },
+          {
+            "name": "aggregate",
+            "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+            "kind": "original",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107
+            ],
+            "validation_columns": [
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "cc03768aa49d23e0775c5c175f6d81bb711a3058d27ae49a8b2550960ed071c9",
+            "answer_sha256": "9f3aca7904764ef896d1ce8c38c56773de1e5bd183881c76ea0e78356de4a648",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              38503202,
+              38312793,
+              38337011,
+              38905627,
+              38999288
+            ],
+            "median_ns": 770064.04,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "group",
+            "sql": "SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket",
+            "kind": "original",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10
+            ],
+            "validation_costs": [
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016
+            ],
+            "validation_columns": [
+              "bucket",
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i32",
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "7ce4d1e9c9eeac8cd1fcea5ee1ec15f2af6d7757050eab3157dc2d1c28d128e7",
+            "answer_sha256": "0164ce5b4173c53ba2c2b66aa74c2359584c0273d0c2580be042226bbc76e305",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              72526059,
+              72292009,
+              72691538,
+              72408245,
+              72337732
+            ],
+            "median_ns": 1448164.9,
+            "rows_per_sample": [
+              500,
+              500,
+              500,
+              500,
+              500
+            ]
+          },
+          {
+            "name": "aggregate_argument",
+            "sql": "SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1",
+            "kind": "compiled_pipeline",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507
+            ],
+            "validation_columns": [
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "19645aa48748f4bbeeab23b7d4ea1be042e3fde37c7efa9884609f0c1d57451e",
+            "answer_sha256": "409ab0c7de31b7261c941e887b50e7b1214969c82c6e011a4fbebbb55b509780",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              88453803,
+              88558602,
+              88703104,
+              89023100,
+              88158996
+            ],
+            "median_ns": 1771172.04,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_multi",
+            "sql": "SELECT count(*), count(score), min(score), max(score), sum(score), bit_xor(score) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007
+            ],
+            "validation_columns": [
+              "count",
+              "count",
+              "min",
+              "max",
+              "sum",
+              "bit_xor"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64",
+              "i32",
+              "i32",
+              "i64",
+              "i32"
+            ],
+            "validation_sha256": "9ca04ab6f6d22b678af9787c668aeeeb59126818e4e9b09039761449e2a201e1",
+            "answer_sha256": "2420b81f2a5e95d9bd35566f420a9b7dc667b4172e29f580c983810b3ea3ff87",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              123171938,
+              122763268,
+              123024586,
+              123219906,
+              122854984
+            ],
+            "median_ns": 2460491.72,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_filter",
+            "sql": "SELECT sum(CASE WHEN bucket = 0 THEN NULL ELSE score END) FILTER (WHERE bucket >= $1), min(CASE WHEN bucket = 0 THEN NULL ELSE score END) FILTER (WHERE bucket >= $1) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407
+            ],
+            "validation_columns": [
+              "sum",
+              "min"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32"
+            ],
+            "validation_sha256": "77c91227da1bb80f95b9d5103b3af5760d44c281eab80cac90838fbe2c85c358",
+            "answer_sha256": "61d9821d1b8e18f49f6c8c3f98e58043f49d0890b57fca035f66cd10134c673f",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              134667108,
+              135411350,
+              134868854,
+              135255668,
+              135740979
+            ],
+            "median_ns": 2705113.36,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_bool_bits",
+            "sql": "SELECT CASE WHEN bool_and(score >= 0) THEN 1 ELSE 0 END, CASE WHEN bool_or(score > 5000) THEN 1 ELSE 0 END, bit_and(score), bit_or(score), bit_xor(score) FROM items WHERE bucket >= $1",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309
+            ],
+            "validation_columns": [
+              "?column?",
+              "?column?",
+              "bit_and",
+              "bit_or",
+              "bit_xor"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64",
+              "i32",
+              "i32",
+              "i32"
+            ],
+            "validation_sha256": "0fb7a7ca90e2601957970d29a21fd039ce7ba9dda453adb3b34b010d3b97622b",
+            "answer_sha256": "4f128582effa4b01a16a60670b04696d4c3c137ccbe2886e5e8bf26bfa4e14c6",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              123183402,
+              122257660,
+              123110816,
+              122268553,
+              122499014
+            ],
+            "median_ns": 2449980.28,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_many_groups",
+            "sql": "SELECT score % 100, count(*), sum(score) FROM items GROUP BY score % 100 ORDER BY 1",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "validation_costs": [
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106
+            ],
+            "validation_columns": [
+              "?column?",
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i32",
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "a9bf913353514a2b8a7df16a2774a08306463148a58dba0721203a79e2009a4f",
+            "answer_sha256": "acc82dda6921ba9ca84025592a624bef4d2df997415d04b0b64b71b9ce21bc3e",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              181176269,
+              180933979,
+              180560227,
+              180525387,
+              181795149
+            ],
+            "median_ns": 3618679.58,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          },
+          {
+            "name": "aggregate_distinct",
+            "sql": "SELECT count(DISTINCT bucket), sum(DISTINCT bucket) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007
+            ],
+            "validation_columns": [
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "42f08b48b884b3ce8fa79df1974ca8ff31ae06070f0593fc2a66c7378ff5341b",
+            "answer_sha256": "ce1480a1b731c82c219054ac614fc571c6e19baf32760da6452262d594e328ae",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              57252953,
+              57441821,
+              57070494,
+              57787290,
+              57240213
+            ],
+            "median_ns": 1145059.06,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          }
+        ]
+      }
+    },
+    "native-eager": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 60186624,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--disable-yjit",
+        "--disable-zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "native-eager",
+        "--workloads",
+        "scalar,aggregate,group,aggregate_argument,aggregate_multi,aggregate_filter,aggregate_bool_bits,aggregate_many_groups,aggregate_distinct",
+        "--disable-aggregate"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "native-eager",
+        "verify_only": false,
+        "created_at": "2026-10-19T17:16:35Z",
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "ruby_executable_sha256": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf",
+        "yjit": false,
+        "zjit": null,
+        "jit": {
+          "yjit": false,
+          "zjit": false
+        },
+        "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+        "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+        "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+        "native_library": null,
+        "native_library_sha256": null,
+        "script_sha256": "1d6c03eab4cdc3039c17410b32491fdb7acedcb15d2797a4311a78a205dfb6ce",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "additional_plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/aggregate-plan.json",
+        "additional_plan_sha256": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7",
+        "additional_plans": {
+          "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/pipeline-plan.json": "d309733d558cbb1c6a2b82fa2a444b2fad2359e5abd960a47d31916decfd8ba2",
+          "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/aggregate-plan.json": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7"
+        },
+        "storage": "memory",
+        "file": null,
+        "fresh_sql": false,
+        "pipeline_disabled": false,
+        "ordering_disabled": false,
+        "aggregate_disabled": true,
+        "dataset_rows": 1000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Expression/pipeline/ordering/aggregate shapes require an explicit --workloads selection; existing workload schedules remain unchanged.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "scalar",
+            "sql": "SELECT abs($1::i64) + 7",
+            "kind": "original",
+            "validation_parameters": [
+              [
+                -999
+              ],
+              [
+                -982
+              ],
+              [
+                -965
+              ],
+              [
+                -948
+              ],
+              [
+                -931
+              ],
+              [
+                -914
+              ],
+              [
+                -897
+              ],
+              [
+                -880
+              ],
+              [
+                -863
+              ],
+              [
+                -846
+              ],
+              [
+                -829
+              ],
+              [
+                -812
+              ],
+              [
+                -795
+              ],
+              [
+                -778
+              ],
+              [
+                -761
+              ],
+              [
+                -744
+              ],
+              [
+                -727
+              ],
+              [
+                -710
+              ],
+              [
+                -693
+              ],
+              [
+                -676
+              ],
+              [
+                -659
+              ],
+              [
+                -642
+              ],
+              [
+                -625
+              ],
+              [
+                -608
+              ],
+              [
+                -591
+              ],
+              [
+                -574
+              ],
+              [
+                -557
+              ],
+              [
+                -540
+              ],
+              [
+                -523
+              ],
+              [
+                -506
+              ],
+              [
+                -489
+              ],
+              [
+                -472
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4,
+              4
+            ],
+            "validation_columns": [
+              "?column?"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "dd2a48b279dbc34ed87f183a7d466c7a3c54fd9db1c51668f8fd8fbb9b756443",
+            "answer_sha256": "6ee55f0b3c1df4311965e74ee176604aba37d507ebac085df2ff69c17006876f",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 300,
+            "iterations": 2000,
+            "samples_ns": [
+              32376036,
+              33157228,
+              30195206,
+              30254994,
+              30064571
+            ],
+            "median_ns": 15127.497,
+            "rows_per_sample": [
+              2000,
+              2000,
+              2000,
+              2000,
+              2000
+            ]
+          },
+          {
+            "name": "aggregate",
+            "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+            "kind": "original",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                5
+              ],
+              [
+                6
+              ],
+              [
+                7
+              ],
+              [
+                8
+              ],
+              [
+                9
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107,
+              2107
+            ],
+            "validation_columns": [
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "cc03768aa49d23e0775c5c175f6d81bb711a3058d27ae49a8b2550960ed071c9",
+            "answer_sha256": "9f3aca7904764ef896d1ce8c38c56773de1e5bd183881c76ea0e78356de4a648",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              31830494,
+              31816583,
+              31975985,
+              32019542,
+              32330586
+            ],
+            "median_ns": 639519.7,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "group",
+            "sql": "SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket",
+            "kind": "original",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10,
+              10
+            ],
+            "validation_costs": [
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016,
+              3016
+            ],
+            "validation_columns": [
+              "bucket",
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i32",
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "7ce4d1e9c9eeac8cd1fcea5ee1ec15f2af6d7757050eab3157dc2d1c28d128e7",
+            "answer_sha256": "0164ce5b4173c53ba2c2b66aa74c2359584c0273d0c2580be042226bbc76e305",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              62748315,
+              62382944,
+              62102886,
+              62459825,
+              62582023
+            ],
+            "median_ns": 1249196.5,
+            "rows_per_sample": [
+              500,
+              500,
+              500,
+              500,
+              500
+            ]
+          },
+          {
+            "name": "aggregate_argument",
+            "sql": "SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1",
+            "kind": "compiled_pipeline",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507,
+              6007,
+              5507,
+              5007,
+              7007,
+              6507
+            ],
+            "validation_columns": [
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64"
+            ],
+            "validation_sha256": "19645aa48748f4bbeeab23b7d4ea1be042e3fde37c7efa9884609f0c1d57451e",
+            "answer_sha256": "409ab0c7de31b7261c941e887b50e7b1214969c82c6e011a4fbebbb55b509780",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              69983390,
+              70012877,
+              69599485,
+              70332737,
+              70521651
+            ],
+            "median_ns": 1400257.54,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_multi",
+            "sql": "SELECT count(*), count(score), min(score), max(score), sum(score), bit_xor(score) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007,
+              7007
+            ],
+            "validation_columns": [
+              "count",
+              "count",
+              "min",
+              "max",
+              "sum",
+              "bit_xor"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64",
+              "i32",
+              "i32",
+              "i64",
+              "i32"
+            ],
+            "validation_sha256": "9ca04ab6f6d22b678af9787c668aeeeb59126818e4e9b09039761449e2a201e1",
+            "answer_sha256": "2420b81f2a5e95d9bd35566f420a9b7dc667b4172e29f580c983810b3ea3ff87",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              100184572,
+              100117337,
+              99742008,
+              99419795,
+              99436077
+            ],
+            "median_ns": 1994840.16,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_filter",
+            "sql": "SELECT sum(CASE WHEN bucket = 0 THEN NULL ELSE score END) FILTER (WHERE bucket >= $1), min(CASE WHEN bucket = 0 THEN NULL ELSE score END) FILTER (WHERE bucket >= $1) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407,
+              7807,
+              7207,
+              6607,
+              9007,
+              8407
+            ],
+            "validation_columns": [
+              "sum",
+              "min"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32"
+            ],
+            "validation_sha256": "77c91227da1bb80f95b9d5103b3af5760d44c281eab80cac90838fbe2c85c358",
+            "answer_sha256": "61d9821d1b8e18f49f6c8c3f98e58043f49d0890b57fca035f66cd10134c673f",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              110997873,
+              110665227,
+              110833661,
+              109441894,
+              109784569
+            ],
+            "median_ns": 2213304.54,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_bool_bits",
+            "sql": "SELECT CASE WHEN bool_and(score >= 0) THEN 1 ELSE 0 END, CASE WHEN bool_or(score > 5000) THEN 1 ELSE 0 END, bit_and(score), bit_or(score), bit_xor(score) FROM items WHERE bucket >= $1",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ],
+              [
+                2
+              ],
+              [
+                3
+              ],
+              [
+                4
+              ],
+              [
+                0
+              ],
+              [
+                1
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309,
+              7609,
+              6909,
+              6209,
+              9009,
+              8309
+            ],
+            "validation_columns": [
+              "?column?",
+              "?column?",
+              "bit_and",
+              "bit_or",
+              "bit_xor"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64",
+              "i32",
+              "i32",
+              "i32"
+            ],
+            "validation_sha256": "0fb7a7ca90e2601957970d29a21fd039ce7ba9dda453adb3b34b010d3b97622b",
+            "answer_sha256": "4f128582effa4b01a16a60670b04696d4c3c137ccbe2886e5e8bf26bfa4e14c6",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              95595332,
+              96009264,
+              95744469,
+              95912200,
+              97126348
+            ],
+            "median_ns": 1918244.0,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          },
+          {
+            "name": "aggregate_many_groups",
+            "sql": "SELECT score % 100, count(*), sum(score) FROM items GROUP BY score % 100 ORDER BY 1",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100,
+              100
+            ],
+            "validation_costs": [
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106,
+              4106
+            ],
+            "validation_columns": [
+              "?column?",
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i32",
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "a9bf913353514a2b8a7df16a2774a08306463148a58dba0721203a79e2009a4f",
+            "answer_sha256": "acc82dda6921ba9ca84025592a624bef4d2df997415d04b0b64b71b9ce21bc3e",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              137806502,
+              138106977,
+              137692950,
+              138283118,
+              138868747
+            ],
+            "median_ns": 2762139.54,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          },
+          {
+            "name": "aggregate_distinct",
+            "sql": "SELECT count(DISTINCT bucket), sum(DISTINCT bucket) FROM items",
+            "kind": "compiled_aggregate",
+            "validation_parameters": [
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              [],
+              []
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007,
+              3007
+            ],
+            "validation_columns": [
+              "count",
+              "sum"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i64"
+            ],
+            "validation_sha256": "42f08b48b884b3ce8fa79df1974ca8ff31ae06070f0593fc2a66c7378ff5341b",
+            "answer_sha256": "ce1480a1b731c82c219054ac614fc571c6e19baf32760da6452262d594e328ae",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 100,
+            "iterations": 50,
+            "samples_ns": [
+              47186149,
+              47547447,
+              47616191,
+              47408134,
+              47473950
+            ],
+            "median_ns": 949479.0,
+            "rows_per_sample": [
+              50,
+              50,
+              50,
+              50,
+              50
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "errors": [],
+  "source_sha256_after": {
+    "native": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+    "wrapper": "758334a5e5e3c16ec239a3e0185677253ec15136c062e3b524dd353f7dd580b5",
+    "rust": "bf85a2b7feaad510d97bc244ecc6108023d2bd8090dd9fcccd013580fcda938f",
+    "wrapper_library": "2218b17c826093137bd0b12a4f1db904adb6f25834673b1b297dfea8592e62f6",
+    "worker": "1d6c03eab4cdc3039c17410b32491fdb7acedcb15d2797a4311a78a205dfb6ce",
+    "plans": {
+      "plan.json": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+      "compiled-plan.json": "42c25ee0a0fd81e2fd1727c0da93f32261dc6b1586a4980cc540f3d572cd3ea3",
+      "pipeline-plan.json": "d309733d558cbb1c6a2b82fa2a444b2fad2359e5abd960a47d31916decfd8ba2",
+      "ordering-plan.json": "c9d1709b39f6dc5373232b7b73e65be4b4d0f775c8e7564e7288192e76d433d0",
+      "aggregate-plan.json": "8429628089505c2015386062d00f0c85c2c04518c04de159a0eada1f8fd241e7"
+    },
+    "database": null
+  }
+}
