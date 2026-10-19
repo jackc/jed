@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T17:26:04Z",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "jit": "yjit",
+  "options": {
+    "churn": 256,
+    "churn_calls": 200,
+    "jit": "yjit",
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/aggregate-followup/retention-4.0-yjit.json"
+  },
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "script_sha256": "75ad7b188860223dc360e91e9c700eb6525696e8d9b7e73b2dcb8514d36bc3bd",
+  "helper_sha256": "33f64e9f8c58bd3f28c061a1a7fc4d8b24d5e8fceda61b9a6dd101e6664ca16e",
+  "before": {
+    "rss_bytes": 41926656,
+    "live_slots": 56973,
+    "jit": {
+      "inline_code_size": 37392,
+      "outlined_code_size": 35726,
+      "freed_code_size": 0,
+      "code_region_size": 110592,
+      "compiled_iseq_entry": 61,
+      "compiled_iseq_count": 74,
+      "compiled_blockid_count": 604,
+      "compiled_block_count": 749,
+      "compiled_branch_count": 1091,
+      "compile_time_ns": 8180028
+    },
+    "live_kernels": 0,
+    "anonymous_kernel_classes": 0
+  },
+  "while_cache_retained": {
+    "rss_bytes": 72921088,
+    "live_slots": 60504,
+    "jit": {
+      "inline_code_size": 1429157,
+      "outlined_code_size": 2507844,
+      "freed_code_size": 0,
+      "code_region_size": 7843840,
+      "compiled_iseq_entry": 368,
+      "compiled_iseq_count": 484,
+      "compiled_blockid_count": 24633,
+      "compiled_block_count": 51620,
+      "compiled_branch_count": 80136,
+      "compile_time_ns": 432410460
+    },
+    "live_kernels": 64,
+    "anonymous_kernel_classes": 80,
+    "cache_entries": 64,
+    "retained_source_bytes": 44608,
+    "retained_pool_entries": 320
+  },
+  "after_helper_return_and_gc": [
+    {
+      "rss_bytes": 72921088,
+      "live_slots": 59123,
+      "jit": {
+        "inline_code_size": 1429745,
+        "outlined_code_size": 2508884,
+        "freed_code_size": 0,
+        "code_region_size": 7843840,
+        "compiled_iseq_entry": 369,
+        "compiled_iseq_count": 485,
+        "compiled_blockid_count": 24637,
+        "compiled_block_count": 51634,
+        "compiled_branch_count": 80166,
+        "compile_time_ns": 432570218
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "gc_after_return": 1
+    },
+    {
+      "rss_bytes": 72921088,
+      "live_slots": 59068,
+      "jit": {
+        "inline_code_size": 1429745,
+        "outlined_code_size": 2508884,
+        "freed_code_size": 0,
+        "code_region_size": 7843840,
+        "compiled_iseq_entry": 369,
+        "compiled_iseq_count": 485,
+        "compiled_blockid_count": 24637,
+        "compiled_block_count": 51634,
+        "compiled_branch_count": 80166,
+        "compile_time_ns": 432570218
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "gc_after_return": 2
+    },
+    {
+      "rss_bytes": 72921088,
+      "live_slots": 59070,
+      "jit": {
+        "inline_code_size": 1429745,
+        "outlined_code_size": 2508884,
+        "freed_code_size": 0,
+        "code_region_size": 7843840,
+        "compiled_iseq_entry": 369,
+        "compiled_iseq_count": 485,
+        "compiled_blockid_count": 24637,
+        "compiled_block_count": 51634,
+        "compiled_branch_count": 80166,
+        "compile_time_ns": 432570218
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "gc_after_return": 3
+    }
+  ],
+  "notes": [
+    "Same source/pool LRU, second-use admission, 256 generated kernels, and 200 calls per kernel as the main direct diagnostic.",
+    "The cache-populating helper returns only scalar snapshots. These collections run after its engine/cache/kernel local variables leave scope.",
+    "VM-retained anonymous classes and JIT code may outlive generated instances. This probe does not require RSS or JIT code counters to fall."
+  ],
+  "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170"
+}

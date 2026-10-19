@@ -9,6 +9,7 @@ module JedNative
     Kernels = Struct.new(:predicate, :projection, :keys, :pipeline, :ordering, keyword_init: true)
     State = Struct.new(:uses, :kernels, :attempted, :source_bytes, keyword_init: true)
     MAX_ARGUMENT_CACHE_ENTRIES = 64
+    MAX_AGGREGATE_CACHE_ENTRIES = 64
 
     def native_compiled_kernels(plan, predicate, projections, keys = nil, pipeline: nil, offset: false, limit: false, orders: nil)
       return if @native_compilation_disabled
@@ -76,6 +77,33 @@ module JedNative
         @native_compiled_arguments[key] = kernel
       end
       expression.instance_variable_set(:@native_argument_kernel, kernel)
+      kernel
+    end
+
+    # The general executor resolves aggregate expressions afresh. Reuse only
+    # identical bounded programs and immutable pools, never AST identities or
+    # expression objects containing folded subqueries. The first resolution
+    # records admission; a later resolution may materialize the method.
+    def native_compiled_aggregate(expression)
+      return if @storage || @native_compilation_disabled || @native_aggregate_disabled
+      return expression.instance_variable_get(:@native_aggregate_kernel) if expression.instance_variable_defined?(:@native_aggregate_kernel)
+      program = CompiledAggregate.prepare(expression, types: @types)
+      unless program
+        expression.instance_variable_set(:@native_aggregate_kernel, nil)
+        return
+      end
+      @native_compiled_aggregates ||= {}
+      key = [program.source, program.pool].freeze
+      if @native_compiled_aggregates.key?(key)
+        kernel = @native_compiled_aggregates.delete(key)
+        kernel ||= program.materialize
+        @native_compiled_aggregates[key] = kernel
+      else
+        @native_compiled_aggregates.shift if @native_compiled_aggregates.length >= MAX_AGGREGATE_CACHE_ENTRIES
+        kernel = program.materialize if @native_compilation_immediate
+        @native_compiled_aggregates[key] = kernel
+      end
+      expression.instance_variable_set(:@native_aggregate_kernel, kernel)
       kernel
     end
 

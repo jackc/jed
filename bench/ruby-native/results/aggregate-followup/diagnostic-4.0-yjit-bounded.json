@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/aggregate_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "bench/ruby-native/results/aggregate-followup/diagnostic-4.0-yjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 79306752,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 2.352594110008795,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "final_source_sha256": "04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/aggregate-followup/diagnostic-4.0-yjit.json\",\"source_sha256\":\"04bfeb536b5e30381a8f5a05942afe16fdb9e3cc207f5c7a46d2344b138d2170\",\"jit\":\"yjit\",\"workloads\":[{\"name\":\"count_star\",\"generated_code\":{\"source_location\":[\"(jed compiled aggregate)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"5dda9a4231348beae77038a947ef3f9a0285bd9cd4de852b9ad76aa4a7d1f4c0\",\"yjit_compiled_instruction_count\":82,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled aggregate)\",\"first_lineno\":1}},{\"name\":\"nullable_integer_sum\",\"generated_code\":{\"source_location\":[\"(jed compiled aggregate)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"6d6cc2f70c94afabb6558c906f1d0c22af09b0dfe78c2655a74bcaeaa0a8f0ae\",\"yjit_compiled_instruction_count\":264,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled aggregate)\",\"first_lineno\":1}},{\"name\":\"computed_filtered_sum\",\"generated_code\":{\"source_location\":[\"(jed compiled aggregate)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"9d540544a8c8a01c833c88417d5b80ac3492dbed90efbc00a2469a0c8fa1a23c\",\"yjit_compiled_instruction_count\":772,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled aggregate)\",\"first_lineno\":1}},{\"name\":\"nullable_boolean_groups\",\"generated_code\":{\"source_location\":[\"(jed compiled aggregate)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"c16a1ace43e5ba7c74b317feec2ff96c34d2661867a8b60e3b574848e2e65429\",\"yjit_compiled_instruction_count\":286,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled aggregate)\",\"first_lineno\":1}},{\"name\":\"nullable_bit_groups\",\"generated_code\":{\"source_location\":[\"(jed compiled aggregate)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"b4970c21162628d3cbc00f1670cb90f1afd6df27d5c6ae78c5602f91dc69c9d9\",\"yjit_compiled_instruction_count\":273,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled aggregate)\",\"first_lineno\":1}}]}\n",
+  "stderr": ""
+}
