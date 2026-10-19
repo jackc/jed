@@ -1,0 +1,26 @@
+{
+  "command": [
+    "ruby",
+    "bench/ruby-native/results/cursor-conformance-fix/run_audits.rb",
+    "--api",
+    "execute",
+    "--source-sha256",
+    "6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560",
+    "--harness-sha256",
+    "230ef1ebb799353fe57c6eb0874234567c305f2aa8e50a5ee6fd4fa95c18741d"
+  ],
+  "success": false,
+  "reason": "worker exited 1",
+  "peak_rss_bytes": 98734080,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 408.33157861100335,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560",
+  "final_source_sha256": "6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "Starting memory-execute-zjit\n{\"files\":679,\"records\":20267,\"passed\":20267,\"failed\":0,\"unsupported_files\":0,\"skipped_files\":2,\"timed_out_files\":0,\"memory_limited_files\":0,\"omitted_failure_details\":0,\"compiled_kernels\":4332,\"compiled_pipelines\":2420,\"compiled_orderings\":168,\"compiled_aggregates\":289,\"compiled_relations\":594,\"compiled_text_kernels\":432,\"compiled_text_snapshot_kernels\":213,\"execute_api_records\":20087,\"query_api_records\":0,\"materialized_memory_records\":0,\"mode\":\"memory\",\"filter\":\"\",\"started_at\":\"2026-10-19T22:49:20Z\",\"query_api\":\"execute\",\"query_memory_api\":\"execute\",\"compilation\":\"immediate\",\"ruby\":\"ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]\",\"ruby_executable\":\"/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby\",\"jit\":\"zjit\",\"corpus_root\":\"/home/jack/.codex/worktrees/b8e6/jed/spec/conformance/suites\",\"available_records\":20135,\"source_sha256\":\"6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560\",\"worker_memory_bytes\":536870912,\"worker_timeout_seconds\":10.0,\"worker_address_space_bytes\":2147483648,\"peak_worker_rss_bytes\":156033024,\"finished_at\":\"2026-10-19T22:52:11Z\",\"final_source_sha256\":\"6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560\"}\nVerified memory-execute-zjit: 20267/20267, zero failures\nStarting disk-execute-yjit\n{\"files\":679,\"records\":18250,\"passed\":18250,\"failed\":0,\"unsupported_files\":0,\"skipped_files\":77,\"timed_out_files\":0,\"memory_limited_files\":0,\"omitted_failure_details\":0,\"compiled_kernels\":3252,\"compiled_pipelines\":2240,\"compiled_orderings\":161,\"compiled_aggregates\":0,\"compiled_relations\":0,\"compiled_text_kernels\":269,\"compiled_text_snapshot_kernels\":83,\"execute_api_records\":18099,\"query_api_records\":0,\"materialized_memory_records\":0,\"mode\":\"disk\",\"filter\":\"\",\"started_at\":\"2026-10-19T22:52:21Z\",\"query_api\":\"execute\",\"query_memory_api\":\"execute\",\"compilation\":\"immediate\",\"ruby\":\"ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]\",\"ruby_executable\":\"/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby\",\"jit\":\"yjit\",\"locking\":\"exclusive\",\"corpus_root\":\"/home/jack/.codex/worktrees/b8e6/jed/spec/conformance/suites\",\"available_records\":20135,\"source_sha256\":\"6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560\",\"worker_memory_bytes\":536870912,\"worker_timeout_seconds\":10.0,\"worker_address_space_bytes\":2147483648,\"peak_worker_rss_bytes\":180412416,\"finished_at\":\"2026-10-19T22:55:57Z\",\"final_source_sha256\":\"6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560\"}\n",
+  "stderr": "[ruby-native:bounded] $ ruby impl/ruby-native/tools/run_bounded.rb /home/jack/.…\nbounded worker: passed; peak RSS 97271808 bytes\n[ruby-native:bounded] $ ruby impl/ruby-native/tools/run_bounded.rb /home/jack/.…\nbounded worker: passed; peak RSS 88391680 bytes\nbench/ruby-native/results/cursor-conformance-fix/run_audits.rb:53:in 'CursorConformanceAudits.verify!': corpus audit skipped extra files (RuntimeError)\n\tfrom bench/ruby-native/results/cursor-conformance-fix/run_audits.rb:102:in 'CursorConformanceAudits.run'\n\tfrom bench/ruby-native/results/cursor-conformance-fix/run_audits.rb:123:in 'block in CursorConformanceAudits.main'\n\tfrom bench/ruby-native/results/cursor-conformance-fix/run_audits.rb:123:in 'Array#each'\n\tfrom bench/ruby-native/results/cursor-conformance-fix/run_audits.rb:123:in 'CursorConformanceAudits.main'\n\tfrom bench/ruby-native/results/cursor-conformance-fix/run_audits.rb:127:in '<main>'\n"
+}

@@ -187,10 +187,8 @@ JED_NATIVE_TIMEOUT=180 JED_NATIVE_ADDRESS_SPACE_BYTES=2147483648 \
 # Expanded scalar comparison (the default benchmark plan remains unchanged):
 RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/scalar-plan.json \
   RUBY_NATIVE_PHASE=scalar-local mise run ruby-native:compare
-# Exercise the lazy API against expression-corpus expectations:
-JED_NATIVE_QUERY_API=query mise run ruby-native:conformance expr/
-# Mixed audit: finite query-memory fixtures retain their materialized drive:
-JED_NATIVE_QUERY_API=query JED_NATIVE_QUERY_MEMORY_API=execute mise run ruby-native:conformance
+# Exercise the lazy API against every corpus record, including memory limits:
+JED_NATIVE_QUERY_API=query mise run ruby-native:conformance
 # Force generated expression admission in one-shot conformance statements:
 JED_NATIVE_COMPILATION=immediate mise run ruby-native:conformance
 # Expanded runtime-compilation comparison (explicit opt-in):
@@ -209,11 +207,12 @@ The full conformance audit fails on mismatches and reports unsupported harness
 files separately. It does not declare capability parity or hide missing features.
 It uses eager `execute` by default. `JED_NATIVE_QUERY_API=query` explicitly selects
 lazy cursors, drains within the error boundary, and records how many statements
-use the scalar cursor. Finite query-memory fixtures describe eager collection
-thresholds. `JED_NATIVE_QUERY_MEMORY_API=execute` explicitly routes those fixtures
-to the materialized API and reports the routing counts; this is a mixed audit,
-not a full pure-query pass. Lazy collectors have separate host tests described in
-the [correctness follow-up](CORRECTNESS_FOLLOWUP.md).
+use the scalar cursor. The runner collects rows externally through `each`, matching
+the supported cores' conformance adapters. Every record uses the selected API;
+mixed query-memory routing is rejected. `Rows#rows` remains an engine-owned,
+budgeted collector with separate host tests. The
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) records the adapter
+fix and the buffered-result and gathered-column accounting defects it exposed.
 Each corpus file runs in a separate child, sequentially, with a 512 MiB sampled
 process-group RSS ceiling, a hard 1 GiB address-space ceiling, and a 10-second
 deadline. The larger address-space ceiling accommodates Ruby's unused virtual
