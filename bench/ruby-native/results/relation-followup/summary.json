@@ -1,0 +1,1300 @@
+{
+  "statistic": "Mean of two per-process medians per ABBA state; microseconds per complete query.",
+  "controls": {
+    "4.0-none": {
+      "native-prepared": {
+        "scalar": {
+          "disabled_us": 12.30937775,
+          "enabled_us": 12.169547,
+          "speedup": 1.011490218165064,
+          "disabled_medians_ns": [
+            12673.0205,
+            11945.735
+          ],
+          "enabled_medians_ns": [
+            11978.4735,
+            12360.6205
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate": {
+          "disabled_us": 733.4165700000001,
+          "enabled_us": 557.51405,
+          "speedup": 1.3155122637716485,
+          "disabled_medians_ns": [
+            755996.54,
+            710836.6
+          ],
+          "enabled_medians_ns": [
+            544016.44,
+            571011.66
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 1036.44197,
+          "enabled_us": 987.4356299999998,
+          "speedup": 1.049629908533886,
+          "disabled_medians_ns": [
+            1061276.26,
+            1011607.68
+          ],
+          "enabled_medians_ns": [
+            967252.82,
+            1007618.44
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_argument": {
+          "disabled_us": 1544.82992,
+          "enabled_us": 1380.7820699999997,
+          "speedup": 1.118807923106939,
+          "disabled_medians_ns": [
+            1583010.92,
+            1506648.92
+          ],
+          "enabled_medians_ns": [
+            1350591.7,
+            1410972.44
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 1437.19246,
+          "enabled_us": 1436.7543799999999,
+          "speedup": 1.0003049094584977,
+          "disabled_medians_ns": [
+            1480333.78,
+            1394051.14
+          ],
+          "enabled_medians_ns": [
+            1407169.62,
+            1466339.14
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 3035.63244,
+          "enabled_us": 2813.53584,
+          "speedup": 1.0789386070162874,
+          "disabled_medians_ns": [
+            3103579.58,
+            2967685.3
+          ],
+          "enabled_medians_ns": [
+            2762028.28,
+            2865043.4
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 4322.25791,
+          "enabled_us": 2511.4871500000004,
+          "speedup": 1.7209954309342175,
+          "disabled_medians_ns": [
+            4407522.12,
+            4236993.7
+          ],
+          "enabled_medians_ns": [
+            2465221.68,
+            2557752.62
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 5687.592439999999,
+          "enabled_us": 5799.924210000001,
+          "speedup": 0.9806322003645628,
+          "disabled_medians_ns": [
+            5788040.3,
+            5587144.58
+          ],
+          "enabled_medians_ns": [
+            5673807.44,
+            5926040.98
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-query": {
+        "scalar": {
+          "disabled_us": 13.36412025,
+          "enabled_us": 13.53886225,
+          "speedup": 0.9870933024671257,
+          "disabled_medians_ns": [
+            13352.6835,
+            13375.557
+          ],
+          "enabled_medians_ns": [
+            13263.04,
+            13814.6845
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate": {
+          "disabled_us": 726.90255,
+          "enabled_us": 557.1635,
+          "speedup": 1.3046485457141397,
+          "disabled_medians_ns": [
+            720378.72,
+            733426.38
+          ],
+          "enabled_medians_ns": [
+            545735.68,
+            568591.32
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 1016.2030900000001,
+          "enabled_us": 990.71707,
+          "speedup": 1.0257248217192827,
+          "disabled_medians_ns": [
+            1008901.0,
+            1023505.18
+          ],
+          "enabled_medians_ns": [
+            970538.1,
+            1010896.04
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_argument": {
+          "disabled_us": 1567.5996499999999,
+          "enabled_us": 1377.4866299999999,
+          "speedup": 1.1380144212361611,
+          "disabled_medians_ns": [
+            1520615.44,
+            1614583.86
+          ],
+          "enabled_medians_ns": [
+            1339711.78,
+            1415261.48
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 1446.10477,
+          "enabled_us": 1443.6300700000002,
+          "speedup": 1.001714220319614,
+          "disabled_medians_ns": [
+            1407548.82,
+            1484660.72
+          ],
+          "enabled_medians_ns": [
+            1414147.8,
+            1473112.34
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 3069.8151000000003,
+          "enabled_us": 2797.76004,
+          "speedup": 1.0972403122892556,
+          "disabled_medians_ns": [
+            2979419.74,
+            3160210.46
+          ],
+          "enabled_medians_ns": [
+            2746068.34,
+            2849451.74
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 4372.292280000001,
+          "enabled_us": 2518.15305,
+          "speedup": 1.736309188990717,
+          "disabled_medians_ns": [
+            4222576.62,
+            4522007.94
+          ],
+          "enabled_medians_ns": [
+            2459099.24,
+            2577206.86
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 5743.31568,
+          "enabled_us": 5708.777,
+          "speedup": 1.0060501014490493,
+          "disabled_medians_ns": [
+            5612520.58,
+            5874110.78
+          ],
+          "enabled_medians_ns": [
+            5632861.32,
+            5784692.68
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-eager": {
+        "scalar": {
+          "disabled_us": 15.047670750000002,
+          "enabled_us": 15.552438,
+          "speedup": 0.9675441721741633,
+          "disabled_medians_ns": [
+            15152.4355,
+            14942.906
+          ],
+          "enabled_medians_ns": [
+            15008.8825,
+            16095.9935
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate": {
+          "disabled_us": 614.91457,
+          "enabled_us": 448.53351000000004,
+          "speedup": 1.3709445477106048,
+          "disabled_medians_ns": [
+            597873.54,
+            631955.6
+          ],
+          "enabled_medians_ns": [
+            434333.28,
+            462733.74
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 867.60958,
+          "enabled_us": 841.22668,
+          "speedup": 1.0313624147061053,
+          "disabled_medians_ns": [
+            863170.66,
+            872048.5
+          ],
+          "enabled_medians_ns": [
+            816791.04,
+            865662.32
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_argument": {
+          "disabled_us": 1282.55744,
+          "enabled_us": 1138.36456,
+          "speedup": 1.126666698056728,
+          "disabled_medians_ns": [
+            1264435.92,
+            1300678.96
+          ],
+          "enabled_medians_ns": [
+            1106175.94,
+            1170553.18
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 1134.10285,
+          "enabled_us": 1166.60402,
+          "speedup": 0.9721403583025542,
+          "disabled_medians_ns": [
+            1134849.16,
+            1133356.54
+          ],
+          "enabled_medians_ns": [
+            1131653.62,
+            1201554.42
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 2408.46216,
+          "enabled_us": 2098.7495700000004,
+          "speedup": 1.1475700552496122,
+          "disabled_medians_ns": [
+            2329358.32,
+            2487566.0
+          ],
+          "enabled_medians_ns": [
+            2106427.7,
+            2091071.44
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 3985.7393500000003,
+          "enabled_us": 2020.55038,
+          "speedup": 1.9726008267113837,
+          "disabled_medians_ns": [
+            3836302.54,
+            4135176.16
+          ],
+          "enabled_medians_ns": [
+            2022704.14,
+            2018396.62
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 5801.18482,
+          "enabled_us": 5472.508339999999,
+          "speedup": 1.0600595667616655,
+          "disabled_medians_ns": [
+            5402319.7,
+            6200049.94
+          ],
+          "enabled_medians_ns": [
+            5507585.86,
+            5437430.82
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      }
+    },
+    "4.0-yjit": {
+      "native-prepared": {
+        "scalar": {
+          "disabled_us": 4.921452,
+          "enabled_us": 4.83560775,
+          "speedup": 1.0177525255227742,
+          "disabled_medians_ns": [
+            4901.3485,
+            4941.5555
+          ],
+          "enabled_medians_ns": [
+            4899.5325,
+            4771.683
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate": {
+          "disabled_us": 300.46296,
+          "enabled_us": 259.16192,
+          "speedup": 1.159363844811769,
+          "disabled_medians_ns": [
+            305285.64,
+            295640.28
+          ],
+          "enabled_medians_ns": [
+            263905.62,
+            254418.22
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 561.306,
+          "enabled_us": 541.4531499999999,
+          "speedup": 1.0366658685058903,
+          "disabled_medians_ns": [
+            567746.56,
+            554865.44
+          ],
+          "enabled_medians_ns": [
+            549870.94,
+            533035.36
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_argument": {
+          "disabled_us": 664.08046,
+          "enabled_us": 589.2117,
+          "speedup": 1.12706597645634,
+          "disabled_medians_ns": [
+            670832.34,
+            657328.58
+          ],
+          "enabled_medians_ns": [
+            599428.26,
+            578995.14
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 623.1616300000001,
+          "enabled_us": 596.5735800000001,
+          "speedup": 1.0445679307487936,
+          "disabled_medians_ns": [
+            622043.5,
+            624279.76
+          ],
+          "enabled_medians_ns": [
+            607625.12,
+            585522.04
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 1709.74571,
+          "enabled_us": 1543.67733,
+          "speedup": 1.107579723283233,
+          "disabled_medians_ns": [
+            1725406.86,
+            1694084.56
+          ],
+          "enabled_medians_ns": [
+            1555722.66,
+            1531632.0
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 1845.78572,
+          "enabled_us": 1339.9094100000002,
+          "speedup": 1.3775451580715443,
+          "disabled_medians_ns": [
+            1868117.24,
+            1823454.2
+          ],
+          "enabled_medians_ns": [
+            1373259.06,
+            1306559.76
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2306.65138,
+          "enabled_us": 2270.4227,
+          "speedup": 1.015956799586262,
+          "disabled_medians_ns": [
+            2313286.14,
+            2300016.62
+          ],
+          "enabled_medians_ns": [
+            2325055.56,
+            2215789.84
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-query": {
+        "scalar": {
+          "disabled_us": 5.18185175,
+          "enabled_us": 5.379832749999999,
+          "speedup": 0.963199413587718,
+          "disabled_medians_ns": [
+            5170.5005,
+            5193.203
+          ],
+          "enabled_medians_ns": [
+            5275.104,
+            5484.5615
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate": {
+          "disabled_us": 284.78646000000003,
+          "enabled_us": 268.00347,
+          "speedup": 1.0626222861965184,
+          "disabled_medians_ns": [
+            286616.14,
+            282956.78
+          ],
+          "enabled_medians_ns": [
+            260991.28,
+            275015.66
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 534.6821,
+          "enabled_us": 544.0411,
+          "speedup": 0.9827972555749924,
+          "disabled_medians_ns": [
+            535056.6,
+            534307.6
+          ],
+          "enabled_medians_ns": [
+            531828.0,
+            556254.2
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_argument": {
+          "disabled_us": 631.6506400000001,
+          "enabled_us": 601.1642800000001,
+          "speedup": 1.0507121946766365,
+          "disabled_medians_ns": [
+            635094.04,
+            628207.24
+          ],
+          "enabled_medians_ns": [
+            586960.5,
+            615368.06
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 589.38374,
+          "enabled_us": 616.03877,
+          "speedup": 0.9567315706444904,
+          "disabled_medians_ns": [
+            589464.42,
+            589303.06
+          ],
+          "enabled_medians_ns": [
+            598990.04,
+            633087.5
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 1630.6704399999999,
+          "enabled_us": 1545.1563700000002,
+          "speedup": 1.0553433113051205,
+          "disabled_medians_ns": [
+            1630825.1,
+            1630515.78
+          ],
+          "enabled_medians_ns": [
+            1504199.28,
+            1586113.46
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 1788.93922,
+          "enabled_us": 1341.45922,
+          "speedup": 1.3335770430650884,
+          "disabled_medians_ns": [
+            1793160.72,
+            1784717.72
+          ],
+          "enabled_medians_ns": [
+            1305353.42,
+            1377565.02
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2193.18841,
+          "enabled_us": 2279.68804,
+          "speedup": 0.9620563741695114,
+          "disabled_medians_ns": [
+            2189236.36,
+            2197140.46
+          ],
+          "enabled_medians_ns": [
+            2218105.64,
+            2341270.44
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-eager": {
+        "scalar": {
+          "disabled_us": 5.466398750000001,
+          "enabled_us": 5.2709265,
+          "speedup": 1.0370849887586178,
+          "disabled_medians_ns": [
+            5343.978,
+            5588.8195
+          ],
+          "enabled_medians_ns": [
+            5329.976,
+            5211.877
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate": {
+          "disabled_us": 290.81817,
+          "enabled_us": 242.78488000000002,
+          "speedup": 1.1978430040618673,
+          "disabled_medians_ns": [
+            285478.12,
+            296158.22
+          ],
+          "enabled_medians_ns": [
+            248782.16,
+            236787.6
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 550.3486100000001,
+          "enabled_us": 527.58798,
+          "speedup": 1.0431409184113711,
+          "disabled_medians_ns": [
+            539596.68,
+            561100.54
+          ],
+          "enabled_medians_ns": [
+            533225.0,
+            521950.96
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_argument": {
+          "disabled_us": 640.9395999999999,
+          "enabled_us": 567.66084,
+          "speedup": 1.1290889820759875,
+          "disabled_medians_ns": [
+            625586.62,
+            656292.58
+          ],
+          "enabled_medians_ns": [
+            575035.46,
+            560286.22
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 600.7571700000001,
+          "enabled_us": 577.8954100000001,
+          "speedup": 1.0395603765048074,
+          "disabled_medians_ns": [
+            585228.16,
+            616286.18
+          ],
+          "enabled_medians_ns": [
+            588863.02,
+            566927.8
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 1381.9891400000001,
+          "enabled_us": 1218.3825499999998,
+          "speedup": 1.1342817902308273,
+          "disabled_medians_ns": [
+            1352808.16,
+            1411170.12
+          ],
+          "enabled_medians_ns": [
+            1229410.2,
+            1207354.9
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 1670.32342,
+          "enabled_us": 1160.4603,
+          "speedup": 1.4393628286982327,
+          "disabled_medians_ns": [
+            1626354.38,
+            1714292.46
+          ],
+          "enabled_medians_ns": [
+            1175553.1,
+            1145367.5
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2259.7584500000003,
+          "enabled_us": 2194.30532,
+          "speedup": 1.0298286338748885,
+          "disabled_medians_ns": [
+            2192510.4,
+            2327006.5
+          ],
+          "enabled_medians_ns": [
+            2185729.34,
+            2202881.3
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      }
+    },
+    "4.1-zjit": {
+      "native-prepared": {
+        "scalar": {
+          "disabled_us": 5.717345999999999,
+          "enabled_us": 5.50324925,
+          "speedup": 1.038903698574074,
+          "disabled_medians_ns": [
+            5651.009,
+            5783.683
+          ],
+          "enabled_medians_ns": [
+            5345.391,
+            5661.1075
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate": {
+          "disabled_us": 494.43986,
+          "enabled_us": 276.91285,
+          "speedup": 1.7855432133250588,
+          "disabled_medians_ns": [
+            491144.04,
+            497735.68
+          ],
+          "enabled_medians_ns": [
+            272970.92,
+            280854.78
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 656.03677,
+          "enabled_us": 587.4529399999999,
+          "speedup": 1.1167477857885946,
+          "disabled_medians_ns": [
+            664659.28,
+            647414.26
+          ],
+          "enabled_medians_ns": [
+            574330.72,
+            600575.16
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_argument": {
+          "disabled_us": 953.67511,
+          "enabled_us": 700.81076,
+          "speedup": 1.3608168772979456,
+          "disabled_medians_ns": [
+            966345.94,
+            941004.28
+          ],
+          "enabled_medians_ns": [
+            682520.74,
+            719100.78
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 802.66869,
+          "enabled_us": 766.61898,
+          "speedup": 1.0470242857801406,
+          "disabled_medians_ns": [
+            792358.8,
+            812978.58
+          ],
+          "enabled_medians_ns": [
+            755479.82,
+            777758.14
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 1957.4423599999998,
+          "enabled_us": 1680.7264700000003,
+          "speedup": 1.1646406449468245,
+          "disabled_medians_ns": [
+            1962181.14,
+            1952703.58
+          ],
+          "enabled_medians_ns": [
+            1627830.84,
+            1733622.1
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 2655.5815,
+          "enabled_us": 1643.14719,
+          "speedup": 1.61615558007314,
+          "disabled_medians_ns": [
+            2658199.02,
+            2652963.98
+          ],
+          "enabled_medians_ns": [
+            1620959.06,
+            1665335.32
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2759.0074900000004,
+          "enabled_us": 2740.23787,
+          "speedup": 1.0068496316343516,
+          "disabled_medians_ns": [
+            2755772.64,
+            2762242.34
+          ],
+          "enabled_medians_ns": [
+            2679125.96,
+            2801349.78
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-query": {
+        "scalar": {
+          "disabled_us": 5.858537,
+          "enabled_us": 5.74457375,
+          "speedup": 1.0198384170801185,
+          "disabled_medians_ns": [
+            5724.043,
+            5993.031
+          ],
+          "enabled_medians_ns": [
+            5742.4635,
+            5746.684
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "aggregate": {
+          "disabled_us": 478.7105,
+          "enabled_us": 276.05132999999995,
+          "speedup": 1.7341358217690894,
+          "disabled_medians_ns": [
+            461172.02,
+            496248.98
+          ],
+          "enabled_medians_ns": [
+            276846.56,
+            275256.1
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 645.91689,
+          "enabled_us": 572.9434100000001,
+          "speedup": 1.1273659470138595,
+          "disabled_medians_ns": [
+            633645.8,
+            658187.98
+          ],
+          "enabled_medians_ns": [
+            578159.54,
+            567727.28
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_argument": {
+          "disabled_us": 924.7919099999999,
+          "enabled_us": 695.1730600000001,
+          "speedup": 1.3303045863140897,
+          "disabled_medians_ns": [
+            910374.22,
+            939209.6
+          ],
+          "enabled_medians_ns": [
+            700769.46,
+            689576.66
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 785.33863,
+          "enabled_us": 750.4995200000001,
+          "speedup": 1.0464212288903263,
+          "disabled_medians_ns": [
+            769186.76,
+            801490.5
+          ],
+          "enabled_medians_ns": [
+            753888.4,
+            747110.64
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 1929.0789,
+          "enabled_us": 1675.53519,
+          "speedup": 1.151321029551161,
+          "disabled_medians_ns": [
+            1889531.38,
+            1968626.42
+          ],
+          "enabled_medians_ns": [
+            1706941.28,
+            1644129.1
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 2589.84336,
+          "enabled_us": 1613.64625,
+          "speedup": 1.6049635166319756,
+          "disabled_medians_ns": [
+            2511593.38,
+            2668093.34
+          ],
+          "enabled_medians_ns": [
+            1618061.1,
+            1609231.4
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2695.97685,
+          "enabled_us": 2666.54508,
+          "speedup": 1.0110374170010281,
+          "disabled_medians_ns": [
+            2643815.46,
+            2748138.24
+          ],
+          "enabled_medians_ns": [
+            2675701.22,
+            2657388.94
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-eager": {
+        "scalar": {
+          "disabled_us": 5.613691000000001,
+          "enabled_us": 5.4036285,
+          "speedup": 1.038874341565117,
+          "disabled_medians_ns": [
+            5661.3455,
+            5566.0365
+          ],
+          "enabled_medians_ns": [
+            5332.65,
+            5474.607
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate": {
+          "disabled_us": 409.07743999999997,
+          "enabled_us": 201.83347,
+          "speedup": 2.0268067531118596,
+          "disabled_medians_ns": [
+            416971.22,
+            401183.66
+          ],
+          "enabled_medians_ns": [
+            206532.92,
+            197134.02
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "group": {
+          "disabled_us": 552.8567800000001,
+          "enabled_us": 486.82687,
+          "speedup": 1.135633248838545,
+          "disabled_medians_ns": [
+            564266.9,
+            541446.66
+          ],
+          "enabled_medians_ns": [
+            484412.06,
+            489241.68
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_argument": {
+          "disabled_us": 764.5350500000001,
+          "enabled_us": 518.20352,
+          "speedup": 1.4753567285687292,
+          "disabled_medians_ns": [
+            791570.44,
+            737499.66
+          ],
+          "enabled_medians_ns": [
+            520052.16,
+            516354.88
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_multi": {
+          "disabled_us": 566.1375800000001,
+          "enabled_us": 552.3242299999999,
+          "speedup": 1.0250094948758632,
+          "disabled_medians_ns": [
+            576210.68,
+            556064.48
+          ],
+          "enabled_medians_ns": [
+            549324.7,
+            555323.76
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "aggregate_many_groups": {
+          "disabled_us": 1602.81684,
+          "enabled_us": 1260.6259599999998,
+          "speedup": 1.2714452112345838,
+          "disabled_medians_ns": [
+            1686364.14,
+            1519269.54
+          ],
+          "enabled_medians_ns": [
+            1259765.02,
+            1261486.9
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_where_keys": {
+          "disabled_us": 2292.16652,
+          "enabled_us": 1268.1478399999999,
+          "speedup": 1.8074915618671088,
+          "disabled_medians_ns": [
+            2333635.16,
+            2250697.88
+          ],
+          "enabled_medians_ns": [
+            1270573.68,
+            1265722.0
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2710.05407,
+          "enabled_us": 2590.44732,
+          "speedup": 1.04617223792839,
+          "disabled_medians_ns": [
+            2771696.92,
+            2648411.22
+          ],
+          "enabled_medians_ns": [
+            2586928.12,
+            2593966.52
+          ],
+          "enabled_medians_below_both_disabled": true
+        }
+      }
+    }
+  },
+  "before": {
+    "4.0-none": {
+      "native-prepared": {
+        "scalar": 12.5755205,
+        "aggregate": 756.16076,
+        "group": 1041.3231600000001,
+        "aggregate_argument": 1572.88236,
+        "aggregate_multi": 1461.01098,
+        "aggregate_many_groups": 3077.3392000000003,
+        "general_where_keys": 4377.5009,
+        "general_text_filter": 5753.95374
+      },
+      "native-query": {
+        "scalar": 13.3846055,
+        "aggregate": 717.1677,
+        "group": 1007.2527,
+        "aggregate_argument": 1525.74544,
+        "aggregate_multi": 1404.9275400000001,
+        "aggregate_many_groups": 2971.1558999999997,
+        "general_where_keys": 4270.36472,
+        "general_text_filter": 5562.617740000001
+      },
+      "native-eager": {
+        "scalar": 15.0601795,
+        "aggregate": 595.0087,
+        "group": 866.42992,
+        "aggregate_argument": 1260.49848,
+        "aggregate_multi": 1133.88424,
+        "aggregate_many_groups": 2351.58066,
+        "general_where_keys": 3749.07814,
+        "general_text_filter": 5406.456139999999
+      }
+    },
+    "4.0-yjit": {
+      "native-prepared": {
+        "scalar": 4.968358,
+        "aggregate": 293.19878000000006,
+        "group": 551.98202,
+        "aggregate_argument": 650.56396,
+        "aggregate_multi": 604.4643599999999,
+        "aggregate_many_groups": 1678.4712,
+        "general_where_keys": 1875.93828,
+        "general_text_filter": 2276.46312
+      },
+      "native-query": {
+        "scalar": 5.470446,
+        "aggregate": 300.77567999999997,
+        "group": 558.91286,
+        "aggregate_argument": 665.056,
+        "aggregate_multi": 619.9159000000001,
+        "aggregate_many_groups": 1707.42324,
+        "general_where_keys": 1871.65634,
+        "general_text_filter": 2304.58696
+      },
+      "native-eager": {
+        "scalar": 5.495480499999999,
+        "aggregate": 287.5728,
+        "group": 550.9600600000001,
+        "aggregate_argument": 638.0044399999999,
+        "aggregate_multi": 597.5114599999999,
+        "aggregate_many_groups": 1373.3162399999999,
+        "general_where_keys": 1691.30488,
+        "general_text_filter": 2278.30292
+      }
+    },
+    "4.1-zjit": {
+      "native-prepared": {
+        "scalar": 5.5275755,
+        "aggregate": 492.17758000000003,
+        "group": 660.08502,
+        "aggregate_argument": 942.4230600000001,
+        "aggregate_multi": 782.02678,
+        "aggregate_many_groups": 1993.6374799999999,
+        "general_where_keys": 2686.2657799999997,
+        "general_text_filter": 2783.83098
+      },
+      "native-query": {
+        "scalar": 5.9385034999999995,
+        "aggregate": 480.91312,
+        "group": 651.78296,
+        "aggregate_argument": 944.5036,
+        "aggregate_multi": 788.0488399999999,
+        "aggregate_many_groups": 1966.04246,
+        "general_where_keys": 2673.61816,
+        "general_text_filter": 2809.0582200000003
+      },
+      "native-eager": {
+        "scalar": 5.7479455,
+        "aggregate": 424.84592,
+        "group": 569.4728,
+        "aggregate_argument": 784.69352,
+        "aggregate_multi": 580.65502,
+        "aggregate_many_groups": 1582.25798,
+        "general_where_keys": 2296.34598,
+        "general_text_filter": 2716.3034199999997
+      }
+    }
+  },
+  "binding": {
+    "wrapper": {
+      "scalar": 8.2213135,
+      "aggregate": 63.24768,
+      "group": 238.55426,
+      "aggregate_argument": 270.47558000000004,
+      "aggregate_multi": 280.26976,
+      "aggregate_many_groups": 393.4485,
+      "general_where_keys": 369.96646000000004,
+      "general_text_filter": 120.48104
+    },
+    "native-prepared": {
+      "scalar": 4.656685,
+      "aggregate": 253.36318,
+      "group": 526.2243000000001,
+      "aggregate_argument": 573.39474,
+      "aggregate_multi": 583.50174,
+      "aggregate_many_groups": 1494.04588,
+      "general_where_keys": 1301.18486,
+      "general_text_filter": 2209.3050200000002
+    },
+    "native-query": {
+      "scalar": 5.1175825,
+      "aggregate": 254.37726,
+      "group": 530.8069399999999,
+      "aggregate_argument": 579.30774,
+      "aggregate_multi": 590.2088,
+      "aggregate_many_groups": 1506.7206999999999,
+      "general_where_keys": 1311.70974,
+      "general_text_filter": 2223.7087
+    },
+    "native-eager": {
+      "scalar": 5.3178495,
+      "aggregate": 244.12261999999998,
+      "group": 533.108,
+      "aggregate_argument": 559.87606,
+      "aggregate_multi": 576.86316,
+      "aggregate_many_groups": 1247.0671399999999,
+      "general_where_keys": 1166.10538,
+      "general_text_filter": 2225.3516600000003
+    }
+  },
+  "cross_core": {
+    "ruby-yjit": {
+      "scalar": 4.838187,
+      "aggregate": 262.8026666666667,
+      "aggregate_argument": 589.89106,
+      "aggregate_many_groups": 1550.3808600000002,
+      "group": 554.9188666666666,
+      "aggregate_multi": 596.8129799999999,
+      "general_where_keys": 1342.8901799999999,
+      "general_text_filter": 2307.9397400000003
+    },
+    "go": {
+      "scalar": 0.812702,
+      "aggregate": 65.20909999999999,
+      "aggregate_argument": 299.44662,
+      "aggregate_many_groups": 390.15592,
+      "group": 254.502,
+      "aggregate_multi": 283.039,
+      "general_where_keys": 407.27932,
+      "general_text_filter": 182.49962
+    },
+    "rust": {
+      "scalar": 1.4065615,
+      "aggregate": 75.129,
+      "aggregate_argument": 229.6954,
+      "aggregate_many_groups": 267.61872,
+      "group": 185.97573333333332,
+      "aggregate_multi": 244.07042,
+      "general_where_keys": 300.37246000000005,
+      "general_text_filter": 110.7076
+    },
+    "ts": {
+      "scalar": 2.108484,
+      "aggregate": 165.15613333333334,
+      "aggregate_argument": 529.59934,
+      "aggregate_many_groups": 554.03108,
+      "group": 417.74213333333336,
+      "aggregate_multi": 445.87102000000004,
+      "general_where_keys": 698.89768,
+      "general_text_filter": 1677.38804
+    }
+  },
+  "validation": {
+    "matching_values_metadata_costs": {
+      "scalar": "dd2a48b279dbc34ed87f183a7d466c7a3c54fd9db1c51668f8fd8fbb9b756443",
+      "aggregate": "cc03768aa49d23e0775c5c175f6d81bb711a3058d27ae49a8b2550960ed071c9",
+      "group": "7ce4d1e9c9eeac8cd1fcea5ee1ec15f2af6d7757050eab3157dc2d1c28d128e7",
+      "aggregate_argument": "19645aa48748f4bbeeab23b7d4ea1be042e3fde37c7efa9884609f0c1d57451e",
+      "aggregate_multi": "9ca04ab6f6d22b678af9787c668aeeeb59126818e4e9b09039761449e2a201e1",
+      "aggregate_many_groups": "a9bf913353514a2b8a7df16a2774a08306463148a58dba0721203a79e2009a4f",
+      "general_where_keys": "62c2d3571fa47b6a60f2e652e023a165f40a5e6db8ab8c9d67a2a0e6f0bbddc3",
+      "general_text_filter": "3ea2bccb0d4ed9380318f1bc93db6994b3f18a70c27577a10c350f67876e07bb"
+    },
+    "memory-zjit": {
+      "passed": 20267,
+      "failed": 0,
+      "records": 20267,
+      "compiled_relations": 443,
+      "peak_worker_rss_bytes": 153833472
+    },
+    "disk-yjit": {
+      "passed": 18250,
+      "failed": 0,
+      "records": 18250,
+      "compiled_relations": 0,
+      "peak_worker_rss_bytes": 175796224
+    },
+    "mixed-query-yjit": {
+      "passed": 20267,
+      "failed": 0,
+      "records": 20267,
+      "compiled_relations": 381,
+      "peak_worker_rss_bytes": 174600192
+    },
+    "pure-query-yjit": {
+      "passed": 20221,
+      "failed": 46,
+      "records": 20267,
+      "compiled_relations": 381,
+      "peak_worker_rss_bytes": 158912512
+    }
+  },
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "allocations": {
+    "scalar": {
+      "before": 39.0,
+      "final": 39.0
+    },
+    "aggregate": {
+      "before": 901.0,
+      "final": 986.0
+    },
+    "aggregate_argument": {
+      "before": 1666.0,
+      "final": 1751.0
+    },
+    "aggregate_many_groups": {
+      "before": 7457.0,
+      "final": 7561.0
+    },
+    "group": {
+      "before": 3237.133333333333,
+      "final": 3287.0666666666666
+    },
+    "aggregate_multi": {
+      "before": 1649.0,
+      "final": 1649.0
+    },
+    "general_where_keys": {
+      "before": 5348.36,
+      "final": 5229.8
+    },
+    "general_text_filter": {
+      "before": 14918.0,
+      "final": 14944.0
+    }
+  },
+  "diagnostics": {
+    "summary": "diagnostic-summary.json",
+    "all_six_methods_directly_jited": true,
+    "zero_live_kernels_after_thread_exit": true,
+    "caveat": "JIT stack roots and retained classes/code have different lifetimes from engine cache entries."
+  }
+}

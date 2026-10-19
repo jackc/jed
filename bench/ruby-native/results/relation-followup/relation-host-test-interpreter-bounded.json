@@ -1,0 +1,20 @@
+{
+  "command": [
+    "ruby",
+    "impl/ruby-native/test/compiled_relation_test.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 45092864,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 1.7250902939995285,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "ruby-native compiled relation: row/key order, exact guards, ownership release, warmed APIs, cache bounds and cursor captures passed\n",
+  "stderr": ""
+}

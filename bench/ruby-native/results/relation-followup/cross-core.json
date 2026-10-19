@@ -1,0 +1,738 @@
+{
+  "schema": 1,
+  "phase": "relation-cross-core",
+  "verification_only": false,
+  "created_at": "2026-10-19T17:55:18Z",
+  "ordering_disabled": false,
+  "aggregate_disabled": false,
+  "relation_disabled": false,
+  "host": {
+    "platform": "x86_64-linux",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+    "processors": 24,
+    "git_commit": "fa4cbcc18dd15ee5af577ece91a01e20d1c28e4b",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+    "openssl": "OpenSSL 3.5.5 27 Jan 2026"
+  },
+  "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/relation-plan.json",
+  "plan_sha256": "8a6ca01c70711c950a0ea3617e55943434755cb7fcdce76a37f64af76684fe36",
+  "plan": {
+    "schema": 1,
+    "description": "Explicit general relation filter/group-key compilation experiment over the unchanged 1000-row fixture. Existing workloads retain their comparison schedules; new queries cover combined nullable group keys and WHERE, with an unsupported text predicate control.",
+    "rows": 1000,
+    "repetitions": 5,
+    "validation_iterations": 32,
+    "workloads": [
+      {
+        "name": "scalar",
+        "sql": "SELECT abs($1::i64) + 7",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "aggregate",
+        "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+        "iterations": 30,
+        "warmup": 20,
+        "offset": 0,
+        "step": 1,
+        "span": 10
+      },
+      {
+        "name": "aggregate_argument",
+        "sql": "SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 1,
+        "span": 5
+      },
+      {
+        "name": "aggregate_many_groups",
+        "sql": "SELECT score % 100, count(*), sum(score) FROM items GROUP BY score % 100 ORDER BY 1",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "group",
+        "sql": "SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket",
+        "iterations": 15,
+        "warmup": 10,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "aggregate_multi",
+        "sql": "SELECT count(*), count(score), min(score), max(score), sum(score), bit_xor(score) FROM items",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "general_where_keys",
+        "sql": "SELECT bucket % 3, CASE WHEN score < $1 THEN NULL ELSE score % 7 END, count(*), sum(score) FROM items WHERE bucket >= 2 GROUP BY bucket % 3, CASE WHEN score < $1 THEN NULL ELSE score % 7 END ORDER BY 1, 2",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 997,
+        "span": 10000
+      },
+      {
+        "name": "general_text_filter",
+        "sql": "SELECT sum(score) FROM items WHERE label >= 'row5'",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      }
+    ]
+  },
+  "ruby_source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "statuses": {
+    "go": {
+      "status": "ready",
+      "detail": ""
+    },
+    "rust": {
+      "status": "ready",
+      "detail": "    Finished `release` profile [optimized] target(s) in 0.00s\n"
+    },
+    "ruby-yjit": {
+      "status": "ready",
+      "detail": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]\n"
+    },
+    "ts": {
+      "status": "ready",
+      "detail": "v26.10.0\n"
+    }
+  },
+  "results": {
+    "ruby-yjit": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          10719373,
+          9676374,
+          9677190,
+          9622536,
+          9647453
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "aggregate",
+        "checksum": "95913d368b1ddc2c",
+        "validation_rows": 32,
+        "samples_ns": [
+          8125307,
+          8034651,
+          7670720,
+          7884080,
+          7768081
+        ],
+        "rows_total": 150,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "aggregate_argument",
+        "checksum": "11176e3e1f763de4",
+        "validation_rows": 32,
+        "samples_ns": [
+          29494553,
+          29799977,
+          29412775,
+          29543432,
+          29419629
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "aggregate_many_groups",
+        "checksum": "34a0b376469d1fa5",
+        "validation_rows": 3200,
+        "samples_ns": [
+          77519043,
+          77506254,
+          77552584,
+          77657264,
+          77189098
+        ],
+        "rows_total": 25000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "group",
+        "checksum": "6ad01ea05cb39e25",
+        "validation_rows": 320,
+        "samples_ns": [
+          8368763,
+          8301517,
+          8150114,
+          8384964,
+          8323783
+        ],
+        "rows_total": 750,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "aggregate_multi",
+        "checksum": "a83ad1be5db5c325",
+        "validation_rows": 32,
+        "samples_ns": [
+          29757411,
+          29639036,
+          29897065,
+          29840649,
+          30035741
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "general_where_keys",
+        "checksum": "5e7cfb33776cd6e3",
+        "validation_rows": 708,
+        "samples_ns": [
+          66841506,
+          67257061,
+          67144509,
+          67112914,
+          67308581
+        ],
+        "rows_total": 5625,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      },
+      {
+        "workload": "general_text_filter",
+        "checksum": "7fb193569b2eff45",
+        "validation_rows": 32,
+        "samples_ns": [
+          115396987,
+          115524946,
+          115440093,
+          115389332,
+          115358395
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false,
+        "aggregate_disabled": false,
+        "relation_disabled": false
+      }
+    ],
+    "go": [
+      {
+        "checksum": "4f2c86bbdc99682d",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1790286,
+          1590222,
+          1604970,
+          1625404,
+          1806771
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "scalar"
+      },
+      {
+        "checksum": "95913d368b1ddc2c",
+        "iterations": 30,
+        "rows_total": 150,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1956273,
+          1965329,
+          1958332,
+          1953056,
+          1952206
+        ],
+        "validation_rows": 32,
+        "warmup": 20,
+        "workload": "aggregate"
+      },
+      {
+        "checksum": "11176e3e1f763de4",
+        "iterations": 50,
+        "rows_total": 250,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          14972331,
+          14468590,
+          18192778,
+          14656352,
+          16482713
+        ],
+        "validation_rows": 32,
+        "warmup": 100,
+        "workload": "aggregate_argument"
+      },
+      {
+        "checksum": "34a0b376469d1fa5",
+        "iterations": 50,
+        "rows_total": 25000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          19139619,
+          19534366,
+          22086117,
+          19377802,
+          19507796
+        ],
+        "validation_rows": 3200,
+        "warmup": 100,
+        "workload": "aggregate_many_groups"
+      },
+      {
+        "checksum": "6ad01ea05cb39e25",
+        "iterations": 15,
+        "rows_total": 750,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          3801195,
+          3931730,
+          3817530,
+          3903866,
+          3685636
+        ],
+        "validation_rows": 320,
+        "warmup": 10,
+        "workload": "group"
+      },
+      {
+        "checksum": "a83ad1be5db5c325",
+        "iterations": 50,
+        "rows_total": 250,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          13264958,
+          14439274,
+          13944369,
+          14151950,
+          14675375
+        ],
+        "validation_rows": 32,
+        "warmup": 100,
+        "workload": "aggregate_multi"
+      },
+      {
+        "checksum": "5e7cfb33776cd6e3",
+        "iterations": 50,
+        "rows_total": 5625,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          19608027,
+          20640697,
+          20382231,
+          20363966,
+          20039883
+        ],
+        "validation_rows": 708,
+        "warmup": 100,
+        "workload": "general_where_keys"
+      },
+      {
+        "checksum": "7fb193569b2eff45",
+        "iterations": 50,
+        "rows_total": 250,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          8791281,
+          9315941,
+          9124981,
+          8723225,
+          9316166
+        ],
+        "validation_rows": 32,
+        "warmup": 100,
+        "workload": "general_text_filter"
+      }
+    ],
+    "rust": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          2931481,
+          2801560,
+          2798571,
+          2819682,
+          2813123
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "aggregate",
+        "checksum": "95913d368b1ddc2c",
+        "validation_rows": 32,
+        "samples_ns": [
+          2251383,
+          2253870,
+          2252233,
+          4048313,
+          5337429
+        ],
+        "rows_total": 150,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "aggregate_argument",
+        "checksum": "11176e3e1f763de4",
+        "validation_rows": 32,
+        "samples_ns": [
+          11475346,
+          11458159,
+          11484770,
+          11513918,
+          11518274
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "aggregate_many_groups",
+        "checksum": "34a0b376469d1fa5",
+        "validation_rows": 3200,
+        "samples_ns": [
+          13400799,
+          13331030,
+          13375472,
+          13432815,
+          13380936
+        ],
+        "rows_total": 25000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "group",
+        "checksum": "6ad01ea05cb39e25",
+        "validation_rows": 320,
+        "samples_ns": [
+          2789636,
+          2793492,
+          2790618,
+          2771145,
+          2773059
+        ],
+        "rows_total": 750,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "aggregate_multi",
+        "checksum": "a83ad1be5db5c325",
+        "validation_rows": 32,
+        "samples_ns": [
+          12205299,
+          12229764,
+          12203521,
+          12180797,
+          12189242
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "general_where_keys",
+        "checksum": "5e7cfb33776cd6e3",
+        "validation_rows": 708,
+        "samples_ns": [
+          14974486,
+          14943844,
+          15018623,
+          15027667,
+          15034934
+        ],
+        "rows_total": 5625,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "general_text_filter",
+        "checksum": "7fb193569b2eff45",
+        "validation_rows": 32,
+        "samples_ns": [
+          5547455,
+          5524858,
+          5552737,
+          5535380,
+          5520616
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      }
+    ],
+    "ts": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          8191318,
+          4434773,
+          4216968,
+          4208759,
+          3946643
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "aggregate",
+        "checksum": "95913d368b1ddc2c",
+        "validation_rows": 32,
+        "samples_ns": [
+          5120109,
+          5091445,
+          4954684,
+          4905852,
+          4753402
+        ],
+        "rows_total": 150,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "aggregate_argument",
+        "checksum": "11176e3e1f763de4",
+        "validation_rows": 32,
+        "samples_ns": [
+          34537340,
+          24897906,
+          27678505,
+          26479967,
+          24994305
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "aggregate_many_groups",
+        "checksum": "34a0b376469d1fa5",
+        "validation_rows": 3200,
+        "samples_ns": [
+          27701554,
+          29304851,
+          26262024,
+          26554384,
+          30169046
+        ],
+        "rows_total": 25000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "group",
+        "checksum": "6ad01ea05cb39e25",
+        "validation_rows": 320,
+        "samples_ns": [
+          6266132,
+          5938564,
+          6809103,
+          6120594,
+          6473132
+        ],
+        "rows_total": 750,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "aggregate_multi",
+        "checksum": "a83ad1be5db5c325",
+        "validation_rows": 32,
+        "samples_ns": [
+          22082437,
+          21848917,
+          22293551,
+          22645816,
+          22444197
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "general_where_keys",
+        "checksum": "5e7cfb33776cd6e3",
+        "validation_rows": 708,
+        "samples_ns": [
+          33713546,
+          35190524,
+          34944884,
+          35058340,
+          33876485
+        ],
+        "rows_total": 5625,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "general_text_filter",
+        "checksum": "7fb193569b2eff45",
+        "validation_rows": 32,
+        "samples_ns": [
+          68334119,
+          83869402,
+          82189153,
+          100410547,
+          86866268
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      }
+    ]
+  },
+  "resources": {
+    "ruby-yjit": {
+      "peak_rss_bytes": 64217088,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--yjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/lane.rb",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "go": {
+      "peak_rss_bytes": 27324416,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 17179869184,
+      "command": [
+        "/tmp/jed-ruby-native-compare/go-lane",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "rust": {
+      "peak_rss_bytes": 12013568,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 17179869184,
+      "command": [
+        "/tmp/jed-ruby-native-compare/rust-target/release/jed-ruby-experiment-compare",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "ts": {
+      "peak_rss_bytes": 238206976,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 17179869184,
+      "command": [
+        "node",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/lane.ts",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    }
+  },
+  "ruby_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "ruby_source_sha256_after": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "source_sha256": {
+    "harness": "78d7662e47bf1af4e53c75affd2e06b0cfbba61354074db251ead4538bf9e7fd",
+    "ruby_adapter": "f5c12a9bc7c9e2b472a981c2faa4e24d16b80ee24327de9f83b7e44fd75c1b75",
+    "go_adapter": "8a4d62ac61fcbd1e2097fbf145865ef93d7defa06d34078925e01b74bcb869e2",
+    "rust_adapter": "41c0512c1941f8e864e8d0c25fc99923666999f4660035bde4dafc5e77eede31",
+    "ts_adapter": "ebea27b1c22a823b049bf9234a8ba298e7e34f8a995452ded31e0f6110ccce65",
+    "go_core": "529576ad3e3bba25a769e9010ee4b280fe23bd111f5315daeaff0e671813bd05",
+    "rust_core": "d8aa1d6333b72d1d0e5dee9b0722de9e829349089a50a3ed5a509e2e887c2f50",
+    "ts_core": "914c07c6a8540b76f321de2a47786d8a2b3989b99b1cad3743f4b26aadf6897b",
+    "go_binary": "434bf4d1ea4109640635cf12324576b2ee56c3e7546e13dff9069b9f0a634327",
+    "rust_binary": "4587f3f1b2e6a207c9f7249c1396aa9f011a1831eec9fbeee0a887204dffaa92",
+    "ruby_executable": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf"
+  },
+  "source_sha256_after": {
+    "harness": "78d7662e47bf1af4e53c75affd2e06b0cfbba61354074db251ead4538bf9e7fd",
+    "ruby_adapter": "f5c12a9bc7c9e2b472a981c2faa4e24d16b80ee24327de9f83b7e44fd75c1b75",
+    "go_adapter": "8a4d62ac61fcbd1e2097fbf145865ef93d7defa06d34078925e01b74bcb869e2",
+    "rust_adapter": "41c0512c1941f8e864e8d0c25fc99923666999f4660035bde4dafc5e77eede31",
+    "ts_adapter": "ebea27b1c22a823b049bf9234a8ba298e7e34f8a995452ded31e0f6110ccce65",
+    "go_core": "529576ad3e3bba25a769e9010ee4b280fe23bd111f5315daeaff0e671813bd05",
+    "rust_core": "d8aa1d6333b72d1d0e5dee9b0722de9e829349089a50a3ed5a509e2e887c2f50",
+    "ts_core": "914c07c6a8540b76f321de2a47786d8a2b3989b99b1cad3743f4b26aadf6897b",
+    "go_binary": "434bf4d1ea4109640635cf12324576b2ee56c3e7546e13dff9069b9f0a634327",
+    "rust_binary": "4587f3f1b2e6a207c9f7249c1396aa9f011a1831eec9fbeee0a887204dffaa92",
+    "ruby_executable": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf"
+  },
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby"
+}

@@ -1,0 +1,287 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T17:59:27Z",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "jit": "yjit",
+  "options": {
+    "churn": 256,
+    "churn_calls": 200,
+    "jit": "yjit",
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/relation-followup/retention-4.0-yjit.json"
+  },
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "script_sha256": "a5cee26f6803cafba28d7ba488a51facd5e4ff765d8dcf90f2a5e53cfc889c3c",
+  "helper_sha256": "6a5be3c3aec178859dcfe9253af389319b597183478dfad0204a2233e8f23a08",
+  "before": {
+    "rss_bytes": 42004480,
+    "live_slots": 58414,
+    "jit": {
+      "inline_code_size": 36339,
+      "outlined_code_size": 34629,
+      "freed_code_size": 0,
+      "code_region_size": 110592,
+      "compiled_iseq_entry": 60,
+      "compiled_iseq_count": 71,
+      "compiled_blockid_count": 588,
+      "compiled_block_count": 737,
+      "compiled_branch_count": 1068,
+      "compile_time_ns": 7853429
+    },
+    "live_kernels": 0,
+    "anonymous_kernel_classes": 0,
+    "collection": 3
+  },
+  "nested_churn": {
+    "plans_created": 256,
+    "calls_per_plan": 200,
+    "retained_limit": 64,
+    "elapsed_ns": 265932559,
+    "before": {
+      "rss_bytes": 42024960,
+      "live_slots": 58411,
+      "jit": {
+        "inline_code_size": 36339,
+        "outlined_code_size": 34629,
+        "freed_code_size": 0,
+        "code_region_size": 110592,
+        "compiled_iseq_entry": 60,
+        "compiled_iseq_count": 71,
+        "compiled_blockid_count": 588,
+        "compiled_block_count": 737,
+        "compiled_branch_count": 1068,
+        "compile_time_ns": 7853429
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0
+    },
+    "while_cache_retained": {
+      "rss_bytes": 59150336,
+      "live_slots": 60283,
+      "jit": {
+        "inline_code_size": 669040,
+        "outlined_code_size": 1334720,
+        "freed_code_size": 0,
+        "code_region_size": 3637248,
+        "compiled_iseq_entry": 367,
+        "compiled_iseq_count": 477,
+        "compiled_blockid_count": 16266,
+        "compiled_block_count": 24699,
+        "compiled_branch_count": 38248,
+        "compile_time_ns": 218175620
+      },
+      "live_kernels": 64,
+      "anonymous_kernel_classes": 80,
+      "retained_kernels": 64,
+      "retained_source_bytes": 25984,
+      "retained_pool_entries": 128
+    },
+    "after_helper_return_and_gc": [
+      {
+        "rss_bytes": 59162624,
+        "live_slots": 59210,
+        "jit": {
+          "inline_code_size": 669633,
+          "outlined_code_size": 1335765,
+          "freed_code_size": 0,
+          "code_region_size": 3649536,
+          "compiled_iseq_entry": 368,
+          "compiled_iseq_count": 478,
+          "compiled_blockid_count": 16270,
+          "compiled_block_count": 24713,
+          "compiled_branch_count": 38278,
+          "compile_time_ns": 218355557
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 21,
+        "gc_after_return": 1
+      },
+      {
+        "rss_bytes": 59162624,
+        "live_slots": 59156,
+        "jit": {
+          "inline_code_size": 669633,
+          "outlined_code_size": 1335765,
+          "freed_code_size": 0,
+          "code_region_size": 3649536,
+          "compiled_iseq_entry": 368,
+          "compiled_iseq_count": 478,
+          "compiled_blockid_count": 16270,
+          "compiled_block_count": 24713,
+          "compiled_branch_count": 38278,
+          "compile_time_ns": 218355557
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 21,
+        "gc_after_return": 2
+      },
+      {
+        "rss_bytes": 59162624,
+        "live_slots": 59158,
+        "jit": {
+          "inline_code_size": 669633,
+          "outlined_code_size": 1335765,
+          "freed_code_size": 0,
+          "code_region_size": 3649536,
+          "compiled_iseq_entry": 368,
+          "compiled_iseq_count": 478,
+          "compiled_blockid_count": 16270,
+          "compiled_block_count": 24713,
+          "compiled_branch_count": 38278,
+          "compile_time_ns": 218355557
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 21,
+        "gc_after_return": 3
+      }
+    ],
+    "note": "Uses the actual source/pool LRU and second-use admission. Cache population returns only scalar snapshots before final GC, removing its engine/cache/kernel locals from scope. VM classes and machine code may outlive generated instances."
+  },
+  "after_outer_churn_return_and_gc": [
+    {
+      "rss_bytes": 59162624,
+      "live_slots": 59176,
+      "jit": {
+        "inline_code_size": 671212,
+        "outlined_code_size": 1338532,
+        "freed_code_size": 0,
+        "code_region_size": 3649536,
+        "compiled_iseq_entry": 370,
+        "compiled_iseq_count": 480,
+        "compiled_blockid_count": 16320,
+        "compiled_block_count": 24763,
+        "compiled_branch_count": 38342,
+        "compile_time_ns": 218811299
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "collection": 1
+    },
+    {
+      "rss_bytes": 59162624,
+      "live_slots": 59178,
+      "jit": {
+        "inline_code_size": 671212,
+        "outlined_code_size": 1338532,
+        "freed_code_size": 0,
+        "code_region_size": 3649536,
+        "compiled_iseq_entry": 370,
+        "compiled_iseq_count": 480,
+        "compiled_blockid_count": 16320,
+        "compiled_block_count": 24763,
+        "compiled_branch_count": 38342,
+        "compile_time_ns": 218811299
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "collection": 2
+    },
+    {
+      "rss_bytes": 59162624,
+      "live_slots": 59180,
+      "jit": {
+        "inline_code_size": 671212,
+        "outlined_code_size": 1338532,
+        "freed_code_size": 0,
+        "code_region_size": 3649536,
+        "compiled_iseq_entry": 370,
+        "compiled_iseq_count": 480,
+        "compiled_blockid_count": 16320,
+        "compiled_block_count": 24763,
+        "compiled_branch_count": 38342,
+        "compile_time_ns": 218811299
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "collection": 3
+    }
+  ],
+  "while_thread_cache_retained": {
+    "rss_bytes": 73273344,
+    "live_slots": 60438,
+    "jit": {
+      "inline_code_size": 1145503,
+      "outlined_code_size": 2429542,
+      "freed_code_size": 0,
+      "code_region_size": 6602752,
+      "compiled_iseq_entry": 626,
+      "compiled_iseq_count": 736,
+      "compiled_blockid_count": 29011,
+      "compiled_block_count": 44751,
+      "compiled_branch_count": 69396,
+      "compile_time_ns": 415354147
+    },
+    "live_kernels": 64,
+    "anonymous_kernel_classes": 85,
+    "retained_kernels": 64,
+    "retained_source_bytes": 25984,
+    "retained_pool_entries": 128
+  },
+  "after_completed_thread_exit_and_gc": [
+    {
+      "rss_bytes": 73404416,
+      "live_slots": 59265,
+      "jit": {
+        "inline_code_size": 1145503,
+        "outlined_code_size": 2429542,
+        "freed_code_size": 0,
+        "code_region_size": 6602752,
+        "compiled_iseq_entry": 626,
+        "compiled_iseq_count": 736,
+        "compiled_blockid_count": 29011,
+        "compiled_block_count": 44751,
+        "compiled_branch_count": 69396,
+        "compile_time_ns": 415354147
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "collection": 1
+    },
+    {
+      "rss_bytes": 73404416,
+      "live_slots": 59205,
+      "jit": {
+        "inline_code_size": 1145503,
+        "outlined_code_size": 2429542,
+        "freed_code_size": 0,
+        "code_region_size": 6602752,
+        "compiled_iseq_entry": 626,
+        "compiled_iseq_count": 736,
+        "compiled_blockid_count": 29011,
+        "compiled_block_count": 44751,
+        "compiled_branch_count": 69396,
+        "compile_time_ns": 415354147
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "collection": 2
+    },
+    {
+      "rss_bytes": 73404416,
+      "live_slots": 59207,
+      "jit": {
+        "inline_code_size": 1145503,
+        "outlined_code_size": 2429542,
+        "freed_code_size": 0,
+        "code_region_size": 6602752,
+        "compiled_iseq_entry": 626,
+        "compiled_iseq_count": 736,
+        "compiled_blockid_count": 29011,
+        "compiled_block_count": 44751,
+        "compiled_branch_count": 69396,
+        "compile_time_ns": 415354147
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 21,
+      "collection": 3
+    }
+  ],
+  "scalar_snapshots_only": true,
+  "notes": [
+    "Each phase creates 256 generated relation kernels and calls each 200 times through the actual 64-entry source/pool LRU.",
+    "The first phase collects after the complete existing churn helper returns. The second uses a completed thread and releases its Thread object before collection, removing temporary VM/native-stack roots.",
+    "Only recursively verified scalar snapshots escape helpers. Class and machine-code retention is runtime policy; zero instances does not imply immediate JIT code reclamation."
+  ],
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276"
+}

@@ -156,7 +156,14 @@ module JedNative
       # Grouping-set membership is fixed for this query. Resolve those slots
       # once instead of hashing an AST for every key of every input row.
       key_slots = keys.each_with_index.to_h
-      key_values = relation.rows.map { |row| compiled.map { |expression| evaluate(expression, row) } } unless keys.empty?
+      unless keys.empty?
+        key_kernel = native_compiled_relation_keys(compiled) if relation.rows.is_a?(Array)
+        key_values = if key_kernel
+          key_kernel.call(self, relation.rows, @params)
+        else
+          relation.rows.map { |row| compiled.map { |expression| evaluate(expression, row) } }
+        end
+      end
       empty_key = [].freeze
       having = compile_filter(statement[:having], relation.columns)
       materialized = projection_aggregates([statement[:columns], statement[:having], statement[:order_by]]).map { |node| compile(node, relation.columns) }

@@ -1,0 +1,248 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T17:59:43Z",
+  "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+  "jit": "zjit",
+  "options": {
+    "churn": 256,
+    "churn_calls": 200,
+    "jit": "zjit",
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/relation-followup/retention-4.1-zjit.json"
+  },
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "script_sha256": "a5cee26f6803cafba28d7ba488a51facd5e4ff765d8dcf90f2a5e53cfc889c3c",
+  "helper_sha256": "6a5be3c3aec178859dcfe9253af389319b597183478dfad0204a2233e8f23a08",
+  "before": {
+    "rss_bytes": 45477888,
+    "live_slots": 57446,
+    "jit": {
+      "compiled_iseq_count": 71,
+      "compile_time_ns": 13308927,
+      "compiled_side_exit_count": 921,
+      "jit_frame_region_bytes": 12288,
+      "code_region_bytes": 122880,
+      "zjit_alloc_bytes": 160216,
+      "total_mem_bytes": 295384
+    },
+    "live_kernels": 0,
+    "anonymous_kernel_classes": 0,
+    "collection": 3
+  },
+  "nested_churn": {
+    "plans_created": 256,
+    "calls_per_plan": 200,
+    "retained_limit": 64,
+    "elapsed_ns": 251726920,
+    "before": {
+      "rss_bytes": 45477888,
+      "live_slots": 57446,
+      "jit": {
+        "compiled_iseq_count": 71,
+        "compile_time_ns": 13308927,
+        "compiled_side_exit_count": 921,
+        "jit_frame_region_bytes": 12288,
+        "code_region_bytes": 122880,
+        "zjit_alloc_bytes": 160216,
+        "total_mem_bytes": 295384
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0
+    },
+    "while_cache_retained": {
+      "rss_bytes": 53342208,
+      "live_slots": 61564,
+      "jit": {
+        "compiled_iseq_count": 478,
+        "compile_time_ns": 214592541,
+        "compiled_side_exit_count": 15347,
+        "jit_frame_region_bytes": 114688,
+        "code_region_bytes": 2842624,
+        "zjit_alloc_bytes": 2342548,
+        "total_mem_bytes": 5299860
+      },
+      "live_kernels": 64,
+      "anonymous_kernel_classes": 256,
+      "retained_kernels": 64,
+      "retained_source_bytes": 25984,
+      "retained_pool_entries": 128
+    },
+    "after_helper_return_and_gc": [
+      {
+        "rss_bytes": 53342208,
+        "live_slots": 61616,
+        "jit": {
+          "compiled_iseq_count": 479,
+          "compile_time_ns": 214761513,
+          "compiled_side_exit_count": 15352,
+          "jit_frame_region_bytes": 114688,
+          "code_region_bytes": 2842624,
+          "zjit_alloc_bytes": 2343924,
+          "total_mem_bytes": 5301236
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 256,
+        "gc_after_return": 1
+      },
+      {
+        "rss_bytes": 53342208,
+        "live_slots": 61618,
+        "jit": {
+          "compiled_iseq_count": 479,
+          "compile_time_ns": 214761513,
+          "compiled_side_exit_count": 15352,
+          "jit_frame_region_bytes": 114688,
+          "code_region_bytes": 2842624,
+          "zjit_alloc_bytes": 2343924,
+          "total_mem_bytes": 5301236
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 256,
+        "gc_after_return": 2
+      },
+      {
+        "rss_bytes": 53342208,
+        "live_slots": 61620,
+        "jit": {
+          "compiled_iseq_count": 479,
+          "compile_time_ns": 214761513,
+          "compiled_side_exit_count": 15352,
+          "jit_frame_region_bytes": 114688,
+          "code_region_bytes": 2842624,
+          "zjit_alloc_bytes": 2343924,
+          "total_mem_bytes": 5301236
+        },
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 256,
+        "gc_after_return": 3
+      }
+    ],
+    "note": "Uses the actual source/pool LRU and second-use admission. Cache population returns only scalar snapshots before final GC, removing its engine/cache/kernel locals from scope. VM classes and machine code may outlive generated instances."
+  },
+  "after_outer_churn_return_and_gc": [
+    {
+      "rss_bytes": 53350400,
+      "live_slots": 61639,
+      "jit": {
+        "compiled_iseq_count": 482,
+        "compile_time_ns": 215402990,
+        "compiled_side_exit_count": 15417,
+        "jit_frame_region_bytes": 114688,
+        "code_region_bytes": 2850816,
+        "zjit_alloc_bytes": 2350712,
+        "total_mem_bytes": 5316216
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 256,
+      "collection": 1
+    },
+    {
+      "rss_bytes": 53350400,
+      "live_slots": 61641,
+      "jit": {
+        "compiled_iseq_count": 482,
+        "compile_time_ns": 215402990,
+        "compiled_side_exit_count": 15417,
+        "jit_frame_region_bytes": 114688,
+        "code_region_bytes": 2850816,
+        "zjit_alloc_bytes": 2350712,
+        "total_mem_bytes": 5316216
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 256,
+      "collection": 2
+    },
+    {
+      "rss_bytes": 53350400,
+      "live_slots": 61643,
+      "jit": {
+        "compiled_iseq_count": 482,
+        "compile_time_ns": 215402990,
+        "compiled_side_exit_count": 15417,
+        "jit_frame_region_bytes": 114688,
+        "code_region_bytes": 2850816,
+        "zjit_alloc_bytes": 2350712,
+        "total_mem_bytes": 5316216
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 256,
+      "collection": 3
+    }
+  ],
+  "while_thread_cache_retained": {
+    "rss_bytes": 59940864,
+    "live_slots": 65333,
+    "jit": {
+      "compiled_iseq_count": 753,
+      "compile_time_ns": 386671936,
+      "compiled_side_exit_count": 26308,
+      "jit_frame_region_bytes": 188416,
+      "code_region_bytes": 5058560,
+      "zjit_alloc_bytes": 3886192,
+      "total_mem_bytes": 9133168
+    },
+    "live_kernels": 64,
+    "anonymous_kernel_classes": 512,
+    "retained_kernels": 64,
+    "retained_source_bytes": 25984,
+    "retained_pool_entries": 128
+  },
+  "after_completed_thread_exit_and_gc": [
+    {
+      "rss_bytes": 60071936,
+      "live_slots": 65366,
+      "jit": {
+        "compiled_iseq_count": 753,
+        "compile_time_ns": 386671936,
+        "compiled_side_exit_count": 26308,
+        "jit_frame_region_bytes": 188416,
+        "code_region_bytes": 5058560,
+        "zjit_alloc_bytes": 3886192,
+        "total_mem_bytes": 9133168
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 512,
+      "collection": 1
+    },
+    {
+      "rss_bytes": 60071936,
+      "live_slots": 65368,
+      "jit": {
+        "compiled_iseq_count": 753,
+        "compile_time_ns": 386671936,
+        "compiled_side_exit_count": 26308,
+        "jit_frame_region_bytes": 188416,
+        "code_region_bytes": 5058560,
+        "zjit_alloc_bytes": 3886192,
+        "total_mem_bytes": 9133168
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 512,
+      "collection": 2
+    },
+    {
+      "rss_bytes": 60071936,
+      "live_slots": 65370,
+      "jit": {
+        "compiled_iseq_count": 753,
+        "compile_time_ns": 386671936,
+        "compiled_side_exit_count": 26308,
+        "jit_frame_region_bytes": 188416,
+        "code_region_bytes": 5058560,
+        "zjit_alloc_bytes": 3886192,
+        "total_mem_bytes": 9133168
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 512,
+      "collection": 3
+    }
+  ],
+  "scalar_snapshots_only": true,
+  "notes": [
+    "Each phase creates 256 generated relation kernels and calls each 200 times through the actual 64-entry source/pool LRU.",
+    "The first phase collects after the complete existing churn helper returns. The second uses a completed thread and releases its Thread object before collection, removing temporary VM/native-stack roots.",
+    "Only recursively verified scalar snapshots escape helpers. Class and machine-code retention is runtime policy; zero instances does not imply immediate JIT code reclamation."
+  ],
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276"
+}
