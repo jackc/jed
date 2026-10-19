@@ -1,6 +1,68 @@
 # frozen_string_literal: true
 
 module JedNative
+  # Character indexing without one heap String per input character. ASCII has
+  # no index allocation; UTF-8 uses four packed bytes per character boundary.
+  class RegexText
+    include Enumerable
+    ASCII = Array.new(128) { |value| value.chr.freeze }.freeze
+    attr_reader :length
+
+    def initialize(text)
+      @text = text
+      @insensitive = false
+      if text.ascii_only?
+        @length = text.bytesize
+      else
+        @offsets = String.new(capacity: text.bytesize + 4, encoding: Encoding::BINARY)
+        cursor = 0
+        while cursor < text.bytesize
+          @offsets << [cursor].pack('L<')
+          byte = text.getbyte(cursor)
+          cursor += byte < 128 ? 1 : byte < 224 ? 2 : byte < 240 ? 3 : 4
+        end
+        @length = @offsets.bytesize / 4
+        @offsets << [cursor].pack('L<')
+      end
+    end
+
+    def with_case(insensitive)
+      copy = dup
+      copy.instance_variable_set(:@insensitive, insensitive)
+      copy
+    end
+
+    def byte_offset(index)
+      @offsets ? @offsets.unpack1('L<', offset: index * 4) : index
+    end
+
+    def [](index)
+      return nil if index.negative? || index >= @length
+      offset = byte_offset(index)
+      byte = @text.getbyte(offset)
+      if byte < 128
+        byte += 32 if @insensitive && byte.between?(65, 90)
+        ASCII[byte]
+      else
+        @text.byteslice(offset, byte_offset(index + 1) - offset)
+      end
+    end
+
+    def slice(first, last)
+      offset = byte_offset(first)
+      @text.byteslice(offset, byte_offset(last) - offset)
+    end
+
+    def each
+      return enum_for(:each) unless block_given?
+      index = 0
+      while index < @length
+        yield self[index]
+        index += 1
+      end
+    end
+  end
+
   # The shared regex grammar lowers to the specified Pike VM. No SQL pattern is
   # passed to Ruby's backtracking regexp engine. Each input position visits an
   # instruction at most once, bounding work by program length times input length.
@@ -18,7 +80,8 @@ module JedNative
     def initialize(pattern, insensitive: false, dotall: false, multiline: false, literal: false, newline_sensitive: false)
       @insensitive, @dotall, @multiline = insensitive, dotall, multiline
       @newline_sensitive = newline_sensitive && !literal
-      @characters, @position, @groups, @depth = pattern.chars, 0, 0, 0
+      @characters, @position, @groups, @depth = RegexText.new(pattern), 0, 0, 0
+      raise Error.new('54001', 'regular expression program is too large') if literal && @characters.length + 6 > LIMIT
       root = literal ? [:concat, @characters.map { |char| [:char, fold(char)] }] : alternatives
       @position = @characters.length if literal
       invalid('unbalanced parenthesis') unless @position == @characters.length
@@ -34,7 +97,7 @@ module JedNative
     end
 
     def input(text)
-      @insensitive ? text.tr('A-Z', 'a-z').chars : text.chars
+      (text.is_a?(RegexText) ? text : RegexText.new(text)).with_case(@insensitive)
     end
 
     def match?(text, context: nil) = !search(input(text), 0, context: context).nil?

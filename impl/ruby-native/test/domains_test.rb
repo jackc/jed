@@ -66,7 +66,8 @@ module NativeDomainTests
         assert(File.binread(main_path) == original_main, 'attachment-only commit must not rewrite main')
         db.execute('BEGIN')
         db.execute('INSERT INTO t VALUES (1)')
-        error('0A000') { db.execute("UPDATE ref.t SET value = 'forbidden' WHERE id = 1") }
+        db.execute("UPDATE ref.t SET value = 'forbidden' WHERE id = 1")
+        error('0A000') { db.execute('COMMIT') }
         db.execute('ROLLBACK')
         assert(db.query('SELECT * FROM t').rows.empty?, 'second durable writer rejection rolls back main')
         db.execute('BEGIN')

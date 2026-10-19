@@ -94,7 +94,7 @@ module JedNative
 
     def project_mutation(statement, table, operation, changes, scope, expressions, columns)
       result = super
-      query_memory_stage_changes(table, changes) unless table[:temporary]
+      query_memory_stage_changes(table, changes)
       result
     end
 
@@ -102,7 +102,7 @@ module JedNative
       existed = @tables.key?(statement[:name])
       result = super
       stored = @tables[statement[:name]]
-      if !existed && stored && !stored[:temporary] && !stored[:rows].empty?
+      if !existed && stored && !stored[:rows].empty?
         query_memory_stage_changes(stored.merge(rows: [], rowids: [], next_rowid: 1), stored[:rows].map { |row| [nil, row] })
       end
       result
@@ -113,7 +113,7 @@ module JedNative
       result = super
       name = statement[:action] == :rename ? statement[:new_name] : statement[:name]
       stored = @tables[name]
-      return result unless original && stored && !stored[:temporary]
+      return result unless original && stored
       if name != original[:name]
         @query_memory_versions = @query_memory_versions.to_h do |key, bytes|
           [key.first == original[:name] ? [name, *key.drop(1)] : key, bytes]
@@ -125,13 +125,15 @@ module JedNative
       if rewrite
         codec = statistics_codec
         original[:rows].each_with_index do |row, index|
+          next if stored[:temporary]
           query_memory_replace_records(original[:name], query_memory_storage_records(original, row, original[:rowids][index], codec), {})
         end
         stored[:rows].each_with_index do |row, index|
-          query_memory_replace_records(name, {}, query_memory_storage_records(stored, row, stored[:rowids][index], codec))
+          records = query_memory_storage_records(stored, row, stored[:rowids][index], codec, meter: true)
+          query_memory_replace_records(name, {}, records) unless stored[:temporary]
         end
       else
-        query_memory_stage_new_indexes(original, stored)
+        query_memory_stage_new_indexes(original, stored) unless stored[:temporary]
       end
       query_memory_check_pending
       result
@@ -360,10 +362,11 @@ module JedNative
         end
         next_id += 1 unless before
         previous = before && !@query_memory_versions.empty? ? query_memory_storage_records(table, before, rowid, codec) : {}
-        current = after ? query_memory_storage_records(table, after, rowid, codec) : {}
+        current = after ? query_memory_storage_records(table, after, rowid, codec, meter: true) : {}
         removed.merge!(previous)
         added.merge!(current)
       end
+      return if table[:temporary]
       query_memory_replace_records(table[:name], removed, added)
       query_memory_check_pending
     end
@@ -397,22 +400,48 @@ module JedNative
       definitions = catalog_indexes(stored).reject { |index| existing.include?(index[:name]) }
       return if definitions.empty?
       codec = statistics_codec
+      gist, others = definitions.partition { |index| index[:method] == 'gist' }
+      # Q3 measures encoded leaf entries, not the routing structure. Resolve
+      # each definition once and avoid building a singleton GiST per row.
+      cost, lifetime, maximum, lifetime_maximum = @cost, @lifetime_cost, @max_cost, @lifetime_max_cost
+      @max_cost = @lifetime_max_cost = 0
+      gist = gist.map do |index|
+        details = secondary_metadata(stored, index)
+        operations = codec.gist_opclasses_for(stored, cols: details[:columns])
+        [index[:name], details, operations]
+      end
       stored[:rows].each_with_index do |row, ordinal|
-        records = query_memory_index_records(stored.merge(rows: [row], rowids: [stored[:rowids][ordinal]]), codec, definitions)
+        records = others.empty? ? {} : query_memory_index_records(stored.merge(rows: [row], rowids: [stored[:rowids][ordinal]]), codec, others)
+        unless gist.empty?
+          key = row.respond_to?(:storage_key) ? row.storage_key : query_memory_storage_key(stored, row, stored[:rowids][ordinal], codec)
+          gist.each do |name, details, operations|
+            next if details[:columns].any? { |column| row[column].nil? }
+            next if details[:predicate] && evaluate(details[:predicate], row) != true
+            values = Array.new(stored[:columns].length)
+            details[:columns].each { |column| values[column] = statistics_value(stored[:columns][column][:type], row[column]) }
+            bound = codec.gist_leaf_bound(operations, values, details[:columns])
+            encoded = codec.gist_encode_bound(operations, bound)
+            records[[:index, name, encoded + key]] = 4 + encoded.bytesize + key.bytesize
+          end
+        end
         query_memory_replace_records(stored[:name], {}, records)
       end
+    ensure
+      @cost, @lifetime_cost, @max_cost, @lifetime_max_cost = cost, lifetime, maximum, lifetime_maximum if defined?(cost) && cost
     end
 
     def query_memory_storage_key(table, row, rowid, codec)
       statistics_storage_rows(table.merge(rows: [row], rowids: [rowid]), codec).first.first
     end
 
-    def query_memory_storage_records(table, row, rowid, codec)
+    def query_memory_storage_records(table, row, rowid, codec, meter: false)
       key = query_memory_storage_key(table, row, rowid, codec)
-      values = row.each_with_index.map { |value, index| statistics_value(table[:columns][index][:type], value) }
-      forms, compressed, bytes = codec.plan_record(table, key, values, storage_page_size(table) - FileFormat::PAGE_HEADER)
+      values, forms, compressed, bytes = storage_record_plan(table, key, row, codec, storage_page_size(table) - FileFormat::PAGE_HEADER, meter: meter)
       forms.each_with_index do |form, index|
-        bytes += codec.value_payload(table[:columns][index][:type], values[index]).bytesize if form == :external
+        if form == :external
+          value = values[index]
+          bytes += value.is_a?(StoredValue) ? value.payload_length : codec.value_payload(table[:columns][index][:type], value).bytesize
+        end
         bytes += compressed[index].bytesize if form == :external_comp
       end
       records = { [:primary, key] => bytes }
@@ -424,12 +453,15 @@ module JedNative
       definitions ||= catalog_indexes(table)
       records = {}
       btrees, auxiliary = definitions.partition { |definition| !definition[:method] || definition[:method] == 'btree' }
-      _, indexes = build_secondary_indexes(table, codec, btrees)
+      # This table contains only staged versions. Q3 needs their entry bytes;
+      # applying them as a replacement for the committed index would walk and
+      # delete every unchanged key merely to size one row.
+      _, indexes = build_secondary_indexes(table, codec, btrees, fresh: true)
       indexes.each do |name, entries|
         entries.each { |key, _| records[[:index, name, key]] = key.bytesize }
       end
       unless auxiliary.empty?
-        build_auxiliary_indexes(table, codec, auxiliary).each do |name, details|
+        build_auxiliary_indexes(table, codec, auxiliary, fresh: true).each do |name, details|
           if details[:kind] == 'gin'
             details[:entries].each { |key, _| records[[:index, name, key]] = key.bytesize }
           else

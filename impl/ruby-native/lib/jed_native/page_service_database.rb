@@ -101,6 +101,7 @@ module JedNative
     def run(statement, *arguments)
       unless %i[rollback rollback_to].include?(statement[:kind])
         (@service_roles || {}).each do |storage, generation|
+          storage.send(:ensure_open)
           raise Error.new('08006', 'transaction belongs to an earlier page-service role') unless storage.service_generation == generation
         end
       end

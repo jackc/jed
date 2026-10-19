@@ -76,11 +76,12 @@ module RubyPageServiceTest
         STDOUT.sync = true
         database = JedNative.open(ARGV.fetch(0), locking: :auto)
         session = database.session
+        prepared = {}
         puts JSON.generate(role: database.engine.instance_variable_get(:@storage).service_role)
         STDIN.each_line do |line|
           break if line.chomp == 'close'
           begin
-            result = session.execute(line)
+            result = session.execute_prepared(prepared[line] ||= session.prepare(line))
             puts JSON.generate(rows: result.rows, cost: result.cost)
           rescue JedNative::Error => error
             puts JSON.generate(error: error.sqlstate, message: error.message)

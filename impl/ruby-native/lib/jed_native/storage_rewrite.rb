@@ -174,7 +174,7 @@ module JedNative
 
   module StorageRewrite
     def physical_scratch(snapshot = @snapshot, txid = @meta[:txid] + 1, &sink)
-      PhysicalImage.new(@codec, @page_size, source_image: @image).write(snapshot, txid, &sink)
+      PhysicalImage.new(rewrite_codec, @page_size, source_image: @image).write(snapshot, txid, &sink)
     end
 
     def compact
@@ -182,6 +182,7 @@ module JedNative
       raise Error.new('55006', 'a page client cannot compact its owner') if @service_remote
       operation = lambda do
         flush(shrink: false) if respond_to?(:flush)
+        load
         @mutex.synchronize { compact_file }
       end
       @service_owner ? @service_owner.with_exclusive_operation(&operation) : operation.call
@@ -190,7 +191,14 @@ module JedNative
     def backup(destination, form: :page_identical)
       ensure_open
       raise Error.new('22023', 'unknown backup form') unless %i[page_identical compacted].include?(form)
-      snapshot, selected_meta, source_image = @mutex.synchronize { [@snapshot, @meta.dup, @image] }
+      captured = nil
+      loop do
+        load
+        captured = @mutex.synchronize { [@snapshot, @meta.dup, @image] }
+        break if captured.first
+      end
+      snapshot, selected_meta, source_image = captured
+      codec = rewrite_codec
       destination = File.join(File.realpath(File.dirname(destination)), File.basename(destination))
       raise Error.new('58P02', 'backup destination exists') if File.exist?(destination) || File.symlink?(destination)
       temporary = "#{destination}.jedtmp"
@@ -199,7 +207,7 @@ module JedNative
         flags = File::WRONLY | File::CREAT | File::TRUNC | File::NOFOLLOW
         File.open(temporary, flags, 0o600) do |output|
           if form == :compacted
-            meta = PhysicalImage.new(@codec, @page_size, source_image: source_image).write(snapshot, selected_meta[:txid] + 1) do |page, bytes|
+            meta = PhysicalImage.new(codec, @page_size, source_image: source_image).write(snapshot, selected_meta[:txid] + 1) do |page, bytes|
               write_at(output, bytes, page * @page_size)
             end
           else
@@ -209,17 +217,17 @@ module JedNative
             page = meta[:free_head] || 0
             until page.zero?
               raise Error.new('XX001', 'free-list chain cycle or overlap') unless reached.add?(page)
-              raw = @codec.read_page(source_image, @page_size, page)
+              raw = codec.read_page(source_image, @page_size, page)
               raise Error.new('XX001', 'expected free-list page') unless raw[:type] == 7
               page = raw[:next_page]
             end
             zero = "\0".b * @page_size
             (2...meta[:page_count]).each do |id|
-              @codec.read_page(source_image, @page_size, id) if reached.include?(id)
+              codec.read_page(source_image, @page_size, id) if reached.include?(id)
               bytes = reached.include?(id) ? source_image.byteslice(id * @page_size, @page_size) : zero
               write_at(output, bytes, id * @page_size)
             end
-            PhysicalImage.meta_pages(@codec, @page_size, meta).each { |id, bytes| write_at(output, bytes, id * @page_size) }
+            PhysicalImage.meta_pages(codec, @page_size, meta).each { |id, bytes| write_at(output, bytes, id * @page_size) }
           end
           output.truncate(meta[:page_count] * @page_size)
           durable_sync(output) if @sync
@@ -244,6 +252,10 @@ module JedNative
     end
 
     private
+
+    def rewrite_codec
+      FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key), expression: @codec.instance_variable_get(:@expression))
+    end
 
     def compact_file
       temporary = "#{@path}.jedtmp"

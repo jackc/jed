@@ -89,10 +89,86 @@ module RubyPagedStorageTest
     end
   end
 
+  def self.shared_decoded_budget
+    Dir.mktmpdir('jed-ruby-shared-leaves') do |directory|
+      database = JedNative.create(File.join(directory, 'db'), page_size: 512, cache_bytes: 1024)
+      writer = database.session
+      %w[a b c].each do |name|
+        writer.execute("CREATE TABLE #{name} (id i32 PRIMARY KEY, v text)")
+        writer.execute("INSERT INTO #{name} SELECT g::i32, '#{name}-' || g::text FROM generate_series(1, 40) g")
+      end
+      readers, pools = [], []
+      6.times do |generation|
+        readers << database.read_session
+        %w[a b c].each do |name|
+          reader = readers.last
+          assert(reader.query("SELECT v FROM #{name} WHERE id = 39").rows.length == 1, 'shared-cache read failed')
+          pools << reader.engine.tables.fetch(name)[:rows].pool
+        end
+        writer.execute("UPDATE #{%w[a b c][generation % 3]} SET v = 'generation-#{generation}' WHERE id = 39")
+      end
+      assert(pools.map { |pool| pool.decoded_cache.object_id }.uniq.length == 1, 'generations retained independent decoded budgets')
+      assert(pools.all? { |pool| pool.cached_leaves <= 2 }, 'shared decoded cache exceeded its device budget')
+      assert(readers.first.query('SELECT v FROM a WHERE id = 39').rows == [['a-39']], 'shared cache changed a pinned old page')
+      readers.each(&:close)
+      8.times { |index| writer.execute("UPDATE a SET v = 'reuse-#{index}'") }
+      assert(writer.query('SELECT v FROM a WHERE id = 39').rows == [['reuse-7']], 'reused page retained stale decoded bytes')
+      writer.close
+      database.close
+    end
+  end
+
+  def self.index_build_keeps_primary_pages
+    Dir.mktmpdir('jed-ruby-index-pager') do |directory|
+      path = File.join(directory, 'db')
+      database = JedNative.create(path, page_size: 512, cache_bytes: 1024)
+      writer = database.session
+      writer.execute('CREATE TABLE t (id i32 PRIMARY KEY, v i32, tags i32[], span int4range)')
+      writer.execute('INSERT INTO t SELECT g::i32, (g % 7)::i32, ARRAY[(g % 7)::i32], int4range(g::i32, (g+2)::i32) FROM generate_series(1, 160) g')
+      original = File.binread(path)
+      writer.execute('BEGIN')
+      rows = writer.engine.tables.fetch('t')[:rows]
+      root = rows.tree
+      statements = ['CREATE INDEX t_v ON t (v)', 'CREATE INDEX t_tags ON t USING gin (tags)',
+                    'CREATE INDEX t_span ON t USING gist (span)']
+      statements.each do |sql|
+        writer.execute(sql)
+        table = writer.engine.tables.fetch('t')
+        assert(table[:rows].equal?(rows), 'CREATE INDEX copied the primary row inventory')
+        assert(table[:native_primary_tree].equal?(root), 'CREATE INDEX rebuilt the primary tree')
+      end
+      indexes = writer.engine.tables.fetch('t')[:indexes]
+      writer.execute('ANALYZE t (v, tags)')
+      analyzed = writer.engine.tables.fetch('t')
+      assert(analyzed[:rows].equal?(rows), 'ANALYZE copied the primary row inventory')
+      assert(analyzed[:native_primary_tree].equal?(root), 'ANALYZE rebuilt the primary tree')
+      assert(analyzed[:indexes].equal?(indexes), 'ANALYZE rebuilt index storage profiles')
+      assert(analyzed[:storage_statistics].length == 2, 'ANALYZE lost selected column facts')
+      writer.execute("INSERT INTO t VALUES (161, 3, '{3}', '[161,163)')")
+      assert(writer.query('SELECT id FROM t WHERE v = 3 ORDER BY id').rows.last == [161], 'pending btree did not accept a write')
+      assert(writer.query("SELECT id FROM t WHERE tags @> '{3}'::i32[] ORDER BY id").rows.last == [161], 'pending GIN did not accept a write')
+      assert(writer.query("SELECT id FROM t WHERE span && '[161,162)'::int4range ORDER BY id").rows.last == [161], 'pending GiST did not accept a write')
+      writer.execute('SAVEPOINT keep_indexes')
+      writer.execute('DROP INDEX t_v')
+      writer.execute('ROLLBACK TO keep_indexes')
+      assert(writer.engine.tables.fetch('t')[:native_secondary_metadata].key?('t_v'), 'index rollback lost its pending tree')
+      writer.execute('ROLLBACK')
+      assert(File.binread(path) == original, 'rolled-back index builds changed committed bytes')
+      assert(writer.engine.tables.fetch('t')[:indexes].empty?, 'index builds escaped rollback')
+      page = writer.engine.tables.fetch('t')[:native_primary_tree][:page]
+      writer.execute(statements.first)
+      assert(writer.engine.tables.fetch('t')[:native_primary_tree][:page] == page, 'index commit rewrote the primary root')
+      writer.close
+      database.close
+    end
+  end
+
   def self.run
     cache_and_pins
     auxiliary_reopen
-    puts 'ruby-native pager: 2 tests passed (bounded caches, pinned roots, lazy auxiliary indexes)'
+    shared_decoded_budget
+    index_build_keeps_primary_pages
+    puts 'ruby-native pager: 4 tests passed (shared bounded caches, pinned roots, streamed index builds and statistics)'
   end
 end
 

@@ -13,7 +13,7 @@ module JedNative
     def initialize(codec, page_size: 8192, image: nil, state: nil)
       @codec, @page_size = codec, page_size
       image ||= codec.build_image([], [], [], page_size)
-      @pages = {}
+      @pages = PendingPages.new(page_size)
       @page_count = image.bytesize / page_size
       @page_count.times { |page| @pages[page] = image.byteslice(page * page_size, page_size) }
       @free = state ? state.fetch(:free_pages, []) : []

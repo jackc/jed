@@ -70,15 +70,36 @@ module JedNative
         @live_pages.add(ids[index])
       end
       @live += catalog.length
-      @pages = PageBuffer.new(page_size, @allocator.high_water)
+      @pages = PageBuffer.new(page_size, @allocator.high_water, compact: true)
       @body.each do |page, (kind, count, following, payload, flags)|
         @codec.write_page(@pages, @page_size, page, kind, count, following, payload, flags: flags || 0)
       end
     end
 
     def adopt
-      @assignments.each { |node, page| @next_page_ids[node] = page }
       @next_page_ids
+    end
+
+    # Publication reuses the already validated bounds and leaf entries. Only
+    # routing nodes need their newly assigned physical page identity; decoding
+    # all freshly encoded pages would duplicate the entire index inventory.
+    def published_gist(node, operations)
+      count = height = 0
+      visit = lambda do |current, depth|
+        next nil unless current
+        count += 1
+        height = [height, depth].max
+        page = @next_page_ids[current] || @page_ids[current] || current[:page]
+        raise Error.new('XX001', 'GiST node has no committed page') unless page
+        if current[:leaf]
+          current[:page] == page ? current : current.merge(page: page)
+        else
+          children = current[:children].map { |bound, child| [bound, visit.call(child, depth + 1)] }
+          current.merge(page: page, children: children)
+        end
+      end
+      tree = visit.call(node, 1)
+      { tree: tree, node_count: count, height: height, opclasses: operations }
     end
 
     private
@@ -104,62 +125,51 @@ module JedNative
       entries.empty? ? nil : @codec.gist_build(operations, entries)
     end
 
-    def tree_live_pages(node)
-      return 0 unless node
-      return 1 + node[:overflow_pages].length if node.is_a?(PagedLeaf)
-      if node[:children].empty?
-        1 + node[:recs].sum do |record|
-          record[:forms].each_with_index.sum do |form, column|
-            length = case form
-            when :external then @codec.value_payload(record[:table][:columns][column][:type], record[:row][column]).bytesize
-            when :external_comp then record[:comps][column].bytesize
-            else 0
-            end
-            (length + @capacity - 1) / @capacity
-          end
-        end
-      else
-        1 + node[:children].sum { |child| tree_live_pages(child) }
-      end
-    end
-
     def write_tree(node)
       return 0 unless node
       if (page = @page_ids[node] || node[:page])
-        remember_tree(node)
-        @live += tree_live_pages(node)
+        @live += remember_tree(node)
         return page
       end
       children = node[:children].map { |child| write_tree(child) }
-      page = @allocator.allocate
-      @assignments << [node, page]
-      @live_pages.add(page)
-      @live += 1
       if children.empty?
         overflow = {}
-        payload = @codec.emit_leaf_pax(node[:recs], @capacity, -> { @allocator.allocate }, overflow)
+        kept = []
+        retain = lambda do |reference|
+          reference.each_overflow_page do |id|
+            raise Error.new('XX001', 'overflow chain belongs to multiple records') unless @live_pages.add?(id)
+            kept << id
+          end
+        end
+        payload = @codec.emit_leaf_pax(node[:recs], @capacity, -> { @allocator.allocate }, overflow, retain: retain)
         overflow.each do |id, (kind, count, bytes, following)|
           @body[id] = [kind, count, following || 0, bytes]
           @live_pages.add(id)
         end
-        @overflow_ids[node] = overflow.keys
-        @live += overflow.length
-        @body[page] = [FileFormat::PAGE_LEAF, node[:keys].length, 0, payload]
+        @overflow_ids[node] = (kept + overflow.keys).freeze
+        @live += kept.length + overflow.length
+        kind = FileFormat::PAGE_LEAF
       else
-        @body[page] = [FileFormat::PAGE_INTERIOR, node[:keys].length, 0, @codec.emit_interior(node[:keys], children)]
+        kind = FileFormat::PAGE_INTERIOR
+        payload = @codec.emit_interior(node[:keys], children)
       end
+      # Incremental commits allocate a dirty leaf after its fresh chains. The
+      # separate from-scratch writer allocates the leaf first, as the golden
+      # image contract requires.
+      page = @allocator.allocate
+      @assignments << [node, page]
+      @next_page_ids[node] = page
+      @overflow_ids[page] = @overflow_ids[node] if children.empty?
+      @live_pages.add(page)
+      @live += 1
+      @body[page] = [kind, node[:keys].length, 0, payload]
       page
-    end
-
-    def gist_live_pages(node)
-      node[:leaf] ? 1 : 1 + node[:children].sum { |_, child| gist_live_pages(child) }
     end
 
     def write_gist(node, operations)
       return 0 unless node
       if (page = @page_ids[node] || node[:page])
-        remember_tree(node, gist: true)
-        @live += gist_live_pages(node)
+        @live += remember_tree(node, gist: true)
         return page
       end
       payload = +''.b
@@ -180,6 +190,7 @@ module JedNative
       raise Error.new('0A000', 'GiST page exceeds capacity') if payload.bytesize > @capacity
       page = @allocator.allocate
       @assignments << [node, page]
+      @next_page_ids[node] = page
       @live_pages.add(page)
       @body[page] = [kind, count, 0, payload]
       @live += 1
@@ -190,11 +201,18 @@ module JedNative
       page = @page_ids[node] || node[:page]
       @next_page_ids[node] = page if page
       @live_pages.add(page) if page
-      overflow = @old_overflow_ids[node] || node[:overflow_pages] || []
-      @overflow_ids[node] = overflow unless overflow.empty?
-      @live_pages.merge(overflow)
       children = gist ? (node[:leaf] ? [] : node[:children].map(&:last)) : node[:children]
-      children.each { |child| remember_tree(child, gist: gist) }
+      count = page ? 1 : 0
+      if !gist && children.empty?
+        cache_key = node.is_a?(PagedLeaf) ? page : node
+        overflow = @old_overflow_ids[cache_key] || @old_overflow_ids[node] || node[:overflow_pages] || []
+        overflow = overflow.freeze
+        @overflow_ids[cache_key] = overflow
+        @live_pages.merge(overflow)
+        count += overflow.length
+      end
+      children.each { |child| count += remember_tree(child, gist: gist) }
+      count
     end
   end
 end

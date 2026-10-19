@@ -1,0 +1,1276 @@
+[
+  {
+    "bench": "point_lookup_pk_ramp",
+    "status": "smoke_pass",
+    "checksum": "1a273fc3c4c7cf82",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 222629888
+  },
+  {
+    "bench": "point_lookup_pk",
+    "status": "smoke_pass",
+    "checksum": "1a273fc3c4c7cf82",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 225869824
+  },
+  {
+    "bench": "point_lookup_pk_miss",
+    "status": "smoke_pass",
+    "checksum": "cbf29ce484222325",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 185679872
+  },
+  {
+    "bench": "composite_pk_lookup",
+    "status": "smoke_pass",
+    "checksum": "87b699e60b37d3d2",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 217337856
+  },
+  {
+    "bench": "interval_set_pk",
+    "status": "smoke_pass",
+    "checksum": "e64a1489723e9ee3",
+    "rows": 24,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 196603904
+  },
+  {
+    "bench": "any_array_pk",
+    "status": "smoke_pass",
+    "checksum": "f40e9c7d8b3b8a01",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 200794112
+  },
+  {
+    "bench": "composite_pk_any",
+    "status": "smoke_pass",
+    "checksum": "f7b2435a6c7a2215",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 197259264
+  },
+  {
+    "bench": "index_tuple_any",
+    "status": "smoke_pass",
+    "checksum": "0b8c14fced986f01",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 361189376
+  },
+  {
+    "bench": "any_array_pk_promoted",
+    "status": "smoke_pass",
+    "checksum": "dfb630e89e74016d",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 186441728
+  },
+  {
+    "bench": "any_array_pk_param",
+    "status": "smoke_pass",
+    "checksum": "849cbb0f7f61b420",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 192536576
+  },
+  {
+    "bench": "composite_pk_any_param",
+    "status": "smoke_pass",
+    "checksum": "ff5a71261ef836ff",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 199303168
+  },
+  {
+    "bench": "index_tuple_text",
+    "status": "smoke_pass",
+    "checksum": "78909ce8e8747373",
+    "rows": 2,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 423182336
+  },
+  {
+    "bench": "subquery_in_pk",
+    "status": "smoke_pass",
+    "checksum": "3c8449ecc08e486a",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 201908224
+  },
+  {
+    "bench": "any_or_leaf_pk",
+    "status": "smoke_pass",
+    "checksum": "a190a536674e2593",
+    "rows": 4,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 194162688
+  },
+  {
+    "bench": "inl_any_array",
+    "status": "smoke_pass",
+    "checksum": "5982400a597e1350",
+    "rows": 8,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 201879552
+  },
+  {
+    "bench": "inl_tuple_set",
+    "status": "smoke_pass",
+    "checksum": "ac07906dfd09e7cb",
+    "rows": 3,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 214495232
+  },
+  {
+    "bench": "bounded_index_limit",
+    "status": "smoke_pass",
+    "checksum": "dba35e426969bb19",
+    "rows": 5,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 356601856
+  },
+  {
+    "bench": "order_only_index_limit",
+    "status": "smoke_pass",
+    "checksum": "4c2eef8580c5e6ad",
+    "rows": 5,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 324878336
+  },
+  {
+    "bench": "index_vartail_prefix",
+    "status": "smoke_pass",
+    "checksum": "f6f10530bc60734d",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 332570624
+  },
+  {
+    "bench": "partial_index_implied_range",
+    "status": "smoke_pass",
+    "checksum": "c7be92182a4988f1",
+    "rows": 156,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 301318144
+  },
+  {
+    "bench": "partial_index_live_topn",
+    "status": "smoke_pass",
+    "checksum": "c39b1b16882677d3",
+    "rows": 10,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 197058560
+  },
+  {
+    "bench": "gist_range_select",
+    "status": "failed",
+    "reason": "workload exceeded 180 seconds",
+    "active_sql": {
+      "sql": "CREATE INDEX p6b_ranges_span_gist ON p6b_ranges USING gist (span)",
+      "sql_original_bytes": 65
+    },
+    "peak_rss_bytes": 326352896
+  },
+  {
+    "bench": "join_inl_topn",
+    "status": "smoke_pass",
+    "checksum": "531393332356219a",
+    "rows": 10,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 214036480
+  },
+  {
+    "bench": "hash_join_equijoin",
+    "status": "smoke_pass",
+    "checksum": "ce82fe1a52e94d20",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 85528576
+  },
+  {
+    "bench": "hash_join_nested_fallback",
+    "status": "smoke_pass",
+    "checksum": "ce82fe1a52e94d20",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 85528576
+  },
+  {
+    "bench": "where_pushdown_join",
+    "status": "smoke_pass",
+    "checksum": "de152c1478eae25a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 87109632
+  },
+  {
+    "bench": "where_pushdown_join_residual",
+    "status": "smoke_pass",
+    "checksum": "de152c1478eae25a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 87109632
+  },
+  {
+    "bench": "where_contradiction",
+    "status": "smoke_pass",
+    "checksum": "4eb8c6181d9224ca",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 197132288
+  },
+  {
+    "bench": "derived_pushdown_pk",
+    "status": "smoke_pass",
+    "checksum": "e79f624940f81a92",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 205729792
+  },
+  {
+    "bench": "derived_pushdown_pk_residual",
+    "status": "smoke_pass",
+    "checksum": "e79f624940f81a92",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 223035392
+  },
+  {
+    "bench": "safe_conjunct_pushdown_join",
+    "status": "smoke_pass",
+    "checksum": "de152c1478eae25a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 87158784
+  },
+  {
+    "bench": "widened_arm_pushdown_pk",
+    "status": "smoke_pass",
+    "checksum": "8d935cf51102348d",
+    "rows": 2,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 292757504
+  },
+  {
+    "bench": "grouped_pushdown_pk",
+    "status": "smoke_pass",
+    "checksum": "aaf7db2640a694f3",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 214056960
+  },
+  {
+    "bench": "grouped_pushdown_pk_residual",
+    "status": "smoke_pass",
+    "checksum": "aaf7db2640a694f3",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 249118720
+  },
+  {
+    "bench": "setop_pushdown_pk",
+    "status": "smoke_pass",
+    "checksum": "7b61035c4dda60a1",
+    "rows": 2,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 293191680
+  },
+  {
+    "bench": "setop_pushdown_pk_residual",
+    "status": "smoke_pass",
+    "checksum": "7b61035c4dda60a1",
+    "rows": 2,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 337379328
+  },
+  {
+    "bench": "window_pushdown_pk",
+    "status": "smoke_pass",
+    "checksum": "c3b686860034affe",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 219885568
+  },
+  {
+    "bench": "window_pushdown_pk_residual",
+    "status": "smoke_pass",
+    "checksum": "c3b686860034affe",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 295641088
+  },
+  {
+    "bench": "cte_pushdown_pk",
+    "status": "smoke_pass",
+    "checksum": "e79f624940f81a92",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 204050432
+  },
+  {
+    "bench": "cte_pushdown_pk_residual",
+    "status": "smoke_pass",
+    "checksum": "e79f624940f81a92",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 210993152
+  },
+  {
+    "bench": "on_pushdown_join",
+    "status": "smoke_pass",
+    "checksum": "de152c1478eae25a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 85630976
+  },
+  {
+    "bench": "on_pushdown_join_residual",
+    "status": "smoke_pass",
+    "checksum": "de152c1478eae25a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 87109632
+  },
+  {
+    "bench": "join_reverse_inl",
+    "status": "smoke_pass",
+    "checksum": "885617e1b0a03819",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 121671680
+  },
+  {
+    "bench": "join_reverse_nested_fallback",
+    "status": "smoke_pass",
+    "checksum": "885617e1b0a03819",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 124895232
+  },
+  {
+    "bench": "join_nway_inl_3",
+    "status": "smoke_pass",
+    "checksum": "833240765a0a4545",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 90439680
+  },
+  {
+    "bench": "join_nway_inl_5",
+    "status": "smoke_pass",
+    "checksum": "833240765a0a4545",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 169549824
+  },
+  {
+    "bench": "join_nway_greedy_9",
+    "status": "smoke_pass",
+    "checksum": "179e820b35045fba",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 87863296
+  },
+  {
+    "bench": "statistics_uniform_before",
+    "status": "smoke_pass",
+    "checksum": "833240765a0a4545",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 238731264
+  },
+  {
+    "bench": "statistics_uniform_after",
+    "status": "smoke_pass",
+    "checksum": "833240765a0a4545",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 320155648
+  },
+  {
+    "bench": "statistics_skew_before",
+    "status": "smoke_pass",
+    "checksum": "990b168e19cfa4df",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 247656448
+  },
+  {
+    "bench": "statistics_skew_after",
+    "status": "smoke_pass",
+    "checksum": "990b168e19cfa4df",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 311144448
+  },
+  {
+    "bench": "secondary_lookup",
+    "status": "smoke_pass",
+    "checksum": "8489336be5932462",
+    "rows": 13,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 203603968
+  },
+  {
+    "bench": "secondary_update",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "BEGIN",
+      "sql_original_bytes": 5
+    },
+    "peak_rss_bytes": 545320960
+  },
+  {
+    "bench": "costed_update",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "BEGIN",
+      "sql_original_bytes": 5
+    },
+    "peak_rss_bytes": 569344000
+  },
+  {
+    "bench": "dml_contradiction",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ROLLBACK",
+      "sql_original_bytes": 8
+    },
+    "peak_rss_bytes": 539901952
+  },
+  {
+    "bench": "secondary_pointset_delete",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ROLLBACK",
+      "sql_original_bytes": 8
+    },
+    "peak_rss_bytes": 541450240
+  },
+  {
+    "bench": "expr_lookup",
+    "status": "smoke_pass",
+    "checksum": "cbf29ce484222325",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 204263424
+  },
+  {
+    "bench": "partial_lookup",
+    "status": "smoke_pass",
+    "checksum": "d0f9e217bf5b8c8f",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 223346688
+  },
+  {
+    "bench": "in_list_pk",
+    "status": "smoke_pass",
+    "checksum": "709f47b1ac977809",
+    "rows": 10,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 205545472
+  },
+  {
+    "bench": "gin_inl",
+    "status": "smoke_pass",
+    "checksum": "6320635bbd81da7a",
+    "rows": 11893,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 132542464
+  },
+  {
+    "bench": "gist_inl",
+    "status": "failed",
+    "reason": "workload exceeded 180 seconds",
+    "active_sql": {
+      "sql": "CREATE INDEX gist_inl_inner_room_gist ON gist_inl_inner USING gist (room)",
+      "sql_original_bytes": 73
+    },
+    "peak_rss_bytes": 142524416
+  },
+  {
+    "bench": "gist_inl_nested_fallback",
+    "status": "failed",
+    "reason": "workload exceeded 180 seconds",
+    "active_sql": {
+      "sql": "CREATE INDEX gist_inl_ref_inner_room_gist ON gist_inl_ref_inner USING gist (room)",
+      "sql_original_bytes": 81
+    },
+    "peak_rss_bytes": 140111872
+  },
+  {
+    "bench": "in_list_secondary",
+    "status": "smoke_pass",
+    "checksum": "4bbe0c195541bb21",
+    "rows": 86,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 204214272
+  },
+  {
+    "bench": "index_range",
+    "status": "smoke_pass",
+    "checksum": "702f7042ec3fd737",
+    "rows": 430,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 223686656
+  },
+  {
+    "bench": "index_range_nonselective",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT count(*) FROM orders WHERE customer_id >= $1",
+      "sql_original_bytes": 51
+    },
+    "peak_rss_bytes": 536928256
+  },
+  {
+    "bench": "full_scan_agg",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT count(*), sum(amount) FROM orders",
+      "sql_original_bytes": 40
+    },
+    "peak_rss_bytes": 537006080
+  },
+  {
+    "bench": "full_scan_minmax",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT min(amount), max(amount) FROM orders",
+      "sql_original_bytes": 43
+    },
+    "peak_rss_bytes": 537288704
+  },
+  {
+    "bench": "full_scan_agg_filter",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT count(*), sum(amount) FROM orders WHERE amount > $1",
+      "sql_original_bytes": 58
+    },
+    "peak_rss_bytes": 537214976
+  },
+  {
+    "bench": "group_by_agg",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT amount / 1000 AS bucket, count(*), sum(amount) FROM orders GROUP BY amount / 1000 ORDER BY bucket",
+      "sql_original_bytes": 104
+    },
+    "peak_rss_bytes": 536915968
+  },
+  {
+    "bench": "group_by_agg_high_card",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT customer_id, count(*), sum(amount) FROM orders GROUP BY customer_id HAVING count(*) >= 20 ORDER BY customer_id",
+      "sql_original_bytes": 117
+    },
+    "peak_rss_bytes": 536932352
+  },
+  {
+    "bench": "order_by_limit",
+    "status": "smoke_pass",
+    "checksum": "694211052fd61083",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 304926720
+  },
+  {
+    "bench": "order_by_pk_limit",
+    "status": "smoke_pass",
+    "checksum": "e201e07fadb7a6a3",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 201883648
+  },
+  {
+    "bench": "insert_rollback",
+    "status": "smoke_pass",
+    "checksum": "ac02f0205c4f05c5",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1000,
+    "peak_rss_bytes": 176152576
+  },
+  {
+    "bench": "delete_rollback_serial",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1000,
+    "peak_rss_bytes": 275464192
+  },
+  {
+    "bench": "delete_rollback_random",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1000,
+    "peak_rss_bytes": 329846784
+  },
+  {
+    "bench": "delete_range_rollback",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 236240896
+  },
+  {
+    "bench": "delete_insert_churn",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1000,
+    "peak_rss_bytes": 283918336
+  },
+  {
+    "bench": "insert_commit_durable",
+    "status": "smoke_pass",
+    "checksum": "45b6df18185ef8c5",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 84275200
+  },
+  {
+    "bench": "insert_commit_durable_text",
+    "status": "smoke_pass",
+    "checksum": "45b6df18185ef8c5",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 84275200
+  },
+  {
+    "bench": "update_commit_durable",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 206581760
+  },
+  {
+    "bench": "update_untouched_large_rollback",
+    "status": "smoke_pass",
+    "checksum": "1ca9195ead0b8612",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 202641408
+  },
+  {
+    "bench": "update_untouched_large_durable",
+    "status": "smoke_pass",
+    "checksum": "1ca9195ead0b8612",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 185487360
+  },
+  {
+    "bench": "insert_commit_relaxed",
+    "status": "smoke_pass",
+    "checksum": "45b6df18185ef8c5",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 85585920
+  },
+  {
+    "bench": "update_commit_relaxed",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 208957440
+  },
+  {
+    "bench": "text_scan",
+    "status": "smoke_pass",
+    "checksum": "ad88aba95182a966",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 189452288
+  },
+  {
+    "bench": "text_point_read",
+    "status": "smoke_pass",
+    "checksum": "3916e7bae37043c5",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 92545024
+  },
+  {
+    "bench": "cte_materialized",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "WITH cust AS (SELECT customer_id, count(*) AS n FROM orders GROUP BY customer_id) SELECT (SELECT count(*) FROM cust WHERE n > 5) AS many, (SELECT count(*) FROM cust WHERE n <= 5) AS few",
+      "sql_original_bytes": 185
+    },
+    "peak_rss_bytes": 536944640
+  },
+  {
+    "bench": "lateral_top_n_per_group",
+    "status": "smoke_pass",
+    "checksum": "c33d0804c1ffe8ab",
+    "rows": 15,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 205221888
+  },
+  {
+    "bench": "index_nested_loop_join",
+    "status": "smoke_pass",
+    "checksum": "8c77be7897153c4f",
+    "rows": 1000,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 205676544
+  },
+  {
+    "bench": "gin_contains",
+    "status": "smoke_pass",
+    "checksum": "a4d94775d92b87d4",
+    "rows": 6,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 95694848
+  },
+  {
+    "bench": "gin_overlaps",
+    "status": "smoke_pass",
+    "checksum": "3a13041348b57f36",
+    "rows": 2349,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 97001472
+  },
+  {
+    "bench": "gin_member",
+    "status": "smoke_pass",
+    "checksum": "442ab6397bd19d87",
+    "rows": 1134,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 91766784
+  },
+  {
+    "bench": "gin_text_contains",
+    "status": "smoke_pass",
+    "checksum": "24d88b4c3c57763d",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 369135616
+  },
+  {
+    "bench": "gin_text_member",
+    "status": "smoke_pass",
+    "checksum": "a575c4679514a63e",
+    "rows": 1031,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 356511744
+  },
+  {
+    "bench": "gin_decimal_contains",
+    "status": "smoke_pass",
+    "checksum": "b60a80c30271ddb5",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 301563904
+  },
+  {
+    "bench": "gin_bytea_contains",
+    "status": "smoke_pass",
+    "checksum": "f238fa02505b0473",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 296718336
+  },
+  {
+    "bench": "gin_stats_common_tag",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ANALYZE tstats",
+      "sql_original_bytes": 14
+    },
+    "peak_rss_bytes": 540438528
+  },
+  {
+    "bench": "gin_stats_rare_tag",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ANALYZE tstats",
+      "sql_original_bytes": 14
+    },
+    "peak_rss_bytes": 543920128
+  },
+  {
+    "bench": "varscan_text_eq",
+    "status": "smoke_pass",
+    "checksum": "31fa351a8f12676d",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 415338496
+  },
+  {
+    "bench": "varscan_text_isnull",
+    "status": "smoke_pass",
+    "checksum": "a187dedf691d9b30",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 393539584
+  },
+  {
+    "bench": "varscan_bytea_eq",
+    "status": "smoke_pass",
+    "checksum": "1ca9195ead0b8612",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 401698816
+  },
+  {
+    "bench": "varscan_array_count",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 393773056
+  },
+  {
+    "bench": "varscan_array_contains",
+    "status": "smoke_pass",
+    "checksum": "833240765a0a4545",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 395481088
+  },
+  {
+    "bench": "varscan_text_max",
+    "status": "smoke_pass",
+    "checksum": "6404d5c146627026",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 394285056
+  },
+  {
+    "bench": "varscan_project_needle",
+    "status": "smoke_pass",
+    "checksum": "517981d6b6cfd6eb",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 380985344
+  },
+  {
+    "bench": "custom_plan_gin_common_tag",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ANALYZE tstats_int",
+      "sql_original_bytes": 18
+    },
+    "peak_rss_bytes": 549457920
+  },
+  {
+    "bench": "custom_plan_gin_rare_tag",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ANALYZE tstats_int",
+      "sql_original_bytes": 18
+    },
+    "peak_rss_bytes": 544337920
+  },
+  {
+    "bench": "custom_plan_mcv_common",
+    "status": "smoke_pass",
+    "checksum": "fb114b43f4fc9cdd",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 521437184
+  },
+  {
+    "bench": "custom_plan_mcv_rare",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "ANALYZE tskew",
+      "sql_original_bytes": 13
+    },
+    "peak_rss_bytes": 539725824
+  },
+  {
+    "bench": "gin_jsonb_contains",
+    "status": "smoke_pass",
+    "checksum": "45be261863e8d0ab",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 417071104
+  },
+  {
+    "bench": "gin_jsonb_path_match",
+    "status": "smoke_pass",
+    "checksum": "64bf6e8e70932051",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 467308544
+  },
+  {
+    "bench": "gin_jsonb_exists",
+    "status": "smoke_pass",
+    "checksum": "df7932af3c129e80",
+    "rows": 1030,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 419667968
+  },
+  {
+    "bench": "gin_array_eq",
+    "status": "smoke_pass",
+    "checksum": "5014c4bf66ae2e5c",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 92303360
+  },
+  {
+    "bench": "gin_in",
+    "status": "smoke_pass",
+    "checksum": "2ff795c2d2471b5a",
+    "rows": 59,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 103632896
+  },
+  {
+    "bench": "gin_delete",
+    "status": "smoke_pass",
+    "checksum": "56f8b69ee7c3fd4a",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 121962496
+  },
+  {
+    "bench": "regex_filter_scan",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT count(*) FROM orders WHERE note ~ '[aeiou]{2}'",
+      "sql_original_bytes": 53
+    },
+    "peak_rss_bytes": 543797248
+  },
+  {
+    "bench": "regex_replace_captures",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT sum(length(regexp_replace(note, '([aeiou])([a-z])', '\\2\\1\\1', 'g'))) FROM orders",
+      "sql_original_bytes": 87
+    },
+    "peak_rss_bytes": 548483072
+  },
+  {
+    "bench": "window_running_sum",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT id, sum(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM orders ORDER BY id LIMIT 100",
+      "sql_original_bytes": 135
+    },
+    "peak_rss_bytes": 541847552
+  },
+  {
+    "bench": "window_moving_count",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS w FROM orders ORDER BY id LIMIT 100",
+      "sql_original_bytes": 118
+    },
+    "peak_rss_bytes": 561823744
+  },
+  {
+    "bench": "window_shared_named",
+    "status": "smoke_pass",
+    "checksum": "4066cd4673bd9a21",
+    "rows": 10000,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 89182208
+  },
+  {
+    "bench": "concurrent_read_pk_r1",
+    "status": "smoke_pass",
+    "checksum": "b8e7f1a2fd37c55a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 88727552
+  },
+  {
+    "bench": "concurrent_read_pk_r4",
+    "status": "smoke_pass",
+    "checksum": "d062ccb5c8dde3cb",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 88731648
+  },
+  {
+    "bench": "concurrent_read_pk_cold_r1",
+    "status": "smoke_pass",
+    "checksum": "9b9b02b986c101bd",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 203763712
+  },
+  {
+    "bench": "concurrent_read_pk_cold_r4",
+    "status": "smoke_pass",
+    "checksum": "ea04160e4170cb52",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 218984448
+  },
+  {
+    "bench": "fk_delete_parent_indexed",
+    "status": "smoke_pass",
+    "checksum": "1ca9195ead0b8612",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 10,
+    "peak_rss_bytes": 337764352
+  },
+  {
+    "bench": "fk_delete_parent_unindexed",
+    "status": "smoke_pass",
+    "checksum": "1ca9195ead0b8612",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 10,
+    "peak_rss_bytes": 214753280
+  },
+  {
+    "bench": "fk_cascade_delete_indexed",
+    "status": "smoke_pass",
+    "checksum": "ac02f0205c4f05c5",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 425758720
+  },
+  {
+    "bench": "fk_cascade_delete_unindexed",
+    "status": "smoke_pass",
+    "checksum": "ac02f0205c4f05c5",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 256450560
+  },
+  {
+    "bench": "host_function_none",
+    "status": "smoke_pass",
+    "checksum": "cc58980fd33ef770",
+    "rows": 977,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 89448448
+  },
+  {
+    "bench": "host_function_row",
+    "status": "smoke_pass",
+    "checksum": "dbd5515c01a3a23b",
+    "rows": 977,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 89395200
+  },
+  {
+    "bench": "host_function_batch",
+    "status": "smoke_pass",
+    "checksum": "dbd5515c01a3a23b",
+    "rows": 977,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 89595904
+  },
+  {
+    "bench": "host_function_stream_none",
+    "status": "smoke_pass",
+    "checksum": "b678323eeb1bc1cb",
+    "rows": 1000,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 88793088
+  },
+  {
+    "bench": "host_function_stream_row",
+    "status": "smoke_pass",
+    "checksum": "35e872758ae485ce",
+    "rows": 1000,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 88920064
+  },
+  {
+    "bench": "host_function_stream_batch",
+    "status": "smoke_pass",
+    "checksum": "35e872758ae485ce",
+    "rows": 1000,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 89100288
+  },
+  {
+    "bench": "json_float_render",
+    "status": "smoke_pass",
+    "checksum": "bdf7aaa1a41a79a8",
+    "rows": 10000,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 88535040
+  },
+  {
+    "bench": "cold_open_pk_small",
+    "status": "smoke_pass",
+    "checksum": "a409d372af406971",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 90222592
+  },
+  {
+    "bench": "cold_open_pk",
+    "status": "smoke_pass",
+    "checksum": "39bef220c212dfbd",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 280129536
+  },
+  {
+    "bench": "index_desc_order_topn",
+    "status": "smoke_pass",
+    "checksum": "9c2ea189f4f7167d",
+    "rows": 10,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 321191936
+  },
+  {
+    "bench": "index_desc_range",
+    "status": "smoke_pass",
+    "checksum": "4b4cae1a9d39f108",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 325300224
+  }
+]

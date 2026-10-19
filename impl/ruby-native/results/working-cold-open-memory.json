@@ -1,0 +1,46 @@
+{
+  "purpose": "Memory regression; timings are diagnostic, not the final comparison",
+  "status": [
+    {
+      "bench": "cold_open_pk_small",
+      "status": "completed",
+      "peak_rss_bytes": 161517568
+    }
+  ],
+  "metadata": {
+    "mode": "standard_benchmark",
+    "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+    "jit": "interpreter",
+    "source_sha256": "530467a606f7876c1e139a4b448d5db85616bfc0bd43028d29c8f1728db26713",
+    "source_sha256_after": "75768f284352c265a755b9edbf52373197cc31e3667d6dba552f9f29eebdf0ac",
+    "dataset_fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+    "workload_fingerprint": "978445de06e249ce2a743af6d46c207d8c20a19efcc3a0d5cecd48492452b462",
+    "timeout_seconds_per_workload": 120,
+    "memory_bytes_per_workload": 536870912,
+    "address_space_bytes_per_workload": 1073741824,
+    "isolation": "sequential_process_per_workload"
+  },
+  "results": [
+    {
+      "schema": 2,
+      "bench": "cold_open_pk_small",
+      "dataset": "small",
+      "engine": "jed",
+      "lang": "ruby-native",
+      "variant": "interpreter",
+      "iterations": 200,
+      "warmup": 10,
+      "readers": 0,
+      "total_ns": 13173748413,
+      "ns_per_op": 65868742,
+      "min_ns": 64217787,
+      "p50_ns": 65300503,
+      "p90_ns": 67191145,
+      "p99_ns": 72110207,
+      "rows_total": 200,
+      "checksum": "a4c0e86b8353f4ce",
+      "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+      "started_at": "2026-10-18T23:14:31Z"
+    }
+  ]
+}

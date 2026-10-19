@@ -7,9 +7,12 @@ conformance, benchmarking, and CI; default tasks must not acquire a dependency o
 
 The experiment investigates Ruby integration and execution performance, including
 the interpreter and available Ruby JITs. The engine itself must remain pure Ruby:
-no FFI, native extension, embedded interpreter for another core, or SQL subprocess.
+no FFI, native engine extension, embedded interpreter for another core, or SQL subprocess.
 Ruby's built-in arbitrary-precision integers are permitted for exact arithmetic.
-No new third-party dependencies are authorized by this experiment.
+The maintainer explicitly approved Ruby's OpenSSL binding for vetted cryptographic
+digest primitives. This narrow exception does not authorize another native engine
+component; parser, planner, remaining evaluation, and storage stay handwritten Ruby.
+Other new third-party dependencies still require explicit confirmation.
 
 Completion requires the current supported surface, shared corpus verification,
 file-format and host-boundary verification, a recorded working baseline, followed

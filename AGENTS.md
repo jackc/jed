@@ -206,6 +206,10 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   deterministic cross-core behavior, provide a significant platform-specific
   speedup while remaining byte-identical, or are vetted cryptography.
 - Always get explicit human confirmation before adding a dependency.
+- The Ruby experiment has explicit maintainer approval for Ruby's OpenSSL binding
+  solely for vetted cryptographic digest functions. Its parser, planner, other
+  evaluation, and storage remain handwritten Ruby; no other native engine
+  dependency or Rust/WASM binding is authorized by this exception.
 - Dependencies must not introduce unsafe, cgo, FFI, nondeterminism, locale or
   library-version-sensitive behavior, or divergence across cores.
 - Bench modules are not cores, but new benchmark dependencies still require

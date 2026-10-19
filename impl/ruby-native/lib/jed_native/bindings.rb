@@ -499,6 +499,12 @@ module JedNative
   end
 
   module Bindings
+    def parameter_binding_schema
+      [@tables.map { |name, table| [name, table[:columns].object_id] },
+       @types.map { |name, fields| [name, fields.object_id] },
+       @views.map { |name, view| [name, view.object_id] }]
+    end
+
     def query_metadata(statement, outer = [])
       binding = ParameterBindings.new(self, statement)
       columns = binding.query_columns(statement, outer, parameter_types: @native_binding_types)
@@ -509,11 +515,9 @@ module JedNative
       return super if @native_binding_active
       owns_binding = true
       @native_binding_plans ||= {}.compare_by_identity
-      schema = [@tables.map { |name, table| [name, table[:columns].object_id] },
-                @types.map { |name, fields| [name, fields.object_id] },
-                @views.map { |name, view| [name, view.object_id] }]
+      schema = parameter_binding_schema
       entry = @native_binding_plans[statement]
-      if entry && entry[0] == schema
+      if entry && entry[0] == schema && entry[1].instance_variable_get(:@engine).equal?(self)
         binding = entry[1]
       else
         binding = ParameterBindings.new(self, statement)

@@ -62,15 +62,19 @@ module JedNative
       prefix = @window_scan_prefix
       return super unless prefix && prefix[:source].equal?(source)
       stored = table(source[:name])
-      rows = stored[:rows].sort do |left, right|
-        comparison = 0
-        prefix[:indices].each do |index|
-          comparison = Types.compare(left[index], right[index])
-          break unless comparison.zero?
+      # Eligibility proves that both window and output order match the complete
+      # primary key. Walk that order directly, retaining only the needed prefix.
+      # The page/payload block still covers the full bound; only row work stops.
+      charge(full_scan_pages(stored))
+      charge_scan_payload(stored)
+      rows = []
+      if prefix[:count].positive?
+        storage_scan_entries(stored, reverse: prefix[:descending]).each do |_, ordinal|
+          charge
+          rows << storage_row(stored, ordinal)
+          break if rows.length >= prefix[:count]
         end
-        prefix[:descending] ? -comparison : comparison
-      end.take(prefix[:count])
-      charge(1 + rows.length) unless rows.empty?
+      end
       columns = table_columns(stored, source[:alias] || source[:name])
       Relation.new(columns: columns, rows: rows)
     end
@@ -182,8 +186,7 @@ module JedNative
       limit = evaluate(compile(statement[:limit], []), [])
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) : 0
       return nil unless limit.is_a?(Integer) && offset.is_a?(Integer) && limit >= 0 && offset >= 0
-      indices = keys.map { |name| @tables[source[:name]][:columns].index { |column| column[:name] == name } }
-      { source: source, count: limit + offset, indices: indices, descending: descending }
+      { source: source, count: limit.zero? ? 0 : limit + offset, descending: descending }
     end
 
     def validate_window_key(expression)

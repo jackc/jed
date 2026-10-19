@@ -1,0 +1,16 @@
+{
+  "mode": "single_execution_smoke_no_timings",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "jit": "yjit",
+  "source_sha256": "3ba8840c85484e7665f31a5e79409587c839a1d6665d326247e8c25577b62751",
+  "source_sha256_after": "3ba8840c85484e7665f31a5e79409587c839a1d6665d326247e8c25577b62751",
+  "dataset_fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+  "workload_fingerprint": "978445de06e249ce2a743af6d46c207d8c20a19efcc3a0d5cecd48492452b462",
+  "timeout_seconds_per_workload": 180,
+  "memory_bytes_per_workload": 536870912,
+  "address_space_bytes_per_workload": 2147483648,
+  "work_mem_bytes": 16777216,
+  "selected_names": null,
+  "locking": "exclusive",
+  "isolation": "sequential_process_per_workload"
+}

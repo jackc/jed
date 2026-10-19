@@ -186,6 +186,10 @@ module JedNative
     private
 
     def validate_cte_structure(node, top_level = false)
+      if top_level
+        @native_cte_validation ||= {}.compare_by_identity
+        return if @native_cte_validation.key?(node)
+      end
       case node
       when Array then node.each { |child| validate_cte_structure(child) }
       when Hash
@@ -202,6 +206,10 @@ module JedNative
         node.each do |key, child|
           validate_cte_structure(child, key == :query && %i[create_table create_table_as].include?(node[:kind]))
         end
+      end
+      if top_level
+        @native_cte_validation.shift if @native_cte_validation.length >= 64
+        @native_cte_validation[node] = true
       end
     end
 

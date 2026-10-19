@@ -35,7 +35,7 @@ module JedNative
         end
         unless name.end_with?('_strict') && operand.nil?
           charge
-          image = json_image_value(operand, expression.args[1].type, expression.args[1], binary: true)
+          image = json_image_value(operand, expression.args[1].type, expression.args[1], binary: name.start_with?('jsonb'))
           collections.push(owner, [key, image])
         end
         return CompositeValue.new([true])

@@ -59,6 +59,7 @@ module JedNative
               chunk << source.next
               charges << recorded
             rescue StopIteration
+              failure_charges = recorded
               finished = true
               break
             rescue StandardError => error
@@ -85,10 +86,8 @@ module JedNative
               @host_batch_stack.pop
             end
           end
-          if failure
-            failure_charges.each { |units| charge(units) }
-            raise failure
-          end
+          failure_charges.each { |units| charge(units) }
+          raise failure if failure
         end
       end
     end

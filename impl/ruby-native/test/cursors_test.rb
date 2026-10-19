@@ -26,12 +26,20 @@ module NativeCursorTests
         assert(cursor.rows == eager.rows, "cursor rows differ: #{sql}")
         assert(cursor.cost == eager.cost, "cursor cost #{cursor.cost} differs from #{eager.cost}: #{sql}")
         assert(cursor.column_types == eager.column_types, "cursor metadata differs: #{sql}")
+        assert(cursor.instance_variable_get(:@engine).nil? && cursor.instance_variable_get(:@session).nil?, 'drained result retained a catalog generation')
+        begin
+          cursor.next
+          raise 'closed cursor yielded another row'
+        rescue StopIteration
+          assert(cursor.cost == eager.cost, 'closed cursor lost its final cost')
+        end
       end
       cursor = s.query('select 10/(id-2) from t')
       assert(cursor.next == [-10], 'first pull evaluates one projection')
       cost = cursor.cost
       cursor.close
       assert(cursor.cost == cost, 'early close does no additional work')
+      assert(cursor.instance_variable_get(:@engine).nil? && cursor.instance_variable_get(:@fiber).nil?, 'early close retained its execution snapshot')
       sorted = s.query('select 10/(id-2) from t order by v desc')
       assert(sorted.next == [-10], 'blocking sort defers final projection')
       sorted.close
@@ -58,6 +66,12 @@ module NativeCursorTests
         assert(error.sqlstate == '22012', 'cursor arithmetic error')
       end
       assert(cursor.closed?, 'failed cursor releases pin')
+      cursor = s.query('select id from t order by id')
+      first = cursor.next
+      cursor.columns.first.replace('changed')
+      second = cursor.next
+      assert(first['id'] == 1 && second['id'] == 2, 'mutable public headers changed row lookup names')
+      cursor.close
       assert(core.query('select count(*) from t').rows == [[4]], 'bare database cursor owns its temporary session')
     end
     puts 'ruby-native cursors: lazy projections, full-drain costs, errors and frozen snapshot lifecycle passed'

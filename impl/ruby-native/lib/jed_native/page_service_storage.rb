@@ -26,7 +26,10 @@ module JedNative
       @service_remote ? :client : :owner
     end
     def service_generation = [@service_epoch, !!@service_remote&.connection&.failure]
-    def service_finish_open = @service_remote&.finish_open
+    def service_finish_open
+      ensure_pid
+      @service_remote&.finish_open
+    end
     def service_begin_read(token)
       service_ensure_role
       @service_remote ? @service_remote.begin_read(token) : @service_owner&.pin_local(token)
@@ -38,9 +41,11 @@ module JedNative
       @service_remote&.finish_open
     end
     def service_copy_pin(source, target)
+      ensure_pid
       @service_remote ? @service_remote.copy_pin(source, target) : @service_owner&.copy_local_pin(source, target)
     end
     def service_end_read(token)
+      ensure_pid
       @service_remote&.end_read(token) unless @service_remote&.connection&.failure
       @service_owner&.unpin_local(token)
     end
@@ -55,6 +60,7 @@ module JedNative
       @service_remote&.finish_open
     end
     def service_release(token)
+      ensure_pid
       return if @service_remote&.connection&.failure
       @service_remote ? @service_remote.end_write(token) : @service_owner&.release(token)
       @service_remote&.finish_open if @service_resolved_token.equal?(token)
@@ -73,6 +79,7 @@ module JedNative
       super
     end
     def close
+      ensure_pid
       @service_owner&.shutdown unless @closed || @poisoned
       super
     end
@@ -109,27 +116,42 @@ module JedNative
     end
 
     def service_ensure_role
+      ensure_pid
       return unless @service_reselect || @service_remote&.connection&.failure
       @service_role_mutex.synchronize do
         return unless @service_reselect || @service_remote&.connection&.failure
-        @service_remote&.close
-        @service_remote = nil
-        @service_reselect = false
-        @creating = false
-        @service_epoch += 1
-        acquire_lock(@service_timeout)
-        if @service_remote
-          @service_remote.open
-        else
-          @file = File.open(@path, @read_only ? 'rb' : 'r+b')
-          @file.close_on_exec = true
-          @snapshot = decode_file
-          @meta, @free_pages = @snapshot.values_at(:meta, :free_pages)
-          @free_generation = @meta[:txid]
-          @live_at_compaction = @meta[:page_count] - @free_pages.length
-          @page_ids, @overflow_ids = {}.compare_by_identity, {}.compare_by_identity
-          @needs_stabilization = @needs_directory_sync = true
-          initialize_service_owner
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @service_timeout / 1000.0
+        loop do
+          @service_remote&.close
+          @service_remote = nil
+          @service_reselect = false
+          @creating = false
+          @service_epoch += 1
+          remaining = [(deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)) * 1000, 0].max.to_i
+          acquire_lock(remaining)
+          if @service_remote
+            begin
+              @service_remote.open
+            rescue Error => error
+              # A yielding transport can disappear again while election is
+              # underway. No snapshot was exposed by this attempt: retry only
+              # within the original open deadline.
+              raise unless error.sqlstate == '08006' && @service_remote.connection.failure && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+              next
+            end
+          else
+            @file = File.open(@path, @read_only ? 'rb' : 'r+b')
+            @file.close_on_exec = true
+            @snapshot = decode_file
+            @meta, @free_pages = @snapshot.values_at(:meta, :free_pages)
+            reset_durability_floor(@meta)
+            @free_generation = @meta[:txid]
+            @live_at_compaction = @meta[:page_count] - @free_pages.length
+            @page_ids, @overflow_ids = {}.compare_by_identity, {}.compare_by_identity
+            @needs_stabilization = @needs_directory_sync = true
+            initialize_service_owner
+          end
+          break
         end
       rescue Error => error
         @service_reselect = true
@@ -142,13 +164,13 @@ module JedNative
         return unless @service_owner.equal?(owner)
         @service_owner = nil
         @service_reselect = true
-        @service_pause_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
         @service_epoch += 1
         owner.close
         @file.close unless @file.closed?
         File.unlink(File.join(@bundle, 'owner')) rescue nil
         @presence.close unless @presence.closed?
         @presence, @owns_presence = nil, false
+        @service_pause_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
       end
       service_ensure_role
     rescue Error
@@ -187,7 +209,9 @@ module JedNative
         durable_sync(@file)
         @meta = meta.merge(slot: slot)
         reset_durability_floor(@meta)
-        @free_pages, @free_generation = free, meta[:txid]
+        # Clients only consume the owner's free list. They never add newly
+        # orphaned pages, so the reuse watermark remains its rebuild generation.
+        @free_pages = free
         @page_ids, @overflow_ids = {}.compare_by_identity, {}.compare_by_identity
         @snapshot, @foreign_snapshot = nil, true
         @image.invalidate([slot])

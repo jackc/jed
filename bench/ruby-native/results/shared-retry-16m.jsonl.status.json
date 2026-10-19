@@ -1,0 +1,148 @@
+[
+  {
+    "bench": "gist_range_select",
+    "status": "smoke_pass",
+    "checksum": "750382eeadaa8759",
+    "rows": 10,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 471298048
+  },
+  {
+    "bench": "secondary_update",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "UPDATE orders SET amount = amount + 1 WHERE customer_id = $1",
+      "sql_original_bytes": 60
+    },
+    "peak_rss_bytes": 578281472
+  },
+  {
+    "bench": "costed_update",
+    "status": "failed",
+    "reason": "workload exceeded 536870912 bytes of memory",
+    "active_sql": {
+      "sql": "UPDATE orders SET amount = amount + 1 WHERE id > $1 AND customer_id = $2",
+      "sql_original_bytes": 72
+    },
+    "peak_rss_bytes": 557334528
+  },
+  {
+    "bench": "dml_contradiction",
+    "status": "smoke_pass",
+    "checksum": "46b9d6e731035a45",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 303017984
+  },
+  {
+    "bench": "secondary_pointset_delete",
+    "status": "smoke_pass",
+    "checksum": "46b9d6e731035a45",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 301924352
+  },
+  {
+    "bench": "gist_inl",
+    "status": "smoke_pass",
+    "checksum": "a381d0d01b3b8832",
+    "rows": 500,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 317304832
+  },
+  {
+    "bench": "gist_inl_nested_fallback",
+    "status": "smoke_pass",
+    "checksum": "a381d0d01b3b8832",
+    "rows": 500,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 396410880
+  },
+  {
+    "bench": "index_range_nonselective",
+    "status": "smoke_pass",
+    "checksum": "476376f116ba93f0",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 430231552
+  },
+  {
+    "bench": "full_scan_agg",
+    "status": "smoke_pass",
+    "checksum": "1c9bb2aa47065b11",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 297910272
+  },
+  {
+    "bench": "full_scan_minmax",
+    "status": "smoke_pass",
+    "checksum": "5e707552ce47d88a",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 302845952
+  },
+  {
+    "bench": "full_scan_agg_filter",
+    "status": "smoke_pass",
+    "checksum": "27337eb8e0090e30",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 297504768
+  },
+  {
+    "bench": "group_by_agg",
+    "status": "smoke_pass",
+    "checksum": "f1d2d2bf60c1c90d",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 326000640
+  },
+  {
+    "bench": "group_by_agg_high_card",
+    "status": "smoke_pass",
+    "checksum": "9d771d4c859b47da",
+    "rows": 346,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 352133120
+  },
+  {
+    "bench": "cte_materialized",
+    "status": "smoke_pass",
+    "checksum": "239f97b75a0b4fab",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 378314752
+  },
+  {
+    "bench": "regex_filter_scan",
+    "status": "smoke_pass",
+    "checksum": "3e93241e761348c8",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 297328640
+  },
+  {
+    "bench": "regex_replace_captures",
+    "status": "smoke_pass",
+    "checksum": "977c3423f97f38a9",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 319959040
+  }
+]
