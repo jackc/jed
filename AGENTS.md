@@ -40,6 +40,10 @@ files in the same change.
   effort: sorting, parsing/planning and long scalar kernels stay synchronous. Node data-page reads
   can await I/O; storage lifecycle, commit and
   async crypto remain separate work. No encryption suite or Rust delivery default is selected.
+  Host functions register inside the execution worker: Node uses `extensionModule`; browsers
+  supply a fresh worker through `workerFactory` and call the public
+  `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
+  SQL kernels remain synchronous, with no application-thread callback RPC.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.
 

@@ -255,8 +255,8 @@ Require common SQL, cost, error and file contracts; expose differences in extens
 and deployment requirements. Neither WASM nor native Rust is an unconditional performance win.
 
 Host functions are a material migration question. Arbitrary application closures cannot be
-transferred to a worker. Prefer explicit worker-local extension registration; define how trusted
-host code is loaded and given capabilities before shipping it. Calls back to the application
+transferred to a worker. Registration is worker-local: Node loads an explicit extension module,
+and browser applications supply a worker using the public startup helper (§10). Calls back to the application
 thread would need a deliberate async RPC/reentrancy contract and measurements. Do not claim
 transparent compatibility or quietly run SQL back on the main thread. Host extensions remain
 outside built-in safety/determinism guarantees; the codec and built-ins gain no arbitrary host access.
@@ -357,7 +357,7 @@ with larger observed Node timer gaps, and are reverted. Batch limits, packed val
 256-checkpoint task yields remain unchanged. The report preserves the variants and raw evidence.
 
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
-admission errors, retained continuations and Node extension registration. Remaining decisions
+admission errors, retained continuations and Node/browser extension registration. Remaining decisions
 include async storage lifecycle/commit and crypto providers, worker pools,
 broader platform measurements and optional engine-package defaults. A public synchronous
 application interface would still need a concrete use case and evidence.
@@ -522,8 +522,29 @@ substitutes for those features.
 
 Data-only Unicode/time-zone bundles can be provided at open. Node additionally accepts a
 trusted `extensionModule` file URL exporting `configure(EnvironmentBuilder)`; it loads and
-registers host functions inside the execution worker before opening storage. Arbitrary
-application closures cannot cross the port. There is no application-thread callback RPC.
-Host extensions retain their existing safety/determinism exclusion. Browser applications
-needing custom host code supply a custom worker build; no dynamic browser extension loader
-is promised by this package.
+registers host functions inside the execution worker before opening storage.
+
+Browser `createDatabase` and `openDatabase` accept an optional `workerFactory: () => Worker`.
+The factory runs in the calling thread and is omitted from the wire options. It must return a
+fresh, dedicated worker for that database handle; returning a worker already claimed by jed
+fails `PROTOCOL`, including after its original handle closed. Jed owns the returned worker,
+terminating it after database close or initialization failure. A failed reuse attempt does not
+terminate the original handle's worker. The default factory creates the package's ordinary
+worker with no host registrations.
+
+The public `jed-ts/browser/worker` entry point exports
+`startDatabaseWorker({ configure? })`, called once at the top level of the application's
+worker module. It installs the message listener synchronously. On opening the database, it
+loads the data bundles and calls `configure(builder)` once, awaiting a returned promise before
+building the environment or acquiring storage. A configuration failure rejects the opening
+request and the client releases the worker. The entry point also exports `EnvironmentBuilder`,
+the `HostFunctionSpec`, `HostKernel`, `HostBatchKernel` and `Value` types, and the `intValue`
+and `Decimal` value helpers. This lets registration modules use a public, browser-safe import;
+Node's `extensionModule` may reuse the same `configure` export when its other imports support
+both hosts. Browser extensions are statically bundled with the application worker; the package
+does not dynamically load browser extension modules.
+
+Arbitrary application closures cannot cross the port. There is no application-thread callback
+RPC. Worker-local closures can retain state, and changing application inputs can be passed as
+SQL parameters. Configuration may be asynchronous; scalar and batch SQL kernels remain
+synchronous. Host extensions retain their existing safety/determinism exclusion.

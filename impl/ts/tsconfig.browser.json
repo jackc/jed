@@ -9,5 +9,5 @@
     "types": []
   },
   "include": ["src/browser/client.ts", "browser/**/*.ts"],
-  "exclude": ["src/browser/worker.ts"]
+  "exclude": ["src/browser/worker.ts", "browser/workers/**"]
 }

@@ -95,9 +95,9 @@ function times or sampled CPU figures to the preceding wall-time table.
 
 **A major hotspot is SQL's repeated hex decoding.** The constant expression
 `decode('0001feff','hex')` is evaluated for every output row. In Node,
-[`decodeText`](../../../../impl/ts/src/executor.ts#L1602) accounts for roughly 62–66 ms/query
+[`decodeText`](https://github.com/jackc/jed/blob/d4f742903acbce75e7235d92b6bf433c5c92891e/impl/ts/src/executor.ts#L1602) accounts for roughly 62–66 ms/query
 inclusive: approximately 46–50 ms in native UTF-8 encoding and 15 ms in
-[`decodeHexPairs`](../../../../impl/ts/src/value.ts#L401). Chromium's native encoding alone
+[`decodeHexPairs`](https://github.com/jackc/jed/blob/d4f742903acbce75e7235d92b6bf433c5c92891e/impl/ts/src/value.ts#L401). Chromium's native encoding alone
 accounts for about 80–88 ms/query. This is expression evaluation in both direct and worker
 paths, not result serialization. The full `applyScalarFunc` branch has inlined descendants in
 Chromium, so its larger inclusive time is not a separate function-dispatch cost.

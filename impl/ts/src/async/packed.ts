@@ -13,6 +13,8 @@ export type PackedRows = { version: 1; length: number; data: ArrayBuffer };
 const MAX_DEPTH = 256;
 const HEADER_BYTES = 4;
 const ENVELOPE_BYTES = 128;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!
+  .get!;
 const TAG = {
   null: 0,
   int: 1,
@@ -537,15 +539,16 @@ export function decodePackedRows(packet: PackedRows, budget = new WireBudget()):
   // Real ports provide data properties; custom transports cannot change the envelope between
   // the validation and construction passes.
   const { version, length, data } = packet;
-  if (
-    version !== 1 ||
-    !Number.isSafeInteger(length) ||
-    length < 0 ||
-    length > 0xffffffff ||
-    !(data instanceof ArrayBuffer)
-  )
+  if (version !== 1 || !Number.isSafeInteger(length) || length < 0 || length > 0xffffffff)
     invalid();
-  const bytes = data.byteLength;
+  // Native brand checking accepts buffers delivered by workers from another realm,
+  // while rejecting shared buffers and impostors without copying their contents.
+  let bytes: number;
+  try {
+    bytes = arrayBufferByteLength.call(data);
+  } catch {
+    invalid();
+  }
   if (bytes < HEADER_BYTES) invalid();
   // Physical transport cannot evade the logical reservation by appending unparsed padding.
   if (bytes - HEADER_BYTES > budget.remaining)

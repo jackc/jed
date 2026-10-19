@@ -612,7 +612,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   batch limits, full decoding validation and 256-checkpoint yields are unchanged.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
-  for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar
+  for conformance/tooling. Browser custom host functions use `workerFactory` and the public
+  `jed-ts/browser/worker` startup helper; registration runs once before storage opens, and jed
+  owns the dedicated worker's cleanup. Browser-safe registration modules can be reused through
+  Node's `extensionModule`. Cancellation is best effort; sorting, parsing/planning and long scalar
   kernels stay synchronous unless measurements justify extra pause points. Remaining: async
   storage lifecycle/commit and crypto providers, cold/durable and other-browser
   public-boundary measurements, ARM/package-size measurements, and optional Rust delivery parity.
