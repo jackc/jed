@@ -465,10 +465,11 @@ module JedNative
         strict = name.end_with?('_strict')
       end
       seen = {} if @query_memory && distinct
+      argument_kernel = native_compiled_aggregate_arguments(expression)
       group.each_with_index do |row, ordinal|
         next if filter && evaluate(filter, row) != true
         charge
-        values = expression.args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, row) }
+        values = argument_kernel ? argument_kernel.call(self, row, @params) : expression.args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, row) }
         charge if extra_charge
         keys = orderings.map { |compiled, _| evaluate(compiled, row) } if ordered
         if owner

@@ -447,6 +447,7 @@ module JedNative
     end
 
     def spill_groups(rows, scope, nodes, aggregates, owners, groupings = [])
+      argument_kernels = aggregates.map { |aggregate| native_compiled_aggregate_arguments(aggregate) }
       sets = expand_grouping_sets(nodes)
       master = sets.flatten(1).uniq
       keys = master.map { |node| compile(node, scope) }
@@ -487,7 +488,8 @@ module JedNative
               collections.push(state[0] * aggregates.length + index, values)
               next
             end
-            values = aggregate.args.map { |argument| argument.kind == :star ? 1 : evaluate(argument, row) }
+            kernel = argument_kernels[index]
+            values = kernel ? kernel.call(self, row, @params) : aggregate.args.map { |argument| argument.kind == :star ? 1 : evaluate(argument, row) }
             charge if aggregate.value == 'string_agg' || aggregate.value.include?('object_agg') || AggregateExecution::PAIRS.include?(aggregate.value)
             orders = (aggregate.extra[:aggregate_order] || []).map { |argument, _| evaluate(argument, row) }
             if aggregate.extra[:distinct]
