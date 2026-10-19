@@ -22,9 +22,11 @@ module JedNative
   class PagedIntegerLookup
     def initialize(rows, codec, type)
       @rows, @codec, @bytes = rows, codec, Types::INTEGER_BITS.fetch(type) / 8
+      @minimum, upper = Types::INTEGER_BOUNDS.fetch(type)
+      @maximum = upper - 1
     end
     def [](key)
-      return nil unless key.is_a?(Integer) && key.between?(-(1 << (@bytes * 8 - 1)), (1 << (@bytes * 8 - 1)) - 1)
+      return nil unless key.is_a?(Integer) && key.between?(@minimum, @maximum)
       @rows.point(@codec.encode_int(@bytes, key))
     end
   end
