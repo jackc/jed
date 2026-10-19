@@ -265,7 +265,8 @@ module JedNative
       @database.shared_open!
       transient_pin = !@engine.transaction_open? && !@pinned
       @database.shared_capture(self, pin: true, read: true) if transient_pin
-      Rows.new(self, statement, params.map { |value| HostValues.copy(value) })
+      params = params.map { |value| HostValues.copy(value) }
+      PointRows.build(self, statement, params) || Rows.new(self, statement, params)
     rescue Error
       @engine.instance_variable_set(:@failed, true) if @engine.transaction_open? && $!.sqlstate != '25001'
       raise
@@ -296,3 +297,5 @@ module JedNative
   end
   Session.prepend(SessionCursors)
 end
+
+require_relative 'point_cursor'

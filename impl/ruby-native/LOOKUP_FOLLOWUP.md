@@ -1,5 +1,9 @@
 # Primary-key lookup and Ruby JIT follow-up
 
+This report preserves the first follow-up's measurements. The explicitly requested
+[second lookup pass](LOOKUP_SECOND_PASS.md) records subsequent improvements and
+repeated measurements against Go.
+
 This is the explicitly requested follow-up to the [initial experiment](REPORT.md).
 The initial 58× gap against Go included substantial avoidable Ruby work. This pass
 removes repeated planning, type parsing, structural hashing, and cursor work,

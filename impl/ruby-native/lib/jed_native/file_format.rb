@@ -3063,22 +3063,55 @@ module JedNative
     end
     
     # Decode value (record i, column c) from a parsed v24 leaf region: nil from the bitmap (fixed) or
-    # the zero-length span (variable); a fixed slot is the untagged body (re-tagged for decode_value);
-    # a variable span is the tagged codec bytes as-is.
+    # the zero-length span (variable). Fixed regions have already had their extent
+    # validated by parse_pax_leaf; read their untagged slots directly, without
+    # constructing a synthetic tag and running the container/overflow decoder.
     def leaf_value(region, type, i, fetch)
       if region[:width]
         w = region[:width]
         return nil if (region[:bitmap].getbyte(i / 8) & (0x80 >> (i % 8))) != 0
     
-        v, = decode_value(type, "\x00".b + region[:body].byteslice(i * w, w), 0, fetch)
-        v
+        body, offset = region[:body], i * w
+        raise "negative byte extent" if offset.negative?
+        raise "unexpected end of page data" if offset + w > body.bytesize
+        case type
+        when "i16" then body.unpack1('n', offset: offset) - (1 << 15)
+        when "i32", "date" then body.unpack1('N', offset: offset) - (1 << 31)
+        when "i64", "timestamp", "timestamptz" then body.unpack1('Q>', offset: offset) - INTEGER_BIAS[8]
+        when "boolean"
+          value = body.getbyte(offset)
+          raise "invalid boolean value" unless value <= 1
+          value == 1
+        when "f32" then body.unpack1('g', offset: offset)
+        when "f64" then body.unpack1('G', offset: offset)
+        when "interval" then body.unpack('l>l>q>', offset: offset)
+        when "uuid" then uuid_from_bytes(body.byteslice(offset, w))
+        else
+          decode_value(type, "\x00".b + body.byteslice(offset, w), 0, fetch).first
+        end
       else
         lo = i.zero? ? 0 : region[:ends][i - 1]
         len = region[:ends][i] - lo
         return nil if len.zero?
     
-        v, = decode_value(type, region[:body].byteslice(lo, len), 0, fetch)
-        v
+        body = region[:body]
+        if (type == "text" || type == "bytea" || type == "json") && body.getbyte(lo) == 0
+          # Inline strings have no recursive type work. Keep their value extent
+          # check local: a corrupt length must never read the following slot.
+          raise "unexpected end of page data" if len < 3
+          size = body.unpack1('n', offset: lo + 1)
+          raise "unexpected end of page data" if size + 3 > len
+          value = body.byteslice(lo + 3, size)
+          if type == "bytea"
+            value.force_encoding('ASCII-8BIT')
+          else
+            value.force_encoding('UTF-8')
+            raise Error.new('XX001', 'stored text is not valid UTF-8') unless value.valid_encoding?
+            value
+          end
+        else
+          decode_value(type, body.byteslice(lo, len), 0, fetch).first
+        end
       end
     end
     

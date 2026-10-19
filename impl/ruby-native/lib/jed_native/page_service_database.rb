@@ -62,6 +62,19 @@ module JedNative
       @service_seen ||= {}
       main = @engine.instance_variable_get(:@storage)
       attachments = @engine.instance_variable_get(:@attachments)
+      # Most captures observe the same single-file publication. Compare its
+      # scalar facts before allocating the general attachment inventory. A
+      # change still enters the ordinary locked adoption path below.
+      if attachments.empty?
+        return unless main
+        generation, txid = main.service_generation, main.meta[:txid]
+        known = @service_seen[main.path]
+        unless known
+          known = @engine.instance_variable_get(:@storage_publication) || [generation, txid]
+          @service_seen[main.path] = known
+        end
+        return if known[0] == generation && known[1] == txid
+      end
       domains = [[nil, main]].select { |_, storage| storage }
       domains.concat(attachments.filter_map { |name, attachment| [name, attachment[:storage]] if attachment[:storage] })
       domains.each do |name, storage|
