@@ -82,11 +82,15 @@ class NativeCorpus
     @filter, @mode, @output = filter, mode, output
     @query_api = ENV.fetch('JED_NATIVE_QUERY_API', 'execute')
     raise 'JED_NATIVE_QUERY_API must be execute or query' unless %w[execute query].include?(@query_api)
+    @query_memory_api = ENV.fetch('JED_NATIVE_QUERY_MEMORY_API', @query_api)
+    raise 'JED_NATIVE_QUERY_MEMORY_API must be execute or query' unless %w[execute query].include?(@query_memory_api)
     @failure_detail_bytes = 0
     @summary = { files: 0, records: 0, passed: 0, failed: 0, unsupported_files: 0, skipped_files: 0, timed_out_files: 0, memory_limited_files: 0, omitted_failure_details: 0, failures: [] }
     @summary[:scalar_cursor_records] = 0 if @query_api == 'query'
     @summary[:compiled_kernels] = 0
     @summary[:compiled_pipelines] = 0
+    @summary[:query_api_records] = @summary[:execute_api_records] = 0
+    @summary[:materialized_memory_records] = 0
   end
 
   def run
@@ -98,6 +102,7 @@ class NativeCorpus
     abort "unknown corpus locking mode #{locking.inspect}" unless %w[auto exclusive].include?(locking)
     @summary[:mode], @summary[:filter], @summary[:started_at] = @mode, @filter, Time.now.utc.iso8601
     @summary[:query_api] = @query_api
+    @summary[:query_memory_api] = @query_memory_api
     @summary[:compilation] = NativeCorpusCompilation::MODE
     @summary[:ruby], @summary[:ruby_executable] = RUBY_DESCRIPTION, RbConfig.ruby
     @summary[:jit] = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then 'yjit'
@@ -271,9 +276,17 @@ class NativeCorpus
         params = pending['params'] ? CorpusParams.parse(pending['params']).map { |value| bind_value(value) } : []
         error = nil
         result = nil
+        # The authored query-memory thresholds exercise the materialized drive.
+        # An explicitly selected mixed audit keeps those exact checks on execute
+        # while exercising the lazy API elsewhere. Rows#rows has an additional
+        # admitted collector (memory.md §5.1/§5.4), tested at its own host-API
+        # thresholds. The default still runs every record through query_api.
+        api = @query_api == 'query' && db.max_query_memory_bytes.positive? ? @query_memory_api : @query_api
+        @summary[:materialized_memory_records] += 1 if api != @query_api
+        @summary[api == 'query' ? :query_api_records : :execute_api_records] += 1
         result = begin
-          result = db.public_send(@query_api, sql.join("\n"), *params)
-          if @query_api == 'query'
+          result = db.public_send(api, sql.join("\n"), *params)
+          if api == 'query'
             @summary[:scalar_cursor_records] += 1 if defined?(JedNative::ScalarRows) && result.is_a?(JedNative::ScalarRows)
             # Pull inside the error boundary: query() defers execution errors.
             result.rows
@@ -283,7 +296,7 @@ class NativeCorpus
           error = e
           nil
         ensure
-          result&.close if @query_api == 'query'
+          result&.close if api == 'query'
         end
         if line.start_with?('statement error')
           want = line.split[2]

@@ -12,6 +12,12 @@ module JedNative
     end
 
     def view_query_columns(query, ctes = nil, outer = [])
+      depth = @native_query_metadata_depth || 0
+      if depth >= 16
+        @native_query_metadata_depth = 0
+        return Fiber.new { view_query_columns(query, ctes, outer) }.resume
+      end
+      @native_query_metadata_depth = depth + 1
       return super unless @native_query_shape_cache
       scope = [ctes || @ctes.transform_values(&:columns), outer]
       cached = (@native_query_shape_cache[query] ||= {})
@@ -19,6 +25,8 @@ module JedNative
       result = super
       cached[scope] = result.map(&:dup)
       result
+    ensure
+      @native_query_metadata_depth = depth
     end
 
     def select(statement)

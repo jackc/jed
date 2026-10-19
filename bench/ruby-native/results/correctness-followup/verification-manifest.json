@@ -1,0 +1,204 @@
+{
+  "baseline_commit": "39f804e416fd264a315b98183ef38354e5105d15",
+  "runs": {
+    "memory-zjit": {
+      "source_sha256": "e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e",
+      "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+      "query_api": "execute",
+      "query_memory_api": "execute",
+      "passed": 20267,
+      "failed": 0,
+      "records": 20267,
+      "skipped_files": 2,
+      "timed_out_files": 0,
+      "memory_limited_files": 0,
+      "peak_worker_rss_bytes": 158732288
+    },
+    "disk-yjit": {
+      "source_sha256": "e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e",
+      "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]",
+      "query_api": "execute",
+      "query_memory_api": "execute",
+      "passed": 18250,
+      "failed": 0,
+      "records": 18250,
+      "skipped_files": 77,
+      "timed_out_files": 0,
+      "memory_limited_files": 0,
+      "peak_worker_rss_bytes": 186941440
+    },
+    "mixed-query-yjit": {
+      "source_sha256": "e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e",
+      "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+      "query_api": "query",
+      "query_memory_api": "execute",
+      "passed": 20267,
+      "failed": 0,
+      "records": 20267,
+      "skipped_files": 2,
+      "timed_out_files": 0,
+      "memory_limited_files": 0,
+      "peak_worker_rss_bytes": 169209856
+    },
+    "pure-query-yjit": {
+      "source_sha256": "e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e",
+      "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+      "query_api": "query",
+      "query_memory_api": "query",
+      "passed": 20221,
+      "failed": 46,
+      "records": 20267,
+      "skipped_files": 2,
+      "timed_out_files": 0,
+      "memory_limited_files": 0,
+      "peak_worker_rss_bytes": 175935488
+    }
+  },
+  "host_test_files": 51,
+  "pure_query_comparison": {
+    "resolved_failures": [
+      [
+        "spec/conformance/suites/cte/recursive_errors.test",
+        19,
+        "RuntimeError: expected 42P19, got 42P01"
+      ],
+      [
+        "spec/conformance/suites/cte/recursive_errors.test",
+        23,
+        "RuntimeError: expected 42P19, got 42P01"
+      ],
+      [
+        "spec/conformance/suites/joins/parenthesized.test",
+        367,
+        "JedNative::Error: 42703: unknown column id"
+      ],
+      [
+        "spec/conformance/suites/joins/parenthesized.test",
+        385,
+        "JedNative::Error: 42703: unknown column id"
+      ],
+      [
+        "spec/conformance/suites/joins/parenthesized.test",
+        412,
+        "RuntimeError: names: expected id, k, got k, id"
+      ],
+      [
+        "spec/conformance/suites/joins/parenthesized_lateral.test",
+        447,
+        "RuntimeError: expected 42P10, got 42702"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        28,
+        "JedNative::Error: 42804: types jsonb and text cannot be matched"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        37,
+        "JedNative::Error: 42804: types jsonb and text cannot be matched"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        45,
+        "JedNative::Error: 42804: types jsonb and text[] cannot be matched"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        61,
+        "JedNative::Error: 42804: types jsonb and text cannot be matched"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        69,
+        "RuntimeError: expected 22023, got 42804"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        72,
+        "RuntimeError: expected 22023, got 42804"
+      ],
+      [
+        "spec/conformance/suites/json/json_mutate.test",
+        85,
+        "JedNative::Error: 42804: types jsonb and text cannot be matched"
+      ],
+      [
+        "spec/conformance/suites/json/json_path_walk.test",
+        215,
+        "JedNative::Error: 42804: types jsonb and text[] cannot be matched"
+      ],
+      [
+        "spec/conformance/suites/json/json_path_walk.test",
+        222,
+        "RuntimeError: expected 22023, got 42804"
+      ],
+      [
+        "spec/conformance/suites/json/json_path_walk.test",
+        225,
+        "RuntimeError: expected 22023, got 42804"
+      ],
+      [
+        "spec/conformance/suites/json/json_path_walk.test",
+        228,
+        "RuntimeError: expected 2202E, got 42804"
+      ],
+      [
+        "spec/conformance/suites/json/to_json_sources.test",
+        158,
+        "JedNative::Error: 42883: function array_to_json has no matching overload"
+      ],
+      [
+        "spec/conformance/suites/json/to_json_sources.test",
+        166,
+        "RuntimeError: expected 22P02, got 42883"
+      ],
+      [
+        "spec/conformance/suites/resource/depth_limit.test",
+        44,
+        "harness worker exited 70: SystemStackError: stack level too deep"
+      ],
+      [
+        "spec/conformance/suites/resource/dos_amplification.test",
+        109,
+        "JedNative::Error: 54P01: statement cost limit exceeded"
+      ],
+      [
+        "spec/conformance/suites/resource/json_depth_limit.test",
+        95,
+        "harness worker exited 70: SystemStackError: stack level too deep"
+      ],
+      [
+        "spec/conformance/suites/resource/operand_resolution.test",
+        19,
+        "harness worker exited 70: SystemStackError: stack level too deep"
+      ],
+      [
+        "spec/conformance/suites/resource/view_depth_limit.test",
+        92,
+        "harness worker exited 70: SystemStackError: stack level too deep"
+      ],
+      [
+        "spec/conformance/suites/resource/view_expansion_limit.test",
+        216,
+        "harness worker exited 70: SystemStackError: stack level too deep"
+      ]
+    ],
+    "new_failures": [],
+    "unchanged_memory_failures": 46,
+    "additional_records_attempted": 97
+  },
+  "artifacts": {
+    "disk-yjit-bounded.json": "6ea4cbd45f30e0de6712c55edee1f1b18c15c7f2c54600dbf9b5fa08c64516e2",
+    "disk-yjit.json": "c061ed0fde115d7a3cabcdaf51abad780e71c5dfe4cef5fc23bae40a175352ab",
+    "host-tests-bounded.json": "8f9e2f60574a119123ad5e37698ccde6ac70503bfb670f14a4d5834c0cc3347e",
+    "limit-cost-focused.json": "ea78e0f80b819358853726531457d8a26bc3684f58f05620a947f3a1cde48ab2",
+    "limit-cost-probe.rb": "df0f135fadc86f424b02a783821559253e81d49f5e87cf55aa154854977cbe74",
+    "memory-zjit-bounded.json": "1f16c8ab2d3d7f00b87a1b5f9a6c516699ba8e84df7fc7e91d779248036dbb46",
+    "memory-zjit.json": "7a6be9ef5b93d6e01766f7891028425c03919cf0b3c48bba0b3c5d9111f5a04e",
+    "mixed-query-yjit-bounded.json": "d3b1fe2a17bde7e6e6b5d0fa9b238920635a7725ecb114fe3eaa94d6895e5f5f",
+    "mixed-query-yjit.json": "91d49081faa0c6ea328e77ddd4826f0345ed374fec2d589eb1e0f51903c26f0c",
+    "pure-query-yjit-bounded.json": "fea3edf9232b8f9ff73f7a0ae5482b4b66696c42240f6035a74e2ff84ff0c775",
+    "pure-query-yjit.json": "2d13f06ab4f6d19acd2383e04178b095be172068b9a69876fcdc1284cbce4384",
+    "scan-cost-focused.json": "0550dd9eb318807f18bf6263a93a2183f39c74711c2c3356300f19e9e9297224"
+  }
+}

@@ -368,6 +368,10 @@ module JedNative
 
     def scan_units(ordinals = nil, columns = nil)
       return [0, 0] if columns&.empty?
+      # Fixed-width columns cannot spill or compress. Their zero payload block
+      # must not force later leaves merely to price a short LIMIT scan.
+      selected = columns || @columns.each_index
+      return [0, 0] if selected.all? { |column| @pool.codec.fixed_width(@columns[column][:type]) }
       pages = slabs = 0
       if ordinals
         ordinals.each do |ordinal|
