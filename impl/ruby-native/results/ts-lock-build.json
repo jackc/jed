@@ -1,0 +1,21 @@
+{
+  "command": [
+    "mise",
+    "run",
+    "ts:lock_build"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 546013184,
+  "memory_bytes": 1073741824,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 14.52214841300156,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb",
+  "final_source_sha256": "05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "",
+  "stderr": "[ts:lock_build] $ # Every task that runs the TS core depends on this one, so it…\n   Compiling napi v3.10.5\n   Compiling napi-derive v3.5.10\n   Compiling jed-node-lock v0.0.0 (/home/jack/.codex/worktrees/b8e6/jed/impl/ts/native-lock)\n    Finished `release` profile [optimized] target(s) in 4.39s\n"
+}

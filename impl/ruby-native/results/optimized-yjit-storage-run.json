@@ -1,0 +1,21 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "bench/ruby-native/storage_bench.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 27627520,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 0.8763306009932421,
+  "source": "/tmp/jed-ruby-measured-final",
+  "source_sha256": "05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb",
+  "final_source_sha256": "05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "crc32_8k: 15045.8 ns/op\ncrc64_8k: 29450.6 ns/op\ndurable_full_snapshot_1_rows: 6549136.0 ns/op\ndurable_full_snapshot_100_rows: 5593196.4 ns/op\nstorage benchmark artifact: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/optimized-yjit-storage.json\n",
+  "stderr": ""
+}
