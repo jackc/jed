@@ -271,31 +271,31 @@ The linked report retains all 104 cases, samples, versions, allocation modes and
 
 ### 8.1 Browser execution and the Rust/WASM option
 
-The follow-on [browser/Node runtime proposal](ts-runtime.md) develops an async-only public JS
-API, worker scheduling, cancellation and internal page/crypto suspension. It is design work;
-the implementation observations and benchmark limitations below still apply.
-
-The browser **client already returns promises** (`impl/ts/src/browser/client.ts`). A dedicated
-worker runs the synchronous TS engine over synchronous OPFS access handles. That preserves the
-same synchronous pager/B-tree/executor contracts as Node, keeps promises out of resident query
-work, and avoids blocking the UI thread. It is an implementation choice, not a SQL requirement.
+The [browser/Node runtime](ts-runtime.md) implements async-only public JS entry points,
+dedicated execution workers, bounded typed transport, serialized operation scheduling and
+cooperative cancellation. Retained page and expression continuations let execution await data
+reads without replaying SQL. Common resident expressions still return immediate values. Node
+data-page reads can await I/O; browser OPFS sync access handles remain synchronous inside the
+worker. Async storage lifecycle, commit and crypto integration remain follow-on work.
 
 WebCrypto needs suspension **inside the worker** at decryption/cache misses and before encrypted
-commit writes. Marking the existing RPC API async changes nothing. A useful prototype would keep
-resident computation synchronous, add bounded asynchronous page loading/prefetch and commit
-encryption, and resume execution at explicit suspension points. Cache misses currently occur
-inside synchronous tree traversal and lazy decoding, so this crosses more than the BlockStore
-interface. Do not replay partially evaluated SQL to recover from a miss: entropy consumption,
-costs, host functions and staged writes must occur exactly once. Do not preload the whole file
-to hide asynchronous reads, which would violate bounded-residency requirements.
+commit writes. The retained-continuation machinery supplies the traversal and lazy-decoding
+foundation, but an async-only crypto provider is not yet sufficient for all storage paths.
+A follow-on must add the core-owned encrypted-page codec, await authenticated decryption before
+cache insertion, and bound pending page work and commit encryption. Open/recovery, maintenance,
+spill and commit still have synchronous paths. Do not replay partially evaluated SQL to recover
+from a miss: entropy consumption, costs, host functions and staged writes must occur exactly
+once. Do not preload the whole file to hide asynchronous reads, which would violate
+bounded-residency requirements.
 
-Awaiting crypto also introduces event-loop interleavings. The worker currently dispatches
-requests without an explicit serialized queue because SQL runs synchronously. An async engine
-must retain the statement's snapshot/pins and writer ownership, serialize incompatible operations
-(including close/rollback), and preserve publication/barrier/error-poisoning ordering. Bounded
-batches of independent dirty pages may overlap encryption; parent-dependent reads cannot all
-be launched together. Promise dispatch overhead, allocation, cancellation and working memory
-belong in integrated measurements. No async refactor is approved or implemented by this research.
+Awaiting crypto also introduces event-loop interleavings. The runtime already retains the active
+operation's snapshot/pins and writer ownership across suspension, processes cancellation/control
+messages, and queues other engine operations. Encryption must preserve that ownership model and
+validated-COW publication/barrier/error-poisoning ordering. Bounded batches of independent dirty
+pages may overlap encryption; parent-dependent reads cannot all be launched together. Promise
+dispatch overhead, allocation, cancellation and working memory belong in integrated measurements.
+The runtime implementation selects no encryption suite, nonce protocol or production provider;
+the primitive measurements below do not establish encrypted-database performance.
 
 The existing **full Rust/WASM wrapper** (`impl/wasm`) targets WASI and is driven through Node;
 it is not yet a browser/OPFS package. It keeps Rust execution synchronous and adds parameter/result

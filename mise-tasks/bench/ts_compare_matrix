@@ -1,0 +1,83 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Run controlled master/direct, branch/direct and branch/worker TS comparisons"
+require_relative "../../scripts/lib/tasks"
+require "json"
+require "time"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_compare_matrix"
+  puts "JED_COMPARE_MASTER=origin/master, JED_COMPARE_BRANCH=HEAD select committed engine revisions."
+  puts "JED_COMPARE_RESULTS selects a fresh directory (default ignored bench/results/ts-compare-matrix-*)."
+  puts "JED_COMPARE_REPEATS=3; JED_COMPARE_CPUS optionally pins every child via taskset."
+  puts "JED_COMPARE_HOSTS=node,browser; other workload settings are documented by bench:ts_compare."
+  puts "Runs serially, rotating variant order on each repeat. Uses installed tools; no downloads."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+repeats = Integer(ENV.fetch("JED_COMPARE_REPEATS", "3"))
+hosts = ENV.fetch("JED_COMPARE_HOSTS", "node,browser").split(",")
+abort "Invalid repeats or hosts" unless repeats.positive? && !hosts.empty? && (hosts - %w[node browser]).empty?
+directory = File.expand_path(ENV.fetch("JED_COMPARE_RESULTS", "bench/results/ts-compare-matrix-#{stamp}"))
+abort "Result directory must be fresh" if File.exist?(directory)
+FileUtils.mkdir_p(directory)
+revisions = %w[master branch].to_h do |name|
+  ref = ENV.fetch("JED_COMPARE_#{name.upcase}", name == "master" ? "origin/master" : "HEAD")
+  revision, ok = capture("git", "rev-parse", "--verify", "#{ref}^{commit}")
+  abort "Cannot resolve #{ref}" unless ok
+  [name, revision.strip]
+end
+revisions.each do |name, revision|
+  snapshot = File.join(directory, "sources", name)
+  FileUtils.mkdir_p(snapshot)
+  archive = File.join(directory, "#{name}.tar")
+  sh "git", "archive", "--format=tar", "--output=#{archive}", revision,
+     "impl/ts/src", "impl/ts/package.json", "impl/ts/package-lock.json"
+  sh "tar", "-xf", archive, "-C", snapshot
+  FileUtils.rm(archive)
+  %w[node_modules jed_lock.node].each do |dependency|
+    installed = File.join(TS_DIR, dependency)
+    abort "Missing installed dependency: #{installed}" unless File.exist?(installed)
+    File.symlink(installed, File.join(snapshot, "impl/ts", dependency))
+  end
+end
+settings = ENV.select { |key, _| key.start_with?("JED_ASYNC_HEAVY_", "JED_COMPARE_CHEAP_") }
+settings["JED_COMPARE_BROWSER_ISOLATED"] = ENV.fetch("JED_COMPARE_BROWSER_ISOLATED", "0")
+affinity = ENV["JED_COMPARE_CPUS"]
+variants = [["master-direct", "master", "direct"], ["branch-direct", "branch", "direct"], ["branch-worker", "branch", "worker"]]
+runs = []
+manifest = {
+  schemaVersion: 1, startedAt: Time.now.utc.iso8601, revisions: revisions,
+  repeats: repeats, hosts: hosts, settings: settings, cpuAffinity: affinity,
+  matrixTaskSha256: Digest::SHA256.file(__FILE__).hexdigest, runs: runs
+}
+save_manifest = -> { File.write(File.join(directory, "matrix.json"), JSON.pretty_generate(manifest) + "\n") }
+save_manifest.call
+repeats.times do |repeat|
+  hosts.each do |host|
+    variants.rotate(repeat % variants.length).each do |variant, source, mode|
+      name = "#{host}-#{repeat + 1}-#{variant}"
+      output = File.join(directory, name)
+      env = settings.merge(
+        "JED_COMPARE_ROOT" => File.join(directory, "sources", source),
+        "JED_COMPARE_REVISION" => revisions.fetch(source),
+        "JED_COMPARE_MODE" => mode, "JED_COMPARE_HOST" => host, "JED_COMPARE_RESULTS" => output
+      )
+      command = ["mise", "run", "bench:ts_compare"]
+      command = ["taskset", "-c", affinity, *command] if affinity && !affinity.empty?
+      log = File.join(directory, "#{name}.log")
+      puts "#{name}: #{revisions.fetch(source)} (log: #{log})"
+      $stdout.flush
+      started = Time.now.utc.iso8601
+      success = File.open(log, "w") { |file| system(env, *command, out: file, err: [:child, :out]) }
+      abort "#{name} failed; inspect #{log}" unless success
+      runs << { host: host, variant: variant, repeat: repeat + 1, revision: revisions.fetch(source),
+                mode: mode, path: "#{name}/results.json.gz", startedAt: started, endedAt: Time.now.utc.iso8601 }
+      save_manifest.call
+    end
+  end
+end
+manifest[:endedAt] = Time.now.utc.iso8601
+save_manifest.call
+sh "node", "bench/ts/compare/summarize.mjs", directory
