@@ -1,0 +1,88 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compare baseline, Rows channel, engine channel, and both in alternating Go runs"
+require "tmpdir"
+require "fileutils"
+
+root = File.expand_path("../../..", __dir__)
+revision = "d4c8ef54"
+out_dir = File.join(root, "bench/cancellation")
+
+def run!(*args, **options)
+  system(*args, **options) || abort("failed: #{args.join(' ')}")
+end
+
+def replace!(source, from, to)
+  abort("ablation source changed: #{from}") unless source.include?(from)
+  source.sub!(from, to)
+end
+
+Dir.mktmpdir("jed-cancellation-channels-") do |dir|
+  archive = File.join(dir, "baseline.tar")
+  run!("git", "-C", root, "archive", revision, "impl/go", "spec", out: archive)
+  builds = %w[baseline rows engine combined].to_h { |name| [name, File.join(dir, name)] }
+  builds.each do |name, source|
+    FileUtils.mkdir_p(source)
+    if %w[baseline rows].include?(name)
+      run!("tar", "-xf", archive, "-C", source)
+    else
+      FileUtils.mkdir_p(File.join(source, "impl"))
+      FileUtils.cp_r(File.join(root, "impl/go"), File.join(source, "impl/go"))
+      FileUtils.cp_r(File.join(root, "spec"), File.join(source, "spec"))
+    end
+    # Identical fixture/selection in all builds; the historical SQL watcher fixture
+    # is tied to the former function-valued meter and is not part of this experiment.
+    FileUtils.cp(File.join(root, "impl/go/cancellation_bench_test.go"), File.join(source, "impl/go"))
+    if name == "rows"
+      api = File.join(source, "impl/go/api.go")
+      text = File.read(api)
+      replace!(text, "ctx ctxIface", "done <-chan struct{}")
+      replace!(text, "ctxErr(r.ctx)", "doneErr(r.done)")
+      File.write(api, text)
+      ergo = File.join(source, "impl/go/ergonomic.go")
+      text = File.read(ergo)
+      replace!(text, "rows.ctx = ctx", "if ctx != nil { rows.done = ctx.Done() }")
+      replace!(text, "r.ctx = nil", "r.done = nil")
+      # Use exactly the final immediate channel-check implementation.
+      helper = File.read(File.join(root, "impl/go/ergonomic.go"))[/func doneErr\(.*?\n\}/m]
+      abort("missing doneErr") unless helper
+      File.write(ergo, text + "\n" + helper + "\n")
+    elsif name == "engine"
+      api = File.join(source, "impl/go/api.go")
+      text = File.read(api)
+      replace!(text, "done <-chan struct{}", "ctx ctxIface")
+      replace!(text, "doneErr(r.done)", "ctxErr(r.ctx)")
+      File.write(api, text)
+      ergo = File.join(source, "impl/go/ergonomic.go")
+      text = File.read(ergo)
+      replace!(text, "rows.done = done", "rows.ctx = ctx")
+      replace!(text, "r.done = nil", "r.ctx = nil")
+      # Keep the baseline entry check byte-for-byte in this engine-only variant.
+      helper = File.read(File.join(builds.fetch("baseline"), "impl/go/ergonomic.go"))[/func ctxErr\(.*?\n\}/m]
+      abort("missing ctxErr") unless helper
+      File.write(ergo, text + "\ntype ctxIface = context.Context\n" + helper + "\n")
+    end
+    # These binaries are for measurement only; the real combined checkout gets the
+    # full unit/race/conformance checks. No synthetic variants enter production.
+    run!("go", "test", "-C", File.join(source, "impl/go"), "-c", "-o", File.join(dir, "#{name}.test"))
+  end
+  outputs = builds.keys.to_h { |name| [name, File.open(File.join(out_dir, "go-channels-#{name}.txt"), "w")] }
+  begin
+    # Vary the order across rounds to reduce a consistent ordering bias.
+    4.times do |i|
+      names = builds.keys.rotate(i)
+      names.reverse! if i.odd?
+      names.each do |name|
+        outputs[name].puts("# round #{i + 1}; #{name}; baseline #{revision}; GOMAXPROCS=1; CPU 0")
+        outputs[name].flush
+        run!({"GOMAXPROCS" => "1"}, "taskset", "-c", "0", File.join(dir, "#{name}.test"),
+             "-test.run", "^$",
+             "-test.bench", "^BenchmarkCancellation$/(cheap|stream|aggregate|projection)/^(disabled|enabled)$",
+             "-test.benchmem", "-test.benchtime=500ms", "-test.count=1",
+             out: outputs[name], err: outputs[name])
+      end
+    end
+  ensure
+    outputs.each_value(&:close)
+  end
+end

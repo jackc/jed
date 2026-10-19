@@ -291,13 +291,13 @@ type sessionState struct {
 	// counts; a pointer so the activate() VALUE swap of the session keeps the same counter. SESSION
 	// state, not snapshot state: it does NOT roll back when a transaction rolls back.
 	lifetimeTotal *int64
-	// cancel is the per-statement cancellation poll the ergonomic API arms for one statement
+	// cancel is the per-statement cancellation channel the ergonomic API arms for one statement
 	// (spec/design/api.md §11.4): nil unless a host cancellation handle (Go context.Context, …) is
 	// active. newMeter copies it into the statement's meter, whose execution loops sample it at bounded
 	// intervals, so a flipped handle aborts a long-running statement (57014) — not only at the
 	// cursor boundary. Set/cleared by engine.armCancel around a single statement (ergonomic.go); a
 	// cached context Done channel check on the hot path.
-	cancel func() bool
+	cancel <-chan struct{}
 	// maxSQLLength is the maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 =
 	// unlimited; default DefaultMaxSQLLength (1 MiB). Over-limit input is rejected 54000 at parse,
 	// before lexing.

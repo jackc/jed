@@ -32,10 +32,10 @@ func BenchmarkCancellation(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		for _, mode := range []string{"disabled", "enabled", "watcher", "scalar-disabled", "scalar-enabled"} {
+		for _, mode := range []string{"disabled", "enabled", "scalar-disabled", "scalar-enabled"} {
 			b.Run(q.name+"/"+mode, func(b *testing.B) {
 				runCtx := ctx
-				if mode == "enabled" || mode == "scalar-enabled" || mode == "watcher" {
+				if mode == "enabled" || mode == "scalar-enabled" {
 					var cancel context.CancelFunc
 					runCtx, cancel = context.WithCancel(ctx)
 					defer cancel()
@@ -48,25 +48,12 @@ func BenchmarkCancellation(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					var rows *Rows
-					var err error
-					var stop func()
-					if mode == "watcher" {
-						rows, stop, err = benchmarkWatcherQuery(runCtx, s, stmt)
-					} else {
-						rows, err = s.QueryPrepared(runCtx, stmt)
-					}
+					rows, err := s.QueryPrepared(runCtx, stmt)
 					if err != nil {
-						if stop != nil {
-							stop()
-						}
 						b.Fatal(err)
 					}
 					for rows.Next() {
 						_ = rows.Row()
-					}
-					if stop != nil {
-						stop()
 					}
 					if err := rows.Err(); err != nil {
 						b.Fatal(err)
@@ -76,32 +63,6 @@ func BenchmarkCancellation(b *testing.B) {
 			})
 		}
 	}
-}
-
-// Model the former watcher with corrected lifetime: the caller stops it after draining,
-// while the session poll is restored immediately and the cursor retains its atomic flag.
-// This has the same no-argument prepared query seam as QueryPrepared, without installing
-// a second channel poll around the watcher being measured.
-func benchmarkWatcherQuery(ctx context.Context, s *Session, stmt *PreparedStatement) (*Rows, func(), error) {
-	if err := ctxErr(ctx); err != nil {
-		return nil, nil, err
-	}
-	var flag atomic.Bool
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			flag.Store(true)
-		case <-done:
-		}
-	}()
-	s.engine.session.cancel = flag.Load
-	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc, &stmt.ic)
-	s.engine.session.cancel = nil
-	if rows != nil {
-		rows.ctx = ctx
-	}
-	return rows, func() { close(done) }, err
 }
 
 // Isolate watcher lifecycle and polling from the SQL engine. The watcher covers the entire

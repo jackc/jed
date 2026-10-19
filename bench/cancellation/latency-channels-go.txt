@@ -1,0 +1,7 @@
+=== RUN   TestCancellationLatencyMeasurement
+    cancellation_bench_test.go:169: SELECT sum(v) FROM t: cancellation response median=2915ns p95=18330ns max=125156ns
+    cancellation_bench_test.go:169: SELECT v FROM t: cancellation response median=15589ns p95=188338ns max=206143ns
+    cancellation_bench_test.go:169: SELECT v FROM t ORDER BY id LIMIT 1000000: cancellation response median=586ns p95=1279ns max=3039ns
+--- PASS: TestCancellationLatencyMeasurement (1.04s)
+PASS
+ok  	github.com/jackc/jed/impl/go	1.065s

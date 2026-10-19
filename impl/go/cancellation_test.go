@@ -2,8 +2,8 @@ package jed
 
 // Cancellation through the cost meter (spec/design/api.md §11.4). Per-core unit tests, NOT the
 // shared corpus: cancellation is timing-dependent (CLAUDE.md §10), so it cannot live there. These
-// pin the mechanism deterministically — the meter's Checkpoint() honors the cancel poll, and a flipped
-// poll aborts a running statement with 57014 (not only at the cursor boundary).
+// pin the mechanism deterministically — closing the channel makes the meter's Checkpoint()
+// abort a running statement with 57014 (not only at the cursor boundary).
 
 import (
 	"context"
@@ -26,7 +26,7 @@ func cancelCode(t *testing.T, err error) string {
 	return ee.Code()
 }
 
-// The meter's Checkpoint aborts with 57014 the instant the cancel poll returns true, independently of
+// The meter's Checkpoint aborts with 57014 once the channel closes, independently of
 // the cost ceilings (a zero-limit meter never aborts on cost).
 func TestMeterCheckpointCancel(t *testing.T) {
 	t.Parallel()
@@ -35,12 +35,12 @@ func TestMeterCheckpointCancel(t *testing.T) {
 		t.Fatalf("no cancel set: Guard should pass, got %v", err)
 	}
 
-	flag := false
-	m.cancel = func() bool { return flag }
+	done := make(chan struct{})
+	m.cancel = done
 	if err := m.Checkpoint(); err != nil {
 		t.Fatalf("cancel=false: Guard should pass, got %v", err)
 	}
-	flag = true
+	close(done)
 	if code := cancelCode(t, m.Checkpoint()); code != "57014" {
 		t.Fatalf("cancel=true: want 57014, got %s", code)
 	}
@@ -86,7 +86,9 @@ func TestCancelDuringExecution(t *testing.T) {
 	// 57014 can only come from the meter consulting session.cancel. Since S4 (streaming.md §6) Query
 	// returns a LAZY cursor — a bare scan buffers its input on the first pull — so building the cursor
 	// no longer runs the scan; the meter checkpoint trips during the drain and the 57014 surfaces via Err().
-	s.engine.session.cancel = func() bool { return true }
+	done := make(chan struct{})
+	close(done)
+	s.engine.session.cancel = done
 	rows, err := s.queryValues("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatalf("building the lazy cursor should not error, got %v", err)
@@ -306,7 +308,8 @@ func TestCursorCancellationLifetime(t *testing.T) {
 }
 
 // Batch eligibility is independent of cancellation, but never of deterministic ceilings.
-// The second poll must happen INSIDE the scan, before all rows are processed. Partial work must still accrue to the lifetime gauge.
+// Cancel on a page fault INSIDE Next, after the first leaf has been processed.
+// The batch check must abort the scan and charge its partial work to the lifetime gauge.
 func TestCancellationBatchCheckpoints(t *testing.T) {
 	db := memDB()
 	defer db.Close()
@@ -320,18 +323,24 @@ func TestCancellationBatchCheckpoints(t *testing.T) {
 		t.Run(sql, func(t *testing.T) {
 			s := db.Session(SessionOptions{})
 			defer s.Close()
-			polls := 0
-			s.engine.session.cancel = func() bool { polls++; return polls == 2 }
+			done := make(chan struct{})
+			s.engine.session.cancel = done
 			r, err := s.queryValues(sql, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer r.Close()
+			paging := db.core.storage.paging
+			oldPool := paging.pool
+			paging.pool = newBufferPool(oldPool.capacity)
+			store := &cancelOnReadStore{blockStore: paging.pgr.store, done: done}
+			paging.pgr.store = store
+			defer func() { paging.pgr.store, paging.pool = store.blockStore, oldPool }()
 			if r.Next() || cancelCode(t, r.Err()) != "57014" {
 				t.Fatal("batch did not cancel")
 			}
-			if polls != 2 || r.Cost() <= 0 || r.Cost() >= 2000 {
-				t.Fatalf("scan ran to completion before cancel: polls=%d cost=%d", polls, r.Cost())
+			if store.reads < 2 || r.Cost() <= 0 || r.Cost() >= 2000 {
+				t.Fatalf("scan ran to completion before cancel: reads=%d cost=%d", store.reads, r.Cost())
 			}
 			if *s.engine.session.lifetimeTotal != r.Cost() {
 				t.Fatal("canceled work lost from lifetime total")
@@ -393,13 +402,12 @@ func TestCancellationPreservesCostLimits(t *testing.T) {
 // Cost guards never poll, and sampling cannot postpone a deterministic cost abort.
 func TestCancellationSamplingIndependentOfCost(t *testing.T) {
 	m := newMeter()
-	polls := 0
-	canceled := false
-	m.cancel = func() bool { polls++; return canceled }
+	done := make(chan struct{})
+	m.cancel = done
 	if err := m.Step(); err != nil {
 		t.Fatal(err)
 	}
-	canceled = true
+	close(done)
 	for i := 0; i < 255; i++ {
 		if err := m.Guard(); err != nil {
 			t.Fatal(err)
@@ -408,14 +416,11 @@ func TestCancellationSamplingIndependentOfCost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if polls != 1 {
-		t.Fatalf("polled %d times before the next batch", polls)
-	}
 	if code := cancelCode(t, m.Step()); code != "57014" {
 		t.Fatal(code)
 	}
 	m = newMeterWithLimit(2)
-	m.cancel = func() bool { return false }
+	m.cancel = make(chan struct{})
 	if err := m.Step(); err != nil {
 		t.Fatal(err)
 	}
@@ -450,11 +455,22 @@ func TestCancellationWithoutRowEmission(t *testing.T) {
 		t.Run(sql, func(t *testing.T) {
 			s := db.Session(SessionOptions{})
 			defer s.Close()
-			polls := 0
-			s.engine.session.cancel = func() bool { polls++; return polls >= 2 }
+			done := make(chan struct{})
+			s.engine.session.cancel = done
 			r, err := s.queryValues(sql, nil)
 			if err == nil {
 				defer r.Close()
+				// Skip the first sample, as if the preceding step already polled.
+				// The rejected-candidate loop must reach the next one on its own.
+				switch c := r.cursor.(type) {
+				case *streamingCursor:
+					c.meter.cancelSteps = 1
+				case *bufferedScanCursor:
+					c.meter.cancelSteps = 1
+				default:
+					t.Fatalf("unexpected cursor %T", c)
+				}
+				close(done)
 				for r.Next() {
 					t.Fatal("unexpected row")
 				}
@@ -463,9 +479,84 @@ func TestCancellationWithoutRowEmission(t *testing.T) {
 			if code := cancelCode(t, err); code != "57014" {
 				t.Fatal(code)
 			}
-			if polls != 2 {
-				t.Fatalf("poll count %d", polls)
-			}
 		})
+	}
+}
+
+// This host storage seam fires synchronously during a leaf read, so there is no
+// scheduler race or test-only callback in the production cancellation meter.
+type cancelOnReadStore struct {
+	blockStore
+	done  chan struct{}
+	reads int
+}
+
+func (s *cancelOnReadStore) readAt(off int64, length int) ([]byte, error) {
+	b, err := s.blockStore.readAt(off, length)
+	s.reads++
+	if s.reads == 2 {
+		close(s.done)
+	}
+	return b, err
+}
+
+type countedDoneContext struct {
+	context.Context
+	calls int
+}
+
+func (c *countedDoneContext) Done() <-chan struct{} {
+	c.calls++
+	return c.Context.Done()
+}
+
+func TestCancellationCachesDone(t *testing.T) {
+	db := memDB()
+	defer db.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	counted := &countedDoneContext{Context: ctx}
+	r, err := db.Query(counted, "SELECT generate_series FROM generate_series(1, 3)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if !r.Next() || !r.Next() {
+		t.Fatalf("expected rows: %v", r.Err())
+	}
+	cancel()
+	if r.Next() || cancelCode(t, r.Err()) != "57014" {
+		t.Fatal("cached channel did not observe cancellation")
+	}
+	if counted.calls != 1 {
+		t.Fatalf("Done called %d times; want one capture per operation", counted.calls)
+	}
+}
+
+func TestCancellationRestoresSession(t *testing.T) {
+	db := memDB()
+	defer db.Close()
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	previous := make(chan struct{})
+	close(previous)
+	s.engine.session.cancel = previous
+	// Both successful and failed calls must temporarily replace, then restore,
+	// the prior channel; nil context must clear it during the operation too.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for _, c := range []context.Context{nil, context.Background(), ctx} {
+		if _, err := s.Exec(c, "SELECT 1"); err != nil {
+			t.Fatal(err)
+		}
+		if s.engine.session.cancel != previous {
+			t.Fatal("successful query lost prior cancellation")
+		}
+		if _, err := s.Query(c, "SELECT missing_column"); err == nil {
+			t.Fatal("expected query error")
+		}
+		if s.engine.session.cancel != previous {
+			t.Fatal("failed query lost prior cancellation")
+		}
 	}
 }
