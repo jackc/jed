@@ -32,11 +32,16 @@ module JedNative
       @privilege_revokes.clear
     end
 
+    def unrestricted_capabilities?
+      @allow_ddl && @allow_temp_ddl != false && @default_privileges.sort == TABLE_PRIVILEGES.sort &&
+        @privilege_revokes.empty? && !@read_only
+    end
+
     def dispatch(statement)
       owns = !@capability_preflight
       if owns
         @capability_preflight = true
-        unless @allow_ddl && @allow_temp_ddl != false && @default_privileges.sort == TABLE_PRIVILEGES.sort && @privilege_revokes.empty? && !@read_only
+        unless unrestricted_capabilities?
           authorize_node(statement, {}, true, [])
         end
       end

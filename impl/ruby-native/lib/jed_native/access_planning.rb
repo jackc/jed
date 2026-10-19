@@ -400,7 +400,7 @@ module JedNative
         intervals.each do |lower, upper|
           charge(name ? secondary_page_count(stored, name, lower, upper) : primary_page_count(stored, lower, upper))
           if stored[:rows].is_a?(PagedRows)
-            ordinals = storage_scan_entries(stored, name, lower: lower, upper: upper).map(&:last)
+            ordinals = paged_scan_ordinals(stored, name, lower: lower, upper: upper)
           else
             first = lower ? entries.bsearch_index { |encoded, _| encoded >= lower } || entries.length : 0
             last = upper ? entries.bsearch_index { |encoded, _| encoded >= upper } || entries.length : entries.length

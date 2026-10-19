@@ -36,6 +36,7 @@ module JedNative
       @attachments[name] = attachment
       remember_attachment_storage(name) if attachment[:storage] && respond_to?(:remember_attachment_storage, true)
       refresh_primary_indexes
+      storage.service_finish_open if storage
       nil
     rescue StandardError
       storage&.close unless defined?(Storage) && source.is_a?(Storage) || @attachments.key?(name)
@@ -228,28 +229,53 @@ module JedNative
     def domain_key(database, name) = "\u0001#{database}\0#{name}"
 
     def route_domains(node)
+      return node if node.is_a?(Hash) && node[:native_routed]
+      # Prepared statements retain their routed syntax. Recheck qualifications
+      # against the current namespace on every execution, without rebuilding the
+      # whole tree or making the binding/selection caches miss by identity.
+      return route_domain_node(node, []) unless node.is_a?(Hash) && node[:kind] == :select && !node[:into]
+      @native_domain_routes ||= {}.compare_by_identity
+      if (entry = @native_domain_routes[node])
+        entry[1].each { |database, name, relation| validate_domain_qualification(database, name, relation) }
+        return entry[0]
+      end
+      checks = []
+      routed = route_domain_node(node, checks)
+      @native_domain_routes.shift if @native_domain_routes.length >= 64
+      @native_domain_routes[node] = [routed, checks]
+      routed
+    end
+
+    def validate_domain_qualification(database, name, relation)
+      unless %w[main temp].include?(database) || @attachments.key?(database)
+        raise Error.new('42P01', "database #{database} is not attached")
+      end
+      return unless relation
+      object = @tables[name] || @views[name]
+      if object && !!object[:temporary] != (database == 'temp')
+        raise Error.new('42P01', "relation #{database}.#{name} does not exist")
+      end
+    end
+
+    def route_domain_node(node, checks)
       case node
-      when Array then node.map { |item| route_domains(item) }
+      when Array then node.map { |item| route_domain_node(item, checks) }
       when Hash
         return node if node[:native_routed]
-        routed = node.transform_values { |value| route_domains(value) }
+        routed = node.transform_values { |value| route_domain_node(value, checks) }
         kind, database = routed[:kind], routed[:database]
         if database
-          unless %w[main temp].include?(database) || @attachments.key?(database)
-            raise Error.new('42P01', "database #{database} is not attached")
-          end
           name_key = routed[:table].is_a?(String) ? :table : :name
           local_name = routed[name_key]
+          relation = !%i[create_table create_view].include?(kind) && local_name &&
+                     %w[main temp].include?(database) && !introspection_relation?(local_name)
+          validate_domain_qualification(database, local_name, relation)
+          checks << [database, local_name, relation]
           if kind == :create_table || kind == :create_view
             if routed[:temporary] && database != 'temp'
               raise Error.new('42601', 'TEMP conflicts with the database qualifier')
             end
             routed[:temporary] = true if database == 'temp'
-          elsif local_name && %w[main temp].include?(database) && !introspection_relation?(local_name)
-            object = @tables[local_name] || @views[local_name]
-            if object && !!object[:temporary] != (database == 'temp')
-              raise Error.new('42P01', "relation #{database}.#{local_name} does not exist")
-            end
           end
           unless %w[main temp].include?(database) || introspection_relation?(local_name)
             routed[:native_database], routed[:native_local_name] = database, local_name
@@ -280,14 +306,9 @@ module JedNative
       kind = statement[:kind]
       return unless kind.to_s.start_with?('create_', 'alter_', 'drop_') || %i[insert update delete truncate analyze reindex].include?(kind)
       domain = statement[:native_database]
-      unless temporary_statement?(statement)
-        durable = domain ? @attachments.dig(domain, :storage) : @storage
-        if durable
-          writer = domain || 'main'
-          raise Error.new('0A000', 'a transaction may modify at most one durable database') if @durable_writer && @durable_writer != writer
-          @durable_writer = writer
-        end
-      end
+      # Persistence checks the actual changed domains together at commit,
+      # before any file is written. Merely visiting a domain (including zero-
+      # row DML) must not reserve the durable writer slot.
       return unless domain
       attachment = @attachments.fetch(domain)
       raise Error.new('25006', 'attachment is read-only') if attachment[:read_only]

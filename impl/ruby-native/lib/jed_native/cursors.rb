@@ -20,6 +20,28 @@ module JedNative
   end
 
   module CursorExecution
+    def cursor_metadata(statement)
+      ast = route_domains(statement)
+      schema = parameter_binding_schema
+      context = [@environment, timezone, default_collation]
+      @native_cursor_metadata ||= {}.compare_by_identity
+      entry = @native_cursor_metadata[ast]
+      unless entry && entry[0] == schema && entry[1] == context
+        binding = ParameterBindings.new(self, ast)
+        binding.resolve
+        previous = @native_binding_types
+        begin
+          @native_binding_types = binding.types
+          columns = query_metadata(ast)[:columns]
+        ensure
+          @native_binding_types = previous
+        end
+        @native_cursor_metadata.shift if @native_cursor_metadata.length >= 64
+        entry = @native_cursor_metadata[ast] = [schema, context, binding, columns]
+      end
+      [ast, entry[2], entry[3]]
+    end
+
     def select(statement)
       @cursor_select_depth = (@cursor_select_depth || 0) + 1 if @native_cursor
       super
@@ -33,7 +55,7 @@ module JedNative
       @native_cursor.accept_row(row, columns)
     end
     def cacheable_select?(statement)
-      return false if cursor_output?
+      return false if cursor_output? && (!(statement[:from] || []).empty? || !(statement[:order_by] || []).empty?)
       super
     end
     def streaming_select_shape?(statement)
@@ -57,17 +79,28 @@ module JedNative
     include Enumerable
     attr_reader :columns, :column_types
     alias column_names columns
+    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_cte_validation @native_window_shapes].freeze
+    REPLACED_STATE = (SharedDatabase::CATALOGS + %i[@native_binding_plans @savepoints]).freeze
 
     def initialize(session, statement, params)
       @session, @database = session, session.database
+      ast, binding, metadata = session.engine.cursor_metadata(statement.ast)
+      raise Error.new('42601', 'bind parameter count mismatch') unless params.length == binding.count
+      binding.bind(params) unless binding.count.zero?
+      SHARED_CACHES.each do |name|
+        session.engine.instance_variable_set(name, {}.compare_by_identity) unless session.engine.instance_variable_defined?(name)
+      end
       @engine = session.engine.dup
       @engine.instance_variables.each do |name|
+        next if SHARED_CACHES.include?(name) || REPLACED_STATE.include?(name)
         value = @engine.instance_variable_get(name)
         @engine.instance_variable_set(name, value.dup) if value.is_a?(Hash) || value.is_a?(Array)
       end
       SharedDatabase::CATALOGS.each do |name|
         values = session.engine.instance_variable_get(name)
-        @engine.instance_variable_set(name, name == :@types ? values.dup : values.transform_values(&:dup))
+        # Reads never mutate published table/view descriptors. Their containers
+        # remain private, while unchanged descriptors retain plan identity.
+        @engine.instance_variable_set(name, name == :@sequences ? values.transform_values(&:dup) : values.dup)
       end
       @engine.instance_variable_set(:@transaction, nil)
       @engine.instance_variable_set(:@savepoints, [])
@@ -78,24 +111,19 @@ module JedNative
       @engine.instance_variable_set(:@cost, 0)
       @engine.instance_variable_set(:@native_cursor_emitted, false)
       @engine.instance_variable_set(:@cursor_select_depth, 0)
-      ast = @engine.send(:route_domains, statement.ast)
-      binding = ParameterBindings.new(@engine, ast)
-      binding.resolve
-      raise Error.new('42601', 'bind parameter count mismatch') unless params.length == binding.count
-      binding.bind(params) unless binding.count.zero?
-      @engine.instance_variable_set(:@native_binding_types, binding.types)
-      metadata = @engine.query_metadata(ast)[:columns]
-      @engine.instance_variable_set(:@native_binding_types, nil)
+      binding = binding.dup
+      binding.instance_variable_set(:@engine, @engine)
+      @engine.instance_variable_set(:@native_binding_plans, { ast => [@engine.parameter_binding_schema, binding] }.compare_by_identity)
       @columns = metadata.map { |column| column[:name].dup }
       @column_types = metadata.map { |column| column[:type].dup }
-      @engine.send(:authorize_node, ast, {}, true, [])
+      @engine.send(:authorize_node, ast, {}, true, []) unless @engine.unrestricted_capabilities?
       @closed, @collecting, @cached_rows = false, false, nil
       @block_bound = session.engine.transaction_open?
       @database.shared_cursor_pin(self, session)
       session.register_cursor(self)
       @fiber = Fiber.new do
         begin
-          result = @engine.run(statement.ast, params)
+          result = @engine.run(ast, params)
           unless @engine.instance_variable_get(:@native_cursor_emitted)
             result.rows.each { |row| accept_row(row, result.columns.zip(result.column_types).map { |name, type| { name: name, type: type } }) }
           end
@@ -115,16 +143,19 @@ module JedNative
     def collecting? = @collecting
     def block_bound? = @block_bound
     def closed? = @closed
-    def cost = @engine.cost
+    def cost = @engine ? @engine.cost : @final_cost
     def rows_affected = nil
     def accept_row(row, columns)
       if @collecting && @engine.instance_variable_get(:@query_memory)
         @collection_owner ||= @engine.query_memory_owner
         @engine.query_memory_add_row(@collection_owner, row, columns)
       end
-      @columns = columns.map { |column| column[:name].dup }
-      @column_types = columns.map { |column| column[:type].dup }
-      Fiber.yield(Row.new(row.map { |value| HostValues.copy(value) }, @columns))
+      unless @row_names
+        @row_names = columns.map { |column| column[:name].dup.freeze }.freeze
+        @columns = @row_names.map(&:dup)
+        @column_types = columns.map { |column| column[:type].dup }
+      end
+      Fiber.yield(Row.new(row.map { |value| HostValues.copy(value) }, @row_names))
     end
     def next
       raise StopIteration if @closed
@@ -133,7 +164,7 @@ module JedNative
       raise StopIteration unless row
       row
     rescue Exception
-      finish unless @fiber.alive?
+      finish unless @fiber&.alive?
       raise
     end
     def each
@@ -164,9 +195,19 @@ module JedNative
     def finish
       return if @closed
       @closed = true
-      @database.shared_unpin(self)
-      @session.unregister_cursor(self)
-      @session.close if @owns_session
+      @final_cost = @engine.cost
+      begin
+        @database.shared_unpin(self)
+      ensure
+        @session.unregister_cursor(self)
+        @session.close if @owns_session
+      end
+    ensure
+      if @closed
+        # Collected rows and their metadata belong to the caller. Keeping that
+        # result must not retain a closed cursor's old catalog/pager generation.
+        @engine = @fiber = @session = @database = nil
+      end
     end
   end
 

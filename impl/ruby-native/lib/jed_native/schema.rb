@@ -18,7 +18,10 @@ module JedNative
       scanned = false
       scan = lambda do
         unless scanned
-          charge(1 + original[:rows].length) unless original[:rows].empty?
+          unless original[:rows].empty?
+            charge(full_scan_pages(original) + original[:rows].length)
+            charge_scan_payload(original, nil, (0...original[:columns].length).to_a)
+          end
           scanned = true
         end
       end
@@ -63,6 +66,9 @@ module JedNative
         raise Error.new('42704', 'constraint does not exist') unless constraint
         raise Error.new('42710', 'constraint already exists') if t[:constraints].any? { |item| item[:name] == stmt[:new_name] }
         constraint[:name] = stmt[:new_name]
+        if %i[unique exclude].include?(constraint[:kind])
+          t[:indexes].each { |index| index[:name] = stmt[:new_name] if index[:name] == stmt[:column] }
+        end
       else
         (stmt[:actions] || []).each do |action|
           case action[:kind]
@@ -204,6 +210,9 @@ module JedNative
       validate_alter_constraints(t, constraints)
       if retype || rekey
         t[:indexes].each do |index|
+          # Imported UNIQUE constraints retain their backing index for paging.
+          # Their keys were checked above, just as for an in-memory constraint.
+          next if t[:constraints].any? { |constraint| constraint[:kind] == :unique && constraint[:name] == index[:name] }
           charge(1 + t[:rows].length) unless t[:rows].empty?
           columns = table_columns(t)
           expressions = (index[:elements] || []).map { |element| compile(element[:expr], columns) }

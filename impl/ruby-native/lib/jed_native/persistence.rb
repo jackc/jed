@@ -327,7 +327,7 @@ module JedNative
       result[:host_deps] = index[:host_deps] if index[:host_deps]
       if index[:where]
         reject_stateful_index(index[:where])
-        predicate = compile(index[:where], scope)
+        predicate = compile_filter(index[:where], scope)
         result[:predicate] = catalog_expression(index[:where])
         result[:where] = ->(row) { unmetered_storage_evaluate(predicate, table, row, 'boolean') == true }
       end
@@ -386,7 +386,8 @@ module JedNative
         end
         constraints = []
         unless stored[:pk].empty?
-          constraints << { kind: :primary_key, columns: stored[:pk].map { |index| columns[index][:name] } }
+          constraints << { kind: :primary_key, name: object_name(stored[:name], '', 'pkey'),
+                           columns: stored[:pk].map { |index| columns[index][:name] } }
         end
         stored[:checks].each do |check|
           constraints << { kind: :check, name: check[:name], storage_check: check,
@@ -452,7 +453,7 @@ module JedNative
       modifier = if column[:precision]
                    { precision: column[:precision], scale: column[:scale] }
                  elsif column[:varchar_len]
-                   { precision: column[:varchar_len] }
+                   { precision: column[:varchar_len], scale: nil }
                  elsif column[:temporal]
                    temporal = column[:temporal]
                    fields = temporal[:fields]

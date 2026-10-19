@@ -9,13 +9,24 @@ require_relative "free_list_plan"
 
 module JedNative
   # Experimental local-file host. It owns protocol-v2's crash-clean exclusive
-  # lock and writes the shared v49 format. It does not serve page clients.
+  # lock or accesses the owner through ServiceStorage, using the shared format.
   # Commits encode dirty B+tree paths, preserve clean pages, and reclaim obsolete
   # generations under the validated-COW manifest protection contract.
   class Storage
     OPEN_PATHS = {}
-    PATH_MUTEX = Mutex.new
+    @registry_pid = Process.pid
+    @path_mutex = Mutex.new
     PAGE_SIZES = (8..16).map { |exponent| 1 << exponent }.freeze
+
+    def self.path_mutex
+      if @registry_pid != Process.pid
+        inherited = OPEN_PATHS.values
+        OPEN_PATHS.clear
+        @registry_pid, @path_mutex = Process.pid, Mutex.new
+        inherited.each { |storage| storage.send(:discard_inherited) }
+      end
+      @path_mutex
+    end
 
     attr_reader :path, :page_size, :meta
     attr_writer :reader_watermark_provider
@@ -29,7 +40,7 @@ module JedNative
       @codec.instance_variable_set(:@collation_key, provider)
     end
 
-    def initialize(path:, create: false, page_size: 8192, locking: :exclusive,
+    def initialize(path:, create: false, page_size: 8192, locking: :auto,
                    file_lock_timeout_ms: 5000, fsync: true, synchronous: :on, read_only: false,
                    max_storage_bytes: 0, cache_bytes: FileImage::DEFAULT_CACHE_BYTES, collation_key: nil, expression: nil)
       @codec = FileFormat.new(collation_key: collation_key, expression: expression)
@@ -92,7 +103,7 @@ module JedNative
       @meta = @snapshot.fetch(:meta)
       @free_generation = @meta[:txid]
       @free_pages = @snapshot.fetch(:free_pages)
-      @live_at_compaction = @meta[:page_count] - @free_pages.length
+      @live_at_compaction = create ? 0 : @meta[:page_count] - @free_pages.length
       @needs_stabilization = !create
       @needs_directory_sync = !create
       initialize_service_owner if @locking == :auto
@@ -176,6 +187,7 @@ module JedNative
           end
         rescue SystemCallError, IOError => error
           @poisoned = true
+          @service_owner&.close
           raise Error.new("58030", error.message)
         end
         @meta = { txid: txid, root_page: root, page_count: pages.page_count,
@@ -183,7 +195,7 @@ module JedNative
         @page_ids = plan.adopt
         @overflow_ids = plan.overflow_ids
         @free_pages, @live_at_compaction = free_plan.free, free_plan.live_at_compaction
-        @free_generation = txid
+        @free_generation = txid if free_plan.compacted
         @image.invalidate(pages.pages.keys)
         overlay.publish
         @snapshot = prepared_snapshot.merge(meta: @meta, free_pages: @free_pages)
@@ -209,10 +221,15 @@ module JedNative
       return if @closed
 
       ensure_pid
-      flush unless @poisoned
+      begin
+        flush unless @poisoned
+      rescue Error => error
+        failure = error
+      end
       @closed = true
       poisoned = @poisoned
       release_resources
+      raise failure if failure
       raise Error.new("58030", "storage handle failed; reopen through recovery") if poisoned
     end
 
@@ -232,6 +249,7 @@ module JedNative
       @file.truncate(@meta[:page_count] * @page_size) if shrink && @file.size > @meta[:page_count] * @page_size
     rescue SystemCallError, IOError => error
       @poisoned = true
+      @service_owner&.close
       raise Error.new('58030', error.message)
     end
 
@@ -242,12 +260,22 @@ module JedNative
       reader.instance_variable_set(:@ctypes, snapshot.fetch(:types, []).to_h { |type| [type[:name], type[:fields]] })
       pool = LeafPool.new(reader, image, @page_size, image.cache_pages)
       previous = @snapshot.fetch(:tables, []).to_h { |table| [table[:name], table] }
+      physical = snapshot.fetch(:tables, []).to_h { |table| [table[:name], table[:physical_tree]] }
+      gist_trees = snapshot.fetch(:tables, []).to_h do |table|
+        [table[:name], table.fetch(:indexes, []).select { |index| index.key?(:physical_gist) }.to_h { |index| [index[:name], index[:physical_gist]] }]
+      end
       tables = plan.table_catalog.map do |entry|
         old = previous[entry[:name]]
         rows = if old && old[:root_data_page] == entry[:root_data_page] && old[:columns] == entry[:columns] && old[:rows].is_a?(PagedRows)
                  old[:rows]
                else
-                 PagedRows.new(pool, entry[:root_data_page], entry[:columns], entry[:row_count])
+                 tree = physical[entry[:name]]
+                 if tree && tree[:children].empty?
+                   leaf = ResidentLeaf.new(pool, entry[:root_data_page], entry[:columns], tree[:recs])
+                   PagedRows.new(pool, 0, entry[:columns], entry[:row_count], tree: leaf)
+                 else
+                   PagedRows.new(pool, entry[:root_data_page], entry[:columns], entry[:row_count])
+                 end
                end
         entry[:indexes].each do |index|
           prior = old && old[:indexes].find { |item| item[:name] == index[:name] && item[:root_page] == index[:root_page] }
@@ -255,7 +283,11 @@ module JedNative
             index[:tree_profile], index[:gist_profile] = prior.values_at(:tree_profile, :gist_profile)
           elsif index[:kind] == 'gist'
             operations = index[:cols].all? { |column| column.is_a?(Integer) } ? reader.gist_opclasses_for(entry, index) : nil
-            index[:gist_profile] = reader.read_gist_tree(image, @page_size, index[:root_page], operations)
+            index[:gist_profile] = if gist_trees[entry[:name]].key?(index[:name])
+              plan.published_gist(gist_trees[entry[:name]][index[:name]], operations)
+            else
+              reader.read_gist_tree(image, @page_size, index[:root_page], operations)
+            end
           else
             index[:tree_profile] = PagedRows.new(pool, index[:root_page], [], nil).profile
           end
@@ -374,7 +406,7 @@ module JedNative
     end
 
     def claim_path
-      PATH_MUTEX.synchronize do
+      Storage.path_mutex.synchronize do
         raise Error.new("55006", "database is already open in this process") if OPEN_PATHS[@path]
 
         OPEN_PATHS[@path] = self
@@ -459,8 +491,20 @@ module JedNative
       @arrival&.close unless @arrival&.closed?
       @presence&.close unless @presence&.closed?
       @owns_presence = false
-      PATH_MUTEX.synchronize { OPEN_PATHS.delete(@path) } if @claimed
+      Storage.path_mutex.synchronize { OPEN_PATHS.delete(@path) } if @claimed
       @claimed = false
+    end
+
+    # fork copies descriptors that refer to the parent's open-file descriptions.
+    # Closing only the child's copies preserves the parent's flock. Do not run
+    # ordinary shutdown, send service messages, unlock, or unlink owner paths.
+    def discard_inherited
+      @service_owner&.discard_inherited
+      @service_remote&.discard_inherited
+      [@file, @arrival, @presence].compact.each { |file| file.close unless file.closed? }
+      @service_owner = @service_remote = nil
+      @claimed = @owns_presence = false
+      @closed = true
     end
   end
 end

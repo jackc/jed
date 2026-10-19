@@ -14,10 +14,14 @@ module JedNative
       @connection.page_size = @page_size
       @connection.notice_handler = lambda do |notice|
         if notice[:kind] == 1 && notice[:connection_id] != @connection_id
-          @storage.instance_variable_set(:@service_pause_until, Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0)
+          @yield_preferred_other = true
         elsif notice[:kind] == 2
+          @yield_preferred_other = false
           @storage.instance_variable_set(:@service_pause_until, nil)
         end
+      end
+      @connection.failure_handler = lambda do
+        @storage.instance_variable_set(:@service_pause_until, Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0) if @yield_preferred_other
       end
       @incarnation, @txid = "\0".b * 16, 0
       @tokens, @counts = {}, {}
@@ -113,6 +117,11 @@ module JedNative
         name, reply = @connection.request(:read_pages, txid: txid, indices: indices)
         raise Error.new('08P01', 'expected pages') unless name == :pages && reply[:pages].length == indices.length
         reply[:pages]
+      rescue Error => error
+        # Reporting revocation consumes the owner's write transaction. Cleanup
+        # must not send the abort reserved for a still-open writer gate.
+        @write_txid, @pending_overlay = nil, nil if error.sqlstate == '25P03'
+        raise
       end
     end
 
@@ -142,10 +151,9 @@ module JedNative
     def commit(snapshot)
       raise Error.new('08006', 'client does not hold writer gate') unless @write_txid
       @storage.send(:ensure_open, write: true)
-      # The base pin protects clean dependencies while publication still uses
-      # its private newly written pages after the owner's acknowledgement.
-      @commit_token = Object.new
-      begin_read(@commit_token)
+      # The writer pin protects preparation. Publication uses already decoded
+      # routing metadata and private dirty pages, so it performs no page RPC
+      # after acknowledgement and needs no additional old-generation pin.
       base = @storage.meta
       allocator = PageAllocator.new(base[:page_count], @grant ? @storage.instance_variable_get(:@free_pages) : [])
       plan = CommitPlan.new(@codec, snapshot, @page_size, allocator,
@@ -171,12 +179,19 @@ module JedNative
       # Check the complete first frame before sending any part of a delta.
       PageServiceWire.encode(:commit_begin, 1, { txid: txid, meta: meta_bytes, manifest_pages: ordered_chain }, @page_size)
       @connection.request(:commit_begin, { txid: txid, meta: meta_bytes, manifest_pages: ordered_chain }, reply: false)
-      body = pages.pages.reject { |index, bytes| index < 2 || bytes.getbyte(0) == 8 }.sort_by(&:first)
+      body = pages.pages.keys.select { |index| index >= 2 && pages.pages.fetch(index).getbyte(0) != 8 }.sort
       batch = (PageServiceWire::MAX_FRAME - 9) / (@page_size + 4)
-      body.each_slice(batch) { |entries| @connection.request(:commit_pages, { pages: entries }, reply: false) }
+      body.each_slice(batch) do |indices|
+        entries = indices.map { |index| [index, pages.pages.fetch(index)] }
+        @connection.request(:commit_pages, { pages: entries }, reply: false)
+      end
       begin
         name, reply = @connection.request(:commit_end)
       rescue Error => error
+        if error.sqlstate == '25P03'
+          @state_mutex.synchronize { @write_txid, @pending_overlay = nil, nil }
+          raise
+        end
         raise unless error.sqlstate == '08006'
         return @storage.send(:resolve_service_commit, txid, @codec.crc64(meta_bytes), @write_token)
       end
@@ -196,5 +211,6 @@ module JedNative
       meta
     end
     def close = @connection.close
+    def discard_inherited = @connection.discard_inherited
   end
 end

@@ -87,7 +87,7 @@ module JedNative
       expression
     end
 
-    def join_index_relation(plan, left, row)
+    def join_index_relation(plan, left, row, spool: nil)
       correlated(left.columns, row) do
         scan_start = @cost if plan[:scan_profile]
         rows = join_empty_bound?(plan) ? [] : execute_scan_access(plan[:stored], plan[:predicate], plan[:access])
@@ -96,14 +96,27 @@ module JedNative
           charge_scan_payload(plan[:stored])
           rows = plan[:stored][:native_primary_entries].map { |_, index| plan[:stored][:rows][index] }
         end
+        if spool
+          rows.each { |candidate| spool.push(candidate.to_a) }
+          rows = spool
+        elsif rows.is_a?(Enumerator)
+          rows = rows.to_a
+        end
         charge(rows.length)
         plan[:scan_profile].actual += @cost - scan_start if scan_start
         filter_start = @cost if plan[:filter_profile]
-        rows = rows.select { |candidate| evaluate(plan[:filter], candidate) == true } if plan[:filter]
+        if block_given?
+          rows.each do |candidate|
+            yield candidate if !plan[:filter] || evaluate(plan[:filter], candidate) == true
+          end
+        elsif plan[:filter]
+          rows = rows.select { |candidate| evaluate(plan[:filter], candidate) == true }
+        end
         if filter_start
           start = plan[:filter_profile].equal?(plan[:scan_profile]) ? filter_start : scan_start
           plan[:filter_profile].actual += @cost - start
         end
+        next if block_given?
         relation = Relation.new(columns: plan[:columns], rows: rows)
         query_memory_relation(relation, mask: query_memory_mask(relation.columns)) if @query_memory
         relation

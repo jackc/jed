@@ -109,17 +109,32 @@ module JedNative
 
     def initialize(**options)
       @session_defaults = options.dup
+      @session_setting_overrides = {}
       @shared_mutex, @writer_condition = Mutex.new, ConditionVariable.new
       @sessions, @pins = {}, {}
       @writer = nil
       @logical_version = @publication_generation = 0
       @database_closed = false
       super
+      @session_defaults[:default_privileges] = @engine.default_privileges.dup.freeze if options.key?(:default_privileges)
     end
 
     def session(**options)
-      shared_open!
-      Session.new(self, **@session_defaults.merge(options))
+      defaults, overrides, grants, revokes = @shared_mutex.synchronize do
+        shared_open!
+        [@session_defaults.merge(options),
+         @session_setting_overrides.reject { |name, _| options.key?(name == :timezone ? :time_zone : name) },
+         @engine.instance_variable_get(:@privilege_grants).transform_values(&:dup),
+         @engine.instance_variable_get(:@privilege_revokes).transform_values(&:dup)]
+      end
+      child = Session.new(self, **defaults)
+      overrides.each { |name, value| child.send(:configure_session_setting, name, value) }
+      child.engine.instance_variable_set(:@privilege_grants, grants)
+      child.engine.instance_variable_set(:@privilege_revokes, revokes)
+      child
+    rescue Exception
+      child&.close
+      raise
     end
     def read_session(**options) = session(**options, read_only: true, pinned: true)
     def write_session(**options)
@@ -136,6 +151,39 @@ module JedNative
     def execute_prepared(statement, *params) = with_session { |child| child.execute_prepared(statement, *params) }
     def execute_script(sql) = with_session { |child| child.execute_script(sql) }
     def upgrade_collations = with_session { |child| child.upgrade_collations }
+    def set_max_storage_bytes(bytes, database = 'main')
+      @shared_mutex.synchronize do
+        shared_open!
+        super
+      end
+    end
+    def storage_bytes(name = 'main')
+      name = String(name)
+      reader = read_session
+      @shared_mutex.synchronize do
+        shared_open!
+        attachment = @engine.instance_variable_get(:@attachments)[name] unless name == 'main'
+        raise Error.new('42704', 'database is not attached') unless name == 'main' || attachment
+        storage = attachment ? attachment[:storage] : @engine.instance_variable_get(:@storage)
+        if storage
+          storage.meta.fetch(:live) * storage.page_size
+        elsif (domain = @engine.instance_variable_get(:@memory_domains)[name])
+          domain.page_count * domain.page_size
+        else
+          # Empty memory domains are allocated lazily, but logically already
+          # contain both meta slots and the empty catalog page.
+          3 * (name == 'main' ? page_size : 8192)
+        end
+      end
+    ensure
+      reader&.close
+    end
+    def to_image(page_size: self.page_size, txid: 0)
+      reader = read_session
+      image_from_engine(reader.engine, page_size, txid)
+    ensure
+      reader&.close
+    end
     def transaction(&block) = with_session { |child| child.transaction(&block) }
     def view(&block) = with_session { |child| child.view(&block) }
     def update(&block) = with_session { |child| child.update(&block) }
@@ -168,20 +216,25 @@ module JedNative
       @shared_mutex.synchronize do
         shared_open!
         destination = child.engine
-        CATALOGS.each do |name|
-          previous = destination.instance_variable_get(name) || {}
-          temporary = previous.select { |_, value| value.is_a?(Hash) && value[:temporary] }
-          shared = @engine.instance_variable_get(name)
-          copy = name == :@types ? shared.dup : shared.transform_values(&:dup)
-          destination.instance_variable_set(name, copy.merge(temporary))
+        # Catalog copies are private to a session, but stay valid until a local
+        # or foreign publication changes. Preserving their identity lets resolved
+        # plans and index metadata survive repeated reads of the same roots.
+        if child.instance_variable_get(:@captured_generation) != @publication_generation
+          CATALOGS.each do |name|
+            previous = destination.instance_variable_get(name) || {}
+            temporary = previous.select { |_, value| value.is_a?(Hash) && value[:temporary] }
+            shared = @engine.instance_variable_get(name)
+            copy = name == :@types ? shared.dup : shared.transform_values(&:dup)
+            destination.instance_variable_set(name, copy.merge(temporary))
+          end
+          attachments = @engine.instance_variable_get(:@attachments).transform_values(&:dup)
+          destination.instance_variable_set(:@attachments, attachments)
         end
         STORAGE.each { |name| destination.instance_variable_set(name, @engine.instance_variable_get(name)) }
         domains = @engine.instance_variable_get(:@memory_domains).dup
         own_temp = destination.instance_variable_get(:@memory_domains)['temp']
         domains['temp'] = own_temp if own_temp
         destination.instance_variable_set(:@memory_domains, domains)
-        attachments = @engine.instance_variable_get(:@attachments).transform_values(&:dup)
-        destination.instance_variable_set(:@attachments, attachments)
         destination.instance_variable_set(:@dirty, false)
         child.instance_variable_set(:@captured_generation, @publication_generation)
         @pins[child.object_id] = [@logical_version, shared_file_txid] if pin
@@ -245,13 +298,17 @@ module JedNative
     def attach(name, source = :memory, mode = :read_write, **options)
       @shared_mutex.synchronize do
         raise Error.new('55006', 'attachment change while sessions are pinned') unless @pins.empty? && @writer.nil?
-        super
+        result = super
+        @publication_generation += 1
+        result
       end
     end
     def detach(name)
       @shared_mutex.synchronize do
         raise Error.new('55006', 'attachment is in use') unless @pins.empty? && @writer.nil?
-        super
+        result = super
+        @publication_generation += 1
+        result
       end
     end
     def close
@@ -263,6 +320,28 @@ module JedNative
       end
       super
     end
+
+    private
+
+    def configure_session_setting(name, value)
+      @shared_mutex.synchronize do
+        shared_open!
+        applied = apply_session_setting(name, value)
+        applied = applied.dup.freeze if applied.is_a?(Array) || applied.is_a?(String)
+        @session_defaults[name == :timezone ? :time_zone : name] = applied
+        # Constructor work_mem: 0 means default; the setter's 0 means unlimited.
+        # Apply explicit setters after construction to preserve that distinction.
+        @session_setting_overrides[name] = applied
+        applied
+      end
+    end
+
+    def configure_privileges(operation, *arguments)
+      @shared_mutex.synchronize do
+        shared_open!
+        super
+      end
+    end
   end
 
   class Session < Database
@@ -270,7 +349,7 @@ module JedNative
     attr_accessor :lock_timeout_ms
 
     def initialize(database, read_only: false, pinned: false, lock_timeout_ms: 0, time_zone: nil, **options)
-      @database, @session_read_only, @pinned = database, read_only, pinned
+      @database, @session_read_only, @pinned = database, read_only || database.read_only?, pinned
       @lock_timeout_ms, @session_closed, @gate = lock_timeout_ms, false, false
       # Database initialization is intentionally bypassed: a session is not a
       # second owner of storage or of a writer gate.
@@ -281,10 +360,30 @@ module JedNative
       @engine.instance_variable_set(:@read_only, true) if @session_read_only
     end
     def pinned? = @pinned
+    def read_only? = @session_read_only
+    def lifetime_cost = @engine.lifetime_cost
     def status = @engine.instance_variable_get(:@failed) ? :failed : (@engine.transaction_open? ? :open : :idle)
     def set_var(name, value) = @engine.set_var(name, value)
     def reset_var(name) = @engine.reset_var(name)
     def var(name) = @engine.var(name)
+    def set_max_storage_bytes(bytes, database = 'main')
+      raise Error.new('55000', 'session is closed') if @session_closed
+      @database.set_max_storage_bytes(bytes, database)
+    end
+    def storage_bytes(name = 'main')
+      raise Error.new('55000', 'session is closed') if @session_closed
+      @database.storage_bytes(name)
+    end
+    def to_image(page_size: self.page_size, txid: 0)
+      raise Error.new('55000', 'session is closed') if @session_closed
+      @database.shared_open!
+      return @database.to_image(page_size: page_size, txid: txid) unless @pinned || @engine.transaction_open?
+      # A transaction's working set is private. Serialize the committed view
+      # captured at BEGIN, leaving pending rows, DDL, and temporary state out.
+      snapshot = @engine.dup
+      snapshot.restore(@engine.instance_variable_get(:@transaction)) if @engine.transaction_open?
+      image_from_engine(snapshot, page_size, txid)
+    end
     def begin(writable = nil)
       query(writable.nil? ? 'BEGIN' : writable ? 'BEGIN READ WRITE' : 'BEGIN READ ONLY')
       self
@@ -303,6 +402,10 @@ module JedNative
       @database.shared_open!
       ast, was_open = statement.ast, @engine.transaction_open?
       kind = ast[:kind]
+      if @session_read_only && kind == :begin && !was_open
+        raise Error.new('25006', 'read-only session') if ast[:mode] == :read_write
+        ast = ast.merge(mode: :read_only, read_only: true)
+      end
       writing = statement_writes?(ast)
       if @session_read_only && writing && !@engine.temporary_statement?(ast)
         raise Error.new('25006', 'read-only session')
@@ -323,6 +426,7 @@ module JedNative
         end
       end
       @engine.instance_variable_set(:@read_only, true) if @session_read_only
+      @engine.instance_variable_set(:@read_only, false) if @session_read_only && kind == :begin && !was_open
       result = @engine.run(ast, params.map { |value| HostValues.copy(value) }).detach
       if !@engine.transaction_open?
         @database.shared_publish(self) if @gate && kind != :rollback
@@ -414,11 +518,32 @@ module JedNative
     end
     def close
       return if @session_closed
-      @engine.run(kind: :rollback) if @engine.transaction_open?
-      @session_closed = true
-      @engine.instance_variable_set(:@closed, true)
-      @database.shared_forget(self)
+      # Cleanup cannot consume a spent session allowance or keep its writer
+      # gate held merely because SQL admission is now closed. ROLLBACK itself
+      # is unmetered and never refunds the work already performed.
+      budget = @engine.lifetime_max_cost
+      begin
+        @engine.lifetime_max_cost = 0
+        @engine.run(kind: :rollback) if @engine.transaction_open?
+      ensure
+        @engine.lifetime_max_cost = budget
+        @session_closed = true
+        @engine.instance_variable_set(:@closed, true)
+        @database.shared_forget(self)
+      end
       nil
+    end
+
+    private
+
+    def configure_session_setting(name, value)
+      raise Error.new('55000', 'session is closed') if @session_closed
+      apply_session_setting(name, value)
+    end
+
+    def configure_privileges(operation, *arguments)
+      raise Error.new('55000', 'session is closed') if @session_closed
+      @engine.public_send(operation, *arguments)
     end
   end
   Database.prepend(SharedDatabase)

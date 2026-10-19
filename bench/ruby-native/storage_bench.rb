@@ -16,6 +16,7 @@ root = File.expand_path('../..', __dir__)
 phase = ENV.fetch('RUBY_NATIVE_PHASE', 'baseline')
 raise 'invalid phase name' unless phase.match?(/\A[a-zA-Z0-9_-]+\z/)
 source = NativeRubySource.resolve(root, phase: phase)
+source_hash = NativeRubySource.digest(source)
 require File.join(source, 'lib/jed_native/storage')
 
 repetitions = 5
@@ -38,7 +39,7 @@ parent = File.join(root, '.dev/ruby-native-storage-bench')
 FileUtils.mkdir_p(parent)
 [1, 100].each do |count|
   Dir.mktmpdir('durable-', parent) do |dir|
-    storage = JedNative::Storage.new(path: File.join(dir, 'test.jed'), create: true)
+    storage = JedNative::Storage.new(path: File.join(dir, 'test.jed'), create: true, locking: :exclusive)
     columns = [codec.col('id', 'i32', pk: true), codec.col('v', 'text')]
     rows = Array.new(count) { |i| [i, "value-#{i}"] }
     state = { tables: [{ name: 't', columns: columns, rows: rows }] }
@@ -59,7 +60,7 @@ FileUtils.mkdir_p(parent)
     path = storage.path
     metadata = storage.meta.dup
     storage.close
-    reopened = JedNative::Storage.new(path: path)
+    reopened = JedNative::Storage.new(path: path, locking: :exclusive)
     raise 'durable benchmark rows did not survive reopen' unless reopened.load[:tables].first[:rows] == rows
     reopened.close
     results["durable_full_snapshot_#{count}_rows"] = { iterations: iterations, samples_ns: samples,
@@ -70,10 +71,15 @@ end
 
 filesystem, = Open3.capture2('stat', '-f', '-c', '%T', parent)
 report = { schema: 1, phase: phase, created_at: Time.now.utc.iso8601, runtime: RUBY_DESCRIPTION,
-           platform: RUBY_PLATFORM, filesystem: filesystem.strip, repetitions: repetitions,
+           yjit: defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?,
+           zjit: defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled?,
+           platform: RUBY_PLATFORM, filesystem: filesystem.strip, locking: 'exclusive', repetitions: repetitions,
+           warmup: { checksum: 5, durable_snapshot: 3 },
            ruby_source: source,
-           ruby_source_sha256: NativeRubySource.digest(source),
+           ruby_source_sha256: source_hash,
+           ruby_source_sha256_after: NativeRubySource.digest(source),
            results: results }
+raise 'Ruby source changed during measurement' unless report[:ruby_source_sha256_after] == source_hash
 out = File.join(__dir__, 'results', "#{phase}-storage.json")
 FileUtils.mkdir_p(File.dirname(out))
 File.write(out, JSON.pretty_generate(report) + "\n")

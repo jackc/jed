@@ -26,8 +26,7 @@ module JedNative
       shape = { columns: table[:columns] }
       changes.each do |_, after, _, key|
         next unless after
-        values = after.each_with_index.map { |value, index| statistics_value(table[:columns][index][:type], value) }
-        forms, comps, size = codec.plan_record(shape, key, values, capacity)
+        values, forms, comps, size = storage_record_plan(table, key, after, codec, capacity)
         record = { key: key, row: values, table: shape, forms: forms, comps: comps, size: size }
         tree = pending_tree_put(codec, tree, key, record, capacity)
       end
@@ -127,7 +126,8 @@ module JedNative
       changes.each do |_, row, _, key|
         next unless row && metadata[:columns].none? { |column| row[column].nil? }
         next if metadata[:predicate] && evaluate(metadata[:predicate], row) != true
-        values = row.each_with_index.map { |value, column| statistics_value(table[:columns][column][:type], value) }
+        values = Array.new(table[:columns].length)
+        metadata[:columns].each { |column| values[column] = statistics_value(table[:columns][column][:type], row[column]) }
         entries << [codec.gist_leaf_bound(operations, values, metadata[:columns]), key]
       end
       tree = entries.empty? ? nil : codec.gist_build(operations, entries)

@@ -7,7 +7,9 @@ module JedNative
   # Other relational shapes continue through the general executor.
   module PreparedSelect
     Plan = Struct.new(:table, :source, :columns, :projections, :predicate, :orders,
-                      :parameters, :parameter_types, :lookup, :index, keyword_init: true)
+                      :parameters, :parameter_types, :lookup, :index, :context, keyword_init: true)
+    ReadPlan = Struct.new(:table, :scope, :projections, :expressions, :columns, :predicate,
+                          :parameters, :context, keyword_init: true)
     CACHE_ENTRIES = 64
     STATEFUL_FUNCTIONS = %w[nextval currval setval lastval current_setting now
                             current_date current_time localtime localtimestamp
@@ -30,9 +32,8 @@ module JedNative
                                     native_primary_ordinal: ordinal, native_primary_index: index,
                                     native_primary_sorted: index && index.sort_by(&:first).freeze)
       end
-      @native_select_plans&.delete_if do |_statement, plan|
-        plan.source && !@tables[plan.source[:name]].equal?(plan.table)
-      end
+      # PagedAccess validates plans after restoring both resident and paged
+      # tables; paged tables are temporarily absent during this method.
     end
 
     # A resolved integer primary-key bound is safe to test before reading any
@@ -91,11 +92,13 @@ module JedNative
       return super unless cacheable_select?(statement)
       source = statement[:from]&.first
       stored = source && table(source[:name])
-      types = @params.map { |value| Types.infer(value) }
+      types = @native_binding_types || @params.map { |value| Types.infer(value) }
+      context = [@types, @environment, timezone, default_collation]
       @native_select_plans ||= {}.compare_by_identity
       plan = @native_select_plans[statement]
-      unless plan && plan.table.equal?(stored) && plan.parameter_types == types
+      unless plan && plan.table.equal?(stored) && plan.parameter_types == types && plan.context == context
         plan = resolve_select_plan(statement, source, stored, types)
+        plan.context = context
         @native_select_plans.shift if @native_select_plans.length >= CACHE_ENTRIES
         @native_select_plans[statement] = plan
       end
@@ -148,7 +151,8 @@ module JedNative
         end
       end
       profile_checkpoint(:scan) if @explain_profile_frames
-      output, sort_keys = [], []
+      streaming = cursor_output?
+      output, sort_keys = cursor_output(plan.columns), []
       row_index = 0
       while row_index < input.length
         row = input[row_index]
@@ -164,6 +168,7 @@ module JedNative
           column_index += 1
         end
         query_memory_add_row(output_owner, values, plan.columns) if output_owner
+        charge if streaming
         output << values
         unless plan.orders.empty?
           sort_start = @cost if @explain_profile_frames
@@ -189,7 +194,7 @@ module JedNative
         end
         output = indices.map { |index| output[index] }
       end
-      charge(output.length)
+      charge(output.length) unless streaming
       profile_checkpoint(:root) if @explain_profile_frames
       result = Relation.new(columns: plan.columns, rows: output)
       query_memory_attach(result, output_owner) if output_owner
@@ -199,6 +204,41 @@ module JedNative
     end
 
     private
+
+    # Streaming and sorted readers share resolution, but still choose access
+    # paths for the current bindings on every execution. No subquery, outer
+    # scope, aggregate or clock-dependent expression is retained here.
+    def resolved_read_plan(statement, stored)
+      nodes = statement[:columns].map { |entry| entry[:expr] } + [statement[:where]] +
+              (statement[:order_by] || []).map { |entry| entry[:expr] }
+      reusable = @outer.empty? && @ctes.empty? && nodes.all? { |node| cacheable_expression?(node) }
+      context = [@types, @environment, timezone, default_collation, @native_binding_types]
+      @native_read_plans ||= {}.compare_by_identity
+      plan = reusable && @native_read_plans[statement]
+      unless plan && plan.table.equal?(stored) && plan.context == context
+        source = statement[:from].first
+        scope = table_columns(stored, source[:alias] || source[:name])
+        projections = expand_stars(statement[:columns], scope)
+        expressions = projections.map { |entry| compile(entry[:expr], scope) }
+        columns = projections.zip(expressions).map { |entry, expression| { name: entry[:alias] || expression_name(entry[:expr]), type: expression.type } }
+        predicate = compile_filter(statement[:where], scope)
+        parameters = []
+        visit = lambda do |expression|
+          return unless expression.is_a?(Expression)
+          parameters << expression if expression.kind == :param && expression.extra&.dig(:context_type)
+          (expression.args || []).each { |child| visit.call(child) }
+        end
+        (expressions + [predicate]).each { |expression| visit.call(expression) }
+        plan = ReadPlan.new(table: stored, scope: scope, projections: projections, expressions: expressions,
+                            columns: columns, predicate: predicate, parameters: parameters, context: context)
+        if reusable
+          @native_read_plans.shift if @native_read_plans.length >= CACHE_ENTRIES
+          @native_read_plans[statement] = plan
+        end
+      end
+      plan.parameters.each { |parameter| cast_value(@params[parameter.value], parameter.type) }
+      plan
+    end
 
     def cacheable_select?(statement)
       return false if @query_memory && !(statement[:order_by] || []).empty?

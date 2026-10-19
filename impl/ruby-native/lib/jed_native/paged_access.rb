@@ -4,6 +4,21 @@ require_relative 'key_reader'
 require_relative 'pending_rows'
 
 module JedNative
+  # Repeatable forward/reverse cursors avoid retaining one token per matched row.
+  class PagedScanOrdinals
+    include Enumerable
+    def initialize(&source) = (@source = source)
+    def each(&block)
+      return enum_for(:each) unless block
+      @source.call(false).each { |_, row| block.call(row) }
+    end
+    def reverse_each(&block)
+      return enum_for(:reverse_each) unless block
+      @source.call(true).each { |_, row| block.call(row) }
+    end
+    def length = count
+  end
+
   class PagedIntegerLookup
     def initialize(rows, codec, type)
       @rows, @codec, @bytes = rows, codec, Types::INTEGER_BITS.fetch(type) / 8
@@ -22,11 +37,13 @@ module JedNative
       @tables = resident
       super
       paged.each do |name, table|
-        signature = [table[:rows], table[:columns].object_id, table[:indexes].object_id, table[:constraints].object_id]
+        signature = [table[:rows].object_id, table[:columns].object_id, table[:indexes].object_id, table[:constraints].object_id]
         if table[:native_paged_signature] == signature
           @tables[name] = table
           next
         end
+        table = build_missing_paged_indexes(table)
+        signature[2] = table[:indexes].object_id
         rows = table[:rows]
         primary = table[:constraints].find { |constraint| constraint[:kind] == :primary_key }
         ordinals = primary ? primary[:columns].map { |column| table[:columns].index { |item| item[:name] == column } } : []
@@ -80,6 +97,7 @@ module JedNative
           native_auxiliary_indexes: auxiliary, native_auxiliary_codec: codec)
       end
       @native_select_plans&.delete_if { |_, plan| plan.source && !@tables[plan.source[:name]].equal?(plan.table) }
+      @native_read_plans&.delete_if { |_, plan| !@tables[plan.table[:name]].equal?(plan.table) }
     rescue StandardError
       @tables = resident.merge(paged) if defined?(resident) && resident
       raise
@@ -88,6 +106,12 @@ module JedNative
     def primary_scan_units(table, row_ordinals = nil, columns = nil)
       return super unless table[:rows].is_a?(PagedRows)
       table[:rows].scan_units(row_ordinals, columns)
+    end
+
+    def paged_scan_ordinals(table, index_name = nil, lower: nil, upper: nil)
+      PagedScanOrdinals.new do |reverse|
+        storage_scan_entries(table, index_name, lower: lower, upper: upper, reverse: reverse)
+      end
     end
 
     def storage_scan_entries(table, index_name = nil, lower: nil, upper: nil, reverse: false, charge_pages: false, prepaid_pages: 0)
@@ -146,7 +170,7 @@ module JedNative
       if statement[:kind] == :reindex
         reindex_targets(statement).each { |table, _| materialize_paged_table(table) }
       end
-      if %i[truncate alter_table create_index reindex analyze].include?(statement[:kind])
+      if %i[truncate alter_table reindex].include?(statement[:kind])
         table = @tables[statement[:table] || statement[:name]]
         original = table if table && table[:rows].is_a?(PagedRows) && %i[insert update delete].include?(statement[:kind])
         materialize_paged_table(table) if table
@@ -167,6 +191,52 @@ module JedNative
       changed[:storage_rows] = rows if table[:storage_rows].equal?(table[:rows])
       @tables[table[:name]] = changed
       refresh_primary_indexes
+    end
+
+    # CREATE INDEX owns new index keys, not copies of every table row and its
+    # primary record plan. The resulting tree also serves queries and later
+    # writes in the same transaction before it receives physical page numbers.
+    def build_missing_paged_indexes(table)
+      missing = table[:indexes].any? do |index|
+        !index[:unparsed] && !(index[:method] == 'gist' ? index[:storage_gist_profile] : index[:storage_tree_profile])
+      end
+      return table unless missing
+
+      rows = table[:rows]
+      raise Error.new('XX001', 'persisted row count does not match tree') unless rows.actual_count == rows.length
+      codec = statistics_codec
+      stored = { columns: table[:columns], rows: rows.raw || rows }
+      capacity = storage_page_size(table) - FileFormat::PAGE_HEADER
+      definitions = table[:indexes].to_h { |index| [index[:name], export_index(table, index)] }
+      indexes = table[:indexes].map do |index|
+        next index if index[:unparsed]
+        definition = definitions.fetch(index[:name])
+        if index[:method] == 'gist'
+          next index if index[:storage_gist_profile]
+          operations = codec.gist_opclasses_for(stored, definition)
+          entries = codec.table_entries(stored).filter_map do |key, row|
+            next if definition[:cols].any? { |column| row[column].nil? } || !codec.index_admits?(definition, row)
+            [codec.gist_leaf_bound(operations, row, definition[:cols]), key]
+          end
+          tree = entries.empty? ? nil : codec.gist_build(operations, entries)
+          count = height = 0
+          visit = lambda do |node, depth|
+            next unless node
+            count += 1
+            height = [height, depth].max
+            node[:children].each { |_, child| visit.call(child, depth + 1) } unless node[:leaf]
+          end
+          visit.call(tree, 1)
+          index.merge(storage_gist_profile: { tree: tree, node_count: count, height: height, opclasses: operations })
+        else
+          next index if index[:storage_tree_profile]
+          entries = index[:method] == 'gin' ? codec.gin_index_entries(stored, definition) : codec.index_entries(stored, definition)
+          tree = codec.build_tree(entries, capacity)
+          raw = PagedRows.new(rows.pool, 0, [], nil, tree: tree)
+          index.merge(storage_tree_profile: raw.profile)
+        end
+      end
+      table.merge(indexes: indexes)
     end
   end
   Engine.prepend(PagedAccess)

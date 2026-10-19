@@ -116,7 +116,7 @@ module JedNative
 
   class Database
     attr_reader :engine
-    attr_accessor :max_sql_length
+    attr_reader :max_sql_length
 
     def initialize(max_sql_length: 1_048_576, **options)
       @max_sql_length = max_sql_length
@@ -166,38 +166,100 @@ module JedNative
     def close = @engine.close
     def upgrade_collations = @engine.upgrade_collations
     def set_max_storage_bytes(bytes, database = 'main') = @engine.set_max_storage_bytes(bytes, database)
+    def max_storage_bytes = @engine.instance_variable_get(:@storage_limits).fetch('main', 0)
+    def max_storage_bytes=(bytes)
+      set_max_storage_bytes(bytes)
+    end
+    def max_temp_storage_bytes = @engine.max_temp_storage_bytes
     def max_temp_storage_bytes=(bytes)
-      @engine.max_temp_storage_bytes = bytes
+      configure_session_setting(:max_temp_storage_bytes, bytes)
+    end
+    def max_sql_length=(bytes)
+      configure_session_setting(:max_sql_length, bytes)
     end
     def render(value, type = nil) = @engine.render_value(value, type)
     def timezone = @engine.timezone
     def timezone=(name)
-      @engine.timezone = name
+      configure_session_setting(:timezone, name)
     end
     def attach(name, source = :memory, mode = :read_write, **options) = @engine.attach(name, source, mode, **options)
     def detach(name) = @engine.detach(name)
-    def grant(privileges, object) = @engine.grant(privileges, object)
-    def revoke(privileges, object) = @engine.revoke(privileges, object)
-    def reset_privileges = @engine.reset_privileges
+    def grant(privileges, object) = configure_privileges(:grant, privileges, object)
+    def revoke(privileges, object) = configure_privileges(:revoke, privileges, object)
+    def reset_privileges = configure_privileges(:reset_privileges)
+    def default_privileges = @engine.default_privileges.dup
     def default_privileges=(value)
-      @engine.default_privileges = value
+      configure_session_setting(:default_privileges, value)
     end
+    def allow_ddl = @engine.allow_ddl
     def allow_ddl=(value)
-      @engine.allow_ddl = value
+      configure_session_setting(:allow_ddl, value)
     end
+    def allow_temp_ddl = @engine.allow_temp_ddl
     def allow_temp_ddl=(value)
-      @engine.allow_temp_ddl = value
+      configure_session_setting(:allow_temp_ddl, value)
     end
+    def max_cost = @engine.max_cost
     def max_cost=(value)
-      @engine.max_cost = value
+      configure_session_setting(:max_cost, value)
     end
+    def lifetime_max_cost = @engine.lifetime_max_cost
+    def lifetime_max_cost=(value)
+      configure_session_setting(:lifetime_max_cost, value)
+    end
+    def max_scalar_bytes = @engine.max_scalar_bytes
+    def max_scalar_bytes=(value)
+      configure_session_setting(:max_scalar_bytes, value)
+    end
+    def max_query_memory_bytes = @engine.max_query_memory_bytes
     def max_query_memory_bytes=(value)
-      @engine.max_query_memory_bytes = value
+      configure_session_setting(:max_query_memory_bytes, value)
     end
+    def work_mem = @engine.work_mem
     def work_mem=(value)
-      @engine.work_mem = value
+      configure_session_setting(:work_mem, value)
     end
-    def set_work_mem(value) = (@engine.work_mem = value)
+    def set_work_mem(value) = configure_session_setting(:work_mem, value)
+
+    def path = @engine.instance_variable_get(:@storage)&.path&.dup
+    def page_size = @engine.instance_variable_get(:@storage)&.page_size || @engine.instance_variable_get(:@native_page_size)
+    def read_only? = !!@engine.instance_variable_get(:@storage)&.read_only?
+    def resident_leaves
+      if (storage = @engine.instance_variable_get(:@storage))
+        storage.instance_variable_get(:@image).decoded_leaf_cache.size
+      elsif (domain = @engine.instance_variable_get(:@memory_domains)['main'])
+        pages = domain.instance_variable_get(:@pages)
+        domain.instance_variable_get(:@live_pages).count { |page| pages[page]&.getbyte(0) == FileFormat::PAGE_LEAF }
+      else
+        0
+      end
+    end
+
+    private
+
+    def image_from_engine(engine, page_size, txid)
+      codec = engine.send(:statistics_codec)
+      raise Error.new('0A000', 'invalid page size') unless codec.valid_page_size?(page_size)
+      unless txid.is_a?(Integer) && txid.between?(0, 0xFFFF_FFFF_FFFF_FFFF)
+        raise Error.new('54000', 'transaction id overflow')
+      end
+      pages = PageBuffer.new(page_size, 3)
+      meta = PhysicalImage.new(codec, page_size).write(engine.export_storage, txid) do |page, bytes|
+        pages.resize(page + 1) if page >= pages.page_count
+        pages[page * page_size, page_size] = bytes
+      end
+      pages.resize(meta[:page_count])
+      pages.to_s
+    end
+
+    def apply_session_setting(name, value)
+      return @max_sql_length = value if name == :max_sql_length
+      @engine.public_send("#{name}=", value)
+      @engine.public_send(name)
+    end
+
+    def configure_session_setting(name, value) = apply_session_setting(name, value)
+    def configure_privileges(operation, *arguments) = @engine.public_send(operation, *arguments)
   end
 
   def self.memory(**options)
@@ -241,6 +303,7 @@ module JedNative
     storage_options = options.reject { |key, _| engine_options.key?(key) }
     db = Database.new(**engine_options)
     db.engine.attach_storage(path: path, create: create, **storage_options)
+    db.engine.set_max_storage_bytes(storage_options[:max_storage_bytes]) if storage_options.key?(:max_storage_bytes)
     return db unless block_given?
     begin
       yield db
@@ -260,5 +323,8 @@ require_relative 'jed_native/deep_stack'
 
 require_relative 'jed_native/paged_constraints'
 require_relative 'jed_native/storage_rewrite'
+require_relative 'jed_native/spill_semantics'
 
 require_relative 'jed_native/host_batches'
+require_relative 'jed_native/storage_operations'
+require_relative 'jed_native/fast_evaluation'

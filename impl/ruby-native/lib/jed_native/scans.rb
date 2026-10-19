@@ -165,7 +165,7 @@ module JedNative
       end
       entries = stored[:native_primary_entries]
       if stored[:rows].is_a?(PagedRows)
-        ordinals = storage_scan_entries(stored, lower: lower, upper: upper).map(&:last)
+        ordinals = paged_scan_ordinals(stored, lower: lower, upper: upper)
       else
         first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0
         last = upper ? entries.bsearch_index { |key, _| key >= upper } || entries.length : entries.length
@@ -245,7 +245,7 @@ module JedNative
         return [] if lower && upper && lower >= upper
         entries = indexes[name]
         if stored[:rows].is_a?(PagedRows)
-          selected = storage_scan_entries(stored, name, lower: lower, upper: upper).map(&:last)
+          selected = paged_scan_ordinals(stored, name, lower: lower, upper: upper)
           choices << [selected.length, name.b, name, nil, nil, lower, upper, selected]
         else
           first = lower ? entries.bsearch_index { |key, _| key >= lower } || entries.length : 0

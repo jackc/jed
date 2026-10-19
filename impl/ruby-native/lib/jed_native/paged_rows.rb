@@ -38,7 +38,7 @@ module JedNative
     attr_reader :codec, :image, :page_size
     def initialize(codec, image, page_size, limit)
       @codec, @image, @page_size = codec, image, page_size
-      @limit, @cache = [limit, 1].max, {}
+      @fallback_cache = DecodedLeafCache.new(limit) unless image.respond_to?(:decoded_leaf_cache)
     end
 
     def page(index)
@@ -51,23 +51,21 @@ module JedNative
 
     def leaf(index, columns)
       key = [index, columns]
-      value = @cache.delete(key)
-      unless value
+      decoded_cache.fetch(key) do
         raw = page(index)
         raise Error.new('XX001', 'expected a B-tree leaf') unless raw[:type] == FileFormat::PAGE_LEAF
         keys, regions = @codec.parse_pax_leaf(raw[:payload], raw[:item_count], columns)
         raise Error.new('XX001', 'leaf keys are not strictly ascending') unless keys.each_cons(2).all? { |a, b| a < b }
-        value = { keys: keys, regions: regions, count: raw[:item_count] }
-        @cache.shift if @cache.length >= @limit
+        { keys: keys, regions: regions, count: raw[:item_count] }
       end
-      @cache[key] = value
     rescue Error
       raise
     rescue StandardError => error
       raise Error.new('XX001', error.message)
     end
 
-    def cached_leaves = @cache.length
+    def decoded_cache = @fallback_cache || @image.decoded_leaf_cache
+    def cached_leaves = decoded_cache.size
   end
 
   class PagedLeaf
@@ -151,12 +149,26 @@ module JedNative
     end
 
     def records
-      codec, capacity = @pool.codec, @pool.page_size - FileFormat::PAGE_HEADER
+      codec = @pool.codec
       shape = { columns: @columns }
       self[:keys].each_with_index.map do |key, slot|
-        row = @columns.each_index.map { |column| value(slot, column) }
-        forms, comps, size = codec.plan_record(shape, key, row, capacity)
+        row = @columns.each_index.map { |column| storage_reference(slot, column) || value(slot, column) }
+        forms = row.map { |value| value.is_a?(StoredValue) ? value.form : :inline }
+        comps = row.map { |value| value.is_a?(StoredValue) ? value.compressed_block : nil }
+        size = key.bytesize + row.each_with_index.sum do |value, column|
+          codec.fixed_width(@columns[column][:type]) || (value.is_a?(StoredValue) ? value.stored_bytes.bytesize : 0)
+        end
         { key: key, row: row, table: shape, forms: forms, comps: comps, size: size }
+      end
+    end
+
+    def storage_reference(slot, column) = StoredValue.from_leaf(self, slot, column)
+    def null_at?(slot, column)
+      region = data[:regions].fetch(column)
+      if region[:width]
+        value(slot, column).nil?
+      else
+        region[:ends][slot] == (slot.zero? ? 0 : region[:ends][slot - 1])
       end
     end
   end
@@ -248,6 +260,8 @@ module JedNative
     def zip(*others, &block) = to_a.zip(*others, &block)
     def values_at(*indices) = indices.map { |index| self[index] }
     def storage_key = @storage_leaf[:keys][@storage_slot]
+    def storage_reference(column) = @storage_leaf.storage_reference(@storage_slot, column)
+    def null_at?(column) = @storage_leaf.null_at?(@storage_slot, column)
     def ==(other) = to_a == other.to_a
   end
 

@@ -234,6 +234,10 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
 - The isolated AEAD benchmark dependencies are approved (2026-10-17): RustCrypto aes-gcm and
   chacha20poly1305, Go x/crypto/chacha20poly1305, and TS @noble/ciphers, including their standard
   accelerated backends for measurement. This selects no production cipher or engine dependency.
+- The Ruby experiment has explicit maintainer approval for Ruby's OpenSSL binding
+  solely for vetted cryptographic digest functions. Its parser, planner, other
+  evaluation, and storage remain handwritten Ruby; no other native engine
+  dependency or Rust/WASM binding is authorized by this exception.
 - Bench modules are not cores, but new benchmark dependencies still require
   explicit confirmation.
 

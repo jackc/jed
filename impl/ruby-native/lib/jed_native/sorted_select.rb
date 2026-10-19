@@ -8,12 +8,10 @@ module JedNative
       return super unless sorted_select_shape?(statement)
       source = statement[:from].first
       stored = table(source[:name])
-      scope = table_columns(stored, source[:alias] || source[:name])
-      projections = expand_stars(statement[:columns], scope)
-      expressions = projections.map { |entry| compile(entry[:expr], scope) }
+      resolved = resolved_read_plan(statement, stored)
+      scope, projections, expressions, columns = resolved.scope, resolved.projections, resolved.expressions, resolved.columns
       return super if expressions.any? { |expression| aggregate_expr?(expression) }
-      columns = projections.zip(expressions).map { |entry, expression| { name: entry[:alias] || expression_name(entry[:expr]), type: expression.type } }
-      predicate = compile_filter(statement[:where], scope)
+      predicate = resolved.predicate
       access = scan_access_plan(stored, predicate, statement)
       return super unless access[:order] == :blocking
       orders = statement[:order_by]
@@ -47,7 +45,8 @@ module JedNative
       unless input
         charge(full_scan_pages(stored))
         charge_scan_payload(stored)
-        input = scan_rows(stored, stored[:native_primary_entries]&.map(&:last) || stored[:rows].each_index.to_a)
+        ordinals = stored[:native_primary_entries]&.lazy&.map(&:last) || stored[:rows].each_index
+        input = scan_rows(stored, ordinals)
       end
       profile_accumulate(:scan, @cost - scan_start) if @explain_profile_frames
       scan_resume = @cost if @explain_profile_frames
