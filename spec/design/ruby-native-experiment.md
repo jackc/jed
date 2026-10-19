@@ -39,6 +39,9 @@ handwritten emitter for resolved expressions, eligible single-table row loops,
 typed ORDER BY comparators, primitive aggregate input/reduction loops, and
 materialized WHERE and grouping-key loops;
 it does not permit evaluating SQL text as Ruby or introducing a native engine dependency.
+The scalar emitter's C-text comparison extension preserves collation metadata
+and string-work charges; linguistic collation and general string functions keep
+their ordinary execution.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

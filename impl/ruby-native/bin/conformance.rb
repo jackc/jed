@@ -17,13 +17,18 @@ module NativeCorpusCompilation
   MODE = ENV.fetch('JED_NATIVE_COMPILATION', 'auto')
   raise 'JED_NATIVE_COMPILATION must be auto, immediate, or disabled' unless %w[auto immediate disabled].include?(MODE)
   class << self
-    attr_accessor :kernels, :pipelines, :orderings, :aggregates, :relations
+    attr_accessor :kernels, :pipelines, :orderings, :aggregates, :relations, :text_kernels
+
+    def record_text(kernel)
+      self.text_kernels += 1 if kernel && kernel.source.include?('# C text specialization')
+    end
   end
   self.kernels = 0
   self.pipelines = 0
   self.orderings = 0
   self.aggregates = 0
   self.relations = 0
+  self.text_kernels = 0
   module Engines
     def initialize(**options)
       super
@@ -35,6 +40,7 @@ module NativeCorpusCompilation
     def materialize
       result = super
       NativeCorpusCompilation.kernels += 1 if result
+      NativeCorpusCompilation.record_text(result)
       result
     end
   end
@@ -44,6 +50,7 @@ module NativeCorpusCompilation
       if result
         NativeCorpusCompilation.kernels += 1
         NativeCorpusCompilation.pipelines += 1
+        NativeCorpusCompilation.record_text(result)
       end
       result
     end
@@ -54,6 +61,7 @@ module NativeCorpusCompilation
       if result
         NativeCorpusCompilation.kernels += 1
         NativeCorpusCompilation.orderings += 1
+        NativeCorpusCompilation.record_text(result)
       end
       result
     end
@@ -64,6 +72,7 @@ module NativeCorpusCompilation
       if result
         NativeCorpusCompilation.kernels += 1
         NativeCorpusCompilation.aggregates += 1
+        NativeCorpusCompilation.record_text(result)
       end
       result
     end
@@ -74,6 +83,7 @@ module NativeCorpusCompilation
       if result
         NativeCorpusCompilation.kernels += 1
         NativeCorpusCompilation.relations += 1
+        NativeCorpusCompilation.record_text(result)
       end
       result
     end
@@ -128,6 +138,7 @@ class NativeCorpus
     @summary[:compiled_orderings] = 0
     @summary[:compiled_aggregates] = 0
     @summary[:compiled_relations] = 0
+    @summary[:compiled_text_kernels] = 0
     @summary[:query_api_records] = @summary[:execute_api_records] = 0
     @summary[:materialized_memory_records] = 0
   end
@@ -168,6 +179,7 @@ class NativeCorpus
         worker.summary[:compiled_orderings] = NativeCorpusCompilation.orderings
         worker.summary[:compiled_aggregates] = NativeCorpusCompilation.aggregates
         worker.summary[:compiled_relations] = NativeCorpusCompilation.relations
+        worker.summary[:compiled_text_kernels] = NativeCorpusCompilation.text_kernels
         worker.summary
       end
       @summary[:peak_worker_rss_bytes] = [@summary[:peak_worker_rss_bytes], result.peak_rss_bytes].max

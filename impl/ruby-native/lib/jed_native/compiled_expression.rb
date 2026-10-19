@@ -11,12 +11,21 @@ module JedNative
     MAX_DEPTH = 32
     MAX_SOURCE_BYTES = 32_768
     MAX_POOL = 256
-    TYPES = %w[i16 i32 i64 boolean null unknown].freeze
+    MAX_POOL_BYTES = 32_768
+    TYPES = %w[i16 i32 i64 boolean text null unknown].freeze
     BOOLEAN_TYPES = %w[boolean null unknown].freeze
     COMPARISONS = { '=' => '==', '<>' => '!=', '!=' => '!=', '<' => '<',
                     '<=' => '<=', '>' => '>', '>=' => '>=' }.freeze
     ARITHMETIC = { '+' => '+', '-' => '-', '*' => '*' }.freeze
     INTEGER_FUNCTIONS = %w[abs coalesce nullif greatest least].freeze
+    # Preserve all flags, including nil versus false, without retaining a
+    # resolved expression's label or a host-loaded collation table. Only these
+    # fixed C labels can appear in emitted source, by validated numeric index.
+    C_LABEL_FLAGS = [nil, false, true].product([nil, false], [nil, false, true], [nil, false]).map(&:freeze).freeze
+    C_LABELS = C_LABEL_FLAGS.map do |explicit, conflict, default, none|
+      CollationLabel.new(name: 'C'.freeze, explicit: explicit, conflict: conflict,
+                         table: nil, default: default, none: none).freeze
+    end.freeze
 
     class Kernel
       attr_reader :source, :source_bytes, :node_count, :pool
@@ -25,6 +34,27 @@ module JedNative
         @source, @node_count, @pool = source.freeze, node_count, pool.freeze
         @source_bytes = source.bytesize
         freeze
+      end
+
+      # The resolved comparison usually supplies its C label. Unlabeled
+      # operands can still carry transient runtime metadata, so retain the
+      # ordinary evaluator's dynamic-label path instead of assuming raw bytes.
+      def compare_text(engine, left, right, operator, label)
+        return nil if left.nil? || right.nil?
+        label ||= CollationRules.combine([CollationRules.label(left), CollationRules.label(right)])
+        if operator == '=' || operator == '<>' || operator == '!='
+          engine.scalar_work(operator, left, right) if engine.respond_to?(:scalar_work)
+          equal = left == right
+          return operator == '=' ? equal : !equal
+        end
+        raise Error.new('42P22', 'indeterminate collation') if label&.conflict || label&.none
+        if label&.table
+          engine.charge(engine.collation_comparison_points(left, right))
+          left, right = CollationRules.wrap(left, label), CollationRules.wrap(right, label)
+        elsif engine.respond_to?(:scalar_work)
+          engine.scalar_work(operator, left, right)
+        end
+        Types.binary(operator, left, right, type: 'boolean')
       end
     end
 
@@ -50,8 +80,8 @@ module JedNative
     class Unsupported < StandardError; end
     private_constant :Unsupported
 
-    def self.build(expression, types:)
-      new(types).build(expression)
+    def self.build(expression, types:, text: true)
+      new(types, text: text).build(expression)
     rescue Unsupported
       nil
     end
@@ -59,23 +89,24 @@ module JedNative
     # A projection can contain scalar operations beside types whose evaluation
     # remains in the ordinary engine. Each unsupported root is delegated intact,
     # preserving all of its special evaluation rules and observable ordering.
-    def self.build_many(expressions, types:)
-      new(types).build_many(expressions)
+    def self.build_many(expressions, types:, text: true)
+      new(types, text: text).build_many(expressions)
     rescue Unsupported
       nil
     end
 
-    def self.prepare_many(expressions, types:)
-      new(types).prepare_many(expressions)
+    def self.prepare_many(expressions, types:, text: true)
+      new(types, text: text).prepare_many(expressions)
     rescue Unsupported
       nil
     end
 
-    def initialize(types)
+    def initialize(types, text: true)
       @types = types
+      @text = text
       @pool = []
       @lines = []
-      @node_count = @source_bytes = @indent = 0
+      @node_count = @source_bytes = @pool_bytes = @indent = 0
     end
 
     def build(expression)
@@ -90,13 +121,13 @@ module JedNative
       begin_method
       useful = false
       values = expressions.map do |expression|
-        state = [@lines.length, @pool.length, @source_bytes, @node_count, @indent]
+        state = [@lines.length, @pool.length, @source_bytes, @pool_bytes, @node_count, @indent]
         begin
           value = emit(expression, 1)
           useful ||= !%i[literal column param].include?(expression.kind)
           value
         rescue Unsupported
-          line_count, pool_count, @source_bytes, @node_count, @indent = state
+          line_count, pool_count, @source_bytes, @pool_bytes, @node_count, @indent = state
           @lines.slice!(line_count..)
           @pool.slice!(pool_count..)
           raise Unsupported unless expression.is_a?(Expression) && @node_count < MAX_NODES
@@ -144,7 +175,12 @@ module JedNative
 
     def pooled(value)
       raise Unsupported if @pool.length >= MAX_POOL
-      value = value.dup.freeze if value.is_a?(String)
+      if value.is_a?(String)
+        bytes = value.bytesize
+        raise Unsupported if @pool_bytes + bytes > MAX_POOL_BYTES
+        @pool_bytes += bytes
+        value = value.dup.freeze
+      end
       index = @pool.length
       @pool << value
       "pool[#{index}]"
@@ -158,20 +194,32 @@ module JedNative
       BOOLEAN_TYPES.include?(type) && !@types.key?(type)
     end
 
+    def c_label_source(label)
+      return 'nil' unless label
+      raise Unsupported unless @text && label.instance_of?(CollationLabel) &&
+                               label.name == 'C' && label.table.nil?
+      index = C_LABEL_FLAGS.index([label.explicit, label.conflict, label.default, label.none])
+      raise Unsupported unless index
+      "::JedNative::CompiledExpression::C_LABELS[#{index}]"
+    end
+
     def emit(expression, depth)
       raise Unsupported unless expression.is_a?(Expression)
       raise Unsupported if depth > MAX_DEPTH || @node_count >= MAX_NODES
       raise Unsupported unless TYPES.include?(expression.type) && !@types.key?(expression.type)
+      raise Unsupported if expression.type == 'text' && !@text
       raise Unsupported if expression.instance_variable_get(:@native_deep_evaluation) ||
-                           expression.instance_variable_get(:@native_iterative_arithmetic) ||
-                           expression.instance_variable_get(:@native_collation)
+                           expression.instance_variable_get(:@native_iterative_arithmetic)
+      label = c_label_source(expression.instance_variable_get(:@native_collation))
+      line('# C text specialization') if expression.type == 'text'
       output = "v#{@node_count}"
       @node_count += 1
       case expression.kind
       when :literal
         value = expression.value
         valid = value.nil? || integer?(expression.type) && value.is_a?(Integer) ||
-                expression.type == 'boolean' && (value == true || value == false)
+                expression.type == 'boolean' && (value == true || value == false) ||
+                expression.type == 'text' && value.instance_of?(String)
         raise Unsupported unless valid
         line("#{output} = #{pooled(value)}")
       when :column, :param
@@ -188,6 +236,9 @@ module JedNative
       when :call then emit_call(expression, output, depth)
       when :case then emit_case(expression, output, depth)
       else raise Unsupported
+      end
+      if expression.type == 'text' && label != 'nil'
+        line("#{output} = ::JedNative::CollationRules.wrap(#{output}, #{label})")
       end
       output
     end
@@ -219,12 +270,17 @@ module JedNative
       raise Unsupported unless argument.is_a?(Expression)
       null = argument.kind == :literal && argument.value.nil? && BOOLEAN_TYPES.include?(argument.type)
       compatible = integer?(expression.type) && (integer?(argument.type) || null) ||
-                   expression.type == 'boolean' && (argument.type == 'boolean' || null)
+                   expression.type == 'boolean' && (argument.type == 'boolean' || null) ||
+                   expression.type == 'text' && (argument.type == 'text' || null)
       raise Unsupported unless compatible
       raise Unsupported if expression.extra&.dig(:type_mod)
       charge
       value = child(argument, depth)
-      line("#{output} = #{value}")
+      if expression.type == 'text'
+        line("#{output} = engine.cast_value(#{value}, #{pooled('text')}, source_type: #{pooled(argument.type)})")
+      else
+        line("#{output} = #{value}")
+      end
       if integer?(expression.type)
         line("unless #{output}.nil?")
         @indent += 1
@@ -274,6 +330,19 @@ module JedNative
         raise Unsupported unless expression.type == 'boolean' && boolean?(left.type) && boolean?(right.type)
         return emit_boolean(expression, output, depth)
       end
+      if COMPARISONS.key?(operator) && [left, right].any? { |argument| argument.type == 'text' }
+        raise Unsupported unless expression.type == 'boolean' &&
+                                 [left, right].all? { |argument| %w[text null unknown].include?(argument.type) }
+        charge
+        a, b = child(left, depth), child(right, depth)
+        label = c_label_source(expression.instance_variable_get(:@native_collation))
+        if label == 'nil'
+          line("#{output} = compare_text(engine, #{a}, #{b}, #{pooled(operator)}, nil)")
+        else
+          emit_c_comparison(expression, output, left, right, a, b, label)
+        end
+        return
+      end
       raise Unsupported unless expression.extra&.dig(:integer_kernel) && integer?(left.type) && integer?(right.type)
       comparison = COMPARISONS[operator]
       arithmetic = ARITHMETIC[operator]
@@ -302,6 +371,34 @@ module JedNative
         end
         checked_integer(output, expression.type, message: "integer out of range for #{expression.type}")
       end
+      @indent -= 1
+      line('end')
+    end
+
+    def emit_c_comparison(expression, output, left, right, a, b, label)
+      line("if #{a}.nil? || #{b}.nil?")
+      @indent += 1
+      line("#{output} = nil")
+      @indent -= 1
+      # A statically C-labeled child just created a fresh C wrapper. An
+      # unlabeled child must be an ordinary String: a CollatedText parameter
+      # could carry a table, conflicting labels, or another dynamic derivation.
+      guards = [[left, a], [right, b]].map do |argument, value|
+        klass = argument.type == 'text' && argument.instance_variable_get(:@native_collation) ?
+          '::JedNative::CollatedText' : '::String'
+        "#{value}.instance_of?(#{klass})"
+      end
+      line("elsif #{guards.join(' && ')}")
+      @indent += 1
+      line("left_length_#{output} = #{a}.length")
+      line("right_length_#{output} = #{b}.length")
+      line("length_#{output} = left_length_#{output} < right_length_#{output} ? left_length_#{output} : right_length_#{output}")
+      line("engine.charge(length_#{output} - 1) if length_#{output} > 1")
+      line("#{output} = #{a} #{COMPARISONS.fetch(expression.value)} #{b}")
+      @indent -= 1
+      line('else')
+      @indent += 1
+      line("#{output} = compare_text(engine, #{a}, #{b}, #{pooled(expression.value)}, #{label})")
       @indent -= 1
       line('end')
     end
