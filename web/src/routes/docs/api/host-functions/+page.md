@@ -23,13 +23,66 @@ schema, and the function itself is never written to the file: a reopening host b
 an index or `CHECK` that uses a host function records which implementation it was built against
 (below).
 
-For Node TypeScript, register functions in a trusted worker-local module that exports
-`configure(builder)`, as shown below. Pass its file URL as `extensionModule` to
-`await createDatabase(...)` or `await openDatabase(...)`. Application closures and `Environment`
-instances cannot cross the worker boundary. The browser adapter currently accepts Unicode and
-time-zone bundles as bytes, but does not provide this module-loading extension hook.
+For TypeScript, register functions in a module that exports `configure(builder)`, as shown below.
+Registration runs inside the database's worker. Node loads the module from the trusted file URL
+passed as `extensionModule` to `await createDatabase(...)` or `await openDatabase(...)`.
+Browser applications import it into a custom worker, using the public helper shown below.
+Application closures and `Environment` instances cannot cross the worker boundary.
 
 <CodeTabs topic="host-functions" />
+
+## Browser registration
+
+Import your registration module into a worker and call the startup helper at the module's top
+level:
+
+```ts
+// database-worker.ts
+import { startDatabaseWorker } from 'jed-ts/browser/worker';
+import { configure } from './discount.ts';
+
+startDatabaseWorker({ configure });
+```
+
+Supply a factory when creating or opening the database. Keep `new Worker(new URL(...))` directly
+in the factory so your bundler can discover the worker entry point:
+
+```ts
+import { createDatabase, openDatabase } from 'jed-ts/browser';
+
+const workerFactory = () =>
+  new Worker(new URL('./database-worker.ts', import.meta.url), { type: 'module' });
+
+const db = await createDatabase({ path: 'shop.jed', workerFactory });
+try {
+  console.log(await db.get('SELECT discount(1250, 15) AS sale')); // { sale: 1063n }
+} finally {
+  await db.close();
+}
+
+// Bring the same registrations when reopening the file.
+const reopened = await openDatabase('shop.jed', { workerFactory });
+await reopened.close();
+```
+
+The factory must create a **fresh dedicated worker** for each database handle. Jed owns it,
+terminates it after close or initialization failure, and rejects reuse with `PROTOCOL`.
+Omitting `workerFactory` uses the ordinary package worker with no custom functions.
+
+Call `startDatabaseWorker` once, synchronously. It installs the message listener immediately and
+awaits `configure(builder)` before building the environment and opening storage. Configuration
+can load data asynchronously; scalar and batch SQL kernels remain synchronous. A configuration
+error rejects `createDatabase` or `openDatabase` and releases the worker.
+
+The `jed-ts/browser/worker` entry point exports `EnvironmentBuilder`, `HostFunctionSpec`,
+`HostKernel`, `HostBatchKernel`, `Value`, `intValue`, and `Decimal` for registration code. A module
+using these imports can also serve Node's `extensionModule`, provided its other imports support
+both hosts. Importing the entry point alone does not start a worker.
+
+Functions can capture variables in their **worker module**. They cannot capture variables from
+the application thread, and changing an application variable does not change worker state. Pass
+changing inputs as SQL parameters. Calls run directly in the worker, without a callback to the
+application thread.
 
 ## A function's shape
 

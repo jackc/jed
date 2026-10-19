@@ -8,6 +8,6 @@
     "lib": ["esnext", "webworker"],
     "types": []
   },
-  "include": ["src/browser/worker.ts"],
+  "include": ["src/browser/worker.ts", "browser/workers/**/*.ts"],
   "exclude": []
 }

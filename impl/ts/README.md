@@ -61,6 +61,56 @@ Node's `extensionModule` accepts a trusted file URL exporting `configure(builder
 registers host functions on the worker's `EnvironmentBuilder` before storage opens. Application
 closures are not transferable. Unicode/time-zone bundles may be passed as data at open.
 
+For browser host functions, bundle a worker that calls the public startup helper:
+
+```ts
+// database-worker.ts
+import { startDatabaseWorker, intValue } from "jed-ts/browser/worker";
+
+startDatabaseWorker({
+  configure(builder) {
+    builder.registerFunction({
+      name: "add_one",
+      argTypes: ["i64"],
+      result: "i64",
+      kernel: ([value]) => {
+        if (value.kind !== "int") throw new Error("expected i64");
+        return intValue(value.int + 1n);
+      },
+    });
+  },
+});
+```
+
+```ts
+// Application
+import { createDatabase, openDatabase } from "jed-ts/browser";
+
+const workerFactory = () =>
+  new Worker(new URL("./database-worker.ts", import.meta.url), { type: "module" });
+const db = await createDatabase({ path: "app.jed", workerFactory });
+try {
+  console.log(await db.get("SELECT add_one(41) AS answer")); // { answer: 42n }
+} finally {
+  await db.close();
+}
+const reopened = await openDatabase("app.jed", { workerFactory });
+await reopened.close();
+```
+
+Call `startDatabaseWorker` once, synchronously at the top level of the worker module. The helper
+installs its message listener immediately and awaits `configure(builder)` before building the
+environment or opening storage. Configuration may load data asynchronously; SQL kernels remain
+synchronous. The public worker entry point exports registration types (`EnvironmentBuilder`,
+`HostFunctionSpec`, `HostKernel`, `HostBatchKernel`), `Value`, `intValue`, and `Decimal`.
+A shared `configure` module can import these and serve Node's `extensionModule` too when its
+other imports support both hosts.
+
+The factory runs in the application thread and must return a fresh dedicated worker each time.
+Jed owns the worker and terminates it on close or initialization failure; reusing one fails
+`PROTOCOL`. Pass changing application values as SQL parameters: functions run in the worker's
+own heap, with no callback RPC to the application thread.
+
 The repository's synchronous core (`src/lib.ts`, also `jed-ts/internal`) remains available for
 conformance and existing host tooling. It does not offload work; application code uses the async
 entry points. No new runtime dependency or database format was introduced by this migration.
