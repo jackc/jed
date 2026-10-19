@@ -6,6 +6,16 @@ module JedNative
   # Keep this small front door explicit; all other expressions retain the full
   # evaluator, including its stack slicing for deeply nested SQL.
   module FastEvaluation
+    # Canonical integer values only need a range check. Avoid forwarding through
+    # temporal/composite/collation keyword wrappers for every row in a numeric
+    # filter or aggregate; nominal types keep their registry precedence.
+    def cast_value(value, type, source_type: nil)
+      if value.is_a?(Integer) && Types::INTEGER_BITS.key?(type) && !@types.key?(type)
+        return Types.check_integer(value, type)
+      end
+      super
+    end
+
     def evaluate(expression, row, group = nil)
       # ROLLUP/CUBE can replace an entire grouping expression with a stored
       # grouping key (including NULL); evaluating its children would be wrong.

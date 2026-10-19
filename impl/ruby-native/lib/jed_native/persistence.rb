@@ -67,7 +67,8 @@ module JedNative
           @persisted_snapshot = storage_signature(export_storage)
         end
       end
-      refresh_primary_indexes unless publications.empty?
+      # Each published domain has already refreshed its adopted page roots in
+      # adopt_storage_pages. The memory-domain caller refreshes before staging.
       @dirty = false
     end
 

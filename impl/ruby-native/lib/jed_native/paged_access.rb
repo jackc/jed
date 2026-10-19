@@ -152,11 +152,18 @@ module JedNative
     end
 
     def storage_stream_rows(table, lower: nil, upper: nil, reverse: false)
-      initial = table[:native_primary_metadata][:height]
+      metadata = table[:native_primary_metadata]
+      initial = metadata[:height]
       charge(initial)
+      # Resident descriptors and their scan-unit maps are immutable snapshots;
+      # writes publish a replacement table. An empty map needs no per-row
+      # singleton list, but its zero charge still checks the shared lifetime
+      # budget after a cursor resumes. Paged rows retain demand-fault accounting.
+      units = metadata[:scan_units]
+      empty_payload = !table[:rows].is_a?(PagedRows) && (!units || units.empty?)
       Enumerator.new do |output|
         storage_scan_entries(table, lower: lower, upper: upper, reverse: reverse, charge_pages: true, prepaid_pages: initial).each do |_, ordinal|
-          charge_scan_payload(table, [ordinal])
+          empty_payload ? charge(0) : charge_scan_payload(table, [ordinal])
           output << storage_row(table, ordinal)
         end
       end

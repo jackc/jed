@@ -1,5 +1,9 @@
 # Ruby lookup: second optimization pass
 
+The subsequent [query-shape pass](QUERY_FOLLOWUP.md) improves general scans,
+aggregates, grouping, sorting, and prepared execution. Measurements below remain
+the historical results of this second lookup pass.
+
 This explicitly requested continuation brings the canonical file primary-key
 lookup **within 10× Go with both YJIT and ZJIT**. Across three runs per Ruby JIT,
 the median is **16.99 µs on Ruby 4.0.7 YJIT**, **17.64 µs on Ruby 4.1 preview
