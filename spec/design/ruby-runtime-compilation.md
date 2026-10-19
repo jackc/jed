@@ -5,7 +5,8 @@ prepared query plans and let Ruby's JIT optimize query-specific code. This is a
 narrow exception to the prohibition on generated engine implementations: the
 compiler and its semantics are handwritten Ruby, operating on already resolved
 expressions, eligible single-table scan/filter/projection plans, typed ORDER BY
-comparators, and primitive aggregate input/reduction loops. The Ruby core
+comparators, primitive aggregate input/reduction loops, and materialized WHERE
+and grouping-key loops. The Ruby core
 remains frozen, experimental, and explicitly selected for every test, benchmark,
 and feature update.
 
@@ -15,6 +16,7 @@ The expression tier specializes kernels inside existing query plans. A second
 tier fuses eligible single-table scan/filter/projection loops, including streaming
 OFFSET/LIMIT. A third tier specializes comparisons of precomputed ORDER BY keys.
 A fourth tier specializes primitive aggregate input collection and reduction.
+A fifth tier specializes materialized relation filtering and grouping-key evaluation.
 The planner, access paths, row sources, grouping and spill algorithms,
 storage, and host API remain the existing engine. A resolved expression can emit a
 Ruby method containing straight-line locals and branches instead of recursively
@@ -28,7 +30,9 @@ passed to `eval`, and no SQL value becomes a method name or interpolated Ruby
 literal. Each kernel is an instance of a collectible anonymous class with one
 generated `call(engine, row, params)` method. A pipeline instead receives the current
 engine, input, parameters, output sink, OFFSET and LIMIT. An ordering kernel receives
-two sort entries containing precomputed keys and their input ordinals. None captures an engine,
+two sort entries containing precomputed keys and their input ordinals. A relation
+kernel receives the materialized row array and, when needed, the current memory
+owner, columns, and mask. None captures an engine,
 session, row source, output sink, or parameter binding. `class_eval` defines the
 method once, outside the row loop.
 
@@ -65,6 +69,16 @@ integer/boolean min/max, boolean folds, and integer bit folds. Arguments and FIL
 must be complete supported expression trees. DISTINCT, aggregate ordering,
 ordered sets, windows, host calls, named/collatable types, decimal, and float reductions
 retain the ordinary executor. File hosts retain their existing aggregation.
+
+Materialized-relation admission specializes the memory host's final residual
+WHERE filter and the complete grouping-key matrix. It requires fully supported
+integer/boolean expression trees. Filtering returns the original accepted row
+objects in input order. Key evaluation remains row-major and left-to-right
+within each key vector; grouping-set construction and hash grouping stay in the
+ordinary executor. File hosts, unsupported predicates, and unsupported complete
+key vectors retain their existing loops. Non-array row sequences also retain
+their original iterators. Neither path captures a resolved
+expression or silently delegates an unsupported subtree.
 
 ## Semantic obligations
 
@@ -107,6 +121,16 @@ Boolean reductions still evaluate every input even after their result is known.
 Grouping substitutions, result caching, projection, and output charges stay in
 the ordinary engine. Finite statement/lifetime limits retain the same prefixes.
 
+Materialized filtering starts only after relation materialization, access-path
+selection, and scan charging. With query-memory accounting, a rejected row's
+existing logical bytes are released immediately after its predicate finishes;
+ownership transfer remains unchanged. Every WHERE evaluation finishes before
+any grouping key is evaluated, so a later predicate error still precedes an
+earlier survivor's invalid key expression. The complete key matrix finishes
+before grouping, aggregate reduction, or HAVING. These loops do not move
+profiling checkpoints or compile grouped projections/HAVING, where grouping-set
+substitutions can replace a whole expression with NULL.
+
 ## Lifetime and bounds
 
 Resolved plan caches retain at most 64 entries each and already validate table
@@ -139,6 +163,11 @@ session; execution context is passed on each call. The internal aggregate-disabl
 control leaves all earlier compiler tiers enabled. Unsupported aggregates retain
 their existing argument compilation and folding. Grouping substitutions remain
 unchanged.
+Materialized-relation methods use another 64-entry source-and-immutable-pool
+cache, shared by lazy cursors with their session. The same second-use policy and
+per-method limits apply. Filter memory-accounting mode is encoded in fixed
+source, while the current owner, columns, mask, rows, and parameters are passed
+at invocation. The internal relation-disable switch leaves earlier tiers active.
 Exceeding a limit selects the evaluator. These bound retained source and compiler
 work, not total VM/JIT memory; active cursors can retain their own old plans and
 Ruby controls machine-code reclamation. Validation and benchmarks therefore also

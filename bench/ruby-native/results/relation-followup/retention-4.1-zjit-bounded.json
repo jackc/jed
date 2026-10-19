@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "bench/ruby-native/relation_retention.rb",
+    "--jit",
+    "zjit",
+    "--report",
+    "bench/ruby-native/results/relation-followup/retention-4.1-zjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 60071936,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 0.7124732869997388,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/relation-followup/retention-4.1-zjit.json\",\"jit\":\"zjit\",\"nested_after_return\":[0,0,0],\"after_outer_return\":[0,0,0],\"after_thread_exit\":[0,0,0],\"final_classes\":512}\n",
+  "stderr": ""
+}

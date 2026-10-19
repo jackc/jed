@@ -1,0 +1,144 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T17:59:09Z",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "jit": "none",
+  "options": {
+    "churn": 256,
+    "churn_calls": 200,
+    "jit": "none",
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/relation-followup/retention-4.0-none.json"
+  },
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "script_sha256": "a5cee26f6803cafba28d7ba488a51facd5e4ff765d8dcf90f2a5e53cfc889c3c",
+  "helper_sha256": "6a5be3c3aec178859dcfe9253af389319b597183478dfad0204a2233e8f23a08",
+  "before": {
+    "rss_bytes": 40964096,
+    "live_slots": 58411,
+    "jit": {},
+    "live_kernels": 0,
+    "anonymous_kernel_classes": 0,
+    "collection": 3
+  },
+  "nested_churn": {
+    "plans_created": 256,
+    "calls_per_plan": 200,
+    "retained_limit": 64,
+    "elapsed_ns": 61899487,
+    "before": {
+      "rss_bytes": 40988672,
+      "live_slots": 58406,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0
+    },
+    "while_cache_retained": {
+      "rss_bytes": 43819008,
+      "live_slots": 60099,
+      "jit": {},
+      "live_kernels": 64,
+      "anonymous_kernel_classes": 64,
+      "retained_kernels": 64,
+      "retained_source_bytes": 25984,
+      "retained_pool_entries": 128
+    },
+    "after_helper_return_and_gc": [
+      {
+        "rss_bytes": 43819008,
+        "live_slots": 58925,
+        "jit": {},
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 0,
+        "gc_after_return": 1
+      },
+      {
+        "rss_bytes": 43819008,
+        "live_slots": 58867,
+        "jit": {},
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 0,
+        "gc_after_return": 2
+      },
+      {
+        "rss_bytes": 43819008,
+        "live_slots": 58869,
+        "jit": {},
+        "live_kernels": 0,
+        "anonymous_kernel_classes": 0,
+        "gc_after_return": 3
+      }
+    ],
+    "note": "Uses the actual source/pool LRU and second-use admission. Cache population returns only scalar snapshots before final GC, removing its engine/cache/kernel locals from scope. VM classes and machine code may outlive generated instances."
+  },
+  "after_outer_churn_return_and_gc": [
+    {
+      "rss_bytes": 43823104,
+      "live_slots": 58886,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0,
+      "collection": 1
+    },
+    {
+      "rss_bytes": 43823104,
+      "live_slots": 58888,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0,
+      "collection": 2
+    },
+    {
+      "rss_bytes": 43823104,
+      "live_slots": 58890,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0,
+      "collection": 3
+    }
+  ],
+  "while_thread_cache_retained": {
+    "rss_bytes": 45150208,
+    "live_slots": 60158,
+    "jit": {},
+    "live_kernels": 64,
+    "anonymous_kernel_classes": 64,
+    "retained_kernels": 64,
+    "retained_source_bytes": 25984,
+    "retained_pool_entries": 128
+  },
+  "after_completed_thread_exit_and_gc": [
+    {
+      "rss_bytes": 45281280,
+      "live_slots": 58964,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0,
+      "collection": 1
+    },
+    {
+      "rss_bytes": 45281280,
+      "live_slots": 58905,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0,
+      "collection": 2
+    },
+    {
+      "rss_bytes": 45281280,
+      "live_slots": 58907,
+      "jit": {},
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 0,
+      "collection": 3
+    }
+  ],
+  "scalar_snapshots_only": true,
+  "notes": [
+    "Each phase creates 256 generated relation kernels and calls each 200 times through the actual 64-entry source/pool LRU.",
+    "The first phase collects after the complete existing churn helper returns. The second uses a completed thread and releases its Thread object before collection, removing temporary VM/native-stack roots.",
+    "Only recursively verified scalar snapshots escape helpers. Class and machine-code retention is runtime policy; zero instances does not imply immediate JIT code reclamation."
+  ],
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276"
+}

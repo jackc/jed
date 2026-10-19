@@ -1,0 +1,28 @@
+{
+  "command": [
+    "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "--zjit-log-compiled-iseqs=bench/ruby-native/results/relation-followup/diagnostic-4.1-zjit.log",
+    "bench/ruby-native/relation_diagnostics.rb",
+    "--jit",
+    "zjit",
+    "--zjit-log",
+    "bench/ruby-native/results/relation-followup/diagnostic-4.1-zjit.log",
+    "--report",
+    "bench/ruby-native/results/relation-followup/diagnostic-4.1-zjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 69451776,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 4.292877815998509,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/relation-followup/diagnostic-4.1-zjit.json\",\"source_sha256\":\"c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276\",\"jit\":\"zjit\",\"workloads\":[{\"name\":\"parameter_filter\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"057b13115ad4b259c4e01efed65b8c2e47bcd202c2a9174feb077c50d82ac289\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's relation kernel is called between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"nullable_filter\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"34bc8e872e00c0c88f8cb8b9d1b39a19203138dbf3a3c21057ff95bebef3d208\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's relation kernel is called between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"accounted_filter\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"95c2794e33ea2763cb95128306545ca9b4d11595358f85cfe518b1202cef380c\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's relation kernel is called between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"plain_key\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"a547f48a2d33587c050de6fe8ec76ddd80c40698ecb07e8154c4d883403e1fdc\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's relation kernel is called between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"computed_key\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"2ae534eaa8f622d712559bcae2667e30c365f40229e1a8758fa419da696c61c6\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's relation kernel is called between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"nullable_key_vector\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"21d1a8c43a36efdbaeb6565c0847fb6ef977103afa2ccd9d23f6d9c99c141bb8\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's relation kernel is called between log snapshots; repeat materializations are never invoked.\"}}]}\n",
+  "stderr": ""
+}

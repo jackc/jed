@@ -1,0 +1,25 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "bench/ruby-native/query_profile.rb",
+    "--api",
+    "execute",
+    "--report",
+    "bench/ruby-native/results/relation-followup/final-profile.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 71401472,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 2.875935935997404,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "execute scalar: 4971.6ns; 39.0 allocations\nexecute aggregate: 198635.5ns; 986.0 allocations\nexecute aggregate_argument: 449193.9ns; 1751.0 allocations\nexecute aggregate_many_groups: 1125605.8ns; 7561.0 allocations\nexecute group: 485732.7ns; 3287.1 allocations\nexecute aggregate_multi: 481109.9ns; 1649.0 allocations\nexecute general_where_keys: 1018693.1ns; 5229.8 allocations\nexecute general_text_filter: 2086317.4ns; 14944.0 allocations\n",
+  "stderr": ""
+}
