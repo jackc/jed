@@ -1,0 +1,64 @@
+--- a/impl/ts/src/async/server.ts
++++ b/impl/ts/src/async/server.ts
+@@ -109,6 +109,7 @@
+   private running = false;
+   private activeJob: Job | null = null;
+   private scheduled = false;
++  private receivedDuringPump = false;
+   private closing = false;
+   private closed = false;
+ 
+@@ -161,7 +162,7 @@
+           if (cursor.request.request.id === id) cursor.request.canceled = true;
+         }
+         this.reply(request.id, null);
+-        this.schedule();
++        this.dispatchReceived();
+         return;
+       }
+       const bytes = messageBytes(request, this.limits.maxQueuedBytes);
+@@ -195,7 +196,7 @@
+         batchResults: [],
+       });
+       this.queuedBytes += bytes;
+-      this.schedule();
++      this.dispatchReceived();
+     } catch (error) {
+       this.fail(request.id, error);
+     }
+@@ -214,6 +215,16 @@
+     }
+   }
+ 
++  private dispatchReceived(): void {
++    // Worker message delivery already supplies a task turn. Keep any pending turn for queued
++    // work, and never enter another statement while an active continuation is suspended.
++    if (this.running) {
++      this.receivedDuringPump = true;
++      return;
++    }
++    if (!this.scheduled) void this.pump();
++  }
++
+   private schedule(): void {
+     if (this.scheduled || this.running) return;
+     this.scheduled = true;
+@@ -227,6 +238,7 @@
+   private async pump(): Promise<void> {
+     if (this.running) return;
+     this.running = true;
++    this.receivedDuringPump = false;
+     let progressed = false;
+     const seenSessions = new Set<number>();
+     try {
+@@ -302,7 +314,9 @@
+       }
+     } finally {
+       this.running = false;
+-      if (progressed && this.jobs.length > 0) this.schedule();
++      // A request admitted while a writer was parking was not in this pump's snapshot. Wake it
++      // even if every visited job parked, so an owner's release cannot be stranded behind it.
++      if ((progressed || this.receivedDuringPump) && this.jobs.length > 0) this.schedule();
+     }
+   }
+ 

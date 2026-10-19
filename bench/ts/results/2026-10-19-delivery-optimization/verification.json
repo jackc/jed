@@ -1,0 +1,90 @@
+{
+  "checks": [
+    {
+      "command": "mise run typecheck:ts",
+      "result": "passed",
+      "configurations": [
+        "node",
+        "browser",
+        "worker"
+      ]
+    },
+    {
+      "command": "mise run unit:ts",
+      "result": "passed",
+      "tests": 1137,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "command": "mise run conformance:ts",
+      "result": "passed",
+      "memory": {
+        "passed": 677,
+        "failed": 0,
+        "skipped": 2
+      },
+      "disk": {
+        "passed": 596,
+        "failed": 0,
+        "skipped": 83
+      }
+    },
+    {
+      "command": "mise run e2e:ts",
+      "result": "passed",
+      "tests": 9
+    },
+    {
+      "command": "mise run lint:check",
+      "result": "passed",
+      "existingWarnings": 4
+    },
+    {
+      "command": "mise run corpus:check spec/conformance/suites/expr/string_functions.test",
+      "result": "passed; PostgreSQL regenerated corpus byte-identically"
+    },
+    {
+      "command": "JED_CONFORMANCE_FILTER=expr/string_functions.test GOPROXY=off GOSUMDB=off mise run conformance:go",
+      "result": "passed",
+      "memory": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      "disk": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "command": "JED_CONFORMANCE_FILTER=expr/string_functions.test CARGO_NET_OFFLINE=true mise run conformance:rust",
+      "result": "passed",
+      "memory": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      "disk": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "command": "Ruby syntax checks for changed tasks and experiment scripts",
+      "result": "passed"
+    },
+    {
+      "command": "experiments/summarize.rb against all raw results",
+      "result": "passed; 28 timing processes and 12 cancellation processes; same values, types, costs and fixed limits"
+    },
+    {
+      "command": "Compare every production impl/ts/src hash to experiments/hex.json",
+      "result": "passed"
+    }
+  ],
+  "productionVariant": "hex",
+  "dependenciesAdded": false
+}

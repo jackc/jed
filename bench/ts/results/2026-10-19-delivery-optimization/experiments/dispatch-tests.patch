@@ -1,0 +1,218 @@
+--- /dev/null
++++ b/impl/ts/tests/async_dispatch.test.ts
+@@ -0,0 +1,215 @@
++// Deterministic host-task scheduling checks. SQL concurrency behavior is exercised by the shared
++// schedules in async_server.test.ts; this seam controls only dispatch and continuation task turns.
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { RUNTIME_VERSION, type RuntimeReply, type RuntimeRequest } from "../src/async/protocol.ts";
++import { RuntimeServer } from "../src/async/server.ts";
++import { createDatabase } from "../src/file.ts";
++
++function controlledRuntime() {
++  const core = createDatabase();
++  const turns: (() => void)[] = [];
++  const replies: RuntimeReply[] = [];
++  let executed = 0;
++  let nextId = 0;
++  const originalSession = core.session.bind(core);
++  core.session = (...args) => {
++    const session = originalSession(...args);
++    const originalExecute = session.executePreparedSteps.bind(session);
++    session.executePreparedSteps = function* (...args) {
++      executed++;
++      return yield* originalExecute(...args);
++    };
++    return session;
++  };
++  const server = new RuntimeServer({
++    open: () => core,
++    send: (reply) => replies.push(reply),
++    schedule: (callback) => {
++      // The browser adapter owns a single pending MessageChannel callback slot.
++      assert.equal(turns.length, 0, "only one task may own the scheduler callback slot");
++      turns.push(callback);
++    },
++  });
++  function request(op: string, options: Partial<RuntimeRequest> = {}): number {
++    const id = ++nextId;
++    server.receive({ version: RUNTIME_VERSION, id, op, args: {}, ...options });
++    return id;
++  }
++  // Drain promise continuations without running the explicitly held scheduler task.
++  const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
++  function success<T>(id: number): T {
++    const reply = replies.find((reply) => reply.id === id);
++    assert.ok(reply, `missing reply for request ${id}`);
++    assert.ok(reply.ok, !reply.ok ? reply.error.message : undefined);
++    return reply.result as T;
++  }
++  async function turn(): Promise<void> {
++    const callback = turns.shift();
++    assert.ok(callback, "expected one pending scheduler task");
++    callback();
++    await settle();
++  }
++  return {
++    request,
++    settle,
++    success,
++    turn,
++    turns,
++    replies,
++    get executed() {
++      return executed;
++    },
++    async open(limits = {}) {
++      const id = request("open", { args: { limits } });
++      await settle();
++      success(id);
++    },
++    async close() {
++      const id = request("close");
++      await settle();
++      while (turns.length > 0) await turn();
++      success(id);
++    },
++  };
++}
++
++test("an idle worker dispatches a received request without another task hop", async () => {
++  const runtime = controlledRuntime();
++  await runtime.open();
++  try {
++    const execution = runtime.request("execute", { args: { sql: "SELECT 1" } });
++    assert.equal(runtime.executed, 1, "admitted SQL starts in the message delivery turn");
++    assert.equal(runtime.turns.length, 0);
++    await runtime.settle();
++    runtime.success(execution);
++
++    const query = runtime.request("query", { args: { sql: "SELECT 1" } });
++    await runtime.settle();
++    const { cursor } = runtime.success<{ cursor: number }>(query);
++    assert.equal(runtime.turns.length, 0);
++    const fetch = runtime.request("fetch", { args: { cursor } });
++    await runtime.settle();
++    assert.equal(runtime.success<{ rows: { length: number } }>(fetch).rows.length, 1);
++    assert.equal(runtime.turns.length, 0, "a small fetch uses its delivery task directly");
++  } finally {
++    await runtime.close();
++  }
++});
++
++test("queued requests retain the reserved task turn and same-session batch order", async () => {
++  const runtime = controlledRuntime();
++  await runtime.open();
++  try {
++    const opened = runtime.request("session.open");
++    await runtime.settle();
++    const { session } = runtime.success<{ session: number }>(opened);
++    const batch = runtime.request("batch", {
++      session,
++      args: { statements: [{ sql: "SELECT 1" }, { sql: "SELECT 2" }, { sql: "SELECT 3" }] },
++    });
++    assert.equal(runtime.executed, 1);
++    await runtime.settle();
++    assert.equal(runtime.turns.length, 1);
++
++    const following = runtime.request("execute", { session, args: { sql: "SELECT 4" } });
++    assert.equal(runtime.executed, 1, "new delivery must not bypass an already reserved task");
++    await runtime.turn();
++    assert.equal(runtime.executed, 2, "a batch executes one statement per task turn");
++    await runtime.turn();
++    assert.equal(runtime.executed, 3);
++    assert.equal(runtime.success<unknown[]>(batch).length, 3);
++    assert.equal(
++      runtime.replies.some((reply) => reply.id === following),
++      false,
++    );
++    await runtime.turn();
++    assert.equal(runtime.executed, 4);
++    runtime.success(following);
++    assert.equal(runtime.turns.length, 0);
++  } finally {
++    await runtime.close();
++  }
++});
++
++test("message cancellation reuses a pending batch task without executing another member", async () => {
++  const runtime = controlledRuntime();
++  await runtime.open();
++  try {
++    const batch = runtime.request("batch", {
++      args: { statements: [{ sql: "SELECT 1" }, { sql: "SELECT 2" }] },
++    });
++    await runtime.settle();
++    assert.equal(runtime.executed, 1);
++    const canceled = runtime.request("cancel", { args: { request: batch } });
++    runtime.success(canceled);
++    assert.equal(runtime.turns.length, 1);
++    await runtime.turn();
++    assert.equal(runtime.executed, 1);
++    const reply = runtime.replies.find((reply) => reply.id === batch);
++    assert.ok(reply && !reply.ok);
++    assert.equal(reply.error.code, "57014");
++    assert.equal(runtime.turns.length, 0);
++  } finally {
++    await runtime.close();
++  }
++});
++
++test("a request received during a writer parking attempt cannot lose its wakeup", async () => {
++  const runtime = controlledRuntime();
++  await runtime.open();
++  try {
++    const ownerOpened = runtime.request("session.open");
++    await runtime.settle();
++    const owner = runtime.success<{ session: number }>(ownerOpened).session;
++    const waiterOpened = runtime.request("session.open");
++    await runtime.settle();
++    const waiter = runtime.success<{ session: number }>(waiterOpened).session;
++    const ownerBegan = runtime.request("begin", { session: owner });
++    await runtime.settle();
++    const { transaction } = runtime.success<{ transaction: number }>(ownerBegan);
++
++    const waiting = runtime.request("begin", { session: waiter });
++    // This arrives before pump observes the resolved PARKED result, so its snapshot cannot include
++    // the release. A pump with no progress must nevertheless schedule the newly admitted request.
++    const release = runtime.request("rollback", { session: owner, transaction });
++    await runtime.settle();
++    assert.equal(runtime.turns.length, 1);
++    assert.equal(
++      runtime.replies.some((reply) => reply.id === waiting),
++      false,
++    );
++    await runtime.turn();
++    runtime.success(release);
++    assert.equal(
++      runtime.replies.some((reply) => reply.id === waiting),
++      false,
++    );
++    await runtime.turn();
++    runtime.success(waiting);
++    assert.equal(runtime.turns.length, 0);
++  } finally {
++    await runtime.close();
++  }
++});
++
++test("immediate dispatch still reserves queue capacity until its reply completes", async () => {
++  const runtime = controlledRuntime();
++  await runtime.open({ maxQueuedRequests: 1 });
++  try {
++    const first = runtime.request("execute", { args: { sql: "SELECT 1" } });
++    const rejected = runtime.request("execute", { args: { sql: "SELECT 2" } });
++    assert.equal(runtime.executed, 1);
++    const reply = runtime.replies.find((reply) => reply.id === rejected);
++    assert.ok(reply && !reply.ok);
++    assert.equal(reply.error.code, "QUEUE_FULL");
++    await runtime.settle();
++    runtime.success(first);
++    const next = runtime.request("execute", { args: { sql: "SELECT 3" } });
++    await runtime.settle();
++    runtime.success(next);
++    assert.equal(runtime.executed, 2);
++  } finally {
++    await runtime.close();
++  }
++});
