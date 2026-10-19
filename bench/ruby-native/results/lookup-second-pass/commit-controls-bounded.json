@@ -1,0 +1,20 @@
+{
+  "command": [
+    "ruby",
+    "/tmp/jed-ruby-second-commit-controls.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 95834112,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 11.666218120000849,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "final_source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "File comparison: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/lookup-second-pass/commit-control-before.json\nFile comparison: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/lookup-second-pass/commit-control-after.json\n",
+  "stderr": "file comparison ruby: preparing (no workloads)\nfile comparison ruby: ready\nfile comparison ruby-yjit: preparing (no workloads)\nfile comparison ruby-yjit: ready\nfile comparison ruby: insert_commit_durable\nfile comparison ruby-yjit: insert_commit_durable\nfile comparison ruby: preparing (no workloads)\nfile comparison ruby: ready\nfile comparison ruby-yjit: preparing (no workloads)\nfile comparison ruby-yjit: ready\nfile comparison ruby: insert_commit_durable\nfile comparison ruby-yjit: insert_commit_durable\n"
+}

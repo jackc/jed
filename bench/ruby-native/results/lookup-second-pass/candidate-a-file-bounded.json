@@ -1,0 +1,25 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "bench/ruby-native/file_compare.rb",
+    "--run",
+    "--lanes",
+    "ruby-yjit,go",
+    "--report",
+    "bench/ruby-native/results/lookup-second-pass/candidate-a-file.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 83288064,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 10.402880822999578,
+  "source": "/tmp/jed-ruby-lookup-second-a",
+  "source_sha256": "1f0c9a7132b1b9d935e10ac50c99b19e741a8439e7264802bf1ac760791bf9db",
+  "final_source_sha256": "1f0c9a7132b1b9d935e10ac50c99b19e741a8439e7264802bf1ac760791bf9db",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "File comparison: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/lookup-second-pass/candidate-a-file.json\n",
+  "stderr": "file comparison ruby-yjit: preparing (no workloads)\nfile comparison ruby-yjit: ready\nfile comparison go: preparing (no workloads)\nfile comparison go: ready\nfile comparison ruby-yjit: point_lookup_pk\nfile comparison ruby-yjit: cold_open_pk_small\nfile comparison ruby-yjit: insert_commit_durable\nfile comparison go: point_lookup_pk\nfile comparison go: cold_open_pk_small\nfile comparison go: insert_commit_durable\n"
+}

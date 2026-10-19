@@ -1,0 +1,22 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/lookup_allocations.rb",
+    "bench/ruby-native/results/lookup-second-pass/before-allocations.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 227737600,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 60.0,
+  "elapsed_seconds": 1.3822344669970335,
+  "source": "/tmp/jed-ruby-lookup-complete",
+  "source_sha256": "b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456",
+  "final_source_sha256": "b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\n  \"mode\": \"primary_key_allocation_diagnostic\",\n  \"runtime\": \"ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]\",\n  \"ruby_executable\": \"/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby\",\n  \"source\": \"/tmp/jed-ruby-lookup-complete\",\n  \"source_sha256\": \"b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456\",\n  \"final_source_sha256\": \"b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456\",\n  \"sql\": \"SELECT id, customer_id, amount, note FROM orders WHERE id = $1\",\n  \"seed\": 4201,\n  \"script_sha256\": \"ae2b0e5d5c413e9f838a3bf361fd09c2b3b727b47599728857b649ed47a3d2d2\",\n  \"notes\": [\n    \"100 warmed canonical parameters; allocation tracing with GC disabled for one100-operation phase at a time.\",\n    \"Allocation-phase timings are deliberately not reported. No decoded leaf misses occurred after warmup.\",\n    \"Checksum replay times the unchanged canonical Ruby FNV-1a implementation over precollected results; no SQL is executed.\"\n  ],\n  \"checksum_replay_samples\": [\n    {\n      \"ns_per_row\": 3484.2951,\n      \"allocations_per_row\": 150.205,\n      \"checksum\": \"e9a424023674ff25\"\n    },\n    {\n      \"ns_per_row\": 3473.4755,\n      \"allocations_per_row\": 150.2044,\n      \"checksum\": \"e9a424023674ff25\"\n    },\n    {\n      \"ns_per_row\": 3267.9312,\n      \"allocations_per_row\": 150.2044,\n      \"checksum\": \"e9a424023674ff25\"\n    },\n    {\n      \"ns_per_row\": 3326.3302,\n      \"allocations_per_row\": 150.2044,\n      \"checksum\": \"e9a424023674ff25\"\n    },\n    {\n      \"ns_per_row\": 3369.6165,\n      \"allocations_per_row\": 150.2044,\n      \"checksum\": \"e9a424023674ff25\"\n    }\n  ],\n  \"allocation_groups\": {\n    \"engine_only\": {\n      \"core\": {\n        \"allocations_per_query\": 256.0,\n        \"bytes_per_query\": 15912.0\n      },\n      \"other\": {\n        \"allocations_per_query\": 23.0,\n        \"bytes_per_query\": 1128.0\n      }\n    },\n    \"checksum_only\": {\n      \"benchmark_checksum\": {\n        \"allocations_per_query\": 149.58,\n        \"bytes_per_query\": 4812.16\n      },\n      \"other\": {\n        \"allocations_per_query\": 0.01,\n        \"bytes_per_query\": 0.32\n      }\n    },\n    \"combined\": {\n      \"benchmark_checksum\": {\n        \"allocations_per_query\": 149.58,\n        \"bytes_per_query\": 4812.16\n      },\n      \"core\": {\n        \"allocations_per_query\": 256.0,\n        \"bytes_per_query\": 15912.0\n      },\n      \"other\": {\n        \"allocations_per_query\": 23.01,\n        \"bytes_per_query\": 1128.32\n      }\n    }\n  }\n}\n",
+  "stderr": ""
+}

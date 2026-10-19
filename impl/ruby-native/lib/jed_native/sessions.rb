@@ -111,6 +111,10 @@ module JedNative
       @session_defaults = options.dup
       @session_setting_overrides = {}
       @shared_mutex, @writer_condition = Mutex.new, ConditionVariable.new
+      # Bound methods retain only this database, not a capture frame containing
+      # a session and its catalog roots. The watermark itself remains live.
+      @shared_reader_watermark_provider = method(:shared_reader_watermark)
+      @shared_storage_reuse_provider = method(:shared_storage_reuse_allowed?)
       @sessions, @pins = {}, {}
       @writer = nil
       @logical_version = @publication_generation = 0
@@ -239,8 +243,8 @@ module JedNative
         child.instance_variable_set(:@captured_generation, @publication_generation)
         @pins[child.object_id] = [@logical_version, shared_file_txid] if pin
         @sessions[child.object_id] = child
-        @engine.instance_variable_get(:@storage)&.reader_watermark_provider = -> { reader_watermark(true) }
-        destination.storage_reuse_allowed_provider = -> { oldest_live_txid >= current_logical_version }
+        @engine.instance_variable_get(:@storage)&.reader_watermark_provider = @shared_reader_watermark_provider
+        destination.storage_reuse_allowed_provider = @shared_storage_reuse_provider
       end
     end
     def shared_pin(child)
@@ -322,6 +326,9 @@ module JedNative
     end
 
     private
+
+    def shared_reader_watermark = reader_watermark(true)
+    def shared_storage_reuse_allowed? = oldest_live_txid >= current_logical_version
 
     def configure_session_setting(name, value)
       @shared_mutex.synchronize do

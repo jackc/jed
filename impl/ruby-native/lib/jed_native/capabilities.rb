@@ -33,7 +33,8 @@ module JedNative
     end
 
     def unrestricted_capabilities?
-      @allow_ddl && @allow_temp_ddl != false && @default_privileges.sort == TABLE_PRIVILEGES.sort &&
+      @allow_ddl && @allow_temp_ddl != false && @default_privileges.length == TABLE_PRIVILEGES.length &&
+        TABLE_PRIVILEGES.all? { |privilege| @default_privileges.include?(privilege) } &&
         @privilege_revokes.empty? && !@read_only
     end
 

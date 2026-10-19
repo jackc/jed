@@ -880,6 +880,12 @@ module JedNative
     end
     def from_storage_value(type, value, composites = {})
       return nil if value.nil?
+      # These canonical storage scalars already use the engine's value form.
+      # Retain nominal-type precedence for callers supplying a type registry.
+      case type
+      when 'i16', 'i32', 'i64', 'boolean', 'text', 'f32', 'f64'
+        return value unless composites.key?(type)
+      end
       type = normalize(type)
       if type.end_with?('[]')
         elem = type[0...-2]

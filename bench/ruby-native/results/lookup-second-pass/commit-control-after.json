@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "mode": "canonical_file_workloads",
+  "created_at": "2026-10-19T02:32:32Z",
+  "host": {
+    "go": "go version go1.27.1 linux/amd64",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "node": "v26.10.0",
+    "commit": "222b81aeddfd97547b042c629d7c3f4fb4617554",
+    "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+    "platform": "x86_64-linux",
+    "processors": 24,
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K"
+  },
+  "locking": "exclusive",
+  "memory_bytes": 536870912,
+  "lane_timeout_seconds": 1800,
+  "workspace_filesystem": {
+    "directory": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-file-compare/workspaces",
+    "source": "/dev/mapper/ubuntu--vg-ubuntu--lv",
+    "type": "ext4",
+    "mount_point": "/",
+    "device": 64513
+  },
+  "corpus_sha256": "978445de06e249ce2a743af6d46c207d8c20a19efcc3a0d5cecd48492452b462",
+  "dataset_fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+  "workloads": {
+    "insert_commit_durable": {
+      "corpus": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-file-compare/corpus/insert_commit_durable",
+      "dataset": "scratch",
+      "iterations": 300,
+      "warmup": 10,
+      "sql": "INSERT INTO scratch (id, v) VALUES ($1, $2)",
+      "source_sha256": "8ce829fc54b77e8cdc54480884436951b3ee101094e3342cc90979d4b5eeae66"
+    }
+  },
+  "statuses": {
+    "ruby": {
+      "status": "ready",
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--disable-yjit",
+        "--disable-zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/bench_jed.rb"
+      ],
+      "detail": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]\n\n",
+      "peak_rss_bytes": 33370112,
+      "source": "/tmp/jed-ruby-lookup-second-complete",
+      "source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+      "jit": "interpreter",
+      "adapter_sha256": "c40ec58a6b72cf0a83a2303c14ec71e0e61cdb02d41779589c549144edc3fbe1",
+      "library_sha256": "8e5a7a1d323d8012fafbc352587b69a33ba99eec8161a38936a7210c8fd26652",
+      "final_source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3"
+    },
+    "ruby-yjit": {
+      "status": "ready",
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--yjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/bench_jed.rb"
+      ],
+      "detail": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]\n\n",
+      "peak_rss_bytes": 38211584,
+      "source": "/tmp/jed-ruby-lookup-second-complete",
+      "source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+      "jit": "yjit",
+      "adapter_sha256": "c40ec58a6b72cf0a83a2303c14ec71e0e61cdb02d41779589c549144edc3fbe1",
+      "library_sha256": "8e5a7a1d323d8012fafbc352587b69a33ba99eec8161a38936a7210c8fd26652",
+      "final_source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3"
+    }
+  },
+  "results": [
+    {
+      "lane": "ruby",
+      "workload": "insert_commit_durable",
+      "status": "completed",
+      "result": {
+        "schema": 2,
+        "bench": "insert_commit_durable",
+        "dataset": "scratch",
+        "engine": "jed",
+        "lang": "ruby-native",
+        "variant": "interpreter",
+        "iterations": 300,
+        "warmup": 10,
+        "readers": 0,
+        "total_ns": 2192047863,
+        "ns_per_op": 7306826,
+        "min_ns": 5899242,
+        "p50_ns": 7015519,
+        "p90_ns": 8525207,
+        "p99_ns": 12225420,
+        "rows_total": 0,
+        "checksum": "6645d7dfab9c0296",
+        "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+        "started_at": "2026-10-19T02:32:32Z"
+      },
+      "reason": null,
+      "sampled_peak_worker_rss_bytes": 121053184,
+      "memory_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "timeout_seconds": 1800,
+      "interrupted": null
+    },
+    {
+      "lane": "ruby-yjit",
+      "workload": "insert_commit_durable",
+      "status": "completed",
+      "result": {
+        "schema": 2,
+        "bench": "insert_commit_durable",
+        "dataset": "scratch",
+        "engine": "jed",
+        "lang": "ruby-native",
+        "variant": "yjit",
+        "iterations": 300,
+        "warmup": 10,
+        "readers": 0,
+        "total_ns": 1637437248,
+        "ns_per_op": 5458124,
+        "min_ns": 3737441,
+        "p50_ns": 4798502,
+        "p90_ns": 7660495,
+        "p99_ns": 13089195,
+        "rows_total": 0,
+        "checksum": "6645d7dfab9c0296",
+        "fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+        "started_at": "2026-10-19T02:32:35Z"
+      },
+      "reason": null,
+      "sampled_peak_worker_rss_bytes": 109481984,
+      "memory_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "timeout_seconds": 1800,
+      "interrupted": null
+    }
+  ],
+  "notes": [
+    "Original SQL, warmup, measured iterations, parameter streams, and checksums; one workload per process.",
+    "Each workload uses a private dataset copy; cold_open measures a fresh database handle, not a cold operating-system file cache.",
+    "All lane datasets and nested Ruby scratch workers use the recorded disk-backed workspace filesystem.",
+    "Peak RSS is sampled; Ruby engine workers have their own supervisor inside the lane supervisor."
+  ],
+  "datasets": {},
+  "finished_at": "2026-10-19T02:32:37Z"
+}

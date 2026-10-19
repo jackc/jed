@@ -35,9 +35,10 @@ module JedNative
   # row values nor leaf key arrays escape this bounded cache unless a query or
   # pending write actually retains them.
   class LeafPool
-    attr_reader :codec, :image, :page_size
+    attr_reader :codec, :image, :page_size, :fetch_page
     def initialize(codec, image, page_size, limit)
       @codec, @image, @page_size = codec, image, page_size
+      @fetch_page = method(:page)
       @fallback_cache = DecodedLeafCache.new(limit) unless image.respond_to?(:decoded_leaf_cache)
     end
 
@@ -49,11 +50,11 @@ module JedNative
       raise Error.new('XX001', error.message)
     end
 
-    def leaf(index, columns)
+    def leaf(index, columns, key = nil)
       # Hash the schema's identity, rather than recursively hashing every
       # column descriptor for every field read. The cached value retains that
       # exact object, so its identity cannot be reused while this key is live.
-      key = [index, columns.object_id]
+      key ||= [index, columns.object_id]
       decoded_cache.fetch(key) do
         raw = page(index)
         raise Error.new('XX001', 'expected a B-tree leaf') unless raw[:type] == FileFormat::PAGE_LEAF
@@ -76,6 +77,7 @@ module JedNative
     EMPTY = [].freeze
     def initialize(pool, page, columns)
       @pool, @page, @columns = pool, page, columns
+      @cache_key = [page, columns.object_id].freeze
     end
 
     def [](key)
@@ -88,7 +90,7 @@ module JedNative
       end
     end
 
-    def data = @pool.leaf(@page, @columns)
+    def data = @pool.leaf(@page, @columns, @cache_key)
     def count
       raw = @pool.page(@page)
       raise Error.new('XX001', 'expected a B-tree leaf') unless raw[:type] == FileFormat::PAGE_LEAF
@@ -97,7 +99,7 @@ module JedNative
 
     def value(slot, column)
       region = data[:regions].fetch(column)
-      @pool.codec.leaf_value(region, @columns[column][:type], slot, ->(page) { @pool.page(page) })
+      @pool.codec.leaf_value(region, @columns[column][:type], slot, @pool.fetch_page)
     rescue Error
       raise
     rescue StandardError => error
@@ -111,16 +113,19 @@ module JedNative
         low = slot.zero? ? 0 : region[:ends][slot - 1]
         length = region[:ends][slot] - low
         next if length.zero?
-        bytes = region[:body].byteslice(low, length)
+        body = region[:body]
         capacity = @pool.page_size - FileFormat::PAGE_HEADER
-        case bytes.getbyte(0)
+        case body.getbyte(low)
         when FileFormat::TAG_EXTERNAL
-          pages += (bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity
+          raise Error.new('XX001', 'short external value span') if length < 9
+          pages += (body.unpack1('N', offset: low + 5) + capacity - 1) / capacity
         when FileFormat::TAG_INLINE_COMP
-          slabs += (bytes.byteslice(1, 4).unpack1('N') + capacity - 1) / capacity
+          raise Error.new('XX001', 'short compressed value span') if length < 5
+          slabs += (body.unpack1('N', offset: low + 1) + capacity - 1) / capacity
         when FileFormat::TAG_EXTERNAL_COMP
-          pages += (bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity
-          slabs += (bytes.byteslice(9, 4).unpack1('N') + capacity - 1) / capacity
+          raise Error.new('XX001', 'short compressed external value span') if length < 13
+          pages += (body.unpack1('N', offset: low + 5) + capacity - 1) / capacity
+          slabs += (body.unpack1('N', offset: low + 9) + capacity - 1) / capacity
         end
       end
       [pages, slabs]
@@ -230,18 +235,19 @@ module JedNative
     def initialize(leaf, slot, converter = nil)
       super(leaf.columns.length)
       @storage_leaf, @storage_slot, @converter = leaf, slot, converter
-      @loaded = {}
+      @loaded = 0
     end
     def [](index, count = nil)
       return to_a[index, count] if count
       return to_a[index] if index.is_a?(Range)
       index += length if index.negative?
       return nil unless index.between?(0, length - 1)
-      unless @loaded[index]
+      mask = 1 << index
+      if (@loaded & mask).zero?
         value = @storage_leaf.value(@storage_slot, index)
         value = @converter.call(@storage_leaf.columns[index][:type], value) if @converter
         self[index] = value
-        @loaded[index] = true
+        @loaded |= mask
       end
       super(index)
     end
@@ -355,8 +361,9 @@ module JedNative
         node = node[:children][index]
       end
       return [nil, nil] unless node
-      slot = node[:keys].bsearch_index { |stored| stored >= key }
-      slot && node[:keys][slot] == key ? [node, slot] : [nil, nil]
+      keys = node[:keys]
+      slot = keys.bsearch_index { |stored| stored >= key }
+      slot && keys[slot] == key ? [node, slot] : [nil, nil]
     end
 
     def scan_units(ordinals = nil, columns = nil)

@@ -45,6 +45,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   with YJIT and ZJIT. The experiment is frozen; subsequent features
   do not update it unless requested. → [report](impl/ruby-native/REPORT.md),
   [lookup/JIT follow-up](impl/ruby-native/LOOKUP_FOLLOWUP.md),
+  [second lookup pass](impl/ruby-native/LOOKUP_SECOND_PASS.md),
   [policy](spec/design/ruby-native-experiment.md)
 
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, `LIKE`/`ILIKE … ESCAPE e` (desugared to PostgreSQL's `like_escape(p, e)`), and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)

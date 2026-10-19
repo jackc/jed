@@ -50,6 +50,64 @@ module RubyPagedStorageTest
     assert(cache.size.zero?, 'in-flight decode escaped generation invalidation')
   end
 
+  def self.direct_leaf_values
+    codec = JedNative::FileFormat.new
+    values = {
+      'i16' => [-(1 << 15), -1, 0, (1 << 15) - 1],
+      'i32' => [-(1 << 31), -1, 0, (1 << 31) - 1],
+      'i64' => [-(1 << 63), -1, 0, (1 << 63) - 1],
+      'date' => [-(1 << 31), 17, (1 << 31) - 1],
+      'timestamp' => [-(1 << 63), 42, (1 << 63) - 1],
+      'timestamptz' => [-(1 << 63), -42, (1 << 63) - 1],
+      'boolean' => [false, true],
+      'uuid' => ['12345678-90ab-cdef-1234-567890abcdef'],
+      'interval' => [[-12, 34, -(1 << 63)], [12, -34, (1 << 63) - 1]],
+      'f32' => [-Float::INFINITY, -0.0, 1.5, Float::INFINITY, Float::NAN],
+      'f64' => [-Float::INFINITY, -0.0, 1.5, Float::INFINITY, Float::NAN]
+    }
+    values.each do |type, entries|
+      width = codec.fixed_width(type)
+      bytes = entries.map { |value| codec.encode_value(type, value) }
+      # Put NULL first so every tested value has a nonzero slot offset.
+      bitmap = "\x80".b.ljust((entries.length + 8) / 8, "\x00".b)
+      region = { width: width, bitmap: bitmap, body: "\x00".b * width + bytes.map { |entry| entry.byteslice(1, width) }.join }
+      assert(codec.leaf_value(region, type, 0, nil).nil?, "#{type} NULL bitmap was ignored")
+      entries.each_index do |index|
+        value = codec.leaf_value(region, type, index + 1, nil)
+        assert(codec.encode_value(type, value) == bytes[index], "#{type} fixed PAX slot changed bytes at #{index}")
+      end
+    end
+    { 'text' => ['', 'snowman ☃'], 'json' => ['{"x":"☃"}'], 'bytea' => ["\x00\xff".b] }.each do |type, entries|
+      bytes = entries.map { |value| codec.encode_value(type, value) }
+      total = 0
+      region = { ends: [0] + bytes.map { |entry| total += entry.bytesize }, body: bytes.join }
+      assert(codec.leaf_value(region, type, 0, nil).nil?, "#{type} NULL span was ignored")
+      entries.each_with_index do |expected, index|
+        value = codec.leaf_value(region, type, index + 1, nil)
+        assert(value == expected, "#{type} inline value changed")
+        assert(value.encoding == (type == 'bytea' ? Encoding::ASCII_8BIT : Encoding::UTF_8), "#{type} inline encoding changed")
+        value.replace('changed')
+        assert(codec.leaf_value(region, type, index + 1, nil) == expected, 'caller mutation changed cached PAX bytes')
+      end
+    end
+    malformed = [
+      [{ width: 1, bitmap: "\x00".b, body: "\x02".b }, 'boolean'],
+      [{ width: 8, bitmap: "\x00".b, body: "\x00".b * 7 }, 'i64'],
+      # The declared length crosses into a following value even though the
+      # overall region contains enough bytes. Only the first span is legal.
+      [{ ends: [4, 8], body: "\x00\x00\x02a\x00\x00\x01b".b }, 'text'],
+      [{ ends: [4], body: "\x00\x00\x01\xff".b }, 'text']
+    ]
+    malformed.each do |region, type|
+      begin
+        codec.leaf_value(region, type, 0, nil)
+      rescue StandardError
+        next
+      end
+      raise "accepted malformed #{type} PAX value"
+    end
+  end
+
   def self.cache_and_pins
     Dir.mktmpdir('jed-ruby-pager') do |directory|
       path = File.join(directory, 'db.jed')
@@ -207,11 +265,12 @@ module RubyPagedStorageTest
 
   def self.run
     decoded_schema_identity
+    direct_leaf_values
     cache_and_pins
     auxiliary_reopen
     shared_decoded_budget
     index_build_keeps_primary_pages
-    puts 'ruby-native pager: 5 tests passed (bounded schema identities, shared caches, pinned roots, streamed index builds and statistics)'
+    puts 'ruby-native pager: 6 tests passed (PAX codecs, bounded schema identities, shared caches, pinned roots, streamed index builds and statistics)'
   end
 end
 

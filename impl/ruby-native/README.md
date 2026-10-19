@@ -10,7 +10,9 @@ remains the Rust binding.
 and host surface of its recorded source revision. The [experiment report](REPORT.md)
 records conformance, interoperability, resource limits and benchmark measurements.
 The [lookup follow-up](LOOKUP_FOLLOWUP.md) records further profiling and measurements
-with Ruby 4.1.0-preview1 YJIT and ZJIT. [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
+with Ruby 4.1.0-preview1 YJIT and ZJIT. The [second lookup pass](LOOKUP_SECOND_PASS.md)
+records the specialized lazy point cursor and repeated comparisons within 10× Go.
+[Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
 
