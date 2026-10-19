@@ -59,7 +59,7 @@ module JedNative
           end
         end
       end
-      super
+      super(name, args, context: context, arg_types: arg_types)
     end
   end
   Functions.singleton_class.prepend(FoldComparisonWork)

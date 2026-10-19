@@ -317,6 +317,10 @@ module JedNative
       orders.each { |kind, expression, _| ensure_comparable_type(kind == :output ? outputs[expression][:type] : expression.type) }
       parameters = []
       visit = lambda do |expression|
+        if expression.is_a?(Array)
+          expression.each { |child| visit.call(child) }
+          next
+        end
         return unless expression.is_a?(Expression)
         parameters << expression if expression.kind == :param
         (expression.args || []).each { |arg| visit.call(arg) }

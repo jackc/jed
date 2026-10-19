@@ -14,6 +14,8 @@ with Ruby 4.1.0-preview1 YJIT and ZJIT. The [second lookup pass](LOOKUP_SECOND_P
 records the specialized lazy point cursor and repeated comparisons within 10× Go.
 The [query-shape follow-up](QUERY_FOLLOWUP.md) records further scan, aggregate,
 grouping, sort, and general prepared-execution improvements.
+The [scalar follow-up](SCALAR_FOLLOWUP.md) records lightweight scalar cursors,
+conditional/text execution, and comparisons across both JITs.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
@@ -120,6 +122,11 @@ JED_NATIVE_TIMEOUT=180 JED_NATIVE_ADDRESS_SPACE_BYTES=2147483648 \
 # General query shapes through lazy and eager prepared APIs:
 JED_NATIVE_TIMEOUT=180 JED_NATIVE_ADDRESS_SPACE_BYTES=2147483648 \
   mise run ruby-native:bounded -- ruby --yjit bench/ruby-native/query_profile.rb --report /tmp/queries.json
+# Expanded scalar comparison (the default benchmark plan remains unchanged):
+RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/scalar-plan.json \
+  RUBY_NATIVE_PHASE=scalar-local mise run ruby-native:compare
+# Exercise the lazy API against expression-corpus expectations:
+JED_NATIVE_QUERY_API=query mise run ruby-native:conformance expr/
 # Disk SQL audit; default locking is auto (page service):
 JED_NATIVE_STORAGE=disk JED_NATIVE_LOCKING=exclusive mise run ruby-native:conformance
 # Full benchmark adapter, using the separately prepared standard databases:
@@ -128,6 +135,10 @@ mise run ruby-native:bench bench/corpus bench/data /tmp/ruby-native.jsonl
 
 The full conformance audit fails on mismatches and reports unsupported harness
 files separately. It does not declare capability parity or hide missing features.
+It uses eager `execute` by default. `JED_NATIVE_QUERY_API=query` explicitly selects
+lazy cursors, drains within the error boundary, and records how many statements
+use the scalar cursor. Finite query-memory fixtures describe eager collection
+thresholds and may need separate expectations for the lazy API.
 Each corpus file runs in a separate child, sequentially, with a 512 MiB sampled
 process-group RSS ceiling, a hard 1 GiB address-space ceiling, and a 10-second
 deadline. The larger address-space ceiling accommodates Ruby's unused virtual

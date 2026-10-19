@@ -46,7 +46,7 @@ module JedNative
       if type == 'date' && source_type == 'text' && (offset = date_clock_offset(value))
         return date_clock_value(offset)
       end
-      super
+      super(value, type, source_type: source_type)
     end
 
     def constant_expression?(expression)

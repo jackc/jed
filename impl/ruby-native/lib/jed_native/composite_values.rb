@@ -80,7 +80,7 @@ module JedNative
         end
         return CompositeValue.new(values, type_name: type, field_names: fields.map { |field| field[:name] })
       end
-      super
+      super(value, type, source_type: source_type)
     end
 
     def dispatch(statement)

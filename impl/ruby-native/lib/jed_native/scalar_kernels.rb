@@ -8,7 +8,7 @@ module JedNative
     MAX_RESULT_BYTES = 0x3fffffff
 
     def call(name, args, context: nil, arg_types: nil)
-      return super unless KERNELS.include?(name)
+      return super(name, args, context: context, arg_types: arg_types) unless KERNELS.include?(name)
       types = arg_types || args.map { |value| Types.infer(value) }
       resolve_signature(name, types)
       return nil if !Functions::NULL_TOLERANT.include?(name) && args.any?(&:nil?)
