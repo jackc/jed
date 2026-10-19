@@ -151,8 +151,13 @@ module JedNative
     def build_aggregate_contexts(statement, relation, group_nodes)
       sets = expand_grouping_sets(group_nodes)
       keys = sets.flatten(1).uniq
-      compiled = keys.to_h { |key| [key, compile(key, relation.columns)] }
-      key_values = relation.rows.map { |row| keys.to_h { |key| [key, evaluate(compiled[key], row)] } }
+      compiled = keys.map { |key| compile(key, relation.columns) }
+      signatures = compiled.map { |expression| aggregate_expression_key(expression) }
+      # Grouping-set membership is fixed for this query. Resolve those slots
+      # once instead of hashing an AST for every key of every input row.
+      key_slots = keys.each_with_index.to_h
+      key_values = relation.rows.map { |row| compiled.map { |expression| evaluate(expression, row) } } unless keys.empty?
+      empty_key = [].freeze
       having = compile_filter(statement[:having], relation.columns)
       materialized = projection_aggregates([statement[:columns], statement[:having], statement[:order_by]]).map { |node| compile(node, relation.columns) }
       contexts = []
@@ -163,10 +168,12 @@ module JedNative
         synthetic_rows = []
       end
       sets.each do |set|
+        slots = set.map { |key| key_slots.fetch(key) }
+        positions = keys.map { |key| set.index(key) }
         groups = {}
         owners = {} if @query_memory
         relation.rows.each_with_index do |row, index|
-          key = set.map { |item| key_values[index][item] }
+          key = slots.empty? ? empty_key : slots.map { |slot| key_values[index][slot] }
           if @query_memory && !groups.key?(key)
             owners[key] = query_memory_owner
             query_memory_add(owners[key], MemorySchedule::ENTRY + query_memory_key_bytes(key))
@@ -183,10 +190,9 @@ module JedNative
         groups.each do |values, group|
           row = (group.first || Array.new(relation.columns.length)).dup
           state = { keys: {}, active: [] }
-          keys.each do |key|
-            expression = compiled[key]
-            signature = aggregate_expression_key(expression)
-            index = set.index(key)
+          compiled.each_with_index do |expression, key_index|
+            signature = signatures[key_index]
+            index = positions[key_index]
             state[:keys][signature] = index ? values[index] : nil
             state[:active] << signature if index
             row[expression.value] = nil if !index && expression.kind == :column
@@ -201,7 +207,7 @@ module JedNative
           if @query_memory
             @query_memory_aggregate_owner = previous_aggregate_owner
             query_memory_release(owners[values]) unless vector
-            synthetic = keys.map { |key| state[:keys][aggregate_expression_key(compiled[key])] } + aggregate_values
+            synthetic = signatures.map { |signature| state[:keys][signature] } + aggregate_values
             if accepted
               vector ? synthetic_rows << synthetic : query_memory_add_row(rows_owner, synthetic)
             end
@@ -445,40 +451,53 @@ module JedNative
 
     def aggregate_inputs(expression, group)
       rows = []
-      orderings = expression.extra[:aggregate_order] || []
-      seen = {} if @query_memory && expression.extra[:distinct]
+      extra = expression.extra
+      orderings = extra[:aggregate_order] || []
+      ordered = !orderings.empty?
+      distinct = extra[:distinct]
+      filter = extra[:filter_expr]
+      name = expression.value
+      extra_charge = PAIRS.include?(name) || name == 'string_agg' || name.include?('object_agg')
+      owner = @query_memory && @query_memory_aggregate_owner
+      if owner
+        retains_values = name.match?(/\A(?:array_agg|string_agg|jsonb?_agg|jsonb?_object_agg)/)
+        retained_types = expression.args.map(&:type) if retains_values
+        strict = name.end_with?('_strict')
+      end
+      seen = {} if @query_memory && distinct
       group.each_with_index do |row, ordinal|
-        next if expression.extra[:filter_expr] && evaluate(expression.extra[:filter_expr], row) != true
+        next if filter && evaluate(filter, row) != true
         charge
         values = expression.args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, row) }
-        charge if PAIRS.include?(expression.value) || expression.value == 'string_agg' || expression.value.include?('object_agg')
-        keys = orderings.map { |compiled, _| evaluate(compiled, row) }
-        if @query_memory && @query_memory_aggregate_owner
-          owner = @query_memory_aggregate_owner
-          if !orderings.empty?
+        charge if extra_charge
+        keys = orderings.map { |compiled, _| evaluate(compiled, row) } if ordered
+        if owner
+          if ordered
             query_memory_add_row(owner, keys + values)
           end
           if seen && values.none?(&:nil?) && !seen.key?(values)
             query_memory_add(owner, MemorySchedule::ENTRY + query_memory_key_bytes(values))
             seen[values] = true
           end
-          retained = expression.value.match?(/\A(?:array_agg|string_agg|jsonb?_agg|jsonb?_object_agg)/)
-          retained &&= !values.first.nil? if expression.value == 'string_agg'
-          retained &&= !values.last.nil? if expression.value.end_with?('_strict')
-          query_memory_add(owner, query_memory_key_bytes(values, expression.args.map(&:type))) if retained
+          retained = retains_values
+          retained &&= !values.first.nil? if name == 'string_agg'
+          retained &&= !values.last.nil? if strict
+          query_memory_add(owner, query_memory_key_bytes(values, retained_types)) if retained
         end
-        rows << [values, keys, ordinal]
+        rows << (ordered ? [values, keys, ordinal] : values)
       end
-      rows.uniq! { |entry| entry[0] } if expression.extra[:distinct]
-      unless orderings.empty?
-        rows.sort! do |left, right|
-          comparison = 0
-          orderings.each_with_index do |(_, order), index|
-            comparison = order_compare(left[1][index], right[1][index], order)
-            break unless comparison.zero?
-          end
-          comparison.zero? ? left[2] <=> right[2] : comparison
+      unless ordered
+        rows.uniq! if distinct
+        return rows
+      end
+      rows.uniq! { |entry| entry[0] } if distinct
+      rows.sort! do |left, right|
+        comparison = 0
+        orderings.each_with_index do |(_, order), index|
+          comparison = order_compare(left[1][index], right[1][index], order)
+          break unless comparison.zero?
         end
+        comparison.zero? ? left[2] <=> right[2] : comparison
       end
       rows.map!(&:first)
     end

@@ -172,10 +172,67 @@ module NativePreparedCacheTests
     end
   end
 
+  def eager_catalogs(database)
+    reader, writer = database.session, database.session
+    writer.execute('CREATE TABLE eager_t(id i32 PRIMARY KEY, v i32)')
+    writer.execute('INSERT INTO eager_t VALUES(1, 10)')
+    statement = reader.prepare('SELECT v FROM eager_t WHERE id = $1')
+    first = reader.execute_prepared(statement, 1)
+    3.times do
+      result = reader.execute_prepared(statement, 1)
+      assert(result.rows == [[10]] && result.cost == first.cost, 'eager cache changed answer or cost')
+    end
+    assert(reader.execute_prepared(statement, nil).rows.empty?, 'eager NULL binding matched a row')
+    error('42804') { reader.execute_prepared(statement, '1') }
+    writer.execute('UPDATE eager_t SET v=20 WHERE id=1')
+    assert(reader.execute_prepared(statement, 1).rows == [[20]], 'eager cache missed a publication')
+    reader.begin(true)
+    reader.execute('UPDATE eager_t SET v=30 WHERE id=1')
+    reader.execute('SAVEPOINT eager_before')
+    reader.execute('UPDATE eager_t SET v=40 WHERE id=1')
+    assert(reader.execute_prepared(statement, 1).rows == [[40]], 'eager read missed pending rows')
+    reader.execute('ROLLBACK TO eager_before')
+    assert(reader.execute_prepared(statement, 1).rows == [[30]], 'eager read missed savepoint restore')
+    reader.rollback
+    assert(reader.execute_prepared(statement, 1).rows == [[20]], 'eager read missed transaction rollback')
+
+    unbound = reader.prepare('SELECT * FROM eager_t')
+    assert(reader.execute_prepared(unbound).column_types == %w[i32 i32], 'initial unbound metadata')
+    writer.execute('DROP TABLE eager_t')
+    writer.execute('CREATE TABLE eager_t(id text PRIMARY KEY, v text)')
+    writer.execute("INSERT INTO eager_t VALUES('one', 'replacement')")
+    assert(reader.execute_prepared(statement, 'one').rows == [['replacement']], 'eager binding retained old column type')
+    error('42804') { reader.execute_prepared(statement, 1) }
+    result = reader.execute_prepared(unbound)
+    assert(result.rows == [['one', 'replacement']] && result.column_types == %w[text text], 'unbound cache retained old schema')
+
+    writer.execute('CREATE TABLE eager_source(n i32, t text)')
+    writer.execute("INSERT INTO eager_source VALUES(7, 'seven')")
+    writer.execute('CREATE VIEW eager_view AS SELECT n AS v FROM eager_source')
+    view = reader.prepare('SELECT v FROM eager_view WHERE v=$1')
+    assert(reader.execute_prepared(view, 7).rows == [[7]], 'initial eager view binding')
+    writer.execute('DROP VIEW eager_view')
+    writer.execute('CREATE VIEW eager_view AS SELECT t AS v FROM eager_source')
+    assert(reader.execute_prepared(view, 'seven').rows == [['seven']], 'eager binding retained old view')
+    error('42804') { reader.execute_prepared(view, 7) }
+
+    writer.execute('CREATE TYPE eager_pair AS (x i32)')
+    composite = reader.prepare('SELECT $1::eager_pair')
+    assert(reader.execute_prepared(composite, [5]).rows == [[[5]]], 'initial eager composite binding')
+    writer.execute('DROP TYPE eager_pair')
+    writer.execute('CREATE TYPE eager_pair AS (x text)')
+    result = reader.execute_prepared(composite, ['five'])
+    assert(result.rows == [[['five']]], 'eager binding retained old composite fields')
+    error('42804') { reader.execute_prepared(composite, [5]) }
+  ensure
+    reader&.close
+    writer&.close
+  end
+
   def run
-    JedNative.memory { |database| publication(database) }
+    JedNative.memory { |database| publication(database); eager_catalogs(database) }
     Dir.mktmpdir('jed-ruby-prepared') do |directory|
-      JedNative.create(File.join(directory, 'db'), locking: :exclusive) { |database| publication(database) }
+      JedNative.create(File.join(directory, 'db'), locking: :exclusive) { |database| publication(database); eager_catalogs(database) }
     end
     namespaces
     execution_context

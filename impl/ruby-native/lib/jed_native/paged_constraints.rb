@@ -64,7 +64,8 @@ module JedNative
       codec = table[:native_primary_codec] || statistics_codec
       ordinals.each_with_index.map do |ordinal, index|
         column = table[:columns][ordinal]
-        codec.key_body(column[:type], statistics_value(column[:type], key[index]), column[:collation])
+        collation = column[:collation]
+        codec.key_body(column[:type], statistics_value(column[:type], key[index]), collation == 'C' ? nil : collation)
       end.join.b
     end
 
