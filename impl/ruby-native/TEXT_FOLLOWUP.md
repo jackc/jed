@@ -1,5 +1,9 @@
 # Compiled C-text comparisons
 
+The cursor failures reported below are historical. The
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
+supersedes the mixed-routing interpretation. Original measurements are retained.
+
 Measured 2026-10-19. This explicitly requested extension follows the materialized
 relation compiler at `8347075b8b235bba4a3a173460ba74963f7049aa`. Ruby remains a frozen,
 opt-in experiment. Normal tests, benchmarks, CI, supported cores, and public APIs

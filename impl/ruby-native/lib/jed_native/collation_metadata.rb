@@ -225,7 +225,9 @@ module JedNative
       return relation unless relation.columns.length == columns.length
       schema = relation.columns.each_with_index.map { |column, index| column.merge(collation: columns[index][:collation], collation_label: columns[index][:collation_label]) }
       rows = relation.rows.map { |row| row.each_with_index.map { |value, index| CollationRules.wrap(value, columns[index][:collation_label]) } }
-      Relation.new(columns: schema, rows: rows)
+      # Relabeling preserves the logical buffer and its payload mask. Its owner
+      # must survive the surrounding select's cleanup and subsequent cursor pulls.
+      query_memory_transfer(relation, Relation.new(columns: schema, rows: rows))
     end
   end
   Engine.prepend(CollationMetadata)

@@ -45,18 +45,52 @@ module JedNative
 
     def select(statement)
       @cursor_select_depth = (@cursor_select_depth || 0) + 1 if @native_cursor
-      super
+      root = @native_cursor && @cursor_select_depth == 1
+      previous_buffered = @cursor_buffered_output
+      # WITH owns its final result until the body has completed. Preserve that
+      # buffered drive, including its output reservations, before yielding it.
+      @cursor_buffered_output = true if root && statement[:with]
+      result = super
+      if root && !result.rows.is_a?(CursorOutput)
+        cursor_buffered_result(result)
+      else
+        result
+      end
     ensure
+      @cursor_buffered_output = previous_buffered
       @cursor_select_depth -= 1 if @native_cursor
     end
-    def cursor_output? = @native_cursor && @cursor_select_depth == 1
+    def cursor_output? = @native_cursor && @cursor_select_depth == 1 && !@cursor_buffered_output
     def cursor_output(columns) = cursor_output? ? CursorOutput.new(self, columns) : []
     def cursor_yield(row, columns)
       @native_cursor_emitted = true
       @native_cursor.accept_row(row, columns)
     end
+    def cursor_buffered_result(relation)
+      rows = relation.rows
+      owner = relation.instance_variable_get(:@native_memory_owner)
+      mask = relation.instance_variable_get(:@native_memory_mask)
+      output = CursorOutput.new(self, relation.columns)
+      index = 0
+      while index < rows.length
+        row = rows[index]
+        rows[index] = nil
+        index += 1
+        # A buffered row transfers out of the engine before a materializing
+        # host collector admits its copy. Keep the statement account alive
+        # across suspension, instead of yielding after Engine#run unwinds it.
+        query_memory_release(owner, query_memory_row_bytes(row, relation.columns, mask)) if @query_memory && owner
+        output << row
+      end
+      relation.rows = output
+      relation
+    ensure
+      query_memory_release(owner) if @query_memory && owner
+    end
     def cacheable_select?(statement)
-      return false if cursor_output? && (!(statement[:from] || []).empty? || !(statement[:order_by] || []).empty?)
+      if cursor_output? && (!(statement[:from] || []).empty? || !(statement[:order_by] || []).empty?)
+        return false unless columnar_cursor?(statement)
+      end
       super
     end
     def query_memory_collect_result?

@@ -1,5 +1,9 @@
 # Compiled Ruby ORDER BY comparisons
 
+The cursor failures reported below are historical. The
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
+supersedes the mixed-routing interpretation. Original measurements are retained.
+
 Measured 2026-10-19. This explicitly requested extension adds typed comparisons
 to the experimental runtime compiler after the
 [cursor and scan correctness fixes](CORRECTNESS_FOLLOWUP.md), committed at
