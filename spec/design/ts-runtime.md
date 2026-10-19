@@ -340,19 +340,13 @@ Per-value conversion still costs substantial time; codec prototypes did not esta
 and were reverted. Larger configurable byte batches remain a throughput/responsiveness and
 concurrent-result-reservation tradeoff, not a new default.
 
-The [elapsed-scheduling investigation](../../bench/ts/results/2026-10-19-scheduling/report.md)
-retains 512-row/256 KiB batches and the existing codec, and selects a 1 ms elapsed slice checked
-at existing 256-unit checkpoints. An initial interleaved comparison evaluates baseline, 4 ms
-scheduling and a combined codec prototype; six later runs tune the slice to 1 ms. Relative to
-the earlier baseline process medians, aggregate worker time falls from 328 to 240 ms in Chromium
-and 314 to 284 ms in Node. Typed-output time is about flat in Chromium; Node rises 3.7% alongside
-a 3.5% direct-reference rise, leaving worker/direct overhead essentially unchanged. The fused
-codec was reverted after mixed results, including a 9% Node bulk regression. These are separate
-process/isolate observations, not evidence that async execution is intrinsically faster; the
-1 ms scheduling slice does not guarantee a maximum cancellation delay. In a separate rotated
-cancellation comparison, ordinary Chromium typed-output abort-to-rejection rises from 13.1 to
-21.1 ms by median of process medians (observed maximum 33.9 to 58.4 ms). All measured operations
-cancel with `57014` and leave the session reusable, but this is a throughput/cancellation tradeoff.
+The [elapsed-scheduling experiment](../../bench/ts/results/2026-10-19-scheduling/report.md)
+was subsequently [reverted](../../bench/ts/results/2026-10-19-scheduling-rollback/report.md).
+Neither the 1 ms slice nor a shorter 0.125 ms prototype preserved ordinary-browser cancellation
+latency in repeated tests. The runtime retains a task yield every 256 checkpoint visits, with
+the existing 512-row/256 KiB transport limits and packed codec. Shared-memory result transport
+is not implemented; only cancellation flags use shared memory where available. The rollback
+report also records current platform support and possible future transport experiments.
 
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions
@@ -480,13 +474,8 @@ event-loop task turn. This provides inter-operation scheduling, not CPU-parallel
 File page-service waits remain inside the execution worker and preserve owner-only reuse.
 Within an operation, the shared generator driver retains execution state across data-page reads
 and periodically yields a real task turn for cached/resident page access, row generation,
-recursive queries and common scan/join/group loops. Every 256 checkpoint visits the driver checks
-a monotonic scheduling clock and yields when its 1 ms execution slice has elapsed. Actual I/O
-retains its suspension points; a new slice starts after a task yield. Awaited I/O retains the
-deadline so immediately resolved reads cannot starve control messages. The clock
-is physical scheduler state, separate from SQL's injected clock, values and cost. Neither the
-checkpoint interval nor the slice is a latency guarantee: synchronous kernels may exceed it.
-Control messages can mark
+recursive queries and common scan/join/group loops. The initial physical quantum is 256
+checkpoint visits; it is not a SQL cost unit or a latency guarantee. Control messages can mark
 the active operation canceled, but another engine operation cannot run until it completes or
 unwinds. Session scopes, writer ownership and cursor pins therefore remain valid across awaits.
 
