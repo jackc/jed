@@ -68,7 +68,7 @@ module JedNative
         return nil if args.first.nil?
         return context ? context.fold_case(args.first, name.to_sym) : args.first.tr(name == 'upper' ? 'a-z' : 'A-Z', name == 'upper' ? 'A-Z' : 'a-z')
       end
-      super
+      super(name, args, context: context, arg_types: arg_types)
     end
     def like(text, pattern, escape: '\\', insensitive: false, context: nil)
       if insensitive && context
@@ -168,7 +168,7 @@ module JedNative
 
     def cast_value(value, type, source_type: nil)
       return value if type == 'text' && value.is_a?(CollatedText)
-      super
+      super(value, type, source_type: source_type)
     end
 
     def evaluate(expression, row, group = nil)

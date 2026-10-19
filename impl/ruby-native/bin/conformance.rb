@@ -37,8 +37,11 @@ class NativeCorpus
 
   def initialize(filter: '', mode: 'memory', output: nil)
     @filter, @mode, @output = filter, mode, output
+    @query_api = ENV.fetch('JED_NATIVE_QUERY_API', 'execute')
+    raise 'JED_NATIVE_QUERY_API must be execute or query' unless %w[execute query].include?(@query_api)
     @failure_detail_bytes = 0
     @summary = { files: 0, records: 0, passed: 0, failed: 0, unsupported_files: 0, skipped_files: 0, timed_out_files: 0, memory_limited_files: 0, omitted_failure_details: 0, failures: [] }
+    @summary[:scalar_cursor_records] = 0 if @query_api == 'query'
   end
 
   def run
@@ -49,6 +52,7 @@ class NativeCorpus
     locking = ENV.fetch('JED_NATIVE_LOCKING', 'auto')
     abort "unknown corpus locking mode #{locking.inspect}" unless %w[auto exclusive].include?(locking)
     @summary[:mode], @summary[:filter], @summary[:started_at] = @mode, @filter, Time.now.utc.iso8601
+    @summary[:query_api] = @query_api
     @summary[:ruby], @summary[:ruby_executable] = RUBY_DESCRIPTION, RbConfig.ruby
     @summary[:jit] = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then 'yjit'
                     elsif defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled? then 'zjit'
@@ -218,11 +222,20 @@ class NativeCorpus
         end
         params = pending['params'] ? CorpusParams.parse(pending['params']).map { |value| bind_value(value) } : []
         error = nil
+        result = nil
         result = begin
-          db.execute(sql.join("\n"), *params)
+          result = db.public_send(@query_api, sql.join("\n"), *params)
+          if @query_api == 'query'
+            @summary[:scalar_cursor_records] += 1 if defined?(JedNative::ScalarRows) && result.is_a?(JedNative::ScalarRows)
+            # Pull inside the error boundary: query() defers execution errors.
+            result.rows
+          end
+          result
         rescue JedNative::Error => e
           error = e
           nil
+        ensure
+          result&.close if @query_api == 'query'
         end
         if line.start_with?('statement error')
           want = line.split[2]

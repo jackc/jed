@@ -1,0 +1,90 @@
+{
+  "files": 87,
+  "records": 2877,
+  "passed": 2867,
+  "failed": 10,
+  "unsupported_files": 0,
+  "skipped_files": 0,
+  "timed_out_files": 0,
+  "memory_limited_files": 0,
+  "omitted_failure_details": 0,
+  "failures": [
+    {
+      "file": "spec/conformance/suites/expr/array_containment.test",
+      "line": 130,
+      "error": "JedNative::Error: 42804: types i64 and i64[] cannot be matched",
+      "sql": "SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] @> ARRAY[3], ARRAY[ARRAY[1,2],ARRAY[3,4]] && ARRAY[4,9] FROM t WHERE id = 1"
+    },
+    {
+      "file": "spec/conformance/suites/expr/array_containment.test",
+      "line": 157,
+      "error": "RuntimeError: expected 42883, got 42804",
+      "sql": "SELECT ARRAY[1,2] @> ARRAY['a','b'] FROM t WHERE id = 1"
+    },
+    {
+      "file": "spec/conformance/suites/expr/array_quantified.test",
+      "line": 122,
+      "error": "JedNative::Error: 42804: types i64 and i64[] cannot be matched",
+      "sql": "SELECT 3 = ANY(ARRAY[ARRAY[1,2],ARRAY[3,4]])"
+    },
+    {
+      "file": "spec/conformance/suites/expr/array_quantified.test",
+      "line": 127,
+      "error": "JedNative::Error: 42804: types i64 and i64[] cannot be matched",
+      "sql": "SELECT 4 = ALL(ARRAY[ARRAY[4,4],ARRAY[4,4]])"
+    },
+    {
+      "file": "spec/conformance/suites/expr/array_quantified.test",
+      "line": 155,
+      "error": "RuntimeError: expected 42883, got 42804",
+      "sql": "SELECT 1 = ANY(ARRAY['a','b'])"
+    },
+    {
+      "file": "spec/conformance/suites/expr/like_escape.test",
+      "line": 202,
+      "error": "RuntimeError: expected 42883, got 42804",
+      "sql": "SELECT 'a' LIKE 'a' ESCAPE 5 FROM one"
+    },
+    {
+      "file": "spec/conformance/suites/expr/width_bucket_array.test",
+      "line": 67,
+      "error": "RuntimeError: expected 42883, got 42804",
+      "sql": "SELECT width_bucket(5::i64, ARRAY[1.5, 2.5]::f64[])"
+    },
+    {
+      "file": "spec/conformance/suites/expr/width_bucket_array.test",
+      "line": 70,
+      "error": "JedNative::Error: 42804: types f64 and decimal cannot be matched",
+      "sql": "SELECT width_bucket(5, ARRAY[1.5, 2.5]::f64[])"
+    },
+    {
+      "file": "spec/conformance/suites/expr/width_bucket_array.test",
+      "line": 76,
+      "error": "JedNative::Error: 42804: types f64 and i64 cannot be matched",
+      "sql": "SELECT width_bucket('NaN'::f64, ARRAY[1, 2]::f64[]), width_bucket(1::f64, '{1,NaN}'::f64[]), width_bucket('NaN'::f64, '{1,NaN}'::f64[]), width_bucket('-Infinity'::f64, '{-Infinity,0}'::f64[]), width_bucket(-0.0::f64, ARRAY[0]::f64[])"
+    },
+    {
+      "file": "spec/conformance/suites/expr/width_bucket_array.test",
+      "line": 85,
+      "error": "JedNative::Error: 42804: types f64 and decimal cannot be matched",
+      "sql": "SELECT width_bucket(2.5::f64, ARRAY[1.5, 2.5, 3.5]::f64[])"
+    }
+  ],
+  "scalar_cursor_records": 0,
+  "mode": "memory",
+  "filter": "expr/",
+  "started_at": "2026-10-19T12:03:33Z",
+  "query_api": "query",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "jit": "interpreter",
+  "corpus_root": "/home/jack/.codex/worktrees/b8e6/jed/spec/conformance/suites",
+  "available_records": 2877,
+  "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+  "worker_memory_bytes": 536870912,
+  "worker_timeout_seconds": 60.0,
+  "worker_address_space_bytes": 1073741824,
+  "peak_worker_rss_bytes": 36655104,
+  "finished_at": "2026-10-19T12:03:38Z",
+  "final_source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7"
+}

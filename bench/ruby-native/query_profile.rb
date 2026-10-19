@@ -21,7 +21,7 @@ root = File.expand_path('../..', __dir__)
 source = File.expand_path(ENV.fetch('RUBY_NATIVE_SOURCE', File.join(root, 'impl/ruby-native')))
 source_hash = NativeRubySource.digest(source)
 require File.join(source, 'lib/jed_native')
-plan_path = File.join(__dir__, 'compare/plan.json')
+plan_path = File.expand_path(ENV.fetch('RUBY_NATIVE_COMPARE_PLAN', File.join(__dir__, 'compare/plan.json')))
 plan = JSON.parse(File.read(plan_path))
 database = JedNative.memory
 session = database.session
@@ -102,7 +102,7 @@ raise 'source changed during profiling' unless after == source_hash
 report = { schema: 1, mode: 'query_shape_diagnostic', created_at: Time.now.utc.iso8601,
   ruby: RUBY_DESCRIPTION, ruby_executable: RbConfig.ruby,
   source: source, source_sha256: source_hash, final_source_sha256: after,
-  script_sha256: Digest::SHA256.file(__FILE__).hexdigest, plan_sha256: Digest::SHA256.file(plan_path).hexdigest,
+  script_sha256: Digest::SHA256.file(__FILE__).hexdigest, plan_path: plan_path, plan_sha256: Digest::SHA256.file(plan_path).hexdigest,
   options: options, notes: ['Canonical memory-comparison SQL/data/parameters and batch counts; diagnostic, not a cross-core benchmark.',
     'All timing precedes tracing. Allocation tracing disables GC for one query at a time; traced time is never reported.',
     'Core allocation sites exclude Ruby internal objects. Answer digests compare query and execute paths on the first parameter.'],

@@ -20,7 +20,7 @@ module JedNative
     end
 
     def call(name, args, context: nil, arg_types: nil)
-      return super unless context
+      return super(name, args, context: context, arg_types: arg_types) unless context
       if name == 'timezone'
         return nil if args.any?(&:nil?)
         zone, value = args
@@ -53,7 +53,7 @@ module JedNative
         return nil if args.any?(&:nil?)
         unit, value = args
         unit = datetime_unit(unit)
-        return super if unit.downcase == 'epoch' || value.micros.is_a?(Float)
+        return super(name, args, context: context, arg_types: arg_types) if unit.downcase == 'epoch' || value.micros.is_a?(Float)
         context.charge
         offset = context.timezone_at(value.micros)[0]
         if %w[timezone timezone_hour timezone_minute].include?(unit.downcase)
@@ -66,7 +66,7 @@ module JedNative
         end
         return super(name, [unit, TimestampValue.new(TimeZoneData.finite(value.micros + offset * 1_000_000))], context: context, arg_types: ['text', 'timestamp'])
       end
-      super
+      super(name, args, context: context, arg_types: arg_types)
     end
   end
   Functions.singleton_class.prepend(ZonedFunctions)
@@ -205,7 +205,7 @@ module JedNative
           return type == 'date' ? DateValue.new(micros.is_a?(Float) ? micros : micros.div(TimestampValue::DAY)) : TimestampValue.new(micros)
         end
       end
-      super
+      super(value, type, source_type: source_type)
     end
 
     def json_image_text(value, type, expression = nil, pretty: false)

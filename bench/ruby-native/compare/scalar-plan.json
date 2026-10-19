@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "description": "Explicit scalar follow-up: diverse prepared FROM-less queries, using the existing adapters and integer parameter schedule. The default seven-query comparison plan is unchanged.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"integer_abs","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"integer_arithmetic","sql":"SELECT ($1::i64 * 3 - 2) / 5","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"conditional","sql":"SELECT CASE WHEN $1::i64 BETWEEN -100 AND 100 THEN 1 ELSE 0 END","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"numeric_folds","sql":"SELECT greatest($1::i64, 17), least($1::i64, 17), coalesce(nullif($1::i64, 17), 0)","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"decimal_arithmetic","sql":"SELECT (($1::i64)::decimal * 3::decimal + 2::decimal)::i64","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"float_arithmetic","sql":"SELECT sqrt(abs(($1::i64)::f64))::i64","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"text_functions","sql":"SELECT length(reverse(lower('AbCdEfGhIj'))) + $1::i64","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"mixed_projection","sql":"SELECT $1::i64, abs($1::i64), ($1::i64)::text","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"constant","sql":"SELECT 42::i64","iterations":2000,"warmup":300,"offset":0,"step":0,"span":0},
+    {"name":"filtered_scalar","sql":"SELECT $1::i64 + 1 WHERE $1::i64 > 0","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000}
+  ]
+}
