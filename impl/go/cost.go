@@ -59,7 +59,7 @@ type costMeter struct {
 	lifetimeLimit int64
 	// cancel belongs to this operation, including frozen cursor engines. Execution
 	// steps sample it independently of deterministic cost enforcement.
-	cancel      func() bool
+	cancel      <-chan struct{}
 	cancelSteps uint8
 }
 
@@ -135,10 +135,7 @@ func (m *costMeter) Checkpoint() error {
 
 // Poll checks cancellation without moving any deterministic cost checkpoint.
 func (m *costMeter) Poll() error {
-	if m.cancel != nil && m.cancel() {
-		return newError(QueryCanceled, "canceling statement due to user request")
-	}
-	return nil
+	return doneErr(m.cancel)
 }
 
 // Step enforces cost on every call, but polls cancellation only on the first

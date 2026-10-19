@@ -184,9 +184,9 @@ type Rows struct {
 	current []Value
 	valid   bool
 	closed  bool
-	// ctx is captured at Query time for the entry check. The cursor's snapshot and
-	// meters independently retain the operation's poll throughout execution inside Next.
-	ctx ctxIface
+	// done is captured at Query time for the entry check. The cursor's snapshot and
+	// meters independently retain the same channel throughout execution inside Next.
+	done <-chan struct{}
 	// err holds a terminal error reached during iteration (cancellation or a mid-stream
 	// fault). Surfaced by Err() after the loop — the bufio.Scanner / database/sql idiom.
 	err error
@@ -239,7 +239,7 @@ func (r *Rows) Next() bool {
 	if r.closed || r.err != nil {
 		return false
 	}
-	if err := ctxErr(r.ctx); err != nil {
+	if err := doneErr(r.done); err != nil {
 		r.setErr(err)
 		r.Close()
 		return false

@@ -1155,11 +1155,15 @@ carries no query methods; the handle supplies the session, §2.4), `Result` comm
 accessors, `All()`/`Collect`, `RowTo`/`RowToStructByName`, `Null[T]`, `Valuer`/`Scanner`. The
 conversion + cancellation logic lives once (`ergoQuery`/`ergoExec`); the per-type methods are
 one-liners over the raw `[]Value` primitives. **Cancellation is wired through the cost meter:** each
-operation arms a poll (`engine.armCancel`) on the `sessionState` of the engine that runs the
+operation captures `ctx.Done()` once and arms that channel (`engine.armCancel`) on the
+`sessionState` of the engine that runs the
 statement, `sessionState.newMeter` copies it into the statement's meter, and execution
 checkpoints consult it — so a flipped `context.Context` aborts a long-running statement with the
 registered **`57014 query_canceled`** at the next cancellation checkpoint, not only at the cursor/entry
-boundary (`ctxErr`). The poll is `nil` (no channel polling, the §8 cost determinism intact) unless a cancelable ctx is active; a non-cancelable background ctx (nil `Done`) arms
+boundary (`doneErr`). `Rows` retains the same channel for its immediate entry check; neither a
+context interface nor a polling/restoration closure is retained. The channel is `nil` (no channel
+polling, the §8 cost determinism intact) unless a cancelable ctx is active; a non-cancelable
+background ctx (nil `Done`) arms
 nothing. Verified by `impl/go/cancellation_test.go` (the meter-checkpoint and sampling unit tests, the boundary
 abort, synchronized cancellation inside `Next` across all ergonomic handles and prepared/Exec
 paths, transaction poisoning/rollback, cleanup/isolation, and batch/cost-limit regressions).

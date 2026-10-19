@@ -35,10 +35,6 @@ import (
 	"time"
 )
 
-// ctxIface is context.Context under a local name so api.go can hold a ctx field without importing
-// context (it carries no other context use).
-type ctxIface = context.Context
-
 // ErrNoRows is returned by Row.Scan when the query produced no rows (database/sql's sentinel).
 var ErrNoRows = errors.New("jed: no rows in result set")
 
@@ -77,22 +73,23 @@ var (
 // methods are one-liners that supply the right engine + raw []Value primitive. armCancel threads ctx
 // into the statement's cost meter (api.md §11.4), so a
 // flipped context aborts a long-running statement at the executor's cancellation checkpoint — not only
-// at the cursor boundary (ctxErr, the cheap pre-exec / cursor poll).
+// at the cursor boundary (doneErr, the cheap pre-exec / cursor poll).
 
 func ergoQuery(ctx context.Context, eng *engine, args []any, raw func([]Value) (*Rows, error)) (*Rows, error) {
 	params, err := toValues(args)
 	if err != nil {
 		return nil, err
 	}
-	if err := ctxErr(ctx); err != nil {
+	done := contextDone(ctx)
+	if err := doneErr(done); err != nil {
 		return nil, err
 	}
-	defer eng.armCancel(ctx)()
+	defer eng.restoreCancel(eng.armCancel(done))
 	rows, err := raw(params)
 	if err != nil {
 		return nil, err
 	}
-	rows.ctx = ctx
+	rows.done = done
 	return rows, nil
 }
 
@@ -330,7 +327,7 @@ func (r *Rows) Close() error {
 	}
 	r.closed = true
 	r.valid = false
-	r.ctx = nil
+	r.done = nil
 	r.onErr = nil
 	r.cursor.close()
 	if r.onClose != nil {
@@ -867,44 +864,38 @@ func kindName(k ValueKind) string {
 
 // ───────────────────────────── cancellation ─────────────────────────────
 
-// ctxErr reports a non-blocking cancellation check on ctx — the cheap poll at the API entry and
-// cursor boundary (in-statement polls run at execution checkpoints, armed by armCancel). A nil or
-// already-canceled ctx is handled here; a background ctx (nil Done channel) costs nothing.
-func ctxErr(ctx ctxIface) error {
+// contextDone captures the channel once per operation. A nil context is accepted
+// like context.Background; no context or closure is retained by the cursor.
+func contextDone(ctx context.Context) <-chan struct{} {
 	if ctx == nil {
 		return nil
 	}
+	return ctx.Done()
+}
+
+// doneErr is the immediate cancellation-only check at API, cursor, and batch
+// boundaries. A nil channel disables cancellation without blocking.
+func doneErr(done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
 	select {
-	case <-ctx.Done():
+	case <-done:
 		return newError(QueryCanceled, "canceling statement due to user request")
 	default:
 		return nil
 	}
 }
 
-// armCancel temporarily installs an operation-owned poll. Meters and snapshot engines
-// copy the closure, whose cached Done channel remains live after Query returns. Restoring
-// the session cannot disarm an existing cursor or let its cancellation affect a later call.
-// There is no watcher to stop on query errors, exhaustion, early Close, or drain errors.
-func (e *engine) armCancel(ctx context.Context) func() {
-	var done <-chan struct{}
-	if ctx != nil {
-		done = ctx.Done()
-	}
+// armCancel temporarily installs an operation-owned channel. Meters and snapshot
+// engines copy it, so restoring the session cannot disarm an existing cursor or
+// let its cancellation affect a later call. No goroutine or closure is needed.
+func (e *engine) armCancel(done <-chan struct{}) <-chan struct{} {
 	previous := e.session.cancel
-	if done == nil && previous == nil {
-		return func() {}
-	}
-	e.session.cancel = nil
-	if done != nil {
-		e.session.cancel = func() bool {
-			select {
-			case <-done:
-				return true
-			default:
-				return false
-			}
-		}
-	}
-	return func() { e.session.cancel = previous }
+	e.session.cancel = done
+	return previous
+}
+
+func (e *engine) restoreCancel(previous <-chan struct{}) {
+	e.session.cancel = previous
 }

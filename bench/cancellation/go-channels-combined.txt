@@ -1,0 +1,56 @@
+# round 1; combined; baseline e3bb2db8; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  546315	      1051 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  542895	      1067 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/stream/disabled        	    1045	    568515 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	    1024	    584764 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4494	    134168 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4483	    134049 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/projection/disabled    	    1050	    500327 ns/op	 1792546 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1056	    481826 ns/op	 1792547 B/op	   10035 allocs/op
+PASS
+# round 2; combined; baseline e3bb2db8; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  547118	      1051 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  544551	      1075 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/stream/disabled        	    1038	    571876 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	    1014	    588500 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4468	    134286 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4482	    134223 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/projection/disabled    	    1123	    451714 ns/op	 1792547 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1054	    475141 ns/op	 1792547 B/op	   10035 allocs/op
+PASS
+# round 3; combined; baseline e3bb2db8; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  534762	      1057 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  551484	      1075 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/stream/disabled        	    1057	    572773 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	     996	    587947 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4420	    134313 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4530	    133503 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/projection/disabled    	    1089	    471440 ns/op	 1792547 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1057	    473288 ns/op	 1792547 B/op	   10035 allocs/op
+PASS
+# round 4; combined; baseline e3bb2db8; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  566851	      1027 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  557317	      1056 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/stream/disabled        	    1040	    567108 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	    1030	    587273 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4488	    134953 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4447	    134803 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/projection/disabled    	    1317	    476300 ns/op	 1792547 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1234	    509730 ns/op	 1792547 B/op	   10035 allocs/op
+PASS
