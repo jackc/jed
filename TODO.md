@@ -602,6 +602,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [rollback measurements and transport options](bench/ts/results/2026-10-19-scheduling-rollback/report.md)
   retain the evidence. Shared-memory result transport and batch-oriented consumption remain
   unimplemented investigations, separate from the existing atomic cancellation flag.
+  The [query-stage profile](bench/ts/results/2026-10-19-query-profile/report.md) separates worker
+  execution/waits, message delivery/dispatch, result decoding and client consumption, with
+  independently sampled main/worker CPU and explicit instrumentation calibration.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar

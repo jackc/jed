@@ -83,7 +83,7 @@ export type DrainResult = {
 // Two independent 32-bit accumulators, with tags, lengths and row boundaries. This is a
 // reproducibility check, not a cryptographic proof. No rendering or transport encoding occurs.
 // These workloads deliberately use this small typed surface; unexpected kinds fail loudly.
-class Fingerprint {
+export class Fingerprint {
   private first = 0x811c9dc5;
   private second = 0x9e3779b9;
   rows = 0;
