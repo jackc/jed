@@ -348,6 +348,14 @@ the existing 512-row/256 KiB transport limits and packed codec. Shared-memory re
 is not implemented; only cancellation flags use shared memory where available. The rollback
 report also records current platform support and possible future transport experiments.
 
+The [profile-guided delivery experiment](../../bench/ts/results/2026-10-19-delivery-optimization/report.md)
+retains direct ASCII scanning for successful SQL hex decoding. For 200,000 typed output rows,
+worker time falls from 539 to 505 ms in Node and 666 to 461 ms in ordinary Chromium, while the
+direct core improves too; this does not resolve the transport overhead. A cached byte-view codec
+prototype and immediate idle-worker dispatch add only about 1% over hex alone in repeated runs,
+with larger observed Node timer gaps, and are reverted. Batch limits, packed validation and
+256-checkpoint task yields remain unchanged. The report preserves the variants and raw evidence.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions
 include async storage lifecycle/commit and crypto providers, worker pools,

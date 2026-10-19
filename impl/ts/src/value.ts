@@ -391,6 +391,28 @@ export function parseByteaHex(s: string): { bytes: Uint8Array } | { error: strin
 const HEX_INPUT_ENCODER = new TextEncoder();
 const HEX_ERROR_DECODER = new TextDecoder();
 
+// Successful hex input is ASCII, so it can be scanned directly without an intermediate UTF-8
+// buffer. Malformed input uses the byte decoder below: this keeps its first-error ordering and
+// full UTF-8 error character, including TextEncoder's replacement of unpaired UTF-16 surrogates.
+export function decodeHexString(s: string): { bytes: Uint8Array } | { error: string } {
+  const out: number[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 10 || c === 9 || c === 13) {
+      i++;
+      continue;
+    }
+    const hi = hexVal(c);
+    if (hi < 0 || i + 1 >= s.length) return decodeHexPairs(HEX_INPUT_ENCODER.encode(s));
+    const lo = hexVal(s.charCodeAt(i + 1));
+    if (lo < 0) return decodeHexPairs(HEX_INPUT_ENCODER.encode(s));
+    i += 2;
+    out.push((hi << 4) | lo);
+  }
+  return { bytes: Uint8Array.from(out) };
+}
+
 // decodeHexPairs is PostgreSQL's hex_decode_safe (encode.c), shared by bytea hex input and
 // decode(s, 'hex'): hexadecimal digit pairs (case-insensitive), each pair one byte. A space, tab,
 // newline, or carriage return is skipped *between* pairs only — inside a pair it is an invalid
