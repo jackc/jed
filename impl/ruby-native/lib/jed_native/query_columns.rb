@@ -84,17 +84,50 @@ module JedNative
       scope = []
       (query[:from] || []).each_with_index do |source, index|
         visible = source[:lateral] || %i[function join_group].include?(source[:kind]) ? scope + outer : outer
-        scope.concat(query_source_columns(source, ctes, visible, analyzer))
+        component = query_source_columns(source, ctes, visible, analyzer)
         (query[:joins] || []).select { |join| (join[:from_index] || 0) == index }.each do |join|
-        joined = join[:relation]
-        visible = joined[:lateral] || %i[function join_group].include?(joined[:kind]) ? scope + outer : outer
-        right = query_source_columns(joined, ctes, visible, analyzer)
-        using = join[:using] || (join[:natural] ? scope.map { |column| column[:name] } & right.map { |column| column[:name] } : [])
-        right = right.map { |column| using.include?(column[:name]) ? column.merge(qualified_only: true) : column }
-        scope.concat(right)
+          joined = join[:relation]
+          validate_query_lateral_join(joined, component, join[:kind], scope)
+          visible = joined[:lateral] || %i[function join_group].include?(joined[:kind]) ? component + scope + outer : outer
+          right = query_source_columns(joined, ctes, visible, analyzer)
+          component = query_join_columns(component, right, join)
         end
+        scope.concat(component)
       end
       scope + outer
+    end
+
+    def validate_query_lateral_join(source, left, kind, prefix)
+      return unless %i[right full right_outer full_outer].include?(kind)
+      previous = @join_group_outer
+      # Earlier comma items participate in ambiguity checks but are outside
+      # this join's nullable left input, just as in materialize_from.
+      @join_group_outer = (previous || []) + [[prefix, []]] unless prefix.empty?
+      if lateral_source_dependency?(source, left)
+        raise Error.new('42P10', 'invalid lateral reference in RIGHT/FULL JOIN')
+      end
+    ensure
+      @join_group_outer = previous if %i[right full right_outer full_outer].include?(kind)
+    end
+
+    # Match the executor's USING layout: merged names first, other visible
+    # columns next, and both original key columns retained for qualification.
+    def query_join_columns(left, right, join)
+      names = join[:using] || (join[:natural] ? left.reject { |column| column[:qualified_only] }.map { |column| column[:name] } & right.reject { |column| column[:qualified_only] }.map { |column| column[:name] } : [])
+      return left + right if names.empty?
+      pairs = names.map do |name|
+        a = left.each_index.select { |index| left[index][:name] == name && !left[index][:qualified_only] }
+        b = right.each_index.select { |index| right[index][:name] == name && !right[index][:qualified_only] }
+        raise Error.new('42702', "ambiguous USING column #{name}") if a.length > 1 || b.length > 1
+        raise Error.new('42703', "unknown USING column #{name}") if a.empty? || b.empty?
+        [a.first, b.first]
+      end
+      merged = pairs.map { |a, b| left[a].merge(table: nil, type: common_type(left[a][:type], right[b][:type])) }
+      left_keys, right_keys = pairs.transpose
+      visible = left.each_index.reject { |index| left_keys.include?(index) }.map { |index| left[index] } +
+                right.each_index.reject { |index| right_keys.include?(index) }.map { |index| right[index] }
+      hidden = pairs.flat_map { |a, b| [left[a].merge(qualified_only: true), right[b].merge(qualified_only: true)] }
+      merged + visible + hidden
     end
 
     def query_source_columns(source, ctes, outer, analyzer)
@@ -110,10 +143,11 @@ module JedNative
                 when :subquery then view_query_columns(source[:query], ctes, outer)
                 when :join_group
                   joined = query_input_columns(source, ctes, outer, analyzer)
-                  joined.take(joined.length - outer.length).reject { |column| column[:qualified_only] }
+                  joined.take(joined.length - outer.length)
                 else analyzer.relation_columns(source, outer)
                 end
       label = source[:alias] || source[:name]
+      columns = columns.reject { |column| column[:qualified_only] } if source[:kind] == :join_group && label
       columns.each_with_index.map { |column, index| column.merge(table: label || column[:table], name: source[:columns]&.[](index) || column[:name]) }
     end
 

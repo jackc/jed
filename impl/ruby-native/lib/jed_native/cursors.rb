@@ -22,6 +22,7 @@ module JedNative
   module CursorExecution
     def cursor_metadata(statement)
       ast = route_domains(statement)
+      validate_cte_structure(ast, true)
       @native_cursor_metadata ||= {}.compare_by_identity
       entry = @native_cursor_metadata[ast]
       unless entry && parameter_binding_schema_current?(entry[0]) &&

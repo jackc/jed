@@ -116,15 +116,12 @@ module JedNative
       end
     end
 
-    def storage_scan_entries(table, index_name = nil, lower: nil, upper: nil, reverse: false, charge_pages: false, prepaid_pages: 0)
+    def storage_scan_entries(table, index_name = nil, lower: nil, upper: nil, reverse: false)
       entries = index_name ? table[:native_secondary_indexes].fetch(index_name) : table[:native_primary_entries]
       metadata = index_name ? table[:native_secondary_metadata].fetch(index_name) : table[:native_primary_metadata]
       Enumerator.new do |output|
         walk = lambda do |node|
           next unless node
-          if charge_pages
-            prepaid_pages.positive? ? prepaid_pages -= 1 : charge
-          end
           if node[:children].empty?
             keys = node[:keys]
             first = lower ? keys.bsearch_index { |key| key >= lower } || keys.length : 0
@@ -152,18 +149,17 @@ module JedNative
     end
 
     def storage_stream_rows(table, lower: nil, upper: nil, reverse: false)
-      metadata = table[:native_primary_metadata]
-      initial = metadata[:height]
-      charge(initial)
-      # Resident descriptors and their scan-unit maps are immutable snapshots;
-      # writes publish a replacement table. An empty map needs no per-row
-      # singleton list, but its zero charge still checks the shared lifetime
-      # budget after a cursor resumes. Paged rows retain demand-fault accounting.
-      units = metadata[:scan_units]
-      empty_payload = !table[:rows].is_a?(PagedRows) && (!units || units.empty?)
+      # Cost counts every structural page and touched payload in the bound,
+      # even when LIMIT stops before reaching its last leaf. The page block is
+      # paid before pulling rows; physical row/value reads remain lazy.
+      charge(primary_page_count(table, lower, upper))
+      ordinals = paged_scan_ordinals(table, lower: lower, upper: upper) if lower || upper
+      charge_scan_payload(table, ordinals)
       Enumerator.new do |output|
-        storage_scan_entries(table, lower: lower, upper: upper, reverse: reverse, charge_pages: true, prepaid_pages: initial).each do |_, ordinal|
-          empty_payload ? charge(0) : charge_scan_payload(table, [ordinal])
+        storage_scan_entries(table, lower: lower, upper: upper, reverse: reverse).each do |_, ordinal|
+          # A suspended cursor shares its session's lifetime budget. Recheck
+          # it before resolving a row when another query spent that budget.
+          charge(0)
           output << storage_row(table, ordinal)
         end
       end

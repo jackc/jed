@@ -5,6 +5,11 @@ experiment's runtime compiler from expression methods into single-table row
 loops. No dependency, public API, supported-core implementation, or default task
 selection changes.
 
+Historical report: the subsequent [correctness follow-up](CORRECTNESS_FOLLOWUP.md)
+fixes the metadata, stack-depth, correlated-cost, and multi-page LIMIT defects
+identified here. These measurements and original failure reports remain intact;
+the follow-up separately records corrected costs and API-specific memory audits.
+
 ## Result and scope
 
 The implementation fuses predicate evaluation and projection into the existing

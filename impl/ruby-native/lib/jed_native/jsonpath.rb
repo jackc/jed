@@ -73,6 +73,17 @@ module JedNative
     end
     def predicate?(node) = PREDICATES.include?(node[:kind])
     def expression(minimum = 0)
+      stack_depth = @parse_stack_depth || 0
+      if stack_depth >= 24
+        @parse_stack_depth = 0
+        return Fiber.new { expression(minimum) }.resume
+      end
+      @parse_stack_depth = stack_depth + 1
+      expression_body(minimum)
+    ensure
+      @parse_stack_depth = stack_depth
+    end
+    def expression_body(minimum)
       previous_depth = @depth
       left = prefix
       loop do
@@ -278,6 +289,17 @@ module JedNative
       number.coefficient
     end
     def render(node, parent: 0, top: false)
+      stack_depth = @render_stack_depth || 0
+      if stack_depth >= 24
+        @render_stack_depth = 0
+        return Fiber.new { render(node, parent: parent, top: top) }.resume
+      end
+      @render_stack_depth = stack_depth + 1
+      render_body(node, parent: parent, top: top)
+    ensure
+      @render_stack_depth = stack_depth
+    end
+    def render_body(node, parent:, top:)
       kind = node[:kind]
       case kind
       when :root then '$'
