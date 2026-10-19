@@ -1831,6 +1831,14 @@ fingerprint work while consuming results; row counts, typed fingerprints, column
 logical costs must agree outside the timed interval. Alternate direct/worker order and preserve
 raw samples. With small sample counts, report medians and ranges rather than tail guarantees.
 
+For controlled transport experiments, both heavy tasks accept optional positive integer
+`JED_ASYNC_HEAVY_BATCH_ROWS` and `JED_ASYNC_HEAVY_BATCH_BYTES` overrides. These change only
+the measured worker's configured limits; omitted settings retain production defaults, SQL and
+the timing method remain unchanged. Record the effective runtime limits in every result.
+Batch bytes must fit the unchanged 2 MiB client result-credit limit. Compare the same workload
+and check responsiveness alongside throughput: larger batches change synchronous decode work
+and how much one cursor can retain. These environment overrides affect only the measured run.
+
 Measure responsiveness in separate runs from latency. Record an idle baseline, periodic timer
 gaps and callbacks during SQL; in the browser also record animation-frame gaps and long-task
 observations. Include the first delayed callback after synchronous work returns, and flush
@@ -1846,3 +1854,6 @@ engines, ARM, concurrent consumers and peak memory need their own measurements. 
 remain outside CI gates; correctness and resource-boundary tests stay in their existing suites.
 The [2026-10-18 heavy-query report](../../bench/ts/results/2026-10-18-heavy/report.md) retains three
 Node runs and three runs each of ordinary and isolated Chromium, with raw samples and results.
+The [result-batching follow-up](../../bench/ts/results/2026-10-18-result-batching/report.md)
+compares 128- and 512-row defaults under the same byte allowance, and separately measures an
+opt-in larger byte batch. It retains controlled Node/browser repeats and isolated codec probes.

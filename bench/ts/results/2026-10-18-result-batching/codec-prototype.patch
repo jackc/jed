@@ -1,0 +1,37 @@
+--- baseline/packed.ts
++++ rejected-prototype/packed.ts
+@@ -58,0 +59 @@
++  private readonly rowBudget: WireBudget;
+@@ -63,0 +65 @@
++    this.rowBudget = new WireBudget(maxBatchBytes - ENVELOPE_BYTES);
+@@ -70 +72,4 @@
+-      size = measureValues(row, new WireBudget(this.maxBytes - ENVELOPE_BYTES));
++      // Appends are synchronous. Reuse this writer's scratch allowance while keeping row
++      // admission independent of earlier successes, refusals and failed preflights.
++      this.rowBudget.used = 0;
++      size = measureValues(row, this.rowBudget);
+@@ -279 +284,4 @@
+-    this.budget?.reserve(bytes);
++    // Construction reads an already validated batch. Logical accounting belongs exclusively
++    // to preflight; writing its totals again for every decoded value serves no admission need.
++    if (this.build) return;
++    this.budget!.reserve(bytes);
+@@ -456 +464 @@
+-              bytes: new Uint8Array(this.data, at, length).slice(),
++              bytes: new Uint8Array(this.data.slice(at, at + length)),
+@@ -555 +563,8 @@
+-  for (let i = 0; i < length; i++) checked.row();
++  // Grow only after validating each row, so an unchecked packet row count cannot allocate an
++  // arbitrarily large metadata array. No Value is constructed until the entire batch passes.
++  const rowBytes: number[] = [];
++  for (let i = 0; i < length; i++) {
++    const before = checked.logicalBytes;
++    checked.row();
++    rowBytes.push(checked.logicalBytes - before);
++  }
+@@ -559 +573,0 @@
+-  const rowBytes = new Array<number>(length);
+@@ -561 +574,0 @@
+-    const before = reader.logicalBytes;
+@@ -563 +575,0 @@
+-    rowBytes[i] = reader.logicalBytes - before;

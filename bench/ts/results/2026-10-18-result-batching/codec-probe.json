@@ -1,0 +1,345 @@
+{
+  "metadata": {
+    "node": "v26.10.0",
+    "v8": "14.6.202.34-node.34",
+    "baselinePath": "/tmp/jed-row-before/impl/ts/src/async/packed.ts",
+    "prototypePath": "/home/jack/.codex/worktrees/2cdf/jed/impl/ts/src/async/packed.ts",
+    "baselineSha256": "885a8fde20f3098547d39b9de21a4b8b049fe40f58daacecb3b2e3675651fed8",
+    "prototypeSha256": "4c20d5205edec90e34fa748494cd4ea960a6c16d05e09049ec4516a86a15cfdf",
+    "rows": 200000,
+    "maxBatchRows": 512,
+    "maxBatchBytes": 262144,
+    "warmups": 3,
+    "samples": 7,
+    "actualBatches": 560,
+    "totalPhysicalBytes": 14582242,
+    "logicalBytes": 146320008,
+    "methodology": "No SQL. Prebuilt representative typed-output rows. Shared byte-identical dependencies. Exact packet equality and decoded boundary rows checked before warmup. Alternate baseline/prototype order; rotate/reverse all variants per round. Encoders discard complete packets; decoders retain only one batch. GC occurs naturally inside samples; explicit full GC once before warmups only."
+  },
+  "raw": {
+    "encode": {
+      "baseline": [
+        49.51580000000013,
+        71.49904599999991,
+        66.5654199999999,
+        66.71892400000024,
+        53.13206799999989,
+        55.568236999999954,
+        59.08807800000022
+      ],
+      "prototype": [
+        84.1707080000001,
+        62.84433799999988,
+        50.750906000000214,
+        86.7342749999998,
+        83.7788059999998,
+        59.43048100000033,
+        73.74890400000004
+      ],
+      "budgetOnly": [
+        92.19595600000002,
+        65.47200699999985,
+        50.091645000000426,
+        92.15608399999974,
+        76.43746399999964,
+        59.899773000000096,
+        82.85199799999964
+      ]
+    },
+    "decode": {
+      "baseline": [
+        37.13277300000027,
+        36.25698199999988,
+        36.488938999999846,
+        35.88644199999999,
+        37.24295399999937,
+        36.17314700000043,
+        36.501688000000286
+      ],
+      "prototype": [
+        137.11453100000017,
+        143.76122899999973,
+        136.3563920000006,
+        126.72491700000046,
+        138.04513099999986,
+        130.15877799999998,
+        133.63413499999933
+      ],
+      "accountingOnly": [
+        36.9079270000002,
+        36.786646000000474,
+        36.59133399999973,
+        36.595296999999846,
+        36.449319999999716,
+        36.980867999999646,
+        36.616172000000006
+      ],
+      "copyOnly": [
+        143.65047200000026,
+        143.85287400000016,
+        138.55722999999944,
+        131.02244100000007,
+        139.96588100000008,
+        142.28726900000038,
+        136.52612799999952
+      ],
+      "prototypeNoCopy": [
+        38.007744999999886,
+        37.03116599999976,
+        37.55312200000026,
+        37.62052500000027,
+        36.676212000000305,
+        37.374297999999726,
+        37.43179000000055
+      ]
+    }
+  },
+  "order": [
+    {
+      "phase": "encode",
+      "round": -3,
+      "order": [
+        "baseline",
+        "prototype",
+        "budgetOnly"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": -2,
+      "order": [
+        "baseline",
+        "budgetOnly",
+        "prototype"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": -1,
+      "order": [
+        "budgetOnly",
+        "baseline",
+        "prototype"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 0,
+      "order": [
+        "budgetOnly",
+        "prototype",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 1,
+      "order": [
+        "prototype",
+        "budgetOnly",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 2,
+      "order": [
+        "prototype",
+        "baseline",
+        "budgetOnly"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 3,
+      "order": [
+        "baseline",
+        "prototype",
+        "budgetOnly"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 4,
+      "order": [
+        "baseline",
+        "budgetOnly",
+        "prototype"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 5,
+      "order": [
+        "budgetOnly",
+        "baseline",
+        "prototype"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 6,
+      "order": [
+        "budgetOnly",
+        "prototype",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": -3,
+      "order": [
+        "baseline",
+        "prototype",
+        "accountingOnly",
+        "copyOnly",
+        "prototypeNoCopy"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": -2,
+      "order": [
+        "baseline",
+        "prototypeNoCopy",
+        "copyOnly",
+        "accountingOnly",
+        "prototype"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": -1,
+      "order": [
+        "accountingOnly",
+        "copyOnly",
+        "prototypeNoCopy",
+        "baseline",
+        "prototype"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 0,
+      "order": [
+        "accountingOnly",
+        "prototype",
+        "baseline",
+        "prototypeNoCopy",
+        "copyOnly"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 1,
+      "order": [
+        "prototypeNoCopy",
+        "baseline",
+        "prototype",
+        "accountingOnly",
+        "copyOnly"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 2,
+      "order": [
+        "prototypeNoCopy",
+        "copyOnly",
+        "accountingOnly",
+        "prototype",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 3,
+      "order": [
+        "prototype",
+        "accountingOnly",
+        "copyOnly",
+        "prototypeNoCopy",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 4,
+      "order": [
+        "prototype",
+        "baseline",
+        "prototypeNoCopy",
+        "copyOnly",
+        "accountingOnly"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 5,
+      "order": [
+        "copyOnly",
+        "prototypeNoCopy",
+        "baseline",
+        "prototype",
+        "accountingOnly"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 6,
+      "order": [
+        "copyOnly",
+        "accountingOnly",
+        "prototype",
+        "baseline",
+        "prototypeNoCopy"
+      ]
+    }
+  ],
+  "summary": {
+    "encode": {
+      "baseline": {
+        "min": 49.51580000000013,
+        "p50": 59.08807800000022,
+        "max": 71.49904599999991
+      },
+      "prototype": {
+        "min": 50.750906000000214,
+        "p50": 73.74890400000004,
+        "max": 86.7342749999998
+      },
+      "budgetOnly": {
+        "min": 50.091645000000426,
+        "p50": 76.43746399999964,
+        "max": 92.19595600000002
+      }
+    },
+    "decode": {
+      "baseline": {
+        "min": 35.88644199999999,
+        "p50": 36.488938999999846,
+        "max": 37.24295399999937
+      },
+      "prototype": {
+        "min": 126.72491700000046,
+        "p50": 136.3563920000006,
+        "max": 143.76122899999973
+      },
+      "accountingOnly": {
+        "min": 36.449319999999716,
+        "p50": 36.616172000000006,
+        "max": 36.980867999999646
+      },
+      "copyOnly": {
+        "min": 131.02244100000007,
+        "p50": 139.96588100000008,
+        "max": 143.85287400000016
+      },
+      "prototypeNoCopy": {
+        "min": 36.676212000000305,
+        "p50": 37.43179000000055,
+        "max": 38.007744999999886
+      }
+    }
+  }
+}
