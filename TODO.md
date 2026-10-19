@@ -590,7 +590,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   page boundaries and common execution loops on every host. Retained continuations share sync
   and async semantic paths, including awaitable Node data-page reads. The immediate-expression
   prototype removes generator traversal for common resident expressions; pending operands retain
-  their state without replay. Broaden this only with throughput and cancellation measurements.
+  their state without replay. Transferable binary result batches avoid cloning recursive value
+  objects, and buffered iteration avoids per-row scheduling chains. Broaden these changes only
+  with throughput and cancellation measurements.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar

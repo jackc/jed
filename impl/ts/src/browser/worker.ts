@@ -53,8 +53,8 @@ const runtime = new RuntimeServer({
     if (options.maxStorageBytes !== undefined) engine.storageBudget.limit = options.maxStorageBytes;
     return Database.fromEngine(engine);
   },
-  send(reply) {
-    postMessage(reply);
+  send(reply, transfer) {
+    postMessage(reply, { transfer });
   },
 });
 

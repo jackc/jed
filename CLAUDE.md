@@ -101,6 +101,7 @@ language, because hardening the spec was never the reason to add it.
    fourth conformance voice.
    **Async application runtime:** `spec/design/ts-runtime.md` specifies the implemented async-only
    package entry points on browser and Node, dedicated execution workers, bounded typed transport,
+   transferable binary result batches with lossless values and bounded decoding,
    session scheduling, prepared/batched execution and cancellation. One TS semantic core serves
    both adapters; synchronous core APIs remain internal for conformance and tooling. Node and
    shared-memory-capable browsers poll atomic cancellation flags; all hosts also cooperate at

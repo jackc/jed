@@ -9,10 +9,17 @@ import {
   acquireWorker,
 } from "../src/async/client.ts";
 import { encodeError, TransportError } from "../src/async/errors.ts";
-import { encodeValues } from "../src/async/wire.ts";
+import { PackedRowsWriter, type PackedRows } from "../src/async/packed.ts";
+import type { Value } from "../src/value.ts";
 import { Decimal } from "../src/decimal.ts";
+import { engineError, EngineError } from "../src/errors.ts";
 import type { JsParam } from "../src/ergonomic.ts";
-import type { RuntimeReply, RuntimeRequest, RuntimeTransport } from "../src/async/protocol.ts";
+import {
+  RUNTIME_VERSION,
+  type RuntimeReply,
+  type RuntimeRequest,
+  type RuntimeTransport,
+} from "../src/async/protocol.ts";
 
 class FakeTransport implements RuntimeTransport {
   requests: RuntimeRequest[] = [];
@@ -31,11 +38,11 @@ class FakeTransport implements RuntimeTransport {
     this.terminated = true;
   }
   reply(request: RuntimeRequest, result: unknown): void {
-    this.message({ version: 1, id: request.id, ok: true, result });
+    this.message({ version: RUNTIME_VERSION, id: request.id, ok: true, result });
   }
   reject(request: RuntimeRequest): void {
     this.message({
-      version: 1,
+      version: RUNTIME_VERSION,
       id: request.id,
       ok: false,
       error: encodeError(new TransportError("QUEUE_FULL", "full", "not-started")),
@@ -45,6 +52,12 @@ class FakeTransport implements RuntimeTransport {
 
 const queueFull = (error: unknown): boolean =>
   error instanceof TransportError && error.code === "QUEUE_FULL";
+
+function packedRows(rows: Value[][]): PackedRows {
+  const writer = new PackedRowsWriter(1024 * 1024);
+  for (const row of rows) assert.equal(writer.append(row), true);
+  return writer.finish();
+}
 
 test("transaction cleanup and handle close remain retryable after rejected admission", async () => {
   const transport = new FakeTransport();
@@ -74,7 +87,7 @@ test("malformed worker errors reject the matching request and all peers", async 
   const connection = new RuntimeConnection(transport);
   transport.handle = (request) => {
     transport.message({
-      version: 1,
+      version: RUNTIME_VERSION,
       id: request.id,
       ok: false,
       error: null,
@@ -99,7 +112,7 @@ test("a reported worker failure invalidates peer requests and the connection", a
   transport.handle = (request) => {
     if (request.id !== 1) return;
     transport.message({
-      version: 1,
+      version: RUNTIME_VERSION,
       id: request.id,
       ok: false,
       error: encodeError(new Error("worker invariant failed")),
@@ -122,7 +135,7 @@ test("concurrent row reads serialize and close releases the batch reservation", 
   const connection = new RuntimeConnection(transport, { maxBatchBytes: 512, maxResultBytes: 512 });
   transport.handle = (request) =>
     transport.reply(request, {
-      rows: [encodeValues([{ kind: "int", int: 1n }]), encodeValues([{ kind: "int", int: 2n }])],
+      rows: packedRows([[{ kind: "int", int: 1n }], [{ kind: "int", int: 2n }]]),
       cost: 42n,
       done: true,
     });
@@ -147,11 +160,201 @@ test("concurrent row reads serialize and close releases the batch reservation", 
   );
 });
 
+test("resident reads preserve order across a queued fetch and close", async () => {
+  const transport = new FakeTransport();
+  const connection = new RuntimeConnection(transport, {
+    maxBatchBytes: 512,
+    maxResultBytes: 512,
+    maxQueuedRequests: 2,
+  });
+  let fetched = 0;
+  let releaseFetch!: () => void;
+  transport.handle = (request) => {
+    if (request.op !== "fetch") {
+      transport.reply(request, null);
+      return;
+    }
+    const values = ++fetched === 1 ? [1n, 2n, 3n] : [4n, 5n];
+    const reply = () =>
+      transport.reply(request, {
+        rows: packedRows(values.map((int) => [{ kind: "int", int }])),
+        cost: BigInt(fetched),
+        done: false,
+      });
+    if (fetched === 1) reply();
+    else releaseFetch = reply;
+  };
+  const rows = new AsyncRows(connection, {
+    cursor: 1,
+    columnNames: ["n"],
+    columnTypes: ["i64"],
+    rowsAffected: null,
+    cost: 0n,
+  });
+  assert.deepEqual((await rows.next()).value, [{ kind: "int", int: 1n }]);
+  const second = rows.next();
+  const third = rows.next();
+  const fourth = rows.next();
+  const fifth = rows.next();
+  await assert.rejects(rows.next(), queueFull);
+  const closing = rows.close();
+  assert.equal(fetched, 2);
+  releaseFetch();
+  assert.deepEqual(
+    (await Promise.all([second, third, fourth, fifth])).map((result) => result.value),
+    [2n, 3n, 4n, 5n].map((int) => [{ kind: "int", int }]),
+  );
+  await closing;
+  assert.equal((await rows.next()).done, true);
+  assert.equal(rows.cost, 2n);
+  connection.reserveResult()();
+  assert.deepEqual(
+    transport.requests.map((request) => request.op),
+    ["fetch", "fetch", "cursor.close"],
+  );
+});
+
+test("a close queued ahead of a resident read discards the remaining batch", async () => {
+  const transport = new FakeTransport();
+  const connection = new RuntimeConnection(transport, { maxBatchBytes: 512, maxResultBytes: 512 });
+  transport.handle = (request) =>
+    transport.reply(
+      request,
+      request.op === "fetch"
+        ? {
+            rows: packedRows([[{ kind: "int", int: 1n }], [{ kind: "int", int: 2n }]]),
+            cost: 2n,
+            done: false,
+          }
+        : null,
+    );
+  const rows = new AsyncRows(connection, {
+    cursor: 1,
+    columnNames: ["n"],
+    columnTypes: ["i64"],
+    rowsAffected: null,
+    cost: 0n,
+  });
+  assert.equal((await rows.next()).done, false);
+  const closing = rows.close();
+  assert.equal((await rows.next()).done, true);
+  await closing;
+  connection.reserveResult()();
+  assert.deepEqual(
+    transport.requests.map((request) => request.op),
+    ["fetch", "cursor.close"],
+  );
+});
+
+test("abort discards resident rows and reaches a live worker cursor", async () => {
+  const transport = new FakeTransport();
+  const connection = new RuntimeConnection(transport, { maxBatchBytes: 512, maxResultBytes: 512 });
+  const controller = new AbortController();
+  let fetched = 0;
+  transport.handle = (request) => {
+    if (request.op !== "fetch") transport.reply(request, null);
+    else if (++fetched === 1)
+      transport.reply(request, {
+        rows: packedRows([1n, 2n].map((int) => [{ kind: "int", int }])),
+        cost: 2n,
+        done: false,
+      });
+    else {
+      assert.equal(request.aborted, true);
+      transport.message({
+        version: RUNTIME_VERSION,
+        id: request.id,
+        ok: false,
+        error: encodeError(engineError("query_canceled", "canceled")),
+      });
+    }
+  };
+  const rows = new AsyncRows(
+    connection,
+    { cursor: 1, columnNames: ["n"], columnTypes: ["i64"], rowsAffected: null, cost: 0n },
+    undefined,
+    undefined,
+    { signal: controller.signal },
+  );
+  assert.deepEqual((await rows.next()).value, [{ kind: "int", int: 1n }]);
+  controller.abort();
+  await assert.rejects(
+    rows.next(),
+    (error) => error instanceof EngineError && error.code() === "57014",
+  );
+  assert.equal((await rows.next()).done, true);
+  connection.reserveResult()();
+  assert.deepEqual(
+    transport.requests.map((request) => request.op),
+    ["fetch", "fetch", "cursor.close"],
+  );
+});
+
+test("a malformed later value rejects the complete batch before its first row", async () => {
+  const transport = new FakeTransport();
+  const connection = new RuntimeConnection(transport, { maxBatchBytes: 512, maxResultBytes: 512 });
+  const packet = packedRows([[{ kind: "int", int: 1n }], [{ kind: "int", int: 2n }]]);
+  packet.data = packet.data.slice(0, -1);
+  transport.handle = (request) =>
+    transport.reply(
+      request,
+      request.op === "fetch"
+        ? {
+            rows: packet,
+            done: true,
+            cost: 2n,
+          }
+        : null,
+    );
+  const rows = new AsyncRows(connection, {
+    cursor: 1,
+    columnNames: ["n"],
+    columnTypes: ["i64"],
+    rowsAffected: null,
+    cost: 0n,
+  });
+  await assert.rejects(
+    rows.next(),
+    (error) => error instanceof TransportError && error.code === "PROTOCOL",
+  );
+  assert.equal((await rows.next()).done, true);
+  connection.reserveResult()();
+  assert.deepEqual(
+    transport.requests.map((request) => request.op),
+    ["fetch", "cursor.close"],
+  );
+});
+
+test("a fetched batch owns decoded values before later pulls", async () => {
+  const transport = new FakeTransport();
+  const connection = new RuntimeConnection(transport, { maxBatchBytes: 512, maxResultBytes: 512 });
+  const wire = packedRows([
+    [{ kind: "bytea", bytes: new Uint8Array([1]) }],
+    [{ kind: "bytea", bytes: new Uint8Array([2]) }],
+  ]);
+  transport.handle = (request) => transport.reply(request, { rows: wire, done: true, cost: 2n });
+  const rows = new AsyncRows(connection, {
+    cursor: 1,
+    columnNames: ["n"],
+    columnTypes: ["bytea"],
+    rowsAffected: null,
+    cost: 0n,
+  });
+  assert.deepEqual((await rows.next()).value, [{ kind: "bytea", bytes: new Uint8Array([1]) }]);
+  new Uint8Array(wire.data).fill(99);
+  assert.deepEqual((await rows.next()).value, [{ kind: "bytea", bytes: new Uint8Array([2]) }]);
+  assert.equal((await rows.next()).done, true);
+  connection.reserveResult()();
+});
+
 test("a malformed empty batch closes its worker cursor and releases its reservation", async () => {
   const transport = new FakeTransport();
   const connection = new RuntimeConnection(transport, { maxBatchBytes: 512, maxResultBytes: 512 });
   transport.handle = (request) =>
-    transport.reply(request, request.op === "fetch" ? { rows: [], done: false, cost: 0n } : null);
+    transport.reply(
+      request,
+      request.op === "fetch" ? { rows: packedRows([]), done: false, cost: 0n } : null,
+    );
   const rows = new AsyncRows(connection, {
     cursor: 1,
     columnNames: [],
@@ -205,7 +408,7 @@ test("ergonomic results bound decimal rendering before allocating its large text
         ? { cursor: 1, columnNames: ["n"], columnTypes: ["decimal"], rowsAffected: null, cost: 0n }
         : request.op === "fetch"
           ? {
-              rows: [encodeValues([{ kind: "decimal", dec: Decimal.zero(16383) }])],
+              rows: packedRows([[{ kind: "decimal", dec: Decimal.zero(16383) }]]),
               done: true,
               cost: 0n,
             }
@@ -234,7 +437,7 @@ test("failed connections retain their worker slot and close waits for platform t
   });
   transport.handle = (request) =>
     transport.message({
-      version: 1,
+      version: RUNTIME_VERSION,
       id: request.id,
       ok: false,
       error: null,
