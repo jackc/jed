@@ -20,13 +20,22 @@ module JedNative
     end
 
     def highest_parameter(node)
-      case node
-      when Hash
-        return node[:index] if node[:kind] == :param
-        node.values.map { |child| highest_parameter(child) }.max || 0
-      when Array then node.map { |child| highest_parameter(child) }.max || 0
-      else 0
+      highest = 0
+      pending = [node]
+      until pending.empty?
+        current = pending.pop
+        if current.is_a?(Hash)
+          if current[:kind] == :param
+            index = current[:index]
+            highest = index if index > highest
+          else
+            current.each_value { |child| pending << child if child.is_a?(Hash) || child.is_a?(Array) }
+          end
+        elsif current.is_a?(Array)
+          current.each { |child| pending << child if child.is_a?(Hash) || child.is_a?(Array) }
+        end
       end
+      highest
     end
 
     def resolve

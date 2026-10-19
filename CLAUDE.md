@@ -318,6 +318,13 @@ between runtime-loaded data (portable but indirect) and hand-writing N times
 evaluator. Those are irreducibly per-language and are the parts that genuinely cost N
 times. Everything else, push into the shared layer.
 
+**Explicit Ruby experiment exception:** the maintainer authorized investigating and
+implementing runtime compilation of resolved query expressions into Ruby methods.
+The bounded template emitter is handwritten Ruby; SQL text, names, and values remain
+data rather than Ruby source. This does not change the supported differential set,
+the experiment's frozen status, or any semantic/resource contract. See
+`spec/design/ruby-runtime-compilation.md`.
+
 **Open types shift the contract in kind, not degree.** For scalars the cross-core contract is
 "the data table is byte-identical" — `scalars.toml`/`compare.toml` are authored once and each
 core is cross-checked against them. A composite type (§4) has no such fixed data table: its set

@@ -404,11 +404,11 @@ module NativeScalarCursorTests
     JedNative.memory(environment: environment) do |database|
       session = database.session
       cursor = session.query('SELECT scalar_probe($1::i64)', 8)
-      assert(!cursor.is_a?(JedNative::ScalarRows) && calls.empty?, 'host function was evaluated or admitted during construction')
+      assert(cursor.is_a?(JedNative::ScalarRows) && calls.empty?, 'host scalar cursor was not lazy during construction')
       cursor.close
       assert(calls.empty?, 'unread close invoked a host function')
       cursor = session.query('SELECT scalar_probe($1::i64)', 9)
-      assert(cursor.rows == [[10]] && calls == [9], 'host fallback lost lazy evaluation')
+      assert(cursor.rows == [[10]] && calls == [9], 'host scalar cursor lost lazy evaluation')
       session.close
     end
   end
@@ -457,7 +457,7 @@ module NativeScalarCursorTests
         calls.clear
         lifetime = session.lifetime_cost
         cursor = session.query("SELECT #{expression}")
-        assert(!cursor.is_a?(JedNative::ScalarRows) && calls.empty?, 'integer fold bypassed lazy host-function fallback')
+        assert(cursor.is_a?(JedNative::ScalarRows) && calls.empty?, 'integer fold bypassed lazy host-function evaluation')
         if expected == :error
           error('22023') { cursor.next }
         else

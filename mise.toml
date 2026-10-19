@@ -166,6 +166,10 @@ run = "ruby bench/ruby-native/compare.rb"
 description = "Explicit opt-in: validate preliminary benchmark answers without measuring timings"
 run = "ruby bench/ruby-native/compare.rb --verify-only"
 
+[tasks."ruby-native:binding-compare"]
+description = "Explicit opt-in: native Ruby versus the Ruby Rust binding, including host callbacks"
+run = "ruby bench/ruby-native/binding_compare.rb"
+
 [tasks."ruby-native:file-compare"]
 description = "Explicit opt-in: prepare real-file benchmark adapters; --run measures canonical workloads"
 usage = 'arg "[args]..." var=#true help="Use --prepare-only (default), --run, or --help"'

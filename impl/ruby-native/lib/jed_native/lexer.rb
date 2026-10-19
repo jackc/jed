@@ -9,6 +9,11 @@ module JedNative
     MAX_INTEGER_MAGNITUDE = 1 << 63
     OPERATORS = %w[!~* ->> #>> -|- <= >= <> != :: => || -> #> ?| ?& #- @> <@ && << >> &< &> @? @@ ~* !~].freeze
     PUNCTUATION = '(),.[]+-*/%=<>:;?~'.freeze
+    # Keep the longest spelling first within each leading byte. Ordinary
+    # punctuation never needs to scan the unrelated multi-byte operators.
+    OPERATORS_BY_BYTE = OPERATORS.group_by { |operator| operator.getbyte(0) }.transform_values(&:freeze).freeze
+    PUNCTUATION_BY_BYTE = PUNCTUATION.each_char.to_h { |character| [character.ord, character.freeze] }.freeze
+    RADIX_BASES = { '0x' => 16, '0o' => 8, '0b' => 2 }.freeze
 
     def initialize(sql)
       @sql = sql.to_s
@@ -57,13 +62,16 @@ module JedNative
           fail_syntax('trailing junk after parameter') if alpha?(@sql.getbyte(@offset))
           result << Token.new(:param, index, start)
         else
-          op = OPERATORS.find { |candidate| @sql.byteslice(@offset, candidate.bytesize) == candidate }
+          op = OPERATORS_BY_BYTE[byte]&.find do |candidate|
+            @sql.getbyte(@offset + 1) == candidate.getbyte(1) &&
+              (candidate.bytesize == 2 || @sql.getbyte(@offset + 2) == candidate.getbyte(2))
+          end
           if op
             @offset += op.bytesize
             result << Token.new(:symbol, op == '!=' ? '<>' : op, start)
-          elsif byte && PUNCTUATION.include?(byte.chr)
+          elsif (punctuation = PUNCTUATION_BY_BYTE[byte])
             @offset += 1
-            result << Token.new(:symbol, byte.chr, start)
+            result << Token.new(:symbol, punctuation, start)
           else
             fail_syntax("unexpected character #{@sql.byteslice(@offset, 1).inspect}")
           end
@@ -89,19 +97,20 @@ module JedNative
     def skip_space
       loop do
         @offset += 1 while space?(@sql.getbyte(@offset))
-        if @sql.byteslice(@offset, 2) == '--'
+        byte = @sql.getbyte(@offset)
+        if byte == 45 && @sql.getbyte(@offset + 1) == 45
           @offset += 2
           @offset += 1 while @offset < @length && @sql.getbyte(@offset) != 10
-        elsif @sql.byteslice(@offset, 2) == '/*'
+        elsif byte == 47 && @sql.getbyte(@offset + 1) == 42
           @offset += 2
           depth = 1
           until depth.zero?
             fail_syntax('unterminated block comment') if @offset >= @length
-            pair = @sql.byteslice(@offset, 2)
-            if pair == '/*'
+            byte = @sql.getbyte(@offset)
+            if byte == 47 && @sql.getbyte(@offset + 1) == 42
               depth += 1
               @offset += 2
-            elsif pair == '*/'
+            elsif byte == 42 && @sql.getbyte(@offset + 1) == 47
               depth -= 1
               @offset += 2
             else
@@ -201,8 +210,7 @@ module JedNative
     def number
       start = @offset
       prefix = @sql.byteslice(@offset, 2)&.downcase
-      bases = { '0x' => 16, '0o' => 8, '0b' => 2 }
-      if (base = bases[prefix])
+      if (base = RADIX_BASES[prefix])
         @offset += 2
         digits_start = @offset
         @offset += 1 if @sql.getbyte(@offset) == 95 && radix_digit?(@sql.getbyte(@offset + 1), base)

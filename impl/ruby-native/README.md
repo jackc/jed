@@ -16,6 +16,12 @@ The [query-shape follow-up](QUERY_FOLLOWUP.md) records further scan, aggregate,
 grouping, sort, and general prepared-execution improvements.
 The [scalar follow-up](SCALAR_FOLLOWUP.md) records lightweight scalar cursors,
 conditional/text execution, and comparisons across both JITs.
+The [binding comparison](BINDING_COMPARISON.md) compares the native and Rust-backed
+Ruby APIs, host callbacks, and remaining promotion requirements.
+The [API follow-up](API_FOLLOWUP.md) measures ordinary query setup, host-call
+planning, and batch execution improvements, including fresh SQL and both JITs.
+The [runtime compilation follow-up](COMPILED_FOLLOWUP.md) measures generated Ruby
+expression methods inside reusable plans, including direct YJIT/ZJIT evidence.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
@@ -53,6 +59,22 @@ Use `db.session` for session settings, temporary objects, or SQL transactions;
 `db.read_session` pins a committed snapshot. Sessions expose `#transaction` and
 `#execute_script` for atomic block/script execution. Errors carry a five-character
 `sqlstate`.
+
+Ordinary SQL calls reuse a bounded database-owned cache of parsed statements
+(64 entries, 64 KiB of SQL, at most 16 KiB per statement). Bindings, privileges,
+session settings, and catalog state are checked for each execution; results are
+never cached. `EXPLAIN` and larger statements bypass this cache. Public `prepare`
+still returns an independently owned statement. Reusing an explicit session also
+retains its resolved plans; database convenience methods still use fresh sessions.
+
+Reused plans can compile supported integer and boolean expressions into bounded
+Ruby methods after their first execution. This also applies to ordinary repeated
+SQL in a session. Unsupported expressions keep the existing evaluator, with the
+same SQL coverage and costs. No SQL text or literal is evaluated as Ruby source.
+Enable YJIT or ZJIT on the Ruby command line to let the runtime optimize these
+methods; the library does not change JIT settings. Short-lived queries may not
+amortize compilation. See the [design](../../spec/design/ruby-runtime-compilation.md)
+for admission, cache limits, and semantic boundaries.
 
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;
@@ -127,6 +149,11 @@ RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/scalar-plan.json \
   RUBY_NATIVE_PHASE=scalar-local mise run ruby-native:compare
 # Exercise the lazy API against expression-corpus expectations:
 JED_NATIVE_QUERY_API=query mise run ruby-native:conformance expr/
+# Force generated expression admission in one-shot conformance statements:
+JED_NATIVE_COMPILATION=immediate mise run ruby-native:conformance
+# Expanded runtime-compilation comparison (explicit opt-in):
+RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/compiled-plan.json \
+  RUBY_NATIVE_PHASE=compiled-local mise run ruby-native:compare
 # Disk SQL audit; default locking is auto (page service):
 JED_NATIVE_STORAGE=disk JED_NATIVE_LOCKING=exclusive mise run ruby-native:conformance
 # Full benchmark adapter, using the separately prepared standard databases:

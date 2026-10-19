@@ -1,8 +1,9 @@
 # frozen_string_literal: true
 
 module JedNative
-  # A resolved expression contains only Ruby values and column offsets. SQL never
-  # becomes Ruby source, and names never become method dispatch on a host object.
+  # A resolved expression contains Ruby values and column offsets. Runtime
+  # compilation uses trusted templates; SQL text/values never become Ruby source
+  # and names never become method dispatch on a host object.
   Expression = Struct.new(:kind, :type, :value, :args, :extra, keyword_init: true)
   Relation = Struct.new(:columns, :rows, keyword_init: true)
 

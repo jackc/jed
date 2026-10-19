@@ -5,7 +5,7 @@ module JedNative
   # functions, but cannot register code or obtain arbitrary Ruby dispatch.
   class HostFunction
     attr_reader :name, :args, :result, :cost, :volatility, :cross_core,
-                :component_id, :semantic_version, :kernel, :batch_kernel
+                :component_id, :semantic_version, :kernel, :batch_kernel, :result_bounds
     def initialize(name, args:, returns:, cost: 1, volatility: :volatile,
                    cross_core: false, component_id: nil, semantic_version: 0,
                    kernel: nil, batch_kernel: nil, &block)
@@ -23,6 +23,7 @@ module JedNative
       @cost, @volatility, @cross_core = cost, volatility, !!cross_core
       @component_id = component_id && String(component_id).dup.freeze
       @semantic_version = semantic_version
+      @result_bounds = Types::INTEGER_BOUNDS[@result]
       freeze
     end
     def dependency
@@ -42,6 +43,10 @@ module JedNative
       end
       raise Error.new('22000', 'batch kernel must append one result per row') unless out.length == 1
       out.first
+    end
+    def call_one(argument)
+      return call([argument]) unless @kernel
+      @kernel.call(HostValues.copy(argument))
     end
   end
 
@@ -73,7 +78,23 @@ module JedNative
   ParameterBindings.prepend(HostFunctionBindings)
 
   module HostFunctions
-    def host_function_name?(name) = @environment && @environment.functions.any? { |entry| entry.name == name }
+    NO_HOST_FUNCTIONS = [].freeze
+
+    # Environments are immutable. Keep their overload sets beside the engine so
+    # compilation need not scan every registered extension for every SQL call.
+    # The identity check also keeps copied cursor engines tied to their captured
+    # environment rather than a later engine's registry.
+    def host_functions_named(name)
+      unless @native_host_functions && @native_host_environment.equal?(@environment)
+        functions = {}
+        @environment&.functions&.each { |entry| (functions[entry.name] ||= []) << entry }
+        functions.each_value(&:freeze)
+        @native_host_functions = functions.freeze
+        @native_host_environment = @environment
+      end
+      @native_host_functions.fetch(name, NO_HOST_FUNCTIONS)
+    end
+    def host_function_name?(name) = !host_functions_named(name).empty?
     def builtin_function_name?(name)
       FunctionCatalog::SIGNATURES.key?(name) || Functions.aggregate?(name) ||
         Functions::WINDOWS.include?(name) || Types::RANGES.key?(Types.normalize(name)) ||
@@ -87,12 +108,25 @@ module JedNative
       false
     end
     def resolve_host_function(name, types)
-      candidates = (@environment&.functions || []).select do |entry|
-        entry.name == name && entry.args.length == types.length && entry.args.zip(types).all? { |expected, actual| expected == actual || %w[unknown null].include?(actual) }
+      candidate = nil
+      host_functions_named(name).each do |entry|
+        next unless entry.args.length == types.length
+        matches = true
+        index = 0
+        while index < types.length
+          actual = types[index]
+          unless entry.args[index] == actual || actual == 'unknown' || actual == 'null'
+            matches = false
+            break
+          end
+          index += 1
+        end
+        next unless matches
+        raise Error.new('42725', "function #{name} is ambiguous") if candidate
+        candidate = entry
       end
-      raise Error.new('42883', "function #{name}(#{types.join(', ')}) does not exist") if candidates.empty?
-      raise Error.new('42725', "function #{name} is ambiguous") if candidates.length > 1
-      candidates.first
+      raise Error.new('42883', "function #{name}(#{types.join(', ')}) does not exist") unless candidate
+      candidate
     end
     def compile(node, columns)
       unless node[:kind] == :call && host_function_name?(node[:name])
@@ -117,27 +151,33 @@ module JedNative
       return super unless expression.kind == :host_call
       function = expression.value
       charge(function.cost)
-      outcome = host_batch_outcome(expression, row) if @host_batch_stack
-      if outcome
-        raise outcome[1] if outcome[0]
-        value = outcome[1]
-      else
-        values = expression.args.map { |argument| evaluate(argument, row, group) }
-        return nil if values.any?(&:nil?)
-        value = function.call(values)
+      value = @host_batch_stack ? host_batch_outcome(expression, row) : HostBatches::MISSING_OUTCOME
+      if value.equal?(HostBatches::MISSING_OUTCOME)
+        if expression.args.length == 1
+          argument = evaluate(expression.args[0], row, group)
+          return nil if argument.nil?
+          value = function.call_one(argument)
+        else
+          values = expression.args.map { |argument| evaluate(argument, row, group) }
+          return nil if values.any?(&:nil?)
+          value = function.call(values)
+        end
       end
       return nil if value.nil?
       type = function.result
-      kind = Types.infer(value)
-      valid = if Types::INTEGER_BITS.key?(type)
-        value.is_a?(Integer)
-      elsif %w[f32 f64].include?(type)
+      if (bounds = function.result_bounds)
+        unless value.is_a?(Integer)
+          raise Error.new('22000', "host function #{function.name} returned #{Types.infer(value)}, expected #{type}")
+        end
+        raise Error.new('22003', "#{type} out of range") if value < bounds[0] || value >= bounds[1]
+        return value
+      end
+      valid = if type == 'f32' || type == 'f64'
         value.is_a?(Float)
       else
-        kind == type
+        Types.infer(value) == type
       end
-      raise Error.new('22000', "host function #{function.name} returned #{kind}, expected #{type}") unless valid
-      value = Types.check_integer(value, type) if Types::INTEGER_BITS.key?(type)
+      raise Error.new('22000', "host function #{function.name} returned #{Types.infer(value)}, expected #{type}") unless valid
       value = cast_value(value, type, source_type: type) if type == 'f32'
       HostValues.copy(value)
     end
@@ -155,8 +195,19 @@ module JedNative
       end
       super
     end
-    def cacheable_expression?(node)
-      return false if node && node[:kind] == :call && host_function_name?(node[:name])
+    def cacheable_expression?(node, host: false)
+      if node && node[:kind] == :call && host_function_name?(node[:name])
+        # Reusing resolved expressions does not reuse their values, even for
+        # volatile functions. Only the ordinary read executor opts in: changing
+        # the generic SELECT lane would also change batching and cost order.
+        return false unless host
+        # A host overload does not displace a built-in signature. Keep names
+        # whose built-in compiler captures statement state on the old route.
+        return false if PreparedSelect::STATEFUL_FUNCTIONS.include?(node[:name])
+        return !node[:over] && !node[:filter] && !node[:within_group] && !node[:distinct] &&
+          !node[:variadic] && (node[:order_by] || []).empty? && (node[:arg_names] || []).empty? &&
+          (node[:args] || []).all? { |argument| cacheable_expression?(argument, host: true) }
+      end
       super
     end
     def constant_expression?(expression)
