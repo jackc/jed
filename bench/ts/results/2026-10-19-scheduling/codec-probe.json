@@ -1,0 +1,262 @@
+{
+  "metadata": {
+    "node": "v26.10.0",
+    "v8": "14.6.202.34-node.34",
+    "snapshotDirectory": "/tmp/jed-fused-codec",
+    "dependencyDirectory": "/home/jack/.codex/worktrees/2cdf/jed/impl/ts/src",
+    "sourceFiles": {
+      "baseline": "baseline.ts",
+      "fusedDecoder": "decoder-only.ts",
+      "fusedCombined": "combined.ts"
+    },
+    "sourceHashes": {
+      "baseline": "885a8fde20f3098547d39b9de21a4b8b049fe40f58daacecb3b2e3675651fed8",
+      "fusedDecoder": "f3935d2a8b0383e390274df3bc0097c83616850ade183b6565abc0f3167def34",
+      "fusedCombined": "02591e1cf9bb7213adfb4c565981668f5ca9aef67f8625bae17b263b11a1e4dc"
+    },
+    "dependencyHashes": {
+      "decimal.ts": "613bc7b9a282502504ef9bd546cd24adf3e528bc8cfde579b89d6b322c6213ea",
+      "async/wire.ts": "67e8ce0fbbb67d7b70d16b263efc7414e9657ca5dcf1c66735dc258b8c300c27",
+      "async/errors.ts": "6bee3e21383eceb39b4226e56a02119f9248f918b1ded4ea23fb471357f260f2"
+    },
+    "rows": 200000,
+    "maxBatchRows": 512,
+    "maxBatchBytes": 262144,
+    "warmups": 3,
+    "samples": 7,
+    "actualBatches": 560,
+    "totalPhysicalBytes": 14582242,
+    "logicalBytes": 146320008,
+    "methodology": "No SQL or worker messaging. Prebuilt representative typed-output rows. Exact full-result packet bytes, values, per-row accounting and budget equality checked before warmup. Shared byte-identical dependencies. Variant order rotates every round, alternating AB/BA for each pair. Encoders discard completed packets; decoders retain one batch. Natural GC remains inside samples; explicit full GC once before warmups only. Encoding and decoding measured separately; timings are not end-to-end throughput or browser responsiveness."
+  },
+  "raw": {
+    "encode": {
+      "baseline": [
+        57.16247999999996,
+        43.55523399999993,
+        80.14815999999973,
+        86.0294859999999,
+        58.00882999999976,
+        87.19822000000022,
+        44.698443999999654
+      ],
+      "fusedCombined": [
+        80.84557499999983,
+        86.30428200000006,
+        47.974967000000106,
+        44.8227280000001,
+        70.97692300000017,
+        93.16621799999984,
+        44.28224300000011
+      ]
+    },
+    "decode": {
+      "baseline": [
+        36.820644999999786,
+        36.86932200000001,
+        37.89493600000014,
+        37.48988899999995,
+        37.55333699999983,
+        37.544740000000274,
+        37.82045900000003
+      ],
+      "fusedDecoder": [
+        29.10477600000013,
+        29.008903999999802,
+        28.764858999999888,
+        28.854921000000104,
+        29.022322999999687,
+        28.97211900000002,
+        29.052724000000126
+      ]
+    }
+  },
+  "order": [
+    {
+      "phase": "encode",
+      "round": -3,
+      "order": [
+        "baseline",
+        "fusedCombined"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": -2,
+      "order": [
+        "fusedCombined",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": -1,
+      "order": [
+        "baseline",
+        "fusedCombined"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 0,
+      "order": [
+        "fusedCombined",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 1,
+      "order": [
+        "baseline",
+        "fusedCombined"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 2,
+      "order": [
+        "fusedCombined",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 3,
+      "order": [
+        "baseline",
+        "fusedCombined"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 4,
+      "order": [
+        "fusedCombined",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 5,
+      "order": [
+        "baseline",
+        "fusedCombined"
+      ]
+    },
+    {
+      "phase": "encode",
+      "round": 6,
+      "order": [
+        "fusedCombined",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": -3,
+      "order": [
+        "baseline",
+        "fusedDecoder"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": -2,
+      "order": [
+        "fusedDecoder",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": -1,
+      "order": [
+        "baseline",
+        "fusedDecoder"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 0,
+      "order": [
+        "fusedDecoder",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 1,
+      "order": [
+        "baseline",
+        "fusedDecoder"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 2,
+      "order": [
+        "fusedDecoder",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 3,
+      "order": [
+        "baseline",
+        "fusedDecoder"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 4,
+      "order": [
+        "fusedDecoder",
+        "baseline"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 5,
+      "order": [
+        "baseline",
+        "fusedDecoder"
+      ]
+    },
+    {
+      "phase": "decode",
+      "round": 6,
+      "order": [
+        "fusedDecoder",
+        "baseline"
+      ]
+    }
+  ],
+  "summary": {
+    "encode": {
+      "baseline": {
+        "min": 43.55523399999993,
+        "p50": 58.00882999999976,
+        "max": 87.19822000000022
+      },
+      "fusedCombined": {
+        "min": 44.28224300000011,
+        "p50": 70.97692300000017,
+        "max": 93.16621799999984
+      }
+    },
+    "decode": {
+      "baseline": {
+        "min": 36.820644999999786,
+        "p50": 37.544740000000274,
+        "max": 37.89493600000014
+      },
+      "fusedDecoder": {
+        "min": 28.764858999999888,
+        "p50": 29.008903999999802,
+        "max": 29.10477600000013
+      }
+    }
+  }
+}

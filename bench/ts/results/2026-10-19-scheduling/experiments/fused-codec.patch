@@ -1,0 +1,517 @@
+--- a/impl/ts/src/async/packed.ts
++++ b/impl/ts/src/async/packed.ts
+@@ -3,2 +3,2 @@
+-// the existing wire budget, and decoding validates the complete expanded batch before allocating
+-// its values. All integers are little-endian; strings preserve raw UTF-16 code units.
++// the existing wire budget. Decoding reserves before allocation and exposes values only after
++// the complete batch validates. All integers are little-endian; strings preserve UTF-16 units.
+@@ -9 +9 @@
+-import { measureValues, WireBudget } from "./wire.ts";
++import { WireBudget } from "./wire.ts";
+@@ -15,0 +16,2 @@
++const I64_MIN = -(1n << 63n);
++const I64_MAX = (1n << 63n) - 1n;
+@@ -41,0 +44,3 @@
++function invalidSource(): never {
++  throw new TransportError("PROTOCOL", "invalid typed worker value");
++}
+@@ -58,0 +64,4 @@
++  private appending = false;
++  private rowBudget?: WireBudget;
++  private startOffset = 0;
++  private copying = false;
+@@ -68,12 +77,5 @@
+-    let size: number;
+-    try {
+-      size = measureValues(row, new WireBudget(this.maxBytes - ENVELOPE_BYTES));
+-    } catch (error) {
+-      if (error instanceof TransportError && error.code === "RESULT_TOO_LARGE") tooLarge();
+-      throw error;
+-    }
+-    if (size > this.maxBytes - this.used) return false;
+-    // Every binary field is no larger than its expanded wire charge. This upper bound permits
+-    // one growth before copying the row; no source buffer is copied before admission succeeds.
+-    this.grow(this.offset + size);
+-    const start = this.offset;
++    if (this.appending) invalidSource();
++    this.appending = true;
++    this.rowBudget = new WireBudget(this.maxBytes - ENVELOPE_BYTES);
++    this.startOffset = this.offset;
++    this.copying = true;
+@@ -80,0 +83 @@
++      this.array(row);
+@@ -82 +85,11 @@
+-      for (const value of row) this.datum(value);
++      for (const value of row) {
++        this.reserve(32); // The versioned value envelope in the logical wire accounting.
++        this.datum(value, 0);
++      }
++      if (!this.copying) {
++        this.offset = this.startOffset;
++        return false;
++      }
++      this.used += this.rowBudget.used;
++      this.rows++;
++      return true;
+@@ -84 +97,2 @@
+-      this.offset = start;
++      this.offset = this.startOffset;
++      if (error instanceof TransportError && error.code === "RESULT_TOO_LARGE") tooLarge();
+@@ -85,0 +100,4 @@
++    } finally {
++      this.appending = false;
++      this.rowBudget = undefined;
++      this.copying = false;
+@@ -87,3 +104,0 @@
+-    this.used += size;
+-    this.rows++;
+-    return true;
+@@ -93,0 +109 @@
++    if (this.appending) invalidSource();
+@@ -103,0 +120,33 @@
++  private reserve(bytes: number): void {
++    const budget = this.rowBudget!;
++    budget.reserve(bytes);
++    // Keep validating a refused row against the full single-row allowance: malformed or
++    // individually oversized rows still fail even when the current batch is already full.
++    if (budget.used > this.maxBytes - this.used) this.copying = false;
++    // Expanded accounting bounds the binary prefix. Refused prefixes stay private and their
++    // offsets are rolled back; scratch growth never exceeds the original batch allowance.
++    const needed = this.startOffset + budget.used;
++    if (this.copying && needed > this.buffer.byteLength) this.grow(needed);
++  }
++  private object(value: unknown): void {
++    if (value === null || typeof value !== "object") invalidSource();
++  }
++  private bool(value: unknown): void {
++    if (typeof value !== "boolean") invalidSource();
++  }
++  private integer(value: unknown): void {
++    if (!Number.isSafeInteger(value)) invalidSource();
++  }
++  private int64(value: unknown): void {
++    if (typeof value !== "bigint" || value < I64_MIN || value > I64_MAX) invalidSource();
++  }
++  private node(value: unknown, depth: number): void {
++    if (depth > MAX_DEPTH)
++      throw new TransportError("PROTOCOL", "typed worker value nesting exceeds 256");
++    this.object(value);
++    this.reserve(32);
++  }
++  private array(value: unknown): void {
++    if (!Array.isArray(value)) invalidSource();
++    this.reserve(32 + value.length * 8);
++  }
+@@ -117,0 +167 @@
++    if (!this.copying) return;
+@@ -120,0 +171 @@
++    if (!this.copying) return;
+@@ -125,0 +177 @@
++    if (!this.copying) return;
+@@ -129,0 +182 @@
++    if (!this.copying) return;
+@@ -133,0 +187 @@
++    if (!this.copying) return;
+@@ -137,0 +192,3 @@
++    if (typeof value !== "string") invalidSource();
++    this.reserve(value.length * 2);
++    if (!this.copying) return;
+@@ -141,0 +199,7 @@
++    this.object(value);
++    this.bool(value.neg);
++    this.integer(value.scale);
++    if (value.scale < 0 || value.scale > MAX_SCALE) invalidSource();
++    const limbs = value.limbs;
++    this.array(limbs);
++    if (limbs.length > Math.ceil((MAX_INT_DIGITS + MAX_SCALE) / 4)) invalidSource();
+@@ -144,2 +208,7 @@
+-    this.u32(value.limbs.length);
+-    for (const limb of value.limbs) this.u16(limb);
++    this.u32(limbs.length);
++    for (const limb of limbs) {
++      if (!Number.isInteger(limb) || limb < 0 || limb >= 10000) invalidSource();
++      this.u16(limb);
++    }
++    if (limbs.length === 0 ? value.neg : limbs[limbs.length - 1] === 0) invalidSource();
++    this.reserve(40);
+@@ -147 +216,2 @@
+-  private json(value: JsonNode): void {
++  private json(value: JsonNode, depth: number): void {
++    this.node(value, depth);
+@@ -152,0 +223 @@
++        this.bool(value.value);
+@@ -161,0 +233 @@
++        this.array(value.elements);
+@@ -163 +235 @@
+-        for (const element of value.elements) this.json(element);
++        for (const element of value.elements) this.json(element, depth + 1);
+@@ -165,0 +238 @@
++        this.array(value.members);
+@@ -167,0 +241,2 @@
++          this.object(member);
++          this.reserve(32);
+@@ -169 +244 @@
+-          this.json(member.value);
++          this.json(member.value, depth + 1);
+@@ -171,0 +247,2 @@
++      default:
++        invalidSource();
+@@ -174,2 +251,3 @@
+-  private datum(value: Value): void {
+-    if (value.kind === "unfetched") invalid();
++  private datum(value: Value, depth: number): void {
++    this.node(value, depth);
++    if (value.kind === "unfetched") invalidSource();
+@@ -180,0 +259,2 @@
++        this.int64(value.int);
++        this.reserve(8);
+@@ -183,0 +264 @@
++        this.bool(value.value);
+@@ -186,0 +268,2 @@
++        this.int64(value.days);
++        this.reserve(8);
+@@ -190,0 +274,2 @@
++        this.int64(value.micros);
++        this.reserve(8);
+@@ -193,0 +279,5 @@
++        this.object(value.iv);
++        this.integer(value.iv.months);
++        this.integer(value.iv.days);
++        this.int64(value.iv.micros);
++        this.reserve(56);
+@@ -207,2 +297,7 @@
+-        this.view.setFloat32(this.offset, value.value, true);
+-        this.offset += 4;
++        if (typeof value.value !== "number" || !Object.is(Math.fround(value.value), value.value))
++          invalidSource();
++        this.reserve(8);
++        if (this.copying) {
++          this.view.setFloat32(this.offset, value.value, true);
++          this.offset += 4;
++        }
+@@ -210,0 +306,2 @@
++        if (typeof value.value !== "number") invalidSource();
++        this.reserve(8);
+@@ -214,7 +311,10 @@
+-        this.u32(value.bytes.length);
+-        this.bytes.set(value.bytes, this.offset);
+-        this.offset += value.bytes.length;
+-        return;
+-      case "uuid":
+-        this.bytes.set(value.bytes, this.offset);
+-        this.offset += 16;
++      case "uuid": {
++        const bytes = value.bytes;
++        if (!(bytes instanceof Uint8Array) || (value.kind === "uuid" && bytes.length !== 16))
++          invalidSource();
++        this.reserve(32 + bytes.byteLength);
++        if (this.copying) {
++          if (value.kind === "bytea") this.u32(bytes.length);
++          this.bytes.set(bytes, this.offset);
++          this.offset += bytes.length;
++        }
+@@ -221,0 +322 @@
++      }
+@@ -222,0 +324 @@
++        this.array(value.fields);
+@@ -224 +326 @@
+-        for (const field of value.fields) this.datum(field);
++        for (const field of value.fields) this.datum(field, depth + 1);
+@@ -226 +328,5 @@
+-      case "array":
++      case "array": {
++        this.array(value.dims);
++        this.array(value.lbounds);
++        this.array(value.elements);
++        if (value.dims.length !== value.lbounds.length || value.dims.length > 6) invalidSource();
+@@ -227,0 +334 @@
++        let count = value.dims.length === 0 ? 0 : 1;
+@@ -229,2 +336,9 @@
+-          this.f64(value.dims[i]!);
+-          this.f64(value.lbounds[i]!);
++          const dimension = value.dims[i]!;
++          const lower = value.lbounds[i]!;
++          this.integer(dimension);
++          this.integer(lower);
++          if (dimension <= 0) invalidSource();
++          count *= dimension;
++          if (!Number.isSafeInteger(count)) invalidSource();
++          this.f64(dimension);
++          this.f64(lower);
+@@ -232 +346,2 @@
+-        for (const element of value.elements) this.datum(element);
++        if (count !== value.elements.length) invalidSource();
++        for (const element of value.elements) this.datum(element, depth + 1);
+@@ -233,0 +349 @@
++      }
+@@ -234,0 +351,3 @@
++        this.bool(value.empty);
++        this.bool(value.lowerInc);
++        this.bool(value.upperInc);
+@@ -242,2 +361,2 @@
+-        if (value.lower !== null) this.datum(value.lower);
+-        if (value.upper !== null) this.datum(value.upper);
++        if (value.lower !== null) this.datum(value.lower, depth + 1);
++        if (value.upper !== null) this.datum(value.upper, depth + 1);
+@@ -246 +365 @@
+-        this.json(value.node);
++        this.json(value.node, depth + 1);
+@@ -247,0 +367,2 @@
++      default:
++        invalidSource();
+@@ -252,3 +373,3 @@
+-// The preflight reader has a budget and allocates no result containers, strings, bytes or decimals.
+-// The construction reader traverses the already checked immutable ArrayBuffer synchronously.
+-// Both modes use this one layout decoder so validation and reconstruction cannot disagree on offsets.
++// Validation and construction share one traversal. Each allocation follows its logical reservation
++// and input bounds check. A malformed suffix discards the bounded prefix; no row escapes until the
++// entire batch succeeds.
+@@ -259 +379,0 @@
+-  private readonly build: boolean;
+@@ -261,2 +381,2 @@
+-  private readonly budget?: WireBudget;
+-  constructor(data: ArrayBuffer, budget?: WireBudget) {
++  private readonly budget: WireBudget;
++  constructor(data: ArrayBuffer, budget: WireBudget) {
+@@ -266 +385,0 @@
+-    this.build = budget === undefined;
+@@ -270,5 +389 @@
+-    if (
+-      !this.build &&
+-      (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.data.byteLength - at)
+-    )
+-      invalid();
++    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.data.byteLength - at) invalid();
+@@ -279 +394 @@
+-    this.budget?.reserve(bytes);
++    this.budget.reserve(bytes);
+@@ -283 +398 @@
+-    if (!this.build && depth > MAX_DEPTH) invalid();
++    if (depth > MAX_DEPTH) invalid();
+@@ -286 +401 @@
+-  private array(length: number): void {
++  private array(length: number, minimumBytes = 1): void {
+@@ -287,0 +403,3 @@
++    // A valid reservation alone cannot make truncated input a valid container. Every encoded
++    // element consumes at least one tag byte; dimensions and object members need more.
++    if (length > Math.floor((this.data.byteLength - this.offset) / minimumBytes)) invalid();
+@@ -292,3 +409,0 @@
+-  private u16(): number {
+-    return this.view.getUint16(this.take(2), true);
+-  }
+@@ -300 +415 @@
+-    return this.build ? this.view.getBigInt64(at, true) : 0n;
++    return this.view.getBigInt64(at, true);
+@@ -307 +422 @@
+-    if (!this.build && v > 1) invalid();
++    if (v > 1) invalid();
+@@ -312 +427 @@
+-    if (!this.build && !Number.isSafeInteger(v)) invalid();
++    if (!Number.isSafeInteger(v)) invalid();
+@@ -319 +434 @@
+-    if (!this.build || length === 0) return "";
++    if (length === 0) return "";
+@@ -329 +444 @@
+-  private decimal(): Decimal | undefined {
++  private decimal(): Decimal {
+@@ -334,3 +449,3 @@
+-    if (!this.build && (scale > MAX_SCALE || count > Math.ceil((MAX_INT_DIGITS + MAX_SCALE) / 4)))
+-      invalid();
+-    const limbs = this.build ? new Array<number>(count) : undefined;
++    if (scale > MAX_SCALE || count > Math.ceil((MAX_INT_DIGITS + MAX_SCALE) / 4)) invalid();
++    const start = this.take(count * 2);
++    const limbs = new Array<number>(count);
+@@ -339,3 +454,3 @@
+-      last = this.u16();
+-      if (!this.build && last >= 10000) invalid();
+-      if (limbs !== undefined) limbs[i] = last;
++      last = this.view.getUint16(start + i * 2, true);
++      if (last >= 10000) invalid();
++      limbs[i] = last;
+@@ -343,2 +458,2 @@
+-    if (!this.build && (count === 0 ? neg : last === 0)) invalid();
+-    return limbs === undefined ? undefined : Decimal.fromParts(neg, scale, limbs);
++    if (count === 0 ? neg : last === 0) invalid();
++    return Decimal.fromParts(neg, scale, limbs);
+@@ -346 +461 @@
+-  private json(depth: number): JsonNode | undefined {
++  private json(depth: number): JsonNode {
+@@ -350 +465 @@
+-        return this.build ? { kind: "null" } : undefined;
++        return { kind: "null" };
+@@ -353 +468 @@
+-        return this.build ? { kind: "bool", value } : undefined;
++        return { kind: "bool", value };
+@@ -357 +472 @@
+-        return this.build ? { kind: "number", dec: dec! } : undefined;
++        return { kind: "number", dec };
+@@ -361 +476 @@
+-        return this.build ? { kind: "string", value } : undefined;
++        return { kind: "string", value };
+@@ -366 +481 @@
+-        const elements = this.build ? new Array<JsonNode>(count) : undefined;
++        const elements = new Array<JsonNode>(count);
+@@ -369 +484 @@
+-          if (elements !== undefined) elements[i] = value!;
++          elements[i] = value;
+@@ -371 +486 @@
+-        return elements === undefined ? undefined : { kind: "array", elements };
++        return { kind: "array", elements };
+@@ -375,2 +490,2 @@
+-        this.array(count);
+-        const members = this.build ? new Array<{ key: string; value: JsonNode }>(count) : undefined;
++        this.array(count, 5); // Key length followed by at least one JSON tag.
++        const members = new Array<{ key: string; value: JsonNode }>(count);
+@@ -381 +496 @@
+-          if (members !== undefined) members[i] = { key, value: value! };
++          members[i] = { key, value };
+@@ -383 +498 @@
+-        return members === undefined ? undefined : { kind: "object", members };
++        return { kind: "object", members };
+@@ -389 +504 @@
+-  private datum(depth: number): Value | undefined {
++  private datum(depth: number): Value {
+@@ -393 +508 @@
+-        return this.build ? { kind: "null" } : undefined;
++        return { kind: "null" };
+@@ -397 +512 @@
+-        return this.build ? { kind: "int", int } : undefined;
++        return { kind: "int", int };
+@@ -401 +516 @@
+-        return this.build ? { kind: "bool", value } : undefined;
++        return { kind: "bool", value };
+@@ -406 +521 @@
+-        return this.build ? { kind: "date", days } : undefined;
++        return { kind: "date", days };
+@@ -413,3 +528 @@
+-        return this.build
+-          ? { kind: tag === TAG.timestamp ? "timestamp" : "timestamptz", micros }
+-          : undefined;
++        return { kind: tag === TAG.timestamp ? "timestamp" : "timestamptz", micros };
+@@ -422 +535 @@
+-        return this.build ? { kind: "interval", iv: { months, days, micros } } : undefined;
++        return { kind: "interval", iv: { months, days, micros } };
+@@ -429,3 +542 @@
+-        return this.build
+-          ? { kind: tag === TAG.text ? "text" : tag === TAG.json ? "json" : "jsonpath", text }
+-          : undefined;
++        return { kind: tag === TAG.text ? "text" : tag === TAG.json ? "json" : "jsonpath", text };
+@@ -435 +546 @@
+-        return this.build ? { kind: "decimal", dec: dec! } : undefined;
++        return { kind: "decimal", dec };
+@@ -440 +551 @@
+-        return this.build ? { kind: "f32", value: this.view.getFloat32(at, true) } : undefined;
++        return { kind: "f32", value: this.view.getFloat32(at, true) };
+@@ -445 +556 @@
+-        return this.build ? { kind: "f64", value: this.view.getFloat64(at, true) } : undefined;
++        return { kind: "f64", value: this.view.getFloat64(at, true) };
+@@ -453,6 +564,4 @@
+-        return this.build
+-          ? {
+-              kind: tag === TAG.bytea ? "bytea" : "uuid",
+-              bytes: new Uint8Array(this.data, at, length).slice(),
+-            }
+-          : undefined;
++        return {
++          kind: tag === TAG.bytea ? "bytea" : "uuid",
++          bytes: new Uint8Array(this.data, at, length).slice(),
++        };
+@@ -463 +572 @@
+-        const fields = this.build ? new Array<Value>(count) : undefined;
++        const fields = new Array<Value>(count);
+@@ -466 +575 @@
+-          if (fields !== undefined) fields[i] = value!;
++          fields[i] = value;
+@@ -468 +577 @@
+-        return fields === undefined ? undefined : { kind: "composite", fields };
++        return { kind: "composite", fields };
+@@ -472,5 +581,5 @@
+-        if (!this.build && dimensions > 6) invalid();
+-        this.array(dimensions);
+-        this.array(dimensions);
+-        const dims = this.build ? new Array<number>(dimensions) : undefined;
+-        const lbounds = this.build ? new Array<number>(dimensions) : undefined;
++        if (dimensions > 6) invalid();
++        this.array(dimensions, 16);
++        this.array(dimensions, 16);
++        const dims = new Array<number>(dimensions);
++        const lbounds = new Array<number>(dimensions);
+@@ -482,5 +591,3 @@
+-          if (!this.build && (dimension <= 0 || !Number.isSafeInteger(count))) invalid();
+-          if (dims !== undefined) {
+-            dims[i] = dimension;
+-            lbounds![i] = lower;
+-          }
++          if (dimension <= 0 || !Number.isSafeInteger(count)) invalid();
++          dims[i] = dimension;
++          lbounds[i] = lower;
+@@ -489 +596 @@
+-        const elements = this.build ? new Array<Value>(count) : undefined;
++        const elements = new Array<Value>(count);
+@@ -492 +599 @@
+-          if (elements !== undefined) elements[i] = value!;
++          elements[i] = value;
+@@ -494,3 +601 @@
+-        return elements === undefined
+-          ? undefined
+-          : { kind: "array", dims: dims!, lbounds: lbounds!, elements };
++        return { kind: "array", dims, lbounds, elements };
+@@ -500 +605 @@
+-        if (!this.build && flags > 31) invalid();
++        if (flags > 31) invalid();
+@@ -503,10 +608,8 @@
+-        return this.build
+-          ? {
+-              kind: "range",
+-              empty: !!(flags & 1),
+-              lowerInc: !!(flags & 2),
+-              upperInc: !!(flags & 4),
+-              lower: lower!,
+-              upper: upper!,
+-            }
+-          : undefined;
++        return {
++          kind: "range",
++          empty: !!(flags & 1),
++          lowerInc: !!(flags & 2),
++          upperInc: !!(flags & 4),
++          lower,
++          upper,
++        };
+@@ -516 +619 @@
+-        return this.build ? { kind: "jsonb", node: node! } : undefined;
++        return { kind: "jsonb", node };
+@@ -522 +625 @@
+-  row(): Value[] | undefined {
++  row(): Value[] {
+@@ -525 +628 @@
+-    const values = this.build ? new Array<Value>(count) : undefined;
++    const values = new Array<Value>(count);
+@@ -529 +632 @@
+-      if (values !== undefined) values[i] = value!;
++      values[i] = value;
+@@ -537,2 +640 @@
+-  // Real ports provide data properties; custom transports cannot change the envelope between
+-  // the validation and construction passes.
++  // Capture custom transport envelope accessors once.
+@@ -554,6 +656,5 @@
+-  const checked = new PackedReader(data, budget);
+-  for (let i = 0; i < length; i++) checked.row();
+-  if (checked.offset !== bytes) invalid();
+-  const reader = new PackedReader(data);
+-  const rows = new Array<Value[]>(length);
+-  const rowBytes = new Array<number>(length);
++  const reader = new PackedReader(data, budget);
++  // Grow metadata only after a complete row has validated and reserved its bytes. An unchecked
++  // envelope count cannot allocate a large result array before a truncated input is rejected.
++  const rows: Value[][] = [];
++  const rowBytes: number[] = [];
+@@ -562,2 +663,2 @@
+-    rows[i] = reader.row()!;
+-    rowBytes[i] = reader.logicalBytes - before;
++    rows.push(reader.row());
++    rowBytes.push(reader.logicalBytes - before);
+@@ -565 +666,2 @@
+-  return { rows, rowBytes, bytes: checked.logicalBytes };
++  if (reader.offset !== bytes) invalid();
++  return { rows, rowBytes, bytes: reader.logicalBytes };

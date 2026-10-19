@@ -61,20 +61,38 @@ type ExecutionContext = {
   cooperative: boolean;
   remaining: number;
   quantum: number;
+  timeSliceMs: number;
+  now: () => number;
+  deadline: number;
   planning: PlanningFrames;
 };
 let activeContext: ExecutionContext | undefined;
 const DEFAULT_QUANTUM = 256;
+const DEFAULT_TIME_SLICE_MS = 1;
 
-// The counter is physical scheduling state, never SQL cost. Resident-page walks and outer row
-// loops use the same checkpoint as cold I/O without turning scalar kernels into promises.
-export function shouldCooperate(units = 1): boolean {
-  const context = activeContext;
-  if (context === undefined || !context.cooperative) return false;
+function monotonicNow(): number {
+  return performance.now();
+}
+
+function cooperationDue(context: ExecutionContext, units = 1): boolean {
   context.remaining -= units;
   if (context.remaining > 0) return false;
   context.remaining = context.quantum;
-  return true;
+  return context.now() >= context.deadline;
+}
+
+function resetSlice(context: ExecutionContext): void {
+  context.remaining = context.quantum;
+  context.deadline = context.now() + context.timeSliceMs;
+}
+
+// The counter and clock are physical scheduling state, never SQL cost or the SQL host clock.
+// Read the monotonic clock only at sparse work checkpoints; cheap resident work can pass several
+// checkpoints without creating an effect, promise or task turn.
+export function shouldCooperate(units = 1): boolean {
+  const context = activeContext;
+  if (context === undefined || !context.cooperative) return false;
+  return cooperationDue(context, units);
 }
 
 export function* ioSteps<T>(sync: () => T, async?: () => Promise<T>): Steps<T> {
@@ -190,6 +208,10 @@ export type AsyncExecutionOptions = {
   poll?: () => boolean;
   schedule?: (callback: () => void) => void;
   quantum?: number;
+  // Elapsed scheduling budget, checked every quantum units. Zero forces every checkpoint to yield.
+  timeSliceMs?: number;
+  // Monotonic scheduling clock; injectable for deterministic driver tests, never exposed to SQL.
+  now?: () => number;
 };
 
 export async function runAsync<T>(
@@ -199,10 +221,17 @@ export async function runAsync<T>(
   const quantum = options.quantum ?? DEFAULT_QUANTUM;
   if (!Number.isSafeInteger(quantum) || quantum <= 0)
     throw new RangeError("execution quantum must be positive");
+  const timeSliceMs = options.timeSliceMs ?? DEFAULT_TIME_SLICE_MS;
+  if (!Number.isFinite(timeSliceMs) || timeSliceMs < 0)
+    throw new RangeError("execution time slice must be finite and non-negative");
+  const now = options.now ?? monotonicNow;
   const context = {
     cooperative: true,
     remaining: quantum,
     quantum,
+    timeSliceMs,
+    now,
+    deadline: now() + timeSliceMs,
     planning: currentPlanningFrames().slice(),
   };
   const poll = options.poll ?? currentCancellationCheck();
@@ -267,19 +296,23 @@ export async function runAsync<T>(
     try {
       if (step.value.kind === "cooperate") {
         await new Promise<void>((resolve) => schedule(resolve));
+        resetSlice(context);
       } else {
         const effect = step.value;
         // Even a synchronous host gets a real suspension point at page I/O on the async path.
         // This admits cancel messages before the next segment and keeps the continuation intact.
         if (effect.async !== undefined) {
           input = await effect.async();
-          // Hot promise-returning hosts must still admit cancel messages periodically.
-          if (--context.remaining <= 0) {
-            context.remaining = quantum;
+          // Preserve the deadline across awaits: an already-resolved provider must not reset
+          // its slice forever and starve control messages. Actual I/O is always awaited promptly;
+          // its wait may conservatively count toward the next sparse scheduling checkpoint.
+          if (cooperationDue(context)) {
             await new Promise<void>((resolve) => schedule(resolve));
+            resetSlice(context);
           }
         } else {
           await new Promise<void>((resolve) => schedule(resolve));
+          resetSlice(context);
           if (!canceled && check?.()) {
             failure = engineError("query_canceled", "canceling statement due to user request");
             failed = true;

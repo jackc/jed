@@ -1,0 +1,189 @@
+--- a/impl/ts/tests/async_packed.test.ts
++++ b/impl/ts/tests/async_packed.test.ts
+@@ -55 +55 @@
+-test("packed row admission has exactly the old logical byte boundaries and no source copies on refusal", () => {
++test("packed row admission has exactly the old logical byte boundaries and excludes refused rows", () => {
+@@ -61,2 +61 @@
+-  // A refused row is only measured, not copied. An invalid first element on an oversized row
+-  // must still fail preflight rather than allocating a buffer for its already visited prefix.
++  // A refused row may copy bounded private scratch, but it must not become part of the batch.
+@@ -79,0 +79,135 @@
++test("writer rolls back refused and failed prefixes and still validates rows after refusal", () => {
++  const row: Value[] = [{ kind: "null" }];
++  const writer = new PackedRowsWriter(128 + measureValues(row) * 2);
++  assert.equal(writer.append(row), true);
++  assert.equal(writer.append([{ kind: "text", text: "x" }]), false);
++  assert.throws(
++    () => writer.append([{ kind: "null" }, { kind: "bool", value: 1 } as unknown as Value]),
++    protocol,
++  );
++  assert.throws(() => writer.append([{ kind: "text", text: "x".repeat(200) }]), oversized);
++  assert.equal(writer.append(row), true);
++  assert.deepEqual(decodePackedRows(writer.finish()).rows, [row, row]);
++});
++
++test("packed bytes retain their golden layout across fused encoding and decoding", () => {
++  const row: Value[] = [
++    { kind: "int", int: -2n },
++    { kind: "decimal", dec: Decimal.fromParts(false, 2, [1234]) },
++    { kind: "bytea", bytes: Uint8Array.of(0, 255) },
++    { kind: "array", dims: [1], lbounds: [-1], elements: [{ kind: "null" }] },
++  ];
++  const fixture = Uint8Array.from([
++    1,
++    0,
++    0,
++    0,
++    4,
++    0,
++    0,
++    0, // One row, four columns.
++    1,
++    254,
++    255,
++    255,
++    255,
++    255,
++    255,
++    255,
++    255, // Integer -2.
++    10,
++    0,
++    2,
++    0,
++    0,
++    0,
++    1,
++    0,
++    0,
++    0,
++    210,
++    4, // Decimal 12.34.
++    13,
++    2,
++    0,
++    0,
++    0,
++    0,
++    255, // Two bytes.
++    16,
++    1,
++    0,
++    0,
++    0,
++    0,
++    0,
++    0,
++    240,
++    63,
++    0,
++    0,
++    0,
++    0,
++    0,
++    0,
++    240,
++    191,
++    0, // [-1:-1]={NULL}.
++  ]);
++  assert.deepEqual(new Uint8Array(pack([row]).data), fixture);
++  assert.deepEqual(decodePackedRows({ version: 1, length: 1, data: fixture.buffer }).rows, [row]);
++});
++
++test("writer preserves source validation and exact admission for every value kind", () => {
++  for (const value of values) {
++    const row = [value];
++    const size = measureValues(row);
++    const writer = new PackedRowsWriter(128 + size);
++    assert.equal(writer.append(row), true);
++    assert.equal(writer.append(row), false);
++    assert.deepEqual(decodePackedRows(writer.finish()).rows, [row]);
++    assert.throws(() => new PackedRowsWriter(127 + size).append(row), oversized);
++  }
++
++  const malformed: unknown[] = [
++    null,
++    { kind: "missing" },
++    { kind: "int", int: 1 },
++    { kind: "int", int: 1n << 63n },
++    { kind: "bool", value: 1 },
++    { kind: "date", days: -(1n << 63n) - 1n },
++    { kind: "timestamp", micros: "1" },
++    { kind: "timestamptz", micros: 1.5 },
++    { kind: "interval", iv: { months: 0.5, days: 0, micros: 0n } },
++    { kind: "text", text: 0 },
++    { kind: "json", text: null },
++    { kind: "jsonpath", text: [] },
++    { kind: "decimal", dec: { neg: true, scale: 0, limbs: [] } },
++    { kind: "decimal", dec: { neg: false, scale: -1, limbs: [1] } },
++    { kind: "decimal", dec: { neg: false, scale: 0, limbs: [10000] } },
++    { kind: "decimal", dec: { neg: false, scale: 0, limbs: [1, 0] } },
++    { kind: "f32", value: 1.1 },
++    { kind: "f64", value: "1" },
++    { kind: "bytea", bytes: [1, 2] },
++    { kind: "uuid", bytes: new Uint8Array(15) },
++    { kind: "composite", fields: {} },
++    { kind: "array", dims: [1], lbounds: [], elements: [{ kind: "null" }] },
++    { kind: "array", dims: [0], lbounds: [1], elements: [] },
++    { kind: "array", dims: [2], lbounds: [1], elements: [{ kind: "null" }] },
++    { kind: "range", empty: false, lowerInc: 1, upperInc: false, lower: null, upper: null },
++    { kind: "jsonb", node: { kind: "object", members: [{ key: 1, value: { kind: "null" } }] } },
++  ];
++  for (const value of malformed) {
++    const row = [value] as Value[];
++    assert.throws(() => measureValues(row), protocol);
++    const writer = new PackedRowsWriter(4096);
++    assert.equal(writer.append([{ kind: "int", int: 1n }]), true);
++    assert.throws(() => writer.append(row), protocol);
++    assert.equal(writer.append([{ kind: "int", int: 2n }]), true);
++    assert.deepEqual(decodePackedRows(writer.finish()).rows, [
++      [{ kind: "int", int: 1n }],
++      [{ kind: "int", int: 2n }],
++    ]);
++  }
++});
++
+@@ -137 +271 @@
+-test("packed preflight rejects all truncations, inconsistent row counts, unknown tags and padding", () => {
++test("packed decoding rejects all truncations, inconsistent row counts, unknown tags and padding", () => {
+@@ -176 +310 @@
+-test("packed decimal and array shape validation runs before any decoded decimal construction", () => {
++test("packed decimal and array shape validation rejects malformed values without exposing a prefix", () => {
+@@ -203 +337,36 @@
+-  assert.equal(allocations, 0);
++  // A valid prefix may be constructed privately, but the malformed suffix prevents any return.
++  assert.ok(allocations <= 1);
++});
++
++test("decoder reserves each value before construction and rejects truncated containers", () => {
++  const row: Value[] = [{ kind: "decimal", dec: decimal }];
++  const packet = pack([row, row]);
++  const budget = new WireBudget(measureValues(row) + 40);
++  const original = Decimal.fromParts;
++  let allocations = 0;
++  Decimal.fromParts = (...args) => {
++    allocations++;
++    assert.ok(budget.used <= budget.maxBytes);
++    return original(...args);
++  };
++  try {
++    assert.throws(() => decodePackedRows(packet, budget), oversized);
++  } finally {
++    Decimal.fromParts = original;
++  }
++  assert.equal(allocations, 1); // The second decimal cannot allocate before its reservation.
++  assert.ok(budget.used <= budget.maxBytes);
++
++  // These counts fit the logical allowance but do not fit the encoded input. No iteration or
++  // allocation should trust them just because a caller chose a very generous byte allowance.
++  for (const bytes of [
++    [1, 0, 0, 0, 255, 255, 255, 127],
++    [...ROW_ONE, 15, 255, 255, 255, 127],
++    [...ROW_ONE, 18, 4, 255, 255, 255, 127],
++    [...ROW_ONE, 18, 5, 255, 255, 255, 127],
++  ])
++    assert.throws(
++      () => decodePackedRows(raw(bytes), new WireBudget(Number.MAX_SAFE_INTEGER)),
++      protocol,
++    );
++  assert.throws(() => decodePackedRows(raw([255, 255, 255, 127], 0x7fffffff)), protocol);
