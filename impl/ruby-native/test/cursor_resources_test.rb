@@ -3,7 +3,7 @@
 require_relative '../lib/jed_native'
 
 # Collector ownership and captured budgets are host-API contracts; the shared
-# corpus checks the separate materialized executor's operator thresholds.
+# corpus drains cursors externally and checks their operator thresholds.
 module NativeCursorResourcesTests
   module_function
 

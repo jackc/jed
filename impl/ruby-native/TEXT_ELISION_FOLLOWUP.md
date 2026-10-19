@@ -1,5 +1,9 @@
 # Private text-comparison snapshots
 
+The cursor failures reported below are historical. The
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
+supersedes the mixed-routing interpretation. Original measurements are retained.
+
 Measured 2026-10-19. This explicitly requested optimization follows the C-text compiler at
 `2f947c81012f6d1e9a29291b61dda6768409f510`. Ruby remains a frozen, opt-in
 experiment; normal test, benchmark and CI tasks are unchanged.

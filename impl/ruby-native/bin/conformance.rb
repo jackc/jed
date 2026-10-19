@@ -130,8 +130,9 @@ class NativeCorpus
     @filter, @mode, @output = filter, mode, output
     @query_api = ENV.fetch('JED_NATIVE_QUERY_API', 'execute')
     raise 'JED_NATIVE_QUERY_API must be execute or query' unless %w[execute query].include?(@query_api)
-    @query_memory_api = ENV.fetch('JED_NATIVE_QUERY_MEMORY_API', @query_api)
-    raise 'JED_NATIVE_QUERY_MEMORY_API must be execute or query' unless %w[execute query].include?(@query_memory_api)
+    if ENV.key?('JED_NATIVE_QUERY_MEMORY_API') && ENV['JED_NATIVE_QUERY_MEMORY_API'] != @query_api
+      raise 'mixed query-memory routing is no longer supported; audit each API against every record'
+    end
     @failure_detail_bytes = 0
     @summary = { files: 0, records: 0, passed: 0, failed: 0, unsupported_files: 0, skipped_files: 0, timed_out_files: 0, memory_limited_files: 0, omitted_failure_details: 0, failures: [] }
     @summary[:scalar_cursor_records] = 0 if @query_api == 'query'
@@ -155,7 +156,8 @@ class NativeCorpus
     abort "unknown corpus locking mode #{locking.inspect}" unless %w[auto exclusive].include?(locking)
     @summary[:mode], @summary[:filter], @summary[:started_at] = @mode, @filter, Time.now.utc.iso8601
     @summary[:query_api] = @query_api
-    @summary[:query_memory_api] = @query_memory_api
+    @summary[:query_memory_api] = @query_api
+    @summary[:query_collection] = 'external' if @query_api == 'query'
     @summary[:compilation] = NativeCorpusCompilation::MODE
     @summary[:ruby], @summary[:ruby_executable] = RUBY_DESCRIPTION, RbConfig.ruby
     @summary[:jit] = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then 'yjit'
@@ -334,27 +336,14 @@ class NativeCorpus
         params = pending['params'] ? CorpusParams.parse(pending['params']).map { |value| bind_value(value) } : []
         error = nil
         result = nil
-        # The authored query-memory thresholds exercise the materialized drive.
-        # An explicitly selected mixed audit keeps those exact checks on execute
-        # while exercising the lazy API elsewhere. Rows#rows has an additional
-        # admitted collector (memory.md §5.1/§5.4), tested at its own host-API
-        # thresholds. The default still runs every record through query_api.
-        api = @query_api == 'query' && db.max_query_memory_bytes.positive? ? @query_memory_api : @query_api
-        @summary[:materialized_memory_records] += 1 if api != @query_api
+        api = @query_api
         @summary[api == 'query' ? :query_api_records : :execute_api_records] += 1
         result = begin
-          result = db.public_send(api, sql.join("\n"), *params)
-          if api == 'query'
-            @summary[:scalar_cursor_records] += 1 if defined?(JedNative::ScalarRows) && result.is_a?(JedNative::ScalarRows)
-            # Pull inside the error boundary: query() defers execution errors.
-            result.rows
-          end
-          result
+          # Pull inside the error boundary: query() defers execution errors.
+          run_statement(db, api, sql.join("\n"), params)
         rescue JedNative::Error => e
           error = e
           nil
-        ensure
-          result&.close if api == 'query'
         end
         if line.start_with?('statement error')
           want = line.split[2]
@@ -408,6 +397,20 @@ class NativeCorpus
     db&.close
     core&.close
     FileUtils.remove_entry(directory) if directory
+  end
+
+  def run_statement(db, api, sql, params)
+    result = db.public_send(api, sql, *params)
+    return result unless api == 'query'
+    @summary[:scalar_cursor_records] += 1 if defined?(JedNative::ScalarRows) && result.is_a?(JedNative::ScalarRows)
+    # Match the supported cores' conformance adapters: these rows belong to
+    # the runner. Rows#rows would introduce an extra engine-owned collector.
+    # Its separate admission contract remains covered by host-API tests.
+    values = result.each.to_a
+    JedNative::Result.new(columns: result.columns, column_types: result.column_types,
+      rows: values, cost: result.cost, rows_affected: result.rows_affected)
+  ensure
+    result&.close if api == 'query'
   end
 
   def relative(path) = path.delete_prefix(ROOT + '/')

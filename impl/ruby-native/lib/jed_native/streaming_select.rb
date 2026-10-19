@@ -117,6 +117,7 @@ module JedNative
       return false unless @native_stream_shapes[statement]
       name = statement[:from][0][:name]
       return false unless @tables.key?(name) && !@ctes.key?(name)
+      return false if columnar_cursor?(statement)
       return false unless statement[:limit] || statement[:offset] || !(statement[:order_by] || []).empty? || cursor_output?
       true
     end

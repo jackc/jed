@@ -1,0 +1,40 @@
+{
+  "status": "Superseded pre-fix correctness evidence, retained unchanged",
+  "source_sha256": "6bf013130b3966a81c334f6c93ba30822876997a0cbda80c4a39ee69e041a560",
+  "corpus_findings": "Memory query and both execute audits passed their complete record sets; disk query completed all records and reported two where_pushdown nested-subquery result failures.",
+  "runner_findings": "The archived runner counted explicit skip directives only: it expected 76 disk skips. The corpus also authors one concurrency file requiring resource.storage_memory, which the harness correctly skips on disk; actual authored disk skips total 77. This evidence-runner check is fixed for subsequent audits.",
+  "archived_runner_sha256": "56af23a58b9aa95a782ba16bff937f77e08026135d40503018c6979451e28791",
+  "preserved_files": [
+    "disk-execute-yjit-bounded.json",
+    "disk-execute-yjit-run.json",
+    "disk-execute-yjit.json",
+    "disk-pure-query-yjit-bounded.json",
+    "disk-pure-query-yjit-run.json",
+    "disk-pure-query-yjit.json",
+    "execute-audits-bounded.json",
+    "host-tests-bounded.json",
+    "memory-execute-zjit-bounded.json",
+    "memory-execute-zjit-run.json",
+    "memory-execute-zjit.json",
+    "memory-pure-query-zjit-bounded.json",
+    "memory-pure-query-zjit-run.json",
+    "memory-pure-query-zjit.json"
+  ],
+  "note": "The archived runner is retained byte-for-byte for its journal hash. Its original location was the parent directory; this archive copy is not a standalone executable.",
+  "preserved_file_sha256": {
+    "disk-execute-yjit-bounded.json": "7393a841219efb296957717d97969428ec68d87b0d584af3ad7dca949b51c955",
+    "disk-execute-yjit-run.json": "003596b58963f4bbaac29a91e5589cb5f6f0bd532d48cd3a7d1de7a87f9a9d7d",
+    "disk-execute-yjit.json": "7a3302f350087f5da7bc218886fbc829f7d303e0fba6131acf966807878fbfc8",
+    "disk-pure-query-yjit-bounded.json": "094e765232014135000b53fda5bbe192b7778782551e0670ace230f41da76fdd",
+    "disk-pure-query-yjit-run.json": "de2803c2a451cfca66e8ec3468641ccc6aa373ec98df2c663691b057f9d48bbd",
+    "disk-pure-query-yjit.json": "08e792511ed36d9baa6ce566af0f91b0a2f7448e36492c5eca3cb5b0437609ef",
+    "execute-audits-bounded.json": "95d840fe642ce5ff81a8a4bdc5ea81220e1b842b4b31eff8413a8c8e2c16295b",
+    "host-tests-bounded.json": "cb308b70bcba9b8758e36ac45de2e79c8b1735f043729edf778dbc3070656b42",
+    "memory-execute-zjit-bounded.json": "f62f2dfd05e81057e6c7763b5db88c76118c3478855b2b9cce6e74f4a8eefe7e",
+    "memory-execute-zjit-run.json": "39e3488112cdc1bee3287fd45e35ac958175139b98c90d7c1f1f4008b2282af1",
+    "memory-execute-zjit.json": "5b23ff618f8be6d68f5d4557486009016420ad2f78cea454ce076faa9af51951",
+    "memory-pure-query-zjit-bounded.json": "cc78db50527b62f074b6398b7a05b747cc17e5d917d3451058a0d4c581431312",
+    "memory-pure-query-zjit-run.json": "a3d0b62a65a49b8a428932fc44475e6b7aaf62b4b3c61567ca9eb4b474a9efcf",
+    "memory-pure-query-zjit.json": "17f29a6617570768acecfaa8236ee2c9fa7e84c6aec695c0fae706fcf7dbd54d"
+  }
+}

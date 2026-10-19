@@ -1,5 +1,12 @@
 # Ruby cursor and scan correctness follow-up
 
+The remaining 46 failures in this historical report were subsequently addressed
+by the [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md). The explanation
+below that the shared corpus was authored for materialized execution was wrong:
+the supported runners drain cursors externally. Correcting the Ruby adapter also
+exposed three real accounting failures that its extra collector had masked.
+The original measurements and raw failure reports remain historical evidence.
+
 Updated 2026-10-19. This explicitly requested pass fixes defects found during the
 [pipeline audit](PIPELINE_FOLLOWUP.md) at commit
 `39f804e416fd264a315b98183ef38354e5105d15`. The Ruby core remains frozen and opt-in;
