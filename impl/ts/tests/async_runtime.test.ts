@@ -169,6 +169,21 @@ test("SQL structured diagnostics and bounded transport errors remain distinct", 
   }
 });
 
+test("Node can reuse registration code importing the public browser worker entry", async () => {
+  const db = await createDatabase({
+    extensionModule: new URL("../browser/workers/host_functions.ts", import.meta.url).href,
+  });
+  try {
+    assert.equal(
+      (await db.get("SELECT app_add($1::i64) AS n", 9007199254740993n))?.n,
+      9007199254741034n,
+    );
+    assert.equal((await db.get("SELECT app_next() AS n"))?.n, 1n);
+  } finally {
+    await db.close();
+  }
+});
+
 test("trusted extensions register in the execution worker, including worker death", async () => {
   const directory = mkdtempSync(join(tmpdir(), "jed-async-extension-"));
   const modulePath = join(directory, "extension.mjs");

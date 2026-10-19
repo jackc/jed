@@ -128,20 +128,15 @@ export async function errorScenario() {
 }
 
 export async function failureScenario() {
-  const NativeWorker = globalThis.Worker;
   let created: Worker | undefined;
-  globalThis.Worker = class extends NativeWorker {
-    constructor(url: string | URL, options?: WorkerOptions) {
-      super(url, options);
-      created = this;
-    }
-  };
-  let db: Awaited<ReturnType<typeof createDatabase>>;
-  try {
-    db = await createDatabase();
-  } finally {
-    globalThis.Worker = NativeWorker;
-  }
+  const db = await createDatabase({
+    workerFactory() {
+      created = new Worker(new URL("./workers/custom_worker.ts", import.meta.url), {
+        type: "module",
+      });
+      return created;
+    },
+  });
   try {
     const pending = db.execute("SELECT 1");
     created!.dispatchEvent(

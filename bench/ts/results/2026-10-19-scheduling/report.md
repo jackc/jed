@@ -161,7 +161,7 @@ The [manifest](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3
 
 The [1 ms patch](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling/experiments/short.patch) and [4 ms patch](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling/experiments/scheduler.patch) reconstruct the scheduler variants relative to baseline `2a8bdfcb264d1ef388296ee8554b485bee3e7d26`. Apply the [fused codec patch](https://github.com/jackc/jed/blob/752cd4b922673af9a107ea4b65a8ee3a6a24fd7b/bench/ts/results/2026-10-19-scheduling/experiments/fused-codec.patch) alongside the 4 ms patch to reconstruct the combined variant. These are experiment artifacts for isolated baseline checkouts, not changes to apply to the selected production checkout. The manifest identifies the frozen sources used for the repeated comparisons; earlier 4 ms pilots predate the internal execution-clock test seam and must not be assumed to match that full source hash.
 
-To repeat the selected implementation, use this change's checkout or reconstruct the selected source from the baseline and retained patch. Choose a fresh output directory for every process run and run the existing tasks serially:
+To repeat the selected 1 ms experiment, reconstruct its source from baseline `2a8bdfcb264d1ef388296ee8554b485bee3e7d26` and the archived 1 ms patch above. The current implementation uses the restored checkpoint scheduler. Choose a fresh output directory for every process run and run the existing tasks serially:
 
 ```sh
 JED_ASYNC_HEAVY_CASES=decimal-aggregate,typed-output \

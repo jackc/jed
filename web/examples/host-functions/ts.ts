@@ -1,7 +1,6 @@
-// discount.ts — a trusted Node worker extension module. It exports configure;
-// the application passes this module's file URL as the extensionModule option.
-import { intValue } from 'jed-ts';
-import type { EnvironmentBuilder } from 'jed-ts/internal';
+// discount.ts — shared registration code, imported inside the database worker.
+// The public worker entry point is browser-safe and can also be imported on Node.
+import { intValue, type EnvironmentBuilder } from 'jed-ts/browser/worker';
 
 export function configure(builder: EnvironmentBuilder): void {
   // discount(cents, pct) -> the price after a whole-percent discount. STRICT — a NULL argument
@@ -44,10 +43,25 @@ export function configure(builder: EnvironmentBuilder): void {
   });
 }
 
-// In a separate application module:
+// In a separate Node application module:
 // const db = await createDatabase({
 //   path: 'shop.jed',
 //   extensionModule: new URL('./discount.ts', import.meta.url).href
+// });
+// await db.get('SELECT discount(1250, 15) AS sale'); // { sale: 1063n }
+// await db.close();
+//
+// In database-worker.ts for the browser:
+// import { startDatabaseWorker } from 'jed-ts/browser/worker';
+// import { configure } from './discount.ts';
+// startDatabaseWorker({ configure });
+//
+// In the browser application:
+// import { createDatabase } from 'jed-ts/browser';
+// const db = await createDatabase({
+//   path: 'shop.jed',
+//   workerFactory: () =>
+//     new Worker(new URL('./database-worker.ts', import.meta.url), { type: 'module' })
 // });
 // await db.get('SELECT discount(1250, 15) AS sale'); // { sale: 1063n }
 // await db.close();
