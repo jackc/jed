@@ -1,0 +1,29 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure substantial TS queries and application responsiveness in real Chromium"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_async_browser"
+  puts "Uses existing impl/ts Vite, Playwright and Chromium; installs/downloads nothing."
+  puts "JED_ASYNC_BROWSER_RESULTS sets the output directory (default bench/results/ts-async-browser-TIMESTAMP-PID)."
+  puts "JED_ASYNC_BROWSER_ISOLATED=1 enables COOP/COEP; default is a browser without shared memory."
+  puts "JED_ASYNC_BROWSER_TIMEOUT_MS bounds the complete run (default 1800000)."
+  puts "JED_ASYNC_HEAVY_WARMUPS, SAMPLES, RESPONSE_SAMPLES, DECIMAL_ROWS, TABLE_ROWS, SORT_ROWS, TYPED_ROWS and CASES"
+  puts "use the same settings and workloads as bench:ts_async_heavy."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+vite = File.join(TS_DIR, "node_modules/vite/bin/vite.js")
+playwright = File.join(TS_DIR, "node_modules/playwright-core/index.mjs")
+abort "Install the existing impl/ts tooling before benchmarking; no downloads performed" unless File.file?(vite) && File.file?(playwright)
+
+directory = File.expand_path(ENV.fetch("JED_ASYNC_BROWSER_RESULTS", "bench/results/ts-async-browser-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(directory)
+revision, revision_ok = capture("git", "rev-parse", "HEAD")
+status, status_ok = capture("git", "status", "--porcelain")
+abort "Could not read benchmark revision" unless revision_ok && status_ok
+sh "node", vite, "build", "--config", "bench/ts/browser/vite.config.ts", "--outDir", File.join(directory, "site")
+sh "node", "bench/ts/browser/run.mjs", directory,
+   env: { "JED_BENCH_REVISION" => revision.strip, "JED_BENCH_DIRTY" => (!status.empty?).to_s }
