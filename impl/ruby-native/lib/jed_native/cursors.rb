@@ -76,7 +76,7 @@ module JedNative
     include Enumerable
     attr_reader :columns, :column_types
     alias column_names columns
-    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_compiled_arguments @native_cte_validation
+    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_compiled_arguments @native_compiled_aggregates @native_cte_validation
                        @native_window_shapes @native_spill_shapes @native_stream_shapes].freeze
     REPLACED_STATE = (SharedDatabase::CATALOGS + %i[@native_binding_plans @savepoints
       @params @foreign_key_checks @native_query_shape_cache @subquery_hoists]).freeze
@@ -99,7 +99,7 @@ module JedNative
       params = bound if prebound_types && bound
       SHARED_CACHES.each do |name|
         next if session.engine.instance_variable_defined?(name)
-        cache = name == :@native_compiled_arguments ? {} : {}.compare_by_identity
+        cache = %i[@native_compiled_arguments @native_compiled_aggregates].include?(name) ? {} : {}.compare_by_identity
         session.engine.instance_variable_set(name, cache)
       end
       @engine = session.engine.dup

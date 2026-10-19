@@ -4,8 +4,8 @@ The maintainer explicitly requested investigating Ruby `eval` as a way to compil
 prepared query plans and let Ruby's JIT optimize query-specific code. This is a
 narrow exception to the prohibition on generated engine implementations: the
 compiler and its semantics are handwritten Ruby, operating on already resolved
-expressions, eligible single-table scan/filter/projection plans, and typed ORDER BY
-comparators. The Ruby core
+expressions, eligible single-table scan/filter/projection plans, typed ORDER BY
+comparators, and primitive aggregate input/reduction loops. The Ruby core
 remains frozen, experimental, and explicitly selected for every test, benchmark,
 and feature update.
 
@@ -14,7 +14,8 @@ and feature update.
 The expression tier specializes kernels inside existing query plans. A second
 tier fuses eligible single-table scan/filter/projection loops, including streaming
 OFFSET/LIMIT. A third tier specializes comparisons of precomputed ORDER BY keys.
-The planner, access paths, row sources, sort and aggregate algorithms,
+A fourth tier specializes primitive aggregate input collection and reduction.
+The planner, access paths, row sources, grouping and spill algorithms,
 storage, and host API remain the existing engine. A resolved expression can emit a
 Ruby method containing straight-line locals and branches instead of recursively
 dispatching through expression objects. Ruby's JIT may compile this method after
@@ -57,6 +58,14 @@ kernel's cached method Proc retains only the kernel itself. Blocking single-tabl
 sorting uses it with the existing bounded heap, full sort, or external sorter;
 other operators keep their existing comparisons.
 
+Aggregate admission specializes the memory host's general executor in its existing
+two phases: first evaluate FILTER and arguments for every input, then reduce the
+collected non-NULL scalars. It supports count, i16/i32 sum widened to i64,
+integer/boolean min/max, boolean folds, and integer bit folds. Arguments and FILTER
+must be complete supported expression trees. DISTINCT, aggregate ordering,
+ordered sets, windows, host calls, named/collatable types, decimal, and float reductions
+retain the ordinary executor. File hosts retain their existing aggregation.
+
 ## Semantic obligations
 
 Resolution and contextual typing finish before emission. Filter conjunction
@@ -89,6 +98,15 @@ unchanged, including the external sorter's run/merge ordering. Finite cost,
 query-memory budgets, and profiling therefore do not require disabling this
 comparator tier. Admission never interprets SQL text as a comparator expression.
 
+Aggregate input visits retain FILTER-before-charge-before-argument ordering.
+Reduction starts only after every input has been evaluated: an earlier partial
+sum overflow cannot replace a later argument error. NULL omission and removing
+one-element argument wrappers do not alter the fixed aggregates' logical memory
+charges. Integer sum checks each addition at i64 width with the existing error.
+Boolean reductions still evaluate every input even after their result is known.
+Grouping substitutions, result caching, projection, and output charges stay in
+the ordinary engine. Finite statement/lifetime limits retain the same prefixes.
+
 ## Lifetime and bounds
 
 Resolved plan caches retain at most 64 entries each and already validate table
@@ -114,8 +132,13 @@ immutable scalar pool form the cache key. Emission happens before lookup;
 `class_eval` happens only after reuse. Unsupported argument vectors have no
 compiled program, and an admitted kernel is reused within all groups of the same
 resolved expression. This avoids retaining stale folded subquery values or using
-an AST object ID as a persistent execution key. Aggregate folding and grouping
-substitutions remain unchanged.
+an AST object ID as a persistent execution key. Primitive aggregate kernels use
+their own 64-entry source-and-pool cache with the same reuse policy and per-kernel
+source/node/depth/pool limits. Lazy cursors share this bounded cache with the
+session; execution context is passed on each call. The internal aggregate-disable
+control leaves all earlier compiler tiers enabled. Unsupported aggregates retain
+their existing argument compilation and folding. Grouping substitutions remain
+unchanged.
 Exceeding a limit selects the evaluator. These bound retained source and compiler
 work, not total VM/JIT memory; active cursors can retain their own old plans and
 Ruby controls machine-code reclamation. Validation and benchmarks therefore also
