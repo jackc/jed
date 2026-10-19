@@ -650,6 +650,7 @@ end
       raise Error.new('42804', "types #{left} and #{right} cannot be matched")
     end
     def compare(a, b)
+      return a <=> b if a.is_a?(Integer) && b.is_a?(Integer)
       return 0 if a.nil? && b.nil?
       return 1 if a.nil?
       return -1 if b.nil?
@@ -689,6 +690,11 @@ end
       result.is_a?(Integer) ? check_integer(result, type || 'i64') : result
     end
     def binary(op, a, b, type: nil)
+      # Integer folds already carry canonical operands. Keep the same result
+      # range check without normalizing their symbolic operator on every row.
+      if (op == '+' || op == :+) && a.is_a?(Integer) && b.is_a?(Integer)
+        return check_integer(a + b, type || 'i64')
+      end
       op = op.to_s.downcase
       return false if op == 'and' && (a == false || b == false)
       return true if op == 'or' && (a == true || b == true)

@@ -49,10 +49,22 @@ module JedNative
         result = dispatch(statement)
         flush_foreign_keys
         # A frozen reader already captured prepared catalog/index metadata.
-        # Rebuilding that metadata after an unchanged read only copies the
-        # same descriptors. Retain refresh for any statement that dirtied them.
-        refresh_primary_indexes unless @native_cursor && !@dirty
+        # Eager reads can also reuse a completed refresh, within the same
+        # catalog and immutable host-function environment. Changed catalogs,
+        # transactions and statements that dirty them retain the write path.
+        skip_refresh = @native_cursor && !@dirty
+        if !skip_refresh && !@dirty && !@transaction && @native_refreshed_tables.equal?(@tables) &&
+           @native_refreshed_types.equal?(@types) && @native_refreshed_environment.equal?(@environment)
+          skip_refresh = case statement[:kind]
+                         when :select, :values, :set_operation, :setop, :with then true
+                         else false
+                         end
+        end
+        refresh_primary_indexes unless skip_refresh
         persist if @dirty && !@transaction
+        unless skip_refresh
+          @native_refreshed_tables, @native_refreshed_types, @native_refreshed_environment = @tables, @types, @environment
+        end
         Result.new(columns: result.columns, column_types: result.column_types,
                    rows: result.rows, rows_affected: result.rows_affected, cost: @cost)
       rescue StandardError
@@ -1238,11 +1250,19 @@ module JedNative
     end
 
     def order_compare(a, b, order)
-      desc = order[:direction].to_s.downcase == 'desc' || order[:desc]
-      nulls = (order[:nulls] || (desc ? :first : :last)).to_s
+      direction = order[:direction]
+      desc = order[:desc] || direction == :desc || direction == 'desc'
+      unless desc || direction == :asc || direction == 'asc' || direction.nil?
+        desc = direction.to_s.downcase == 'desc'
+      end
       return 0 if a.nil? && b.nil?
-      return nulls == 'first' ? -1 : 1 if a.nil?
-      return nulls == 'first' ? 1 : -1 if b.nil?
+      if a.nil? || b.nil?
+        nulls = order[:nulls] || (desc ? :first : :last)
+        first = nulls == :first || nulls == 'first'
+        first ||= nulls.to_s == 'first' unless nulls == :last || nulls == 'last'
+        return first ? -1 : 1 if a.nil?
+        return first ? 1 : -1
+      end
       n = Types.compare(a, b)
       desc ? -n : n
     end

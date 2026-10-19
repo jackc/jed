@@ -162,6 +162,48 @@ module RubyPagedStorageTest
     end
   end
 
+  # Disk corpus records reopen after autocommit. This host sequence deliberately
+  # keeps the original C-labelled column descriptors across CREATE and INSERT.
+  def self.c_collated_constraint_keys
+    Dir.mktmpdir('jed-ruby-c-keys') do |directory|
+      path = File.join(directory, 'db')
+      database = JedNative.create(path, page_size: 512, locking: :exclusive)
+      session = database.session
+      expected = {}
+      { 'text_keys' => 'text', 'array_keys' => 'text[]' }.each do |name, type|
+        session.execute("CREATE TABLE #{name}(id #{type} COLLATE \"C\" PRIMARY KEY, v #{type} COLLATE \"C\" UNIQUE)")
+        values = type == 'text' ? %w[a m z] : [%w[a], %w[a m], %w[z]]
+        insert = session.prepare("INSERT INTO #{name} VALUES($1, $2)")
+        session.execute_prepared(insert, values[0], values[1])
+        session.execute_prepared(insert, values[1], values[2])
+        [[values[0], values[0]], [values[2], values[1]]].each do |params|
+          begin
+            session.execute_prepared(insert, *params)
+            raise "#{type} duplicate constraint key was accepted"
+          rescue JedNative::Error => error
+            assert(error.sqlstate == '23505', "#{type} duplicate returned #{error.sqlstate}")
+          end
+        end
+        table = session.engine.tables.fetch(name)
+        codec = table.fetch(:native_primary_codec)
+        keys = values.first(2).map { |value| codec.key_body(type, JedNative::Types.storage_value(type, value)) }
+        assert(table[:rows].keys.to_a == keys, "#{type} C constraint key differs from canonical stored key bytes")
+        expected[name] = [[values[0], values[1]], [values[1], values[2]]]
+        assert(session.execute("SELECT * FROM #{name} ORDER BY id").rows == expected[name], "#{type} live rows changed after duplicate rejection")
+      end
+      session.close
+      database.close
+      database = JedNative.open(path, locking: :exclusive)
+      session = database.session
+      expected.each do |name, values|
+        assert(session.execute("SELECT * FROM #{name} ORDER BY id").rows == values, 'C constraint keys changed across reopen')
+      end
+    ensure
+      session&.close
+      database&.close
+    end
+  end
+
   def self.auxiliary_reopen
     Dir.mktmpdir('jed-ruby-auxiliary-pager') do |directory|
       path = File.join(directory, 'db.jed')
@@ -266,11 +308,12 @@ module RubyPagedStorageTest
   def self.run
     decoded_schema_identity
     direct_leaf_values
+    c_collated_constraint_keys
     cache_and_pins
     auxiliary_reopen
     shared_decoded_budget
     index_build_keeps_primary_pages
-    puts 'ruby-native pager: 6 tests passed (PAX codecs, bounded schema identities, shared caches, pinned roots, streamed index builds and statistics)'
+    puts 'ruby-native pager: 7 tests passed (PAX codecs, C constraint keys, bounded schema identities, shared caches, pinned roots, streamed index builds and statistics)'
   end
 end
 

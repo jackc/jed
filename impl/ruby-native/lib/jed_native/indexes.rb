@@ -6,6 +6,8 @@ module JedNative
   # Native B-tree search inventory. Keys are the shared byte-order contract,
   # including nullable slots, direction, and the row storage-key suffix.
   module SecondaryIndexes
+    ZERO_SCAN_UNITS = [0, 0].freeze
+
     def storage_page_size(table = nil)
       return 8192 if table && table[:temporary]
       return @attachments&.dig(table[:database], :storage)&.page_size || 8192 if table && table[:database]
@@ -138,8 +140,8 @@ module JedNative
     # Overflow pages and decompression slabs for the selected rows/columns,
     # separate from B-tree traversal pages. Nil selects all rows or all columns.
     def primary_scan_units(table, row_ordinals = nil, columns = nil)
-      units = table.fetch(:native_primary_metadata)[:scan_units] || {}
-      return [0, 0] if units.empty?
+      units = table.fetch(:native_primary_metadata)[:scan_units]
+      return ZERO_SCAN_UNITS unless units && !units.empty?
       pages, slabs = 0, 0
       selected = row_ordinals ? row_ordinals.filter_map { |ordinal| units[ordinal] } : units.values
       selected.each do |row|
