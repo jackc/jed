@@ -22,6 +22,9 @@ The [API follow-up](API_FOLLOWUP.md) measures ordinary query setup, host-call
 planning, and batch execution improvements, including fresh SQL and both JITs.
 The [runtime compilation follow-up](COMPILED_FOLLOWUP.md) measures generated Ruby
 expression methods inside reusable plans, including direct YJIT/ZJIT evidence.
+The [pipeline follow-up](PIPELINE_FOLLOWUP.md) extends that compiler into eligible
+single-table scan/filter/projection loops, preserving lazy LIMIT/OFFSET behavior.
+It also records existing lazy-API conformance gaps and a multi-page LIMIT cost defect.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
@@ -75,6 +78,12 @@ Enable YJIT or ZJIT on the Ruby command line to let the runtime optimize these
 methods; the library does not change JIT settings. Short-lived queries may not
 amortize compilation. See the [design](../../spec/design/ruby-runtime-compilation.md)
 for admission, cache limits, and semantic boundaries.
+
+Eligible single-table queries fuse the row loop, predicate, and projections into
+one generated method. Ordered scans can retain streaming OFFSET/LIMIT and cursor
+pull behavior. Exact-point/scalar paths, host callbacks, DISTINCT, blocking sorts,
+profiling, and finite query-memory accounting retain their existing executors.
+Pipeline methods share the plan's 64 KiB source allowance with expression kernels.
 
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;
@@ -154,6 +163,9 @@ JED_NATIVE_COMPILATION=immediate mise run ruby-native:conformance
 # Expanded runtime-compilation comparison (explicit opt-in):
 RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/compiled-plan.json \
   RUBY_NATIVE_PHASE=compiled-local mise run ruby-native:compare
+# Fused scan comparisons, including LIMIT/OFFSET (explicit opt-in):
+RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/pipeline-plan.json \
+  RUBY_NATIVE_PHASE=pipeline-local mise run ruby-native:compare
 # Disk SQL audit; default locking is auto (page service):
 JED_NATIVE_STORAGE=disk JED_NATIVE_LOCKING=exclusive mise run ruby-native:conformance
 # Full benchmark adapter, using the separately prepared standard databases:

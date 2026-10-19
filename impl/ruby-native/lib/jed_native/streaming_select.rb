@@ -16,7 +16,11 @@ module JedNative
       access = scan_access_plan(stored, predicate, statement) unless point
       order = point ? :none : access[:order]
       return super if order == :blocking
-      kernels = native_compiled_kernels(resolved, predicate, expressions)
+      pipeline_mode = :stream unless resolved.point || statement[:distinct] || @query_memory ||
+                                      @explain_profile_frames || @native_pipeline_disabled
+      kernels = native_compiled_kernels(resolved, predicate, expressions, pipeline: pipeline_mode,
+        offset: !!statement[:offset], limit: !!statement[:limit])
+      pipeline = kernels&.pipeline if pipeline_mode
       predicate_kernel, projection_kernel = kernels&.predicate, kernels&.projection
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) || 0 : 0
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
@@ -47,36 +51,40 @@ module JedNative
         seen_owner = query_memory_owner if @query_memory && seen.is_a?(Hash)
       end
       unless limit == 0
-        remaining = limit && -> { offset + limit - output.length }
-        host_batch_rows(input, [predicate, *expressions], pulled: true, remaining: remaining).each do |row|
-          begin
-            charge
-            profile_accumulate(:scan, @cost - scan_resume) if @explain_profile_frames
-            filter_start = @cost if @explain_profile_frames
-            accepted = !predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(predicate, row)) == true
-            profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
-            next unless accepted
-            if seen
-              result_row = projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }
-              if seen.is_a?(Hash)
-                next if seen.key?(result_row)
-                query_memory_add(seen_owner, MemorySchedule::ENTRY + query_memory_key_bytes(result_row)) if seen_owner
-                seen[result_row] = true
-              else
-                next unless seen.insert(result_row)
+        if pipeline
+          pipeline.call(self, input, @params, output, offset, limit)
+        else
+          remaining = limit && -> { offset + limit - output.length }
+          host_batch_rows(input, [predicate, *expressions], pulled: true, remaining: remaining).each do |row|
+            begin
+              charge
+              profile_accumulate(:scan, @cost - scan_resume) if @explain_profile_frames
+              filter_start = @cost if @explain_profile_frames
+              accepted = !predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(predicate, row)) == true
+              profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
+              next unless accepted
+              if seen
+                result_row = projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }
+                if seen.is_a?(Hash)
+                  next if seen.key?(result_row)
+                  query_memory_add(seen_owner, MemorySchedule::ENTRY + query_memory_key_bytes(result_row)) if seen_owner
+                  seen[result_row] = true
+                else
+                  next unless seen.insert(result_row)
+                end
               end
+              if offset.positive?
+                offset -= 1
+                next
+              end
+              result_row = (projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }) unless seen
+              query_memory_add_row(memory_owner, result_row, columns) if memory_owner
+              charge
+              output << result_row
+              break if limit && output.length >= limit
+            ensure
+              scan_resume = @cost if @explain_profile_frames
             end
-            if offset.positive?
-              offset -= 1
-              next
-            end
-            result_row = (projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }) unless seen
-            query_memory_add_row(memory_owner, result_row, columns) if memory_owner
-            charge
-            output << result_row
-            break if limit && output.length >= limit
-          ensure
-            scan_resume = @cost if @explain_profile_frames
           end
         end
       end
