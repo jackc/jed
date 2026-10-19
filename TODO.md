@@ -53,6 +53,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [runtime compilation](impl/ruby-native/COMPILED_FOLLOWUP.md),
   [fused scan pipelines](impl/ruby-native/PIPELINE_FOLLOWUP.md),
   [cursor and scan correctness](impl/ruby-native/CORRECTNESS_FOLLOWUP.md),
+  [compiled ORDER BY comparisons](impl/ruby-native/ORDERING_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 
   The explicitly requested correctness pass fixes the pipeline audit's metadata,

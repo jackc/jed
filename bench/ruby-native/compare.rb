@@ -83,7 +83,10 @@ module NativeRubyCompare
               when 'ts' then ['node', File.join(SOURCES, 'lane.ts')]
               else raise "unknown lane #{lane}"
               end
-    command + [plan] + (verify ? ['--verify-only'] : [])
+    command += [plan]
+    command << '--verify-only' if verify
+    command << '--disable-ordering' if lane.start_with?('ruby') && ARGV.include?('--disable-ordering')
+    command
   end
 
   def host
@@ -182,6 +185,7 @@ module NativeRubyCompare
     FileUtils.mkdir_p(RESULTS)
     artifact = File.join(RESULTS, "#{phase}#{verify ? '-verify' : ''}.json")
     report = { schema: 1, phase: phase, verification_only: verify, created_at: Time.now.utc.iso8601,
+               ordering_disabled: ARGV.include?('--disable-ordering'),
                host: host, plan_path: plan_path, plan_sha256: Digest::SHA256.hexdigest(plan_json), plan: plan,
                ruby_source: ENV.fetch('RUBY_NATIVE_SOURCE', File.join(ROOT, 'impl/ruby-native')),
                statuses: statuses, results: results, resources: resources }

@@ -35,7 +35,8 @@ before optimizations. JIT settings belong to the benchmark launcher, never the l
 
 The separately requested runtime compilation experiment is described in
 [`ruby-runtime-compilation.md`](ruby-runtime-compilation.md). It permits a bounded,
-handwritten emitter for resolved expressions and eligible single-table row loops;
+handwritten emitter for resolved expressions, eligible single-table row loops,
+and typed ORDER BY comparators;
 it does not permit evaluating SQL text as Ruby or introducing a native engine dependency.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
