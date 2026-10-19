@@ -153,6 +153,11 @@ test("packed preflight rejects all truncations, inconsistent row counts, unknown
     () => decodePackedRows({ version: 1, length: 0, data: shared } as unknown as PackedRows),
     protocol,
   );
+  const impostor = Object.create(ArrayBuffer.prototype, { byteLength: { value: 4 } });
+  assert.throws(() => decodePackedRows({ version: 1, length: 0, data: impostor }), protocol);
+  const detached = new ArrayBuffer(4);
+  structuredClone(detached, { transfer: [detached] });
+  assert.throws(() => decodePackedRows({ version: 1, length: 0, data: detached }), protocol);
 });
 
 test("tiny packed inputs cannot expand unchecked counts into large arrays, strings or byte buffers", () => {

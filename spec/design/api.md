@@ -1279,6 +1279,15 @@ NULL before the kernel runs), **exact scalar signatures** (no implicit promotion
 **single-row or batch kernel** (the column-in → column-out ABI, extensibility.md §4.2.1). Since step 4 an `immutable` host function
 that also declares a **component identity** may back a **persisted index** (below).
 
+The TypeScript application API performs this registration inside its execution worker, before
+opening storage: Node loads a trusted `extensionModule` exporting `configure(builder)`, and a
+browser application's `workerFactory` supplies a dedicated worker that calls
+`startDatabaseWorker({ configure })` from `jed-ts/browser/worker`. Configuration may return a
+promise; the scalar/batch kernels themselves remain synchronous. Application closures and built
+environments do not cross the worker boundary. See [ts-runtime.md §10](ts-runtime.md#10-implemented-async-host-contract)
+for the factory ownership and initialization contract. The TS table below describes the internal
+synchronous core that the worker configures.
+
 - **Register.** A function carries a name (taken **verbatim**, never folded — register a lowercase
   name to make it callable with a bare spelling, grammar.md §3), an exact scalar argument signature, a scalar result type,
   a kernel, and three declarations: **`volatility`** (`immutable`/`stable`/`volatile`, recorded

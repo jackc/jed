@@ -111,7 +111,10 @@ language, because hardening the spec was never the reason to add it.
    effort: sorting, parsing/planning and long scalar kernels stay synchronous. Node data-page reads
    can await I/O; storage lifecycle, commit and
    async crypto remain separate work. No encryption suite or Rust delivery default is selected
-   by this migration.
+   by this migration. Host functions register inside the execution worker: Node uses
+   `extensionModule`; browsers supply a fresh worker through `workerFactory` and call the public
+   `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
+   SQL kernels remain synchronous, with no application-thread callback RPC.
 
 **Beyond the differential set — best experience per language.** For every language past
 core #3 the question is not "how much new divergence does it surface" (usually little) but

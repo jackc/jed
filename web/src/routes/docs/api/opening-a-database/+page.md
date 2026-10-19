@@ -32,6 +32,13 @@ currently the only available backend. Browser paths name OPFS files; ordinary br
 not require cross-origin isolation. A handle owns one long-lived worker and `await db.close()`
 releases it, rolling back open transactions.
 
+Browser applications that register [host functions](../host-functions/)
+can supply `workerFactory: () => new Worker(new URL('./database-worker.ts', import.meta.url),
+{ type: 'module' })` to either constructor. That worker calls `startDatabaseWorker({ configure })`
+from `jed-ts/browser/worker`. The factory must return a fresh dedicated worker for each handle;
+jed owns termination on close or initialization failure. Register the same functions when
+reopening a file that uses them.
+
 The `runtime` open option bounds queued requests and bytes, result batches, total retained result
 bytes, sessions, prepared statements, cursors, and workers. Those physical transport budgets are
 separate from SQL cost and query-memory limits. An oversized row or full queue rejects with a
@@ -188,6 +195,13 @@ time-zone data, [host functions](../host-functions/), and the random and clock s
 database that should share those inputs; omit it and the database gets a fresh, empty one (`C`
 collation and ASCII casing, `UTC` and fixed offsets, no host functions, OS randomness, the wall
 clock).
+
+TypeScript's application API builds this environment inside the database worker. Pass Unicode
+and time-zone bundles as the `unicodeData` and `timeZoneData` byte options, and use a
+[worker-local `configure(builder)` function](../host-functions/) for code registrations:
+`extensionModule` on Node, or a custom browser worker supplied by `workerFactory`. The function
+runs once before storage opens and may return a promise. Built environments are not transferred
+from the application thread.
 
 ```rust
 let env = jed::Environment::builder()

@@ -32,6 +32,8 @@ export type BrowserDatabaseOptions = {
   unicodeData?: Uint8Array;
   timeZoneData?: Uint8Array;
   runtime?: Partial<RuntimeLimits>;
+  /** Creates a fresh dedicated worker running startDatabaseWorker. Jed owns its lifetime. */
+  workerFactory?: () => Worker;
 };
 
 export type BrowserOpenOptions = Omit<BrowserDatabaseOptions, "path" | "pageSize"> & {
@@ -39,6 +41,10 @@ export type BrowserOpenOptions = Omit<BrowserDatabaseOptions, "path" | "pageSize
   cacheBytes?: number;
   workMem?: number;
 };
+
+// A worker cannot serve two connections or be restarted after a database closes.
+// Weak ownership tracking does not retain workers after application references disappear.
+const ownedWorkers = new WeakSet<Worker>();
 
 function browserTransport(worker: Worker): RuntimeTransport {
   return {
@@ -70,22 +76,50 @@ async function connect(
   if (options.backend !== undefined && options.backend !== "typescript") {
     throw new TransportError("UNSUPPORTED", "this package provides the typescript backend");
   }
-  const release = acquireWorker(runtimeLimits(options.runtime));
+  const limits = runtimeLimits(options.runtime);
+  const release = acquireWorker(limits);
   let worker: Worker;
   try {
-    worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+    worker = options.workerFactory
+      ? options.workerFactory()
+      : new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+    // A valid Worker can come from another same-origin realm. Check the required
+    // transport methods without relying on the calling realm's constructor identity.
+    if (
+      worker === null ||
+      typeof worker !== "object" ||
+      typeof worker.postMessage !== "function" ||
+      typeof worker.addEventListener !== "function" ||
+      typeof worker.terminate !== "function"
+    ) {
+      throw new TransportError("PROTOCOL", "workerFactory must return a dedicated Worker");
+    }
+    if (ownedWorkers.has(worker)) {
+      throw new TransportError("PROTOCOL", "workerFactory must create a fresh Worker");
+    }
+    ownedWorkers.add(worker);
   } catch (error) {
     release();
     throw error;
   }
-  const connection = new RuntimeConnection(
-    browserTransport(worker),
-    options.runtime,
-    globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined",
-    release,
-  );
+  let connection: RuntimeConnection;
   try {
-    const { runtime: _runtime, ...settings } = options;
+    connection = new RuntimeConnection(
+      browserTransport(worker),
+      limits,
+      globalThis.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined",
+      release,
+    );
+  } catch (error) {
+    try {
+      worker.terminate();
+    } finally {
+      release();
+    }
+    throw error;
+  }
+  try {
+    const { runtime: _runtime, workerFactory: _workerFactory, ...settings } = options;
     await connection.call("open", { mode, options: settings, limits: connection.limits });
     return new AsyncDatabase(connection);
   } catch (error) {
