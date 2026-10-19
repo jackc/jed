@@ -106,6 +106,8 @@ module JedNative
       plan.parameters.each do |parameter|
         cast_value(@params[parameter.value], parameter.type) if parameter.extra&.dig(:context_type)
       end
+      kernels = native_compiled_kernels(plan, plan.predicate, plan.projections)
+      predicate_kernel, projection_kernel = kernels&.predicate, kernels&.projection
       input = if where_contradiction?(plan.predicate)
         []
       elsif plan.lookup
@@ -159,14 +161,18 @@ module JedNative
         row = input[row_index]
         row_index += 1
         filter_start = @cost if @explain_profile_frames
-        accepted = !plan.predicate || evaluate(plan.predicate, row) == true
+        accepted = !plan.predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(plan.predicate, row)) == true
         profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
         next unless accepted
-        values = Array.new(plan.projections.length)
-        column_index = 0
-        while column_index < values.length
-          values[column_index] = gathered ? gathered[column_index][row_index - 1] : evaluate(plan.projections[column_index], row)
-          column_index += 1
+        if projection_kernel && !gathered
+          values = projection_kernel.call(self, row, @params)
+        else
+          values = Array.new(plan.projections.length)
+          column_index = 0
+          while column_index < values.length
+            values[column_index] = gathered ? gathered[column_index][row_index - 1] : evaluate(plan.projections[column_index], row)
+            column_index += 1
+          end
         end
         query_memory_add_row(output_owner, values, plan.columns) if output_owner
         charge if streaming
@@ -217,7 +223,7 @@ module JedNative
       unless plan && plan.table.equal?(stored) && plan.context == context
         nodes = statement[:columns].map { |entry| entry[:expr] } + [statement[:where]] +
                 (statement[:order_by] || []).map { |entry| entry[:expr] }
-        reusable &&= nodes.all? { |node| cacheable_expression?(node) }
+        reusable &&= nodes.all? { |node| cacheable_read_expression?(node) }
         source = statement[:from].first
         scope = table_columns(stored, source[:alias] || source[:name])
         projections = expand_stars(statement[:columns], scope)
@@ -226,6 +232,10 @@ module JedNative
         predicate = compile_filter(statement[:where], scope)
         parameters = []
         visit = lambda do |expression|
+          if expression.is_a?(Array)
+            expression.each { |child| visit.call(child) }
+            next
+          end
           return unless expression.is_a?(Expression)
           parameters << expression if expression.kind == :param && expression.extra&.dig(:context_type)
           (expression.args || []).each { |child| visit.call(child) }
@@ -242,6 +252,35 @@ module JedNative
       end
       plan.parameters.each { |parameter| cast_value(@params[parameter.value], parameter.type) }
       plan
+    end
+
+    # Read-plan reuse does not choose a different executor lane. It can retain
+    # conditional expression trees while the eager SELECT eligibility above
+    # keeps its original charge and error ordering. Inspect every branch even
+    # when a particular binding would not execute it.
+    def cacheable_read_expression?(node)
+      return true unless node
+      case node[:kind]
+      when :case
+        cacheable_read_expression?(node[:operand]) &&
+          node[:branches].all? do |branch|
+            condition, value = branch.is_a?(Array) ? branch : [branch[:when], branch[:then]]
+            cacheable_read_expression?(condition) && cacheable_read_expression?(value)
+          end && cacheable_read_expression?(node[:else])
+      when :between
+        cacheable_read_expression?(node[:expr]) &&
+          cacheable_read_expression?(node[:low] || node[:lower]) &&
+          cacheable_read_expression?(node[:high] || node[:upper])
+      when :cast, :unary
+        cacheable_read_expression?(node[:expr] || node[:operand])
+      when :binary
+        cacheable_read_expression?(node[:left]) && cacheable_read_expression?(node[:right])
+      when :call
+        (node[:args] || []).all? { |argument| cacheable_read_expression?(argument) } &&
+          cacheable_expression?(node.merge(args: []), host: true)
+      else
+        cacheable_expression?(node, host: true)
+      end
     end
 
     # A single exact integer key has only a full scan and equivalent primary
@@ -284,14 +323,14 @@ module JedNative
       statements.all? { |expression| cacheable_expression?(expression) }
     end
 
-    def cacheable_expression?(node)
+    def cacheable_expression?(node, host: false)
       return true unless node
       case node[:kind]
       when :literal, :column, :param, :star then true
-      when :cast, :unary then cacheable_expression?(node[:expr])
-      when :binary then cacheable_expression?(node[:left]) && cacheable_expression?(node[:right])
+      when :cast, :unary then cacheable_expression?(node[:expr], host: host)
+      when :binary then cacheable_expression?(node[:left], host: host) && cacheable_expression?(node[:right], host: host)
       when :call
-        !STATEFUL_FUNCTIONS.include?(node[:name]) && !node[:over] && !node[:filter] && !node[:within_group] && !Functions.aggregate?(node[:name]) && (node[:args] || []).all? { |arg| cacheable_expression?(arg) }
+        !STATEFUL_FUNCTIONS.include?(node[:name]) && !node[:over] && !node[:filter] && !node[:within_group] && !Functions.aggregate?(node[:name]) && (node[:args] || []).all? { |arg| cacheable_expression?(arg, host: host) }
       else false
       end
     end

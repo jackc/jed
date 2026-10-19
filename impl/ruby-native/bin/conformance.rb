@@ -11,6 +11,37 @@ require_relative '../tools/bounded_process'
 require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('..', __dir__)), 'lib/jed_native')
 require_relative '../../../spec/conformance/params'
 
+# Force admission in an explicit audit lane: ordinary corpus statements often
+# run only once, before the production second-use compilation threshold.
+module NativeCorpusCompilation
+  MODE = ENV.fetch('JED_NATIVE_COMPILATION', 'auto')
+  raise 'JED_NATIVE_COMPILATION must be auto, immediate, or disabled' unless %w[auto immediate disabled].include?(MODE)
+  class << self
+    attr_accessor :kernels
+  end
+  self.kernels = 0
+  module Engines
+    def initialize(**options)
+      super
+      @native_compilation_immediate = NativeCorpusCompilation::MODE == 'immediate'
+      @native_compilation_disabled = NativeCorpusCompilation::MODE == 'disabled'
+    end
+  end
+  module Compiler
+    def materialize
+      result = super
+      NativeCorpusCompilation.kernels += 1 if result
+      result
+    end
+  end
+end
+JedNative::Engine.prepend(NativeCorpusCompilation::Engines)
+if defined?(JedNative::CompiledExpression::Program)
+  JedNative::CompiledExpression::Program.prepend(NativeCorpusCompilation::Compiler)
+elsif NativeCorpusCompilation::MODE == 'immediate'
+  raise 'selected Ruby source has no runtime compiler'
+end
+
 # The environment keeps these source identities for its entire lifetime. Only
 # the harness changes their controlled state between corpus records.
 class NativeCorpusClock
@@ -42,6 +73,7 @@ class NativeCorpus
     @failure_detail_bytes = 0
     @summary = { files: 0, records: 0, passed: 0, failed: 0, unsupported_files: 0, skipped_files: 0, timed_out_files: 0, memory_limited_files: 0, omitted_failure_details: 0, failures: [] }
     @summary[:scalar_cursor_records] = 0 if @query_api == 'query'
+    @summary[:compiled_kernels] = 0
   end
 
   def run
@@ -53,6 +85,7 @@ class NativeCorpus
     abort "unknown corpus locking mode #{locking.inspect}" unless %w[auto exclusive].include?(locking)
     @summary[:mode], @summary[:filter], @summary[:started_at] = @mode, @filter, Time.now.utc.iso8601
     @summary[:query_api] = @query_api
+    @summary[:compilation] = NativeCorpusCompilation::MODE
     @summary[:ruby], @summary[:ruby_executable] = RUBY_DESCRIPTION, RbConfig.ruby
     @summary[:jit] = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then 'yjit'
                     elsif defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled? then 'zjit'
@@ -73,6 +106,7 @@ class NativeCorpus
       result = JedNativeTools::BoundedProcess.run(timeout: file_timeout, memory_bytes: memory_bytes, address_space_bytes: address_space_bytes) do
         worker = self.class.new(filter: @filter, mode: @mode)
         worker.run_file(path)
+        worker.summary[:compiled_kernels] = NativeCorpusCompilation.kernels
         worker.summary
       end
       @summary[:peak_worker_rss_bytes] = [@summary[:peak_worker_rss_bytes], result.peak_rss_bytes].max

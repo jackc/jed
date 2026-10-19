@@ -111,6 +111,7 @@ module JedNative
       @session_defaults = options.dup
       @session_setting_overrides = {}
       @shared_mutex, @writer_condition = Mutex.new, ConditionVariable.new
+      @native_statement_cache = StatementCache.new
       # Bound methods retain only this database, not a capture frame containing
       # a session and its catalog roots. The watermark itself remains live.
       @shared_reader_watermark_provider = method(:shared_reader_watermark)
@@ -322,6 +323,7 @@ module JedNative
         @database_closed = true
         @writer_condition.broadcast
       end
+      @native_statement_cache.close
       super
     end
 
@@ -398,7 +400,7 @@ module JedNative
     def commit = query('COMMIT')
     def rollback = query('ROLLBACK')
     def query(sql, *params)
-      query_prepared(prepare(sql), *params)
+      query_prepared(cached_statement(sql), *params)
     rescue Error
       @engine.instance_variable_set(:@failed, true) if @engine.transaction_open? && !$!.sqlstate.eql?('25001')
       raise

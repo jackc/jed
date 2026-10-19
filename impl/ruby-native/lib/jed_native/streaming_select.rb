@@ -16,6 +16,8 @@ module JedNative
       access = scan_access_plan(stored, predicate, statement) unless point
       order = point ? :none : access[:order]
       return super if order == :blocking
+      kernels = native_compiled_kernels(resolved, predicate, expressions)
+      predicate_kernel, projection_kernel = kernels&.predicate, kernels&.projection
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) || 0 : 0
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
       raise Error.new('2201X', 'negative OFFSET') if offset.negative?
@@ -51,11 +53,11 @@ module JedNative
             charge
             profile_accumulate(:scan, @cost - scan_resume) if @explain_profile_frames
             filter_start = @cost if @explain_profile_frames
-            accepted = !predicate || evaluate(predicate, row) == true
+            accepted = !predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(predicate, row)) == true
             profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
             next unless accepted
             if seen
-              result_row = expressions.map { |expression| evaluate(expression, row) }
+              result_row = projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }
               if seen.is_a?(Hash)
                 next if seen.key?(result_row)
                 query_memory_add(seen_owner, MemorySchedule::ENTRY + query_memory_key_bytes(result_row)) if seen_owner
@@ -68,7 +70,7 @@ module JedNative
               offset -= 1
               next
             end
-            result_row = expressions.map { |expression| evaluate(expression, row) } unless seen
+            result_row = (projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }) unless seen
             query_memory_add_row(memory_owner, result_row, columns) if memory_owner
             charge
             output << result_row

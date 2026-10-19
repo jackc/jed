@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "description": "Explicit runtime-compilation experiment: unchanged seven-query controls plus expressions evaluated over the same 1000-row fixture. Integer/text outputs remain compatible with every existing comparison adapter.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"pk_hit","sql":"SELECT score FROM items WHERE id = $1","iterations":300,"warmup":100,"offset":0,"step":17,"span":1000},
+    {"name":"pk_miss","sql":"SELECT score FROM items WHERE id = $1","iterations":300,"warmup":100,"offset":1000,"step":17,"span":1000},
+    {"name":"filtered_scan","sql":"SELECT id, score FROM items WHERE score >= $1 ORDER BY id","iterations":30,"warmup":20,"offset":9700,"step":7,"span":300},
+    {"name":"aggregate","sql":"SELECT sum(score) FROM items WHERE bucket = $1","iterations":30,"warmup":20,"offset":0,"step":1,"span":10},
+    {"name":"group","sql":"SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket","iterations":15,"warmup":10,"offset":0,"step":0,"span":0},
+    {"name":"sort_limit","sql":"SELECT id, score FROM items ORDER BY score DESC, id LIMIT 20","iterations":15,"warmup":10,"offset":0,"step":0,"span":0},
+    {"name":"arithmetic_filter","sql":"SELECT id, score FROM items WHERE score * 3 + bucket >= $1 ORDER BY id","iterations":50,"warmup":100,"offset":15000,"step":137,"span":10000},
+    {"name":"arithmetic_projection","sql":"SELECT id, (score::i64 * 3 + bucket::i64) / (bucket::i64 + 1) FROM items WHERE bucket >= $1 ORDER BY id","iterations":50,"warmup":100,"offset":0,"step":1,"span":5},
+    {"name":"case_projection","sql":"SELECT id, CASE WHEN score >= $1 THEN score::i64 * 3 + bucket::i64 ELSE -score::i64 END FROM items ORDER BY id","iterations":50,"warmup":100,"offset":2500,"step":137,"span":5000},
+    {"name":"aggregate_argument","sql":"SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1","iterations":50,"warmup":100,"offset":0,"step":1,"span":5},
+    {"name":"computed_sort","sql":"SELECT id, score FROM items ORDER BY score * 3 + bucket DESC, id LIMIT 20","iterations":50,"warmup":100,"offset":0,"step":0,"span":0}
+  ]
+}

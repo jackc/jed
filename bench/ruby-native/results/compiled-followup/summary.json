@@ -1,0 +1,1297 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T15:12:50Z",
+  "unit": "microseconds unless labeled otherwise",
+  "before_source_sha256": "d3db0d7784b23d9d9aa6da1f3f45045b298eef7279dc7e7987b81052ee2032fc",
+  "after_source_sha256": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+  "all_checks_passed": true,
+  "core_reports": [
+    "compiled-before-4_0_7.json",
+    "compiled-before-4_1_preview1.json",
+    "compiled-after-4_0_7.json",
+    "compiled-after-4_1_preview1.json"
+  ],
+  "prepared_queries": [
+    {
+      "name": "scalar",
+      "before_4.0_ruby": 13.5626205,
+      "before_4.0_ruby-yjit": 5.0547335,
+      "before_go": 0.9971165,
+      "before_rust": 1.4212885,
+      "before_ts": 2.26033,
+      "before_4.1_ruby-yjit": 4.9115780000000004,
+      "before_4.1_ruby-zjit": 5.3831055,
+      "after_4.0_ruby": 12.3050455,
+      "after_4.0_ruby-yjit": 4.661587,
+      "after_go": 0.843661,
+      "after_rust": 1.4187525,
+      "after_ts": 2.3627825,
+      "after_4.1_ruby-yjit": 4.503073,
+      "after_4.1_ruby-zjit": 4.4467655
+    },
+    {
+      "name": "pk_hit",
+      "before_4.0_ruby": 8.450116666666666,
+      "before_4.0_ruby-yjit": 4.15395,
+      "before_go": 1.38765,
+      "before_rust": 2.1875733333333334,
+      "before_ts": 4.786756666666666,
+      "before_4.1_ruby-yjit": 4.29559,
+      "before_4.1_ruby-zjit": 3.8017833333333333,
+      "after_4.0_ruby": 8.98959,
+      "after_4.0_ruby-yjit": 4.126956666666667,
+      "after_go": 1.41959,
+      "after_rust": 2.234766666666667,
+      "after_ts": 4.9694666666666665,
+      "after_4.1_ruby-yjit": 4.088393333333333,
+      "after_4.1_ruby-zjit": 4.0135233333333336
+    },
+    {
+      "name": "pk_miss",
+      "before_4.0_ruby": 6.571693333333333,
+      "before_4.0_ruby-yjit": 3.4746033333333335,
+      "before_go": 1.0998633333333334,
+      "before_rust": 1.78793,
+      "before_ts": 2.93819,
+      "before_4.1_ruby-yjit": 3.3924866666666667,
+      "before_4.1_ruby-zjit": 3.34573,
+      "after_4.0_ruby": 6.627713333333333,
+      "after_4.0_ruby-yjit": 3.34644,
+      "after_go": 1.03759,
+      "after_rust": 1.7820033333333334,
+      "after_ts": 3.1254666666666666,
+      "after_4.1_ruby-yjit": 3.3204333333333333,
+      "after_4.1_ruby-zjit": 3.367496666666667
+    },
+    {
+      "name": "filtered_scan",
+      "before_4.0_ruby": 875.1814,
+      "before_4.0_ruby-yjit": 342.8933666666667,
+      "before_go": 159.41013333333333,
+      "before_rust": 111.82256666666666,
+      "before_ts": 389.2816,
+      "before_4.1_ruby-yjit": 316.9095,
+      "before_4.1_ruby-zjit": 502.01123333333334,
+      "after_4.0_ruby": 757.7453,
+      "after_4.0_ruby-yjit": 256.6376333333333,
+      "after_go": 163.6002,
+      "after_rust": 106.7517,
+      "after_ts": 447.4905,
+      "after_4.1_ruby-yjit": 245.2484,
+      "after_4.1_ruby-zjit": 259.54856666666666
+    },
+    {
+      "name": "aggregate",
+      "before_4.0_ruby": 735.3149333333333,
+      "before_4.0_ruby-yjit": 297.6623333333333,
+      "before_go": 64.8828,
+      "before_rust": 52.61686666666667,
+      "before_ts": 250.9789,
+      "before_4.1_ruby-yjit": 295.1114,
+      "before_4.1_ruby-zjit": 518.2002666666667,
+      "after_4.0_ruby": 778.338,
+      "after_4.0_ruby-yjit": 299.03086666666667,
+      "after_go": 64.82953333333333,
+      "after_rust": 50.83416666666667,
+      "after_ts": 205.20866666666666,
+      "after_4.1_ruby-yjit": 296.07683333333335,
+      "after_4.1_ruby-zjit": 527.1059666666666
+    },
+    {
+      "name": "group",
+      "before_4.0_ruby": 1388.9638666666667,
+      "before_4.0_ruby-yjit": 687.0141333333333,
+      "before_go": 265.5006666666667,
+      "before_rust": 182.86393333333334,
+      "before_ts": 500.81713333333335,
+      "before_4.1_ruby-yjit": 677.2858,
+      "before_4.1_ruby-zjit": 851.5096,
+      "after_4.0_ruby": 1465.9374,
+      "after_4.0_ruby-yjit": 685.8519333333334,
+      "after_go": 253.82973333333334,
+      "after_rust": 170.7878,
+      "after_ts": 547.7538,
+      "after_4.1_ruby-yjit": 665.5706,
+      "after_4.1_ruby-zjit": 857.027
+    },
+    {
+      "name": "sort_limit",
+      "before_4.0_ruby": 1579.7722666666666,
+      "before_4.0_ruby-yjit": 942.205,
+      "before_go": 213.17553333333333,
+      "before_rust": 139.86633333333333,
+      "before_ts": 430.28006666666664,
+      "before_4.1_ruby-yjit": 980.8364666666666,
+      "before_4.1_ruby-zjit": 1065.7901333333334,
+      "after_4.0_ruby": 1686.0903333333333,
+      "after_4.0_ruby-yjit": 908.7998,
+      "after_go": 209.7188,
+      "after_rust": 130.32713333333334,
+      "after_ts": 491.74173333333334,
+      "after_4.1_ruby-yjit": 950.4127333333333,
+      "after_4.1_ruby-zjit": 1071.1333333333334
+    },
+    {
+      "name": "arithmetic_filter",
+      "before_4.0_ruby": 1765.54752,
+      "before_4.0_ruby-yjit": 728.46938,
+      "before_go": 211.97606,
+      "before_rust": 163.6047,
+      "before_ts": 537.49338,
+      "before_4.1_ruby-yjit": 936.84016,
+      "before_4.1_ruby-zjit": 1422.673,
+      "after_4.0_ruby": 1329.65562,
+      "after_4.0_ruby-yjit": 443.46866,
+      "after_go": 209.68698,
+      "after_rust": 149.5586,
+      "after_ts": 484.70898,
+      "after_4.1_ruby-yjit": 704.3514,
+      "after_4.1_ruby-zjit": 828.30862
+    },
+    {
+      "name": "arithmetic_projection",
+      "before_4.0_ruby": 3468.70142,
+      "before_4.0_ruby-yjit": 1390.41036,
+      "before_go": 281.42618,
+      "before_rust": 232.08008,
+      "before_ts": 687.84894,
+      "before_4.1_ruby-yjit": 1790.04694,
+      "before_4.1_ruby-zjit": 2909.08038,
+      "after_4.0_ruby": 2277.76644,
+      "after_4.0_ruby-yjit": 816.32908,
+      "after_go": 268.83126,
+      "after_rust": 214.1241,
+      "after_ts": 711.31028,
+      "after_4.1_ruby-yjit": 1191.47024,
+      "after_4.1_ruby-zjit": 1384.23598
+    },
+    {
+      "name": "case_projection",
+      "before_4.0_ruby": 4793.05892,
+      "before_4.0_ruby-yjit": 1654.19466,
+      "before_go": 241.72214,
+      "before_rust": 202.82282,
+      "before_ts": 619.22294,
+      "before_4.1_ruby-yjit": 1962.56844,
+      "before_4.1_ruby-zjit": 3088.4781,
+      "after_4.0_ruby": 2206.16528,
+      "after_4.0_ruby-yjit": 819.75474,
+      "after_go": 251.91442,
+      "after_rust": 183.93392,
+      "after_ts": 598.1711,
+      "after_4.1_ruby-yjit": 1268.2792,
+      "after_4.1_ruby-zjit": 1332.93042
+    },
+    {
+      "name": "aggregate_argument",
+      "before_4.0_ruby": 2311.87698,
+      "before_4.0_ruby-yjit": 1019.9156,
+      "before_go": 290.4269,
+      "before_rust": 229.2341,
+      "before_ts": 594.0782,
+      "before_4.1_ruby-yjit": 1032.69794,
+      "before_4.1_ruby-zjit": 1686.7584,
+      "after_4.0_ruby": 1789.37974,
+      "after_4.0_ruby-yjit": 721.7743,
+      "after_go": 301.78316,
+      "after_rust": 217.86278,
+      "after_ts": 548.4188,
+      "after_4.1_ruby-yjit": 743.49714,
+      "after_4.1_ruby-zjit": 1035.52788
+    },
+    {
+      "name": "computed_sort",
+      "before_4.0_ruby": 2319.91434,
+      "before_4.0_ruby-yjit": 1410.91542,
+      "before_go": 326.77636,
+      "before_rust": 219.76312,
+      "before_ts": 435.68304,
+      "before_4.1_ruby-yjit": 1503.01816,
+      "before_4.1_ruby-zjit": 1707.3192,
+      "after_4.0_ruby": 1894.6469,
+      "after_4.0_ruby-yjit": 1026.29696,
+      "after_go": 345.13456,
+      "after_rust": 207.52318,
+      "after_ts": 431.86286,
+      "after_4.1_ruby-yjit": 1116.64804,
+      "after_4.1_ruby-zjit": 1223.11434
+    }
+  ],
+  "binding_and_cold_api_microseconds": {
+    "binding-before-4.0-yjit.json": {
+      "wrapper": {
+        "scalar": 8.1341065,
+        "pk_hit": 10.7049295,
+        "host_scalar": 8.6793485,
+        "host_streamed_row": 1346.8783,
+        "host_streamed_batch": 890.98284,
+        "arithmetic_filter": 368.34876,
+        "arithmetic_projection": 716.4155999999999,
+        "case_projection": 801.14072,
+        "aggregate_argument": 267.87358,
+        "computed_sort": 271.3712
+      },
+      "native-prepared": {
+        "scalar": 5.13216,
+        "pk_hit": 4.111923,
+        "host_scalar": 4.9593715000000005,
+        "host_streamed_row": 1385.94282,
+        "host_streamed_batch": 1642.97098,
+        "arithmetic_filter": 769.92602,
+        "arithmetic_projection": 1457.88088,
+        "case_projection": 1537.73446,
+        "aggregate_argument": 1099.61142,
+        "computed_sort": 1354.4901
+      },
+      "native-query": {
+        "scalar": 5.683055,
+        "pk_hit": 4.5396025,
+        "host_scalar": 5.4351175000000005,
+        "host_streamed_row": 1364.45948,
+        "host_streamed_batch": 1746.7829,
+        "arithmetic_filter": 764.80746,
+        "arithmetic_projection": 1482.4032,
+        "case_projection": 1669.52946,
+        "aggregate_argument": 1110.20968,
+        "computed_sort": 1344.37326
+      },
+      "native-eager": {
+        "scalar": 5.7340219999999995,
+        "pk_hit": 3.9193404999999997,
+        "host_scalar": 27.047772000000002,
+        "host_streamed_row": 1120.51612,
+        "host_streamed_batch": 1419.53576,
+        "arithmetic_filter": 704.41674,
+        "arithmetic_projection": 1298.55278,
+        "case_projection": 1456.7376000000002,
+        "aggregate_argument": 1033.88096,
+        "computed_sort": 1360.3731
+      }
+    },
+    "binding-after-4.0-yjit.json": {
+      "wrapper": {
+        "scalar": 8.194792999999999,
+        "pk_hit": 10.644935,
+        "host_scalar": 8.692467,
+        "host_streamed_row": 1408.65266,
+        "host_streamed_batch": 882.2335400000001,
+        "arithmetic_filter": 364.59082,
+        "arithmetic_projection": 703.37612,
+        "case_projection": 789.12026,
+        "aggregate_argument": 271.32786,
+        "computed_sort": 276.79591999999997
+      },
+      "native-prepared": {
+        "scalar": 4.7274365,
+        "pk_hit": 3.93319,
+        "host_scalar": 4.6990415,
+        "host_streamed_row": 1218.03908,
+        "host_streamed_batch": 1449.4715800000001,
+        "arithmetic_filter": 525.89598,
+        "arithmetic_projection": 985.12582,
+        "case_projection": 840.77302,
+        "aggregate_argument": 770.48968,
+        "computed_sort": 1090.0478400000002
+      },
+      "native-query": {
+        "scalar": 5.192237,
+        "pk_hit": 4.381202,
+        "host_scalar": 5.205533999999999,
+        "host_streamed_row": 1178.1559,
+        "host_streamed_batch": 1420.44946,
+        "arithmetic_filter": 490.63656,
+        "arithmetic_projection": 969.72762,
+        "case_projection": 841.16156,
+        "aggregate_argument": 781.29228,
+        "computed_sort": 1083.6800600000001
+      },
+      "native-eager": {
+        "scalar": 5.7536195,
+        "pk_hit": 4.257998499999999,
+        "host_scalar": 28.7617715,
+        "host_streamed_row": 1016.04056,
+        "host_streamed_batch": 1243.8464,
+        "arithmetic_filter": 464.47734,
+        "arithmetic_projection": 795.23442,
+        "case_projection": 710.66162,
+        "aggregate_argument": 806.4715799999999,
+        "computed_sort": 1112.2607
+      }
+    },
+    "binding-after-4.1-yjit.json": {
+      "wrapper": {
+        "scalar": 7.8745075,
+        "pk_hit": 10.108989,
+        "host_scalar": 8.267864,
+        "host_streamed_row": 1304.72062,
+        "host_streamed_batch": 861.60446,
+        "arithmetic_filter": 340.40018,
+        "arithmetic_projection": 655.0535600000001,
+        "case_projection": 732.0081,
+        "aggregate_argument": 264.5918,
+        "computed_sort": 262.43109999999996
+      },
+      "native-prepared": {
+        "scalar": 4.942457999999999,
+        "pk_hit": 4.17815,
+        "host_scalar": 5.130004,
+        "host_streamed_row": 1647.28762,
+        "host_streamed_batch": 1826.45796,
+        "arithmetic_filter": 823.2993399999999,
+        "arithmetic_projection": 1482.0260600000001,
+        "case_projection": 1397.93444,
+        "aggregate_argument": 861.19016,
+        "computed_sort": 1152.76526
+      },
+      "native-query": {
+        "scalar": 5.228644500000001,
+        "pk_hit": 4.384712,
+        "host_scalar": 5.3902494999999995,
+        "host_streamed_row": 1659.8168999999998,
+        "host_streamed_batch": 1841.8097,
+        "arithmetic_filter": 881.2636,
+        "arithmetic_projection": 1461.7529,
+        "case_projection": 1455.96136,
+        "aggregate_argument": 884.58994,
+        "computed_sort": 1109.80906
+      },
+      "native-eager": {
+        "scalar": 5.664003,
+        "pk_hit": 4.028539,
+        "host_scalar": 18.8495915,
+        "host_streamed_row": 1059.4643,
+        "host_streamed_batch": 1296.83676,
+        "arithmetic_filter": 611.72738,
+        "arithmetic_projection": 925.17724,
+        "case_projection": 721.92668,
+        "aggregate_argument": 763.16304,
+        "computed_sort": 1175.0560600000001
+      }
+    },
+    "binding-after-4.1-zjit.json": {
+      "wrapper": {
+        "scalar": 8.089409999999999,
+        "pk_hit": 10.302145000000001,
+        "host_scalar": 8.6003515,
+        "host_streamed_row": 1327.97174,
+        "host_streamed_batch": 888.4623399999999,
+        "arithmetic_filter": 358.5965,
+        "arithmetic_projection": 701.56538,
+        "case_projection": 779.32696,
+        "aggregate_argument": 271.16624,
+        "computed_sort": 283.93066
+      },
+      "native-prepared": {
+        "scalar": 5.516232,
+        "pk_hit": 4.0302005,
+        "host_scalar": 5.7267399999999995,
+        "host_streamed_row": 1499.7854,
+        "host_streamed_batch": 1834.2796,
+        "arithmetic_filter": 808.02474,
+        "arithmetic_projection": 1348.32718,
+        "case_projection": 1349.50678,
+        "aggregate_argument": 1116.71676,
+        "computed_sort": 1217.0874199999998
+      },
+      "native-query": {
+        "scalar": 6.217147,
+        "pk_hit": 4.5690485,
+        "host_scalar": 6.1066955,
+        "host_streamed_row": 1496.85232,
+        "host_streamed_batch": 1717.76992,
+        "arithmetic_filter": 812.15108,
+        "arithmetic_projection": 1366.9596000000001,
+        "case_projection": 1369.98128,
+        "aggregate_argument": 1149.31946,
+        "computed_sort": 1205.2401200000002
+      },
+      "native-eager": {
+        "scalar": 6.0052885,
+        "pk_hit": 3.884268,
+        "host_scalar": 18.617537,
+        "host_streamed_row": 932.6736999999999,
+        "host_streamed_batch": 1113.21896,
+        "arithmetic_filter": 503.44948,
+        "arithmetic_projection": 770.8987,
+        "case_projection": 767.85424,
+        "aggregate_argument": 851.4323,
+        "computed_sort": 1149.82926
+      }
+    },
+    "cold-before-4.0-yjit.json": {
+      "wrapper": {
+        "scalar": 7.949268,
+        "pk_hit": 10.3893155,
+        "cold_mixed": 15.449318499999999,
+        "cold_join": 30.568574,
+        "arithmetic_projection": 679.90364
+      },
+      "native-query": {
+        "scalar": 90.81554150000001,
+        "pk_hit": 85.484804,
+        "cold_mixed": 293.531588,
+        "cold_join": 659.8604015000001,
+        "arithmetic_projection": 1911.75486
+      },
+      "native-eager": {
+        "scalar": 96.855199,
+        "pk_hit": 90.4906615,
+        "cold_mixed": 322.213919,
+        "cold_join": 602.6667045,
+        "arithmetic_projection": 1663.83824
+      }
+    },
+    "cold-after-4.0-yjit.json": {
+      "wrapper": {
+        "scalar": 8.330348,
+        "pk_hit": 10.7391865,
+        "cold_mixed": 16.0875795,
+        "cold_join": 32.906378,
+        "arithmetic_projection": 704.77472
+      },
+      "native-query": {
+        "scalar": 95.2982395,
+        "pk_hit": 92.910331,
+        "cold_mixed": 308.4129205,
+        "cold_join": 763.2693485,
+        "arithmetic_projection": 2153.30566
+      },
+      "native-eager": {
+        "scalar": 96.51614599999999,
+        "pk_hit": 92.1937935,
+        "cold_mixed": 305.708027,
+        "cold_join": 602.1973760000001,
+        "arithmetic_projection": 1637.20686
+      }
+    }
+  },
+  "file_control": {
+    "historical_before": "api-followup/after-file-4.0-yjit.json",
+    "after": "compiled-followup/file-after-4.0-yjit.json",
+    "matching_fixture_sha256": "db0367e136e9989830648b6b256c45a115d3714928afff49bf6409c4be562b4f",
+    "matching_warmup": 50000,
+    "matching_iterations": 5000,
+    "lanes": {
+      "wrapper": {
+        "before_microseconds": 17.6113506,
+        "after_microseconds": 18.1455622
+      },
+      "native-prepared": {
+        "before_microseconds": 18.6835188,
+        "after_microseconds": 18.8809692
+      },
+      "native-query": {
+        "before_microseconds": 18.968958999999998,
+        "after_microseconds": 19.2394074
+      },
+      "native-eager": {
+        "before_microseconds": 18.2657414,
+        "after_microseconds": 18.5887946
+      }
+    }
+  },
+  "diagnostics": {
+    "diagnostic-4.0-none.json": {
+      "jit": "none",
+      "workloads": [
+        {
+          "name": "integer_scalar",
+          "interpreter_nanoseconds": 1101.6097,
+          "compiled_nanoseconds": 419.50391,
+          "first_compile_nanoseconds": 99901,
+          "median_compile_nanoseconds": 50763,
+          "first_call_nanoseconds": 4661,
+          "source_bytes": 817,
+          "node_count": 7,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "29b40704c766637c67e8616cd58f3e085e7c45c3706f1eae706d95ab1efcb468"
+          }
+        },
+        {
+          "name": "row_arithmetic",
+          "interpreter_nanoseconds": 1999.04426,
+          "compiled_nanoseconds": 763.56916,
+          "first_compile_nanoseconds": 169407,
+          "median_compile_nanoseconds": 93079,
+          "first_call_nanoseconds": 4665,
+          "source_bytes": 1489,
+          "node_count": 12,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "44016fb7999df7bbe6478a35dca6a70ab50af0eccb7e6bf02e9396496d487eb9"
+          }
+        },
+        {
+          "name": "conditional",
+          "interpreter_nanoseconds": 2701.83905,
+          "compiled_nanoseconds": 592.40967,
+          "first_compile_nanoseconds": 160498,
+          "median_compile_nanoseconds": 70095,
+          "first_call_nanoseconds": 3394,
+          "source_bytes": 1216,
+          "node_count": 12,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "ea461f94019994841a0fd0699d43fce2f48547da495ca75e412074101b8c8e84"
+          }
+        },
+        {
+          "name": "null_folds",
+          "interpreter_nanoseconds": 2226.89964,
+          "compiled_nanoseconds": 612.48146,
+          "first_compile_nanoseconds": 216207,
+          "median_compile_nanoseconds": 73441,
+          "first_call_nanoseconds": 3024,
+          "source_bytes": 1166,
+          "node_count": 11,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "4bd6b3071bef1de813129f2f9bf90683cbd55dbcf46700d19b7b92258b8820af"
+          }
+        },
+        {
+          "name": "predicate",
+          "interpreter_nanoseconds": 2385.58375,
+          "compiled_nanoseconds": 372.8662,
+          "first_compile_nanoseconds": 145706,
+          "median_compile_nanoseconds": 35101,
+          "first_call_nanoseconds": 3718,
+          "source_bytes": 563,
+          "node_count": 8,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "7260cada9667b4438b70587e4f23055f3a617b628e7a2c4ac1872cffd8a487d6"
+          }
+        }
+      ],
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 31877066,
+        "before": {
+          "rss_bytes": 42831872,
+          "live_slots": 57968,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 0
+        },
+        "after_eviction_and_gc": {
+          "rss_bytes": 42983424,
+          "live_slots": 60819,
+          "jit": {},
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 64,
+          "retained_kernels": 64,
+          "retained_source_bytes": 27776,
+          "retained_pool_entries": 320
+        },
+        "after_release_and_gc": {
+          "rss_bytes": 42983424,
+          "live_slots": 59273,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 0
+        },
+        "note": "Generator lifetime probe with a diagnostic-owned bounded array, not a proof of the engine cache bound. JIT code reclamation is runtime policy; RSS need not fall after GC."
+      },
+      "zjit_generated_method_proof": null
+    },
+    "diagnostic-4.0-yjit.json": {
+      "jit": "yjit",
+      "workloads": [
+        {
+          "name": "integer_scalar",
+          "interpreter_nanoseconds": 377.08023,
+          "compiled_nanoseconds": 101.7142,
+          "first_compile_nanoseconds": 399183,
+          "median_compile_nanoseconds": 52187,
+          "first_call_nanoseconds": 5228,
+          "source_bytes": 817,
+          "node_count": 7,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "29b40704c766637c67e8616cd58f3e085e7c45c3706f1eae706d95ab1efcb468",
+            "yjit_compiled_instruction_count": 236,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "row_arithmetic",
+          "interpreter_nanoseconds": 674.10144,
+          "compiled_nanoseconds": 200.76309,
+          "first_compile_nanoseconds": 366209,
+          "median_compile_nanoseconds": 85300,
+          "first_call_nanoseconds": 94631,
+          "source_bytes": 1489,
+          "node_count": 12,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "44016fb7999df7bbe6478a35dca6a70ab50af0eccb7e6bf02e9396496d487eb9",
+            "yjit_compiled_instruction_count": 315,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "conditional",
+          "interpreter_nanoseconds": 638.17162,
+          "compiled_nanoseconds": 132.10188,
+          "first_compile_nanoseconds": 2351728,
+          "median_compile_nanoseconds": 66910,
+          "first_call_nanoseconds": 3818,
+          "source_bytes": 1216,
+          "node_count": 12,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "ea461f94019994841a0fd0699d43fce2f48547da495ca75e412074101b8c8e84",
+            "yjit_compiled_instruction_count": 247,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "null_folds",
+          "interpreter_nanoseconds": 755.29389,
+          "compiled_nanoseconds": 141.16497,
+          "first_compile_nanoseconds": 458256,
+          "median_compile_nanoseconds": 71383,
+          "first_call_nanoseconds": 89059,
+          "source_bytes": 1166,
+          "node_count": 11,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "4bd6b3071bef1de813129f2f9bf90683cbd55dbcf46700d19b7b92258b8820af",
+            "yjit_compiled_instruction_count": 290,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "predicate",
+          "interpreter_nanoseconds": 438.11852,
+          "compiled_nanoseconds": 62.3926,
+          "first_compile_nanoseconds": 1273054,
+          "median_compile_nanoseconds": 26223,
+          "first_call_nanoseconds": 2924,
+          "source_bytes": 563,
+          "node_count": 8,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "7260cada9667b4438b70587e4f23055f3a617b628e7a2c4ac1872cffd8a487d6",
+            "yjit_compiled_instruction_count": 171,
+            "direct_jit_proof": true
+          }
+        }
+      ],
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 124710647,
+        "before": {
+          "rss_bytes": 48693248,
+          "live_slots": 58320,
+          "jit": {
+            "inline_code_size": 342672,
+            "outlined_code_size": 404289,
+            "freed_code_size": 0,
+            "code_region_size": 1257472,
+            "compiled_iseq_entry": 130,
+            "compiled_iseq_count": 282,
+            "compiled_blockid_count": 6534,
+            "compiled_block_count": 8832,
+            "compiled_branch_count": 13588,
+            "compile_time_ns": 79568471
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 15
+        },
+        "after_eviction_and_gc": {
+          "rss_bytes": 58142720,
+          "live_slots": 61268,
+          "jit": {
+            "inline_code_size": 782375,
+            "outlined_code_size": 1049815,
+            "freed_code_size": 0,
+            "code_region_size": 2945024,
+            "compiled_iseq_entry": 396,
+            "compiled_iseq_count": 549,
+            "compiled_blockid_count": 17166,
+            "compiled_block_count": 21104,
+            "compiled_branch_count": 31910,
+            "compile_time_ns": 177686506
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 84,
+          "retained_kernels": 64,
+          "retained_source_bytes": 27776,
+          "retained_pool_entries": 320
+        },
+        "after_release_and_gc": {
+          "rss_bytes": 58142720,
+          "live_slots": 59817,
+          "jit": {
+            "inline_code_size": 782963,
+            "outlined_code_size": 1050855,
+            "freed_code_size": 0,
+            "code_region_size": 2945024,
+            "compiled_iseq_entry": 397,
+            "compiled_iseq_count": 550,
+            "compiled_blockid_count": 17170,
+            "compiled_block_count": 21118,
+            "compiled_branch_count": 31940,
+            "compile_time_ns": 177839375
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 25
+        },
+        "note": "Generator lifetime probe with a diagnostic-owned bounded array, not a proof of the engine cache bound. JIT code reclamation is runtime policy; RSS need not fall after GC."
+      },
+      "zjit_generated_method_proof": null
+    },
+    "diagnostic-4.1-zjit.json": {
+      "jit": "zjit",
+      "workloads": [
+        {
+          "name": "integer_scalar",
+          "interpreter_nanoseconds": 359.43787,
+          "compiled_nanoseconds": 110.8089,
+          "first_compile_nanoseconds": 416458,
+          "median_compile_nanoseconds": 50907,
+          "first_call_nanoseconds": 6668,
+          "source_bytes": 817,
+          "node_count": 7,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "29b40704c766637c67e8616cd58f3e085e7c45c3706f1eae706d95ab1efcb468",
+            "zjit_generated_compilations": 2,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "row_arithmetic",
+          "interpreter_nanoseconds": 684.31362,
+          "compiled_nanoseconds": 196.09665,
+          "first_compile_nanoseconds": 128140,
+          "median_compile_nanoseconds": 48012,
+          "first_call_nanoseconds": 69003,
+          "source_bytes": 1489,
+          "node_count": 12,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "44016fb7999df7bbe6478a35dca6a70ab50af0eccb7e6bf02e9396496d487eb9",
+            "zjit_generated_compilations": 2,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "conditional",
+          "interpreter_nanoseconds": 904.29654,
+          "compiled_nanoseconds": 149.37355,
+          "first_compile_nanoseconds": 152019,
+          "median_compile_nanoseconds": 60409,
+          "first_call_nanoseconds": 3289,
+          "source_bytes": 1216,
+          "node_count": 12,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "ea461f94019994841a0fd0699d43fce2f48547da495ca75e412074101b8c8e84",
+            "zjit_generated_compilations": 1,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "null_folds",
+          "interpreter_nanoseconds": 1418.05486,
+          "compiled_nanoseconds": 141.4209,
+          "first_compile_nanoseconds": 167684,
+          "median_compile_nanoseconds": 41848,
+          "first_call_nanoseconds": 89414,
+          "source_bytes": 1166,
+          "node_count": 11,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "4bd6b3071bef1de813129f2f9bf90683cbd55dbcf46700d19b7b92258b8820af",
+            "zjit_generated_compilations": 1,
+            "direct_jit_proof": true
+          }
+        },
+        {
+          "name": "predicate",
+          "interpreter_nanoseconds": 607.08231,
+          "compiled_nanoseconds": 82.02677,
+          "first_compile_nanoseconds": 252031,
+          "median_compile_nanoseconds": 20237,
+          "first_call_nanoseconds": 2145,
+          "source_bytes": 563,
+          "node_count": 8,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "7260cada9667b4438b70587e4f23055f3a617b628e7a2c4ac1872cffd8a487d6",
+            "zjit_generated_compilations": 1,
+            "direct_jit_proof": true
+          }
+        }
+      ],
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 158162287,
+        "before": {
+          "rss_bytes": 54136832,
+          "live_slots": 57143,
+          "jit": {
+            "compiled_iseq_count": 276,
+            "compile_time_ns": 120057970,
+            "compiled_side_exit_count": 9370,
+            "jit_frame_region_bytes": 86016,
+            "code_region_bytes": 1593344,
+            "zjit_alloc_bytes": 1313188,
+            "total_mem_bytes": 2992548
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 10
+        },
+        "after_eviction_and_gc": {
+          "rss_bytes": 57167872,
+          "live_slots": 63355,
+          "jit": {
+            "compiled_iseq_count": 582,
+            "compile_time_ns": 247505423,
+            "compiled_side_exit_count": 22211,
+            "jit_frame_region_bytes": 172032,
+            "code_region_bytes": 3555328,
+            "zjit_alloc_bytes": 2833320,
+            "total_mem_bytes": 6560680
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 266,
+          "retained_kernels": 64,
+          "retained_source_bytes": 27776,
+          "retained_pool_entries": 320
+        },
+        "after_release_and_gc": {
+          "rss_bytes": 57167872,
+          "live_slots": 63296,
+          "jit": {
+            "compiled_iseq_count": 583,
+            "compile_time_ns": 247695482,
+            "compiled_side_exit_count": 22216,
+            "jit_frame_region_bytes": 172032,
+            "code_region_bytes": 3555328,
+            "zjit_alloc_bytes": 2834696,
+            "total_mem_bytes": 6562056
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 266
+        },
+        "note": "Generator lifetime probe with a diagnostic-owned bounded array, not a proof of the engine cache bound. JIT code reclamation is runtime policy; RSS need not fall after GC."
+      },
+      "zjit_generated_method_proof": {
+        "path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/compiled-followup/diagnostic-4.1-zjit.log",
+        "sha256": "95d7ff30d635af6f0b1a8ab7333f5a9c0357f7ff902c2290ba97035928be2408",
+        "generated_compilations": 263,
+        "generated_locations": [
+          "call@(jed compiled expression):2"
+        ],
+        "direct_jit_proof": true
+      }
+    }
+  },
+  "peak_rss": {
+    "report": "compiled-before-4_0_7.json",
+    "lane": "ts",
+    "bytes": 358764544
+  },
+  "native_peak_rss": {
+    "report": "file-after-4.0-yjit.json",
+    "lane": "native-query",
+    "bytes": 309493760
+  },
+  "peaks": [
+    {
+      "report": "compiled-before-4_0_7.json",
+      "lane": "ruby",
+      "bytes": 50417664
+    },
+    {
+      "report": "compiled-before-4_0_7.json",
+      "lane": "ruby-yjit",
+      "bytes": 62242816
+    },
+    {
+      "report": "compiled-before-4_0_7.json",
+      "lane": "go",
+      "bytes": 28475392
+    },
+    {
+      "report": "compiled-before-4_0_7.json",
+      "lane": "rust",
+      "bytes": 29958144
+    },
+    {
+      "report": "compiled-before-4_0_7.json",
+      "lane": "ts",
+      "bytes": 358764544
+    },
+    {
+      "report": "compiled-before-4_1_preview1.json",
+      "lane": "ruby-yjit",
+      "bytes": 78319616
+    },
+    {
+      "report": "compiled-before-4_1_preview1.json",
+      "lane": "ruby-zjit",
+      "bytes": 79687680
+    },
+    {
+      "report": "compiled-after-4_0_7.json",
+      "lane": "ruby",
+      "bytes": 49397760
+    },
+    {
+      "report": "compiled-after-4_0_7.json",
+      "lane": "ruby-yjit",
+      "bytes": 64081920
+    },
+    {
+      "report": "compiled-after-4_0_7.json",
+      "lane": "go",
+      "bytes": 28819456
+    },
+    {
+      "report": "compiled-after-4_0_7.json",
+      "lane": "rust",
+      "bytes": 29732864
+    },
+    {
+      "report": "compiled-after-4_0_7.json",
+      "lane": "ts",
+      "bytes": 343601152
+    },
+    {
+      "report": "compiled-after-4_1_preview1.json",
+      "lane": "ruby-yjit",
+      "bytes": 79572992
+    },
+    {
+      "report": "compiled-after-4_1_preview1.json",
+      "lane": "ruby-zjit",
+      "bytes": 77598720
+    },
+    {
+      "report": "binding-before-4.0-yjit.json",
+      "lane": "wrapper",
+      "bytes": 33230848
+    },
+    {
+      "report": "binding-before-4.0-yjit.json",
+      "lane": "native-prepared",
+      "bytes": 84172800
+    },
+    {
+      "report": "binding-before-4.0-yjit.json",
+      "lane": "native-query",
+      "bytes": 83353600
+    },
+    {
+      "report": "binding-before-4.0-yjit.json",
+      "lane": "native-eager",
+      "bytes": 82825216
+    },
+    {
+      "report": "binding-after-4.0-yjit.json",
+      "lane": "wrapper",
+      "bytes": 33861632
+    },
+    {
+      "report": "binding-after-4.0-yjit.json",
+      "lane": "native-prepared",
+      "bytes": 86282240
+    },
+    {
+      "report": "binding-after-4.0-yjit.json",
+      "lane": "native-query",
+      "bytes": 85823488
+    },
+    {
+      "report": "binding-after-4.0-yjit.json",
+      "lane": "native-eager",
+      "bytes": 84918272
+    },
+    {
+      "report": "binding-after-4.1-yjit.json",
+      "lane": "wrapper",
+      "bytes": 39825408
+    },
+    {
+      "report": "binding-after-4.1-yjit.json",
+      "lane": "native-prepared",
+      "bytes": 107954176
+    },
+    {
+      "report": "binding-after-4.1-yjit.json",
+      "lane": "native-query",
+      "bytes": 107171840
+    },
+    {
+      "report": "binding-after-4.1-yjit.json",
+      "lane": "native-eager",
+      "bytes": 95703040
+    },
+    {
+      "report": "binding-after-4.1-zjit.json",
+      "lane": "wrapper",
+      "bytes": 44011520
+    },
+    {
+      "report": "binding-after-4.1-zjit.json",
+      "lane": "native-prepared",
+      "bytes": 91672576
+    },
+    {
+      "report": "binding-after-4.1-zjit.json",
+      "lane": "native-query",
+      "bytes": 92454912
+    },
+    {
+      "report": "binding-after-4.1-zjit.json",
+      "lane": "native-eager",
+      "bytes": 89743360
+    },
+    {
+      "report": "cold-before-4.0-yjit.json",
+      "lane": "wrapper",
+      "bytes": 33812480
+    },
+    {
+      "report": "cold-before-4.0-yjit.json",
+      "lane": "native-query",
+      "bytes": 92348416
+    },
+    {
+      "report": "cold-before-4.0-yjit.json",
+      "lane": "native-eager",
+      "bytes": 87535616
+    },
+    {
+      "report": "cold-after-4.0-yjit.json",
+      "lane": "wrapper",
+      "bytes": 33058816
+    },
+    {
+      "report": "cold-after-4.0-yjit.json",
+      "lane": "native-query",
+      "bytes": 90460160
+    },
+    {
+      "report": "cold-after-4.0-yjit.json",
+      "lane": "native-eager",
+      "bytes": 88879104
+    },
+    {
+      "report": "file-after-4.0-yjit.json",
+      "lane": "wrapper",
+      "bytes": 97406976
+    },
+    {
+      "report": "file-after-4.0-yjit.json",
+      "lane": "native-prepared",
+      "bytes": 297132032
+    },
+    {
+      "report": "file-after-4.0-yjit.json",
+      "lane": "native-query",
+      "bytes": 309493760
+    },
+    {
+      "report": "file-after-4.0-yjit.json",
+      "lane": "native-eager",
+      "bytes": 302305280
+    },
+    {
+      "report": "diagnostic-4.0-none-bounded.json",
+      "lane": "diagnostic",
+      "bytes": 42926080
+    },
+    {
+      "report": "diagnostic-4.0-yjit-bounded.json",
+      "lane": "diagnostic",
+      "bytes": 60047360
+    },
+    {
+      "report": "diagnostic-4.1-zjit-bounded.json",
+      "lane": "diagnostic",
+      "bytes": 60121088
+    },
+    {
+      "report": "cold-control-1-before.json",
+      "lane": "wrapper",
+      "bytes": 33189888
+    },
+    {
+      "report": "cold-control-1-before.json",
+      "lane": "native-query",
+      "bytes": 84590592
+    },
+    {
+      "report": "cold-control-2-after.json",
+      "lane": "wrapper",
+      "bytes": 31809536
+    },
+    {
+      "report": "cold-control-2-after.json",
+      "lane": "native-query",
+      "bytes": 78729216
+    },
+    {
+      "report": "cold-control-3-after.json",
+      "lane": "wrapper",
+      "bytes": 33439744
+    },
+    {
+      "report": "cold-control-3-after.json",
+      "lane": "native-query",
+      "bytes": 85184512
+    },
+    {
+      "report": "cold-control-4-before.json",
+      "lane": "wrapper",
+      "bytes": 32075776
+    },
+    {
+      "report": "cold-control-4-before.json",
+      "lane": "native-query",
+      "bytes": 79437824
+    }
+  ],
+  "notes": [
+    "Prepared cross-core and available Ruby API comparisons are separate harnesses; timings are not interchangeable.",
+    "The file before sample is historical, with exact baseline source, fixture, query, schedule, values and costs checked.",
+    "Direct expression diagnostics isolate evaluator dispatch, not full-query overhead.",
+    "Churn uses a diagnostic-owned 64-kernel retention bound. JIT memory reclamation remains runtime policy."
+  ],
+  "cold_abba_controls": {
+    "order": "before, after, after, before",
+    "runs": [
+      {
+        "report": "cold-control-1-before.json",
+        "source_sha256": "d3db0d7784b23d9d9aa6da1f3f45045b298eef7279dc7e7987b81052ee2032fc",
+        "microseconds": {
+          "wrapper": {
+            "cold_join": 30.965169000000003,
+            "arithmetic_projection": 706.0268199999999
+          },
+          "native-query": {
+            "cold_join": 630.1735695,
+            "arithmetic_projection": 1753.29284
+          }
+        }
+      },
+      {
+        "report": "cold-control-2-after.json",
+        "source_sha256": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+        "microseconds": {
+          "wrapper": {
+            "cold_join": 31.818906,
+            "arithmetic_projection": 720.20528
+          },
+          "native-query": {
+            "cold_join": 692.4364235,
+            "arithmetic_projection": 1750.8008
+          }
+        }
+      },
+      {
+        "report": "cold-control-3-after.json",
+        "source_sha256": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+        "microseconds": {
+          "wrapper": {
+            "cold_join": 30.057070500000002,
+            "arithmetic_projection": 681.08676
+          },
+          "native-query": {
+            "cold_join": 631.8777605,
+            "arithmetic_projection": 1646.5681200000001
+          }
+        }
+      },
+      {
+        "report": "cold-control-4-before.json",
+        "source_sha256": "d3db0d7784b23d9d9aa6da1f3f45045b298eef7279dc7e7987b81052ee2032fc",
+        "microseconds": {
+          "wrapper": {
+            "cold_join": 31.544646,
+            "arithmetic_projection": 676.63784
+          },
+          "native-query": {
+            "cold_join": 687.056431,
+            "arithmetic_projection": 1876.19612
+          }
+        }
+      }
+    ],
+    "all_validation_passed": true,
+    "interpretation": "Initial lazy cold-query slowdowns did not reproduce consistently: join ranges overlap, and arithmetic projection was faster in the after controls. Retain the initial sample; no universal cold-query speedup is established."
+  }
+}

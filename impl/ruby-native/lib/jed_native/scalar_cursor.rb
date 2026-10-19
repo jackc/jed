@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module JedNative
-  # Pure scalar SELECTs need an expression context, but no relational executor
+  # Scalar SELECTs need an expression context, but no relational executor
   # snapshot or suspended Fiber. Resolution and evaluation still use the normal
   # compiler, evaluator, and meters, and start only on the first pull.
   module ScalarCursorPlanning
@@ -31,7 +31,8 @@ module JedNative
       return cached[1] if cached && cached[0].equal?(metadata)
 
       plan = nil
-      if scalar_cursor_syntax?(ast) && binding.types.all? { |type| TYPES.key?(type) && !@types.key?(type) }
+      if scalar_cursor_syntax?(ast) && binding.types.all? { |type| TYPES.key?(type) && !@types.key?(type) } &&
+         metadata.all? { |column| TYPES.key?(column[:type]) && !@types.key?(column[:type]) }
         general_projection = ast[:columns].any? { |item| !cacheable_expression?(item[:expr]) } ||
                              ast[:where] && !cacheable_expression?(ast[:where])
         # The general executor filters before compiling projections. Its
@@ -88,8 +89,9 @@ module JedNative
       plan.parameters.each do |parameter|
         cast_value(@params[parameter.value], parameter.type) if parameter.extra&.dig(:context_type)
       end
+      kernels = native_compiled_kernels(plan, plan.predicate, plan.projections) unless cursor_plan.general_projection
       return nil if where_contradiction?(plan.predicate)
-      return nil if plan.predicate && evaluate(plan.predicate, EMPTY_ARRAY) != true
+      return nil if plan.predicate && (kernels&.predicate ? kernels.predicate.call(self, EMPTY_ARRAY, @params) : evaluate(plan.predicate, EMPTY_ARRAY)) != true
       if cursor_plan.general_projection
         # General deferred projections reserve the output row before evaluating
         # its expressions. Their zero-work checkpoints and error cost prefixes
@@ -103,7 +105,8 @@ module JedNative
           evaluate(plan.projections[index], EMPTY_ARRAY)
         end
       else
-        values = Array.new(plan.projections.length) { |index| evaluate(plan.projections[index], EMPTY_ARRAY) }
+        values = kernels&.projection ? kernels.projection.call(self, EMPTY_ARRAY, @params) :
+          Array.new(plan.projections.length) { |index| evaluate(plan.projections[index], EMPTY_ARRAY) }
         charge # row_produced, after all projection work
       end
       values
@@ -111,16 +114,16 @@ module JedNative
 
     private
 
-    def scalar_cursor_syntax?(statement)
+    def scalar_cursor_syntax?(statement, host: true)
       return false if statement[:with] || statement[:into] || statement[:distinct] || statement[:distinct_on] ||
                       statement[:having] || statement[:limit] || statement[:offset]
       return false unless (statement[:joins] || []).empty? && (statement[:group_by] || []).empty? &&
                           (statement[:windows] || {}).empty? && (statement[:order_by] || []).empty?
-      statement[:columns].all? { |item| scalar_cursor_expression?(item[:expr]) } &&
-        (!statement[:where] || scalar_cursor_expression?(statement[:where]))
+      statement[:columns].all? { |item| scalar_cursor_expression?(item[:expr], host: host) } &&
+        (!statement[:where] || scalar_cursor_expression?(statement[:where], host: host))
     end
 
-    def scalar_cursor_expression?(node)
+    def scalar_cursor_expression?(node, host: true)
       case node[:kind]
       when :literal
         value = node[:value]
@@ -131,24 +134,38 @@ module JedNative
         type = Types.normalize(node[:type])
         return false unless TYPES.key?(type) && !@types.key?(type)
         child = node[:expr]
-        child[:kind] == :literal && child[:value].is_a?(String) || scalar_cursor_expression?(child)
-      when :unary then scalar_cursor_expression?(node[:expr] || node[:operand])
+        child[:kind] == :literal && child[:value].is_a?(String) || scalar_cursor_expression?(child, host: host)
+      when :unary then scalar_cursor_expression?(node[:expr] || node[:operand], host: host)
       when :binary
-        OPERATORS.key?(node[:op]) && scalar_cursor_expression?(node[:left]) && scalar_cursor_expression?(node[:right])
+        OPERATORS.key?(node[:op]) && scalar_cursor_expression?(node[:left], host: host) && scalar_cursor_expression?(node[:right], host: host)
       when :case
-        (!node[:operand] || scalar_cursor_expression?(node[:operand])) &&
+        (!node[:operand] || scalar_cursor_expression?(node[:operand], host: host)) &&
           node[:branches].all? do |branch|
             condition, value = branch.is_a?(Array) ? branch : [branch[:when], branch[:then]]
-            scalar_cursor_expression?(condition) && scalar_cursor_expression?(value)
-          end && (!node[:else] || scalar_cursor_expression?(node[:else]))
+            scalar_cursor_expression?(condition, host: host) && scalar_cursor_expression?(value, host: host)
+          end && (!node[:else] || scalar_cursor_expression?(node[:else], host: host))
       when :between
-        scalar_cursor_expression?(node[:expr]) && scalar_cursor_expression?(node[:low] || node[:lower]) &&
-          scalar_cursor_expression?(node[:high] || node[:upper])
+        scalar_cursor_expression?(node[:expr], host: host) && scalar_cursor_expression?(node[:low] || node[:lower], host: host) &&
+          scalar_cursor_expression?(node[:high] || node[:upper], host: host)
       when :call
-        FUNCTIONS.key?(node[:name]) && !host_function_name?(node[:name]) && !node[:over] && !node[:filter] &&
+        return false if PreparedSelect::STATEFUL_FUNCTIONS.include?(node[:name])
+        callable = if host_function_name?(node[:name])
+          return false unless host
+          return false if builtin_function_name?(node[:name]) && !FUNCTIONS.key?(node[:name])
+          # Host callbacks are never folded. Their frozen signature and scalar
+          # result need no relational executor state; evaluation still goes
+          # through HostFunctions at first pull. Batched callbacks retain the
+          # general executor's speculative prefetch and replay boundaries.
+          host_functions_named(node[:name]).all? do |function|
+            function.kernel && TYPES.key?(function.result) && function.args.all? { |type| TYPES.key?(type) }
+          end
+        else
+          FUNCTIONS.key?(node[:name])
+        end
+        callable && !node[:over] && !node[:filter] &&
           !node[:within_group] && !node[:distinct] && !node[:variadic] && (node[:order_by] || []).empty? &&
           (node[:arg_names] || []).empty? && !Functions.aggregate?(node[:name]) &&
-          (node[:args] || []).all? { |argument| scalar_cursor_expression?(argument) }
+          (node[:args] || []).all? { |argument| scalar_cursor_expression?(argument, host: host) }
       else false
       end
     end

@@ -32,3 +32,8 @@ The implementation and validation report are under `impl/ruby-native`. Results
 must distinguish interpreter, YJIT, and ZJIT, record actual runtime availability,
 warmup, dataset size, checksums, and command lines, and preserve baseline measurements
 before optimizations. JIT settings belong to the benchmark launcher, never the library.
+
+The separately requested runtime compilation experiment is described in
+[`ruby-runtime-compilation.md`](ruby-runtime-compilation.md). It permits a bounded,
+handwritten emitter for resolved expressions; it does not permit evaluating SQL
+text as Ruby or introducing a native engine dependency.

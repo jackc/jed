@@ -1,0 +1,29 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "bench/ruby-native/compiled_diagnostics.rb",
+    "--report",
+    "bench/ruby-native/results/compiled-followup/diagnostic-4.0-yjit.json",
+    "--jit",
+    "yjit",
+    "--churn",
+    "256",
+    "--churn-calls",
+    "200"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 60047360,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 120.0,
+  "elapsed_seconds": 2.2519698050018633,
+  "source": "/tmp/jed-ruby-compiled-after",
+  "source_sha256": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+  "final_source_sha256": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/compiled-followup/diagnostic-4.0-yjit.json\",\"source_sha256\":\"e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473\",\"jit\":\"yjit\",\"workloads\":[{\"name\":\"integer_scalar\",\"admitted\":true,\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"29b40704c766637c67e8616cd58f3e085e7c45c3706f1eae706d95ab1efcb468\",\"yjit_compiled_instruction_count\":236,\"direct_jit_proof\":true}},{\"name\":\"row_arithmetic\",\"admitted\":true,\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"44016fb7999df7bbe6478a35dca6a70ab50af0eccb7e6bf02e9396496d487eb9\",\"yjit_compiled_instruction_count\":315,\"direct_jit_proof\":true}},{\"name\":\"conditional\",\"admitted\":true,\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"ea461f94019994841a0fd0699d43fce2f48547da495ca75e412074101b8c8e84\",\"yjit_compiled_instruction_count\":247,\"direct_jit_proof\":true}},{\"name\":\"null_folds\",\"admitted\":true,\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"4bd6b3071bef1de813129f2f9bf90683cbd55dbcf46700d19b7b92258b8820af\",\"yjit_compiled_instruction_count\":290,\"direct_jit_proof\":true}},{\"name\":\"predicate\",\"admitted\":true,\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"7260cada9667b4438b70587e4f23055f3a617b628e7a2c4ac1872cffd8a487d6\",\"yjit_compiled_instruction_count\":171,\"direct_jit_proof\":true}}]}\n",
+  "stderr": ""
+}

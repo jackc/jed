@@ -1,0 +1,39 @@
+{
+  "checked_at": "2026-10-19T12:42:21Z",
+  "timing_cells": 180,
+  "validation_queries": 3324,
+  "peak_worker_rss_bytes": 389730304,
+  "engine_source_sha256": {
+    "native": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+    "wrapper": "758334a5e5e3c16ec239a3e0185677253ec15136c062e3b524dd353f7dd580b5",
+    "rust": "bf85a2b7feaad510d97bc244ecc6108023d2bd8090dd9fcccd013580fcda938f",
+    "wrapper_library": "2218b17c826093137bd0b12a4f1db904adb6f25834673b1b297dfea8592e62f6"
+  },
+  "reports": [
+    {
+      "path": "memory-4.0-yjit.json",
+      "sha256": "f02071128cb7243e2bfc89c38c7150ca8f44b730a5c2901e434ccfcaa53642a8"
+    },
+    {
+      "path": "memory-4.1-yjit.json",
+      "sha256": "ad43e6dd734c5c12b9c31f79096db690a3ec4f758dfb707d1424d0b316b34aed"
+    },
+    {
+      "path": "memory-4.1-zjit.json",
+      "sha256": "b61d6fe4efbf2c964597451c997cf5cff9e59359e11feafc33429d0d172290aa"
+    },
+    {
+      "path": "file-4.0-yjit.json",
+      "sha256": "f8a7d4f87f32e0c4117371ed5378fa5cab28913eaced38e455bcf033b8ee7b66"
+    },
+    {
+      "path": "file-4.1-yjit.json",
+      "sha256": "98fed6164ec7c0a53a1e4b3978a4b823c7d5eee6da77512bae9d4a415883bb69"
+    },
+    {
+      "path": "file-4.1-zjit.json",
+      "sha256": "ee215755170d56104fd39b7f6ed0c50ebff2e2e8e520b221606472715d72a3b4"
+    }
+  ],
+  "checks": "values, names, types, costs, rows, callbacks, JIT activation, source consistency, medians, resource bounds"
+}
