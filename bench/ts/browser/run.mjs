@@ -72,6 +72,7 @@ try {
   const sourceFiles = [
     "bench/ts/browser/index.html",
     "bench/ts/browser/heavy.ts",
+    "bench/ts/browser/observe.ts",
     "bench/ts/browser/run.mjs",
     "bench/ts/browser/vite.config.ts",
     "bench/ts/src/async-heavy.ts",
