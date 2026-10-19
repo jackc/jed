@@ -1,0 +1,23 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/query_profile.rb",
+    "--report",
+    "bench/ruby-native/results/query-followup/candidate-profile.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 73986048,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 1.7489721629972337,
+  "source": "/tmp/jed-ruby-query-candidate",
+  "source_sha256": "54186e6d2bf18fa6b865d2bddf1efaf7818ee99e7c0383b41c03a3aa3d579ba5",
+  "final_source_sha256": "54186e6d2bf18fa6b865d2bddf1efaf7818ee99e7c0383b41c03a3aa3d579ba5",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "query scalar: 20008.2ns; 147.0 allocations\nquery pk_hit: 4143.8ns; 28.0 allocations\nquery pk_miss: 3582.1ns; 24.0 allocations\nquery filtered_scan: 306208.5ns; 503.1 allocations\nquery aggregate: 320964.8ns; 1228.0 allocations\nquery group: 804718.5ns; 6293.1 allocations\nquery sort_limit: 1416185.6ns; 9696.0 allocations\nexecute scalar: 13414.4ns; 140.0 allocations\nexecute pk_hit: 12574.4ns; 134.0 allocations\nexecute pk_miss: 12213.0ns; 131.0 allocations\nexecute filtered_scan: 283777.9ns; 478.1 allocations\nexecute aggregate: 306974.5ns; 1004.0 allocations\nexecute group: 804990.3ns; 6208.1 allocations\nexecute sort_limit: 1427161.8ns; 9663.0 allocations\n",
+  "stderr": ""
+}

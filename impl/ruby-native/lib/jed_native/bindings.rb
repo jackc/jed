@@ -518,6 +518,17 @@ module JedNative
        @views.map { |name, view| [name, view.object_id] }]
     end
 
+    # A cache hit needs only to validate the saved catalog identities. Building
+    # another inventory would allocate one pair for every visible object even
+    # when a prepared statement's binding types are unchanged.
+    def parameter_binding_schema_current?(schema)
+      tables, types, views = schema
+      return false unless tables.length == @tables.length && types.length == @types.length && views.length == @views.length
+      tables.all? { |name, identity| (table = @tables[name]) && table[:columns].object_id == identity } &&
+        types.all? { |name, identity| (fields = @types[name]) && fields.object_id == identity } &&
+        views.all? { |name, identity| (view = @views[name]) && view.object_id == identity }
+    end
+
     def query_metadata(statement, outer = [])
       binding = ParameterBindings.new(self, statement)
       columns = binding.query_columns(statement, outer, parameter_types: @native_binding_types)
@@ -528,9 +539,9 @@ module JedNative
       return super if @native_binding_active
       owns_binding = true
       @native_binding_plans ||= {}.compare_by_identity
-      schema = parameter_binding_schema
       entry = @native_binding_plans[statement]
-      if entry && entry[0] == schema && entry[1].instance_variable_get(:@engine).equal?(self)
+      if entry && entry[1].instance_variable_get(:@engine).equal?(self) &&
+         (entry[1].count.zero? || parameter_binding_schema_current?(entry[0]))
         binding = entry[1]
       else
         binding = ParameterBindings.new(self, statement)
@@ -538,6 +549,7 @@ module JedNative
         binding.resolve
         raise Error.new('42601', 'bind parameter count mismatch') unless @params.length == binding.count
         @native_binding_plans.shift if @native_binding_plans.length >= 64
+        schema = parameter_binding_schema unless binding.count.zero?
         @native_binding_plans[statement] = [schema, binding]
       end
       raise Error.new('42601', 'bind parameter count mismatch') unless @params.length == binding.count

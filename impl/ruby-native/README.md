@@ -12,6 +12,8 @@ records conformance, interoperability, resource limits and benchmark measurement
 The [lookup follow-up](LOOKUP_FOLLOWUP.md) records further profiling and measurements
 with Ruby 4.1.0-preview1 YJIT and ZJIT. The [second lookup pass](LOOKUP_SECOND_PASS.md)
 records the specialized lazy point cursor and repeated comparisons within 10× Go.
+The [query-shape follow-up](QUERY_FOLLOWUP.md) records further scan, aggregate,
+grouping, sort, and general prepared-execution improvements.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
@@ -115,6 +117,9 @@ mise run ruby-native:file-compare -- --run
 # Investigate allocation/call counts separately from canonical timing:
 JED_NATIVE_TIMEOUT=180 JED_NATIVE_ADDRESS_SPACE_BYTES=2147483648 \
   mise run ruby-native:bounded -- ruby --yjit bench/ruby-native/lookup_profile.rb --report /tmp/lookup.json
+# General query shapes through lazy and eager prepared APIs:
+JED_NATIVE_TIMEOUT=180 JED_NATIVE_ADDRESS_SPACE_BYTES=2147483648 \
+  mise run ruby-native:bounded -- ruby --yjit bench/ruby-native/query_profile.rb --report /tmp/queries.json
 # Disk SQL audit; default locking is auto (page service):
 JED_NATIVE_STORAGE=disk JED_NATIVE_LOCKING=exclusive mise run ruby-native:conformance
 # Full benchmark adapter, using the separately prepared standard databases:

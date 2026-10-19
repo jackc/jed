@@ -1,0 +1,22 @@
+{
+  "command": [
+    "env",
+    "TMPDIR=/tmp",
+    "ruby",
+    "bench/ruby-native/compare.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 177192960,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 5.492061148994253,
+  "source": "/tmp/jed-ruby-lookup-second-complete",
+  "source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "final_source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "scalar: ruby=63940.4ns ruby-yjit=25785.5ns go=791.3ns rust=1417.7ns ts=2091.0ns\npk_hit: ruby=8131.2ns ruby-yjit=3955.0ns go=1586.2ns rust=2236.1ns ts=4714.8ns\npk_miss: ruby=6712.8ns ruby-yjit=3506.4ns go=1009.4ns rust=1836.1ns ts=3046.4ns\nfiltered_scan: ruby=1912203.1ns ruby-yjit=982852.0ns go=171497.2ns rust=111493.6ns ts=306216.6ns\naggregate: ruby=1624307.9ns ruby-yjit=942766.8ns go=65066.7ns rust=52433.5ns ts=166247.3ns\ngroup: ruby=2948688.7ns ruby-yjit=1832476.2ns go=255600.3ns rust=175999.7ns ts=434100.9ns\nsort_limit: ruby=2818918.9ns ruby-yjit=1670754.3ns go=214591.3ns rust=137020.0ns ts=301360.3ns\n",
+  "stderr": "compare go: ready\ncompare rust: ready\ncompare ruby: ready\ncompare ruby-yjit: ready\ncompare ts: ready\ncompare ruby: measuring\ncompare ruby-yjit: measuring\ncompare go: measuring\ncompare rust: measuring\ncompare ts: measuring\ncomparison artifact: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/query-before-4_0_7.json\n"
+}

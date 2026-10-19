@@ -22,11 +22,10 @@ module JedNative
   module CursorExecution
     def cursor_metadata(statement)
       ast = route_domains(statement)
-      schema = parameter_binding_schema
-      context = [@environment, timezone, default_collation]
       @native_cursor_metadata ||= {}.compare_by_identity
       entry = @native_cursor_metadata[ast]
-      unless entry && entry[0] == schema && entry[1] == context
+      unless entry && parameter_binding_schema_current?(entry[0]) &&
+             entry[1][0] == @environment && entry[1][1] == timezone && entry[1][2] == default_collation
         binding = ParameterBindings.new(self, ast)
         binding.resolve
         previous = @native_binding_types
@@ -37,9 +36,10 @@ module JedNative
           @native_binding_types = previous
         end
         @native_cursor_metadata.shift if @native_cursor_metadata.length >= 64
-        entry = @native_cursor_metadata[ast] = [schema, context, binding, columns]
+        entry = @native_cursor_metadata[ast] = [parameter_binding_schema,
+          [@environment, timezone, default_collation], [ast, binding, columns].freeze]
       end
-      [ast, entry[2], entry[3]]
+      entry[2]
     end
 
     def select(statement)
@@ -79,6 +79,15 @@ module JedNative
                        @native_window_shapes @native_spill_shapes @native_stream_shapes].freeze
     REPLACED_STATE = (SharedDatabase::CATALOGS + %i[@native_binding_plans @savepoints
       @params @foreign_key_checks @native_query_shape_cache @subquery_hoists]).freeze
+    # These maps carry no mutable execution state. Domain routing rechecks its
+    # namespace qualifications on each use; the other two caches are consulted
+    # only when constructing a cursor. Service roles are replaced wholesale at
+    # capture, so retaining the old map preserves the cursor's admission guard.
+    # Refresh provenance holds identity-only references, never mutable work.
+    SHARED_REFERENCES = %i[@native_domain_routes @native_cursor_metadata
+                           @native_point_cursor_plans @service_roles
+                           @native_refreshed_tables @native_refreshed_types].freeze
+    COPY_OMISSIONS = (SHARED_CACHES + REPLACED_STATE + SHARED_REFERENCES).to_h { |name| [name, true] }.freeze
 
     def initialize(session, statement, params)
       @session, @database = session, session.database
@@ -92,7 +101,7 @@ module JedNative
       end
       @engine = session.engine.dup
       @engine.instance_variables.each do |name|
-        next if SHARED_CACHES.include?(name) || REPLACED_STATE.include?(name)
+        next if COPY_OMISSIONS.key?(name)
         value = @engine.instance_variable_get(name)
         @engine.instance_variable_set(name, value.dup) if value.is_a?(Hash) || value.is_a?(Array)
       end

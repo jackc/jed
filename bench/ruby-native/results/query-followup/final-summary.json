@@ -1,0 +1,1053 @@
+{
+  "checked_at": "2026-10-19T11:40:58Z",
+  "passed": true,
+  "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+  "baseline_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "memory_cells": [
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds": 63.940383
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds": 8.13121
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds": 6.71275
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds": 1912.2030666666667
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds": 1624.3079
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds": 2948.6887333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds": 2818.918866666667
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds": 25.7854515
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds": 3.95504
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds": 3.50641
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds": 982.8519666666666
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds": 942.7668333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds": 1832.4762
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds": 1670.7543333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "scalar",
+      "microseconds": 0.791277
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_hit",
+      "microseconds": 1.5861866666666666
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_miss",
+      "microseconds": 1.0093533333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "filtered_scan",
+      "microseconds": 171.49723333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "aggregate",
+      "microseconds": 65.06673333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "group",
+      "microseconds": 255.60026666666667
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "sort_limit",
+      "microseconds": 214.59133333333332
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "scalar",
+      "microseconds": 1.4177475
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_hit",
+      "microseconds": 2.23606
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_miss",
+      "microseconds": 1.8361433333333332
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "filtered_scan",
+      "microseconds": 111.4936
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "aggregate",
+      "microseconds": 52.43353333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "group",
+      "microseconds": 175.99966666666666
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "sort_limit",
+      "microseconds": 137.02
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "scalar",
+      "microseconds": 2.090986
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_hit",
+      "microseconds": 4.714766666666667
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_miss",
+      "microseconds": 3.0464433333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "filtered_scan",
+      "microseconds": 306.2166
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "aggregate",
+      "microseconds": 166.24733333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "group",
+      "microseconds": 434.10093333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "sort_limit",
+      "microseconds": 301.36033333333336
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds": 57.556156
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds": 7.3866966666666665
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds": 6.188583333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds": 1893.2343333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds": 1578.4036333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds": 2846.5361333333335
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds": 2612.5709333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds": 24.1289065
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds": 4.346163333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds": 3.342966666666667
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds": 966.6181
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds": 924.9396333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds": 2275.478
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds": 1651.9606666666666
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "scalar",
+      "microseconds": 26.5973775
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_hit",
+      "microseconds": 3.982953333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_miss",
+      "microseconds": 3.5036633333333334
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "filtered_scan",
+      "microseconds": 1169.3113
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "aggregate",
+      "microseconds": 1150.3278333333333
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "group",
+      "microseconds": 2328.0226666666667
+    },
+    {
+      "phase": "before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "sort_limit",
+      "microseconds": 1671.8574
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds": 56.1681485
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds": 8.436913333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds": 6.826646666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds": 878.1204
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds": 740.8430333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds": 1356.6771333333334
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds": 1594.5506
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds": 22.08103
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds": 4.129896666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds": 3.29913
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds": 322.0542
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds": 303.0219
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds": 652.9104
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds": 867.2018666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "scalar",
+      "microseconds": 0.7405905
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_hit",
+      "microseconds": 1.3372966666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_miss",
+      "microseconds": 0.9803266666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "filtered_scan",
+      "microseconds": 162.93316666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "aggregate",
+      "microseconds": 65.15876666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "group",
+      "microseconds": 250.42326666666668
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "sort_limit",
+      "microseconds": 208.20946666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "scalar",
+      "microseconds": 1.414955
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_hit",
+      "microseconds": 2.23263
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_miss",
+      "microseconds": 1.7923066666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "filtered_scan",
+      "microseconds": 106.1293
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "aggregate",
+      "microseconds": 51.56973333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "group",
+      "microseconds": 172.21773333333334
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "sort_limit",
+      "microseconds": 136.40526666666668
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "scalar",
+      "microseconds": 1.7401445
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_hit",
+      "microseconds": 4.110076666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_miss",
+      "microseconds": 2.479833333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "filtered_scan",
+      "microseconds": 322.6193333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "aggregate",
+      "microseconds": 169.4706
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "group",
+      "microseconds": 442.03093333333334
+    },
+    {
+      "phase": "after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "sort_limit",
+      "microseconds": 318.8722666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds": 51.6054955
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds": 8.278346666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds": 6.0700666666666665
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds": 867.9539666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds": 744.2036
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds": 1321.6482
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds": 1613.5536
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds": 19.1796085
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds": 4.340833333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds": 3.2908333333333335
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds": 292.5926666666667
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds": 297.0078
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds": 653.1328
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds": 929.32
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "scalar",
+      "microseconds": 22.862403
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_hit",
+      "microseconds": 3.960653333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_miss",
+      "microseconds": 3.5734066666666666
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "filtered_scan",
+      "microseconds": 511.24536666666665
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "aggregate",
+      "microseconds": 499.7658333333333
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "group",
+      "microseconds": 883.7848
+    },
+    {
+      "phase": "after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "sort_limit",
+      "microseconds": 1147.0964666666666
+    }
+  ],
+  "file_cells": [
+    {
+      "run": "before-file-4.0.7",
+      "lane": "ruby",
+      "workload": "point_lookup_pk",
+      "microseconds": 35.73868134
+    },
+    {
+      "run": "before-file-4.0.7",
+      "lane": "ruby",
+      "workload": "cold_open_pk_small",
+      "microseconds": 26441.24241
+    },
+    {
+      "run": "before-file-4.0.7",
+      "lane": "ruby",
+      "workload": "insert_commit_durable",
+      "microseconds": 6530.35671
+    },
+    {
+      "run": "before-file-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 16.80019562
+    },
+    {
+      "run": "before-file-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "cold_open_pk_small",
+      "microseconds": 4386.039105
+    },
+    {
+      "run": "before-file-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "insert_commit_durable",
+      "microseconds": 5368.462673333333
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ruby",
+      "workload": "point_lookup_pk",
+      "microseconds": 34.9059182
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ruby",
+      "workload": "cold_open_pk_small",
+      "microseconds": 26811.75355
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ruby",
+      "workload": "insert_commit_durable",
+      "microseconds": 6890.67984
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 16.2706363
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "cold_open_pk_small",
+      "microseconds": 4024.31212
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "insert_commit_durable",
+      "microseconds": 5263.337836666667
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "go",
+      "workload": "point_lookup_pk",
+      "microseconds": 2.10377922
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "go",
+      "workload": "cold_open_pk_small",
+      "microseconds": 492.13902
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "go",
+      "workload": "insert_commit_durable",
+      "microseconds": 1975.4183733333334
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "rust",
+      "workload": "point_lookup_pk",
+      "microseconds": 2.36645658
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "rust",
+      "workload": "cold_open_pk_small",
+      "microseconds": 454.110935
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "rust",
+      "workload": "insert_commit_durable",
+      "microseconds": 1696.1949633333334
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ts",
+      "workload": "point_lookup_pk",
+      "microseconds": 7.75715106
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ts",
+      "workload": "cold_open_pk_small",
+      "microseconds": 1150.13829
+    },
+    {
+      "run": "final-file-4.0.7",
+      "lane": "ts",
+      "workload": "insert_commit_durable",
+      "microseconds": 2085.55493
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby",
+      "workload": "point_lookup_pk",
+      "microseconds": 35.31792734
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby",
+      "workload": "cold_open_pk_small",
+      "microseconds": 25234.32182
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby",
+      "workload": "insert_commit_durable",
+      "microseconds": 6315.044063333334
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 17.6119598
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "cold_open_pk_small",
+      "microseconds": 3920.12537
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "insert_commit_durable",
+      "microseconds": 5045.734
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 17.49198806
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "cold_open_pk_small",
+      "microseconds": 7712.662835
+    },
+    {
+      "run": "final-file-4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "insert_commit_durable",
+      "microseconds": 5785.51789
+    }
+  ],
+  "memory_answers": {
+    "scalar": [
+      "4f2c86bbdc99682d",
+      32
+    ],
+    "pk_hit": [
+      "129dbfe50e014edb",
+      32
+    ],
+    "pk_miss": [
+      "cbf29ce484222325",
+      0
+    ],
+    "filtered_scan": [
+      "c53e1273a1e9add2",
+      494
+    ],
+    "aggregate": [
+      "95913d368b1ddc2c",
+      32
+    ],
+    "group": [
+      "6ad01ea05cb39e25",
+      320
+    ],
+    "sort_limit": [
+      "b0d527ed3d1d1ce5",
+      640
+    ]
+  },
+  "file_answers": {
+    "point_lookup_pk": [
+      "28f09c46d56e242a",
+      50000
+    ],
+    "cold_open_pk_small": [
+      "a4c0e86b8353f4ce",
+      200
+    ],
+    "insert_commit_durable": [
+      "6645d7dfab9c0296",
+      0
+    ]
+  },
+  "validation": {
+    "memory-4.1-zjit": {
+      "passed": 20267,
+      "files": 679,
+      "skipped_files": 2,
+      "peak_worker_rss_bytes": 144826368,
+      "jit": "zjit"
+    },
+    "disk-4.1-yjit": {
+      "passed": 18250,
+      "files": 679,
+      "skipped_files": 77,
+      "peak_worker_rss_bytes": 197140480,
+      "jit": "yjit"
+    },
+    "host": {
+      "success": true,
+      "peak_rss_bytes": 114253824,
+      "test_files": 40
+    }
+  },
+  "artifact_sha256": {
+    "bench/ruby-native/results/query-before-4_0_7.json": "477b4669f74d3b1030ccfc57225091e8d4845ee27efe2b670f08c5b938dbccd5",
+    "bench/ruby-native/results/query-before-4_1_preview1.json": "2d56c79f6d75d33cb1a1392fe350ed3a6baf6cf5f05b354b18a09bc9c2fdc717",
+    "bench/ruby-native/results/query-after-4_0_7.json": "52d54b6ccb0f14b87d5b63c6a59f2c07ab4d8452598d5f973fbdce4a841f8877",
+    "bench/ruby-native/results/query-after-4_1_preview1.json": "feda9f11a5f6a150592bebf91774f476e5374eb969760d12c95bd03324283ddb",
+    "bench/ruby-native/results/query-followup/before-file-4.0.7.json": "eeef5e35cbdb0bc3c9a3574cecfbadb20c95cca6f0ed97ecc8f1ec18c121d205",
+    "bench/ruby-native/results/query-followup/final-file-4.0.7.json": "aaf88e66d24e3c629b070ffec8b3bf6e735d2d44ff17166e3d7aba6a6e56f318",
+    "bench/ruby-native/results/query-followup/final-file-4.1-preview1.json": "abe23b6d27de7c830e9703d60a43e69fe2b811ecf3a6933b2c478d0b1433c5b4",
+    "bench/ruby-native/results/query-followup/final-conformance-memory-4.1-zjit.json": "c82118ad3dcec04eef357fd61cdb06e7a1e0bcb2b9d44753ad87445d641174f9",
+    "bench/ruby-native/results/query-followup/final-conformance-disk-4.1-yjit.json": "9f0dad4d6c77db9d324bbbfc13e9c84aaf39b53ad420b5db2e8bfd114beaac2b",
+    "bench/ruby-native/results/query-followup/final-host-4.0.7.json": "691d1b03a14b9b7207eb7067e4cadef67f35dcaa13ed1c35b860aea2ca06cae3",
+    "bench/ruby-native/results/query-followup/before-profile.json": "e591112ee6c1ed57b5f18ad8abc04b54a23d4e936716c73f31cbb40353f6ac0f",
+    "bench/ruby-native/results/query-followup/final-profile.json": "00b28a761d5623c2821ef2017fa8245a2e34de08dc03e7f21cfb05b8779c7c80"
+  }
+}
