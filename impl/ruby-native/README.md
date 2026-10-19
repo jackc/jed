@@ -112,6 +112,9 @@ preserving collation metadata and exact comparison-work charges. This extends
 the existing eligible expression and row loops; general string functions and
 linguistic comparisons keep their ordinary execution. See the
 [text follow-up](TEXT_FOLLOWUP.md).
+Comparisons of two statically C-labeled text leaves use cheaper private string
+snapshots while retaining wrapper metadata on escaping text and fallback values.
+See the [snapshot optimization](TEXT_ELISION_FOLLOWUP.md).
 
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;

@@ -203,7 +203,7 @@ module JedNative
       "::JedNative::CompiledExpression::C_LABELS[#{index}]"
     end
 
-    def emit(expression, depth)
+    def emit(expression, depth, text_snapshot: false)
       raise Unsupported unless expression.is_a?(Expression)
       raise Unsupported if depth > MAX_DEPTH || @node_count >= MAX_NODES
       raise Unsupported unless TYPES.include?(expression.type) && !@types.key?(expression.type)
@@ -238,7 +238,25 @@ module JedNative
       else raise Unsupported
       end
       if expression.type == 'text' && label != 'nil'
-        line("#{output} = ::JedNative::CollationRules.wrap(#{output}, #{label})")
+        if text_snapshot && expression.kind == :literal
+          # The pool already owns a canonical frozen String. Only the enclosing
+          # C comparison can consume it; escaping text still carries its label.
+        elsif text_snapshot
+          line("if #{output}.instance_of?(::String) || #{output}.instance_of?(::JedNative::CollatedText)")
+          @indent += 1
+          # Wrapping snapshots bytes, strips singleton methods and replaces any
+          # incoming label with this child's C label. Keep the byte copy before
+          # the next operand read, without constructing a transient wrapper.
+          line("#{output} = ::String.new(#{output})")
+          @indent -= 1
+          line('else')
+          @indent += 1
+          line("#{output} = ::JedNative::CollationRules.wrap(#{output}, #{label})")
+          @indent -= 1
+          line('end')
+        else
+          line("#{output} = ::JedNative::CollationRules.wrap(#{output}, #{label})")
+        end
       end
       output
     end
@@ -334,12 +352,21 @@ module JedNative
         raise Unsupported unless expression.type == 'boolean' &&
                                  [left, right].all? { |argument| %w[text null unknown].include?(argument.type) }
         charge
-        a, b = child(left, depth), child(right, depth)
         label = c_label_source(expression.instance_variable_get(:@native_collation))
+        # Both children must normalize their own values under static C labels.
+        # An unlabeled host String can have singleton comparison methods that
+        # observe the other operand's class; leave that path entirely unchanged.
+        snapshots = label != 'nil' && [left, right].all? do |argument|
+          argument.type == 'text' && %i[literal column param].include?(argument.kind) &&
+            argument.instance_variable_get(:@native_collation)
+        end
+        line('# C text snapshots') if snapshots
+        a = emit(left, depth + 1, text_snapshot: snapshots)
+        b = emit(right, depth + 1, text_snapshot: snapshots)
         if label == 'nil'
           line("#{output} = compare_text(engine, #{a}, #{b}, #{pooled(operator)}, nil)")
         else
-          emit_c_comparison(expression, output, left, right, a, b, label)
+          emit_c_comparison(expression, output, left, right, a, b, label, snapshots: snapshots)
         end
         return
       end
@@ -375,18 +402,19 @@ module JedNative
       line('end')
     end
 
-    def emit_c_comparison(expression, output, left, right, a, b, label)
+    def emit_c_comparison(expression, output, left, right, a, b, label, snapshots: false)
       line("if #{a}.nil? || #{b}.nil?")
       @indent += 1
       line("#{output} = nil")
       @indent -= 1
-      # A statically C-labeled child just created a fresh C wrapper. An
-      # unlabeled child must be an ordinary String: a CollatedText parameter
+      # A statically C-labeled child produced a C wrapper or a private snapshot.
+      # An unlabeled child must be an ordinary String: a CollatedText parameter
       # could carry a table, conflicting labels, or another dynamic derivation.
       guards = [[left, a], [right, b]].map do |argument, value|
         klass = argument.type == 'text' && argument.instance_variable_get(:@native_collation) ?
           '::JedNative::CollatedText' : '::String'
-        "#{value}.instance_of?(#{klass})"
+        guard = "#{value}.instance_of?(#{klass})"
+        snapshots ? "(#{value}.instance_of?(::String) || #{guard})" : guard
       end
       line("elsif #{guards.join(' && ')}")
       @indent += 1
@@ -398,6 +426,14 @@ module JedNative
       @indent -= 1
       line('else')
       @indent += 1
+      if snapshots
+        # Unexpected values retain the ordinary helper, with the same labels
+        # that its wrapped inputs would have had. Never re-read either operand.
+        [[left, a], [right, b]].each do |argument, value|
+          child_label = c_label_source(argument.instance_variable_get(:@native_collation))
+          line("#{value} = ::JedNative::CollationRules.wrap(#{value}, #{child_label}) if #{value}.instance_of?(::String)")
+        end
+      end
       line("#{output} = compare_text(engine, #{a}, #{b}, #{pooled(expression.value)}, #{label})")
       @indent -= 1
       line('end')
