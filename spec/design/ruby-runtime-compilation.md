@@ -4,7 +4,8 @@ The maintainer explicitly requested investigating Ruby `eval` as a way to compil
 prepared query plans and let Ruby's JIT optimize query-specific code. This is a
 narrow exception to the prohibition on generated engine implementations: the
 compiler and its semantics are handwritten Ruby, operating on already resolved
-expressions and eligible single-table scan/filter/projection plans. The Ruby core
+expressions, eligible single-table scan/filter/projection plans, and typed ORDER BY
+comparators. The Ruby core
 remains frozen, experimental, and explicitly selected for every test, benchmark,
 and feature update.
 
@@ -12,7 +13,8 @@ and feature update.
 
 The expression tier specializes kernels inside existing query plans. A second
 tier fuses eligible single-table scan/filter/projection loops, including streaming
-OFFSET/LIMIT. The planner, access paths, row sources, sort and aggregate algorithms,
+OFFSET/LIMIT. A third tier specializes comparisons of precomputed ORDER BY keys.
+The planner, access paths, row sources, sort and aggregate algorithms,
 storage, and host API remain the existing engine. A resolved expression can emit a
 Ruby method containing straight-line locals and branches instead of recursively
 dispatching through expression objects. Ruby's JIT may compile this method after
@@ -24,7 +26,8 @@ and fallback expression objects stay in a separate data pool. No SQL string is
 passed to `eval`, and no SQL value becomes a method name or interpolated Ruby
 literal. Each kernel is an instance of a collectible anonymous class with one
 generated `call(engine, row, params)` method. A pipeline instead receives the current
-engine, input, parameters, output sink, OFFSET and LIMIT. Neither captures an engine,
+engine, input, parameters, output sink, OFFSET and LIMIT. An ordering kernel receives
+two sort entries containing precomputed keys and their input ordinals. None captures an engine,
 session, row source, output sink, or parameter binding. `class_eval` defines the
 method once, outside the row loop.
 
@@ -44,6 +47,15 @@ operators. A streaming plan may consume an index-ordered input without generatin
 a sort. Host callbacks and unsupported types select the existing operator and
 expression tier. Array execution preserves its indexed `while`; streaming uses
 the existing source's internal `each` so it introduces no Enumerator Fiber per row.
+
+Ordering admission requires a complete key vector of plain integers, booleans,
+or proven NULL literals. Validated direction and NULL placement select fixed
+branches at compilation. Non-NULL integers compare directly; booleans retain
+FALSE-before-TRUE ordering. Complete ties compare the original input ordinals.
+Unsupported, nominal, and collatable keys retain the original comparator. The
+kernel's cached method Proc retains only the kernel itself. Blocking single-table
+sorting uses it with the existing bounded heap, full sort, or external sorter;
+other operators keep their existing comparisons.
 
 ## Semantic obligations
 
@@ -70,6 +82,13 @@ preparation remains at its original site. Closing a suspended cursor unwinds the
 same scanner and engine cleanup scopes. Charges are never summed or hoisted across
 these boundaries, including when statement/lifetime budgets are enabled.
 
+Plain integer/boolean ordering comparisons accrue no cost and invoke no host
+callbacks. Specializing them does not move key evaluation, projection, errors,
+memory reservations, or spill decisions. The sort algorithm and tie-break stay
+unchanged, including the external sorter's run/merge ordering. Finite cost,
+query-memory budgets, and profiling therefore do not require disabling this
+comparator tier. Admission never interprets SQL text as a comparator expression.
+
 ## Lifetime and bounds
 
 Resolved plan caches retain at most 64 entries each and already validate table
@@ -81,12 +100,14 @@ switches can force first-use admission or disable compilation for differential
 testing; neither changes public SQL or embedding APIs.
 
 An expression, fused projection, or pipeline is limited to 192 emitted nodes,
-depth 32, 256 pool entries, and 32 KiB source. A plan retains at most four kernels
-(predicate, projection, sort keys, and pipeline) and 64 KiB total source. A pipeline
+depth 32, 256 pool entries, and 32 KiB source. An ordering kernel permits at most
+192 keys and 32 KiB source, and has no value pool. A plan retains at most five kernels
+(predicate, projection, sort keys, pipeline, and ordering) and 64 KiB total source. A pipeline
 is attempted before separate expression kernels on eligible execution; fallback
 operators may later request those kernels under the same total cap. Rejection is
 cached. The internal pipeline-disable diagnostic keeps the expression tier active
-for differential comparisons; it is not a public API.
+for differential comparisons; the ordering-disable diagnostic likewise leaves
+the expression and pipeline tiers active. Neither is a public API.
 Aggregate arguments in the general and spill executors use a separate 64-entry
 LRU cache. Those expressions are resolved afresh, so the exact emitted source and
 immutable scalar pool form the cache key. Emission happens before lookup;

@@ -1,0 +1,572 @@
+{
+  "schema": 1,
+  "phase": "ordering-cross-core",
+  "verification_only": false,
+  "created_at": "2026-10-19T16:45:15Z",
+  "ordering_disabled": false,
+  "host": {
+    "platform": "x86_64-linux",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+    "processors": 24,
+    "git_commit": "e8ec94e5ef5a8e6a5f33ec375d0cc8c548a5012f",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+    "openssl": "OpenSSL 3.5.5 27 Jan 2026"
+  },
+  "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/ordering-plan.json",
+  "plan_sha256": "c9d1709b39f6dc5373232b7b73e65be4b4d0f775c8e7564e7288192e76d433d0",
+  "plan": {
+    "schema": 1,
+    "description": "Explicit ordering-compilation experiment: existing scalar, scan, bounded sort and computed-sort controls plus full sorting and mixed nullable integer/boolean keys over the unchanged 1000-row fixture. Projection outputs remain integers for every comparison adapter.",
+    "rows": 1000,
+    "repetitions": 5,
+    "validation_iterations": 32,
+    "workloads": [
+      {
+        "name": "scalar",
+        "sql": "SELECT abs($1::i64) + 7",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "sort_limit",
+        "sql": "SELECT id, score FROM items ORDER BY score DESC, id LIMIT 20",
+        "iterations": 15,
+        "warmup": 10,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "computed_sort",
+        "sql": "SELECT id, score FROM items ORDER BY score * 3 + bucket DESC, id LIMIT 20",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "plain_scan",
+        "sql": "SELECT id, score FROM items ORDER BY id",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "full_sort",
+        "sql": "SELECT id, score FROM items ORDER BY score DESC, id",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "sort_mixed_nulls",
+        "sql": "SELECT id, score FROM items ORDER BY CASE WHEN bucket < 3 THEN NULL ELSE bucket END ASC NULLS FIRST, (score >= 5000) DESC, score DESC, id LIMIT 20",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      }
+    ]
+  },
+  "ruby_source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "statuses": {
+    "go": {
+      "status": "ready",
+      "detail": ""
+    },
+    "rust": {
+      "status": "ready",
+      "detail": "    Finished `release` profile [optimized] target(s) in 0.00s\n"
+    },
+    "ruby-yjit": {
+      "status": "ready",
+      "detail": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]\n"
+    },
+    "ts": {
+      "status": "ready",
+      "detail": "v26.10.0\n"
+    }
+  },
+  "results": {
+    "ruby-yjit": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          10342467,
+          9367325,
+          9343668,
+          9388726,
+          9387476
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false
+      },
+      {
+        "workload": "sort_limit",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          5321695,
+          5439796,
+          5410712,
+          5425989,
+          5415230
+        ],
+        "rows_total": 1500,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false
+      },
+      {
+        "workload": "computed_sort",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          21554042,
+          21596443,
+          21498073,
+          21758753,
+          21810319
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false
+      },
+      {
+        "workload": "plain_scan",
+        "checksum": "4996975980d1fc25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          25624389,
+          25141867,
+          25111693,
+          25205535,
+          25249177
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false
+      },
+      {
+        "workload": "full_sort",
+        "checksum": "c853f428927a7c25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          43775878,
+          43850466,
+          43648522,
+          43385825,
+          43212512
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false
+      },
+      {
+        "workload": "sort_mixed_nulls",
+        "checksum": "d2f95926536ac5e5",
+        "validation_rows": 640,
+        "samples_ns": [
+          26711236,
+          26706076,
+          26807750,
+          26751647,
+          27055849
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+        "ordering_disabled": false
+      }
+    ],
+    "go": [
+      {
+        "checksum": "4f2c86bbdc99682d",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1711387,
+          1783076,
+          1422431,
+          1606542,
+          2252859
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "scalar"
+      },
+      {
+        "checksum": "b0d527ed3d1d1ce5",
+        "iterations": 15,
+        "rows_total": 1500,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          3373989,
+          3472929,
+          3452843,
+          3219171,
+          3460042
+        ],
+        "validation_rows": 640,
+        "warmup": 10,
+        "workload": "sort_limit"
+      },
+      {
+        "checksum": "b0d527ed3d1d1ce5",
+        "iterations": 50,
+        "rows_total": 5000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          16222324,
+          15886252,
+          15679588,
+          15726922,
+          16113682
+        ],
+        "validation_rows": 640,
+        "warmup": 100,
+        "workload": "computed_sort"
+      },
+      {
+        "checksum": "4996975980d1fc25",
+        "iterations": 50,
+        "rows_total": 250000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          8678997,
+          8215129,
+          8366583,
+          8578985,
+          8093732
+        ],
+        "validation_rows": 32000,
+        "warmup": 100,
+        "workload": "plain_scan"
+      },
+      {
+        "checksum": "c853f428927a7c25",
+        "iterations": 50,
+        "rows_total": 250000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          18666436,
+          19468330,
+          18554508,
+          17956041,
+          17826026
+        ],
+        "validation_rows": 32000,
+        "warmup": 100,
+        "workload": "full_sort"
+      },
+      {
+        "checksum": "d2f95926536ac5e5",
+        "iterations": 50,
+        "rows_total": 5000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          18247452,
+          19091335,
+          19123550,
+          17470110,
+          17575661
+        ],
+        "validation_rows": 640,
+        "warmup": 100,
+        "workload": "sort_mixed_nulls"
+      }
+    ],
+    "rust": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          2799072,
+          2765209,
+          2771692,
+          2757788,
+          2766057
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "sort_limit",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          2490972,
+          2486379,
+          2221545,
+          1958056,
+          1952309
+        ],
+        "rows_total": 1500,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "computed_sort",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          10423594,
+          10399383,
+          10400088,
+          10444223,
+          10373422
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "plain_scan",
+        "checksum": "4996975980d1fc25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          5512764,
+          5544206,
+          5483732,
+          5478398,
+          5483621
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "full_sort",
+        "checksum": "c853f428927a7c25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          8793616,
+          8796949,
+          8807938,
+          8806580,
+          8795613
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "sort_mixed_nulls",
+        "checksum": "d2f95926536ac5e5",
+        "validation_rows": 640,
+        "samples_ns": [
+          12184946,
+          12164013,
+          12147869,
+          12170021,
+          12155364
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "rust-release"
+      }
+    ],
+    "ts": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          8361401,
+          4605806,
+          4650371,
+          4522934,
+          4402075
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "sort_limit",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          7503630,
+          6491287,
+          7361183,
+          6798432,
+          6219271
+        ],
+        "rows_total": 1500,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "computed_sort",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          22995880,
+          21864505,
+          26087080,
+          27034905,
+          28544025
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "plain_scan",
+        "checksum": "4996975980d1fc25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          16391220,
+          16954190,
+          16734895,
+          17184059,
+          16998745
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "full_sort",
+        "checksum": "c853f428927a7c25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          20739244,
+          20624101,
+          21150094,
+          19772443,
+          22992450
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "sort_mixed_nulls",
+        "checksum": "d2f95926536ac5e5",
+        "validation_rows": 640,
+        "samples_ns": [
+          27764810,
+          27267221,
+          28784296,
+          27037749,
+          26035525
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "v26.10.0"
+      }
+    ]
+  },
+  "resources": {
+    "ruby-yjit": {
+      "peak_rss_bytes": 58236928,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+        "--yjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/lane.rb",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "go": {
+      "peak_rss_bytes": 27566080,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 17179869184,
+      "command": [
+        "/tmp/jed-ruby-native-compare/go-lane",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "rust": {
+      "peak_rss_bytes": 27303936,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 17179869184,
+      "command": [
+        "/tmp/jed-ruby-native-compare/rust-target/release/jed-ruby-experiment-compare",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "ts": {
+      "peak_rss_bytes": 353124352,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 17179869184,
+      "command": [
+        "node",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/lane.ts",
+        "/tmp/jed-ruby-native-compare/plan.tsv"
+      ]
+    }
+  },
+  "ruby_source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "ruby_source_sha256_after": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "source_sha256": {
+    "harness": "90b358f5ae3f7cc2c522c74e5349a63c069a191fe00e2ccc45d9732a4828500d",
+    "ruby_adapter": "30d4a20f53c986c41fc945f58ee9d4622ede8859b1221237b3bbbee61631bef2",
+    "go_adapter": "8a4d62ac61fcbd1e2097fbf145865ef93d7defa06d34078925e01b74bcb869e2",
+    "rust_adapter": "41c0512c1941f8e864e8d0c25fc99923666999f4660035bde4dafc5e77eede31",
+    "ts_adapter": "ebea27b1c22a823b049bf9234a8ba298e7e34f8a995452ded31e0f6110ccce65",
+    "go_core": "529576ad3e3bba25a769e9010ee4b280fe23bd111f5315daeaff0e671813bd05",
+    "rust_core": "d8aa1d6333b72d1d0e5dee9b0722de9e829349089a50a3ed5a509e2e887c2f50",
+    "ts_core": "914c07c6a8540b76f321de2a47786d8a2b3989b99b1cad3743f4b26aadf6897b",
+    "go_binary": "796adb99c4460c9954bfdc45e3b36925ee0150d8fa3f52993a9f28d0a23e342b",
+    "rust_binary": "4587f3f1b2e6a207c9f7249c1396aa9f011a1831eec9fbeee0a887204dffaa92",
+    "ruby_executable": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf"
+  },
+  "source_sha256_after": {
+    "harness": "90b358f5ae3f7cc2c522c74e5349a63c069a191fe00e2ccc45d9732a4828500d",
+    "ruby_adapter": "30d4a20f53c986c41fc945f58ee9d4622ede8859b1221237b3bbbee61631bef2",
+    "go_adapter": "8a4d62ac61fcbd1e2097fbf145865ef93d7defa06d34078925e01b74bcb869e2",
+    "rust_adapter": "41c0512c1941f8e864e8d0c25fc99923666999f4660035bde4dafc5e77eede31",
+    "ts_adapter": "ebea27b1c22a823b049bf9234a8ba298e7e34f8a995452ded31e0f6110ccce65",
+    "go_core": "529576ad3e3bba25a769e9010ee4b280fe23bd111f5315daeaff0e671813bd05",
+    "rust_core": "d8aa1d6333b72d1d0e5dee9b0722de9e829349089a50a3ed5a509e2e887c2f50",
+    "ts_core": "914c07c6a8540b76f321de2a47786d8a2b3989b99b1cad3743f4b26aadf6897b",
+    "go_binary": "796adb99c4460c9954bfdc45e3b36925ee0150d8fa3f52993a9f28d0a23e342b",
+    "rust_binary": "4587f3f1b2e6a207c9f7249c1396aa9f011a1831eec9fbeee0a887204dffaa92",
+    "ruby_executable": "7789390ecb126680df568546ccdbe8168de6d9071c1b0d9921e2e75c21117dbf"
+  },
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby"
+}

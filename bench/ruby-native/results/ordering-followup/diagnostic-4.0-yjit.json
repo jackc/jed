@@ -1,0 +1,971 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T16:44:35Z",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "script_sha256": "b9552ebbda315c8507970f3e5da18c8d6b9bf5a72eb7a65e277c35d739562960",
+  "helper_sha256": "16acd72b261b93dedb2b8f9f0cc850cf6deec0e93a82a57f509b75e846c683cf",
+  "options": {
+    "rows": 1000,
+    "warmup": 10000,
+    "iterations": 100000,
+    "sort_warmup": 50,
+    "sort_iterations": 100,
+    "repetitions": 5,
+    "compile_samples": 30,
+    "churn": 256,
+    "churn_calls": 200,
+    "jit": "yjit",
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/ordering-followup/diagnostic-4.0-yjit.json"
+  },
+  "jit": "yjit",
+  "workloads": [
+    {
+      "name": "integer_desc_id_asc",
+      "key_types": [
+        "i32",
+        "i32"
+      ],
+      "orders": [
+        {
+          "direction": "desc"
+        },
+        {
+          "direction": "asc"
+        }
+      ],
+      "first_prepare_ns": 22614,
+      "first_materialize_ns": 49208,
+      "first_compile_ns": 71822,
+      "first_call_ns": 803,
+      "first_result": 0,
+      "source_bytes": 424,
+      "node_count": 2,
+      "pool_entries": 0,
+      "jit_after_first_call": {
+        "inline_code_size": 42016,
+        "outlined_code_size": 26237,
+        "freed_code_size": 0,
+        "code_region_size": 126976,
+        "compiled_iseq_entry": 69,
+        "compiled_iseq_count": 82,
+        "compiled_blockid_count": 662,
+        "compiled_block_count": 837,
+        "compiled_branch_count": 1225,
+        "compile_time_ns": 9557389
+      },
+      "validation": {
+        "entry_cases": 38,
+        "checked_pairs": 1444,
+        "comparison_sha256": "249915a9093cf0b6c3a6d632efe7d3e0389267af2632f9a21fd16e723fa32c27",
+        "sorted_ordinals_sha256": "f22cdaec56588433934d8b7360af5d97f41ce2302ebe7772e1bc58c382715b47",
+        "input_sha256": "03b2af4bc6e0019ec388d79e10b2a0ed61b406411ec8bd24ff5daffae64bc09b",
+        "cost": 0,
+        "lifetime_cost": 0
+      },
+      "compile_samples": [
+        {
+          "prepare_ns": 309380,
+          "materialize_ns": 58553
+        },
+        {
+          "prepare_ns": 8697,
+          "materialize_ns": 32056
+        },
+        {
+          "prepare_ns": 6299,
+          "materialize_ns": 27849
+        },
+        {
+          "prepare_ns": 5950,
+          "materialize_ns": 24274
+        },
+        {
+          "prepare_ns": 5081,
+          "materialize_ns": 20354
+        },
+        {
+          "prepare_ns": 4731,
+          "materialize_ns": 18915
+        },
+        {
+          "prepare_ns": 4389,
+          "materialize_ns": 16506
+        },
+        {
+          "prepare_ns": 4454,
+          "materialize_ns": 90312
+        },
+        {
+          "prepare_ns": 6634,
+          "materialize_ns": 24208
+        },
+        {
+          "prepare_ns": 5395,
+          "materialize_ns": 18788
+        },
+        {
+          "prepare_ns": 4449,
+          "materialize_ns": 16456
+        },
+        {
+          "prepare_ns": 4095,
+          "materialize_ns": 16486
+        },
+        {
+          "prepare_ns": 4455,
+          "materialize_ns": 15694
+        },
+        {
+          "prepare_ns": 1578663,
+          "materialize_ns": 38312
+        },
+        {
+          "prepare_ns": 54375,
+          "materialize_ns": 32483
+        },
+        {
+          "prepare_ns": 5664,
+          "materialize_ns": 25536
+        },
+        {
+          "prepare_ns": 4501,
+          "materialize_ns": 22548
+        },
+        {
+          "prepare_ns": 4070,
+          "materialize_ns": 19833
+        },
+        {
+          "prepare_ns": 4049,
+          "materialize_ns": 19633
+        },
+        {
+          "prepare_ns": 3923,
+          "materialize_ns": 18411
+        },
+        {
+          "prepare_ns": 3498,
+          "materialize_ns": 18377
+        },
+        {
+          "prepare_ns": 3503,
+          "materialize_ns": 17800
+        },
+        {
+          "prepare_ns": 3602,
+          "materialize_ns": 18463
+        },
+        {
+          "prepare_ns": 3520,
+          "materialize_ns": 17062
+        },
+        {
+          "prepare_ns": 3155,
+          "materialize_ns": 17132
+        },
+        {
+          "prepare_ns": 3653,
+          "materialize_ns": 16542
+        },
+        {
+          "prepare_ns": 3389,
+          "materialize_ns": 15608
+        },
+        {
+          "prepare_ns": 3288,
+          "materialize_ns": 16083
+        },
+        {
+          "prepare_ns": 1147309,
+          "materialize_ns": 541927
+        },
+        {
+          "prepare_ns": 103052,
+          "materialize_ns": 237067
+        }
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 72897,
+        "outlined_code_size": 59136,
+        "freed_code_size": 0,
+        "code_region_size": 241664,
+        "compiled_iseq_entry": 87,
+        "compiled_iseq_count": 108,
+        "compiled_blockid_count": 1243,
+        "compiled_block_count": 1712,
+        "compiled_branch_count": 2511,
+        "compile_time_ns": 17153271
+      },
+      "samples": [
+        {
+          "order": [
+            "ordinary",
+            "compiled"
+          ],
+          "measurements": {
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 23553664,
+                "ns_per_comparison": 235.53664,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 193084253,
+                "ns_per_sort": 1930842.53,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 1783400,
+                "gc_count": 68
+              }
+            },
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 3360728,
+                "ns_per_comparison": 33.60728,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 27409362,
+                "ns_per_sort": 274093.62,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "compiled",
+            "ordinary"
+          ],
+          "measurements": {
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 3695872,
+                "ns_per_comparison": 36.95872,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 27353350,
+                "ns_per_sort": 273533.5,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            },
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 23138419,
+                "ns_per_comparison": 231.38419,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 193161231,
+                "ns_per_sort": 1931612.31,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 1783400,
+                "gc_count": 67
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "ordinary",
+            "compiled"
+          ],
+          "measurements": {
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 23368025,
+                "ns_per_comparison": 233.68025,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 193024201,
+                "ns_per_sort": 1930242.01,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 1783400,
+                "gc_count": 68
+              }
+            },
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 4029669,
+                "ns_per_comparison": 40.29669,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 26922254,
+                "ns_per_sort": 269222.54,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "compiled",
+            "ordinary"
+          ],
+          "measurements": {
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 3802764,
+                "ns_per_comparison": 38.02764,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 26946520,
+                "ns_per_sort": 269465.2,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            },
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 23190970,
+                "ns_per_comparison": 231.9097,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 193151566,
+                "ns_per_sort": 1931515.66,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 1783400,
+                "gc_count": 68
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "ordinary",
+            "compiled"
+          ],
+          "measurements": {
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 23456349,
+                "ns_per_comparison": 234.56349,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 175000,
+                "gc_count": 6
+              },
+              "full_sort": {
+                "elapsed_ns": 194020799,
+                "ns_per_sort": 1940207.99,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 1783400,
+                "gc_count": 68
+              }
+            },
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 4176987,
+                "ns_per_comparison": 41.76987,
+                "iterations": 100000,
+                "checksum": 6580,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 27144736,
+                "ns_per_sort": 271447.36,
+                "iterations": 100,
+                "checksum": 104600,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            }
+          }
+        }
+      ],
+      "validation_after_timing": {
+        "entry_cases": 38,
+        "checked_pairs": 1444,
+        "comparison_sha256": "249915a9093cf0b6c3a6d632efe7d3e0389267af2632f9a21fd16e723fa32c27",
+        "sorted_ordinals_sha256": "f22cdaec56588433934d8b7360af5d97f41ce2302ebe7772e1bc58c382715b47",
+        "input_sha256": "03b2af4bc6e0019ec388d79e10b2a0ed61b406411ec8bd24ff5daffae64bc09b",
+        "cost": 0,
+        "lifetime_cost": 0
+      },
+      "jit_after_timing": {
+        "inline_code_size": 73019,
+        "outlined_code_size": 59223,
+        "freed_code_size": 0,
+        "code_region_size": 241664,
+        "compiled_iseq_entry": 88,
+        "compiled_iseq_count": 109,
+        "compiled_blockid_count": 1244,
+        "compiled_block_count": 1713,
+        "compiled_branch_count": 2511,
+        "compile_time_ns": 17189584
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled ordering)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "7be6f68556fa937d8ac17e4aa3dc82922f596000d3767353b93be10733d0be42",
+        "yjit_compiled_instruction_count": 178,
+        "direct_jit_proof": true,
+        "iseq_path": "(jed compiled ordering)",
+        "first_lineno": 1
+      }
+    },
+    {
+      "name": "nullable_integer_boolean_integer",
+      "key_types": [
+        "i32",
+        "boolean",
+        "i32"
+      ],
+      "orders": [
+        {
+          "direction": "asc",
+          "nulls": "first"
+        },
+        {
+          "direction": "desc",
+          "nulls": "last"
+        },
+        {
+          "direction": "desc",
+          "nulls": "first"
+        }
+      ],
+      "first_prepare_ns": 223033,
+      "first_materialize_ns": 196489,
+      "first_compile_ns": 419522,
+      "first_call_ns": 1381,
+      "first_result": 0,
+      "source_bytes": 632,
+      "node_count": 3,
+      "pool_entries": 0,
+      "jit_after_first_call": {
+        "inline_code_size": 75539,
+        "outlined_code_size": 62766,
+        "freed_code_size": 0,
+        "code_region_size": 245760,
+        "compiled_iseq_entry": 88,
+        "compiled_iseq_count": 109,
+        "compiled_blockid_count": 1263,
+        "compiled_block_count": 1761,
+        "compiled_branch_count": 2586,
+        "compile_time_ns": 17941927
+      },
+      "validation": {
+        "entry_cases": 110,
+        "checked_pairs": 12100,
+        "comparison_sha256": "666bdd14e94c803a3edc1ce6a056825b461d6f5a0fb907e5da323122ac573af9",
+        "sorted_ordinals_sha256": "1dd4c8bfb8eb0dc83c6236fbea9e1d670fcd6a7bf468606614289add50625624",
+        "input_sha256": "cdac727d822f55590081009b8daa304e2d9639336c1c49db393fa6cbbf0420da",
+        "cost": 0,
+        "lifetime_cost": 0
+      },
+      "compile_samples": [
+        {
+          "prepare_ns": 35091,
+          "materialize_ns": 173440
+        },
+        {
+          "prepare_ns": 7790,
+          "materialize_ns": 119871
+        },
+        {
+          "prepare_ns": 6542,
+          "materialize_ns": 238609
+        },
+        {
+          "prepare_ns": 6777,
+          "materialize_ns": 84958
+        },
+        {
+          "prepare_ns": 6002,
+          "materialize_ns": 67311
+        },
+        {
+          "prepare_ns": 5965,
+          "materialize_ns": 64007
+        },
+        {
+          "prepare_ns": 5650,
+          "materialize_ns": 64571
+        },
+        {
+          "prepare_ns": 5488,
+          "materialize_ns": 109945
+        },
+        {
+          "prepare_ns": 5951,
+          "materialize_ns": 52420
+        },
+        {
+          "prepare_ns": 5324,
+          "materialize_ns": 48172
+        },
+        {
+          "prepare_ns": 5106,
+          "materialize_ns": 46612
+        },
+        {
+          "prepare_ns": 4879,
+          "materialize_ns": 45600
+        },
+        {
+          "prepare_ns": 4982,
+          "materialize_ns": 43441
+        },
+        {
+          "prepare_ns": 5122,
+          "materialize_ns": 31856
+        },
+        {
+          "prepare_ns": 4840,
+          "materialize_ns": 28385
+        },
+        {
+          "prepare_ns": 4406,
+          "materialize_ns": 27065
+        },
+        {
+          "prepare_ns": 4414,
+          "materialize_ns": 26708
+        },
+        {
+          "prepare_ns": 4165,
+          "materialize_ns": 25743
+        },
+        {
+          "prepare_ns": 4585,
+          "materialize_ns": 25372
+        },
+        {
+          "prepare_ns": 4173,
+          "materialize_ns": 24173
+        },
+        {
+          "prepare_ns": 3957,
+          "materialize_ns": 23909
+        },
+        {
+          "prepare_ns": 4251,
+          "materialize_ns": 23455
+        },
+        {
+          "prepare_ns": 4256,
+          "materialize_ns": 24453
+        },
+        {
+          "prepare_ns": 3997,
+          "materialize_ns": 23444
+        },
+        {
+          "prepare_ns": 4594,
+          "materialize_ns": 23748
+        },
+        {
+          "prepare_ns": 54065,
+          "materialize_ns": 23758
+        },
+        {
+          "prepare_ns": 4160,
+          "materialize_ns": 22586
+        },
+        {
+          "prepare_ns": 4550,
+          "materialize_ns": 22951
+        },
+        {
+          "prepare_ns": 4387,
+          "materialize_ns": 22705
+        },
+        {
+          "prepare_ns": 4088,
+          "materialize_ns": 23569
+        }
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 97618,
+        "outlined_code_size": 103233,
+        "freed_code_size": 0,
+        "code_region_size": 344064,
+        "compiled_iseq_entry": 91,
+        "compiled_iseq_count": 111,
+        "compiled_blockid_count": 1429,
+        "compiled_block_count": 2566,
+        "compiled_branch_count": 3726,
+        "compile_time_ns": 24437505
+      },
+      "samples": [
+        {
+          "order": [
+            "ordinary",
+            "compiled"
+          ],
+          "measurements": {
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 31339206,
+                "ns_per_comparison": 313.39206,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 257837944,
+                "ns_per_sort": 2578379.44,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 1681100,
+                "gc_count": 67
+              }
+            },
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 4513937,
+                "ns_per_comparison": 45.13937,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 31931190,
+                "ns_per_sort": 319311.9,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "compiled",
+            "ordinary"
+          ],
+          "measurements": {
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 4399485,
+                "ns_per_comparison": 43.99485,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 31695201,
+                "ns_per_sort": 316952.01,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            },
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 31559395,
+                "ns_per_comparison": 315.59395,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 259704310,
+                "ns_per_sort": 2597043.1,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 1681100,
+                "gc_count": 68
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "ordinary",
+            "compiled"
+          ],
+          "measurements": {
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 31206179,
+                "ns_per_comparison": 312.06179,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 257564699,
+                "ns_per_sort": 2575646.99,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 1681100,
+                "gc_count": 67
+              }
+            },
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 3896098,
+                "ns_per_comparison": 38.96098,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 31786144,
+                "ns_per_sort": 317861.44,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "compiled",
+            "ordinary"
+          ],
+          "measurements": {
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 3836214,
+                "ns_per_comparison": 38.36214,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 31871018,
+                "ns_per_sort": 318710.18,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            },
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 31442181,
+                "ns_per_comparison": 314.42181,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 258899755,
+                "ns_per_sort": 2588997.55,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 1681100,
+                "gc_count": 67
+              }
+            }
+          }
+        },
+        {
+          "order": [
+            "ordinary",
+            "compiled"
+          ],
+          "measurements": {
+            "ordinary": {
+              "pairs": {
+                "elapsed_ns": 31428082,
+                "ns_per_comparison": 314.28082,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 175000,
+                "gc_count": 7
+              },
+              "full_sort": {
+                "elapsed_ns": 255987670,
+                "ns_per_sort": 2559876.7,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 1681100,
+                "gc_count": 67
+              }
+            },
+            "compiled": {
+              "pairs": {
+                "elapsed_ns": 3918068,
+                "ns_per_comparison": 39.18068,
+                "iterations": 100000,
+                "checksum": 25898,
+                "allocations": 0,
+                "gc_count": 0
+              },
+              "full_sort": {
+                "elapsed_ns": 31664463,
+                "ns_per_sort": 316644.63,
+                "iterations": 100,
+                "checksum": 93500,
+                "allocations": 200,
+                "gc_count": 0
+              }
+            }
+          }
+        }
+      ],
+      "validation_after_timing": {
+        "entry_cases": 110,
+        "checked_pairs": 12100,
+        "comparison_sha256": "666bdd14e94c803a3edc1ce6a056825b461d6f5a0fb907e5da323122ac573af9",
+        "sorted_ordinals_sha256": "1dd4c8bfb8eb0dc83c6236fbea9e1d670fcd6a7bf468606614289add50625624",
+        "input_sha256": "cdac727d822f55590081009b8daa304e2d9639336c1c49db393fa6cbbf0420da",
+        "cost": 0,
+        "lifetime_cost": 0
+      },
+      "jit_after_timing": {
+        "inline_code_size": 97618,
+        "outlined_code_size": 103233,
+        "freed_code_size": 0,
+        "code_region_size": 344064,
+        "compiled_iseq_entry": 91,
+        "compiled_iseq_count": 111,
+        "compiled_blockid_count": 1429,
+        "compiled_block_count": 2566,
+        "compiled_branch_count": 3726,
+        "compile_time_ns": 24437505
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled ordering)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "269b674a86521f0152e580b6869641a5fc20bd03890720758052eb4f20b379ee",
+        "yjit_compiled_instruction_count": 560,
+        "direct_jit_proof": true,
+        "iseq_path": "(jed compiled ordering)",
+        "first_lineno": 1
+      }
+    }
+  ],
+  "churn": {
+    "plans_created": 256,
+    "calls_per_plan": 200,
+    "retained_limit": 64,
+    "elapsed_ns": 149959169,
+    "before": {
+      "rss_bytes": 45944832,
+      "live_slots": 57427,
+      "jit": {
+        "inline_code_size": 97618,
+        "outlined_code_size": 103233,
+        "freed_code_size": 0,
+        "code_region_size": 344064,
+        "compiled_iseq_entry": 91,
+        "compiled_iseq_count": 111,
+        "compiled_blockid_count": 1429,
+        "compiled_block_count": 2566,
+        "compiled_branch_count": 3726,
+        "compile_time_ns": 24437505
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 16
+    },
+    "after_eviction_and_gc": {
+      "rss_bytes": 54435840,
+      "live_slots": 60192,
+      "jit": {
+        "inline_code_size": 529994,
+        "outlined_code_size": 967997,
+        "freed_code_size": 0,
+        "code_region_size": 2699264,
+        "compiled_iseq_entry": 347,
+        "compiled_iseq_count": 372,
+        "compiled_blockid_count": 14775,
+        "compiled_block_count": 21826,
+        "compiled_branch_count": 32525,
+        "compile_time_ns": 155712358
+      },
+      "live_kernels": 64,
+      "anonymous_kernel_classes": 85,
+      "retained_kernels": 64,
+      "retained_source_bytes": 40416,
+      "retained_pool_entries": 0
+    },
+    "after_release_and_gc": {
+      "rss_bytes": 54435840,
+      "live_slots": 58937,
+      "jit": {
+        "inline_code_size": 530582,
+        "outlined_code_size": 969037,
+        "freed_code_size": 0,
+        "code_region_size": 2699264,
+        "compiled_iseq_entry": 348,
+        "compiled_iseq_count": 373,
+        "compiled_blockid_count": 14779,
+        "compiled_block_count": 21840,
+        "compiled_branch_count": 32555,
+        "compile_time_ns": 155870781
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 26
+    },
+    "note": "Generator lifetime with a bounded diagnostic-owned array, not proof of engine cache eviction. JIT class/code retention is Ruby policy; RSS need not fall after GC."
+  },
+  "notes": [
+    "Direct comparator calls and full sorts of precomputed keys; excludes SQL parsing, row scanning, key evaluation and projection.",
+    "Control is the original SortedSelect lambda. Sort calls use each comparator's to_proc, as the executor does.",
+    "Validation checks every boundary-entry pair, complete sorted orders, stable ordinal ties and zero added cost before/after timing.",
+    "GC remains enabled. Timed samples exclude source compilation, validation, JIT introspection and explicit GC.",
+    "Compilation and first invocation are separate from warmed timings; runtime JIT counters are cumulative whole-process values."
+  ],
+  "final_source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d"
+}

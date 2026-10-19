@@ -31,7 +31,7 @@ module JedNative
         end
       end
       keys.each { |expression| ensure_comparable_type(expression.type) }
-      kernels = native_compiled_kernels(resolved, predicate, expressions, keys)
+      kernels = native_compiled_kernels(resolved, predicate, expressions, keys, orders: orders)
       predicate_kernel, projection_kernel, key_kernel = kernels&.predicate, kernels&.projection, kernels&.keys
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) || 0 : 0
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
@@ -61,7 +61,8 @@ module JedNative
         output_owner = query_memory_owner if query_memory_collect_result?
         mask = query_memory_mask(scope)
       end
-      compare = lambda do |left, right|
+      compare = kernels&.ordering unless @native_ordering_disabled
+      compare ||= lambda do |left, right|
         comparison = 0
         orders.each_with_index do |order, index|
           comparison = order_compare(left[1][index], right[1][index], order)
