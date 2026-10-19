@@ -1849,6 +1849,21 @@ Headless timer/frame observations are evidence of scheduling, not a claim about 
 input or rendering latency. Worker isolation and cooperative cancellation are separate concerns:
 an event-loop heartbeat does not measure cancellation delay or isolate checkpoint overhead.
 
+`mise run bench:ts_async_cancel` measures cancellation separately. Select `node` or `browser`
+with `JED_ASYNC_CANCEL_HOST` (default browser), and an output directory with
+`JED_ASYNC_CANCEL_RESULTS`. It reuses the heavy SQL and accepts the same workload selectors;
+batch limits stay fixed at 512 rows / 256 KiB / 2 MiB held. Benchmark-only worker adapters
+post a marker at the first real task yield inside active query execution. The caller requests
+abort 20 ms after receiving that marker, so the probe does not mistake cancellation before
+execution for interruption. Record abort-to-rejection on the caller's clock, marker and timer
+delays separately, and whether the operation completed before cancellation. A follow-up query
+checks session reuse after every sample. Node checks atomic cancellation; ordinary Chromium
+checks message-only cancellation without isolation headers. No cross-clock subtraction is used.
+`JED_CANCEL_FULL_WARMUPS`, `JED_CANCEL_WARMUPS`, `JED_CANCEL_SAMPLES`, and
+`JED_CANCEL_DELAY_MS` control sampling. `JED_PROBE_ROOT` selects a frozen source checkout for
+comparisons; engine, harness and browser bundle hashes identify each run. These observations
+sample a particular execution phase and do not bound long synchronous scalar/sort cancellation.
+
 These probes use warm, in-memory databases. Browser OPFS durability, cold reads, other browser
 engines, ARM, concurrent consumers and peak memory need their own measurements. Timing results
 remain outside CI gates; correctness and resource-boundary tests stay in their existing suites.
@@ -1857,3 +1872,10 @@ Node runs and three runs each of ordinary and isolated Chromium, with raw sample
 The [result-batching follow-up](../../bench/ts/results/2026-10-18-result-batching/report.md)
 compares 128- and 512-row defaults under the same byte allowance, and separately measures an
 opt-in larger byte batch. It retains controlled Node/browser repeats and isolated codec probes.
+The [elapsed-scheduling follow-up](../../bench/ts/results/2026-10-19-scheduling/report.md)
+keeps those transport limits fixed. It separates the interleaved baseline/4 ms/codec comparison
+from later 1 ms tuning, single-pair additional-query coverage and isolated codec probes.
+The [cancellation follow-up](../../bench/ts/results/2026-10-19-scheduling-rollback/report.md)
+compares the original scheduler with 1 ms and 0.125 ms slices in fresh browser runs. Both
+elapsed-time variants were rejected for cancellation regressions, and the original scheduling
+policy was restored. Result-codec and transport limits are unchanged.

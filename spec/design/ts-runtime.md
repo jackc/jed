@@ -340,6 +340,14 @@ Per-value conversion still costs substantial time; codec prototypes did not esta
 and were reverted. Larger configurable byte batches remain a throughput/responsiveness and
 concurrent-result-reservation tradeoff, not a new default.
 
+The [elapsed-scheduling experiment](../../bench/ts/results/2026-10-19-scheduling/report.md)
+was subsequently [reverted](../../bench/ts/results/2026-10-19-scheduling-rollback/report.md).
+Neither the 1 ms slice nor a shorter 0.125 ms prototype preserved ordinary-browser cancellation
+latency in repeated tests. The runtime retains a task yield every 256 checkpoint visits, with
+the existing 512-row/256 KiB transport limits and packed codec. Shared-memory result transport
+is not implemented; only cancellation flags use shared memory where available. The rollback
+report also records current platform support and possible future transport experiments.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions
 include async storage lifecycle/commit and crypto providers, worker pools,
