@@ -1,0 +1,107 @@
+{
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "yjit": false,
+  "zlib_gem": "3.2.3",
+  "zlib_runtime": "1.3.1",
+  "source_sha256": "05b5aa0e67adf3fd2c19f99059397772d141ed0f0d3a6094eefde9702c5adbfb",
+  "results": {
+    "ruby_crc32_8k": {
+      "iterations": 1000,
+      "samples_ns": [
+        236144216,
+        235120950,
+        234804570,
+        238198643,
+        236814076,
+        235750649,
+        231268486
+      ],
+      "median_ns": 235750.649,
+      "checksum": "b6675307"
+    },
+    "zlib_crc32_8k": {
+      "iterations": 10000,
+      "samples_ns": [
+        42426438,
+        42293209,
+        42693181,
+        42262525,
+        42486885,
+        42815102,
+        42418109
+      ],
+      "median_ns": 4242.6438,
+      "checksum": "b6675307"
+    },
+    "ruby_crc64_8k": {
+      "iterations": 1000,
+      "samples_ns": [
+        330000653,
+        331902800,
+        330766775,
+        327945002,
+        332225933,
+        327552076,
+        328955307
+      ],
+      "median_ns": 330000.653,
+      "checksum": "f4dba925fcc2a5b0"
+    },
+    "zlib_page_concat_8k": {
+      "iterations": 10000,
+      "samples_ns": [
+        61263597,
+        55042380,
+        52984150,
+        54121462,
+        54057616,
+        54268694,
+        54383541
+      ],
+      "median_ns": 5426.8694,
+      "checksum": "2034d6db"
+    },
+    "zlib_page_stream_8k": {
+      "iterations": 10000,
+      "samples_ns": [
+        43791372,
+        43066559,
+        43425424,
+        43313738,
+        43211568,
+        43436052,
+        43180632
+      ],
+      "median_ns": 4331.3738,
+      "checksum": "2034d6db"
+    },
+    "zlib_meta_concat_8k": {
+      "iterations": 10000,
+      "samples_ns": [
+        58045581,
+        54868592,
+        54244978,
+        53326198,
+        53791305,
+        53532979,
+        52886235
+      ],
+      "median_ns": 5379.1305,
+      "checksum": "a2c0ed9b"
+    },
+    "zlib_meta_stream_8k": {
+      "iterations": 10000,
+      "samples_ns": [
+        45090440,
+        44101424,
+        44112900,
+        43745270,
+        43897422,
+        43578604,
+        43818801
+      ],
+      "median_ns": 4389.7422,
+      "checksum": "a2c0ed9b"
+    }
+  }
+}

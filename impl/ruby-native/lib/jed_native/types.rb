@@ -442,10 +442,18 @@ module JedNative
       'int4range' => 'i32range', 'int8range' => 'i64range'
     }.freeze
     INTEGER_BITS = {'i16' => 16, 'i32' => 32, 'i64' => 64}.freeze
+    INTEGER_BOUNDS = INTEGER_BITS.transform_values { |bits| [-(1 << (bits - 1)), 1 << (bits - 1)].freeze }.freeze
     RANGES = {'i32range' => 'i32', 'i64range' => 'i64', 'numrange' => 'decimal', 'tsrange' => 'timestamp', 'tstzrange' => 'timestamptz', 'daterange' => 'date'}.freeze
     BUILTIN_NAMES = (ALIASES.keys + ALIASES.values + RANGES.keys + %w[unknown null record date interval bytea uuid json jsonb jsonpath boolean decimal i16 i32 i64 f32 f64 text timestamp timestamptz]).uniq.freeze
+    CANONICAL_NAMES = (BUILTIN_NAMES - ALIASES.keys - ['null']).to_h { |name| [name, name] }.freeze
     module_function
     def normalize(type)
+      # Execution already carries canonical scalar names. Parsing them again
+      # for every value allocates strings and regex captures; only external
+      # spellings, modifiers, arrays, and open types need the general path.
+      if type.instance_of?(String) && (canonical = CANONICAL_NAMES[type])
+        return canonical
+      end
       text = type.to_s.strip.gsub(/\s+/, ' ')
       base_name = text.sub(/(?:\[\d*\])+\z/, '').sub(/\(.*\)\z/, '')
       text = BUILTIN_NAMES.include?(base_name) ? text : type.to_s
@@ -456,7 +464,12 @@ module JedNative
       base = ALIASES.fetch(match[1].strip, match[1].strip)
       base + (match[2] || '').delete(' ')
     end
-    def base(type) = normalize(type).sub(/\(.*\)\z/, '')
+    def base(type)
+      if type.instance_of?(String) && (canonical = CANONICAL_NAMES[type])
+        return canonical
+      end
+      normalize(type).sub(/\(.*\)\z/, '')
+    end
     def infer(value)
       case value
       when nil then 'unknown'
@@ -606,8 +619,8 @@ end
       end
     end
     def check_integer(value, type = 'i64')
-      bits = INTEGER_BITS.fetch(base(type), 64)
-      raise Error.new('22003', "#{type} out of range") if value < -(1 << (bits - 1)) || value >= (1 << (bits - 1))
+      bounds = INTEGER_BOUNDS[type] || INTEGER_BOUNDS.fetch(base(type), INTEGER_BOUNDS['i64'])
+      raise Error.new('22003', "#{type} out of range") if value < bounds[0] || value >= bounds[1]
       value
     end
     def parse_integer_text(value)

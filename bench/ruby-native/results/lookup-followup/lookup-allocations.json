@@ -1,0 +1,765 @@
+{
+  "mode": "primary_key_allocation_diagnostic",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "e4cadba5c6f76ab83334114baf9d78d21fd76a54b97df1ead41124b734f20ae2",
+  "final_source_sha256": "e4cadba5c6f76ab83334114baf9d78d21fd76a54b97df1ead41124b734f20ae2",
+  "sql": "SELECT id, customer_id, amount, note FROM orders WHERE id = $1",
+  "seed": 4201,
+  "script_sha256": "2c2f5b0522b73f586998e74326cc70a98c5489e05f4f3d5e45f5efc52e038be3",
+  "notes": [
+    "100 warmed canonical parameters; allocation tracing with GC disabled for one100-operation phase at a time.",
+    "Allocation-phase timings are deliberately not reported. No decoded leaf misses occurred after warmup.",
+    "Checksum replay times the unchanged canonical Ruby FNV-1a implementation over precollected results; no SQL is executed."
+  ],
+  "profiles": {
+    "engine_only": {
+      "operations": 100,
+      "total_allocations_per_query": 704.85,
+      "checksum": null,
+      "grouped": {
+        "core": {
+          "allocations_per_query": 596.78,
+          "bytes_per_query": 42004.8
+        },
+        "other": {
+          "allocations_per_query": 26.0,
+          "bytes_per_query": 1640.0
+        }
+      },
+      "sites": [
+        {
+          "count": 8000,
+          "bytes": 320000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 456,
+          "class": "String"
+        },
+        {
+          "count": 4000,
+          "bytes": 160000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 457,
+          "class": "String"
+        },
+        {
+          "count": 4000,
+          "bytes": 160000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 450,
+          "class": "String"
+        },
+        {
+          "count": 4000,
+          "bytes": 160000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 449,
+          "class": "String"
+        },
+        {
+          "count": 2200,
+          "bytes": 352000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 178,
+          "class": "String"
+        },
+        {
+          "count": 2000,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 610,
+          "class": "Integer"
+        },
+        {
+          "count": 2000,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_database.rb",
+          "line": 8,
+          "class": "Array"
+        },
+        {
+          "count": 2000,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 454,
+          "class": "String"
+        },
+        {
+          "count": 2000,
+          "bytes": 336000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 454,
+          "class": "MatchData"
+        },
+        {
+          "count": 1300,
+          "bytes": 88000,
+          "path": "<internal:array>",
+          "line": 246,
+          "class": "Array"
+        },
+        {
+          "count": 1200,
+          "bytes": 48000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 459,
+          "class": "String"
+        },
+        {
+          "count": 1200,
+          "bytes": 211200,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 97,
+          "class": "Hash"
+        },
+        {
+          "count": 1000,
+          "bytes": 40000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_database.rb",
+          "line": 7,
+          "class": "Array"
+        },
+        {
+          "count": 978,
+          "bytes": 42240,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 2247,
+          "class": "String"
+        },
+        {
+          "count": 900,
+          "bytes": 36000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 2247,
+          "class": "Array"
+        },
+        {
+          "count": 900,
+          "bytes": 36000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 182,
+          "class": "Integer"
+        },
+        {
+          "count": 900,
+          "bytes": 36000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 3065,
+          "class": "String"
+        },
+        {
+          "count": 800,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/capabilities.rb",
+          "line": 36,
+          "class": "Array"
+        },
+        {
+          "count": 700,
+          "bytes": 28000,
+          "path": "impl/ruby-native/lib/jed_native/page_buffer.rb",
+          "line": 17,
+          "class": "Array"
+        },
+        {
+          "count": 700,
+          "bytes": 28000,
+          "path": "impl/ruby-native/lib/jed_native/paged_rows.rb",
+          "line": 56,
+          "class": "Array"
+        },
+        {
+          "count": 600,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/paged_access.rb",
+          "line": 27,
+          "class": "Integer"
+        },
+        {
+          "count": 600,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 186,
+          "class": "Integer"
+        },
+        {
+          "count": 500,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_database.rb",
+          "line": 8,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 32000,
+          "path": "impl/ruby-native/lib/jed_native/paged_rows.rb",
+          "line": 100,
+          "class": "Proc"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/engine.rb",
+          "line": 1368,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 164,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "<internal:array>",
+          "line": 248,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 166,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/engine.rb",
+          "line": 157,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 119,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/record_shapes.rb",
+          "line": 103,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 103,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/composite_values.rb",
+          "line": 83,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/date_clock.rb",
+          "line": 49,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/collations.rb",
+          "line": 171,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "<internal:array>",
+          "line": 271,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/paged_access.rb",
+          "line": 36,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/timezones.rb",
+          "line": 208,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 120,
+          "class": "String"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 97,
+          "class": "Array"
+        },
+        {
+          "count": 300,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/host_functions.rb",
+          "line": 211,
+          "class": "String"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 2844,
+          "class": "Array"
+        },
+        {
+          "count": 300,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 186,
+          "class": "Array"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "impl/ruby-native/lib/jed_native/bindings.rb",
+          "line": 510,
+          "class": "Array"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_storage.rb",
+          "line": 28,
+          "class": "Array"
+        }
+      ]
+    },
+    "checksum_only": {
+      "operations": 100,
+      "total_allocations_per_query": 149.63,
+      "checksum": "57b50e4ced988a7b",
+      "grouped": {
+        "benchmark_checksum": {
+          "allocations_per_query": 149.58,
+          "bytes_per_query": 5984.8
+        },
+        "other": {
+          "allocations_per_query": 0.01,
+          "bytes_per_query": 0.4
+        }
+      },
+      "sites": [
+        {
+          "count": 12888,
+          "bytes": 515520,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 58,
+          "class": "Integer"
+        },
+        {
+          "count": 1768,
+          "bytes": 70720,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 62,
+          "class": "Integer"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 71,
+          "class": "String"
+        },
+        {
+          "count": 2,
+          "bytes": 240,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 85,
+          "class": "String"
+        },
+        {
+          "count": 1,
+          "bytes": 40,
+          "path": "bench/ruby-native/lookup_allocations.rb",
+          "line": 49,
+          "class": "Bench::Checksum"
+        }
+      ]
+    },
+    "combined": {
+      "operations": 100,
+      "total_allocations_per_query": 854.38,
+      "checksum": "57b50e4ced988a7b",
+      "grouped": {
+        "core": {
+          "allocations_per_query": 596.78,
+          "bytes_per_query": 42004.8
+        },
+        "other": {
+          "allocations_per_query": 26.01,
+          "bytes_per_query": 1640.4
+        },
+        "benchmark_checksum": {
+          "allocations_per_query": 149.58,
+          "bytes_per_query": 5984.8
+        }
+      },
+      "sites": [
+        {
+          "count": 12888,
+          "bytes": 515520,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 58,
+          "class": "Integer"
+        },
+        {
+          "count": 8000,
+          "bytes": 320000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 456,
+          "class": "String"
+        },
+        {
+          "count": 4000,
+          "bytes": 160000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 457,
+          "class": "String"
+        },
+        {
+          "count": 4000,
+          "bytes": 160000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 450,
+          "class": "String"
+        },
+        {
+          "count": 4000,
+          "bytes": 160000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 449,
+          "class": "String"
+        },
+        {
+          "count": 2200,
+          "bytes": 352000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 178,
+          "class": "String"
+        },
+        {
+          "count": 2000,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 454,
+          "class": "String"
+        },
+        {
+          "count": 2000,
+          "bytes": 336000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 454,
+          "class": "MatchData"
+        },
+        {
+          "count": 2000,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_database.rb",
+          "line": 8,
+          "class": "Array"
+        },
+        {
+          "count": 2000,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 610,
+          "class": "Integer"
+        },
+        {
+          "count": 1768,
+          "bytes": 70720,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 62,
+          "class": "Integer"
+        },
+        {
+          "count": 1300,
+          "bytes": 88000,
+          "path": "<internal:array>",
+          "line": 246,
+          "class": "Array"
+        },
+        {
+          "count": 1200,
+          "bytes": 211200,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 97,
+          "class": "Hash"
+        },
+        {
+          "count": 1200,
+          "bytes": 48000,
+          "path": "impl/ruby-native/lib/jed_native/types.rb",
+          "line": 459,
+          "class": "String"
+        },
+        {
+          "count": 1000,
+          "bytes": 40000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_database.rb",
+          "line": 7,
+          "class": "Array"
+        },
+        {
+          "count": 978,
+          "bytes": 42240,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 2247,
+          "class": "String"
+        },
+        {
+          "count": 900,
+          "bytes": 36000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 2247,
+          "class": "Array"
+        },
+        {
+          "count": 900,
+          "bytes": 36000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 182,
+          "class": "Integer"
+        },
+        {
+          "count": 900,
+          "bytes": 36000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 3065,
+          "class": "String"
+        },
+        {
+          "count": 800,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/capabilities.rb",
+          "line": 36,
+          "class": "Array"
+        },
+        {
+          "count": 700,
+          "bytes": 28000,
+          "path": "impl/ruby-native/lib/jed_native/page_buffer.rb",
+          "line": 17,
+          "class": "Array"
+        },
+        {
+          "count": 700,
+          "bytes": 28000,
+          "path": "impl/ruby-native/lib/jed_native/paged_rows.rb",
+          "line": 56,
+          "class": "Array"
+        },
+        {
+          "count": 600,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 186,
+          "class": "Integer"
+        },
+        {
+          "count": 600,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/paged_access.rb",
+          "line": 27,
+          "class": "Integer"
+        },
+        {
+          "count": 500,
+          "bytes": 80000,
+          "path": "impl/ruby-native/lib/jed_native/page_service_database.rb",
+          "line": 8,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 120,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/timezones.rb",
+          "line": 208,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/paged_access.rb",
+          "line": 36,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "<internal:array>",
+          "line": 271,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 32000,
+          "path": "impl/ruby-native/lib/jed_native/paged_rows.rb",
+          "line": 100,
+          "class": "Proc"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/collations.rb",
+          "line": 171,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/date_clock.rb",
+          "line": 49,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/composite_values.rb",
+          "line": 83,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/engine.rb",
+          "line": 1368,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 103,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/record_shapes.rb",
+          "line": 103,
+          "class": "Array"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 119,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 64000,
+          "path": "impl/ruby-native/lib/jed_native/engine.rb",
+          "line": 157,
+          "class": "Hash"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 164,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "<internal:array>",
+          "line": 248,
+          "class": "String"
+        },
+        {
+          "count": 400,
+          "bytes": 16000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 166,
+          "class": "String"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "impl/ruby-native/lib/jed_native/cursors.rb",
+          "line": 97,
+          "class": "Array"
+        },
+        {
+          "count": 300,
+          "bytes": 24000,
+          "path": "impl/ruby-native/lib/jed_native/host_functions.rb",
+          "line": 211,
+          "class": "String"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "impl/ruby-native/lib/jed_native/file_format.rb",
+          "line": 2844,
+          "class": "Array"
+        },
+        {
+          "count": 300,
+          "bytes": 12000,
+          "path": "bench/ruby/lib/bench.rb",
+          "line": 71,
+          "class": "String"
+        }
+      ]
+    }
+  },
+  "checksum_replay_samples": [
+    {
+      "ns_per_row": 3331.6971,
+      "allocations_per_row": 150.205,
+      "checksum": "e9a424023674ff25"
+    },
+    {
+      "ns_per_row": 3638.9992,
+      "allocations_per_row": 150.2044,
+      "checksum": "e9a424023674ff25"
+    },
+    {
+      "ns_per_row": 3352.8972,
+      "allocations_per_row": 150.2044,
+      "checksum": "e9a424023674ff25"
+    },
+    {
+      "ns_per_row": 3197.9863,
+      "allocations_per_row": 150.2044,
+      "checksum": "e9a424023674ff25"
+    },
+    {
+      "ns_per_row": 3366.1136,
+      "allocations_per_row": 150.2044,
+      "checksum": "e9a424023674ff25"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "command": [
+    "ruby",
+    "-Iimpl/ruby-native/lib",
+    "-e",
+    "require_relative \"impl/ruby-native/test/checksum_test\"; require_relative \"impl/ruby-native/test/storage_test\"; require_relative \"impl/ruby-native/test/page_service_test\""
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 104595456,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 1073741824,
+  "timeout_seconds": 120.0,
+  "elapsed_seconds": 2.9659150669976952,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "bb691a6f6826fabad6c510356c065fda449ea352deb4e70a8a56e2d2b5323293",
+  "final_source_sha256": "bb691a6f6826fabad6c510356c065fda449ea352deb4e70a8a56e2d2b5323293",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "ruby-native checksums: shared vectors, byte tails, seeded continuation, and page spans passed\nruby-native storage: golden_decode passed\nruby-native storage: golden_encode passed\nruby-native storage: durable_recovery passed\nruby-native storage: locking passed\nruby-native storage: storage_limit_and_serialization passed\nruby-native storage: io_failure passed\nruby-native storage: sql_reopen passed\nruby-native storage: view_query_reopen passed\nruby-native storage: view_catalog_reopen passed\nruby-native storage: exclusion_reopen passed\nruby-native storage: statistics_reopen passed\nruby-native storage: temporal_containers_reopen passed\nruby-native storage: collation_upgrade passed\nruby-native storage: incremental_reclamation passed\nruby-native storage: 14 tests passed (106 shared images, 65 byte-exact encodes)\nruby-native page service: 38 shared wire fixtures passed\nruby-native page service: owner/client reads, writes, refresh and pins passed\n",
+  "stderr": ""
+}

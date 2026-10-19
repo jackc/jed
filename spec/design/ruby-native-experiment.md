@@ -10,9 +10,11 @@ the interpreter and available Ruby JITs. The engine itself must remain pure Ruby
 no FFI, native engine extension, embedded interpreter for another core, or SQL subprocess.
 Ruby's built-in arbitrary-precision integers are permitted for exact arithmetic.
 The maintainer explicitly approved Ruby's OpenSSL binding for vetted cryptographic
-digest primitives. This narrow exception does not authorize another native engine
-component; parser, planner, remaining evaluation, and storage stay handwritten Ruby.
-Other new third-party dependencies still require explicit confirmation.
+digest primitives, stdlib Zlib for byte-identical CRC32 checksums, and a well-supported
+native checksum gem if profiling justifies it (prefer the standard library). These
+utility exceptions do not authorize a native engine component; parser, planner,
+remaining evaluation, and storage algorithms stay handwritten Ruby. Other new
+third-party dependencies still require explicit confirmation.
 
 Completion requires the current supported surface, shared corpus verification,
 file-format and host-boundary verification, a recorded working baseline, followed

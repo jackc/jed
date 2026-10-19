@@ -6,6 +6,7 @@ require 'digest'
 require 'tmpdir'
 require 'fileutils'
 require 'time'
+require 'rbconfig'
 require_relative '../tools/bounded_process'
 require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('..', __dir__)), 'lib/jed_native')
 require_relative '../../../spec/conformance/params'
@@ -48,6 +49,11 @@ class NativeCorpus
     locking = ENV.fetch('JED_NATIVE_LOCKING', 'auto')
     abort "unknown corpus locking mode #{locking.inspect}" unless %w[auto exclusive].include?(locking)
     @summary[:mode], @summary[:filter], @summary[:started_at] = @mode, @filter, Time.now.utc.iso8601
+    @summary[:ruby], @summary[:ruby_executable] = RUBY_DESCRIPTION, RbConfig.ruby
+    @summary[:jit] = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then 'yjit'
+                    elsif defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled? then 'zjit'
+                    else 'interpreter'
+                    end
     @summary[:locking] = locking if @mode == 'disk'
     @summary[:corpus_root] = corpus
     @summary[:available_records] = paths.sum { |path| File.read(path).scan(/^(?:statement|query) /).length }

@@ -1,0 +1,25 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "bench/ruby-native/file_compare.rb",
+    "--run",
+    "--lanes",
+    "ruby,ruby-yjit,ruby-zjit",
+    "--report",
+    "bench/ruby-native/results/lookup-followup/final-file-4.1-preview1.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 87707648,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 44.32047224500275,
+  "source": "/tmp/jed-ruby-lookup-complete",
+  "source_sha256": "b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456",
+  "final_source_sha256": "b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "File comparison: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/lookup-followup/final-file-4.1-preview1.json\n",
+  "stderr": "file comparison ruby: preparing (no workloads)\nfile comparison ruby: ready\nfile comparison ruby-yjit: preparing (no workloads)\nfile comparison ruby-yjit: ready\nfile comparison ruby-zjit: preparing (no workloads)\nfile comparison ruby-zjit: ready\nfile comparison ruby: point_lookup_pk\nfile comparison ruby: cold_open_pk_small\nfile comparison ruby: insert_commit_durable\nfile comparison ruby-yjit: point_lookup_pk\nfile comparison ruby-yjit: cold_open_pk_small\nfile comparison ruby-yjit: insert_commit_durable\nfile comparison ruby-zjit: point_lookup_pk\nfile comparison ruby-zjit: cold_open_pk_small\nfile comparison ruby-zjit: insert_commit_durable\n"
+}
