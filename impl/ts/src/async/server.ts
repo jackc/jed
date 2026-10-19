@@ -12,12 +12,14 @@ import { encodeError, TransportError } from "./errors.ts";
 import {
   isControlOperation,
   RUNTIME_VERSION,
+  type FetchReply,
   type RuntimeLimits,
   type RuntimeReply,
   type RuntimeRequest,
   runtimeLimits,
 } from "./protocol.ts";
-import { decodeValues, encodeValues, measureValues, WireBudget, type WireValue } from "./wire.ts";
+import { decodeValues, WireBudget, type WireValue } from "./wire.ts";
+import { PackedRowsWriter } from "./packed.ts";
 
 type SessionHandle = { session: Session; transaction?: number };
 type StatementHandle = { statement: PreparedStatement; session: number };
@@ -93,7 +95,7 @@ function cancellationCheck(job: Job): (() => boolean) | undefined {
 
 export class RuntimeServer {
   private readonly openDatabase: (args: Record<string, unknown>) => Database | Promise<Database>;
-  private readonly send: (reply: RuntimeReply) => void;
+  private readonly send: (reply: RuntimeReply, transfer?: ArrayBuffer[]) => void;
   private readonly scheduleTask: (callback: () => void) => void;
   private limits: RuntimeLimits;
   private database: Database | null = null;
@@ -112,7 +114,7 @@ export class RuntimeServer {
 
   constructor(options: {
     open: (args: Record<string, unknown>) => Database | Promise<Database>;
-    send: (reply: RuntimeReply) => void;
+    send: (reply: RuntimeReply, transfer?: ArrayBuffer[]) => void;
     limits?: Partial<RuntimeLimits>;
     schedule?: (callback: () => void) => void;
   }) {
@@ -552,12 +554,11 @@ export class RuntimeServer {
     if (cursor.owner.transaction !== job.request.transaction) {
       throw new TransportError("BUSY", "cursor operation does not own the transaction");
     }
-    const rows: WireValue[][] = [];
-    const budget = new WireBudget(this.limits.maxBatchBytes);
     let done = false;
     try {
-      budget.reserve(128);
-      while (rows.length < this.limits.maxBatchRows) {
+      const batch = new PackedRowsWriter(this.limits.maxBatchBytes);
+      let count = 0;
+      while (count < this.limits.maxBatchRows) {
         if (shouldCooperate()) yield COOPERATE;
         if (canceled(job) || canceled(cursor.request)) throw canceledError();
         let row = cursor.pending;
@@ -569,24 +570,16 @@ export class RuntimeServer {
           }
           row = next.value;
         }
-        const size = measureValues(row, new WireBudget(Number.MAX_SAFE_INTEGER));
-        if (size > this.limits.maxBatchBytes - 128) {
-          throw new TransportError(
-            "RESULT_TOO_LARGE",
-            "one result row exceeds the worker batch byte budget",
-            "unknown",
-          );
-        }
-        if (size > budget.remaining) {
+        if (!batch.append(row)) {
           cursor.pending = row;
           break;
         }
         cursor.pending = undefined;
-        rows.push(encodeValues(row, budget));
+        count++;
       }
       const cost = cursor.rows.cost;
       if (done) this.closeCursor(id);
-      return { rows, done, cost };
+      return { rows: batch.finish(), done, cost } satisfies FetchReply;
     } catch (error) {
       this.closeCursor(id);
       throw error;
@@ -661,11 +654,16 @@ export class RuntimeServer {
     const keepsSession = error === undefined && job.request.op === "query";
     if ((job.request.session ?? 0) === 0 && !keepsSession) job.owner?.session.close();
     if (error !== undefined) this.fail(job.request.id, error);
-    else this.reply(job.request.id, result);
+    else
+      this.reply(
+        job.request.id,
+        result,
+        job.request.op === "fetch" ? [(result as FetchReply).rows.data] : undefined,
+      );
   }
 
-  private reply(id: number, result: unknown): void {
-    this.send({ version: RUNTIME_VERSION, id, ok: true, result });
+  private reply(id: number, result: unknown, transfer?: ArrayBuffer[]): void {
+    this.send({ version: RUNTIME_VERSION, id, ok: true, result }, transfer);
   }
 
   private fail(id: number, error: unknown): void {
