@@ -50,16 +50,8 @@ test("interleaved WITH and EXPLAIN continuations isolate bound planning values",
   try {
     const expectedFirst = runSync(collect(first, withSql, 40n));
     const expectedSecond = runSync(collect(second, explainSql, 85n));
-    const pendingFirst = runAsync(collect(first, withSql, 40n), {
-      quantum: 2,
-      timeSliceMs: 0,
-      schedule,
-    });
-    const pendingSecond = runAsync(collect(second, explainSql, 85n), {
-      quantum: 2,
-      timeSliceMs: 0,
-      schedule,
-    });
+    const pendingFirst = runAsync(collect(first, withSql, 40n), { quantum: 2, schedule });
+    const pendingSecond = runAsync(collect(second, explainSql, 85n), { quantum: 2, schedule });
     assert.equal(currentPlanningFrames(), ambient);
     assert.equal(paramValue(0), callerValue);
     const [actualFirst, actualSecond] = await Promise.all([pendingFirst, pendingSecond]);
@@ -114,7 +106,6 @@ test("cancellation unwinds its planning frames while nested sync work shares the
     await assert.rejects(
       runAsync(work(), {
         quantum: 2,
-        timeSliceMs: 0,
         check: () => canceled,
         schedule(resume) {
           assert.equal(currentPlanningFrames(), ambient);
