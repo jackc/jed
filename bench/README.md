@@ -15,6 +15,13 @@ exceeds physical machine RAM or that `work_mem` caps process RSS.
 Use `mise run bench:spill <rows> <payload_bytes> <work_mem>` to change scale; raw results
 and workload metadata go into `bench/results/spill-<timestamp>/`.
 
+`mise run bench:ts_compare_matrix` compares frozen master and branch TypeScript sources on Node
+and Chromium: master direct, branch direct, and the branch's production worker API. It checks
+typed results and costs, rotates run order, and measures throughput and responsiveness separately.
+See [the comparison harness](ts/compare/README.md) for controls and limitations. Generated
+snapshots, browser bundles and raw measurements stay in ignored `bench/results/`; compact reports
+can retain conclusions and reproduction details without committing the raw runs.
+
 ```
 mise run bench:setup # generate benchmark databases (once; fingerprint-gated)
 mise run bench:run   # run every harness binary, then print the comparison table + HTML
