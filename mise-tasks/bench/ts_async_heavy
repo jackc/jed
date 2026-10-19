@@ -1,0 +1,23 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure heavy shared TS workloads on the direct core and production Node worker"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_async_heavy"
+  puts "JED_ASYNC_RESULTS sets the output directory (default bench/results/ts-async-heavy-TIMESTAMP-PID)."
+  puts "JED_ASYNC_HEAVY_WARMUPS (3), SAMPLES (7), RESPONSE_SAMPLES (3), DECIMAL_ROWS (1000000),"
+  puts "TABLE_ROWS (100000), SORT_ROWS (800000), TYPED_ROWS (200000) use the same JED_ASYNC_HEAVY_ prefix."
+  puts "JED_ASYNC_HEAVY_CASES selects comma-separated decimal-aggregate,resident-join-group,sort-top100,typed-output."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+abort "Install the existing impl/ts dependencies before benchmarking" unless File.directory?(File.join(TS_DIR, "node_modules/@noble/hashes"))
+
+directory = File.expand_path(ENV.fetch("JED_ASYNC_RESULTS", "bench/results/ts-async-heavy-#{stamp}-#{Process.pid}"))
+revision, revision_ok = capture("git", "rev-parse", "HEAD")
+status, status_ok = capture("git", "status", "--porcelain")
+abort "Could not read benchmark revision" unless revision_ok && status_ok
+sh "node", "bench/ts/src/bench-async-heavy.ts", directory,
+   env: { "JED_BENCH_REVISION" => revision.strip, "JED_BENCH_DIRTY" => (!status.empty?).to_s }
