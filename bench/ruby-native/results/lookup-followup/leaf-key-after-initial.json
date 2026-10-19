@@ -1,0 +1,27 @@
+{
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "samples": [
+    {
+      "ns_per_op": 2741.0103,
+      "allocations_per_op": 24.00035
+    },
+    {
+      "ns_per_op": 2350.74245,
+      "allocations_per_op": 24.0
+    },
+    {
+      "ns_per_op": 2315.9134,
+      "allocations_per_op": 24.0
+    },
+    {
+      "ns_per_op": 2327.5049,
+      "allocations_per_op": 24.0
+    },
+    {
+      "ns_per_op": 2260.6803,
+      "allocations_per_op": 24.0
+    }
+  ],
+  "median_ns_per_op": 2327.5049,
+  "cache_entries": 1
+}

@@ -1,0 +1,20 @@
+{
+  "command": [
+    "ruby",
+    "bench/ruby-native/compare.rb"
+  ],
+  "success": null,
+  "reason": "worker memory limit exceeded (536870912 bytes)",
+  "peak_rss_bytes": 617390080,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 3.4860065940010827,
+  "source": "/tmp/jed-ruby-lookup-final",
+  "source_sha256": "fe2f73b7ba68a8fbb0c23494db11a9f51b2827163131ef519605162cac830917",
+  "final_source_sha256": "fe2f73b7ba68a8fbb0c23494db11a9f51b2827163131ef519605162cac830917",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "",
+  "stderr": "#<Thread:0x000079c4efb92390 /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/4.0.0/open3.rb:917 run> terminated with exception (report_on_exception is true):\n/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/4.0.0/open3.rb:917:in 'IO#read': stream closed in another thread (IOError)\n\tfrom /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/4.0.0/open3.rb:917:in 'block (2 levels) in Open3.capture2e'\n"
+}

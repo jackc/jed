@@ -58,10 +58,6 @@ module JedNative
       return false if cursor_output? && (!(statement[:from] || []).empty? || !(statement[:order_by] || []).empty?)
       super
     end
-    def streaming_select_shape?(statement)
-      return super unless cursor_output? && !(statement[:limit] || statement[:offset]) && (statement[:order_by] || []).empty?
-      super(statement.merge(offset: { kind: :literal, value: 0, type: 'i64' }))
-    end
     def query_memory_collect_result?
       return false if cursor_output?
       super
@@ -79,14 +75,18 @@ module JedNative
     include Enumerable
     attr_reader :columns, :column_types
     alias column_names columns
-    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_cte_validation @native_window_shapes].freeze
-    REPLACED_STATE = (SharedDatabase::CATALOGS + %i[@native_binding_plans @savepoints]).freeze
+    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_cte_validation
+                       @native_window_shapes @native_spill_shapes @native_stream_shapes].freeze
+    REPLACED_STATE = (SharedDatabase::CATALOGS + %i[@native_binding_plans @savepoints
+      @params @foreign_key_checks @native_query_shape_cache @subquery_hoists]).freeze
 
     def initialize(session, statement, params)
       @session, @database = session, session.database
       ast, binding, metadata = session.engine.cursor_metadata(statement.ast)
       raise Error.new('42601', 'bind parameter count mismatch') unless params.length == binding.count
-      binding.bind(params) unless binding.count.zero?
+      bound = binding.bind(params) unless binding.count.zero?
+      prebound_types = binding.types if binding.reusable_bound_values?
+      params = bound if prebound_types && bound
       SHARED_CACHES.each do |name|
         session.engine.instance_variable_set(name, {}.compare_by_identity) unless session.engine.instance_variable_defined?(name)
       end
@@ -111,9 +111,11 @@ module JedNative
       @engine.instance_variable_set(:@cost, 0)
       @engine.instance_variable_set(:@native_cursor_emitted, false)
       @engine.instance_variable_set(:@cursor_select_depth, 0)
-      binding = binding.dup
-      binding.instance_variable_set(:@engine, @engine)
-      @engine.instance_variable_set(:@native_binding_plans, { ast => [@engine.parameter_binding_schema, binding] }.compare_by_identity)
+      unless prebound_types
+        binding = binding.dup
+        binding.instance_variable_set(:@engine, @engine)
+        @engine.instance_variable_set(:@native_binding_plans, { ast => [@engine.parameter_binding_schema, binding] }.compare_by_identity)
+      end
       @columns = metadata.map { |column| column[:name].dup }
       @column_types = metadata.map { |column| column[:type].dup }
       @engine.send(:authorize_node, ast, {}, true, []) unless @engine.unrestricted_capabilities?
@@ -123,6 +125,10 @@ module JedNative
       session.register_cursor(self)
       @fiber = Fiber.new do
         begin
+          if prebound_types
+            @engine.instance_variable_set(:@native_binding_types, prebound_types)
+            @engine.instance_variable_set(:@native_binding_active, true)
+          end
           result = @engine.run(ast, params)
           unless @engine.instance_variable_get(:@native_cursor_emitted)
             result.rows.each { |row| accept_row(row, result.columns.zip(result.column_types).map { |name, type| { name: name, type: type } }) }
@@ -133,6 +139,10 @@ module JedNative
           session.engine.instance_variable_set(:@failed, true) if @block_bound && session.engine.transaction_open?
           raise
         ensure
+          if prebound_types
+            @engine.instance_variable_set(:@native_binding_types, nil)
+            @engine.instance_variable_set(:@native_binding_active, false)
+          end
           finish
         end
         nil
@@ -158,19 +168,27 @@ module JedNative
       Fiber.yield(Row.new(row.map { |value| HostValues.copy(value) }, @row_names))
     end
     def next
-      raise StopIteration if @closed
-      @started = true
-      row = @fiber.resume
+      row = pull
       raise StopIteration unless row
       row
+    end
+    # Enumerable drains use an ordinary sentinel at EOF. Only the public next
+    # method needs an exception (and its backtrace) to report exhaustion.
+    def pull
+      return nil if @closed
+      @started = true
+      @fiber.resume
     rescue Exception
       finish unless @fiber&.alive?
       raise
     end
+    private :pull
     def each
       return enum_for(:each) unless block_given?
       begin
-        loop { yield self.next }
+        while (row = pull)
+          yield row
+        end
       ensure
         close
       end

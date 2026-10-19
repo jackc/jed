@@ -9,7 +9,8 @@ module JedNative
     Plan = Struct.new(:table, :source, :columns, :projections, :predicate, :orders,
                       :parameters, :parameter_types, :lookup, :index, :context, keyword_init: true)
     ReadPlan = Struct.new(:table, :scope, :projections, :expressions, :columns, :predicate,
-                          :parameters, :context, keyword_init: true)
+                          :parameters, :context, :scan_columns, :point, keyword_init: true)
+    PointRead = Struct.new(:expression, :index, :minimum, :maximum, :pages, keyword_init: true)
     CACHE_ENTRIES = 64
     STATEFUL_FUNCTIONS = %w[nextval currval setval lastval current_setting now
                             current_date current_time localtime localtimestamp
@@ -205,17 +206,18 @@ module JedNative
 
     private
 
-    # Streaming and sorted readers share resolution, but still choose access
-    # paths for the current bindings on every execution. No subquery, outer
-    # scope, aggregate or clock-dependent expression is retained here.
+    # Streaming and sorted readers share resolution. General predicates choose
+    # access paths for each binding; an unambiguous exact point retains its path.
+    # No subquery, outer scope, aggregate or clock-dependent expression is retained.
     def resolved_read_plan(statement, stored)
-      nodes = statement[:columns].map { |entry| entry[:expr] } + [statement[:where]] +
-              (statement[:order_by] || []).map { |entry| entry[:expr] }
-      reusable = @outer.empty? && @ctes.empty? && nodes.all? { |node| cacheable_expression?(node) }
+      reusable = @outer.empty? && @ctes.empty?
       context = [@types, @environment, timezone, default_collation, @native_binding_types]
       @native_read_plans ||= {}.compare_by_identity
       plan = reusable && @native_read_plans[statement]
       unless plan && plan.table.equal?(stored) && plan.context == context
+        nodes = statement[:columns].map { |entry| entry[:expr] } + [statement[:where]] +
+                (statement[:order_by] || []).map { |entry| entry[:expr] }
+        reusable &&= nodes.all? { |node| cacheable_expression?(node) }
         source = statement[:from].first
         scope = table_columns(stored, source[:alias] || source[:name])
         projections = expand_stars(statement[:columns], scope)
@@ -230,7 +232,9 @@ module JedNative
         end
         (expressions + [predicate]).each { |expression| visit.call(expression) }
         plan = ReadPlan.new(table: stored, scope: scope, projections: projections, expressions: expressions,
-                            columns: columns, predicate: predicate, parameters: parameters, context: context)
+                            columns: columns, predicate: predicate, parameters: parameters, context: context,
+                            scan_columns: scan_column_inventory(statement))
+        plan.point = prepared_stream_point(statement, stored, predicate) if reusable
         if reusable
           @native_read_plans.shift if @native_read_plans.length >= CACHE_ENTRIES
           @native_read_plans[statement] = plan
@@ -238,6 +242,27 @@ module JedNative
       end
       plan.parameters.each { |parameter| cast_value(@params[parameter.value], parameter.type) }
       plan
+    end
+
+    # A single exact integer key has only a full scan and equivalent primary
+    # bounds when no other access candidate applies. The primary bound always
+    # wins that comparison, independent of the binding or statistics. Resolve
+    # this once beside the expressions, then use the existing point index on
+    # each pull. More involved predicates still use the ordinary cost planner.
+    def prepared_stream_point(statement, stored, predicate)
+      return unless !(statement[:distinct] || statement[:limit] || statement[:offset]) && (statement[:order_by] || []).empty?
+      return unless stored[:native_primary_index] && stored[:collation_skew].to_a.empty?
+      return unless predicate&.kind == :binary && predicate.value == '='
+      left, right = predicate.args
+      left, right = right, left if right.kind == :column
+      return unless left.kind == :column && left.value == stored[:native_primary_ordinal]
+      return unless %i[literal param].include?(right.kind) && Types::INTEGER_BITS.key?(right.type) && !right.extra&.dig(:subquery_origin)
+      candidates = scan_access_candidates(stored, predicate)
+      return unless candidates.all? { |candidate| %i[full primary primary_interval].include?(candidate[:kind]) }
+      bits = Types::INTEGER_BITS.fetch(stored[:columns][stored[:native_primary_ordinal]][:type])
+      PointRead.new(expression: right, index: stored[:native_primary_index],
+        minimum: -(1 << (bits - 1)), maximum: (1 << (bits - 1)) - 1,
+        pages: stored[:rows].empty? ? 0 : stored.dig(:native_primary_metadata, :height) || 1)
     end
 
     def cacheable_select?(statement)

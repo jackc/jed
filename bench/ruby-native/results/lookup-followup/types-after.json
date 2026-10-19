@@ -1,0 +1,36 @@
+{
+  "mode": "resolved_type_microkernel",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "types_sha256": "a80348cd89f8b98f1b338bc28f395520b9f746e9e31ce5f0b3ba8cab9bc5e510",
+  "final_types_sha256": "a80348cd89f8b98f1b338bc28f395520b9f746e9e31ce5f0b3ba8cab9bc5e510",
+  "script_sha256": "6e35af00c1abce028baa3dd6904a4998aea575f7d8ab4020e57bf9971b13ab3a",
+  "notes": [
+    "Each operation normalizes and extracts the base of4 canonical scalar types, then checks3 integer values.",
+    "No SQL or file I/O; 3000 warmup operations followed by5 batches of10000 operations."
+  ],
+  "samples": [
+    {
+      "ns_per_op": 251.5997,
+      "allocations_per_op": 2.0007
+    },
+    {
+      "ns_per_op": 125.0532,
+      "allocations_per_op": 2.0
+    },
+    {
+      "ns_per_op": 194.0258,
+      "allocations_per_op": 2.0
+    },
+    {
+      "ns_per_op": 170.6894,
+      "allocations_per_op": 2.0
+    },
+    {
+      "ns_per_op": 133.715,
+      "allocations_per_op": 2.0
+    }
+  ],
+  "median_ns_per_op": 170.6894
+}

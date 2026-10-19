@@ -48,7 +48,10 @@ module JedNative
         end
         result = dispatch(statement)
         flush_foreign_keys
-        refresh_primary_indexes
+        # A frozen reader already captured prepared catalog/index metadata.
+        # Rebuilding that metadata after an unchanged read only copies the
+        # same descriptors. Retain refresh for any statement that dirtied them.
+        refresh_primary_indexes unless @native_cursor && !@dirty
         persist if @dirty && !@transaction
         Result.new(columns: result.columns, column_types: result.column_types,
                    rows: result.rows, rows_affected: result.rows_affected, cost: @cost)

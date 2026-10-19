@@ -8,6 +8,48 @@ module RubyPagedStorageTest
     raise message unless value
   end
 
+  class LeafFixtureCodec
+    attr_reader :reads
+    attr_accessor :on_parse
+    def initialize = (@reads = 0)
+    def read_page(*)
+      @reads += 1
+      { type: JedNative::FileFormat::PAGE_LEAF, payload: ''.b, item_count: 1 }
+    end
+    def parse_pax_leaf(*)
+      @on_parse&.call
+      [["key".b], []]
+    end
+  end
+
+  def self.decoded_schema_identity
+    cache = JedNative::DecodedLeafCache.new(2)
+    image = Object.new
+    image.define_singleton_method(:decoded_leaf_cache) { cache }
+    codec = LeafFixtureCodec.new
+    first = JedNative::LeafPool.new(codec, image, 512, 2)
+    second = JedNative::LeafPool.new(codec, image, 512, 2)
+    schemas = 3.times.map do
+      columns = [{ name: 'id', type: 'i64' }]
+      columns.define_singleton_method(:hash) { raise 'leaf access hashed the column schema' }
+      columns
+    end
+    a = first.leaf(3, schemas[0])
+    b = first.leaf(3, schemas[1])
+    assert(!a.equal?(b), 'different schema identities shared a decoded entry')
+    assert(a[:schema].equal?(schemas[0]), 'cache key does not retain its schema identity')
+    assert(second.leaf(3, schemas[0]).equal?(a) && codec.reads == 2, 'shared pool lost schema identity reuse')
+    first.leaf(4, schemas[2])
+    assert(first.leaf(3, schemas[0]).equal?(a), 'recent schema entry was evicted')
+    assert(!first.leaf(3, schemas[1]).equal?(b), 'least-recent schema entry was retained')
+    assert(cache.size == 2 && codec.reads == 4, 'schema identities escaped the bounded LRU')
+    cache.invalidate([3])
+    assert(cache.size.zero?, 'page invalidation missed a schema variant')
+    codec.on_parse = -> { cache.invalidate([3]) }
+    first.leaf(3, schemas[0])
+    assert(cache.size.zero?, 'in-flight decode escaped generation invalidation')
+  end
+
   def self.cache_and_pins
     Dir.mktmpdir('jed-ruby-pager') do |directory|
       path = File.join(directory, 'db.jed')
@@ -164,11 +206,12 @@ module RubyPagedStorageTest
   end
 
   def self.run
+    decoded_schema_identity
     cache_and_pins
     auxiliary_reopen
     shared_decoded_budget
     index_build_keeps_primary_pages
-    puts 'ruby-native pager: 4 tests passed (shared bounded caches, pinned roots, streamed index builds and statistics)'
+    puts 'ruby-native pager: 5 tests passed (bounded schema identities, shared caches, pinned roots, streamed index builds and statistics)'
   end
 end
 

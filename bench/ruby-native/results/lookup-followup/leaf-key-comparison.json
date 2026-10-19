@@ -1,0 +1,68 @@
+{
+  "mode": "synthetic_leaf_key_kernel",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "e4cadba5c6f76ab83334114baf9d78d21fd76a54b97df1ead41124b734f20ae2",
+  "final_source_sha256": "e4cadba5c6f76ab83334114baf9d78d21fd76a54b97df1ead41124b734f20ae2",
+  "script_sha256": "7447673834d954cf9544e306f13644245a869a2c2711968438e63cf0d2b1886f",
+  "notes": [
+    "Four PagedRow field reads over a fake codec and one cached leaf; no SQL, file I/O, or decoding.",
+    "StructuralLeafPool reproduces the previous structural schema key. Identity mode uses the current core.",
+    "Sequential lanes, 5000 warmup operations, 5 batches of 20000 measured operations."
+  ],
+  "results": {
+    "structural_schema": {
+      "samples": [
+        {
+          "ns_per_op": 6126.4355,
+          "allocations_per_op": 24.00035
+        },
+        {
+          "ns_per_op": 5523.6358,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 5536.20125,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 5494.035,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 5517.49455,
+          "allocations_per_op": 24.0
+        }
+      ],
+      "median_ns_per_op": 5523.6358,
+      "cache_entries": 1
+    },
+    "identity_schema": {
+      "samples": [
+        {
+          "ns_per_op": 2225.9098,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 2220.5904,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 2227.69535,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 2210.0062,
+          "allocations_per_op": 24.0
+        },
+        {
+          "ns_per_op": 2206.582,
+          "allocations_per_op": 24.0
+        }
+      ],
+      "median_ns_per_op": 2220.5904,
+      "cache_entries": 1
+    }
+  }
+}

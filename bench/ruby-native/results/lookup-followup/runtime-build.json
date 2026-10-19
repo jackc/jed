@@ -1,0 +1,384 @@
+{
+  "recorded_at_utc": "2026-10-19T01:28:46Z",
+  "purpose": "Explicit follow-up ZJIT runtime investigation; no normal task/default runtime changes",
+  "documentation": "https://docs.ruby-lang.org/en/4.0/jit/zjit_md.html",
+  "release": "https://www.ruby-lang.org/en/news/2026/10/12/ruby-4-1-0-preview1-released/",
+  "source_url": "https://cache.ruby-lang.org/pub/ruby/4.1/ruby-4.1.0-preview1.tar.xz",
+  "published_source_sha256": "b81f20bf2bc72aa360785eb77ffa0c9f15343ac7316637fbf347500fc3e2e3a8",
+  "downloaded_source_sha256": "b81f20bf2bc72aa360785eb77ffa0c9f15343ac7316637fbf347500fc3e2e3a8",
+  "installed_binary": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+  "installed_binary_sha256": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194",
+  "compiler": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "packaged_runtime": {
+    "result": {
+      "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+      "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+      "configure_args": " '--prefix=/work/.build/4.0.7-x86_64_linux-yjit/package/ruby-4.0.7' '--enable-load-relative' '--without-ext=win32,win32ole' '--without-gmp' '--with-rdoc=ri' '--disable-dependency-tracking' '--with-libyaml-dir=/work/.build/4.0.7-x86_64_linux-yjit/deps/libyaml' '--with-baseruby=/work/.build/bootstrap/x86_64_linux-3.4.7/bin/ruby' '--enable-yjit' '--with-libffi-dir=/work/.build/4.0.7-x86_64_linux-yjit/deps/libffi' '--with-zlib-dir=/work/.build/4.0.7-x86_64_linux-yjit/deps/zlib' 'MKDIR_P=/bin/mkdir -p' 'ac_cv_lib_z_uncompress=no' 'LDFLAGS=' 'CPPFLAGS='",
+      "zjit_constant_defined": false,
+      "zjit_enabled": null
+    },
+    "status": 0,
+    "warning": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby: warning: Ruby was built without ZJIT support. You may need to install rustc to build Ruby with ZJIT.\n"
+  },
+  "build_phases": [
+    {
+      "command": [
+        "sh",
+        "-c",
+        "cd .dev/ruby-native-runtimes/build/ruby-4.1.0-preview1 && ./configure --prefix=/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1 --enable-yjit --enable-zjit --disable-install-doc --without-gmp --with-baseruby=/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby"
+      ],
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 147787776,
+      "memory_bytes": 2147483648,
+      "address_space_bytes": 8589934592,
+      "timeout_seconds": 1800.0,
+      "elapsed_seconds": 24.2703370800009,
+      "name": "configure"
+    },
+    {
+      "command": [
+        "nice",
+        "-n",
+        "10",
+        "make",
+        "-C",
+        ".dev/ruby-native-runtimes/build/ruby-4.1.0-preview1",
+        "-j2"
+      ],
+      "success": false,
+      "reason": "worker exited 2",
+      "peak_rss_bytes": 690872320,
+      "memory_bytes": 2147483648,
+      "address_space_bytes": 8589934592,
+      "timeout_seconds": 1800.0,
+      "elapsed_seconds": 45.523017717001494,
+      "name": "build",
+      "failure_detail": "file2lastrev.rb: does not seem to be under a vcs: .\nfile2lastrev.rb: does not seem to be under a vcs: .\nCloning into 'gems/src/debug'...\nfatal: unable to access 'https://github.com/ruby/debug/': Could not resolve host: github.com\nmake: *** [defs/gmake.mk:408: gems/src/debug/.git] Error 128\nmake: *** Waiting for unfinished jobs....\n"
+    },
+    {
+      "command": [
+        "nice",
+        "-n",
+        "10",
+        "make",
+        "-C",
+        ".dev/ruby-native-runtimes/build/ruby-4.1.0-preview1",
+        "-j2",
+        "HAVE_GIT=no"
+      ],
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 1188442112,
+      "memory_bytes": 2147483648,
+      "address_space_bytes": 8589934592,
+      "timeout_seconds": 1800.0,
+      "elapsed_seconds": 104.93464277499879,
+      "name": "build-offline"
+    },
+    {
+      "command": [
+        "make",
+        "-C",
+        ".dev/ruby-native-runtimes/build/ruby-4.1.0-preview1",
+        "install",
+        "HAVE_GIT=no"
+      ],
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 52584448,
+      "memory_bytes": 2147483648,
+      "address_space_bytes": 8589934592,
+      "timeout_seconds": 300.0,
+      "elapsed_seconds": 2.331339939002646,
+      "name": "install"
+    }
+  ],
+  "build_note": "First make tried cloning bundled debug gem; HAVE_GIT=no resumed offline using all gem archives in the verified release tarball. No Ruby source edits. Normal mise runtime unchanged.",
+  "activation_probes": [
+    {
+      "command": [
+        "env",
+        "-u",
+        "RUBYOPT",
+        "-u",
+        "RUBY_YJIT_ENABLE",
+        "-u",
+        "RUBY_ZJIT_ENABLE",
+        ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--disable-yjit",
+        "--disable-zjit",
+        "bench/ruby-native/runtime_probe.rb",
+        "interpreter"
+      ],
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 47198208,
+      "memory_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "timeout_seconds": 60.0,
+      "elapsed_seconds": 0.4063774669994018,
+      "source_sha256": "04cba636c3626c2678194bcd5e0f5d96d6dd8ddd03375e903c4ca6979919cd62",
+      "final_source_sha256": "04cba636c3626c2678194bcd5e0f5d96d6dd8ddd03375e903c4ca6979919cd62",
+      "stderr": "",
+      "result": {
+        "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +PRISM [x86_64-linux]",
+        "executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "configure_args": " '--prefix=/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1' '--enable-yjit' '--enable-zjit' '--disable-install-doc' '--without-gmp' '--with-baseruby=/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby'",
+        "mode": "interpreter",
+        "yjit_enabled": false,
+        "zjit_enabled": false,
+        "primary_key_checks": 1000,
+        "openssl": "OpenSSL 3.5.5 27 Jan 2026",
+        "zlib": "1.3.1",
+        "compilation": {}
+      }
+    },
+    {
+      "command": [
+        "env",
+        "-u",
+        "RUBYOPT",
+        "-u",
+        "RUBY_YJIT_ENABLE",
+        "-u",
+        "RUBY_ZJIT_ENABLE",
+        ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--yjit",
+        "--yjit-stats=quiet",
+        "bench/ruby-native/runtime_probe.rb",
+        "yjit"
+      ],
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 56504320,
+      "memory_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "timeout_seconds": 60.0,
+      "elapsed_seconds": 0.6607570950000081,
+      "source_sha256": "04cba636c3626c2678194bcd5e0f5d96d6dd8ddd03375e903c4ca6979919cd62",
+      "final_source_sha256": "04cba636c3626c2678194bcd5e0f5d96d6dd8ddd03375e903c4ca6979919cd62",
+      "stderr": "",
+      "result": {
+        "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]",
+        "executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "configure_args": " '--prefix=/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1' '--enable-yjit' '--enable-zjit' '--disable-install-doc' '--without-gmp' '--with-baseruby=/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby'",
+        "mode": "yjit",
+        "yjit_enabled": true,
+        "zjit_enabled": false,
+        "primary_key_checks": 1000,
+        "openssl": "OpenSSL 3.5.5 27 Jan 2026",
+        "zlib": "1.3.1",
+        "compilation": {
+          "inline_code_size": 924456,
+          "code_region_size": 2195456,
+          "compiled_iseq_entry": 287,
+          "compiled_iseq_count": 580,
+          "compiled_blockid_count": 9158,
+          "compiled_block_count": 12253,
+          "compiled_branch_count": 19490,
+          "compile_time_ns": 131520238
+        }
+      }
+    },
+    {
+      "command": [
+        "env",
+        "-u",
+        "RUBYOPT",
+        "-u",
+        "RUBY_YJIT_ENABLE",
+        "-u",
+        "RUBY_ZJIT_ENABLE",
+        ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--zjit",
+        "--zjit-stats-quiet",
+        "bench/ruby-native/runtime_probe.rb",
+        "zjit"
+      ],
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 54820864,
+      "memory_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "timeout_seconds": 60.0,
+      "elapsed_seconds": 0.7748289110022597,
+      "source_sha256": "04cba636c3626c2678194bcd5e0f5d96d6dd8ddd03375e903c4ca6979919cd62",
+      "final_source_sha256": "04cba636c3626c2678194bcd5e0f5d96d6dd8ddd03375e903c4ca6979919cd62",
+      "stderr": "",
+      "result": {
+        "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+        "executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "configure_args": " '--prefix=/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1' '--enable-yjit' '--enable-zjit' '--disable-install-doc' '--without-gmp' '--with-baseruby=/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby'",
+        "mode": "zjit",
+        "yjit_enabled": false,
+        "zjit_enabled": true,
+        "primary_key_checks": 1000,
+        "openssl": "OpenSSL 3.5.5 27 Jan 2026",
+        "zlib": "1.3.1",
+        "compilation": {
+          "compiled_iseq_count": 582,
+          "failed_iseq_count": 0,
+          "compile_time_ns": 174358797,
+          "compiled_side_exit_count": 13023,
+          "code_region_bytes": 2854912
+        }
+      }
+    }
+  ],
+  "probe_note": "Statistics enabled only to verify compilation; these are correctness/activation probes, not performance samples. Every probe remained below the 512 MiB worker RSS ceiling.",
+  "benchmark_dependencies": {
+    "archives": [
+      {
+        "name": "citrus-3.0.2",
+        "path": "/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/citrus-3.0.2.gem",
+        "sha256": "4ec2412fc389ad186735f4baee1460f7900a8e130ffe3f216b30d4f9c684f650",
+        "native_extensions": []
+      },
+      {
+        "name": "toml-rb-4.2.0",
+        "path": "/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/toml-rb-4.2.0.gem",
+        "sha256": "10a48c91613e20cf63483a7a776767dfb3cd7d70e9327c0237443da601e13776",
+        "native_extensions": []
+      }
+    ],
+    "install_attempts": [
+      {
+        "command": [
+          "env",
+          "-u",
+          "RUBYOPT",
+          "-u",
+          "GEM_HOME",
+          "-u",
+          "GEM_PATH",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/gem",
+          "install",
+          "--local",
+          "--no-document",
+          "--install-dir",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5",
+          "/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/citrus-3.0.2.gem",
+          "/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/toml-rb-4.2.0.gem"
+        ],
+        "success": false,
+        "reason": "worker exited 2",
+        "peak_rss_bytes": 28250112,
+        "memory_bytes": 536870912,
+        "address_space_bytes": 2147483648,
+        "timeout_seconds": 60.0,
+        "elapsed_seconds": 0.10442849799437681,
+        "stdout": "Successfully installed citrus-3.0.2\n1 gem installed\n",
+        "stderr": "ERROR:  Error installing /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/toml-rb-4.2.0.gem:\n\tBecause every version of toml-rb depends on citrus > 3.0, < 4.A which could not be found in any repository\n  and your request depends on toml-rb = 4.2.0,\n  version solving has failed.\n"
+      },
+      {
+        "command": [
+          "env",
+          "-u",
+          "RUBYOPT",
+          "-u",
+          "GEM_HOME",
+          "-u",
+          "GEM_PATH",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/gem",
+          "install",
+          "--local",
+          "--no-document",
+          "--install-dir",
+          "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5",
+          "/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/toml-rb-4.2.0.gem"
+        ],
+        "success": false,
+        "reason": "worker exited 2",
+        "peak_rss_bytes": 29155328,
+        "memory_bytes": 536870912,
+        "address_space_bytes": 2147483648,
+        "timeout_seconds": 60.0,
+        "elapsed_seconds": 0.10401252399606165,
+        "stdout": "",
+        "stderr": "ERROR:  Error installing /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/toml-rb-4.2.0.gem:\n\tBecause every version of toml-rb depends on citrus > 3.0, < 4.A which could not be found in any repository\n  and your request depends on toml-rb = 4.2.0,\n  version solving has failed.\n"
+      },
+      {
+        "command": [
+          "env",
+          "-u",
+          "RUBYOPT",
+          "-u",
+          "GEM_HOME",
+          "-u",
+          "GEM_PATH",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+          ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/gem",
+          "install",
+          "--local",
+          "--no-document",
+          "--ignore-dependencies",
+          "--install-dir",
+          "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5",
+          "/home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/gems/4.0.0/cache/toml-rb-4.2.0.gem"
+        ],
+        "success": true,
+        "reason": null,
+        "peak_rss_bytes": 29442048,
+        "memory_bytes": 536870912,
+        "address_space_bytes": 2147483648,
+        "timeout_seconds": 60.0,
+        "elapsed_seconds": 0.103492351998284,
+        "stdout": "Successfully installed toml-rb-4.2.0\n1 gem installed\n",
+        "stderr": ""
+      }
+    ],
+    "probe": {
+      "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +PRISM [x86_64-linux]",
+      "gems": {
+        "citrus": {
+          "version": "3.0.2",
+          "path": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5/gems/citrus-3.0.2",
+          "extensions": []
+        },
+        "toml-rb": {
+          "version": "4.2.0",
+          "path": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5/gems/toml-rb-4.2.0",
+          "extensions": []
+        },
+        "racc": {
+          "version": "1.8.1",
+          "path": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5/gems/racc-1.8.1",
+          "extensions": [
+            "ext/racc/cparse/extconf.rb"
+          ]
+        },
+        "date": {
+          "version": "3.6.0",
+          "path": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5/gems/date-3.6.0",
+          "extensions": [
+            "ext/date/extconf.rb"
+          ]
+        }
+      },
+      "loaded_extensions": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/x86_64-linux/date_core.so",
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/gems/4.1.0+5/extensions/x86_64-linux/4.1.0+5-static/racc-1.8.1/racc/cparse.so"
+      ],
+      "toml_result": {
+        "example": 42
+      }
+    },
+    "requirements_checked_before_explicit_install": {
+      "citrus": {
+        "requirement": "~> 3.0, > 3.0",
+        "installed": "3.0.2",
+        "satisfied": true
+      },
+      "racc": {
+        "requirement": "~> 1.7",
+        "installed": "1.8.1",
+        "satisfied": true
+      }
+    },
+    "note": "Only existing approved pure Ruby benchmark dependencies were copied from their cached archives. Preview RubyGems local resolver rejected an installed Citrus dependency; after verifying both requirements were satisfied, explicit --ignore-dependencies archive installation succeeded. Native Racc and Date extensions remain those built for the local Ruby 4.1 runtime. No network gem fetches or global runtime changes."
+  }
+}

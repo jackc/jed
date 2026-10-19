@@ -1,0 +1,44 @@
+{
+  "purpose": "Supplemental microkernels; these do not measure end-to-end SQL or database throughput.",
+  "initial_leaf_probe": {
+    "before": "leaf-key-before-initial.json",
+    "after": "leaf-key-after-initial.json",
+    "script": "leaf-key-initial-probe.rb",
+    "script_sha256": "fd68c9623e01e7583b626e841a478b3e478ac2f1ac3e53cb2ca72fb92d15355e",
+    "source_sha256": null,
+    "limitation": "Initial exploratory calls did not record the engine source hash. Keep these as historical evidence; use leaf-key-comparison.json and leaf_key_probe.rb for the reproducible controlled comparison."
+  },
+  "controlled_leaf_probe": {
+    "report": "leaf-key-comparison.json",
+    "script": "../../leaf_key_probe.rb",
+    "source_sha256": "e4cadba5c6f76ab83334114baf9d78d21fd76a54b97df1ead41124b734f20ae2",
+    "description": "Same loaded core, fake codec, four field reads; legacy structural key implementation compared with current identity key."
+  },
+  "type_probe": {
+    "before": "types-before.json",
+    "after": "types-after.json",
+    "script": "../../type_probe.rb",
+    "description": "Already-resolved scalar names and exact integer bounds. The type source file hashes are recorded independently; other core files are not exercised by this kernel."
+  },
+  "allocations": {
+    "report": "lookup-allocations.json",
+    "script": "../../lookup_allocations.rb",
+    "description": "Intermediate source before the final type and EOF optimizations. ObjectSpace records allocation counts, never traced timings. Checksum replay times the unchanged canonical Ruby harness separately.",
+    "script_revision_note": "After capture, the script's path classification was corrected for external RUBY_NATIVE_SOURCE snapshots. This recorded run used the working tree, so its allocation groups were unaffected. The report retains its original script hash; timings and raw results were not rewritten."
+  },
+  "final_source": {
+    "sha256": "b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456",
+    "profile": "candidate-profile.json",
+    "control": "candidate-control-profile.json",
+    "description": "Final source includes standard fixed-width integer pack/unpack and empty-attachment storage enumeration. These remove 74 allocations per canonical lookup. Short timing samples overlap the preceding source; canonical final-file-* results are the end-to-end evidence."
+  },
+  "preceding_source": {
+    "sha256": "fe2f73b7ba68a8fbb0c23494db11a9f51b2827163131ef519605162cac830917",
+    "profile": "after-profile.json",
+    "file_reports": [
+      "file-4.0.7.json",
+      "file-4.1-preview1.json"
+    ],
+    "description": "Fully validated preceding source before the last two allocation reductions. Retained as intermediate evidence."
+  }
+}

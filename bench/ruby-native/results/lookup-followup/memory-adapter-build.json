@@ -1,0 +1,21 @@
+{
+  "command": [
+    "ruby",
+    "bench/ruby-native/compare.rb",
+    "--build-only"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 1390333952,
+  "memory_bytes": 2147483648,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 600.0,
+  "elapsed_seconds": 74.38343044899375,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "fe2f73b7ba68a8fbb0c23494db11a9f51b2827163131ef519605162cac830917",
+  "final_source_sha256": "fe2f73b7ba68a8fbb0c23494db11a9f51b2827163131ef519605162cac830917",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\n  \"go\": {\n    \"status\": \"ready\",\n    \"detail\": \"\"\n  },\n  \"rust\": {\n    \"status\": \"ready\",\n    \"detail\": \"   Compiling typenum v1.20.1\\n   Compiling hybrid-array v0.4.15\\n   Compiling block-buffer v0.12.1\\n   Compiling crypto-common v0.2.2\\n   Compiling const-oid v0.10.2\\n   Compiling cfg-if v1.0.4\\n   Compiling libc v0.2.186\\n   Compiling digest v0.11.3\\n   Compiling getrandom v0.3.4\\n   Compiling jed v0.0.0 (/home/jack/.codex/worktrees/b8e6/jed/impl/rust)\\n   Compiling cpufeatures v0.3.1\\n   Compiling sha2 v0.11.0\\n   Compiling md-5 v0.11.0\\n   Compiling jed-ruby-experiment-compare v0.0.0 (/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/rust)\\n    Finished `release` profile [optimized] target(s) in 1m 02s\\n\"\n  },\n  \"ruby\": {\n    \"status\": \"ready\",\n    \"detail\": \"ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]\\n\"\n  },\n  \"ruby-yjit\": {\n    \"status\": \"ready\",\n    \"detail\": \"ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]\\n\"\n  },\n  \"ts\": {\n    \"status\": \"ready\",\n    \"detail\": \"v26.10.0\\n\"\n  }\n}\n",
+  "stderr": "compare go: ready\ncompare rust: ready\ncompare ruby: ready\ncompare ruby-yjit: ready\ncompare ts: ready\n"
+}

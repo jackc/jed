@@ -207,9 +207,11 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   speedup while remaining byte-identical, or are vetted cryptography.
 - Always get explicit human confirmation before adding a dependency.
 - The Ruby experiment has explicit maintainer approval for Ruby's OpenSSL binding
-  solely for vetted cryptographic digest functions. Its parser, planner, other
-  evaluation, and storage remain handwritten Ruby; no other native engine
-  dependency or Rust/WASM binding is authorized by this exception.
+  for vetted cryptographic digest functions and stdlib Zlib for byte-identical
+  CRC32 checksums. The maintainer also permits a well-supported native checksum
+  gem if profiling justifies it; prefer the standard library. Its parser, planner,
+  other evaluation, and storage algorithms remain handwritten Ruby; no native
+  engine dependency or Rust/WASM binding is authorized by these utility exceptions.
 - Dependencies must not introduce unsafe, cgo, FFI, nondeterminism, locale or
   library-version-sensitive behavior, or divergence across cores.
 - Bench modules are not cores, but new benchmark dependencies still require

@@ -1,0 +1,645 @@
+{
+  "checked_at": "2026-10-19T01:56:56Z",
+  "passed": true,
+  "source_sha256": "b7275e0ee4b632191e078d24ee3134961b607fdad778f5575754b2b4cf7b0456",
+  "file_cells": [
+    {
+      "runtime": "4.0.7",
+      "lane": "ruby",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 98.47534384,
+      "peak_rss_bytes": 309153792
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ruby",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 26807.85061,
+      "peak_rss_bytes": 110735360
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ruby",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 5377.500196666667,
+      "peak_rss_bytes": 111329280
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 54.1241825,
+      "peak_rss_bytes": 305954816
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 3978.46395,
+      "peak_rss_bytes": 114184192
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 5498.91853,
+      "peak_rss_bytes": 114892800
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "go",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 2.30199208,
+      "peak_rss_bytes": 205234176
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "go",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 526.036855,
+      "peak_rss_bytes": 80162816
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "go",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 2012.2335166666667,
+      "peak_rss_bytes": 80654336
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "rust",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 2.40761304,
+      "peak_rss_bytes": 132005888
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "rust",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 446.312145,
+      "peak_rss_bytes": 71553024
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "rust",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 1815.4677466666667,
+      "peak_rss_bytes": 71385088
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ts",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 7.65905238,
+      "peak_rss_bytes": 361570304
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ts",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 1133.292495,
+      "peak_rss_bytes": 252350464
+    },
+    {
+      "runtime": "4.0.7",
+      "lane": "ts",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 1998.8691,
+      "peak_rss_bytes": 239374336
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 93.70506108,
+      "peak_rss_bytes": 329330688
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 24037.70618,
+      "peak_rss_bytes": 122122240
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 6465.788936666667,
+      "peak_rss_bytes": 121966592
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 43.84431796,
+      "peak_rss_bytes": 353792000
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 4203.65542,
+      "peak_rss_bytes": 125321216
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 4880.63717,
+      "peak_rss_bytes": 125370368
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "point_lookup_pk",
+      "microseconds_per_operation": 49.75129792,
+      "peak_rss_bytes": 348782592
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "cold_open_pk_small",
+      "microseconds_per_operation": 8143.90636,
+      "peak_rss_bytes": 129839104
+    },
+    {
+      "runtime": "4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "insert_commit_durable",
+      "microseconds_per_operation": 5626.714893333334,
+      "peak_rss_bytes": 130088960
+    }
+  ],
+  "memory_cells": [
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds_per_operation": 66.9225515,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 54.51003,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 48.02260666666667,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 1914.3016666666667,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds_per_operation": 1621.7491666666667,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds_per_operation": 2931.7178,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 2824.3644,
+      "peak_rss_bytes": 49307648
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds_per_operation": 30.5455515,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 23.795946666666666,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 21.976493333333334,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 1067.3314,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds_per_operation": 1029.4386,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds_per_operation": 1997.6563333333334,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 1928.7107333333333,
+      "peak_rss_bytes": 60030976
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "scalar",
+      "microseconds_per_operation": 0.7052165,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 1.6085166666666666,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 1.07606,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 152.66633333333334,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "aggregate",
+      "microseconds_per_operation": 64.91133333333333,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "group",
+      "microseconds_per_operation": 241.6036,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 199.9762,
+      "peak_rss_bytes": 19705856
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "scalar",
+      "microseconds_per_operation": 1.400778,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 2.2329833333333333,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 1.7769666666666666,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 147.67323333333334,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "aggregate",
+      "microseconds_per_operation": 51.9447,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "group",
+      "microseconds_per_operation": 172.79953333333333,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 135.5212,
+      "peak_rss_bytes": 11657216
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "scalar",
+      "microseconds_per_operation": 1.7503255,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 4.214556666666667,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 2.5165433333333334,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 327.832,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "aggregate",
+      "microseconds_per_operation": 176.23876666666666,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "group",
+      "microseconds_per_operation": 456.3018666666667,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 321.6177333333333,
+      "peak_rss_bytes": 182022144
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds_per_operation": 60.054886,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 49.98256,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 43.91585666666667,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 1828.8409333333334,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds_per_operation": 1554.3301,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds_per_operation": 2793.23,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 2561.4378,
+      "peak_rss_bytes": 55336960
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds_per_operation": 24.620265,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 19.447116666666666,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 17.184706666666667,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 948.9442333333334,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds_per_operation": 983.5468333333333,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds_per_operation": 2060.9405333333334,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 1667.7824666666668,
+      "peak_rss_bytes": 67309568
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "scalar",
+      "microseconds_per_operation": 28.4394025,
+      "peak_rss_bytes": 76812288
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_hit",
+      "microseconds_per_operation": 22.957903333333334,
+      "peak_rss_bytes": 76812288
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_miss",
+      "microseconds_per_operation": 20.886316666666666,
+      "peak_rss_bytes": 76812288
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "filtered_scan",
+      "microseconds_per_operation": 1142.0192333333334,
+      "peak_rss_bytes": 76812288
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "aggregate",
+      "microseconds_per_operation": 1132.1798333333334,
+      "peak_rss_bytes": 76812288
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "group",
+      "microseconds_per_operation": 2024.8426666666667,
+      "peak_rss_bytes": 76812288
+    },
+    {
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "sort_limit",
+      "microseconds_per_operation": 1696.2266666666667,
+      "peak_rss_bytes": 76812288
+    }
+  ],
+  "file_answers": {
+    "point_lookup_pk": [
+      "28f09c46d56e242a",
+      50000
+    ],
+    "cold_open_pk_small": [
+      "a4c0e86b8353f4ce",
+      200
+    ],
+    "insert_commit_durable": [
+      "6645d7dfab9c0296",
+      0
+    ]
+  },
+  "memory_answers": {
+    "scalar": [
+      "4f2c86bbdc99682d",
+      32
+    ],
+    "pk_hit": [
+      "129dbfe50e014edb",
+      32
+    ],
+    "pk_miss": [
+      "cbf29ce484222325",
+      0
+    ],
+    "filtered_scan": [
+      "c53e1273a1e9add2",
+      494
+    ],
+    "aggregate": [
+      "95913d368b1ddc2c",
+      32
+    ],
+    "group": [
+      "6ad01ea05cb39e25",
+      320
+    ],
+    "sort_limit": [
+      "b0d527ed3d1d1ce5",
+      640
+    ]
+  },
+  "validation": {
+    "memory-4.1-zjit": {
+      "passed": 20267,
+      "files": 679,
+      "skipped_files": 2,
+      "peak_worker_rss_bytes": 144982016,
+      "jit": "zjit"
+    },
+    "disk-4.1-yjit": {
+      "passed": 18250,
+      "files": 679,
+      "skipped_files": 77,
+      "peak_worker_rss_bytes": 210583552,
+      "jit": "yjit"
+    },
+    "host": {
+      "success": true,
+      "peak_rss_bytes": 195731456,
+      "test_files": 39
+    }
+  },
+  "artifact_sha256": {
+    "bench/ruby-native/results/lookup-followup/final-file-4.0.7.json": "0ba39c091a4edb496e69973feddc6a113b06e40921c3c542268f0c22ae7a7eec",
+    "bench/ruby-native/results/lookup-followup/final-file-4.1-preview1.json": "2050f7eb10332dce279ad213957da44f2a34b655f0b361db7decbde07b530048",
+    "bench/ruby-native/results/lookup-4_0_7.json": "c61858b83cd15da63b06cfa1c40ec4a0d7b4a3ece664b5535d417acad550c274",
+    "bench/ruby-native/results/lookup-4_1_preview1.json": "64a6b909ce8e47b21255d99c2d65a1d0a6f420f8b26327f9a6847a99e8b2793e",
+    "bench/ruby-native/results/lookup-followup/final-conformance-memory-4.1-zjit.json": "5efabd64b612760773431fee2e282fc76dd4b94672ec9500ba09ddc488c56b50",
+    "bench/ruby-native/results/lookup-followup/final-conformance-disk-4.1-yjit.json": "1290255bcd42f3b7eed6aea83d62ae1b252afdd204778894f1a4076768734bd0",
+    "bench/ruby-native/results/lookup-followup/final-host-4.0.7.json": "e400685e04618861e19f846d622dfcb6a52247d74d933bce0ddbc6c4d3420864",
+    "bench/ruby-native/results/lookup-followup/before-profile.json": "539535606a7e57c3876c2f934ee8498a5a7683fa98ee902c41188d49a7cc32fe",
+    "bench/ruby-native/results/lookup-followup/candidate-profile.json": "2bf4e5c07721285ca0123efd4a9329dcdd4c6dafcdefb03ef0d4b721dab05663"
+  }
+}

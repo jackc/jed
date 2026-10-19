@@ -73,6 +73,25 @@ module NativeCursorTests
       assert(first['id'] == 1 && second['id'] == 2, 'mutable public headers changed row lookup names')
       cursor.close
       assert(core.query('select count(*) from t').rows == [[4]], 'bare database cursor owns its temporary session')
+      bindings = [
+        ['i16', 12], ['i32', nil], ['i64', 2**40], ['boolean', true],
+        ['text', 'bound text'], ['bytea', "\x00\xff".b],
+        ['uuid', '00000000-0000-0000-0000-000000000001'],
+        ['decimal', JedNative::Decimal.parse('1.25')], ['f32', 1.25], ['f64', 1.25],
+        ['timestamptz', JedNative::TimestampValue.new(0, zoned: false)],
+        ['timestamptz[]', JedNative::ArrayValue.new([JedNative::TimestampValue.new(0, zoned: false)], element_type: 'timestamptz')]
+      ]
+      bindings.each do |type, value|
+        statement = s.prepare("select $1::#{type}")
+        eager = s.execute_prepared(statement, value)
+        cursor = s.query_prepared(statement, value)
+        assert(cursor.cost.zero?, "binding ran query before pull: #{type}")
+        assert(cursor.rows == eager.rows && cursor.cost == eager.cost, "cursor binding changed value or cost: #{type}")
+      end
+      label = +'original'
+      cursor = s.query('select $1::text', label)
+      label.replace('changed')
+      assert(cursor.rows == [['original']], 'prebound cursor retained mutable host parameter')
     end
     puts 'ruby-native cursors: lazy projections, full-drain costs, errors and frozen snapshot lifecycle passed'
   end
