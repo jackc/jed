@@ -17,11 +17,12 @@ module NativeCorpusCompilation
   MODE = ENV.fetch('JED_NATIVE_COMPILATION', 'auto')
   raise 'JED_NATIVE_COMPILATION must be auto, immediate, or disabled' unless %w[auto immediate disabled].include?(MODE)
   class << self
-    attr_accessor :kernels, :pipelines, :orderings, :aggregates, :relations, :text_kernels, :text_snapshot_kernels
+    attr_accessor :kernels, :pipelines, :orderings, :aggregates, :relations, :text_kernels, :text_snapshot_kernels, :like_kernels
 
     def record_text(kernel)
       self.text_kernels += 1 if kernel && kernel.source.include?('# C text specialization')
       self.text_snapshot_kernels += 1 if kernel && kernel.source.include?('# C text snapshots')
+      self.like_kernels += 1 if kernel && kernel.source.include?('# literal LIKE specialization')
     end
   end
   self.kernels = 0
@@ -31,6 +32,7 @@ module NativeCorpusCompilation
   self.relations = 0
   self.text_kernels = 0
   self.text_snapshot_kernels = 0
+  self.like_kernels = 0
   module Engines
     def initialize(**options)
       super
@@ -143,6 +145,7 @@ class NativeCorpus
     @summary[:compiled_relations] = 0
     @summary[:compiled_text_kernels] = 0
     @summary[:compiled_text_snapshot_kernels] = 0
+    @summary[:compiled_like_kernels] = 0
     @summary[:query_api_records] = @summary[:execute_api_records] = 0
     @summary[:materialized_memory_records] = 0
   end
@@ -186,6 +189,7 @@ class NativeCorpus
         worker.summary[:compiled_relations] = NativeCorpusCompilation.relations
         worker.summary[:compiled_text_kernels] = NativeCorpusCompilation.text_kernels
         worker.summary[:compiled_text_snapshot_kernels] = NativeCorpusCompilation.text_snapshot_kernels
+        worker.summary[:compiled_like_kernels] = NativeCorpusCompilation.like_kernels
         worker.summary
       end
       @summary[:peak_worker_rss_bytes] = [@summary[:peak_worker_rss_bytes], result.peak_rss_bytes].max

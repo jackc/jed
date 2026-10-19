@@ -256,7 +256,7 @@ module RubyBindingComparison
     if options[:workloads] && !options[:file]
       # Additional compiler controls are opt-in within this opt-in
       # harness. Selecting an existing workload leaves its schedule unchanged.
-      %w[pipeline ordering aggregate relation text].each do |kind|
+      %w[pipeline ordering aggregate relation text like].each do |kind|
         missing = options[:workloads] - jobs.map { |job| job.fetch('name') }
         break if missing.empty?
         path = File.join(__dir__, "compare/#{kind}-plan.json")

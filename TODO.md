@@ -58,6 +58,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [compiled primitive aggregates](impl/ruby-native/AGGREGATE_FOLLOWUP.md),
   [compiled materialized filters and grouping keys](impl/ruby-native/RELATION_FOLLOWUP.md),
   [compiled C-text comparisons](impl/ruby-native/TEXT_FOLLOWUP.md),
+  [compiled literal LIKE predicates](impl/ruby-native/LIKE_FOLLOWUP.md),
   [private text-comparison snapshots](impl/ruby-native/TEXT_ELISION_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 

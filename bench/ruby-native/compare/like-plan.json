@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "description": "Opt-in literal LIKE compilation experiment over the unchanged 1000-row fixture. The scalar control and historical text_like_fallback prefix query retain their exact schedules. Literal exact/prefix/suffix/contains and NOT LIKE filters, CASE projection and grouped CASE cover new admission. An underscore pattern remains a generic fallback control. Dynamic patterns and actual text bindings are checked separately in like_diagnostics.rb.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"text_like_fallback","sql":"SELECT sum(score) FROM items WHERE label LIKE 'row5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_exact_filter","sql":"SELECT count(*) FROM items WHERE label LIKE 'row500'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_suffix_filter","sql":"SELECT sum(score) FROM items WHERE label LIKE '%50'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_contains_filter","sql":"SELECT sum(score) FROM items WHERE label LIKE '%ow5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_not_prefix_filter","sql":"SELECT count(*) FROM items WHERE label NOT LIKE 'row5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_predicate_projection","sql":"SELECT id, CASE WHEN label LIKE '%ow5%' THEN score + 1 ELSE score - 1 END FROM items ORDER BY id","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_predicate_group","sql":"SELECT CASE WHEN label LIKE 'row5%' THEN 1 ELSE 0 END, count(*), sum(score) FROM items GROUP BY CASE WHEN label LIKE 'row5%' THEN 1 ELSE 0 END ORDER BY 1","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_complex_fallback","sql":"SELECT sum(score) FROM items WHERE label LIKE 'row_5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0}
+  ]
+}

@@ -81,7 +81,8 @@ files in the same change.
   comparators, primitive aggregate input/reduction loops, and materialized WHERE
   and grouping-key loops into Ruby methods
   at runtime using a handwritten, bounded template emitter. SQL text and values
-  remain data; admitted scalar operations include bounded C-text comparisons.
+  remain data; admitted scalar operations include bounded C-text comparisons
+  and simple literal LIKE predicates.
   All conformance contracts still apply. See
   `spec/design/ruby-runtime-compilation.md`.
 - Record deliberate PostgreSQL divergences in the relevant spec doc or ledger.
