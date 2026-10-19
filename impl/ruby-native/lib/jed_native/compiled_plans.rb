@@ -6,11 +6,11 @@ module JedNative
   # Execution never rescues a compiled failure to retry in the interpreter.
   module CompiledPlans
     MAX_PLAN_SOURCE_BYTES = 65_536
-    Kernels = Struct.new(:predicate, :projection, :keys, keyword_init: true)
+    Kernels = Struct.new(:predicate, :projection, :keys, :pipeline, keyword_init: true)
     State = Struct.new(:uses, :kernels, :attempted, :source_bytes, keyword_init: true)
     MAX_ARGUMENT_CACHE_ENTRIES = 64
 
-    def native_compiled_kernels(plan, predicate, projections, keys = nil)
+    def native_compiled_kernels(plan, predicate, projections, keys = nil, pipeline: nil, offset: false, limit: false)
       return if @native_compilation_disabled
       state = plan.instance_variable_get(:@native_compiled_state)
       unless state
@@ -19,6 +19,15 @@ module JedNative
       end
       state.uses += 1 if state.uses < 2
       return if state.uses < 2 && !@native_compilation_immediate
+
+      if pipeline && !@native_pipeline_disabled
+        unless state.attempted[:pipeline]
+          state.attempted[:pipeline] = true
+          native_admit_kernel(state, :pipeline,
+            CompiledPipeline.build(predicate, projections, types: @types, mode: pipeline, offset: offset, limit: limit))
+        end
+        return state.kernels if state.kernels.pipeline
+      end
 
       unless state.attempted[:predicate]
         state.attempted[:predicate] = true

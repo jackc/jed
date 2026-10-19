@@ -1,0 +1,21 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--yjit",
+    "impl/ruby-native/bin/conformance.rb"
+  ],
+  "success": false,
+  "reason": "worker exited 1",
+  "peak_rss_bytes": 51544064,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 900.0,
+  "elapsed_seconds": 4.23468420500285,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+  "final_source_sha256": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"files\":16,\"records\":586,\"passed\":515,\"failed\":71,\"unsupported_files\":0,\"skipped_files\":0,\"timed_out_files\":0,\"memory_limited_files\":0,\"omitted_failure_details\":0,\"scalar_cursor_records\":4,\"compiled_kernels\":2,\"compiled_pipelines\":1,\"mode\":\"memory\",\"filter\":\"\",\"started_at\":\"2026-10-19T15:59:36Z\",\"query_api\":\"query\",\"compilation\":\"immediate\",\"ruby\":\"ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]\",\"ruby_executable\":\"/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby\",\"jit\":\"yjit\",\"corpus_root\":\"/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites\",\"available_records\":683,\"source_sha256\":\"0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd\",\"worker_memory_bytes\":536870912,\"worker_timeout_seconds\":10.0,\"worker_address_space_bytes\":2147483648,\"peak_worker_rss_bytes\":139931648,\"finished_at\":\"2026-10-19T15:59:40Z\",\"final_source_sha256\":\"0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd\"}\n",
+  "stderr": ""
+}

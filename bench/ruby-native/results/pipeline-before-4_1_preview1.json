@@ -1,0 +1,713 @@
+{
+  "schema": 1,
+  "phase": "pipeline-before-4_1_preview1",
+  "verification_only": false,
+  "created_at": "2026-10-19T15:43:40Z",
+  "host": {
+    "platform": "x86_64-linux",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+    "processors": 24,
+    "git_commit": "627cbb631e3a922999c3a0cb3bcba32136fcb345",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +PRISM [x86_64-linux]",
+    "openssl": "OpenSSL 3.5.5 27 Jan 2026"
+  },
+  "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/pipeline-plan.json",
+  "plan_sha256": "d309733d558cbb1c6a2b82fa2a444b2fad2359e5abd960a47d31916decfd8ba2",
+  "plan": {
+    "schema": 1,
+    "description": "Explicit fused scan pipeline experiment: unchanged twelve runtime-compilation workloads plus primary-key ordered full scan and filter/projection LIMIT/OFFSET controls over the same 1000-row fixture.",
+    "rows": 1000,
+    "repetitions": 5,
+    "validation_iterations": 32,
+    "workloads": [
+      {
+        "name": "scalar",
+        "sql": "SELECT abs($1::i64) + 7",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "pk_hit",
+        "sql": "SELECT score FROM items WHERE id = $1",
+        "iterations": 300,
+        "warmup": 100,
+        "offset": 0,
+        "step": 17,
+        "span": 1000
+      },
+      {
+        "name": "pk_miss",
+        "sql": "SELECT score FROM items WHERE id = $1",
+        "iterations": 300,
+        "warmup": 100,
+        "offset": 1000,
+        "step": 17,
+        "span": 1000
+      },
+      {
+        "name": "filtered_scan",
+        "sql": "SELECT id, score FROM items WHERE score >= $1 ORDER BY id",
+        "iterations": 30,
+        "warmup": 20,
+        "offset": 9700,
+        "step": 7,
+        "span": 300
+      },
+      {
+        "name": "aggregate",
+        "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+        "iterations": 30,
+        "warmup": 20,
+        "offset": 0,
+        "step": 1,
+        "span": 10
+      },
+      {
+        "name": "group",
+        "sql": "SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket",
+        "iterations": 15,
+        "warmup": 10,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "sort_limit",
+        "sql": "SELECT id, score FROM items ORDER BY score DESC, id LIMIT 20",
+        "iterations": 15,
+        "warmup": 10,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "arithmetic_filter",
+        "sql": "SELECT id, score FROM items WHERE score * 3 + bucket >= $1 ORDER BY id",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 15000,
+        "step": 137,
+        "span": 10000
+      },
+      {
+        "name": "arithmetic_projection",
+        "sql": "SELECT id, (score::i64 * 3 + bucket::i64) / (bucket::i64 + 1) FROM items WHERE bucket >= $1 ORDER BY id",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 1,
+        "span": 5
+      },
+      {
+        "name": "case_projection",
+        "sql": "SELECT id, CASE WHEN score >= $1 THEN score::i64 * 3 + bucket::i64 ELSE -score::i64 END FROM items ORDER BY id",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 2500,
+        "step": 137,
+        "span": 5000
+      },
+      {
+        "name": "aggregate_argument",
+        "sql": "SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 1,
+        "span": 5
+      },
+      {
+        "name": "computed_sort",
+        "sql": "SELECT id, score FROM items ORDER BY score * 3 + bucket DESC, id LIMIT 20",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "plain_scan",
+        "sql": "SELECT id, score FROM items ORDER BY id",
+        "iterations": 50,
+        "warmup": 100,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "scan_projection_limit",
+        "sql": "SELECT id, score * 3 + bucket FROM items WHERE bucket >= $1 ORDER BY id LIMIT 20",
+        "iterations": 300,
+        "warmup": 100,
+        "offset": 0,
+        "step": 1,
+        "span": 5
+      },
+      {
+        "name": "scan_projection_offset_limit",
+        "sql": "SELECT id, score * 3 + bucket FROM items WHERE bucket >= $1 ORDER BY id LIMIT 20 OFFSET 500",
+        "iterations": 100,
+        "warmup": 100,
+        "offset": 0,
+        "step": 1,
+        "span": 5
+      }
+    ]
+  },
+  "ruby_source": "/tmp/jed-ruby-pipeline-before",
+  "statuses": {
+    "ruby-yjit": {
+      "status": "ready",
+      "detail": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]\n"
+    },
+    "ruby-zjit": {
+      "status": "ready",
+      "detail": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]\n"
+    }
+  },
+  "results": {
+    "ruby-yjit": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          10261797,
+          9371528,
+          8722826,
+          8499083,
+          8265615
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "pk_hit",
+        "checksum": "129dbfe50e014edb",
+        "validation_rows": 32,
+        "samples_ns": [
+          1219347,
+          1228420,
+          1173271,
+          1173593,
+          1134335
+        ],
+        "rows_total": 1500,
+        "iterations": 300,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "pk_miss",
+        "checksum": "cbf29ce484222325",
+        "validation_rows": 0,
+        "samples_ns": [
+          958039,
+          959313,
+          975613,
+          946645,
+          955163
+        ],
+        "rows_total": 0,
+        "iterations": 300,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "filtered_scan",
+        "checksum": "c53e1273a1e9add2",
+        "validation_rows": 494,
+        "samples_ns": [
+          7033914,
+          7024929,
+          7008141,
+          6967246,
+          6996742
+        ],
+        "rows_total": 2405,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "aggregate",
+        "checksum": "95913d368b1ddc2c",
+        "validation_rows": 32,
+        "samples_ns": [
+          15767566,
+          8680962,
+          8460326,
+          8428153,
+          9958729
+        ],
+        "rows_total": 150,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "group",
+        "checksum": "6ad01ea05cb39e25",
+        "validation_rows": 320,
+        "samples_ns": [
+          9539045,
+          9947753,
+          9681084,
+          9337948,
+          10125120
+        ],
+        "rows_total": 750,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "sort_limit",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          13681420,
+          13597269,
+          13830867,
+          13790966,
+          13804054
+        ],
+        "rows_total": 1500,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "arithmetic_filter",
+        "checksum": "9de0b883193b75aa",
+        "validation_rows": 12240,
+        "samples_ns": [
+          37136378,
+          35300001,
+          33540862,
+          33102280,
+          34311349
+        ],
+        "rows_total": 84630,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "arithmetic_projection",
+        "checksum": "adabe5384860f89e",
+        "validation_rows": 25900,
+        "samples_ns": [
+          63027303,
+          57915972,
+          57492505,
+          58228175,
+          57996634
+        ],
+        "rows_total": 200000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "case_projection",
+        "checksum": "12a40dc49f6a593f",
+        "validation_rows": 32000,
+        "samples_ns": [
+          60868502,
+          60124373,
+          60460780,
+          60341912,
+          60694092
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "aggregate_argument",
+        "checksum": "11176e3e1f763de4",
+        "validation_rows": 32,
+        "samples_ns": [
+          36235921,
+          35713734,
+          34929463,
+          35960656,
+          35534498
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "computed_sort",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          55539900,
+          56638367,
+          54934230,
+          53987318,
+          53934166
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "plain_scan",
+        "checksum": "4996975980d1fc25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          36181046,
+          36091787,
+          36215619,
+          36172892,
+          35706603
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "scan_projection_limit",
+        "checksum": "643c110d05f97ca0",
+        "validation_rows": 640,
+        "samples_ns": [
+          29340701,
+          22550634,
+          22224326,
+          22195988,
+          22349135
+        ],
+        "rows_total": 30000,
+        "iterations": 300,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "scan_projection_offset_limit",
+        "checksum": "33961ab847dffe3d",
+        "validation_rows": 640,
+        "samples_ns": [
+          28500569,
+          29372982,
+          29260010,
+          28581356,
+          35072428
+        ],
+        "rows_total": 10000,
+        "iterations": 100,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]"
+      }
+    ],
+    "ruby-zjit": [
+      {
+        "workload": "scalar",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          10627086,
+          9596406,
+          9057822,
+          8761049,
+          8364953
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "pk_hit",
+        "checksum": "129dbfe50e014edb",
+        "validation_rows": 32,
+        "samples_ns": [
+          1459937,
+          1298322,
+          1156359,
+          1155820,
+          1160578
+        ],
+        "rows_total": 1500,
+        "iterations": 300,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "pk_miss",
+        "checksum": "cbf29ce484222325",
+        "validation_rows": 0,
+        "samples_ns": [
+          998198,
+          993491,
+          995529,
+          994451,
+          1001280
+        ],
+        "rows_total": 0,
+        "iterations": 300,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "filtered_scan",
+        "checksum": "c53e1273a1e9add2",
+        "validation_rows": 494,
+        "samples_ns": [
+          9301806,
+          8266462,
+          8304289,
+          8276334,
+          8829642
+        ],
+        "rows_total": 2405,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "aggregate",
+        "checksum": "95913d368b1ddc2c",
+        "validation_rows": 32,
+        "samples_ns": [
+          16811466,
+          18887137,
+          15681863,
+          14068963,
+          13975420
+        ],
+        "rows_total": 150,
+        "iterations": 30,
+        "warmup": 20,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "group",
+        "checksum": "6ad01ea05cb39e25",
+        "validation_rows": 320,
+        "samples_ns": [
+          14818620,
+          15314750,
+          14433514,
+          13831974,
+          14733822
+        ],
+        "rows_total": 750,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "sort_limit",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          26561830,
+          17935868,
+          17991501,
+          18265090,
+          17841641
+        ],
+        "rows_total": 1500,
+        "iterations": 15,
+        "warmup": 10,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "arithmetic_filter",
+        "checksum": "9de0b883193b75aa",
+        "validation_rows": 12240,
+        "samples_ns": [
+          42079734,
+          48818009,
+          41675339,
+          44274498,
+          41864518
+        ],
+        "rows_total": 84630,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "arithmetic_projection",
+        "checksum": "adabe5384860f89e",
+        "validation_rows": 25900,
+        "samples_ns": [
+          69019710,
+          68964257,
+          68941636,
+          75575784,
+          69458660
+        ],
+        "rows_total": 200000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "case_projection",
+        "checksum": "12a40dc49f6a593f",
+        "validation_rows": 32000,
+        "samples_ns": [
+          68467072,
+          67644620,
+          68302059,
+          67352239,
+          67391065
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "aggregate_argument",
+        "checksum": "11176e3e1f763de4",
+        "validation_rows": 32,
+        "samples_ns": [
+          52303036,
+          51745157,
+          51061211,
+          53359783,
+          54159983
+        ],
+        "rows_total": 250,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "computed_sort",
+        "checksum": "b0d527ed3d1d1ce5",
+        "validation_rows": 640,
+        "samples_ns": [
+          66507656,
+          65544824,
+          65651470,
+          64993137,
+          65823452
+        ],
+        "rows_total": 5000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "plain_scan",
+        "checksum": "4996975980d1fc25",
+        "validation_rows": 32000,
+        "samples_ns": [
+          44203334,
+          43611818,
+          44100969,
+          43655074,
+          44019322
+        ],
+        "rows_total": 250000,
+        "iterations": 50,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "scan_projection_limit",
+        "checksum": "643c110d05f97ca0",
+        "validation_rows": 640,
+        "samples_ns": [
+          33064485,
+          26666042,
+          26359658,
+          26172425,
+          31249419
+        ],
+        "rows_total": 30000,
+        "iterations": 300,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "scan_projection_offset_limit",
+        "checksum": "33961ab847dffe3d",
+        "validation_rows": 640,
+        "samples_ns": [
+          38047585,
+          37181370,
+          36678376,
+          37243045,
+          36959624
+        ],
+        "rows_total": 10000,
+        "iterations": 100,
+        "warmup": 100,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      }
+    ]
+  },
+  "resources": {
+    "ruby-yjit": {
+      "peak_rss_bytes": 83369984,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--yjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/lane.rb",
+        "/tmp/jed-ruby-worker-20261019-68-zwa6y0/jed-ruby-native-compare/plan.tsv"
+      ]
+    },
+    "ruby-zjit": {
+      "peak_rss_bytes": 82112512,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/lane.rb",
+        "/tmp/jed-ruby-worker-20261019-68-zwa6y0/jed-ruby-native-compare/plan.tsv"
+      ]
+    }
+  },
+  "ruby_source_sha256": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+  "ruby_source_sha256_after": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+  "source_sha256": {
+    "harness": "e09717a6b3cab10d65a0bc38be5e5e7ae81076bb5d819b8879746817fcebce1e",
+    "ruby_adapter": "c5b54ed4008ef89a8dc55bd3291ae2a8914732b2f541cca4a195af337986d2c6",
+    "go_adapter": "8a4d62ac61fcbd1e2097fbf145865ef93d7defa06d34078925e01b74bcb869e2",
+    "rust_adapter": "41c0512c1941f8e864e8d0c25fc99923666999f4660035bde4dafc5e77eede31",
+    "ts_adapter": "ebea27b1c22a823b049bf9234a8ba298e7e34f8a995452ded31e0f6110ccce65",
+    "go_core": "529576ad3e3bba25a769e9010ee4b280fe23bd111f5315daeaff0e671813bd05",
+    "rust_core": "d8aa1d6333b72d1d0e5dee9b0722de9e829349089a50a3ed5a509e2e887c2f50",
+    "ts_core": "914c07c6a8540b76f321de2a47786d8a2b3989b99b1cad3743f4b26aadf6897b",
+    "go_binary": false,
+    "rust_binary": false,
+    "ruby_executable": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194"
+  },
+  "source_sha256_after": {
+    "harness": "e09717a6b3cab10d65a0bc38be5e5e7ae81076bb5d819b8879746817fcebce1e",
+    "ruby_adapter": "c5b54ed4008ef89a8dc55bd3291ae2a8914732b2f541cca4a195af337986d2c6",
+    "go_adapter": "8a4d62ac61fcbd1e2097fbf145865ef93d7defa06d34078925e01b74bcb869e2",
+    "rust_adapter": "41c0512c1941f8e864e8d0c25fc99923666999f4660035bde4dafc5e77eede31",
+    "ts_adapter": "ebea27b1c22a823b049bf9234a8ba298e7e34f8a995452ded31e0f6110ccce65",
+    "go_core": "529576ad3e3bba25a769e9010ee4b280fe23bd111f5315daeaff0e671813bd05",
+    "rust_core": "d8aa1d6333b72d1d0e5dee9b0722de9e829349089a50a3ed5a509e2e887c2f50",
+    "ts_core": "914c07c6a8540b76f321de2a47786d8a2b3989b99b1cad3743f4b26aadf6897b",
+    "go_binary": false,
+    "rust_binary": false,
+    "ruby_executable": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194"
+  },
+  "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby"
+}

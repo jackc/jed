@@ -1,0 +1,70 @@
+{
+  "corpus_root": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites",
+  "selection": "Every file with a failure in the complete lazy YJIT audit",
+  "files": [
+    {
+      "file": "spec/conformance/suites/cte/recursive_errors.test",
+      "sha256": "a73aa6ed0344c9bca5d67334300aa0ecdb1cfb3c831e8c3b8853144fd8703ff5"
+    },
+    {
+      "file": "spec/conformance/suites/joins/parenthesized.test",
+      "sha256": "b737661dbb7357f365e9ac217592456331e9189de835e76782a9c618a074a4cc"
+    },
+    {
+      "file": "spec/conformance/suites/joins/parenthesized_lateral.test",
+      "sha256": "b2c2c55c39f110ed177eebfbc96a5e27b36e934b288a0e766b6093b9d27d24d2"
+    },
+    {
+      "file": "spec/conformance/suites/json/json_mutate.test",
+      "sha256": "70236b4830f1276f2932eff66c536fe214ebd8e9ac29c4a67887bbc14230d834"
+    },
+    {
+      "file": "spec/conformance/suites/json/json_path_walk.test",
+      "sha256": "4e086887948ed575855c0948a005393fb00f4808d0767c9b60b45aa4eaecd2c2"
+    },
+    {
+      "file": "spec/conformance/suites/json/to_json_sources.test",
+      "sha256": "5c2f453458182f2c24ae181325f2bb03bde6bfa89c51eb3d904c8c8ee62d8e0a"
+    },
+    {
+      "file": "spec/conformance/suites/resource/depth_limit.test",
+      "sha256": "a05bcf1146a9724f08234e0177e79a5b9065fa5c2070d4d93b799990ecbeccde"
+    },
+    {
+      "file": "spec/conformance/suites/resource/dos_amplification.test",
+      "sha256": "f9d73d7204f50de841894688dde7ef831f5673b247e9edae7effbcbe6f865315"
+    },
+    {
+      "file": "spec/conformance/suites/resource/json_depth_limit.test",
+      "sha256": "a9979136c44e5b33f902f97362ef7aed4d1acdb75959399700ee6fa0dc4c81f3"
+    },
+    {
+      "file": "spec/conformance/suites/resource/operand_resolution.test",
+      "sha256": "da76caf84b15fc62174d37240d8c9bd4581fe1fd04ab77dbf1aaafd696768ab3"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "sha256": "5c49375c162127195011f083f729a97635e6dd2f4175237701aaadadc65c488b"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "sha256": "5d5dbb932955b751e0970ae5e6ec825f8eef8ee4e87dbfca12dfc60526872fd1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "sha256": "517f219b4af9305f56f8cebeae6d0e3a860a223e90c74ad4f1fe4b4c115fc60a"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "sha256": "4c16d372e2c8a1953014e1dc329b2aa838c472a08a72ef67b76f17bcca8f0df1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/view_depth_limit.test",
+      "sha256": "112a5c30fc5e03f149b3e86613d3f6cb214e9e7f1022af1f8b97dbde76baf946"
+    },
+    {
+      "file": "spec/conformance/suites/resource/view_expansion_limit.test",
+      "sha256": "9395fa53a79c5373b513fd395819e7a466210fc4b87f5d59e74622830ea63385"
+    }
+  ]
+}
