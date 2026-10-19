@@ -1,6 +1,7 @@
 // Shared Node/browser workloads. Setup, validation comparisons and timer probes are outside
 // latency samples. Both boundaries include the same complete drain and typed fingerprint.
 import type { Value } from "../../../impl/ts/src/value.ts";
+import type { RuntimeLimits } from "../../../impl/ts/src/async/protocol.ts";
 
 export type Boundary = "direct" | "worker";
 export type HeavyConfig = {
@@ -14,6 +15,25 @@ export type HeavyConfig = {
   cases: string[];
 };
 const CASE_IDS = ["decimal-aggregate", "resident-join-group", "sort-top100", "typed-output"];
+
+// Experimental transport settings belong to the benchmark, not the production defaults.
+export function heavyRuntimeFrom(
+  settings: Record<string, string | undefined>,
+): Partial<Pick<RuntimeLimits, "maxBatchRows" | "maxBatchBytes">> {
+  const overrides: Partial<Pick<RuntimeLimits, "maxBatchRows" | "maxBatchBytes">> = {};
+  for (const [suffix, key] of [
+    ["BATCH_ROWS", "maxBatchRows"],
+    ["BATCH_BYTES", "maxBatchBytes"],
+  ] as const) {
+    const name = `JED_ASYNC_HEAVY_${suffix}`;
+    if (settings[name] === undefined) continue;
+    const value = Number(settings[name]);
+    if (!Number.isSafeInteger(value) || value <= 0)
+      throw new Error(`${name} must be a positive safe integer`);
+    overrides[key] = value;
+  }
+  return overrides;
+}
 
 export function heavyConfigFrom(settings: Record<string, string | undefined>): HeavyConfig {
   const integer = (suffix: string, fallback: number, minimum = 1) => {
