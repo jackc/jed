@@ -1,5 +1,8 @@
 # Ruby query-shape optimization pass
 
+The subsequent [scalar pass](SCALAR_FOLLOWUP.md) addresses the cheap-query
+overhead measured here. These tables retain this pass's original measurements.
+
 This explicitly requested continuation makes the canonical memory filtered scan
 and aggregate about **3.1× faster**, grouping **2.8× faster**, and sort-and-limit
 **1.9× faster** on Ruby 4.0.7 YJIT. Across the tested YJIT/ZJIT modes, all six

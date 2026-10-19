@@ -104,7 +104,8 @@ module NativeRubyCompare
     phase = ENV.fetch('RUBY_NATIVE_PHASE', 'baseline')
     raise 'invalid phase name' unless phase.match?(/\A[a-zA-Z0-9_-]+\z/)
 
-    plan_json = File.binread(File.join(SOURCES, 'plan.json'))
+    plan_path = File.expand_path(ENV.fetch('RUBY_NATIVE_COMPARE_PLAN', File.join(SOURCES, 'plan.json')))
+    plan_json = File.binread(plan_path)
     plan = JSON.parse(plan_json)
     statuses = build(lanes)
     statuses.each { |lane, status| warn "compare #{lane}: #{status[:status]}#{status[:status] == 'ready' ? '' : "\n#{status[:detail]}"}" }
@@ -155,7 +156,7 @@ module NativeRubyCompare
     FileUtils.mkdir_p(RESULTS)
     artifact = File.join(RESULTS, "#{phase}#{verify ? '-verify' : ''}.json")
     report = { schema: 1, phase: phase, verification_only: verify, created_at: Time.now.utc.iso8601,
-               host: host, plan_sha256: Digest::SHA256.hexdigest(plan_json), plan: plan,
+               host: host, plan_path: plan_path, plan_sha256: Digest::SHA256.hexdigest(plan_json), plan: plan,
                ruby_source: ENV.fetch('RUBY_NATIVE_SOURCE', File.join(ROOT, 'impl/ruby-native')),
                statuses: statuses, results: results, resources: resources }
     report[:ruby_source_sha256] = source_hash
