@@ -1,0 +1,20 @@
+{
+  "command": [
+    "ruby",
+    "/tmp/jed-ruby-limit-cost-probe.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 52166656,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 60.0,
+  "elapsed_seconds": 0.2586985109956004,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "0b92c137f1f0aa27bea74afee8408d9751a0c8baaf5d63ad45ed7ccf84d255b7",
+  "final_source_sha256": "0b92c137f1f0aa27bea74afee8408d9751a0c8baaf5d63ad45ed7ccf84d255b7",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\n  \"SELECT id, score * 3 + bucket FROM items WHERE bucket >= $1 ORDER BY id LIMIT 20\": {\n    \"execute\": [\n      106,\n      112,\n      118,\n      124,\n      138\n    ],\n    \"query\": [\n      106,\n      112,\n      118,\n      124,\n      138\n    ],\n    \"execute_prepared\": [\n      106,\n      112,\n      118,\n      124,\n      138\n    ],\n    \"query_prepared\": [\n      106,\n      112,\n      118,\n      124,\n      138\n    ],\n    \"wrapper\": [\n      106,\n      112,\n      118,\n      124,\n      138\n    ]\n  },\n  \"SELECT id, score * 3 + bucket FROM items WHERE bucket >= $1 ORDER BY id LIMIT 20 OFFSET 500\": {\n    \"execute\": [\n      1106,\n      1222,\n      1366,\n      1556,\n      1802\n    ],\n    \"query\": [\n      1106,\n      1222,\n      1366,\n      1556,\n      1802\n    ],\n    \"execute_prepared\": [\n      1106,\n      1222,\n      1366,\n      1556,\n      1802\n    ],\n    \"query_prepared\": [\n      1106,\n      1222,\n      1366,\n      1556,\n      1802\n    ],\n    \"wrapper\": [\n      1106,\n      1222,\n      1366,\n      1556,\n      1802\n    ]\n  }\n}\n",
+  "stderr": ""
+}

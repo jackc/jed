@@ -1,0 +1,313 @@
+{
+  "files": 679,
+  "records": 20267,
+  "passed": 20221,
+  "failed": 46,
+  "unsupported_files": 0,
+  "skipped_files": 2,
+  "timed_out_files": 0,
+  "memory_limited_files": 0,
+  "omitted_failure_details": 0,
+  "failures": [
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 33,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 2796 bytes",
+      "sql": "SELECT a.id, b.v FROM t a, t b"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 123,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 192 bytes",
+      "sql": "SELECT g FROM generate_series(1, 3) g"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 135,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 195 bytes",
+      "sql": "SELECT * FROM (VALUES (1, 'x'), (2, 'yy')) v(a, b)"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 206,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 515 bytes",
+      "sql": "SELECT id, v, row_number() OVER (ORDER BY id) FROM t"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 226,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 128 bytes",
+      "sql": "SELECT id, (SELECT count(*) FROM t i WHERE i.id <= o.id % 3) FROM n o ORDER BY id DESC"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 247,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 384 bytes",
+      "sql": "SELECT id, EXISTS (SELECT 1 FROM t i WHERE i.id = o.id % 4) FROM n o ORDER BY id DESC"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "line": 269,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 1 bytes",
+      "sql": "SELECT id, v FROM t ORDER BY id DESC LIMIT 2"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 34,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 84 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 42,
+      "error": "JedNative::Error: 25P02: transaction is aborted",
+      "sql": "UPDATE t SET v = 'cccccccccc' WHERE id = 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 46,
+      "error": "JedNative::Error: 25P02: transaction is aborted",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 52,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 75,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 94 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 81,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 108,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 63 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 114,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 139,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 74 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 145,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 168,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 53 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 174,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 196,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 32 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 261,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 32 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 302,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 12197 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 308,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 329,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 70 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 335,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 356,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 74 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 362,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 396,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 105 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 402,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 410,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 53 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 416,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 428,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 74 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 434,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 446,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 53 bytes",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "line": 452,
+      "error": "RuntimeError: expected 54P05, got 25P02",
+      "sql": "SELECT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "line": 123,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 548 bytes",
+      "sql": "SELECT id, json_agg(v) OVER (ORDER BY id) FROM t ORDER BY id"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "line": 139,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 896 bytes",
+      "sql": "SELECT id, count(*) OVER (PARTITION BY g) FROM n"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "line": 197,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 387 bytes",
+      "sql": "SELECT id, v FROM t ORDER BY v"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "line": 213,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 129 bytes",
+      "sql": "SELECT id, v FROM t ORDER BY v LIMIT 1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "line": 238,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 192 bytes",
+      "sql": "SELECT id FROM n"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "line": 254,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 192 bytes",
+      "sql": "SELECT g, sum(id) FROM n GROUP BY g"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "line": 28,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 528 bytes",
+      "sql": "SELECT id, s FROM c ORDER BY s COLLATE \"unicode\", id"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "line": 57,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 688 bytes",
+      "sql": "SELECT id, row_number() OVER (ORDER BY s COLLATE \"unicode\") FROM c"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "line": 87,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 864 bytes",
+      "sql": "SELECT id, lag(s, 3) OVER (ORDER BY id) FROM d"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "line": 105,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 864 bytes",
+      "sql": "SELECT id, first_value(s) OVER (ORDER BY id ROWS BETWEEN 3 FOLLOWING AND 3 FOLLOWING) FROM d"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "line": 123,
+      "error": "JedNative::Error: 54P05: query memory exceeded the limit of 864 bytes",
+      "sql": "SELECT id, count(s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM d"
+    }
+  ],
+  "scalar_cursor_records": 664,
+  "compiled_kernels": 3087,
+  "compiled_pipelines": 2216,
+  "execute_api_records": 0,
+  "query_api_records": 20087,
+  "materialized_memory_records": 0,
+  "mode": "memory",
+  "filter": "",
+  "started_at": "2026-10-19T16:24:48Z",
+  "query_api": "query",
+  "query_memory_api": "query",
+  "compilation": "immediate",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "ruby_executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "jit": "yjit",
+  "corpus_root": "/home/jack/.codex/worktrees/b8e6/jed/spec/conformance/suites",
+  "available_records": 20135,
+  "source_sha256": "e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e",
+  "worker_memory_bytes": 536870912,
+  "worker_timeout_seconds": 10.0,
+  "worker_address_space_bytes": 2147483648,
+  "peak_worker_rss_bytes": 175935488,
+  "finished_at": "2026-10-19T16:27:19Z",
+  "final_source_sha256": "e717a4cc8d51ac2d139bde06ab6f58c288aaf8f5510ea112eb4317cef83ab97e"
+}

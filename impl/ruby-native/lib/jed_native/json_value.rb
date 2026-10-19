@@ -153,11 +153,16 @@ module JedNative
       else Types.compare(a, b)
       end
     end
-    def self.contains_node?(a, b, top: true)
+    def self.contains_node?(a, b, top: true, depth: 0)
+      # A legal 256-level JSON value must also fit while evaluating on a
+      # cursor's smaller VM stack. Containment cannot yield a query row; a
+      # fresh stack preserves its short-circuit order without growing Ruby's
+      # process-wide Fiber stack setting or changing the JSON depth limit.
+      return Fiber.new { contains_node?(a, b, top: top) }.resume if depth >= 24
       if a.is_a?(Hash) && b.is_a?(Hash)
-        b.all? { |k, v| a.key?(k) && node_rank(a[k]) == node_rank(v) && contains_node?(a[k], v, top: false) }
+        b.all? { |k, v| a.key?(k) && node_rank(a[k]) == node_rank(v) && contains_node?(a[k], v, top: false, depth: depth + 1) }
       elsif a.is_a?(Array)
-        if b.is_a?(Array) then b.all? { |v| a.any? { |u| node_rank(u) == node_rank(v) && contains_node?(u, v, top: false) } }
+        if b.is_a?(Array) then b.all? { |v| a.any? { |u| node_rank(u) == node_rank(v) && contains_node?(u, v, top: false, depth: depth + 1) } }
         else top && a.any? { |u| !u.is_a?(Array) && !u.is_a?(Hash) && compare_nodes(u, b).zero? }
         end
       else compare_nodes(a, b).zero?

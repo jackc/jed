@@ -848,10 +848,12 @@ module JedNative
               charge(0)
               @cost += 1
               @lifetime_cost += 1
+              @cursor_session.engine.instance_variable_set(:@lifetime_cost, @lifetime_cost) if @cursor_session
             end
           else
             @cost += results.length
             @lifetime_cost += results.length
+            @cursor_session.engine.instance_variable_set(:@lifetime_cost, @lifetime_cost) if @cursor_session
           end
         end
         profile_checkpoint(:root) if @explain_profile_frames

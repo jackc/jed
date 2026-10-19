@@ -24,7 +24,10 @@ The [runtime compilation follow-up](COMPILED_FOLLOWUP.md) measures generated Rub
 expression methods inside reusable plans, including direct YJIT/ZJIT evidence.
 The [pipeline follow-up](PIPELINE_FOLLOWUP.md) extends that compiler into eligible
 single-table scan/filter/projection loops, preserving lazy LIMIT/OFFSET behavior.
-It also records existing lazy-API conformance gaps and a multi-page LIMIT cost defect.
+It also records lazy-API failures and a multi-page LIMIT cost defect found during
+that audit. The [correctness follow-up](CORRECTNESS_FOLLOWUP.md) fixes the metadata,
+stack-depth, and cost defects and distinguishes materialized-memory corpus
+expectations from lazy collector thresholds.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
@@ -158,6 +161,8 @@ RUBY_NATIVE_COMPARE_PLAN=bench/ruby-native/compare/scalar-plan.json \
   RUBY_NATIVE_PHASE=scalar-local mise run ruby-native:compare
 # Exercise the lazy API against expression-corpus expectations:
 JED_NATIVE_QUERY_API=query mise run ruby-native:conformance expr/
+# Mixed audit: finite query-memory fixtures retain their materialized drive:
+JED_NATIVE_QUERY_API=query JED_NATIVE_QUERY_MEMORY_API=execute mise run ruby-native:conformance
 # Force generated expression admission in one-shot conformance statements:
 JED_NATIVE_COMPILATION=immediate mise run ruby-native:conformance
 # Expanded runtime-compilation comparison (explicit opt-in):
@@ -177,7 +182,10 @@ files separately. It does not declare capability parity or hide missing features
 It uses eager `execute` by default. `JED_NATIVE_QUERY_API=query` explicitly selects
 lazy cursors, drains within the error boundary, and records how many statements
 use the scalar cursor. Finite query-memory fixtures describe eager collection
-thresholds and may need separate expectations for the lazy API.
+thresholds. `JED_NATIVE_QUERY_MEMORY_API=execute` explicitly routes those fixtures
+to the materialized API and reports the routing counts; this is a mixed audit,
+not a full pure-query pass. Lazy collectors have separate host tests described in
+the [correctness follow-up](CORRECTNESS_FOLLOWUP.md).
 Each corpus file runs in a separate child, sequentially, with a 512 MiB sampled
 process-group RSS ceiling, a hard 1 GiB address-space ceiling, and a 10-second
 deadline. The larger address-space ceiling accommodates Ruby's unused virtual

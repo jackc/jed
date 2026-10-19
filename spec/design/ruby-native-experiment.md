@@ -38,13 +38,13 @@ The separately requested runtime compilation experiment is described in
 handwritten emitter for resolved expressions and eligible single-table row loops;
 it does not permit evaluating SQL text as Ruby or introducing a native engine dependency.
 
-The pipeline follow-up records a pre-existing cost gap against source revision
-`627cbb631e3a922999c3a0cb3bcba32136fcb345`: ordered streaming scans over multiple
-pages charge visited structural pages under LIMIT/OFFSET rather than the canonical
-complete bounded page block. This is an experimental implementation defect, not a
-change to the shared cost contract. See
-[`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md).
-The full lazy-API audit in that report reproduces 71 unchanged failures from the
-same baseline. It separates API-dependent collector thresholds from remaining
-resolution/metadata, stack-depth, and correlated-subquery cost gaps. Passing the
-eager corpus does not establish complete lazy-API conformance.
+The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
+records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
+at source revision `627cbb631e3a922999c3a0cb3bcba32136fcb345`. The explicitly
+requested [`CORRECTNESS_FOLLOWUP.md`](../../impl/ruby-native/CORRECTNESS_FOLLOWUP.md)
+fixes the ordered scan page block, correlated output/lifetime accounting,
+resolution/metadata, and stack-depth defects without changing shared contracts.
+It preserves the original evidence and separates materialized-executor memory
+expectations from lazy host-collector thresholds. Optional mixed audits explicitly
+route finite query-memory fixtures to `execute` and report their counts; a passing
+mixed audit does not establish a full pure-query conformance pass.

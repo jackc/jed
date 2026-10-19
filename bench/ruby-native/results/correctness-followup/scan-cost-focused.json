@@ -1,0 +1,21 @@
+{
+  "command": [
+    "ruby",
+    "-Iimpl/ruby-native/lib",
+    "impl/ruby-native/test/scan_cost_test.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 43327488,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 60.0,
+  "elapsed_seconds": 0.41163591100485064,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "2307f16dd5064a915f25cbee2a28c49ea85ac0f8641404e84516a11bcb4186c3",
+  "final_source_sha256": "2307f16dd5064a915f25cbee2a28c49ea85ac0f8641404e84516a11bcb4186c3",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "ruby-native scan cost: full bound blocks, lazy row access, payload slabs and correlated budget prefixes passed\n",
+  "stderr": ""
+}
