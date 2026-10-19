@@ -11,12 +11,15 @@ module JedNative
     end
 
     def fetch(key)
-      cached, generation = @mutex.synchronize do
+      generation = nil
+      @mutex.synchronize do
         value = @entries.delete(key)
-        @entries[key] = value if value
-        [value, @generation]
+        if value
+          @entries[key] = value
+          return value
+        end
+        generation = @generation
       end
-      return cached if cached
       value = yield
       @mutex.synchronize do
         # A concurrent publication may invalidate a reused page while it is

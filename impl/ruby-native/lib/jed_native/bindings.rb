@@ -71,13 +71,14 @@ module JedNative
     end
 
     def bind(values)
-      values.each_with_index.map do |value, index|
+      Array.new(values.length) do |index|
+        value = values[index]
         if value.nil? && @not_null[index]
           raise Error.new('23502', 'NULL parameter assigned to a NOT NULL column')
         end
         result = coerce(value, @types[index])
-        (@modifiers[index] || []).each do |mod|
-          result = @engine.send(:explicit_modifier, result, @types[index], mod)
+        if (modifiers = @modifiers[index])
+          modifiers.each { |mod| result = @engine.send(:explicit_modifier, result, @types[index], mod) }
         end
         result
       end
@@ -107,7 +108,12 @@ module JedNative
         return CompositeValue.new(fields.each_with_index.map { |field, i| coerce(value[i], field[:type]) }, type_name: type, field_names: fields.map { |field| field[:name] })
       end
       valid = case type
-      when 'i16', 'i32', 'i64' then value.is_a?(Integer)
+      when 'i16', 'i32', 'i64'
+        # Host integers already have their resolved SQL type. The remaining
+        # conversion is its exact range check; temporal/container cast layers
+        # neither transform nor meter this case.
+        return Types.check_integer(value, type) if value.is_a?(Integer)
+        false
       when 'decimal' then value.is_a?(Integer) || value.is_a?(Decimal)
       when 'f32', 'f64' then value.is_a?(Integer) || value.is_a?(Decimal) || value.is_a?(Float)
       when 'boolean' then value == true || value == false

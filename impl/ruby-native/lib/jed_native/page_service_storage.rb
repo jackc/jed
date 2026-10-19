@@ -25,7 +25,9 @@ module JedNative
       service_ensure_role
       @service_remote ? :client : :owner
     end
-    def service_generation = [@service_epoch, !!@service_remote&.connection&.failure]
+    # An internal equality token, not a wire/file field. Keep failure live: a
+    # disconnected client invalidates its cursors before role reselection.
+    def service_generation = (@service_epoch << 1) | (@service_remote&.connection&.failure ? 1 : 0)
     def service_finish_open
       ensure_pid
       @service_remote&.finish_open

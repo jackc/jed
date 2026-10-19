@@ -1,0 +1,23 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/lookup_profile.rb",
+    "--report",
+    "bench/ruby-native/results/lookup-second-pass/final-profile.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 349372416,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 3.1297153039995464,
+  "source": "/tmp/jed-ruby-lookup-second-complete",
+  "source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "final_source_sha256": "00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\n  \"schema\": 1,\n  \"mode\": \"primary_key_diagnostic\",\n  \"created_at\": \"2026-10-19T02:26:08Z\",\n  \"ruby\": \"ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]\",\n  \"ruby_executable\": \"/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby\",\n  \"ruby_executable_sha256\": \"4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194\",\n  \"jit\": \"yjit\",\n  \"source\": \"/tmp/jed-ruby-lookup-second-complete\",\n  \"source_sha256\": \"00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3\",\n  \"final_source_sha256\": \"00fa6ca66444430c9715160c1a59c6d00c6432a4f83a810fb2b8e0b3a1041ae3\",\n  \"script_sha256\": \"af8e37042a2fbc2a8b4d27ec0c4277994082f9a7a9fa74972c3fd6a63b627586\",\n  \"sql\": \"SELECT id, customer_id, amount, note FROM orders WHERE id = $1\",\n  \"seed\": 4201,\n  \"locking\": \"exclusive\",\n  \"options\": {\n    \"warmup\": 50000,\n    \"iterations\": 5000,\n    \"repetitions\": 5,\n    \"trace\": 100,\n    \"report\": \"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/lookup-second-pass/final-profile.json\"\n  },\n  \"notes\": [\n    \"Canonical SQL/data/parameter stream; shorter diagnostic batches with additional timer and result checks.\",\n    \"Setup includes lazy cursor construction; drain includes execution, host row conversion, and benchmark checksum.\",\n    \"TracePoint runs after timing. Call counts are diagnostic; traced timings are never used as performance measurements.\"\n  ],\n  \"samples\": [\n    {\n      \"total_ns\": 118895143,\n      \"ns_per_query\": 23779.0286,\n      \"setup_ns_per_query\": 4654.7794,\n      \"drain_ns_per_query\": 18991.5036,\n      \"allocations_per_query\": 201.1216,\n      \"gc_count\": 6,\n      \"checksum\": \"528290051ed4faf6\"\n    },\n    {\n      \"total_ns\": 122712536,\n      \"ns_per_query\": 24542.5072,\n      \"setup_ns_per_query\": 4804.0672,\n      \"drain_ns_per_query\": 19662.2436,\n      \"allocations_per_query\": 200.8708,\n      \"gc_count\": 5,\n      \"checksum\": \"2896d2e7b8da6bf2\"\n    },\n    {\n      \"total_ns\": 157261450,\n      \"ns_per_query\": 31452.29,\n      \"setup_ns_per_query\": 5356.8336,\n      \"drain_ns_per_query\": 26018.3994,\n      \"allocations_per_query\": 200.4792,\n      \"gc_count\": 6,\n      \"checksum\": \"91eaad109dab4489\"\n    },\n    {\n      \"total_ns\": 126480299,\n      \"ns_per_query\": 25296.0598,\n      \"setup_ns_per_query\": 4882.592,\n      \"drain_ns_per_query\": 20336.4012,\n      \"allocations_per_query\": 200.8526,\n      \"gc_count\": 5,\n      \"checksum\": \"d234a8f0208e43f6\"\n    },\n    {\n      \"total_ns\": 125001255,\n      \"ns_per_query\": 25000.251,\n      \"setup_ns_per_query\": 4751.0708,\n      \"drain_ns_per_query\": 20171.728,\n      \"allocations_per_query\": 200.8498,\n      \"gc_count\": 5,\n      \"checksum\": \"6ebc57008d506eb8\"\n    }\n  ],\n  \"crc_calls_per_query\": {\n    \"crc32\": 0.0,\n    \"crc64\": 0.0,\n    \"page_crc\": 0.0,\n    \"meta_crc\": 0.0\n  }\n}\n",
+  "stderr": ""
+}
