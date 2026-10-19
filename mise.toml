@@ -106,11 +106,15 @@ run = ["ruby impl/ruby-native/tools/generate_catalog.rb", "ruby impl/ruby-native
 
 [tasks."ruby-native:test"]
 description = "Explicit opt-in: pure Ruby experimental host/storage tests"
-run = "ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].sort.each { |f| require_relative f }'"
+run = "JED_NATIVE_TIMEOUT=${JED_NATIVE_TIMEOUT:-180} ruby impl/ruby-native/tools/run_bounded.rb ruby -Iimpl/ruby-native/lib -e 'Dir[\"impl/ruby-native/test/*_test.rb\"].sort.each { |f| require_relative f }'"
 
 [tasks."ruby-native:storage-test"]
 description = "Explicit opt-in: experimental Ruby storage byte and durability tests"
 run = "ruby impl/ruby-native/test/storage_test.rb"
+
+[tasks."ruby-native:regex-test"]
+description = "Explicit opt-in: Ruby regex bytecode, costs and compact input checks"
+run = "ruby -Iimpl/ruby-native/lib -e 'require_relative \"impl/ruby-native/test/regex_test\"; require_relative \"impl/ruby-native/test/regex_memory_test\"'"
 
 [tasks."ruby-native:rewrite-test"]
 description = "Explicit opt-in: experimental Ruby backup and compaction tests"
@@ -129,8 +133,8 @@ description = "Explicit opt-in: build the existing Go process actor for Ruby int
 run = "cd impl/go && go build -o process_actor ./cmd/process_actor"
 
 [tasks."ruby-native:process"]
-description = "Explicit opt-in: shared process corpus including experimental Ruby"
-run = "JED_PROCESS_CORES=${JED_PROCESS_CORES:-ruby-native,go} ruby scripts/process_conformance.rb"
+description = "Explicit opt-in: bounded sequential process corpus including experimental Ruby"
+run = "JED_PROCESS_CORES=${JED_PROCESS_CORES:-ruby-native,go} JED_PROCESS_JOBS=1 JED_NATIVE_TIMEOUT=${JED_NATIVE_TIMEOUT:-1800} JED_NATIVE_MEMORY_BYTES=${JED_NATIVE_MEMORY_BYTES:-536870912} JED_NATIVE_ADDRESS_SPACE_BYTES=${JED_NATIVE_ADDRESS_SPACE_BYTES:-4294967296} ruby impl/ruby-native/tools/run_bounded.rb ruby scripts/process_conformance.rb"
 
 [tasks."ruby-native:domains-test"]
 description = "Explicit opt-in: experimental Ruby attachment lifecycle and independent durability tests"
@@ -162,6 +166,11 @@ run = "ruby bench/ruby-native/compare.rb"
 description = "Explicit opt-in: validate preliminary benchmark answers without measuring timings"
 run = "ruby bench/ruby-native/compare.rb --verify-only"
 
+[tasks."ruby-native:file-compare"]
+description = "Explicit opt-in: prepare real-file benchmark adapters; --run measures canonical workloads"
+usage = 'arg "[args]..." var=#true help="Use --prepare-only (default), --run, or --help"'
+run = 'ruby bench/ruby-native/file_compare.rb'
+
 [tasks."ruby-native:storage-bench"]
 description = "Explicit opt-in: experimental Ruby CRC and durable snapshot microbenchmarks"
 run = "ruby bench/ruby-native/storage_bench.rb"
@@ -176,8 +185,8 @@ run = "ruby bench/ruby-native/setup.rb"
 
 [tasks."ruby-native:bench:smoke-go"]
 description = "Explicit opt-in: canonical Go one-execution checksums for the full Ruby benchmark smoke"
-usage = 'flag "--compare-only" help="Compare recorded smoke results without rerunning Go"'
-run = 'ruby bench/ruby-native/shared_go_smoke.rb ${usage_compare_only:+--compare-only}'
+usage = 'arg "[args]..." var=#true help="Use --compare-only and repeated --attempt STATUS_PATH to merge recorded attempts; --help lists options"'
+run = 'ruby bench/ruby-native/shared_go_smoke.rb'
 
 [tasks."ruby-native:interop"]
 description = "Explicit opt-in: actual Ruby/Go durable file handoff using only local core dependencies"
@@ -877,3 +886,15 @@ run = "go test -race -run 'Test.*(Cancel|Ergo|Streaming|Deferred|Drain|HostFunc)
 [tasks."ruby-native:durability-test"]
 description = "Opt-in experimental Ruby batched durability checks"
 run = "ruby impl/ruby-native/test/durability_test.rb"
+
+[tasks."ruby-native:storage-operations-test"]
+description = "Opt-in experimental Ruby storage operation host checks"
+run = "ruby impl/ruby-native/test/storage_operations_test.rb"
+
+[tasks."ruby-native:process:rust-build"]
+description = "Build the existing Rust actor for opt-in Ruby page-service interoperability"
+run = "cargo build --offline --release --bin process_actor --manifest-path impl/rust/Cargo.toml"
+
+[tasks."ruby-native:bounded"]
+description = "Run one opt-in experimental Ruby command with enforced process-group limits"
+run = "ruby impl/ruby-native/tools/run_bounded.rb"

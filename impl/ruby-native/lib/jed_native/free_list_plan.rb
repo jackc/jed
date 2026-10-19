@@ -5,7 +5,7 @@ module JedNative
   class FreeListPlan
     COMPACT_MIN_PAGES = 16
     COMPACT_GROWTH = 2
-    attr_reader :free, :head, :live_at_compaction, :protected
+    attr_reader :free, :head, :live_at_compaction, :protected, :compacted
 
     def initialize(codec, commit, page_size, previous_live, txid, slot, truncate: true, reclaim: true, pending: {}, deferred_free: [])
       @codec, @pages, @page_size = codec, commit.pages, page_size
@@ -13,6 +13,7 @@ module JedNative
       safe = commit.allocator.remaining
       unlisted = high - safe.length
       compact = reclaim && (previous_live.zero? || unlisted > COMPACT_MIN_PAGES && unlisted > COMPACT_GROWTH * previous_live)
+      @compacted = compact
       candidates = if compact
         reached = commit.live_pages | @pages.pages.keys.to_set | pending.keys.to_set
         (2...high).reject { |page| reached.include?(page) }

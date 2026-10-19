@@ -4,14 +4,14 @@
 # Explicit-only pure Ruby core adapter for the existing shared benchmark corpus.
 # Harness dependencies stay in development tooling; the core loads none of them.
 $LOAD_PATH.unshift(File.expand_path('../ruby/lib', __dir__))
-$LOAD_PATH.unshift(File.expand_path('../../impl/ruby-native/lib', __dir__))
+$LOAD_PATH.unshift(File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('../../impl/ruby-native', __dir__)), 'lib'))
 
 require 'fileutils'
 require 'tmpdir'
-require 'timeout'
 require 'bench'
 require 'jed_native'
 require_relative 'source'
+require_relative '../../impl/ruby-native/tools/bounded_process'
 
 module NativeRubyBench
   Parameter = Struct.new(*Bench::Param.members, :elem_min, :elem_max)
@@ -47,18 +47,36 @@ module NativeRubyBench
 
   class Engine
     attr_reader :database
-    def initialize(db, data_dir, dataset, scratch_dir = nil)
+    def initialize(db, data_dir, dataset, scratch_dir = nil, &on_close)
       @database, @db, @data_dir, @dataset, @scratch_dir = db, db.session, data_dir, dataset, scratch_dir
+      @on_close = on_close
       @closed = false
     end
 
-    def exec(sql) = @db.execute(sql)
-    def prepare(sql) = (@statement = @db.prepare(sql))
-    def exec_prepared(args) = @db.execute_prepared(@statement, *args)
+    def exec(sql)
+      smoke_progress(sql)
+      @db.execute(sql)
+    end
+    def prepare(sql)
+      smoke_progress(sql)
+      @statement_sql = sql
+      @statement = @db.prepare(sql)
+    end
+    def exec_prepared(args)
+      smoke_progress(@statement_sql)
+      @db.execute_prepared(@statement, *args)
+    end
     def query_int(sql) = @db.query(sql).rows.first.first
     def stored_fingerprint = Bench.read_sidecar(@data_dir, @dataset, 'jed')
 
+    def smoke_progress(sql)
+      path = ENV['JED_NATIVE_BREADCRUMB']
+      return unless ENV['RUBY_NATIVE_BENCH_SMOKE'] == '1' && path
+      File.write(path, JSON.generate(sql: sql.byteslice(0, 4096), sql_original_bytes: sql.bytesize))
+    end
+
     def query_prepared(args, sum)
+      smoke_progress(@statement_sql)
       self.class.drain(@db.query_prepared(@statement, *args), sum)
     end
 
@@ -85,9 +103,13 @@ module NativeRubyBench
       return if @closed
 
       @closed = true
-      @db.close
-      @database.close
+      begin
+        @db.close
+      ensure
+        @database.close
+      end
     ensure
+      @on_close&.call(self)
       FileUtils.remove_entry(@scratch_dir) if @scratch_dir && File.directory?(@scratch_dir)
     end
   end
@@ -162,8 +184,17 @@ module NativeRubyBench
     corpus_dir, data_dir, out_path, filter = ARGV
     filter ||= ''
     smoke = ENV['RUBY_NATIVE_BENCH_SMOKE'] == '1'
-    timeout = Integer(ENV.fetch('RUBY_NATIVE_BENCH_TIMEOUT', '60'))
-    source = File.expand_path('../../impl/ruby-native', __dir__)
+    timeout = Integer(ENV.fetch('RUBY_NATIVE_BENCH_TIMEOUT', smoke ? '60' : '1800'))
+    memory_bytes = Integer(ENV.fetch('RUBY_NATIVE_MEMORY_BYTES', JedNativeTools::BoundedProcess::DEFAULT_MEMORY_BYTES.to_s))
+    address_space_bytes = Integer(ENV.fetch('RUBY_NATIVE_ADDRESS_SPACE_BYTES', (memory_bytes * 2).to_s))
+    work_mem = Integer(ENV.fetch('RUBY_NATIVE_WORK_MEM', JedNative::WorkMemory::DEFAULT_WORK_MEM.to_s))
+    raise 'work_mem must be nonnegative' if work_mem.negative?
+    selected_names = ENV['RUBY_NATIVE_BENCH_NAMES']&.split(',')
+    source = ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('../../impl/ruby-native', __dir__))
+    jit = if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled? then 'yjit'
+          elsif defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled? then 'zjit'
+          else 'interpreter'
+          end
     source_hash = NativeRubySource.digest(source)
     fingerprint = Bench.corpus_fingerprint(corpus_dir)
     handles = []
@@ -171,25 +202,33 @@ module NativeRubyBench
       [entry.fetch('name'), entry]
     end
     synchronous = :on
-    config = { engine: 'jed', lang: 'ruby-native', variant: 'core', open: lambda do |dir, dataset|
+    config = { engine: 'jed', lang: 'ruby-native', variant: jit, open: lambda do |dir, dataset|
       scratch = dataset == 'scratch' ? Dir.mktmpdir('scratch-ruby-native-', dir) : nil
       path = scratch ? File.join(scratch, 'scratch.jed') : File.join(dir, "#{dataset}.jed")
-      options = { environment: environment, synchronous: synchronous }
-      db = scratch ? JedNative.create(path, **options) : JedNative.open(path, **options)
-      engine = Engine.new(db, dir, dataset, scratch)
-      handles << engine
-      engine
+      options = { environment: environment, synchronous: synchronous, locking: :exclusive, work_mem: work_mem }
+      begin
+        db = scratch ? JedNative.create(path, **options) : JedNative.open(path, **options)
+        engine = Engine.new(db, dir, dataset, scratch) { |closed| handles.delete(closed) }
+        handles << engine
+        engine
+      rescue Exception
+        db&.close
+        FileUtils.remove_entry(scratch) if scratch && File.directory?(scratch)
+        raise
+      end
     end }
     outcomes = []
     File.open(out_path, 'w') do |output|
       Bench.load_corpus(corpus_dir).each do |workload|
         next unless workload.runs_on?('jed') && workload.name.include?(filter)
+        next if selected_names && !selected_names.include?(workload.name)
         workload.params = workload.params.each_with_index.map do |parameter, index|
           raw = workload_data.fetch(workload.name).fetch('param', []).fetch(index)
           Parameter.new(*parameter.to_a, raw['elem_min'], raw['elem_max'])
         end
 
         synchronous = workload.relaxed ? :off : :on
+        worker = nil
         begin
           warn "jed/ruby-native/core: #{workload.name} (#{workload.dataset}) ..."
           if workload.dataset != 'scratch' && Bench.read_sidecar(data_dir, workload.dataset, 'jed') != fingerprint
@@ -197,43 +236,67 @@ module NativeRubyBench
           end
           execution = workload.dup
           execution.warmup, execution.iterations = 0, 1 if smoke
-          run = lambda do
-            if workload.kind == 'concurrent_read'
-              run_concurrent(config, execution, workload_data.fetch(workload.name).fetch('readers'), data_dir, fingerprint)
+          worker = JedNativeTools::BoundedProcess.run(timeout: timeout, memory_bytes: memory_bytes, address_space_bytes: address_space_bytes) do |workspace|
+            # Scratch databases belong to the supervisor's temporary directory,
+            # so forced termination cannot leave a large abandoned write file.
+            worker_dir = workload.dataset == 'scratch' ? workspace : data_dir
+            result = if workload.kind == 'concurrent_read'
+              run_concurrent(config, execution, workload_data.fetch(workload.name).fetch('readers'), worker_dir, fingerprint)
             else
-              Bench.run_one(config, execution, corpus_dir, data_dir, fingerprint)
+              Bench.run_one(config, execution, corpus_dir, worker_dir, fingerprint)
             end
+            { line: result.to_json_line(config), checksum: result.checksum, rows: result.rows_total }
+          ensure
+            handles.dup.each(&:close)
+            handles.clear
           end
-          result = smoke ? Timeout.timeout(timeout) { run.call } : run.call
+          unless worker.success?
+            reason = if worker.interrupted then "interrupted by #{worker.interrupted}"
+                     elsif worker.timed_out then "workload exceeded #{timeout} seconds"
+                     elsif worker.memory_exceeded then "workload exceeded #{memory_bytes} bytes of memory"
+                     else "#{worker.reason}: #{worker.stderr.lines.first(8).join}"
+                     end
+            raise reason
+          end
+          result = worker.value
           if smoke
-            outcomes << { bench: workload.name, status: 'smoke_pass', checksum: result.checksum,
-                          rows: result.rows_total, iterations: 1, batch: workload.batch }
+            outcomes << { bench: workload.name, status: 'smoke_pass', checksum: result.fetch('checksum'),
+                          rows: result.fetch('rows'), iterations: 1, batch: workload.batch,
+                          peak_rss_bytes: worker.peak_rss_bytes }
           else
-            output.puts(result.to_json_line(config))
+            output.puts(result.fetch('line'))
             output.flush
-            outcomes << { bench: workload.name, status: 'completed' }
+            outcomes << { bench: workload.name, status: 'completed', peak_rss_bytes: worker.peak_rss_bytes }
           end
         rescue StandardError, NotImplementedError => error
-          outcomes << { bench: workload.name, status: 'failed', reason: error.message }
+          outcomes << { bench: workload.name, status: 'failed', reason: error.message,
+                        active_sql: worker&.breadcrumb, peak_rss_bytes: worker&.peak_rss_bytes }
           warn "ruby-native: #{workload.name}: FAILED: #{error.message}"
         ensure
-          handles.each(&:close)
+          handles.dup.each(&:close)
           handles.clear
           File.write("#{out_path}.status.json", JSON.pretty_generate(outcomes) + "\n")
         end
+        break if worker&.interrupted
       end
     end
     File.write("#{out_path}.status.json", JSON.pretty_generate(outcomes) + "\n")
     File.write("#{out_path}.metadata.json", JSON.pretty_generate(
       mode: smoke ? 'single_execution_smoke_no_timings' : 'standard_benchmark',
-      ruby: RUBY_DESCRIPTION, source_sha256: source_hash,
+      ruby: RUBY_DESCRIPTION, jit: jit, source_sha256: source_hash,
       source_sha256_after: NativeRubySource.digest(source),
       dataset_fingerprint: fingerprint,
       workload_fingerprint: Digest::SHA256.file(File.join(corpus_dir, 'benchmarks.toml')).hexdigest,
-      timeout_seconds_per_workload: smoke ? timeout : nil
+      timeout_seconds_per_workload: timeout, memory_bytes_per_workload: memory_bytes,
+      address_space_bytes_per_workload: address_space_bytes,
+      work_mem_bytes: work_mem.zero? ? JedNative::WorkMemory::DEFAULT_WORK_MEM : work_mem,
+      selected_names: selected_names,
+      locking: 'exclusive',
+      isolation: 'sequential_process_per_workload'
     ) + "\n")
     counts = outcomes.group_by { |outcome| outcome[:status] }.transform_values(&:length)
     warn "ruby-native benchmark outcomes: #{counts}; details: #{out_path}.status.json"
+    raise "no workloads match #{filter.inspect}" if outcomes.empty?
     outcomes.all? { |outcome| %w[completed smoke_pass].include?(outcome[:status]) } ? 0 : 1
   rescue StandardError => error
     warn "ruby-native benchmark failed: #{error.message}"

@@ -559,7 +559,10 @@ module JedNative
 
     def view_schema(view)
       return view[:schema] if view[:schema]
-      view_query_columns(view[:query]).each_with_index.map { |column, index| column.merge(name: view[:columns]&.at(index) || column[:name]) }
+      view_query_columns(view[:query]).each_with_index.map do |column, index|
+        column.merge(name: view[:columns]&.at(index) || column[:name],
+                     type: column[:type] == 'unknown' ? 'text' : column[:type])
+      end
     end
 
     def view_query_columns(query, ctes = {}, outer = [])

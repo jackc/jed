@@ -5,6 +5,7 @@ require_relative "lz4"
 require_relative "page_buffer"
 require_relative "persistent_tree"
 require_relative "paged_rows"
+require_relative "stored_value"
 
 module JedNative
   # Experimental v49 codec. Adapted from the independently handwritten Ruby
@@ -124,6 +125,10 @@ module JedNative
     end
 
     def u16(v) = [v].pack("n")
+    def length16(bytes)
+      raise Error.new('0A000', 'encoded value exceeds its 16-bit storage length') if bytes.bytesize > 0xFFFF
+      u16(bytes.bytesize)
+    end
     def u32(v) = [v].pack("N")
     def u64(v) = [v].pack("Q>")
     
@@ -554,7 +559,7 @@ module JedNative
     # then (for a composite element) its name. v1 elements are scalars. Mutates `out`.
     def push_array_element_type(out, elem_type)
       if composite_fields(elem_type)
-        out << [14].pack("C") << u16(elem_type.bytesize) << elem_type.b
+        out << [14].pack("C") << length16(elem_type) << elem_type.b
       else
         out << [TYPECODE.fetch(elem_type)].pack("C")
       end
@@ -656,10 +661,10 @@ module JedNative
     
     def table_entry_bytes(table, root_data_page, index_roots, row_count)
       out = +"".b
-      out << u16(table[:name].bytesize) << table[:name].b
+      out << length16(table[:name]) << table[:name].b
       out << u16(table[:columns].size)
       table[:columns].each do |c|
-        out << u16(c[:name].bytesize) << c[:name].b
+        out << length16(c[:name]) << c[:name].b
         # A composite column (v9): type_code 14, flags, then the type NAME in the typmod slot
         # (spec/design/composite.md §3). A composite DEFAULT is always an expression default (v44, flags
         # bit3): its expr-text follows the type name. Bit2 (a constant default) is never set.
@@ -668,8 +673,8 @@ module JedNative
           cflags = c[:not_null] ? 0b10 : 0
           cflags |= 0b1000 if c[:default_expr]
           out << [cflags].pack("C")
-          out << u16(c[:type].bytesize) << c[:type].b
-          out << u16(c[:default_expr].bytesize) << c[:default_expr].b if c[:default_expr]
+          out << length16(c[:type]) << c[:type].b
+          out << length16(c[:default_expr]) << c[:default_expr].b if c[:default_expr]
           next
         end
         # An array column (v10): type_code 15, flags, then the element-type descriptor
@@ -682,7 +687,7 @@ module JedNative
           aflags |= 0b100_0000 if c[:collation]
           out << [aflags].pack("C")
           push_array_element_type(out, elem)
-          out << u16(c[:collation].bytesize) << c[:collation].b if c[:collation]
+          out << length16(c[:collation]) << c[:collation].b if c[:collation]
           next
         end
         # A range column (v15): type_code 17, flags, then the element-type descriptor — one scalar
@@ -728,10 +733,10 @@ module JedNative
         if has_default
           out << encode_value(c[:type], c[:default])
         elsif has_default_expr
-          out << u16(c[:default_expr].bytesize) << c[:default_expr].b
+          out << length16(c[:default_expr]) << c[:default_expr].b
         end
         # The effective collation name (v17, flags bit6) — last in the per-column entry (collation.md §5).
-        out << u16(c[:collation].bytesize) << c[:collation].b if c[:collation]
+        out << length16(c[:collation]) << c[:collation].b if c[:collation]
       end
       # The primary key (v5): count, then the member column ordinals in KEY order.
       pk = pk_order(table)
@@ -742,8 +747,8 @@ module JedNative
       checks = table[:checks] || []
       out << u16(checks.size)
       checks.each do |ck|
-        out << u16(ck[:name].bytesize) << ck[:name].b
-        out << u16(ck[:expr].bytesize) << ck[:expr].b
+        out << length16(ck[:name]) << ck[:name].b
+        out << length16(ck[:expr]) << ck[:expr].b
         # v35: check_flags (bit0 has_host_deps), then the dependency list when bit0 is set.
         check_deps = ck[:host_deps] || []
         out << [check_deps.empty? ? 0 : 1].pack("C")
@@ -755,7 +760,7 @@ module JedNative
       indexes = table[:indexes] || []
       out << u16(indexes.size)
       indexes.each_with_index do |ix, k|
-        out << u16(ix[:name].bytesize) << ix[:name].b
+        out << length16(ix[:name]) << ix[:name].b
         out << u16(ix[:cols].size)
         # Each key element is a column ordinal (u16) OR, for an EXPRESSION key (v26 — indexes.md §6),
         # the 0xFFFF sentinel + u16 length + canonical text. A fixture writes an expression element as
@@ -763,7 +768,7 @@ module JedNative
         ix[:cols].each do |c|
           if c.is_a?(Hash)
             out << u16(0xFFFF)
-            out << u16(c[:expr].bytesize) << c[:expr].b
+            out << length16(c[:expr]) << c[:expr].b
           else
             out << u16(c)
           end
@@ -782,15 +787,15 @@ module JedNative
         out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
         out << u32(index_roots[k])
         # v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
-        out << u16(ix[:predicate].bytesize) << ix[:predicate].b if ix[:predicate]
+        out << length16(ix[:predicate]) << ix[:predicate].b if ix[:predicate]
         # v31: the host-function dependency list (extensibility.md §8.1) after the predicate — only when
         # bit2 is set. Already in ascending (name, arg-type codes) order (a fixture writes them sorted).
         write_host_deps(out, host_deps) unless host_deps.empty?
         if has_timezone_deps
           out << [timezone_deps[:dynamic] ? 1 : 0].pack("C") << u16(timezone_deps[:zones].size)
           timezone_deps[:zones].each do |dep|
-            out << u16(dep[:name].bytesize) << dep[:name].b
-            out << u16(dep[:version].bytesize) << dep[:version].b
+            out << length16(dep[:name]) << dep[:name].b
+            out << length16(dep[:version]) << dep[:version].b
             out << u32(dep[:checksum])
           end
         end
@@ -805,10 +810,10 @@ module JedNative
       fks = table[:fks] || []
       out << u16(fks.size)
       fks.each do |fk|
-        out << u16(fk[:name].bytesize) << fk[:name].b
+        out << length16(fk[:name]) << fk[:name].b
         out << u16(fk[:local].size)
         fk[:local].each { |i| out << u16(i) }
-        out << u16(fk[:ref_table].bytesize) << fk[:ref_table].b
+        out << length16(fk[:ref_table]) << fk[:ref_table].b
         out << u16(fk[:ref].size)
         fk[:ref].each { |i| out << u16(i) }
         out << [fk[:actions] || 0].pack("C")
@@ -820,8 +825,8 @@ module JedNative
       exclusions = table[:exclusions] || []
       out << u16(exclusions.size)
       exclusions.each do |ex|
-        out << u16(ex[:name].bytesize) << ex[:name].b
-        out << u16(ex[:index].bytesize) << ex[:index].b
+        out << length16(ex[:name]) << ex[:name].b
+        out << length16(ex[:index]) << ex[:index].b
         out << u16(ex[:elements].size)
         ex[:elements].each do |col, op|
           out << u16(col) << [{ "&&" => 0, "=" => 1 }.fetch(op)].pack("C")
@@ -842,7 +847,7 @@ module JedNative
         col = table[:columns].fetch(s[:column])
         distribution = !s[:distinct_count].nil?
         summary = +"\x04\x00".b
-        summary << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
+        summary << length16(table[:name]) << table[:name].b << u16(s[:column])
         terms = s[:terms]
         summary << [(s[:stale] ? 1 : 0) | (distribution ? 2 : 0) | (terms ? 4 : 0)].pack("C")
         summary << [s[:analyzed_rows], s[:null_count], s[:width_sum], s[:distinct_count] || 0].pack("q>q>q>q>")
@@ -853,21 +858,21 @@ module JedNative
         s[:mcv].each_with_index do |(value, frequency), ordinal|
           encoded = encode_value(col[:type], value)
           item = +"\x04\x01".b
-          item << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
-          item << u16(ordinal) << u32(frequency) << u16(encoded.bytesize) << encoded
+          item << length16(table[:name]) << table[:name].b << u16(s[:column])
+          item << u16(ordinal) << u32(frequency) << length16(encoded) << encoded
           out << item
         end
         s[:histogram].each_with_index do |value, ordinal|
           encoded = encode_value(col[:type], value)
           item = +"\x04\x02".b
-          item << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
-          item << u16(ordinal) << u16(encoded.bytesize) << encoded
+          item << length16(table[:name]) << table[:name].b << u16(s[:column])
+          item << u16(ordinal) << length16(encoded) << encoded
           out << item
         end
         (terms ? terms[:entries] : []).each_with_index do |(term, rows), ordinal|
           item = +"\x04\x03".b
-          item << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
-          item << u16(ordinal) << [rows].pack("q>") << u16(term.bytesize) << term.b
+          item << length16(table[:name]) << table[:name].b << u16(s[:column])
+          item << u16(ordinal) << [rows].pack("q>") << length16(term) << term.b
           out << item
         end
         out
@@ -950,10 +955,10 @@ module JedNative
     # (bit0 not_null), [decimal typmod when code 6] (format.md *Composite-type entry*).
     def composite_type_entry_bytes(ct)
       out = +"".b
-      out << u16(ct[:name].bytesize) << ct[:name].b
+      out << length16(ct[:name]) << ct[:name].b
       out << u16(ct[:fields].size)
       ct[:fields].each do |f|
-        out << u16(f[:name].bytesize) << f[:name].b
+        out << length16(f[:name]) << f[:name].b
         if (elem = array_elem(f[:type]))
           # An array-typed field (spec/design/array.md §12): type_code 15 + the inline element-type
           # descriptor (§3), before the flags byte — mirroring where a nested-composite name sits.
@@ -966,7 +971,7 @@ module JedNative
         elsif TYPECODE.key?(f[:type])
           out << [TYPECODE.fetch(f[:type])].pack("C")
         else
-          out << [14].pack("C") << u16(f[:type].bytesize) << f[:type].b # nested composite, by name
+          out << [14].pack("C") << length16(f[:type]) << f[:type].b # nested composite, by name
         end
         out << [f[:not_null] ? 1 : 0].pack("C")
         out << u16(f[:precision] || 0) << u16(f[:scale] || 0) if f[:type] == "decimal"
@@ -985,7 +990,7 @@ module JedNative
     # nothing after the flags byte (spec/design/sequences.md §3/§12, format.md *Sequence entry*).
     def sequence_entry_bytes(s)
       out = +"".b
-      out << u16(s[:name].bytesize) << s[:name].b
+      out << length16(s[:name]) << s[:name].b
       out << [s[:increment]].pack("q>")
       out << [s[:min_value]].pack("q>")
       out << [s[:max_value]].pack("q>")
@@ -998,7 +1003,7 @@ module JedNative
       flags |= 0b100 if s[:owned_by]
       out << [flags].pack("C")
       if (o = s[:owned_by])
-        out << u16(o[0].bytesize) << o[0].b
+        out << length16(o[0]) << o[0].b
         out << u16(o[1])
       end
       out
@@ -1012,7 +1017,7 @@ module JedNative
     # (none for any other kind); (v39) the check_option byte; (v48) the view flags byte (bit0
     # security_barrier, bit1 security_invoker).
     def view_entry_bytes(v)
-      str = ->(x) { u16(x.bytesize) + x.b }
+      str = ->(x) { length16(x) + x.b }
       out = str.(v[:name])
       out << u16(v[:columns].size)
       defaults = v[:defaults] || {}
@@ -1101,7 +1106,7 @@ module JedNative
     def collation_entry_bytes(c)
       out = +"".b
       out << [c[:default] ? 0b1 : 0].pack("C")
-      [c[:name], c[:unicode], c[:cldr], c[:desc]].each { |s| out << u16(s.bytesize) << s.b }
+      [c[:name], c[:unicode], c[:cldr], c[:desc]].each { |s| out << length16(s) << s.b }
       out
     end
     
@@ -1124,6 +1129,11 @@ module JedNative
     # PRIMARY KEY, ../design/encoding.md §2.3; a single-column key is the one-member case).
     # A no-PK table keys on a synthetic i64 rowid = insertion index (executor.rs).
     def table_entries(table)
+      # Committed rows already carry their encoded storage key in tree order.
+      # Keep this a cursor so an index build need not retain a second complete
+      # inventory of row tokens (and their demand-loaded values).
+      return table[:rows].each_entry if defined?(PagedRows) && table[:rows].is_a?(PagedRows)
+
       pk_idxs = pk_order(table)
       pairs = table[:rows].each_with_index.map do |row, i|
         key = if pk_idxs.empty?
@@ -1205,9 +1215,12 @@ module JedNative
     # jed maintained under text this reference cannot evaluate (unparsable_definitions.jed). A reader that
     # wrongly trusts it loses rows.
     def index_entries(table, ix)
-      table_entries(table).select { |_k, row| index_admits?(ix, row) }.map do |storage_key, row|
+      empty = [].freeze
+      shape = { columns: empty }.freeze
+      table_entries(table).filter_map do |storage_key, row|
+        next unless index_admits?(ix, row)
         key = index_entry_key(table, ix, storage_key, row)
-        [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
+        [key, { key: key, row: empty, table: shape, forms: empty, comps: empty, size: key.bytesize }]
       end.sort_by { |key, _| key }
     end
     
@@ -1453,7 +1466,7 @@ module JedNative
           out << encode_range_body(op[:elem], bound[k])
         else
           min, max = bound[k]
-          out << u16(min.bytesize) << min << u16(max.bytesize) << max
+          out << length16(min) << min << length16(max) << max
         end
       end
       out
@@ -1475,7 +1488,7 @@ module JedNative
     end
     
     def gist_subtree_min_skey(node)
-      if node[:leaf]
+      node[:min_skey] ||= if node[:leaf]
         node[:entries].map { |_, s| s }.min
       else
         node[:children].map { |_, c| gist_subtree_min_skey(c) }.min
@@ -1510,6 +1523,9 @@ module JedNative
     # Insert (bound, skey) into `node` (mutated in place); returns nil or a new right-sibling child
     # [union_bound, node] when the node split.
     def gist_insert_node(ops, node, bound, skey)
+      # Child sorting needs each subtree's minimum key. Only this insertion
+      # path changes; walking every other subtree on every insert is quadratic.
+      node.delete(:min_skey)
       if node[:leaf]
         node[:entries] << [bound, skey]
         gist_sort_leaf!(ops, node[:entries])
@@ -1556,7 +1572,7 @@ module JedNative
         payload = +"".b
         node[:entries].each do |bound, skey|
           b = gist_encode_bound(ops, bound)
-          payload << u16(b.bytesize) << b << u16(skey.bytesize) << skey
+          payload << length16(b) << b << length16(skey) << skey
         end
         index = next_index
         next_index += 1
@@ -1570,7 +1586,7 @@ module JedNative
         payload = +"".b
         node[:children].each_with_index do |(u, _), i|
           b = gist_encode_bound(ops, u)
-          payload << u16(b.bytesize) << b << u32(child_indices[i])
+          payload << length16(b) << b << u32(child_indices[i])
         end
         index = next_index
         next_index += 1
@@ -1671,6 +1687,7 @@ module JedNative
     # A value's content payload P(v) — the bytes stored in the overflow chain when externalized: raw
     # UTF-8 / raw bytes for text/bytea, the decimal body for decimal (large-values.md §12).
     def value_payload(type, v)
+      v = v.resolve if v.is_a?(StoredValue)
       case type
       when "text", "bytea", "json" then v.b
       when "decimal" then encode_decimal(v) # the body (no presence tag)
@@ -1680,11 +1697,12 @@ module JedNative
     
     # Decide each column's disposition for a record: [forms, comps, on-disk record size], where
     # forms[i] is :inline / :inline_comp / :external / :external_comp and comps[i] holds the LZ4
-    # block for a compressed form. Spill only when forced (record > RECORD_MAX); then COMPRESS the
+    # block or a length-bearing deferred block for a compressed form. Spill only when forced
+    # (record > RECORD_MAX); then COMPRESS the
     # largest eligible values first (store-smaller rule), then EXTERNALIZE the largest remaining —
     # both passes ties-by-column-index. Deterministic, mirrors the cores' plan_dispositions
     # (large-values.md §12/§13; format.md "Large values").
-    def plan_record(table, key, row, cap)
+    def plan_record(table, key, row, cap, compression_units: nil)
       cols = table[:columns]
       # Each column's inline-plain contribution to record_size (the v24 basis — format.md "Record"):
       # a fixed-width column always its width (NULL occupies a zero-filled slot); a variable column 0
@@ -1693,7 +1711,8 @@ module JedNative
         if (w = fixed_width(c[:type]))
           w
         else
-          row[i].nil? ? 0 : encode_value(c[:type], row[i]).bytesize
+          value = row[i]
+          value.is_a?(StoredValue) ? value.plain_size : value.nil? ? 0 : encode_value(c[:type], value).bytesize
         end
       end
       forms = Array.new(cols.size, :inline)
@@ -1706,13 +1725,24 @@ module JedNative
       # Pass 1 — compress (lz4.md): payload >= S_COMPRESS, largest inline-plain encoded size first,
       # ties by ascending index; adopt iff the encoded compressed form is strictly smaller.
       cand = (0...cols.size).select do |i|
-        spillable?(cols[i][:type]) && !row[i].nil? && value_payload(cols[i][:type], row[i]).bytesize >= S_COMPRESS
+        value = row[i]
+        spillable?(cols[i][:type]) && !value.nil? &&
+          (value.is_a?(StoredValue) ? value.payload_length : value_payload(cols[i][:type], value).bytesize) >= S_COMPRESS
       end
       cand.sort_by! { |i| [-inline[i], i] }
       cand.each do |i|
         break if size <= max
     
-        comp = LZ4.compress(value_payload(cols[i][:type], row[i]))
+        value = row[i]
+        if value.is_a?(StoredValue)
+          compression_units&.call((value.payload_length + cap - 1) / cap)
+          next if value.compression_outcome == :rejected
+          comp = value.compressed? ? value.compressed_block : LZ4.compress(value.planning_payload)
+        else
+          payload = value_payload(cols[i][:type], value)
+          compression_units&.call((payload.bytesize + cap - 1) / cap)
+          comp = LZ4.compress(payload)
+        end
         next unless INLINE_COMP_OVERHEAD + comp.bytesize < inline[i]
     
         forms[i] = :inline_comp
@@ -1743,6 +1773,12 @@ module JedNative
 
       [forms, comps, size]
     end
+
+    def compression_units(table, key, row, cap)
+      units = 0
+      plan_record(table, key, row, cap, compression_units: ->(count) { units += count })
+      units
+    end
     
     # Write a payload across a chain of overflow pages (cap-byte slabs, in order), allocating each via
     # `alloc` and linking with next_page (0 terminates). Returns the first page index for the pointer.
@@ -1763,7 +1799,22 @@ module JedNative
     # One value's on-disk body given its disposition (the value codec, unchanged across row-major and PAX):
     # inline-plain is encode_value; the large-value forms carry a pointer / inline block and allocate
     # overflow chains via `alloc` (large-values.md §12/§13). `comp` is the LZ4 block for a compressed form.
-    def emit_value(c, v, form, comp, cap, alloc, pages)
+    def emit_value(c, v, form, comp, cap, alloc, pages, retain: nil)
+      if v.is_a?(StoredValue)
+        if v.form == form
+          return v.stored_bytes unless v.external?
+          if retain
+            retain.call(v)
+            return v.stored_bytes
+          end
+          first = write_overflow_chain(v.stored_payload, cap, alloc, pages)
+          bytes = v.stored_bytes.dup
+          bytes[1, 4] = u32(first)
+          return bytes
+        end
+        v = v.resolve
+      end
+      comp = comp.to_s if comp.is_a?(StoredValue::CompressedBlock)
       case form
       when :external
         payload = value_payload(c[:type], v)
@@ -1771,7 +1822,7 @@ module JedNative
         [TAG_EXTERNAL].pack("C") + u32(first) + u32(payload.bytesize)
       when :inline_comp
         payload = value_payload(c[:type], v)
-        [TAG_INLINE_COMP].pack("C") + u32(payload.bytesize) + u16(comp.bytesize) + comp
+        [TAG_INLINE_COMP].pack("C") + u32(payload.bytesize) + length16(comp) + comp
       when :external_comp
         payload = value_payload(c[:type], v)
         first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
@@ -1797,7 +1848,7 @@ module JedNative
     # key dir (N end offsets) | key blob | col dir (K+1) | per region: flags byte, then null bitmap +
     # dense untagged slots (fixed-width) or an N-entry end-offset value directory + tagged bodies
     # (variable; NULL = a zero-length span). `recs` are record plans.
-    def emit_leaf_pax(recs, cap, alloc, pages)
+    def emit_leaf_pax(recs, cap, alloc, pages, retain: nil)
       n = recs.size
       cols = recs.empty? ? [] : recs[0][:table][:columns]
       k = cols.size
@@ -1812,7 +1863,7 @@ module JedNative
             elsif v.nil?
               "".b # a zero-length span
             else
-              emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages)
+              emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages, retain: retain)
             end
         end
       end
@@ -2166,11 +2217,11 @@ module JedNative
     def write_host_deps(out, deps)
       out << u16(deps.size)
       deps.each do |dep|
-        out << u16(dep[:name].bytesize) << dep[:name].b
+        out << length16(dep[:name]) << dep[:name].b
         out << u16(dep[:arg_types].size)
         dep[:arg_types].each { |tc| out << [tc].pack("C") }
         out << [dep[:result]].pack("C")
-        out << u16(dep[:component_id].bytesize) << dep[:component_id].b
+        out << length16(dep[:component_id]) << dep[:component_id].b
         out << u32(dep[:semantic_version])
       end
     end
@@ -2673,11 +2724,17 @@ module JedNative
     end
     
     # Reconstruct a value from the P(v) content gathered from its overflow chain (large-values.md §12).
+    def decode_utf8(bytes)
+      value = bytes.dup.force_encoding('UTF-8')
+      raise Error.new('XX001', 'stored text is not valid UTF-8') unless value.valid_encoding?
+      value
+    end
+
     def value_from_payload(type, payload)
       case type
-      when "text" then payload.dup.force_encoding("UTF-8")
+      when "text" then decode_utf8(payload)
       when "bytea" then payload.dup.force_encoding("ASCII-8BIT")
-      when "json" then payload.dup.force_encoding("UTF-8")
+      when "json" then decode_utf8(payload)
       when "jsonb" then decode_jsonb_body(payload, 0).first
       when "decimal" then decode_decimal_body(payload, 0).first
       else decode_value(type, "\x00".b + payload, 0).first
@@ -2760,7 +2817,7 @@ module JedNative
       when "text"
         len, pos = take(buf, pos, 2)
         sb, pos = take(buf, pos, len.unpack1("n"))
-        [sb.dup.force_encoding("UTF-8"), pos]
+        [decode_utf8(sb), pos]
       when "boolean"
         bb, pos = take(buf, pos, 1)
         raise "invalid boolean value" unless bb.getbyte(0) <= 1
@@ -2778,7 +2835,7 @@ module JedNative
       when "json"
         len, pos = take(buf, pos, 2) # verbatim text, length-prefixed like text (spec/design/json.md §4)
         sb, pos = take(buf, pos, len.unpack1("n"))
-        [sb.dup.force_encoding("UTF-8"), pos]
+        [decode_utf8(sb), pos]
       when "jsonb"
         decode_jsonb_body(buf, pos) # the self-delimiting tagged-node tree (§2)
       when "interval"
@@ -3387,7 +3444,12 @@ module JedNative
           fk[:local].zip(fk[:ref]).each do |local, remote|
             local_column = table[:columns][local]
             remote_column = parent[:columns][remote]
-            unless local_column && remote_column && local_column[:type] == remote_column[:type]
+            local_type, remote_type = local_column&.dig(:type), remote_column&.dig(:type)
+            integers = %w[i16 i32 i64]
+            comparable = local_type && remote_type && (local_type == remote_type ||
+              integers.include?(local_type) && (integers.include?(remote_type) || remote_type == 'decimal') ||
+              %w[f32 f64].include?(local_type) && %w[f32 f64].include?(remote_type))
+            unless comparable
               raise "foreign key column type mismatch"
             end
           end
@@ -3423,3 +3485,5 @@ module JedNative
     
   end
 end
+
+require_relative "checksum_kernels"

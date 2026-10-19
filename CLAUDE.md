@@ -145,6 +145,11 @@ recorded baseline revision, coverage, omissions, and performance are part of the
 experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
 
+The maintainer approved Ruby's OpenSSL binding solely for vetted cryptographic
+digest functions in this experiment. SQL parsing, planning, evaluation outside
+those digest primitives, and storage remain handwritten Ruby; this approval
+does not authorize other native engine dependencies or a Rust/WASM binding.
+
 4. **Java**, **C#**, **Swift** (and later reach languages) — **native or wrapped, chosen
    per language on best-experience grounds**, not by a blanket rule. Current leanings
    (`spec/design/cores.md` §2): **C#** is the strongest *native* candidate (value-type

@@ -71,6 +71,11 @@ module JedNative
     def paged_key_equal?(table, ordinals, row, key)
       values = ordinals.map { |ordinal| row[ordinal] }
       return false if values.any?(&:nil?)
+      ordinals.each_with_index do |ordinal, index|
+        type = table[:columns][ordinal][:type]
+        next unless %w[i16 i32 i64 decimal f32 f64].include?(type)
+        return false unless Types.compare(values[index], key[index]).zero?
+      end
       paged_constraint_key(table, ordinals, values) == paged_constraint_key(table, ordinals, key)
     end
 
@@ -84,7 +89,8 @@ module JedNative
       if primary == ordinals && base[:rows].is_a?(PagedRows)
         encoded = primary_prefix_key(base, key)
         return false if pending && pending.changes.key?(encoded)
-        return !base[:rows].point(encoded).nil?
+        candidate = base[:rows].point(encoded)
+        return candidate && paged_key_equal?(table, ordinals, candidate, key)
       end
       if index_name && base.dig(:native_secondary_metadata, index_name) && base[:rows].is_a?(PagedRows)
         prefix = secondary_prefix_key(base, index_name, key)
@@ -92,7 +98,7 @@ module JedNative
           break unless encoded.start_with?(prefix)
           row = ordinal.is_a?(Array) ? ordinal : storage_row(base, ordinal)
           next if pending && pending.changes.key?(row.storage_key)
-          return true
+          return true if paged_key_equal?(table, ordinals, row, key)
         end
         return false
       end

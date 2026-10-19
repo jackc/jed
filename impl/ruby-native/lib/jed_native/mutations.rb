@@ -30,41 +30,45 @@ module JedNative
       # Resolve every VALUES slot first so its uncorrelated subqueries fold in
       # row-major order. Materialize all rows before RETURNING and conflict
       # subqueries are allowed to run (cost.md §3).
-      prepared = inputs.map do |input|
-        unless stmt[:default_values] || input.length == indices.length
-          raise Error.new('42601', 'INSERT column count mismatch')
+      prepared = if source
+        inputs.each do |input|
+          raise Error.new('42601', 'INSERT column count mismatch') unless input.length == indices.length
         end
-        input.each_with_index.map do |node, position|
-          column = t[:columns][indices[position]]
-          if source
-            Expression.new(kind: :source, type: source.columns[position][:type])
-          elsif stmt[:default_values] || node[:kind] == :default || column[:identity] && stmt[:overriding] == 'user'
-            nil
-          else
-            compile(node, [])
+        # Source types are identical for every row. Keep one descriptor per
+        # column instead of allocating rows × columns identical expressions.
+        source.columns.map { |column| Expression.new(kind: :source, type: column[:type]) }
+      else
+        inputs.map do |input|
+          unless stmt[:default_values] || input.length == indices.length
+            raise Error.new('42601', 'INSERT column count mismatch')
+          end
+          input.each_with_index.map do |node, position|
+            column = t[:columns][indices[position]]
+            if stmt[:default_values] || node[:kind] == :default || column[:identity] && stmt[:overriding] == 'user'
+              nil
+            else
+              compile(node, [])
+            end
           end
         end
       end
+      assignment_columns = t[:columns].map { |column| column.merge(nullable: true) }
+      unassigned = (0...t[:columns].length).to_a - (stmt[:default_values] ? [] : indices)
       candidates = inputs.each_with_index.map do |input, row_index|
         values_start = @cost if @explain_profile_frames
         candidate = Array.new(t[:columns].length)
-        assigned = {}
         indices.each_with_index do |ordinal, position|
           next if stmt[:default_values]
           column = t[:columns][ordinal]
-          expr = prepared[row_index][position]
+          expr = source ? prepared[position] : prepared[row_index][position]
           if column[:identity] && stmt[:overriding] == 'user' || !source && input[position][:kind] == :default
             candidate[ordinal] = INSERT_DEFAULT
           else
             value = source ? input[position] : assignment_value(expr)
-            candidate[ordinal] = assign(value, column.merge(nullable: true), expr)
+            candidate[ordinal] = assign(value, assignment_columns[ordinal], expr)
           end
-          assigned[ordinal] = true
         end
-        t[:columns].each_with_index do |column, ordinal|
-          next if assigned[ordinal]
-          candidate[ordinal] = INSERT_DEFAULT
-        end
+        unassigned.each { |ordinal| candidate[ordinal] = INSERT_DEFAULT }
         profile_accumulate(:values, @cost - values_start) if @explain_profile_frames
         candidate
       end
@@ -90,7 +94,7 @@ module JedNative
           next unless candidate[ordinal].equal?(INSERT_DEFAULT)
           expr = defaults[ordinal]
           value = expr && assignment_value(expr)
-          candidate[ordinal] = assign(value, t[:columns][ordinal].merge(nullable: true), expr)
+          candidate[ordinal] = assign(value, assignment_columns[ordinal], expr)
         end
         validate_candidate(t, candidate, checks)
         target = conflict && conflict_row(arbiters, candidate, rows, affected)
@@ -157,7 +161,7 @@ module JedNative
         accepted = !predicate || evaluate(predicate, row) == true
         profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
         next unless accepted
-        replacement = apply_assignments(t, row, row, assignments)
+        replacement = apply_assignments(t, row, row, assignments, retain: true)
         validate_candidate(t, replacement, checks)
         changes << [row, replacement]
         if paged
@@ -254,8 +258,15 @@ module JedNative
       end
     end
 
-    def apply_assignments(t, original, context, assignments)
-      replacement = original.dup
+    def mutation_copy_row(table, original)
+      return original.dup unless original.respond_to?(:storage_reference)
+      names = table[:constraints].find { |constraint| constraint[:kind] == :primary_key }&.dig(:columns) || []
+      excluded = table[:columns].each_index.select { |index| names.include?(table[:columns][index][:name]) }
+      CarriedRow.new(original, excluded)
+    end
+
+    def apply_assignments(t, original, context, assignments, retain: false)
+      replacement = retain ? mutation_copy_row(t, original) : original.dup
       assignments.each do |targets, expression|
         value = evaluate(expression, context)
         values = targets.length == 1 ? [value] : value
@@ -277,7 +288,9 @@ module JedNative
 
     def validate_candidate(t, row, checks)
       t[:columns].each_with_index do |column, index|
-        raise Error.new('23502', "NULL in #{column[:name]}") if row[index].nil? && column[:nullable] == false
+        next unless column[:nullable] == false
+        absent = row.respond_to?(:null_at?) ? row.null_at?(index) : row[index].nil?
+        raise Error.new('23502', "NULL in #{column[:name]}") if absent
       end
       checks.each { |expression| raise Error.new('23514', 'check constraint violation') if evaluate(expression, row) == false }
     end
@@ -307,10 +320,11 @@ module JedNative
       memory_owner = query_memory_owner if @query_memory
       rows = changes.map do |before, after|
         current = operation == :delete ? before : after
-        context = current.dup
+        segments = [current]
         scope.drop(t[:columns].length).each_slice(t[:columns].length) do |group|
-          context.concat((group.first[:row_version] == :old ? before : after) || null_row)
+          segments << ((group.first[:row_version] == :old ? before : after) || null_row)
         end
+        context = MutationFrame.new(segments)
         values = expressions.map { |expression| evaluate(expression, context) }
         charge
         query_memory_add_row(memory_owner, values, columns) if @query_memory

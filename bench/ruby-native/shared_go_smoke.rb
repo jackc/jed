@@ -4,13 +4,30 @@
 require 'fileutils'
 require 'json'
 require 'digest'
+require 'optparse'
+require 'shellwords'
+require_relative 'shared_smoke_report'
 
 root = File.expand_path('../..', __dir__)
 results = File.join(__dir__, 'results')
 build = File.join(root, '.dev/ruby-native-bench-build')
 reference = File.join(results, 'shared-go-smoke.json')
+output = File.join(results, 'shared-smoke-comparison.json')
+attempts = []
+compare_only = false
+arguments = ARGV.empty? && ENV['usage_args'] ? Shellwords.split(ENV['usage_args']) : ARGV
+OptionParser.new do |options|
+  options.banner = 'Usage: shared_go_smoke.rb [--compare-only] [--attempt STATUS_PATH ...]'
+  options.separator 'Supply attempts oldest to newest. Every result and its metadata are retained.'
+  options.on('--compare-only', 'Use the saved canonical Go results without running SQL') { compare_only = true }
+  options.on('--attempt PATH', 'Ruby .status.json file; repeat for each attempt') { |path| attempts << path }
+  options.on('--reference PATH', 'Canonical Go smoke artifact') { |path| reference = path }
+  options.on('--output PATH', 'Merged comparison artifact') { |path| output = path }
+  options.on('-h', '--help', 'Show this help') { puts options; exit }
+end.parse!(arguments)
+abort "unexpected arguments: #{arguments.join(' ')}" unless arguments.empty?
 
-unless ARGV.include?('--compare-only')
+unless compare_only
   source_data = File.join(root, '.dev/ruby-native-bench-data')
   data = File.join(root, '.dev/ruby-native-go-smoke-data')
   FileUtils.mkdir_p([build, data, results])
@@ -56,25 +73,21 @@ unless ARGV.include?('--compare-only')
     result.slice('bench', 'dataset', 'iterations', 'warmup', 'rows_total', 'checksum', 'fingerprint')
   end : []
   File.write(reference, JSON.pretty_generate(mode: 'single_execution_smoke_no_timings',
+                                            workload_fingerprint: Digest::SHA256.file(File.join(root, 'bench/corpus/benchmarks.toml')).hexdigest,
                                             completed: okay, outcomes: outcomes) + "\n")
   abort 'canonical Go smoke failed; see logs and reference status' unless okay
 end
 
-ruby_path = File.join(results, 'shared-smoke.jsonl.status.json')
-if File.file?(ruby_path)
-  expected = JSON.parse(File.read(reference)).fetch('outcomes').to_h { |entry| [entry.fetch('bench'), entry] }
-  comparisons = JSON.parse(File.read(ruby_path)).map do |entry|
-    next entry unless entry['status'] == 'smoke_pass'
-
-    other = expected[entry.fetch('bench')]
-    same = other && entry.values_at('checksum', 'rows') == other.values_at('checksum', 'rows_total')
-    entry.merge('status' => same ? 'matches_go' : 'mismatch_go',
-                'go_checksum' => other&.fetch('checksum'), 'go_rows' => other&.fetch('rows_total'))
-  end
-  out = File.join(results, 'shared-smoke-comparison.json')
-  File.write(out, JSON.pretty_generate(comparisons) + "\n")
-  puts comparisons.group_by { |entry| entry.fetch('status') }.transform_values(&:length).inspect
-  abort 'shared workload checksum mismatch' if comparisons.any? { |entry| entry['status'] == 'mismatch_go' }
-else
+default_attempt = File.join(results, 'shared-smoke.jsonl.status.json')
+if attempts.empty? && !File.file?(default_attempt)
   warn 'Ruby smoke still pending; run this task with --compare-only after it finishes'
+  exit
 end
+attempts << default_attempt if attempts.empty?
+report = NativeRubySharedSmokeReport.build(reference: reference, attempts: attempts, root: root)
+FileUtils.mkdir_p(File.dirname(output))
+temporary = "#{output}.tmp"
+File.write(temporary, JSON.pretty_generate(report) + "\n")
+File.rename(temporary, output)
+puts JSON.pretty_generate(report.fetch('summary'))
+abort 'shared workload comparison is incomplete or has mismatches; see retained attempts and provenance' unless report.fetch('summary').fetch('all_canonical_workloads_match')

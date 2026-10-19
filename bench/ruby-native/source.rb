@@ -9,14 +9,15 @@ require 'tmpdir'
 # Keep the initial implementation reproducible after the ignored .dev directory
 # is removed. The tracked source archive contains Ruby source, not build output.
 module NativeRubySource
+  ARCHIVED_PHASES = %w[baseline working-baseline].freeze
   module_function
 
   def digest(path)
     Digest::SHA256.hexdigest(Dir[File.join(path, 'lib/**/*.rb')].sort.map { |file| File.binread(file) }.join)
   end
 
-  def verify_baseline(path)
-    report = File.join(__dir__, 'results/baseline.json')
+  def verify_baseline(path, phase = 'baseline')
+    report = File.join(__dir__, "results/#{phase}.json")
     return unless File.file?(report)
 
     expected = JSON.parse(File.read(report)).fetch('ruby_source_sha256')
@@ -28,25 +29,25 @@ module NativeRubySource
     source = ENV['RUBY_NATIVE_SOURCE']
     if source
       source = File.expand_path(source)
-    elsif phase == 'baseline'
-      source = File.join(root, '.dev/ruby-native-baseline')
+    elsif ARCHIVED_PHASES.include?(phase)
+      source = File.join(root, ".dev/ruby-native-#{phase}")
       unless File.directory?(source)
         FileUtils.mkdir_p(File.dirname(source))
-        archive = File.join(__dir__, 'results/baseline-source.tar.gz')
+        archive = File.join(__dir__, "results/#{phase}-source.tar.gz")
         if File.file?(archive)
           temporary = Dir.mktmpdir('ruby-native-restore-', File.dirname(source))
           begin
             output, status = Open3.capture2e('tar', '-xzf', archive, '-C', temporary)
             raise "cannot restore baseline source: #{output}" unless status.success?
 
-            verify_baseline(temporary)
+            verify_baseline(temporary, phase)
             FileUtils.mv(temporary, source)
           ensure
             FileUtils.remove_entry(temporary) if File.exist?(temporary)
           end
         else
           # The first experiment run has no published baseline yet.
-          raise 'baseline source archive is missing' if File.file?(File.join(__dir__, 'results/baseline.json'))
+          raise 'baseline source archive is missing' if File.file?(File.join(__dir__, "results/#{phase}.json"))
 
           FileUtils.cp_r(File.join(root, 'impl/ruby-native'), source)
         end
@@ -54,7 +55,7 @@ module NativeRubySource
     else
       source = File.join(root, 'impl/ruby-native')
     end
-    verify_baseline(source) if phase == 'baseline'
+    verify_baseline(source, phase) if ARCHIVED_PHASES.include?(phase)
     source
   end
 end

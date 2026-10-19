@@ -75,7 +75,7 @@ module JedNative
   module HostFunctions
     def host_function_name?(name) = @environment && @environment.functions.any? { |entry| entry.name == name }
     def builtin_function_name?(name)
-      FunctionCatalog::SIGNATURES.key?(name) || Functions::AGGREGATES.include?(name) ||
+      FunctionCatalog::SIGNATURES.key?(name) || Functions.aggregate?(name) ||
         Functions::WINDOWS.include?(name) || Types::RANGES.key?(Types.normalize(name)) ||
         %w[nextval currval setval lastval coalesce greatest least nullif extract grouping
            mode percentile_cont percentile_disc timezone date_trunc mod div gcd lcm width_bucket json_object_agg jsonb_object_agg].include?(name)

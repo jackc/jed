@@ -88,29 +88,33 @@ module JedNative
       @mutex.synchronize { (@connections.values.flat_map { |connection| connection.pins.keys } + @local_pins.values).min || @meta[:txid] + 1 }
     end
     def pin_local(token)
-      await_admission
-      @mutex.synchronize { @local_pins[token] ||= @meta[:txid] }
+      @mutex.synchronize do
+        await_admission_locked unless @local_pins.key?(token)
+        @local_pins[token] ||= @meta[:txid]
+      end
     end
     def copy_local_pin(source, token)
-      @mutex.synchronize { @local_pins[token] ||= @local_pins[source] || @meta[:txid] }
+      @mutex.synchronize do
+        await_admission_locked unless @local_pins.key?(source) || @local_pins.key?(token)
+        @local_pins[token] ||= @local_pins[source] || @meta[:txid]
+      end
     end
     def unpin_local(token) = @mutex.synchronize { @local_pins.delete(token); @condition.broadcast }
     def draining? = @mutex.synchronize { !!@draining }
-    def await_admission
-      @mutex.synchronize do
-        @condition.wait(@mutex) while @draining && !@closed
-        raise Error.new('08006', 'page-service owner left') if @closed
-      end
+    def await_admission_locked
+      @condition.wait(@mutex) while (@draining || @exclusive) && !@closed
+      raise Error.new('08006', 'page-service owner left') if @closed
     end
     def acquire(token, timeout_ms)
-      await_admission
       deadline = now + timeout_ms / 1000.0 if timeout_ms.positive?
       @mutex.synchronize do
+        await_admission_locked unless @writer.equal?(token)
         while @writer && !@writer.equal?(token)
           remaining = deadline && deadline - now
           raise Error.new('55P03', 'writer lock timeout') if remaining && remaining <= 0
           raise Error.new('08006', 'page-service owner is closing') if @closed
           @condition.wait(@mutex, remaining)
+          await_admission_locked
         end
         @writer = token
       end
@@ -123,6 +127,32 @@ module JedNative
         end
       end
     end
+    def with_exclusive_operation
+      token = Object.new
+      @mutex.synchronize do
+        busy = @closed || @writer || @draining || @exclusive || !@local_pins.empty? || @connections.values.any? { |connection| !connection.pins.empty? }
+        raise Error.new('55006', 'database is in use') if busy
+        @writer, @exclusive = token, true
+      end
+      begin
+        yield
+      ensure
+        @mutex.synchronize do
+          @exclusive = false
+          @writer = nil if @writer.equal?(token)
+          @condition.broadcast
+        end
+      end
+    end
+    def replace_image(meta, bytes)
+      @mutex.synchronize do
+        @meta, @meta_bytes = meta, bytes
+        @window = []
+        @window_start = meta[:txid]
+        @resolution[meta[:txid]] = @codec.crc64(bytes)
+        @resolution.shift while @resolution.length > 256
+      end
+    end
     def publish(meta, bytes, indices)
       @mutex.synchronize do
         @meta, @meta_bytes = meta, bytes
@@ -133,8 +163,8 @@ module JedNative
       end
     end
     def snapshot(connection, request)
-      await_admission
       @mutex.synchronize do
+        await_admission_locked unless @writer.equal?(connection)
         txid = @meta[:txid]
         previous = request[:last_txid]
         all = request[:incarnation] != @incarnation || previous.zero? || previous > txid || previous < @window_start
@@ -190,7 +220,9 @@ module JedNative
         @draining, @yield_target = true, connection.id
         true
       end
-      return false unless accepted
+      accepted
+    end
+    def begin_handoff(connection)
       unless @yield_thread&.alive?
         @yield_thread = Thread.new do
           broadcast_notice(1, connection.id)
@@ -201,7 +233,6 @@ module JedNative
         end
         @yield_thread.report_on_exception = false
       end
-      true
     end
     def drain(milliseconds, cancellation: nil)
       deadline = now + milliseconds / 1000.0 if milliseconds.positive?
@@ -233,6 +264,14 @@ module JedNative
       File.unlink(@endpoint) if @endpoint && File.exist?(@endpoint)
     end
 
+    def discard_inherited
+      @closed = true
+      @listener&.close unless @listener&.closed?
+      @connections.each_value(&:discard_inherited)
+      @connections.clear
+      @local_pins.clear
+    end
+
     class OwnerConnection
       attr_reader :id, :pins
       def initialize(owner, socket, id)
@@ -246,6 +285,10 @@ module JedNative
       def start
         @thread = Thread.new { run }
         @thread.report_on_exception = false
+      end
+      def discard_inherited
+        @socket.close unless @socket.closed?
+        @pins.clear
       end
       def send_frame(name, request, values = {})
         @send_mutex.synchronize { @socket.write(PageServiceWire.encode(name, request, values, @page_size)) }
@@ -307,10 +350,15 @@ module JedNative
           end
         when :end_read then @owner.unpin(self, fields[:txid])
         when :read_pages
-          raise Error.new('25P03', 'idle write transaction was revoked') if @revoked && fields[:txid] == @revoked
+          if @revoked && fields[:txid] == @revoked
+            @revoked = nil
+            raise Error.new('25P03', 'idle write transaction was revoked')
+          end
           send_frame(:pages, request, pages: @owner.read_pages(self, fields[:txid], fields[:indices]))
         when :begin_write then begin_write(request, fields)
-        when :abort then abort_write
+        when :abort
+          raise Error.new('08P01', 'abort without writer gate') unless @writing || @revoked
+          abort_write
         when :commit_begin then begin_commit(fields)
         when :commit_pages then receive_pages(fields[:pages])
         when :commit_end then end_commit(request)
@@ -319,7 +367,10 @@ module JedNative
           digest = @owner.instance_variable_get(:@mutex).synchronize { @owner.instance_variable_get(:@resolution)[fields[:txid]] }
           status = digest ? (digest == fields[:digest] ? 0 : 1) : (fields[:txid] > meta[:txid] ? 1 : 2)
           send_frame(:commit_status_reply, request, status: status)
-        when :request_ownership then send_frame(:ownership_reply, request, status: @owner.request_ownership(self) ? 0 : 1)
+        when :request_ownership
+          accepted = @owner.request_ownership(self)
+          send_frame(:ownership_reply, request, status: accepted ? 0 : 1)
+          @owner.begin_handoff(self) if accepted
         else raise Error.new('08P01', 'unsupported page-service operation')
         end
       end
@@ -346,6 +397,7 @@ module JedNative
           rescue Error => error
             @waiting = false
             @owner.release(self)
+            @owner.close if @storage.instance_variable_get(:@poisoned)
             fail_request(request, error, error.sqlstate == '08006')
           rescue IOError, SystemCallError
             close
@@ -421,6 +473,9 @@ module JedNative
         end
         send_frame(:committed, request, txid: @delta[:meta][:txid])
         @storage.send(:service_maintenance)
+      rescue Error => error
+        @owner.close if @storage.instance_variable_get(:@poisoned)
+        raise error
       rescue IOError, SystemCallError => error
         poison(error)
       ensure
@@ -447,7 +502,7 @@ module JedNative
       def committing? = !!@committing
       def poison(error)
         @storage.instance_variable_set(:@poisoned, true)
-        close
+        @owner.close
         raise Error.new('58030', error.message)
       end
       def close

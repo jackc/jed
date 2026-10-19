@@ -6,13 +6,11 @@ module JedNative
       return super unless streaming_select_shape?(statement)
       source = statement[:from].first
       stored = table(source[:name])
-      scope = table_columns(stored, source[:alias] || source[:name])
-      projections = expand_stars(statement[:columns], scope)
-      expressions = projections.map { |entry| compile(entry[:expr], scope) }
+      resolved = resolved_read_plan(statement, stored)
+      scope, projections, expressions, columns = resolved.scope, resolved.projections, resolved.expressions, resolved.columns
       return super if expressions.any? { |expression| aggregate_expr?(expression) }
-      columns = projections.zip(expressions).map { |entry, expression| { name: entry[:alias] || expression_name(entry[:expr]), type: expression.type } }
       validate_aggregate_scope(statement, scope, false) if statement[:distinct]
-      predicate = compile_filter(statement[:where], scope)
+      predicate = resolved.predicate
       access = scan_access_plan(stored, predicate, statement)
       order = access[:order]
       return super if order == :blocking
@@ -32,7 +30,7 @@ module JedNative
         else
           charge(full_scan_pages(stored))
           charge_scan_payload(stored)
-          ordinals = stored[:native_primary_entries]&.map(&:last) || stored[:rows].each_index.to_a
+          ordinals = stored[:native_primary_entries]&.lazy&.map(&:last) || stored[:rows].each_index
           input = scan_rows(stored, ordinals)
         end
       end
@@ -125,9 +123,19 @@ module JedNative
     end
 
     def contains_window?(node)
+      return false unless node.is_a?(Array) || node.is_a?(Hash)
+      @native_window_shapes ||= {}.compare_by_identity
+      return @native_window_shapes[node] if @native_window_shapes.key?(node)
+      result = window_shape?(node)
+      @native_window_shapes.shift if @native_window_shapes.length >= 64
+      @native_window_shapes[node] = result
+      result
+    end
+
+    def window_shape?(node)
       case node
-      when Array then node.any? { |child| contains_window?(child) }
-      when Hash then !!node[:over] || node.each_value.any? { |child| contains_window?(child) }
+      when Array then node.any? { |child| window_shape?(child) }
+      when Hash then !!node[:over] || node.each_value.any? { |child| window_shape?(child) }
       else false
       end
     end

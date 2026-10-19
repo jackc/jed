@@ -282,6 +282,9 @@ module JedNative
         operand = catalog_expression(node[:expr] || node[:operand], 70)
         node[:op].to_s.start_with?('is ') ? "#{operand} #{node[:op]}" : "#{node[:op]} #{operand}"
       when :call
+        if node[:name] == 'extract' && node[:args]&.length == 2
+          return "extract ( #{catalog_expression(node[:args][0])} from #{catalog_expression(node[:args][1])} )"
+        end
         arguments = (node[:args] || []).each_with_index.map do |arg, index|
           name = node[:arg_names]&.at(index)
           prefix = name ? "#{catalog_identifier(name)} => " : ''

@@ -1,9 +1,11 @@
-# Pure Ruby experiment: implementation in progress
+# Ruby experiment: validation and optimization in progress
 
-This is an **incomplete experiment**, not a completed port or a fourth supported
-core. Work started against `d4a01ebdbf3edff0c130b1fdb4c1115df6d1c4bd`.
+This is an **experimental core**, not a fourth supported core. The requested
+implementation and performance work remains in progress. Work started against
+`d4a01ebdbf3edff0c130b1fdb4c1115df6d1c4bd`.
 The implementation is independent Ruby; its SQL execution does not call Rust,
-Go, TypeScript, WASM, FFI, or another database engine. No gem dependency was added.
+Go, TypeScript, WASM, FFI, or another database engine. SQL digest functions use
+the explicitly approved Ruby OpenSSL dependency; database algorithms remain Ruby.
 
 Normal tests, benchmarks, code generation, and CI do not run or maintain this
 directory. The explicit `ruby-native:*` mise tasks are the entry points. Future
@@ -13,18 +15,41 @@ feature work must leave the persisted experiment unchanged unless requested.
 
 The runner reads the existing shared SQL corpus. Unsupported harness directives
 are reported separately and cause a failed audit; they are not passing tests.
-Value, type, name, error-code, and cost mismatches also fail. Full audits remain
-red. The latest comprehensive audit will be recorded after implementation stops
-changing; intermediate runs are diagnostic, not a release gate.
+Value, type, name, error-code, and cost mismatches also fail. The first complete
+SQL audits on October 18 passed against immutable source snapshots:
 
-The October 18 implementation checkpoint includes a diagnostic run against a
-copied, immutable source tree (SHA-256
-`6950c33f1685f28b16ad15c376097a29706f0832889606bba97c748ffbf151f7`):
-679 files, 20,266 executed checks including concurrency assertions, 20,161 passed,
-105 failed, no unsupported harness files, no timeouts, and two mode-specific
-skipped files. The source hash was unchanged throughout the run. Several failures
-have since been corrected; this remains progress evidence, not a passing
-conformance claim.
+| Mode | Files considered | Checks passed | Declared file skips | Peak worker RSS |
+|---|---:|---:|---:|---:|
+| Memory | 679 | 20,267 / 20,267 | 2 | 145.4 MiB |
+| Disk | 679 | 18,250 / 18,250 | 77 | 152.1 MiB |
+
+Both had zero unsupported harness files, timeouts, or memory-limit failures.
+The [memory report](results/working-memory-conformance.json) and
+[disk report](results/working-disk-conformance.json) retain source hashes,
+timestamps, limits, and exact counts. The memory snapshot predates the subsequent
+bytea escape allocation reduction; its separate rendering suite passed 16/16.
+Final integration and optimized-source audits remain pending.
+
+An earlier unbounded run was stopped by the maintainer after reaching 49 GB.
+An orphaned benchmark worker was also found and terminated. The exact allocation
+path responsible for that peak was not established. Validation now isolates each
+file/workload in a sequential child with a 512 MiB sampled process-group RSS
+threshold, a hard 1 GiB address-space limit for Ruby, and an external deadline.
+The supervisor kills descendants on timeout/interruption; a separate watchdog
+also kills them if the supervisor dies. Reports and diagnostic payloads are
+bounded. These are harness limits, separate from SQL's logical resource budgets.
+
+Core fixes remove row-token arrays from file scans, share decoded-page cache
+budgets across generations, use compact UTF-8 regex views, and avoid retaining
+all global replacement captures. The benchmark adapter also removes closed
+handles from its cleanup registry immediately: retaining every closed handle
+kept every page cache alive throughout a 200-iteration cold-open workload. The
+repeated cold-open regression now completes at 154.0 MiB peak RSS; its
+[diagnostic report](results/working-cold-open-memory.json) records the workload.
+Closed query cursors likewise release their engine and snapshot while retaining
+their collected rows, metadata, and final cost.
+Those fixes and harness containment do not
+turn logical SQL budgets into a whole-engine heap guarantee.
 
 Executed independent checks include:
 
@@ -49,12 +74,15 @@ Executed independent checks include:
 - Actual bounded scans and physical join selection: 30/30 bounded LIMIT,
   32/32 two-input P7 and 94/94 multi-input P8 join-planning records.
 - WHERE contradiction proofs: 58/58 SELECT/UPDATE/DELETE records; ON CONFLICT:
-  349/349 records. Broader SQL and plan coverage remains incomplete.
+  349/349 records; the complete SQL audits above include broader plan coverage.
 
-None of these scoped results establishes whole-core conformance. Later changes
-add sparse pending writes, native page-service owners and clients, host function
-registration, and physical backup/compaction. Their full integration audit and
-performance measurements are still pending.
+SQL corpus results do not alone establish host/file interoperability. Sparse
+pending writes, native page-service owners and clients, host function registration,
+and physical backup/compaction also have explicit host tests. All 108 Ruby/Go
+process pairings pass, including byte-identical backups, owner handoff, crash
+recovery, attachments, and serialization/storage-limit failures. The latest host
+suite also passes unchanged-chain corruption and compression-cost checks, at
+109 MiB peak RSS. Final performance measurements remain pending.
 
 ## Recorded prototype baseline
 
@@ -99,9 +127,9 @@ coverage results and optimized timings are still pending.
 
 The engine reads and writes the current v49 shared file format, including
 validated COW content manifests. The current pure Ruby file host takes exclusive
-protocol-v2 ownership with Ruby's built-in `flock` by default. The opt-in
-`locking: :auto` path serves or joins the multi-process page service; lifecycle
-and cross-core process verification are ongoing. SQL commits persist changed B-tree paths, retain
+protocol-v2 ownership with Ruby's built-in `flock`. Default `locking: :auto`
+serves or joins the multi-process page service; `locking: :exclusive` requires
+sole file access. SQL commits persist changed B-tree paths, retain
 clean page identities, protect current manifest dependencies during free-page
 reuse, and reclaim trailing free pages. Memory and file storage limits use the
 shared page accounting; 48 memory, 35 file and 10 temporary-limit records pass.
@@ -110,6 +138,9 @@ retain their changed rows over immutable tree pages; constraint checks use key
 probes or bounded spools. Changed
 attachment domains persist independently and temporary-only work leaves main
 unchanged.
+Unchanged large-value spans and overflow chains survive leaf rewrites, including
+unassigned values in UPDATE and primary-key changes. Their live-page dependencies
+remain protected without rewriting them into the current content manifest.
 Large-file performance must not be inferred from the small in-memory comparison.
 
 ## Completion criteria

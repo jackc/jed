@@ -556,7 +556,7 @@ module JedNative
                 rows.replace(row, nil) if paged
                 next
               end
-              replacement = row.dup
+              replacement = mutation_copy_row(child, row)
               child_indices.each_with_index do |i, j|
                 replacement[i] = case action
                 when :cascade then mapping[matched_key][j]
@@ -575,7 +575,7 @@ module JedNative
               rowids << child[:rowids]&.dig(index)
             end
           end
-          query_memory_stage_changes(child, child_changes) unless child[:temporary]
+          query_memory_stage_changes(child, child_changes)
           @tables[name] = child.merge(rows: rows, rowids: rowids)
           validate_rows(@tables[name], rows)
           enforce_references(child, child_changes, operation, visited)
@@ -812,7 +812,7 @@ module JedNative
             @lifetime_cost += 1
             entry[0] = compiled.each_with_index.map do |expression, index|
               charge(0)
-              entry[3].fetch(index) { evaluate(expression, entry[1], entry[2]) }
+              evaluate(expression, entry[1], entry[2])
             end
             query_memory_add_row(output_owner, entry[0], columns) if output_owner
             if cursor_rows
@@ -1064,7 +1064,7 @@ module JedNative
     def lateral_source_relation(source, columns, row)
       if source[:kind] != :join_group && @join_group_outer&.any?
         prefix_columns = @join_group_outer.flat_map(&:first)
-        prefix_values = @join_group_outer.flat_map(&:last)
+        prefix_values = @join_group_outer.flat_map { |_, values| values.to_a }
         columns = prefix_columns + columns
         row = prefix_values + row.to_a
       end
