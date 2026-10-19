@@ -1,0 +1,27 @@
+--- a/impl/ts/src/async/packed.ts
++++ b/impl/ts/src/async/packed.ts
+@@ -256,6 +256,7 @@
+   offset = HEADER_BYTES;
+   logicalBytes = 0;
+   private readonly view: DataView;
++  private readonly bytes: Uint8Array;
+   private readonly build: boolean;
+   private readonly data: ArrayBuffer;
+   private readonly budget?: WireBudget;
+@@ -263,6 +264,7 @@
+     this.data = data;
+     this.budget = budget;
+     this.view = new DataView(data);
++    this.bytes = new Uint8Array(data);
+     this.build = budget === undefined;
+   }
+   private take(bytes: number): number {
+@@ -453,7 +455,7 @@
+         return this.build
+           ? {
+               kind: tag === TAG.bytea ? "bytea" : "uuid",
+-              bytes: new Uint8Array(this.data, at, length).slice(),
++              bytes: this.bytes.slice(at, at + length),
+             }
+           : undefined;
+       }
