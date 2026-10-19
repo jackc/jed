@@ -592,13 +592,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   prototype removes generator traversal for common resident expressions; pending operands retain
   their state without replay. Transferable binary result batches avoid cloning recursive value
   objects, and buffered iteration avoids per-row scheduling chains. Broaden these changes only
-  with throughput and cancellation measurements.
+  with throughput and cancellation measurements. Heavy-query measurements now cover Node and
+  ordinary/isolated Chromium, including main-thread responsiveness and 200,000 typed result rows
+  ([report](bench/ts/results/2026-10-18-heavy/report.md)); large result delivery still adds substantial overhead.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar
   kernels stay synchronous unless measurements justify extra pause points. Remaining: async
-  storage lifecycle/commit and crypto providers, broader
-  public-boundary workload/ARM/package-size measurements, and optional Rust delivery parity.
+  storage lifecycle/commit and crypto providers, cold/durable and other-browser
+  public-boundary measurements, ARM/package-size measurements, and optional Rust delivery parity.
   Encryption protocol/provider selection is separate; no SQL replay or whole-file preload.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
