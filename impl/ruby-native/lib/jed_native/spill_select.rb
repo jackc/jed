@@ -27,7 +27,7 @@ module JedNative
       expressions = projections.map { |item| compile(item[:expr], scope) }
       columns = projections.zip(expressions).map { |item, expression| { name: item[:alias] || expression_name(item[:expr]), type: expression.type } }
       nodes = resolve_group_nodes(statement, scope)
-      aggregate_nodes = projection_aggregates([statement[:columns], statement[:having], statement[:order_by]])
+      aggregate_nodes = spill_query_shape(statement)[1]
       grouped = !nodes.empty? || !aggregate_nodes.empty?
       validate_aggregate_scope(statement, scope, grouped)
       predicate = compile_filter(where, scope)
@@ -212,7 +212,8 @@ module JedNative
 
     def spill_select_shape?(statement)
       return false unless spill_available? && statement[:kind] == :select && !statement[:with] && !statement[:distinct_on]
-      return false if contains_window?([statement[:columns], statement[:order_by]]) || !(statement[:windows] || {}).empty?
+      has_window, aggregates = spill_query_shape(statement)
+      return false if has_window || !(statement[:windows] || {}).empty?
       sources = (statement[:from] || []) + (statement[:joins] || []).map { |join| join[:relation] }
       return false unless sources.all? { |source| !source[:lateral] && %i[table subquery].include?(source[:kind]) && !source[:columns] && !source[:column_aliases] }
       if statement[:distinct] && streaming_select_shape?(statement) && sources.length == 1 && (stored = @tables[sources[0][:name]])
@@ -221,7 +222,6 @@ module JedNative
         return false unless scan_access_plan(stored, predicate, statement)[:order] == :blocking
       end
       return false if (statement[:joins] || []).any? { |join| join[:using] || join[:natural] || %i[right full right_outer full_outer].include?(join[:kind]) }
-      aggregates = projection_aggregates([statement[:columns], statement[:having], statement[:order_by]])
       return false unless aggregates.all? { |node| spill_aggregate_supported?(node) }
       return true if statement[:distinct] || !aggregates.empty? || !(statement[:group_by] || []).empty?
       joins = statement[:joins] || []
@@ -236,6 +236,18 @@ module JedNative
       right = spill_source_columns(joins.first[:relation])
       return false if join_index_plan(Relation.new(columns: left, rows: []), joins.first[:relation], joins.first[:kind], joins.first[:on], nil)
       !!hash_join_keys(compile_filter(joins.first[:on], left + right), left.length)
+    end
+
+    # These are syntax facts, independent of bindings, statistics, or the current
+    # catalog. Key them by the retained statement, not a fresh wrapper Array on
+    # every execution; those wrappers defeated the bounded window-shape cache.
+    def spill_query_shape(statement)
+      @native_spill_shapes ||= {}.compare_by_identity
+      return @native_spill_shapes[statement] if @native_spill_shapes.key?(statement)
+      shape = [contains_window?(statement[:columns]) || contains_window?(statement[:order_by]),
+               projection_aggregates([statement[:columns], statement[:having], statement[:order_by]])]
+      @native_spill_shapes.shift if @native_spill_shapes.length >= 64
+      @native_spill_shapes[statement] = shape
     end
 
     def spill_owner(owners, klass, **options, &block)

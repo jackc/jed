@@ -11,8 +11,10 @@ module JedNative
       return super if expressions.any? { |expression| aggregate_expr?(expression) }
       validate_aggregate_scope(statement, scope, false) if statement[:distinct]
       predicate = resolved.predicate
-      access = scan_access_plan(stored, predicate, statement)
-      order = access[:order]
+      # Budget/profile lanes retain their original incremental charge schedule.
+      point = resolved.point unless @explain_profile_frames || @max_cost.positive? || @lifetime_max_cost.positive? || @query_memory
+      access = scan_access_plan(stored, predicate, statement) unless point
+      order = point ? :none : access[:order]
       return super if order == :blocking
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) || 0 : 0
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
@@ -21,9 +23,9 @@ module JedNative
       previous = [@native_stream_scan, @native_reverse_scan, @native_scan_columns, @native_ordered_scan]
       @native_stream_scan, @native_reverse_scan = true, order == :reverse
       @native_ordered_scan = %i[forward reverse].include?(order)
-      @native_scan_columns = scan_column_inventory(statement)
+      @native_scan_columns = resolved.scan_columns
       scan_start = @cost if @explain_profile_frames
-      input = execute_scan_access(stored, predicate, access)
+      input = point ? prepared_stream_point_rows(stored, point) : execute_scan_access(stored, predicate, access)
       unless input
         if %i[forward reverse].include?(order)
           input = storage_stream_rows(stored, reverse: order == :reverse)
@@ -88,17 +90,41 @@ module JedNative
     end
 
     def streaming_select_shape?(statement)
+      @native_stream_shapes ||= {}.compare_by_identity
+      unless @native_stream_shapes.key?(statement)
+        @native_stream_shapes.shift if @native_stream_shapes.length >= 64
+        @native_stream_shapes[statement] = streaming_select_syntax?(statement)
+      end
+      return false unless @native_stream_shapes[statement]
+      name = statement[:from][0][:name]
+      return false unless @tables.key?(name) && !@ctes.key?(name)
+      return false unless statement[:limit] || statement[:offset] || !(statement[:order_by] || []).empty? || cursor_output?
+      true
+    end
+
+    private
+
+    def streaming_select_syntax?(statement)
       return false unless statement[:kind] == :select && !statement[:with] && !statement[:distinct_on] && !statement[:having]
       return false if statement[:distinct] && (statement[:order_by] || []).empty?
       return false unless (statement[:joins] || []).empty? && (statement[:group_by] || []).empty? && (statement[:windows] || {}).empty?
       sources = statement[:from] || []
-      return false unless sources.length == 1 && sources[0][:kind] == :table && @tables.key?(sources[0][:name]) && !@ctes.key?(sources[0][:name])
+      return false unless sources.length == 1 && sources[0][:kind] == :table
       return false if sources[0][:columns] || sources[0][:column_aliases]
-      return false unless statement[:limit] || statement[:offset] || !(statement[:order_by] || []).empty?
       !contains_window?(statement[:columns]) && !contains_aggregate?(statement[:columns])
     end
 
-    private
+    def prepared_stream_point_rows(stored, point)
+      value = evaluate(point.expression, [])
+      return [] if value.nil?
+      return [] unless value.between?(point.minimum, point.maximum)
+      charge(point.pages) unless point.pages.zero?
+      row = point.index[value]
+      return [] unless row
+      ordinal = row.is_a?(PagedRow) ? row : stored[:native_row_positions]&.[](row.object_id)
+      charge_scan_payload(stored, [ordinal]) if ordinal
+      [row]
+    end
 
     def stream_order(statement, stored, scope, projections, columns)
       orders = statement[:order_by] || []

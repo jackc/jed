@@ -8,6 +8,7 @@ module JedNative
     UNKNOWN = 'unknown'
     TEXT_OPERATORS = %w[like ilike not\ like not\ ilike ~ ~* !~ !~*].freeze
     COMPARISONS = %w[= <> != < <= > >= is\ distinct\ from is\ not\ distinct\ from @> <@ && << >> &< &> -|-].freeze
+    UNMETERED_SCALARS = %w[i16 i32 i64 boolean text bytea uuid decimal f32 f64].freeze
     attr_reader :types, :count, :correlated
 
     def initialize(engine, statement)
@@ -81,6 +82,12 @@ module JedNative
         result
       end
     end
+
+    # Cursor construction validates bindings immediately. Primitive host
+    # coercions can be retained for its later pull; temporal and container
+    # conversions keep the ordinary execution-time path because they can charge
+    # work, consult the statement clock, or recursively perform either action.
+    def reusable_bound_values? = @types.all? { |type| UNMETERED_SCALARS.include?(type) }
 
     def coerce(value, type)
       return nil if value.nil?

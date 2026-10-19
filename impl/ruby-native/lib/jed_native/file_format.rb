@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "set"
+require "zlib"
 require_relative "lz4"
 require_relative "page_buffer"
 require_relative "persistent_tree"
@@ -132,12 +133,6 @@ module JedNative
     def u32(v) = [v].pack("N")
     def u64(v) = [v].pack("Q>")
     
-    CRC32_TABLE = Array.new(256) do |byte|
-      value = byte
-      8.times { value = (value >> 1) ^ ((value & 1).zero? ? 0 : 0xEDB88320) }
-      value
-    end.freeze
-
     CRC64_TABLE = Array.new(256) do |byte|
       value = byte << 56
       8.times do
@@ -150,24 +145,19 @@ module JedNative
     CRC64_HIGH = CRC64_TABLE.map { |value| value >> 32 }.freeze
     CRC64_LOW = CRC64_TABLE.map { |value| value & 0xFFFFFFFF }.freeze
 
-    # The same IEEE and ECMA polynomials as the shared byte contract. Lookup
-    # tables remove eight interpreted bit steps per byte; all arithmetic remains
-    # pure Ruby and checksums retain their exact initial/final conventions.
-    def crc32(data)
-      crc = 0xFFFFFFFF
-      data.each_byte { |byte| crc = (crc >> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xFF] }
-      crc ^ 0xFFFFFFFF
-    end
+    # The shared format uses standard zlib CRC-32/IEEE. The optional finalized
+    # state continues a previous span, including across the skipped checksum field.
+    def crc32(data, crc = 0) = Zlib.crc32(data, crc)
     
     # The per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's bytes
-    # EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,ps). crc32 is linear over
-    # the byte stream, so checksumming the concatenation matches the cores' streaming page_crc exactly.
+    # EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,ps).
+    # Continue the first span's finalized CRC to avoid allocating their concatenation.
     def page_crc(page)
-      crc32(page.byteslice(0, 12) + page.byteslice(PAGE_HEADER, page.bytesize - PAGE_HEADER))
+      crc32(page.byteslice(PAGE_HEADER, page.bytesize - PAGE_HEADER), crc32(page.byteslice(0, 12)))
     end
     
     def meta_crc(page)
-      crc32(page.byteslice(0, 32) + page.byteslice(36, page.bytesize - 36))
+      crc32(page.byteslice(36, page.bytesize - 36), crc32(page.byteslice(0, 32)))
     end
     
     # CRC-64/ECMA-182: unreflected, init = xorout = 0. A supplied initial state
@@ -186,13 +176,21 @@ module JedNative
     end
     
     # int-be-signflip: add bias 2^(bits-1), emit unsigned big-endian (encoding.md).
+    INTEGER_PACK = { 2 => 'n', 4 => 'N', 8 => 'Q>' }.freeze
+    INTEGER_BIAS = { 2 => 1 << 15, 4 => 1 << 31, 8 => 1 << 63 }.freeze
     def encode_int(width, value)
+      if value.is_a?(Integer) && (format = INTEGER_PACK[width])
+        return [value + INTEGER_BIAS.fetch(width)].pack(format)
+      end
       bias = 1 << (width * 8 - 1)
       u = value + bias
       Array.new(width) { |i| (u >> (8 * (width - 1 - i))) & 0xFF }.pack("C*")
     end
     
     def decode_int(width, bytes)
+      if (format = INTEGER_PACK[width]) && bytes.bytesize == width
+        return bytes.unpack1(format) - INTEGER_BIAS.fetch(width)
+      end
       bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
     end
     

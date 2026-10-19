@@ -2,12 +2,16 @@
 
 `JedNative` is an independent, handwritten Ruby implementation. It does not load
 the Rust binding, WASM, FFI, or another SQL engine. SQL digest functions use Ruby's
-OpenSSL extension, explicitly approved for cryptographic primitives; all database
-algorithms remain Ruby. The existing `impl/ruby` package remains the Rust binding.
+OpenSSL extension, and page CRC32 uses stdlib Zlib, both explicitly approved utility
+dependencies; all database algorithms remain Ruby. The existing `impl/ruby` package
+remains the Rust binding.
 
 **This frozen experiment is not a supported core.** It implements the SQL, storage
 and host surface of its recorded source revision. The [experiment report](REPORT.md)
 records conformance, interoperability, resource limits and benchmark measurements.
+The [lookup follow-up](LOOKUP_FOLLOWUP.md) records further profiling and measurements
+with Ruby 4.1.0-preview1 YJIT and ZJIT. [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
+describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
 
 ```ruby
@@ -106,6 +110,9 @@ RUBY_NATIVE_PHASE=optimized mise run ruby-native:compare
 # The TypeScript file lane needs its existing OS-lock artifact:
 mise run ts:lock_build
 mise run ruby-native:file-compare -- --run
+# Investigate allocation/call counts separately from canonical timing:
+JED_NATIVE_TIMEOUT=180 JED_NATIVE_ADDRESS_SPACE_BYTES=2147483648 \
+  mise run ruby-native:bounded -- ruby --yjit bench/ruby-native/lookup_profile.rb --report /tmp/lookup.json
 # Disk SQL audit; default locking is auto (page service):
 JED_NATIVE_STORAGE=disk JED_NATIVE_LOCKING=exclusive mise run ruby-native:conformance
 # Full benchmark adapter, using the separately prepared standard databases:
@@ -142,7 +149,7 @@ The separate comparison uses a shared 1,000-row plan,
 records raw timings and checksums, and distinguishes interpreter/YJIT/ZJIT; an
 unavailable JIT is reported, never silently measured as interpreter Ruby.
 
-The approved OpenSSL extension is required for digest functions.
+The approved OpenSSL and Zlib extensions are required for digests and CRC32.
 `tools/generate_catalog.rb` snapshots only
 mechanical function metadata from shared spec data using the existing development
 TOML parser; normal codegen never runs it. Parser, resolver, executor, codecs, and

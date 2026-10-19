@@ -4,7 +4,9 @@ module JedNative
   module ServiceDatabase
     def service_storages(writable: false)
       main = @engine.instance_variable_get(:@storage)
-      attached = @engine.instance_variable_get(:@attachments).values.filter_map { |attachment| attachment[:storage] unless writable && attachment[:read_only] }
+      attachments = @engine.instance_variable_get(:@attachments)
+      return main ? [main] : [] if attachments.empty?
+      attached = attachments.values.filter_map { |attachment| attachment[:storage] unless writable && attachment[:read_only] }
       ([main].compact + attached).sort_by { |storage| storage.path.b }
     end
 
