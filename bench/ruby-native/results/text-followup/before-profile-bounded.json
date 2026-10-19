@@ -1,0 +1,25 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "bench/ruby-native/query_profile.rb",
+    "--api",
+    "execute",
+    "--report",
+    "bench/ruby-native/results/text-followup/before-profile.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 78729216,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 6.500062436010921,
+  "source": "/tmp/jed-text-before/impl/ruby-native",
+  "source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "final_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "execute scalar: 4723.0ns; 39.0 allocations\nexecute general_text_filter: 2024757.8ns; 14944.0 allocations\nexecute text_equality_filter: 1164678.9ns; 5871.0 allocations\nexecute text_predicate_projection: 2740762.5ns; 16930.0 allocations\nexecute text_predicate_sort: 2747530.3ns; 18259.0 allocations\nexecute text_predicate_group: 2840724.4ns; 17975.0 allocations\nexecute text_like_fallback: 1909374.7ns; 26785.0 allocations\n",
+  "stderr": ""
+}

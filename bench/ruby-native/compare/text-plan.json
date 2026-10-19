@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "description": "Explicit C-text predicate compilation experiment over the unchanged 1000-row fixture. The scalar integer control and existing general_text_filter retain their schedules. New equality, projection, integer sort-key, and grouping shapes use C-text comparisons; LIKE remains an unsupported control. Actual text parameter bindings are covered separately by text_diagnostics.rb.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"general_text_filter","sql":"SELECT sum(score) FROM items WHERE label >= 'row5'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"text_equality_filter","sql":"SELECT count(*) FROM items WHERE label = 'row500'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"text_predicate_projection","sql":"SELECT id, CASE WHEN label >= 'row5' THEN score + 1 ELSE score - 1 END FROM items ORDER BY id","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"text_predicate_sort","sql":"SELECT id, score FROM items ORDER BY CASE WHEN label >= 'row5' THEN 1 ELSE 0 END DESC, id LIMIT 20","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"text_predicate_group","sql":"SELECT CASE WHEN label >= 'row5' THEN 1 ELSE 0 END, count(*), sum(score) FROM items GROUP BY CASE WHEN label >= 'row5' THEN 1 ELSE 0 END ORDER BY 1","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"text_like_fallback","sql":"SELECT sum(score) FROM items WHERE label LIKE 'row5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0}
+  ]
+}

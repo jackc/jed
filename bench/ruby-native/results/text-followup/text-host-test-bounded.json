@@ -1,0 +1,21 @@
+{
+  "command": [
+    "ruby",
+    "--yjit",
+    "impl/ruby-native/test/compiled_text_test.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 83525632,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 2.5446569729974726,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "final_source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "ruby-native compiled text: metadata, character work, deferred reads, exact guards, collation fallback, warm APIs and captured contexts passed\n",
+  "stderr": ""
+}

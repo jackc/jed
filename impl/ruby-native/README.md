@@ -107,6 +107,12 @@ complete integer/boolean grouping-key vectors. It preserves the separate filter
 and key-evaluation phases, rejected-row memory release, and ordinary grouping
 and HAVING behavior. See the [relation follow-up](RELATION_FOLLOWUP.md).
 
+The scalar compiler also admits C-text comparisons, leaves, and identity casts,
+preserving collation metadata and exact comparison-work charges. This extends
+the existing eligible expression and row loops; general string functions and
+linguistic comparisons keep their ordinary execution. See the
+[text follow-up](TEXT_FOLLOWUP.md).
+
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;
 explicit options to `db.session` override the defaults. Sessions expose

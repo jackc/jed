@@ -200,7 +200,9 @@ module NativeCompiledExpressionTests
     assert(!kernel.source.include?(marker), 'SQL identifier reached generated source')
     assert(!defined?($jed_compiled_source_escape), 'SQL identifier escaped into Ruby execution')
     literal = JedNative::Expression.new(kind: :literal, type: 'text', value: marker)
-    assert(build(literal).nil?, 'string literal crossed the primitive compiler boundary')
+    text_kernel = build(literal)
+    assert(text_kernel && !text_kernel.source.include?(marker) && text_kernel.pool.include?(marker),
+      'text literal did not remain data in the generated pool')
     malicious = Object.new
     def malicious.inspect = raise('compiler inspected an unsupported SQL value')
     def malicious.to_s = raise('compiler stringified an unsupported SQL value')
@@ -236,7 +238,7 @@ module NativeCompiledExpressionTests
   end
 
   def bounded_fallback
-    unsupported = ["SELECT 'text'", 'SELECT 1.25::decimal', 'SELECT 1::f64', 'SELECT ARRAY[1, 2]',
+    unsupported = ['SELECT 1.25::decimal', 'SELECT 1::f64', 'SELECT ARRAY[1, 2]',
       'SELECT ROW(1, 2)', 'SELECT CASE 1 WHEN 1 THEN 2 ELSE 3 END', 'SELECT lower(\'a\')', 'SELECT now()']
     unsupported.each do |sql|
       expression, registry = resolve(sql)
@@ -259,7 +261,7 @@ module NativeCompiledExpressionTests
     node.instance_variable_set(:@native_deep_evaluation, true)
     assert(build(node).nil?, 'deep-stack expression bypassed its interpreter lane')
     node = literal.call
-    node.instance_variable_set(:@native_collation, JedNative::CollationLabel.new(name: 'C'))
+    node.instance_variable_set(:@native_collation, JedNative::CollationLabel.new(name: 'unicode'))
     assert(build(node).nil?, 'collation metadata crossed the primitive compiler boundary')
     assert(build(literal.call, { 'i64' => [{ name: 'nominal', type: 'i32' }] }).nil?, 'nominal registry precedence was bypassed')
     %i[column param].each do |kind|

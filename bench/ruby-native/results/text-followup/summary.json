@@ -1,0 +1,1899 @@
+{
+  "statistic": "Mean of two per-process medians per ABBA state; microseconds per complete query. Raw samples and paired medians remain available; this is not a confidence interval.",
+  "baseline_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "runtime_identities": {
+    "4.0-none": {
+      "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+      "version": "ruby 4.0.7 ",
+      "jit": "none"
+    },
+    "4.0-yjit": {
+      "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+      "version": "ruby 4.0.7 ",
+      "jit": "yjit"
+    },
+    "4.1-zjit": {
+      "executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+      "version": "ruby 4.1.0preview1 ",
+      "jit": "zjit"
+    }
+  },
+  "controls": {
+    "4.0-none": {
+      "native-prepared": {
+        "scalar": {
+          "disabled_us": 12.5666585,
+          "enabled_us": 12.74690375,
+          "speedup": 0.9858596837683035,
+          "disabled_medians_ns": [
+            12649.941,
+            12483.376
+          ],
+          "enabled_medians_ns": [
+            12636.408,
+            12857.3995
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 5879.44825,
+          "enabled_us": 1262.5083900000002,
+          "speedup": 4.656957764850972,
+          "disabled_medians_ns": [
+            5959192.1,
+            5799704.4
+          ],
+          "enabled_medians_ns": [
+            1264354.84,
+            1260661.94
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 4539.88192,
+          "enabled_us": 1054.7882400000003,
+          "speedup": 4.304069525841508,
+          "disabled_medians_ns": [
+            4567183.46,
+            4512580.38
+          ],
+          "enabled_medians_ns": [
+            1056124.86,
+            1053451.62
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 9239.106699999998,
+          "enabled_us": 2344.5023300000003,
+          "speedup": 3.940753899783925,
+          "disabled_medians_ns": [
+            9260998.84,
+            9217214.56
+          ],
+          "enabled_medians_ns": [
+            2356479.84,
+            2332524.82
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 8181.55661,
+          "enabled_us": 1738.75631,
+          "speedup": 4.705407286199869,
+          "disabled_medians_ns": [
+            8195442.26,
+            8167670.96
+          ],
+          "enabled_medians_ns": [
+            1741197.26,
+            1736315.36
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 8206.1923,
+          "enabled_us": 2051.12425,
+          "speedup": 4.000826522332813,
+          "disabled_medians_ns": [
+            8213546.16,
+            8198838.44
+          ],
+          "enabled_medians_ns": [
+            2059467.78,
+            2042780.72
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 5535.48541,
+          "enabled_us": 5503.730509999999,
+          "speedup": 1.0057697047379597,
+          "disabled_medians_ns": [
+            5572898.76,
+            5498072.06
+          ],
+          "enabled_medians_ns": [
+            5498129.9,
+            5509331.12
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-query": {
+        "scalar": {
+          "disabled_us": 13.55015225,
+          "enabled_us": 13.7753085,
+          "speedup": 0.9836550847481927,
+          "disabled_medians_ns": [
+            13596.6885,
+            13503.616
+          ],
+          "enabled_medians_ns": [
+            13719.9855,
+            13830.6315
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 5581.41258,
+          "enabled_us": 1198.8556,
+          "speedup": 4.6556170567998345,
+          "disabled_medians_ns": [
+            5597407.3,
+            5565417.86
+          ],
+          "enabled_medians_ns": [
+            1196007.86,
+            1201703.34
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 4335.319130000001,
+          "enabled_us": 1012.80303,
+          "speedup": 4.280515560858858,
+          "disabled_medians_ns": [
+            4339427.32,
+            4331210.94
+          ],
+          "enabled_medians_ns": [
+            1012722.7,
+            1012883.36
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 8823.6123,
+          "enabled_us": 2258.98,
+          "speedup": 3.9060161223206937,
+          "disabled_medians_ns": [
+            8865228.36,
+            8781996.24
+          ],
+          "enabled_medians_ns": [
+            2228954.38,
+            2289005.62
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 7854.803099999999,
+          "enabled_us": 1677.3955899999999,
+          "speedup": 4.682737421528573,
+          "disabled_medians_ns": [
+            7870980.52,
+            7838625.68
+          ],
+          "enabled_medians_ns": [
+            1666479.28,
+            1688311.9
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 7934.083630000001,
+          "enabled_us": 1969.13699,
+          "speedup": 4.029218723883705,
+          "disabled_medians_ns": [
+            8031904.4,
+            7836262.86
+          ],
+          "enabled_medians_ns": [
+            1968485.66,
+            1969788.32
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 5295.764609999999,
+          "enabled_us": 5279.7110600000005,
+          "speedup": 1.003040611468613,
+          "disabled_medians_ns": [
+            5309792.02,
+            5281737.2
+          ],
+          "enabled_medians_ns": [
+            5294793.44,
+            5264628.68
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-eager": {
+        "scalar": {
+          "disabled_us": 15.226685999999999,
+          "enabled_us": 15.342458999999998,
+          "speedup": 0.9924540779284469,
+          "disabled_medians_ns": [
+            15228.8985,
+            15224.4735
+          ],
+          "enabled_medians_ns": [
+            15312.5265,
+            15372.3915
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 5334.28398,
+          "enabled_us": 1039.9445600000001,
+          "speedup": 5.129392647623447,
+          "disabled_medians_ns": [
+            5296977.74,
+            5371590.22
+          ],
+          "enabled_medians_ns": [
+            1052788.62,
+            1027100.5
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 4102.17368,
+          "enabled_us": 871.00327,
+          "speedup": 4.709710997985117,
+          "disabled_medians_ns": [
+            4089946.72,
+            4114400.64
+          ],
+          "enabled_medians_ns": [
+            878933.2,
+            863073.34
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 7981.25429,
+          "enabled_us": 1654.15497,
+          "speedup": 4.824973738705993,
+          "disabled_medians_ns": [
+            8002764.74,
+            7959743.84
+          ],
+          "enabled_medians_ns": [
+            1654505.0,
+            1653804.94
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 7669.49624,
+          "enabled_us": 1513.3260500000001,
+          "speedup": 5.06797344828631,
+          "disabled_medians_ns": [
+            7591401.82,
+            7747590.66
+          ],
+          "enabled_medians_ns": [
+            1521550.34,
+            1505101.76
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 7577.507519999999,
+          "enabled_us": 1766.2516600000001,
+          "speedup": 4.290162999761879,
+          "disabled_medians_ns": [
+            7573687.4,
+            7581327.64
+          ],
+          "enabled_medians_ns": [
+            1787099.74,
+            1745403.58
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 5112.3613700000005,
+          "enabled_us": 5136.704970000001,
+          "speedup": 0.9952608529899664,
+          "disabled_medians_ns": [
+            5108358.16,
+            5116364.58
+          ],
+          "enabled_medians_ns": [
+            5142899.48,
+            5130510.46
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      }
+    },
+    "4.0-yjit": {
+      "native-prepared": {
+        "scalar": {
+          "disabled_us": 4.8570995,
+          "enabled_us": 4.89797025,
+          "speedup": 0.9916555740615207,
+          "disabled_medians_ns": [
+            4950.377,
+            4763.822
+          ],
+          "enabled_medians_ns": [
+            4990.4455,
+            4805.495
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 2183.27017,
+          "enabled_us": 610.3886600000001,
+          "speedup": 3.5768524434906768,
+          "disabled_medians_ns": [
+            2231256.98,
+            2135283.36
+          ],
+          "enabled_medians_ns": [
+            624759.06,
+            596018.26
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 1270.31946,
+          "enabled_us": 493.81831,
+          "speedup": 2.572443010466744,
+          "disabled_medians_ns": [
+            1290429.04,
+            1250209.88
+          ],
+          "enabled_medians_ns": [
+            505004.24,
+            482632.38
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 3263.6589299999996,
+          "enabled_us": 1162.3088599999999,
+          "speedup": 2.807910222761272,
+          "disabled_medians_ns": [
+            3344998.08,
+            3182319.78
+          ],
+          "enabled_medians_ns": [
+            1189902.78,
+            1134714.94
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 2874.25292,
+          "enabled_us": 1018.27073,
+          "speedup": 2.822680486946728,
+          "disabled_medians_ns": [
+            2931406.26,
+            2817099.58
+          ],
+          "enabled_medians_ns": [
+            1084827.0,
+            951714.46
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 2895.01833,
+          "enabled_us": 986.5771500000001,
+          "speedup": 2.9344064273128563,
+          "disabled_medians_ns": [
+            2969850.02,
+            2820186.64
+          ],
+          "enabled_medians_ns": [
+            1007149.42,
+            966004.88
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 1959.48344,
+          "enabled_us": 1874.9991100000002,
+          "speedup": 1.0450583307210208,
+          "disabled_medians_ns": [
+            2005252.2,
+            1913714.68
+          ],
+          "enabled_medians_ns": [
+            1999121.12,
+            1750877.1
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-query": {
+        "scalar": {
+          "disabled_us": 5.272651,
+          "enabled_us": 5.4757929999999995,
+          "speedup": 0.9629018116645388,
+          "disabled_medians_ns": [
+            5245.9025,
+            5299.3995
+          ],
+          "enabled_medians_ns": [
+            5437.531,
+            5514.055
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 2113.86321,
+          "enabled_us": 623.6771499999999,
+          "speedup": 3.389354909026249,
+          "disabled_medians_ns": [
+            2123644.76,
+            2104081.66
+          ],
+          "enabled_medians_ns": [
+            621469.58,
+            625884.72
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 1227.35364,
+          "enabled_us": 509.42134,
+          "speedup": 2.4093094333268414,
+          "disabled_medians_ns": [
+            1239242.42,
+            1215464.86
+          ],
+          "enabled_medians_ns": [
+            505321.68,
+            513521.0
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 3207.40759,
+          "enabled_us": 1121.36224,
+          "speedup": 2.860277861683661,
+          "disabled_medians_ns": [
+            3325490.8,
+            3089324.38
+          ],
+          "enabled_medians_ns": [
+            1181405.54,
+            1061318.94
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 2838.25767,
+          "enabled_us": 1082.68595,
+          "speedup": 2.6214967230340434,
+          "disabled_medians_ns": [
+            2931737.88,
+            2744777.46
+          ],
+          "enabled_medians_ns": [
+            1088152.66,
+            1077219.24
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 2866.7421799999997,
+          "enabled_us": 1019.8552,
+          "speedup": 2.8109305909309477,
+          "disabled_medians_ns": [
+            2951838.26,
+            2781646.1
+          ],
+          "enabled_medians_ns": [
+            1014491.52,
+            1025218.88
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 1945.1910899999998,
+          "enabled_us": 1985.2436200000002,
+          "speedup": 0.9798248791249105,
+          "disabled_medians_ns": [
+            1989196.04,
+            1901186.14
+          ],
+          "enabled_medians_ns": [
+            1976637.98,
+            1993849.26
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-eager": {
+        "scalar": {
+          "disabled_us": 5.57287525,
+          "enabled_us": 5.4968255,
+          "speedup": 1.0138352127059518,
+          "disabled_medians_ns": [
+            5556.27,
+            5589.4805
+          ],
+          "enabled_medians_ns": [
+            5480.486,
+            5513.165
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "general_text_filter": {
+          "disabled_us": 2212.09175,
+          "enabled_us": 597.20608,
+          "speedup": 3.704067698038171,
+          "disabled_medians_ns": [
+            2198815.2,
+            2225368.3
+          ],
+          "enabled_medians_ns": [
+            599536.4,
+            594875.76
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 1276.25594,
+          "enabled_us": 504.00359,
+          "speedup": 2.532235812050466,
+          "disabled_medians_ns": [
+            1274964.58,
+            1277547.3
+          ],
+          "enabled_medians_ns": [
+            478009.66,
+            529997.52
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 3060.76458,
+          "enabled_us": 987.1223100000001,
+          "speedup": 3.1006943607626494,
+          "disabled_medians_ns": [
+            3060206.3,
+            3061322.86
+          ],
+          "enabled_medians_ns": [
+            1003957.16,
+            970287.46
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 2927.6218499999995,
+          "enabled_us": 1130.15215,
+          "speedup": 2.5904670003945927,
+          "disabled_medians_ns": [
+            2926522.28,
+            2928721.42
+          ],
+          "enabled_medians_ns": [
+            1203030.74,
+            1057273.56
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 3064.1172800000004,
+          "enabled_us": 1100.48559,
+          "speedup": 2.7843320329164873,
+          "disabled_medians_ns": [
+            3067856.74,
+            3060377.82
+          ],
+          "enabled_medians_ns": [
+            1031521.62,
+            1169449.56
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 2023.2726699999998,
+          "enabled_us": 2014.85212,
+          "speedup": 1.004179239715121,
+          "disabled_medians_ns": [
+            2012414.6,
+            2034130.74
+          ],
+          "enabled_medians_ns": [
+            1985061.12,
+            2044643.12
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      }
+    },
+    "4.1-zjit": {
+      "native-prepared": {
+        "scalar": {
+          "disabled_us": 5.4168795,
+          "enabled_us": 5.3710932499999995,
+          "speedup": 1.008524568066287,
+          "disabled_medians_ns": [
+            5297.3845,
+            5536.3745
+          ],
+          "enabled_medians_ns": [
+            5318.079,
+            5424.1075
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 2322.62777,
+          "enabled_us": 676.27286,
+          "speedup": 3.4344536168433555,
+          "disabled_medians_ns": [
+            2270448.3,
+            2374807.24
+          ],
+          "enabled_medians_ns": [
+            664521.82,
+            688023.9
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 1466.70946,
+          "enabled_us": 554.92643,
+          "speedup": 2.6430701093116076,
+          "disabled_medians_ns": [
+            1449189.7,
+            1484229.22
+          ],
+          "enabled_medians_ns": [
+            543470.88,
+            566381.98
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 4150.17454,
+          "enabled_us": 1371.15274,
+          "speedup": 3.026777702387846,
+          "disabled_medians_ns": [
+            4053688.82,
+            4246660.26
+          ],
+          "enabled_medians_ns": [
+            1393202.68,
+            1349102.8
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 3403.47762,
+          "enabled_us": 984.72641,
+          "speedup": 3.4562672285797635,
+          "disabled_medians_ns": [
+            3333756.88,
+            3473198.36
+          ],
+          "enabled_medians_ns": [
+            1005289.16,
+            964163.66
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 3370.46823,
+          "enabled_us": 1141.4977799999997,
+          "speedup": 2.952671734499563,
+          "disabled_medians_ns": [
+            3296841.4,
+            3444095.06
+          ],
+          "enabled_medians_ns": [
+            1152444.88,
+            1130550.68
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 2315.27321,
+          "enabled_us": 2355.53413,
+          "speedup": 0.9829079445348559,
+          "disabled_medians_ns": [
+            2318263.58,
+            2312282.84
+          ],
+          "enabled_medians_ns": [
+            2355399.7,
+            2355668.56
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-query": {
+        "scalar": {
+          "disabled_us": 5.8941565,
+          "enabled_us": 5.9677732500000005,
+          "speedup": 0.9876642849994343,
+          "disabled_medians_ns": [
+            5594.5655,
+            6193.7475
+          ],
+          "enabled_medians_ns": [
+            5723.17,
+            6212.3765
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 2410.95932,
+          "enabled_us": 684.56449,
+          "speedup": 3.5218877917550175,
+          "disabled_medians_ns": [
+            2408579.88,
+            2413338.76
+          ],
+          "enabled_medians_ns": [
+            680311.12,
+            688817.86
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 1595.57762,
+          "enabled_us": 551.5768,
+          "speedup": 2.8927569469926944,
+          "disabled_medians_ns": [
+            1594306.16,
+            1596849.08
+          ],
+          "enabled_medians_ns": [
+            544017.34,
+            559136.26
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 4197.6358,
+          "enabled_us": 1500.70773,
+          "speedup": 2.7971041369927505,
+          "disabled_medians_ns": [
+            4120160.3,
+            4275111.3
+          ],
+          "enabled_medians_ns": [
+            1460773.62,
+            1540641.84
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 3471.6295099999998,
+          "enabled_us": 983.71112,
+          "speedup": 3.5291148381040967,
+          "disabled_medians_ns": [
+            3396346.54,
+            3546912.48
+          ],
+          "enabled_medians_ns": [
+            953355.3,
+            1014066.94
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 3412.4959599999997,
+          "enabled_us": 1144.99453,
+          "speedup": 2.9803600546458506,
+          "disabled_medians_ns": [
+            3345506.72,
+            3479485.2
+          ],
+          "enabled_medians_ns": [
+            1157561.6,
+            1132427.46
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 2367.77352,
+          "enabled_us": 2371.68048,
+          "speedup": 0.9983526617379758,
+          "disabled_medians_ns": [
+            2332848.68,
+            2402698.36
+          ],
+          "enabled_medians_ns": [
+            2388760.16,
+            2354600.8
+          ],
+          "enabled_medians_below_both_disabled": false
+        }
+      },
+      "native-eager": {
+        "scalar": {
+          "disabled_us": 5.4551185,
+          "enabled_us": 5.5454040000000004,
+          "speedup": 0.9837188597981319,
+          "disabled_medians_ns": [
+            5408.1875,
+            5502.0495
+          ],
+          "enabled_medians_ns": [
+            5495.732,
+            5595.076
+          ],
+          "enabled_medians_below_both_disabled": false
+        },
+        "general_text_filter": {
+          "disabled_us": 2200.9324699999997,
+          "enabled_us": 563.1262399999999,
+          "speedup": 3.9084175335178837,
+          "disabled_medians_ns": [
+            2204341.98,
+            2197522.96
+          ],
+          "enabled_medians_ns": [
+            555404.54,
+            570847.94
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_equality_filter": {
+          "disabled_us": 1471.52158,
+          "enabled_us": 437.52532,
+          "speedup": 3.363283249527136,
+          "disabled_medians_ns": [
+            1487252.46,
+            1455790.7
+          ],
+          "enabled_medians_ns": [
+            431118.94,
+            443931.7
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_projection": {
+          "disabled_us": 3435.29527,
+          "enabled_us": 802.6609,
+          "speedup": 4.279883659463168,
+          "disabled_medians_ns": [
+            3432827.92,
+            3437762.62
+          ],
+          "enabled_medians_ns": [
+            804503.64,
+            800818.16
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_sort": {
+          "disabled_us": 3122.64991,
+          "enabled_us": 831.09336,
+          "speedup": 3.757279338629297,
+          "disabled_medians_ns": [
+            3117754.9,
+            3127544.92
+          ],
+          "enabled_medians_ns": [
+            828406.14,
+            833780.58
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_predicate_group": {
+          "disabled_us": 3211.66511,
+          "enabled_us": 959.98649,
+          "speedup": 3.345531570970337,
+          "disabled_medians_ns": [
+            3224776.34,
+            3198553.88
+          ],
+          "enabled_medians_ns": [
+            957505.06,
+            962467.92
+          ],
+          "enabled_medians_below_both_disabled": true
+        },
+        "text_like_fallback": {
+          "disabled_us": 2278.53348,
+          "enabled_us": 2213.85708,
+          "speedup": 1.0292143519942127,
+          "disabled_medians_ns": [
+            2278412.88,
+            2278654.08
+          ],
+          "enabled_medians_ns": [
+            2181737.02,
+            2245977.14
+          ],
+          "enabled_medians_below_both_disabled": true
+        }
+      }
+    }
+  },
+  "before": {
+    "4.0-none": {
+      "native-prepared": {
+        "scalar": 12.872583,
+        "general_text_filter": 5786.84758,
+        "text_equality_filter": 4483.6723,
+        "text_predicate_projection": 9247.50758,
+        "text_predicate_sort": 8172.65056,
+        "text_predicate_group": 7871.28542,
+        "text_like_fallback": 5272.116059999999
+      },
+      "native-query": {
+        "scalar": 13.778858,
+        "general_text_filter": 5571.14258,
+        "text_equality_filter": 4354.84714,
+        "text_predicate_projection": 8808.169199999998,
+        "text_predicate_sort": 7873.1141,
+        "text_predicate_group": 7903.42376,
+        "text_like_fallback": 5315.750639999999
+      },
+      "native-eager": {
+        "scalar": 15.2707565,
+        "general_text_filter": 5448.5992400000005,
+        "text_equality_filter": 4320.21704,
+        "text_predicate_projection": 8257.30398,
+        "text_predicate_sort": 7852.30196,
+        "text_predicate_group": 7810.04256,
+        "text_like_fallback": 5308.5178399999995
+      }
+    },
+    "4.0-yjit": {
+      "native-prepared": {
+        "scalar": 4.914624,
+        "general_text_filter": 2010.83762,
+        "text_equality_filter": 1141.71006,
+        "text_predicate_projection": 3196.5244,
+        "text_predicate_sort": 2935.82796,
+        "text_predicate_group": 2937.8945,
+        "text_like_fallback": 1991.17852
+      },
+      "native-query": {
+        "scalar": 5.7347605,
+        "general_text_filter": 2214.92524,
+        "text_equality_filter": 1186.86028,
+        "text_predicate_projection": 3292.91168,
+        "text_predicate_sort": 2903.64312,
+        "text_predicate_group": 2933.41224,
+        "text_like_fallback": 1963.25808
+      },
+      "native-eager": {
+        "scalar": 5.1966425,
+        "general_text_filter": 2104.86602,
+        "text_equality_filter": 1231.3728600000002,
+        "text_predicate_projection": 2921.02748,
+        "text_predicate_sort": 2797.24652,
+        "text_predicate_group": 2896.93716,
+        "text_like_fallback": 1945.24716
+      }
+    },
+    "4.1-zjit": {
+      "native-prepared": {
+        "scalar": 5.648534499999999,
+        "general_text_filter": 2382.91038,
+        "text_equality_filter": 1465.73982,
+        "text_predicate_projection": 4224.96892,
+        "text_predicate_sort": 3510.14062,
+        "text_predicate_group": 3474.5854,
+        "text_like_fallback": 2390.3633
+      },
+      "native-query": {
+        "scalar": 5.5432325,
+        "general_text_filter": 2295.65114,
+        "text_equality_filter": 1512.76834,
+        "text_predicate_projection": 4102.07428,
+        "text_predicate_sort": 3394.20482,
+        "text_predicate_group": 3354.4862200000002,
+        "text_like_fallback": 2315.9605
+      },
+      "native-eager": {
+        "scalar": 5.656865,
+        "general_text_filter": 2233.1942400000003,
+        "text_equality_filter": 1322.76364,
+        "text_predicate_projection": 3402.35788,
+        "text_predicate_sort": 3154.6135600000002,
+        "text_predicate_group": 3207.13646,
+        "text_like_fallback": 2106.14094
+      }
+    }
+  },
+  "binding": {
+    "wrapper": {
+      "scalar": 7.7782945,
+      "general_text_filter": 116.14424000000001,
+      "text_equality_filter": 34.64552,
+      "text_predicate_projection": 847.80988,
+      "text_predicate_sort": 309.21171999999996,
+      "text_predicate_group": 332.34402,
+      "text_like_fallback": 175.29232000000002
+    },
+    "native-prepared": {
+      "scalar": 5.007595500000001,
+      "general_text_filter": 619.0877800000001,
+      "text_equality_filter": 505.07822,
+      "text_predicate_projection": 1032.08532,
+      "text_predicate_sort": 1070.6349,
+      "text_predicate_group": 1016.10452,
+      "text_like_fallback": 1827.6718
+    },
+    "native-query": {
+      "scalar": 5.498581,
+      "general_text_filter": 624.33008,
+      "text_equality_filter": 488.0322,
+      "text_predicate_projection": 1150.82848,
+      "text_predicate_sort": 1061.41474,
+      "text_predicate_group": 969.87912,
+      "text_like_fallback": 1914.58864
+    },
+    "native-eager": {
+      "scalar": 5.316529999999999,
+      "general_text_filter": 572.01802,
+      "text_equality_filter": 505.38452,
+      "text_predicate_projection": 923.7528000000001,
+      "text_predicate_sort": 1020.0316,
+      "text_predicate_group": 1103.84098,
+      "text_like_fallback": 1981.81572
+    }
+  },
+  "cross_core": {
+    "ruby-yjit": {
+      "scalar": 4.9385905,
+      "general_text_filter": 621.4315799999999,
+      "text_equality_filter": 504.94721999999996,
+      "text_predicate_projection": 1260.5818000000002,
+      "text_predicate_sort": 1117.5588799999998,
+      "text_predicate_group": 1051.75834,
+      "text_like_fallback": 1990.3401999999999
+    },
+    "go": {
+      "scalar": 0.80291,
+      "general_text_filter": 174.43668,
+      "text_equality_filter": 45.27698,
+      "text_predicate_projection": 469.7549,
+      "text_predicate_sort": 402.29836,
+      "text_predicate_group": 441.30778000000004,
+      "text_like_fallback": 143.07283999999999
+    },
+    "rust": {
+      "scalar": 1.3846735000000001,
+      "general_text_filter": 109.87558,
+      "text_equality_filter": 27.907919999999997,
+      "text_predicate_projection": 276.94840000000005,
+      "text_predicate_sort": 247.59106,
+      "text_predicate_group": 285.31918,
+      "text_like_fallback": 148.46742
+    },
+    "ts": {
+      "scalar": 2.1922235,
+      "general_text_filter": 1598.7608799999998,
+      "text_equality_filter": 83.71503999999999,
+      "text_predicate_projection": 1862.16574,
+      "text_predicate_sort": 1335.4576200000001,
+      "text_predicate_group": 1468.4549399999999,
+      "text_like_fallback": 315.40544
+    }
+  },
+  "validation": {
+    "source_provenance": {
+      "baseline_commit": "8347075b8b235bba4a3a173460ba74963f7049aa",
+      "baseline_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+      "final_source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+      "host_test_files": 55,
+      "host_tests_sha256": "32aeecc76657007adacafdfcfbfc0ce422efa49e20de7841f22b46389614f62f",
+      "corpus_files": 679,
+      "corpus_sha256": "c146c24f8d0dc33043aba9ac6d2d7b0d238529b368403079f6b7ddd64facec65",
+      "plan_sha256": "16cd82ad8b3e3f467ad4c81c95a10d8bc52c800eaf529d5ea2b61d6c8186f582",
+      "limits": {
+        "worker_rss_bytes": 536870912,
+        "worker_address_space_bytes": 2147483648
+      },
+      "note": "Opt-in frozen experiment. The baseline source is recoverable with git archive from baseline_commit. The final commit contains the measured final source and all evidence."
+    },
+    "matching_values_metadata_costs": {
+      "scalar": {
+        "validation_sha256": "dd2a48b279dbc34ed87f183a7d466c7a3c54fd9db1c51668f8fd8fbb9b756443",
+        "answer_sha256": "6ee55f0b3c1df4311965e74ee176604aba37d507ebac085df2ff69c17006876f",
+        "validation_rows": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "validation_costs": [
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4,
+          4
+        ],
+        "validation_columns": [
+          "?column?"
+        ],
+        "validation_column_types": [
+          "i64"
+        ]
+      },
+      "general_text_filter": {
+        "validation_sha256": "3ea2bccb0d4ed9380318f1bc93db6994b3f18a70c27577a10c350f67876e07bb",
+        "answer_sha256": "86cc241017db39bf59f877cfec15c9a50a7c270fc1a77b20f4762bea3520678c",
+        "validation_rows": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "validation_costs": [
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562,
+          5562
+        ],
+        "validation_columns": [
+          "sum"
+        ],
+        "validation_column_types": [
+          "i64"
+        ]
+      },
+      "text_equality_filter": {
+        "validation_sha256": "6ed581a3f89b5e565468d159d1e7a297ff9cb7c877f4297855cad3f01eab162f",
+        "answer_sha256": "b90cf274327f7d7232bb60a93946b41945f538e39009dc5ebc006b0a196f5bd4",
+        "validation_rows": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "validation_costs": [
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898,
+          6898
+        ],
+        "validation_columns": [
+          "count"
+        ],
+        "validation_column_types": [
+          "i64"
+        ]
+      },
+      "text_predicate_projection": {
+        "validation_sha256": "0117642248ba5dfe12fffe06161a24ac92586884e45b59fa0514e67bb82d0c05",
+        "answer_sha256": "1c796863b9cd262e36e5457408a9f1b2ca4b73213c380ad1dc580d1e95de87f7",
+        "validation_rows": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ],
+        "validation_costs": [
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006,
+          8006
+        ],
+        "validation_columns": [
+          "id",
+          "?column?"
+        ],
+        "validation_column_types": [
+          "i32",
+          "i32"
+        ]
+      },
+      "text_predicate_sort": {
+        "validation_sha256": "9e0f6426f4063fea4df85ce6751eb5442939df817870e40916bc2ea82d3afdc2",
+        "answer_sha256": "f41743a559f4c7aa7f2a16f1a33d6e5e6379cdee5c8650e544ac9ce6667df976",
+        "validation_rows": [
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20,
+          20
+        ],
+        "validation_costs": [
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026,
+          6026
+        ],
+        "validation_columns": [
+          "id",
+          "score"
+        ],
+        "validation_column_types": [
+          "i32",
+          "i32"
+        ]
+      },
+      "text_predicate_group": {
+        "validation_sha256": "b6a308d03287fcce8a86d2a3137644bfb8dba48ea18df22f2e50c49d56874191",
+        "answer_sha256": "367136e3a1f8d72b07e8109bef42e4175d1b2d2a3cfd8a881a199ec355f65f89",
+        "validation_rows": [
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2
+        ],
+        "validation_costs": [
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008,
+          8008
+        ],
+        "validation_columns": [
+          "?column?",
+          "count",
+          "sum"
+        ],
+        "validation_column_types": [
+          "i64",
+          "i64",
+          "i64"
+        ]
+      },
+      "text_like_fallback": {
+        "validation_sha256": "89b97732e7c7a7dfc2cd55c6812ff34f5cd50c00412a8e335c8ba73153d36a0f",
+        "answer_sha256": "246011dd4015d7caf518b0d09c54a87cc7a0056ca7ce72dc7bed44e6137d9ef3",
+        "validation_rows": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "validation_costs": [
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118,
+          2118
+        ],
+        "validation_columns": [
+          "sum"
+        ],
+        "validation_column_types": [
+          "i64"
+        ]
+      }
+    },
+    "schedules": {
+      "scalar": {
+        "warmup": 300,
+        "iterations": 2000,
+        "rows_per_sample": [
+          2000,
+          2000,
+          2000,
+          2000,
+          2000
+        ]
+      },
+      "general_text_filter": {
+        "warmup": 100,
+        "iterations": 50,
+        "rows_per_sample": [
+          50,
+          50,
+          50,
+          50,
+          50
+        ]
+      },
+      "text_equality_filter": {
+        "warmup": 100,
+        "iterations": 50,
+        "rows_per_sample": [
+          50,
+          50,
+          50,
+          50,
+          50
+        ]
+      },
+      "text_predicate_projection": {
+        "warmup": 100,
+        "iterations": 50,
+        "rows_per_sample": [
+          50000,
+          50000,
+          50000,
+          50000,
+          50000
+        ]
+      },
+      "text_predicate_sort": {
+        "warmup": 100,
+        "iterations": 50,
+        "rows_per_sample": [
+          1000,
+          1000,
+          1000,
+          1000,
+          1000
+        ]
+      },
+      "text_predicate_group": {
+        "warmup": 100,
+        "iterations": 50,
+        "rows_per_sample": [
+          100,
+          100,
+          100,
+          100,
+          100
+        ]
+      },
+      "text_like_fallback": {
+        "warmup": 100,
+        "iterations": 50,
+        "rows_per_sample": [
+          50,
+          50,
+          50,
+          50,
+          50
+        ]
+      }
+    },
+    "cross_core_values_and_rows": {
+      "scalar": [
+        "4f2c86bbdc99682d",
+        32,
+        10000,
+        2000,
+        300
+      ],
+      "general_text_filter": [
+        "7fb193569b2eff45",
+        32,
+        250,
+        50,
+        100
+      ],
+      "text_equality_filter": [
+        "cc7fbcde7d695725",
+        32,
+        250,
+        50,
+        100
+      ],
+      "text_predicate_projection": [
+        "438f2f43eec82425",
+        32000,
+        250000,
+        50,
+        100
+      ],
+      "text_predicate_sort": [
+        "220a6551698bcda5",
+        640,
+        5000,
+        50,
+        100
+      ],
+      "text_predicate_group": [
+        "91c5065f9ee1e925",
+        64,
+        500,
+        50,
+        100
+      ],
+      "text_like_fallback": [
+        "c40042c9dcdc4ea5",
+        32,
+        250,
+        50,
+        100
+      ]
+    },
+    "memory-zjit": {
+      "passed": 20267,
+      "failed": 0,
+      "records": 20267,
+      "skipped_files": 2,
+      "compiled_text_kernels": 432,
+      "compiled_relations": 594,
+      "peak_worker_rss_bytes": 168275968
+    },
+    "disk-yjit": {
+      "passed": 18250,
+      "failed": 0,
+      "records": 18250,
+      "skipped_files": 77,
+      "compiled_text_kernels": 269,
+      "compiled_relations": 0,
+      "peak_worker_rss_bytes": 183652352
+    },
+    "mixed-query-yjit": {
+      "passed": 20267,
+      "failed": 0,
+      "records": 20267,
+      "skipped_files": 2,
+      "compiled_text_kernels": 433,
+      "compiled_relations": 519,
+      "peak_worker_rss_bytes": 171896832
+    },
+    "pure-query-yjit": {
+      "passed": 20221,
+      "failed": 46,
+      "records": 20267,
+      "skipped_files": 2,
+      "compiled_text_kernels": 433,
+      "compiled_relations": 519,
+      "peak_worker_rss_bytes": 168943616
+    },
+    "host_tests": {
+      "files": 55,
+      "peak_rss_bytes": 138158080,
+      "source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7"
+    }
+  },
+  "source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "allocations": {
+    "scalar": {
+      "before": 39.0,
+      "final": 39.0
+    },
+    "general_text_filter": {
+      "before": 14944.0,
+      "final": 5059.0
+    },
+    "text_equality_filter": {
+      "before": 5871.0,
+      "final": 4986.0
+    },
+    "text_predicate_projection": {
+      "before": 16930.04,
+      "final": 6371.04
+    },
+    "text_predicate_sort": {
+      "before": 18259.04,
+      "final": 7703.04
+    },
+    "text_predicate_group": {
+      "before": 17975.0,
+      "final": 7575.0
+    },
+    "text_like_fallback": {
+      "before": 26785.0,
+      "final": 26790.0
+    }
+  },
+  "diagnostics": {
+    "summary": "diagnostic-summary.json",
+    "all_six_methods_directly_jited": true,
+    "compiler_limits": {
+      "nodes": 192,
+      "depth": 32,
+      "pool_entries": 256,
+      "pool_bytes": 32768,
+      "source_bytes": 32768,
+      "relation_cache_entries": 64
+    },
+    "after_thread_exit_live_kernels": {
+      "4.0-none": [
+        0,
+        0,
+        0
+      ],
+      "4.0-yjit": [
+        0,
+        0,
+        0
+      ],
+      "4.1-zjit": [
+        0,
+        0,
+        0
+      ]
+    },
+    "caveat": "Engine cache bounds do not bound VM-retained classes or machine code; every churn observation is preserved."
+  }
+}

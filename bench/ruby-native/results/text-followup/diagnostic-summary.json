@@ -1,0 +1,1188 @@
+{
+  "schema": 1,
+  "source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "statistic": "Ratios of medians of five alternating samples. Scalar projection samples contain 100000 one-row calls; relation samples contain 100 calls over 512 rows. Allocations are Ruby objects allocated per call. Compile medians sum emission and materialization across 30 samples.",
+  "runtimes": {
+    "4.0-none": {
+      "peak_rss_mib": 57.51953125,
+      "elapsed_seconds": 49.27787947100296,
+      "jobs": {
+        "text_parameter_projection": {
+          "kind": "scalar",
+          "ordinary": {
+            "us_per_call": 7.06742687,
+            "allocations_per_call": 13.0,
+            "raw_us_per_call": [
+              7.077650569999999,
+              7.06742687,
+              7.05021824,
+              7.07713389,
+              7.06709116
+            ]
+          },
+          "compiled": {
+            "us_per_call": 1.3128400999999998,
+            "allocations_per_call": 4.0,
+            "raw_us_per_call": [
+              1.3172976,
+              1.3185482899999998,
+              1.3128400999999998,
+              1.3041747700000001,
+              1.31126469
+            ]
+          },
+          "speedup": 5.383311242549646,
+          "compile_median_us": 41.33,
+          "first_compile_us": 81.995,
+          "first_call_us": 28.422,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "ad44165f5c451e23bcdff18b2d1a83b4b063f2f954aeb5a2372dd704117b370d",
+            "iseq_path": "(jed compiled expression)",
+            "first_lineno": 1
+          },
+          "source_bytes": 787,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "text_identity_projection": {
+          "kind": "scalar",
+          "ordinary": {
+            "us_per_call": 3.50868585,
+            "allocations_per_call": 2.0,
+            "raw_us_per_call": [
+              3.5156528899999997,
+              3.57559008,
+              3.48021378,
+              3.50868585,
+              3.4803564299999996
+            ]
+          },
+          "compiled": {
+            "us_per_call": 0.80838493,
+            "allocations_per_call": 2.0,
+            "raw_us_per_call": [
+              0.8293923099999999,
+              0.84210801,
+              0.80623537,
+              0.80616232,
+              0.80838493
+            ]
+          },
+          "speedup": 4.340365239119437,
+          "compile_median_us": 13.3825,
+          "first_compile_us": 74.058,
+          "first_call_us": 4.356,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "65631875a078175a0fcbbbcdeacd4ead82f21f0e2aedbbc241e75f1c622b8117",
+            "iseq_path": "(jed compiled expression)",
+            "first_lineno": 1
+          },
+          "source_bytes": 201,
+          "pool_entries": 2,
+          "pool_bytes": 8
+        },
+        "text_equality_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 2949.9315699999997,
+            "allocations_per_call": 1969.0,
+            "raw_us_per_call": [
+              2963.68763,
+              2945.75661,
+              2949.9315699999997,
+              2951.17802,
+              2946.86521
+            ]
+          },
+          "compiled": {
+            "us_per_call": 583.52172,
+            "allocations_per_call": 1457.0,
+            "raw_us_per_call": [
+              585.22645,
+              583.2526700000001,
+              583.2165600000001,
+              586.313,
+              583.52172
+            ]
+          },
+          "speedup": 5.055392916650986,
+          "compile_median_us": 48.282,
+          "first_compile_us": 363.61,
+          "first_call_us": 724.583,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "3619d9ca6a33b01f30e525392ab889dd6371576ff73b948aa89d55612fb32561",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 999,
+          "pool_entries": 3,
+          "pool_bytes": 9
+        },
+        "nullable_text_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 1332.91507,
+            "allocations_per_call": 1911.0,
+            "raw_us_per_call": [
+              1342.2590400000001,
+              1335.5864,
+              1332.6468200000002,
+              1330.76656,
+              1332.91507
+            ]
+          },
+          "compiled": {
+            "us_per_call": 259.76914999999997,
+            "allocations_per_call": 485.0,
+            "raw_us_per_call": [
+              261.14261,
+              259.32874,
+              259.76914999999997,
+              258.26147,
+              261.4585
+            ]
+          },
+          "speedup": 5.131152294258191,
+          "compile_median_us": 61.66,
+          "first_compile_us": 149.944,
+          "first_call_us": 263.395,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "3c6fdab6b9312543c0e81b33f29bc5bd7cdfc38e8dbd6e6ccaec0ffc9e9a2cd4",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 1136,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "accounted_text_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 1685.35528,
+            "allocations_per_call": 2368.0,
+            "raw_us_per_call": [
+              1685.35528,
+              1677.9155600000001,
+              1704.17475,
+              1684.08366,
+              1687.57584
+            ]
+          },
+          "compiled": {
+            "us_per_call": 517.43331,
+            "allocations_per_call": 942.0,
+            "raw_us_per_call": [
+              518.4490999999999,
+              515.39536,
+              520.8494000000001,
+              517.43331,
+              514.63192
+            ]
+          },
+          "speedup": 3.2571449255943725,
+          "compile_median_us": 58.7315,
+          "first_compile_us": 176.064,
+          "first_call_us": 525.444,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "eb4051d9819550816fb66c11142cb9b640aee4e080b0a993c49225cc6f5d1974",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 1251,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "text_predicate_key_vector": {
+          "kind": "keys",
+          "ordinary": {
+            "us_per_call": 7602.6530999999995,
+            "allocations_per_call": 8939.0,
+            "raw_us_per_call": [
+              7590.82551,
+              7622.37597,
+              7602.6530999999995,
+              7596.9325,
+              7621.13233
+            ]
+          },
+          "compiled": {
+            "us_per_call": 1118.96503,
+            "allocations_per_call": 3937.0,
+            "raw_us_per_call": [
+              1120.5761,
+              1111.0555200000001,
+              1118.96503,
+              1124.76529,
+              1108.57215
+            ]
+          },
+          "speedup": 6.7943616611503925,
+          "compile_median_us": 102.1495,
+          "first_compile_us": 209.366,
+          "first_call_us": 1094.051,
+          "yjit_instructions": null,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "a5ddf4a3a9b0134604e77bda9264dc13e3605fbc9e64130d97abcb37c5787d9a",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 2122,
+          "pool_entries": 11,
+          "pool_bytes": 23
+        }
+      },
+      "cache_admission": {
+        "first_use_deferred": true,
+        "second_use_materialized": true,
+        "equal_program_reused": true,
+        "exact_text_pool_key": true,
+        "immutable_scalar_pool": true,
+        "text_disabled_rejected": true,
+        "oversized_text_pool_rejected": true,
+        "unsupported_predicates": [
+          "label LIKE 'row%'",
+          "lower(label) >= 'row5'",
+          "label || 'x' >= 'row5'"
+        ]
+      },
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 103146644,
+        "before": {
+          "rss_bytes": 53432320,
+          "live_slots": 91260,
+          "jit": {},
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 4
+        },
+        "while_cache_retained": {
+          "rss_bytes": 60313600,
+          "live_slots": 94202,
+          "jit": {},
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 68,
+          "retained_kernels": 64,
+          "retained_source_bytes": 63936,
+          "retained_pool_entries": 128,
+          "retained_pool_bytes": 768
+        },
+        "after_completed_thread_exit_and_gc": [
+          {
+            "rss_bytes": 60444672,
+            "live_slots": 92530,
+            "jit": {},
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 4,
+            "collection": 1
+          },
+          {
+            "rss_bytes": 60444672,
+            "live_slots": 92468,
+            "jit": {},
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 4,
+            "collection": 2
+          },
+          {
+            "rss_bytes": 60444672,
+            "live_slots": 92470,
+            "jit": {},
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 4,
+            "collection": 3
+          }
+        ],
+        "note": "Actual source/pool LRU and second-use admission. Only verified scalar snapshots escape a completed thread; its reference is released before GC. VM classes and code can outlive kernel instances; this is not an overall JIT memory bound."
+      }
+    },
+    "4.0-yjit": {
+      "peak_rss_mib": 76.7265625,
+      "elapsed_seconds": 14.624239101991407,
+      "jobs": {
+        "text_parameter_projection": {
+          "kind": "scalar",
+          "ordinary": {
+            "us_per_call": 2.0248030100000003,
+            "allocations_per_call": 13.0,
+            "raw_us_per_call": [
+              2.02911689,
+              2.00734243,
+              2.01068877,
+              2.03796778,
+              2.0248030100000003
+            ]
+          },
+          "compiled": {
+            "us_per_call": 0.5285441200000001,
+            "allocations_per_call": 4.0,
+            "raw_us_per_call": [
+              0.5281957599999999,
+              0.52948354,
+              0.52903165,
+              0.5285441200000001,
+              0.52793029
+            ]
+          },
+          "speedup": 3.830906320554659,
+          "compile_median_us": 50.8405,
+          "first_compile_us": 86.261,
+          "first_call_us": 23.621,
+          "yjit_instructions": 136,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "ad44165f5c451e23bcdff18b2d1a83b4b063f2f954aeb5a2372dd704117b370d",
+            "yjit_compiled_instruction_count": 136,
+            "direct_jit_proof": true,
+            "iseq_path": "(jed compiled expression)",
+            "first_lineno": 1
+          },
+          "source_bytes": 787,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "text_identity_projection": {
+          "kind": "scalar",
+          "ordinary": {
+            "us_per_call": 0.61358255,
+            "allocations_per_call": 2.0,
+            "raw_us_per_call": [
+              0.6386109,
+              0.61707011,
+              0.61358255,
+              0.6127978900000001,
+              0.61299857
+            ]
+          },
+          "compiled": {
+            "us_per_call": 0.30394564,
+            "allocations_per_call": 2.0,
+            "raw_us_per_call": [
+              0.32751007,
+              0.32683152,
+              0.30394564,
+              0.30354439,
+              0.3005039
+            ]
+          },
+          "speedup": 2.018724631154439,
+          "compile_median_us": 7.675,
+          "first_compile_us": 154.539,
+          "first_call_us": 373.8,
+          "yjit_instructions": 32,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "65631875a078175a0fcbbbcdeacd4ead82f21f0e2aedbbc241e75f1c622b8117",
+            "yjit_compiled_instruction_count": 32,
+            "direct_jit_proof": true,
+            "iseq_path": "(jed compiled expression)",
+            "first_lineno": 1
+          },
+          "source_bytes": 201,
+          "pool_entries": 2,
+          "pool_bytes": 8
+        },
+        "text_equality_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 636.49499,
+            "allocations_per_call": 1969.0,
+            "raw_us_per_call": [
+              635.3772700000001,
+              636.49499,
+              638.00707,
+              636.9192800000001,
+              634.25159
+            ]
+          },
+          "compiled": {
+            "us_per_call": 291.4248,
+            "allocations_per_call": 1457.0,
+            "raw_us_per_call": [
+              290.30329,
+              291.4248,
+              292.10384999999997,
+              296.36420000000004,
+              290.72279
+            ]
+          },
+          "speedup": 2.184079700835344,
+          "compile_median_us": 43.588,
+          "first_compile_us": 872.068,
+          "first_call_us": 1666.596,
+          "yjit_instructions": 121,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "3619d9ca6a33b01f30e525392ab889dd6371576ff73b948aa89d55612fb32561",
+            "yjit_compiled_instruction_count": 121,
+            "direct_jit_proof": true,
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 999,
+          "pool_entries": 3,
+          "pool_bytes": 9
+        },
+        "nullable_text_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 383.44782,
+            "allocations_per_call": 1911.0,
+            "raw_us_per_call": [
+              385.83595,
+              385.20344,
+              383.19774,
+              383.44782,
+              382.36528000000004
+            ]
+          },
+          "compiled": {
+            "us_per_call": 91.68202000000001,
+            "allocations_per_call": 485.0,
+            "raw_us_per_call": [
+              92.689,
+              91.59742999999999,
+              90.91017,
+              93.04511,
+              91.68202000000001
+            ]
+          },
+          "speedup": 4.182366618885578,
+          "compile_median_us": 57.8405,
+          "first_compile_us": 1172.33,
+          "first_call_us": 2605.678,
+          "yjit_instructions": 415,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "3c6fdab6b9312543c0e81b33f29bc5bd7cdfc38e8dbd6e6ccaec0ffc9e9a2cd4",
+            "yjit_compiled_instruction_count": 415,
+            "direct_jit_proof": true,
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 1136,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "accounted_text_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 518.37733,
+            "allocations_per_call": 2368.0,
+            "raw_us_per_call": [
+              519.00232,
+              515.33226,
+              516.4811599999999,
+              518.37733,
+              519.4321199999999
+            ]
+          },
+          "compiled": {
+            "us_per_call": 240.34865,
+            "allocations_per_call": 942.0,
+            "raw_us_per_call": [
+              239.61317000000003,
+              240.224,
+              240.51174,
+              241.15144,
+              240.34865
+            ]
+          },
+          "speedup": 2.1567723804564745,
+          "compile_median_us": 52.1175,
+          "first_compile_us": 478.257,
+          "first_call_us": 1716.285,
+          "yjit_instructions": 449,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "eb4051d9819550816fb66c11142cb9b640aee4e080b0a993c49225cc6f5d1974",
+            "yjit_compiled_instruction_count": 449,
+            "direct_jit_proof": true,
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 1251,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "text_predicate_key_vector": {
+          "kind": "keys",
+          "ordinary": {
+            "us_per_call": 1839.11764,
+            "allocations_per_call": 8939.0,
+            "raw_us_per_call": [
+              1839.11764,
+              1839.65175,
+              1836.01979,
+              1835.1251399999999,
+              1849.58315
+            ]
+          },
+          "compiled": {
+            "us_per_call": 593.82238,
+            "allocations_per_call": 3937.0,
+            "raw_us_per_call": [
+              601.28762,
+              593.82238,
+              591.0866500000001,
+              587.54151,
+              596.16359
+            ]
+          },
+          "speedup": 3.0970837441323784,
+          "compile_median_us": 105.708,
+          "first_compile_us": 1359.944,
+          "first_call_us": 3159.275,
+          "yjit_instructions": 340,
+          "zjit_entries": 0,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "a5ddf4a3a9b0134604e77bda9264dc13e3605fbc9e64130d97abcb37c5787d9a",
+            "yjit_compiled_instruction_count": 340,
+            "direct_jit_proof": true,
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1
+          },
+          "source_bytes": 2122,
+          "pool_entries": 11,
+          "pool_bytes": 23
+        }
+      },
+      "cache_admission": {
+        "first_use_deferred": true,
+        "second_use_materialized": true,
+        "equal_program_reused": true,
+        "exact_text_pool_key": true,
+        "immutable_scalar_pool": true,
+        "text_disabled_rejected": true,
+        "oversized_text_pool_rejected": true,
+        "unsupported_predicates": [
+          "label LIKE 'row%'",
+          "lower(label) >= 'row5'",
+          "label || 'x' >= 'row5'"
+        ]
+      },
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 342780348,
+        "before": {
+          "rss_bytes": 60772352,
+          "live_slots": 91587,
+          "jit": {
+            "inline_code_size": 428138,
+            "outlined_code_size": 530481,
+            "freed_code_size": 0,
+            "code_region_size": 1556480,
+            "compiled_iseq_entry": 181,
+            "compiled_iseq_count": 357,
+            "compiled_blockid_count": 7469,
+            "compiled_block_count": 10844,
+            "compiled_branch_count": 16769,
+            "compile_time_ns": 98287825
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 30
+        },
+        "while_cache_retained": {
+          "rss_bytes": 80453632,
+          "live_slots": 94643,
+          "jit": {
+            "inline_code_size": 1184637,
+            "outlined_code_size": 2013731,
+            "freed_code_size": 0,
+            "code_region_size": 5734400,
+            "compiled_iseq_entry": 450,
+            "compiled_iseq_count": 634,
+            "compiled_blockid_count": 29974,
+            "compiled_block_count": 40107,
+            "compiled_branch_count": 64185,
+            "compile_time_ns": 349428272
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 99,
+          "retained_kernels": 64,
+          "retained_source_bytes": 63936,
+          "retained_pool_entries": 128,
+          "retained_pool_bytes": 768
+        },
+        "after_completed_thread_exit_and_gc": [
+          {
+            "rss_bytes": 80596992,
+            "live_slots": 93084,
+            "jit": {
+              "inline_code_size": 1186874,
+              "outlined_code_size": 2017911,
+              "freed_code_size": 0,
+              "code_region_size": 5746688,
+              "compiled_iseq_entry": 454,
+              "compiled_iseq_count": 638,
+              "compiled_blockid_count": 30023,
+              "compiled_block_count": 40177,
+              "compiled_branch_count": 64297,
+              "compile_time_ns": 350087445
+            },
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 40,
+            "collection": 1
+          },
+          {
+            "rss_bytes": 80596992,
+            "live_slots": 93031,
+            "jit": {
+              "inline_code_size": 1186874,
+              "outlined_code_size": 2017911,
+              "freed_code_size": 0,
+              "code_region_size": 5746688,
+              "compiled_iseq_entry": 454,
+              "compiled_iseq_count": 638,
+              "compiled_blockid_count": 30023,
+              "compiled_block_count": 40177,
+              "compiled_branch_count": 64297,
+              "compile_time_ns": 350087445
+            },
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 40,
+            "collection": 2
+          },
+          {
+            "rss_bytes": 80596992,
+            "live_slots": 93033,
+            "jit": {
+              "inline_code_size": 1186874,
+              "outlined_code_size": 2017911,
+              "freed_code_size": 0,
+              "code_region_size": 5746688,
+              "compiled_iseq_entry": 454,
+              "compiled_iseq_count": 638,
+              "compiled_blockid_count": 30023,
+              "compiled_block_count": 40177,
+              "compiled_branch_count": 64297,
+              "compile_time_ns": 350087445
+            },
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 40,
+            "collection": 3
+          }
+        ],
+        "note": "Actual source/pool LRU and second-use admission. Only verified scalar snapshots escape a completed thread; its reference is released before GC. VM classes and code can outlive kernel instances; this is not an overall JIT memory bound."
+      }
+    },
+    "4.1-zjit": {
+      "peak_rss_mib": 78.72265625,
+      "elapsed_seconds": 21.17600689099345,
+      "jobs": {
+        "text_parameter_projection": {
+          "kind": "scalar",
+          "ordinary": {
+            "us_per_call": 2.97857665,
+            "allocations_per_call": 13.0,
+            "raw_us_per_call": [
+              3.00643697,
+              2.97857665,
+              2.99280434,
+              2.97799299,
+              2.9772492699999997
+            ]
+          },
+          "compiled": {
+            "us_per_call": 0.55377752,
+            "allocations_per_call": 4.0,
+            "raw_us_per_call": [
+              0.55255148,
+              0.55377752,
+              0.5573266,
+              0.5568747,
+              0.55313384
+            ]
+          },
+          "speedup": 5.3786521525828634,
+          "compile_median_us": 71.5965,
+          "first_compile_us": 90.066,
+          "first_call_us": 26.284,
+          "yjit_instructions": null,
+          "zjit_entries": 2,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "ad44165f5c451e23bcdff18b2d1a83b4b063f2f954aeb5a2372dd704117b370d",
+            "iseq_path": "(jed compiled expression)",
+            "first_lineno": 1,
+            "zjit_generated_compilations": [
+              "call@(jed compiled expression):2",
+              "call@(jed compiled expression):2"
+            ],
+            "direct_jit_proof": true,
+            "note": "Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked."
+          },
+          "source_bytes": 787,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "text_identity_projection": {
+          "kind": "scalar",
+          "ordinary": {
+            "us_per_call": 1.10706694,
+            "allocations_per_call": 2.0,
+            "raw_us_per_call": [
+              1.1325558900000001,
+              1.11233775,
+              1.10065616,
+              1.10706694,
+              1.09965341
+            ]
+          },
+          "compiled": {
+            "us_per_call": 0.31534113,
+            "allocations_per_call": 2.0,
+            "raw_us_per_call": [
+              0.34624136,
+              0.34665425,
+              0.31534113,
+              0.31488574999999996,
+              0.3130645
+            ]
+          },
+          "speedup": 3.510696305299597,
+          "compile_median_us": 7.42,
+          "first_compile_us": 74.145,
+          "first_call_us": 12.231,
+          "yjit_instructions": null,
+          "zjit_entries": 1,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled expression)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "65631875a078175a0fcbbbcdeacd4ead82f21f0e2aedbbc241e75f1c622b8117",
+            "iseq_path": "(jed compiled expression)",
+            "first_lineno": 1,
+            "zjit_generated_compilations": [
+              "call@(jed compiled expression):2"
+            ],
+            "direct_jit_proof": true,
+            "note": "Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked."
+          },
+          "source_bytes": 201,
+          "pool_entries": 2,
+          "pool_bytes": 8
+        },
+        "text_equality_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 1162.3882800000001,
+            "allocations_per_call": 1969.0,
+            "raw_us_per_call": [
+              1163.3699,
+              1161.45556,
+              1162.3882800000001,
+              1162.8672,
+              1156.06791
+            ]
+          },
+          "compiled": {
+            "us_per_call": 253.30459,
+            "allocations_per_call": 1457.0,
+            "raw_us_per_call": [
+              255.21175,
+              252.75263,
+              256.24647,
+              252.41185000000002,
+              253.30459
+            ]
+          },
+          "speedup": 4.5888954479664195,
+          "compile_median_us": 49.148,
+          "first_compile_us": 432.588,
+          "first_call_us": 349.685,
+          "yjit_instructions": null,
+          "zjit_entries": 4,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "3619d9ca6a33b01f30e525392ab889dd6371576ff73b948aa89d55612fb32561",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1,
+            "zjit_generated_compilations": [
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1"
+            ],
+            "direct_jit_proof": true,
+            "note": "Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked."
+          },
+          "source_bytes": 999,
+          "pool_entries": 3,
+          "pool_bytes": 9
+        },
+        "nullable_text_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 576.9393299999999,
+            "allocations_per_call": 1911.0,
+            "raw_us_per_call": [
+              576.9393299999999,
+              572.35589,
+              579.92303,
+              582.6271899999999,
+              571.63291
+            ]
+          },
+          "compiled": {
+            "us_per_call": 138.45286,
+            "allocations_per_call": 485.0,
+            "raw_us_per_call": [
+              140.61651,
+              139.37461,
+              138.13043,
+              138.45286,
+              138.2215
+            ]
+          },
+          "speedup": 4.167045231134987,
+          "compile_median_us": 33.8025,
+          "first_compile_us": 135.57,
+          "first_call_us": 155.12,
+          "yjit_instructions": null,
+          "zjit_entries": 4,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "3c6fdab6b9312543c0e81b33f29bc5bd7cdfc38e8dbd6e6ccaec0ffc9e9a2cd4",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1,
+            "zjit_generated_compilations": [
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1"
+            ],
+            "direct_jit_proof": true,
+            "note": "Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked."
+          },
+          "source_bytes": 1136,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "accounted_text_filter": {
+          "kind": "filter",
+          "ordinary": {
+            "us_per_call": 707.9756,
+            "allocations_per_call": 2368.0,
+            "raw_us_per_call": [
+              708.5106999999999,
+              709.97488,
+              707.9756,
+              707.38434,
+              703.6271800000001
+            ]
+          },
+          "compiled": {
+            "us_per_call": 212.79277,
+            "allocations_per_call": 942.0,
+            "raw_us_per_call": [
+              210.93892000000002,
+              213.73462,
+              212.79277,
+              213.95304000000002,
+              211.93867
+            ]
+          },
+          "speedup": 3.327066046463891,
+          "compile_median_us": 47.9275,
+          "first_compile_us": 140.177,
+          "first_call_us": 833.903,
+          "yjit_instructions": null,
+          "zjit_entries": 4,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "eb4051d9819550816fb66c11142cb9b640aee4e080b0a993c49225cc6f5d1974",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1,
+            "zjit_generated_compilations": [
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1"
+            ],
+            "direct_jit_proof": true,
+            "note": "Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked."
+          },
+          "source_bytes": 1251,
+          "pool_entries": 3,
+          "pool_bytes": 10
+        },
+        "text_predicate_key_vector": {
+          "kind": "keys",
+          "ordinary": {
+            "us_per_call": 3187.28917,
+            "allocations_per_call": 8939.0,
+            "raw_us_per_call": [
+              3186.4824900000003,
+              3195.5232,
+              3173.8910499999997,
+              3195.24019,
+              3187.28917
+            ]
+          },
+          "compiled": {
+            "us_per_call": 514.10333,
+            "allocations_per_call": 3937.0,
+            "raw_us_per_call": [
+              571.12606,
+              512.95756,
+              514.10333,
+              512.0152800000001,
+              516.15595
+            ]
+          },
+          "speedup": 6.199705358842939,
+          "compile_median_us": 79.935,
+          "first_compile_us": 199.302,
+          "first_call_us": 1321.295,
+          "yjit_instructions": null,
+          "zjit_entries": 4,
+          "generated_code": {
+            "source_location": [
+              "(jed compiled relation)",
+              1
+            ],
+            "iseq_label": "call",
+            "generated_source_sha256": "a5ddf4a3a9b0134604e77bda9264dc13e3605fbc9e64130d97abcb37c5787d9a",
+            "iseq_path": "(jed compiled relation)",
+            "first_lineno": 1,
+            "zjit_generated_compilations": [
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1",
+              "call@(jed compiled relation):1"
+            ],
+            "direct_jit_proof": true,
+            "note": "Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked."
+          },
+          "source_bytes": 2122,
+          "pool_entries": 11,
+          "pool_bytes": 23
+        }
+      },
+      "cache_admission": {
+        "first_use_deferred": true,
+        "second_use_materialized": true,
+        "equal_program_reused": true,
+        "exact_text_pool_key": true,
+        "immutable_scalar_pool": true,
+        "text_disabled_rejected": true,
+        "oversized_text_pool_rejected": true,
+        "unsupported_predicates": [
+          "label LIKE 'row%'",
+          "lower(label) >= 'row5'",
+          "label || 'x' >= 'row5'"
+        ]
+      },
+      "churn": {
+        "plans_created": 256,
+        "calls_per_plan": 200,
+        "retained_limit": 64,
+        "elapsed_ns": 372842104,
+        "before": {
+          "rss_bytes": 67092480,
+          "live_slots": 90520,
+          "jit": {
+            "compiled_iseq_count": 505,
+            "compile_time_ns": 194110345,
+            "compiled_side_exit_count": 14258,
+            "jit_frame_region_bytes": 155648,
+            "code_region_bytes": 2633728,
+            "zjit_alloc_bytes": 1731472,
+            "total_mem_bytes": 4520848
+          },
+          "live_kernels": 0,
+          "anonymous_kernel_classes": 20
+        },
+        "while_cache_retained": {
+          "rss_bytes": 82563072,
+          "live_slots": 97211,
+          "jit": {
+            "compiled_iseq_count": 824,
+            "compile_time_ns": 482931268,
+            "compiled_side_exit_count": 35221,
+            "jit_frame_region_bytes": 286720,
+            "code_region_bytes": 7446528,
+            "zjit_alloc_bytes": 4907172,
+            "total_mem_bytes": 12640420
+          },
+          "live_kernels": 64,
+          "anonymous_kernel_classes": 276,
+          "retained_kernels": 64,
+          "retained_source_bytes": 63936,
+          "retained_pool_entries": 128,
+          "retained_pool_bytes": 768
+        },
+        "after_completed_thread_exit_and_gc": [
+          {
+            "rss_bytes": 82698240,
+            "live_slots": 97137,
+            "jit": {
+              "compiled_iseq_count": 828,
+              "compile_time_ns": 483881401,
+              "compiled_side_exit_count": 35266,
+              "jit_frame_region_bytes": 286720,
+              "code_region_bytes": 7450624,
+              "zjit_alloc_bytes": 4914428,
+              "total_mem_bytes": 12651772
+            },
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 276,
+            "collection": 1
+          },
+          {
+            "rss_bytes": 82698240,
+            "live_slots": 97139,
+            "jit": {
+              "compiled_iseq_count": 828,
+              "compile_time_ns": 483881401,
+              "compiled_side_exit_count": 35266,
+              "jit_frame_region_bytes": 286720,
+              "code_region_bytes": 7450624,
+              "zjit_alloc_bytes": 4914428,
+              "total_mem_bytes": 12651772
+            },
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 276,
+            "collection": 2
+          },
+          {
+            "rss_bytes": 82698240,
+            "live_slots": 97141,
+            "jit": {
+              "compiled_iseq_count": 828,
+              "compile_time_ns": 483881401,
+              "compiled_side_exit_count": 35266,
+              "jit_frame_region_bytes": 286720,
+              "code_region_bytes": 7450624,
+              "zjit_alloc_bytes": 4914428,
+              "total_mem_bytes": 12651772
+            },
+            "live_kernels": 0,
+            "anonymous_kernel_classes": 276,
+            "collection": 3
+          }
+        ],
+        "note": "Actual source/pool LRU and second-use admission. Only verified scalar snapshots escape a completed thread; its reference is released before GC. VM classes and code can outlive kernel instances; this is not an overall JIT memory bound."
+      }
+    }
+  },
+  "caveats": [
+    "Isolated generated projections and materialized relation phases, not complete queries. SQL parsing/resolution, storage, grouping, sorting and public result collection are excluded.",
+    "Controls preserve existing evaluate/select/map behavior, including C metadata wrapping and string-comparison work charges. Both scalar paths construct a one-element projection array.",
+    "The accounted filter reseeds its account and owner before each invocation in both modes. Fixture byte sizing/account construction are outside timing.",
+    "Before/after validation checks actual wrapper class, every collation-label field, Unicode/NULL/empty/prefix text, changing/mutated real text parameters, all small statement/lifetime cost prefixes and rejected-row accounting.",
+    "Warmup checkpoints follow validation; first compilation and first call are separate observations that include runtime warmup effects.",
+    "The source/pool cache bounds engine-retained kernels, not VM classes or generated machine code. Churn uses a completed thread and releases its Thread reference before three full collections; all observed instance/class/code counts are retained.",
+    "Ruby 4.0.7 and 4.1.0-preview1 are different builds; cross-runtime measurements do not isolate YJIT versus ZJIT implementation effects."
+  ],
+  "compiler_limits": {
+    "nodes": 192,
+    "depth": 32,
+    "pool_entries": 256,
+    "pool_bytes": 32768,
+    "source_bytes": 32768,
+    "relation_cache_entries": 64
+  },
+  "zjit_log_audit": {
+    "snapshot_bytes": 63798,
+    "snapshot_sha256": "7aa56fe8654dd5098a5b0d7bd2922b597a2b3073242701e5d332cd71b9d23264",
+    "final_sha256": "fbc76b4003bca58769e09f1104a826286fb7b89cc80bff266e0c2367f979ae7d",
+    "per_job_proof_entries": 19,
+    "captured_generated_entries": 275,
+    "final_generated_entries": 275,
+    "exact_snapshot_prefix_and_all_job_windows_present": true
+  }
+}

@@ -16,14 +16,14 @@ module JedNative
       end
     end
 
-    def self.prepare_filter(predicate, types: {}, memory: false)
-      new(types).prepare_filter(predicate, memory: memory)
+    def self.prepare_filter(predicate, types: {}, memory: false, text: true)
+      new(types, text: text).prepare_filter(predicate, memory: memory)
     rescue Unsupported
       nil
     end
 
-    def self.prepare_keys(expressions, types: {})
-      new(types).prepare_keys(expressions)
+    def self.prepare_keys(expressions, types: {}, text: true)
+      new(types, text: text).prepare_keys(expressions)
     rescue Unsupported
       nil
     end

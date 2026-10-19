@@ -20,8 +20,8 @@ module JedNative
     # out of the cache key lets one prepared statement vary either binding.
     # A pipeline admits only complete supported trees: host and other fallback
     # expressions keep their ordinary executor and callback/checkpoint schedule.
-    def self.build(predicate, projections, types:, mode:, offset: false, limit: false)
-      new(types).build(predicate, projections, mode: mode, offset: offset, limit: limit)
+    def self.build(predicate, projections, types:, mode:, offset: false, limit: false, text: true)
+      new(types, text: text).build(predicate, projections, mode: mode, offset: offset, limit: limit)
     rescue Unsupported
       nil
     end
