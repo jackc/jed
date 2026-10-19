@@ -1,0 +1,41 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure active-query cancellation in Node or ordinary Chromium"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_async_cancel"
+  puts "JED_ASYNC_CANCEL_HOST selects browser (default) or node; existing tooling only, no downloads."
+  puts "JED_ASYNC_CANCEL_RESULTS sets the output directory (default bench/results/ts-async-cancel-HOST-TIMESTAMP-PID)."
+  puts "JED_PROBE_ROOT optionally selects an engine source snapshot; benchmark tools remain in this checkout."
+  puts "JED_ASYNC_HEAVY_CASES and workload sizes select the shared heavy SQL; default is all four cases."
+  puts "JED_CANCEL_FULL_WARMUPS (3), WARMUPS (2), SAMPLES (7), DELAY_MS (20), TIMEOUT_MS (30000)"
+  puts "use the JED_CANCEL_ prefix. Abort follows an active execution marker, never initial submission."
+  puts "JED_CANCEL_RUN_TIMEOUT_MS bounds the complete run (600000)."
+  puts "Batch limits are fixed at 512 rows / 256 KiB / 2 MiB held for all comparisons."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+host = ENV.fetch("JED_ASYNC_CANCEL_HOST", "browser")
+abort "JED_ASYNC_CANCEL_HOST must be browser or node" unless %w[browser node].include?(host)
+root = File.expand_path(ENV.fetch("JED_PROBE_ROOT", ROOT))
+abort "Engine source root is missing" unless File.file?(File.join(root, "impl/ts/src/async/server.ts"))
+directory = File.expand_path(ENV.fetch("JED_ASYNC_CANCEL_RESULTS", "bench/results/ts-async-cancel-#{host}-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(directory)
+revision, revision_ok = capture("git", "-C", root, "rev-parse", "HEAD")
+status, status_ok = capture("git", "-C", root, "status", "--porcelain")
+env = {
+  "JED_PROBE_ROOT" => root, "JED_PROBE_TOOLS_ROOT" => ROOT,
+  "JED_BENCH_REVISION" => revision_ok ? revision.strip : "source-snapshot",
+  "JED_BENCH_DIRTY" => status_ok ? (!status.empty?).to_s : "true"
+}
+if host == "node"
+  sh "node", "bench/ts/cancel/node.mjs", File.join(directory, "results.json"), env: env
+else
+  vite = File.join(TS_DIR, "node_modules/vite/bin/vite.js")
+  playwright = File.join(TS_DIR, "node_modules/playwright-core/index.mjs")
+  abort "Install the existing Vite/Playwright tooling; no downloads performed" unless File.file?(vite) && File.file?(playwright)
+  sh "node", vite, "build", "--config", "bench/ts/cancel/vite.config.mjs", "--outDir", File.join(directory, "site"), env: env
+  sh "node", "bench/ts/cancel/browser-run.mjs", directory, env: env
+end

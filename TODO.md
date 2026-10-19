@@ -597,6 +597,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   ([report](bench/ts/results/2026-10-18-heavy/report.md)). Default fetches now admit up to 512 rows
   under the same byte allowances; the [batching investigation](bench/ts/results/2026-10-18-result-batching/report.md)
   measures the gain and remaining substantial per-value delivery overhead.
+  The elapsed-time scheduling experiment was reverted after both 1 ms and 0.125 ms slices
+  regressed browser message-only cancellation. The original 256-checkpoint task yields remain;
+  [rollback measurements and transport options](bench/ts/results/2026-10-19-scheduling-rollback/report.md)
+  retain the evidence. Shared-memory result transport and batch-oriented consumption remain
+  unimplemented investigations, separate from the existing atomic cancellation flag.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar
