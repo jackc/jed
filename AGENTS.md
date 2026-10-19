@@ -77,7 +77,8 @@ files in the same change.
 - Do not codegen parsers, planners, executors, storage layers, expression
   evaluators, or recursive open-type behavior.
 - Explicit maintainer exception: the frozen Ruby experiment may compile resolved
-  query expressions and single-table scan/filter/projection loops into Ruby methods
+  query expressions, single-table scan/filter/projection loops, and typed ORDER BY
+  comparators into Ruby methods
   at runtime using a handwritten, bounded template emitter. SQL text and values
   remain data, and all conformance contracts still apply. See
   `spec/design/ruby-runtime-compilation.md`.
