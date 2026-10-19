@@ -97,7 +97,6 @@ export class RuntimeServer {
   private readonly openDatabase: (args: Record<string, unknown>) => Database | Promise<Database>;
   private readonly send: (reply: RuntimeReply, transfer?: ArrayBuffer[]) => void;
   private readonly scheduleTask: (callback: () => void) => void;
-  private readonly executionClock?: () => number;
   private limits: RuntimeLimits;
   private database: Database | null = null;
   private sessions = new Map<number, SessionHandle>();
@@ -118,12 +117,9 @@ export class RuntimeServer {
     send: (reply: RuntimeReply, transfer?: ArrayBuffer[]) => void;
     limits?: Partial<RuntimeLimits>;
     schedule?: (callback: () => void) => void;
-    // Internal monotonic clock seam for deterministic elapsed-scheduling tests.
-    executionClock?: () => number;
   }) {
     this.openDatabase = options.open;
     this.send = options.send;
-    this.executionClock = options.executionClock;
     this.scheduleTask =
       options.schedule ??
       ((callback) => {
@@ -274,7 +270,6 @@ export class RuntimeServer {
               check,
               poll,
               schedule: this.scheduleTask,
-              now: this.executionClock,
             });
             if (result === PARKED) continue;
             if (result !== MORE) this.finish(job, undefined, result);

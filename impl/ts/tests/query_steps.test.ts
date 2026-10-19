@@ -216,7 +216,6 @@ for (const mode of ["memory", "file"] as const) {
       let asyncReads = 0;
       const options: AsyncExecutionOptions = {
         quantum: 4,
-        timeSliceMs: 0,
         schedule: (resume) =>
           setImmediate(() => {
             yields++;
@@ -268,7 +267,6 @@ test("message-only cancellation interrupts generated work and releases its curso
     await assert.rejects(
       runAsync(collectSteps(session, "SELECT sum(g::i64) FROM generate_series(1,1000000) AS g"), {
         quantum: 8,
-        timeSliceMs: 0,
         check: () => canceled,
         schedule(resume) {
           setImmediate(() => {
@@ -333,7 +331,6 @@ test("message cancellation reaches resident operators before their first output 
         await assert.rejects(
           runAsync(collectSteps(session, probe.sql), {
             quantum: 32,
-            timeSliceMs: 0,
             check: () => canceled,
             schedule(resume) {
               setImmediate(() => {
@@ -432,7 +429,6 @@ test("async blocking operators spill with identical results and release scratch 
           asyncFileReadsOnly(() =>
             runAsync(collectSteps(session, "SELECT DISTINCT id, txt FROM t ORDER BY txt, id"), {
               quantum: 1,
-              timeSliceMs: 0,
               check: () => canceled,
               schedule(resume) {
                 setImmediate(() => {

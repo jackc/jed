@@ -242,7 +242,6 @@ test("cancellation after partial DML writes rolls back the implicit statement an
       await assert.rejects(
         runAsync(collect(session, "DELETE FROM t"), {
           quantum: 4,
-          timeSliceMs: 0,
           check: () => canceled,
           schedule(resume) {
             setImmediate(() => {
