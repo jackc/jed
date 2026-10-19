@@ -1105,10 +1105,15 @@ native mapping is a follow-on.
 
 The ergonomic `Query`/`Exec`/`QueryRow` take a cancellation handle — Go `context.Context`
 (first parameter, pgx convention), Rust a cancellation token / `AtomicBool`, TS an `AbortSignal`.
-It is captured on the operation and **polled at the existing cost-meter checkpoint** (the single
-`Guard()` chokepoint already run at the unbounded-work points for `max_cost`, [cost.md](cost.md)
-§6) — so cancellation is **one more condition at a seam that already exists**, not a new
-cross-cutting concern. An observed cancellation aborts with **`57014 query_canceled`**
+It is captured on the operation and polled at **execution checkpoints**, independently of
+cost enforcement. Go samples input-row, join-candidate, recursive-iteration and operator loops
+every 256 steps. Rust keeps its cheap atomic poll at each such step: sampling did not improve
+throughput and delayed cancellation. Ordinary expression nodes enforce cost without polling
+cancellation in either core.
+Batch boundaries and host-call boundaries poll immediately. Selected expensive built-ins retain
+internal checks (decimal work, regex search and JSONPath traversal). These intervals count work,
+not time, and are implementation details rather than a response-time guarantee.
+An observed cancellation aborts with **`57014 query_canceled`**
 (PostgreSQL's exact code for a canceled statement / `statement_timeout`), which **rolls back like
 any error** (autocommit write → table untouched; inside a block → poisons it, transactions.md §6),
 exactly as the `54P01` cost abort does.
@@ -1133,8 +1138,8 @@ execution** (one event loop; nothing else runs until the call returns), so an `A
 is honored only at operation boundaries, not mid-statement — a deliberate best-experience-per-
 language divergence, not a uniform-shape failure.
 
-The meter `Guard()` is the primary mechanism; the cursor *also* captures the token and re-checks it
-in Go's `Next()`. Streaming and deferred cursors execute after `Query` returns, so their frozen
+The meter carries separate cost guards and cancellation checkpoints; the cursor also captures
+the token and re-checks it in Go's `Next()`. Streaming and deferred cursors execute after `Query` returns, so their frozen
 engines and meters retain the operation's cancellation state for the entire cursor lifetime.
 Restoring the live session after `Query` must not disarm the cursor or affect another operation.
 Go closes cursor resources and reader pins on exhaustion or terminal iteration error; an early
@@ -1151,12 +1156,11 @@ accessors, `All()`/`Collect`, `RowTo`/`RowToStructByName`, `Null[T]`, `Valuer`/`
 conversion + cancellation logic lives once (`ergoQuery`/`ergoExec`); the per-type methods are
 one-liners over the raw `[]Value` primitives. **Cancellation is wired through the cost meter:** each
 operation arms a poll (`engine.armCancel`) on the `sessionState` of the engine that runs the
-statement, `sessionState.newMeter` copies it into the statement's meter, and the meter's `Guard()`
-checkpoint consults it — so a flipped `context.Context` aborts a long-running statement with the
-registered **`57014 query_canceled`** at the next metering point, not only at the cursor/entry
-boundary (`ctxErr`). The poll is `nil` (zero-overhead, untouched hot path, the §8 cost determinism
-intact) unless a cancelable ctx is active; a non-cancelable background ctx (nil `Done`) arms
-nothing. Verified by `impl/go/cancellation_test.go` (the meter-`Guard` unit test, the boundary
+statement, `sessionState.newMeter` copies it into the statement's meter, and execution
+checkpoints consult it — so a flipped `context.Context` aborts a long-running statement with the
+registered **`57014 query_canceled`** at the next cancellation checkpoint, not only at the cursor/entry
+boundary (`ctxErr`). The poll is `nil` (no channel polling, the §8 cost determinism intact) unless a cancelable ctx is active; a non-cancelable background ctx (nil `Done`) arms
+nothing. Verified by `impl/go/cancellation_test.go` (the meter-checkpoint and sampling unit tests, the boundary
 abort, synchronized cancellation inside `Next` across all ergonomic handles and prepared/Exec
 paths, transaction poisoning/rollback, cleanup/isolation, and batch/cost-limit regressions).
 Reproducible overhead and response-latency measurements are in `bench/cancellation/README.md`. The **`Queryer`** interface
@@ -1168,16 +1172,15 @@ each type was renamed **`QueryValues`** so the ergonomic `Query` owns the name (
 **Landed (Rust, cancellation — `impl/rust/src/cancel.rs`):** the cancellation half of the mirror.
 A public **`CancellationToken`** (a clonable `Arc<AtomicBool>` with `cancel()` / `is_cancelled()`)
 is the Rust spelling of Go's `context.Context` cancellation — and *simpler*, because Rust has real
-threads (CLAUDE.md §2): the token **is** the shared atomic the Go core spins up a watcher goroutine
-to feed, so thread B flips the same token thread A is running under, no watcher needed. It is wired
-through the **same cost-meter seam**: `Meter` gains a `cancel: Option<CancellationToken>` checked
-**first** in `guard()` (`57014` before the `54P01`/`54P02` cost ceilings), `SessionState` gains a
+threads (CLAUDE.md §2): thread B flips the same token thread A is running under, with no watcher.
+Go checks a cached context channel. `Meter` carries a `cancel: Option<CancellationToken>` polled
+by execution checkpoints, separately from deterministic `guard()` checks. `SessionState` has a
 `cancel` field that `new_meter` copies into every statement's meter, and the cancelable methods —
 `execute_cancelable` / `query_cancelable` on **`Session`, `Database`, *and* `Transaction`** — arm a
 clone for the statement's duration (a cheap boundary `check()` first, then restore the prior token),
-so a flipped token aborts a long-running statement with `57014` at the next metering point, not only
-at the boundary. `None` (the default) ⇒ zero overhead, the §8 cost determinism untouched. Verified by
-`impl/rust/tests/cancellation.rs` (the `Meter::guard` unit test, the boundary abort on `Session`/
+so a flipped token aborts a long-running statement with `57014` at the next cancellation checkpoint, not only
+at the boundary. `None` (the default) skips atomic polling; the §8 cost determinism is untouched. Verified by
+`impl/rust/tests/cancellation.rs` (the `Meter::checkpoint` and cost-separation unit tests, the boundary abort on `Session`/
 `Database`, the un-cancelled-completes regression, and the transaction roll-back) plus the white-box
 mid-scan-via-meter test inline in `src/shared.rs` (it reaches the private session state to bypass the
 boundary poll and prove the *meter* aborts the running scan). The Rust **arg/scan ergonomic layer**

@@ -1431,7 +1431,7 @@ impl Engine {
             let mut width_sum = 0i64;
             let mask: Vec<bool> = (0..table.columns.len()).map(|i| i == column).collect();
             while let Some((storage_key, mut row)) = scan.next()? {
-                meter.guard()?;
+                meter.checkpoint()?;
                 let units = store.statistics_scan_units(&storage_key, &row, column);
                 meter.charge(
                     COSTS.page_read * units.pages as i64
@@ -1509,7 +1509,7 @@ impl Engine {
                     },
                 );
             }
-            meter.guard()?;
+            meter.checkpoint()?;
             let nonnull_rows = analyzed_rows.saturating_sub(null_count);
             let distinct_count = eligible.then(|| kmv_count(&kmv, nonnull_rows));
             let sample_rows = sample.len() as u32;

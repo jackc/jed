@@ -131,7 +131,7 @@ func (db *engine) scanBlockingRel(p *selectPlan, i int, env *evalEnv, m *costMet
 	m.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 	_, pushed := p.pushedFilter(i)
 	err = store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return false, err
 		}
 		m.Charge(costs.StorageRowRead)
@@ -186,6 +186,9 @@ func (db *engine) buildSpillHashTable(hash *hashJoinPlan, buildOffset, probeOffs
 	rightIndices, _ := joinKeyParts(hash, buildOffset, true)
 	entries := own.hashRows()
 	err := rows.each(func(row storedRow) error {
+		if err := m.PollStep(); err != nil {
+			return err
+		}
 		key, present, err := hashJoinRowKey(row, rightIndices, types, costs.HashBuild, m)
 		if err != nil || !present {
 			return err
@@ -217,7 +220,7 @@ func (t *spillHashTable) probe(left storedRow, m *costMeter) (*rowSpool, error) 
 	if present {
 		err = t.entries.each(hashJoinFNV1a(key), func(entry storedRow) error {
 			stored := []byte(entry[0].str())
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return err
 			}
 			m.Charge(costs.HashProbe * int64(max(1, min(len(stored), len(key)))))
@@ -336,6 +339,9 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 	// the pass completes.
 	filtered := own.spool()
 	err := rows.each(func(row storedRow) error {
+		if err := m.PollStep(); err != nil {
+			return err
+		}
 		if p.postJoinFilter() != nil {
 			v, err := p.postJoinFilter().evalFilter(row, env, m)
 			if err != nil {
@@ -367,6 +373,9 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 		if p.having != nil {
 			kept := own.spool()
 			err := rows.each(func(row storedRow) error {
+				if err := m.PollStep(); err != nil {
+					return err
+				}
 				v, err := p.having.evalFilter(row, env, m)
 				if err != nil {
 					return err
@@ -403,6 +412,9 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 		seen := own.stateMap()
 		distinct := own.spool()
 		err := rows.each(func(row storedRow) error {
+			if err := m.PollStep(); err != nil {
+				return err
+			}
 			out := make(storedRow, len(p.projections))
 			for i, e := range p.projections {
 				v, err := e.eval(row, env, m)
@@ -457,6 +469,9 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 func (db *engine) blockingOrder(p *selectPlan, rows *rowSpool, env *evalEnv, m *costMeter, own *blockingOwner) (*rowSpool, error) {
 	decorated := own.spool()
 	err := rows.each(func(row storedRow) error {
+		if err := m.PollStep(); err != nil {
+			return err
+		}
 		row = append(storedRow(nil), row...)
 		for _, e := range p.orderExprs {
 			v, err := e.eval(row, env, m)
@@ -667,6 +682,9 @@ func (db *engine) blockingJoinSteps(p *selectPlan, inputs []*rowSpool, env *eval
 			matched := false
 			var ordinal int64
 			if err := source.each(func(right storedRow) error {
+				if err := m.PollStep(); err != nil {
+					return err
+				}
 				index := ordinal
 				ordinal++
 				combined := append(storedRow(nil), left...)
@@ -821,6 +839,9 @@ func (db *engine) boundedJoinTopN(p *selectPlan, own *blockingOwner, env *evalEn
 				source = inputs[inner]
 			}
 			return source.each(func(right storedRow) error {
+				if err := m.PollStep(); err != nil {
+					return err
+				}
 				combined := append(storedRow(nil), left...)
 				copy(combined[innerOffset:], right)
 				for _, i := range onIndices {
@@ -849,7 +870,7 @@ func (db *engine) boundedJoinTopN(p *selectPlan, own *blockingOwner, env *evalEn
 				if passed <= offset {
 					return nil
 				}
-				if err := m.Guard(); err != nil {
+				if err := m.Step(); err != nil {
 					return err
 				}
 				before := m.Accrued

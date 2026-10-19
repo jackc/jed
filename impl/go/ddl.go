@@ -1868,7 +1868,7 @@ func (db *engine) evalDefault(col catColumn, defaultRExpr *rExpr, rng *stmtRng, 
 	if defaultRExpr == nil {
 		return defaultOrNull(col), nil
 	}
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return Value{}, err
 	}
 	env := &evalEnv{exec: db, rng: rng}
@@ -2868,7 +2868,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	}
 	meter := db.session.newMeter()
 	meter.Charge(prepCost)
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return outcome{}, err
 	}
 	var rewriteRows []entry
@@ -2921,7 +2921,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		seenKeys := map[string]bool{}
 		compressUnits := int64(0)
 		for i := range rows {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Step(); err != nil {
 				return outcome{}, err
 			}
 			meter.Charge(costs.StorageRowRead)
@@ -2979,7 +2979,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, pagePayload(alterPageSize)))
 		}
 		meter.Charge(costs.ValueCompress * compressUnits)
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return outcome{}, err
 		}
 		rewriteRows = rows
@@ -3000,7 +3000,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 		for _, e := range entries {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Step(); err != nil {
 				return outcome{}, err
 			}
 			meter.Charge(costs.StorageRowRead)
@@ -4047,7 +4047,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return outcome{}, err
 	}
 
@@ -4145,7 +4145,7 @@ func (db *engine) executeReindex(rx *reindexStmt) (outcome, error) {
 			rebuilt = append(rebuilt, reindexRebuilt{scope: scope, tableKey: tg.tableKey, def: def, entries: entries})
 		}
 	}
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return outcome{}, err
 	}
 	for _, rb := range rebuilt {
@@ -4400,7 +4400,7 @@ func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDe
 	// prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
 	seenPrefixes := make(map[string]bool)
 	for _, e := range stored {
-		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
+		if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row
 			return nil, err
 		}
 		meter.Charge(costs.StorageRowRead)
@@ -4432,7 +4432,7 @@ func (db *engine) buildIndexEntries(scope *string, table *catTable, def *indexDe
 			entries = append(entries, indexEntry{ek, len(e.Key)})
 		}
 	}
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return nil, err
 	}
 	// Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built tree

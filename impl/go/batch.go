@@ -430,7 +430,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 		var werr error
 		rowCount, nodes, werr = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, i int) error {
 			if visited&255 == 0 {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Checkpoint(); err != nil {
 					return err
 				}
 			}
@@ -677,7 +677,7 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 		var err error
 		rowCount, nodes, err = store.rows.foldScan(b, store.leafSrc(), func(n *pnode, i int) error {
 			if visited&255 == 0 {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Checkpoint(); err != nil {
 					return err
 				}
 			}
@@ -806,7 +806,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 	meter.Charge(costs.AggregateAccumulate * int64(len(survivors)) * int64(len(plan.aggSpecs)))
 	for ri, r := range survivors {
 		if ri&255 == 0 {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Checkpoint(); err != nil {
 				return nil, err
 			}
 		}
@@ -855,7 +855,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 	out := make([]storedRow, 0, len(groups))
 	for i := range groups {
 		if i&255 == 0 {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Checkpoint(); err != nil {
 				return nil, err
 			}
 		}
@@ -877,7 +877,7 @@ func (db *engine) groupByIntKey(plan *selectPlan, gset *groupSetPlan, survivors 
 // floatSum.add — matching the scalar arm exactly).
 func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter) error {
 	meter.Charge(costs.AggregateAccumulate * int64(len(survivors)))
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return err
 	}
 	switch spec.plan {
@@ -887,7 +887,7 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 		b := extractIntColumn(survivors, spec.operand.index)
 		for i := 0; i < b.n; i++ {
 			if i&255 == 0 {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Checkpoint(); err != nil {
 					return err
 				}
 			}
@@ -899,7 +899,7 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 		b := extractIntColumn(survivors, spec.operand.index)
 		for i := 0; i < b.n; i++ {
 			if i&255 == 0 {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Checkpoint(); err != nil {
 					return err
 				}
 			}
@@ -924,7 +924,7 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 		idx := spec.operand.index
 		for i := range survivors {
 			if i&255 == 0 {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Checkpoint(); err != nil {
 					return err
 				}
 			}
@@ -937,7 +937,7 @@ func foldAggBatch(a *acc, spec *aggSpec, survivors []storedRow, meter *costMeter
 		idx := spec.operand.index
 		for i := range survivors {
 			if i&255 == 0 {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Checkpoint(); err != nil {
 					return err
 				}
 			}

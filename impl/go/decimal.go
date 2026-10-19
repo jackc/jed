@@ -1625,7 +1625,7 @@ func decimalMathStep(m *costMeter, scale int64, sqrt bool, args ...Decimal) erro
 		work *= bits
 	}
 	m.Charge(costs.DecimalTranscend * work)
-	if err := m.Guard(); err != nil {
+	if err := m.Checkpoint(); err != nil {
 		return err
 	}
 	return m.ReserveScalar(8 * digits)

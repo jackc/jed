@@ -2,7 +2,7 @@ package jed
 
 // Cancellation through the cost meter (spec/design/api.md §11.4). Per-core unit tests, NOT the
 // shared corpus: cancellation is timing-dependent (CLAUDE.md §10), so it cannot live there. These
-// pin the mechanism deterministically — the meter's Guard() honors the cancel poll, and a flipped
+// pin the mechanism deterministically — the meter's Checkpoint() honors the cancel poll, and a flipped
 // poll aborts a running statement with 57014 (not only at the cursor boundary).
 
 import (
@@ -26,22 +26,22 @@ func cancelCode(t *testing.T, err error) string {
 	return ee.Code()
 }
 
-// The meter's Guard aborts with 57014 the instant the cancel poll returns true, independently of
+// The meter's Checkpoint aborts with 57014 the instant the cancel poll returns true, independently of
 // the cost ceilings (a zero-limit meter never aborts on cost).
-func TestMeterGuardCancel(t *testing.T) {
+func TestMeterCheckpointCancel(t *testing.T) {
 	t.Parallel()
 	m := newMeter()
-	if err := m.Guard(); err != nil {
+	if err := m.Checkpoint(); err != nil {
 		t.Fatalf("no cancel set: Guard should pass, got %v", err)
 	}
 
 	flag := false
 	m.cancel = func() bool { return flag }
-	if err := m.Guard(); err != nil {
+	if err := m.Checkpoint(); err != nil {
 		t.Fatalf("cancel=false: Guard should pass, got %v", err)
 	}
 	flag = true
-	if code := cancelCode(t, m.Guard()); code != "57014" {
+	if code := cancelCode(t, m.Checkpoint()); code != "57014" {
 		t.Fatalf("cancel=true: want 57014, got %s", code)
 	}
 }
@@ -65,9 +65,9 @@ func TestCancelBeforeRun(t *testing.T) {
 	}
 }
 
-// A cancel poll armed on the running engine aborts mid-execution through the meter's Guard — NOT
+// A cancel poll armed on the running engine aborts mid-execution through the meter's Checkpoint — NOT
 // the cursor boundary. Proven white-box: session.cancel is set directly (bypassing ctx), so only
-// the in-statement Guard can produce the 57014.
+// the in-statement checkpoint can produce the 57014.
 func TestCancelDuringExecution(t *testing.T) {
 	t.Parallel()
 	db := memDB()
@@ -82,10 +82,10 @@ func TestCancelDuringExecution(t *testing.T) {
 
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	// Always-cancel: the first Guard during the scan aborts. The ctx path is untouched here, so a
+	// Always-cancel: the first checkpoint during the scan aborts. The ctx path is untouched here, so a
 	// 57014 can only come from the meter consulting session.cancel. Since S4 (streaming.md §6) Query
 	// returns a LAZY cursor — a bare scan buffers its input on the first pull — so building the cursor
-	// no longer runs the scan; the meter Guard trips during the drain and the 57014 surfaces via Err().
+	// no longer runs the scan; the meter checkpoint trips during the drain and the 57014 surfaces via Err().
 	s.engine.session.cancel = func() bool { return true }
 	rows, err := s.queryValues("SELECT id FROM t", nil)
 	if err != nil {
@@ -303,7 +303,6 @@ func TestCursorCancellationLifetime(t *testing.T) {
 	if exhausted.Next() || exhausted.Err() != nil || !exhausted.closed {
 		t.Fatal("late cancellation changed exhausted cursor")
 	}
-
 }
 
 // Batch eligibility is independent of cancellation, but never of deterministic ceilings.
@@ -388,5 +387,85 @@ func TestCancellationPreservesCostLimits(t *testing.T) {
 				s.Close()
 			}
 		}
+	}
+}
+
+// Cost guards never poll, and sampling cannot postpone a deterministic cost abort.
+func TestCancellationSamplingIndependentOfCost(t *testing.T) {
+	m := newMeter()
+	polls := 0
+	canceled := false
+	m.cancel = func() bool { polls++; return canceled }
+	if err := m.Step(); err != nil {
+		t.Fatal(err)
+	}
+	canceled = true
+	for i := 0; i < 255; i++ {
+		if err := m.Guard(); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if polls != 1 {
+		t.Fatalf("polled %d times before the next batch", polls)
+	}
+	if code := cancelCode(t, m.Step()); code != "57014" {
+		t.Fatal(code)
+	}
+	m = newMeterWithLimit(2)
+	m.cancel = func() bool { return false }
+	if err := m.Step(); err != nil {
+		t.Fatal(err)
+	}
+	m.Charge(2)
+	if code := cancelCode(t, m.Step()); code != "54P01" {
+		t.Fatal(code)
+	}
+}
+
+// These plans produce no rows: output-only checks cannot cancel them. With 20
+// rows the join's input scans cannot reach a second sampled poll; its rejected
+// candidate loop must supply that checkpoint itself.
+func TestCancellationWithoutRowEmission(t *testing.T) {
+	db := memDB()
+	defer db.Close()
+	bg := context.Background()
+	for _, sql := range []string{
+		"CREATE TABLE t (id i32 PRIMARY KEY)",
+		"INSERT INTO t SELECT generate_series FROM generate_series(1,20)",
+		"CREATE TABLE big (id i32 PRIMARY KEY)",
+		"INSERT INTO big SELECT generate_series FROM generate_series(1,2000)",
+	} {
+		if _, err := db.Exec(bg, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT id FROM big WHERE id + 1 < 0 ORDER BY id LIMIT 1",
+		"SELECT a.id FROM t a JOIN t b ON a.id + b.id < 0",
+		"SELECT a.id FROM t a JOIN t b ON a.id + b.id < 0 ORDER BY a.id LIMIT 1",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			s := db.Session(SessionOptions{})
+			defer s.Close()
+			polls := 0
+			s.engine.session.cancel = func() bool { polls++; return polls >= 2 }
+			r, err := s.queryValues(sql, nil)
+			if err == nil {
+				defer r.Close()
+				for r.Next() {
+					t.Fatal("unexpected row")
+				}
+				err = r.Err()
+			}
+			if code := cancelCode(t, err); code != "57014" {
+				t.Fatal(code)
+			}
+			if polls != 2 {
+				t.Fatalf("poll count %d", polls)
+			}
+		})
 	}
 }

@@ -2820,7 +2820,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
 		// weight aborts BEFORE the kernel runs.
 		m.Charge(hf.cost)
-		if err := m.Guard(); err != nil {
+		if err := m.Checkpoint(); err != nil {
 			return Value{}, err
 		}
 		// The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 — speculative
@@ -2846,6 +2846,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			out, err = hf.callOne(hvals)
 		}
 		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Poll(); err != nil {
 			return Value{}, err
 		}
 		// Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the

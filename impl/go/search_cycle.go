@@ -296,7 +296,7 @@ func (db *engine) searchCycleRows(plan *searchCyclePlan, exprs []*rExpr, filter 
 	before := measureRows(acct, rows)
 	out := make([][]Value, 0, len(rows))
 	for _, row := range rows {
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return nil, 0, err
 		}
 		if filter != nil {

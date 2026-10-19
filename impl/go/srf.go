@@ -1008,7 +1008,7 @@ func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) 
 	}
 	var out []storedRow
 	for _, t := range snap.tablesSorted() {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1035,7 +1035,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 	var out []storedRow
 	for _, t := range snap.tablesSorted() {
 		for i, c := range t.Columns {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1079,7 +1079,7 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				return nil, err
 			}
 			for i, name := range v.Columns {
-				if err := m.Guard(); err != nil {
+				if err := m.Step(); err != nil {
 					return nil, err
 				}
 				m.Charge(costs.GeneratedRow)
@@ -1116,7 +1116,7 @@ func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 	var out []storedRow
 	for _, t := range snap.tablesSorted() {
 		for _, idx := range t.Indexes {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1169,7 +1169,7 @@ func (db *engine) jedStatisticsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 		if table == nil || item.column >= len(table.Columns) {
 			continue
 		}
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1222,7 +1222,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 	for _, t := range snap.tablesSorted() {
 		// CHECK: name / table / 'check' / NULL columns / expression text / NULL ref_*.
 		for _, ck := range t.Checks {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1243,7 +1243,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 			if !idx.Unique {
 				continue
 			}
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1272,7 +1272,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 		// parent's canonical names — the parent always exists, it cannot be dropped while referenced,
 		// constraints.md §6.10).
 		for _, fk := range t.ForeignKeys {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1306,7 +1306,7 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 		}
 		// EXCLUDE: the excluded columns and their WITH operators, both in element order.
 		for _, exc := range t.Exclusions {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1352,7 +1352,7 @@ func (db *engine) jedSequencesRows(sp *srfPlan, m *costMeter) ([]storedRow, erro
 	}
 	var out []storedRow
 	for _, seq := range snap.sequencesSorted() {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1397,7 +1397,7 @@ func (db *engine) jedTypesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 	}
 	var out []storedRow
 	for _, ct := range snap.compositeTypesSorted() {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1418,7 +1418,7 @@ func (db *engine) jedTypeFieldsRows(sp *srfPlan, m *costMeter) ([]storedRow, err
 	var out []storedRow
 	for _, ct := range snap.compositeTypesSorted() {
 		for i, f := range ct.Fields {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1445,7 +1445,7 @@ func (db *engine) jedViewsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
 	}
 	var out []storedRow
 	for _, v := range snap.viewsSorted() {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1524,7 +1524,7 @@ func (db *engine) generateSeriesRows(sp *srfPlan, env *evalEnv, m *costMeter, ma
 		if !inRange {
 			break
 		}
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1585,7 +1585,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, newError(InvalidParameterValue, "cannot extract elements from a scalar")
 		}
 		for i := range node.Arr {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1613,7 +1613,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, newError(InvalidParameterValue, "cannot call jsonb_object_keys on a non-object")
 		}
 		for i := range node.Obj {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1624,7 +1624,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, newError(InvalidParameterValue, "cannot call "+srfKindName(sp.kind)+" on a non-object")
 		}
 		for i := range node.Obj {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1650,7 +1650,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 		}
 	case srfJSONRecord:
 		// json[b]_to_record (R1): one record row, mapping members → the col-def columns by name.
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -1666,7 +1666,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, newError(InvalidParameterValue, "cannot call json_to_recordset on a non-array")
 		}
 		for i := range node.Arr {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1716,7 +1716,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, err
 		}
 		for i := range seq {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -1998,7 +1998,7 @@ func (db *engine) jsonTableRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stor
 	}
 	out := make([]storedRow, 0, len(sparse))
 	for _, assignment := range sparse {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -2063,7 +2063,7 @@ func jtEvalOpts(vars jpVars) jpEvalOpts { return jpEvalOpts{vars: vars} }
 func expandJtLevel(cols []jtCol, items []JsonNode, vars jpVars, env *evalEnv, m *costMeter) ([][]jtAssign, error) {
 	var rows [][]jtAssign
 	for i := range items {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		ord := int64(i + 1)
@@ -2229,7 +2229,7 @@ func (db *engine) regexSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]store
 	items := v.arrayVal().Elements
 	out := make([]storedRow, 0, len(items))
 	for _, item := range items {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -2250,7 +2250,7 @@ func (db *engine) unnestRows(sp *srfPlan, env *evalEnv, m *costMeter, mask []boo
 	case ValArray:
 		out := make([]storedRow, 0, len(v.arrayVal().Elements))
 		for _, e := range v.arrayVal().Elements {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -2284,7 +2284,7 @@ func (db *engine) unnestRecordRows(sp *srfPlan, env *evalEnv, m *costMeter, mask
 	width := len(sp.recordCols)
 	out := make([]storedRow, 0, len(v.arrayVal().Elements))
 	for _, e := range v.arrayVal().Elements {
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -2328,7 +2328,7 @@ func jsonRecordsetRowsVerbatim(sp *srfPlan, text string, env *evalEnv, m *costMe
 		if err != nil {
 			return nil, err
 		}
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
@@ -2373,7 +2373,7 @@ func jsonVerbatimSrfRows(kind srfKind, text string, m *costMeter) ([]storedRow, 
 			return nil, err
 		}
 		for _, sub := range elems {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
@@ -2389,7 +2389,7 @@ func jsonVerbatimSrfRows(kind srfKind, text string, m *costMeter) ([]storedRow, 
 			return nil, err
 		}
 		for _, mem := range members {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)

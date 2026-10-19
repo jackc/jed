@@ -637,7 +637,9 @@ impl Engine {
         rhs_buffers.push(Vec::new()); // slot `ci`
         debug_assert_eq!(rhs_buffers.len(), ci + 1);
 
+        let cancel_meter = self.session.new_meter();
         while !working.is_empty() {
+            cancel_meter.poll()?;
             acct.release(acct.measure_rows(&rhs_buffers[ci]));
             rhs_buffers[ci] = std::mem::take(&mut working);
             let rr = {
@@ -1327,7 +1329,7 @@ impl Engine {
         let mut meter = self.session.new_meter();
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());
         for row in &plan.rows {
-            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+            meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
             meter.charge(COSTS.row_produced);
             let mut out = Vec::with_capacity(plan.column_types.len());
             for (ci, e) in row.iter().enumerate() {

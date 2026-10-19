@@ -57,13 +57,10 @@ type costMeter struct {
 	// lifetimeLimit is the session's cumulative cost budget, or 0 for unlimited (track-only). When
 	// positive, Guard aborts 54P02 once *lifetimeTotal reaches it.
 	lifetimeLimit int64
-	// cancel is an optional cancellation poll (spec/design/api.md §11.4): when set and it returns
-	// true, the next Guard aborts the statement with 57014 query_canceled. It rides this same
-	// chokepoint so a host's cancellation handle (Go context.Context, …) interrupts a long-running
-	// statement at the next metering point — NOT only at the cursor boundary. nil ⇒ no cancellation
-	// (the default; zero overhead, and the path every conformance / cost test takes — cost is
-	// unaffected, the §8 determinism contract intact). The poll checks a cached context Done channel (armCancel).
-	cancel func() bool
+	// cancel belongs to this operation, including frozen cursor engines. Execution
+	// steps sample it independently of deterministic cost enforcement.
+	cancel      func() bool
+	cancelSteps uint8
 }
 
 // NewMeter returns a fresh meter with zero accrued cost, no ceiling, and no session context.
@@ -73,7 +70,7 @@ func newMeter() *costMeter {
 
 // canBatchCosts permits bulk cost accrual only without deterministic cost ceilings.
 // Cancellation does not constrain the cost schedule: batch loops poll at least every
-// 256 records, while scalar execution keeps its existing Guard checkpoints.
+// 256 records, while scalar execution samples cancellation separately from cost guards.
 func (m *costMeter) canBatchCosts() bool {
 	return m.Limit == 0 && m.lifetimeLimit == 0
 }
@@ -127,6 +124,51 @@ func (m *costMeter) Charge(units int64) {
 	}
 }
 
+// Checkpoint checks cancellation immediately at a batch or host-call boundary,
+// then enforces cost. It does not charge work or reset the sampling counter.
+func (m *costMeter) Checkpoint() error {
+	if err := m.Poll(); err != nil {
+		return err
+	}
+	return m.Guard()
+}
+
+// Poll checks cancellation without moving any deterministic cost checkpoint.
+func (m *costMeter) Poll() error {
+	if m.cancel != nil && m.cancel() {
+		return newError(QueryCanceled, "canceling statement due to user request")
+	}
+	return nil
+}
+
+// Step enforces cost on every call, but polls cancellation only on the first
+// and every 256th execution step. Call at input-row, join-candidate, recursive
+// iteration and operator-loop boundaries, never at ordinary expression nodes.
+func (m *costMeter) Step() error {
+	if m.cancel != nil {
+		poll := m.cancelSteps == 0
+		m.cancelSteps++
+		if poll {
+			if err := m.Poll(); err != nil {
+				return err
+			}
+		}
+	}
+	return m.Guard()
+}
+
+// PollStep samples work that has no deterministic cost guard at this point.
+func (m *costMeter) PollStep() error {
+	if m.cancel != nil {
+		poll := m.cancelSteps == 0
+		m.cancelSteps++
+		if poll {
+			return m.Poll()
+		}
+	}
+	return nil
+}
+
 // Guard enforces the ceilings: it aborts if the per-statement max_cost (54P01) OR the session
 // lifetime_max_cost (54P02) has been REACHED (>=, CLAUDE.md §13 — "the instant accrued cost
 // reaches it, execution aborts"). When both are over, the one REACHED FIRST wins — the ceiling
@@ -135,13 +177,15 @@ func (m *costMeter) Charge(units int64) {
 // points in every core, so the abort is deterministic and cross-core identical (spec/design/cost.md
 // §6, spec/design/session.md §5.4). A no-op (one or two comparisons) when both are unlimited.
 func (m *costMeter) Guard() error {
-	// Cancellation is checked first and independently of the cost ceilings: a flipped token aborts
-	// regardless of accrued cost (spec/design/api.md §11.4). The nil check short-circuits when no
-	// cancellation handle is armed, so the cost accrual and the cross-core abort points are
-	// unchanged (CLAUDE.md §8) — this never fires in the conformance/cost suites.
-	if m.cancel != nil && m.cancel() {
-		return newError(QueryCanceled, "canceling statement due to user request")
+	// Keep the common unlimited path small enough to inline into expression
+	// evaluation and execution steps. Finite limits retain the exact comparisons.
+	if m.Limit <= 0 && m.lifetimeLimit <= 0 {
+		return nil
 	}
+	return m.guardLimits()
+}
+
+func (m *costMeter) guardLimits() error {
 	stmtOver := m.Limit > 0 && m.Accrued >= m.Limit
 	lifeOver := m.lifetimeTotal != nil && m.lifetimeLimit > 0 && *m.lifetimeTotal >= m.lifetimeLimit
 	if !stmtOver && !lifeOver {

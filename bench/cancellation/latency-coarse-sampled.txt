@@ -1,0 +1,471 @@
+[bench:cancellation:latency] $ cd impl/go && JED_CANCEL_LATENCY=1 go test -run …
+=== RUN   TestCancellationLatencyMeasurement
+    cancellation_bench_test.go:208: SELECT sum(v) FROM t: cancellation response median=3687ns p95=7710ns max=7989ns
+    cancellation_bench_test.go:208: SELECT v FROM t: cancellation response median=6845ns p95=283587ns max=316729ns
+    cancellation_bench_test.go:208: SELECT v FROM t ORDER BY id LIMIT 1000000: cancellation response median=1156ns p95=25449ns max=70857ns
+--- PASS: TestCancellationLatencyMeasurement (1.07s)
+PASS
+ok  	github.com/jackc/jed/impl/go	1.086s
+[bench:cancellation:latency] $ cargo test --release --manifest-path impl/rust/C…
+warning: variable does not need to be mutable
+   --> src/batched_durability_tests.rs:528:9
+    |
+528 |     let mut re = Database::open(&path).unwrap();
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+  --> src/../tests/file_sessions.rs:76:13
+   |
+76 |         let mut db = Database::create(CreateOptions {
+   |             ----^^
+   |             |
+   |             help: remove this `mut`
+
+warning: function `execute_params` is never used
+    --> src/lib.rs:1314:15
+     |
+1314 | pub(crate) fn execute_params(db: &mut Engine, sql: &str, params: &[Value]) -> Result<Outcome> {
+     |               ^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `begin`, `view`, `update`, `with_tx`, and `execute_script` are never used
+   --> src/api.rs:384:12
+    |
+379 | impl Engine {
+    | ----------- methods in this implementation
+...
+384 |     pub fn begin(&mut self, writable: bool) -> Result<Transaction<'_>> {
+    |            ^^^^^
+...
+394 |     pub fn view<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
+    |            ^^^^
+...
+400 |     pub fn update<R>(&mut self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
+    |            ^^^^^^
+...
+404 |     fn with_tx<R>(
+    |        ^^^^^^^
+...
+552 |     pub fn execute_script(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
+    |            ^^^^^^^^^^^^^^
+
+warning: method `scalar` is never used
+   --> src/catalog.rs:748:12
+    |
+745 | impl ColType {
+    | ------------ method in this implementation
+...
+748 |     pub fn scalar(&self) -> ScalarType {
+    |            ^^^^^^
+
+warning: method `held` is never used
+   --> src/cost.rs:232:19
+    |
+165 | impl StateCharge {
+    | ---------------- method in this implementation
+...
+232 |     pub(crate) fn held(&self) -> i64 {
+    |                   ^^^^
+
+warning: constant `STATISTICS_TARGET` is never used
+  --> src/estimator_constants.rs:16:11
+   |
+16 | pub const STATISTICS_TARGET: usize = 100;
+   |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_STATISTICS_VALUE` is never used
+  --> src/estimator_constants.rs:86:11
+   |
+86 | pub const UNIT_STATISTICS_VALUE: usize = 1;
+   |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_CONSTRAINT_CHECK` is never used
+  --> src/estimator_constants.rs:88:11
+   |
+88 | pub const UNIT_CONSTRAINT_CHECK: usize = 3;
+   |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_VALUE_COMPRESS` is never used
+  --> src/estimator_constants.rs:89:11
+   |
+89 | pub const UNIT_VALUE_COMPRESS: usize = 4;
+   |           ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_VALUE_DECOMPRESS` is never used
+  --> src/estimator_constants.rs:90:11
+   |
+90 | pub const UNIT_VALUE_DECOMPRESS: usize = 5;
+   |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_DECIMAL_WORK` is never used
+  --> src/estimator_constants.rs:91:11
+   |
+91 | pub const UNIT_DECIMAL_WORK: usize = 6;
+   |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_SEQUENCE_ADVANCE` is never used
+  --> src/estimator_constants.rs:99:11
+   |
+99 | pub const UNIT_SEQUENCE_ADVANCE: usize = 14;
+   |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_COLLATE` is never used
+   --> src/estimator_constants.rs:102:11
+    |
+102 | pub const UNIT_COLLATE: usize = 17;
+    |           ^^^^^^^^^^^^
+
+warning: constant `UNIT_TIMEZONE` is never used
+   --> src/estimator_constants.rs:103:11
+    |
+103 | pub const UNIT_TIMEZONE: usize = 18;
+    |           ^^^^^^^^^^^^^
+
+warning: constant `UNIT_REGEX_COMPILE` is never used
+   --> src/estimator_constants.rs:104:11
+    |
+104 | pub const UNIT_REGEX_COMPILE: usize = 19;
+    |           ^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_REGEX_STEP` is never used
+   --> src/estimator_constants.rs:105:11
+    |
+105 | pub const UNIT_REGEX_STEP: usize = 20;
+    |           ^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_VARLEN_COMPARE` is never used
+   --> src/estimator_constants.rs:107:11
+    |
+107 | pub const UNIT_VARLEN_COMPARE: usize = 22;
+    |           ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_WINDOW_FRAME_STEP` is never used
+   --> src/estimator_constants.rs:108:11
+    |
+108 | pub const UNIT_WINDOW_FRAME_STEP: usize = 23;
+    |           ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_SCALAR_BYTE` is never used
+   --> src/estimator_constants.rs:109:11
+    |
+109 | pub const UNIT_SCALAR_BYTE: usize = 24;
+    |           ^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_DECIMAL_TRANSCEND` is never used
+   --> src/estimator_constants.rs:110:11
+    |
+110 | pub const UNIT_DECIMAL_TRANSCEND: usize = 25;
+    |           ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_JSONPATH_COMPILE` is never used
+   --> src/estimator_constants.rs:111:11
+    |
+111 | pub const UNIT_JSONPATH_COMPILE: usize = 26;
+    |           ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNIT_JSONPATH_STEP` is never used
+   --> src/estimator_constants.rs:112:11
+    |
+112 | pub const UNIT_JSONPATH_STEP: usize = 27;
+    |           ^^^^^^^^^^^^^^^^^^
+
+warning: methods `in_transaction`, `allow_temp_ddl`, `temp_buffers`, and `max_temp_storage_bytes` are never used
+    --> src/executor/mod.rs:1234:12
+     |
+1064 | impl SessionState {
+     | ----------------- methods in this implementation
+...
+1234 |     pub fn in_transaction(&self) -> bool {
+     |            ^^^^^^^^^^^^^^
+...
+1308 |     pub fn allow_temp_ddl(&self) -> bool {
+     |            ^^^^^^^^^^^^^^
+...
+1316 |     pub fn temp_buffers(&self) -> usize {
+     |            ^^^^^^^^^^^^
+...
+1324 |     pub fn max_temp_storage_bytes(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+   --> src/executor/execute.rs:196:12
+    |
+ 10 | impl Engine {
+    | ----------- methods in this implementation
+...
+196 |     pub fn oldest_live_txid(&self) -> u64 {
+    |            ^^^^^^^^^^^^^^^^
+...
+209 |     pub fn status(&self) -> TxStatus {
+    |            ^^^^^^
+...
+246 |     pub fn set_max_cost(&mut self, limit: i64) {
+    |            ^^^^^^^^^^^^
+...
+256 |     pub fn set_lifetime_max_cost(&mut self, limit: i64) {
+    |            ^^^^^^^^^^^^^^^^^^^^^
+...
+262 |     pub fn lifetime_max_cost(&self) -> i64 {
+    |            ^^^^^^^^^^^^^^^^^
+...
+269 |     pub fn lifetime_cost(&self) -> i64 {
+    |            ^^^^^^^^^^^^^
+...
+276 |     pub fn set_default_privileges(&mut self, privs: PrivilegeSet) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+282 |     pub fn grant(&mut self, privs: PrivilegeSet, object: &str) {
+    |            ^^^^^
+...
+288 |     pub fn revoke(&mut self, privs: PrivilegeSet, object: &str) {
+    |            ^^^^^^
+...
+306 |     pub fn privileges(&self) -> &crate::privileges::Privileges {
+    |            ^^^^^^^^^^
+...
+311 |     pub fn set_allow_ddl(&mut self, allow: bool) {
+    |            ^^^^^^^^^^^^^
+...
+316 |     pub fn allow_ddl(&self) -> bool {
+    |            ^^^^^^^^^
+...
+324 |     pub fn set_allow_temp_ddl(&mut self, allow: bool) {
+    |            ^^^^^^^^^^^^^^^^^^
+...
+329 |     pub fn allow_temp_ddl(&self) -> bool {
+    |            ^^^^^^^^^^^^^^
+...
+336 |     pub fn set_temp_buffers(&mut self, bytes: usize) {
+    |            ^^^^^^^^^^^^^^^^
+...
+341 |     pub fn temp_buffers(&self) -> usize {
+    |            ^^^^^^^^^^^^
+...
+348 |     pub fn set_max_temp_storage_bytes(&mut self, bytes: usize) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+353 |     pub fn max_temp_storage_bytes(&self) -> usize {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+360 |     pub fn set_var(&mut self, name: &str, value: &str) -> Result<()> {
+    |            ^^^^^^^
+...
+365 |     pub fn reset_var(&mut self, name: &str) -> Result<()> {
+    |            ^^^^^^^^^
+...
+373 |     pub fn set_time_zone(&mut self, zone: &str) -> Result<()> {
+    |            ^^^^^^^^^^^^^
+...
+378 |     pub fn var(&self, name: &str) -> Option<String> {
+    |            ^^^
+...
+384 |     pub fn reset_vars(&mut self) {
+    |            ^^^^^^^^^^
+...
+393 |     pub fn set_max_sql_length(&mut self, bytes: usize) {
+    |            ^^^^^^^^^^^^^^^^^^
+...
+398 |     pub fn max_sql_length(&self) -> usize {
+    |            ^^^^^^^^^^^^^^
+...
+402 |     pub fn set_lock_timeout_ms(&mut self, milliseconds: u64) {
+    |            ^^^^^^^^^^^^^^^^^^^
+...
+406 |     pub fn lock_timeout_ms(&self) -> u64 {
+    |            ^^^^^^^^^^^^^^^
+...
+412 |     pub fn read_only(&self) -> bool {
+    |            ^^^^^^^^^
+...
+417 |     pub fn max_cost(&self) -> i64 {
+    |            ^^^^^^^^
+...
+428 |     pub fn set_max_scalar_bytes(&mut self, bytes: i64) {
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+431 |     pub fn max_scalar_bytes(&self) -> i64 {
+    |            ^^^^^^^^^^^^^^^^
+...
+435 |     pub fn set_max_query_memory_bytes(&mut self, bytes: i64) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+438 |     pub fn max_query_memory_bytes(&self) -> i64 {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+441 |     pub fn set_work_mem(&mut self, bytes: usize) {
+    |            ^^^^^^^^^^^^
+...
+446 |     pub fn work_mem(&self) -> usize {
+    |            ^^^^^^^^
+...
+451 |     pub fn path(&self) -> Option<&std::path::Path> {
+    |            ^^^^
+...
+505 |     pub fn loaded_time_zones(&self) -> Vec<crate::timezone::TimeZoneInfo> {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: field `charge` is never read
+   --> src/executor/exec_helpers.rs:499:9
+    |
+493 |     Columnar {
+    |     -------- field in this variant
+...
+499 |         charge: crate::cost::StateCharge,
+    |         ^^^^^^
+
+warning: method `needs_eager_scan` is never used
+  --> src/executor/access_encode.rs:17:19
+   |
+ 9 | impl ScanBound {
+   | -------------- method in this implementation
+...
+17 |     pub(crate) fn needs_eager_scan(&self) -> bool {
+   |                   ^^^^^^^^^^^^^^^^
+
+warning: function `detect_scan_bound` is never used
+   --> src/executor/access_encode.rs:665:15
+    |
+665 | pub(crate) fn detect_scan_bound(
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: method `storage_bytes` is never used
+    --> src/executor/snapshot.rs:1002:19
+     |
+   8 | impl Snapshot {
+     | ------------- method in this implementation
+...
+1002 |     pub(crate) fn storage_bytes(&self) -> u64 {
+     |                   ^^^^^^^^^^^^^
+
+warning: function `pack` is never used
+    --> src/format.rs:4536:4
+     |
+4536 | fn pack(sizes: &[usize], cap: usize) -> Result<Vec<Vec<usize>>> {
+     |    ^^^^
+
+warning: function `read_page` is never used
+    --> src/format.rs:4997:4
+     |
+4997 | fn read_page(image: &[u8], ps: usize, index: u32) -> Result<Page<'_>> {
+     |    ^^^^^^^^^
+
+warning: function `page_block` is never used
+    --> src/format.rs:5007:4
+     |
+5007 | fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
+     |    ^^^^^^^^^^
+
+warning: multiple fields are never read
+    --> src/operators.rs:8486:9
+     |
+8485 | pub struct WindowDesc {
+     |            ---------- fields in this struct
+8486 |     pub name: &'static str,
+     |         ^^^^
+8487 |     pub surface: &'static str,
+8488 |     pub args: &'static str,
+     |         ^^^^
+8489 |     pub arg_families: &'static [&'static str],
+     |         ^^^^^^^^^^^^
+8490 |     pub result: &'static str,
+8491 |     pub frame_sensitive: bool,
+     |         ^^^^^^^^^^^^^^^
+8492 |     pub requires_order: bool,
+     |         ^^^^^^^^^^^^^^
+8493 |     pub null: &'static str,
+     |         ^^^^
+8494 |     pub errors: &'static [&'static str],
+     |         ^^^^^^
+
+warning: associated function `loaded` is never used
+   --> src/pmap.rs:222:19
+    |
+188 | impl Node {
+    | --------- associated function in this implementation
+...
+222 |     pub(crate) fn loaded(
+    |                   ^^^^^^
+
+warning: method `resident_record_bytes` is never used
+    --> src/pmap.rs:1005:19
+     |
+ 748 | impl PMap {
+     | --------- method in this implementation
+...
+1005 |     pub(crate) fn resident_record_bytes(&self) -> u64 {
+     |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `total` is never used
+   --> src/spill.rs:125:19
+    |
+ 75 | impl Sorter {
+    | ----------- method in this implementation
+...
+125 |     pub(crate) fn total(&self) -> usize {
+    |                   ^^^^^
+
+warning: methods `is_empty` and `stored_bytes` are never used
+   --> src/storage.rs:821:12
+    |
+184 | impl TableStore {
+    | --------------- methods in this implementation
+...
+821 |     pub fn is_empty(&self) -> bool {
+    |            ^^^^^^^^
+...
+827 |     pub(crate) fn stored_bytes(&self) -> u64 {
+    |                   ^^^^^^^^^^^^
+
+warning: `jed` (lib test) generated 37 warnings (run `cargo fix --lib -p jed --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (impl/rust/target/release/deps/jed-b554edaff490c72f)
+
+running 1 test
+test shared::cancellation_bench::cancellation_latency_measurement ... SELECT sum(v) FROM t: cancellation response median=2680ns p95=8298ns max=10098ns
+SELECT v FROM t: cancellation response median=162047ns p95=220303ns max=510056ns
+SELECT v FROM t ORDER BY id LIMIT 1000000: cancellation response median=9176ns p95=15958ns max=17640ns
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1030 filtered out; finished in 1.54s
+
+     Running unittests src/bin/build_collation_bundle.rs (impl/rust/target/release/deps/build_collation_bundle-e895cdccf0c2e76e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/build_timezone_bundle.rs (impl/rust/target/release/deps/build_timezone_bundle-8c222597257d028b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/conformance.rs (impl/rust/target/release/deps/conformance-ef10efc0f628b452)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running unittests src/bin/gen_collation_vectors.rs (impl/rust/target/release/deps/gen_collation_vectors-e8f4c7390c3ebdeb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/gen_timezone_vectors.rs (impl/rust/target/release/deps/gen_timezone_vectors-cd0d89ad96bc6100)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/process_actor.rs (impl/rust/target/release/deps/process_actor-78af706c3f228f61)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

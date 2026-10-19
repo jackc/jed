@@ -38,7 +38,7 @@ pub(crate) fn fold_agg_whole(
         let oc = operand_col(spec);
         for j in 0..nsurv {
             if j & 255 == 0 {
-                meter.guard()?;
+                meter.checkpoint()?;
             }
             let v = match oc {
                 Some(c) => src.at(j, c).clone(),
@@ -78,7 +78,7 @@ pub(crate) fn group_by_int_key(
     meter.charge(COSTS.aggregate_accumulate * nsurv as i64 * specs.len() as i64);
     for j in 0..nsurv {
         if j & 255 == 0 {
-            meter.guard()?;
+            meter.checkpoint()?;
         }
         let kv = src.at(j, key_col);
         let gi = match kv {
@@ -310,7 +310,7 @@ impl crate::cursor::RowStream for StreamingScan {
                         self.seen.release(); // the scan ended (memory.md §6.2)
                         return Ok(None);
                     };
-                    self.meter.guard()?; // enforce the cost ceiling / cancellation per scanned row
+                    self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per scanned row
                     self.meter.charge(COSTS.storage_row_read);
                     if TableStore::needs_resolution(&ra.rows[i], mask) {
                         self.scan.resolve_columns(&mut ra.rows[i], mask)?;
@@ -327,7 +327,7 @@ impl crate::cursor::RowStream for StreamingScan {
                             return Ok(None);
                         }
                     };
-                    self.meter.guard()?; // enforce the cost ceiling / cancellation per scanned row
+                    self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per scanned row
                     self.meter.charge(COSTS.storage_row_read);
                     // Materialize the touched columns left unfetched by the lazy load
                     // (large-values.md §14); the chain reads were already metered in the up-front
@@ -599,7 +599,7 @@ impl crate::cursor::RowStream for BufferedScan {
                     let row = rows.next()?.expect("spool cardinality");
                     *remaining -= 1;
                     if !*charged {
-                        self.meter.guard()?;
+                        self.meter.checkpoint()?;
                         self.meter.charge(COSTS.row_produced);
                     }
                     return Ok(Some(row));
@@ -624,7 +624,7 @@ impl crate::cursor::RowStream for BufferedScan {
                 };
                 *remaining -= 1;
                 if !*charged {
-                    self.meter.guard()?;
+                    self.meter.checkpoint()?;
                     self.meter.charge(COSTS.row_produced);
                 }
                 let base = EvalEnv {
@@ -703,7 +703,7 @@ impl crate::cursor::RowStream for BufferedScan {
                     }
                 };
                 *remaining -= 1;
-                self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
+                self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
                 let base = EvalEnv {
                     exec: &self.engine,
@@ -744,7 +744,7 @@ impl crate::cursor::RowStream for BufferedScan {
                 let i = *idx;
                 *idx += 1;
                 let project = *project;
-                self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
+                self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
                 if project {
                     let base = EvalEnv {
@@ -790,7 +790,7 @@ impl crate::cursor::RowStream for BufferedScan {
                 }
                 let j = *idx;
                 *idx += 1;
-                self.meter.guard()?; // enforce the cost ceiling / cancellation per produced row
+                self.meter.checkpoint()?; // enforce the cost ceiling / cancellation per produced row
                 self.meter.charge(COSTS.row_produced);
                 let mut out = Vec::with_capacity(proj_cols.len());
                 for &c in proj_cols.iter() {

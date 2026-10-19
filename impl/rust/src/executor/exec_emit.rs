@@ -130,6 +130,7 @@ impl Engine {
                 };
                 let mut left_matched = false;
                 for (candidate_index, right) in candidates.iter().enumerate() {
+                    meter.poll()?;
                     let mut combined = left.clone();
                     let offset = plan.rels[inner].offset;
                     combined[offset..offset + right.len()].clone_from_slice(right);
@@ -254,6 +255,7 @@ impl Engine {
                 inner_rows.clone()
             };
             for inner_row in &candidates {
+                meter.poll()?;
                 let combined = combine_physical_relation_rows(
                     plan,
                     outer_ordinal,
@@ -555,6 +557,7 @@ impl Engine {
                             rel_work[k + 1] += meter.accrued - before;
                             let mut left_matched = false;
                             for right in &right_rows {
+                                meter.poll()?;
                                 let mut combined = left.clone();
                                 combined.extend_from_slice(right);
                                 let keep = match &on {
@@ -603,6 +606,7 @@ impl Engine {
                             rel_work[k + 1] += meter.accrued - before;
                             let mut left_matched = false;
                             for right in &right_rows {
+                                meter.poll()?;
                                 let mut combined = left.clone();
                                 combined.extend_from_slice(right);
                                 let keep = match &on {
@@ -647,6 +651,7 @@ impl Engine {
                             let candidates = table.probe(hash_plan, left, meter)?;
                             let mut left_matched = false;
                             for ri in candidates {
+                                meter.poll()?;
                                 let mut combined = left.clone();
                                 combined.extend_from_slice(&right_rows[ri]);
                                 if pred.eval_filter(&combined, &env, meter)? {
@@ -670,6 +675,7 @@ impl Engine {
                     for left in &running {
                         let mut left_matched = false;
                         for (ri, right) in right_rows.iter().enumerate() {
+                            meter.poll()?;
                             let mut combined = left.clone();
                             combined.extend_from_slice(right);
                             let keep = match &on {
@@ -692,6 +698,7 @@ impl Engine {
                     }
                     if emit_right {
                         for (ri, right) in right_rows.iter().enumerate() {
+                            meter.poll()?;
                             if !right_matched[ri] {
                                 let mut combined: Row = vec![Value::Null; left_pad];
                                 combined.extend_from_slice(right);
@@ -757,6 +764,7 @@ impl Engine {
             let filter = plan.post_join_filter();
             let mut rows: Vec<Row> = Vec::new();
             for row in running {
+                meter.poll()?;
                 let keep = match &filter {
                     None => true,
                     Some(f) => f.eval_filter(&row, &env, meter)?,
@@ -892,7 +900,7 @@ impl Engine {
                 // once and the values are shared across sets. A plain column GROUP BY appends nothing.
                 if !plan.group_exprs.is_empty() {
                     for row in rows.iter_mut() {
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         for ge in &plan.group_exprs {
                             let v = ge.eval(row, &env, meter)?;
                             meter.admit_value(&v)?;
@@ -926,7 +934,7 @@ impl Engine {
                         index.insert(Vec::new(), 0);
                     }
                     for row in &rows {
-                        meter.guard()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
+                        meter.checkpoint()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
                         let key: Vec<Value> =
                             gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
                         let gi = match index.get(&key) {
@@ -1081,7 +1089,7 @@ impl Engine {
                                 let mut inner =
                                     Acc::from_spec_unordered(spec, &self.session.time_zone);
                                 for v in sort_agg_order_rows(rows, order) {
-                                    meter.guard()?;
+                                    meter.checkpoint()?;
                                     inner.fold_charged(v, meter, &mut charge)?;
                                 }
                                 inner.finalize()?
@@ -1108,6 +1116,7 @@ impl Engine {
                 if let Some(h) = &plan.having {
                     let mut kept: Vec<Vec<Value>> = Vec::with_capacity(group_rows.len());
                     for srow in group_rows {
+                        meter.poll()?;
                         if h.eval_filter(&srow, &env, meter)? {
                             kept.push(srow);
                         } else {
@@ -1808,7 +1817,7 @@ impl Engine {
                 None => store,
             };
             meter.charge(COSTS.page_read * tree.overlap_node_count(&bound) as i64);
-            meter.guard()?;
+            meter.checkpoint()?;
             let mut found = false;
             tree.scan_range(&bound, &mut |_, _| {
                 found = true;
@@ -1822,14 +1831,14 @@ impl Engine {
         }
         let (pages, slabs) = store.scan_units(&mask)?;
         meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
-        meter.guard()?;
+        meter.checkpoint()?;
         // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
         // parent key column with the PARENT's collation (§2.12).
         let parent_colls = self.column_collations(&parent.columns);
         let mut found = false;
         store.scan_range(&KeyBound::unbounded(), &mut |_, row| {
             meter.charge(COSTS.storage_row_read);
-            meter.guard()?;
+            meter.checkpoint()?;
             // Persisted child rows may defer even inline values. Leave unrelated payloads deferred.
             let mut row = row.clone();
             store.resolve_columns(&mut row, &mask)?;

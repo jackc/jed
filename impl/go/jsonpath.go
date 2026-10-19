@@ -709,7 +709,7 @@ func checkVarsObject(vars *JsonNode) error {
 // compile.
 func compileMetered(src string, m *costMeter, prop *propertyTable) (jsonPath, error) {
 	m.Charge(costs.JsonpathCompile * int64(len(src)))
-	if err := m.Guard(); err != nil {
+	if err := m.Step(); err != nil {
 		return jsonPath{}, err
 	}
 	// The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
@@ -720,7 +720,7 @@ func compileMetered(src string, m *costMeter, prop *propertyTable) (jsonPath, er
 	}
 	// Each like_regex pattern was compiled with the path (jsonpath.md §7).
 	m.Charge(costs.RegexCompile * jp.regexInsts)
-	if err := m.Guard(); err != nil {
+	if err := m.Step(); err != nil {
 		return jsonPath{}, err
 	}
 	return jp, nil
@@ -890,7 +890,7 @@ func (cx *jpCtx) structural() bool { return cx.strict && !cx.ignore }
 // charge charges n units of jsonpath_step and guards (jsonpath.md §7).
 func (cx *jpCtx) charge(n int64) error {
 	cx.m.Charge(costs.JsonpathStep * n)
-	return cx.m.Guard()
+	return cx.m.Step()
 }
 
 // jpFrame is a step application in progress: step `step` applied to `item`, producing its outputs
@@ -1158,7 +1158,7 @@ func (cx *jpCtx) evalBinary(e *jpPathExpr, current jpItem, base jpBase, last int
 		work = workMod(a, b)
 	}
 	cx.m.Charge(costs.DecimalWork * (work - 1))
-	if err := cx.m.Guard(); err != nil {
+	if err := cx.m.Step(); err != nil {
 		return jpItem{}, err
 	}
 	var v Decimal
@@ -1708,7 +1708,7 @@ func (cx *jpCtx) combinePairs(n int, test func(k int) (*bool, error)) (*bool, er
 func (cx *jpCtx) chargeStringCompare(a, b string) error {
 	w := min(utf8.RuneCountInString(a), utf8.RuneCountInString(b))
 	cx.m.Charge(costs.VarlenCompare * int64(max(w, 1)-1))
-	return cx.m.Guard()
+	return cx.m.Step()
 }
 
 // evalStartsWith is `l starts with r` (§4.4 rule 5): l's items (lax-unwrapped) against r's (not
@@ -1795,7 +1795,7 @@ func (cx *jpCtx) evalCompare(l *jpPathExpr, op jpCmpOp, r *jpPathExpr, current j
 			}
 		case a != nil && b != nil && a.Kind == JNumber && b.Kind == JNumber:
 			cx.m.Charge(costs.DecimalWork * (workLinear(a.Num, b.Num) - 1))
-			if err := cx.m.Guard(); err != nil {
+			if err := cx.m.Step(); err != nil {
 				return nil, err
 			}
 		}

@@ -671,13 +671,13 @@ pub fn compile_metered(
     m: &mut Meter,
 ) -> Result<JsonPath> {
     m.charge(COSTS.jsonpath_compile * src.len() as i64);
-    m.guard()?;
+    m.checkpoint()?;
     // The text is a jsonpath value's canonical text (or a JSON_TABLE path), already checked by
     // `compile` at resolve.
     let path = JsonPath::parse(src, casing)?;
     // Each like_regex pattern was compiled with the path (jsonpath.md §7).
     m.charge(COSTS.regex_compile * path.regex_insts);
-    m.guard()?;
+    m.checkpoint()?;
     Ok(path)
 }
 
@@ -860,7 +860,7 @@ impl Ctx<'_, '_> {
     /// Charge `n` units of `jsonpath_step` and guard (jsonpath.md §7).
     fn charge(&mut self, n: i64) -> Result<()> {
         self.m.charge(COSTS.jsonpath_step * n);
-        self.m.guard()
+        self.m.checkpoint()
     }
 
     /// Whether a navigation failure raises: strict, and not below a `.**` (§3.3, §4.2).
@@ -1165,7 +1165,7 @@ fn eval_binary<'d>(
         ArithOp::Mod => decimal::work_mod(&a, &b),
     };
     cx.m.charge(COSTS.decimal_work * (work as i64 - 1));
-    cx.m.guard()?;
+    cx.m.checkpoint()?;
     let v = match op {
         ArithOp::Add => a.add(&b)?,
         ArithOp::Sub => a.sub(&b)?,
@@ -1678,7 +1678,7 @@ fn combine_pairs<'d, 'm>(
 fn charge_string_compare(cx: &mut Ctx<'_, '_>, a: &str, b: &str) -> Result<()> {
     let w = a.chars().count().min(b.chars().count()).max(1);
     cx.m.charge(COSTS.varlen_compare * (w as i64 - 1));
-    cx.m.guard()
+    cx.m.checkpoint()
 }
 
 /// `l starts with r` (§4.4 rule 5): `l`'s items (lax-unwrapped) against `r`'s (not unwrapped); a
@@ -1769,7 +1769,7 @@ fn eval_compare<'d>(
             }
             (Some(JsonNode::Number(x)), Some(JsonNode::Number(y))) => {
                 cx.m.charge(COSTS.decimal_work * (decimal::work_linear(x, y) as i64 - 1));
-                cx.m.guard()?;
+                cx.m.checkpoint()?;
             }
             _ => {}
         }

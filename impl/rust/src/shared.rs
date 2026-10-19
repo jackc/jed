@@ -3720,8 +3720,8 @@ impl Session {
 
     /// Run a (possibly mutating) statement under a [`CancellationToken`] (spec/design/api.md §11.4):
     /// arm `cancel` on this session for the statement's duration so a flipped token (from any thread)
-    /// aborts it with `57014 query_canceled` at the next cost-meter checkpoint — not only at the
-    /// boundary. The cheap boundary poll fires before any work; the in-statement meter `guard` does the
+    /// aborts it with `57014 query_canceled` at the next execution checkpoint — not only at the
+    /// boundary. The cheap boundary poll fires before any work; the in-statement meter checkpoint does the
     /// rest. The previous token (if a caller nested arming) is restored on return.
     pub fn execute_cancelable(
         &mut self,
@@ -4721,7 +4721,7 @@ impl Database {
     }
 
     /// Run a statement on a fresh autocommit session under a [`CancellationToken`] (spec/design/api.md
-    /// §11.4): a flipped token (from any thread) aborts it `57014` at the next cost-meter checkpoint.
+    /// §11.4): a flipped token (from any thread) aborts it `57014` at the next execution checkpoint.
     pub fn execute_cancelable(
         &mut self,
         sql: &str,
@@ -4815,14 +4815,14 @@ mod cancel_internal_tests {
 
     /// White-box mid-execution proof (spec/design/api.md §11.4): arm the cancel poll DIRECTLY on the
     /// running session (bypassing the cancelable wrappers' boundary `check`), run a multi-row scan, and
-    /// assert the abort comes from the meter `guard` (`57014`) — NOT the boundary. A 57014 here can only
+    /// assert the abort comes from the meter checkpoint (`57014`) — NOT the boundary. A 57014 here can only
     /// come from the executor consulting `session.cancel` mid-statement, so this pins that the cancel
     /// poll threads through `new_meter` into the running statement. Then clear it and confirm the same
     /// query completes (the poll is the only difference). This reaches the private session state the
     /// public `tests/cancellation.rs` cannot.
     ///
     /// Since S4 (streaming.md §6) `query()` returns a LAZY cursor — a bare scan buffers its input on the
-    /// first pull — so building the cursor no longer runs the scan; the meter `guard` trips during the
+    /// first pull — so building the cursor no longer runs the scan; the meter checkpoint trips during the
     /// drain and the `57014` surfaces via `Rows::error()`, not at `query()` time. (This is the very
     /// surface-during-iteration contract S4 adds; the cancel-threads-through-the-meter proof is unchanged.)
     #[test]
@@ -4841,13 +4841,17 @@ mod cancel_internal_tests {
         let token = CancellationToken::new();
         token.cancel();
         session.engine.session.cancel = Some(token);
-        // Building the lazy cursor is fine; the meter guard aborts during the drain (streaming.md §6).
+        // Building the lazy cursor is fine; the meter checkpoint aborts during the drain (streaming.md §6).
         let mut rows = session.query("SELECT id FROM t", &[]).unwrap();
         for _ in &mut rows {}
         let err = rows
             .error()
-            .expect_err("the meter guard must abort the running scan");
-        assert_eq!(err.code(), "57014", "the abort came from the meter guard");
+            .expect_err("the meter checkpoint must abort the running scan");
+        assert_eq!(
+            err.code(),
+            "57014",
+            "the abort came from the meter checkpoint"
+        );
 
         // Cleared: the same query completes and returns every row (the poll was the only difference).
         session.engine.session.cancel = None;

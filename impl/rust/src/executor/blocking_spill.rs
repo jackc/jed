@@ -105,7 +105,7 @@ impl Engine {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, env.params, env.outer, &[]) {
                 Some(b) => b,
                 None => {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     return Ok(out);
                 }
             },
@@ -115,13 +115,13 @@ impl Engine {
         let mask = &plan.rel_masks[ri];
         let (pages, slabs) = store.overlap_scan_units(&bound, mask)?;
         meter.charge(COSTS.value_decompress * slabs as i64);
-        meter.guard()?;
+        meter.checkpoint()?;
         meter.charge(COSTS.page_read * pages as i64);
         let pushed = plan.pushed_local_filter(ri);
         let mut first = true;
         store.scan_range(&bound, &mut |_, row| {
             if !first {
-                meter.guard()?;
+                meter.checkpoint()?;
             }
             first = false;
             meter.charge(COSTS.storage_row_read);
@@ -145,7 +145,7 @@ impl Engine {
             Ok(true)
         })?;
         if !first {
-            meter.guard()?;
+            meter.checkpoint()?;
         }
         Ok(out)
     }
@@ -238,6 +238,7 @@ impl Engine {
         let mut filtered = self.blocking_spool();
         let mut scan = rows.into_reader()?;
         while let Some(row) = scan.next()? {
+            meter.poll()?;
             if match &filter {
                 Some(f) => f.eval_filter(&row, env, meter)?,
                 None => true,
@@ -261,6 +262,7 @@ impl Engine {
                 let mut kept = self.blocking_spool();
                 let mut scan = rows.into_reader()?;
                 while let Some(row) = scan.next()? {
+                    meter.poll()?;
                     if having.eval_filter(&row, env, meter)? {
                         kept.push(row)?;
                     }
@@ -281,6 +283,7 @@ impl Engine {
             let mut decorated = self.blocking_spool();
             let mut scan = rows.into_reader()?;
             while let Some(mut row) = scan.next()? {
+                meter.poll()?;
                 let values = plan
                     .order_exprs
                     .iter()
@@ -293,6 +296,7 @@ impl Engine {
             let mut scan = decorated.into_reader()?;
             let mut sorter = None;
             while let Some(mut row) = scan.next()? {
+                meter.poll()?;
                 let base = row.len();
                 let order: Vec<_> = plan
                     .order
@@ -319,6 +323,7 @@ impl Engine {
             let mut sorted = sorter.finish()?;
             rows = self.blocking_spool();
             while let Some(row) = sorted.next()? {
+                meter.poll()?;
                 rows.push(row)?;
             }
             if root != "Sort" {
@@ -332,6 +337,7 @@ impl Engine {
             let mut distinct = self.blocking_spool();
             let mut scan = rows.into_reader()?;
             while let Some(row) = scan.next()? {
+                meter.poll()?;
                 let out = plan
                     .projections
                     .iter()
@@ -453,6 +459,7 @@ impl Engine {
                     inputs[inner].reader()?
                 };
                 while let Some(right) = candidates.next()? {
+                    meter.poll()?;
                     let mut combined = left.clone();
                     let offset = plan.rels[inner].offset;
                     combined[offset..offset + right.len()].clone_from_slice(&right);
@@ -480,7 +487,7 @@ impl Engine {
                     if passed <= plan.offset.unwrap_or(0) {
                         continue;
                     }
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     let before = meter.accrued;
                     meter.charge(COSTS.row_produced);
                     let projected = plan
@@ -656,6 +663,7 @@ impl Engine {
                 let mut matched = false;
                 let mut ordinal = 0i64;
                 while let Some(right) = candidates.next()? {
+                    meter.poll()?;
                     let mut combined = left.clone();
                     let offset = plan.rels[inner].offset;
                     combined[offset..offset + right.len()].clone_from_slice(&right);
@@ -723,7 +731,7 @@ impl Engine {
             let mut decorated = self.blocking_spool();
             let mut scan = rows.into_reader()?;
             while let Some(mut row) = scan.next()? {
-                meter.guard()?;
+                meter.checkpoint()?;
                 for ge in &plan.group_exprs {
                     let v = ge.eval(&row, env, meter)?;
                     row.push(v);
@@ -752,7 +760,7 @@ impl Engine {
             }
             let mut scan = rows.reader()?;
             while let Some(row) = scan.next()? {
-                meter.guard()?;
+                meter.checkpoint()?;
                 let key: Row = gset.key_cols.iter().map(|&k| row[k].clone()).collect();
                 let mut state = match groups.get(&key)? {
                     Some(state) => state,
@@ -902,7 +910,7 @@ impl Engine {
                 // measured bytes match every core's (memory.md §6.6).
                 let prefix = [Value::Int(0), Value::Int(0)];
                 while let Some(mut row) = sorted.next()? {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     let v = row.pop().expect("an ordered tuple ends with its value");
                     fold_spilled_value(&mut inner, v, meter, &mut unique, &prefix, &mut folded, 0)?;
                 }
@@ -1434,7 +1442,7 @@ impl SpillHashTable {
                 let Value::Bytea(stored_key) = &entry[0] else {
                     unreachable!()
                 };
-                meter.guard()?;
+                meter.checkpoint()?;
                 let work = stored_key.len().min(key.len()).max(1);
                 meter.charge(COSTS.hash_probe * i64::try_from(work).unwrap_or(i64::MAX));
                 if *stored_key == key {

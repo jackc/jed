@@ -560,7 +560,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		if !v.IsNull() {
 			in := toDecimal(v)
 			m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return err
 			}
 			// Uncapped: the running sum may exceed the §2 format cap mid-fold; only the FINAL
@@ -573,7 +573,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		if !v.IsNull() {
 			in := toDecimal(v)
 			m.Charge(costs.DecimalWork * (workLinear(a.sumDec, in) - 1))
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return err
 			}
 			// Uncapped (as planSumDecimal): the average's final divide brings the value back in
@@ -656,7 +656,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		if !(a.jsonStrict && v.IsNull()) {
 			m.Charge(costs.GeneratedRow)
 			m.Charge(costs.Timezone * v.zoneRenderCount())
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return err
 			}
 			img, err := jsonAggImage(v, a.jsonAsJSON, a.jsonTypes[0], a.jsonZone)
@@ -676,7 +676,7 @@ func (a *acc) fold(v Value, m *costMeter) error {
 		fields := *v.composite()
 		kv, vv := fields[0], fields[1]
 		m.Charge(costs.Timezone * (kv.zoneRenderCount() + vv.zoneRenderCount()))
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return err
 		}
 		// A NULL key: json_object_agg 22004, jsonb_object_agg 22023 (PG's two messages).

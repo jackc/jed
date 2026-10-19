@@ -1,0 +1,85 @@
+[bench:cancellation:go] $ go test -run '^$' -bench '^BenchmarkCancellation' -be…
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  555294	      1065 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/disabled         	  554611	      1056 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/disabled         	  554767	      1052 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  526773	      1107 ns/op	    1984 B/op	      30 allocs/op
+BenchmarkCancellation/cheap/enabled          	  527331	      1110 ns/op	    1984 B/op	      30 allocs/op
+BenchmarkCancellation/cheap/enabled          	  519295	      1116 ns/op	    1984 B/op	      30 allocs/op
+BenchmarkCancellation/cheap/watcher          	  331844	      1829 ns/op	    2136 B/op	      33 allocs/op
+BenchmarkCancellation/cheap/watcher          	  295467	      1800 ns/op	    2136 B/op	      33 allocs/op
+BenchmarkCancellation/cheap/watcher          	  300561	      1821 ns/op	    2136 B/op	      33 allocs/op
+BenchmarkCancellation/cheap/scalar-disabled  	  481778	      1089 ns/op	    1568 B/op	      21 allocs/op
+BenchmarkCancellation/cheap/scalar-disabled  	  463076	      1090 ns/op	    1568 B/op	      21 allocs/op
+BenchmarkCancellation/cheap/scalar-disabled  	  472255	      1088 ns/op	    1568 B/op	      21 allocs/op
+BenchmarkCancellation/cheap/scalar-enabled   	  526981	      1151 ns/op	    1608 B/op	      23 allocs/op
+BenchmarkCancellation/cheap/scalar-enabled   	  520814	      1158 ns/op	    1608 B/op	      23 allocs/op
+BenchmarkCancellation/cheap/scalar-enabled   	  439328	      1166 ns/op	    1608 B/op	      23 allocs/op
+BenchmarkCancellation/stream/disabled        	     930	    636427 ns/op	  961712 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/disabled        	     909	    643113 ns/op	  961712 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/disabled        	     906	    642934 ns/op	  961712 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	     890	    654890 ns/op	  961752 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/enabled         	     902	    649671 ns/op	  961752 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/enabled         	     932	    645760 ns/op	  961752 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/watcher         	     902	    645515 ns/op	  961912 B/op	   20023 allocs/op
+BenchmarkCancellation/stream/watcher         	     915	    642519 ns/op	  961912 B/op	   20023 allocs/op
+BenchmarkCancellation/stream/watcher         	     908	    639798 ns/op	  961912 B/op	   20023 allocs/op
+BenchmarkCancellation/stream/scalar-disabled 	     876	    645403 ns/op	  961712 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/scalar-disabled 	     913	    645145 ns/op	  961712 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/scalar-disabled 	     907	    648461 ns/op	  961712 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/scalar-enabled  	     865	    663058 ns/op	  961752 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/scalar-enabled  	     878	    674621 ns/op	  961752 B/op	   20020 allocs/op
+BenchmarkCancellation/stream/scalar-enabled  	     878	    673247 ns/op	  961752 B/op	   20020 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4501	    134295 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4504	    134047 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4507	    134492 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4454	    135355 ns/op	    2872 B/op	      21 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4326	    135315 ns/op	    2872 B/op	      21 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4312	    135527 ns/op	    2872 B/op	      21 allocs/op
+BenchmarkCancellation/aggregate/watcher      	    4425	    135745 ns/op	    3024 B/op	      24 allocs/op
+BenchmarkCancellation/aggregate/watcher      	    4471	    135722 ns/op	    3024 B/op	      24 allocs/op
+BenchmarkCancellation/aggregate/watcher      	    4470	    135952 ns/op	    3024 B/op	      24 allocs/op
+BenchmarkCancellation/aggregate/scalar-disabled         	     350	   1710654 ns/op	 5279401 B/op	   10092 allocs/op
+BenchmarkCancellation/aggregate/scalar-disabled         	     358	   1669909 ns/op	 5279401 B/op	   10092 allocs/op
+BenchmarkCancellation/aggregate/scalar-disabled         	     352	   1672549 ns/op	 5279401 B/op	   10092 allocs/op
+BenchmarkCancellation/aggregate/scalar-enabled          	     344	   1713702 ns/op	 5279441 B/op	   10094 allocs/op
+BenchmarkCancellation/aggregate/scalar-enabled          	     345	   1715391 ns/op	 5279441 B/op	   10094 allocs/op
+BenchmarkCancellation/aggregate/scalar-enabled          	     348	   1700135 ns/op	 5279441 B/op	   10094 allocs/op
+BenchmarkCancellation/projection/disabled               	    1028	    553733 ns/op	 1792544 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/disabled               	    1026	    556837 ns/op	 1792544 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/disabled               	    1023	    551527 ns/op	 1792544 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled                	     969	    563708 ns/op	 1792584 B/op	   10037 allocs/op
+BenchmarkCancellation/projection/enabled                	     976	    566705 ns/op	 1792584 B/op	   10037 allocs/op
+BenchmarkCancellation/projection/enabled                	     978	    566161 ns/op	 1792584 B/op	   10037 allocs/op
+BenchmarkCancellation/projection/watcher                	     957	    563796 ns/op	 1792738 B/op	   10040 allocs/op
+BenchmarkCancellation/projection/watcher                	     988	    563519 ns/op	 1792738 B/op	   10040 allocs/op
+BenchmarkCancellation/projection/watcher                	     979	    562360 ns/op	 1792738 B/op	   10040 allocs/op
+BenchmarkCancellation/projection/scalar-disabled        	     350	   1675502 ns/op	 5597864 B/op	   20085 allocs/op
+BenchmarkCancellation/projection/scalar-disabled        	     350	   1675143 ns/op	 5597864 B/op	   20085 allocs/op
+BenchmarkCancellation/projection/scalar-disabled        	     351	   1724451 ns/op	 5597864 B/op	   20085 allocs/op
+BenchmarkCancellation/projection/scalar-enabled         	     339	   1691765 ns/op	 5597904 B/op	   20087 allocs/op
+BenchmarkCancellation/projection/scalar-enabled         	     344	   1709642 ns/op	 5597904 B/op	   20087 allocs/op
+BenchmarkCancellation/projection/scalar-enabled         	     348	   1674331 ns/op	 5597904 B/op	   20087 allocs/op
+BenchmarkCancellationMechanism/watcher/1                	 1000000	       611.4 ns/op	     191 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1                	 1000000	       615.3 ns/op	     167 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1                	 1000000	       621.5 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/channel/1                	140211579	         4.291 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1                	140203302	         4.280 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1                	139739584	         4.285 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/watcher/1000             	  487654	      1092 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1000             	  789135	      1091 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/watcher/1000             	  770377	      1091 ns/op	     164 B/op	       3 allocs/op
+BenchmarkCancellationMechanism/channel/1000             	  201753	      2807 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1000             	  214338	      2796 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationMechanism/channel/1000             	  211832	      2801 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCancellationCaller/context                     	 3741000	       149.6 ns/op	     208 B/op	       3 allocs/op
+BenchmarkCancellationCaller/context                     	 3821504	       168.6 ns/op	     208 B/op	       3 allocs/op
+BenchmarkCancellationCaller/context                     	 3475045	       178.4 ns/op	     208 B/op	       3 allocs/op
+BenchmarkCancellationCaller/deadline                    	 1327794	       379.1 ns/op	     384 B/op	       5 allocs/op
+BenchmarkCancellationCaller/deadline                    	 1560949	       383.2 ns/op	     384 B/op	       5 allocs/op
+BenchmarkCancellationCaller/deadline                    	 1548176	       386.6 ns/op	     384 B/op	       5 allocs/op
+PASS
+ok  	github.com/jackc/jed/impl/go	55.391s

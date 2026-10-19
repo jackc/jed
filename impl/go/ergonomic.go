@@ -15,8 +15,8 @@ package jed
 //     without leaving the Query/Exec/QueryRow surface.
 //
 // Cancellation is wired through the cost meter: each Query/Exec/QueryRow arms a poll on the engine
-// that runs the statement (armCancel), and the meter's Guard() checkpoint consults it, so a flipped
-// context.Context aborts a long-running statement with 57014 at the next metering point — not only
+// that runs the statement (armCancel), and the meter's execution checkpoints consult it, so a flipped
+// context.Context aborts a long-running statement with 57014 at the next execution checkpoint — not only
 // at the cursor boundary (api.md §11.4). The 57014 query_canceled SQLSTATE is registered in
 // spec/errors/registry.toml. Container types in Values still degrade to the raw Value (the §11.5
 // follow-up), and the same surface on the shared Read/Write handles is pending.
@@ -76,7 +76,7 @@ var (
 // statement, so the conversion + cancellation logic lives once, in ergoQuery/ergoExec; the per-type
 // methods are one-liners that supply the right engine + raw []Value primitive. armCancel threads ctx
 // into the statement's cost meter (api.md §11.4), so a
-// flipped context aborts a long-running statement at the executor's Guard() checkpoint — not only
+// flipped context aborts a long-running statement at the executor's cancellation checkpoint — not only
 // at the cursor boundary (ctxErr, the cheap pre-exec / cursor poll).
 
 func ergoQuery(ctx context.Context, eng *engine, args []any, raw func([]Value) (*Rows, error)) (*Rows, error) {
@@ -868,7 +868,7 @@ func kindName(k ValueKind) string {
 // ───────────────────────────── cancellation ─────────────────────────────
 
 // ctxErr reports a non-blocking cancellation check on ctx — the cheap poll at the API entry and
-// cursor boundary (the in-statement poll is the meter's Guard, armed by armCancel). A nil or
+// cursor boundary (in-statement polls run at execution checkpoints, armed by armCancel). A nil or
 // already-canceled ctx is handled here; a background ctx (nil Done channel) costs nothing.
 func ctxErr(ctx ctxIface) error {
 	if ctx == nil {

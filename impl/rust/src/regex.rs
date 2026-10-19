@@ -1181,7 +1181,7 @@ impl Program {
                 i += 1;
             }
             std::mem::swap(&mut clist, &mut nlist);
-            m.guard()?; // §6 ceiling, once per input position
+            m.checkpoint()?; // §6 ceiling, once per input position
             if clist.is_empty() {
                 break;
             }

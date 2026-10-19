@@ -599,7 +599,11 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		}
 	}
 
+	cancelMeter := db.session.newMeter()
 	for len(working) > 0 {
+		if err := cancelMeter.PollStep(); err != nil {
+			return nil, err
+		}
 		acct.release(measureRows(acct, rhsBuffers[ci]))
 		rhsBuffers[ci] = working
 		working = nil
@@ -2027,7 +2031,7 @@ func (db *engine) execValuesPlan(plan *valuesPlan, outer []storedRow, params []V
 	meter := db.session.newMeter()
 	rows := make([][]Value, 0, len(plan.rows))
 	for _, row := range plan.rows {
-		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+		if err := meter.Step(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 			return selectResult{}, err
 		}
 		meter.Charge(costs.RowProduced)

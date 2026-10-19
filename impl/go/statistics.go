@@ -1386,7 +1386,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			if !ok {
 				break
 			}
-			if err := meter.Guard(); err != nil {
+			if err := meter.Step(); err != nil {
 				return outcome{}, err
 			}
 			pages, slabs := store.statisticsScanUnits(storageKey, row, column)
@@ -1447,7 +1447,7 @@ func (db *engine) executeAnalyze(analyze *analyzeStmt) (outcome, error) {
 			}
 			retainStatisticsSample(sample, statisticsSample{priority: priority, ordinal: ordinal, nonnull: true, oversized: oversized, retained: retained})
 		}
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return outcome{}, err
 		}
 		nonnull := analyzedRows - nullCount
