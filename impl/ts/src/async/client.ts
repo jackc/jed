@@ -5,14 +5,10 @@ import { toValue, valueToJs, type JsParam, type Row, type RunResult } from "../e
 import type { SessionOptions, TxStatus } from "../snapshot.ts";
 import type { ScriptSummary } from "../split.ts";
 import { decodeError, TransportError } from "./errors.ts";
+import { encodeValues, measureValues, WireBudget } from "./wire.ts";
+import { decodePackedRows } from "./packed.ts";
 import {
-  decodeValues,
-  encodeValues,
-  measureValues,
-  measureWireValues,
-  WireBudget,
-} from "./wire.ts";
-import {
+  RUNTIME_VERSION,
   type FetchReply,
   type QueryReply,
   type RuntimeLimits,
@@ -214,7 +210,7 @@ export class RuntimeConnection {
     const cancel = signal && this.sharedCancellation ? new SharedArrayBuffer(4) : undefined;
     const flag = cancel ? new Int32Array(cancel) : undefined;
     const request: RuntimeRequest = {
-      version: 1,
+      version: RUNTIME_VERSION,
       id,
       op,
       session,
@@ -230,7 +226,7 @@ export class RuntimeConnection {
         // Cancellation bypasses ordinary admission and creates no extra pending promise.
         try {
           this.transport.postMessage({
-            version: 1,
+            version: RUNTIME_VERSION,
             id: this.nextId++,
             op: "cancel",
             args: { request: id },
@@ -293,7 +289,7 @@ export class RuntimeConnection {
       if (
         reply === null ||
         typeof reply !== "object" ||
-        reply.version !== 1 ||
+        reply.version !== RUNTIME_VERSION ||
         !Number.isSafeInteger(reply.id) ||
         typeof reply.ok !== "boolean"
       ) {
@@ -369,7 +365,7 @@ export class AsyncRows implements AsyncIterableIterator<Value[]> {
   private readonly session?: number;
   private readonly transaction?: number;
   private readonly options: OperationOptions;
-  private batch: FetchReply["rows"] = [];
+  private batch: Value[][] = [];
   private index = 0;
   private done = false;
   private closed = false;
@@ -404,6 +400,19 @@ export class AsyncRows implements AsyncIterableIterator<Value[]> {
     if (this.pendingPulls >= this.connection.limits.maxQueuedRequests) {
       return Promise.reject(new TransportError("QUEUE_FULL", "too many pending cursor reads"));
     }
+    // An already-decoded row needs no queued work. Consume it immediately in invocation order,
+    // retaining the promise API without creating a chain of scheduling promises for every row.
+    // Calls behind a fetch or close still join the queue, and abort must reach the worker while
+    // its cursor is live even when a previous batch has resident rows left.
+    if (this.pendingPulls === 0 && this.closing === undefined) {
+      if (this.closed || (this.done && this.batch.length === 0)) {
+        this.closed = true;
+        return Promise.resolve({ done: true, value: undefined });
+      }
+      if (this.index < this.batch.length && (!this.options.signal?.aborted || this.done)) {
+        return Promise.resolve(this.takeRow());
+      }
+    }
     this.pendingPulls++;
     const next = this.tail
       .then(() => this.pull())
@@ -419,6 +428,12 @@ export class AsyncRows implements AsyncIterableIterator<Value[]> {
     this.index = 0;
     this.release?.();
     this.release = undefined;
+  }
+
+  private takeRow(): IteratorYieldResult<Value[]> {
+    const row = this.batch[this.index++]!;
+    if (this.index === this.batch.length) this.clearBatch();
+    return { done: false, value: row };
   }
 
   private async pull(): Promise<IteratorResult<Value[]>> {
@@ -444,7 +459,10 @@ export class AsyncRows implements AsyncIterableIterator<Value[]> {
           typeof reply !== "object" ||
           typeof reply.done !== "boolean" ||
           typeof reply.cost !== "bigint" ||
-          !Array.isArray(reply.rows) ||
+          reply.rows === null ||
+          typeof reply.rows !== "object" ||
+          !Number.isSafeInteger(reply.rows.length) ||
+          reply.rows.length < 0 ||
           reply.rows.length > this.connection.limits.maxBatchRows ||
           (reply.rows.length === 0 && !reply.done)
         ) {
@@ -452,22 +470,17 @@ export class AsyncRows implements AsyncIterableIterator<Value[]> {
         }
         const budget = new WireBudget(this.connection.limits.maxBatchBytes);
         budget.reserve(128);
-        for (const row of reply.rows) measureWireValues(row, budget);
+        const decoded = decodePackedRows(reply.rows, budget);
         this.cost = reply.cost;
         this.done = reply.done;
-        this.batch = reply.rows;
+        this.batch = decoded.rows;
         if (this.batch.length === 0) {
           this.clearBatch();
           this.closed = true;
           return { done: true, value: undefined };
         }
       }
-      const row = decodeValues(
-        this.batch[this.index++],
-        new WireBudget(this.connection.limits.maxBatchBytes),
-      );
-      if (this.index === this.batch.length) this.clearBatch();
-      return { done: false, value: row };
+      return this.takeRow();
     } catch (error) {
       this.clearBatch();
       this.closed = true;

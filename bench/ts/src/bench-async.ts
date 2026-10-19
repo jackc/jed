@@ -84,7 +84,7 @@ async function measuredWorker(): Promise<AsyncDatabase> {
           typeof reply.result === "object" &&
           "rows" in reply.result
         ) {
-          const rows = (reply.result as { rows: unknown[] }).rows;
+          const rows = (reply.result as { rows: { length: number } }).rows;
           counts.batches++;
           counts.rows += rows.length;
           counts.maxBatchRows = Math.max(counts.maxBatchRows, rows.length);
