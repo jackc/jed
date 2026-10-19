@@ -1,0 +1,215 @@
+{
+  "revisions": {
+    "master": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+    "branch": "f70719f03f1a6589d148481f120a0000c5bcc61a"
+  },
+  "startedAt": "2026-10-19T22:46:50Z",
+  "endedAt": "2026-10-19T22:55:15Z",
+  "cpuAffinity": "0,2",
+  "config": {
+    "heavy": {
+      "warmups": 3,
+      "samples": 7,
+      "responseSamples": 3,
+      "decimalRows": 1000000,
+      "tableRows": 100000,
+      "sortRows": 800000,
+      "typedRows": 200000,
+      "cases": [
+        "decimal-aggregate",
+        "resident-join-group",
+        "sort-top100",
+        "typed-output"
+      ]
+    },
+    "cheap": {
+      "warmups": 3,
+      "samples": 21,
+      "operations": 100
+    }
+  },
+  "exclusionReason": "Browser harness typecheck overlapped first master Node run at 22:46:52.888–22:46:56.605 UTC. Conservatively exclude and repeat entire initial Node ABC block, retaining chronological balanced order BCA,CAB,ABC.",
+  "matrixTaskSha256": "5f43499c1fd8872aa1b1944db33374ed8e3443cf1ebc8706c589b0c4dd3b468d",
+  "evidence": [
+    {
+      "host": "browser",
+      "variant": "master-direct",
+      "repeat": 1,
+      "revision": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+      "recordedAt": "2026-10-19T22:48:17.647Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-1-master-direct/results.json.gz",
+      "sha256": "4cbb182c960ab1d7c7fa9b573c8e1cb1ce2285f9a0e333894b0e6ee792200723",
+      "sourceManifestDigest": "de125f73f0d4b93eecbd20bb1350d76a9181ee04c72d238232d75b81f3f0d771"
+    },
+    {
+      "host": "browser",
+      "variant": "branch-direct",
+      "repeat": 1,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:48:37.088Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-1-branch-direct/results.json.gz",
+      "sha256": "f944ed64a3be81178b36d258ca81d7fd896dcf5804b833debc46aad9b9b8e28c",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "browser",
+      "variant": "branch-worker",
+      "repeat": 1,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:49:01.585Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-1-branch-worker/results.json.gz",
+      "sha256": "3518d135e9809c28e996d08813f6fccf876d0276d400923676c74f50723cfaf3",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "node",
+      "variant": "branch-direct",
+      "repeat": 2,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:49:23.292Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-2-branch-direct/results.json.gz",
+      "sha256": "2ace55531139a1ff6f65e4030e142cb850529ebed1a263c3913f5ed802288f03",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "node",
+      "variant": "branch-worker",
+      "repeat": 2,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:49:52.022Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-2-branch-worker/results.json.gz",
+      "sha256": "62668e708ea2f9d867a6bf07ec6670e701faf56d73e48780beeb858c437572bc",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "node",
+      "variant": "master-direct",
+      "repeat": 2,
+      "revision": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+      "recordedAt": "2026-10-19T22:50:12.410Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-2-master-direct/results.json.gz",
+      "sha256": "a8cbb6ca5bd96c3c3f0d80bdc3030b88f7094db5b642c9b0622f56b4108ed5ac",
+      "sourceManifestDigest": "de125f73f0d4b93eecbd20bb1350d76a9181ee04c72d238232d75b81f3f0d771"
+    },
+    {
+      "host": "browser",
+      "variant": "branch-direct",
+      "repeat": 2,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:50:33.179Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-2-branch-direct/results.json.gz",
+      "sha256": "4691cf57fab26f4834b062a69a0aeede6ae6c9627a01131292bc0bad4d23e05a",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "browser",
+      "variant": "branch-worker",
+      "repeat": 2,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:50:59.006Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-2-branch-worker/results.json.gz",
+      "sha256": "ed10017c75b7cc2dfde8b27f2ee4ad6f026ee2947a7c5c77a3163945fefc38e3",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "browser",
+      "variant": "master-direct",
+      "repeat": 2,
+      "revision": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+      "recordedAt": "2026-10-19T22:51:20.260Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-2-master-direct/results.json.gz",
+      "sha256": "255e586f44092ce01ce9a15f0c2f0d09f3768f5681dcb0e59bfa013c494a2832",
+      "sourceManifestDigest": "de125f73f0d4b93eecbd20bb1350d76a9181ee04c72d238232d75b81f3f0d771"
+    },
+    {
+      "host": "node",
+      "variant": "branch-worker",
+      "repeat": 3,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:51:49.249Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-3-branch-worker/results.json.gz",
+      "sha256": "75dd0f2867c962333e7403567ff6a76038e98a55a6e31c912f9a7a8487997ad1",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "node",
+      "variant": "master-direct",
+      "repeat": 3,
+      "revision": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+      "recordedAt": "2026-10-19T22:52:09.479Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-3-master-direct/results.json.gz",
+      "sha256": "90bc640d35ba2d15596bd1d642e8210f7ab59b4b0e89c23bdc9d5757b26ae04d",
+      "sourceManifestDigest": "de125f73f0d4b93eecbd20bb1350d76a9181ee04c72d238232d75b81f3f0d771"
+    },
+    {
+      "host": "node",
+      "variant": "branch-direct",
+      "repeat": 3,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:52:33.271Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-3-branch-direct/results.json.gz",
+      "sha256": "4b858db601f436f2b889e8cdbfeb3fb65bbcf954747816f490def98e7b1e81b5",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "browser",
+      "variant": "branch-worker",
+      "repeat": 3,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:52:58.970Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-3-branch-worker/results.json.gz",
+      "sha256": "a83abf74410b75e3ae05fdd1bbe62a27606b1dc776daf7cd79bf7eb173a975be",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "browser",
+      "variant": "master-direct",
+      "repeat": 3,
+      "revision": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+      "recordedAt": "2026-10-19T22:53:19.761Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-3-master-direct/results.json.gz",
+      "sha256": "8626a6890cb0a8f0dad2e8a6c1213b20c6d1eb5320e0236c8bf21f472a0b8c95",
+      "sourceManifestDigest": "de125f73f0d4b93eecbd20bb1350d76a9181ee04c72d238232d75b81f3f0d771"
+    },
+    {
+      "host": "browser",
+      "variant": "branch-direct",
+      "repeat": 3,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:53:41.513Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/browser-3-branch-direct/results.json.gz",
+      "sha256": "d438fcb773681cb15b6a82dd7845b4228606ac51831d445cf49b30e9b443bb14",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "node",
+      "variant": "master-direct",
+      "repeat": 1,
+      "revision": "0b1869c8e97051e7e4c88853058cf11eb942181b",
+      "recordedAt": "2026-10-19T22:54:21.209Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-1-master-direct/results.json.gz",
+      "sha256": "fbe9f3e3f7794e6fb25a7a254a56a1013bd26310792b3b10b733e34c9c906fa5",
+      "sourceManifestDigest": "de125f73f0d4b93eecbd20bb1350d76a9181ee04c72d238232d75b81f3f0d771"
+    },
+    {
+      "host": "node",
+      "variant": "branch-direct",
+      "repeat": 1,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:54:46.059Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-1-branch-direct/results.json.gz",
+      "sha256": "3565e4226c846a16ec417987f709ee38fa11d89cb0fb68b465ef0e01d7666ddf",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    },
+    {
+      "host": "node",
+      "variant": "branch-worker",
+      "repeat": 1,
+      "revision": "f70719f03f1a6589d148481f120a0000c5bcc61a",
+      "recordedAt": "2026-10-19T22:55:14.988Z",
+      "localPath": "bench/results/ts-master-comparison-final-20261019/node-1-branch-worker/results.json.gz",
+      "sha256": "77ebfafa583d279e6b098b98db3a321b0ee2daeb19bbfb1c37adaa74cc83fd45",
+      "sourceManifestDigest": "ea526c7a13545c1db3659d03858b20cd1663b65b138eb3b48a0b69d42342b0ca"
+    }
+  ]
+}

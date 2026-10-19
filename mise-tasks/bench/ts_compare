@@ -1,0 +1,46 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compare a frozen TS revision's direct core or production worker on Node/Chromium"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_compare"
+  puts "JED_COMPARE_ROOT and JED_COMPARE_REVISION select an existing frozen engine snapshot and its commit."
+  puts "JED_COMPARE_HOST=node|browser (default node); JED_COMPARE_MODE=direct|worker (default direct)."
+  puts "JED_COMPARE_RESULTS selects a fresh output directory (default ignored bench/results/ts-compare-*)."
+  puts "Runs one source/mode per process so master, branch-direct and branch-worker use separate engines."
+  puts "JED_ASYNC_HEAVY_CASES and workload sizes/WARMUPS/SAMPLES/RESPONSE_SAMPLES retain the shared heavy workloads."
+  puts "JED_COMPARE_CHEAP_WARMUPS=3, JED_COMPARE_CHEAP_SAMPLES=21, JED_COMPARE_CHEAP_OPERATIONS=100."
+  puts "Browser defaults to ordinary origin; JED_COMPARE_BROWSER_ISOLATED=1 enables COOP/COEP."
+  puts "JED_COMPARE_TIMEOUT_MS bounds a browser run (default 1800000)."
+  puts "Uses existing dependencies and Chromium; never installs or downloads anything. Raw results stay gzip-compressed."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+host = ENV.fetch("JED_COMPARE_HOST", "node")
+mode = ENV.fetch("JED_COMPARE_MODE", "direct")
+abort "Invalid host/mode" unless %w[node browser].include?(host) && %w[direct worker].include?(mode)
+root_setting = ENV["JED_COMPARE_ROOT"]
+revision = ENV["JED_COMPARE_REVISION"]
+abort "Set JED_COMPARE_ROOT and JED_COMPARE_REVISION" unless root_setting && revision && !revision.empty?
+root = File.expand_path(root_setting)
+abort "Missing frozen TS engine in JED_COMPARE_ROOT" unless File.file?(File.join(root, "impl/ts/src/shared.ts"))
+if mode == "worker"
+  adapter = host == "node" ? "async/node.ts" : "browser/async.ts"
+  abort "Selected revision has no worker runtime" unless File.file?(File.join(root, "impl/ts/src", adapter))
+end
+directory = File.expand_path(ENV.fetch("JED_COMPARE_RESULTS", "bench/results/ts-compare-#{host}-#{mode}-#{stamp}-#{Process.pid}"))
+abort "Result directory must be fresh" if File.exist?(directory) && !Dir.empty?(directory)
+FileUtils.mkdir_p(directory)
+env = { "JED_COMPARE_ROOT" => root, "JED_COMPARE_REVISION" => revision, "JED_COMPARE_MODE" => mode }
+if host == "node"
+  sh "node", "bench/ts/compare/node.ts", root, mode, directory, revision, env: env
+else
+  vite = File.join(TS_DIR, "node_modules/vite/bin/vite.js")
+  playwright = File.join(TS_DIR, "node_modules/playwright-core/index.mjs")
+  abort "Install the existing impl/ts tools before benchmarking; no downloads performed" unless File.file?(vite) && File.file?(playwright)
+  sh "node", "bench/ts/compare/run.mjs", "--manifest", directory, env: env
+  sh "node", vite, "build", "--config", "bench/ts/compare/vite.config.mjs", "--outDir", File.join(directory, "site"), env: env
+  sh "node", "bench/ts/compare/run.mjs", directory, env: env
+end
