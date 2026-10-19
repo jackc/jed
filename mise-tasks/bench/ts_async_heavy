@@ -10,6 +10,8 @@ if ARGV.include?("--help")
   puts "JED_ASYNC_HEAVY_WARMUPS (3), SAMPLES (7), RESPONSE_SAMPLES (3), DECIMAL_ROWS (1000000),"
   puts "TABLE_ROWS (100000), SORT_ROWS (800000), TYPED_ROWS (200000) use the same JED_ASYNC_HEAVY_ prefix."
   puts "JED_ASYNC_HEAVY_CASES selects comma-separated decimal-aggregate,resident-join-group,sort-top100,typed-output."
+  puts "JED_ASYNC_HEAVY_BATCH_ROWS and JED_ASYNC_HEAVY_BATCH_BYTES override worker batch limits for experiments."
+  puts "Defaults retain production limits; batch bytes must fit the existing 2 MiB result credit."
   exit
 end
 abort "Unexpected arguments; use --help" unless ARGV.empty?
