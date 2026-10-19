@@ -1,0 +1,294 @@
+{
+  "schema": 1,
+  "note": "All full lazy audit failures reproduce in the immutable baseline. Original failed results are retained; the external-drain diagnostic does not replace conformance results.",
+  "sources": {
+    "before": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+    "before_final": "e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473",
+    "after": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+    "after_final": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd"
+  },
+  "settings": {
+    "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]",
+    "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "jit": "yjit",
+    "mode": "memory",
+    "query_api": "query",
+    "compilation": "immediate",
+    "worker_memory_bytes": 536870912,
+    "worker_timeout_seconds": 10.0,
+    "worker_address_space_bytes": 2147483648
+  },
+  "full_lazy": {
+    "files": 679,
+    "available_records": 20135,
+    "records": 20170,
+    "passed": 20099,
+    "failed": 71,
+    "unsupported_files": 0,
+    "skipped_files": 2,
+    "timed_out_files": 0,
+    "memory_limited_files": 0,
+    "omitted_failure_details": 0
+  },
+  "before_control": {
+    "files": 16,
+    "available_records": 683,
+    "records": 586,
+    "passed": 515,
+    "failed": 71,
+    "unsupported_files": 0,
+    "skipped_files": 0,
+    "timed_out_files": 0,
+    "memory_limited_files": 0,
+    "omitted_failure_details": 0
+  },
+  "after_control": {
+    "files": 16,
+    "available_records": 683,
+    "records": 586,
+    "passed": 515,
+    "failed": 71,
+    "unsupported_files": 0,
+    "skipped_files": 0,
+    "timed_out_files": 0,
+    "memory_limited_files": 0,
+    "omitted_failure_details": 0
+  },
+  "exact_failure_equivalence": {
+    "fields": [
+      "file",
+      "line",
+      "error",
+      "sql"
+    ],
+    "path_normalization": "Strip temporary corpus-root prefix, preserving spec/conformance/suites and all remaining path components",
+    "before_equals_after": true,
+    "controls_equal_full_lazy": true,
+    "record_counts_equal": true
+  },
+  "selected_files": [
+    {
+      "file": "spec/conformance/suites/cte/recursive_errors.test",
+      "sha256": "a73aa6ed0344c9bca5d67334300aa0ecdb1cfb3c831e8c3b8853144fd8703ff5"
+    },
+    {
+      "file": "spec/conformance/suites/joins/parenthesized.test",
+      "sha256": "b737661dbb7357f365e9ac217592456331e9189de835e76782a9c618a074a4cc"
+    },
+    {
+      "file": "spec/conformance/suites/joins/parenthesized_lateral.test",
+      "sha256": "b2c2c55c39f110ed177eebfbc96a5e27b36e934b288a0e766b6093b9d27d24d2"
+    },
+    {
+      "file": "spec/conformance/suites/json/json_mutate.test",
+      "sha256": "70236b4830f1276f2932eff66c536fe214ebd8e9ac29c4a67887bbc14230d834"
+    },
+    {
+      "file": "spec/conformance/suites/json/json_path_walk.test",
+      "sha256": "4e086887948ed575855c0948a005393fb00f4808d0767c9b60b45aa4eaecd2c2"
+    },
+    {
+      "file": "spec/conformance/suites/json/to_json_sources.test",
+      "sha256": "5c2f453458182f2c24ae181325f2bb03bde6bfa89c51eb3d904c8c8ee62d8e0a"
+    },
+    {
+      "file": "spec/conformance/suites/resource/depth_limit.test",
+      "sha256": "a05bcf1146a9724f08234e0177e79a5b9065fa5c2070d4d93b799990ecbeccde"
+    },
+    {
+      "file": "spec/conformance/suites/resource/dos_amplification.test",
+      "sha256": "f9d73d7204f50de841894688dde7ef831f5673b247e9edae7effbcbe6f865315"
+    },
+    {
+      "file": "spec/conformance/suites/resource/json_depth_limit.test",
+      "sha256": "a9979136c44e5b33f902f97362ef7aed4d1acdb75959399700ee6fa0dc4c81f3"
+    },
+    {
+      "file": "spec/conformance/suites/resource/operand_resolution.test",
+      "sha256": "da76caf84b15fc62174d37240d8c9bd4581fe1fd04ab77dbf1aaafd696768ab3"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory.test",
+      "sha256": "5c49375c162127195011f083f729a97635e6dd2f4175237701aaadadc65c488b"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_pending.test",
+      "sha256": "5d5dbb932955b751e0970ae5e6ec825f8eef8ee4e87dbfca12dfc60526872fd1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_state.test",
+      "sha256": "517f219b4af9305f56f8cebeae6d0e3a860a223e90c74ad4f1fe4b4c115fc60a"
+    },
+    {
+      "file": "spec/conformance/suites/resource/query_memory_transient.test",
+      "sha256": "4c16d372e2c8a1953014e1dc329b2aa838c472a08a72ef67b76f17bcca8f0df1"
+    },
+    {
+      "file": "spec/conformance/suites/resource/view_depth_limit.test",
+      "sha256": "112a5c30fc5e03f149b3e86613d3f6cb214e9e7f1022af1f8b97dbde76baf946"
+    },
+    {
+      "file": "spec/conformance/suites/resource/view_expansion_limit.test",
+      "sha256": "9395fa53a79c5373b513fd395819e7a466210fc4b87f5d59e74622830ea63385"
+    }
+  ],
+  "failures_by_file": {
+    "spec/conformance/suites/cte/recursive_errors.test": 2,
+    "spec/conformance/suites/joins/parenthesized.test": 3,
+    "spec/conformance/suites/joins/parenthesized_lateral.test": 1,
+    "spec/conformance/suites/json/json_mutate.test": 7,
+    "spec/conformance/suites/json/json_path_walk.test": 4,
+    "spec/conformance/suites/json/to_json_sources.test": 2,
+    "spec/conformance/suites/resource/depth_limit.test": 1,
+    "spec/conformance/suites/resource/dos_amplification.test": 1,
+    "spec/conformance/suites/resource/json_depth_limit.test": 1,
+    "spec/conformance/suites/resource/operand_resolution.test": 1,
+    "spec/conformance/suites/resource/query_memory.test": 7,
+    "spec/conformance/suites/resource/query_memory_pending.test": 28,
+    "spec/conformance/suites/resource/query_memory_state.test": 6,
+    "spec/conformance/suites/resource/query_memory_transient.test": 5,
+    "spec/conformance/suites/resource/view_depth_limit.test": 1,
+    "spec/conformance/suites/resource/view_expansion_limit.test": 1
+  },
+  "worker_crashes": [
+    {
+      "file": "spec/conformance/suites/resource/depth_limit.test",
+      "line": 44,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep"
+    },
+    {
+      "file": "spec/conformance/suites/resource/json_depth_limit.test",
+      "line": 95,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep"
+    },
+    {
+      "file": "spec/conformance/suites/resource/operand_resolution.test",
+      "line": 19,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep"
+    },
+    {
+      "file": "spec/conformance/suites/resource/view_depth_limit.test",
+      "line": 92,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep"
+    },
+    {
+      "file": "spec/conformance/suites/resource/view_expansion_limit.test",
+      "line": 216,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep"
+    }
+  ],
+  "unattempted_selected_records_after_worker_crashes": 97,
+  "external_drain_diagnostic": {
+    "official_conformance_result": false,
+    "mechanism": {
+      "collector": "Host-owned Rows#each.to_a; no Rows#rows collector reservation",
+      "mechanism": "Prepend a diagnostic-only Rows#rows method that caches each.to_a without setting @collecting",
+      "scope": "The same affected files selected by the complete lazy audit",
+      "official_conformance_result": false,
+      "driver_sha256": "a30b518998109ff0c4e1b80cb0eecd52f4f2df404d76310a9b398ac410fbeca5"
+    },
+    "counts": {
+      "files": 16,
+      "available_records": 683,
+      "records": 586,
+      "passed": 558,
+      "failed": 28,
+      "unsupported_files": 0,
+      "skipped_files": 0,
+      "timed_out_files": 0,
+      "memory_limited_files": 0,
+      "omitted_failure_details": 0
+    },
+    "exact_original_failures_removed": 46,
+    "exact_original_failures_remaining": 25,
+    "newly_different_outcomes": 3,
+    "removed_failures_by_file": {
+      "spec/conformance/suites/resource/query_memory.test": 7,
+      "spec/conformance/suites/resource/query_memory_pending.test": 28,
+      "spec/conformance/suites/resource/query_memory_state.test": 6,
+      "spec/conformance/suites/resource/query_memory_transient.test": 5
+    },
+    "newly_different_failures": [
+      {
+        "file": "spec/conformance/suites/resource/query_memory.test",
+        "line": 187,
+        "error": "RuntimeError: expected 54P05, got success"
+      },
+      {
+        "file": "spec/conformance/suites/resource/query_memory.test",
+        "line": 201,
+        "error": "RuntimeError: expected 54P05, got success"
+      },
+      {
+        "file": "spec/conformance/suites/resource/query_memory_state.test",
+        "line": 249,
+        "error": "RuntimeError: expected 54P05, got success"
+      }
+    ],
+    "interpretation": "All 46 failures in query_memory files, including failed-transaction cascades, disappear with host-owned each collection. Three previously expected 54P05 outcomes instead succeed with the smaller streaming allowance. The remaining 25 original failures are unchanged: 19 CTE/join/JSON resolution or metadata mismatches, five stack overflows, and one cost-budget mismatch. This distinguishes API-specific collector/lane thresholds from unrelated pre-existing lazy execution defects.",
+    "source_references": [
+      "impl/ruby-native/lib/jed_native/cursors.rb:170",
+      "impl/ruby-native/lib/jed_native/cursors.rb:209",
+      "spec/design/memory.md:238",
+      "spec/design/memory.md:307"
+    ]
+  },
+  "artifacts": [
+    {
+      "path": "conformance-memory-zjit.json",
+      "sha256": "56535adfbaf32ab1ffe932656ffe2d65996c89038bb60bd56873a899f87694d1"
+    },
+    {
+      "path": "conformance-memory-zjit-bounded.json",
+      "sha256": "e0017d7b2e779290a7db30c0e5ea921a722f6c39e089e4c53204fa173461b302"
+    },
+    {
+      "path": "conformance-disk-yjit.json",
+      "sha256": "9679b201f62b76807c5683f76497205c9c71d69850742839b59226cc1c4ab8a6"
+    },
+    {
+      "path": "conformance-disk-yjit-bounded.json",
+      "sha256": "be34c9d6567c00654280fc17fadde29eb87cfdef6156dff9c04d4e6f85017234"
+    },
+    {
+      "path": "conformance-lazy-yjit.json",
+      "sha256": "fc366961ffee94c122757b3ec9c79d89a6d8dfe6fb2621e0365a6a6c8ba0be5f"
+    },
+    {
+      "path": "conformance-lazy-yjit-bounded.json",
+      "sha256": "8575b7e787777d072d15dd3b15cb4a776f34daed149f272796a0ee18002e379b"
+    },
+    {
+      "path": "conformance-lazy-before-control.json",
+      "sha256": "93a7a231f69196090ea9e4d45623500ab9277d319d6e140b67f4d68a2c0ce736"
+    },
+    {
+      "path": "conformance-lazy-before-control-bounded.json",
+      "sha256": "d943bfc7b5e6b5c59706aa2809636f47d1854a16f901ae989a73ddbe4ae589dd"
+    },
+    {
+      "path": "conformance-lazy-after-control.json",
+      "sha256": "8027c3dd658cad387136d6ac265d77b7f2f6155203c88723fd2230323e10ffb6"
+    },
+    {
+      "path": "conformance-lazy-after-control-bounded.json",
+      "sha256": "5b8415478c46d535d1dac494bcb7df60564fde5ed85d8c69446956960f211d33"
+    },
+    {
+      "path": "conformance-lazy-external-drain-diagnostic.json",
+      "sha256": "673666578b43ee074bdbea8525a4c550a0d19117de8310ca601c32e8afdeb78c"
+    },
+    {
+      "path": "conformance-lazy-external-drain-diagnostic-bounded.json",
+      "sha256": "ec32c23fea69a43cd0a7667110e69294b16a2bd432eef1004eed25ef9d4880dc"
+    },
+    {
+      "path": "lazy-control-corpus.json",
+      "sha256": "b25be7c288d8d345a5db7c62c84b80cc961499c162a2a0773529415f36428ccb"
+    },
+    {
+      "path": "lazy-drain-diagnostic.rb",
+      "sha256": "a30b518998109ff0c4e1b80cb0eecd52f4f2df404d76310a9b398ac410fbeca5"
+    }
+  ]
+}

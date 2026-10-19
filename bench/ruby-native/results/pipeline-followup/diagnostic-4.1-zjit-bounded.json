@@ -1,0 +1,28 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "--zjit-log-compiled-iseqs=bench/ruby-native/results/pipeline-followup/diagnostic-4.1-zjit.log",
+    "bench/ruby-native/pipeline_diagnostics.rb",
+    "--jit",
+    "zjit",
+    "--zjit-log",
+    "bench/ruby-native/results/pipeline-followup/diagnostic-4.1-zjit.log",
+    "--report",
+    "bench/ruby-native/results/pipeline-followup/diagnostic-4.1-zjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 56049664,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 2.966982197991456,
+  "source": "/tmp/jed-ruby-pipeline-after",
+  "source_sha256": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+  "final_source_sha256": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/pipeline-followup/diagnostic-4.1-zjit.json\",\"source_sha256\":\"0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd\",\"jit\":\"zjit\",\"workloads\":[{\"name\":\"stream_plain\",\"generated_code\":{\"source_location\":[\"(jed compiled pipeline)\",1],\"source_sha256\":\"1c00feb3e355234945c72964e9984290593bfea8c55dfa0594316c2217a634db\",\"instruction_sequences\":[{\"label\":\"call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":1,\"zjit_compiled\":false,\"direct_jit_proof\":false},{\"label\":\"block in call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":3,\"zjit_compiled\":true,\"direct_jit_proof\":true}],\"direct_jit_proof\":true,\"all_instruction_sequences_logged\":false,\"zjit_generated_compilations\":[\"block in call@(jed compiled pipeline):4\"],\"note\":\"Direct proof concerns the generated hot loop. A missing standalone wrapper entry is not proof of its separate compilation.\"}},{\"name\":\"stream_arithmetic\",\"generated_code\":{\"source_location\":[\"(jed compiled pipeline)\",1],\"source_sha256\":\"7f23a71becfa1f6816727077dc5ebd1d2cba044c35ff9358d01e84fd5345b90a\",\"instruction_sequences\":[{\"label\":\"call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":1,\"zjit_compiled\":true,\"direct_jit_proof\":true},{\"label\":\"block in call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":3,\"zjit_compiled\":true,\"direct_jit_proof\":true}],\"direct_jit_proof\":true,\"all_instruction_sequences_logged\":true,\"zjit_generated_compilations\":[\"block in call@(jed compiled pipeline):4\",\"block in call@(jed compiled pipeline):4\",\"call@(jed compiled pipeline):1\",\"block in call@(jed compiled pipeline):4\",\"block in call@(jed compiled pipeline):4\"],\"note\":\"Direct proof concerns the generated hot loop. A missing standalone wrapper entry is not proof of its separate compilation.\"}},{\"name\":\"stream_case\",\"generated_code\":{\"source_location\":[\"(jed compiled pipeline)\",1],\"source_sha256\":\"4d36832a451f857324003a650ae4fc16800757a1827fea02fc0af9f923f2762c\",\"instruction_sequences\":[{\"label\":\"call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":1,\"zjit_compiled\":true,\"direct_jit_proof\":true},{\"label\":\"block in call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":3,\"zjit_compiled\":true,\"direct_jit_proof\":true}],\"direct_jit_proof\":true,\"all_instruction_sequences_logged\":true,\"zjit_generated_compilations\":[\"block in call@(jed compiled pipeline):4\",\"block in call@(jed compiled pipeline):4\",\"call@(jed compiled pipeline):1\",\"block in call@(jed compiled pipeline):4\",\"block in call@(jed compiled pipeline):4\"],\"note\":\"Direct proof concerns the generated hot loop. A missing standalone wrapper entry is not proof of its separate compilation.\"}},{\"name\":\"stream_offset_limit\",\"generated_code\":{\"source_location\":[\"(jed compiled pipeline)\",1],\"source_sha256\":\"a8f8ecde95d1573cb58b45797219f8468a8b0e956fd744df14550b8dc6b5acd8\",\"instruction_sequences\":[{\"label\":\"call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":1,\"zjit_compiled\":true,\"direct_jit_proof\":true},{\"label\":\"block in call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":4,\"zjit_compiled\":true,\"direct_jit_proof\":true}],\"direct_jit_proof\":true,\"all_instruction_sequences_logged\":true,\"zjit_generated_compilations\":[\"block in call@(jed compiled pipeline):4\",\"block in call@(jed compiled pipeline):4\",\"block in call@(jed compiled pipeline):4\",\"call@(jed compiled pipeline):1\",\"block in call@(jed compiled pipeline):4\"],\"note\":\"Direct proof concerns the generated hot loop. A missing standalone wrapper entry is not proof of its separate compilation.\"}},{\"name\":\"array_arithmetic\",\"generated_code\":{\"source_location\":[\"(jed compiled pipeline)\",1],\"source_sha256\":\"e54a4c2ce2da70c87ecaafbc2755b56cdb500cbb323530a884488637449f431c\",\"instruction_sequences\":[{\"label\":\"call\",\"path\":\"(jed compiled pipeline)\",\"first_lineno\":1,\"zjit_compiled\":true,\"direct_jit_proof\":true}],\"direct_jit_proof\":true,\"all_instruction_sequences_logged\":true,\"zjit_generated_compilations\":[\"call@(jed compiled pipeline):1\",\"call@(jed compiled pipeline):1\",\"call@(jed compiled pipeline):1\"],\"note\":\"Direct proof concerns the generated hot loop. A missing standalone wrapper entry is not proof of its separate compilation.\"}}]}\n",
+  "stderr": ""
+}

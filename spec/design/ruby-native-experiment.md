@@ -35,5 +35,16 @@ before optimizations. JIT settings belong to the benchmark launcher, never the l
 
 The separately requested runtime compilation experiment is described in
 [`ruby-runtime-compilation.md`](ruby-runtime-compilation.md). It permits a bounded,
-handwritten emitter for resolved expressions; it does not permit evaluating SQL
-text as Ruby or introducing a native engine dependency.
+handwritten emitter for resolved expressions and eligible single-table row loops;
+it does not permit evaluating SQL text as Ruby or introducing a native engine dependency.
+
+The pipeline follow-up records a pre-existing cost gap against source revision
+`627cbb631e3a922999c3a0cb3bcba32136fcb345`: ordered streaming scans over multiple
+pages charge visited structural pages under LIMIT/OFFSET rather than the canonical
+complete bounded page block. This is an experimental implementation defect, not a
+change to the shared cost contract. See
+[`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md).
+The full lazy-API audit in that report reproduces 71 unchanged failures from the
+same baseline. It separates API-dependent collector thresholds from remaining
+resolution/metadata, stack-depth, and correlated-subquery cost gaps. Passing the
+eager corpus does not establish complete lazy-API conformance.

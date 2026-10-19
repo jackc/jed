@@ -1,0 +1,208 @@
+{
+  "files": 16,
+  "records": 586,
+  "passed": 558,
+  "failed": 28,
+  "unsupported_files": 0,
+  "skipped_files": 0,
+  "timed_out_files": 0,
+  "memory_limited_files": 0,
+  "omitted_failure_details": 0,
+  "failures": [
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/cte/recursive_errors.test",
+      "line": 19,
+      "error": "RuntimeError: expected 42P19, got 42P01",
+      "sql": "WITH RECURSIVE c AS (SELECT n FROM c) SELECT n FROM c"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/cte/recursive_errors.test",
+      "line": 23,
+      "error": "RuntimeError: expected 42P19, got 42P01",
+      "sql": "WITH RECURSIVE c(n) AS (SELECT n FROM c UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/joins/parenthesized.test",
+      "line": 367,
+      "error": "JedNative::Error: 42703: unknown column id",
+      "sql": "SELECT o.w, id, a.id, b.id FROM (SELECT 1 AS w) AS o JOIN (a LEFT JOIN b USING (id)) ON true"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/joins/parenthesized.test",
+      "line": 385,
+      "error": "JedNative::Error: 42703: unknown column id",
+      "sql": "SELECT id, a.id, b.id, y FROM (SELECT 1 AS w) AS o JOIN (a RIGHT JOIN b USING (id)) ON true"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/joins/parenthesized.test",
+      "line": 412,
+      "error": "RuntimeError: names: expected id, k, got k, id",
+      "sql": "SELECT * FROM (SELECT 1 AS k, 5 AS id) JOIN (SELECT 1 AS id) USING (id)"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/joins/parenthesized_lateral.test",
+      "line": 447,
+      "error": "RuntimeError: expected 42P10, got 42702",
+      "sql": "SELECT 1 FROM a RIGHT JOIN (b JOIN LATERAL (SELECT id) s ON true) ON true"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 28,
+      "error": "JedNative::Error: 42804: types jsonb and text cannot be matched",
+      "sql": "SELECT '{\"a\":1,\"b\":2}'::jsonb - 'a', '[\"a\",\"b\",\"a\"]'::jsonb - 'a', '[1,2,3]'::jsonb - 1, '[1,2,3]'::jsonb - -1"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 37,
+      "error": "JedNative::Error: 42804: types jsonb and text cannot be matched",
+      "sql": "SELECT '{\"a\":1}'::jsonb - 'x', '[1,2,3]'::jsonb - 5, '{\"a\":1,\"b\":2,\"c\":3}'::jsonb - '{a,c}'"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 45,
+      "error": "JedNative::Error: 42804: types jsonb and text[] cannot be matched",
+      "sql": "SELECT '{\"a\":1,\"b\":2,\"c\":3}'::jsonb - '{a,c}'::text[], '{\"a\":1,\"b\":2,\"c\":3}'::jsonb - ARRAY['a','c']"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 61,
+      "error": "JedNative::Error: 42804: types jsonb and text cannot be matched",
+      "sql": "SELECT (NULL::jsonb) || '{}', '{\"a\":1}'::jsonb - (NULL::text), '{\"a\":1}'::jsonb #- (NULL::text[])"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 69,
+      "error": "RuntimeError: expected 22023, got 42804",
+      "sql": "SELECT '5'::jsonb - 'a'"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 72,
+      "error": "RuntimeError: expected 22023, got 42804",
+      "sql": "SELECT '{\"a\":1}'::jsonb - 0"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_mutate.test",
+      "line": 85,
+      "error": "JedNative::Error: 42804: types jsonb and text cannot be matched",
+      "sql": "SELECT (b - 'a') || '{\"c\":3}' FROM t"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_path_walk.test",
+      "line": 215,
+      "error": "JedNative::Error: 42804: types jsonb and text[] cannot be matched",
+      "sql": "SELECT '{\"a\": 1, \"b\": 2}'::jsonb - '{a,NULL}'::text[], '[\"a\", \"b\"]'::jsonb - '{NULL,b}'::text[], '{}'::jsonb - '{NULL}'::text[]"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_path_walk.test",
+      "line": 222,
+      "error": "RuntimeError: expected 22023, got 42804",
+      "sql": "SELECT '5'::jsonb - '{}'::text[]"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_path_walk.test",
+      "line": 225,
+      "error": "RuntimeError: expected 22023, got 42804",
+      "sql": "SELECT '5'::jsonb - '{NULL}'::text[]"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/json_path_walk.test",
+      "line": 228,
+      "error": "RuntimeError: expected 2202E, got 42804",
+      "sql": "SELECT '[]'::jsonb - '{{a}}'::text[]"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/to_json_sources.test",
+      "line": 158,
+      "error": "JedNative::Error: 42883: function array_to_json has no matching overload",
+      "sql": "SELECT array_to_json(ARRAY[1, 2], false), array_to_json(ARRAY[1, 2], 'false'), array_to_json(ARRAY[1, 2], NULL), array_to_json(NULL::i32[], true)"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/json/to_json_sources.test",
+      "line": 166,
+      "error": "RuntimeError: expected 22P02, got 42883",
+      "sql": "SELECT array_to_json(ARRAY[1], 'maybe')"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/depth_limit.test",
+      "line": 44,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep",
+      "sql": "SELECT * FROM ((((((((((((((((((((((((((((((((((((((((((((((((((t AS t0 JOIN t AS t1 ON true))))))))))))))))))))))))))))))))))))))))))))))))))"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/dos_amplification.test",
+      "line": 109,
+      "error": "JedNative::Error: 54P01: statement cost limit exceeded",
+      "sql": "SELECT (SELECT count(*) FROM s WHERE s.v = o.v) FROM o"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/json_depth_limit.test",
+      "line": 95,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep",
+      "sql": "SELECT a.id, b.id, a.j @> b.j FROM jd a, jd b WHERE a.id <> b.id"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/operand_resolution.test",
+      "line": 19,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep",
+      "sql": "SELECT 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 - 1 FROM t"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/query_memory.test",
+      "line": 187,
+      "error": "RuntimeError: expected 54P05, got success",
+      "sql": "WITH c AS MATERIALIZED (SELECT id, v FROM t) SELECT * FROM c"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/query_memory.test",
+      "line": 201,
+      "error": "RuntimeError: expected 54P05, got success",
+      "sql": "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/query_memory_state.test",
+      "line": 249,
+      "error": "RuntimeError: expected 54P05, got success",
+      "sql": "SELECT id FROM n"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/view_depth_limit.test",
+      "line": 92,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep",
+      "sql": "SELECT a FROM w2"
+    },
+    {
+      "file": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites/resource/view_expansion_limit.test",
+      "line": 216,
+      "error": "harness worker exited 70: SystemStackError: stack level too deep",
+      "sql": "SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM t WHERE b > 0) d0 WHERE a > -1) d1 WHERE a > -2) d2 WHERE a > -3) d3 WHERE a > -4) d4 WHERE a > -5) d5 WHERE a > -6) d6 WHERE a > -7) d7 WHERE a > -8) d8 WHERE a > -9) d9 WHERE a > -10) d10 WHERE a > -11) d11 WHERE a > -12) d12 WHERE a > -13) d13 WHERE a > -14) d14 WHERE a > -15) d15 WHERE a > -16) d16 WHERE a > -17) d17 WHERE a > -18) d18 WHERE a > -19) d19 WHERE a > -20) d20 WHERE a > -21) d21 WHERE a > -22) d22 WHERE a > -23) d23 WHERE a > -24) d24 WHERE a > -25) d25 WHERE a > -26) d26 WHERE a > -27) d27 WHERE a > -28) d28 WHERE a > -29) d29 WHERE a > -30) d30 WHERE a > -31) d31 WHERE a > -32) d32 WHERE a > -33) d33 WHERE a > -34) d34 WHERE a > -35) d35 WHERE a > -36) d36 WHERE a > -37) d37 WHERE a > -38) d38 WHERE a > -39) d39 WHERE a > -40) d40 WHERE a > -41) d41 WHERE a > -42) d42 WHERE a > -43) d43 WHERE a > -44) d44 WHERE a > -45) d45 WHERE a > -46) d46 WHERE a > -47) d47 WHERE a > -48) d48 WHERE a > -49) d49 WHERE a > -50) d50 WHERE a > -51) d51 WHERE a > -52) d52 WHERE a > -53) d53 WHERE a > -54) d54 WHERE a > -55) d55 WHERE a > -56) d56 WHERE a > -57) d57 WHERE a > -58) d58 WHERE a > -59) d59 WHERE a > -60) d60 WHERE a > -61) d61 WHERE a > -62) d62 WHERE a > -63) d63 WHERE a > -64) d64 WHERE a > -65) d65 WHERE a > -66) d66 WHERE a > -67) d67 WHERE a > -68) d68 WHERE a > -69) d69 WHERE a > -70) d70 WHERE a > -71) d71 WHERE a > -72) d72 WHERE a > -73) d73 WHERE a > -74) d74 WHERE a > -75) d75 WHERE a > -76) d76 WHERE a > -77) d77 WHERE a > -78) d78 WHERE a > -79) d79 WHERE a > -80) d80 WHERE a > -81) d81 WHERE a > -82) d82 WHERE a > -83) d83 WHERE a > -84) d84 WHERE a > -85) d85 WHERE a > -86) d86 WHERE a > -87) d87 WHERE a > -88) d88 WHERE a > -89) d89 WHERE a > -90) d90 WHERE a > -91) d91 WHERE a > -92) d92 WHERE a > -93) d93 WHERE a > -94) d94 WHERE a > -95) d95 WHERE a > -96) d96 WHERE a > -97) d97 WHERE a > -98) d98 WHERE a > -99) d99 WHERE a > -100) d WHERE a = 2"
+    }
+  ],
+  "scalar_cursor_records": 4,
+  "compiled_kernels": 2,
+  "compiled_pipelines": 1,
+  "mode": "memory",
+  "filter": "",
+  "started_at": "2026-10-19T16:00:21Z",
+  "query_api": "query",
+  "compilation": "immediate",
+  "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +YJIT +PRISM [x86_64-linux]",
+  "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+  "jit": "yjit",
+  "corpus_root": "/tmp/jed-ruby-pipeline-lazy-control/spec/conformance/suites",
+  "available_records": 683,
+  "source_sha256": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+  "worker_memory_bytes": 536870912,
+  "worker_timeout_seconds": 10.0,
+  "worker_address_space_bytes": 2147483648,
+  "peak_worker_rss_bytes": 139337728,
+  "finished_at": "2026-10-19T16:00:25Z",
+  "final_source_sha256": "0932dbb113e7015a22a72188d2a5a3a29cb3b6a40ba9026518ad3b9e276e83fd",
+  "diagnostic": {
+    "collector": "Host-owned Rows#each.to_a; no Rows#rows collector reservation",
+    "mechanism": "Prepend a diagnostic-only Rows#rows method that caches each.to_a without setting @collecting",
+    "scope": "The same affected files selected by the complete lazy audit",
+    "official_conformance_result": false,
+    "driver_sha256": "a30b518998109ff0c4e1b80cb0eecd52f4f2df404d76310a9b398ac410fbeca5"
+  }
+}
