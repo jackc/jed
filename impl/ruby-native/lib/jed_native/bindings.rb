@@ -9,6 +9,7 @@ module JedNative
     TEXT_OPERATORS = %w[like ilike not\ like not\ ilike ~ ~* !~ !~*].freeze
     COMPARISONS = %w[= <> != < <= > >= is\ distinct\ from is\ not\ distinct\ from @> <@ && << >> &< &> -|-].freeze
     UNMETERED_SCALARS = %w[i16 i32 i64 boolean text bytea uuid decimal f32 f64].freeze
+    METADATA_STACK_SLICE = 24
     attr_reader :types, :count, :correlated
 
     def initialize(engine, statement)
@@ -17,6 +18,7 @@ module JedNative
       @count = highest_parameter(statement)
       @ctes = engine.instance_variable_get(:@ctes).transform_values(&:columns)
       @scope_depth = 0
+      @type_revision = 0
     end
 
     def highest_parameter(node)
@@ -47,10 +49,12 @@ module JedNative
       # A later occurrence can constrain an earlier function or expression.
       (@count + 1).times do
         previous = @types.dup
+        @expression_types = nil
         statement(@statement)
         break if @types == previous
       end
       @final = true
+      @expression_types = nil
       statement(@statement)
       raise Error.new('42P18', 'could not determine parameter type') if @types.include?(UNKNOWN)
       self
@@ -72,6 +76,7 @@ module JedNative
       @types = Array.new(@count, UNKNOWN) if @types.empty? && @count.positive?
       @correlated = false
       @validate_names = true
+      @expression_types = nil
       statement(node, outer.map { |column| column.merge(binding_external: true, binding_scope: -1) })
     end
 
@@ -147,13 +152,22 @@ module JedNative
       index = node[:index] - 1
       old = @types[index] || UNKNOWN
       raise Error.new('42804', 'conflicting parameter types') unless old == UNKNOWN || old == type
+      @type_revision += 1 if old != type
       @types[index] = type
       (@modifiers[index] ||= []) << modifier if modifier && !(@modifiers[index] || []).include?(modifier)
       @not_null[index] = true if not_null
     end
 
     def statement(node, outer = [])
+      stack_depth = @metadata_depth || 0
       return [] unless node
+      # Metadata is resolved before a cursor can yield. Bound each VM stack
+      # independently of the SQL nesting limit while preserving scope order.
+      if stack_depth >= METADATA_STACK_SLICE
+        @metadata_depth = 0
+        return Fiber.new { statement(node, outer) }.resume
+      end
+      @metadata_depth = stack_depth + 1
       previous_depth = @scope_depth
       @scope_depth += 1
       previous_ctes = @ctes.dup
@@ -171,20 +185,7 @@ module JedNative
       end
       case node[:kind]
       when :select
-        scope = []
-        (node[:from] || []).each_with_index do |source, index|
-          visible = source[:lateral] || %i[function join_group].include?(source[:kind]) ? scope + outer : outer
-          scope.concat(relation(source, visible))
-          (node[:joins] || []).select { |join| (join[:from_index] || 0) == index }.each do |join|
-          joined = join[:relation]
-          visible = joined[:lateral] || %i[function join_group].include?(joined[:kind]) ? scope + outer : outer
-          right = relation(joined, visible)
-          using = join[:using] || (join[:natural] ? scope.map { |column| column[:name] } & right.map { |column| column[:name] } : [])
-          right = right.map { |column| using.include?(column[:name]) ? column.merge(qualified_only: true) : column }
-          scope.concat(right)
-          expression(join[:on], scope + outer, 'boolean') if join[:on]
-          end
-        end
+        scope = input_columns(node, outer)
         scope = scope.map { |column| column.merge(binding_scope: @scope_depth) } + outer
         expression(node[:where], scope, 'boolean') if node[:where]
         output = (node[:columns] || []).flat_map do |projection|
@@ -260,12 +261,39 @@ module JedNative
     ensure
       @ctes = previous_ctes if previous_ctes
       @scope_depth = previous_depth if previous_depth
+      @metadata_depth = stack_depth
     end
 
     def assignment(node, column, scope)
       return unless column
       constrain(node, column[:type], column[:type_mod], column[:nullable] == false)
       expression(node, scope, column[:type])
+    end
+
+    def input_columns(node, outer)
+      stack_depth = @metadata_depth || 0
+      if stack_depth >= METADATA_STACK_SLICE
+        @metadata_depth = 0
+        return Fiber.new { input_columns(node, outer) }.resume
+      end
+      @metadata_depth = stack_depth + 1
+      scope = []
+      (node[:from] || []).each_with_index do |source, index|
+        visible = source[:lateral] || %i[function join_group].include?(source[:kind]) ? scope + outer : outer
+        component = relation(source, visible)
+        (node[:joins] || []).select { |join| (join[:from_index] || 0) == index }.each do |join|
+          joined = join[:relation]
+          @engine.send(:validate_query_lateral_join, joined, component, join[:kind], scope)
+          visible = joined[:lateral] || %i[function join_group].include?(joined[:kind]) ? component + scope + outer : outer
+          right = relation(joined, visible)
+          expression(join[:on], component + right + outer, 'boolean') if join[:on]
+          component = @engine.send(:query_join_columns, component, right, join)
+        end
+        scope.concat(component)
+      end
+      scope
+    ensure
+      @metadata_depth = stack_depth
     end
 
     def relation(node, outer)
@@ -284,7 +312,7 @@ module JedNative
         end
       when :subquery then statement(node[:query], outer)
       when :values then statement(node, outer)
-      when :join_group then statement(node.merge(kind: :select, columns: [{ expr: { kind: :star } }]), outer)
+      when :join_group then input_columns(node, outer)
       when :function, :call, :srf
         call = node[:expr] || node[:call] || node
         if call[:kind] == :json_table
@@ -301,11 +329,22 @@ module JedNative
         end
       else []
       end
+      columns = columns.reject { |column| column[:qualified_only] } if node[:kind] == :join_group && name
       raise Error.new('42P10', 'too many relation column aliases') if node[:columns] && node[:columns].length > columns.length
       columns.each_with_index.map { |column, i| column.merge(table: name || column[:table], name: node[:columns]&.[](i) || column[:name]) }
     end
 
     def expression(node, scope, wanted = nil)
+      return resolve_expression(node, scope, wanted) unless @expression_types && node.is_a?(Hash)
+      scopes = (@expression_types[scope] ||= {}.compare_by_identity)
+      types = (scopes[node] ||= {})
+      key = [wanted, @type_revision]
+      return types[key] if types.key?(key)
+      result = resolve_expression(node, scope, wanted)
+      types[[wanted, @type_revision]] = result
+    end
+
+    def resolve_expression(node, scope, wanted = nil)
       return UNKNOWN unless node.is_a?(Hash)
       case node[:kind]
       when :param
@@ -414,6 +453,12 @@ module JedNative
         return 'boolean'
       end
       lt, rt = expression(left, scope), expression(right, scope)
+      # JSON deletion has heterogeneous operands; it does not use arithmetic's
+      # common-type rule. Resolution still validates the operand in compile.
+      if op == '-' && lt == 'jsonb'
+        expression(right, scope, 'text') if right[:kind] == :param && !known?(rt)
+        return 'jsonb'
+      end
       numeric = %w[i16 i32 i64 decimal f32 f64]
       if left[:kind] == :literal && left[:untyped] && !%i[literal param].include?(right[:kind]) && numeric.include?(lt) && numeric.include?(rt) && !(lt == 'decimal' && Types::INTEGER_BITS.key?(rt))
         lt = rt
@@ -429,8 +474,8 @@ module JedNative
         expression(right, scope, anchor) if right[:kind] == :param
         return anchor
       end
-      lt = expression(left, scope, rt) if known?(rt) && rt != 'record' && %i[param array].include?(left[:kind])
-      rt = expression(right, scope, lt) if known?(lt) && lt != 'record' && %i[param array].include?(right[:kind])
+      lt = expression(left, scope, rt) if @count.positive? && known?(rt) && rt != 'record' && %i[param array].include?(left[:kind])
+      rt = expression(right, scope, lt) if @count.positive? && known?(lt) && lt != 'record' && %i[param array].include?(right[:kind])
       unless known?(lt) || known?(rt)
         lt = expression(left, scope, wanted || 'i64')
         rt = expression(right, scope, wanted || 'i64')
@@ -442,9 +487,13 @@ module JedNative
     end
 
     def unify(nodes, scope, wanted = nil)
+      # Only parameters can absorb a new type hint in this metadata pass. A
+      # parameterized subtree may still be revisited by several enclosing
+      # constructors, so reuse its type for the same scope/hint/binding revision.
+      @expression_types ||= {}.compare_by_identity if @count.positive?
       types = nodes.map { |node| expression(node, scope) }
       type = types.reduce(wanted || UNKNOWN) { |a, b| common(a, b) }
-      nodes.each { |node| expression(node, scope, type) } if known?(type)
+      nodes.each { |node| expression(node, scope, type) } if @count.positive? && known?(type)
       type
     end
 
@@ -471,6 +520,12 @@ module JedNative
         return unify(args, scope, wanted)
       end
       types = args.map { |arg| expression(arg, scope) }
+      # These JSON image functions contextually type an untyped pretty flag.
+      # Keep the actual cast in compile so invalid text retains its 22P02 error.
+      if %w[array_to_json row_to_json].include?(name) && args.length == 2 &&
+          args[1][:kind] == :literal && (args[1][:value].nil? || args[1][:untyped] && args[1][:value].is_a?(String))
+        types[1] = 'boolean'
+      end
       signatures = FunctionCatalog::SIGNATURES[name]
       if signatures
         candidates = signatures.select do |families, _result, promote, variadic, defaults|

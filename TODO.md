@@ -52,17 +52,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [ordinary API/host optimization](impl/ruby-native/API_FOLLOWUP.md),
   [runtime compilation](impl/ruby-native/COMPILED_FOLLOWUP.md),
   [fused scan pipelines](impl/ruby-native/PIPELINE_FOLLOWUP.md),
+  [cursor and scan correctness](impl/ruby-native/CORRECTNESS_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 
-  Known experimental gap: multi-page ordered `LIMIT`/`OFFSET` scans charge visited
-  structural pages instead of the complete bounded page block. This predates
-  pipeline compilation; its recorded benchmark reproducer and cost deltas are in
-  [the pipeline report](impl/ruby-native/PIPELINE_FOLLOWUP.md). A correction needs
-  storage-meter budget/fault-order verification and an explicitly requested update.
-  The full lazy-API audit also reproduces existing resolution/metadata, stack-depth,
-  and correlated-subquery cost failures, plus API-dependent result-collection
-  thresholds. Its before/after controls and unfiltered failures are retained in
-  that report; the passing eager corpus is not a full lazy-API conformance claim.
+  The explicitly requested correctness pass fixes the pipeline audit's metadata,
+  stack-depth, correlated-cost, and multi-page ordered `LIMIT`/`OFFSET` defects.
+  Native LIMIT costs now match the actual Rust binding across all four Ruby APIs,
+  with budget/fault-order host regressions. Original failure reports remain in
+  [the pipeline report](impl/ruby-native/PIPELINE_FOLLOWUP.md). Finite query-memory
+  fixtures can be explicitly routed to their materialized executor in a mixed
+  audit; lazy collectors have separate threshold tests. A passing mixed audit
+  does not claim a full pure-query pass; see the correctness report for coverage.
 
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, `LIKE`/`ILIKE … ESCAPE e` (desugared to PostgreSQL's `like_escape(p, e)`), and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ `SIMILAR TO` (deliberately excluded — the SQL-standard surface); Unicode-property char classes (`\p{…}`).

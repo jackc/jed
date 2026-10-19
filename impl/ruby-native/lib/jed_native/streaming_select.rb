@@ -4,6 +4,15 @@ module JedNative
   module StreamingSelect
     def select(statement)
       return super unless streaming_select_shape?(statement)
+      # A cursor alone must not move a budgeted query expression onto the
+      # streaming lane: the ordinary executor charges output before projection,
+      # and an inner query may finish exactly at an unguarded output checkpoint.
+      # Check syntax before resolving, which can execute independent subqueries.
+      if (@max_cost.positive? || @lifetime_max_cost.positive?) &&
+         !statement[:limit] && !statement[:offset] && (statement[:order_by] || []).empty? &&
+         streaming_query_projection?(statement[:columns])
+        return super
+      end
       source = statement[:from].first
       stored = table(source[:name])
       resolved = resolved_read_plan(statement, stored)
@@ -114,6 +123,21 @@ module JedNative
 
     private
 
+    def streaming_query_projection?(node)
+      pending = [node]
+      until pending.empty?
+        current = pending.pop
+        case current
+        when Array
+          current.each { |child| pending << child if child.is_a?(Array) || child.is_a?(Hash) }
+        when Hash
+          return true if current.key?(:query)
+          current.each_value { |child| pending << child if child.is_a?(Array) || child.is_a?(Hash) }
+        end
+      end
+      false
+    end
+
     def streaming_select_syntax?(statement)
       return false unless statement[:kind] == :select && !statement[:with] && !statement[:distinct_on] && !statement[:having]
       return false if statement[:distinct] && (statement[:order_by] || []).empty?
@@ -169,11 +193,18 @@ module JedNative
     end
 
     def window_shape?(node)
-      case node
-      when Array then node.any? { |child| window_shape?(child) }
-      when Hash then !!node[:over] || node.each_value.any? { |child| window_shape?(child) }
-      else false
+      pending = [node]
+      until pending.empty?
+        current = pending.pop
+        case current
+        when Array
+          current.each { |child| pending << child if child.is_a?(Array) || child.is_a?(Hash) }
+        when Hash
+          return true if current[:over]
+          current.each_value { |child| pending << child if child.is_a?(Array) || child.is_a?(Hash) }
+        end
       end
+      false
     end
   end
   Engine.prepend(StreamingSelect)

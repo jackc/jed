@@ -321,10 +321,15 @@ module JedNative
       intervals.reverse! if @native_reverse_scan
       iterator = Enumerator.new do |output|
         intervals.each do |lower, upper|
-          storage_scan_entries(stored, name, lower: lower, upper: upper, reverse: !!@native_reverse_scan, charge_pages: true).each do |_, ordinal|
-            charge(stored.dig(:native_primary_metadata, :height) || 1) if name
-            charge_scan_payload(stored, [ordinal])
-            output << storage_row(stored, ordinal)
+          if name
+            charge(secondary_page_count(stored, name, lower, upper))
+            storage_scan_entries(stored, name, lower: lower, upper: upper, reverse: !!@native_reverse_scan).each do |_, ordinal|
+              charge(stored.dig(:native_primary_metadata, :height) || 1)
+              charge_scan_payload(stored, [ordinal])
+              output << storage_row(stored, ordinal)
+            end
+          else
+            storage_stream_rows(stored, lower: lower, upper: upper, reverse: !!@native_reverse_scan).each { |row| output << row }
           end
         end
       end

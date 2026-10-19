@@ -129,6 +129,7 @@ module JedNative
           charge(0)
           @cost += 1
           @lifetime_cost += 1
+          @cursor_session.engine.instance_variable_set(:@lifetime_cost, @lifetime_cost) if @cursor_session
           output << values
         end
       end

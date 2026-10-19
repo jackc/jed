@@ -39,11 +39,17 @@ module JedNative
     def unwrap(items) = @strict ? items : items.flat_map { |item| item.is_a?(Array) ? item : [item] }
     def numeric?(value) = value.is_a?(Integer) || value.is_a?(Decimal)
     def charge_regex(node)
-      case node
-      when Hash
-        charge(node[:program].code.length) if node[:kind] == :regex
-        node.each_value { |value| charge_regex(value) unless value.is_a?(RegexProgram) }
-      when Array then node.each { |value| charge_regex(value) }
+      pending = [node]
+      until pending.empty?
+        current = pending.pop
+        case current
+        when Hash
+          charge(current[:program].code.length) if current[:kind] == :regex
+          # Reverse the push order to keep the original preorder checkpoints.
+          current.values.reverse_each { |value| pending << value if value.is_a?(Array) || value.is_a?(Hash) }
+        when Array
+          current.reverse_each { |value| pending << value if value.is_a?(Array) || value.is_a?(Hash) }
+        end
       end
     end
 
