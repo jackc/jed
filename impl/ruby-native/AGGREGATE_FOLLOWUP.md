@@ -1,5 +1,9 @@
 # Compiled primitive Ruby aggregates
 
+The cursor failures reported below are historical. The
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
+supersedes the mixed-routing interpretation. Original measurements are retained.
+
 Measured 2026-10-19, after the compiled ordering work at `8243d0bc`. This explicitly
 requested extension keeps Ruby frozen, experimental, and opt-in. It changes no
 dependency, public API, shared SQL contract, supported core, or normal task selection.

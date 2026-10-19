@@ -53,6 +53,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [runtime compilation](impl/ruby-native/COMPILED_FOLLOWUP.md),
   [fused scan pipelines](impl/ruby-native/PIPELINE_FOLLOWUP.md),
   [cursor and scan correctness](impl/ruby-native/CORRECTNESS_FOLLOWUP.md),
+  [cursor conformance correction](impl/ruby-native/CURSOR_CONFORMANCE_FIX.md),
   [compiled ORDER BY comparisons](impl/ruby-native/ORDERING_FOLLOWUP.md),
   [compiled primitive aggregates](impl/ruby-native/AGGREGATE_FOLLOWUP.md),
   [compiled materialized filters and grouping keys](impl/ruby-native/RELATION_FOLLOWUP.md),
@@ -64,10 +65,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   stack-depth, correlated-cost, and multi-page ordered `LIMIT`/`OFFSET` defects.
   Native LIMIT costs now match the actual Rust binding across all four Ruby APIs,
   with budget/fault-order host regressions. Original failure reports remain in
-  [the pipeline report](impl/ruby-native/PIPELINE_FOLLOWUP.md). Finite query-memory
-  fixtures can be explicitly routed to their materialized executor in a mixed
-  audit; lazy collectors have separate threshold tests. A passing mixed audit
-  does not claim a full pure-query pass; see the correctness report for coverage.
+  [the pipeline report](impl/ruby-native/PIPELINE_FOLLOWUP.md). The cursor audit
+  now drains externally like the supported cores, without mixed API routing.
+  Buffered WITH results and gathered column lanes retain their required memory
+  ownership; engine-owned collectors keep separate exact-threshold host tests.
 
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, `LIKE`/`ILIKE … ESCAPE e` (desugared to PostgreSQL's `like_escape(p, e)`), and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ `SIMILAR TO` (deliberately excluded — the SQL-standard surface); Unicode-property char classes (`\p{…}`).

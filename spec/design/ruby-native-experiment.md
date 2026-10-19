@@ -49,7 +49,10 @@ at source revision `627cbb631e3a922999c3a0cb3bcba32136fcb345`. The explicitly
 requested [`CORRECTNESS_FOLLOWUP.md`](../../impl/ruby-native/CORRECTNESS_FOLLOWUP.md)
 fixes the ordered scan page block, correlated output/lifetime accounting,
 resolution/metadata, and stack-depth defects without changing shared contracts.
-It preserves the original evidence and separates materialized-executor memory
-expectations from lazy host-collector thresholds. Optional mixed audits explicitly
-route finite query-memory fixtures to `execute` and report their counts; a passing
-mixed audit does not establish a full pure-query conformance pass.
+The later [cursor conformance correction](../../impl/ruby-native/CURSOR_CONFORMANCE_FIX.md)
+corrects the earlier interpretation of the remaining memory failures: shared
+conformance uses external cursor drains, not engine-owned result collectors.
+The Ruby adapter now does the same for every query record, and mixed API routing
+is rejected. Buffered WITH results and gathered column lanes preserve their
+canonical ownership and admission checkpoints; `Rows#rows` retains its separate
+engine-owned collector contract. Original failure evidence remains unchanged.

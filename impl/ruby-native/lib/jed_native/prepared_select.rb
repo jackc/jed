@@ -146,7 +146,13 @@ module JedNative
         output_owner = query_memory_owner if query_memory_collect_result?
         if !stored
           query_memory_add(gathered_owner, MemorySchedule::ROW) unless input.empty? || plan.predicate&.kind == :literal && plan.predicate.value != true
-        elsif !plan.predicate && plan.projections.all? { |expression| expression.kind == :column }
+        end
+      end
+      if stored && !plan.predicate && plan.projections.all? { |expression| expression.kind == :column } &&
+         (@query_memory || columnar_cursor?(statement))
+        if @max_cost.positive? || @lifetime_max_cost.positive? || @explain_profile_frames
+          # Preserve the eager metered/profile lane's original incremental
+          # reservations, including rejection before a later storage read.
           gathered = plan.projections.map do |expression|
             input.map do |row|
               value = row[expression.value]
@@ -154,6 +160,20 @@ module JedNative
               value
             end
           end
+        else
+          ordinals = plan.projections.map(&:value).uniq.sort
+          lanes = ordinals.to_h { |ordinal| [ordinal, []] }
+          input.each do |row|
+            ordinals.each { |ordinal| lanes[ordinal] << row[ordinal] }
+          end
+          if gathered_owner
+            bytes = ordinals.sum do |ordinal|
+              type = stored[:columns][ordinal][:type]
+              lanes[ordinal].sum { |value| LogicalMemory.value_bytes(value, type) }
+            end
+            query_memory_add(gathered_owner, bytes)
+          end
+          gathered = plan.projections.map { |expression| lanes[expression.value] }
         end
       end
       profile_checkpoint(:scan) if @explain_profile_frames
@@ -176,7 +196,15 @@ module JedNative
             values = Array.new(plan.projections.length)
             column_index = 0
             while column_index < values.length
-              values[column_index] = gathered ? gathered[column_index][row_index - 1] : evaluate(plan.projections[column_index], row)
+              expression = plan.projections[column_index]
+              values[column_index] = if gathered
+                # Gathered values are stored cells, not evaluated columns.
+                # Escaping text must receive the declared column's label just
+                # as ordinary evaluation does, without rereading the storage.
+                CollationRules.wrap(gathered[column_index][row_index - 1], expression.instance_variable_get(:@native_collation))
+              else
+                evaluate(expression, row)
+              end
               column_index += 1
             end
           end
@@ -309,6 +337,27 @@ module JedNative
       PointRead.new(expression: right, index: stored[:native_primary_index],
         minimum: -(1 << (bits - 1)), maximum: (1 << (bits - 1)) - 1,
         pages: stored[:rows].empty? ? 0 : stored.dig(:native_primary_metadata, :height) || 1)
+    end
+
+    # A bare-column cursor retains the ordinary projection lane's gathered
+    # state, independently of the memory limit. Execution starts on its first
+    # pull and each output is yielded separately. Expressions, filters and
+    # windowed scans keep their existing lazy lanes.
+    def columnar_cursor?(statement)
+      return false unless cursor_output? && statement[:kind] == :select
+      # Cost ceilings and profiling keep the row lane's incremental checkpoints.
+      return false if @max_cost.positive? || @lifetime_max_cost.positive? || @explain_profile_frames
+      return false unless @outer.empty? && @ctes.empty?
+      return false if statement[:where] || statement[:with] || statement[:distinct] || statement[:distinct_on] ||
+                      statement[:having] || statement[:limit] || statement[:offset]
+      return false unless (statement[:joins] || []).empty? && (statement[:group_by] || []).empty? &&
+                          (statement[:windows] || {}).empty? && (statement[:order_by] || []).empty?
+      sources = statement[:from] || []
+      return false unless sources.length == 1
+      source = sources.first
+      return false unless source[:kind] == :table && @tables.key?(source[:name]) &&
+                          !source[:database] && !source[:columns] && !source[:column_aliases]
+      statement[:columns].all? { |projection| %i[column star].include?(projection[:expr][:kind]) }
     end
 
     def cacheable_select?(statement)

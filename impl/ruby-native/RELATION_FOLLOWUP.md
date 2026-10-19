@@ -1,5 +1,9 @@
 # Compiled materialized filters and grouping keys
 
+The cursor failures reported below are historical. The
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
+supersedes the mixed-routing interpretation. Original measurements are retained.
+
 Measured 2026-10-19. This explicitly requested extension follows the primitive aggregate compiler at
 `fa4cbcc18dd15ee5af577ece91a01e20d1c28e4b`. Ruby remains a frozen, opt-in experiment;
 normal tests, benchmarks, CI, supported cores, and public APIs are unchanged.

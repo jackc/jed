@@ -314,6 +314,9 @@ module JedNative
 end
 
 require_relative 'jed_native/sessions'
+# Cursor depth must enclose spill preflight too: shape planning can evaluate
+# independent subqueries, whose rows belong to the enclosing query.
+require_relative 'jed_native/spill_semantics'
 require_relative 'jed_native/cursors'
 require_relative 'jed_native/page_service_database'
 require_relative 'jed_native/deep_expressions'
@@ -323,7 +326,6 @@ require_relative 'jed_native/deep_stack'
 
 require_relative 'jed_native/paged_constraints'
 require_relative 'jed_native/storage_rewrite'
-require_relative 'jed_native/spill_semantics'
 
 require_relative 'jed_native/host_batches'
 require_relative 'jed_native/storage_operations'
