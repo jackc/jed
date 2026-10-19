@@ -1,0 +1,37 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Profile query execution, result delivery, and main/worker CPU costs"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:ts_async_profile"
+  puts "       mise run bench:ts_async_profile --analyze OUTPUT [--wall-only] RESULT_DIR..."
+  puts "JED_PROFILE_HOST=node|browser (default node); JED_PROFILE_MODE=plain|coarse|detailed|cpu."
+  puts "JED_PROFILE_RESULTS selects a fresh output directory. No dependencies or browsers are downloaded."
+  puts "JED_PROFILE_SAMPLES=7, JED_PROFILE_CPU_REPEATS=3, JED_PROFILE_COUNT=0 disables count-only sensitivity trials."
+  puts "Shared JED_ASYNC_HEAVY_CASES/workload sizes/WARMUPS choose queries. Defaults are the aggregate and typed output."
+  puts "Modes prepare isolated source snapshots; production engine source is never edited."
+  exit
+end
+if ARGV.first == "--analyze"
+  ARGV.shift
+  sh "node", "bench/ts/profile/analyze.mjs", "--out", *ARGV
+  exit
+end
+abort "Unexpected arguments" unless ARGV.empty?
+host = ENV.fetch("JED_PROFILE_HOST", "node")
+mode = ENV.fetch("JED_PROFILE_MODE", "plain")
+abort "Invalid host/mode" unless %w[node browser].include?(host) && %w[plain coarse detailed cpu].include?(mode)
+directory = File.expand_path(ENV.fetch("JED_PROFILE_RESULTS", "bench/results/ts-profile-#{host}-#{mode}-#{stamp}-#{Process.pid}"))
+abort "Output results already exist" if File.exist?(File.join(directory, "results.json"))
+FileUtils.mkdir_p(directory)
+snapshot = File.join(directory, "source")
+sh "ruby", "bench/ts/profile/prepare.rb", ROOT, snapshot, mode == "cpu" ? "plain" : mode
+env = { "JED_PROFILE_ROOT" => snapshot, "JED_PROFILE_MODE" => mode,
+        "JED_ASYNC_HEAVY_CASES" => ENV.fetch("JED_ASYNC_HEAVY_CASES", "decimal-aggregate,typed-output") }
+if host == "node"
+  sh "node", "bench/ts/profile/node.mjs", directory, env: env
+else
+  sh "node", File.join(TS_DIR, "node_modules/vite/bin/vite.js"), "build", "--config", "bench/ts/profile/vite.config.mjs", "--outDir", File.join(directory, "site"), env: env
+  sh "node", "bench/ts/profile/browser-run.mjs", directory, env: env
+end

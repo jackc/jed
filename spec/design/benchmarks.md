@@ -1879,3 +1879,27 @@ The [cancellation follow-up](../../bench/ts/results/2026-10-19-scheduling-rollba
 compares the original scheduler with 1 ms and 0.125 ms slices in fresh browser runs. Both
 elapsed-time variants were rejected for cancellation regressions, and the original scheduling
 policy was restored. Result-codec and transport limits are unchanged.
+
+`mise run bench:ts_async_profile` separates query execution and result delivery using the same
+heavy workloads. It copies the TS core into an isolated snapshot, records source/adapter hashes
+and an exact instrumentation patch, and retains production connection/server/codec behavior.
+`JED_PROFILE_HOST=node|browser` selects the host and `JED_PROFILE_MODE=plain|coarse|detailed|cpu`
+selects uninstrumented timing, batch/await timers, additional per-row encoder timers, or independent
+main/worker V8 samples. Ordinary replies carry no telemetry; counters are retrieved after the
+drain. Compare modes across repeated fresh processes because instrumentation, especially per-row
+clocks, can change JIT/GC behavior. Count-only consumption is a sensitivity check, not an exact
+subtraction of application CPU.
+
+For the sequential drain, form additive per-sample partitions from worker service, execution
+waits, caller RPC duration, batch validation/construction and the remaining client interval.
+Caller RPC duration minus worker service is a delivery/dispatch residual, including pauses;
+it does not isolate byte transfer. Worker service minus execution waits still includes runtime
+dispatch and encoding unless separately measured. Use arithmetic means for an additive table;
+independent stage medians need not sum. CPU sampled self-time is a separate diagnostic: preserve
+GC, idle and unclassified samples, retain mapped/generated frames, and never add overlapping
+inclusive hotspots or GC to wall intervals that already contain them.
+
+The [query-stage profile](../../bench/ts/results/2026-10-19-query-profile/report.md) retains the
+Node/Chromium baseline, timer calibration, additive timing breakdown and both threads' CPU
+profiles. The [profiling harness notes](../../bench/ts/profile/README.md) document boundaries and
+reproduction. This investigation changes no production scheduler, codec or transport limits.

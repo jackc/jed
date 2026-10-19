@@ -1,0 +1,300 @@
+[
+  {
+    "name": "node-plain-1",
+    "recordedAt": "2026-10-19T12:45:24.981Z",
+    "mode": "plain",
+    "raw": "raw/node-plain-1/results.json.gz",
+    "originalResultsSha256": "0c995a1b03680baab406bb5861895828fb4fe1caf2e2932abc04b163a53c87cd",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-plain-1",
+    "recordedAt": "2026-10-19T12:45:55.904Z",
+    "mode": "plain",
+    "raw": "raw/browser-plain-1/results.json.gz",
+    "originalResultsSha256": "1fc0ceb20d93b62d717f97b9617f90106c148f1ea114667e8c6adcde194c634e",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-coarse-1",
+    "recordedAt": "2026-10-19T12:46:23.162Z",
+    "mode": "coarse",
+    "raw": "raw/node-coarse-1/results.json.gz",
+    "originalResultsSha256": "bde8ad77b1c387fa00520cea892a563b1b84bdb1144a085467985ff060b67499",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-coarse-1",
+    "recordedAt": "2026-10-19T12:46:54.010Z",
+    "mode": "coarse",
+    "raw": "raw/browser-coarse-1/results.json.gz",
+    "originalResultsSha256": "373e8eeddcec9fa9e06dea26af6480c9bc8f74f2a66a3f1563571ea685831e41",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-detailed-1",
+    "recordedAt": "2026-10-19T12:47:22.930Z",
+    "mode": "detailed",
+    "raw": "raw/node-detailed-1/results.json.gz",
+    "originalResultsSha256": "a41b02909ce94f06446ce6bd937a45b0bc023bafd4fbd91d4d3a8356abb46050",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-detailed-1",
+    "recordedAt": "2026-10-19T12:47:56.449Z",
+    "mode": "detailed",
+    "raw": "raw/browser-detailed-1/results.json.gz",
+    "originalResultsSha256": "98c686dd53ce0c374a42db328ca1b08f29f6196e7a685728eeccce23f694ab55",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-coarse-2",
+    "recordedAt": "2026-10-19T12:48:28.048Z",
+    "mode": "coarse",
+    "raw": "raw/browser-coarse-2/results.json.gz",
+    "originalResultsSha256": "0a947edf474cf28a571f01de8062cff0a64897cc278bbad36f5f62d2e4576208",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-coarse-2",
+    "recordedAt": "2026-10-19T12:48:56.101Z",
+    "mode": "coarse",
+    "raw": "raw/node-coarse-2/results.json.gz",
+    "originalResultsSha256": "7bceca95a677f2f424c04d38f6340ee1bc441a9daa535bc55c43d2b251c69237",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-detailed-2",
+    "recordedAt": "2026-10-19T12:49:29.517Z",
+    "mode": "detailed",
+    "raw": "raw/browser-detailed-2/results.json.gz",
+    "originalResultsSha256": "056a800dee8f8f2ae301d32e2f0e1b52e83dd3621b3c4d5275477c910bd4bd4a",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-detailed-2",
+    "recordedAt": "2026-10-19T12:49:57.683Z",
+    "mode": "detailed",
+    "raw": "raw/node-detailed-2/results.json.gz",
+    "originalResultsSha256": "13209e0435ac193e69c3ecb4eeb65c0d28ebd68b5c6c871ba1e6964929b55cd3",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-plain-2",
+    "recordedAt": "2026-10-19T12:50:28.799Z",
+    "mode": "plain",
+    "raw": "raw/browser-plain-2/results.json.gz",
+    "originalResultsSha256": "4a48dc4b029eb7975549fd522251e332f04c62e556cb015498d4c2c910f9ca0a",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-plain-2",
+    "recordedAt": "2026-10-19T12:50:56.543Z",
+    "mode": "plain",
+    "raw": "raw/node-plain-2/results.json.gz",
+    "originalResultsSha256": "fc0ed949e3c6c7d6afdbe9f3cdca3699a3db3c76c5f1cb9483701d11e2d4ca1e",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-detailed-3",
+    "recordedAt": "2026-10-19T12:51:25.662Z",
+    "mode": "detailed",
+    "raw": "raw/node-detailed-3/results.json.gz",
+    "originalResultsSha256": "5a742d3ae8baec2f2d94b24951a73d7a1065aa179c43a6167f2ff817168f3f21",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-detailed-3",
+    "recordedAt": "2026-10-19T12:51:58.911Z",
+    "mode": "detailed",
+    "raw": "raw/browser-detailed-3/results.json.gz",
+    "originalResultsSha256": "c478ff7d99805945120c1b04fec9391b4e0cfb74d4a0d3e8486983a695d90457",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-plain-3",
+    "recordedAt": "2026-10-19T12:52:26.015Z",
+    "mode": "plain",
+    "raw": "raw/node-plain-3/results.json.gz",
+    "originalResultsSha256": "6417f0a7d4d3ca1714c96471153b8cf14ee9f6458c0bc3217681af1f838c2924",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-plain-3",
+    "recordedAt": "2026-10-19T12:52:56.125Z",
+    "mode": "plain",
+    "raw": "raw/browser-plain-3/results.json.gz",
+    "originalResultsSha256": "56a77a3b9f644bd1a9c698eac5bc05a8864d6171efca405dcd439508fd64b3b5",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-coarse-3",
+    "recordedAt": "2026-10-19T12:53:23.882Z",
+    "mode": "coarse",
+    "raw": "raw/node-coarse-3/results.json.gz",
+    "originalResultsSha256": "20b869f9a2096906faf1db61bcbbdc0a73dd3f7d0562e2bfb6ee35e9e5e275f2",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "browser-coarse-3",
+    "recordedAt": "2026-10-19T12:53:55.563Z",
+    "mode": "coarse",
+    "raw": "raw/browser-coarse-3/results.json.gz",
+    "originalResultsSha256": "ab76a16528cfebb71ebd422adb5b55b6764138705a9db6b15301cfe80968f024",
+    "profileConfig": {
+      "samplesPerBoundary": 7,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint",
+        "count"
+      ]
+    }
+  },
+  {
+    "name": "node-cpu-1",
+    "recordedAt": "2026-10-19T12:54:10.838Z",
+    "mode": "cpu",
+    "raw": "raw/node-cpu-1/results.json.gz",
+    "originalResultsSha256": "705374b5aedf5af20c8f96829c4697385e43f84590d678cd14ac786046bc7046",
+    "profileConfig": {
+      "samplesPerBoundary": 5,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint"
+      ]
+    }
+  },
+  {
+    "name": "browser-cpu-1",
+    "recordedAt": "2026-10-19T12:54:27.945Z",
+    "mode": "cpu",
+    "raw": "raw/browser-cpu-1/results.json.gz",
+    "originalResultsSha256": "73e749e0591cf15ea6e88574f0834173b395b49ae4c71777c4b15eb2adab6d24",
+    "profileConfig": {
+      "samplesPerBoundary": 5,
+      "cpuRepeats": 5,
+      "consumers": [
+        "fingerprint"
+      ]
+    }
+  }
+]
