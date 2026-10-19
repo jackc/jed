@@ -1,0 +1,1089 @@
+{
+  "created_at": "2026-10-19T13:26:28Z",
+  "options": {
+    "ruby": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "jit": "zjit",
+    "lanes": [
+      "wrapper",
+      "native-prepared",
+      "native-query",
+      "native-eager"
+    ],
+    "native_source": "/tmp/jed-ruby-api-final",
+    "file": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-bench-data/large.jed",
+    "output": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/api-followup/after-file-4.1-zjit.json"
+  },
+  "git_commit": "e5dbbe514e41822793e92c996fffbba5e5419e96",
+  "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+  "source_sha256": {
+    "native": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+    "wrapper": "758334a5e5e3c16ec239a3e0185677253ec15136c062e3b524dd353f7dd580b5",
+    "rust": "bf85a2b7feaad510d97bc244ecc6108023d2bd8090dd9fcccd013580fcda938f",
+    "wrapper_library": "2218b17c826093137bd0b12a4f1db904adb6f25834673b1b297dfea8592e62f6",
+    "worker": "a5a70597c16aac4879026be20e68b94895dc4b9fe76e1480decdbfb366edd256",
+    "database": "db0367e136e9989830648b6b256c45a115d3714928afff49bf6409c4be562b4f"
+  },
+  "lanes": {
+    "wrapper": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 96272384,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "wrapper",
+        "--file",
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/wrapper-20261019-681554-8ox8h0/large.jed"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "wrapper",
+        "verify_only": false,
+        "created_at": "2026-10-19T13:26:30Z",
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "ruby_executable_sha256": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194",
+        "yjit": false,
+        "zjit": true,
+        "jit": {
+          "yjit": false,
+          "zjit": true
+        },
+        "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby",
+        "source_sha256": "db02291f6f2566ad649d7ca4d0bbe3d99326507e7cc78e42afc7dbfba421187e",
+        "final_source_sha256": "db02291f6f2566ad649d7ca4d0bbe3d99326507e7cc78e42afc7dbfba421187e",
+        "native_library": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby/ext/target/release/libjed_ruby.so",
+        "native_library_sha256": "2218b17c826093137bd0b12a4f1db904adb6f25834673b1b297dfea8592e62f6",
+        "script_sha256": "a5a70597c16aac4879026be20e68b94895dc4b9fe76e1480decdbfb366edd256",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "storage": "file",
+        "file": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/wrapper-20261019-681554-8ox8h0/large.jed",
+        "fresh_sql": false,
+        "dataset_rows": 1000000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "file_pk",
+            "sql": "SELECT id, customer_id, amount, note FROM orders WHERE id = $1",
+            "kind": "file_pk",
+            "validation_parameters": [
+              [
+                1
+              ],
+              [
+                7920
+              ],
+              [
+                15839
+              ],
+              [
+                23758
+              ],
+              [
+                31677
+              ],
+              [
+                39596
+              ],
+              [
+                47515
+              ],
+              [
+                55434
+              ],
+              [
+                63353
+              ],
+              [
+                71272
+              ],
+              [
+                79191
+              ],
+              [
+                87110
+              ],
+              [
+                95029
+              ],
+              [
+                102948
+              ],
+              [
+                110867
+              ],
+              [
+                118786
+              ],
+              [
+                126705
+              ],
+              [
+                134624
+              ],
+              [
+                142543
+              ],
+              [
+                150462
+              ],
+              [
+                158381
+              ],
+              [
+                166300
+              ],
+              [
+                174219
+              ],
+              [
+                182138
+              ],
+              [
+                190057
+              ],
+              [
+                197976
+              ],
+              [
+                205895
+              ],
+              [
+                213814
+              ],
+              [
+                221733
+              ],
+              [
+                229652
+              ],
+              [
+                237571
+              ],
+              [
+                245490
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6
+            ],
+            "validation_columns": [
+              "id",
+              "customer_id",
+              "amount",
+              "note"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32",
+              "i32",
+              "text"
+            ],
+            "validation_sha256": "cb06128b548494d82d7532d4d22f9dd4600184747101f7f6f98f299712ef9f59",
+            "answer_sha256": "5c66f74a3dde7c173320b94e6caada3f3176ce4065e3e77a8692d1dbc6460c62",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 50000,
+            "iterations": 5000,
+            "samples_ns": [
+              93836046,
+              97258825,
+              94678879,
+              98253482,
+              94139979
+            ],
+            "median_ns": 18935.7758,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          }
+        ]
+      }
+    },
+    "native-prepared": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 337694720,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "native-prepared",
+        "--file",
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/native-prepared-20261019-681554-53t34m/large.jed"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "native-prepared",
+        "verify_only": false,
+        "created_at": "2026-10-19T13:26:35Z",
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "ruby_executable_sha256": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194",
+        "yjit": false,
+        "zjit": true,
+        "jit": {
+          "yjit": false,
+          "zjit": true
+        },
+        "source": "/tmp/jed-ruby-api-final",
+        "source_sha256": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+        "final_source_sha256": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+        "native_library": null,
+        "native_library_sha256": null,
+        "script_sha256": "a5a70597c16aac4879026be20e68b94895dc4b9fe76e1480decdbfb366edd256",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "storage": "file",
+        "file": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/native-prepared-20261019-681554-53t34m/large.jed",
+        "fresh_sql": false,
+        "dataset_rows": 1000000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "file_pk",
+            "sql": "SELECT id, customer_id, amount, note FROM orders WHERE id = $1",
+            "kind": "file_pk",
+            "validation_parameters": [
+              [
+                1
+              ],
+              [
+                7920
+              ],
+              [
+                15839
+              ],
+              [
+                23758
+              ],
+              [
+                31677
+              ],
+              [
+                39596
+              ],
+              [
+                47515
+              ],
+              [
+                55434
+              ],
+              [
+                63353
+              ],
+              [
+                71272
+              ],
+              [
+                79191
+              ],
+              [
+                87110
+              ],
+              [
+                95029
+              ],
+              [
+                102948
+              ],
+              [
+                110867
+              ],
+              [
+                118786
+              ],
+              [
+                126705
+              ],
+              [
+                134624
+              ],
+              [
+                142543
+              ],
+              [
+                150462
+              ],
+              [
+                158381
+              ],
+              [
+                166300
+              ],
+              [
+                174219
+              ],
+              [
+                182138
+              ],
+              [
+                190057
+              ],
+              [
+                197976
+              ],
+              [
+                205895
+              ],
+              [
+                213814
+              ],
+              [
+                221733
+              ],
+              [
+                229652
+              ],
+              [
+                237571
+              ],
+              [
+                245490
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6
+            ],
+            "validation_columns": [
+              "id",
+              "customer_id",
+              "amount",
+              "note"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32",
+              "i32",
+              "text"
+            ],
+            "validation_sha256": "cb06128b548494d82d7532d4d22f9dd4600184747101f7f6f98f299712ef9f59",
+            "answer_sha256": "5c66f74a3dde7c173320b94e6caada3f3176ce4065e3e77a8692d1dbc6460c62",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 50000,
+            "iterations": 5000,
+            "samples_ns": [
+              103445746,
+              102849458,
+              103287545,
+              103440558,
+              104180495
+            ],
+            "median_ns": 20688.1116,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          }
+        ]
+      }
+    },
+    "native-query": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 343453696,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "native-query",
+        "--file",
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/native-query-20261019-681554-uhgfyb/large.jed"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "native-query",
+        "verify_only": false,
+        "created_at": "2026-10-19T13:26:41Z",
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "ruby_executable_sha256": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194",
+        "yjit": false,
+        "zjit": true,
+        "jit": {
+          "yjit": false,
+          "zjit": true
+        },
+        "source": "/tmp/jed-ruby-api-final",
+        "source_sha256": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+        "final_source_sha256": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+        "native_library": null,
+        "native_library_sha256": null,
+        "script_sha256": "a5a70597c16aac4879026be20e68b94895dc4b9fe76e1480decdbfb366edd256",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "storage": "file",
+        "file": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/native-query-20261019-681554-uhgfyb/large.jed",
+        "fresh_sql": false,
+        "dataset_rows": 1000000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "file_pk",
+            "sql": "SELECT id, customer_id, amount, note FROM orders WHERE id = $1",
+            "kind": "file_pk",
+            "validation_parameters": [
+              [
+                1
+              ],
+              [
+                7920
+              ],
+              [
+                15839
+              ],
+              [
+                23758
+              ],
+              [
+                31677
+              ],
+              [
+                39596
+              ],
+              [
+                47515
+              ],
+              [
+                55434
+              ],
+              [
+                63353
+              ],
+              [
+                71272
+              ],
+              [
+                79191
+              ],
+              [
+                87110
+              ],
+              [
+                95029
+              ],
+              [
+                102948
+              ],
+              [
+                110867
+              ],
+              [
+                118786
+              ],
+              [
+                126705
+              ],
+              [
+                134624
+              ],
+              [
+                142543
+              ],
+              [
+                150462
+              ],
+              [
+                158381
+              ],
+              [
+                166300
+              ],
+              [
+                174219
+              ],
+              [
+                182138
+              ],
+              [
+                190057
+              ],
+              [
+                197976
+              ],
+              [
+                205895
+              ],
+              [
+                213814
+              ],
+              [
+                221733
+              ],
+              [
+                229652
+              ],
+              [
+                237571
+              ],
+              [
+                245490
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6
+            ],
+            "validation_columns": [
+              "id",
+              "customer_id",
+              "amount",
+              "note"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32",
+              "i32",
+              "text"
+            ],
+            "validation_sha256": "cb06128b548494d82d7532d4d22f9dd4600184747101f7f6f98f299712ef9f59",
+            "answer_sha256": "5c66f74a3dde7c173320b94e6caada3f3176ce4065e3e77a8692d1dbc6460c62",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 50000,
+            "iterations": 5000,
+            "samples_ns": [
+              106627440,
+              105590917,
+              104769929,
+              104221323,
+              105865524
+            ],
+            "median_ns": 21118.1834,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          }
+        ]
+      }
+    },
+    "native-eager": {
+      "success": true,
+      "reason": null,
+      "peak_rss_bytes": 344379392,
+      "memory_limit_bytes": 536870912,
+      "address_space_bytes": 2147483648,
+      "command": [
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "--zjit",
+        "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/binding_compare_lane.rb",
+        "native-eager",
+        "--file",
+        "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/native-eager-20261019-681554-ikwnpf/large.jed"
+      ],
+      "stderr": "",
+      "result": {
+        "schema": 1,
+        "mode": "ruby_binding_comparison",
+        "engine": "native-eager",
+        "verify_only": false,
+        "created_at": "2026-10-19T13:26:47Z",
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]",
+        "ruby_executable": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "ruby_executable_sha256": "4a9c1a4abfb6408a2ce33f24f23a3006ef84924bd5e9d28bcdd7fa2bc1206194",
+        "yjit": false,
+        "zjit": true,
+        "jit": {
+          "yjit": false,
+          "zjit": true
+        },
+        "source": "/tmp/jed-ruby-api-final",
+        "source_sha256": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+        "final_source_sha256": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+        "native_library": null,
+        "native_library_sha256": null,
+        "script_sha256": "a5a70597c16aac4879026be20e68b94895dc4b9fe76e1480decdbfb366edd256",
+        "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/plan.json",
+        "plan_sha256": "2f053a8446eb930ad4ba324aa3dfa0ee3e13094ddd905ce21bc9251efd8aaea6",
+        "storage": "file",
+        "file": "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-binding-compare/native-eager-20261019-681554-ikwnpf/large.jed",
+        "fresh_sql": false,
+        "dataset_rows": 1000000,
+        "repetitions": 5,
+        "notes": [
+          "Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.",
+          "Native modes use a long-lived session, matching the wrapper connection lifetime.",
+          "Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.",
+          "Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.",
+          "All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.",
+          "File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.",
+          "Host buffered site has a bucket index and selects 500 rows; streamed site selects 1000 rows. Actual batching is recorded in validation."
+        ],
+        "workloads": [
+          {
+            "name": "file_pk",
+            "sql": "SELECT id, customer_id, amount, note FROM orders WHERE id = $1",
+            "kind": "file_pk",
+            "validation_parameters": [
+              [
+                1
+              ],
+              [
+                7920
+              ],
+              [
+                15839
+              ],
+              [
+                23758
+              ],
+              [
+                31677
+              ],
+              [
+                39596
+              ],
+              [
+                47515
+              ],
+              [
+                55434
+              ],
+              [
+                63353
+              ],
+              [
+                71272
+              ],
+              [
+                79191
+              ],
+              [
+                87110
+              ],
+              [
+                95029
+              ],
+              [
+                102948
+              ],
+              [
+                110867
+              ],
+              [
+                118786
+              ],
+              [
+                126705
+              ],
+              [
+                134624
+              ],
+              [
+                142543
+              ],
+              [
+                150462
+              ],
+              [
+                158381
+              ],
+              [
+                166300
+              ],
+              [
+                174219
+              ],
+              [
+                182138
+              ],
+              [
+                190057
+              ],
+              [
+                197976
+              ],
+              [
+                205895
+              ],
+              [
+                213814
+              ],
+              [
+                221733
+              ],
+              [
+                229652
+              ],
+              [
+                237571
+              ],
+              [
+                245490
+              ]
+            ],
+            "validation_rows": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "validation_costs": [
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6,
+              6
+            ],
+            "validation_columns": [
+              "id",
+              "customer_id",
+              "amount",
+              "note"
+            ],
+            "validation_column_types": [
+              "i64",
+              "i32",
+              "i32",
+              "text"
+            ],
+            "validation_sha256": "cb06128b548494d82d7532d4d22f9dd4600184747101f7f6f98f299712ef9f59",
+            "answer_sha256": "5c66f74a3dde7c173320b94e6caada3f3176ce4065e3e77a8692d1dbc6460c62",
+            "callback_counts": {
+              "row_calls": 0,
+              "batch_calls": 0,
+              "batch_sizes": []
+            },
+            "warmup": 50000,
+            "iterations": 5000,
+            "samples_ns": [
+              100428343,
+              122250279,
+              129726958,
+              97752141,
+              123397811
+            ],
+            "median_ns": 24450.0558,
+            "rows_per_sample": [
+              5000,
+              5000,
+              5000,
+              5000,
+              5000
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "errors": [],
+  "source_sha256_after": {
+    "native": "a66f6a468190e7441f265e88e67fe5cf9c0688f83436ebc52620d12446cc8893",
+    "wrapper": "758334a5e5e3c16ec239a3e0185677253ec15136c062e3b524dd353f7dd580b5",
+    "rust": "bf85a2b7feaad510d97bc244ecc6108023d2bd8090dd9fcccd013580fcda938f",
+    "wrapper_library": "2218b17c826093137bd0b12a4f1db904adb6f25834673b1b297dfea8592e62f6",
+    "worker": "a5a70597c16aac4879026be20e68b94895dc4b9fe76e1480decdbfb366edd256",
+    "database": "db0367e136e9989830648b6b256c45a115d3714928afff49bf6409c4be562b4f"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "source_sha256": "d3db0d7784b23d9d9aa6da1f3f45045b298eef7279dc7e7987b81052ee2032fc",
+  "archive_sha256": "3c4abdfc6ab87a924701b3df6b32ce0533a347e741a512ce395897696f3d1438",
+  "archive_bytes": 456790,
+  "contents": "lib only",
+  "format": "ustar; sorted paths; uid/gid/mtime zero; gzip mtime zero",
+  "source_revision": "Working tree at start of compiled-expression task; includes prior API follow-up changes"
+}

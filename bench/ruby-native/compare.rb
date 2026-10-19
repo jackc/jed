@@ -42,10 +42,11 @@ module NativeRubyCompare
       check = case lane
               when 'ruby-yjit' then 'abort "YJIT unavailable" unless defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?; puts RUBY_DESCRIPTION'
               when 'ruby-zjit' then 'abort "ZJIT unavailable" unless defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled?; puts RUBY_DESCRIPTION'
-              else 'puts RUBY_DESCRIPTION'
+              else 'abort "unexpected JIT enabled" if (defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?) || (defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled?); puts RUBY_DESCRIPTION'
               end
       flags = flag ? [flag] : ['--disable-yjit', '--disable-zjit']
-      output, okay = capture(RbConfig.ruby, *flags, '-e', check, environment: { 'RUBYOPT' => nil })
+      output, okay = capture(RbConfig.ruby, *flags, '-e', check,
+        environment: { 'RUBYOPT' => nil, 'RUBY_YJIT_ENABLE' => nil, 'RUBY_ZJIT_ENABLE' => nil })
       status[lane] = { status: okay ? 'ready' : 'unavailable', detail: output }
     end
     if lanes.include?('ts')
@@ -98,6 +99,28 @@ module NativeRubyCompare
     }
   end
 
+  def source_hashes
+    paths = {
+      harness: [__FILE__, File.join(__dir__, 'source.rb'), File.join(ROOT, 'impl/ruby-native/tools/bounded_process.rb')],
+      ruby_adapter: [File.join(SOURCES, 'lane.rb')],
+      go_adapter: Dir[File.join(SOURCES, 'go/*')].select { |path| File.file?(path) },
+      rust_adapter: Dir[File.join(SOURCES, 'rust/src/**/*.rs'), File.join(SOURCES, 'rust/Cargo.*')],
+      ts_adapter: [File.join(SOURCES, 'lane.ts')],
+      go_core: Dir[File.join(ROOT, 'impl/go/**/*.go')],
+      rust_core: Dir[File.join(ROOT, 'impl/rust/src/**/*.rs')],
+      ts_core: Dir[File.join(ROOT, 'impl/ts/src/**/*.ts')]
+    }
+    paths.transform_values do |files|
+      digest = Digest::SHA256.new
+      files.sort.each { |path| digest.update(path.delete_prefix(ROOT + '/')).update("\0").update(File.binread(path)) }
+      digest.hexdigest
+    end.merge(
+      go_binary: File.file?(File.join(BUILD, 'go-lane')) && Digest::SHA256.file(File.join(BUILD, 'go-lane')).hexdigest,
+      rust_binary: File.file?(File.join(BUILD, 'rust-target/release/jed-ruby-experiment-compare')) &&
+        Digest::SHA256.file(File.join(BUILD, 'rust-target/release/jed-ruby-experiment-compare')).hexdigest,
+      ruby_executable: Digest::SHA256.file(RbConfig.ruby).hexdigest)
+  end
+
   def run
     require 'etc'
     lanes = ENV.fetch('RUBY_NATIVE_LANES', 'ruby,ruby-yjit,ruby-zjit,go,rust,ts').split(',')
@@ -116,6 +139,7 @@ module NativeRubyCompare
     verify = ARGV.include?('--verify-only')
     ENV['RUBY_NATIVE_SOURCE'] = NativeRubySource.resolve(ROOT, phase: verify ? 'verification' : phase)
     source_hash = NativeRubySource.digest(ENV.fetch('RUBY_NATIVE_SOURCE'))
+    provenance = source_hashes
     path = plan_file(plan)
     results = {}
     resources = {}
@@ -123,14 +147,16 @@ module NativeRubyCompare
       next unless statuses[lane][:status] == 'ready'
 
       warn "compare #{lane}: #{verify ? 'validating' : 'measuring'}"
-      worker = JedNativeTools::BoundedProcess.run(command_for(lane, path, verify),
+      command = command_for(lane, path, verify)
+      worker = JedNativeTools::BoundedProcess.run(command,
         timeout: Integer(ENV.fetch('RUBY_NATIVE_COMPARE_TIMEOUT', '1800')),
         # Go and V8 reserve large virtual regions; resident memory is capped
         # identically, while Ruby also has a tighter allocation ceiling.
-        address_space_bytes: lane.start_with?('ruby') ? 1024**3 : 16 * 1024**3,
-        chdir: ROOT, env: { 'RUBYOPT' => nil })
+        address_space_bytes: lane.start_with?('ruby') ? Integer(ENV.fetch('RUBY_NATIVE_COMPARE_RUBY_ADDRESS_SPACE_BYTES', (1024**3).to_s)) : 16 * 1024**3,
+        chdir: ROOT, env: { 'RUBYOPT' => nil, 'RUBY_YJIT_ENABLE' => nil, 'RUBY_ZJIT_ENABLE' => nil })
       output, okay = worker.stdout, worker.success?
-      resources[lane] = { peak_rss_bytes: worker.peak_rss_bytes, memory_limit_bytes: worker.memory_bytes }
+      resources[lane] = { peak_rss_bytes: worker.peak_rss_bytes, memory_limit_bytes: worker.memory_bytes,
+                          address_space_bytes: worker.address_space_bytes, command: command }
       entries = output.lines.filter_map do |line|
         JSON.parse(line) if line.start_with?('{')
       end
@@ -161,6 +187,10 @@ module NativeRubyCompare
                statuses: statuses, results: results, resources: resources }
     report[:ruby_source_sha256] = source_hash
     report[:ruby_source_sha256_after] = NativeRubySource.digest(report[:ruby_source])
+    report[:source_sha256] = provenance
+    report[:source_sha256_after] = source_hashes
+    report[:ruby_executable] = RbConfig.ruby
+    statuses['provenance'] = { status: 'failed', detail: 'Harness, adapter, runtime, or supported core sources changed during measurement' } unless provenance == report[:source_sha256_after]
     statuses['source'] = { status: 'failed', detail: 'Ruby source changed during measurement' } unless source_hash == report[:ruby_source_sha256_after]
     File.write(artifact, JSON.pretty_generate(report) + "\n")
     warn "comparison artifact: #{artifact}"

@@ -31,6 +31,8 @@ module JedNative
         end
       end
       keys.each { |expression| ensure_comparable_type(expression.type) }
+      kernels = native_compiled_kernels(resolved, predicate, expressions, keys)
+      predicate_kernel, projection_kernel, key_kernel = kernels&.predicate, kernels&.projection, kernels&.keys
       offset = statement[:offset] ? evaluate(compile(statement[:offset], []), []) || 0 : 0
       limit = statement[:limit] ? evaluate(compile(statement[:limit], []), []) : nil
       raise Error.new('2201X', 'negative OFFSET') if offset.negative?
@@ -79,11 +81,11 @@ module JedNative
           charge
           profile_accumulate(:scan, @cost - scan_resume) if @explain_profile_frames
           filter_start = @cost if @explain_profile_frames
-          accepted = !predicate || evaluate(predicate, row) == true
+          accepted = !predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(predicate, row)) == true
           profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
           next unless accepted
           sort_start = @cost if @explain_profile_frames
-          values = keys.map { |expression| evaluate(expression, row) }
+          values = key_kernel ? key_kernel.call(self, row, @params) : keys.map { |expression| evaluate(expression, row) }
           profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
           next if capacity == 0
           entry = [row, values, ordinal]
@@ -150,7 +152,7 @@ module JedNative
       window = window.take(limit) if limit
       host_batch_rows(window, expressions, pulled: true, row_at: ->(entry) { entry[0] }).each do |entry|
         row = entry[0]
-        values = expressions.map { |expression| evaluate(expression, row) }
+        values = projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }
         query_memory_add_row(output_owner, values, columns) if output_owner
         charge
         output << values

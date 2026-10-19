@@ -1,0 +1,2002 @@
+{
+  "schema": 1,
+  "created_at": "2026-10-19T14:46:37Z",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "executable": "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+  "source": "/tmp/jed-ruby-compiled-proof-a",
+  "source_sha256": "51a3a7d34740c7c3b47eee34c51bfb46a0868a69449bca382aa3d934a64eeab7",
+  "script_sha256": "2885a202705896270592989832dd4e800b4e7de411d58538402cc08d8964f9bc",
+  "options": {
+    "warmup": 10000,
+    "iterations": 20000,
+    "repetitions": 3,
+    "compile_samples": 10,
+    "churn": 256,
+    "churn_calls": 1,
+    "report": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/compiled-followup/proof-yjit.json",
+    "expected_jit": "yjit"
+  },
+  "jit": "yjit",
+  "workloads": [
+    {
+      "name": "integer_scalar",
+      "sql": "abs($1::i64) * 3 + 7",
+      "parse_ns": 537570,
+      "resolve_ns": 178877,
+      "admitted": true,
+      "first_compile_ns": 393179,
+      "jit_before_compile": {
+        "inline_code_size": 40119,
+        "outlined_code_size": 57235,
+        "freed_code_size": 0,
+        "code_region_size": 114688,
+        "compiled_iseq_entry": 68,
+        "compiled_iseq_count": 81,
+        "compiled_blockid_count": 660,
+        "compiled_block_count": 819,
+        "compiled_branch_count": 1208,
+        "compile_time_ns": 10270324
+      },
+      "first_call_ns": 5911,
+      "first_call": {
+        "value": 376,
+        "cost": 4
+      },
+      "jit_after_first_call": {
+        "inline_code_size": 41580,
+        "outlined_code_size": 59863,
+        "freed_code_size": 0,
+        "code_region_size": 126976,
+        "compiled_iseq_entry": 70,
+        "compiled_iseq_count": 83,
+        "compiled_blockid_count": 689,
+        "compiled_block_count": 855,
+        "compiled_branch_count": 1268,
+        "compile_time_ns": 10607432
+      },
+      "source_bytes": 817,
+      "node_count": 7,
+      "pool_entries": 10,
+      "validation": [
+        {
+          "row": [],
+          "params": [
+            -123
+          ],
+          "outcome": {
+            "status": "value",
+            "value": 376,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        },
+        {
+          "row": [],
+          "params": [
+            0
+          ],
+          "outcome": {
+            "status": "value",
+            "value": 7,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        },
+        {
+          "row": [],
+          "params": [
+            null
+          ],
+          "outcome": {
+            "status": "value",
+            "value": null,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        },
+        {
+          "row": [],
+          "params": [
+            -9223372036854775808
+          ],
+          "outcome": {
+            "status": "error",
+            "sqlstate": "22003",
+            "message": "22003: i64 out of range",
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        }
+      ],
+      "compile_samples_ns": [
+        95757,
+        456278,
+        165301,
+        3939952,
+        63744,
+        140413,
+        83711,
+        175581,
+        55205,
+        50849
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 85892,
+        "outlined_code_size": 112388,
+        "freed_code_size": 0,
+        "code_region_size": 294912,
+        "compiled_iseq_entry": 83,
+        "compiled_iseq_count": 108,
+        "compiled_blockid_count": 1607,
+        "compiled_block_count": 2079,
+        "compiled_branch_count": 3180,
+        "compile_time_ns": 21028017
+      },
+      "interpreter": [
+        {
+          "elapsed_ns": 7551065,
+          "ns_per_expression": 377.55325,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 7625331,
+          "ns_per_expression": 381.26655,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 7611633,
+          "ns_per_expression": 380.58165,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "compiled": [
+        {
+          "elapsed_ns": 2051162,
+          "ns_per_expression": 102.5581,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 2060096,
+          "ns_per_expression": 103.0048,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 2045143,
+          "ns_per_expression": 102.25715,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "jit_after_timing": {
+        "inline_code_size": 86014,
+        "outlined_code_size": 112475,
+        "freed_code_size": 0,
+        "code_region_size": 294912,
+        "compiled_iseq_entry": 84,
+        "compiled_iseq_count": 109,
+        "compiled_blockid_count": 1608,
+        "compiled_block_count": 2080,
+        "compiled_branch_count": 3180,
+        "compile_time_ns": 21049596
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled expression)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "29b40704c766637c67e8616cd58f3e085e7c45c3706f1eae706d95ab1efcb468",
+        "yjit_compiled_instruction_count": 184,
+        "direct_jit_proof": true
+      }
+    },
+    {
+      "name": "row_arithmetic",
+      "sql": "(score::i64 * 3 + bucket::i64) / (bucket::i64 + 1)",
+      "parse_ns": 1351573,
+      "resolve_ns": 228116,
+      "admitted": true,
+      "first_compile_ns": 269611,
+      "jit_before_compile": {
+        "inline_code_size": 91106,
+        "outlined_code_size": 123794,
+        "freed_code_size": 0,
+        "code_region_size": 323584,
+        "compiled_iseq_entry": 91,
+        "compiled_iseq_count": 116,
+        "compiled_blockid_count": 1753,
+        "compiled_block_count": 2247,
+        "compiled_branch_count": 3434,
+        "compile_time_ns": 22428784
+      },
+      "first_call_ns": 85590,
+      "first_call": {
+        "value": 5926,
+        "cost": 7
+      },
+      "jit_after_first_call": {
+        "inline_code_size": 91892,
+        "outlined_code_size": 124994,
+        "freed_code_size": 0,
+        "code_region_size": 323584,
+        "compiled_iseq_entry": 91,
+        "compiled_iseq_count": 116,
+        "compiled_blockid_count": 1757,
+        "compiled_block_count": 2272,
+        "compiled_branch_count": 3477,
+        "compile_time_ns": 22645468
+      },
+      "source_bytes": 1489,
+      "node_count": 12,
+      "pool_entries": 18,
+      "validation": [
+        {
+          "row": [
+            9876,
+            4
+          ],
+          "params": [],
+          "outcome": {
+            "status": "value",
+            "value": 5926,
+            "cost": 7,
+            "lifetime_cost": 7
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            },
+            {
+              "limit": 7,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 7,
+                "lifetime_cost": 7
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            -9876,
+            4
+          ],
+          "params": [],
+          "outcome": {
+            "status": "value",
+            "value": -5924,
+            "cost": 7,
+            "lifetime_cost": 7
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            },
+            {
+              "limit": 7,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 7,
+                "lifetime_cost": 7
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            null,
+            4
+          ],
+          "params": [],
+          "outcome": {
+            "status": "value",
+            "value": null,
+            "cost": 7,
+            "lifetime_cost": 7
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            },
+            {
+              "limit": 7,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 7,
+                "lifetime_cost": 7
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            1,
+            -1
+          ],
+          "params": [],
+          "outcome": {
+            "status": "error",
+            "sqlstate": "22012",
+            "message": "22012: division by zero",
+            "cost": 7,
+            "lifetime_cost": 7
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            },
+            {
+              "limit": 7,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 7,
+                "lifetime_cost": 7
+              }
+            }
+          ]
+        }
+      ],
+      "compile_samples_ns": [
+        156190,
+        100112,
+        95105,
+        92259,
+        88113,
+        125607,
+        88879,
+        86576,
+        81793,
+        83255
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 103968,
+        "outlined_code_size": 137617,
+        "freed_code_size": 0,
+        "code_region_size": 360448,
+        "compiled_iseq_entry": 93,
+        "compiled_iseq_count": 118,
+        "compiled_blockid_count": 1985,
+        "compiled_block_count": 2592,
+        "compiled_branch_count": 3976,
+        "compile_time_ns": 25234318
+      },
+      "interpreter": [
+        {
+          "elapsed_ns": 13689268,
+          "ns_per_expression": 684.4634,
+          "iterations": 20000,
+          "cost": 140000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 13747374,
+          "ns_per_expression": 687.3687,
+          "iterations": 20000,
+          "cost": 140000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 13637051,
+          "ns_per_expression": 681.85255,
+          "iterations": 20000,
+          "cost": 140000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "compiled": [
+        {
+          "elapsed_ns": 3957933,
+          "ns_per_expression": 197.89665,
+          "iterations": 20000,
+          "cost": 140000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 4009391,
+          "ns_per_expression": 200.46955,
+          "iterations": 20000,
+          "cost": 140000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 3995926,
+          "ns_per_expression": 199.7963,
+          "iterations": 20000,
+          "cost": 140000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "jit_after_timing": {
+        "inline_code_size": 103968,
+        "outlined_code_size": 137617,
+        "freed_code_size": 0,
+        "code_region_size": 360448,
+        "compiled_iseq_entry": 93,
+        "compiled_iseq_count": 118,
+        "compiled_blockid_count": 1985,
+        "compiled_block_count": 2592,
+        "compiled_branch_count": 3976,
+        "compile_time_ns": 25234318
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled expression)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "44016fb7999df7bbe6478a35dca6a70ab50af0eccb7e6bf02e9396496d487eb9",
+        "yjit_compiled_instruction_count": 306,
+        "direct_jit_proof": true
+      }
+    },
+    {
+      "name": "conditional",
+      "sql": "CASE WHEN score >= $1::i32 THEN score::i64 * 3 ELSE -score::i64 END",
+      "parse_ns": 3009702,
+      "resolve_ns": 9253151,
+      "admitted": true,
+      "first_compile_ns": 2369651,
+      "jit_before_compile": {
+        "inline_code_size": 154826,
+        "outlined_code_size": 195689,
+        "freed_code_size": 0,
+        "code_region_size": 573440,
+        "compiled_iseq_entry": 102,
+        "compiled_iseq_count": 177,
+        "compiled_blockid_count": 3216,
+        "compiled_block_count": 4067,
+        "compiled_branch_count": 6281,
+        "compile_time_ns": 37153466
+      },
+      "first_call_ns": 3716,
+      "first_call": {
+        "value": 29628,
+        "cost": 5
+      },
+      "jit_after_first_call": {
+        "inline_code_size": 165096,
+        "outlined_code_size": 206089,
+        "freed_code_size": 0,
+        "code_region_size": 618496,
+        "compiled_iseq_entry": 102,
+        "compiled_iseq_count": 180,
+        "compiled_blockid_count": 3412,
+        "compiled_block_count": 4285,
+        "compiled_branch_count": 6664,
+        "compile_time_ns": 39307581
+      },
+      "source_bytes": 1216,
+      "node_count": 12,
+      "pool_entries": 13,
+      "validation": [
+        {
+          "row": [
+            9876,
+            4
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": 29628,
+            "cost": 5,
+            "lifetime_cost": 5
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            4,
+            1
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": -4,
+            "cost": 5,
+            "lifetime_cost": 5
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            null,
+            1
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": null,
+            "cost": 5,
+            "lifetime_cost": 5
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            }
+          ]
+        }
+      ],
+      "compile_samples_ns": [
+        122246,
+        87864,
+        79727,
+        101078,
+        72028,
+        92543,
+        895761,
+        147986,
+        145538,
+        173266
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 201862,
+        "outlined_code_size": 257110,
+        "freed_code_size": 0,
+        "code_region_size": 765952,
+        "compiled_iseq_entry": 113,
+        "compiled_iseq_count": 220,
+        "compiled_blockid_count": 4227,
+        "compiled_block_count": 5382,
+        "compiled_branch_count": 8204,
+        "compile_time_ns": 48197513
+      },
+      "interpreter": [
+        {
+          "elapsed_ns": 13043389,
+          "ns_per_expression": 652.16945,
+          "iterations": 20000,
+          "cost": 100000,
+          "allocations": 20000,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 13455678,
+          "ns_per_expression": 672.7839,
+          "iterations": 20000,
+          "cost": 100000,
+          "allocations": 20000,
+          "gc_count": 1
+        },
+        {
+          "elapsed_ns": 13624213,
+          "ns_per_expression": 681.21065,
+          "iterations": 20000,
+          "cost": 100000,
+          "allocations": 20000,
+          "gc_count": 1
+        }
+      ],
+      "compiled": [
+        {
+          "elapsed_ns": 2789911,
+          "ns_per_expression": 139.49555,
+          "iterations": 20000,
+          "cost": 100000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 2791738,
+          "ns_per_expression": 139.5869,
+          "iterations": 20000,
+          "cost": 100000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 2864395,
+          "ns_per_expression": 143.21975,
+          "iterations": 20000,
+          "cost": 100000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "jit_after_timing": {
+        "inline_code_size": 201862,
+        "outlined_code_size": 257110,
+        "freed_code_size": 0,
+        "code_region_size": 765952,
+        "compiled_iseq_entry": 113,
+        "compiled_iseq_count": 220,
+        "compiled_blockid_count": 4227,
+        "compiled_block_count": 5382,
+        "compiled_branch_count": 8204,
+        "compile_time_ns": 48197513
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled expression)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "ea461f94019994841a0fd0699d43fce2f48547da495ca75e412074101b8c8e84",
+        "yjit_compiled_instruction_count": 247,
+        "direct_jit_proof": true
+      }
+    },
+    {
+      "name": "null_folds",
+      "sql": "coalesce(nullif($1::i64, 17), 0) + greatest($1::i64, 4)",
+      "parse_ns": 3891809,
+      "resolve_ns": 12680984,
+      "admitted": true,
+      "first_compile_ns": 450470,
+      "jit_before_compile": {
+        "inline_code_size": 284784,
+        "outlined_code_size": 362503,
+        "freed_code_size": 0,
+        "code_region_size": 1044480,
+        "compiled_iseq_entry": 115,
+        "compiled_iseq_count": 263,
+        "compiled_blockid_count": 5605,
+        "compiled_block_count": 7296,
+        "compiled_branch_count": 11156,
+        "compile_time_ns": 64357860
+      },
+      "first_call_ns": 80635,
+      "first_call": {
+        "value": 246,
+        "cost": 6
+      },
+      "jit_after_first_call": {
+        "inline_code_size": 286751,
+        "outlined_code_size": 365295,
+        "freed_code_size": 0,
+        "code_region_size": 1048576,
+        "compiled_iseq_entry": 115,
+        "compiled_iseq_count": 264,
+        "compiled_blockid_count": 5623,
+        "compiled_block_count": 7335,
+        "compiled_branch_count": 11225,
+        "compile_time_ns": 64773152
+      },
+      "source_bytes": 1166,
+      "node_count": 11,
+      "pool_entries": 13,
+      "validation": [
+        {
+          "row": [],
+          "params": [
+            123
+          ],
+          "outcome": {
+            "status": "value",
+            "value": 246,
+            "cost": 6,
+            "lifetime_cost": 6
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            }
+          ]
+        },
+        {
+          "row": [],
+          "params": [
+            17
+          ],
+          "outcome": {
+            "status": "value",
+            "value": 17,
+            "cost": 6,
+            "lifetime_cost": 6
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            }
+          ]
+        },
+        {
+          "row": [],
+          "params": [
+            null
+          ],
+          "outcome": {
+            "status": "value",
+            "value": 4,
+            "cost": 6,
+            "lifetime_cost": 6
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            },
+            {
+              "limit": 5,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 5,
+                "lifetime_cost": 5
+              }
+            },
+            {
+              "limit": 6,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 6,
+                "lifetime_cost": 6
+              }
+            }
+          ]
+        }
+      ],
+      "compile_samples_ns": [
+        271594,
+        133322,
+        207034,
+        111374,
+        113344,
+        195820,
+        79313,
+        122782,
+        76829,
+        76079
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 303601,
+        "outlined_code_size": 396714,
+        "freed_code_size": 0,
+        "code_region_size": 1110016,
+        "compiled_iseq_entry": 120,
+        "compiled_iseq_count": 270,
+        "compiled_blockid_count": 5905,
+        "compiled_block_count": 7824,
+        "compiled_branch_count": 11982,
+        "compile_time_ns": 68755798
+      },
+      "interpreter": [
+        {
+          "elapsed_ns": 15597732,
+          "ns_per_expression": 779.8866,
+          "iterations": 20000,
+          "cost": 120000,
+          "allocations": 60000,
+          "gc_count": 3
+        },
+        {
+          "elapsed_ns": 15511202,
+          "ns_per_expression": 775.5601,
+          "iterations": 20000,
+          "cost": 120000,
+          "allocations": 60000,
+          "gc_count": 2
+        },
+        {
+          "elapsed_ns": 15608749,
+          "ns_per_expression": 780.43745,
+          "iterations": 20000,
+          "cost": 120000,
+          "allocations": 60000,
+          "gc_count": 3
+        }
+      ],
+      "compiled": [
+        {
+          "elapsed_ns": 3045310,
+          "ns_per_expression": 152.2655,
+          "iterations": 20000,
+          "cost": 120000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 2800788,
+          "ns_per_expression": 140.0394,
+          "iterations": 20000,
+          "cost": 120000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 2809184,
+          "ns_per_expression": 140.4592,
+          "iterations": 20000,
+          "cost": 120000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "jit_after_timing": {
+        "inline_code_size": 306640,
+        "outlined_code_size": 400959,
+        "freed_code_size": 0,
+        "code_region_size": 1114112,
+        "compiled_iseq_entry": 121,
+        "compiled_iseq_count": 271,
+        "compiled_blockid_count": 5950,
+        "compiled_block_count": 7875,
+        "compiled_branch_count": 12070,
+        "compile_time_ns": 69314785
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled expression)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "4bd6b3071bef1de813129f2f9bf90683cbd55dbcf46700d19b7b92258b8820af",
+        "yjit_compiled_instruction_count": 284,
+        "direct_jit_proof": true
+      }
+    },
+    {
+      "name": "predicate",
+      "sql": "score >= $1::i32 AND bucket <> 3",
+      "parse_ns": 349668,
+      "resolve_ns": 1356585,
+      "admitted": true,
+      "first_compile_ns": 1322294,
+      "jit_before_compile": {
+        "inline_code_size": 313666,
+        "outlined_code_size": 412954,
+        "freed_code_size": 0,
+        "code_region_size": 1142784,
+        "compiled_iseq_entry": 122,
+        "compiled_iseq_count": 272,
+        "compiled_blockid_count": 6052,
+        "compiled_block_count": 8055,
+        "compiled_branch_count": 12340,
+        "compile_time_ns": 70905871
+      },
+      "first_call_ns": 2400,
+      "first_call": {
+        "value": true,
+        "cost": 4
+      },
+      "jit_after_first_call": {
+        "inline_code_size": 319392,
+        "outlined_code_size": 415157,
+        "freed_code_size": 0,
+        "code_region_size": 1163264,
+        "compiled_iseq_entry": 122,
+        "compiled_iseq_count": 274,
+        "compiled_blockid_count": 6167,
+        "compiled_block_count": 8180,
+        "compiled_branch_count": 12570,
+        "compile_time_ns": 72118881
+      },
+      "source_bytes": 563,
+      "node_count": 8,
+      "pool_entries": 3,
+      "validation": [
+        {
+          "row": [
+            9876,
+            4
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": true,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            9876,
+            3
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": false,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            null,
+            4
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": null,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        },
+        {
+          "row": [
+            9876,
+            null
+          ],
+          "params": [
+            5000
+          ],
+          "outcome": {
+            "status": "value",
+            "value": null,
+            "cost": 4,
+            "lifetime_cost": 4
+          },
+          "cost_boundaries": [
+            {
+              "limit": 1,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 1,
+                "lifetime_cost": 1
+              }
+            },
+            {
+              "limit": 2,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 2,
+                "lifetime_cost": 2
+              }
+            },
+            {
+              "limit": 3,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 3,
+                "lifetime_cost": 3
+              }
+            },
+            {
+              "limit": 4,
+              "outcome": {
+                "status": "error",
+                "sqlstate": "54P01",
+                "message": "54P01: statement cost limit exceeded",
+                "cost": 4,
+                "lifetime_cost": 4
+              }
+            }
+          ]
+        }
+      ],
+      "compile_samples_ns": [
+        71501,
+        50230,
+        43310,
+        37749,
+        34119,
+        34987,
+        31834,
+        30577,
+        31343,
+        27297
+      ],
+      "jit_after_warmup": {
+        "inline_code_size": 332452,
+        "outlined_code_size": 443338,
+        "freed_code_size": 0,
+        "code_region_size": 1224704,
+        "compiled_iseq_entry": 124,
+        "compiled_iseq_count": 277,
+        "compiled_blockid_count": 6405,
+        "compiled_block_count": 8600,
+        "compiled_branch_count": 13196,
+        "compile_time_ns": 75585313
+      },
+      "interpreter": [
+        {
+          "elapsed_ns": 8795966,
+          "ns_per_expression": 439.7983,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 8753952,
+          "ns_per_expression": 437.6976,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 8696425,
+          "ns_per_expression": 434.82125,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "compiled": [
+        {
+          "elapsed_ns": 1224780,
+          "ns_per_expression": 61.239,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 1234519,
+          "ns_per_expression": 61.72595,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        },
+        {
+          "elapsed_ns": 1227109,
+          "ns_per_expression": 61.35545,
+          "iterations": 20000,
+          "cost": 80000,
+          "allocations": 0,
+          "gc_count": 0
+        }
+      ],
+      "jit_after_timing": {
+        "inline_code_size": 332452,
+        "outlined_code_size": 443338,
+        "freed_code_size": 0,
+        "code_region_size": 1224704,
+        "compiled_iseq_entry": 124,
+        "compiled_iseq_count": 277,
+        "compiled_blockid_count": 6405,
+        "compiled_block_count": 8600,
+        "compiled_branch_count": 13196,
+        "compile_time_ns": 75585313
+      },
+      "generated_code": {
+        "source_location": [
+          "(jed compiled expression)",
+          1
+        ],
+        "iseq_label": "call",
+        "generated_source_sha256": "7260cada9667b4438b70587e4f23055f3a617b628e7a2c4ac1872cffd8a487d6",
+        "yjit_compiled_instruction_count": 171,
+        "direct_jit_proof": true
+      }
+    }
+  ],
+  "churn": {
+    "plans_created": 256,
+    "calls_per_plan": 1,
+    "retained_limit": 64,
+    "elapsed_ns": 16491520,
+    "before": {
+      "rss_bytes": 48107520,
+      "live_slots": 57852,
+      "jit": {
+        "inline_code_size": 332546,
+        "outlined_code_size": 443410,
+        "freed_code_size": 0,
+        "code_region_size": 1224704,
+        "compiled_iseq_entry": 125,
+        "compiled_iseq_count": 278,
+        "compiled_blockid_count": 6406,
+        "compiled_block_count": 8601,
+        "compiled_branch_count": 13196,
+        "compile_time_ns": 75602901
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 15
+    },
+    "after_eviction_and_gc": {
+      "rss_bytes": 49561600,
+      "live_slots": 60798,
+      "jit": {
+        "inline_code_size": 352835,
+        "outlined_code_size": 475825,
+        "freed_code_size": 0,
+        "code_region_size": 1290240,
+        "compiled_iseq_entry": 140,
+        "compiled_iseq_count": 294,
+        "compiled_blockid_count": 6747,
+        "compiled_block_count": 9076,
+        "compiled_branch_count": 13948,
+        "compile_time_ns": 79993994
+      },
+      "live_kernels": 64,
+      "anonymous_kernel_classes": 84,
+      "retained_kernels": 64,
+      "retained_source_bytes": 27776,
+      "retained_pool_entries": 320
+    },
+    "after_release_and_gc": {
+      "rss_bytes": 49577984,
+      "live_slots": 59348,
+      "jit": {
+        "inline_code_size": 353423,
+        "outlined_code_size": 476865,
+        "freed_code_size": 0,
+        "code_region_size": 1290240,
+        "compiled_iseq_entry": 141,
+        "compiled_iseq_count": 295,
+        "compiled_blockid_count": 6751,
+        "compiled_block_count": 9090,
+        "compiled_branch_count": 13978,
+        "compile_time_ns": 80186206
+      },
+      "live_kernels": 0,
+      "anonymous_kernel_classes": 25
+    },
+    "note": "Generator lifetime probe with a diagnostic-owned bounded array, not a proof of the engine cache bound. JIT code reclamation is runtime policy; RSS need not fall after GC."
+  },
+  "notes": [
+    "Direct expression diagnostic, not full-query performance. GC remains enabled.",
+    "Semantic compilation and Ruby source compilation are separately measured; JIT compile_time_ns is cumulative runtime work.",
+    "Kernel validation compares values, SQLSTATE/message, statement/lifetime cost, and cost-limit prefixes with Engine#evaluate.",
+    "Timing samples exclude validation, JIT introspection, and explicit GC. Timings use one fixed representative row/parameter set per expression."
+  ],
+  "final_source_sha256": "51a3a7d34740c7c3b47eee34c51bfb46a0868a69449bca382aa3d934a64eeab7"
+}

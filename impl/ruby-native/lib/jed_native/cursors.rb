@@ -75,7 +75,7 @@ module JedNative
     include Enumerable
     attr_reader :columns, :column_types
     alias column_names columns
-    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_cte_validation
+    SHARED_CACHES = %i[@native_read_plans @native_select_plans @native_compiled_arguments @native_cte_validation
                        @native_window_shapes @native_spill_shapes @native_stream_shapes].freeze
     REPLACED_STATE = (SharedDatabase::CATALOGS + %i[@native_binding_plans @savepoints
       @params @foreign_key_checks @native_query_shape_cache @subquery_hoists]).freeze
@@ -97,7 +97,9 @@ module JedNative
       prebound_types = binding.types if binding.reusable_bound_values?
       params = bound if prebound_types && bound
       SHARED_CACHES.each do |name|
-        session.engine.instance_variable_set(name, {}.compare_by_identity) unless session.engine.instance_variable_defined?(name)
+        next if session.engine.instance_variable_defined?(name)
+        cache = name == :@native_compiled_arguments ? {} : {}.compare_by_identity
+        session.engine.instance_variable_set(name, cache)
       end
       @engine = session.engine.dup
       @engine.instance_variables.each do |name|
@@ -284,13 +286,14 @@ module JedNative
       @database.shared_unpin(self) if transient_pin
     end
     def execute(sql, *params)
-      execute_prepared(prepare(sql), *params)
+      execute_prepared(cached_statement(sql), *params)
     rescue Error
       @engine.instance_variable_set(:@failed, true) if @engine.transaction_open? && $!.sqlstate != '25001'
       raise
     end
     def close
       @cursors&.values&.dup&.each(&:close)
+      @native_eager_cursor_seen&.clear
       super
     end
   end
@@ -300,9 +303,71 @@ module JedNative
   module SessionCursors
     def execute_prepared(statement, *params)
       ended = @engine.transaction_open? && %i[commit rollback].include?(statement.ast[:kind])
+      if (cursor = eager_cursor(statement, params))
+        execution = cursor.instance_variable_get(:@engine)
+        begin
+          # Fast cursors already detach values and metadata. Keep Result#rows
+          # as ordinary arrays, matching the eager host API.
+          rows = cursor.rows.map(&:to_a)
+          return Result.new(columns: cursor.columns, column_types: cursor.column_types,
+            rows: rows, cost: cursor.cost)
+        ensure
+          cursor.close
+          @engine.instance_variable_set(:@cost, cursor.cost)
+          @engine.instance_variable_set(:@scalar_bytes, execution ? execution.instance_variable_get(:@scalar_bytes) : 0)
+          @engine.instance_variable_set(:@query_memory_peak, 0)
+        end
+      end
       EAGER_QUERY.bind_call(self, statement, *params)
     ensure
       @cursors&.values&.dup&.each { |cursor| cursor.close if cursor.block_bound? } if ended && !@engine.transaction_open?
+    end
+
+    private
+
+    def eager_cursor(statement, params)
+      ast = statement.ast
+      return unless ast[:kind] == :select && !@engine.transaction_open? && !@engine.max_query_memory_bytes.positive?
+      return if @session_closed || @engine.instance_variable_get(:@failed)
+      # Fresh SQL already resolves once in the eager executor. Only repeat
+      # uses can repay a cursor plan's additional metadata admission work.
+      # This bounded session-local hint owns no bindings or catalog state.
+      seen = (@native_eager_cursor_seen ||= {}.compare_by_identity)
+      unless seen[ast]
+        seen.shift if seen.length >= 64
+        seen[ast] = true
+        return
+      end
+      # Preserve Engine#run's admission error and its unchanged prior meter
+      # when the session has exhausted its lifetime allowance.
+      return if @engine.lifetime_max_cost.positive? && @engine.lifetime_cost >= @engine.lifetime_max_cost
+      if (ast[:from] || []).empty?
+        # Synchronous host callbacks can inspect the live eager meter and
+        # change session budgets. Their original executor keeps those effects;
+        # the lazy API independently retains its captured cursor semantics.
+        return unless @engine.send(:scalar_cursor_syntax?, ast, host: false)
+      else
+        return unless @engine.send(:point_cursor_syntax?, ast)
+      end
+      @database.shared_open!
+      transient_pin = !@pinned
+      @database.shared_capture(self, pin: true, read: true) if transient_pin
+      # The ordinary eager entry checks service health before resetting cost or
+      # binding parameters. Keep that order ahead of cursor construction too.
+      @engine.instance_variable_get(:@service_roles)&.each do |storage, generation|
+        storage.send(:ensure_open)
+        raise Error.new('08006', 'transaction belongs to an earlier page-service role') unless storage.service_generation == generation
+      end
+      copied = params.map { |value| HostValues.copy(value) }
+      begin
+        ScalarRows.build(self, statement, copied) || PointRows.build(self, statement, copied)
+      rescue Error
+        # No kernel or SQL work has run. The eager path owns the precedence of
+        # metadata, binding and capability failures and resets its own meter.
+        nil
+      end
+    ensure
+      @database.shared_unpin(self) if transient_pin
     end
   end
   Session.prepend(SessionCursors)
