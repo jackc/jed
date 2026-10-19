@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "description": "Explicit ordering-compilation experiment: existing scalar, scan, bounded sort and computed-sort controls plus full sorting and mixed nullable integer/boolean keys over the unchanged 1000-row fixture. Projection outputs remain integers for every comparison adapter.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"sort_limit","sql":"SELECT id, score FROM items ORDER BY score DESC, id LIMIT 20","iterations":15,"warmup":10,"offset":0,"step":0,"span":0},
+    {"name":"computed_sort","sql":"SELECT id, score FROM items ORDER BY score * 3 + bucket DESC, id LIMIT 20","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"plain_scan","sql":"SELECT id, score FROM items ORDER BY id","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"full_sort","sql":"SELECT id, score FROM items ORDER BY score DESC, id","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"sort_mixed_nulls","sql":"SELECT id, score FROM items ORDER BY CASE WHEN bucket < 3 THEN NULL ELSE bucket END ASC NULLS FIRST, (score >= 5000) DESC, score DESC, id LIMIT 20","iterations":50,"warmup":100,"offset":0,"step":0,"span":0}
+  ]
+}

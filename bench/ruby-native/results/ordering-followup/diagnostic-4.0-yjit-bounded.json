@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/ordering_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "bench/ruby-native/results/ordering-followup/diagnostic-4.0-yjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 53551104,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 3.525068946008105,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "final_source_sha256": "ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/ordering-followup/diagnostic-4.0-yjit.json\",\"source_sha256\":\"ac5c78008942148b55e7f13f4a9c133d4bc1bc730741999a147e5d0dd9e4040d\",\"jit\":\"yjit\",\"workloads\":[{\"name\":\"integer_desc_id_asc\",\"generated_code\":{\"source_location\":[\"(jed compiled ordering)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"7be6f68556fa937d8ac17e4aa3dc82922f596000d3767353b93be10733d0be42\",\"yjit_compiled_instruction_count\":178,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled ordering)\",\"first_lineno\":1}},{\"name\":\"nullable_integer_boolean_integer\",\"generated_code\":{\"source_location\":[\"(jed compiled ordering)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"269b674a86521f0152e580b6869641a5fc20bd03890720758052eb4f20b379ee\",\"yjit_compiled_instruction_count\":560,\"direct_jit_proof\":true,\"iseq_path\":\"(jed compiled ordering)\",\"first_lineno\":1}}]}\n",
+  "stderr": ""
+}

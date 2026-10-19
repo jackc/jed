@@ -28,6 +28,8 @@ It also records lazy-API failures and a multi-page LIMIT cost defect found durin
 that audit. The [correctness follow-up](CORRECTNESS_FOLLOWUP.md) fixes the metadata,
 stack-depth, and cost defects and distinguishes materialized-memory corpus
 expectations from lazy collector thresholds.
+The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
+comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
 Future features do not update this directory unless explicitly requested.
@@ -87,6 +89,12 @@ one generated method. Ordered scans can retain streaming OFFSET/LIMIT and cursor
 pull behavior. Exact-point/scalar paths, host callbacks, DISTINCT, blocking sorts,
 profiling, and finite query-memory accounting retain their existing executors.
 Pipeline methods share the plan's 64 KiB source allowance with expression kernels.
+
+Blocking single-table sorts can also compile comparisons of integer and boolean
+keys, including direction, NULL placement, and stable ties. Key evaluation and
+the existing heap, full-sort, and spill algorithms keep their original execution
+and resource checkpoints. Other key types use the existing comparator. Ordering
+methods share the same plan source limit and compile only after reuse.
 
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;
