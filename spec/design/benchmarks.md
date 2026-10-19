@@ -1812,3 +1812,37 @@ It is a wall-clock benchmark outside `mise run ci` (§10); results go to
 `bench/results/page-service-<stamp>.jsonl`. The before/after check that the page-service hooks cost the
 ordinary alone path nothing uses the standard lanes (`point_lookup_pk`, `full_scan_agg`,
 `insert_commit_durable`) of `bench:run`, alternating base and changed binaries.
+
+## 13. TypeScript async host measurements
+
+`mise run bench:ts_async` covers cheap calls, prepared execution, batching and typed result
+delivery through the public Node worker API. `mise run bench:ts_async_heavy` and
+`mise run bench:ts_async_browser` use the same heavier SQL workloads to compare a synchronous
+internal call with the production worker API on Node and real Chromium. The browser task builds
+the main-thread benchmark and the real execution worker with the existing Vite dependency,
+then serves them locally and drives the installed Playwright browser. It adds no dependencies
+or browser downloads. This is a host-boundary experiment, not another semantic core.
+
+The workloads separate expensive computation with few result rows (decimal aggregation,
+a grouped join over resident pages, and top-N ordering) from substantial typed result delivery.
+Use fixed data sizes and identical SQL for both paths and hosts. Setup and warmup are outside
+timing; query, complete typed drain and close are inside it. Both paths perform the same
+fingerprint work while consuming results; row counts, typed fingerprints, column metadata and
+logical costs must agree outside the timed interval. Alternate direct/worker order and preserve
+raw samples. With small sample counts, report medians and ranges rather than tail guarantees.
+
+Measure responsiveness in separate runs from latency. Record an idle baseline, periodic timer
+gaps and callbacks during SQL; in the browser also record animation-frame gaps and long-task
+observations. Include the first delayed callback after synchronous work returns, and flush
+observer entries before reporting. Record browser/version, visibility, cross-origin isolation
+and shared-memory availability. A long worker operation is not a long main-thread block;
+conversely, streaming many rows still consumes main-thread decoding and application CPU.
+Headless timer/frame observations are evidence of scheduling, not a claim about every user's
+input or rendering latency. Worker isolation and cooperative cancellation are separate concerns:
+an event-loop heartbeat does not measure cancellation delay or isolate checkpoint overhead.
+
+These probes use warm, in-memory databases. Browser OPFS durability, cold reads, other browser
+engines, ARM, concurrent consumers and peak memory need their own measurements. Timing results
+remain outside CI gates; correctness and resource-boundary tests stay in their existing suites.
+The [2026-10-18 heavy-query report](../../bench/ts/results/2026-10-18-heavy/report.md) retains three
+Node runs and three runs each of ordinary and isolated Chromium, with raw samples and results.

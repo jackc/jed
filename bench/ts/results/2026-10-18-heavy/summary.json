@@ -1,0 +1,861 @@
+{
+  "runs": [
+    "browser-1",
+    "browser-2",
+    "browser-3",
+    "isolated-1",
+    "isolated-2",
+    "isolated-3",
+    "node-1",
+    "node-2",
+    "node-3"
+  ],
+  "config": {
+    "warmups": 3,
+    "samples": 7,
+    "responseSamples": 3,
+    "decimalRows": 1000000,
+    "tableRows": 100000,
+    "sortRows": 800000,
+    "typedRows": 200000,
+    "cases": [
+      "decimal-aggregate",
+      "resident-join-group",
+      "sort-top100",
+      "typed-output"
+    ]
+  },
+  "hosts": {
+    "node": {
+      "runs": [
+        "node-1",
+        "node-2",
+        "node-3"
+      ],
+      "idle": {
+        "timerMaxMedian": 5.553890500002581,
+        "timerMaxWorst": 6.486499999999069
+      },
+      "cases": [
+        {
+          "id": "decimal-aggregate",
+          "validated": {
+            "rows": 1,
+            "fingerprint": "79e4eed1d6ce1755",
+            "columnNames": [
+              "total"
+            ],
+            "columnTypes": [
+              "decimal"
+            ],
+            "rowsAffected": null,
+            "cost": "4985718"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                367.03796000000057,
+                334.8115310000003,
+                264.44799499999954
+              ],
+              "median": 334.8115310000003,
+              "min": 264.44799499999954,
+              "max": 367.03796000000057
+            },
+            "worker": {
+              "runMedians": [
+                326.9724759999999,
+                323.6653140000003,
+                305.2706109999999
+              ],
+              "median": 323.6653140000003,
+              "min": 305.2706109999999,
+              "max": 326.9724759999999
+            },
+            "overheadPercent": -3.3291018880708623,
+            "deltaMs": -11.146216999999979,
+            "runOverheadPercents": [
+              -10.915896546504511,
+              -3.3291018880708623,
+              15.436916434174686
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 321.1890309999999,
+              "timerMaxWorst": 699.291451000001,
+              "timerTicksMedian": 0
+            },
+            "worker": {
+              "timerMaxMedian": 7.394268000000011,
+              "timerMaxWorst": 10.175467999999455,
+              "timerTicksMedian": 62
+            }
+          }
+        },
+        {
+          "id": "resident-join-group",
+          "validated": {
+            "rows": 128,
+            "fingerprint": "9eb1401a090ae45e",
+            "columnNames": [
+              "bucket",
+              "total"
+            ],
+            "columnTypes": [
+              "i64",
+              "decimal"
+            ],
+            "rowsAffected": null,
+            "cost": "798985"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                527.9082589999998,
+                453.07750699999997,
+                388.2000509999998
+              ],
+              "median": 453.07750699999997,
+              "min": 388.2000509999998,
+              "max": 527.9082589999998
+            },
+            "worker": {
+              "runMedians": [
+                550.2994400000025,
+                457.45543400000315,
+                419.8557839999994
+              ],
+              "median": 457.45543400000315,
+              "min": 419.8557839999994,
+              "max": 550.2994400000025
+            },
+            "overheadPercent": 0.9662644762462591,
+            "deltaMs": 4.377927000003183,
+            "runOverheadPercents": [
+              4.241490944357951,
+              0.9662644762462591,
+              8.15448965512877
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 430.36171900000045,
+              "timerMaxWorst": 537.5162049999999,
+              "timerTicksMedian": 0
+            },
+            "worker": {
+              "timerMaxMedian": 7.628043000000616,
+              "timerMaxWorst": 12.371112000000721,
+              "timerTicksMedian": 84
+            }
+          }
+        },
+        {
+          "id": "sort-top100",
+          "validated": {
+            "rows": 100,
+            "fingerprint": "961522429f09ca8e",
+            "columnNames": [
+              "id",
+              "sort_key"
+            ],
+            "columnTypes": [
+              "i64",
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "4000500"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                612.3558889999986,
+                468.390707999999,
+                414.42975600000136
+              ],
+              "median": 468.390707999999,
+              "min": 414.42975600000136,
+              "max": 612.3558889999986
+            },
+            "worker": {
+              "runMedians": [
+                711.3941789999953,
+                523.3043090000028,
+                481.7859619999981
+              ],
+              "median": 523.3043090000028,
+              "min": 481.7859619999981,
+              "max": 711.3941789999953
+            },
+            "overheadPercent": 11.723887784726061,
+            "deltaMs": 54.91360100000384,
+            "runOverheadPercents": [
+              16.173322046715377,
+              11.723887784726061,
+              16.25274368571077
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 499.6131180000011,
+              "timerMaxWorst": 546.2823470000003,
+              "timerTicksMedian": 0
+            },
+            "worker": {
+              "timerMaxMedian": 8.441447999997763,
+              "timerMaxWorst": 14.961710000003222,
+              "timerTicksMedian": 95
+            }
+          }
+        },
+        {
+          "id": "typed-output",
+          "validated": {
+            "rows": 200000,
+            "fingerprint": "ee3bf2c6ac80465a",
+            "columnNames": [
+              "id",
+              "exact",
+              "bytes",
+              "pair",
+              "absent"
+            ],
+            "columnTypes": [
+              "i64",
+              "decimal",
+              "bytea",
+              "i64[]",
+              "text"
+            ],
+            "rowsAffected": null,
+            "cost": "18000000"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                376.2675569999992,
+                329.2065199999997,
+                326.0734750000047
+              ],
+              "median": 329.2065199999997,
+              "min": 326.0734750000047,
+              "max": 376.2675569999992
+            },
+            "worker": {
+              "runMedians": [
+                614.5968240000002,
+                641.6212820000001,
+                610.7044890000034
+              ],
+              "median": 614.5968240000002,
+              "min": 610.7044890000034,
+              "max": 641.6212820000001
+            },
+            "overheadPercent": 86.69035595042307,
+            "deltaMs": 285.39030400000047,
+            "runOverheadPercents": [
+              63.34037111788553,
+              94.89932398665755,
+              87.29045317163397
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 341.60243900000205,
+              "timerMaxWorst": 497.958762000002,
+              "timerTicksMedian": 0
+            },
+            "worker": {
+              "timerMaxMedian": 8.518072999999276,
+              "timerMaxWorst": 9.994553000004089,
+              "timerTicksMedian": 129
+            }
+          }
+        }
+      ]
+    },
+    "browser": {
+      "runs": [
+        "browser-1",
+        "browser-2",
+        "browser-3"
+      ],
+      "idle": {
+        "timerMaxMedian": 5.350000001490116,
+        "timerMaxWorst": 7.200000002980232,
+        "frameMaxMedian": 17.0,
+        "frameMaxWorst": 19.399999998509884
+      },
+      "cases": [
+        {
+          "id": "decimal-aggregate",
+          "validated": {
+            "rows": 1,
+            "fingerprint": "79e4eed1d6ce1755",
+            "columnNames": [
+              "total"
+            ],
+            "columnTypes": [
+              "decimal"
+            ],
+            "rowsAffected": null,
+            "cost": "4985718"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                281.69999999552965,
+                262.3999999985099,
+                280.6000000014901
+              ],
+              "median": 280.6000000014901,
+              "min": 262.3999999985099,
+              "max": 281.69999999552965
+            },
+            "worker": {
+              "runMedians": [
+                337,
+                299.8999999985099,
+                320.20000000298023
+              ],
+              "median": 320.20000000298023,
+              "min": 299.8999999985099,
+              "max": 337
+            },
+            "overheadPercent": 14.112615823692032,
+            "deltaMs": 39.600000001490116,
+            "runOverheadPercents": [
+              19.630812923446193,
+              14.291158536666515,
+              14.112615823692032
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 275.8999999985099,
+              "timerMaxWorst": 549.3999999985099,
+              "timerTicksMedian": 0,
+              "frameMaxMedian": 278.79999999701977,
+              "frameMaxWorst": 565.1000000014901,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 549
+            },
+            "worker": {
+              "timerMaxMedian": 8.100000001490116,
+              "timerMaxWorst": 10,
+              "timerTicksMedian": 65,
+              "frameMaxMedian": 18.899999998509884,
+              "frameMaxWorst": 20.299999997019768,
+              "frameTicksMedian": 20,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        },
+        {
+          "id": "resident-join-group",
+          "validated": {
+            "rows": 128,
+            "fingerprint": "9eb1401a090ae45e",
+            "columnNames": [
+              "bucket",
+              "total"
+            ],
+            "columnTypes": [
+              "i64",
+              "decimal"
+            ],
+            "rowsAffected": null,
+            "cost": "798985"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                382.5,
+                322.5,
+                314.5
+              ],
+              "median": 322.5,
+              "min": 314.5,
+              "max": 382.5
+            },
+            "worker": {
+              "runMedians": [
+                412.8999999985099,
+                364,
+                335.70000000298023
+              ],
+              "median": 364,
+              "min": 335.70000000298023,
+              "max": 412.8999999985099
+            },
+            "overheadPercent": 12.868217054263575,
+            "deltaMs": 41.5,
+            "runOverheadPercents": [
+              7.947712417911079,
+              12.868217054263575,
+              6.740858506512004
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 325.5,
+              "timerMaxWorst": 442.1000000014901,
+              "timerTicksMedian": 1,
+              "frameMaxMedian": 331.09999999403954,
+              "frameMaxWorst": 447.3999999985099,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 441
+            },
+            "worker": {
+              "timerMaxMedian": 7.700000002980232,
+              "timerMaxWorst": 9,
+              "timerTicksMedian": 68,
+              "frameMaxMedian": 19.600000001490116,
+              "frameMaxWorst": 23,
+              "frameTicksMedian": 21,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        },
+        {
+          "id": "sort-top100",
+          "validated": {
+            "rows": 100,
+            "fingerprint": "961522429f09ca8e",
+            "columnNames": [
+              "id",
+              "sort_key"
+            ],
+            "columnTypes": [
+              "i64",
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "4000500"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                489,
+                340.1000000014901,
+                279.19999999552965
+              ],
+              "median": 340.1000000014901,
+              "min": 279.19999999552965,
+              "max": 489
+            },
+            "worker": {
+              "runMedians": [
+                500.40000000596046,
+                355.69999999552965,
+                372
+              ],
+              "median": 372,
+              "min": 355.69999999552965,
+              "max": 500.40000000596046
+            },
+            "overheadPercent": 9.379594236509892,
+            "deltaMs": 31.899999998509884,
+            "runOverheadPercents": [
+              2.3312883447771826,
+              4.586886208165586,
+              33.237822351703514
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 348,
+              "timerMaxWorst": 454.09999999403954,
+              "timerTicksMedian": 1,
+              "frameMaxMedian": 350.6000000014901,
+              "frameMaxWorst": 469.20000000298023,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 453
+            },
+            "worker": {
+              "timerMaxMedian": 8.600000001490116,
+              "timerMaxWorst": 10.899999998509884,
+              "timerTicksMedian": 71,
+              "frameMaxMedian": 21,
+              "frameMaxWorst": 24,
+              "frameTicksMedian": 21,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        },
+        {
+          "id": "typed-output",
+          "validated": {
+            "rows": 200000,
+            "fingerprint": "ee3bf2c6ac80465a",
+            "columnNames": [
+              "id",
+              "exact",
+              "bytes",
+              "pair",
+              "absent"
+            ],
+            "columnTypes": [
+              "i64",
+              "decimal",
+              "bytea",
+              "i64[]",
+              "text"
+            ],
+            "rowsAffected": null,
+            "cost": "18000000"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                413.3999999985099,
+                355.19999999552965,
+                362
+              ],
+              "median": 362,
+              "min": 355.19999999552965,
+              "max": 413.3999999985099
+            },
+            "worker": {
+              "runMedians": [
+                817.2000000029802,
+                778.5999999940395,
+                807.3999999985099
+              ],
+              "median": 807.3999999985099,
+              "min": 778.5999999940395,
+              "max": 817.2000000029802
+            },
+            "overheadPercent": 123.03867403273752,
+            "deltaMs": 445.3999999985099,
+            "runOverheadPercents": [
+              97.67779390564245,
+              119.20045045153111,
+              123.03867403273752
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 378.69999999552965,
+              "timerMaxWorst": 474.20000000298023,
+              "timerTicksMedian": 1,
+              "frameMaxMedian": 385.5,
+              "frameMaxWorst": 490.19999999552965,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 473
+            },
+            "worker": {
+              "timerMaxMedian": 9.200000002980232,
+              "timerMaxWorst": 13.100000001490116,
+              "timerTicksMedian": 150,
+              "frameMaxMedian": 18.899999998509884,
+              "frameMaxWorst": 22.100000001490116,
+              "frameTicksMedian": 45,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        }
+      ]
+    },
+    "isolated": {
+      "runs": [
+        "isolated-1",
+        "isolated-2",
+        "isolated-3"
+      ],
+      "idle": {
+        "timerMaxMedian": 5.262499999254942,
+        "timerMaxWorst": 6.009999997913837,
+        "frameMaxMedian": 16.970000002533197,
+        "frameMaxWorst": 17.839999996125698
+      },
+      "cases": [
+        {
+          "id": "decimal-aggregate",
+          "validated": {
+            "rows": 1,
+            "fingerprint": "79e4eed1d6ce1755",
+            "columnNames": [
+              "total"
+            ],
+            "columnTypes": [
+              "decimal"
+            ],
+            "rowsAffected": null,
+            "cost": "4985718"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                282.51500000059605,
+                262.82499999552965,
+                250.3800000026822
+              ],
+              "median": 262.82499999552965,
+              "min": 250.3800000026822,
+              "max": 282.51500000059605
+            },
+            "worker": {
+              "runMedians": [
+                318.804999999702,
+                358.04500000178814,
+                339.6149999946356
+              ],
+              "median": 339.6149999946356,
+              "min": 318.804999999702,
+              "max": 358.04500000178814
+            },
+            "overheadPercent": 29.21715970718617,
+            "deltaMs": 76.78999999910593,
+            "runOverheadPercents": [
+              12.845335645551348,
+              36.22943023223743,
+              35.63982745866181
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 274.39500000327826,
+              "timerMaxWorst": 555.640000000596,
+              "timerTicksMedian": 0,
+              "frameMaxMedian": 280.7850000038743,
+              "frameMaxWorst": 557.6000000014901,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 555
+            },
+            "worker": {
+              "timerMaxMedian": 8.344999998807907,
+              "timerMaxWorst": 11.07999999821186,
+              "timerTicksMedian": 64,
+              "frameMaxMedian": 20.035000003874302,
+              "frameMaxWorst": 23.21000000089407,
+              "frameTicksMedian": 20,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        },
+        {
+          "id": "resident-join-group",
+          "validated": {
+            "rows": 128,
+            "fingerprint": "9eb1401a090ae45e",
+            "columnNames": [
+              "bucket",
+              "total"
+            ],
+            "columnTypes": [
+              "i64",
+              "decimal"
+            ],
+            "rowsAffected": null,
+            "cost": "798985"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                330.4050000011921,
+                328.23499999940395,
+                311.60999999940395
+              ],
+              "median": 328.23499999940395,
+              "min": 311.60999999940395,
+              "max": 330.4050000011921
+            },
+            "worker": {
+              "runMedians": [
+                361.07500000298023,
+                386.0199999958277,
+                338.12999999523163
+              ],
+              "median": 361.07500000298023,
+              "min": 338.12999999523163,
+              "max": 386.0199999958277
+            },
+            "overheadPercent": 10.005026887332535,
+            "deltaMs": 32.84000000357628,
+            "runOverheadPercents": [
+              9.2825471774572,
+              17.60476487776399,
+              8.510638296549654
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 333.0249999985099,
+              "timerMaxWorst": 375.2449999973178,
+              "timerTicksMedian": 0,
+              "frameMaxMedian": 336.945000000298,
+              "frameMaxWorst": 380.2150000035763,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 375
+            },
+            "worker": {
+              "timerMaxMedian": 8.20499999821186,
+              "timerMaxWorst": 10.339999996125698,
+              "timerTicksMedian": 70,
+              "frameMaxMedian": 20.88000000268221,
+              "frameMaxWorst": 22.96000000089407,
+              "frameTicksMedian": 22,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        },
+        {
+          "id": "sort-top100",
+          "validated": {
+            "rows": 100,
+            "fingerprint": "961522429f09ca8e",
+            "columnNames": [
+              "id",
+              "sort_key"
+            ],
+            "columnTypes": [
+              "i64",
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "4000500"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                324.66499999910593,
+                330.20500000566244,
+                299.0600000023842
+              ],
+              "median": 324.66499999910593,
+              "min": 299.0600000023842,
+              "max": 330.20500000566244
+            },
+            "worker": {
+              "runMedians": [
+                380.30000000447035,
+                403.8149999976158,
+                381.08500000089407
+              ],
+              "median": 381.08500000089407,
+              "min": 380.30000000447035,
+              "max": 403.8149999976158
+            },
+            "overheadPercent": 17.37791261821986,
+            "deltaMs": 56.42000000178814,
+            "runOverheadPercents": [
+              17.136124930472207,
+              22.29221241068158,
+              27.427606499650903
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 336.24000000208616,
+              "timerMaxWorst": 363.46000000089407,
+              "timerTicksMedian": 0,
+              "frameMaxMedian": 348.10499999672174,
+              "frameMaxWorst": 374.820000000298,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 363
+            },
+            "worker": {
+              "timerMaxMedian": 9.82999999821186,
+              "timerMaxWorst": 11.780000001192093,
+              "timerTicksMedian": 74,
+              "frameMaxMedian": 20.480000004172325,
+              "frameMaxWorst": 21.95500000566244,
+              "frameTicksMedian": 23,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        },
+        {
+          "id": "typed-output",
+          "validated": {
+            "rows": 200000,
+            "fingerprint": "ee3bf2c6ac80465a",
+            "columnNames": [
+              "id",
+              "exact",
+              "bytes",
+              "pair",
+              "absent"
+            ],
+            "columnTypes": [
+              "i64",
+              "decimal",
+              "bytea",
+              "i64[]",
+              "text"
+            ],
+            "rowsAffected": null,
+            "cost": "18000000"
+          },
+          "latency": {
+            "direct": {
+              "runMedians": [
+                376.3100000023842,
+                401.33500000089407,
+                363.125
+              ],
+              "median": 376.3100000023842,
+              "min": 363.125,
+              "max": 401.33500000089407
+            },
+            "worker": {
+              "runMedians": [
+                750.859999999404,
+                754.140000000596,
+                819.9950000047684
+              ],
+              "median": 754.140000000596,
+              "min": 750.859999999404,
+              "max": 819.9950000047684
+            },
+            "overheadPercent": 100.403922296994,
+            "deltaMs": 377.82999999821186,
+            "runOverheadPercents": [
+              99.53230049550817,
+              87.90785752523853,
+              125.81617900303432
+            ]
+          },
+          "responsiveness": {
+            "direct": {
+              "timerMaxMedian": 375.6550000011921,
+              "timerMaxWorst": 437.57999999821186,
+              "timerTicksMedian": 0,
+              "frameMaxMedian": 379.4350000023842,
+              "frameMaxWorst": 452.320000000298,
+              "frameTicksMedian": 0,
+              "longTasks": 9,
+              "longTaskMaxWorst": 437
+            },
+            "worker": {
+              "timerMaxMedian": 8.484999999403954,
+              "timerMaxWorst": 16.179999999701977,
+              "timerTicksMedian": 149,
+              "frameMaxMedian": 20.305000007152557,
+              "frameMaxWorst": 23.899999998509884,
+              "frameTicksMedian": 45,
+              "longTasks": 0,
+              "longTaskMaxWorst": 0
+            }
+          }
+        }
+      ]
+    }
+  }
+}

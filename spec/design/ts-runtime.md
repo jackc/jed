@@ -313,6 +313,24 @@ small changes within wider process variation. These warm Node measurements suppo
 compact batches while retaining the existing row/byte limits, without claiming a general
 improvement in query execution or browser throughput.
 
+The [heavy-query browser/Node report](../../bench/ts/results/2026-10-18-heavy/report.md) measures
+queries taking hundreds of milliseconds, with three process runs per host. Ordinary Chromium
+without shared memory has direct/worker medians of 281/320 ms for a million-value decimal sum,
+323/364 ms for a resident grouped join, and 340/372 ms for top-N ordering: about 9–14% overhead.
+Isolated Chromium has about 10–29% overhead for those cases. Generating, ordering and consuming
+200,000 typed rows remains substantially more expensive: 362/807 ms in ordinary Chromium and
+376/754 ms in isolated Chromium. The current direct and worker paths share the same engine;
+these measurements do not isolate historical continuation overhead.
+
+Across both browser modes, all 72 worker responsiveness observations record no main-thread long
+tasks, while every direct observation records one and no animation callbacks during execution.
+Median largest frame gaps are about 19–21 ms through workers versus 279–386 ms directly;
+the worst observed worker frame gap is 24 ms. This supports worker isolation for expensive
+queries even without shared memory. It does not establish cancellation latency or the need for
+extra pause points: no measured query passes an `AbortSignal`. This is warm in-memory,
+headless Chromium on x64; OPFS, other browser engines, ARM and application rendering remain
+separate measurements.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions
 include async storage lifecycle/commit and crypto providers, worker pools,
