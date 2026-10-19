@@ -12,6 +12,9 @@ db.engine.instance_variable_set(:@native_ordering_disabled, true) if disable_ord
 disable_aggregate = ARGV.include?('--disable-aggregate')
 abort 'Source has no aggregate compiler to disable' if disable_aggregate && !defined?(JedNative::CompiledAggregate)
 db.engine.instance_variable_set(:@native_aggregate_disabled, true) if disable_aggregate
+disable_relation = ARGV.include?('--disable-relation')
+abort 'Source has no relation compiler to disable' if disable_relation && !defined?(JedNative::CompiledRelation)
+db.engine.instance_variable_set(:@native_relation_disabled, true) if disable_relation
 repetitions = validation_iterations = 0
 verify_only = ARGV.include?('--verify-only')
 File.foreach(ARGV.fetch(0)) do |line|
@@ -61,7 +64,8 @@ File.foreach(ARGV.fetch(0)) do |line|
     end
     puts JSON.generate(workload: name, checksum: format('%016x', checksum), validation_rows: validation_rows,
                        samples_ns: samples, rows_total: total_rows, iterations: iterations, warmup: warmup,
-                       runtime: RUBY_DESCRIPTION, ordering_disabled: disable_ordering, aggregate_disabled: disable_aggregate)
+                       runtime: RUBY_DESCRIPTION, ordering_disabled: disable_ordering, aggregate_disabled: disable_aggregate,
+                       relation_disabled: disable_relation)
     STDOUT.flush
   end
 end

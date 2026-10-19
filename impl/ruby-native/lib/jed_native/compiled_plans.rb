@@ -10,6 +10,7 @@ module JedNative
     State = Struct.new(:uses, :kernels, :attempted, :source_bytes, keyword_init: true)
     MAX_ARGUMENT_CACHE_ENTRIES = 64
     MAX_AGGREGATE_CACHE_ENTRIES = 64
+    MAX_RELATION_CACHE_ENTRIES = 64
 
     def native_compiled_kernels(plan, predicate, projections, keys = nil, pipeline: nil, offset: false, limit: false, orders: nil)
       return if @native_compilation_disabled
@@ -107,7 +108,44 @@ module JedNative
       kernel
     end
 
+    # General relation phases are resolved on each execution, like aggregates.
+    # Their source-and-pool cache contains no AST, row, or accounting owner.
+    def native_compiled_relation_filter(predicate, memory: false)
+      return if @storage || @native_compilation_disabled || @native_relation_disabled || !predicate
+      slot = memory ? :@native_relation_memory_filter_kernel : :@native_relation_filter_kernel
+      return predicate.instance_variable_get(slot) if predicate.instance_variable_defined?(slot)
+      program = CompiledRelation.prepare_filter(predicate, types: @types, memory: memory)
+      kernel = native_relation_program_kernel(program)
+      predicate.instance_variable_set(slot, kernel)
+      kernel
+    end
+
+    def native_compiled_relation_keys(expressions)
+      return if @storage || @native_compilation_disabled || @native_relation_disabled
+      return expressions.instance_variable_get(:@native_relation_keys_kernel) if expressions.instance_variable_defined?(:@native_relation_keys_kernel)
+      program = CompiledRelation.prepare_keys(expressions, types: @types)
+      kernel = native_relation_program_kernel(program)
+      expressions.instance_variable_set(:@native_relation_keys_kernel, kernel)
+      kernel
+    end
+
     private
+
+    def native_relation_program_kernel(program)
+      return unless program
+      @native_compiled_relations ||= {}
+      key = [program.source, program.pool].freeze
+      if @native_compiled_relations.key?(key)
+        kernel = @native_compiled_relations.delete(key)
+        kernel ||= program.materialize
+        @native_compiled_relations[key] = kernel
+      else
+        @native_compiled_relations.shift if @native_compiled_relations.length >= MAX_RELATION_CACHE_ENTRIES
+        kernel = program.materialize if @native_compilation_immediate
+        @native_compiled_relations[key] = kernel
+      end
+      kernel
+    end
 
     def native_admit_kernel(state, slot, kernel)
       return unless kernel && state.source_bytes + kernel.source_bytes <= MAX_PLAN_SOURCE_BYTES

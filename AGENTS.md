@@ -78,7 +78,8 @@ files in the same change.
   evaluators, or recursive open-type behavior.
 - Explicit maintainer exception: the frozen Ruby experiment may compile resolved
   query expressions, single-table scan/filter/projection loops, typed ORDER BY
-  comparators, and primitive aggregate input/reduction loops into Ruby methods
+  comparators, primitive aggregate input/reduction loops, and materialized WHERE
+  and grouping-key loops into Ruby methods
   at runtime using a handwritten, bounded template emitter. SQL text and values
   remain data, and all conformance contracts still apply. See
   `spec/design/ruby-runtime-compilation.md`.

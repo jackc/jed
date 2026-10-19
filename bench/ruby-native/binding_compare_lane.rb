@@ -58,6 +58,7 @@ module RubyBindingComparison
     session.engine.instance_variable_set(:@native_pipeline_disabled, true) if engine != 'wrapper' && @disable_pipeline
     session.engine.instance_variable_set(:@native_ordering_disabled, true) if engine != 'wrapper' && @disable_ordering
     session.engine.instance_variable_set(:@native_aggregate_disabled, true) if engine != 'wrapper' && @disable_aggregate
+    session.engine.instance_variable_set(:@native_relation_disabled, true) if engine != 'wrapper' && @disable_relation
     return yield(session) if file
     session.execute('CREATE TABLE items (id i32 PRIMARY KEY, bucket i32, score i32, label text)')
     values = rows.times.map { |i| "(#{i},#{i % 10},#{(i * 37) % 10_000},'row#{i}')" }.join(',')
@@ -221,6 +222,7 @@ module RubyBindingComparison
       parser.on('--disable-pipeline') { options[:disable_pipeline] = true }
       parser.on('--disable-ordering') { options[:disable_ordering] = true }
       parser.on('--disable-aggregate') { options[:disable_aggregate] = true }
+      parser.on('--disable-relation') { options[:disable_relation] = true }
     end.parse!
     abort "Usage: #{File.basename(__FILE__)} #{ENGINES.join('|')} [--verify-only] [--file PATH]" unless ENGINES.include?(engine) && ARGV.empty?
     root = File.expand_path('../..', __dir__)
@@ -237,6 +239,8 @@ module RubyBindingComparison
     abort 'Source has no ordering compiler to disable' if @disable_ordering && engine != 'wrapper' && !defined?(JedNative::CompiledOrdering)
     @disable_aggregate = !!options[:disable_aggregate]
     abort 'Source has no aggregate compiler to disable' if @disable_aggregate && engine != 'wrapper' && !defined?(JedNative::CompiledAggregate)
+    @disable_relation = !!options[:disable_relation]
+    abort 'Source has no relation compiler to disable' if @disable_relation && engine != 'wrapper' && !defined?(JedNative::CompiledRelation)
     library = engine == 'wrapper' ? File.expand_path(Jed::FFI.lib_path) : nil
     library_hash = library && Digest::SHA256.file(library).hexdigest
     plan_path = File.join(__dir__, 'compare/plan.json')
@@ -246,9 +250,9 @@ module RubyBindingComparison
     additional_plan_path = nil
     additional_plans = {}
     if options[:workloads] && !options[:file]
-      # The expression/pipeline/ordering controls are opt-in within this opt-in
+      # Additional compiler controls are opt-in within this opt-in
       # harness. Selecting an existing workload leaves its schedule unchanged.
-      %w[pipeline ordering aggregate].each do |kind|
+      %w[pipeline ordering aggregate relation].each do |kind|
         missing = options[:workloads] - jobs.map { |job| job.fetch('name') }
         break if missing.empty?
         path = File.join(__dir__, "compare/#{kind}-plan.json")
@@ -294,12 +298,13 @@ module RubyBindingComparison
       pipeline_disabled: @disable_pipeline && engine != 'wrapper',
       ordering_disabled: @disable_ordering && engine != 'wrapper',
       aggregate_disabled: @disable_aggregate && engine != 'wrapper',
+      relation_disabled: @disable_relation && engine != 'wrapper',
       dataset_rows: options[:file] ? 1_000_000 : plan.fetch('rows'), repetitions: REPETITIONS,
       notes: [
         'Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.',
         'Native modes use a long-lived session, matching the wrapper connection lifetime.',
         'Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.',
-        'Expression/pipeline/ordering/aggregate shapes require an explicit --workloads selection; existing workload schedules remain unchanged.',
+        'Expression/pipeline/ordering/aggregate/relation shapes require an explicit --workloads selection; existing workload schedules remain unchanged.',
         'Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.',
         'All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.',
         'File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.',

@@ -17,12 +17,13 @@ module NativeCorpusCompilation
   MODE = ENV.fetch('JED_NATIVE_COMPILATION', 'auto')
   raise 'JED_NATIVE_COMPILATION must be auto, immediate, or disabled' unless %w[auto immediate disabled].include?(MODE)
   class << self
-    attr_accessor :kernels, :pipelines, :orderings, :aggregates
+    attr_accessor :kernels, :pipelines, :orderings, :aggregates, :relations
   end
   self.kernels = 0
   self.pipelines = 0
   self.orderings = 0
   self.aggregates = 0
+  self.relations = 0
   module Engines
     def initialize(**options)
       super
@@ -67,6 +68,16 @@ module NativeCorpusCompilation
       result
     end
   end
+  module RelationCompiler
+    def materialize
+      result = super
+      if result
+        NativeCorpusCompilation.kernels += 1
+        NativeCorpusCompilation.relations += 1
+      end
+      result
+    end
+  end
 end
 JedNative::Engine.prepend(NativeCorpusCompilation::Engines)
 if defined?(JedNative::CompiledExpression::Program)
@@ -77,6 +88,7 @@ end
 JedNative::CompiledPipeline::Program.prepend(NativeCorpusCompilation::PipelineCompiler) if defined?(JedNative::CompiledPipeline::Program)
 JedNative::CompiledOrdering::Program.prepend(NativeCorpusCompilation::OrderingCompiler) if defined?(JedNative::CompiledOrdering::Program)
 JedNative::CompiledAggregate::Program.prepend(NativeCorpusCompilation::AggregateCompiler) if defined?(JedNative::CompiledAggregate::Program)
+JedNative::CompiledRelation::Program.prepend(NativeCorpusCompilation::RelationCompiler) if defined?(JedNative::CompiledRelation::Program)
 
 # The environment keeps these source identities for its entire lifetime. Only
 # the harness changes their controlled state between corpus records.
@@ -115,6 +127,7 @@ class NativeCorpus
     @summary[:compiled_pipelines] = 0
     @summary[:compiled_orderings] = 0
     @summary[:compiled_aggregates] = 0
+    @summary[:compiled_relations] = 0
     @summary[:query_api_records] = @summary[:execute_api_records] = 0
     @summary[:materialized_memory_records] = 0
   end
@@ -154,6 +167,7 @@ class NativeCorpus
         worker.summary[:compiled_pipelines] = NativeCorpusCompilation.pipelines
         worker.summary[:compiled_orderings] = NativeCorpusCompilation.orderings
         worker.summary[:compiled_aggregates] = NativeCorpusCompilation.aggregates
+        worker.summary[:compiled_relations] = NativeCorpusCompilation.relations
         worker.summary
       end
       @summary[:peak_worker_rss_bytes] = [@summary[:peak_worker_rss_bytes], result.peak_rss_bytes].max

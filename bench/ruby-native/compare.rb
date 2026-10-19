@@ -87,6 +87,7 @@ module NativeRubyCompare
     command << '--verify-only' if verify
     command << '--disable-ordering' if lane.start_with?('ruby') && ARGV.include?('--disable-ordering')
     command << '--disable-aggregate' if lane.start_with?('ruby') && ARGV.include?('--disable-aggregate')
+    command << '--disable-relation' if lane.start_with?('ruby') && ARGV.include?('--disable-relation')
     command
   end
 
@@ -188,6 +189,7 @@ module NativeRubyCompare
     report = { schema: 1, phase: phase, verification_only: verify, created_at: Time.now.utc.iso8601,
                ordering_disabled: ARGV.include?('--disable-ordering'),
                aggregate_disabled: ARGV.include?('--disable-aggregate'),
+               relation_disabled: ARGV.include?('--disable-relation'),
                host: host, plan_path: plan_path, plan_sha256: Digest::SHA256.hexdigest(plan_json), plan: plan,
                ruby_source: ENV.fetch('RUBY_NATIVE_SOURCE', File.join(ROOT, 'impl/ruby-native')),
                statuses: statuses, results: results, resources: resources }
