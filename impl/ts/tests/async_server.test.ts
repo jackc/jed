@@ -29,11 +29,17 @@ import { PrivilegeSet } from "../src/privileges.ts";
 import { type Database, setAfterPersistHook } from "../src/shared.ts";
 import { render } from "../src/value.ts";
 
-function harness(core: Database, limits: Partial<RuntimeLimits> = {}, sharedCancellation = true) {
+function harness(
+  core: Database,
+  limits: Partial<RuntimeLimits> = {},
+  sharedCancellation = true,
+  executionClock?: () => number,
+) {
   let receive: (reply: RuntimeReply) => void = () => {};
   const transferredBatches: number[] = [];
   const server = new RuntimeServer({
     open: () => core,
+    executionClock,
     send: (reply, transfer) => {
       const copied = structuredClone(reply, { transfer });
       if (transfer !== undefined) {
@@ -440,7 +446,8 @@ test("message cancellation interrupts a larger fetch before queued work and rele
             pulled++;
             if (pulled === 129) {
               // A message-only abort cannot arrive until the worker gives the task queue a turn.
-              // The source has no checkpoints: the fetch loop must cooperate before 512 rows.
+              // The source has no checkpoints. The injected elapsed clock makes the fetch
+              // loop's first 256-unit checkpoint expire before this batch reaches 512 rows.
               cancelTimer = setTimeout(() => {
                 events.push("cancel sent");
                 queued = db.execute("SELECT 2");
@@ -467,6 +474,7 @@ test("message cancellation interrupts a larger fetch before queued work and rele
     core,
     { maxCursors: 1, maxResultBytes: 256 * 1024 },
     false,
+    () => pulled / 32,
   );
   await connection.call("open", { limits: connection.limits });
   try {
@@ -679,7 +687,8 @@ test("resident filtered scans accept message cancellation before producing a row
   const core = createDatabase();
   core.execute("CREATE TABLE t (id i32)");
   core.execute("INSERT INTO t SELECT g FROM generate_series(1, 2000) g");
-  const { db, connection } = harness(core, {}, false);
+  let clock = 0;
+  const { db, connection } = harness(core, {}, false, () => (clock += 1));
   await connection.call("open");
   const session = await db.session();
   const tx = await session.begin(false);
@@ -712,7 +721,8 @@ test("canceled suspended scripts discard earlier writes and release the writer",
   core.execute("CREATE TABLE source (id i32)");
   core.execute("CREATE TABLE target (id i32)");
   core.execute("INSERT INTO source SELECT g FROM generate_series(1, 2000) g");
-  const { db, connection } = harness(core, {}, false);
+  let clock = 0;
+  const { db, connection } = harness(core, {}, false, () => (clock += 1));
   await connection.call("open");
   const controller = new AbortController();
   const script = db.executeScript(

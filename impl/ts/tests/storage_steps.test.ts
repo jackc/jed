@@ -196,6 +196,7 @@ test("storage steps: resident traversal yields and cancels without restarting ro
   await assert.rejects(
     runAsync(consume(), {
       quantum: 64,
+      timeSliceMs: 0,
       check: () => canceled,
       schedule: (resume) => {
         canceled = true;
