@@ -169,7 +169,34 @@ module NativeRubyFileCompare
       lock_sha256: sha(File.join(directory, 'Cargo.lock')))
   end
 
+  def ts_lock_probe
+    <<~JS
+      import { mkdtempSync, rmSync } from 'node:fs';
+      import { tmpdir } from 'node:os';
+      import { join } from 'node:path';
+      const { osLocks } = await import(#{JSON.generate(File.join(ROOT, 'impl/ts/src/coordinator.ts'))});
+      const directory = mkdtempSync(join(tmpdir(), 'jed-ts-lock-preflight-'));
+      let files;
+      try {
+        // openBundle invokes the production native loader and its ABI check.
+        files = osLocks.openBundle(join(directory, 'probe.jed'));
+        if (!osLocks.tryLock(files.presence, true)) throw new Error('exclusive lock unavailable');
+        osLocks.unlock(files.presence);
+        console.log('Matching native lock ABI loaded; exclusive lock/unlock passed');
+      } finally {
+        if (files) osLocks.closeFiles(files);
+        rmSync(directory, { recursive: true, force: true });
+      }
+    JS
+  end
+
   def prepare_ts
+    lock_check = capture(['node', '--input-type=module', '-e', ts_lock_probe])
+    lock_artifact = File.join(ROOT, 'impl/ts/jed_lock.node')
+    lock_check[:lock_artifact_sha256] = sha(lock_artifact) if File.file?(lock_artifact)
+    lock_check[:coordinator_sha256] = sha(File.join(ROOT, 'impl/ts/src/coordinator.ts'))
+    return lock_check unless lock_check[:status] == 'ready'
+
     directory = File.join(BUILD, 'ts')
     FileUtils.mkdir_p(File.join(directory, 'src'))
     %w[package.json package-lock.json].each { |name| FileUtils.cp(File.join(ROOT, 'bench/ts', name), directory) }
@@ -189,7 +216,7 @@ module NativeRubyFileCompare
     probe = "await import('smol-toml'); await import(#{JSON.generate(File.join(ROOT, 'impl/ts/src/lib.ts'))}); console.log(process.version)"
     status = capture(['node', '--input-type=module', '-e', probe], chdir: directory)
     status.merge(command: ['node', adapted], adapter_sha256: sha(original), overlay_sha256: sha(adapted),
-      library_sha256: sha(File.join(directory, 'src/lib.ts')))
+      library_sha256: sha(File.join(directory, 'src/lib.ts')), lock_preflight: lock_check)
   end
 
   def prepare_ruby(lane, sources)

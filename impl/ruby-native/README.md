@@ -103,6 +103,8 @@ mise run ruby-native:compare:build
 mise run ruby-native:compare:verify
 mise run ruby-native:compare
 RUBY_NATIVE_PHASE=optimized mise run ruby-native:compare
+# The TypeScript file lane needs its existing OS-lock artifact:
+mise run ts:lock_build
 mise run ruby-native:file-compare -- --run
 # Disk SQL audit; default locking is auto (page service):
 JED_NATIVE_STORAGE=disk JED_NATIVE_LOCKING=exclusive mise run ruby-native:conformance
