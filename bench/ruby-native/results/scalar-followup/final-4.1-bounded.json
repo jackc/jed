@@ -1,0 +1,22 @@
+{
+  "command": [
+    "env",
+    "TMPDIR=/tmp",
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "bench/ruby-native/compare.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 44068864,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 4.909341153004789,
+  "source": "/tmp/jed-ruby-scalar-final",
+  "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "final_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "integer_abs: ruby=13129.3ns ruby-yjit=4612.6ns ruby-zjit=5269.0ns\ninteger_arithmetic: ruby=14147.4ns ruby-yjit=5219.3ns ruby-zjit=5975.0ns\nconditional: ruby=18089.4ns ruby-yjit=4954.9ns ruby-zjit=6048.6ns\nnumeric_folds: ruby=20262.1ns ruby-yjit=7377.8ns ruby-zjit=9492.2ns\ndecimal_arithmetic: ruby=35111.4ns ruby-yjit=10451.6ns ruby-zjit=11363.7ns\nfloat_arithmetic: ruby=31798.1ns ruby-yjit=9406.4ns ruby-zjit=11223.0ns\ntext_functions: ruby=31952.8ns ruby-yjit=9742.2ns ruby-zjit=11403.8ns\nmixed_projection: ruby=20530.6ns ruby-yjit=6280.3ns ruby-zjit=7702.3ns\nconstant: ruby=9441.1ns ruby-yjit=3658.0ns ruby-zjit=4037.7ns\nfiltered_scalar: ruby=13569.6ns ruby-yjit=4768.3ns ruby-zjit=5601.6ns\n",
+  "stderr": "compare ruby: ready\ncompare ruby-yjit: ready\ncompare ruby-zjit: ready\ncompare ruby: measuring\ncompare ruby-yjit: measuring\ncompare ruby-zjit: measuring\ncomparison artifact: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/scalar-after-4_1_preview1.json\n"
+}

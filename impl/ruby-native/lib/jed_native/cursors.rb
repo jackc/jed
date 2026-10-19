@@ -85,7 +85,7 @@ module JedNative
     # capture, so retaining the old map preserves the cursor's admission guard.
     # Refresh provenance holds identity-only references, never mutable work.
     SHARED_REFERENCES = %i[@native_domain_routes @native_cursor_metadata
-                           @native_point_cursor_plans @service_roles
+                           @native_point_cursor_plans @native_scalar_cursor_plans @service_roles
                            @native_refreshed_tables @native_refreshed_types].freeze
     COPY_OMISSIONS = (SHARED_CACHES + REPLACED_STATE + SHARED_REFERENCES).to_h { |name| [name, true] }.freeze
 
@@ -138,6 +138,7 @@ module JedNative
             @engine.instance_variable_set(:@native_binding_types, prebound_types)
             @engine.instance_variable_set(:@native_binding_active, true)
           end
+          @engine.instance_variable_set(:@lifetime_cost, session.engine.lifetime_cost)
           result = @engine.run(ast, params)
           unless @engine.instance_variable_get(:@native_cursor_emitted)
             result.rows.each { |row| accept_row(row, result.columns.zip(result.column_types).map { |name, type| { name: name, type: type } }) }
@@ -275,7 +276,7 @@ module JedNative
       transient_pin = !@engine.transaction_open? && !@pinned
       @database.shared_capture(self, pin: true, read: true) if transient_pin
       params = params.map { |value| HostValues.copy(value) }
-      PointRows.build(self, statement, params) || Rows.new(self, statement, params)
+      ScalarRows.build(self, statement, params) || PointRows.build(self, statement, params) || Rows.new(self, statement, params)
     rescue Error
       @engine.instance_variable_set(:@failed, true) if @engine.transaction_open? && $!.sqlstate != '25001'
       raise
@@ -308,3 +309,4 @@ module JedNative
 end
 
 require_relative 'point_cursor'
+require_relative 'scalar_cursor'

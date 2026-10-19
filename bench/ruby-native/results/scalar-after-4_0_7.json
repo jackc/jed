@@ -1,0 +1,977 @@
+{
+  "schema": 1,
+  "phase": "scalar-after-4_0_7",
+  "verification_only": false,
+  "created_at": "2026-10-19T12:11:53Z",
+  "host": {
+    "platform": "x86_64-linux",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+    "processors": 24,
+    "git_commit": "28b12a8acca84c51d1fb4c3b56c58d9c8fae5f07",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+    "openssl": "OpenSSL 3.5.5 27 Jan 2026"
+  },
+  "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compare/scalar-plan.json",
+  "plan_sha256": "d40554de78507fb8888d4d531cc86054cc5cb896d6324330f628e5dccd1e8632",
+  "plan": {
+    "schema": 1,
+    "description": "Explicit scalar follow-up: diverse prepared FROM-less queries, using the existing adapters and integer parameter schedule. The default seven-query comparison plan is unchanged.",
+    "rows": 1000,
+    "repetitions": 5,
+    "validation_iterations": 32,
+    "workloads": [
+      {
+        "name": "integer_abs",
+        "sql": "SELECT abs($1::i64) + 7",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "integer_arithmetic",
+        "sql": "SELECT ($1::i64 * 3 - 2) / 5",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "conditional",
+        "sql": "SELECT CASE WHEN $1::i64 BETWEEN -100 AND 100 THEN 1 ELSE 0 END",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "numeric_folds",
+        "sql": "SELECT greatest($1::i64, 17), least($1::i64, 17), coalesce(nullif($1::i64, 17), 0)",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "decimal_arithmetic",
+        "sql": "SELECT (($1::i64)::decimal * 3::decimal + 2::decimal)::i64",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "float_arithmetic",
+        "sql": "SELECT sqrt(abs(($1::i64)::f64))::i64",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "text_functions",
+        "sql": "SELECT length(reverse(lower('AbCdEfGhIj'))) + $1::i64",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "mixed_projection",
+        "sql": "SELECT $1::i64, abs($1::i64), ($1::i64)::text",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      },
+      {
+        "name": "constant",
+        "sql": "SELECT 42::i64",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": 0,
+        "step": 0,
+        "span": 0
+      },
+      {
+        "name": "filtered_scalar",
+        "sql": "SELECT $1::i64 + 1 WHERE $1::i64 > 0",
+        "iterations": 2000,
+        "warmup": 300,
+        "offset": -999,
+        "step": 17,
+        "span": 2000
+      }
+    ]
+  },
+  "ruby_source": "/tmp/jed-ruby-scalar-final",
+  "statuses": {
+    "go": {
+      "status": "ready",
+      "detail": ""
+    },
+    "rust": {
+      "status": "ready",
+      "detail": "    Finished `release` profile [optimized] target(s) in 0.00s\n"
+    },
+    "ruby": {
+      "status": "ready",
+      "detail": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]\n"
+    },
+    "ruby-yjit": {
+      "status": "ready",
+      "detail": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]\n"
+    },
+    "ts": {
+      "status": "ready",
+      "detail": "v26.10.0\n"
+    }
+  },
+  "results": {
+    "ruby": [
+      {
+        "workload": "integer_abs",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          30020885,
+          33912713,
+          28832685,
+          28388355,
+          28512073
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "integer_arithmetic",
+        "checksum": "d4b792a43c753e1e",
+        "validation_rows": 32,
+        "samples_ns": [
+          31105999,
+          30848978,
+          30895095,
+          30841145,
+          31038049
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "conditional",
+        "checksum": "d038188a18676785",
+        "validation_rows": 32,
+        "samples_ns": [
+          40062370,
+          40129661,
+          40111538,
+          40022418,
+          39937692
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "numeric_folds",
+        "checksum": "cb6d7c2a6d459237",
+        "validation_rows": 32,
+        "samples_ns": [
+          43963115,
+          44118235,
+          43822366,
+          43776312,
+          44136238
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "decimal_arithmetic",
+        "checksum": "2583202bced3a89d",
+        "validation_rows": 32,
+        "samples_ns": [
+          77752674,
+          77772292,
+          77914329,
+          77389981,
+          77196426
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "float_arithmetic",
+        "checksum": "67102845c51b87fa",
+        "validation_rows": 32,
+        "samples_ns": [
+          69644226,
+          69461712,
+          69178749,
+          68983357,
+          68944724
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "text_functions",
+        "checksum": "047f91cac1e31456",
+        "validation_rows": 32,
+        "samples_ns": [
+          69651364,
+          69060542,
+          68859538,
+          69185399,
+          69193968
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "mixed_projection",
+        "checksum": "d8dd2c01e9cec028",
+        "validation_rows": 32,
+        "samples_ns": [
+          45195736,
+          44633344,
+          45000884,
+          44997889,
+          45598130
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "constant",
+        "checksum": "1b9f7bf95381afa5",
+        "validation_rows": 32,
+        "samples_ns": [
+          20948469,
+          20766514,
+          20709097,
+          20764929,
+          20950193
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "filtered_scalar",
+        "checksum": "cbf29ce484222325",
+        "validation_rows": 0,
+        "samples_ns": [
+          29695385,
+          29494082,
+          29767084,
+          29656746,
+          29523034
+        ],
+        "rows_total": 5000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]"
+      }
+    ],
+    "ruby-yjit": [
+      {
+        "workload": "integer_abs",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          12110980,
+          10739766,
+          10211307,
+          10375387,
+          10340481
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "integer_arithmetic",
+        "checksum": "d4b792a43c753e1e",
+        "validation_rows": 32,
+        "samples_ns": [
+          12208575,
+          11685716,
+          11532181,
+          11589329,
+          11539137
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "conditional",
+        "checksum": "d038188a18676785",
+        "validation_rows": 32,
+        "samples_ns": [
+          17794277,
+          11448638,
+          11013281,
+          10886458,
+          11140593
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "numeric_folds",
+        "checksum": "cb6d7c2a6d459237",
+        "validation_rows": 32,
+        "samples_ns": [
+          16906161,
+          16296005,
+          16424390,
+          16270499,
+          16344940
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "decimal_arithmetic",
+        "checksum": "2583202bced3a89d",
+        "validation_rows": 32,
+        "samples_ns": [
+          24438995,
+          24048152,
+          23254540,
+          23360035,
+          23021437
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "float_arithmetic",
+        "checksum": "67102845c51b87fa",
+        "validation_rows": 32,
+        "samples_ns": [
+          28274364,
+          20967991,
+          20764862,
+          20707411,
+          21132698
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "text_functions",
+        "checksum": "047f91cac1e31456",
+        "validation_rows": 32,
+        "samples_ns": [
+          22306871,
+          21904180,
+          21676548,
+          21514021,
+          21880476
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "mixed_projection",
+        "checksum": "d8dd2c01e9cec028",
+        "validation_rows": 32,
+        "samples_ns": [
+          14507383,
+          14289825,
+          14331249,
+          14458559,
+          14594248
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "constant",
+        "checksum": "1b9f7bf95381afa5",
+        "validation_rows": 32,
+        "samples_ns": [
+          8740848,
+          8639409,
+          8380235,
+          8216438,
+          8477297
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      },
+      {
+        "workload": "filtered_scalar",
+        "checksum": "cbf29ce484222325",
+        "validation_rows": 0,
+        "samples_ns": [
+          11057560,
+          10853585,
+          10845603,
+          10864770,
+          10777560
+        ],
+        "rows_total": 5000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]"
+      }
+    ],
+    "go": [
+      {
+        "checksum": "4f2c86bbdc99682d",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1849153,
+          1637509,
+          1572144,
+          1478691,
+          1503731
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "integer_abs"
+      },
+      {
+        "checksum": "d4b792a43c753e1e",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1541337,
+          1425806,
+          1508419,
+          1564683,
+          1430081
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "integer_arithmetic"
+      },
+      {
+        "checksum": "d038188a18676785",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1621227,
+          1474343,
+          1581188,
+          1635377,
+          1593431
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "conditional"
+      },
+      {
+        "checksum": "cb6d7c2a6d459237",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1814220,
+          1794981,
+          1922081,
+          1964578,
+          1794418
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "numeric_folds"
+      },
+      {
+        "checksum": "2583202bced3a89d",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          2236850,
+          1794279,
+          2059022,
+          2572639,
+          2184164
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "decimal_arithmetic"
+      },
+      {
+        "checksum": "67102845c51b87fa",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1729140,
+          1672651,
+          1718400,
+          1733811,
+          1463858
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "float_arithmetic"
+      },
+      {
+        "checksum": "047f91cac1e31456",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1953153,
+          1690368,
+          2321601,
+          2110711,
+          2027594
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "text_functions"
+      },
+      {
+        "checksum": "d8dd2c01e9cec028",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1778938,
+          1731603,
+          1740181,
+          1541711,
+          1160858
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "mixed_projection"
+      },
+      {
+        "checksum": "1b9f7bf95381afa5",
+        "iterations": 2000,
+        "rows_total": 10000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          952200,
+          1206028,
+          1155081,
+          1132962,
+          1120925
+        ],
+        "validation_rows": 32,
+        "warmup": 300,
+        "workload": "constant"
+      },
+      {
+        "checksum": "cbf29ce484222325",
+        "iterations": 2000,
+        "rows_total": 5000,
+        "runtime": "go1.27.1",
+        "samples_ns": [
+          1461104,
+          1433871,
+          1369769,
+          1409626,
+          1363275
+        ],
+        "validation_rows": 0,
+        "warmup": 300,
+        "workload": "filtered_scalar"
+      }
+    ],
+    "rust": [
+      {
+        "workload": "integer_abs",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          2854982,
+          2840705,
+          2845932,
+          2851255,
+          2833995
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "integer_arithmetic",
+        "checksum": "d4b792a43c753e1e",
+        "validation_rows": 32,
+        "samples_ns": [
+          2902432,
+          2900855,
+          2900378,
+          2754692,
+          2416348
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "conditional",
+        "checksum": "d038188a18676785",
+        "validation_rows": 32,
+        "samples_ns": [
+          2410617,
+          2411564,
+          2405820,
+          2390330,
+          2381005
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "numeric_folds",
+        "checksum": "cb6d7c2a6d459237",
+        "validation_rows": 32,
+        "samples_ns": [
+          2603080,
+          2592517,
+          2592345,
+          2596753,
+          2580026
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "decimal_arithmetic",
+        "checksum": "2583202bced3a89d",
+        "validation_rows": 32,
+        "samples_ns": [
+          2677891,
+          2694576,
+          2667047,
+          2705857,
+          2692794
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "float_arithmetic",
+        "checksum": "67102845c51b87fa",
+        "validation_rows": 32,
+        "samples_ns": [
+          2410980,
+          2413943,
+          2411477,
+          2405648,
+          2395590
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "text_functions",
+        "checksum": "047f91cac1e31456",
+        "validation_rows": 32,
+        "samples_ns": [
+          2517711,
+          2509992,
+          2514016,
+          2507037,
+          2495470
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "mixed_projection",
+        "checksum": "d8dd2c01e9cec028",
+        "validation_rows": 32,
+        "samples_ns": [
+          2475442,
+          2480323,
+          2470602,
+          2475091,
+          2473399
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "constant",
+        "checksum": "1b9f7bf95381afa5",
+        "validation_rows": 32,
+        "samples_ns": [
+          2239133,
+          2239798,
+          2236602,
+          2230981,
+          2238368
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      },
+      {
+        "workload": "filtered_scalar",
+        "checksum": "cbf29ce484222325",
+        "validation_rows": 0,
+        "samples_ns": [
+          2327301,
+          2327251,
+          2323150,
+          2322315,
+          2328722
+        ],
+        "rows_total": 5000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "rust-release"
+      }
+    ],
+    "ts": [
+      {
+        "workload": "integer_abs",
+        "checksum": "4f2c86bbdc99682d",
+        "validation_rows": 32,
+        "samples_ns": [
+          8776509,
+          5008774,
+          4830350,
+          4682629,
+          4481918
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "integer_arithmetic",
+        "checksum": "d4b792a43c753e1e",
+        "validation_rows": 32,
+        "samples_ns": [
+          4647094,
+          4257982,
+          4810972,
+          5035434,
+          3734595
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "conditional",
+        "checksum": "d038188a18676785",
+        "validation_rows": 32,
+        "samples_ns": [
+          4991602,
+          4026718,
+          3699427,
+          3522818,
+          3435710
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "numeric_folds",
+        "checksum": "cb6d7c2a6d459237",
+        "validation_rows": 32,
+        "samples_ns": [
+          5131889,
+          4171108,
+          4075220,
+          3690701,
+          3541303
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "decimal_arithmetic",
+        "checksum": "2583202bced3a89d",
+        "validation_rows": 32,
+        "samples_ns": [
+          5405765,
+          5000869,
+          4586554,
+          4513103,
+          4266702
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "float_arithmetic",
+        "checksum": "67102845c51b87fa",
+        "validation_rows": 32,
+        "samples_ns": [
+          4315572,
+          3737012,
+          3816796,
+          3775808,
+          3886634
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "text_functions",
+        "checksum": "047f91cac1e31456",
+        "validation_rows": 32,
+        "samples_ns": [
+          5791669,
+          5405172,
+          4581579,
+          4593340,
+          4621326
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "mixed_projection",
+        "checksum": "d8dd2c01e9cec028",
+        "validation_rows": 32,
+        "samples_ns": [
+          3377341,
+          3303838,
+          3094587,
+          3140299,
+          3107656
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "constant",
+        "checksum": "1b9f7bf95381afa5",
+        "validation_rows": 32,
+        "samples_ns": [
+          1971649,
+          1926375,
+          1780616,
+          1773160,
+          1818114
+        ],
+        "rows_total": 10000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      },
+      {
+        "workload": "filtered_scalar",
+        "checksum": "cbf29ce484222325",
+        "validation_rows": 0,
+        "samples_ns": [
+          3402316,
+          2954010,
+          2759369,
+          2786202,
+          2784666
+        ],
+        "rows_total": 5000,
+        "iterations": 2000,
+        "warmup": 300,
+        "runtime": "v26.10.0"
+      }
+    ]
+  },
+  "resources": {
+    "ruby": {
+      "peak_rss_bytes": 50569216,
+      "memory_limit_bytes": 536870912
+    },
+    "ruby-yjit": {
+      "peak_rss_bytes": 60284928,
+      "memory_limit_bytes": 536870912
+    },
+    "go": {
+      "peak_rss_bytes": 18870272,
+      "memory_limit_bytes": 536870912
+    },
+    "rust": {
+      "peak_rss_bytes": 14598144,
+      "memory_limit_bytes": 536870912
+    },
+    "ts": {
+      "peak_rss_bytes": 229199872,
+      "memory_limit_bytes": 536870912
+    }
+  },
+  "ruby_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "ruby_source_sha256_after": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28"
+}

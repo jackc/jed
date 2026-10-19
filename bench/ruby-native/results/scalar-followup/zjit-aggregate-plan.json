@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "description": "Explicit ZJIT aggregation warmup diagnostic; separate from canonical comparison",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {
+      "name": "aggregate",
+      "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+      "iterations": 300,
+      "warmup": 500,
+      "offset": 0,
+      "step": 1,
+      "span": 10
+    }
+  ]
+}

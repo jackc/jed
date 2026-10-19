@@ -1,0 +1,20 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "impl/ruby-native/test/scalar_cursor_test.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 49315840,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 1073741824,
+  "timeout_seconds": 60.0,
+  "elapsed_seconds": 0.35659940300683957,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "final_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "ruby-native scalar cursor: ordinary parity, lazy failures, budgets, ownership and lifecycle passed\n",
+  "stderr": ""
+}

@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "phase": "scalar-zjit-warm-after",
+  "verification_only": false,
+  "created_at": "2026-10-19T12:18:53Z",
+  "host": {
+    "platform": "x86_64-linux",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+    "processors": 24,
+    "git_commit": "28b12a8acca84c51d1fb4c3b56c58d9c8fae5f07",
+    "rust": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "go": "go version go1.27.1 linux/amd64",
+    "node": "v26.10.0",
+    "ruby": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +PRISM [x86_64-linux]",
+    "openssl": "OpenSSL 3.5.5 27 Jan 2026"
+  },
+  "plan_path": "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/scalar-followup/zjit-aggregate-plan.json",
+  "plan_sha256": "5420543f3d2f58b66fa6be5379a04ea2747de7592d3da348e9077b23bcff9b90",
+  "plan": {
+    "schema": 1,
+    "description": "Explicit ZJIT aggregation warmup diagnostic; separate from canonical comparison",
+    "rows": 1000,
+    "repetitions": 5,
+    "validation_iterations": 32,
+    "workloads": [
+      {
+        "name": "aggregate",
+        "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+        "iterations": 300,
+        "warmup": 500,
+        "offset": 0,
+        "step": 1,
+        "span": 10
+      }
+    ]
+  },
+  "ruby_source": "/tmp/jed-ruby-scalar-final",
+  "statuses": {
+    "ruby-zjit": {
+      "status": "ready",
+      "detail": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]\n"
+    }
+  },
+  "results": {
+    "ruby-zjit": [
+      {
+        "workload": "aggregate",
+        "checksum": "95913d368b1ddc2c",
+        "validation_rows": 32,
+        "samples_ns": [
+          135776534,
+          134755596,
+          135592663,
+          129629124,
+          141879242
+        ],
+        "rows_total": 1500,
+        "iterations": 300,
+        "warmup": 500,
+        "runtime": "ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]"
+      }
+    ]
+  },
+  "resources": {
+    "ruby-zjit": {
+      "peak_rss_bytes": 66658304,
+      "memory_limit_bytes": 536870912
+    }
+  },
+  "ruby_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "ruby_source_sha256_after": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28"
+}

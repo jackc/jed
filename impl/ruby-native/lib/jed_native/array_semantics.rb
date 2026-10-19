@@ -117,7 +117,7 @@ module JedNative
         raise Error.new('0A000', 'function requires a one-dimensional array') if args[0] && args[0].dimensions.length > 1
         raise Error.new('22004', 'initial subscript must not be NULL') if name == 'array_position' && args.length == 3 && args[2].nil?
       end
-      super
+      super(name, args, context: context, arg_types: arg_types)
     end
   end
   Functions.singleton_class.prepend(ArrayFunctionRules)

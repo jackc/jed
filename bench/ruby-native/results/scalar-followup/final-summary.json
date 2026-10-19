@@ -1,0 +1,2027 @@
+{
+  "checked_at": "2026-10-19T12:19:44Z",
+  "passed": true,
+  "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "baseline_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+  "memory_cells": [
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "integer_abs",
+      "microseconds": 58.773729
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "integer_arithmetic",
+      "microseconds": 50.424543
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "conditional",
+      "microseconds": 139.1688015
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "numeric_folds",
+      "microseconds": 78.8817075
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "decimal_arithmetic",
+      "microseconds": 76.155828
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "float_arithmetic",
+      "microseconds": 76.113821
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "text_functions",
+      "microseconds": 76.7716875
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "mixed_projection",
+      "microseconds": 69.4913215
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "constant",
+      "microseconds": 44.492617
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "filtered_scalar",
+      "microseconds": 50.6302845
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "integer_abs",
+      "microseconds": 23.416863
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "integer_arithmetic",
+      "microseconds": 19.6069965
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "conditional",
+      "microseconds": 69.525176
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "numeric_folds",
+      "microseconds": 30.5428085
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "decimal_arithmetic",
+      "microseconds": 33.985585
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "float_arithmetic",
+      "microseconds": 30.8877695
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "text_functions",
+      "microseconds": 30.5171035
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "mixed_projection",
+      "microseconds": 25.9770055
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "constant",
+      "microseconds": 17.7189195
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scalar",
+      "microseconds": 18.887691
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "integer_abs",
+      "microseconds": 0.860384
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "integer_arithmetic",
+      "microseconds": 0.761
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "conditional",
+      "microseconds": 0.809054
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "numeric_folds",
+      "microseconds": 1.007457
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "decimal_arithmetic",
+      "microseconds": 1.158053
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "float_arithmetic",
+      "microseconds": 0.837217
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "text_functions",
+      "microseconds": 0.966367
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "mixed_projection",
+      "microseconds": 0.7701675
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "constant",
+      "microseconds": 0.6149705
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "filtered_scalar",
+      "microseconds": 0.69963
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "integer_abs",
+      "microseconds": 1.4384775
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "integer_arithmetic",
+      "microseconds": 1.450522
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "conditional",
+      "microseconds": 1.4741295
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "numeric_folds",
+      "microseconds": 1.6032625
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "decimal_arithmetic",
+      "microseconds": 1.3521165
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "float_arithmetic",
+      "microseconds": 1.1918635
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "text_functions",
+      "microseconds": 1.24148
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "mixed_projection",
+      "microseconds": 1.230064
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "constant",
+      "microseconds": 1.0589125
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "filtered_scalar",
+      "microseconds": 1.147466
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "integer_abs",
+      "microseconds": 2.4021125
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "integer_arithmetic",
+      "microseconds": 2.1163015
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "conditional",
+      "microseconds": 1.6525185
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "numeric_folds",
+      "microseconds": 1.8195645
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "decimal_arithmetic",
+      "microseconds": 2.1214145
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "float_arithmetic",
+      "microseconds": 1.7384885
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "text_functions",
+      "microseconds": 2.035364
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "mixed_projection",
+      "microseconds": 1.2871105
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "constant",
+      "microseconds": 0.825137
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "filtered_scalar",
+      "microseconds": 1.1948085
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "integer_abs",
+      "microseconds": 53.624341
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "integer_arithmetic",
+      "microseconds": 45.5916185
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "conditional",
+      "microseconds": 128.450254
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "numeric_folds",
+      "microseconds": 70.7836365
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "decimal_arithmetic",
+      "microseconds": 66.634777
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "float_arithmetic",
+      "microseconds": 64.8563495
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "text_functions",
+      "microseconds": 65.0997875
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "mixed_projection",
+      "microseconds": 61.327108
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "constant",
+      "microseconds": 39.4990445
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "filtered_scalar",
+      "microseconds": 45.4258655
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "integer_abs",
+      "microseconds": 19.5073705
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "integer_arithmetic",
+      "microseconds": 15.474136
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "conditional",
+      "microseconds": 51.678898
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "numeric_folds",
+      "microseconds": 24.7670295
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "decimal_arithmetic",
+      "microseconds": 23.847075
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "float_arithmetic",
+      "microseconds": 23.2627285
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "text_functions",
+      "microseconds": 22.686331
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "mixed_projection",
+      "microseconds": 20.2522645
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "constant",
+      "microseconds": 13.4156495
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scalar",
+      "microseconds": 15.054156
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "integer_abs",
+      "microseconds": 21.6084735
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "integer_arithmetic",
+      "microseconds": 18.0212315
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "conditional",
+      "microseconds": 53.132583
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "numeric_folds",
+      "microseconds": 28.4976335
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "decimal_arithmetic",
+      "microseconds": 26.1500585
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "float_arithmetic",
+      "microseconds": 27.315234
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "text_functions",
+      "microseconds": 26.4518505
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "mixed_projection",
+      "microseconds": 25.586413
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "constant",
+      "microseconds": 16.431428
+    },
+    {
+      "phase": "scalar-before",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "filtered_scalar",
+      "microseconds": 18.602259
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "integer_abs",
+      "microseconds": 14.4163425
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "integer_arithmetic",
+      "microseconds": 15.4475475
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "conditional",
+      "microseconds": 20.031185
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "numeric_folds",
+      "microseconds": 21.9815575
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "decimal_arithmetic",
+      "microseconds": 38.876337
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "float_arithmetic",
+      "microseconds": 34.5893745
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "text_functions",
+      "microseconds": 34.5926995
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "mixed_projection",
+      "microseconds": 22.500442
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "constant",
+      "microseconds": 10.383257
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "filtered_scalar",
+      "microseconds": 14.828373
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "integer_abs",
+      "microseconds": 5.1876935
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "integer_arithmetic",
+      "microseconds": 5.7946645
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "conditional",
+      "microseconds": 5.5702965
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "numeric_folds",
+      "microseconds": 8.17247
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "decimal_arithmetic",
+      "microseconds": 11.6800175
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "float_arithmetic",
+      "microseconds": 10.4839955
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "text_functions",
+      "microseconds": 10.940238
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "mixed_projection",
+      "microseconds": 7.2292795
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "constant",
+      "microseconds": 4.2386485
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scalar",
+      "microseconds": 5.4267925
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "integer_abs",
+      "microseconds": 0.786072
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "integer_arithmetic",
+      "microseconds": 0.7542095
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "conditional",
+      "microseconds": 0.7967155
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "numeric_folds",
+      "microseconds": 0.90711
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "decimal_arithmetic",
+      "microseconds": 1.092082
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "float_arithmetic",
+      "microseconds": 0.8592
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "text_functions",
+      "microseconds": 1.013797
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "mixed_projection",
+      "microseconds": 0.8658015
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "constant",
+      "microseconds": 0.566481
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "filtered_scalar",
+      "microseconds": 0.704813
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "integer_abs",
+      "microseconds": 1.422966
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "integer_arithmetic",
+      "microseconds": 1.450189
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "conditional",
+      "microseconds": 1.20291
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "numeric_folds",
+      "microseconds": 1.2962585
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "decimal_arithmetic",
+      "microseconds": 1.346397
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "float_arithmetic",
+      "microseconds": 1.20549
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "text_functions",
+      "microseconds": 1.254996
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "mixed_projection",
+      "microseconds": 1.2375455
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "constant",
+      "microseconds": 1.119184
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "filtered_scalar",
+      "microseconds": 1.1636255
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "integer_abs",
+      "microseconds": 2.415175
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "integer_arithmetic",
+      "microseconds": 2.323547
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "conditional",
+      "microseconds": 1.8497135
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "numeric_folds",
+      "microseconds": 2.03761
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "decimal_arithmetic",
+      "microseconds": 2.293277
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "float_arithmetic",
+      "microseconds": 1.908398
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "text_functions",
+      "microseconds": 2.310663
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "mixed_projection",
+      "microseconds": 1.5701495
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "constant",
+      "microseconds": 0.909057
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "filtered_scalar",
+      "microseconds": 1.393101
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "integer_abs",
+      "microseconds": 13.129258
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "integer_arithmetic",
+      "microseconds": 14.1473915
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "conditional",
+      "microseconds": 18.089356
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "numeric_folds",
+      "microseconds": 20.262134
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "decimal_arithmetic",
+      "microseconds": 35.111364
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "float_arithmetic",
+      "microseconds": 31.7981435
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "text_functions",
+      "microseconds": 31.9528145
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "mixed_projection",
+      "microseconds": 20.530575
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "constant",
+      "microseconds": 9.44112
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "filtered_scalar",
+      "microseconds": 13.569572
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "integer_abs",
+      "microseconds": 4.6126315
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "integer_arithmetic",
+      "microseconds": 5.219326
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "conditional",
+      "microseconds": 4.9548595
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "numeric_folds",
+      "microseconds": 7.3778465
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "decimal_arithmetic",
+      "microseconds": 10.4515855
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "float_arithmetic",
+      "microseconds": 9.4063795
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "text_functions",
+      "microseconds": 9.7421765
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "mixed_projection",
+      "microseconds": 6.2802915
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "constant",
+      "microseconds": 3.6579865
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scalar",
+      "microseconds": 4.768307
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "integer_abs",
+      "microseconds": 5.268957
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "integer_arithmetic",
+      "microseconds": 5.975029
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "conditional",
+      "microseconds": 6.0486115
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "numeric_folds",
+      "microseconds": 9.492243
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "decimal_arithmetic",
+      "microseconds": 11.363714
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "float_arithmetic",
+      "microseconds": 11.222982
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "text_functions",
+      "microseconds": 11.4037655
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "mixed_projection",
+      "microseconds": 7.7023095
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "constant",
+      "microseconds": 4.0376705
+    },
+    {
+      "phase": "scalar-after",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "filtered_scalar",
+      "microseconds": 5.601646
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds": 13.893072
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds": 8.79493
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds": 6.701993333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds": 904.0586333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds": 760.426
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds": 1431.7685333333334
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds": 1719.8683333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds": 5.170584
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds": 3.9869433333333335
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds": 3.55496
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds": 330.14006666666666
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds": 301.27613333333335
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds": 680.9378
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds": 912.7592
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "scalar",
+      "microseconds": 0.7770315
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_hit",
+      "microseconds": 1.4331133333333332
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "pk_miss",
+      "microseconds": 1.0537533333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "filtered_scan",
+      "microseconds": 169.67646666666667
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "aggregate",
+      "microseconds": 64.8594
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "group",
+      "microseconds": 256.763
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "go",
+      "workload": "sort_limit",
+      "microseconds": 204.79513333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "scalar",
+      "microseconds": 1.3747035
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_hit",
+      "microseconds": 2.22348
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "pk_miss",
+      "microseconds": 1.7786533333333334
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "filtered_scan",
+      "microseconds": 107.9566
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "aggregate",
+      "microseconds": 62.05433333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "group",
+      "microseconds": 166.763
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "rust",
+      "workload": "sort_limit",
+      "microseconds": 129.32233333333335
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "scalar",
+      "microseconds": 2.083548
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_hit",
+      "microseconds": 4.568193333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "pk_miss",
+      "microseconds": 3.0211733333333335
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "filtered_scan",
+      "microseconds": 303.30013333333335
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "aggregate",
+      "microseconds": 166.4435
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "group",
+      "microseconds": 431.0408
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_0_7",
+      "lane": "ts",
+      "workload": "sort_limit",
+      "microseconds": 319.7201333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "scalar",
+      "microseconds": 13.509699
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_hit",
+      "microseconds": 8.655063333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "pk_miss",
+      "microseconds": 6.368626666666667
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "filtered_scan",
+      "microseconds": 905.3105333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "aggregate",
+      "microseconds": 745.7072333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "group",
+      "microseconds": 1394.9050666666667
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby",
+      "workload": "sort_limit",
+      "microseconds": 1680.8107333333332
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "scalar",
+      "microseconds": 4.787826
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_hit",
+      "microseconds": 4.003616666666667
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "pk_miss",
+      "microseconds": 3.32924
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "filtered_scan",
+      "microseconds": 301.8541
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "aggregate",
+      "microseconds": 293.12176666666664
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "group",
+      "microseconds": 671.4258
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-yjit",
+      "workload": "sort_limit",
+      "microseconds": 951.83
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "scalar",
+      "microseconds": 5.555906
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_hit",
+      "microseconds": 4.44947
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "pk_miss",
+      "microseconds": 3.5284233333333335
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "filtered_scan",
+      "microseconds": 528.7919666666667
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "aggregate",
+      "microseconds": 561.0042333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "group",
+      "microseconds": 875.4337333333333
+    },
+    {
+      "phase": "scalar-regression",
+      "runtime": "4_1_preview1",
+      "lane": "ruby-zjit",
+      "workload": "sort_limit",
+      "microseconds": 1116.6257333333333
+    }
+  ],
+  "file_cells": [
+    {
+      "run": "final-file-point-4.0.7",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 16.4127612
+    },
+    {
+      "run": "final-file-point-4.0.7",
+      "lane": "go",
+      "workload": "point_lookup_pk",
+      "microseconds": 2.84087328
+    },
+    {
+      "run": "final-file-point-4.0.7",
+      "lane": "rust",
+      "workload": "point_lookup_pk",
+      "microseconds": 2.37376998
+    },
+    {
+      "run": "final-file-point-4.0.7",
+      "lane": "ts",
+      "workload": "point_lookup_pk",
+      "microseconds": 7.52876742
+    },
+    {
+      "run": "final-file-point-4.1-preview1",
+      "lane": "ruby-yjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 16.7067825
+    },
+    {
+      "run": "final-file-point-4.1-preview1",
+      "lane": "ruby-zjit",
+      "workload": "point_lookup_pk",
+      "microseconds": 17.74273838
+    }
+  ],
+  "profile_cells": [
+    {
+      "api": "query",
+      "workload": "integer_abs",
+      "before": {
+        "microseconds": 20.4330435,
+        "allocations": 147.0
+      },
+      "after": {
+        "microseconds": 4.569795500000001,
+        "allocations": 35.0
+      }
+    },
+    {
+      "api": "query",
+      "workload": "integer_arithmetic",
+      "before": {
+        "microseconds": 17.895089,
+        "allocations": 125.0
+      },
+      "after": {
+        "microseconds": 5.093930500000001,
+        "allocations": 34.0
+      }
+    },
+    {
+      "api": "query",
+      "workload": "conditional",
+      "before": {
+        "microseconds": 54.908809,
+        "allocations": 484.1005
+      },
+      "after": {
+        "microseconds": 4.8438985,
+        "allocations": 34.1005
+      }
+    },
+    {
+      "api": "query",
+      "workload": "numeric_folds",
+      "before": {
+        "microseconds": 24.498006,
+        "allocations": 197.0
+      },
+      "after": {
+        "microseconds": 7.224251000000001,
+        "allocations": 50.0
+      }
+    },
+    {
+      "api": "query",
+      "workload": "decimal_arithmetic",
+      "before": {
+        "microseconds": 23.7963515,
+        "allocations": 196.999
+      },
+      "after": {
+        "microseconds": 10.217068,
+        "allocations": 65.999
+      }
+    },
+    {
+      "api": "query",
+      "workload": "float_arithmetic",
+      "before": {
+        "microseconds": 23.114095499999998,
+        "allocations": 201.0
+      },
+      "after": {
+        "microseconds": 9.273312,
+        "allocations": 64.0
+      }
+    },
+    {
+      "api": "query",
+      "workload": "text_functions",
+      "before": {
+        "microseconds": 22.981475999999997,
+        "allocations": 193.0
+      },
+      "after": {
+        "microseconds": 9.637602500000002,
+        "allocations": 73.0
+      }
+    },
+    {
+      "api": "query",
+      "workload": "mixed_projection",
+      "before": {
+        "microseconds": 20.3321705,
+        "allocations": 172.0005
+      },
+      "after": {
+        "microseconds": 6.2946735,
+        "allocations": 46.0005
+      }
+    },
+    {
+      "api": "query",
+      "workload": "constant",
+      "before": {
+        "microseconds": 13.650124,
+        "allocations": 124.0
+      },
+      "after": {
+        "microseconds": 3.5829834999999997,
+        "allocations": 33.0
+      }
+    },
+    {
+      "api": "query",
+      "workload": "filtered_scalar",
+      "before": {
+        "microseconds": 15.1232795,
+        "allocations": 125.0
+      },
+      "after": {
+        "microseconds": 4.693126,
+        "allocations": 35.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "integer_abs",
+      "before": {
+        "microseconds": 10.2898945,
+        "allocations": 140.0
+      },
+      "after": {
+        "microseconds": 7.9764715,
+        "allocations": 120.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "integer_arithmetic",
+      "before": {
+        "microseconds": 9.261469,
+        "allocations": 130.0
+      },
+      "after": {
+        "microseconds": 8.92549,
+        "allocations": 130.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "conditional",
+      "before": {
+        "microseconds": 42.3151695,
+        "allocations": 489.1005
+      },
+      "after": {
+        "microseconds": 43.227203,
+        "allocations": 489.1005
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "numeric_folds",
+      "before": {
+        "microseconds": 19.419931499999997,
+        "allocations": 228.0
+      },
+      "after": {
+        "microseconds": 13.64974,
+        "allocations": 180.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "decimal_arithmetic",
+      "before": {
+        "microseconds": 17.0546175,
+        "allocations": 209.999
+      },
+      "after": {
+        "microseconds": 15.179602999999998,
+        "allocations": 169.999
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "float_arithmetic",
+      "before": {
+        "microseconds": 15.603429,
+        "allocations": 198.0
+      },
+      "after": {
+        "microseconds": 13.413844999999998,
+        "allocations": 154.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "text_functions",
+      "before": {
+        "microseconds": 15.506937,
+        "allocations": 185.0
+      },
+      "after": {
+        "microseconds": 14.00382,
+        "allocations": 159.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "mixed_projection",
+      "before": {
+        "microseconds": 14.067298000000001,
+        "allocations": 179.0005
+      },
+      "after": {
+        "microseconds": 10.769868500000001,
+        "allocations": 149.0005
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "constant",
+      "before": {
+        "microseconds": 6.5689785,
+        "allocations": 105.0
+      },
+      "after": {
+        "microseconds": 6.0581265,
+        "allocations": 105.0
+      }
+    },
+    {
+      "api": "execute",
+      "workload": "filtered_scalar",
+      "before": {
+        "microseconds": 9.303055500000001,
+        "allocations": 134.0
+      },
+      "after": {
+        "microseconds": 8.554789000000001,
+        "allocations": 134.0
+      }
+    }
+  ],
+  "zjit_controls": [
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "scalar",
+      "microseconds": 21.849687
+    },
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "pk_hit",
+      "microseconds": 4.423046666666667
+    },
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "pk_miss",
+      "microseconds": 3.3523733333333334
+    },
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "filtered_scan",
+      "microseconds": 490.8007333333333
+    },
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "aggregate",
+      "microseconds": 490.1811
+    },
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "group",
+      "microseconds": 846.1406666666667
+    },
+    {
+      "run": "scalar-regression-control-before-1",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "sort_limit",
+      "microseconds": 1086.8660666666667
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "scalar",
+      "microseconds": 5.3081225
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "pk_hit",
+      "microseconds": 4.259813333333334
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "pk_miss",
+      "microseconds": 3.1970033333333334
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "filtered_scan",
+      "microseconds": 503.98086666666666
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "aggregate",
+      "microseconds": 538.0359666666667
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "group",
+      "microseconds": 843.0667333333333
+    },
+    {
+      "run": "scalar-regression-control-after-1",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "sort_limit",
+      "microseconds": 1088.5034666666666
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "scalar",
+      "microseconds": 5.40405
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "pk_hit",
+      "microseconds": 4.2990466666666665
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "pk_miss",
+      "microseconds": 3.5576166666666666
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "filtered_scan",
+      "microseconds": 515.9600666666666
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "aggregate",
+      "microseconds": 534.1201666666667
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "group",
+      "microseconds": 894.2156666666667
+    },
+    {
+      "run": "scalar-regression-control-split",
+      "source_sha256": "c6b98be7a1ea7e039fbd6393b26d3784192546fcb8cbaf38f7f79af266ef9b47",
+      "workload": "sort_limit",
+      "microseconds": 1134.3286
+    },
+    {
+      "run": "scalar-zjit-warm-before",
+      "source_sha256": "a4e732343b161afcab199bf9b5a4bde5927c657e0721caa21726bb99a14ef0a7",
+      "workload": "aggregate",
+      "microseconds": 434.09325
+    },
+    {
+      "run": "scalar-zjit-warm-after",
+      "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+      "workload": "aggregate",
+      "microseconds": 451.97554333333335
+    }
+  ],
+  "validation": {
+    "final-conformance-memory-4.1-zjit": {
+      "passed": 20267,
+      "files": 679,
+      "skipped_files": 2,
+      "peak_worker_rss_bytes": 175366144,
+      "jit": "zjit",
+      "query_api": "execute"
+    },
+    "final-conformance-disk-4.1-yjit": {
+      "passed": 18250,
+      "files": 679,
+      "skipped_files": 77,
+      "peak_worker_rss_bytes": 188149760,
+      "jit": "yjit",
+      "query_api": "execute"
+    },
+    "metadata-fixed-lazy-expr": {
+      "passed": 2877,
+      "files": 87,
+      "skipped_files": 0,
+      "peak_worker_rss_bytes": 37343232,
+      "jit": "interpreter",
+      "query_api": "query",
+      "scalar_cursor_records": 457
+    },
+    "final-lazy-cast": {
+      "passed": 269,
+      "files": 10,
+      "skipped_files": 0,
+      "peak_worker_rss_bytes": 35315712,
+      "jit": "interpreter",
+      "query_api": "query",
+      "scalar_cursor_records": 58
+    },
+    "final-lazy-types": {
+      "passed": 1351,
+      "files": 40,
+      "skipped_files": 0,
+      "peak_worker_rss_bytes": 36773888,
+      "jit": "interpreter",
+      "query_api": "query",
+      "scalar_cursor_records": 25
+    },
+    "final-host-4.0.7": {
+      "success": true,
+      "peak_rss_bytes": 118681600,
+      "command": [
+        "ruby",
+        "-Iimpl/ruby-native/lib",
+        "-e",
+        "Dir[\"impl/ruby-native/test/*_test.rb\"].sort.each { |f| require_relative f }"
+      ]
+    },
+    "final-scalar-host": {
+      "success": true,
+      "peak_rss_bytes": 49315840,
+      "command": [
+        ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+        "impl/ruby-native/test/scalar_cursor_test.rb"
+      ]
+    }
+  },
+  "artifact_sha256": {
+    "bench/ruby-native/results/scalar-before-4_0_7.json": "4051cea13f7300f14b9348e061c4be03b4a33dbd4c197140726b5ad530fd2089",
+    "bench/ruby-native/results/scalar-before-4_1_preview1.json": "580d9b5ae07b7fd698d209c02b626aa59721e342813c876c3dbd0f71793f4c77",
+    "bench/ruby-native/results/scalar-after-4_0_7.json": "d424175e572374bd282b07815164173a82085ec387b851ec7f9e1a54a760a886",
+    "bench/ruby-native/results/scalar-after-4_1_preview1.json": "8517f401f7a573d075e21e739e05b497b6218a74c74237db87dd0bd9ef7f2db4",
+    "bench/ruby-native/results/scalar-regression-4_0_7.json": "e36ea6f7562600fe5e7d6a9b6ab016dc50fb32e05782fc19c165b75ea257207f",
+    "bench/ruby-native/results/scalar-regression-4_1_preview1.json": "345f4b21eef3d04c1335790d16e71e2ecd4558e5f8ca0a2314517d395db26954",
+    "bench/ruby-native/results/scalar-followup/final-file-point-4.0.7.json": "53f6cbd7f1b420c91da5d24c314ef41e05cc10a2a6836488c181baa0bae3fd76",
+    "bench/ruby-native/results/scalar-followup/final-file-point-4.1-preview1.json": "8b4fbcb7cfabc61f327934314633209d8154b4c26260bedb47a572c65bb9f1d7",
+    "bench/ruby-native/results/scalar-followup/final-conformance-memory-4.1-zjit.json": "cc46ee130770a1986acf367890da5461a05f7947ba923e51a2afb1e2336729b0",
+    "bench/ruby-native/results/scalar-followup/final-conformance-disk-4.1-yjit.json": "f51666f7dbd19077c3f097647e4aa338944393bfa6f7f7e1ca8cc73c3f8be557",
+    "bench/ruby-native/results/scalar-followup/metadata-fixed-lazy-expr.json": "dfc73a77fc71617e1c49d8aba5c95b8b3fdeae7515a4c62f0be30eb3ddb86358",
+    "bench/ruby-native/results/scalar-followup/final-lazy-cast.json": "02f3ee2c836c82fce169dc078ee31ee9f0d4c1c36ab2dad0cd341f66d1f43137",
+    "bench/ruby-native/results/scalar-followup/final-lazy-types.json": "45d21ca2f63fcb6faab561956091486db6200f4eab7baedf0ea611b3cbc01d78",
+    "bench/ruby-native/results/scalar-followup/final-host-4.0.7.json": "4d4037512522d3fef905f8ec3ad4c15799ca7b4d40e1960421f059cfffd01c8b",
+    "bench/ruby-native/results/scalar-followup/final-scalar-host.json": "cf1b44275df6b37638cb7260b91c43a3f7223a81fca5add8d88bf3879804fe99",
+    "bench/ruby-native/results/scalar-followup/before-profile.json": "2e6d2284c20533a460205d988ab9d928f8716fd60c6f8aa37e531ae7b6b6852f",
+    "bench/ruby-native/results/scalar-followup/final-profile.json": "a3d072ebb08d64a1d18ced1fb912d1227e53cf2c9f36f742afaa7c8c5763881f",
+    "bench/ruby-native/results/scalar-regression-control-before-1.json": "052b6ad493cd8239998c19b0cca97993984dc1641b0b70220d0a5240d74ae84a",
+    "bench/ruby-native/results/scalar-regression-control-after-1.json": "7f04685ea37e1a5f8a91f8655c5f3b36621a2cf5e54343d4ef3570f730d3aa63",
+    "bench/ruby-native/results/scalar-regression-control-split.json": "5e4fb9d5a7bdb7f39b1a818d75a56420278e3b1c91eb6b0753562938b2938b6e",
+    "bench/ruby-native/results/scalar-zjit-warm-before.json": "5070e3c33236d4d1ade65d928671b76eda2ce04ee7393f1fa1429a63e89f2530",
+    "bench/ruby-native/results/scalar-zjit-warm-after.json": "a44780ffe543b19f46bb73b4db619cc7f329823bad9e28e1010110eb054454d9"
+  }
+}

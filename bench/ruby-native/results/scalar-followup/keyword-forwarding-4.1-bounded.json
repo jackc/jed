@@ -1,0 +1,20 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "/tmp/jed-keyword-forwarding.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 19767296,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 1073741824,
+  "timeout_seconds": 20.0,
+  "elapsed_seconds": 0.10416917700786144,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "bb60efdb51d941a0a70e3fb9542880d0dfe66044090897d192393eff44d21af7",
+  "final_source_sha256": "bb60efdb51d941a0a70e3fb9542880d0dfe66044090897d192393eff44d21af7",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\n  \"runtime\": \"ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +PRISM [x86_64-linux]\",\n  \"iterations\": 20000,\n  \"wrappers\": {\n    \"calls\": 6,\n    \"casts\": 5\n  },\n  \"results\": {\n    \"bare\": {\n      \"call_allocations\": 12.00005,\n      \"cast_allocations\": 10.00005\n    },\n    \"explicit\": {\n      \"call_allocations\": 0.0,\n      \"cast_allocations\": 0.0\n    }\n  }\n}\n",
+  "stderr": ""
+}

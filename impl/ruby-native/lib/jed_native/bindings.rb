@@ -360,7 +360,10 @@ module JedNative
         'boolean'
       when :array
         args = node[:args] || node[:elements] || node[:values] || []
-        element = wanted&.end_with?('[]') ? wanted[0...-2] : nil
+        # A parameter-free constructor has its own source type. An explicit
+        # outer cast may convert that array, and multidimensional constructors
+        # keep the same SQL element type rather than adding a type dimension.
+        element = !@count.zero? && wanted&.end_with?('[]') ? wanted[0...-2] : nil
         unify(args, scope, element).sub(/\[\]\z/, '') + '[]'
       when :row
         (node[:args] || node[:elements] || node[:values] || []).each { |arg| expression(arg, scope) }
@@ -394,7 +397,10 @@ module JedNative
       if TEXT_OPERATORS.include?(op) || %w[and or].include?(op)
         target = TEXT_OPERATORS.include?(op) ? 'text' : 'boolean'
         types = [expression(left, scope, target), expression(right, scope, target)]
-        types << expression(node[:escape], scope, 'text') if node[:escape]
+        if node[:escape]
+          escape = expression(node[:escape], scope, 'text')
+          raise Error.new('42883', 'LIKE ESCAPE requires text') if known?(escape) && escape != 'text'
+        end
         raise Error.new('42804', "#{op} requires #{target}") if types.any? { |type| known?(type) && type != target }
         return 'boolean'
       end

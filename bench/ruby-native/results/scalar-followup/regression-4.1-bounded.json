@@ -1,0 +1,22 @@
+{
+  "command": [
+    "env",
+    "TMPDIR=/tmp",
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "bench/ruby-native/compare.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 51412992,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 3.228040993999457,
+  "source": "/tmp/jed-ruby-scalar-final",
+  "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "final_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "scalar: ruby=13509.7ns ruby-yjit=4787.8ns ruby-zjit=5555.9ns\npk_hit: ruby=8655.1ns ruby-yjit=4003.6ns ruby-zjit=4449.5ns\npk_miss: ruby=6368.6ns ruby-yjit=3329.2ns ruby-zjit=3528.4ns\nfiltered_scan: ruby=905310.5ns ruby-yjit=301854.1ns ruby-zjit=528792.0ns\naggregate: ruby=745707.2ns ruby-yjit=293121.8ns ruby-zjit=561004.2ns\ngroup: ruby=1394905.1ns ruby-yjit=671425.8ns ruby-zjit=875433.7ns\nsort_limit: ruby=1680810.7ns ruby-yjit=951830.0ns ruby-zjit=1116625.7ns\n",
+  "stderr": "compare ruby: ready\ncompare ruby-yjit: ready\ncompare ruby-zjit: ready\ncompare ruby: measuring\ncompare ruby-yjit: measuring\ncompare ruby-zjit: measuring\ncomparison artifact: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/scalar-regression-4_1_preview1.json\n"
+}

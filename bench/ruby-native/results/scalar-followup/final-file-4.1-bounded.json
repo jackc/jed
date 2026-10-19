@@ -1,0 +1,29 @@
+{
+  "command": [
+    "env",
+    "TMPDIR=/tmp",
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "bench/ruby-native/file_compare.rb",
+    "--run",
+    "--lanes",
+    "ruby-yjit,ruby-zjit",
+    "--workloads",
+    "point_lookup_pk",
+    "--report",
+    "bench/ruby-native/results/scalar-followup/final-file-point-4.1-preview1.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 74039296,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 17179869184,
+  "timeout_seconds": 1800.0,
+  "elapsed_seconds": 7.868950743009918,
+  "source": "/tmp/jed-ruby-scalar-final",
+  "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "final_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "File comparison: /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/scalar-followup/final-file-point-4.1-preview1.json\n",
+  "stderr": "file comparison ruby-yjit: preparing (no workloads)\nfile comparison ruby-yjit: ready\nfile comparison ruby-zjit: preparing (no workloads)\nfile comparison ruby-zjit: ready\nfile comparison ruby-yjit: point_lookup_pk\nfile comparison ruby-zjit: point_lookup_pk\n"
+}

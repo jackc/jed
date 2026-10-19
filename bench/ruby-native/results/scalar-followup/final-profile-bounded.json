@@ -1,0 +1,23 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/query_profile.rb",
+    "--report",
+    "bench/ruby-native/results/scalar-followup/final-profile.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 72753152,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 180.0,
+  "elapsed_seconds": 2.7769870509946486,
+  "source": "/tmp/jed-ruby-scalar-final",
+  "source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "final_source_sha256": "7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "query integer_abs: 4569.8ns; 35.0 allocations\nquery integer_arithmetic: 5093.9ns; 34.0 allocations\nquery conditional: 4843.9ns; 34.1 allocations\nquery numeric_folds: 7224.3ns; 50.0 allocations\nquery decimal_arithmetic: 10217.1ns; 66.0 allocations\nquery float_arithmetic: 9273.3ns; 64.0 allocations\nquery text_functions: 9637.6ns; 73.0 allocations\nquery mixed_projection: 6294.7ns; 46.0 allocations\nquery constant: 3583.0ns; 33.0 allocations\nquery filtered_scalar: 4693.1ns; 35.0 allocations\nexecute integer_abs: 7976.5ns; 120.0 allocations\nexecute integer_arithmetic: 8925.5ns; 130.0 allocations\nexecute conditional: 43227.2ns; 489.1 allocations\nexecute numeric_folds: 13649.7ns; 180.0 allocations\nexecute decimal_arithmetic: 15179.6ns; 170.0 allocations\nexecute float_arithmetic: 13413.8ns; 154.0 allocations\nexecute text_functions: 14003.8ns; 159.0 allocations\nexecute mixed_projection: 10769.9ns; 149.0 allocations\nexecute constant: 6058.1ns; 105.0 allocations\nexecute filtered_scalar: 8554.8ns; 134.0 allocations\n",
+  "stderr": ""
+}
