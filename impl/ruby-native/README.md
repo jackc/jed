@@ -26,8 +26,11 @@ The [pipeline follow-up](PIPELINE_FOLLOWUP.md) extends that compiler into eligib
 single-table scan/filter/projection loops, preserving lazy LIMIT/OFFSET behavior.
 It also records lazy-API failures and a multi-page LIMIT cost defect found during
 that audit. The [correctness follow-up](CORRECTNESS_FOLLOWUP.md) fixes the metadata,
-stack-depth, and cost defects and distinguishes materialized-memory corpus
-expectations from lazy collector thresholds.
+stack-depth, and cost defects. The later
+[cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes memory ownership,
+nested spill-preflight results and external collection in the conformance adapter.
+The [LIKE follow-up](LIKE_FOLLOWUP.md) records another complete zero-failure audit
+after extending compilation to simple literal LIKE predicates.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
@@ -115,6 +118,10 @@ linguistic comparisons keep their ordinary execution. See the
 Comparisons of two statically C-labeled text leaves use cheaper private string
 snapshots while retaining wrapper metadata on escaping text and fallback values.
 See the [snapshot optimization](TEXT_ELISION_FOLLOWUP.md).
+Simple literal `LIKE`/`NOT LIKE` patterns can also compile to guarded equality,
+prefix, suffix or substring checks. Complex patterns, ILIKE and dynamic patterns
+keep the ordinary matcher. Exact costs, NULL behavior and deferred errors remain
+unchanged; see the [LIKE follow-up](LIKE_FOLLOWUP.md).
 
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;

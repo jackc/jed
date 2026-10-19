@@ -40,8 +40,9 @@ Admission starts with plain integers and booleans: arithmetic and comparisons,
 integer casts, unary operations, three-valued boolean control flow, searched CASE,
 and selected integer functions. The explicitly requested text extension admits
 plain text leaves, identity text casts, and ordinary comparisons under the fixed
-`C` collation. It preserves text collation labels, eager operand evaluation,
-NULL propagation, and variable-width comparison charges. Linguistic collations,
+`C` collation. A subsequent extension admits simple literal LIKE/NOT LIKE
+operators under statically known C labels. It preserves text collation labels,
+eager operand evaluation, NULL propagation, and variable-width comparison charges. Linguistic collations,
 nominal/open types, host calls,
 subqueries, windows, and unsupported expression forms use the existing evaluator.
 A fused projection may delegate an unsupported complete root to that evaluator,
@@ -128,6 +129,27 @@ and all escaping text values keep the previous wrapping path; in particular an
 unlabeled host String's custom comparison cannot observe a changed operand class.
 This substitutes cheaper snapshots for column wrappers; it does not eliminate
 all string allocation or alter the retained pool/cache limits.
+
+Literal LIKE specialization admits an exact literal, a literal prefix followed
+by `%`, a literal suffix preceded by `%`, or a literal contained between `%`
+wildcards. Repeated boundary `%` characters are equivalent. The default
+backslash escape is decoded during bounded admission; escaped wildcards remain
+literal characters. Unescaped `_`, interior `%`, a trailing escape, ILIKE,
+nonliteral patterns and explicit ESCAPE expressions retain the evaluator.
+Only plain text with static C labels is admitted, including a valid UTF-8
+String literal pattern. Unlabeled parameters and linguistic or nominal types
+retain the existing path.
+
+Generated LIKE code charges the operator before evaluating its operands, takes
+the subject snapshot at the original wrapping point, and preserves NULL
+propagation. LIKE has no comparison-length surcharge. Exact normalized runtime
+strings with valid UTF-8 use fixed equality/prefix/suffix/substring operations;
+unexpected runtime values restore the subject's label and call the unchanged
+matcher without rereading an operand. No SQL pattern enters generated source or
+a Ruby regexp. The original pattern and decoded literal both count against the
+existing string-pool limit, checked before admission allocates their copies.
+Trailing-escape errors keep their original data-dependent evaluation in the
+matcher; admission never raises them early.
 
 Array pipelines preserve the existing bulk scan charge before the loop and bulk
 output charge after successful completion. Streaming pipelines preserve source

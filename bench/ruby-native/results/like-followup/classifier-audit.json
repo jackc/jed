@@ -1,0 +1,1 @@
+{"source_sha256":"3e749562c6b764681d6917604cf02aa73b3194cfdbb8c5e756616588de91dc88","patterns":1562,"admitted":528,"rejected":1034,"comparisons":82896,"unlabeled_param_rejections":20,"runtime_guard_comparisons":200,"failures":[],"final_source_sha256":"3e749562c6b764681d6917604cf02aa73b3194cfdbb8c5e756616588de91dc88","passed":true}

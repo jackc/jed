@@ -348,6 +348,7 @@ module JedNative
         raise Unsupported unless expression.type == 'boolean' && boolean?(left.type) && boolean?(right.type)
         return emit_boolean(expression, output, depth)
       end
+      return emit_literal_like(expression, output, left, right, depth) if operator == 'like' || operator == 'not like'
       if COMPARISONS.key?(operator) && [left, right].any? { |argument| argument.type == 'text' }
         raise Unsupported unless expression.type == 'boolean' &&
                                  [left, right].all? { |argument| %w[text null unknown].include?(argument.type) }
@@ -400,6 +401,78 @@ module JedNative
       end
       @indent -= 1
       line('end')
+    end
+
+    # Only boundary % tokens surround the decoded literal. Interior wildcards,
+    # one-character matches and a trailing escape retain the ordinary matcher,
+    # including its data-dependent escape error. Check bytes before copying or
+    # decoding; admission itself must remain bounded for oversized SQL literals.
+    def literal_like_shape(pattern)
+      raise Unsupported unless pattern.instance_of?(String) && pattern.bytesize <= MAX_POOL_BYTES - @pool_bytes
+      pattern = ::String.new(pattern)
+      raise Unsupported unless pattern.encoding == Encoding::UTF_8 && pattern.valid_encoding?
+      decoded = +''
+      available = MAX_POOL_BYTES - @pool_bytes - pattern.bytesize
+      leading = trailing = escaped = false
+      pattern.each_char do |character|
+        if !escaped && character == '\\'
+          escaped = true
+          next
+        elsif !escaped && character == '%'
+          decoded.empty? ? leading = true : trailing = true
+          next
+        elsif !escaped && character == '_'
+          raise Unsupported
+        end
+        raise Unsupported if trailing || character.bytesize > available
+        decoded << character
+        available -= character.bytesize
+        escaped = false
+      end
+      raise Unsupported if escaped
+      shape = leading ? (trailing ? :contains : :suffix) : (trailing ? :prefix : :exact)
+      [shape, decoded]
+    end
+
+    def emit_literal_like(expression, output, left, right, depth)
+      raise Unsupported unless expression.type == 'boolean' && left.type == 'text' && right.type == 'text' && right.kind == :literal
+      labels = [expression, left, right].map { |argument| c_label_source(argument.instance_variable_get(:@native_collation)) }
+      raise Unsupported if labels.include?('nil')
+      shape, literal = literal_like_shape(right.value)
+      line('# literal LIKE specialization')
+      charge
+      # A C leaf normally wraps its value, stripping singleton methods and
+      # replacing transient labels. Preserve that snapshot before reading the
+      # pattern. Cast boundaries keep their ordinary wrapping behavior.
+      snapshot = %i[literal column param].include?(left.kind)
+      a = emit(left, depth + 1, text_snapshot: snapshot)
+      b = emit(right, depth + 1, text_snapshot: true)
+      payload = pooled(literal)
+      line("if #{a}.nil? || #{b}.nil?")
+      @indent += 1
+      line("#{output} = nil")
+      @indent -= 1
+      # The primitive methods agree with code-point matching for valid UTF-8.
+      # Bytea, UUID and unexpected host encodings retain Functions.like instead
+      # of acquiring String encoding errors or different custom method calls.
+      line("elsif (#{a}.instance_of?(::String) || #{a}.instance_of?(::JedNative::CollatedText)) && #{a}.encoding == ::Encoding::UTF_8 && #{a}.valid_encoding?")
+      @indent += 1
+      operation = case shape
+      when :exact then "#{a} == #{payload}"
+      when :prefix then "#{a}.start_with?(#{payload})"
+      when :suffix then "#{a}.end_with?(#{payload})"
+      when :contains then "#{a}.include?(#{payload})"
+      end
+      line("#{output} = #{operation}")
+      @indent -= 1
+      line('else')
+      @indent += 1
+      line("#{a} = ::JedNative::CollationRules.wrap(#{a}, #{labels[1]}) if #{a}.instance_of?(::String)") if snapshot
+      line("#{b} = ::JedNative::CollationRules.wrap(#{b}, #{labels[2]})")
+      line("#{output} = ::JedNative::Functions.like(#{a}, #{b}, context: engine)")
+      @indent -= 1
+      line('end')
+      line("#{output} = !#{output} unless #{output}.nil?") if expression.value == 'not like'
     end
 
     def emit_c_comparison(expression, output, left, right, a, b, label, snapshots: false)
