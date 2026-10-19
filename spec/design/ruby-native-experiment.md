@@ -41,7 +41,9 @@ materialized WHERE and grouping-key loops;
 it does not permit evaluating SQL text as Ruby or introducing a native engine dependency.
 The scalar emitter's C-text comparison extension preserves collation metadata
 and string-work charges; linguistic collation and general string functions keep
-their ordinary execution.
+their ordinary execution. The [literal LIKE extension](../../impl/ruby-native/LIKE_FOLLOWUP.md)
+admits bounded exact, prefix, suffix and contains predicates under static C labels;
+complex patterns retain the handwritten matcher with unchanged values, errors and costs.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

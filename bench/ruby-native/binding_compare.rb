@@ -49,7 +49,7 @@ source_hashes = lambda do
     rust: Digest::SHA256.hexdigest(Dir[File.join(root, 'impl/rust/src/**/*.rs')].sort.map { |path| File.binread(path) }.join),
     wrapper_library: Digest::SHA256.file(wrapper_library).hexdigest,
     worker: Digest::SHA256.file(File.join(__dir__, 'binding_compare_lane.rb')).hexdigest,
-    plans: %w[plan.json compiled-plan.json pipeline-plan.json ordering-plan.json aggregate-plan.json relation-plan.json text-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
+    plans: %w[plan.json compiled-plan.json pipeline-plan.json ordering-plan.json aggregate-plan.json relation-plan.json text-plan.json like-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
     database: options[:file] && Digest::SHA256.file(options[:file]).hexdigest
   }
 end

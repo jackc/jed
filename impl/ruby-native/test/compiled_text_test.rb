@@ -157,7 +157,7 @@ module NativeCompiledTextTests
       assert(kernel.pool.none? { |item| item.equal?(label) }, 'text pool retained external label')
     end
     ["SELECT 'a' COLLATE \"C\"", "SELECT 'a' COLLATE unicode", "SELECT upper('a')", "SELECT 'a' || 'b'",
-     "SELECT CASE WHEN TRUE THEN 'a' ELSE 'b' END", "SELECT coalesce(NULL::text, 'a')", "SELECT 'a' LIKE 'a%'"].each do |sql|
+     "SELECT CASE WHEN TRUE THEN 'a' ELSE 'b' END", "SELECT coalesce(NULL::text, 'a')", "SELECT 'a' LIKE 'a_b'"].each do |sql|
       node, registry = resolve(sql, environment: unicode_environment)
       assert(JedNative::CompiledExpression.build(node, types: registry).nil?, "unsupported text shape compiled: #{sql}")
     end
