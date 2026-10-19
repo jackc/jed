@@ -1874,5 +1874,8 @@ compares 128- and 512-row defaults under the same byte allowance, and separately
 opt-in larger byte batch. It retains controlled Node/browser repeats and isolated codec probes.
 The [elapsed-scheduling follow-up](../../bench/ts/results/2026-10-19-scheduling/report.md)
 keeps those transport limits fixed. It separates the interleaved baseline/4 ms/codec comparison
-from later 1 ms tuning, single-pair additional-query coverage and isolated codec probes; the
-selected change retains the original codec and uses the 1 ms elapsed scheduling slice.
+from later 1 ms tuning, single-pair additional-query coverage and isolated codec probes.
+The [cancellation follow-up](../../bench/ts/results/2026-10-19-scheduling-rollback/report.md)
+compares the original scheduler with 1 ms and 0.125 ms slices in fresh browser runs. Both
+elapsed-time variants were rejected for cancellation regressions, and the original scheduling
+policy was restored. Result-codec and transport limits are unchanged.

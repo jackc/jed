@@ -1,5 +1,11 @@
 # TypeScript elapsed scheduling and result-codec experiments
 
+**Status: the elapsed-time scheduler was reverted.** A later 0.125 ms trial also regressed
+ordinary-browser cancellation. The runtime again yields at every 256 checkpoint visits.
+This report preserves the original experiment and its then-selected 1 ms implementation;
+see the [rollback measurements and transport report](../2026-10-19-scheduling-rollback/report.md)
+for the final disposition. Benchmark tooling and raw evidence are retained.
+
 The selected change uses a **1 ms elapsed scheduling slice**, checked at existing 256-unit work checkpoints, with the existing packed codec. Transport limits remain 512 rows / 256 KiB per batch and 2 MiB client result credit. It retains most of the 4 ms prototype's aggregate improvement while avoiding its larger observed Node bulk-result slowdown. The fused codec prototype was reverted because its isolated decode improvement did not establish a consistent application-level gain.
 
 Compared with the baseline process medians, the later 1 ms trials reduce aggregate worker time from 328 to 240 ms in Chromium and 314 to 284 ms in Node. Typed-output time is approximately flat in Chromium (671 to 662 ms). Node typed-output time rises 3.7% (524 to 544 ms), alongside a 3.5% direct-reference rise; its worker/direct overhead is essentially unchanged, 61.0% to 61.2%. This is a scheduling improvement for the measured compute-heavy query, not a general reduction in typed-result conversion cost.

@@ -1,0 +1,5 @@
+--- a/impl/ts/src/execution.ts
++++ b/impl/ts/src/execution.ts
+@@ -71 +71 @@
+-const DEFAULT_TIME_SLICE_MS = 1;
++const DEFAULT_TIME_SLICE_MS = 0.125;
