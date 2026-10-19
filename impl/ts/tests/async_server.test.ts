@@ -31,9 +31,19 @@ import { render } from "../src/value.ts";
 
 function harness(core: Database, limits: Partial<RuntimeLimits> = {}, sharedCancellation = true) {
   let receive: (reply: RuntimeReply) => void = () => {};
+  const transferredBatches: number[] = [];
   const server = new RuntimeServer({
     open: () => core,
-    send: (reply) => queueMicrotask(() => receive(structuredClone(reply))),
+    send: (reply, transfer) => {
+      const copied = structuredClone(reply, { transfer });
+      if (transfer !== undefined) {
+        assert.equal(transfer.length, 1);
+        assert.equal(transfer[0].byteLength, 0, "the worker relinquishes its result buffer");
+        assert.ok(copied.ok);
+        transferredBatches.push((copied.result as { rows: { length: number } }).rows.length);
+      }
+      queueMicrotask(() => receive(copied));
+    },
   });
   const transport: RuntimeTransport = {
     postMessage: (request) => server.receive(structuredClone(request)),
@@ -44,7 +54,7 @@ function harness(core: Database, limits: Partial<RuntimeLimits> = {}, sharedCanc
     terminate: () => {},
   };
   const connection = new RuntimeConnection(transport, limits, sharedCancellation);
-  return { server, connection, db: new AsyncDatabase(connection) };
+  return { server, connection, db: new AsyncDatabase(connection), transferredBatches };
 }
 
 const suites = new URL("../../../spec/conformance/suites/concurrency/", import.meta.url);
@@ -234,7 +244,7 @@ test("runtime close during asynchronous open releases the opened database", asyn
     },
     send: (reply) => replies.push(reply),
   });
-  const req = (id: number, op: string): RuntimeRequest => ({ version: 1, id, op, args: {} });
+  const req = (id: number, op: string): RuntimeRequest => ({ version: 2, id, op, args: {} });
   server.receive(req(1, "open"));
   await new Promise((resolve) => setTimeout(resolve, 5));
   server.receive(req(2, "close"));
@@ -257,7 +267,7 @@ test("runtime rejects duplicate operation ids without executing SQL twice", asyn
   await connection.call("open");
   await db.execute("CREATE TABLE t (id i32)");
   const request: RuntimeRequest = {
-    version: 1,
+    version: 2,
     id: 100,
     op: "execute",
     args: { sql: "INSERT INTO t VALUES (1)", params: [] },
@@ -267,7 +277,7 @@ test("runtime rejects duplicate operation ids without executing SQL twice", asyn
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(core.get("SELECT count(*) AS n FROM t")!.n, 1n);
   // The direct high id intentionally makes the connection unusable; close via the protocol.
-  server.receive({ version: 1, id: 101, op: "close", args: {} });
+  server.receive({ version: 2, id: 101, op: "close", args: {} });
 });
 
 test("read sessions preserve resource limits and reconstructed privileges", async () => {
@@ -305,6 +315,50 @@ test("oversized result row releases its cursor capacity", async () => {
       (error: unknown) => error instanceof TransportError && error.code === "RESULT_TOO_LARGE",
     );
     assert.deepEqual(await db.all("SELECT 1 AS n"), [{ n: 1n }]);
+  } finally {
+    await db.close();
+  }
+});
+
+test("packed transfers retain the byte boundary and pending row across fetches", async () => {
+  const core = createDatabase();
+  const sql = "SELECT g::i64 AS n, repeat('x',100) AS s FROM generate_series(1,3) g";
+  const direct = core.query(sql);
+  const expected = [...direct];
+  const cost = direct.cost;
+  direct.close();
+  const { db, connection, transferredBatches } = harness(core, {
+    maxBatchBytes: 768,
+    maxResultBytes: 768,
+  });
+  await connection.call("open", { limits: connection.limits });
+  try {
+    const rows = await db.query(sql);
+    const actual = [];
+    for await (const row of rows) actual.push(row);
+    assert.deepEqual(actual, expected);
+    assert.equal(rows.cost, cost);
+    assert.deepEqual(transferredBatches, [1, 1, 1]);
+    connection.reserveResult()();
+  } finally {
+    await db.close();
+  }
+});
+
+test("oversized RETURNING transport preserves committed writes and uncertain outcome", async () => {
+  const { db, connection } = harness(createDatabase(), { maxBatchBytes: 1024, maxCursors: 1 });
+  await connection.call("open", { limits: connection.limits });
+  try {
+    await db.execute("CREATE TABLE t (v text)");
+    const rows = await db.query("INSERT INTO t VALUES (repeat('x',1000)) RETURNING v");
+    await assert.rejects(
+      rows.next(),
+      (error: unknown) =>
+        error instanceof TransportError &&
+        error.code === "RESULT_TOO_LARGE" &&
+        error.outcome === "unknown",
+    );
+    assert.deepEqual(await db.all("SELECT length(v) AS n FROM t"), [{ n: 1000n }]);
   } finally {
     await db.close();
   }

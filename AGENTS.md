@@ -31,7 +31,8 @@ files in the same change.
   conformance voices.
 - The browser/Node runtime (`spec/design/ts-runtime.md`) implements async-only package entry
   points, dedicated execution workers, bounded typed transport and one TS semantic core with
-  platform adapters. Synchronous core APIs remain internal for conformance/tooling. Node and
+  platform adapters. Results use transferable binary batches with lossless values and bounded
+  decoding. Synchronous core APIs remain internal for conformance/tooling. Node and
   shared-memory-capable browsers poll atomic cancellation flags; all hosts also cooperate at
   logical page boundaries and common execution loops through retained continuations shared by
   sync and async drivers. Common resident expressions return immediate values; pending operands
