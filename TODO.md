@@ -594,7 +594,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   objects, and buffered iteration avoids per-row scheduling chains. Broaden these changes only
   with throughput and cancellation measurements. Heavy-query measurements now cover Node and
   ordinary/isolated Chromium, including main-thread responsiveness and 200,000 typed result rows
-  ([report](bench/ts/results/2026-10-18-heavy/report.md)); large result delivery still adds substantial overhead.
+  ([report](bench/ts/results/2026-10-18-heavy/report.md)). Default fetches now admit up to 512 rows
+  under the same byte allowances; the [batching investigation](bench/ts/results/2026-10-18-result-batching/report.md)
+  measures the gain and remaining substantial per-value delivery overhead.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar

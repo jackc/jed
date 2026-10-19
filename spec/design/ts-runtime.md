@@ -331,6 +331,15 @@ extra pause points: no measured query passes an `AbortSignal`. This is warm in-m
 headless Chromium on x64; OPFS, other browser engines, ARM and application rendering remain
 separate measurements.
 
+The [result-batching investigation](../../bench/ts/results/2026-10-18-result-batching/report.md)
+raises the default row cap from 128 to 512 within the existing byte limits. Three controlled
+runs per host/variant reduce the 200,000-row worker median from 735 to 676 ms in Chromium (8%)
+and 643 to 506 ms in Node (21%). Browser frame gaps remain about 20 ms at the median observation
+maximum, with 26 ms worst observed after the change and no worker main-thread long tasks.
+Per-value conversion still costs substantial time; codec prototypes did not establish a gain
+and were reverted. Larger configurable byte batches remain a throughput/responsiveness and
+concurrent-result-reservation tradeoff, not a new default.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions
 include async storage lifecycle/commit and crypto providers, worker pools,
@@ -424,7 +433,7 @@ Runtime limits are host budgets, never SQL cost units or heap-size guarantees. D
 |---|---:|
 | outstanding ordinary requests | 128 |
 | outstanding request payload | 8 MiB |
-| rows per fetch | 128 |
+| rows per fetch | 512 |
 | bytes per result batch, including overhead | 256 KiB |
 | client-held result batches / `all` collector | 2 MiB |
 | explicit sessions / cursors | 64 each |
@@ -439,6 +448,15 @@ fails `RESULT_TOO_LARGE` and closes its cursor. Exhausted queue/result credits f
 requests have a separate finite admission reserve. The worker independently bounds its
 queue and handles. Blocking operators still obey the core's query-memory/spill policy;
 transport batching does not make every executor operator streaming.
+
+The row limit and byte limit apply together. The 512-row default amortizes fetch messages while
+retaining the 256 KiB batch and 2 MiB held-result allowances. A fetch evaluates its whole batch
+before delivering the first row: larger batches can delay that row, surface a later SQL error
+earlier in iteration, and do more work that an early close discards. Applications needing a
+smaller evaluation prefix can set `runtime.maxBatchRows` to 128 or 1. This does not introduce
+speculative fetches; another batch still requires caller demand. Increasing `maxBatchBytes`
+also increases each fetch's reservation against `maxResultBytes`, reducing the number of
+simultaneously held batches unless that total allowance is raised separately.
 
 Session operations retain submission order. The scheduler parses a waiting statement once,
 then parks it before execution if another local session owns the writer. It services other

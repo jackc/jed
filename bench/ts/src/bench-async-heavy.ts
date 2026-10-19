@@ -5,9 +5,16 @@ import { join, resolve } from "node:path";
 import { createDatabase as createWorker } from "../../../impl/ts/src/async/node.ts";
 import { runtimeLimits } from "../../../impl/ts/src/async/protocol.ts";
 import { createDatabase as createDirect } from "../../../impl/ts/src/file.ts";
-import { heavyConfigFrom, observeTimers, runHeavySuite, summarize } from "./async-heavy.ts";
+import {
+  heavyConfigFrom,
+  heavyRuntimeFrom,
+  observeTimers,
+  runHeavySuite,
+  summarize,
+} from "./async-heavy.ts";
 
 const config = heavyConfigFrom(process.env);
+const limits = runtimeLimits(heavyRuntimeFrom(process.env));
 function cpuAffinity(): string | null {
   try {
     return (
@@ -21,7 +28,7 @@ const directory = resolve(process.argv[2] ?? `bench/results/ts-async-heavy-${Dat
 mkdirSync(directory, { recursive: true });
 const directDatabase = createDirect({ pageSize: 8192 });
 const direct = directDatabase.session();
-const workerDatabase = await createWorker({ pageSize: 8192 });
+const workerDatabase = await createWorker({ pageSize: 8192, runtime: limits });
 const worker = await workerDatabase.session();
 const idle = () => observeTimers(() => new Promise<void>((resolve) => setTimeout(resolve, 250)));
 try {
@@ -49,7 +56,7 @@ try {
       baseRevision: process.env.JED_BENCH_REVISION ?? "unknown",
       dirtyWorkingTree: process.env.JED_BENCH_DIRTY === "true",
       pageSize: 8192,
-      runtimeLimits: runtimeLimits(),
+      runtimeLimits: limits,
       sharedAtomicCancellationAvailable: typeof SharedArrayBuffer !== "undefined",
       measuredQueriesPassAbortSignal: false,
       storage: "memory",

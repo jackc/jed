@@ -320,6 +320,76 @@ test("oversized result row releases its cursor capacity", async () => {
   }
 });
 
+test("fetch row limits bound evaluation before early cursor close", async (t) => {
+  const cases: { name: string; limits: Partial<RuntimeLimits>; expected: number }[] = [
+    { name: "default", limits: {}, expected: 512 },
+    { name: "explicit 128", limits: { maxBatchRows: 128 }, expected: 128 },
+    { name: "explicit 1", limits: { maxBatchRows: 1 }, expected: 1 },
+  ];
+  for (const { name, limits, expected } of cases) {
+    await t.test(name, async () => {
+      const core = createDatabase();
+      const originalSession = core.session.bind(core);
+      let pulled = 0;
+      let closed = 0;
+      let released = 0;
+      core.session = (...args) => {
+        const session = originalSession(...args);
+        session.queryPreparedSteps = function* (): Steps<Rows> {
+          const account = newQueryAccount(0n);
+          const rows = new Rows(
+            ["n"],
+            ["i64"],
+            Cursor.streaming({
+              nextRow: () => {
+                if (++pulled > expected) throw new Error("read beyond the requested batch");
+                return [{ kind: "int", int: BigInt(pulled) }];
+              },
+              cost: () => BigInt(pulled),
+              queryAccount: () => account,
+              guardCost: () => {},
+              close: () => {
+                closed++;
+              },
+            }),
+            null,
+          );
+          rows.attachPin(() => {
+            released++;
+          });
+          return rows;
+        };
+        return session;
+      };
+      const { db, connection, transferredBatches } = harness(core, {
+        ...limits,
+        maxResultBytes: 256 * 1024,
+      });
+      await connection.call("open", { limits: connection.limits });
+      try {
+        const rows = await db.query("SELECT 1");
+        assert.equal(pulled, 0, "opening a cursor does not fetch its first batch");
+        assert.deepEqual((await rows.next()).value, [{ kind: "int", int: 1n }]);
+        assert.equal(pulled, expected);
+        assert.equal(rows.cost, BigInt(expected));
+        assert.deepEqual(transferredBatches, [expected]);
+        if (expected > 1) {
+          assert.deepEqual((await rows.next()).value, [{ kind: "int", int: 2n }]);
+          assert.equal(pulled, expected, "resident rows do not fetch another batch");
+        }
+        await rows.close();
+        await rows.close();
+        assert.equal(pulled, expected, "close must not evaluate the following row");
+        assert.equal(closed, 1);
+        assert.equal(released, 1);
+        connection.reserveResult()();
+      } finally {
+        await db.close();
+      }
+    });
+  }
+});
+
 test("packed transfers retain the byte boundary and pending row across fetches", async () => {
   const core = createDatabase();
   const sql = "SELECT g::i64 AS n, repeat('x',100) AS s FROM generate_series(1,3) g";
@@ -341,6 +411,81 @@ test("packed transfers retain the byte boundary and pending row across fetches",
     assert.deepEqual(transferredBatches, [1, 1, 1]);
     connection.reserveResult()();
   } finally {
+    await db.close();
+  }
+});
+
+test("message cancellation interrupts a larger fetch before queued work and releases its cursor", async () => {
+  const core = createDatabase();
+  const originalSession = core.session.bind(core);
+  const controller = new AbortController();
+  const events: string[] = [];
+  let queries = 0;
+  let pulled = 0;
+  let queued: Promise<unknown> | undefined;
+  let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+  core.session = (...args) => {
+    const session = originalSession(...args);
+    session.queryPreparedSteps = function* (): Steps<Rows> {
+      const account = newQueryAccount(0n);
+      if (queries++ > 0) {
+        events.push("next statement");
+        return new Rows([], [], Cursor.buffered([], 0n, account), null);
+      }
+      const rows = new Rows(
+        ["n"],
+        ["i64"],
+        Cursor.streaming({
+          nextRow: () => {
+            pulled++;
+            if (pulled === 129) {
+              // A message-only abort cannot arrive until the worker gives the task queue a turn.
+              // The source has no checkpoints: the fetch loop must cooperate before 512 rows.
+              cancelTimer = setTimeout(() => {
+                events.push("cancel sent");
+                queued = db.execute("SELECT 2");
+                controller.abort();
+              }, 0);
+            }
+            return [{ kind: "int", int: BigInt(pulled) }];
+          },
+          cost: () => BigInt(pulled),
+          queryAccount: () => account,
+          guardCost: () => {},
+          close: () => {
+            events.push("cursor closed");
+          },
+        }),
+        null,
+      );
+      rows.attachPin(() => events.push("pin released"));
+      return rows;
+    };
+    return session;
+  };
+  const { db, connection, transferredBatches } = harness(
+    core,
+    { maxCursors: 1, maxResultBytes: 256 * 1024 },
+    false,
+  );
+  await connection.call("open", { limits: connection.limits });
+  try {
+    const rows = await db.query("SELECT 1", [], { signal: controller.signal });
+    await assert.rejects(
+      rows.next(),
+      (error: unknown) => error instanceof EngineError && error.code() === "57014",
+    );
+    assert.ok(pulled > 128 && pulled < 512, `canceled after ${pulled} row pulls`);
+    assert.ok(queued);
+    await queued;
+    assert.deepEqual(events, ["cancel sent", "cursor closed", "pin released", "next statement"]);
+    assert.deepEqual(transferredBatches, [], "a canceled batch never exposes a partial result");
+    assert.equal((await rows.next()).done, true);
+    connection.reserveResult()();
+    const replacement = await db.query("SELECT 3");
+    await replacement.close();
+  } finally {
+    clearTimeout(cancelTimer);
     await db.close();
   }
 });

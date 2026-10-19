@@ -38,6 +38,14 @@ separate from SQL cost and query-memory limits. An oversized row or full queue r
 `TransportError`; SQL errors retain their `EngineError` SQLSTATE and diagnostic fields. Worker
 failure invalidates all handles and reports an unknown outcome: never retry a write automatically.
 
+Result fetches default to at most 512 rows and 256 KiB, with a 2 MiB allowance for held results.
+Both batch limits apply, so wide rows fill a batch sooner. Larger batches reduce worker messages
+when consuming many rows. They also evaluate more rows before delivering the first one, so a
+later SQL error may arrive earlier in iteration and an early close may discard more work.
+Set `runtime: { maxBatchRows: 128 }` (or `1`) when a smaller evaluation prefix matters.
+Increasing `maxBatchBytes` reserves more of the held-result allowance per fetch; it can reduce
+how many result batches fit concurrently. Result iteration remains demand-driven.
+
 An `AbortSignal` can be passed to `query` or `execute` as the third argument. Node and isolated
 browsers use atomic cancellation checkpoints during resident CPU work. Every host also yields at
 page boundaries and common execution loops, including warm scans, so ordinary browsers can
