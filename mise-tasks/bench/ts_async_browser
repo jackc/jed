@@ -12,6 +12,8 @@ if ARGV.include?("--help")
   puts "JED_ASYNC_BROWSER_TIMEOUT_MS bounds the complete run (default 1800000)."
   puts "JED_ASYNC_HEAVY_WARMUPS, SAMPLES, RESPONSE_SAMPLES, DECIMAL_ROWS, TABLE_ROWS, SORT_ROWS, TYPED_ROWS and CASES"
   puts "use the same settings and workloads as bench:ts_async_heavy."
+  puts "JED_ASYNC_HEAVY_BATCH_ROWS and JED_ASYNC_HEAVY_BATCH_BYTES override worker batch limits for experiments."
+  puts "Defaults retain production limits; batch bytes must fit the existing 2 MiB result credit."
   exit
 end
 abort "Unexpected arguments; use --help" unless ARGV.empty?

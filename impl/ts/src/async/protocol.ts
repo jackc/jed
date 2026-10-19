@@ -19,7 +19,7 @@ export type RuntimeLimits = {
 export const DEFAULT_RUNTIME_LIMITS: Readonly<RuntimeLimits> = Object.freeze({
   maxQueuedRequests: 128,
   maxQueuedBytes: 8 * 1024 * 1024,
-  maxBatchRows: 128,
+  maxBatchRows: 512,
   maxBatchBytes: 256 * 1024,
   maxResultBytes: 2 * 1024 * 1024,
   maxSessions: 64,
