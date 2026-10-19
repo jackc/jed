@@ -50,13 +50,16 @@ module JedNative
     end
 
     def leaf(index, columns)
-      key = [index, columns]
+      # Hash the schema's identity, rather than recursively hashing every
+      # column descriptor for every field read. The cached value retains that
+      # exact object, so its identity cannot be reused while this key is live.
+      key = [index, columns.object_id]
       decoded_cache.fetch(key) do
         raw = page(index)
         raise Error.new('XX001', 'expected a B-tree leaf') unless raw[:type] == FileFormat::PAGE_LEAF
         keys, regions = @codec.parse_pax_leaf(raw[:payload], raw[:item_count], columns)
         raise Error.new('XX001', 'leaf keys are not strictly ascending') unless keys.each_cons(2).all? { |a, b| a < b }
-        { keys: keys, regions: regions, count: raw[:item_count] }
+        { keys: keys, regions: regions, count: raw[:item_count], schema: columns }
       end
     rescue Error
       raise

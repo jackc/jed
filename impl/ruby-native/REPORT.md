@@ -1,5 +1,9 @@
 # Ruby core experiment
 
+This is the initial experiment report, preserved with its original measurements.
+The explicitly requested [lookup and ZJIT follow-up](LOOKUP_FOLLOWUP.md) records
+subsequent optimizations, stdlib CRC32, and Ruby 4.1.0-preview1 measurements.
+
 The independent Ruby port and optimization experiment are complete for the
 recorded revision. It remains **experimental and frozen**, outside normal tests,
 benchmarks, code generation and CI. Future features must leave it unchanged

@@ -235,9 +235,11 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   chacha20poly1305, Go x/crypto/chacha20poly1305, and TS @noble/ciphers, including their standard
   accelerated backends for measurement. This selects no production cipher or engine dependency.
 - The Ruby experiment has explicit maintainer approval for Ruby's OpenSSL binding
-  solely for vetted cryptographic digest functions. Its parser, planner, other
-  evaluation, and storage remain handwritten Ruby; no other native engine
-  dependency or Rust/WASM binding is authorized by this exception.
+  for vetted cryptographic digest functions and stdlib Zlib for byte-identical
+  CRC32 checksums. The maintainer also permits a well-supported native checksum
+  gem if profiling justifies it; prefer the standard library. Its parser, planner,
+  other evaluation, and storage algorithms remain handwritten Ruby; no native
+  engine dependency or Rust/WASM binding is authorized by these utility exceptions.
 - Bench modules are not cores, but new benchmark dependencies still require
   explicit confirmation.
 
