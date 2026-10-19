@@ -514,6 +514,7 @@ import {
   isTrue,
   nullValue,
   decodeHexPairs,
+  decodeHexString,
   renderByteaHex,
   renderUuid,
   textValue,
@@ -1597,11 +1598,16 @@ export function quoteIdentText(s: string): string {
 
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
 // skip a space, tab, newline, or carriage return (hex only between digit pairs); a malformed
-// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
-// bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
+// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split).
+// An unrecognized format traps 22023. The hex success path reads ASCII directly; other paths
+// operate on the input's UTF-8 bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
 export function decodeText(s: string, format: string): Uint8Array {
+  if (format === "hex") {
+    const r = decodeHexString(s);
+    if ("error" in r) throw engineError("invalid_parameter_value", r.error);
+    return r.bytes;
+  }
   const bytes = SQL_BYTE_ENCODER.encode(s);
-  if (format === "hex") return decodeHex(bytes);
   if (format === "base64") return decodeBase64(bytes);
   if (format === "escape") return decodeEscape(bytes);
   throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);

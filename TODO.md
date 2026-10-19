@@ -605,6 +605,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   The [query-stage profile](bench/ts/results/2026-10-19-query-profile/report.md) separates worker
   execution/waits, message delivery/dispatch, result decoding and client consumption, with
   independently sampled main/worker CPU and explicit instrumentation calibration.
+  The [profile-guided optimization](bench/ts/results/2026-10-19-delivery-optimization/report.md)
+  retains the SQL hex ASCII fast path (typed-output worker time −6% Node / −31% Chromium).
+  Codec byte-view reuse and idle dispatch were measured and reverted: only about 1% additional
+  throughput with larger observed Node timer gaps. Transport overhead remains substantial;
+  batch limits, full decoding validation and 256-checkpoint yields are unchanged.
   Website examples/live panels use it;
   the shared concurrency schedules run through the async scheduler. Synchronous internals remain
   for conformance/tooling. Cancellation is best effort; sorting, parsing/planning and long scalar
