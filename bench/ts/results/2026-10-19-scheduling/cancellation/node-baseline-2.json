@@ -1,0 +1,1089 @@
+{
+  "recordedAt": "2026-10-19T12:09:33.198Z",
+  "metadata": {
+    "root": "/tmp/jed-fused-baseline",
+    "revision": "source-snapshot",
+    "dirty": true,
+    "node": "v26.10.0",
+    "v8": "14.6.202.34-node.34",
+    "platform": "linux",
+    "release": "7.0.0-38-generic",
+    "architecture": "x64",
+    "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+    "logicalCpus": 24,
+    "affinity": "0,2",
+    "engineSourceSha256": {
+      "impl/ts/src/api.ts": "585da72934fb192d0304b07ce45ef52733bdca2c38aaa0e6c496a05da21f7a82",
+      "impl/ts/src/ast.ts": "d0b75eab5be6a6ef020d74f60208819b31b384e0a8ff3d2f7cb49daa128ef5b5",
+      "impl/ts/src/async/client.ts": "8d6a6f3096f4d1abdbe1bbb2b2d5bc6757747ad69594ff2b71c9e27b26c09341",
+      "impl/ts/src/async/errors.ts": "6bee3e21383eceb39b4226e56a02119f9248f918b1ded4ea23fb471357f260f2",
+      "impl/ts/src/async/node-worker.ts": "9c3dfe0a93d73beba6c401e78299432986ba9e71b7eaf2670e437cb9d31954c3",
+      "impl/ts/src/async/node.ts": "e8deaf81ac1441d175edbd57af81de8fa2d1fec46b2b66c4d625faab3558014a",
+      "impl/ts/src/async/packed.ts": "885a8fde20f3098547d39b9de21a4b8b049fe40f58daacecb3b2e3675651fed8",
+      "impl/ts/src/async/protocol.ts": "e6ed7e03ddec63ad4ae90db9226ba71795052e475948229571f4ec76e772511a",
+      "impl/ts/src/async/server.ts": "b4ce107a060dc573f4b7efbe063227f890f7842b3b79ed462bb1483e60559065",
+      "impl/ts/src/async/wire.ts": "67e8ce0fbbb67d7b70d16b263efc7414e9657ca5dcf1c66735dc258b8c300c27",
+      "impl/ts/src/autoname.ts": "026359fd469d12dd11925e33b851b2b6a23b00f017d349a2f997eabc0cb79fed",
+      "impl/ts/src/backup.ts": "73102ae4ebfe0439075dbc35d83fcb185d06eed43f276489adf8b9f1d1f78d0d",
+      "impl/ts/src/bin/conformance.ts": "658487157557c1d4190ac2fb581d71fddb80e771fc35f30982c60cef1479ab11",
+      "impl/ts/src/bin/conformance_service.ts": "605ef5b50813966479fbe0e2f6f14839a4d42a13f58a47f57768fd9911f23b67",
+      "impl/ts/src/bin/process_actor.ts": "f5acfca2cbc062c34177c3e297dee500f7af8a7a4a21fdb954aa858780000b94",
+      "impl/ts/src/bin/sim.ts": "441b67af1e5415b36b3dfc60a0c756786110733d0c30f35a5eac639fb6bab595",
+      "impl/ts/src/blocking.ts": "5f2183fc8ccf189fa1cbcfd195633241195526b9b79919439246dcb944546a11",
+      "impl/ts/src/blockstore.ts": "26306938197fdab1ea08fdc7dd006fd81b49347f5a1afe427bf3f6c97ce7042a",
+      "impl/ts/src/browser/async.ts": "16a45a7f8e1a4bec784f338c5d4b097f26f0466e6bcbb7db42bb6dc18403d1a9",
+      "impl/ts/src/browser/client.ts": "25ef1b0dfc7fff55b6228eae443c69fb52bfc8562c30ca529f480468b08aa60b",
+      "impl/ts/src/browser/worker.ts": "961a7f1bf1a30f0d141d7f98945255d8d9d90504a924d19dc61e0c5719d3bf9f",
+      "impl/ts/src/bufferpool.ts": "45536b8e6d2e68294e9d7f7c6a262e51b86426f174cd861c563e246a47d0aea0",
+      "impl/ts/src/cancel.ts": "a329619b0eb53a965e0957e68a5620bf3691d3d73b22adad0c791612841c4be5",
+      "impl/ts/src/catalog.ts": "f0ff1b3be12d3d13f05e7123fc316b07edb90723d84a37885752d20a512a4d42",
+      "impl/ts/src/collation.ts": "8e0b3efa406f22ff471b54e4573f1c4910bf71ddb40669886ab8f9d52c7734f2",
+      "impl/ts/src/commit_manifest.ts": "4f3e8b24f1e39ca975927597871f1cbcb18bbed13f8e70c5a4efa4c17b9d97d6",
+      "impl/ts/src/coordinator.ts": "d90eb0427fedaa3d69cc54c49bfe3ef1bf1fb0085a444676dcd1eae64baa8faf",
+      "impl/ts/src/cost.ts": "b5205840f2a9de0f75eba81c15eb8c03a03d02afc950e8a75b15ed60881c959a",
+      "impl/ts/src/costs.ts": "efb255a0498a42ca80f6bfe37b1ef66073b434ce91d281abd44ea9e7a722ef19",
+      "impl/ts/src/crc32.ts": "4a31a1f8111d8ff5c6ed8ce5b6339c5b36a9f4d1a073ea2f95c05482996c436b",
+      "impl/ts/src/crc32_node.ts": "b4bc037854a390123a62bd9f4aa886b169d4d3547d1cb51e6d64ec5d71189b47",
+      "impl/ts/src/create_table_as.ts": "e8a0e3c96200e9bae3f38e2752def79bb48ff8dfed5182c4f8e7c60061d4ca2d",
+      "impl/ts/src/cursor.ts": "95afdcf97a6ef5952a3aec0799571abfff4148b120da585e3f133325cbce715b",
+      "impl/ts/src/date.ts": "52f8b0f593499f8cf09816f85097623946bd70517683bbcfcf8f3883e879d30f",
+      "impl/ts/src/datetime_fn.ts": "4e437f431c255b91dd7d3d794065a654fc6a4a5aafcac2439c860ae0c8174e09",
+      "impl/ts/src/datetime_units_gen.ts": "cd1e080b156ca661fc6c45cd5db7818bc9e5c85ef2cfaee2778c19447739995c",
+      "impl/ts/src/decimal.ts": "613bc7b9a282502504ef9bd546cd24adf3e528bc8cfde579b89d6b322c6213ea",
+      "impl/ts/src/digest.ts": "93b5c2ec20859429485f44ffa94f4aff7055160899a82b817350493cb19ea19c",
+      "impl/ts/src/encoding.ts": "9e98e8808394d98a6a57aeaddabdb38f4a68a0aab7bbdfe3c28e410b0dd6448f",
+      "impl/ts/src/environment.ts": "e6f848c825ed99b0d7adde4e2b262bd5eda231dd28e892c76da64dc9ffd8c2a5",
+      "impl/ts/src/ergonomic.ts": "72e093a20a8d3e9e4b03c91fdd3925cb4fba72cc314e0569be3304fa7cde0b58",
+      "impl/ts/src/error_detail.ts": "1dad83fb27fc48a1346f9866d7f6c9461f06655d9af2204015f0fc6b0404ff77",
+      "impl/ts/src/error_hint.ts": "ed3132c2b3cb0f95c8b79632fa9e661df9a89ce879c6b56346e7c8953221bd50",
+      "impl/ts/src/errors.ts": "85bf7b7457683a1394b61f7fda865b71187ea13e42e75aa842ddf307f6973176",
+      "impl/ts/src/estimator.ts": "b8fa6a26b5ea57d0b396703a442f4054231963b0b957cd78ba3559d753e99e15",
+      "impl/ts/src/estimator_constants.ts": "1650c34f0c57bf4dacbf6b178d08fce00a88e17024b4b1fdd2413af88f9cd43f",
+      "impl/ts/src/eval.ts": "7c83993bb86414852138ad078e47836e65cc87df6ce395e1c141bfc1d5d5fc2a",
+      "impl/ts/src/eval_ops.ts": "8e752a89cbc4aae4ca9d50889a8d43bde5c6a8a45464be768b5e9a104cbc5998",
+      "impl/ts/src/execution.ts": "6c42b91350e562c83ae220a153a43af4efbbe3591069363d44d82f25a20106e6",
+      "impl/ts/src/executor.ts": "d830c6093468dc1992ee4dc67b7ae9c6dc64429876c154bb2309536349cb4a72",
+      "impl/ts/src/extension.ts": "47b9685c048ecb5eecfa4948b4aff41e7ae2282e4543cf8b1008cab5f9e941df",
+      "impl/ts/src/file.ts": "7ad8c32f728e40dfff40ea270b86c5aa3c6f36044415958294915121fb12df42",
+      "impl/ts/src/fileblockstore.ts": "1395c5c1e85d8731bc0b08a5fbf892d59520a0acdf785686067518e6dc2789ed",
+      "impl/ts/src/filehost.ts": "ab06b8d6c66302058780be867ca91f1da809e4ef15dc3a44c96b40bc2b18848f",
+      "impl/ts/src/format.ts": "f8ac788fb83938a404aa760eb474364eae1a74f527ae60c7b36ea39dbda5ffcc",
+      "impl/ts/src/formatting.ts": "4c1e864c4f3ec1a14c27f9537c30b33e7fa55a53170e1081c00aa4551404d077",
+      "impl/ts/src/formatting_gen.ts": "2ffb790b6411ebd8a9f2c91fab6c250106b294890f3055b17fb3b5952953cf5b",
+      "impl/ts/src/formatting_num.ts": "a629fe59023246d3b39d5dc266dadd355c67277d38fb7028fac4c5022a38a321",
+      "impl/ts/src/gin_jsonb.ts": "f42895a1da0a149ce8116da55e007032d8eb0d36a4208f6f55098e8d25f19982",
+      "impl/ts/src/gin_jsonpath.ts": "5bd6819efeec3ba926aff6bd22ff9197843e9d1eb585ee01a42306391b0d73fb",
+      "impl/ts/src/gin_runs.ts": "6d3fc83c220c410c389d6791cd4c490991c4e6623da1320ee61dc98ae3bd04a7",
+      "impl/ts/src/gist.ts": "12c85cb15b53682ce97c95c21ec6076d4c1396c40d0110f24bb43d51cb5e49e2",
+      "impl/ts/src/host_batch.ts": "84522a830eb07a2a6f9f653d82032b47d2c5b82a4af8abe08dccfbdbf6c2109e",
+      "impl/ts/src/implication.ts": "7849258eab46ad1b547b904a748fef15421b71bfff10c9aee4fc4ffdc3836d91",
+      "impl/ts/src/index_dependencies.ts": "fec376947a95f6ab7e8656308452d27050dfff7cb5a0c0d4161b5ebd4703c6df",
+      "impl/ts/src/interval.ts": "dc86247b9d4998658e4e149841f55dd46b820bf424567324917b961622a5c676",
+      "impl/ts/src/json.ts": "9cdd86df07b4db2b9f1147da9200c61a1b19ed25f60ef05a7767dc54b227d9a7",
+      "impl/ts/src/jsonpath.ts": "947694222cdbe0d19a501dff178a45bf4ad129c42da47b8a2dafdfa812162822",
+      "impl/ts/src/kernels.ts": "79b911b475710f749853ee8e519c6d959b3312861b05ce44049fea736b631df5",
+      "impl/ts/src/lexer.ts": "89f329c050d5c6d2531d755745190fc62069e8af5921898e35342dc450bdf9ae",
+      "impl/ts/src/lib.ts": "bc9bdda6fcc840bb6615fad866b41d053580bdfee6310ad327d42dc81b93b266",
+      "impl/ts/src/lockhost.ts": "96d6cc27ec9d77221c320863fb3baf2617b024cb56a3f6cb4b0a644279631f20",
+      "impl/ts/src/lz4.ts": "9c4553229257b06a2f501fa5a39a6e77421df4bb8e5583edb5e9b11329a599eb",
+      "impl/ts/src/memoryblockstore.ts": "cbd6f06d4513eac771dc159cdd21078434c308c61745cb3ce95242ba9ff18578",
+      "impl/ts/src/memsize.ts": "774b218215c942661c87a1fc0bb27c1a91edee0ac7e252e4882a9020cefcaee0",
+      "impl/ts/src/operators.ts": "0c12919aee43795845a3cab46a02bf2737370892d22c11aff251c870b2fabec4",
+      "impl/ts/src/opfs.ts": "9bfc25ebe8619ecfedc12892f04c5753ef7e46a0285c5b4f9425823ff069d219",
+      "impl/ts/src/opfsblockstore.ts": "e8ffa3cd2f05157b37b1ea03fd189fd8b22db53888dd2cff10c9fda97dcac57b",
+      "impl/ts/src/optimize.ts": "1e2b9379f88bd47a05e53f51a6066b7a19208e4d7c0fbcfa396f832bb1085259",
+      "impl/ts/src/pager.ts": "37c0031042d469cb2c56c3f5f714965a1f3a0d118e50d8bb8aa89b229ae68b52",
+      "impl/ts/src/pageservice/blocking.ts": "79281e82682c36ee7f84baace2637f8b4a631400888e8b37a2580f84741c26bc",
+      "impl/ts/src/pageservice/client.ts": "ace323ca3a23951ea5210ad124a2152f0b26578262ed9b7634c7e492c184d18e",
+      "impl/ts/src/pageservice/client_status.ts": "8a571a828c6c7e2d87a335f8939e8a833c5f5beb1721392823017b123257f6ac",
+      "impl/ts/src/pageservice/client_worker.ts": "89b7c869e3e3becb89d694f11240b67754ce31c3c5bc1335e765446adb4314ff",
+      "impl/ts/src/pageservice/codec.ts": "5fa6f8af147210096bd75aed6d61770864e6f12cc8afd5467d1e667993343425",
+      "impl/ts/src/pageservice/delta.ts": "b82996fef962a7c879b4e18caab79746c8bd23b7d0ef6b322975b2f49c5beec3",
+      "impl/ts/src/pageservice/election.ts": "92fb7cd4046a6ad5603fa0d26bf8f83f5d3caf83d1d51a10c88c70a0425bfcf5",
+      "impl/ts/src/pageservice/endpoint.ts": "2caffce5b1f169623c1f4040237469c7a30c2ae16442d8e4114927691e8782c6",
+      "impl/ts/src/pageservice/handoff.ts": "04d2f2ff9b239a4b129a2499221dae241cdd0d78a6117a66e637b6af8c31fe7e",
+      "impl/ts/src/pageservice/net.ts": "374d7661a17dda976ea60b3549bdd1d5f25e775905b7204b6d6ab566aa27b1eb",
+      "impl/ts/src/pageservice/owner.ts": "0cb442670a0a512aa8115663e6a68373dcf2ee93b8ee67b86ea4bff8efd8150f",
+      "impl/ts/src/pageservice/owner_conn.ts": "2d432fefa83527d5a99698f9af47a9b29c21fc0da861423a31cb932fef0522be",
+      "impl/ts/src/pageservice/owner_worker.ts": "327b95a1087cd5dc4cf4018c907b67d3f40a623622d695c2db6999286d464ea9",
+      "impl/ts/src/pageservice/shared_state.ts": "c156a1676343f8c5a97bfc0bf47c5190b0b1f16a218bdf5b7157f4e6c029e1c8",
+      "impl/ts/src/paging.ts": "84bf0e03776a21a4409ad84ae8d89c84e8fd4a0df580b0b0e2f948d342fef48a",
+      "impl/ts/src/parser.ts": "7092a99692b9173e39bf42cf9aafa282effdb8672a0de8b21d137d9d76684b50",
+      "impl/ts/src/persist.ts": "399eb12eaa9d9cb432a6a70844d6d7aa9d09731f7a2ee9665338d5900dc5b0e6",
+      "impl/ts/src/pg_keywords_gen.ts": "09e46d1125d7b00614b5350cae058cf8ae2cc21e03cf49c1bb7b8dd2baf1750d",
+      "impl/ts/src/plan_params.ts": "ab3b04655ea4f2cf4a8706f28d7c0502e4d4623bd94f0de05a86cf3b22d74e34",
+      "impl/ts/src/pmap.ts": "b08caf611799db1bcb790bcc41a368ae34e6e25d9a777ed00c8451c1b10a93f6",
+      "impl/ts/src/privileges.ts": "a0a94312d6459eb21ed1d1bb0731079f63b17cf31d197a8d65ab4765143194de",
+      "impl/ts/src/range.ts": "85f8b87d6c7b68c1bbbb9588b73f459dd3f2ea941455d857fd504779462b151a",
+      "impl/ts/src/ranges_gen.ts": "71cf63dcf6dc66c6b9cf276fb997b2e51903443fed5358581a3c8e185256ca9c",
+      "impl/ts/src/regex.ts": "65a33ff93512727e1d2d5a255e1d948fd1ca65f41b62c1cf7427dbec1f14122f",
+      "impl/ts/src/resolve.ts": "b3300e35fed2444d9754acc02727e642f7c6af1a4422caf3f83e40398b74b783",
+      "impl/ts/src/rewrite.ts": "ad2593889309a27e524907b43a427b2106186db707eb5bed84c923ffbde1c5b4",
+      "impl/ts/src/row_json.ts": "a911ab8d3ac25f1c788457df6cfdb96d0cbc8afdf63d2a8c958aa2bc361e023d",
+      "impl/ts/src/scope.ts": "b7ddd04d246fa30d417176080b244fb4691962dc22a4d5ef9fcd785ddc64ddba",
+      "impl/ts/src/seam.ts": "332d41ffaa1ae5e85fa7277266f7a49e3121d9ed778a944ae46978991f44d76b",
+      "impl/ts/src/search_cycle.ts": "863c2eaf3758af3a8d4b0f41a4a31dc83112a6a051b2e361219ed9511707ded2",
+      "impl/ts/src/session.ts": "6a4fd96199bd8a5781d7871aa88fec285c8764e9181b3d1276e208eeb3de29b8",
+      "impl/ts/src/shared.ts": "8470dc96b2572e9ef554f0e19d1dd96358ebd3f6758017323e804fd312af4a7a",
+      "impl/ts/src/sim/check.ts": "5db9636ece4850b9781fa4c53740c238dda31c899f94dae7e574eeb40965f6ce",
+      "impl/ts/src/sim/disk.ts": "b86ee3d9b59b13490321917eaab575ee3a1f05f656220ade09e39170ef52cd7a",
+      "impl/ts/src/sim/locks.ts": "b8eb4fa2a2688a89de13c29795d663ad9f5d21d014bf807bad77ee046f7790e8",
+      "impl/ts/src/sim/net.ts": "372f84d81f0c8ed8d0bc241af09b1e59930d27f6599e77595ce9d9298be6e60f",
+      "impl/ts/src/sim/runner.ts": "2f81f8088fe3f2f6738cf34622f08d364f57cbb2ae665ccb2edc663583d7cde5",
+      "impl/ts/src/sim/util.ts": "f57740b03a85a135f65495143bebb3bcd8d93738bc246b3245a6f408d660a4e2",
+      "impl/ts/src/snapshot.ts": "1b81101895341af2dfa59b1f449460405a6a80394c9cc76e7030fed284fbefbe",
+      "impl/ts/src/span_filter.ts": "ab47193aedd6419409d9b7e64c7c70aeac673527228da995b8539a68b16e4356",
+      "impl/ts/src/spill.ts": "6f977be7461f71c271f45be5fa79611974c0a8a50d07a114b8079d0bba50d94f",
+      "impl/ts/src/spillfile.ts": "c47f66c6f854c3334b56d6bfc78105fbd5354a6aea7fe6773fa8b0fc9320070c",
+      "impl/ts/src/split.ts": "0bbff37b730b0001142e92adffc7519e44cbc63819646fd7dd233ed8bc224897",
+      "impl/ts/src/sqlstate.ts": "fa379a0359eb9a8ff483d504f24dbc417ceb9517809923dfd9ffa6e313b02390",
+      "impl/ts/src/statistics.ts": "8de93f5568350e718e97c0246a4679990a31079529a5c65cf683028f92657c47",
+      "impl/ts/src/storage.ts": "3a9567493301f2e688d75ac00e387c2e1c51719e849c683adb0d7803b3d32555",
+      "impl/ts/src/store.ts": "799daa991167bfc5c0db6176bab29875c3096751b373ad8073ba035760c0c333",
+      "impl/ts/src/text_build.ts": "628939ea1f78f10af122766f7d22a203f8ae4d4df273d4fbf74141ffc458ad66",
+      "impl/ts/src/timestamp.ts": "cec3d91e04a5c437b89ae7bfff8a902ecc4f823a1d3898daada19036743e6663",
+      "impl/ts/src/timezone.ts": "ba04e412b0f5e21a5cd4d670143ee9b9a0570cc4e730370313e5340fc19b1fc5",
+      "impl/ts/src/token.ts": "be89be0fe876b1742960b14f79bff01f686c122244323c58de7cc2e23eddb2c0",
+      "impl/ts/src/tooling.ts": "4c334b7b34036817d1b8b1f1b06dd9c7b8f7d492ac7ed649df91461edf0b9eee",
+      "impl/ts/src/trap_class.ts": "fbb498bec790d1a586d0171a09e51f5d5fc6001e34eafce5c026a4a0cb6d3570",
+      "impl/ts/src/types.ts": "75da77a857bd0bc2a6d1d0624937ce3888be1d0751ddcc872b2e35070f6478c9",
+      "impl/ts/src/unparsed.ts": "05b54797178ac217e327550574b8014905e00d7b5bf66f4c57141dc2ba97e3f2",
+      "impl/ts/src/uuid.ts": "b4ab46b1444e0bdf9e8b69721fc133bcb534b7a56eecfc674026ccf8b1ef33c6",
+      "impl/ts/src/value.ts": "428e895d0739c717db5810d7986d3b2c0f5413a0ce5e107b01087b67eab7d02e",
+      "impl/ts/src/view_write.ts": "a933ec3b75a45bc5883f86e49d249b3dd16d8322ea0c464faba6dfca892b608b",
+      "impl/ts/src/views.ts": "cb6c8b91492923ea858c28c10436d29ab213d0673bf28ebb930862d70af515fb",
+      "impl/ts/src/window.ts": "b497208edeb5dc3981289050c806a4f18039a6862c05ab831280edb0e20ef455",
+      "bench/ts/src/async-heavy.ts": "d157d3ffd2f20fa564618d31b25fefa93b3c86e0cb9b17718087dd5d37826e34"
+    },
+    "probeSourceSha256": {
+      "browser-run.mjs": "63654c7a9f5d276bb94629c3213069683bd856c1ccd82767c361c38ccc3d0e1d",
+      "browser-worker.mjs": "4ea08be2b7159a83f76c53c137962cc4f68c0a341b663dd94c2ee93ae56039c2",
+      "browser.mjs": "b312039efee921de6883f75a43fba6a720ebb33aace5f8663ac230b912b07d78",
+      "index.html": "57978daeee68ac27774595c0448324bc5d036003cd75f0e92d2e83fe47c358de",
+      "metadata.mjs": "e17889d08549a4fdd198ee6eed2230907db9fb7546a846d4dc9ebbb74592f95d",
+      "node-worker.mjs": "dbde87354b072b9fd864f762016374e5bab2c16653a89928a38ae48f514a616a",
+      "node.mjs": "74b46cdd3612a92c0f7d46313bc944096186e1302cb0d994ae1ba489b2cb5e95",
+      "shared.mjs": "e2b5a162d2cd85e1f461b43e529c0d7816e910f770d50b340d59ba4a1b078067",
+      "vite.config.mjs": "906bf09c7cd70bca9840438977bbcfd640a38ff50e7313e56ee287e43d5d3932",
+      "worker-common.mjs": "0e50f955532301af1647c10636ce549bb927ac26f743e4bb9bb4aeca04a8d49e",
+      "mise-tasks/bench/ts_async_cancel": "6f73281018107d197fea5003caf1a747cb5fd67cdceb5e27bbe1c4581b19119d"
+    }
+  },
+  "environment": {
+    "root": "/tmp/jed-fused-baseline",
+    "host": "Node",
+    "node": "v26.10.0",
+    "sharedAtomicCancellation": true
+  },
+  "config": {
+    "fullWarmups": 3,
+    "cancelWarmups": 2,
+    "samples": 7,
+    "delayAfterMarkerMs": 20,
+    "watchdogMs": 30000
+  },
+  "limits": {
+    "maxBatchRows": 512,
+    "maxBatchBytes": 262144,
+    "maxResultBytes": 2097152
+  },
+  "results": [
+    {
+      "id": "decimal-aggregate",
+      "description": "Generated exact-decimal sum; one result row",
+      "setup": [],
+      "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+      "expectedRows": 1,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "samples": [
+        {
+          "index": 0,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2828.26041,
+          "markerReceivedAtMs": 2829.500049,
+          "cancelIssuedAtMs": 2849.610822,
+          "settledAtMs": 2851.720536,
+          "cancelPostAtMs": 2849.680139,
+          "marker": {
+            "probe": "active",
+            "token": 3,
+            "workerAtMs": 2829.485609,
+            "operation": "fetch",
+            "requestId": 24
+          },
+          "worker": {
+            "token": 3,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              23,
+              24
+            ],
+            "queryId": 23,
+            "admittedAtMs": 2828.35167,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2829.485609,
+              "operation": "fetch",
+              "requestId": 24
+            },
+            "errorSentAtMs": 2851.503399,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 2851.534174
+          },
+          "submitToMarkerMs": 1.239639000000352,
+          "markerToIssueMs": 20.11077299999988,
+          "issueToSettleMs": 2.1097139999997125,
+          "issueToPostMs": 0.06931699999995544,
+          "receivedToErrorSentMs": -0.03077499999972133,
+          "followupMs": 0.539958000000297,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 1,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2852.377858,
+          "markerReceivedAtMs": 2853.039671,
+          "cancelIssuedAtMs": 2876.662945,
+          "settledAtMs": 2881.751962,
+          "cancelPostAtMs": 2876.721143,
+          "marker": {
+            "probe": "active",
+            "token": 4,
+            "workerAtMs": 2853.026909,
+            "operation": "fetch",
+            "requestId": 30
+          },
+          "worker": {
+            "token": 4,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              29,
+              30
+            ],
+            "queryId": 29,
+            "admittedAtMs": 2852.420365,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2853.026909,
+              "operation": "fetch",
+              "requestId": 30
+            },
+            "cancelReceivedAtMs": 2881.480543,
+            "errorSentAtMs": 2881.622483,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.6618130000001656,
+          "markerToIssueMs": 23.623274000000038,
+          "issueToSettleMs": 5.089016999999785,
+          "issueToPostMs": 0.05819800000017494,
+          "receivedToErrorSentMs": 0.14193999999997686,
+          "followupMs": 0.44430499999998574,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 2,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2882.27599,
+          "markerReceivedAtMs": 2883.111292,
+          "cancelIssuedAtMs": 2904.669924,
+          "settledAtMs": 2907.394136,
+          "cancelPostAtMs": 2904.730886,
+          "marker": {
+            "probe": "active",
+            "token": 5,
+            "workerAtMs": 2883.099456,
+            "operation": "fetch",
+            "requestId": 36
+          },
+          "worker": {
+            "token": 5,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              35,
+              36
+            ],
+            "queryId": 35,
+            "admittedAtMs": 2882.368463,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2883.099456,
+              "operation": "fetch",
+              "requestId": 36
+            },
+            "errorSentAtMs": 2907.198403,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 2907.332064
+          },
+          "submitToMarkerMs": 0.835301999999956,
+          "markerToIssueMs": 21.55863199999976,
+          "issueToSettleMs": 2.7242120000000796,
+          "issueToPostMs": 0.060962000000017724,
+          "receivedToErrorSentMs": -0.133661000000302,
+          "followupMs": 0.42772500000000946,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 3,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2907.935976,
+          "markerReceivedAtMs": 2908.470523,
+          "cancelIssuedAtMs": 2928.5824,
+          "settledAtMs": 2928.943219,
+          "cancelPostAtMs": 2928.643569,
+          "marker": {
+            "probe": "active",
+            "token": 6,
+            "workerAtMs": 2908.459102,
+            "operation": "fetch",
+            "requestId": 42
+          },
+          "worker": {
+            "token": 6,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              41,
+              42
+            ],
+            "queryId": 41,
+            "admittedAtMs": 2907.972826,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2908.459102,
+              "operation": "fetch",
+              "requestId": 42
+            },
+            "errorSentAtMs": 2928.811005,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 2928.834667
+          },
+          "submitToMarkerMs": 0.5345469999997476,
+          "markerToIssueMs": 20.111876999999822,
+          "issueToSettleMs": 0.360819000000447,
+          "issueToPostMs": 0.061169000000063534,
+          "receivedToErrorSentMs": -0.02366200000005847,
+          "followupMs": 0.4129729999999654,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 4,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2929.430874,
+          "markerReceivedAtMs": 2929.759107,
+          "cancelIssuedAtMs": 2955.425635,
+          "settledAtMs": 2955.937977,
+          "cancelPostAtMs": 2955.485753,
+          "marker": {
+            "probe": "active",
+            "token": 7,
+            "workerAtMs": 2929.747551,
+            "operation": "fetch",
+            "requestId": 48
+          },
+          "worker": {
+            "token": 7,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              47,
+              48
+            ],
+            "queryId": 47,
+            "admittedAtMs": 2929.467111,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2929.747551,
+              "operation": "fetch",
+              "requestId": 48
+            },
+            "cancelReceivedAtMs": 2955.722364,
+            "errorSentAtMs": 2955.843349,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.3282329999997273,
+          "markerToIssueMs": 25.6665280000002,
+          "issueToSettleMs": 0.5123419999999896,
+          "issueToPostMs": 0.06011799999987488,
+          "receivedToErrorSentMs": 0.12098500000001877,
+          "followupMs": 0.3175989999999729,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 5,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2956.330211,
+          "markerReceivedAtMs": 2956.706855,
+          "cancelIssuedAtMs": 2976.796785,
+          "settledAtMs": 2983.298556,
+          "cancelPostAtMs": 2976.872519,
+          "marker": {
+            "probe": "active",
+            "token": 8,
+            "workerAtMs": 2956.696268,
+            "operation": "fetch",
+            "requestId": 54
+          },
+          "worker": {
+            "token": 8,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              53,
+              54
+            ],
+            "queryId": 53,
+            "admittedAtMs": 2956.365541,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2956.696268,
+              "operation": "fetch",
+              "requestId": 54
+            },
+            "cancelReceivedAtMs": 2983.066186,
+            "errorSentAtMs": 2983.193137,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.376643999999942,
+          "markerToIssueMs": 20.089930000000095,
+          "issueToSettleMs": 6.50177100000019,
+          "issueToPostMs": 0.07573400000001129,
+          "receivedToErrorSentMs": 0.1269510000001901,
+          "followupMs": 0.3197700000000623,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 6,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 2983.824837,
+          "markerReceivedAtMs": 2984.142717,
+          "cancelIssuedAtMs": 3005.050251,
+          "settledAtMs": 3014.524846,
+          "cancelPostAtMs": 3005.109709,
+          "marker": {
+            "probe": "active",
+            "token": 9,
+            "workerAtMs": 2984.132202,
+            "operation": "fetch",
+            "requestId": 60
+          },
+          "worker": {
+            "token": 9,
+            "sql": "SELECT sum(g::decimal) AS total FROM generate_series(1, 1000000) g",
+            "requestIds": [
+              59,
+              60
+            ],
+            "queryId": 59,
+            "admittedAtMs": 2983.868266,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 2984.132202,
+              "operation": "fetch",
+              "requestId": 60
+            },
+            "cancelReceivedAtMs": 3014.197378,
+            "errorSentAtMs": 3014.406769,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.3178800000000592,
+          "markerToIssueMs": 20.90753399999994,
+          "issueToSettleMs": 9.474594999999681,
+          "issueToPostMs": 0.05945799999972223,
+          "receivedToErrorSentMs": 0.2093910000003234,
+          "followupMs": 0.41643999999996595,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        }
+      ],
+      "canceled": 7,
+      "issueToSettleMs": {
+        "samples": 7,
+        "min": 0.360819000000447,
+        "median": 2.7242120000000796,
+        "max": 9.474594999999681
+      },
+      "submitToMarkerMs": {
+        "samples": 7,
+        "min": 0.3178800000000592,
+        "median": 0.5345469999997476,
+        "max": 1.239639000000352
+      },
+      "markerToIssueMs": {
+        "samples": 7,
+        "min": 20.089930000000095,
+        "median": 20.90753399999994,
+        "max": 25.6665280000002
+      }
+    },
+    {
+      "id": "typed-output",
+      "description": "Complete drain of integer, decimal, bytes, array and NULL rows",
+      "setup": [],
+      "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+      "expectedRows": 200000,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "samples": [
+        {
+          "index": 0,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5400.408094,
+          "markerReceivedAtMs": 5400.828829,
+          "cancelIssuedAtMs": 5421.498667,
+          "settledAtMs": 5423.410766,
+          "cancelPostAtMs": 5421.549472,
+          "marker": {
+            "probe": "active",
+            "token": 12,
+            "workerAtMs": 5400.820653,
+            "operation": "fetch",
+            "requestId": 2322
+          },
+          "worker": {
+            "token": 12,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2321,
+              2322
+            ],
+            "queryId": 2321,
+            "admittedAtMs": 5400.43945,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5400.820653,
+              "operation": "fetch",
+              "requestId": 2322
+            },
+            "cancelReceivedAtMs": 5423.18898,
+            "errorSentAtMs": 5423.291314,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.420734999999695,
+          "markerToIssueMs": 20.6698379999998,
+          "issueToSettleMs": 1.9120990000001257,
+          "issueToPostMs": 0.05080499999985477,
+          "receivedToErrorSentMs": 0.10233400000015536,
+          "followupMs": 1.5980930000005173,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 1,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5425.081799,
+          "markerReceivedAtMs": 5425.466208,
+          "cancelIssuedAtMs": 5445.634522,
+          "settledAtMs": 5446.371732,
+          "cancelPostAtMs": 5445.685511,
+          "marker": {
+            "probe": "active",
+            "token": 13,
+            "workerAtMs": 5425.458798,
+            "operation": "fetch",
+            "requestId": 2328
+          },
+          "worker": {
+            "token": 13,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2327,
+              2328
+            ],
+            "queryId": 2327,
+            "admittedAtMs": 5425.127986,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5425.458798,
+              "operation": "fetch",
+              "requestId": 2328
+            },
+            "errorSentAtMs": 5445.970459,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 5445.997133
+          },
+          "submitToMarkerMs": 0.3844090000002325,
+          "markerToIssueMs": 20.168314000000464,
+          "issueToSettleMs": 0.7372099999993225,
+          "issueToPostMs": 0.05098899999939022,
+          "receivedToErrorSentMs": -0.026673999999729858,
+          "followupMs": 0.6408460000002378,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 2,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5447.102168,
+          "markerReceivedAtMs": 5447.553902,
+          "cancelIssuedAtMs": 5469.661138,
+          "settledAtMs": 5471.451668,
+          "cancelPostAtMs": 5469.715617,
+          "marker": {
+            "probe": "active",
+            "token": 14,
+            "workerAtMs": 5447.543102,
+            "operation": "fetch",
+            "requestId": 2334
+          },
+          "worker": {
+            "token": 14,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2333,
+              2334
+            ],
+            "queryId": 2333,
+            "admittedAtMs": 5447.139408,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5447.543102,
+              "operation": "fetch",
+              "requestId": 2334
+            },
+            "cancelReceivedAtMs": 5471.12668,
+            "errorSentAtMs": 5471.21696,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.4517339999993055,
+          "markerToIssueMs": 22.10723600000074,
+          "issueToSettleMs": 1.7905299999993076,
+          "issueToPostMs": 0.05447899999944639,
+          "receivedToErrorSentMs": 0.09027999999943859,
+          "followupMs": 4.059497000000192,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 3,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5475.803408,
+          "markerReceivedAtMs": 5476.391863,
+          "cancelIssuedAtMs": 5496.604919,
+          "settledAtMs": 5497.226513,
+          "cancelPostAtMs": 5496.657479,
+          "marker": {
+            "probe": "active",
+            "token": 15,
+            "workerAtMs": 5476.381068,
+            "operation": "fetch",
+            "requestId": 2340
+          },
+          "worker": {
+            "token": 15,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2339,
+              2340
+            ],
+            "queryId": 2339,
+            "admittedAtMs": 5475.994038,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5476.381068,
+              "operation": "fetch",
+              "requestId": 2340
+            },
+            "cancelReceivedAtMs": 5496.701139,
+            "errorSentAtMs": 5496.767707,
+            "errorCode": "57014"
+          },
+          "submitToMarkerMs": 0.5884550000000672,
+          "markerToIssueMs": 20.213056000000506,
+          "issueToSettleMs": 0.621593999999277,
+          "issueToPostMs": 0.05256000000008498,
+          "receivedToErrorSentMs": 0.06656800000018848,
+          "followupMs": 0.8198529999999664,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 4,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5498.298459,
+          "markerReceivedAtMs": 5501.604933,
+          "cancelIssuedAtMs": 5520.708121,
+          "settledAtMs": 5521.07246,
+          "cancelPostAtMs": 5520.759274,
+          "marker": {
+            "probe": "active",
+            "token": 16,
+            "workerAtMs": 5498.721707,
+            "operation": "fetch",
+            "requestId": 2346
+          },
+          "worker": {
+            "token": 16,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2345,
+              2346
+            ],
+            "queryId": 2345,
+            "admittedAtMs": 5498.334486,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5498.721707,
+              "operation": "fetch",
+              "requestId": 2346
+            },
+            "errorSentAtMs": 5520.836947,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 5520.862669
+          },
+          "submitToMarkerMs": 3.30647399999998,
+          "markerToIssueMs": 19.103188000000046,
+          "issueToSettleMs": 0.3643390000006548,
+          "issueToPostMs": 0.0511530000003404,
+          "receivedToErrorSentMs": -0.025722000000314438,
+          "followupMs": 0.5745150000002468,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 5,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5521.878798,
+          "markerReceivedAtMs": 5522.62371,
+          "cancelIssuedAtMs": 5542.750691,
+          "settledAtMs": 5543.195669,
+          "cancelPostAtMs": 5542.820071,
+          "marker": {
+            "probe": "active",
+            "token": 17,
+            "workerAtMs": 5522.472006,
+            "operation": "fetch",
+            "requestId": 2352
+          },
+          "worker": {
+            "token": 17,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2351,
+              2352
+            ],
+            "queryId": 2351,
+            "admittedAtMs": 5522.002513,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5522.472006,
+              "operation": "fetch",
+              "requestId": 2352
+            },
+            "errorSentAtMs": 5542.975206,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 5543.001349
+          },
+          "submitToMarkerMs": 0.744912000000113,
+          "markerToIssueMs": 20.12698100000034,
+          "issueToSettleMs": 0.44497799999953713,
+          "issueToPostMs": 0.06937999999991007,
+          "receivedToErrorSentMs": -0.026143000000047323,
+          "followupMs": 0.31864199999927223,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        },
+        {
+          "index": 6,
+          "state": "canceled",
+          "code": "57014",
+          "consumedRows": 0,
+          "watchdogFired": false,
+          "submittedAtMs": 5543.570267,
+          "markerReceivedAtMs": 5543.96754,
+          "cancelIssuedAtMs": 5564.167116,
+          "settledAtMs": 5564.404048,
+          "cancelPostAtMs": 5564.229398,
+          "marker": {
+            "probe": "active",
+            "token": 18,
+            "workerAtMs": 5543.956995,
+            "operation": "fetch",
+            "requestId": 2358
+          },
+          "worker": {
+            "token": 18,
+            "sql": "SELECT g::i64 AS id, g::decimal AS exact, decode('0001feff', 'hex') AS bytes, ARRAY[g::i64, g::i64 + 1] AS pair, NULL::text AS absent FROM generate_series(1, 200000) g ORDER BY id",
+            "requestIds": [
+              2357,
+              2358
+            ],
+            "queryId": 2357,
+            "admittedAtMs": 5543.602586,
+            "sharedFlagPresent": true,
+            "marker": {
+              "workerAtMs": 5543.956995,
+              "operation": "fetch",
+              "requestId": 2358
+            },
+            "errorSentAtMs": 5564.296694,
+            "errorCode": "57014",
+            "cancelReceivedAtMs": 5564.322508
+          },
+          "submitToMarkerMs": 0.3972729999995863,
+          "markerToIssueMs": 20.19957599999998,
+          "issueToSettleMs": 0.23693200000070647,
+          "issueToPostMs": 0.06228200000077777,
+          "receivedToErrorSentMs": -0.025814000000536907,
+          "followupMs": 0.4310889999997016,
+          "cleanupVerified": true,
+          "followup": {
+            "rows": 1,
+            "fingerprint": "64a370e060845a4c",
+            "columnNames": [
+              "ok"
+            ],
+            "columnTypes": [
+              "i64"
+            ],
+            "rowsAffected": null,
+            "cost": "1"
+          }
+        }
+      ],
+      "canceled": 7,
+      "issueToSettleMs": {
+        "samples": 7,
+        "min": 0.23693200000070647,
+        "median": 0.621593999999277,
+        "max": 1.9120990000001257
+      },
+      "submitToMarkerMs": {
+        "samples": 7,
+        "min": 0.3844090000002325,
+        "median": 0.4517339999993055,
+        "max": 3.30647399999998
+      },
+      "markerToIssueMs": {
+        "samples": 7,
+        "min": 19.103188000000046,
+        "median": 20.19957599999998,
+        "max": 22.10723600000074
+      }
+    }
+  ],
+  "methodology": [
+    "Benchmark-only worker adapters use the production RuntimeServer, RuntimeConnection, semantic core and host scheduling primitive.",
+    "One active marker is posted at the first real task yield while a query/fetch continuation is active; no SQL or cost is changed.",
+    "Abort is requested after a fixed delay from receiving that marker. No query is aborted before the active marker.",
+    "Primary issue-to-settle elapsed time uses only the main-thread clock, recorded at the operation rejection before explicit close and followup.",
+    "Worker cancel-receipt to error-send uses only the worker clock; negative values can occur when Node observes the atomic flag before the cancel message.",
+    "No cross-clock subtraction or dispatch-latency claim. Submit-to-marker includes request dispatch and the first execution segment, plus marker delivery.",
+    "Completed-before-abort samples are reported separately; full-query validation/warmup is outside cancellation timing.",
+    "Fixed batch limits. Following every sample, SELECT 1 checks that the same session and worker remain usable.",
+    "Instrumentation adds one worker-to-main marker and fixed bookkeeping; cancellation latency does not characterize an uninterruptible scalar/sort kernel's worst case."
+  ]
+}

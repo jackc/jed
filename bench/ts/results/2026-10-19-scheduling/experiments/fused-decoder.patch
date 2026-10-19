@@ -1,0 +1,263 @@
+--- a/impl/ts/src/async/packed.ts
++++ b/impl/ts/src/async/packed.ts
+@@ -3,2 +3,2 @@
+-// the existing wire budget, and decoding validates the complete expanded batch before allocating
+-// its values. All integers are little-endian; strings preserve raw UTF-16 code units.
++// the existing wire budget. Decoding reserves before allocation and exposes values only after
++// the complete batch validates. All integers are little-endian; strings preserve UTF-16 units.
+@@ -252,3 +252,3 @@
+-// The preflight reader has a budget and allocates no result containers, strings, bytes or decimals.
+-// The construction reader traverses the already checked immutable ArrayBuffer synchronously.
+-// Both modes use this one layout decoder so validation and reconstruction cannot disagree on offsets.
++// Validation and construction share one traversal. Each allocation follows its logical reservation
++// and input bounds check. A malformed suffix discards the bounded prefix; no row escapes until the
++// entire batch succeeds.
+@@ -259 +258,0 @@
+-  private readonly build: boolean;
+@@ -261,2 +260,2 @@
+-  private readonly budget?: WireBudget;
+-  constructor(data: ArrayBuffer, budget?: WireBudget) {
++  private readonly budget: WireBudget;
++  constructor(data: ArrayBuffer, budget: WireBudget) {
+@@ -266 +264,0 @@
+-    this.build = budget === undefined;
+@@ -270,5 +268 @@
+-    if (
+-      !this.build &&
+-      (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.data.byteLength - at)
+-    )
+-      invalid();
++    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.data.byteLength - at) invalid();
+@@ -279 +273 @@
+-    this.budget?.reserve(bytes);
++    this.budget.reserve(bytes);
+@@ -283 +277 @@
+-    if (!this.build && depth > MAX_DEPTH) invalid();
++    if (depth > MAX_DEPTH) invalid();
+@@ -286 +280 @@
+-  private array(length: number): void {
++  private array(length: number, minimumBytes = 1): void {
+@@ -287,0 +282,3 @@
++    // A valid reservation alone cannot make truncated input a valid container. Every encoded
++    // element consumes at least one tag byte; dimensions and object members need more.
++    if (length > Math.floor((this.data.byteLength - this.offset) / minimumBytes)) invalid();
+@@ -292,3 +288,0 @@
+-  private u16(): number {
+-    return this.view.getUint16(this.take(2), true);
+-  }
+@@ -300 +294 @@
+-    return this.build ? this.view.getBigInt64(at, true) : 0n;
++    return this.view.getBigInt64(at, true);
+@@ -307 +301 @@
+-    if (!this.build && v > 1) invalid();
++    if (v > 1) invalid();
+@@ -312 +306 @@
+-    if (!this.build && !Number.isSafeInteger(v)) invalid();
++    if (!Number.isSafeInteger(v)) invalid();
+@@ -319 +313 @@
+-    if (!this.build || length === 0) return "";
++    if (length === 0) return "";
+@@ -329 +323 @@
+-  private decimal(): Decimal | undefined {
++  private decimal(): Decimal {
+@@ -334,3 +328,3 @@
+-    if (!this.build && (scale > MAX_SCALE || count > Math.ceil((MAX_INT_DIGITS + MAX_SCALE) / 4)))
+-      invalid();
+-    const limbs = this.build ? new Array<number>(count) : undefined;
++    if (scale > MAX_SCALE || count > Math.ceil((MAX_INT_DIGITS + MAX_SCALE) / 4)) invalid();
++    const start = this.take(count * 2);
++    const limbs = new Array<number>(count);
+@@ -339,3 +333,3 @@
+-      last = this.u16();
+-      if (!this.build && last >= 10000) invalid();
+-      if (limbs !== undefined) limbs[i] = last;
++      last = this.view.getUint16(start + i * 2, true);
++      if (last >= 10000) invalid();
++      limbs[i] = last;
+@@ -343,2 +337,2 @@
+-    if (!this.build && (count === 0 ? neg : last === 0)) invalid();
+-    return limbs === undefined ? undefined : Decimal.fromParts(neg, scale, limbs);
++    if (count === 0 ? neg : last === 0) invalid();
++    return Decimal.fromParts(neg, scale, limbs);
+@@ -346 +340 @@
+-  private json(depth: number): JsonNode | undefined {
++  private json(depth: number): JsonNode {
+@@ -350 +344 @@
+-        return this.build ? { kind: "null" } : undefined;
++        return { kind: "null" };
+@@ -353 +347 @@
+-        return this.build ? { kind: "bool", value } : undefined;
++        return { kind: "bool", value };
+@@ -357 +351 @@
+-        return this.build ? { kind: "number", dec: dec! } : undefined;
++        return { kind: "number", dec };
+@@ -361 +355 @@
+-        return this.build ? { kind: "string", value } : undefined;
++        return { kind: "string", value };
+@@ -366 +360 @@
+-        const elements = this.build ? new Array<JsonNode>(count) : undefined;
++        const elements = new Array<JsonNode>(count);
+@@ -369 +363 @@
+-          if (elements !== undefined) elements[i] = value!;
++          elements[i] = value;
+@@ -371 +365 @@
+-        return elements === undefined ? undefined : { kind: "array", elements };
++        return { kind: "array", elements };
+@@ -375,2 +369,2 @@
+-        this.array(count);
+-        const members = this.build ? new Array<{ key: string; value: JsonNode }>(count) : undefined;
++        this.array(count, 5); // Key length followed by at least one JSON tag.
++        const members = new Array<{ key: string; value: JsonNode }>(count);
+@@ -381 +375 @@
+-          if (members !== undefined) members[i] = { key, value: value! };
++          members[i] = { key, value };
+@@ -383 +377 @@
+-        return members === undefined ? undefined : { kind: "object", members };
++        return { kind: "object", members };
+@@ -389 +383 @@
+-  private datum(depth: number): Value | undefined {
++  private datum(depth: number): Value {
+@@ -393 +387 @@
+-        return this.build ? { kind: "null" } : undefined;
++        return { kind: "null" };
+@@ -397 +391 @@
+-        return this.build ? { kind: "int", int } : undefined;
++        return { kind: "int", int };
+@@ -401 +395 @@
+-        return this.build ? { kind: "bool", value } : undefined;
++        return { kind: "bool", value };
+@@ -406 +400 @@
+-        return this.build ? { kind: "date", days } : undefined;
++        return { kind: "date", days };
+@@ -413,3 +407 @@
+-        return this.build
+-          ? { kind: tag === TAG.timestamp ? "timestamp" : "timestamptz", micros }
+-          : undefined;
++        return { kind: tag === TAG.timestamp ? "timestamp" : "timestamptz", micros };
+@@ -422 +414 @@
+-        return this.build ? { kind: "interval", iv: { months, days, micros } } : undefined;
++        return { kind: "interval", iv: { months, days, micros } };
+@@ -429,3 +421 @@
+-        return this.build
+-          ? { kind: tag === TAG.text ? "text" : tag === TAG.json ? "json" : "jsonpath", text }
+-          : undefined;
++        return { kind: tag === TAG.text ? "text" : tag === TAG.json ? "json" : "jsonpath", text };
+@@ -435 +425 @@
+-        return this.build ? { kind: "decimal", dec: dec! } : undefined;
++        return { kind: "decimal", dec };
+@@ -440 +430 @@
+-        return this.build ? { kind: "f32", value: this.view.getFloat32(at, true) } : undefined;
++        return { kind: "f32", value: this.view.getFloat32(at, true) };
+@@ -445 +435 @@
+-        return this.build ? { kind: "f64", value: this.view.getFloat64(at, true) } : undefined;
++        return { kind: "f64", value: this.view.getFloat64(at, true) };
+@@ -453,6 +443,4 @@
+-        return this.build
+-          ? {
+-              kind: tag === TAG.bytea ? "bytea" : "uuid",
+-              bytes: new Uint8Array(this.data, at, length).slice(),
+-            }
+-          : undefined;
++        return {
++          kind: tag === TAG.bytea ? "bytea" : "uuid",
++          bytes: new Uint8Array(this.data, at, length).slice(),
++        };
+@@ -463 +451 @@
+-        const fields = this.build ? new Array<Value>(count) : undefined;
++        const fields = new Array<Value>(count);
+@@ -466 +454 @@
+-          if (fields !== undefined) fields[i] = value!;
++          fields[i] = value;
+@@ -468 +456 @@
+-        return fields === undefined ? undefined : { kind: "composite", fields };
++        return { kind: "composite", fields };
+@@ -472,5 +460,5 @@
+-        if (!this.build && dimensions > 6) invalid();
+-        this.array(dimensions);
+-        this.array(dimensions);
+-        const dims = this.build ? new Array<number>(dimensions) : undefined;
+-        const lbounds = this.build ? new Array<number>(dimensions) : undefined;
++        if (dimensions > 6) invalid();
++        this.array(dimensions, 16);
++        this.array(dimensions, 16);
++        const dims = new Array<number>(dimensions);
++        const lbounds = new Array<number>(dimensions);
+@@ -482,5 +470,3 @@
+-          if (!this.build && (dimension <= 0 || !Number.isSafeInteger(count))) invalid();
+-          if (dims !== undefined) {
+-            dims[i] = dimension;
+-            lbounds![i] = lower;
+-          }
++          if (dimension <= 0 || !Number.isSafeInteger(count)) invalid();
++          dims[i] = dimension;
++          lbounds[i] = lower;
+@@ -489 +475 @@
+-        const elements = this.build ? new Array<Value>(count) : undefined;
++        const elements = new Array<Value>(count);
+@@ -492 +478 @@
+-          if (elements !== undefined) elements[i] = value!;
++          elements[i] = value;
+@@ -494,3 +480 @@
+-        return elements === undefined
+-          ? undefined
+-          : { kind: "array", dims: dims!, lbounds: lbounds!, elements };
++        return { kind: "array", dims, lbounds, elements };
+@@ -500 +484 @@
+-        if (!this.build && flags > 31) invalid();
++        if (flags > 31) invalid();
+@@ -503,10 +487,8 @@
+-        return this.build
+-          ? {
+-              kind: "range",
+-              empty: !!(flags & 1),
+-              lowerInc: !!(flags & 2),
+-              upperInc: !!(flags & 4),
+-              lower: lower!,
+-              upper: upper!,
+-            }
+-          : undefined;
++        return {
++          kind: "range",
++          empty: !!(flags & 1),
++          lowerInc: !!(flags & 2),
++          upperInc: !!(flags & 4),
++          lower,
++          upper,
++        };
+@@ -516 +498 @@
+-        return this.build ? { kind: "jsonb", node: node! } : undefined;
++        return { kind: "jsonb", node };
+@@ -522 +504 @@
+-  row(): Value[] | undefined {
++  row(): Value[] {
+@@ -525 +507 @@
+-    const values = this.build ? new Array<Value>(count) : undefined;
++    const values = new Array<Value>(count);
+@@ -529 +511 @@
+-      if (values !== undefined) values[i] = value!;
++      values[i] = value;
+@@ -537,2 +519 @@
+-  // Real ports provide data properties; custom transports cannot change the envelope between
+-  // the validation and construction passes.
++  // Capture custom transport envelope accessors once.
+@@ -554,6 +535,5 @@
+-  const checked = new PackedReader(data, budget);
+-  for (let i = 0; i < length; i++) checked.row();
+-  if (checked.offset !== bytes) invalid();
+-  const reader = new PackedReader(data);
+-  const rows = new Array<Value[]>(length);
+-  const rowBytes = new Array<number>(length);
++  const reader = new PackedReader(data, budget);
++  // Grow metadata only after a complete row has validated and reserved its bytes. An unchecked
++  // envelope count cannot allocate a large result array before a truncated input is rejected.
++  const rows: Value[][] = [];
++  const rowBytes: number[] = [];
+@@ -562,2 +542,2 @@
+-    rows[i] = reader.row()!;
+-    rowBytes[i] = reader.logicalBytes - before;
++    rows.push(reader.row());
++    rowBytes.push(reader.logicalBytes - before);
+@@ -565 +545,2 @@
+-  return { rows, rowBytes, bytes: checked.logicalBytes };
++  if (reader.offset !== bytes) invalid();
++  return { rows, rowBytes, bytes: reader.logicalBytes };
