@@ -1,0 +1,75 @@
+--- a/impl/ts/src/execution.ts
++++ b/impl/ts/src/execution.ts
+@@ -63,0 +64,3 @@
++  timeSliceMs: number;
++  now: () => number;
++  deadline: number;
+@@ -67,0 +71 @@
++const DEFAULT_TIME_SLICE_MS = 1;
+@@ -69,5 +73,5 @@
+-// The counter is physical scheduling state, never SQL cost. Resident-page walks and outer row
+-// loops use the same checkpoint as cold I/O without turning scalar kernels into promises.
+-export function shouldCooperate(units = 1): boolean {
+-  const context = activeContext;
+-  if (context === undefined || !context.cooperative) return false;
++function monotonicNow(): number {
++  return performance.now();
++}
++
++function cooperationDue(context: ExecutionContext, units = 1): boolean {
+@@ -77 +81,15 @@
+-  return true;
++  return context.now() >= context.deadline;
++}
++
++function resetSlice(context: ExecutionContext): void {
++  context.remaining = context.quantum;
++  context.deadline = context.now() + context.timeSliceMs;
++}
++
++// The counter and clock are physical scheduling state, never SQL cost or the SQL host clock.
++// Read the monotonic clock only at sparse work checkpoints; cheap resident work can pass several
++// checkpoints without creating an effect, promise or task turn.
++export function shouldCooperate(units = 1): boolean {
++  const context = activeContext;
++  if (context === undefined || !context.cooperative) return false;
++  return cooperationDue(context, units);
+@@ -192,0 +211,4 @@
++  // Elapsed scheduling budget, checked every quantum units. Zero forces every checkpoint to yield.
++  timeSliceMs?: number;
++  // Monotonic scheduling clock; injectable for deterministic driver tests, never exposed to SQL.
++  now?: () => number;
+@@ -201,0 +224,4 @@
++  const timeSliceMs = options.timeSliceMs ?? DEFAULT_TIME_SLICE_MS;
++  if (!Number.isFinite(timeSliceMs) || timeSliceMs < 0)
++    throw new RangeError("execution time slice must be finite and non-negative");
++  const now = options.now ?? monotonicNow;
+@@ -205,0 +232,3 @@
++    timeSliceMs,
++    now,
++    deadline: now() + timeSliceMs,
+@@ -269,0 +299 @@
++        resetSlice(context);
+@@ -276,3 +306,4 @@
+-          // Hot promise-returning hosts must still admit cancel messages periodically.
+-          if (--context.remaining <= 0) {
+-            context.remaining = quantum;
++          // Preserve the deadline across awaits: an already-resolved provider must not reset
++          // its slice forever and starve control messages. Actual I/O is always awaited promptly;
++          // its wait may conservatively count toward the next sparse scheduling checkpoint.
++          if (cooperationDue(context)) {
+@@ -279,0 +311 @@
++            resetSlice(context);
+@@ -282,0 +315 @@
++          resetSlice(context);
+--- a/impl/ts/src/async/server.ts
++++ b/impl/ts/src/async/server.ts
+@@ -99,0 +100 @@
++  private readonly executionClock?: () => number;
+@@ -119,0 +121,2 @@
++    // Internal monotonic clock seam for deterministic elapsed-scheduling tests.
++    executionClock?: () => number;
+@@ -122,0 +126 @@
++    this.executionClock = options.executionClock;
+@@ -272,0 +277 @@
++              now: this.executionClock,

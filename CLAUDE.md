@@ -106,7 +106,9 @@ language, because hardening the spec was never the reason to add it.
    both adapters; synchronous core APIs remain internal for conformance and tooling. Node and
    shared-memory-capable browsers poll atomic cancellation flags; all hosts also cooperate at
    logical page boundaries and common execution loops through retained continuations shared by
-   sync and async drivers. Common resident expressions return immediate values; pending operands
+   sync and async drivers. Sparse checkpoints check a 1 ms monotonic scheduling budget before
+   yielding; this physical clock affects neither SQL values nor cost and is not a cancellation
+   latency guarantee. Common resident expressions return immediate values; pending operands
    retain continuations without replay or duplicate evaluation semantics. Cancellation is best
    effort: sorting, parsing/planning and long scalar kernels stay synchronous. Node data-page reads
    can await I/O; storage lifecycle, commit and

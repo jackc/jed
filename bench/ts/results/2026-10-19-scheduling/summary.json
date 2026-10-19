@@ -1,0 +1,1118 @@
+{
+  "runs": [
+    {
+      "label": "browser-baseline-1",
+      "sha256": "d3598c78b03cc84cbf217910ee846293f5596c2b44736ef0d62d24ebe8640834",
+      "date": "2026-10-19T11:53:12.495Z"
+    },
+    {
+      "label": "browser-scheduler-1",
+      "sha256": "de42265d56cef30a13bc115831e5e069479709a1b456c35d739cb89ea2acd3d8",
+      "date": "2026-10-19T11:53:37.335Z"
+    },
+    {
+      "label": "browser-combined-1",
+      "sha256": "ac81423d6cf79cb6ad3a5377f6f3e16fef2170bd1f579b9d44a984ceaa1669c9",
+      "date": "2026-10-19T11:54:02.022Z"
+    },
+    {
+      "label": "node-combined-1",
+      "sha256": "cc2bae24efcb63fd0e957044696825f9a61be342d895c2bcb0785e3e85b777e0",
+      "date": "2026-10-19T11:54:24.608Z"
+    },
+    {
+      "label": "node-scheduler-1",
+      "sha256": "c4c592e15b79ab42b7544f9302991178b39113352d57b32c10fa28b032e33b56",
+      "date": "2026-10-19T11:54:46.819Z"
+    },
+    {
+      "label": "node-baseline-1",
+      "sha256": "9cbd8b427ddad9aaf55a3f631088f68783b29b3cbfd842ea6754152066555dc9",
+      "date": "2026-10-19T11:55:09.573Z"
+    },
+    {
+      "label": "node-baseline-2",
+      "sha256": "e97dfb6f9d7c38c2bb8fb9bf90166bc4e18829ea7c7952776f9b29a507f622c6",
+      "date": "2026-10-19T11:55:32.549Z"
+    },
+    {
+      "label": "node-combined-2",
+      "sha256": "980321f5ceadf41bb3c425262279df1a0d5c67b2d5885f260ab9d336bf51da2c",
+      "date": "2026-10-19T11:55:55.297Z"
+    },
+    {
+      "label": "node-scheduler-2",
+      "sha256": "ce1f10b1518e20a789ab8b14fdbe0eba1fddc63761393f160198fc4aa757eeff",
+      "date": "2026-10-19T11:56:17.754Z"
+    },
+    {
+      "label": "browser-scheduler-2",
+      "sha256": "0b569c8df38ead97fdc97e497e406d94bb706f079274a6ab8a2c162ead166343",
+      "date": "2026-10-19T11:56:42.546Z"
+    },
+    {
+      "label": "browser-combined-2",
+      "sha256": "189622f255c18f8ca9339b64d55fe2806126255a1e027df262cd2aa4e92f8e92",
+      "date": "2026-10-19T11:57:07.152Z"
+    },
+    {
+      "label": "browser-baseline-2",
+      "sha256": "5705c80beb7caa702fde4ba08d4a9c55bf38553a491908350355abd50250b357",
+      "date": "2026-10-19T11:57:33.368Z"
+    },
+    {
+      "label": "browser-combined-3",
+      "sha256": "3d168c85ffa70432e7237fd5dddfa05caf95c3e8a5f2db964f4499525c57d551",
+      "date": "2026-10-19T11:57:58.250Z"
+    },
+    {
+      "label": "browser-baseline-3",
+      "sha256": "110d2b4a2f7757edf65b0d1fa25da9387139ead263ece96431df7dce6201aa11",
+      "date": "2026-10-19T11:58:24.491Z"
+    },
+    {
+      "label": "browser-scheduler-3",
+      "sha256": "95340f8a9f4242e638be2a04195fe4680f53381dd4636cc1e35fb485b2d7fb9d",
+      "date": "2026-10-19T11:58:49.353Z"
+    },
+    {
+      "label": "node-scheduler-3",
+      "sha256": "21924730299a6041d1e021858520e1e94d3baf692e53f7acec076d10293256e6",
+      "date": "2026-10-19T11:59:12.050Z"
+    },
+    {
+      "label": "node-baseline-3",
+      "sha256": "08dbfffd8b3f4585a4cea78333fbe02db5c8ec06869f4bdca2b302f85a5f1546",
+      "date": "2026-10-19T11:59:34.860Z"
+    },
+    {
+      "label": "node-combined-3",
+      "sha256": "356c1be70fd5a837408f022cf8b26beb8cb15d38b873c9ccc1b1956466bcfd15",
+      "date": "2026-10-19T11:59:57.684Z"
+    },
+    {
+      "label": "node-short-1",
+      "sha256": "a57f2bc34fecf3f64859ad5218b8db8558bfffaf318a2fdda373d58a32666e10",
+      "date": "2026-10-19T12:01:56.196Z"
+    },
+    {
+      "label": "browser-short-1",
+      "sha256": "2e0b49098d3d575109d20935ba2af211f6fe23421c50c93e201c12389c1927d9",
+      "date": "2026-10-19T12:02:21.497Z"
+    },
+    {
+      "label": "browser-short-2",
+      "sha256": "bf33cca0fba3481e4d110397276e0181f815ef37ffb2c38af62eddc5d2ab27ee",
+      "date": "2026-10-19T12:02:46.579Z"
+    },
+    {
+      "label": "node-short-2",
+      "sha256": "9cf2e2450067e77fe616fe242c259df6b6ab5d65a8b3c03eab80c4d45390a5eb",
+      "date": "2026-10-19T12:03:09.808Z"
+    },
+    {
+      "label": "node-short-3",
+      "sha256": "59e57d18b2629c41dfec93fccb585d1bdd556a70e33cbe36c43fbc54b43806fa",
+      "date": "2026-10-19T12:03:33.353Z"
+    },
+    {
+      "label": "browser-short-3",
+      "sha256": "fc30d7187b22d6abc835648f4330860da35a988b131dea5fa50004b19aa8886c",
+      "date": "2026-10-19T12:03:58.749Z"
+    }
+  ],
+  "groups": [
+    {
+      "host": "browser",
+      "variant": "baseline",
+      "case": "decimal-aggregate",
+      "direct": [
+        270.90000000596046,
+        284.69999998807907,
+        273.59999999403954
+      ],
+      "worker": [
+        343.40000000596046,
+        269,
+        328.30000001192093
+      ],
+      "timer": [
+        7.799999997019768,
+        9.700000002980232,
+        10.199999988079071,
+        6.299999997019768,
+        12.899999991059303,
+        7,
+        10.299999997019768,
+        11.399999991059303,
+        9.599999994039536
+      ],
+      "frames": [
+        21.200000002980232,
+        19.799999997019768,
+        21.200000002980232,
+        17,
+        21.700000002980232,
+        18.400000005960464,
+        20,
+        19.799999997019768,
+        18.700000002980232
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "browser-baseline-1",
+        "browser-baseline-2",
+        "browser-baseline-3"
+      ],
+      "directMedian": 273.59999999403954,
+      "workerMedian": 328.30000001192093,
+      "overheadPercent": 19.99269006545068,
+      "timerMaxMedian": 9.700000002980232,
+      "timerMaxWorst": 12.899999991059303,
+      "frameMaxMedian": 19.799999997019768,
+      "frameMaxWorst": 21.700000002980232
+    },
+    {
+      "host": "browser",
+      "variant": "baseline",
+      "case": "typed-output",
+      "direct": [
+        373.20000000298023,
+        364.69999998807907,
+        367.1000000089407
+      ],
+      "worker": [
+        660.8999999910593,
+        672.9000000059605,
+        671.2999999970198
+      ],
+      "timer": [
+        11.700000002980232,
+        8.600000008940697,
+        10.200000002980232,
+        7.299999997019768,
+        6.800000011920929,
+        17.099999994039536,
+        12.100000008940697,
+        10.299999997019768,
+        12.200000002980232
+      ],
+      "frames": [
+        19.5,
+        16.900000005960464,
+        19.099999994039536,
+        18.80000001192093,
+        20.100000008940697,
+        21.899999991059303,
+        19.899999991059303,
+        22,
+        19.599999994039536
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "browser-baseline-1",
+        "browser-baseline-2",
+        "browser-baseline-3"
+      ],
+      "directMedian": 367.1000000089407,
+      "workerMedian": 671.2999999970198,
+      "overheadPercent": 82.86570416253618,
+      "timerMaxMedian": 10.299999997019768,
+      "timerMaxWorst": 17.099999994039536,
+      "frameMaxMedian": 19.599999994039536,
+      "frameMaxWorst": 22
+    },
+    {
+      "host": "browser",
+      "variant": "combined",
+      "case": "decimal-aggregate",
+      "direct": [
+        262.90000000596046,
+        263.8999999910593,
+        268.29999999701977
+      ],
+      "worker": [
+        228.8999999910593,
+        232,
+        238.90000000596046
+      ],
+      "timer": [
+        7.200000002980232,
+        9.599999994039536,
+        10.900000005960464,
+        8.600000008940697,
+        7.600000008940697,
+        10.5,
+        7,
+        8.099999994039536,
+        7.5999999940395355
+      ],
+      "frames": [
+        16.799999997019768,
+        27,
+        21.899999991059303,
+        19.799999997019768,
+        16.900000005960464,
+        20.299999997019768,
+        19.099999994039536,
+        17.099999994039536,
+        19.799999997019768
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "browser-combined-1",
+        "browser-combined-2",
+        "browser-combined-3"
+      ],
+      "directMedian": 263.8999999910593,
+      "workerMedian": 232.0,
+      "overheadPercent": -12.087912084933706,
+      "timerMaxMedian": 8.099999994039536,
+      "timerMaxWorst": 10.900000005960464,
+      "frameMaxMedian": 19.799999997019768,
+      "frameMaxWorst": 27
+    },
+    {
+      "host": "browser",
+      "variant": "combined",
+      "case": "typed-output",
+      "direct": [
+        379.70000000298023,
+        367,
+        371.09999999403954
+      ],
+      "worker": [
+        644,
+        652.9000000059605,
+        651
+      ],
+      "timer": [
+        13.400000005960464,
+        9.599999994039536,
+        8.800000011920929,
+        12.599999994039536,
+        10.900000005960464,
+        11.400000005960464,
+        8.400000005960464,
+        10.799999997019768,
+        12
+      ],
+      "frames": [
+        17.700000002980232,
+        20,
+        20.200000002980232,
+        18.700000002980232,
+        20.100000008940697,
+        20.099999994039536,
+        19,
+        19.399999991059303,
+        20.900000005960464
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "browser-combined-1",
+        "browser-combined-2",
+        "browser-combined-3"
+      ],
+      "directMedian": 371.09999999403954,
+      "workerMedian": 651.0,
+      "overheadPercent": 75.42441390742552,
+      "timerMaxMedian": 10.900000005960464,
+      "timerMaxWorst": 13.400000005960464,
+      "frameMaxMedian": 20.0,
+      "frameMaxWorst": 20.900000005960464
+    },
+    {
+      "host": "browser",
+      "variant": "scheduler",
+      "case": "decimal-aggregate",
+      "direct": [
+        265.3999999910593,
+        240.19999998807907,
+        276.79999999701977
+      ],
+      "worker": [
+        232.90000000596046,
+        244,
+        230
+      ],
+      "timer": [
+        8.099999994039536,
+        6,
+        8.099999994039536,
+        8.400000005960464,
+        7,
+        12.5,
+        6.600000008940697,
+        7.0999999940395355,
+        7.200000002980232
+      ],
+      "frames": [
+        20,
+        22.299999997019768,
+        16.900000005960464,
+        17.200000002980232,
+        18.400000005960464,
+        19.799999997019768,
+        17.5,
+        16.900000005960464,
+        19.5
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "browser-scheduler-1",
+        "browser-scheduler-2",
+        "browser-scheduler-3"
+      ],
+      "directMedian": 265.3999999910593,
+      "workerMedian": 232.90000000596046,
+      "overheadPercent": -12.24566691265776,
+      "timerMaxMedian": 7.200000002980232,
+      "timerMaxWorst": 12.5,
+      "frameMaxMedian": 18.400000005960464,
+      "frameMaxWorst": 22.299999997019768
+    },
+    {
+      "host": "browser",
+      "variant": "scheduler",
+      "case": "typed-output",
+      "direct": [
+        375.09999999403954,
+        364.3999999910593,
+        366.29999999701977
+      ],
+      "worker": [
+        655.7999999970198,
+        686.2000000029802,
+        681.4000000059605
+      ],
+      "timer": [
+        14.099999994039536,
+        10.100000008940697,
+        7.5999999940395355,
+        10.400000005960464,
+        8.399999991059303,
+        11.299999997019768,
+        10.900000005960464,
+        9.5,
+        8.900000005960464
+      ],
+      "frames": [
+        25.099999994039536,
+        19.5,
+        20,
+        19.299999997019768,
+        22.399999991059303,
+        19.100000008940697,
+        21.899999991059303,
+        21.400000005960464,
+        18.799999997019768
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "browser-scheduler-1",
+        "browser-scheduler-2",
+        "browser-scheduler-3"
+      ],
+      "directMedian": 366.29999999701977,
+      "workerMedian": 681.4000000059605,
+      "overheadPercent": 86.02238602552671,
+      "timerMaxMedian": 10.100000008940697,
+      "timerMaxWorst": 14.099999994039536,
+      "frameMaxMedian": 20.0,
+      "frameMaxWorst": 25.099999994039536
+    },
+    {
+      "host": "browser",
+      "variant": "short",
+      "case": "decimal-aggregate",
+      "direct": [
+        286.20000000298023,
+        271.70000000298023,
+        281.5
+      ],
+      "worker": [
+        240.09999999403954,
+        250.70000000298023,
+        230.40000000596046
+      ],
+      "timer": [
+        6.600000008940697,
+        8.599999994039536,
+        7,
+        6.700000002980232,
+        6.799999997019768,
+        6.5,
+        7,
+        13.299999997019768,
+        5.5999999940395355
+      ],
+      "frames": [
+        18.799999997019768,
+        18.600000008940697,
+        19,
+        17.599999994039536,
+        17,
+        17.100000008940697,
+        18.299999997019768,
+        19.799999997019768,
+        19.400000005960464
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "browser-short-1",
+        "browser-short-2",
+        "browser-short-3"
+      ],
+      "directMedian": 281.5,
+      "workerMedian": 240.09999999403954,
+      "overheadPercent": -14.706927177961093,
+      "timerMaxMedian": 6.799999997019768,
+      "timerMaxWorst": 13.299999997019768,
+      "frameMaxMedian": 18.600000008940697,
+      "frameMaxWorst": 19.799999997019768
+    },
+    {
+      "host": "browser",
+      "variant": "short",
+      "case": "typed-output",
+      "direct": [
+        369.20000000298023,
+        358.59999999403954,
+        369.09999999403954
+      ],
+      "worker": [
+        652.0999999940395,
+        669.5,
+        662.4000000059605
+      ],
+      "timer": [
+        7.399999991059303,
+        7.700000002980232,
+        9.400000005960464,
+        10.399999991059303,
+        8,
+        10.299999997019768,
+        8.200000002980232,
+        8.599999994039536,
+        8.799999997019768
+      ],
+      "frames": [
+        19.900000005960464,
+        22.099999994039536,
+        17.399999991059303,
+        21.099999994039536,
+        17,
+        19.299999997019768,
+        20.599999994039536,
+        20,
+        20.099999994039536
+      ],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "browser-short-1",
+        "browser-short-2",
+        "browser-short-3"
+      ],
+      "directMedian": 369.09999999403954,
+      "workerMedian": 662.4000000059605,
+      "overheadPercent": 79.46356001535013,
+      "timerMaxMedian": 8.599999994039536,
+      "timerMaxWorst": 10.399999991059303,
+      "frameMaxMedian": 20.0,
+      "frameMaxWorst": 22.099999994039536
+    },
+    {
+      "host": "node",
+      "variant": "baseline",
+      "case": "decimal-aggregate",
+      "direct": [
+        301.88527500000055,
+        316.20657200000005,
+        323.01740400000017
+      ],
+      "worker": [
+        296.2241440000007,
+        322.9985719999995,
+        314.0015330000001
+      ],
+      "timer": [
+        12.935106000000815,
+        7.234049000000596,
+        7.195609000000331,
+        10.524572000000262,
+        7.257732000000033,
+        9.143042000001515,
+        6.998693000001367,
+        7.285845000000336,
+        8.90967499999897
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "node-baseline-1",
+        "node-baseline-2",
+        "node-baseline-3"
+      ],
+      "directMedian": 316.20657200000005,
+      "workerMedian": 314.0015330000001,
+      "overheadPercent": -0.6973412937160361,
+      "timerMaxMedian": 7.285845000000336,
+      "timerMaxWorst": 12.935106000000815,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "baseline",
+      "case": "typed-output",
+      "direct": [
+        325.7580089999974,
+        328.9150719999998,
+        325.47732800000085
+      ],
+      "worker": [
+        534.0395750000007,
+        524.3612700000012,
+        517.1541030000008
+      ],
+      "timer": [
+        10.704807000001892,
+        5.999925000000076,
+        13.09934599999906,
+        7.952622999997402,
+        5.920358999999735,
+        14.62583000000086,
+        5.802765000000363,
+        5.766532000001462,
+        6.873679999996966
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "node-baseline-1",
+        "node-baseline-2",
+        "node-baseline-3"
+      ],
+      "directMedian": 325.7580089999974,
+      "workerMedian": 524.3612700000012,
+      "overheadPercent": 60.96650136390214,
+      "timerMaxMedian": 6.873679999996966,
+      "timerMaxWorst": 14.62583000000086,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "combined",
+      "case": "decimal-aggregate",
+      "direct": [
+        287.01276099999995,
+        288.0034820000001,
+        322.2436370000005
+      ],
+      "worker": [
+        284.9055430000003,
+        277.83083399999987,
+        289.2528629999997
+      ],
+      "timer": [
+        7.676628000000164,
+        7.7407899999998335,
+        7.57598500000131,
+        5.602000999999291,
+        7.754089000000022,
+        5.5963879999999335,
+        7.991485000000466,
+        7.532237999999779,
+        7.728461999999126
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "node-combined-1",
+        "node-combined-2",
+        "node-combined-3"
+      ],
+      "directMedian": 288.0034820000001,
+      "workerMedian": 284.9055430000003,
+      "overheadPercent": -1.0756602588574804,
+      "timerMaxMedian": 7.676628000000164,
+      "timerMaxWorst": 7.991485000000466,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "combined",
+      "case": "typed-output",
+      "direct": [
+        334.9305290000011,
+        348.609626999998,
+        339.3123510000005
+      ],
+      "worker": [
+        557.0529660000011,
+        580.2272459999986,
+        571.8571940000002
+      ],
+      "timer": [
+        10.226600999998482,
+        7.514345999999932,
+        6.043431000001874,
+        5.817429999999149,
+        5.663797000001068,
+        12.913423999998486,
+        7.564201000001049,
+        7.751362999999401,
+        8.610576999999466
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "node-combined-1",
+        "node-combined-2",
+        "node-combined-3"
+      ],
+      "directMedian": 339.3123510000005,
+      "workerMedian": 571.8571940000002,
+      "overheadPercent": 68.53415218003643,
+      "timerMaxMedian": 7.564201000001049,
+      "timerMaxWorst": 12.913423999998486,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "scheduler",
+      "case": "decimal-aggregate",
+      "direct": [
+        296.97893100000056,
+        293.09508000000005,
+        290.6757719999996
+      ],
+      "worker": [
+        304.287687,
+        280.3758859999998,
+        274.7185650000001
+      ],
+      "timer": [
+        10.968058999999812,
+        6.751500999999735,
+        5.172119000000748,
+        7.32989600000019,
+        8.832268999999542,
+        8.25010199999997,
+        7.711422999999741,
+        8.286232000000382,
+        7.701038999999582
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "node-scheduler-1",
+        "node-scheduler-2",
+        "node-scheduler-3"
+      ],
+      "directMedian": 293.09508000000005,
+      "workerMedian": 280.3758859999998,
+      "overheadPercent": -4.339613616168592,
+      "timerMaxMedian": 7.711422999999741,
+      "timerMaxWorst": 10.968058999999812,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "scheduler",
+      "case": "typed-output",
+      "direct": [
+        329.1755740000008,
+        354.29419800000323,
+        320.9877689999994
+      ],
+      "worker": [
+        537.8803210000005,
+        552.2114899999997,
+        571.1738060000007
+      ],
+      "timer": [
+        6.941960000000108,
+        8.252803999999742,
+        8.994597000000795,
+        6.5834929999982705,
+        6.789557000000059,
+        7.748253000001569,
+        6.008831999999529,
+        11.779678999999305,
+        6.678003000000899
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "node-scheduler-1",
+        "node-scheduler-2",
+        "node-scheduler-3"
+      ],
+      "directMedian": 329.1755740000008,
+      "workerMedian": 552.2114899999997,
+      "overheadPercent": 67.75591314074791,
+      "timerMaxMedian": 6.941960000000108,
+      "timerMaxWorst": 11.779678999999305,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "short",
+      "case": "decimal-aggregate",
+      "direct": [
+        313.41856000000007,
+        314.92242499999975,
+        320.5726539999996
+      ],
+      "worker": [
+        275.4864940000007,
+        307.01280899999983,
+        283.9137490000003
+      ],
+      "timer": [
+        8.900362000000314,
+        10.24066600000151,
+        7.297862999999779,
+        6.882636000000275,
+        6.921572000001106,
+        13.730826999999408,
+        7.28062300000056,
+        7.659367000000202,
+        7.0913130000008096
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 1,
+        "fingerprint": "79e4eed1d6ce1755",
+        "columnNames": [
+          "total"
+        ],
+        "columnTypes": [
+          "decimal"
+        ],
+        "rowsAffected": null,
+        "cost": "4985718"
+      },
+      "runs": [
+        "node-short-1",
+        "node-short-2",
+        "node-short-3"
+      ],
+      "directMedian": 314.92242499999975,
+      "workerMedian": 283.9137490000003,
+      "overheadPercent": -9.846449010418834,
+      "timerMaxMedian": 7.297862999999779,
+      "timerMaxWorst": 13.730826999999408,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    },
+    {
+      "host": "node",
+      "variant": "short",
+      "case": "typed-output",
+      "direct": [
+        337.217647999998,
+        337.48089900000014,
+        330.96821700000146
+      ],
+      "worker": [
+        540.6470150000023,
+        543.7529649999997,
+        568.2434400000002
+      ],
+      "timer": [
+        6.740127000000939,
+        5.841528000000835,
+        9.036757000001671,
+        6.376609999999346,
+        10.635111999999936,
+        6.589201999999204,
+        10.228151999999682,
+        11.296964999997726,
+        7.006368000002112
+      ],
+      "frames": [],
+      "longTasks": 0,
+      "observations": 9,
+      "validated": {
+        "rows": 200000,
+        "fingerprint": "ee3bf2c6ac80465a",
+        "columnNames": [
+          "id",
+          "exact",
+          "bytes",
+          "pair",
+          "absent"
+        ],
+        "columnTypes": [
+          "i64",
+          "decimal",
+          "bytea",
+          "i64[]",
+          "text"
+        ],
+        "rowsAffected": null,
+        "cost": "18000000"
+      },
+      "runs": [
+        "node-short-1",
+        "node-short-2",
+        "node-short-3"
+      ],
+      "directMedian": 337.217647999998,
+      "workerMedian": 543.7529649999997,
+      "overheadPercent": 61.24688853769684,
+      "timerMaxMedian": 7.006368000002112,
+      "timerMaxWorst": 11.296964999997726,
+      "frameMaxMedian": null,
+      "frameMaxWorst": null
+    }
+  ]
+}
