@@ -46,8 +46,8 @@ const server = new RuntimeServer({
     }
     return openDatabase(options.path, configured as OpenOptions);
   },
-  send(reply) {
-    port.postMessage(reply);
+  send(reply, transfer) {
+    port.postMessage(reply, transfer);
   },
 });
 

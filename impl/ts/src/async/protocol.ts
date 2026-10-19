@@ -1,8 +1,8 @@
-// Worker transport v1. This is a host contract, separate from SQL cost and file bytes.
+// Worker transport v2. This is a host contract, separate from SQL cost and file bytes.
 import type { WireError } from "./errors.ts";
-import type { WireValue } from "./wire.ts";
+import type { PackedRows } from "./packed.ts";
 
-export const RUNTIME_VERSION = 1;
+export const RUNTIME_VERSION = 2;
 
 export type RuntimeLimits = {
   maxQueuedRequests: number;
@@ -42,7 +42,7 @@ export function runtimeLimits(options: Partial<RuntimeLimits> = {}): RuntimeLimi
 }
 
 export type RuntimeRequest = {
-  version: 1;
+  version: typeof RUNTIME_VERSION;
   id: number;
   op: string;
   session?: number;
@@ -53,8 +53,8 @@ export type RuntimeRequest = {
 };
 
 export type RuntimeReply =
-  | { version: 1; id: number; ok: true; result: unknown }
-  | { version: 1; id: number; ok: false; error: WireError };
+  | { version: typeof RUNTIME_VERSION; id: number; ok: true; result: unknown }
+  | { version: typeof RUNTIME_VERSION; id: number; ok: false; error: WireError };
 
 export type QueryReply = {
   cursor: number;
@@ -64,7 +64,7 @@ export type QueryReply = {
   cost: bigint;
 };
 
-export type FetchReply = { rows: WireValue[][]; done: boolean; cost: bigint };
+export type FetchReply = { rows: PackedRows; done: boolean; cost: bigint };
 
 export interface RuntimeTransport {
   postMessage(request: RuntimeRequest): void;

@@ -305,6 +305,14 @@ the direct core and 17% through the worker. Small calls show limited changes; di
 execution is about 1 µs slower. This supports avoiding per-expression continuation machinery,
 without claiming a universal gain or complete recovery of the original synchronous throughput.
 
+The [packed-result follow-up](../../bench/ts/results/2026-10-18-packed/report.md) isolates result
+delivery changes from the unchanged executor. Across three process runs per variant, the same
+4,096-row worker result falls from 29.97 to 9.25 ms (69% lower latency); the direct core remains
+around 5 ms. Cheap worker queries are about 4 µs slower, while prepared calls and batches show
+small changes within wider process variation. These warm Node measurements support transferring
+compact batches while retaining the existing row/byte limits, without claiming a general
+improvement in query execution or browser throughput.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node extension registration. Remaining decisions
 include async storage lifecycle/commit and crypto providers, worker pools,
@@ -341,7 +349,7 @@ worker-owned, reusable on their originating handle, and have async `close`/dispo
 It introduces no transaction: preceding autocommits stay committed, while statements in
 an explicit block share that block. `executeScript` retains the existing atomic script rule.
 
-Requests carry protocol version 1, strictly increasing request IDs, a session ID, an
+Requests carry protocol version 2, strictly increasing request IDs, a session ID, an
 optional transaction ID and operation-specific data. Values carry their own version 1
 tag and an explicit recursive kind. Structured clone carries exact bigints; floats use IEEE
 bit payloads (preserving NaN payloads, infinities and negative zero). Dedicated byte arrays
@@ -351,6 +359,46 @@ fields, ranges and JSONB numbers recurse through the same contract. Unfetched st
 references, cyclic/malformed values, arbitrary prototypes and closures are rejected.
 This wire version is independent of the database file version. Engine errors retain
 SQLSTATE and all public structured fields; diagnostic text has a finite transport limit.
+
+Result batches use a separate versioned binary encoding in an owned `ArrayBuffer`, transferred
+between worker and caller. This avoids structured-cloning a recursive object graph for every
+row. Request parameters retain the object value encoding above. Packing preflights each row
+against the same conservative transport accounting before copying it; decoding bounds both
+the binary payload and its expanded values before exposing rows. UTF-16 code units, exact
+integers/decimals, float bits and recursive value metadata remain lossless. Result values own
+their mutable bytes and arrays. The protocol version change rejects mismatched worker/client
+bundles; it does not change file bytes, SQL cost, result batch limits or cursor pull semantics.
+Buffered row iteration returns a resolved promise directly when no earlier pull is pending;
+concurrent pulls and close retain ordered, bounded admission.
+
+The packed result envelope is `{version: 1, length: rowCount, data: ArrayBuffer}`.
+Its buffer starts with a `u32` row count matching the envelope, followed by each row's
+`u32` column count and tagged values. Multi-byte fields are little-endian. Value tags:
+
+| Tag | Kind | Body |
+|---:|---|---|
+| 0 | NULL | empty |
+| 1 | integer | signed 64-bit integer |
+| 2 | boolean | byte 0 or 1 |
+| 3 | date | signed 64-bit day count |
+| 4, 5 | timestamp, timestamptz | signed 64-bit microseconds |
+| 6 | interval | months and days as exact safe integers in f64 fields, then signed 64-bit microseconds |
+| 7, 8, 9 | text, json, jsonpath | `u32` UTF-16 unit count, then `u16` units |
+| 10 | decimal | sign byte, `u32` scale, `u32` limb count, then little-endian base-10000 `u16` limbs |
+| 11, 12 | f32, f64 | 4 or 8 IEEE bytes |
+| 13 | bytea | `u32` byte count, then bytes |
+| 14 | uuid | 16 bytes |
+| 15 | composite | `u32` field count, then tagged values |
+| 16 | array | dimension count byte; each length/lower-bound pair as exact safe integers in f64 fields; then tagged elements |
+| 17 | range | flag byte: empty=1, lower inclusive=2, upper inclusive=4, lower present=8, upper present=16; then present tagged bounds |
+| 18 | jsonb | tagged JSON node |
+
+Array dimensions are limited to six, with positive lengths and their exact product determining
+the element count; zero dimensions means zero elements. JSON node tags are NULL=0, boolean=1,
+decimal number=2, string=3, array=4 and object=5. Scalars use the bodies above; an array uses
+a `u32` element count followed by nodes, and an object uses a `u32` member count followed by
+string keys and nodes. Decoder validation matches the object wire's depth, decimal and shape
+constraints. Unknown tags, invalid flags/counts, truncation and trailing bytes are errors.
 
 Runtime limits are host budgets, never SQL cost units or heap-size guarantees. Defaults:
 
