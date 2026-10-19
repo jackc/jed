@@ -1,0 +1,47 @@
+[
+  {
+    "bench": "gin_stats_common_tag",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 450801664
+  },
+  {
+    "bench": "gin_stats_rare_tag",
+    "status": "smoke_pass",
+    "checksum": "64bf6e8e70932051",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 436699136
+  },
+  {
+    "bench": "custom_plan_gin_common_tag",
+    "status": "smoke_pass",
+    "checksum": "d15532fc69e580ed",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 431214592
+  },
+  {
+    "bench": "custom_plan_gin_rare_tag",
+    "status": "smoke_pass",
+    "checksum": "cbf29ce484222325",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 401285120
+  },
+  {
+    "bench": "custom_plan_mcv_rare",
+    "status": "smoke_pass",
+    "checksum": "39a8bebffd2c4cde",
+    "rows": 1,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 341164032
+  }
+]

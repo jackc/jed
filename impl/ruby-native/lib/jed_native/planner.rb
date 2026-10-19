@@ -4,7 +4,7 @@ require_relative 'file_format'
 
 module JedNative
   # Deterministic maintenance facts. Collection retains a bounded sample and KMV
-  # set; the experimental engine's row store still owns the full population.
+  # set while file-backed tables stream their committed rows in storage order.
   module Maintenance
     SAMPLE_ROWS = 30_000
     KMV_HASHES = 4096
@@ -103,6 +103,26 @@ module JedNative
       Types.storage_value(type, value, @types)
     end
 
+    def storage_record_plan(table, key, row, codec, capacity, meter: false)
+      values = table[:columns].each_index.map do |index|
+        reference = row.storage_reference(index) if row.respond_to?(:storage_reference)
+        reference || statistics_value(table[:columns][index][:type], row[index])
+      end
+      units = 0
+      forms, compressed, size = codec.plan_record(table, key, values, capacity,
+        compression_units: meter ? ->(count) { units += count } : nil)
+      charge(units) if meter && units.positive?
+      changed = false
+      values.each_with_index do |value, index|
+        next unless value.is_a?(StoredValue) && forms[index] != value.form
+        values[index] = value.resolve
+        row.discard_storage_reference(index) if row.respond_to?(:discard_storage_reference)
+        changed = true
+      end
+      forms, compressed, size = codec.plan_record(table, key, values, capacity) if changed
+      [values, forms, compressed, size]
+    end
+
     def statistics_codec
       codec = FileFormat.new(collation_key: ->(name, value) { resolve_collation(name).sort_key(value) })
       codec.instance_variable_set(:@ctypes, @types)
@@ -143,7 +163,10 @@ module JedNative
         stored[:columns].index { |item| item[:name] == column } || raise(Error.new('42703', "unknown column #{column}"))
       end
       codec = statistics_codec
-      rows = statistics_storage_rows(stored, codec)
+      if stored[:rows].is_a?(PagedRows) && stored[:rows].actual_count != stored[:rows].length
+        raise Error.new('XX001', 'persisted row count does not match tree')
+      end
+      rows = stored[:rows].is_a?(PagedRows) ? stored[:rows].entries : statistics_storage_rows(stored, codec)
       facts = (stored[:storage_statistics] || []).map do |fact|
         fact.merge(stale: fact[:stale] || stored[:storage_rows] && stored[:storage_rows] != stored[:rows])
       end.to_h { |fact| [fact[:column], fact] }
@@ -163,9 +186,10 @@ module JedNative
       null_count, width_sum, occurrences = 0, 0, 0
       terms, pruned, oversized_terms = {}, false, false
       charge(primary_page_count(stored))
-      positions = stored[:rows].each_with_index.to_h { |row, index| [row.object_id, index] }
+      positions = stored[:rows].each_with_index.to_h { |row, index| [row.object_id, index] } unless stored[:rows].is_a?(PagedRows)
       rows.each_with_index do |(storage_key, row), position|
-        charge(1 + primary_scan_units(stored, [positions.fetch(row.object_id)], [ordinal]).sum)
+        location = positions ? positions.fetch(row.object_id) : row
+        charge(1 + primary_scan_units(stored, [location], [ordinal]).sum)
         value = statistics_value(type, row[ordinal])
         priority = statistics_hash(storage_key)
         if value.nil?

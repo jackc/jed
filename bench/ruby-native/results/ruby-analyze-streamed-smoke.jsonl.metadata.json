@@ -1,0 +1,22 @@
+{
+  "mode": "single_execution_smoke_no_timings",
+  "ruby": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +YJIT +PRISM [x86_64-linux]",
+  "jit": "yjit",
+  "source_sha256": "cfe4c79a171f8b3a832adea7f169c40d8d273de220ad63eb7c353ae7c1488153",
+  "source_sha256_after": "5953805880fca8999ec3a0b74a73dde901ef915e4b719114ba452c8143bb5a60",
+  "dataset_fingerprint": "8002498b9e3f39f580555cef27216695b2d41eee2a59646fbfdc6a9cd751d8f6",
+  "workload_fingerprint": "978445de06e249ce2a743af6d46c207d8c20a19efcc3a0d5cecd48492452b462",
+  "timeout_seconds_per_workload": 180,
+  "memory_bytes_per_workload": 536870912,
+  "address_space_bytes_per_workload": 2147483648,
+  "work_mem_bytes": 268435456,
+  "selected_names": [
+    "gin_stats_common_tag",
+    "gin_stats_rare_tag",
+    "custom_plan_gin_common_tag",
+    "custom_plan_gin_rare_tag",
+    "custom_plan_mcv_rare"
+  ],
+  "locking": "exclusive",
+  "isolation": "sequential_process_per_workload"
+}

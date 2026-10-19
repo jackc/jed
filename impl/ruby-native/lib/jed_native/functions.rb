@@ -4,6 +4,7 @@ require_relative 'types'
 require_relative 'json_value'
 require_relative 'decimal_math'
 require_relative 'function_catalog'
+require 'openssl'
 
 module JedNative
   module Functions
@@ -14,6 +15,9 @@ module JedNative
     TEXT_RESULTS = %w[lower upper initcap substr substring left right replace translate reverse repeat lpad rpad trim btrim ltrim rtrim split_part concat concat_ws array_to_string format to_char quote_ident quote_literal quote_nullable encode to_hex md5 json_typeof jsonb_typeof jsonb_pretty current_setting chr overlay].freeze
     FLOAT_RESULTS = %w[pi degrees radians acos asin atan atan2 acosh asinh atanh cos sin tan cot cosh sinh tanh cbrt corr covar_pop covar_samp regr_avgx regr_avgy regr_intercept regr_r2 regr_slope regr_sxx regr_sxy regr_syy date_part percent_rank cume_dist].freeze
     BOOLEAN_RESULTS = %w[starts_with like ilike like_escape isempty lower_inc upper_inc lower_inf upper_inf bool_and bool_or every jsonb_path_exists jsonb_path_match].freeze
+    ESCAPE_BYTES = Array.new(256) do |byte|
+      (byte == 92 ? '\\\\' : byte < 32 || byte > 126 ? Kernel.format('\\%03o', byte) : byte.chr).freeze
+    end.freeze
     module_function
     def aggregate?(name) = AGGREGATES.include?(name.to_s.downcase)
     def return_type(name, arg_types)
@@ -242,7 +246,8 @@ module JedNative
         raise Error.new('22023', 'new bit must be 0 or 1') unless c == 0 || c == 1
         result = Bytea.new(a); result.setbyte(byte, (a.getbyte(byte) & ~(1 << bit)) | (c << bit)); result
       when 'md5', 'sha224', 'sha256', 'sha384', 'sha512'
-        raise Error.new('0A000', 'digest functions require an approved pure Ruby cryptography implementation')
+        digest = OpenSSL::Digest.new(name.upcase)
+        name == 'md5' ? digest.hexdigest(a) : Bytea.new(digest.digest(a))
       when 'like', 'ilike' then like(a, b, escape: c || '\\', insensitive: name == 'ilike', context: context)
       when 'like_escape' then like_escape(a, b)
       when /\Aregexp_/, 'regex_match', 'regex_imatch'
@@ -521,7 +526,10 @@ module JedNative
       case format.downcase
       when 'hex' then bytes.unpack1('H*')
       when 'base64' then [bytes].pack('m').strip
-      when 'escape' then bytes.bytes.map { |b| b == 92 ? '\\\\' : b < 32 || b > 126 ? Kernel.format('\\%03o', b) : b.chr }.join
+      when 'escape'
+        output = +''
+        bytes.each_byte { |byte| output << ESCAPE_BYTES[byte] }
+        output
       else raise Error.new('22023', 'unrecognized encoding')
       end
     end

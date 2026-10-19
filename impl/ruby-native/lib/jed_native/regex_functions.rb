@@ -44,8 +44,8 @@ module JedNative
         program = compile(name, pattern, options)
         context&.charge(program.code.length)
       end
-      original = source.chars
-      input = program.input(source)
+      original = RegexText.new(source)
+      input = program.input(original)
       if %w[regexp_like regex_match regex_imatch].include?(name)
         return !program.search(input, 0, context: context).nil?
       end
@@ -54,7 +54,7 @@ module JedNative
         return nil unless match
         if name == 'substring_regex'
           span = program.span(match, program.groups.positive? ? 1 : 0)
-          return span && original[span[0]...span[1]].join
+          return span && original.slice(*span)
         end
         return capture_array(program, match, original, context)
       end
@@ -67,7 +67,7 @@ module JedNative
           if count == nth && name != 'regexp_count'
             span = program.span(match, group)
             return span ? span[ending] + 1 : 0 if name == 'regexp_instr'
-            return span && original[span[0]...span[1]].join
+            return span && original.slice(*span)
           end
           first, last = program.span(match)
           position = last == first ? last + 1 : last
@@ -77,30 +77,18 @@ module JedNative
       end
       if name == 'regexp_replace'
         template = replacement_tokens(args[2])
-        matches, position = [], 0
-        while position <= input.length
-          match = program.search(input, position, context: context)
-          break unless match
-          context&.charge(args[2].bytesize)
-          matches << match
-          break unless options.include?('g')
-          first, last = program.span(match)
-          position = last == first ? last + 1 : last
-        end
-        prefix = byte_prefix(original)
         bytes = 0
-        output_pieces(program, matches, template, original.length) do |piece|
-          bytes += piece.is_a?(String) ? piece.bytesize : prefix[piece[1]] - prefix[piece[0]]
+        replacement_pieces(program, input, template, options.include?('g'), args[2].bytesize, context) do |piece|
+          bytes += piece.is_a?(String) ? piece.bytesize : original.byte_offset(piece[1]) - original.byte_offset(piece[0])
         end
         context&.charge(bytes)
         context&.consume_scalar_bytes(bytes)
+        # Replay the deterministic matcher only after exact output admission.
+        # The first pass owns its canonical VM/template cost; neither pass
+        # retains match captures beyond the current match.
         output = +''
-        output_pieces(program, matches, template, original.length) do |piece|
-          if piece.is_a?(String)
-            output << piece
-          else
-            piece[0].upto(piece[1] - 1) { |index| output << original[index] }
-          end
+        replacement_pieces(program, input, template, options.include?('g'), 0, nil) do |piece|
+          output << (piece.is_a?(String) ? piece : original.slice(*piece))
         end
         return output
       end
@@ -122,53 +110,54 @@ module JedNative
         break unless match
         first, last = program.span(match)
         if first < input.length && last > previous_end
-          output << original[split_at...first].join
+          output << original.slice(split_at, first)
           split_at = last
         end
         previous_end = last
         position = last == first ? last + 1 : last
       end
-      output << original[split_at..].join
+      output << original.slice(split_at, original.length)
       name == 'regexp_split_to_array' ? ArrayValue.new(output, element_type: 'text') : output
-    end
-
-    def byte_prefix(original)
-      sums = [0]
-      original.each { |char| sums << sums[-1] + char.bytesize }
-      sums
     end
 
     def capture_array(program, match, original, context)
       groups = program.groups.zero? ? [0] : (1..program.groups)
       spans = groups.map { |group| program.span(match, group) }
-      prefix = byte_prefix(original)
-      bytes = 16 + spans.sum { |span| 32 + (span ? prefix[span[1]] - prefix[span[0]] : 0) }
+      bytes = 16 + spans.sum { |span| 32 + (span ? original.byte_offset(span[1]) - original.byte_offset(span[0]) : 0) }
       context&.charge(bytes)
       context&.consume_scalar_bytes(bytes)
-      ArrayValue.new(spans.map { |span| span && original[span[0]...span[1]].join }, element_type: 'text')
+      ArrayValue.new(spans.map { |span| span && original.slice(*span) }, element_type: 'text')
     end
 
     def replacement_tokens(template)
-      chars, result, index = template.chars, [], 0
-      while index < chars.length
-        char = chars[index]
-        if char == '\\' && index + 1 < chars.length
-          index += 1
-          char = chars[index]
-          char = if char.between?('0', '9') then char.to_i
-          elsif char == '&' then 0
-          else char
+      result, literal, escaped = [], +'', false
+      template.each_char do |char|
+        if escaped
+          if char.between?('0', '9') || char == '&'
+            result << literal unless literal.empty?
+            literal = +''
+            result << (char == '&' ? 0 : char.to_i)
+          else
+            literal << char
           end
+          escaped = false
+        elsif char == '\\'
+          escaped = true
+        else
+          literal << char
         end
-        result << char
-        index += 1
       end
+      literal << '\\' if escaped
+      result << literal unless literal.empty?
       result
     end
 
-    def output_pieces(program, matches, template, length)
-      position = 0
-      matches.each do |match|
+    def replacement_pieces(program, input, template, global, template_bytes, context)
+      position, search_at, length = 0, 0, input.length
+      while search_at <= length
+        match = program.search(input, search_at, context: context)
+        break unless match
+        context&.charge(template_bytes)
         first, last = program.span(match)
         yield [position, first]
         template.each do |token|
@@ -181,6 +170,8 @@ module JedNative
         else
           position = last
         end
+        break unless global
+        search_at = last == first ? last + 1 : last
       end
       yield [position, length] if position <= length
     end

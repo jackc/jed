@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-require_relative '../lib/jed_native'
+require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('..', __dir__)), 'lib/jed_native')
 STDOUT.sync = true
 
 def reply_error(error)
@@ -57,8 +57,10 @@ begin
       when 'STORAGE_BYTES' then value = database.engine.instance_variable_get(:@storage).meta[:live].then { |pages| pages * database.engine.instance_variable_get(:@storage).page_size }.to_s
       when 'HANGUP_NEXT_ACK' then database.engine.instance_variable_get(:@storage).instance_variable_set(:@service_drop_ack, true)
       when 'CRASH_NEXT_ACK' then database.engine.instance_variable_get(:@storage).instance_variable_set(:@service_crash_ack, true)
-      when 'COMPACT', 'BACKUP'
-        raise JedNative::Error.new('0A000', "#{command} is not yet implemented")
+      when 'COMPACT' then database.compact(argument.empty? ? 'main' : argument)
+      when 'BACKUP'
+        form, destination = argument.split("\t", 2)
+        database.backup(destination, form: form.to_sym)
       when 'CLOSE'
         reader&.close
         writer&.close

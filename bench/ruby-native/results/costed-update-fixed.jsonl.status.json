@@ -1,0 +1,11 @@
+[
+  {
+    "bench": "costed_update",
+    "status": "smoke_pass",
+    "checksum": "46b9d6e731035a45",
+    "rows": 0,
+    "iterations": 1,
+    "batch": 1,
+    "peak_rss_bytes": 298262528
+  }
+]

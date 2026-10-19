@@ -16,7 +16,8 @@ module JedNative
       sources = statement[:from] || []
       joins = statement[:joins] || []
       where = statement[:where]
-      if (rewritten = rewrite_join_inputs(sources, joins, where))
+      rewritten = @explain_rewritten_from&.[](statement.object_id) || rewrite_join_inputs(sources, joins, where)
+      if rewritten
         sources, joins, where = rewritten
       end
       input_sources = sources + joins.map { |join| join[:relation] }
@@ -39,7 +40,26 @@ module JedNative
       raise Error.new('2201X', 'negative OFFSET') if offset.negative?
       raise Error.new('2201W', 'negative LIMIT') if limit && limit.negative?
       contradiction = respond_to?(:where_contradiction?) && where_contradiction?(compile_filter(statement[:where], scope))
+      if spill_stream_aggregate_plan(statement, sources, joins, nodes, aggregates, predicate, scope)
+        return spill_stream_aggregate(sources.first, expressions, columns, aggregates, predicate, contradiction, offset, limit)
+      end
+      physical_plan = @explain_runtime_plans && @explain_join_plans&.[](statement.object_id)
+      if physical_plan || two_base_join?(sources, joins)
+        physical_plan ||= two_base_join_plan(sources.first, joins.first, where, statement)
+        sources = [physical_plan[:outer]]
+        inner = physical_plan[:inner].merge(native_join_algorithm: physical_plan[:algorithm], native_index_plan: physical_plan[:index])
+        joins = [joins.first.merge(relation: inner)]
+        input_sources = sources + [inner]
+        scopes = input_sources.map { |source| spill_source_columns(source) }
+      end
+      index_plan = if physical_plan
+        physical_plan[:index]
+      elsif sources.length == 1 && joins.length == 1
+        edge = joins.first
+        edge[:relation][:native_index_plan] || join_index_plan(Relation.new(columns: scopes.first, rows: []), edge[:relation], edge[:kind], edge[:on], edge[:using])
+      end
       inputs = input_sources.each_with_index.map do |source, index|
+        next nil if index_plan && index == 1
         contradiction ? spill_owner(owners, RowSpool) : spill_source(source, scopes[index], statement, owners)
       end
       rows = inputs.first || spill_owner(owners, RowSpool)
@@ -48,8 +68,19 @@ module JedNative
       input_sources.drop(1).each_with_index do |_, relative|
         index = relative + 1
         join = index < sources.length ? { kind: :cross } : joins[index - sources.length]
-        rows = spill_join(rows, inputs[index], left_columns, scopes[index], join, owners)
+        rows = if index_plan
+          spill_index_join(rows, index_plan, left_columns, scopes[index], join, owners)
+        else
+          spill_join(rows, inputs[index], left_columns, scopes[index], join, owners)
+        end
         left_columns += scopes[index]
+      end
+      if physical_plan && physical_plan[:reverse]
+        reordered = spill_owner(owners, RowSpool)
+        width = scopes.first.length
+        rows.each { |row| reordered.push(row.drop(width) + row.take(width)) }
+        rows.close
+        rows = reordered
       end
       profile_checkpoint(:scan) if @explain_profile_frames
       filtered = spill_owner(owners, RowSpool)
@@ -95,7 +126,9 @@ module JedNative
         host_batch_rows(window, expressions, pulled: true).each do |row|
           values = expressions.map { |expression| evaluate(expression, row) }
           query_memory_add_row(output_owner, values, columns) if output_owner
-          charge
+          charge(0)
+          @cost += 1
+          @lifetime_cost += 1
           output << values
         end
       end
@@ -109,6 +142,73 @@ module JedNative
     end
 
     private
+
+    # A plain whole-table fold needs no retained input rows. Keep budgeted and
+    # profiled statements on the ordinary lane: their admission/abort schedule
+    # is observable. Decimal and expression operands also retain that lane.
+    def spill_stream_aggregate_plan(statement, sources, joins, nodes, aggregates, predicate, scope)
+      return if @query_memory || @max_cost.positive? || @lifetime_max_cost.positive? || @explain_profile_frames
+      return unless sources.length == 1 && joins.empty? && nodes.empty? && !aggregates.empty?
+      return if statement[:distinct] || statement[:having] || !(statement[:order_by] || []).empty?
+      source = sources.first
+      return unless source[:kind] == :table && !@ctes.key?(source[:name]) && (stored = @tables[source[:name]])
+      return if source[:native_pushed_filter]
+      return unless aggregates.all? do |aggregate|
+        extra = aggregate.extra
+        next false if extra[:distinct] || extra[:filter_expr] || extra[:within_group] || !(extra[:aggregate_order] || []).empty?
+        operand = aggregate.args.first
+        next false unless aggregate.args.length == 1 && operand
+        case aggregate.value
+        when 'count' then %i[star column].include?(operand.kind)
+        when 'min', 'max' then operand.kind == :column
+        when 'sum' then operand.kind == :column && %w[i16 i32 f32 f64].include?(operand.type)
+        when 'avg' then operand.kind == :column && %w[f32 f64].include?(operand.type)
+        else false
+        end
+      end
+      predicate = compile_filter(source[:native_access_predicate], scope) if source[:native_access_predicate]
+      access = source[:native_access_plan] || scan_access_plan(stored, predicate, statement)
+      # Bound scans keep their existing metering path. The full scan can defer
+      # its page/row block until the walk succeeds, just like native folds.
+      access if access[:kind] == :full
+    end
+
+    def spill_stream_aggregate(source, expressions, columns, aggregates, predicate, contradiction, offset, limit)
+      stored = @tables.fetch(source[:name])
+      states = aggregates.map { |aggregate| spill_accumulator(aggregate) }
+      scanned = survivors = scan_units = 0
+      unless contradiction
+        scan_units = full_scan_pages(stored)
+        scan_units += primary_scan_units(stored, nil, @native_scan_columns&.[](stored[:name])).sum if stored[:native_primary_metadata]
+        ordinals = stored[:native_primary_entries]&.lazy&.map(&:last) || stored[:rows].each_index
+        input = scan_rows(stored, ordinals)
+        input.each do |row|
+          scanned += 1
+          next if predicate && evaluate(predicate, row) != true
+          survivors += 1
+          aggregates.each_with_index do |aggregate, index|
+            operand = aggregate.args.first
+            value = operand.kind == :star ? 1 : evaluate(operand, row)
+            if aggregate.value == 'count'
+              states[index][0] += 1 unless value.nil?
+            else
+              states[index] = spill_fold(aggregate, states[index], [value], nil, index)
+            end
+          end
+        end
+      end
+      charge(scan_units + scanned + survivors * aggregates.length)
+      row = aggregates.each_with_index.map { |aggregate, index| spill_finalize(aggregate, states[index], nil, index) }
+      output = cursor_output(columns)
+      if offset.zero? && limit != 0
+        projections = expressions.map { |expression| spill_rewrite(expression, [], aggregates) }
+        host_batch_rows([row], projections, pulled: true).each do |values|
+          charge
+          output << projections.map { |expression| evaluate(expression, values) }
+        end
+      end
+      Relation.new(columns: columns, rows: output)
+    end
 
     def spill_select_shape?(statement)
       return false unless spill_available? && statement[:kind] == :select && !statement[:with] && !statement[:distinct_on]
@@ -160,27 +260,30 @@ module JedNative
       output = spill_owner(owners, RowSpool)
       mask = spill_mask(statement, scope)
       if source[:kind] == :table && (stored = @tables[source[:name]]) && !@ctes.key?(source[:name])
+        profile_start = @cost if source[:native_scan_profile]
         predicate = if source[:native_access_predicate]
           compile_filter(source[:native_access_predicate], scope)
         elsif (statement[:from] || []).length == 1 && (statement[:joins] || []).empty?
           compile_filter(statement[:where], scope)
         end
         pushed = compile_filter(source[:native_pushed_filter], scope)
-        input = primary_scan(stored, predicate)
+        input = source[:native_access_plan] ? execute_scan_access(stored, predicate, source[:native_access_plan]) : primary_scan(stored, predicate)
         unless input
           charge(full_scan_pages(stored))
           charge_scan_payload(stored)
-          input = scan_rows(stored, stored[:native_primary_entries]&.map(&:last) || stored[:rows].each_index.to_a)
+          ordinals = stored[:native_primary_entries]&.lazy&.map(&:last) || stored[:rows].each_index
+          input = scan_rows(stored, ordinals)
         end
         input.each do |row|
           charge
           next if pushed && evaluate(pushed, row) != true
-          output.push(row.each_with_index.map { |value, index| mask[index] ? value : nil })
+          output.push(mask.each_index.map { |index| mask[index] ? row[index] : nil })
         end
+        source[:native_scan_profile].actual += @cost - profile_start if profile_start
       else
         relation = source_relation(source)
         query_memory_release(relation) if @query_memory
-        relation.rows.each { |row| output.push(row.each_with_index.map { |value, index| mask[index] ? value : nil }) }
+        relation.rows.each { |row| output.push(mask.each_index.map { |index| mask[index] ? row[index] : nil }) }
       end
       output
     end
@@ -211,7 +314,9 @@ module JedNative
       predicate = compile_filter(join[:on], left_columns + right_columns)
       gate = join[:relation]&.dig(:native_original_on)
       keys = hash_join_keys(gate ? compile_filter(gate, left_columns + right_columns) : predicate, left_columns.length)
-      if keys
+      forced = join[:relation]&.dig(:native_join_algorithm) == :hash || join[:relation]&.dig(:native_fixed_hash)
+      keys = nil if join[:relation]&.dig(:native_join_algorithm) == :nested
+      if keys && !forced
         pairs = left.length * right.length
         width = keys.sum { |_, _, type| FileFormat::STORAGE_WIDTH.fetch(type, 1) }
         on_work = hash_join_operator_count(predicate)
@@ -259,6 +364,29 @@ module JedNative
       output
     end
 
+    def spill_index_join(left, plan, left_columns, right_columns, join, owners)
+      output = spill_owner(owners, RowSpool)
+      predicate = compile_filter(join[:on], left_columns + right_columns)
+      outer = Relation.new(columns: left_columns, rows: [])
+      left.each do |row|
+        matches = RowSpool.new(self)
+        matched = false
+        join_index_relation(plan, outer, row, spool: matches) do |inner|
+          combined = row + inner.to_a
+          next if predicate && evaluate(predicate, combined) != true
+          matched = true
+          output.push(combined)
+        end
+        if !matched && %i[left left_outer].include?(join[:kind])
+          output.push(row + Array.new(right_columns.length))
+        end
+      ensure
+        matches&.close
+      end
+      left.close
+      output
+    end
+
     def spill_order_expressions(statement, expressions, columns, scope)
       (statement[:order_by] || []).map do |order|
         node = order[:expr]
@@ -295,8 +423,7 @@ module JedNative
       sorter = spill_owner(owners, ExternalSorter, &compare)
       decorated.each do |row|
         keys = row.last(orderings.length).map do |value|
-          label = CollationRules.label(value)
-          label&.table && value ? Bytea.new(label.table.sort_key(value)) : value
+          spill_collation_sort_value(value)
         end
         sorter.push(row + keys)
       end
@@ -469,7 +596,8 @@ module JedNative
         end
         source = unless name.start_with?('jsonb')
           type = expression.args.first.type
-          '[' + fragments.join(type.end_with?('[]') || @types.key?(type) ? ", \n " : ', ') + ']'
+          composite = type.end_with?('[]') || @types.key?(type)
+          '[' + fragments.each_with_index.map { |fragment, index| (index.zero? ? '' : composite && !values[index].nil? ? ", \n " : ', ') + fragment }.join + ']'
         end
         JsonValue.new(values, binary: name.start_with?('jsonb'), source: source)
       end

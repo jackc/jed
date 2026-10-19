@@ -1,17 +1,128 @@
 # frozen_string_literal: true
 
 module JedNative
+  # All generations on a byte device share one decoded-leaf budget. Entries
+  # contain only raw PAX regions and keys; typed/decompressed values belong to
+  # the caller's row or operator, never this cache.
+  class DecodedLeafCache
+    def initialize(limit)
+      @limit, @entries, @generation = [limit, 1].max, {}, 0
+      @mutex = Mutex.new
+    end
+
+    def fetch(key)
+      cached, generation = @mutex.synchronize do
+        value = @entries.delete(key)
+        @entries[key] = value if value
+        [value, @generation]
+      end
+      return cached if cached
+      value = yield
+      @mutex.synchronize do
+        # A concurrent publication may invalidate a reused page while it is
+        # being decoded. Its old bytes remain valid for the pinned caller, but
+        # must not be inserted into the new generation's shared cache.
+        if generation == @generation
+          @entries.delete(key)
+          @entries.shift while @entries.length >= @limit
+          @entries[key] = value
+        end
+      end
+      value
+    end
+
+    def invalidate(indices = nil)
+      @mutex.synchronize do
+        @generation += 1
+        if indices
+          selected = indices.to_set
+          @entries.delete_if { |(page, _), _| selected.include?(page) }
+        else
+          @entries.clear
+        end
+      end
+    end
+
+    def size = @mutex.synchronize { @entries.length }
+  end
+
+  # Pending pages retain their written prefix. Zero padding is reconstructed at
+  # the byte-device boundary; a sparse GiST node need not retain an entire page.
+  # This is an in-memory representation only: checksums and writes still see the
+  # canonical full page, including every zero byte.
+  class PendingPages
+    include Enumerable
+
+    def initialize(page_size)
+      @page_size, @entries = page_size, {}
+    end
+
+    def [](page)
+      bytes = @entries[page]
+      bytes && (bytes.bytesize == @page_size ? bytes : bytes.ljust(@page_size, "\0".b))
+    end
+
+    def fetch(page)
+      self[page] || raise(KeyError, "page not present: #{page}")
+    end
+
+    def []=(page, bytes)
+      raise ArgumentError, 'page length mismatch' unless bytes.bytesize == @page_size
+      @entries[page] = bytes.sub(/\x00+\z/n, ''.b)
+    end
+
+    def write(page, offset, bytes)
+      target = (@entries[page] ||= +''.b)
+      target << "\0".b * (offset - target.bytesize) if offset > target.bytesize
+      target[offset, bytes.bytesize] = bytes
+    end
+
+    def slice(page, offset, length)
+      bytes = @entries[page]
+      value = bytes && offset < bytes.bytesize ? bytes.byteslice(offset, length) : +''.b
+      value.bytesize == length ? value : value.ljust(length, "\0".b)
+    end
+
+    def keys = @entries.keys
+    def length = @entries.length
+    alias size length
+    def empty? = @entries.empty?
+    def key?(page) = @entries.key?(page)
+    def retained_bytes = @entries.values.sum(&:bytesize)
+
+    def each
+      return enum_for(:each) unless block_given?
+      @entries.each_key { |page| yield page, self[page] }
+      self
+    end
+
+    def merge!(other)
+      other.each { |page, bytes| self[page] = bytes }
+      self
+    end
+
+    def select
+      return enum_for(:select) unless block_given?
+      each_with_object({}) { |(page, bytes), result| result[page] = bytes if yield(page, bytes) }
+    end
+
+    def reject
+      return enum_for(:reject) unless block_given?
+      each_with_object({}) { |(page, bytes), result| result[page] = bytes unless yield(page, bytes) }
+    end
+  end
+
   # The codec addresses logical pages. A commit buffers only its newly encoded
   # pages, so an append commit does not allocate the preceding file's length.
   class PageBuffer
     attr_reader :page_size, :page_count, :pages
 
-    def initialize(page_size, page_count)
+    def initialize(page_size, page_count, compact: false)
       raise ArgumentError, "invalid page count" unless page_count.between?(3, 0xFFFF_FFFF)
 
       @page_size = page_size
       @page_count = page_count
-      @pages = {}
+      @pages = compact ? PendingPages.new(page_size) : {}
     end
 
     def bytesize = @page_size * @page_count
@@ -29,8 +140,12 @@ module JedNative
       page, within = offset.divmod(@page_size)
       raise ArgumentError, "page write crosses boundary" if within + length > @page_size
 
-      bytes = (@pages[page] ||= "\0".b * @page_size)
-      bytes[within, length] = value
+      if @pages.is_a?(PendingPages)
+        @pages.write(page, within, value)
+      else
+        bytes = (@pages[page] ||= "\0".b * @page_size)
+        bytes[within, length] = value
+      end
     end
 
     def byteslice(offset, length)
@@ -41,7 +156,11 @@ module JedNative
       while length.positive?
         page, within = offset.divmod(@page_size)
         count = [length, @page_size - within].min
-        out << (@pages[page] ? @pages[page].byteslice(within, count) : "\0".b * count)
+        out << if @pages.is_a?(PendingPages)
+          @pages.slice(page, within, count)
+        else
+          @pages[page] ? @pages[page].byteslice(within, count) : "\0".b * count
+        end
         offset += count
         length -= count
       end
@@ -55,7 +174,7 @@ module JedNative
   # inspect manifests and catalogs without copying the entire file into a String.
   class FileImage
     DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
-    attr_reader :bytesize, :cache_pages
+    attr_reader :bytesize, :cache_pages, :decoded_leaf_cache
 
     def initialize(file, page_size, cache_bytes: DEFAULT_CACHE_BYTES)
       @file = file
@@ -63,10 +182,12 @@ module JedNative
       @bytesize = file.size
       @cache_pages = [1, cache_bytes / page_size].max
       @cache = {}
+      @decoded_leaf_cache = DecodedLeafCache.new(@cache_pages)
     end
 
     def invalidate(pages = nil)
       pages ? pages.each { |page| @cache.delete(page) } : @cache.clear
+      @decoded_leaf_cache.invalidate(pages)
       @bytesize = @file.size
     end
 
@@ -104,10 +225,15 @@ module JedNative
     def initialize(image, pages)
       @image, @pages = image, pages
       @page_size, @cache_pages = pages.page_size, image.cache_pages
+      @private_leaf_cache = DecodedLeafCache.new(@cache_pages)
     end
     def bytesize = @pages ? @pages.bytesize : @image.bytesize
     def cached_pages = @image.cached_pages
-    def publish = (@pages = nil)
+    def decoded_leaf_cache = @pages ? @private_leaf_cache : @image.decoded_leaf_cache
+    def publish
+      @private_leaf_cache.invalidate
+      @pages = nil
+    end
     def byteslice(offset, length)
       return @image.byteslice(offset, length) unless @pages
       return nil if offset.negative? || offset > bytesize

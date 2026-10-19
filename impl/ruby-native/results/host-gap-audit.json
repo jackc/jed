@@ -1,0 +1,20 @@
+{
+  "command": [
+    "ruby",
+    "/tmp/ruby-final-gap-probe.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 39317504,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 1073741824,
+  "timeout_seconds": 60.0,
+  "elapsed_seconds": 0.20688966200395953,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "3ba8840c85484e7665f31a5e79409587c839a1d6665d326247e8c25577b62751",
+  "final_source_sha256": "3ba8840c85484e7665f31a5e79409587c839a1d6665d326247e8c25577b62751",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "execute_script owner: JedNative::SharedDatabase; EXPLAIN join/subquery plan rows: 3\nPersisted named windows, reopen, catalog render, EXPLAIN join/subquery, script transaction: passed\n",
+  "stderr": ""
+}

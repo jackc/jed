@@ -1,0 +1,20 @@
+[
+  {
+    "bench": "window_running_sum",
+    "status": "smoke_pass",
+    "checksum": "7193ab1cca5687b9",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 304840704
+  },
+  {
+    "bench": "window_moving_count",
+    "status": "smoke_pass",
+    "checksum": "a249ea5c7dddbb84",
+    "rows": 100,
+    "iterations": 1,
+    "batch": 0,
+    "peak_rss_bytes": 310513664
+  }
+]

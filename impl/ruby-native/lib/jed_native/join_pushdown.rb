@@ -79,6 +79,11 @@ module JedNative
         source.merge(native_pushed_filter: join_conjunctions(remaining),
                      native_access_predicate: join_conjunctions(access[index]))
       end
+      if inputs.length == 1 && predicate
+        positions = {}.compare_by_identity
+        ast_conjunctions(predicate).each_with_index { |term, index| positions[term] = index }
+        residual.sort_by! { |term| positions.fetch(term, positions.length) }
+      end
       rewritten = rewritten.each_with_index.map do |item, index|
         source = inputs[sources.length + index].merge(native_original_on: joins[index][:on], native_join_where: predicate,
           native_fixed_hash: inputs.length == 2,

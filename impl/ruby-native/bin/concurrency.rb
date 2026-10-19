@@ -9,7 +9,7 @@ class NativeCorpus
       return
     end
     directory = @mode == 'disk' ? Dir.mktmpdir('jed-ruby-concurrency') : nil
-    db = directory ? JedNative.create(File.join(directory, 'database.jed')) : JedNative.memory
+    db = directory ? JedNative.create(File.join(directory, 'database.jed'), locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym) : JedNative.memory
     contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
     contents.scan(/^#\s*max_storage_bytes:\s*(\d+)(?:\s+(\w+))?/).each { |amount, name| db.set_max_storage_bytes(amount.to_i, name || 'main') }
     handles, waiting = {}, []
@@ -20,6 +20,7 @@ class NativeCorpus
       i += 1
       next if line.empty? || line.start_with?('#')
       @summary[:records] += 1
+      worker_progress(path, location, line)
       begin
         words = line.split
         case words[0]
@@ -61,6 +62,7 @@ class NativeCorpus
             end
           end
           error = nil
+          worker_progress(path, location, sql.join("\n"))
           result = begin
             handle.execute(sql.join("\n"))
           rescue JedNative::Error => caught
@@ -88,7 +90,6 @@ class NativeCorpus
         end
         @summary[:passed] += 1
       rescue StandardError => error
-        raise if error.is_a?(Timeout::Error)
         fail_record(path, location, "#{error.class}: #{error.message}", defined?(sql) && sql&.join("\n"))
         warn "#{relative(path)}:#{location}: #{error.message}" if ENV['JED_NATIVE_VERBOSE'] == '1'
       end

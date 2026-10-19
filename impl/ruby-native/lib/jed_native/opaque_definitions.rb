@@ -136,6 +136,10 @@ module JedNative
     end
 
     def validate_opaque_statement(statement)
+      # A cursor contains only a read statement. Opaque executable definitions
+      # on that path can only come from views; table checks/defaults/indexes are
+      # handled by mutation admission and are not interpreted by a plain read.
+      return if @native_cursor && @views.empty?
       case statement[:kind]
       when :select, :values, :set_operation, :setop, :insert, :update, :delete, :explain
         validate_opaque_query_tree(statement)

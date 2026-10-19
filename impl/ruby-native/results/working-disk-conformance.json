@@ -1,0 +1,23 @@
+{
+  "files": 679,
+  "records": 18250,
+  "passed": 18250,
+  "failed": 0,
+  "unsupported_files": 0,
+  "skipped_files": 77,
+  "timed_out_files": 0,
+  "memory_limited_files": 0,
+  "failures": [],
+  "mode": "disk",
+  "filter": "",
+  "started_at": "2026-10-18T23:01:29Z",
+  "corpus_root": "/home/jack/.codex/worktrees/b8e6/jed/spec/conformance/suites",
+  "available_records": 20135,
+  "source_sha256": "2c48d0b05be1b8aea31810bac28a618d0066571a7bf9b7e90f211a11b1736fd7",
+  "worker_memory_bytes": 536870912,
+  "worker_timeout_seconds": 60.0,
+  "worker_address_space_bytes": 1073741824,
+  "peak_worker_rss_bytes": 159444992,
+  "finished_at": "2026-10-18T23:07:19Z",
+  "final_source_sha256": "2c48d0b05be1b8aea31810bac28a618d0066571a7bf9b7e90f211a11b1736fd7"
+}

@@ -5,8 +5,8 @@ require 'json'
 require 'digest'
 require 'tmpdir'
 require 'fileutils'
-require 'timeout'
 require 'time'
+require_relative '../tools/bounded_process'
 require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('..', __dir__)), 'lib/jed_native')
 require_relative '../../../spec/conformance/params'
 
@@ -28,13 +28,16 @@ end
 # directives as well as SQL mismatches. No capability filter hides missing work.
 class NativeCorpus
   ROOT = File.expand_path('../../..', __dir__)
+  DIAGNOSTIC_BYTES = 64 * 1024
+  FAILURE_DETAIL_BYTES = 4 * 1024 * 1024
   SUPPORTED = %w[format set requires names types cost max_cost params max_scalar_bytes max_sql_length lifetime_max_cost clock clock_advance seed attach timezone load-timezone load-collation collation unicode allow_ddl allow_temp_ddl default_privileges grant revoke max_query_memory_bytes fixture upgrade-collations work_mem max_storage_bytes max_temp_storage_bytes].freeze
   DIRECTIVES = %w[requires names types cost max_cost format fixture params clock clock_advance seed timezone collation unicode attach lifetime_max_cost max_query_memory_bytes max_scalar_bytes max_sql_length max_storage_bytes max_temp_storage_bytes work_mem allow_ddl allow_temp_ddl default_privileges grant revoke set load-collation load-timezone upgrade-collations].freeze
   attr_reader :summary
 
   def initialize(filter: '', mode: 'memory', output: nil)
     @filter, @mode, @output = filter, mode, output
-    @summary = { files: 0, records: 0, passed: 0, failed: 0, unsupported_files: 0, skipped_files: 0, timed_out_files: 0, failures: [] }
+    @failure_detail_bytes = 0
+    @summary = { files: 0, records: 0, passed: 0, failed: 0, unsupported_files: 0, skipped_files: 0, timed_out_files: 0, memory_limited_files: 0, omitted_failure_details: 0, failures: [] }
   end
 
   def run
@@ -42,29 +45,51 @@ class NativeCorpus
     paths = Dir[File.join(corpus, '**/*.test')].sort.select { |p| p.include?(@filter) }
     abort "no corpus paths match #{@filter.inspect}" if paths.empty?
     abort "unknown storage mode #{@mode.inspect}" unless %w[memory disk].include?(@mode)
+    locking = ENV.fetch('JED_NATIVE_LOCKING', 'auto')
+    abort "unknown corpus locking mode #{locking.inspect}" unless %w[auto exclusive].include?(locking)
     @summary[:mode], @summary[:filter], @summary[:started_at] = @mode, @filter, Time.now.utc.iso8601
+    @summary[:locking] = locking if @mode == 'disk'
     @summary[:corpus_root] = corpus
     @summary[:available_records] = paths.sum { |path| File.read(path).scan(/^(?:statement|query) /).length }
     @summary[:source_sha256] = source_digest
     file_timeout = Float(ENV.fetch('JED_NATIVE_FILE_TIMEOUT', '10'))
+    memory_bytes = Integer(ENV.fetch('JED_NATIVE_MEMORY_BYTES', JedNativeTools::BoundedProcess::DEFAULT_MEMORY_BYTES.to_s))
+    address_space_bytes = Integer(ENV.fetch('JED_NATIVE_ADDRESS_SPACE_BYTES', ENV.fetch('RUBY_NATIVE_ADDRESS_SPACE_BYTES', (memory_bytes * 2).to_s)))
+    address_space_bytes = [address_space_bytes, Process.getrlimit(Process::RLIMIT_AS).last].min
+    @summary[:worker_memory_bytes], @summary[:worker_timeout_seconds] = memory_bytes, file_timeout
+    @summary[:worker_address_space_bytes] = address_space_bytes
+    @summary[:peak_worker_rss_bytes] = 0
     paths.each do |path|
-      begin
-        Timeout.timeout(file_timeout) { run_file(path) }
-      rescue Timeout::Error
-        @summary[:timed_out_files] += 1
-        fail_record(path, 0, "harness timeout: file exceeded #{file_timeout} seconds")
-      rescue SystemStackError => error
-        fail_record(path, 0, "unbounded recursion: #{error.message}")
+      result = JedNativeTools::BoundedProcess.run(timeout: file_timeout, memory_bytes: memory_bytes, address_space_bytes: address_space_bytes) do
+        worker = self.class.new(filter: @filter, mode: @mode)
+        worker.run_file(path)
+        worker.summary
+      end
+      @summary[:peak_worker_rss_bytes] = [@summary[:peak_worker_rss_bytes], result.peak_rss_bytes].max
+      if result.success? && result.value
+        merge_worker_summary(result.value)
+      else
+        active = result.breadcrumb || {}
+        merge_worker_summary(active['summary'] || { 'files' => 1 })
+        @summary[:timed_out_files] += 1 if result.timed_out
+        @summary[:memory_limited_files] += 1 if result.memory_exceeded
+        fail_record(path, active['line'] || 0, "harness #{result.reason}: #{result.stderr.to_s.lines.first.to_s.strip}", active['sql'], sql_original_bytes: active['sql_original_bytes'])
+      end
+      write_report
+      if result.interrupted
+        @summary[:interrupted] = result.interrupted
+        break
       end
     end
     @summary[:finished_at], @summary[:final_source_sha256] = Time.now.utc.iso8601, source_digest
-    File.write(@output, JSON.pretty_generate(@summary) + "\n") if @output
+    write_report
     puts JSON.generate(@summary.reject { |key, _| key == :failures })
     @summary[:failed].zero? && @summary[:unsupported_files].zero?
   end
 
   def run_file(path)
     @summary[:files] += 1
+    worker_progress(path, 0, nil)
     contents = File.read(path)
     if contents.match?(/^#\s*skip:\s*#{@mode}\b/)
       @summary[:skipped_files] += 1
@@ -74,7 +99,7 @@ class NativeCorpus
     directives = (contents.scan(/^#\s*([a-z_-]+):/).flatten.uniq & DIRECTIVES) - SUPPORTED
     unless directives.empty?
       @summary[:unsupported_files] += 1
-      @summary[:failures] << { file: relative(path), error: "unsupported harness directives: #{directives.join(', ')}" }
+      append_failure(file: relative(path), error: "unsupported harness directives: #{directives.join(', ')}")
       return
     end
     directory = @mode == 'disk' ? Dir.mktmpdir('jed-ruby-native') : nil
@@ -92,7 +117,7 @@ class NativeCorpus
       begin
         if file
           File.binwrite(file, bytes)
-          db = JedNative.open(file, environment: environment)
+          db = JedNative.open(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym)
         else
           db = JedNative.from_image(bytes, environment: environment)
         end
@@ -102,7 +127,7 @@ class NativeCorpus
       end
       raise "expected fixture open error #{expected_error}, got success" if expected_error
     else
-      db = file ? JedNative.create(file, environment: environment) : JedNative.memory(environment: environment)
+      db = file ? JedNative.create(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym) : JedNative.memory(environment: environment)
     end
     contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
     core = db
@@ -152,6 +177,7 @@ class NativeCorpus
         end
       end
       @summary[:records] += 1
+      worker_progress(path, start, sql.join("\n"))
       begin
         if pending['clock_advance']
           clock.reset(*pending['clock_advance'].split(',').map { |part| Integer(part) })
@@ -225,7 +251,6 @@ class NativeCorpus
         end
         @summary[:passed] += 1
       rescue StandardError => error
-        raise if error.is_a?(Timeout::Error)
         fail_record(path, start, "#{error.class}: #{error.message}", sql.join("\n"))
         warn "#{relative(path)}:#{start}: #{error.message}" if ENV['JED_NATIVE_VERBOSE'] == '1'
       ensure
@@ -233,14 +258,13 @@ class NativeCorpus
         if file && !db.engine.transaction_open?
           db.close
           core.close
-          core = JedNative.open(file, environment: environment)
+          core = JedNative.open(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym)
           db = core.session
           storage_limits.each { |name, bytes| db.set_max_storage_bytes(bytes, name) }
         end
       end
     end
   rescue StandardError => error
-    raise if error.is_a?(Timeout::Error)
     fail_record(path, 0, "file failure #{error.class}: #{error.message}")
   ensure
     db&.close
@@ -249,6 +273,30 @@ class NativeCorpus
   end
 
   def relative(path) = path.delete_prefix(ROOT + '/')
+  def worker_progress(path, line, sql)
+    target = ENV['JED_NATIVE_BREADCRUMB']
+    return unless target
+    temporary = "#{target}.tmp"
+    sql, original = truncate_diagnostic(sql)
+    File.write(temporary, JSON.generate(file: relative(path), line: line, sql: sql, sql_original_bytes: original, summary: @summary))
+    File.rename(temporary, target)
+  end
+  def merge_worker_summary(value)
+    value.each do |key, count|
+      name = key.to_sym
+      if name == :failures
+        count.each { |record| append_failure(record.transform_keys(&:to_sym)) }
+      elsif @summary[name].is_a?(Numeric)
+        @summary[name] += count
+      end
+    end
+  end
+  def write_report
+    return unless @output
+    temporary = "#{@output}.tmp.#{Process.pid}"
+    File.write(temporary, JSON.pretty_generate(@summary) + "\n")
+    File.rename(temporary, @output)
+  end
   def source_digest
     source = ENV.fetch('RUBY_NATIVE_SOURCE', File.join(ROOT, 'impl/ruby-native'))
     Digest::SHA256.hexdigest(Dir[File.join(source, 'lib/**/*.rb')].sort.map { |path| File.binread(path) }.join)
@@ -261,9 +309,33 @@ class NativeCorpus
     else value.value
     end
   end
-  def fail_record(path, line, error, sql = nil)
+  def fail_record(path, line, error, sql = nil, sql_original_bytes: nil)
     @summary[:failed] += 1
-    @summary[:failures] << { file: relative(path), line: line, error: error, sql: sql }
+    record = { file: relative(path), line: line, error: error, sql: sql }
+    record[:sql_original_bytes] = sql_original_bytes if sql_original_bytes
+    append_failure(record)
+  end
+
+  def truncate_diagnostic(value)
+    return [value, nil] if value.nil? || value.bytesize <= DIAGNOSTIC_BYTES
+    bytes = value.bytesize
+    suffix = "\n[truncated; original #{bytes} bytes]"
+    prefix = value.byteslice(0, DIAGNOSTIC_BYTES - suffix.bytesize).force_encoding(Encoding::UTF_8).scrub('')
+    [prefix + suffix, bytes]
+  end
+
+  def append_failure(record)
+    %i[error sql].each do |key|
+      record[key], original = truncate_diagnostic(record[key])
+      record["#{key}_original_bytes".to_sym] = original if original
+    end
+    bytes = JSON.generate(record).bytesize
+    if @failure_detail_bytes + bytes > FAILURE_DETAIL_BYTES
+      @summary[:omitted_failure_details] += 1
+    else
+      @failure_detail_bytes += bytes
+      @summary[:failures] << record
+    end
   end
 
   def cell_equal?(actual, expected, tag)
