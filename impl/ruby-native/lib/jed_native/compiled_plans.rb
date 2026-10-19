@@ -14,10 +14,12 @@ module JedNative
 
     def native_compiled_kernels(plan, predicate, projections, keys = nil, pipeline: nil, offset: false, limit: false, orders: nil)
       return if @native_compilation_disabled
-      state = plan.instance_variable_get(:@native_compiled_state)
+      text = !@native_text_compilation_disabled
+      slot = text ? :@native_compiled_state : :@native_compiled_state_without_text
+      state = plan.instance_variable_get(slot)
       unless state
         state = State.new(uses: 0, kernels: Kernels.new, attempted: {}, source_bytes: 0)
-        plan.instance_variable_set(:@native_compiled_state, state)
+        plan.instance_variable_set(slot, state)
       end
       state.uses += 1 if state.uses < 2
       return if state.uses < 2 && !@native_compilation_immediate
@@ -26,7 +28,7 @@ module JedNative
         unless state.attempted[:pipeline]
           state.attempted[:pipeline] = true
           native_admit_kernel(state, :pipeline,
-            CompiledPipeline.build(predicate, projections, types: @types, mode: pipeline, offset: offset, limit: limit))
+            CompiledPipeline.build(predicate, projections, types: @types, mode: pipeline, offset: offset, limit: limit, text: text))
         end
         return state.kernels if state.kernels.pipeline
       end
@@ -34,16 +36,16 @@ module JedNative
       unless state.attempted[:predicate]
         state.attempted[:predicate] = true
         if predicate && !%i[literal column param].include?(predicate.kind)
-          native_admit_kernel(state, :predicate, CompiledExpression.build(predicate, types: @types))
+          native_admit_kernel(state, :predicate, CompiledExpression.build(predicate, types: @types, text: text))
         end
       end
       unless state.attempted[:projection]
         state.attempted[:projection] = true
-        native_admit_kernel(state, :projection, CompiledExpression.build_many(projections, types: @types))
+        native_admit_kernel(state, :projection, CompiledExpression.build_many(projections, types: @types, text: text))
       end
       if keys && !state.attempted[:keys]
         state.attempted[:keys] = true
-        native_admit_kernel(state, :keys, CompiledExpression.build_many(keys, types: @types))
+        native_admit_kernel(state, :keys, CompiledExpression.build_many(keys, types: @types, text: text))
       end
       if orders && !@native_ordering_disabled && !state.attempted[:ordering]
         state.attempted[:ordering] = true
@@ -58,12 +60,14 @@ module JedNative
     # folded subquery or host expression under an AST identity alone.
     def native_compiled_aggregate_arguments(expression)
       return if @native_compilation_disabled
-      return expression.instance_variable_get(:@native_argument_kernel) if expression.instance_variable_defined?(:@native_argument_kernel)
+      text = !@native_text_compilation_disabled
+      slot = text ? :@native_argument_kernel : :@native_argument_kernel_without_text
+      return expression.instance_variable_get(slot) if expression.instance_variable_defined?(slot)
       arguments = expression.args
       return if arguments.all? { |argument| %i[literal column param star].include?(argument.kind) }
-      program = CompiledExpression.prepare_many(arguments, types: @types)
+      program = CompiledExpression.prepare_many(arguments, types: @types, text: text)
       unless program
-        expression.instance_variable_set(:@native_argument_kernel, nil)
+        expression.instance_variable_set(slot, nil)
         return
       end
       @native_compiled_arguments ||= {}
@@ -77,7 +81,7 @@ module JedNative
         kernel = program.materialize if @native_compilation_immediate
         @native_compiled_arguments[key] = kernel
       end
-      expression.instance_variable_set(:@native_argument_kernel, kernel)
+      expression.instance_variable_set(slot, kernel)
       kernel
     end
 
@@ -87,10 +91,12 @@ module JedNative
     # records admission; a later resolution may materialize the method.
     def native_compiled_aggregate(expression)
       return if @storage || @native_compilation_disabled || @native_aggregate_disabled
-      return expression.instance_variable_get(:@native_aggregate_kernel) if expression.instance_variable_defined?(:@native_aggregate_kernel)
-      program = CompiledAggregate.prepare(expression, types: @types)
+      text = !@native_text_compilation_disabled
+      slot = text ? :@native_aggregate_kernel : :@native_aggregate_kernel_without_text
+      return expression.instance_variable_get(slot) if expression.instance_variable_defined?(slot)
+      program = CompiledAggregate.prepare(expression, types: @types, text: text)
       unless program
-        expression.instance_variable_set(:@native_aggregate_kernel, nil)
+        expression.instance_variable_set(slot, nil)
         return
       end
       @native_compiled_aggregates ||= {}
@@ -104,7 +110,7 @@ module JedNative
         kernel = program.materialize if @native_compilation_immediate
         @native_compiled_aggregates[key] = kernel
       end
-      expression.instance_variable_set(:@native_aggregate_kernel, kernel)
+      expression.instance_variable_set(slot, kernel)
       kernel
     end
 
@@ -112,9 +118,14 @@ module JedNative
     # Their source-and-pool cache contains no AST, row, or accounting owner.
     def native_compiled_relation_filter(predicate, memory: false)
       return if @storage || @native_compilation_disabled || @native_relation_disabled || !predicate
-      slot = memory ? :@native_relation_memory_filter_kernel : :@native_relation_filter_kernel
+      text = !@native_text_compilation_disabled
+      slot = if text
+        memory ? :@native_relation_memory_filter_kernel : :@native_relation_filter_kernel
+      else
+        memory ? :@native_relation_memory_filter_kernel_without_text : :@native_relation_filter_kernel_without_text
+      end
       return predicate.instance_variable_get(slot) if predicate.instance_variable_defined?(slot)
-      program = CompiledRelation.prepare_filter(predicate, types: @types, memory: memory)
+      program = CompiledRelation.prepare_filter(predicate, types: @types, memory: memory, text: text)
       kernel = native_relation_program_kernel(program)
       predicate.instance_variable_set(slot, kernel)
       kernel
@@ -122,10 +133,12 @@ module JedNative
 
     def native_compiled_relation_keys(expressions)
       return if @storage || @native_compilation_disabled || @native_relation_disabled
-      return expressions.instance_variable_get(:@native_relation_keys_kernel) if expressions.instance_variable_defined?(:@native_relation_keys_kernel)
-      program = CompiledRelation.prepare_keys(expressions, types: @types)
+      text = !@native_text_compilation_disabled
+      slot = text ? :@native_relation_keys_kernel : :@native_relation_keys_kernel_without_text
+      return expressions.instance_variable_get(slot) if expressions.instance_variable_defined?(slot)
+      program = CompiledRelation.prepare_keys(expressions, types: @types, text: text)
       kernel = native_relation_program_kernel(program)
-      expressions.instance_variable_set(:@native_relation_keys_kernel, kernel)
+      expressions.instance_variable_set(slot, kernel)
       kernel
     end
 

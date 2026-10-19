@@ -17,14 +17,14 @@ module JedNative
       end
     end
 
-    def self.prepare(expression, types: {})
-      new(types).prepare(expression)
+    def self.prepare(expression, types: {}, text: true)
+      new(types, text: text).prepare(expression)
     rescue Unsupported
       nil
     end
 
-    def self.build(expression, types: {})
-      prepare(expression, types: types)&.materialize
+    def self.build(expression, types: {}, text: true)
+      prepare(expression, types: types, text: text)&.materialize
     end
 
     def prepare(expression)
