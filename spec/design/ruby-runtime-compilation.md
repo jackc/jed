@@ -4,13 +4,15 @@ The maintainer explicitly requested investigating Ruby `eval` as a way to compil
 prepared query plans and let Ruby's JIT optimize query-specific code. This is a
 narrow exception to the prohibition on generated engine implementations: the
 compiler and its semantics are handwritten Ruby, operating on already resolved
-expressions. The Ruby core remains frozen, experimental, and explicitly selected
-for every test, benchmark, and feature update.
+expressions and eligible single-table scan/filter/projection plans. The Ruby core
+remains frozen, experimental, and explicitly selected for every test, benchmark,
+and feature update.
 
 ## Execution boundary
 
-The first implementation specializes expression kernels inside existing query
-plans. The planner, access paths, row streams, sort and aggregate algorithms,
+The expression tier specializes kernels inside existing query plans. A second
+tier fuses eligible single-table scan/filter/projection loops, including streaming
+OFFSET/LIMIT. The planner, access paths, row sources, sort and aggregate algorithms,
 storage, and host API remain the existing engine. A resolved expression can emit a
 Ruby method containing straight-line locals and branches instead of recursively
 dispatching through expression objects. Ruby's JIT may compile this method after
@@ -21,8 +23,10 @@ ordinals enter the source. SQL text, identifiers, literals, error messages, type
 and fallback expression objects stay in a separate data pool. No SQL string is
 passed to `eval`, and no SQL value becomes a method name or interpolated Ruby
 literal. Each kernel is an instance of a collectible anonymous class with one
-generated `call(engine, row, params)` method. It captures no engine, session, row,
-or parameter binding. `class_eval` defines the method once, outside the row loop.
+generated `call(engine, row, params)` method. A pipeline instead receives the current
+engine, input, parameters, output sink, OFFSET and LIMIT. Neither captures an engine,
+session, row source, output sink, or parameter binding. `class_eval` defines the
+method once, outside the row loop.
 
 Admission starts with plain integers and booleans: arithmetic and comparisons,
 integer casts, unary operations, three-valued boolean control flow, searched CASE,
@@ -31,6 +35,15 @@ subqueries, windows, and unsupported expression forms use the existing evaluator
 A fused projection may delegate an unsupported complete root to that evaluator,
 in its original position. There is no fallback after execution has started: a
 compiled error is returned immediately, never retried.
+
+Pipeline admission requires complete supported expression trees, including trivial
+column/literal projections. It has no expression fallback inside its generated
+loop. Specialized point and scalar paths retain their existing execution; DISTINCT,
+blocking ordering, profiling, and finite query-memory accounting keep the existing
+operators. A streaming plan may consume an index-ordered input without generating
+a sort. Host callbacks and unsupported types select the existing operator and
+expression tier. Array execution preserves its indexed `while`; streaming uses
+the existing source's internal `each` so it introduces no Enumerator Fiber per row.
 
 ## Semantic obligations
 
@@ -48,6 +61,15 @@ failures, lazy storage failures, cursor pulls, and host batch accounting. Existi
 output, query-memory, spill, and storage charges remain at their original sites.
 Grouping substitutions keep the original evaluator path.
 
+Array pipelines preserve the existing bulk scan charge before the loop and bulk
+output charge after successful completion. Streaming pipelines preserve source
+pull, scan-row charge, predicate, accepted-row OFFSET, projection, output charge,
+sink append/suspension, then LIMIT termination in that order. OFFSET rows do not
+evaluate projections. LIMIT 0 does not enter the source iterator, while scan
+preparation remains at its original site. Closing a suspended cursor unwinds the
+same scanner and engine cleanup scopes. Charges are never summed or hoisted across
+these boundaries, including when statement/lifetime budgets are enabled.
+
 ## Lifetime and bounds
 
 Resolved plan caches retain at most 64 entries each and already validate table
@@ -58,8 +80,13 @@ record a negative admission to avoid repeated emitter work. Internal diagnostic
 switches can force first-use admission or disable compilation for differential
 testing; neither changes public SQL or embedding APIs.
 
-An expression/fused projection is limited to 192 emitted nodes, depth 32, 256 pool
-entries, and 32 KiB source. A plan retains at most three kernels and 64 KiB source.
+An expression, fused projection, or pipeline is limited to 192 emitted nodes,
+depth 32, 256 pool entries, and 32 KiB source. A plan retains at most four kernels
+(predicate, projection, sort keys, and pipeline) and 64 KiB total source. A pipeline
+is attempted before separate expression kernels on eligible execution; fallback
+operators may later request those kernels under the same total cap. Rejection is
+cached. The internal pipeline-disable diagnostic keeps the expression tier active
+for differential comparisons; it is not a public API.
 Aggregate arguments in the general and spill executors use a separate 64-entry
 LRU cache. Those expressions are resolved afresh, so the exact emitted source and
 immutable scalar pool form the cache key. Emission happens before lookup;

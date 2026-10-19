@@ -26,6 +26,7 @@ OptionParser.new do |parser|
   parser.on('--file PATH') { |value| options[:file] = File.expand_path(value) }
   parser.on('--lanes LIST', Array) { |value| options[:lanes] = value }
   parser.on('--verify-only') { options[:verify_only] = true }
+  parser.on('--disable-pipeline') { options[:disable_pipeline] = true }
 end.parse!
 abort 'Specify --output PATH' unless options[:output]
 abort 'Unknown lane' unless (options[:lanes] - %w[wrapper native-prepared native-query native-eager]).empty?
@@ -44,7 +45,7 @@ source_hashes = lambda do
     rust: Digest::SHA256.hexdigest(Dir[File.join(root, 'impl/rust/src/**/*.rs')].sort.map { |path| File.binread(path) }.join),
     wrapper_library: Digest::SHA256.file(wrapper_library).hexdigest,
     worker: Digest::SHA256.file(File.join(__dir__, 'binding_compare_lane.rb')).hexdigest,
-    plans: %w[plan.json compiled-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
+    plans: %w[plan.json compiled-plan.json pipeline-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
     database: options[:file] && Digest::SHA256.file(options[:file]).hexdigest
   }
 end
@@ -68,6 +69,7 @@ options[:lanes].each do |lane|
   command << '--verify-only' if options[:verify_only]
   command += ['--workloads', options[:workloads].join(',')] if options[:workloads]
   command << '--fresh-sql' if options[:fresh_sql]
+  command << '--disable-pipeline' if options[:disable_pipeline]
   result = JedNativeTools::BoundedProcess.run(command, timeout: 300,
     memory_bytes: 512 * 1024**2, address_space_bytes: 2 * 1024**3,
     env: { 'RUBYOPT' => nil, 'RUBY_YJIT_ENABLE' => nil, 'RUBY_ZJIT_ENABLE' => nil,

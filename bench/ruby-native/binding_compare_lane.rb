@@ -55,6 +55,7 @@ module RubyBindingComparison
       database = engine == 'wrapper' ? Jed.memory(environment: env) : JedNative.memory(environment: env)
     end
     session = engine == 'wrapper' ? database : database.session
+    session.engine.instance_variable_set(:@native_pipeline_disabled, true) if engine != 'wrapper' && @disable_pipeline
     return yield(session) if file
     session.execute('CREATE TABLE items (id i32 PRIMARY KEY, bucket i32, score i32, label text)')
     values = rows.times.map { |i| "(#{i},#{i % 10},#{(i * 37) % 10_000},'row#{i}')" }.join(',')
@@ -215,6 +216,7 @@ module RubyBindingComparison
       parser.on('--verify-only') { options[:verify_only] = true }
       parser.on('--workloads LIST', Array) { |names| options[:workloads] = names }
       parser.on('--fresh-sql') { options[:fresh_sql] = true }
+      parser.on('--disable-pipeline') { options[:disable_pipeline] = true }
     end.parse!
     abort "Usage: #{File.basename(__FILE__)} #{ENGINES.join('|')} [--verify-only] [--file PATH]" unless ENGINES.include?(engine) && ARGV.empty?
     root = File.expand_path('../..', __dir__)
@@ -225,6 +227,8 @@ module RubyBindingComparison
     end
     source_hash = NativeRubySource.digest(source)
     require File.join(source, engine == 'wrapper' ? 'lib/jed' : 'lib/jed_native')
+    @disable_pipeline = !!options[:disable_pipeline]
+    abort 'Source has no pipeline compiler to disable' if @disable_pipeline && engine != 'wrapper' && !defined?(JedNative::CompiledPipeline)
     library = engine == 'wrapper' ? File.expand_path(Jed::FFI.lib_path) : nil
     library_hash = library && Digest::SHA256.file(library).hexdigest
     plan_path = File.join(__dir__, 'compare/plan.json')
@@ -233,18 +237,18 @@ module RubyBindingComparison
     jobs += cold_workloads if options[:fresh_sql] && !options[:file]
     additional_plan_path = nil
     if options[:workloads] && !options[:file]
-      # The expression-heavy controls are opt-in even within this opt-in
+      # The expression/pipeline controls are opt-in even within this opt-in
       # harness. Selecting an existing workload leaves its schedule unchanged.
       missing = options[:workloads] - jobs.map { |job| job.fetch('name') }
       unless missing.empty?
-        path = File.join(__dir__, 'compare/compiled-plan.json')
+        path = File.join(__dir__, 'compare/pipeline-plan.json')
         additional_plan = JSON.parse(File.read(path))
         additional_jobs = additional_plan.fetch('workloads').select { |job| missing.include?(job.fetch('name')) }
         unless additional_jobs.empty?
           raise 'additional plan uses a different fixture' unless additional_plan.fetch('rows') == plan.fetch('rows')
           additional_plan_path = path
           jobs += additional_jobs.map do |job|
-            job.merge('validation_iterations' => additional_plan.fetch('validation_iterations'), 'kind' => 'compiled_expression')
+            job.merge('validation_iterations' => additional_plan.fetch('validation_iterations'), 'kind' => 'compiled_pipeline')
           end
         end
       end
@@ -275,12 +279,13 @@ module RubyBindingComparison
       additional_plan_sha256: additional_plan_path && Digest::SHA256.file(additional_plan_path).hexdigest,
       storage: options[:file] ? 'file' : 'memory', file: options[:file],
       fresh_sql: !!options[:fresh_sql],
+      pipeline_disabled: @disable_pipeline && engine != 'wrapper',
       dataset_rows: options[:file] ? 1_000_000 : plan.fetch('rows'), repetitions: REPETITIONS,
       notes: [
         'Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.',
         'Native modes use a long-lived session, matching the wrapper connection lifetime.',
         'Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.',
-        'Expression-heavy shapes require an explicit --workloads selection and use compare/compiled-plan.json unchanged.',
+        'Expression/pipeline shapes require an explicit --workloads selection and use compare/pipeline-plan.json unchanged.',
         'Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.',
         'All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.',
         'File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.',

@@ -51,7 +51,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [Ruby binding/host comparison](impl/ruby-native/BINDING_COMPARISON.md),
   [ordinary API/host optimization](impl/ruby-native/API_FOLLOWUP.md),
   [runtime compilation](impl/ruby-native/COMPILED_FOLLOWUP.md),
+  [fused scan pipelines](impl/ruby-native/PIPELINE_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
+
+  Known experimental gap: multi-page ordered `LIMIT`/`OFFSET` scans charge visited
+  structural pages instead of the complete bounded page block. This predates
+  pipeline compilation; its recorded benchmark reproducer and cost deltas are in
+  [the pipeline report](impl/ruby-native/PIPELINE_FOLLOWUP.md). A correction needs
+  storage-meter budget/fault-order verification and an explicitly requested update.
+  The full lazy-API audit also reproduces existing resolution/metadata, stack-depth,
+  and correlated-subquery cost failures, plus API-dependent result-collection
+  thresholds. Its before/after controls and unfiltered failures are retained in
+  that report; the passing eager corpus is not a full lazy-API conformance claim.
 
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, `LIKE`/`ILIKE … ESCAPE e` (desugared to PostgreSQL's `like_escape(p, e)`), and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
   - [ ] _follow-on:_ `SIMILAR TO` (deliberately excluded — the SQL-standard surface); Unicode-property char classes (`\p{…}`).

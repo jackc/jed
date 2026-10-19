@@ -106,7 +106,10 @@ module JedNative
       plan.parameters.each do |parameter|
         cast_value(@params[parameter.value], parameter.type) if parameter.extra&.dig(:context_type)
       end
-      kernels = native_compiled_kernels(plan, plan.predicate, plan.projections)
+      pipeline_mode = :array if stored && !plan.lookup && plan.orders.empty? &&
+                                !cursor_output? && !@query_memory && !@explain_profile_frames && !@native_pipeline_disabled
+      kernels = native_compiled_kernels(plan, plan.predicate, plan.projections, pipeline: pipeline_mode)
+      pipeline = kernels&.pipeline if pipeline_mode
       predicate_kernel, projection_kernel = kernels&.predicate, kernels&.projection
       input = if where_contradiction?(plan.predicate)
         []
@@ -156,31 +159,35 @@ module JedNative
       profile_checkpoint(:scan) if @explain_profile_frames
       streaming = cursor_output?
       output, sort_keys = cursor_output(plan.columns), []
-      row_index = 0
-      while row_index < input.length
-        row = input[row_index]
-        row_index += 1
-        filter_start = @cost if @explain_profile_frames
-        accepted = !plan.predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(plan.predicate, row)) == true
-        profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
-        next unless accepted
-        if projection_kernel && !gathered
-          values = projection_kernel.call(self, row, @params)
-        else
-          values = Array.new(plan.projections.length)
-          column_index = 0
-          while column_index < values.length
-            values[column_index] = gathered ? gathered[column_index][row_index - 1] : evaluate(plan.projections[column_index], row)
-            column_index += 1
+      if pipeline
+        pipeline.call(self, input, @params, output)
+      else
+        row_index = 0
+        while row_index < input.length
+          row = input[row_index]
+          row_index += 1
+          filter_start = @cost if @explain_profile_frames
+          accepted = !plan.predicate || (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(plan.predicate, row)) == true
+          profile_accumulate(:filter, @cost - filter_start) if @explain_profile_frames
+          next unless accepted
+          if projection_kernel && !gathered
+            values = projection_kernel.call(self, row, @params)
+          else
+            values = Array.new(plan.projections.length)
+            column_index = 0
+            while column_index < values.length
+              values[column_index] = gathered ? gathered[column_index][row_index - 1] : evaluate(plan.projections[column_index], row)
+              column_index += 1
+            end
           end
-        end
-        query_memory_add_row(output_owner, values, plan.columns) if output_owner
-        charge if streaming
-        output << values
-        unless plan.orders.empty?
-          sort_start = @cost if @explain_profile_frames
-          sort_keys << plan.orders.map { |kind, expression, _| kind == :output ? values[expression] : evaluate(expression, row) }
-          profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
+          query_memory_add_row(output_owner, values, plan.columns) if output_owner
+          charge if streaming
+          output << values
+          unless plan.orders.empty?
+            sort_start = @cost if @explain_profile_frames
+            sort_keys << plan.orders.map { |kind, expression, _| kind == :output ? values[expression] : evaluate(expression, row) }
+            profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
+          end
         end
       end
       if @explain_profile_frames

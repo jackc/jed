@@ -247,7 +247,8 @@ module NativeCompiledPlanTests
       3.times { current.query_prepared(statement, 2, 4).rows }
       cache = current.engine.instance_variable_get(:@native_read_plans)
       plan = cache.values.last
-      assert(plan && plan.instance_variable_get(:@native_compiled_state)&.kernels&.projection,
+      kernels = plan&.instance_variable_get(:@native_compiled_state)&.kernels
+      assert(kernels && (kernels.projection || kernels.pipeline),
         'reused table CASE did not retain compiled expressions')
       assert(current.query_prepared(statement, 10, 3).rows == [[13], [nil], [-8]], 'conditional plan retained old bindings')
       assert(cache.values.last.equal?(plan), 'safe CASE/BETWEEN rebuilt the same read plan')
