@@ -88,6 +88,7 @@ module NativeRubyCompare
     command << '--disable-ordering' if lane.start_with?('ruby') && ARGV.include?('--disable-ordering')
     command << '--disable-aggregate' if lane.start_with?('ruby') && ARGV.include?('--disable-aggregate')
     command << '--disable-relation' if lane.start_with?('ruby') && ARGV.include?('--disable-relation')
+    command << '--disable-text' if lane.start_with?('ruby') && ARGV.include?('--disable-text')
     command
   end
 
@@ -190,6 +191,7 @@ module NativeRubyCompare
                ordering_disabled: ARGV.include?('--disable-ordering'),
                aggregate_disabled: ARGV.include?('--disable-aggregate'),
                relation_disabled: ARGV.include?('--disable-relation'),
+               text_compilation_disabled: ARGV.include?('--disable-text'),
                host: host, plan_path: plan_path, plan_sha256: Digest::SHA256.hexdigest(plan_json), plan: plan,
                ruby_source: ENV.fetch('RUBY_NATIVE_SOURCE', File.join(ROOT, 'impl/ruby-native')),
                statuses: statuses, results: results, resources: resources }

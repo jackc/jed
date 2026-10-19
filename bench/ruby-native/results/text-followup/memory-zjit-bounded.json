@@ -1,0 +1,21 @@
+{
+  "command": [
+    ".dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "impl/ruby-native/bin/conformance.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 97308672,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 900.0,
+  "elapsed_seconds": 162.30671661101223,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "final_source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"files\":679,\"records\":20267,\"passed\":20267,\"failed\":0,\"unsupported_files\":0,\"skipped_files\":2,\"timed_out_files\":0,\"memory_limited_files\":0,\"omitted_failure_details\":0,\"compiled_kernels\":4332,\"compiled_pipelines\":2420,\"compiled_orderings\":168,\"compiled_aggregates\":289,\"compiled_relations\":594,\"compiled_text_kernels\":432,\"execute_api_records\":20087,\"query_api_records\":0,\"materialized_memory_records\":0,\"mode\":\"memory\",\"filter\":\"\",\"started_at\":\"2026-10-19T18:19:03Z\",\"query_api\":\"execute\",\"query_memory_api\":\"execute\",\"compilation\":\"immediate\",\"ruby\":\"ruby 4.1.0preview1 (2026-10-11 master 2d08b5f42f) +ZJIT +PRISM [x86_64-linux]\",\"ruby_executable\":\"/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby\",\"jit\":\"zjit\",\"corpus_root\":\"/home/jack/.codex/worktrees/b8e6/jed/spec/conformance/suites\",\"available_records\":20135,\"source_sha256\":\"d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7\",\"worker_memory_bytes\":536870912,\"worker_timeout_seconds\":10.0,\"worker_address_space_bytes\":2147483648,\"peak_worker_rss_bytes\":168275968,\"finished_at\":\"2026-10-19T18:21:45Z\",\"final_source_sha256\":\"d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7\"}\n",
+  "stderr": ""
+}

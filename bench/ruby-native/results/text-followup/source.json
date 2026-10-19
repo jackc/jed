@@ -1,0 +1,15 @@
+{
+  "baseline_commit": "8347075b8b235bba4a3a173460ba74963f7049aa",
+  "baseline_source_sha256": "c23bce9c406d04797d08f2bd155ba5380ba61521df6aeec4a923f9df5831d276",
+  "final_source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "host_test_files": 55,
+  "host_tests_sha256": "32aeecc76657007adacafdfcfbfc0ce422efa49e20de7841f22b46389614f62f",
+  "corpus_files": 679,
+  "corpus_sha256": "c146c24f8d0dc33043aba9ac6d2d7b0d238529b368403079f6b7ddd64facec65",
+  "plan_sha256": "16cd82ad8b3e3f467ad4c81c95a10d8bc52c800eaf529d5ea2b61d6c8186f582",
+  "limits": {
+    "worker_rss_bytes": 536870912,
+    "worker_address_space_bytes": 2147483648
+  },
+  "note": "Opt-in frozen experiment. The baseline source is recoverable with git archive from baseline_commit. The final commit contains the measured final source and all evidence."
+}

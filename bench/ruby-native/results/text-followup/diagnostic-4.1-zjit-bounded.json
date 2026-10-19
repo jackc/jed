@@ -1,0 +1,28 @@
+{
+  "command": [
+    "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "--zjit-log-compiled-iseqs=bench/ruby-native/results/text-followup/diagnostic-4.1-zjit.log",
+    "bench/ruby-native/text_diagnostics.rb",
+    "--jit",
+    "zjit",
+    "--zjit-log",
+    "bench/ruby-native/results/text-followup/diagnostic-4.1-zjit.log",
+    "--report",
+    "bench/ruby-native/results/text-followup/diagnostic-4.1-zjit.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 82546688,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 21.17600689099345,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "final_source_sha256": "d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "{\"report\":\"/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/text-followup/diagnostic-4.1-zjit.json\",\"source_sha256\":\"d65f93d3ce50d13866b970c096dcad9b2f9a1f988fa02844833d683971fd9ec7\",\"jit\":\"zjit\",\"workloads\":[{\"name\":\"text_parameter_projection\",\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"ad44165f5c451e23bcdff18b2d1a83b4b063f2f954aeb5a2372dd704117b370d\",\"iseq_path\":\"(jed compiled expression)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled expression):2\",\"call@(jed compiled expression):2\"],\"direct_jit_proof\":true,\"note\":\"Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"text_identity_projection\",\"generated_code\":{\"source_location\":[\"(jed compiled expression)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"65631875a078175a0fcbbbcdeacd4ead82f21f0e2aedbbc241e75f1c622b8117\",\"iseq_path\":\"(jed compiled expression)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled expression):2\"],\"direct_jit_proof\":true,\"note\":\"Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"text_equality_filter\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"3619d9ca6a33b01f30e525392ab889dd6371576ff73b948aa89d55612fb32561\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"nullable_text_filter\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"3c6fdab6b9312543c0e81b33f29bc5bd7cdfc38e8dbd6e6ccaec0ffc9e9a2cd4\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"accounted_text_filter\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"eb4051d9819550816fb66c11142cb9b640aee4e080b0a993c49225cc6f5d1974\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked.\"}},{\"name\":\"text_predicate_key_vector\",\"generated_code\":{\"source_location\":[\"(jed compiled relation)\",1],\"iseq_label\":\"call\",\"generated_source_sha256\":\"a5ddf4a3a9b0134604e77bda9264dc13e3605fbc9e64130d97abcb37c5787d9a\",\"iseq_path\":\"(jed compiled relation)\",\"first_lineno\":1,\"zjit_generated_compilations\":[\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\",\"call@(jed compiled relation):1\"],\"direct_jit_proof\":true,\"note\":\"Only this job's kernel is invoked between log snapshots; repeat materializations are never invoked.\"}}]}\n",
+  "stderr": ""
+}

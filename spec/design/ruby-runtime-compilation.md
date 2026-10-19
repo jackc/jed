@@ -38,7 +38,11 @@ method once, outside the row loop.
 
 Admission starts with plain integers and booleans: arithmetic and comparisons,
 integer casts, unary operations, three-valued boolean control flow, searched CASE,
-and selected integer functions. Nominal/open/collatable types, host calls,
+and selected integer functions. The explicitly requested text extension admits
+plain text leaves, identity text casts, and ordinary comparisons under the fixed
+`C` collation. It preserves text collation labels, eager operand evaluation,
+NULL propagation, and variable-width comparison charges. Linguistic collations,
+nominal/open types, host calls,
 subqueries, windows, and unsupported expression forms use the existing evaluator.
 A fused projection may delegate an unsupported complete root to that evaluator,
 in its original position. There is no fallback after execution has started: a
@@ -72,7 +76,7 @@ retain the ordinary executor. File hosts retain their existing aggregation.
 
 Materialized-relation admission specializes the memory host's final residual
 WHERE filter and the complete grouping-key matrix. It requires fully supported
-integer/boolean expression trees. Filtering returns the original accepted row
+expression trees, including the admitted C-text surface. Filtering returns the original accepted row
 objects in input order. Key evaluation remains row-major and left-to-right
 within each key vector; grouping-set construction and hash grouping stay in the
 ordinary executor. File hosts, unsupported predicates, and unsupported complete
@@ -95,6 +99,19 @@ checkpoint, or reorder a host callback. This preserves statement/lifetime budget
 failures, lazy storage failures, cursor pulls, and host batch accounting. Existing
 output, query-memory, spill, and storage charges remain at their original sites.
 Grouping substitutions keep the original evaluator path.
+
+Text comparison operands remain eager, including the right operand when the
+left is NULL. Comparison work is charged after both reads and before comparison,
+using the ordinary Unicode-character-length rule. Text results preserve their
+exact transient collation labels through fixed, frozen compiler-owned C-label
+constants; no resolved label or loaded table enters the pool. A direct C-string
+comparison requires static C provenance and guards on each runtime value's exact
+class. Unproven collation provenance or unexpected classes use the fallback
+helper's original dynamic-label and comparison semantics. This guard is not
+permission to compile a statically linguistic, conflicting, indeterminate, or
+nominal expression. Explicit COLLATE
+nodes, text functions/concatenation, text-returning CASE, text aggregate reductions,
+and text sort comparators remain unsupported by this extension.
 
 Array pipelines preserve the existing bulk scan charge before the loop and bulk
 output charge after successful completion. Streaming pipelines preserve source
@@ -142,7 +159,10 @@ switches can force first-use admission or disable compilation for differential
 testing; neither changes public SQL or embedding APIs.
 
 An expression, fused projection, or pipeline is limited to 192 emitted nodes,
-depth 32, 256 pool entries, and 32 KiB source. An ordering kernel permits at most
+depth 32, 256 pool entries, 32 KiB of copied string pool data, and 32 KiB source.
+The string budget is checked before duplication and restored when partial root
+emission is rejected. Oversized text literals retain ordinary evaluation.
+An ordering kernel permits at most
 192 keys and 32 KiB source, and has no value pool. A plan retains at most five kernels
 (predicate, projection, sort keys, pipeline, and ordering) and 64 KiB total source. A pipeline
 is attempted before separate expression kernels on eligible execution; fallback
@@ -168,6 +188,12 @@ cache, shared by lazy cursors with their session. The same second-use policy and
 per-method limits apply. Filter memory-accounting mode is encoded in fixed
 source, while the current owner, columns, mask, rows, and parameters are passed
 at invocation. The internal relation-disable switch leaves earlier tiers active.
+The internal text-disable switch rejects text admission across emitting tiers
+while retaining integer/boolean compilation. Its separate plan/expression memo
+slots prevent a warmed text method from bypassing the switch. Shared source-and-pool
+LRUs keep their existing limits in both modes. Ordinary operation has one 64 KiB
+source state per resolved plan; toggling this internal diagnostic may retain two
+independent states, up to 128 KiB per plan.
 Exceeding a limit selects the evaluator. These bound retained source and compiler
 work, not total VM/JIT memory; active cursors can retain their own old plans and
 Ruby controls machine-code reclamation. Validation and benchmarks therefore also
