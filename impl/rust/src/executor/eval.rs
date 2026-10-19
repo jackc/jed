@@ -1926,7 +1926,7 @@ impl RExpr {
                 // charge their own. Guard immediately after (the size-scaled-charge discipline,
                 // cost.md §3) so a large declared weight aborts BEFORE the kernel runs.
                 m.charge(hf.cost);
-                m.guard()?;
+                m.checkpoint()?;
                 // The kernel's outcome for this row: prefetched by the site's batch (§4.2.1 —
                 // speculative batch, scalar replay), or a batch-of-one call when it has none. A
                 // prefetched outcome proves every argument is trivially evaluable (free, cannot raise)
@@ -1949,6 +1949,7 @@ impl RExpr {
                         hf.call_one(vals)?
                     }
                 };
+                m.poll()?;
                 // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md
                 // §13 — the host owns its consequences, but a wrong-typed value must never reach
                 // jed's codecs / comparators): the returned value must be NULL or match the declared

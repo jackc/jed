@@ -1746,7 +1746,7 @@ func (db *engine) evalValueExpr(node *rExpr, params []Value, rng *stmtRng, ctes 
 	if node == nil {
 		panic("every VALUES expression slot is resolved before materialization")
 	}
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return Value{}, err
 	}
 	env := &evalEnv{exec: db, params: params, rng: rng, ctes: ctes}
@@ -2095,7 +2095,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		// expression work (operator_eval), so guard the ceiling per checked row. The
 		// per-statement rng is shared with the default evaluation above (one StmtRng).
 		if len(checks) > 0 {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Step(); err != nil {
 				return nil, err
 			}
 			env := &evalEnv{exec: db, rng: rng}
@@ -2261,7 +2261,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 
 	// Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
 	meter.Charge(costs.ValueCompress * cunits)
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return nil, err
 	}
 
@@ -2343,7 +2343,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	}
 
 	if len(checks) > 0 {
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return nil, err
 		}
 		if err := evalChecks(checks, table.Name, row, env, meter); err != nil {
@@ -2451,7 +2451,7 @@ func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string,
 	}
 
 	meter.Charge(costs.ValueCompress * cunits)
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return nil, err
 	}
 
@@ -2910,7 +2910,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 			return 0, nil, atRow(err, r)
 		}
 		if len(checks) > 0 {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Step(); err != nil {
 				return 0, nil, err
 			}
 			env := &evalEnv{exec: db, rng: rng}
@@ -3347,7 +3347,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbSco
 		cunits += int64(store.WriteCompressUnits(u.newKey, u.newRow))
 	}
 	meter.Charge(costs.ValueCompress * cunits)
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return 0, nil, err
 	}
 
@@ -3576,7 +3576,7 @@ func (db *engine) projectReturning(nodes []*rExpr, rows []storedRow, others []st
 	env := &evalEnv{exec: db, params: params, rng: newStmtRng(), ctes: ctes}
 	out := make([][]Value, 0, len(rows))
 	for i, row := range rows {
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return nil, err
 		}
 		meter.Charge(costs.RowProduced)
@@ -3652,7 +3652,7 @@ type fkDeferredCheck struct {
 // meter live-charges the shared lifetime counter; its statement total is folded into the caller
 // without charging lifetime twice.
 func (db *engine) runFkActionUpdate(stmt *update, params []Value, meter *costMeter) error {
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return err
 	}
 	if db.session.fkActionDepth >= maxFkActionDepth {
@@ -3674,11 +3674,11 @@ func (db *engine) runFkActionUpdate(stmt *update, params []Value, meter *costMet
 		return err
 	}
 	meter.Accrued += out.Cost
-	return meter.Guard()
+	return meter.Checkpoint()
 }
 
 func (db *engine) runFkActionDelete(stmt *deleteStmt, params []Value, meter *costMeter) error {
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return err
 	}
 	if db.session.fkActionDepth >= maxFkActionDepth {
@@ -3700,7 +3700,7 @@ func (db *engine) runFkActionDelete(stmt *deleteStmt, params []Value, meter *cos
 		return err
 	}
 	meter.Accrued += out.Cost
-	return meter.Guard()
+	return meter.Checkpoint()
 }
 
 // fkActionScope is the qualifier a generated action names its child with: the FK's own domain
@@ -4161,7 +4161,7 @@ func (db *engine) executeDeleteTarget(del *deleteStmt, params []Value, ctx cteCt
 	scanActual += blockCost
 	filterActual := scanActual
 	for _, e := range entries {
-		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+		if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
@@ -4584,7 +4584,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		assignedCol[p.idx] = true
 	}
 	for _, e := range entries {
-		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+		if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
@@ -4888,7 +4888,7 @@ func (db *engine) executeUpdateTarget(upd *update, params []Value, ctx cteCtx) (
 		cunits += int64(store.WriteCompressUnits(u.newKey, u.row))
 	}
 	meter.Charge(costs.ValueCompress * cunits)
-	if err := meter.Guard(); err != nil {
+	if err := meter.Checkpoint(); err != nil {
 		return outcome{}, err
 	}
 

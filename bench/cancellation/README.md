@@ -17,13 +17,93 @@ another operation. There are no watcher goroutines to leak on query errors or ea
 failure hook. Explicit `Close` remains necessary for early exits and is terminal/idempotent.
 Cancellation after exhaustion or close cannot create a new error.
 
-Both cores now distinguish **cost ceilings** from **cancellation** when admitting aggregate and
+The first fix (`46317446`) distinguished **cost ceilings** from **cancellation** when admitting aggregate and
 columnar projection paths. Those paths check cancellation at entry and between blocks of at most
-256 scan/fold records. Scalar execution retains its existing guards. Finite statement/lifetime
+256 scan/fold records. That version still polled at scalar cost guards; the follow-up below separates them. Finite statement/lifetime
 cost ceilings retain the scalar path and its exact failure points. Successful cost totals are
 unchanged. A canceled columnar walk reports its visited-page/record and fold work into the lifetime
 account instead of losing it before the normal bulk accrual. The commit cancellation boundary is
 unchanged; no storage format changes.
+
+## Follow-up: separate cancellation from cost enforcement
+
+The first fix still polled cancellation at every scalar cost guard. The follow-up keeps those
+cost guards at exactly the same points, but ordinary expression evaluation no longer polls.
+Go polls on the first and every 256th execution step: input rows (including rejected rows),
+join candidates, recursive iterations, and operator loops. Its existing `Next` entry check stays
+immediate. Vectorized scans/folds check each block of up to 256 records. Host-call boundaries and
+selected expensive built-ins retain checks. A cancellation-only poll never adds a cost guard.
+
+Rust likewise separates expression cost guards from cancellation, but retains an atomic poll at
+each row/operator step. Sampling Rust at 256 steps did not improve throughput and raised streaming
+cancellation response from sub-microsecond to a 9.176 µs median (15.958 µs p95). It was therefore
+rejected for Rust. Vectorized batches retain their existing 256-record checks in both cores.
+`rust-coarse-sampled.txt` and `latency-coarse-sampled.txt` retain that experiment.
+
+The initial Go sampling wrapper added an extra function call on the unlimited-cost path. The final
+version keeps that path inline and leaves finite-limit comparisons in `guardLimits`; every cost
+limit still aborts at the same guard. `go-coarse-uninlined.txt` retains the intermediate experiment.
+No allocations were added by sampling: enabling Go cancellation still adds 40 bytes / two
+allocations per query, and caller context/deadline creation remains outside engine timings.
+
+### Controlled Go comparison
+
+`mise run bench:cancellation:compare-go` archives the prior commit (`46317446`) into a temporary
+directory, builds both test binaries before timing, and alternates identical workload selections
+in fresh processes (control/current, current/control, control/current). All runs use CPU 0,
+`GOMAXPROCS=1`, 500 ms per sample, and fully drained results. The task neither switches the active
+worktree nor installs dependencies. Raw samples: `go-control-paired.txt`, `go-coarse-paired.txt`.
+Medians of three runs:
+
+| Go workload | Prior disabled / enabled µs | Current disabled / enabled µs | Prior overhead | Current overhead |
+|---|---:|---:|---:|---:|
+| Cheap prepared | 1.057 / 1.128 | 1.045 / 1.105 | 6.7% | 5.7% |
+| Streaming, 10k rows | 582.243 / 654.682 | 577.179 / 594.559 | 12.4% | 3.0% |
+| Aggregate, 10k rows | 133.493 / 133.539 | 133.767 / 134.240 | within noise | within noise |
+| Projection, 10k rows | 465.181 / 529.323 | 475.166 / 501.664 | 13.8% | 5.6% |
+
+With cancellation enabled, streaming is **9.2% faster** and projection **5.2% faster** than the
+prior commit in this comparison. Disabled streaming is 0.9% faster; disabled projection is 2.1%
+slower, so this is not a uniform speedup in every mode. Cheap-query setup still dominates its
+remaining overhead. Current enabled throughput is approximately 905k cheap queries/s, 1,682
+streaming queries/s, 7,450 aggregates/s, and 1,993 projections/s.
+
+The full benchmark selection also includes watcher and forced-scalar variants (`go-coarse.txt`).
+It shows smaller enabled overhead (1.0% streaming, 2.2% projection), but different absolute times;
+benchmark selection and preceding allocation/GC activity matter. Use the identical-selection,
+alternating comparison above for before/after claims, rather than comparing unrelated runs.
+The full run still favors channel polling over watcher setup for cheap queries (1.110 vs 1.821 µs).
+The aggregate/projection fast paths remain available: enabled forced-scalar aggregate takes
+1,713.702 µs versus 135.355 µs optimized (12.7×); projection takes 1,691.765 versus 566.161 µs (3.0×).
+
+### Final Rust overhead and response latency
+
+The final Rust choice (per-step atomic checks, no expression-node polls) measures:
+
+| Rust workload | Disabled µs | Enabled µs | Enabled queries/s |
+|---|---:|---:|---:|
+| Cheap prepared | 1.524 | 1.537 | 650,787 |
+| Streaming, 10k rows | 714.878 | 717.627 | 1,393 |
+| Aggregate, 10k rows | 207.076 | 207.010 | 4,831 |
+| Projection, 10k rows | 319.936 | 320.602 | 3,119 |
+
+Every measured disabled/enabled difference is below 1%, too small to claim a throughput change on
+this workstation. The final response measurement uses the same million-row / twenty-sample probe
+as the first fix, unpinned, including scheduling and cleanup:
+
+| Core / workload | Median µs | p95 µs | Maximum µs |
+|---|---:|---:|---:|
+| Go aggregate | 3.737 | 6.489 | 6.720 |
+| Go projection | 5.681 | 187.404 | 197.568 |
+| Go streaming | 0.783 | 1.808 | 2.101 |
+| Rust aggregate | 3.231 | 5.717 | 7.246 |
+| Rust projection | 126.173 | 185.348 | 229.296 |
+| Rust streaming | 0.254 | 0.306 | 0.399 |
+
+Raw results: `rust-coarse.txt`, `latency-coarse.txt`. This preserves fast cancellation without
+paying for it at every expression node. Best effort still applies: individual scalar kernels,
+parsing, sorting, host callbacks, and commit work can delay observation. No new public knob or
+dependency was introduced, and the commit boundary is unchanged.
 
 ## Reproduce
 
@@ -33,6 +113,7 @@ unchanged; no storage format changes.
 GOMAXPROCS=1 taskset -c 0 mise run bench:cancellation:go
 taskset -c 0 mise run bench:cancellation:rust
 mise run bench:cancellation:latency
+mise run bench:cancellation:compare-go # Linux; alternating control/current comparison
 
 mise run test:cancellation:race
 mise run unit:go
@@ -75,7 +156,7 @@ at least 500 ms. `scalar-*` sets `max_cost` to the largest signed integer to for
 execution path without ever tripping the limit. This includes the small cost of ceiling comparisons;
 it is a path-penalty control, not a pure polling microbenchmark.
 
-## Final engine overhead
+## First-fix engine overhead (`46317446`)
 
 Cancellation is enabled but never triggered. Latency is per fully consumed query, not per row.
 
@@ -136,8 +217,8 @@ the same optimized eligibility as the final channel implementation.
 The watcher adds five allocations per engine operation versus the channel's two. It wins this
 streaming case by about 5.5%, but costs about 55% more on the cheap lookup. The direct-channel
 implementation was selected for cheap-call performance, fewer allocations, immediate observation
-without a scheduled intermediary, and simpler lifetime/isolation behavior. Scalar polling is kept
-at the existing checkpoints rather than adding another mutable sampling counter.
+without a scheduled intermediary, and simpler lifetime/isolation behavior. That initial version still polled at scalar cost checkpoints. The follow-up below replaces this
+with sampled execution steps.
 
 The isolated lifecycle/poll benchmark shows why this is a tradeoff: one poll plus watcher
 setup/teardown costs 626 ns and roughly 164 bytes / three allocations, versus 4.28 ns and no
@@ -179,8 +260,8 @@ cost totals and deterministic cost-limit behavior remain the contract.
   prepared/unprepared calls, streaming/blocking/deferred cursors, Exec drains, writes and rollback.
   They assert `57014`, failed-transaction `25P02`, cleanup, isolation, exhaustion and early close.
 - Go's race task passes, including related streaming/drain/host-function API tests. Rust has a
-  synchronized in-Next test and batch-entry/never-triggered cost/limit regressions.
-- Both full native host/unit suites pass (Rust: 1,027 library tests, plus three conformance-harness
+  synchronized in-Next test and batch-entry/never-triggered cost/limit regressions. New tests\n  separate cancellation checkpoints from deterministic cost enforcement; Go also proves cancellation in scans\n  and nested-loop joins that reject every row, including a join with fewer than 256 input rows.
+- Both full native host/unit suites pass (Rust: 1,028 library tests, plus three conformance-harness
   tests; opt-in measurements remain ignored).
 - Each core's shared conformance run: memory **677 passed**, 2 skipped; file **596 passed**,
   83 skipped; zero failures. Skips are the existing capability/storage-mode exclusions.

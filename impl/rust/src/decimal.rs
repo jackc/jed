@@ -1995,7 +1995,7 @@ fn decimal_math_step(
         work *= (64 - (digits as u64).leading_zeros()) as i64;
     }
     m.charge(COSTS.decimal_transcend * work);
-    m.guard()?;
+    m.checkpoint()?;
     m.reserve_scalar(8 * digits)
 }
 

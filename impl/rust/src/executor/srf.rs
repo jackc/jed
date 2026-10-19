@@ -807,7 +807,7 @@ impl Engine {
         let sparse = expand_jt_level(&plan.columns, &items, vars, defaults, env, meter)?;
         let mut out = Vec::with_capacity(sparse.len());
         for assignment in sparse {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let mut row = vec![Value::Null; plan.width];
             for (idx, v) in assignment {
@@ -1057,7 +1057,7 @@ impl Engine {
         let width = srf.record_cols.len();
         let mut out: Vec<Row> = Vec::with_capacity(arr.elements.len());
         for e in arr.elements {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let row = match e {
                 Value::Composite(fields) => {
@@ -1099,7 +1099,7 @@ impl Engine {
         };
         let mut out: Vec<Row> = Vec::new();
         for t in snap.tables_sorted() {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             out.push(vec![Value::Text(t.name.clone())]);
         }
@@ -1127,7 +1127,7 @@ impl Engine {
         let mut out: Vec<Row> = Vec::new();
         for t in snap.tables_sorted() {
             for (i, c) in t.columns.iter().enumerate() {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let pk_ordinal = match t.pk.iter().position(|&ord| ord == i) {
                     Some(k) => Value::Int(k as i64 + 1),
@@ -1161,7 +1161,7 @@ impl Engine {
                 let types = self.view_column_types(v)?;
                 for (i, (name, ty)) in v.columns.iter().zip(types).enumerate() {
                     let default = v.defaults.get(i).cloned().flatten();
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![
                         Value::Text(v.name.clone()),
@@ -1195,7 +1195,7 @@ impl Engine {
         let mut out: Vec<Row> = Vec::new();
         for t in snap.tables_sorted() {
             for idx in &t.indexes {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 // A column key shows its column name; an expression key its canonical text
                 // (introspection.md §5.1) — the same `columns text[]` cell.
@@ -1248,7 +1248,7 @@ impl Engine {
         };
         let mut out: Vec<Row> = Vec::new();
         for v in snap.views_sorted() {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let cols: Vec<Value> = v.columns.iter().map(|c| Value::Text(c.clone())).collect();
             out.push(vec![
@@ -1285,7 +1285,7 @@ impl Engine {
         };
         let mut out: Vec<Row> = Vec::new();
         for seq in snap.sequences_sorted() {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let last_value = if seq.is_called {
                 Value::Int(seq.last_value)
@@ -1333,7 +1333,7 @@ impl Engine {
         };
         let mut out: Vec<Row> = Vec::new();
         for ty in snap.composite_types_sorted() {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             out.push(vec![
                 Value::Text(ty.name.clone()),
@@ -1361,7 +1361,7 @@ impl Engine {
         let mut out: Vec<Row> = Vec::new();
         for ty in snap.composite_types_sorted() {
             for (i, f) in ty.fields.iter().enumerate() {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 out.push(vec![
                     Value::Text(ty.name.clone()),
@@ -1395,7 +1395,7 @@ impl Engine {
             let Some(declared) = table.columns.get(column) else {
                 continue;
             };
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let nonnull = statistics.analyzed_rows - statistics.null_count;
             let average_width = if nonnull == 0 {
@@ -1453,7 +1453,7 @@ impl Engine {
         for t in snap.tables_sorted() {
             // CHECK: name / table / 'check' / NULL columns / expression text / NULL ref_*.
             for ck in &t.checks {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 out.push(vec![
                     Value::Text(ck.name.clone()),
@@ -1469,7 +1469,7 @@ impl Engine {
             }
             // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
             for idx in t.indexes.iter().filter(|i| i.unique) {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let cols: Vec<String> = idx
                     .keys
@@ -1495,7 +1495,7 @@ impl Engine {
             // parent's canonical names — the parent always exists, it cannot be dropped while
             // referenced, constraints.md §6.10).
             for fk in &t.foreign_keys {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let local: Vec<String> = fk
                     .columns
@@ -1531,7 +1531,7 @@ impl Engine {
             }
             // EXCLUDE: the excluded columns and their WITH operators, both in element order.
             for exc in &t.exclusions {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let cols: Vec<String> = exc
                     .elements
@@ -1602,7 +1602,7 @@ impl Engine {
             if !in_range {
                 break;
             }
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let row = vec![Value::Int(cur)];
             meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
@@ -1682,7 +1682,7 @@ impl Engine {
                     }
                 };
                 for e in elems {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
                     let v = if matches!(srf.kind, SrfKind::JsonbArrayElementsText) {
                         let v = json::node_to_text(e).map_or(Value::Null, Value::Text);
@@ -1708,7 +1708,7 @@ impl Engine {
                     }
                 };
                 for (k, _) in members {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![Value::Text(k.clone())]);
                 }
@@ -1724,7 +1724,7 @@ impl Engine {
                     }
                 };
                 for (k, v) in members {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
                     // (key text, value): jsonb_each keeps the value node; _text renders ->>-style
                     // (a string member's raw content, a JSON null → SQL NULL, else canonical).
@@ -1767,7 +1767,7 @@ impl Engine {
                     crate::jsonpath::eval(&compiled, &node, opts, meter)?
                 };
                 for item in items {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![Value::Jsonb(item.into_owned())]);
                 }
@@ -1785,12 +1785,12 @@ impl Engine {
                         }
                     };
                     for e in elems {
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         meter.charge(COSTS.generated_row);
                         out.push(json_record_row(e, &srf.record_cols, env, meter)?);
                     }
                 } else {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
                     out.push(json_record_row(&node, &srf.record_cols, env, meter)?);
                 }
@@ -1817,7 +1817,7 @@ impl Engine {
         };
         let mut out: Vec<Row> = Vec::with_capacity(items.len());
         for v in items {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             out.push(vec![v]);
         }
@@ -1839,7 +1839,7 @@ impl Engine {
         };
         let mut out: Vec<Row> = Vec::with_capacity(arr.elements.len());
         for e in arr.elements {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.generated_row);
             let row = vec![e];
             meter.admit_row_masked(&row, mask)?; // a materialized relation row (memory.md §5.1)
@@ -1863,7 +1863,7 @@ fn json_recordset_rows_verbatim(
     let mut out: Vec<Row> = Vec::new();
     for sub in json::verbatim_array_elements(text, "json_to_recordset", false)? {
         let e = json::parse_preserving_unless_root(sub, b'[')?;
-        meter.guard()?;
+        meter.checkpoint()?;
         meter.charge(COSTS.generated_row);
         out.push(json_record_row(&e, &srf.record_cols, env, meter)?);
     }
@@ -1886,7 +1886,7 @@ fn json_verbatim_srf_rows(kind: SrfKind, text: &str, meter: &mut Meter) -> Resul
                 "json_array_elements"
             };
             for sub in json::verbatim_array_elements(text, func, text_form)? {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let v = if text_form {
                     json::verbatim_to_text(sub)?.map_or(Value::Null, Value::Text)
@@ -1898,7 +1898,7 @@ fn json_verbatim_srf_rows(kind: SrfKind, text: &str, meter: &mut Meter) -> Resul
         }
         SrfKind::JsonEach | SrfKind::JsonEachText => {
             for (key, sub) in json::verbatim_object_members(text)? {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let v = if matches!(kind, SrfKind::JsonEachText) {
                     json::verbatim_to_text(sub)?.map_or(Value::Null, Value::Text)

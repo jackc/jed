@@ -51,7 +51,7 @@ fn process_streaming_row(
     ahead: Option<(&ReadAhead, usize)>,
 ) -> Result<bool> {
     if !guarded {
-        meter.guard()?;
+        meter.checkpoint()?;
     }
     meter.charge(COSTS.storage_row_read);
     let resolved;
@@ -330,7 +330,7 @@ impl Engine {
                     );
                     if can_pull {
                         let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
-                            meter.guard()?;
+                            meter.checkpoint()?;
                             let row_key = index_entry_row_key(entry_key, prefix_len, &ib.suffix);
                             let (row, pages, slabs) =
                                 store.get_with_units(row_key, &plan.rel_masks[0])?;
@@ -375,7 +375,7 @@ impl Engine {
                         );
                         let mut more = true;
                         let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
-                            meter.guard()?;
+                            meter.checkpoint()?;
                             let row_key = index_entry_row_key(entry_key, prefix_len, &suffix);
                             let (row, pages, slabs) =
                                 store.get_with_units(row_key, &plan.rel_masks[0])?;
@@ -433,7 +433,7 @@ impl Engine {
                         candidates.reverse();
                     }
                     for (key, candidate) in candidates {
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         let row = if candidate.is_empty() {
                             let (row, pages, slabs) =
                                 store.get_with_units(&key, &plan.rel_masks[0])?;
@@ -490,7 +490,7 @@ impl Engine {
                         candidates.reverse();
                     }
                     for (key, candidate) in candidates {
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         let row = if candidate.is_empty() {
                             let (row, pages, slabs) =
                                 store.get_with_units(&key, &plan.rel_masks[0])?;
@@ -704,7 +704,7 @@ impl Engine {
         let mut rows: Vec<Row> = Vec::new();
         if !empty && limit > 0 {
             let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
-                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                 meter.charge(COSTS.storage_row_read);
                 let resolved;
                 let row = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
@@ -1373,7 +1373,7 @@ impl Engine {
         if limit != Some(0) {
             let mut passed: i64 = 0;
             let mut visit = |ekey: &[u8], _erow: &Row| -> Result<bool> {
-                meter.guard()?; // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
+                meter.checkpoint()?; // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
                 // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3):
                 // the entry key is `<index columns> ‖ storage_key`, and `storage_key` is exactly
                 // `io.pk_width` bytes — so the suffix is the row's storage key with no prefix parse.
@@ -1514,7 +1514,7 @@ impl Engine {
             if !empty {
                 // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
                 store.scan_range(&bound, &mut |_key, row| {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     meter.charge(COSTS.storage_row_read);
                     let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
                         let mut r = row.clone();
@@ -1582,7 +1582,7 @@ impl Engine {
             if !empty {
                 // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
                 store.scan_range(&bound, &mut |_key, row| {
-                    meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                    meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                     meter.charge(COSTS.storage_row_read);
                     let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
                         let mut r = row.clone();
@@ -1811,6 +1811,7 @@ impl Engine {
                     &right_rows
                 };
                 for right in current_right {
+                    meter.poll()?;
                     let combined = super::exec_emit::combine_physical_relation_rows(
                         plan,
                         outer_ordinal,
@@ -1843,7 +1844,7 @@ impl Engine {
                     if passed <= offset {
                         continue;
                     }
-                    meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                    meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                     before = meter.accrued;
                     meter.charge(COSTS.row_produced);
                     let mut projected = Vec::with_capacity(plan.projections.len());
@@ -1984,6 +1985,7 @@ impl Engine {
                     inner_rows
                 };
                 for right in candidates {
+                    meter.poll()?;
                     let mut combined = left.clone();
                     let inner_offset = plan.rels[inner].offset;
                     combined[inner_offset..inner_offset + right.len()].clone_from_slice(right);
@@ -2016,7 +2018,7 @@ impl Engine {
                     if passed <= offset {
                         continue;
                     }
-                    meter.guard()?;
+                    meter.checkpoint()?;
                     let before = meter.accrued;
                     meter.charge(COSTS.row_produced);
                     let mut projected = Vec::with_capacity(plan.projections.len());
@@ -2214,7 +2216,7 @@ impl Engine {
                     CteMode::Materialize => {
                         let buf = env.ctes.buffers[ci];
                         for _ in buf {
-                            meter.guard()?;
+                            meter.checkpoint()?;
                             meter.charge(COSTS.cte_scan_row);
                         }
                         // The reference copies the CTE buffer into its own relation rows.
@@ -2505,7 +2507,7 @@ impl Engine {
                                 .next_owned(cap, || rows.next())?
                                 .expect("spool cardinality");
                             if !charged {
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 meter.charge(COSTS.row_produced);
                             }
                             let ra: &ReadAhead = ra;
@@ -2527,7 +2529,7 @@ impl Engine {
                         }
                         let row = rows.next()?.expect("spool cardinality");
                         if !charged {
-                            meter.guard()?;
+                            meter.checkpoint()?;
                             meter.charge(COSTS.row_produced);
                         }
                         let o = match mode {
@@ -2592,7 +2594,7 @@ impl Engine {
                                 (&pulled, None)
                             }
                         };
-                        meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                        meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                         meter.charge(COSTS.row_produced);
                         let penv = match at {
                             Some((ra, i)) => {
@@ -2632,7 +2634,7 @@ impl Engine {
                         meter.release_rows(&rows[end..]);
                         let mut out = Vec::with_capacity(end - start);
                         for row in rows.drain(start..end) {
-                            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                            meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                             meter.charge(COSTS.row_produced);
                             out.push(row);
                         }
@@ -2653,7 +2655,7 @@ impl Engine {
                             HostBatch::for_exprs(&plan.projections, self.session.env.functions());
                         let mut out = Vec::with_capacity(end - start);
                         for (i, row) in rows.iter().enumerate().take(end).skip(start) {
-                            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                            meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                             meter.charge(COSTS.row_produced);
                             if let Some(b) = &batch {
                                 b.set_row(i, &rows, end, &base, &meter);
@@ -2693,7 +2695,7 @@ impl Engine {
                 } => {
                     let mut out = Vec::with_capacity(end - start);
                     for j in start..end {
-                        meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+                        meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                         meter.charge(COSTS.row_produced);
                         let mut o = Vec::with_capacity(proj_cols.len());
                         for &c in &proj_cols {
@@ -2805,7 +2807,7 @@ impl Engine {
             let mut visited = 0usize;
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
                 if visited & 255 == 0 {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                 }
                 visited += 1;
                 if spillable {
@@ -3177,7 +3179,7 @@ impl Engine {
             let mut visited = 0usize;
             let mut visit = |node: &crate::pmap::Node, i: usize| -> Result<()> {
                 if visited & 255 == 0 {
-                    meter.guard()?;
+                    meter.checkpoint()?;
                 }
                 visited += 1;
                 if spillable {

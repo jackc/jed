@@ -589,7 +589,7 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 			c.seen.release() // the scan ended (memory.md §6.2)
 			return nil, false, nil
 		}
-		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per scanned row
+		if err := c.meter.Step(); err != nil { // enforce the cost ceiling / cancellation per scanned row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.StorageRowRead)
@@ -796,7 +796,7 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		if c.em.precharged {
 			return row, true, nil
 		}
-		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+		if err := c.meter.Step(); err != nil { // enforce the cost ceiling / cancellation per produced row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
@@ -825,7 +825,7 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		}
 		row := c.em.final[c.idx]
 		c.idx++
-		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+		if err := c.meter.Step(); err != nil { // enforce the cost ceiling / cancellation per produced row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
@@ -842,7 +842,7 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		}
 		j := c.idx
 		c.idx++
-		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+		if err := c.meter.Step(); err != nil { // enforce the cost ceiling / cancellation per produced row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
@@ -859,7 +859,7 @@ func (c *bufferedScanCursor) nextRow() ([]Value, bool, error) {
 		ri := int(c.idx)
 		row := c.em.src[ri]
 		c.idx++
-		if err := c.meter.Guard(); err != nil { // enforce the cost ceiling / cancellation per produced row
+		if err := c.meter.Step(); err != nil { // enforce the cost ceiling / cancellation per produced row
 			return nil, false, err
 		}
 		c.meter.Charge(costs.RowProduced)
@@ -1062,7 +1062,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	// visitRow runs one scanned row through the pipeline; at is its read-ahead window index, or -1.
 	visitRow := func(row storedRow, guarded bool, at int) (bool, error) {
 		if !guarded {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
 			}
 		}
@@ -1221,7 +1221,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		keepGoing := true
 		err := istore.ScanRange(b, func(ekey []byte, _ storedRow) (bool, error) {
-			if err := meter.Guard(); err != nil {
+			if err := meter.Step(); err != nil {
 				return false, err
 			}
 			rowKey := indexEntryRowKey(ekey, prefixLen, suffix)
@@ -1315,7 +1315,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 		if canPull {
 			for step := 0; step < len(entries); step++ {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Step(); err != nil {
 					return selectResult{}, err
 				}
 				i := step
@@ -1410,7 +1410,7 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 	var rows []storedRow
 	if !empty && limit > 0 {
 		visit := func(_ []byte, row storedRow) (bool, error) {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
 			}
 			meter.Charge(costs.StorageRowRead)
@@ -1504,7 +1504,7 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 	if plan.limit == nil || *plan.limit > 0 {
 		var passed int64
 		err := istore.ScanRange(unboundedBound(), func(ekey []byte, _ storedRow) (bool, error) {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
 				return false, err
 			}
 			// Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3):
@@ -1635,7 +1635,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		charge := meter.stateCharge()
 		if !empty {
 			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Step(); err != nil {
 					return false, err
 				}
 				meter.Charge(costs.StorageRowRead)
@@ -1707,7 +1707,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		var survivorCount int64
 		if !empty {
 			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
-				if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+				if err := meter.Step(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 					return false, err
 				}
 				meter.Charge(costs.StorageRowRead)
@@ -1917,6 +1917,9 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 				}
 			}
 			for _, right := range innerRows {
+				if err := meter.PollStep(); err != nil {
+					return selectResult{}, err
+				}
 				combined := combinePhysicalRelationRows(plan, outerOrdinal, left, innerOrdinal, right)
 				// INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
 				if on != nil {
@@ -1944,7 +1947,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 				if passed <= offset {
 					continue
 				}
-				if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+				if err := meter.Step(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 					return selectResult{}, err
 				}
 				before = meter.Accrued
@@ -2056,6 +2059,9 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 				}
 			}
 			for _, right := range candidates {
+				if err := meter.PollStep(); err != nil {
+					return selectResult{}, err
+				}
 				combined := append(storedRow(nil), left...)
 				copy(combined[plan.rels[inner].offset:], right)
 				keep := true
@@ -2091,7 +2097,7 @@ func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *c
 				if passed <= offset {
 					continue
 				}
-				if err := meter.Guard(); err != nil {
+				if err := meter.Step(); err != nil {
 					return selectResult{}, err
 				}
 				before := meter.Accrued
@@ -2262,7 +2268,7 @@ func (db *engine) materializeRelRows(plan *selectPlan, ri int, params []Value, o
 		case cteMaterialize:
 			buf := env.ctes.buffers[ci]
 			for range buf {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Step(); err != nil {
 					return nil, err
 				}
 				meter.Charge(costs.CteScanRow)

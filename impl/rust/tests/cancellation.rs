@@ -1,6 +1,6 @@
 //! Cooperative cancellation through the cost meter (spec/design/api.md §11.4). Per-core unit tests,
 //! NOT the shared corpus: cancellation is timing-dependent (CLAUDE.md §10), so it cannot live there.
-//! These pin the mechanism deterministically — the meter's `guard` honors the cancel poll, and a
+//! These pin the mechanism deterministically — the meter's `checkpoint` honors the cancel poll, and a
 //! flipped [`CancellationToken`] aborts a statement with `57014 query_canceled` at the boundary, on a
 //! session, and inside a transaction (the mid-scan-via-meter proof is the white-box inline test in
 //! `src/shared.rs`, which can reach the private session state to bypass the boundary poll).
@@ -11,24 +11,24 @@ use std::rc::Rc;
 use jed::cost::{Lifetime, Meter};
 use jed::{CancellationToken, CreateOptions, Database, SessionOptions};
 
-/// The meter's `guard` aborts with `57014` the instant the cancel poll is flipped, independently of
+/// The meter's `checkpoint` aborts with `57014` the instant the cancel poll is flipped, independently of
 /// the cost ceilings (a zero-limit meter never aborts on cost). The token is `Arc`-shared, so flipping
 /// it is visible to the meter that already holds a clone.
 #[test]
-fn meter_guard_honors_cancel() {
+fn meter_checkpoint_honors_cancel() {
     let token = CancellationToken::new();
     let lifetime = Lifetime {
         total: Rc::new(Cell::new(0)),
         limit: 0, // unlimited budget — only cancellation can abort
     };
     let m = Meter::for_session(0, lifetime, Some(token.clone()));
-    assert!(m.guard().is_ok(), "un-cancelled: guard passes");
+    assert!(m.checkpoint().is_ok(), "un-cancelled: checkpoint passes");
 
     token.cancel();
     assert_eq!(
-        m.guard().err().unwrap().code(),
+        m.checkpoint().err().unwrap().code(),
         "57014",
-        "cancelled: guard aborts 57014"
+        "cancelled: checkpoint aborts 57014"
     );
 }
 
@@ -219,4 +219,24 @@ fn cancel_during_next_with_executor_barrier() {
     assert_eq!(rows.error().unwrap_err().code(), "57014");
     worker.join().unwrap();
     assert_eq!(db.query("SELECT id FROM t", &[]).unwrap().count(), 3);
+}
+
+#[test]
+fn cancellation_checkpoints_are_independent_of_cost() {
+    let token = CancellationToken::new();
+    let lifetime = Lifetime {
+        total: Rc::new(Cell::new(0)),
+        limit: 0,
+    };
+    let m = Meter::for_session(0, lifetime.clone(), Some(token.clone()));
+    m.checkpoint().unwrap();
+    token.cancel();
+    for _ in 0..255 {
+        m.guard().unwrap();
+    }
+    assert_eq!(m.checkpoint().unwrap_err().code(), "57014");
+    let mut m = Meter::for_session(2, lifetime, Some(CancellationToken::new()));
+    m.checkpoint().unwrap();
+    m.charge(2);
+    assert_eq!(m.checkpoint().unwrap_err().code(), "54P01");
 }

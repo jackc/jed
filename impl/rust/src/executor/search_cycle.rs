@@ -342,7 +342,7 @@ impl Engine {
         let before = acct.measure_rows(&rows);
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            meter.guard()?;
+            meter.checkpoint()?;
             if let Some(f) = filter {
                 if f.eval(&row, &env, &mut meter)? != Value::Bool(true) {
                     continue;

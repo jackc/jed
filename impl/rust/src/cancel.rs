@@ -3,22 +3,15 @@
 //! A [`CancellationToken`] is a clonable handle around a shared atomic flag. The host arms a clone
 //! on the session that runs a statement (the cancelable query/execute methods on
 //! [`Session`](crate::Session) / [`Database`](crate::Database) / [`Transaction`](crate::Transaction)),
-//! and the statement's cost [`Meter`](crate::cost::Meter) consults it at every
-//! [`guard`](crate::cost::Meter::guard) checkpoint — the same single chokepoint already run at the
-//! unbounded-work points for `max_cost` (spec/design/cost.md §6). A flipped token therefore aborts a
-//! **long-running** statement with `57014 query_canceled` at the next metering point, not only at the
-//! cursor / entry boundary.
+//! and the statement's [`Meter`](crate::cost::Meter) carries it through cursor execution.
+//! Execution loops poll at row/operator steps and between vectorized batches of up to
+//! 256 records; host-call boundaries poll immediately. Ordinary expression cost guards do not poll. Cost accrual and
+//! deterministic limit enforcement remain independent of cancellation frequency.
 //!
-//! Rust has real threads (CLAUDE.md §2), so the token is the whole mechanism: thread A runs the
-//! query while thread B (a timeout, a request-cancel) flips a clone of the *same* token. No watcher
-//! is needed. Go polls a cached context Done channel instead. This token is the
-//! Rust spelling of Go's `context.Context` cancellation; TS, which cannot preempt synchronous
-//! execution, honors its `AbortSignal` only at boundaries (api.md §11.4).
-//!
-//! This rides the existing meter seam, so it touches no conformance / cost path: an un-armed meter
-//! carries `None`, the `guard` short-circuits, and the cross-core cost determinism (CLAUDE.md §8) is
-//! untouched. Cancellation is per-core unit-tested, never in the corpus — whether a cancel lands at
-//! row 1k or 5k is timing (api.md §11.4, CLAUDE.md §10).
+//! A [`CancellationToken`] is an `Arc<AtomicBool>`; another thread flips the same flag
+//! without a watcher. Go polls a cached context Done channel instead. TS, which cannot
+//! preempt synchronous execution, honors its AbortSignal at boundaries (api.md §11.4).
+//! Cancellation is per-core unit-tested, never in the corpus: its timing is nondeterministic.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

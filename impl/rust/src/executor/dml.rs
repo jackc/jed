@@ -905,7 +905,7 @@ impl Engine {
         let node = node
             .as_ref()
             .expect("every VALUES expression slot is resolved before materialization");
-        meter.guard()?;
+        meter.checkpoint()?;
         let env = EvalEnv {
             exec: self,
             params,
@@ -1412,7 +1412,7 @@ impl Engine {
             // expression work (operator_eval), so guard the ceiling per checked row. The
             // per-statement `rng` is shared with the default evaluation above (one `StmtRng`).
             if !checks.is_empty() {
-                meter.guard()?;
+                meter.checkpoint()?;
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
                         return Err(EngineError::check_violation(&relation, name)
@@ -1553,7 +1553,7 @@ impl Engine {
 
         // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
         meter.charge(COSTS.value_compress * cunits);
-        meter.guard()?;
+        meter.checkpoint()?;
 
         // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the validated
         // rows — every check has passed, nothing is written yet, so subqueries in the list
@@ -1743,7 +1743,7 @@ impl Engine {
         }
 
         meter.charge(COSTS.value_compress * cunits);
-        meter.guard()?;
+        meter.checkpoint()?;
 
         let returned = match returning {
             Some(nodes) => {
@@ -2439,7 +2439,7 @@ impl Engine {
                 cunits += store.write_compress_units(key, row) as i64;
             }
             meter.charge(COSTS.value_compress * cunits);
-            meter.guard()?;
+            meter.checkpoint()?;
         }
 
         // RETURNING (grammar.md §32): project the affected rows — inserts (old side all-NULL) then
@@ -2801,7 +2801,7 @@ impl Engine {
         if checks.is_empty() {
             return Ok(());
         }
-        meter.guard()?;
+        meter.checkpoint()?;
         let env = EvalEnv {
             exec: self,
             params: &[],
@@ -3084,7 +3084,7 @@ impl Engine {
         };
         let mut out = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
-            meter.guard()?;
+            meter.checkpoint()?;
             meter.charge(COSTS.row_produced);
             let mut combined = row.clone();
             match others {
@@ -3110,7 +3110,7 @@ impl Engine {
         params: Vec<Value>,
         meter: &mut Meter,
     ) -> Result<()> {
-        meter.guard()?;
+        meter.checkpoint()?;
         if self.session.fk_action_depth >= MAX_FK_ACTION_DEPTH {
             return Err(EngineError::new(
                 SqlState::StatementTooComplex,
@@ -3129,7 +3129,7 @@ impl Engine {
         self.session.max_cost = saved_limit;
         let out = result?;
         meter.accrued = meter.accrued.saturating_add(out.cost());
-        meter.guard()
+        meter.checkpoint()
     }
 
     /// DELETE sibling of [`run_fk_action_update`].
@@ -3139,7 +3139,7 @@ impl Engine {
         params: Vec<Value>,
         meter: &mut Meter,
     ) -> Result<()> {
-        meter.guard()?;
+        meter.checkpoint()?;
         if self.session.fk_action_depth >= MAX_FK_ACTION_DEPTH {
             return Err(EngineError::new(
                 SqlState::StatementTooComplex,
@@ -3158,7 +3158,7 @@ impl Engine {
         self.session.max_cost = saved_limit;
         let out = result?;
         meter.accrued = meter.accrued.saturating_add(out.cost());
-        meter.guard()
+        meter.checkpoint()
     }
 
     /// Apply one inbound FK's generated DELETE-side action to `old_tuples`. `temp` is the FK's
@@ -3801,7 +3801,7 @@ impl Engine {
         let mut filter_actual = scan_actual;
         let store = self.store_scoped(del.db.as_deref(), &del.table);
         for (k, mut row) in batch.entries {
-            meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+            meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             scan_actual += COSTS.storage_row_read;
             filter_actual += COSTS.storage_row_read;
@@ -4251,7 +4251,7 @@ impl Engine {
             .map(|i| plans.iter().any(|p| p.idx == i))
             .collect();
         for (key, mut row) in batch.entries {
-            meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+            meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             scan_actual += COSTS.storage_row_read;
             filter_actual += COSTS.storage_row_read;
@@ -4519,7 +4519,7 @@ impl Engine {
             cunits += store.write_compress_units(new_key, row) as i64;
         }
         meter.charge(COSTS.value_compress * cunits);
-        meter.guard()?;
+        meter.checkpoint()?;
 
         // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched
         // rows' NEW (post-assignment, fully resident) values — all validation has passed,

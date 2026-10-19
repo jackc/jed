@@ -671,7 +671,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		}
 	}
 	for _, e := range rows {
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return nil, err
 		}
 		if rewritten == nil {
@@ -757,7 +757,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 			if parent == t {
 				for _, pe := range rows {
 					meter.Charge(costs.ConstraintCheck)
-					if err := meter.Guard(); err != nil {
+					if err := meter.Step(); err != nil {
 						return nil, err
 					}
 					pr, er := store.resolveInlineColumns(pe.Row)
@@ -829,7 +829,7 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		for i := range members {
 			for j := 0; j < i; j++ {
 				meter.Charge(costs.ConstraintCheck)
-				if err := meter.Guard(); err != nil {
+				if err := meter.Step(); err != nil {
 					return nil, err
 				}
 				a, b := members[i], members[j]

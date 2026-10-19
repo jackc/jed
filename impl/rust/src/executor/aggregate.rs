@@ -208,7 +208,7 @@ impl Acc {
                 if !matches!(value, Value::Null) {
                     let d = to_decimal(value);
                     m.charge(COSTS.decimal_work * ((decimal::work_linear(sum, &d) - 1) as i64));
-                    m.guard()?;
+                    m.checkpoint()?;
                     // Uncapped: the running sum may exceed the §2 format cap mid-fold; only the
                     // FINAL result is cap-checked (in `finalize`), matching PG and making the trap
                     // order-independent (spec/design/decimal.md §2, determinism.md §7).
@@ -220,7 +220,7 @@ impl Acc {
                 if !matches!(value, Value::Null) {
                     let d = to_decimal(value);
                     m.charge(COSTS.decimal_work * ((decimal::work_linear(sum, &d) - 1) as i64));
-                    m.guard()?;
+                    m.checkpoint()?;
                     // Uncapped (as SumDecimal): the average's final divide brings the value back in
                     // range, so AVG never traps on an over-cap intermediate sum the way PG does not.
                     *sum = sum.add_uncapped(&d);
@@ -320,7 +320,7 @@ impl Acc {
                                 + decimal::work_linear(sxx, &x2)
                                 - 1) as i64),
                     );
-                    m.guard()?;
+                    m.checkpoint()?;
                     *sx = sx.add_uncapped(&x);
                     *sxx = sxx.add_uncapped(&x2);
                     *n += 1;
@@ -380,7 +380,7 @@ impl Acc {
                 if !(*strict && matches!(value, Value::Null)) {
                     m.charge(COSTS.generated_row);
                     m.charge(COSTS.timezone * value.zone_render_count() as i64);
-                    m.guard()?;
+                    m.checkpoint()?;
                     elems.push(json_agg_image(&value, *compact, &conv.tys[0], &conv.zone)?);
                 }
             }
@@ -403,7 +403,7 @@ impl Acc {
                     _ => unreachable!("object_agg operand is a 2-field Row"),
                 };
                 m.charge(COSTS.timezone * (kv.zone_render_count() + vv.zone_render_count()) as i64);
-                m.guard()?;
+                m.checkpoint()?;
                 // A NULL key: json_object_agg 22004, jsonb_object_agg 22023 (PG's two messages).
                 if matches!(kv, Value::Null) {
                     if *json {

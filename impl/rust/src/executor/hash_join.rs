@@ -91,7 +91,7 @@ impl HashJoinTable {
         let mut rows = Vec::new();
         if let Some(entries) = self.entries.get(&(self.hash)(&key)) {
             for entry in entries {
-                meter.guard()?;
+                meter.checkpoint()?;
                 let work = entry.key.len().min(key.len()).max(1);
                 meter.charge(COSTS.hash_probe * i64::try_from(work).unwrap_or(i64::MAX));
                 if entry.key == key {
@@ -113,7 +113,7 @@ pub(crate) fn hash_join_row_key(
     let mut parts = Vec::with_capacity(indices.len());
     let mut present = true;
     for (&index, ty) in indices.iter().zip(types) {
-        meter.guard()?;
+        meter.checkpoint()?;
         if matches!(row[index], Value::Null) {
             meter.charge(unit);
             present = false;

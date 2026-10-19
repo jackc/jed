@@ -324,7 +324,7 @@ impl Transaction<'_> {
 
     /// Run a statement within this transaction under a [`CancellationToken`] (spec/design/api.md
     /// §11.4): arm `cancel` for the statement's duration so a flipped token (from any thread) aborts it
-    /// `57014` at the next cost-meter checkpoint — which, like any error, poisons the block (`25P02`).
+    /// `57014` at the next execution checkpoint — which, like any error, poisons the block (`25P02`).
     /// The prior token is restored on return.
     pub fn execute_cancelable(
         &mut self,

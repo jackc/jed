@@ -548,7 +548,7 @@ pub(crate) fn apply_window_stage(
             match spec.plan {
                 WindowPlan::RowNumber => {
                     for (pos, &ri) in ordered.iter().enumerate() {
-                        meter.guard()?; // enforce the cost ceiling per result (CLAUDE.md §13)
+                        meter.checkpoint()?; // enforce the cost ceiling per result (CLAUDE.md §13)
                         meter.charge(COSTS.window_result);
                         results[ri] = Value::Int(pos as i64 + 1);
                     }
@@ -581,7 +581,7 @@ pub(crate) fn apply_window_stage(
                     }
                     for (gi, &(start, end)) in groups.iter().enumerate() {
                         for &ri in &ordered[start..end] {
-                            meter.guard()?;
+                            meter.checkpoint()?;
                             meter.charge(COSTS.window_result);
                             results[ri] = match spec.plan {
                                 WindowPlan::Rank => Value::Int(start as i64 + 1),
@@ -608,7 +608,7 @@ pub(crate) fn apply_window_stage(
                         // NULL bucket count → NULL for every row (PG).
                         Value::Null => {
                             for &ri in &ordered {
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 meter.charge(COSTS.window_result);
                                 results[ri] = Value::Null;
                             }
@@ -625,7 +625,7 @@ pub(crate) fn apply_window_stage(
                             let rem = np % nbuckets; // the first `rem` buckets get one extra row
                             let big = rem * (base + 1); // rows in the larger (base+1) buckets
                             for (pos, &ri) in ordered.iter().enumerate() {
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 meter.charge(COSTS.window_result);
                                 // Larger buckets first: positions [0, big) → (base+1)-sized buckets,
                                 // the rest → base-sized buckets. `base` is 0 only when nbuckets > np,
@@ -673,7 +673,7 @@ pub(crate) fn apply_window_stage(
                         -1
                     };
                     for (pos, &ri) in ordered.iter().enumerate() {
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         meter.charge(COSTS.window_result);
                         results[ri] = match offset {
                             None => Value::Null,
@@ -757,7 +757,7 @@ pub(crate) fn apply_window_stage(
                             }
                             let out = acc.clone().finalize()?;
                             for &ri in &ordered[start..end] {
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 meter.charge(COSTS.window_result);
                                 results[ri] = out.clone();
                             }
@@ -831,7 +831,7 @@ pub(crate) fn apply_window_stage(
                                     let v = eval_at(k, meter, &mut vals)?;
                                     acc.fold_charged(v, meter, &mut acc_charge)?;
                                 }
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 meter.charge(COSTS.window_result);
                                 results[ordered[pos]] = acc.finalize()?;
                                 meter.release_query(acc_charge);
@@ -886,7 +886,7 @@ pub(crate) fn apply_window_stage(
                                 }
                                 cur_lo = lo;
                                 cur_hi = hi;
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 meter.charge(COSTS.window_result);
                                 results[ordered[pos]] = acc.clone().finalize()?;
                             }
@@ -932,7 +932,7 @@ pub(crate) fn apply_window_stage(
                         .as_ref()
                         .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
                     for pos in 0..np {
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         meter.charge(COSTS.window_result);
                         let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                         // first/last/nth pick over the frame's NON-excluded rows (window.md §6); the

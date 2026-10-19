@@ -74,7 +74,7 @@ func (t *hashJoinTable) probe(plan *hashJoinPlan, row storedRow, meter *costMete
 	entries := t.entries[t.hash(encoded)]
 	out := make([]storedRow, 0, len(entries))
 	for _, entry := range entries {
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return nil, err
 		}
 		work := len(entry.key)
@@ -96,7 +96,7 @@ func hashJoinRowKey(row storedRow, indices []int, types []dataType, unit int64, 
 	parts := make([][]byte, len(indices))
 	present := true
 	for i, index := range indices {
-		if err := meter.Guard(); err != nil {
+		if err := meter.Step(); err != nil {
 			return nil, false, err
 		}
 		if row[index].Kind == ValNull {

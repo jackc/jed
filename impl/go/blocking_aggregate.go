@@ -113,7 +113,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 	if len(p.groupExprs) > 0 {
 		decorated := own.spool()
 		err := rows.each(func(row storedRow) error {
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return err
 			}
 			row = append(storedRow(nil), row...)
@@ -166,7 +166,7 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 				}
 			}
 			if err := rows.each(func(row storedRow) error {
-				if err := m.Guard(); err != nil {
+				if err := m.Step(); err != nil {
 					return err
 				}
 				key := make([]Value, len(gs.keyCols))
@@ -390,7 +390,7 @@ func (db *engine) finalizeSpilledAcc(a *acc, spec aggSpec, srow storedRow, colle
 			if !ok {
 				break
 			}
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return NullValue(), err
 			}
 			// A _unique key entry keeps the per-group map's (group, aggregate, key) shape, so its

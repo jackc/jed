@@ -1,0 +1,47 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Alternate identical Go cancellation workloads at the prior commit and current checkout"
+# Compare identical benchmark selections in alternating, freshly started processes.
+# Build outside timing and never switch the active worktree. No extra dependencies.
+require "tmpdir"
+require "fileutils"
+
+root = File.expand_path("../../..", __dir__)
+revision = ARGV.fetch(0, "46317446")
+out_dir = File.join(root, "bench/cancellation")
+
+def run!(*args, **options)
+  system(*args, **options) || abort("failed: #{args.join(' ')}")
+end
+
+Dir.mktmpdir("jed-cancellation-compare-") do |dir|
+  archive = File.join(dir, "control.tar")
+  run!("git", "-C", root, "archive", revision, "impl/go", "spec", out: archive)
+  control = File.join(dir, "control")
+  FileUtils.mkdir_p(control)
+  run!("tar", "-xf", archive, "-C", control)
+  builds = {"control" => control, "coarse" => root}
+  builds.each do |name, source|
+    run!("go", "test", "-C", File.join(source, "impl/go"), "-c", "-o", File.join(dir, "#{name}.test"))
+  end
+  outputs = builds.keys.to_h do |name|
+    [name, File.open(File.join(out_dir, "go-#{name}-paired.txt"), "w")]
+  end
+  begin
+    3.times do |i|
+      # Reverse the order on the middle pair to reduce a consistent ordering bias.
+      names = i.odd? ? builds.keys.reverse : builds.keys
+      names.each do |name|
+        outputs[name].puts("# pair #{i + 1}; #{name}; control #{revision}; GOMAXPROCS=1; CPU 0")
+        outputs[name].flush
+        run!({"GOMAXPROCS" => "1"}, "taskset", "-c", "0", File.join(dir, "#{name}.test"),
+             "-test.run", "^$",
+             "-test.bench", "^BenchmarkCancellation$/(cheap|stream|aggregate|projection)/^(disabled|enabled)$",
+             "-test.benchmem", "-test.benchtime=500ms", "-test.count=1",
+             out: outputs[name], err: outputs[name])
+      end
+    end
+  ensure
+    outputs.each_value(&:close)
+  end
+end

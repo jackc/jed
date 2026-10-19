@@ -1168,7 +1168,7 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 			}
 		}
 		clist, nlist = nlist, clist
-		if err := m.Guard(); err != nil { // §6 ceiling, once per input position
+		if err := m.Step(); err != nil { // §6 ceiling, once per input position
 			return regexCaps{}, false, err
 		}
 		if len(clist) == 0 {

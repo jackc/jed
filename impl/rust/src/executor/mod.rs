@@ -946,9 +946,9 @@ pub struct SessionState {
     /// An optional cancellation poll armed for the duration of one statement (spec/design/api.md §11.4):
     /// the cancelable query/execute methods set it before running and restore it after, and
     /// [`new_meter`](SessionState::new_meter) copies it into the statement's [`Meter`](crate::cost::Meter),
-    /// whose `guard` consults it — so a flipped [`CancellationToken`](crate::CancellationToken) aborts a
-    /// long-running statement with `57014` at the next metering point, not only at the cursor boundary.
-    /// `None` (the default) ⇒ no cancellation, so the hot path is untouched (CLAUDE.md §8). Because the
+    /// whose execution checkpoints consult it — so a flipped [`CancellationToken`](crate::CancellationToken) aborts a
+    /// long-running statement with `57014` at the next execution checkpoint, not only at the cursor boundary.
+    /// `None` (the default) skips atomic polling (CLAUDE.md §8). Because the
     /// token shares an `Arc<AtomicBool>`, another thread can flip the same token while this single-threaded
     /// handle runs the statement.
     pub(crate) cancel: Option<crate::cancel::CancellationToken>,
@@ -6626,7 +6626,7 @@ fn expand_jt_level(
 ) -> Result<Vec<JtAssign>> {
     let mut rows: Vec<JtAssign> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        meter.guard()?;
+        meter.checkpoint()?;
         let ord = (i + 1) as i64;
         // This level's non-nested columns (regular / exists / ordinality).
         let mut local: JtAssign = Vec::new();

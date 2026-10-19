@@ -143,6 +143,9 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 			}
 		}
 		for _, innerRow := range candidates {
+			if err := meter.PollStep(); err != nil {
+				return nil, err
+			}
 			combined := combinePhysicalRelationRows(plan, outerOrdinal, outerRow, innerOrdinal, innerRow)
 			if on != nil {
 				v, err := on.evalFilter(combined, env, meter)
@@ -231,6 +234,9 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 			}
 			leftMatched := false
 			for ri, right := range candidates {
+				if err := meter.PollStep(); err != nil {
+					return nil, err
+				}
 				combined := append(storedRow(nil), left...)
 				copy(combined[plan.rels[inner].offset:], right)
 				keep := true
@@ -351,7 +357,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 				out = append(out, row)
 				continue
 			}
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
@@ -386,7 +392,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		releaseRows(meter, em.final[em.end:])
 		out := make([][]Value, 0, em.end-em.start)
 		for _, row := range em.final[em.start:em.end] {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
@@ -400,7 +406,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		// (whose p.eval is a zero-cost slot read).
 		out := make([][]Value, 0, em.end-em.start)
 		for j := em.start; j < em.end; j++ {
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
@@ -423,7 +429,7 @@ func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, pa
 		out := make([][]Value, 0, em.end-em.start)
 		for ri := int(em.start); ri < int(em.end); ri++ {
 			row := em.src[ri]
-			if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+			if err := meter.Step(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
 				return nil, err
 			}
 			meter.Charge(costs.RowProduced)
@@ -676,6 +682,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					relWork[k+1] += meter.Accrued - before
 					leftMatched := false
 					for _, right := range rightRows {
+						if err := meter.PollStep(); err != nil {
+							return emitter{}, err
+						}
 						combined := make(storedRow, 0, len(left)+len(right))
 						combined = append(combined, left...)
 						combined = append(combined, right...)
@@ -729,6 +738,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					relWork[k+1] += meter.Accrued - before
 					leftMatched := false
 					for _, right := range rightRows {
+						if err := meter.PollStep(); err != nil {
+							return emitter{}, err
+						}
 						combined := make(storedRow, 0, len(left)+len(right))
 						combined = append(combined, left...)
 						combined = append(combined, right...)
@@ -782,6 +794,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					}
 					leftMatched := false
 					for _, right := range candidates {
+						if err := meter.PollStep(); err != nil {
+							return emitter{}, err
+						}
 						combined := make(storedRow, 0, len(left)+len(right))
 						combined = append(combined, left...)
 						combined = append(combined, right...)
@@ -817,6 +832,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			for _, left := range running {
 				leftMatched := false
 				for ri, right := range rightRows {
+					if err := meter.PollStep(); err != nil {
+						return emitter{}, err
+					}
 					combined := make(storedRow, 0, len(left)+len(right))
 					combined = append(combined, left...)
 					combined = append(combined, right...)
@@ -851,6 +869,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			}
 			if emitRight {
 				for ri, right := range rightRows {
+					if err := meter.PollStep(); err != nil {
+						return emitter{}, err
+					}
 					if !rightMatched[ri] {
 						combined := make(storedRow, 0, leftPad+len(right))
 						for i := 0; i < leftPad; i++ {
@@ -910,6 +931,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	filter := plan.postJoinFilter()
 	var rows []storedRow
 	for _, row := range running {
+		if err := meter.PollStep(); err != nil {
+			return emitter{}, err
+		}
 		keep := true
 		if filter != nil {
 			v, err := filter.evalFilter(row, env, meter)
@@ -1057,7 +1081,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		// shared across sets. A plain column GROUP BY appends nothing.
 		if len(plan.groupExprs) > 0 {
 			for ri := range rows {
-				if err := meter.Guard(); err != nil {
+				if err := meter.Step(); err != nil {
 					return emitter{}, err
 				}
 				for _, ge := range plan.groupExprs {
@@ -1091,7 +1115,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				index[""] = 0
 			}
 			for _, row := range rows {
-				if err := meter.Guard(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
+				if err := meter.Step(); err != nil { // enforce the cost ceiling per folded row (CLAUDE.md §13)
 					return emitter{}, err
 				}
 				keys := make([]Value, len(gset.keyCols))
@@ -1263,7 +1287,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						spec := plan.aggSpecs[si]
 						inner := newAccFromSpecUnordered(spec, db.session.timeZone)
 						for _, v := range sortAggOrderRows(a.ordRows, spec.order) {
-							if err := meter.Guard(); err != nil {
+							if err := meter.Step(); err != nil {
 								return emitter{}, err
 							}
 							if ferr := inner.foldCharged(v, meter, &g.charge); ferr != nil {
@@ -1298,6 +1322,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		if plan.having != nil {
 			kept := groupRows[:0:0]
 			for _, srow := range groupRows {
+				if err := meter.PollStep(); err != nil {
+					return emitter{}, err
+				}
 				v, herr := plan.having.evalFilter(srow, env, meter)
 				if herr != nil {
 					return emitter{}, herr
@@ -2298,7 +2325,7 @@ func inMembership(lv Value, list []Value, negated bool, m *costMeter) (Value, er
 		// Each element comparison over a decimal pair charges its size-scaled decimal_work
 		// (spec/design/cost.md §3 "decimal_work"), like a compare node.
 		m.Charge(costs.DecimalWork * (decimalCmpWork(lv, v) - 1))
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return Value{}, err
 		}
 		switch lv.Eq3(v) {
@@ -2360,7 +2387,7 @@ func widthBucketArray(operand, thresholds Value, collation *Collation, m *costMe
 			m.Charge(costs.DecimalWork * (decimalCmpWork(operand, t) - 1))
 			m.Charge(costs.VarlenCompare * (varlenCompareWork(operand, t) - 1))
 		}
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return Value{}, err
 		}
 		var c int
@@ -2412,14 +2439,14 @@ func quantifiedMembership(op binaryOp, all, rowWise bool, lv, av Value, collatio
 	for _, e := range av.arrayVal().Elements {
 		m.Charge(costs.OperatorEval)
 		m.Charge(costs.DecimalWork * (decimalCmpWork(lv, e) - 1))
-		if err := m.Guard(); err != nil {
+		if err := m.Step(); err != nil {
 			return Value{}, err
 		}
 		var tv ThreeValued
 		if collation != nil && (op == opLt || op == opGt || op == opLe || op == opGe) &&
 			lv.Kind == ValText && e.Kind == ValText {
 			m.Charge(costs.Collate * int64(utf8.RuneCountInString(lv.str())+utf8.RuneCountInString(e.str())))
-			if err := m.Guard(); err != nil {
+			if err := m.Step(); err != nil {
 				return Value{}, err
 			}
 			c, err := collatedCmp(collation, lv.str(), e.str())

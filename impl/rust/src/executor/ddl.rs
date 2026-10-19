@@ -3775,7 +3775,7 @@ impl Engine {
         });
         let mut meter = self.session.new_meter();
         meter.charge(prep_cost);
-        meter.guard()?;
+        meter.checkpoint()?;
         let mut rewrite_entries: Option<Vec<(Vec<u8>, Row)>> = None;
         let mut rewrite_next_rowid = 0i64;
         // Make owned sequences (ADD COLUMN serial/identity, ADD IDENTITY) visible to their
@@ -3824,7 +3824,7 @@ impl Engine {
             let mut seen_keys = std::collections::HashSet::new();
             let mut compress_units = 0i64;
             for (key, row) in &mut rows {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.storage_row_read);
                 store.resolve_all(row)?;
                 for step in &row_steps {
@@ -3890,7 +3890,7 @@ impl Engine {
                 ) as i64;
             }
             meter.charge(COSTS.value_compress * compress_units);
-            meter.guard()?;
+            meter.checkpoint()?;
             rewrite_entries = Some(rows);
         }
 
@@ -3909,7 +3909,7 @@ impl Engine {
             let (entries, pages, slabs) = store.scan_with_units(&mask)?;
             meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
             for (_, mut row) in entries {
-                meter.guard()?;
+                meter.checkpoint()?;
                 meter.charge(COSTS.storage_row_read);
                 store.resolve_inline_columns(&mut row)?;
                 for (i, check) in mask.iter().enumerate() {
@@ -3979,7 +3979,7 @@ impl Engine {
                 std::collections::HashMap::<String, std::collections::HashSet<Vec<u8>>>::new();
             let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
             for (key, mut row) in rows.iter().cloned() {
-                meter.guard()?;
+                meter.checkpoint()?;
                 if rewrite_entries.is_none() {
                     meter.charge(COSTS.storage_row_read);
                 }
@@ -4064,7 +4064,7 @@ impl Engine {
                             let mut found = false;
                             for (_, mut candidate) in rows.iter().cloned() {
                                 meter.charge(COSTS.constraint_check);
-                                meter.guard()?;
+                                meter.checkpoint()?;
                                 store.resolve_inline_columns(&mut candidate)?;
                                 if let Some(pp) =
                                     fk_probe(fk, parent, &pc, &candidate, &fk.ref_columns)?
@@ -4125,7 +4125,7 @@ impl Engine {
                 for i in 0..members.len() {
                     for j in 0..i {
                         meter.charge(COSTS.constraint_check);
-                        meter.guard()?;
+                        meter.checkpoint()?;
                         let ((a, ka), (b, kb)) = (&members[i], &members[j]);
                         let conflict = match (ka, kb) {
                             (Some(ka), Some(kb)) => {
@@ -4933,7 +4933,7 @@ impl Engine {
     ) -> Result<Value> {
         match default_rexpr {
             Some(rx) => {
-                meter.guard()?;
+                meter.checkpoint()?;
                 let env = EvalEnv {
                     exec: self,
                     params: &[],
@@ -5381,7 +5381,7 @@ impl Engine {
         // registered — indexes.md §4), preserving all-or-nothing.
         let mut meter = self.session.new_meter();
         let entries = self.build_index_entries(ci.db.as_deref(), table, &def, &mut meter)?;
-        meter.guard()?;
+        meter.checkpoint()?;
 
         let name_key = def.name.to_string();
         let kind = def.kind;
@@ -5445,7 +5445,7 @@ impl Engine {
                 rebuilt.push((scope.clone(), table_key.clone(), def, entries));
             }
         }
-        meter.guard()?;
+        meter.checkpoint()?;
         for (scope, table_key, def, entries) in rebuilt {
             let name_key = def.name.to_string();
             let ps = match scope.as_str() {
@@ -5738,7 +5738,7 @@ impl Engine {
             meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
             entries.reserve(table_entries.len());
             for (key, mut row) in table_entries {
-                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.checkpoint()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                 meter.charge(COSTS.storage_row_read);
                 // Resolve a faulted row's touched columns before encoding (an expression key may
                 // read a spilled value; the evaluator's `Unfetched` backstop also handles it).
@@ -5768,7 +5768,7 @@ impl Engine {
                 );
             }
         }
-        meter.guard()?;
+        meter.checkpoint()?;
         // Sorted by entry key (indexes.md §1): every insert is then a right-edge append, so the built
         // tree packs ~full instead of splintering under the storage-key order the scan produced
         // (random in entry-key space). Part of the byte contract — the sort fixes the built tree's

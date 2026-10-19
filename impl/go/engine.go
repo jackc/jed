@@ -293,8 +293,8 @@ type sessionState struct {
 	lifetimeTotal *int64
 	// cancel is the per-statement cancellation poll the ergonomic API arms for one statement
 	// (spec/design/api.md §11.4): nil unless a host cancellation handle (Go context.Context, …) is
-	// active. newMeter copies it into the statement's meter, whose Guard() polls it at each metering
-	// checkpoint, so a flipped handle aborts a long-running statement (57014) — not only at the
+	// active. newMeter copies it into the statement's meter, whose execution loops sample it at bounded
+	// intervals, so a flipped handle aborts a long-running statement (57014) — not only at the
 	// cursor boundary. Set/cleared by engine.armCancel around a single statement (ergonomic.go); a
 	// cached context Done channel check on the hot path.
 	cancel func() bool

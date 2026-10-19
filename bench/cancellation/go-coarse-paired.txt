@@ -1,0 +1,42 @@
+# pair 1; coarse; control 46317446; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  554288	      1045 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  526740	      1105 ns/op	    1984 B/op	      30 allocs/op
+BenchmarkCancellation/stream/disabled        	    1026	    577880 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	     997	    594559 ns/op	  961753 B/op	   20020 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4546	    133767 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4538	    133759 ns/op	    2872 B/op	      21 allocs/op
+BenchmarkCancellation/projection/disabled    	    1286	    461659 ns/op	 1792547 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1215	    535600 ns/op	 1792587 B/op	   10037 allocs/op
+PASS
+# pair 2; coarse; control 46317446; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  554103	      1045 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  505622	      1110 ns/op	    1984 B/op	      30 allocs/op
+BenchmarkCancellation/stream/disabled        	    1008	    577179 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	     987	    598345 ns/op	  961753 B/op	   20020 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4257	    133686 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4466	    134240 ns/op	    2872 B/op	      21 allocs/op
+BenchmarkCancellation/projection/disabled    	    1039	    484289 ns/op	 1792547 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1166	    501664 ns/op	 1792586 B/op	   10037 allocs/op
+PASS
+# pair 3; coarse; control 46317446; GOMAXPROCS=1; CPU 0
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkCancellation/cheap/disabled         	  554952	      1042 ns/op	    1944 B/op	      28 allocs/op
+BenchmarkCancellation/cheap/enabled          	  523702	      1103 ns/op	    1984 B/op	      30 allocs/op
+BenchmarkCancellation/stream/disabled        	    1028	    577108 ns/op	  961713 B/op	   20018 allocs/op
+BenchmarkCancellation/stream/enabled         	    1010	    593098 ns/op	  961753 B/op	   20020 allocs/op
+BenchmarkCancellation/aggregate/disabled     	    4557	    134105 ns/op	    2832 B/op	      19 allocs/op
+BenchmarkCancellation/aggregate/enabled      	    4309	    134245 ns/op	    2872 B/op	      21 allocs/op
+BenchmarkCancellation/projection/disabled    	    1291	    475166 ns/op	 1792547 B/op	   10035 allocs/op
+BenchmarkCancellation/projection/enabled     	    1171	    489664 ns/op	 1792587 B/op	   10037 allocs/op
+PASS

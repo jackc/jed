@@ -277,6 +277,6 @@ thread can call `cancel()` while the query runs. After manually draining Rust ro
 to check for an execution error.
 
 Cancellation during execution fails an open transaction, which must then be rolled back. It is
-best effort, without a fixed wall-clock response guarantee: sorting, individual scalar kernels,
+best effort, checked periodically during scans, joins, and other execution loops rather than at\nevery expression. There is no fixed wall-clock response guarantee: sorting, individual scalar kernels,
 host callbacks, and commit work can delay observation. Cancellation does not change completed-query
 cost totals or deterministic cost limits.

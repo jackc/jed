@@ -580,7 +580,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			switch spec.plan {
 			case planRowNumber:
 				for pos, ri := range ordered {
-					if err := meter.Guard(); err != nil { // enforce the cost ceiling per result (CLAUDE.md §13)
+					if err := meter.Step(); err != nil { // enforce the cost ceiling per result (CLAUDE.md §13)
 						return err
 					}
 					meter.Charge(costs.WindowResult)
@@ -609,7 +609,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 				}
 				for gi, g := range groups {
 					for _, ri := range ordered[g.start:g.end] {
-						if err := meter.Guard(); err != nil {
+						if err := meter.Step(); err != nil {
 							return err
 						}
 						meter.Charge(costs.WindowResult)
@@ -642,7 +642,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 				case nv.IsNull():
 					// NULL bucket count → NULL for every row (PG).
 					for _, ri := range ordered {
-						if err := meter.Guard(); err != nil {
+						if err := meter.Step(); err != nil {
 							return err
 						}
 						meter.Charge(costs.WindowResult)
@@ -658,7 +658,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					rem := np % nb          // the first `rem` buckets get one extra row
 					big := rem * (base + 1) // rows in the larger (base+1) buckets
 					for pos, ri := range ordered {
-						if err := meter.Guard(); err != nil {
+						if err := meter.Step(); err != nil {
 							return err
 						}
 						meter.Charge(costs.WindowResult)
@@ -720,7 +720,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 					dir = 1
 				}
 				for pos, ri := range ordered {
-					if err := meter.Guard(); err != nil {
+					if err := meter.Step(); err != nil {
 						return err
 					}
 					meter.Charge(costs.WindowResult)
@@ -819,7 +819,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							return err
 						}
 						for _, ri := range ordered[g.start:g.end] {
-							if err := meter.Guard(); err != nil {
+							if err := meter.Step(); err != nil {
 								return err
 							}
 							meter.Charge(costs.WindowResult)
@@ -898,7 +898,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 									return err
 								}
 							}
-							if err := meter.Guard(); err != nil {
+							if err := meter.Step(); err != nil {
 								return err
 							}
 							meter.Charge(costs.WindowResult)
@@ -967,7 +967,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 								}
 							}
 							curLo, curHi = lo, hi
-							if err := meter.Guard(); err != nil {
+							if err := meter.Step(); err != nil {
 								return err
 							}
 							meter.Charge(costs.WindowResult)
@@ -1019,7 +1019,7 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 				ctx := newFrameCtx(ordered, rows, spec.order, collKeys)
 				exclude := newFrameExclusion(spec.frame)
 				for pos := 0; pos < np; pos++ {
-					if err := meter.Guard(); err != nil {
+					if err := meter.Step(); err != nil {
 						return err
 					}
 					meter.Charge(costs.WindowResult)
