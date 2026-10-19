@@ -102,6 +102,11 @@ errors and cost-limit failures retain their original order. DISTINCT, ordered
 aggregates, unsupported types, and file-host aggregation use their existing
 execution. See the [aggregate follow-up](AGGREGATE_FOLLOWUP.md) for measurements.
 
+The general memory executor also compiles reused materialized WHERE filters and
+complete integer/boolean grouping-key vectors. It preserves the separate filter
+and key-evaluation phases, rejected-row memory release, and ordinary grouping
+and HAVING behavior. See the [relation follow-up](RELATION_FOLLOWUP.md).
+
 Database settings and grants become defaults for future sessions, including the
 fresh sessions used by convenience calls. Existing sessions retain their settings;
 explicit options to `db.session` override the defaults. Sessions expose

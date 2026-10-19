@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "description": "Explicit general relation filter/group-key compilation experiment over the unchanged 1000-row fixture. Existing workloads retain their comparison schedules; new queries cover combined nullable group keys and WHERE, with an unsupported text predicate control.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"aggregate","sql":"SELECT sum(score) FROM items WHERE bucket = $1","iterations":30,"warmup":20,"offset":0,"step":1,"span":10},
+    {"name":"aggregate_argument","sql":"SELECT sum((score * 3 + bucket) / (bucket + 1)) FROM items WHERE bucket >= $1","iterations":50,"warmup":100,"offset":0,"step":1,"span":5},
+    {"name":"aggregate_many_groups","sql":"SELECT score % 100, count(*), sum(score) FROM items GROUP BY score % 100 ORDER BY 1","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"group","sql":"SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket ORDER BY bucket","iterations":15,"warmup":10,"offset":0,"step":0,"span":0},
+    {"name":"aggregate_multi","sql":"SELECT count(*), count(score), min(score), max(score), sum(score), bit_xor(score) FROM items","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"general_where_keys","sql":"SELECT bucket % 3, CASE WHEN score < $1 THEN NULL ELSE score % 7 END, count(*), sum(score) FROM items WHERE bucket >= 2 GROUP BY bucket % 3, CASE WHEN score < $1 THEN NULL ELSE score % 7 END ORDER BY 1, 2","iterations":50,"warmup":100,"offset":0,"step":997,"span":10000},
+    {"name":"general_text_filter","sql":"SELECT sum(score) FROM items WHERE label >= 'row5'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0}
+  ]
+}

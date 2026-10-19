@@ -708,7 +708,17 @@ module JedNative
         end
         predicate ||= compile_filter(where_node, rel.columns)
         profile_checkpoint(:scan) if @explain_profile_frames
-        rel = if @query_memory
+        filter_kernel = native_compiled_relation_filter(predicate, memory: !!@query_memory) if rel.rows.is_a?(Array)
+        rel = if filter_kernel
+          if @query_memory
+            owner = rel.instance_variable_get(:@native_memory_owner)
+            mask = rel.instance_variable_get(:@native_memory_mask)
+            rows = filter_kernel.call(self, rel.rows, @params, owner, rel.columns, mask)
+            query_memory_transfer(rel, Relation.new(columns: rel.columns, rows: rows))
+          else
+            Relation.new(columns: rel.columns, rows: filter_kernel.call(self, rel.rows, @params))
+          end
+        elsif @query_memory
           query_memory_filter(rel) { |row| !predicate || evaluate(predicate, row) == true }
         else
           Relation.new(columns: rel.columns, rows: rel.rows.select { |row| !predicate || evaluate(predicate, row) == true })

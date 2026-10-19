@@ -320,8 +320,8 @@ times. Everything else, push into the shared layer.
 
 **Explicit Ruby experiment exception:** the maintainer authorized investigating and
 implementing runtime compilation of resolved query expressions, single-table
-scan/filter/projection loops, typed ORDER BY comparators, and primitive aggregate
-input/reduction loops into Ruby methods.
+scan/filter/projection loops, typed ORDER BY comparators, primitive aggregate
+input/reduction loops, and materialized WHERE and grouping-key loops into Ruby methods.
 The bounded template emitter is handwritten Ruby; SQL text, names, and values remain
 data rather than Ruby source. This does not change the supported differential set,
 the experiment's frozen status, or any semantic/resource contract. See
