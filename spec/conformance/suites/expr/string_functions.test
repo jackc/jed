@@ -861,6 +861,36 @@ SELECT decode('6 1', 'hex')
 statement error 22023
 SELECT decode('61' || chr(12) || '62', 'hex')
 
+# Empty/whitespace-only inputs are empty bytea; ASCII hex letters accept either case.
+query T
+SELECT decode('', 'hex'), decode(' ' || chr(9) || chr(10) || chr(13), 'hex'), decode('aAbBcCdDeEfF', 'hex')
+----
+\x
+\x
+\xaabbccddeeff
+
+# Each row still evaluates the scalar and preserves its deterministic charge.
+# cost: 9
+query T
+SELECT decode('0001feff', 'hex') FROM generate_series(1, 3)
+----
+\x0001feff
+\x0001feff
+\x0001feff
+
+# Non-ASCII characters are invalid in either digit position and between pairs.
+statement error 22023
+SELECT decode('é0', 'hex')
+
+statement error 22023
+SELECT decode('0😀', 'hex')
+
+statement error 22023
+SELECT decode('61' || chr(160) || '62', 'hex')
+
+statement error 22023
+SELECT decode('６１', 'hex')
+
 # base64 decode skips exactly the same four characters: a form feed or vertical tab is an invalid
 # symbol (22023)
 query T

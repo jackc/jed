@@ -12,14 +12,18 @@ if ARGV.include?("--help")
   puts "JED_ASYNC_HEAVY_CASES selects comma-separated decimal-aggregate,resident-join-group,sort-top100,typed-output."
   puts "JED_ASYNC_HEAVY_BATCH_ROWS and JED_ASYNC_HEAVY_BATCH_BYTES override worker batch limits for experiments."
   puts "Defaults retain production limits; batch bytes must fit the existing 2 MiB result credit."
+  puts "JED_PROBE_ROOT optionally selects a frozen source snapshot containing the core and heavy harness."
   exit
 end
 abort "Unexpected arguments; use --help" unless ARGV.empty?
 abort "Install the existing impl/ts dependencies before benchmarking" unless File.directory?(File.join(TS_DIR, "node_modules/@noble/hashes"))
+root = File.expand_path(ENV.fetch("JED_PROBE_ROOT", ROOT))
+script = File.join(root, "bench/ts/src/bench-async-heavy.ts")
+abort "Missing heavy benchmark source in JED_PROBE_ROOT" unless File.file?(script)
 
 directory = File.expand_path(ENV.fetch("JED_ASYNC_RESULTS", "bench/results/ts-async-heavy-#{stamp}-#{Process.pid}"))
 revision, revision_ok = capture("git", "rev-parse", "HEAD")
 status, status_ok = capture("git", "status", "--porcelain")
 abort "Could not read benchmark revision" unless revision_ok && status_ok
-sh "node", "bench/ts/src/bench-async-heavy.ts", directory,
+sh "node", script, directory,
    env: { "JED_BENCH_REVISION" => revision.strip, "JED_BENCH_DIRTY" => (!status.empty?).to_s }

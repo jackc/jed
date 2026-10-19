@@ -1,0 +1,152 @@
+--- a/impl/ts/src/executor.ts
++++ b/impl/ts/src/executor.ts
+@@ -514,6 +514,7 @@
+   isTrue,
+   nullValue,
+   decodeHexPairs,
++  decodeHexString,
+   renderByteaHex,
+   renderUuid,
+   textValue,
+@@ -1597,11 +1598,16 @@
+ 
+ // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
+ // skip a space, tab, newline, or carriage return (hex only between digit pairs); a malformed
+-// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
+-// bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
++// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split).
++// An unrecognized format traps 22023. The hex success path reads ASCII directly; other paths
++// operate on the input's UTF-8 bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
+ export function decodeText(s: string, format: string): Uint8Array {
++  if (format === "hex") {
++    const r = decodeHexString(s);
++    if ("error" in r) throw engineError("invalid_parameter_value", r.error);
++    return r.bytes;
++  }
+   const bytes = SQL_BYTE_ENCODER.encode(s);
+-  if (format === "hex") return decodeHex(bytes);
+   if (format === "base64") return decodeBase64(bytes);
+   if (format === "escape") return decodeEscape(bytes);
+   throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
+--- a/impl/ts/src/value.ts
++++ b/impl/ts/src/value.ts
+@@ -391,6 +391,28 @@
+ const HEX_INPUT_ENCODER = new TextEncoder();
+ const HEX_ERROR_DECODER = new TextDecoder();
+ 
++// Successful hex input is ASCII, so it can be scanned directly without an intermediate UTF-8
++// buffer. Malformed input uses the byte decoder below: this keeps its first-error ordering and
++// full UTF-8 error character, including TextEncoder's replacement of unpaired UTF-16 surrogates.
++export function decodeHexString(s: string): { bytes: Uint8Array } | { error: string } {
++  const out: number[] = [];
++  let i = 0;
++  while (i < s.length) {
++    const c = s.charCodeAt(i);
++    if (c === 32 || c === 10 || c === 9 || c === 13) {
++      i++;
++      continue;
++    }
++    const hi = hexVal(c);
++    if (hi < 0 || i + 1 >= s.length) return decodeHexPairs(HEX_INPUT_ENCODER.encode(s));
++    const lo = hexVal(s.charCodeAt(i + 1));
++    if (lo < 0) return decodeHexPairs(HEX_INPUT_ENCODER.encode(s));
++    i += 2;
++    out.push((hi << 4) | lo);
++  }
++  return { bytes: Uint8Array.from(out) };
++}
++
+ // decodeHexPairs is PostgreSQL's hex_decode_safe (encode.c), shared by bytea hex input and
+ // decode(s, 'hex'): hexadecimal digit pairs (case-insensitive), each pair one byte. A space, tab,
+ // newline, or carriage return is skipped *between* pairs only — inside a pair it is an invalid
+--- a/impl/ts/src/async/server.ts
++++ b/impl/ts/src/async/server.ts
+@@ -109,6 +109,7 @@
+   private running = false;
+   private activeJob: Job | null = null;
+   private scheduled = false;
++  private receivedDuringPump = false;
+   private closing = false;
+   private closed = false;
+ 
+@@ -161,7 +162,7 @@
+           if (cursor.request.request.id === id) cursor.request.canceled = true;
+         }
+         this.reply(request.id, null);
+-        this.schedule();
++        this.dispatchReceived();
+         return;
+       }
+       const bytes = messageBytes(request, this.limits.maxQueuedBytes);
+@@ -195,7 +196,7 @@
+         batchResults: [],
+       });
+       this.queuedBytes += bytes;
+-      this.schedule();
++      this.dispatchReceived();
+     } catch (error) {
+       this.fail(request.id, error);
+     }
+@@ -214,6 +215,16 @@
+     }
+   }
+ 
++  private dispatchReceived(): void {
++    // Worker message delivery already supplies a task turn. Keep any pending turn for queued
++    // work, and never enter another statement while an active continuation is suspended.
++    if (this.running) {
++      this.receivedDuringPump = true;
++      return;
++    }
++    if (!this.scheduled) void this.pump();
++  }
++
+   private schedule(): void {
+     if (this.scheduled || this.running) return;
+     this.scheduled = true;
+@@ -227,6 +238,7 @@
+   private async pump(): Promise<void> {
+     if (this.running) return;
+     this.running = true;
++    this.receivedDuringPump = false;
+     let progressed = false;
+     const seenSessions = new Set<number>();
+     try {
+@@ -302,7 +314,9 @@
+       }
+     } finally {
+       this.running = false;
+-      if (progressed && this.jobs.length > 0) this.schedule();
++      // A request admitted while a writer was parking was not in this pump's snapshot. Wake it
++      // even if every visited job parked, so an owner's release cannot be stranded behind it.
++      if ((progressed || this.receivedDuringPump) && this.jobs.length > 0) this.schedule();
+     }
+   }
+ 
+--- a/impl/ts/src/async/packed.ts
++++ b/impl/ts/src/async/packed.ts
+@@ -256,6 +256,7 @@
+   offset = HEADER_BYTES;
+   logicalBytes = 0;
+   private readonly view: DataView;
++  private readonly bytes: Uint8Array;
+   private readonly build: boolean;
+   private readonly data: ArrayBuffer;
+   private readonly budget?: WireBudget;
+@@ -263,6 +264,7 @@
+     this.data = data;
+     this.budget = budget;
+     this.view = new DataView(data);
++    this.bytes = new Uint8Array(data);
+     this.build = budget === undefined;
+   }
+   private take(bytes: number): number {
+@@ -453,7 +455,7 @@
+         return this.build
+           ? {
+               kind: tag === TAG.bytea ? "bytea" : "uuid",
+-              bytes: new Uint8Array(this.data, at, length).slice(),
++              bytes: this.bytes.slice(at, at + length),
+             }
+           : undefined;
+       }
