@@ -149,7 +149,8 @@ ciphertext for fixed salts, before any timing. Settings are the `JED_AEAD_*` var
 At 8 KiB, a full derive cost 0.81/0.57 µs (extract/expand layout) in Go and 0.34/0.18 µs in
 Rust. Per-page keys raised a cache-miss open from 0.90 to 1.76/1.41 µs in Go and from 2.72 to
 2.98/2.81 µs in Rust; per-commit keys read cold cost slightly more than per-page, and with 16 or
-more pages per commit came within 7% of the fixed key. No granularity is selected.
+more pages per commit came within 7% of the fixed key. This experiment selects no granularity;
+encryption.md §3.1 later chose one key per page (2026-10-20).
 
 ### Integrated async page codec (browser OPFS)
 
