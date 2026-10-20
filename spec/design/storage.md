@@ -377,7 +377,10 @@ sits so the options stay open (CLAUDE.md §9).
   key; data-key rotation rewrites live pages. Nonce/domain safety across crashes, restores and
   writable copies remains unresolved: `(page_index, txid)` alone is insufficient. Identical
   crypto inputs must produce identical bytes. Authenticated pages and metadata address tampering;
-  whole-file rollback needs a separate contract. Vetted libraries use safe APIs, with reviewed
+  whole-file rollback needs a separate contract, and page-level replay is an open decision.
+  Page capacity excludes a per-file reserved region, so tree shape and cost are functions of the
+  usable capacity, not of encryption; scratch files of an encrypted database use an ephemeral key
+  (encryption.md §1.1, §4.1–§4.2). Vetted libraries use safe APIs, with reviewed
   accelerated backends under CLAUDE.md §14. The present requirement is only
   that the format and seam not foreclose it — concretely, don't bake in assumptions that page
   bytes are plaintext-comparable on disk (already satisfied — hosts keep page bytes opaque).

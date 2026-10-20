@@ -29,6 +29,23 @@ content; and the page header already grew once (12→16 bytes for the CRC, forma
 that carrying a per-page authentication tag is within the format's existing flex. The rest of this
 doc is the *intended* design, not a commitment to build.
 
+### 1.1 Settled decisions (2026-10-19)
+
+These bind the eventual build; everything else in this doc that says "open" still is.
+
+- **No FIPS requirement.** jed does not target FIPS 140 deployments, so FIPS approval is not
+  a criterion for the suite (§3.1). (It could not be met uniformly anyway: only Go ships a
+  validated module; the RustCrypto and Noble backends are not validated.)
+- **Usable page capacity excludes a reserved region; guarantees are stated in terms of it**
+  (§4.1). Tree shape, record caps and cost are functions of the usable capacity `C`, not of
+  whether the file is encrypted.
+- **Every page type is authenticated**, including free-list and manifest-overflow pages, and
+  the meta pages' security-relevant content (§4).
+- **Scratch files of an encrypted database are encrypted** with a random per-file key that is
+  never persisted (§4.2).
+- **Key material and nonces come from a dedicated cryptographic entropy source**, never the
+  general-purpose seeded entropy seam (§3.1, *Threat model*).
+
 ## 2. Where it sits: a page codec in the core, above the seam
 
 Encryption is a **page codec layer inside the core, just above the block seam** (hosts.md §6) —
@@ -102,6 +119,24 @@ nonce-misuse resistance justifies its implementation-vetting and performance cos
 reduces collision probability but is not nonce-misuse resistant. AES-GCM-SIV still needs key-use
 limits and a nonce policy; it does not prevent whole-file rollback.
 
+With FIPS ruled out (§1.1), the trade-off between the two candidates is:
+
+| | AES-256-GCM, derived writer keys | XChaCha20-Poly1305, random nonces |
+|---|---|---|
+| Nonce protocol | Writer-key derivation per write ownership, counter allocation with a defined owner (including page-service clients), budget rotation, a salt or key identifier per page, a bounded derived-key cache, and a crash/restore/copy argument still to be proven | None: each encryption draws a fresh 192-bit nonce, so crash, retry, restore, writable copies, compaction and owner change are nonce-safe by construction |
+| Per-page fields | 56 bytes in the direct encoding (32-byte salt, 8-byte counter, 16-byte tag) | 40 bytes (24-byte nonce, 16-byte tag) |
+| Native speed (8 KiB, §8) | Faster: Go 0.87 µs, Rust 2.60 µs, plus about 0.8 µs per writer-key setup | Go 2.00 µs, Rust 4.65 µs |
+| Node | Native synchronous `node:crypto`, about 4 µs | No native XChaCha (OpenSSL has only the 96-bit-nonce construction); Noble, about 30 µs |
+| Browser | WebCrypto, about 8 µs, asynchronous (§8.1) | Synchronous Rust/WASM about 18 µs or Noble about 40 µs; WebCrypto has no ChaCha |
+| Dependencies | Go standard library (`crypto/cipher`, `crypto/hkdf`); Rust `aes-gcm` + `hkdf` | Go needs `golang.org/x/crypto` (pure Go plus assembly, no cgo); Rust `chacha20poly1305` |
+
+AES's protocol cost is design and verification work paid once; XChaCha's cost is slower crypto
+on Node and in the browser, paid on every cache miss and commit. Because the dataset is
+expected to be resident, those operations are not the steady-state hot path. The async
+browser obstacle to WebCrypto AES disappears if the TS commit, open/recovery and maintenance
+paths become asynchronous, work being pursued separately (§8.1); after that the choice reduces
+to protocol complexity versus Node/browser crypto speed.
+
 An AES candidate has the following lifecycle, using a vetted HKDF-SHA-256 implementation:
 
 1. Every acquisition of write ownership creates a fresh 256-bit cryptographic salt and derives
@@ -144,8 +179,18 @@ two backups; it does not require control of a running process. A single writer s
 allocation but cannot prevent historical reuse on its own. Protect ordinary consistent copies,
 backup restoration and crash remnants. A live process fork/checkpoint that duplicates an active
 key and counter requires codec reinitialization; a large random salt at initial open does not
-protect subsequently cloned live state. Fresh cryptographic entropy is a host requirement for
-both candidates; the general-purpose deterministic test source is not a production substitute.
+protect subsequently cloned live state.
+
+**Key material uses a dedicated cryptographic entropy source (decided).** Data keys, KDF salts,
+writer salts, nonces and scratch-file keys are drawn from a source separate from the
+general-purpose entropy seam that SQL generators use ([entropy.md](entropy.md)). A host may
+install a seeded source there to make `uuidv4` reproducible; if that source also fed key
+material, the data key would be predictable, and with either candidate two runs would repeat
+nonces (the same writer salt yields the same derived key and counter sequence; the same random
+nonces repeat directly). In production the cryptographic source reads the OS CSPRNG directly,
+not a buffered userspace generator whose state a VM snapshot or process fork can duplicate.
+Fixtures and simulation inject fixed bytes only through an explicitly insecure test option,
+which never applies by default.
 
 Required future fault fixtures: aborted encryption before/after each body/meta write, failed
 barriers, retry and owner promotion, restore followed by divergent writes, independently opened
@@ -156,11 +201,33 @@ remains a separate trusted-state guarantee.
 
 ## 4. What is encrypted, what is plaintext
 
-- **Body pages (catalog, B-tree nodes, overflow): ciphertext + auth tag.** The page payload is
-  encrypted; the AEAD **authentication tag** travels with it (in the page header region — the
-  16-byte header already carries a CRC slot the tag can occupy/extend, format.md). Page identity,
-  generation and the relevant file/domain identity must be bound as **AAD** so a page cannot be silently
-  relocated; their encoding and nonce relationship remain to be specified (§3).
+- **Every body page: ciphertext + auth tag.** That is every page type except the meta slots:
+  catalog-chain pages, B-tree leaf and interior nodes, GiST leaf and interior nodes, overflow
+  pages, free-list pages (`page_type 7`) and manifest-overflow pages (`page_type 8`). Free-list
+  and manifest pages are not just bookkeeping: a tampered free list could steer the allocator
+  into overwriting live pages, so authenticating only data pages would leave tampering
+  undetected. The page payload is encrypted; the AEAD **authentication tag** and nonce fields
+  live in the page's reserved region (§4.1). Page identity, generation and the relevant
+  file/domain identity must be bound as **AAD** so a page cannot be silently relocated; their
+  encoding and nonce relationship remain to be specified (§3).
+- **Replaying an older version of a page is not detected by per-page AEAD (open).** An attacker
+  with write access can replace page `P` with an older valid ciphertext of `P` from a backup or
+  crash remnant: the tag verifies and the page index in the AAD matches. A "generation" in the
+  AAD helps only if the reader learns the expected generation from somewhere trusted, not from
+  the page itself. Copy-on-write makes a fix natural: every child rewrite already rewrites its
+  parent, so a parent pointer (and the meta root pointer) could carry the child's write
+  generation or tag, chaining authentication from the authenticated meta down the tree as ZFS
+  block pointers do. The cost is wider pointers and so lower interior fan-out (another input
+  to `C`, §4.1). The alternative is to exclude page-level replay from the threat model
+  explicitly, as SQLCipher effectively does. Either is a decision to record before building;
+  silently inheriting the gap is not.
+- **Manifest page identities (open).** The validated-COW manifest hashes logical (decrypted)
+  page bytes ([validated-cow.md](validated-cow.md) §5), so recovery's completeness check needs
+  the key, as it does at a page-service owner ([page-service.md](page-service.md)). Defining the
+  identity over on-disk bytes instead would let a keyless replica or backup check that an
+  applied delta is complete, without authenticating it. Note the manifest also covers a case
+  AEAD alone cannot: a page write that never reached disk leaves the older, still-valid
+  ciphertext in place. Decide which bytes the manifest names when the format is specified.
 - **The AEAD tag supersedes the CRC for encrypted pages.** The tag detects *both* corruption and
   tampering — strictly stronger than the CRC, which detects only the former (§1). So an encrypted
   file replaces the per-page CRC with the AEAD tag rather than carrying both. This *closes* the
@@ -177,11 +244,58 @@ remains a separate trusted-state guarantee.
   key** so the bytes are deterministic and checkable (the encryption analogue of the seeded
   entropy source, determinism.md §5).
 
+### 4.1 Reserved bytes and usable page capacity (decided)
+
+Today every page-capacity rule derives from `C = page_size - 16` (format.md *Page model*):
+`RECORD_MAX`, leaf and interior fan-out, split points, large-value externalization and the
+overflow chunk size. Per-page crypto fields (40–56 bytes plus any binding, §3.1) would shrink
+that capacity, so an encrypted file would build a differently shaped tree from the same rows,
+with different page counts, page-read costs and possibly plans.
+
+The format will therefore follow SQLite's *reserved bytes per page*. SQLite records it at
+database-header offset 20, computes all B-tree capacity from the *usable size* (page size
+minus reserved bytes), and never reads the reserved tail, which is where its encryption
+extensions (SEE, SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps its checksum.
+For jed:
+
+- The meta page records `reserved_bytes`; `C = page_size - 16 - reserved_bytes`. The page
+  codec owns the reserved region; nothing above the codec reads it.
+- **Tree shape, record caps, cost and plan identity are functions of `C`.** The cross-core
+  contract binds for a given `(query, database state, C)`; encryption itself is invisible.
+- A plaintext file may reserve bytes too. That gives a differential test: an encrypted file
+  and a plaintext file with the same `reserved_bytes` and the same history must produce
+  identical tree shapes, page counts, plans and costs.
+- A plaintext file created with a sufficient reserve can later be encrypted in place, and
+  data-key rotation never changes the layout. Without the reserve, encrypting is a full
+  rebuild (as with SQLCipher's export to a fresh file).
+
+The field arrives with the encryption format version, not before. Open: whether plaintext
+files reserve by default (about 0.5–0.7% of an 8 KiB page) so they can be encrypted in place,
+and the reserve's size once the suite and any parent-pointer binding (§4) are chosen. Page
+sizes must keep `C` above the structural minimum; at the 256-byte golden page size a 40–56-byte
+reserve is a large fraction, which fixtures must account for.
+
+### 4.2 Scratch files (decided)
+
+When the database is encrypted, its spill and temporary-table spill files are encrypted too
+([spill.md](spill.md), [temp-tables.md](temp-tables.md) §6). Each scratch file gets a random
+key from the cryptographic entropy source (§3.1), held only in memory and never persisted. The
+key never outlives the process or the unlinked file, so none of §3's crash, restore or copy
+hazards apply: any nonce scheme unique under that key is sufficient, including a simple
+counter. Scratch encryption uses the same AEAD suite as pages, so each core keeps one crypto
+path. A scratch block that fails authentication is an error, never data. Like spill I/O
+itself, scratch encryption is unmetered physical work, so query results and cost do not change.
+Hosts with no scratch target (in-memory, OPFS, WASI) have nothing to encrypt. A compaction's
+`<path>.jedtmp` is an ordinary database image written through the page codec, not a scratch
+file.
+
 ## 5. Cost & determinism
 
-- **Encryption is invisible to the deterministic cost** (CLAUDE.md §13, cost.md). Like the CRC
-  and the buffer pool, encrypt/decrypt is **physical** page I/O, not a metered logical unit, so
-  `# cost:` corpus contracts are byte-unchanged whether or not a file is encrypted. (Contrast the
+- **Encryption is invisible to the deterministic cost at a given usable capacity `C`**
+  (CLAUDE.md §13, cost.md, §4.1). Like the CRC and the buffer pool, encrypt/decrypt is
+  **physical** page I/O, not a metered logical unit. What encryption does change is the page's
+  reserved region, and therefore `C`; cost is a function of `C`, so `# cost:` contracts hold
+  unchanged for an encrypted file and a plaintext file with the same reserve. (Contrast the
   *compression* codec, which **is** metered — `value_compress`/`value_decompress`, cost.md §3 —
   because it is a per-value transform the query can statically attribute; whole-page
   encrypt/decrypt is per-page physical I/O, like the CRC.) If a future requirement wants
@@ -278,6 +392,12 @@ reads without replaying SQL. Common resident expressions still return immediate 
 data-page reads can await I/O; browser OPFS sync access handles remain synchronous inside the
 worker.
 
+The asynchronous-crypto problem is browser-only: Node's native `node:crypto` AEAD calls are
+synchronous, and browsers have no scratch target, so spill is unaffected. Pushing the TS
+commit, open/recovery and maintenance paths to asynchronous execution is being pursued
+separately; it would remove WebCrypto's main integration obstacle (§3.1) without selecting a
+suite.
+
 WebCrypto needs suspension **inside the worker** at decryption/cache misses and before encrypted
 commit writes. The write side is now ready for that ([ts-runtime.md](ts-runtime.md) §11): the
 pager's `PageTransform` seam, above the byte device and below the page cache, accepts
@@ -327,13 +447,14 @@ database benchmark. Compare those layers separately when choosing a suite and br
 
 ## 9. Open / deferred
 
-**Tentative direction after the measurements:** prototype one suite, AES-256-GCM with fresh
-derived writer keys and counter nonces, using native crypto on Node and WebCrypto in the browser.
-Its measured acceleration and platform coverage make it the leading candidate. Retain XChaCha
-as the comparison with a simpler nonce protocol; neither the suite nor a production dependency
-is selected. Approval depends on the exact protocol/security review, supported-platform matrix,
-and integrated async browser measurements. A slower pure-JS fallback and a software-WASM backend
-are material deployment costs, not reasons by themselves to maintain two file suites.
+**Suite: open between two candidates** (§3.1): AES-256-GCM with fresh derived writer keys and
+counter nonces (faster natively, native on Node, WebCrypto in the browser once the TS write path
+is asynchronous) and XChaCha20-Poly1305 with random nonces (no nonce protocol to build or prove,
+synchronous everywhere, slower on Node and in the browser). With FIPS ruled out, the decision is
+protocol complexity versus Node/browser crypto speed. Neither the suite nor a production
+dependency is selected. Approval depends on the exact protocol/security review, supported-platform
+matrix, and integrated measurements. A slower pure-JS fallback and a software-WASM backend are
+material deployment costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one
 algorithm; the selected Noble exports were 3.7–4.6 KiB gzipped. These exclude the passphrase KDF,
@@ -347,9 +468,12 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
 - **Authenticated metadata and wrapped-key format**, including bounded KDF inputs, bootstrap
   validation, both meta slots, and atomic credential changes.
 - **Data-key rotation protocol**, old-key retirement and coordination with open clients.
-- **Integrated performance**, async page/commit prototype and browser portability measurements,
-  and protection of spill/scratch files if
-  the eventual threat model includes them; the page codec alone does not encrypt those files.
+- **Page-level replay** — parent-pointer binding versus an explicit threat-model exclusion (§4).
+- **Manifest identity bytes** — logical versus on-disk, and so whether a keyless replica can
+  check delta completeness (§4).
+- **Reserve sizing** — the reserve per suite and binding choice, and whether plaintext files
+  reserve by default (§4.1).
+- **Integrated performance**, async page/commit prototype and browser portability measurements.
 
 ### 9.1 SQL crypto functions are a separate proposal
 
