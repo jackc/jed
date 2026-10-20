@@ -450,6 +450,22 @@ are recorded in [bench/aead/README.md](../../bench/aead/README.md). The crypto-o
 in the browser; the whole-engine SQL control runs under Node/WASI. Neither is an encrypted OPFS
 database benchmark. Compare those layers separately when choosing a suite and browser architecture.
 
+**Integrated async-codec measurement (2026-10-19).** `mise run bench:aead_codec_browser` installs
+measurement-only `PageTransform` codecs that pay a real AEAD cost per page and return the plaintext.
+File bytes are verified unchanged, and the keys and nonces are fixed benchmark inputs. Over real
+OPFS in five fresh headless-Chromium 149 runs on the x86 host above, WebCrypto AES-256-GCM cost
+about 7–9 µs per 8 KiB page in situ. That is about 2% of a 461-page commit, about 5–8% of a
+single-row commit, and about 3.4 ms on a cold open or scan of about 470 pages, below those
+operations' process-run variation. Synchronous pure-JS XChaCha20-Poly1305 cost about 40–46 µs per
+page: about 10% of a large commit, about 25% of a small commit, and 1.8–2.0× on cold scans and
+opens. Chromium's worker WebCrypto ran each operation inside the call and resolved without a task
+boundary, so encode windows 1/4/16 performed alike and awaiting AES left commit and open as
+unresponsive as no codec. A task turn every 16 operations restored control-message admission
+during open; long commits still blocked on synchronous serialization. These are single-browser,
+single-machine observations: no per-writer key derivation, nonce allocation, ciphertext layout or
+crash behavior. They **select no suite**. See the
+[report](../../bench/aead/results/2026-10-19-async-codec.md).
+
 ## 9. Open / deferred
 
 **Suite: open between two candidates** (§3.1): AES-256-GCM with fresh derived writer keys and
@@ -458,7 +474,8 @@ asynchronous page codec) and XChaCha20-Poly1305 with random nonces (no nonce pro
 synchronous everywhere, slower on Node and in the browser). With FIPS ruled out, the decision is
 protocol complexity versus Node/browser crypto speed. Neither the suite nor a production
 dependency is selected. Approval depends on the exact protocol/security review, supported-platform
-matrix, and integrated measurements. A slower pure-JS fallback and a software-WASM backend are
+matrix, and integrated measurements (a first Chromium/x86 measurement is in §8.1; other
+browsers and ARM remain open). A slower pure-JS fallback and a software-WASM backend are
 material deployment costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one

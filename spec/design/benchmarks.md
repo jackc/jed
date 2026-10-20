@@ -30,6 +30,10 @@ The browser/lifecycle follow-up adds real Chromium-worker WebCrypto versus JS an
 native Go HKDF/writer-key amortization and XChaCha randomness, and five whole-engine TS versus
 Rust/WASI SQL controls under Node. See the [separate report](../../bench/aead/results/2026-10-17-browser-lifecycle.md)
 for measured boundaries; no encrypted OPFS or async engine is implemented.
+The integrated follow-up `mise run bench:aead_codec_browser` (2026-10-19) runs measurement-only
+AES-GCM/XChaCha page codecs through the TS core's async write side over real OPFS in headless
+Chromium. It verifies byte-identical files across codecs and records commit, open, scan and
+worker-responsiveness samples ([report](../../bench/aead/results/2026-10-19-async-codec.md)).
 
 **Blocking spill result (2026-10-04).** `mise run bench:spill` drives the shared
 `bench/corpus/spill.toml` workload through independent Rust, Go and TypeScript
