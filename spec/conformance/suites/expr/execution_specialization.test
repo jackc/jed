@@ -1,0 +1,161 @@
+# Small typed execution roots and ordinary fallback controls. Ordered scans also
+# exercise the pull cursor; expressions must preserve NULL and trap visitation.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.limit, query.offset, query.where_eq, query.comparison_order, query.logical_connectives, expr.arithmetic, expr.comparison_value, expr.case, expr.coalesce, cast.explicit, types.i16, types.i32, types.i64, types.boolean, types.date, null.three_valued, error.overflow_trap, error.division_by_zero
+
+statement ok
+CREATE TABLE kernels (id i32 PRIMARY KEY, a i32, b i32, flag boolean)
+
+statement ok
+INSERT INTO kernels VALUES (1, -7, 3, true), (2, NULL, 2, NULL), (3, 4, NULL, false), (4, 9, -2, true)
+
+query IIII nosort
+SELECT a+b, (a+b)*(a-b), a/b, a%b FROM kernels ORDER BY id
+----
+-4
+40
+-2
+-1
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+7
+77
+-4
+1
+
+query BBBBBB nosort
+SELECT a=b, a<>b, a<b, a>b, a<=b, a>=b FROM kernels ORDER BY id
+----
+false
+true
+true
+false
+true
+false
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+false
+true
+false
+true
+false
+true
+
+query BBB nosort
+SELECT a IS NULL, b IS NOT NULL, NOT flag FROM kernels ORDER BY id
+----
+false
+true
+false
+true
+true
+NULL
+false
+false
+true
+false
+true
+false
+
+query I nosort
+SELECT id FROM kernels WHERE a+b > 0 ORDER BY id
+----
+4
+
+# LIMIT/OFFSET result windows, including an empty window.
+query I nosort
+SELECT a/0 FROM kernels ORDER BY id LIMIT 0
+----
+
+query I nosort
+SELECT a/(id+1) FROM kernels ORDER BY id LIMIT 1 OFFSET 1
+----
+NULL
+
+# Unsupported boolean / lazy roots must retain the ordinary branch behavior.
+query BBII nosort
+SELECT flag AND NULL, flag OR NULL, CASE WHEN flag THEN a ELSE b END, coalesce(a,b) FROM kernels ORDER BY id
+----
+NULL
+true
+-7
+-7
+NULL
+NULL
+2
+2
+false
+NULL
+NULL
+4
+NULL
+true
+9
+9
+
+query I nosort
+SELECT CASE WHEN id > 0 THEN a ELSE b/0 END FROM kernels ORDER BY id
+----
+-7
+NULL
+4
+9
+
+# A NULL left operand does not skip a strict operator's right-hand error.
+statement error 22012
+SELECT a+(b/0) FROM kernels WHERE id = 2 ORDER BY id
+
+# Qual AND skips a NULL left conjunct; value AND still visits its RHS.
+query I nosort
+SELECT id FROM kernels WHERE id = 2 AND flag AND b/0 = 1 ORDER BY id
+----
+
+statement error 22012
+SELECT flag AND b/0 = 1 FROM kernels WHERE id = 2 ORDER BY id
+
+statement ok
+CREATE TABLE boundaries (id i32 PRIMARY KEY, lo i16, hi i32, wide i64, divisor i64)
+
+statement ok
+INSERT INTO boundaries VALUES (1, 32767, 2147483647, -9223372036854775808, -1)
+
+statement error 22003
+SELECT lo + lo FROM boundaries ORDER BY id
+
+statement error 22003
+SELECT hi + hi FROM boundaries ORDER BY id
+
+statement error 22003
+SELECT wide / divisor FROM boundaries ORDER BY id
+
+query I nosort
+SELECT wide % divisor FROM boundaries ORDER BY id
+----
+0
+
+# Integer-result date arithmetic is not proof of integer input types.
+statement ok
+CREATE TABLE dates (id i32 PRIMARY KEY, a date, b date)
+
+statement ok
+INSERT INTO dates VALUES (1, '2020-01-03', '2020-01-01')
+
+query I nosort
+SELECT (a-b)+1 FROM dates ORDER BY id
+----
+3

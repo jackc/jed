@@ -1,0 +1,5 @@
+[experiment:go-specialization] $ ~/.codex/worktrees/214f/jed/mise-tasks/experim…
+ok  	github.com/jackc/jed/impl/go	1.407s
+ok  	github.com/jackc/jed/impl/go/cmd/conformance	1.010s [no tests to run]
+ok  	github.com/jackc/jed/impl/go/cmd/mutate	1.008s [no tests to run]
+?   	github.com/jackc/jed/impl/go/cmd/process_actor	[no test files]

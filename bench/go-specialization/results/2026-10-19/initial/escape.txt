@@ -1,0 +1,210 @@
+./specialization.go:97:6: can inline kernelArithmetic with cost 20 as: func(binaryOp) bool { return op == binaryOp(0) || op == binaryOp(1) || op == binaryOp(2) || op == binaryOp(3) || op == binaryOp(4) }
+./specialization.go:46:6: can inline primitiveKernelType with cost 45 as: func(colType) rtKind { if t.Composite || t.Elem != nil || t.RangeElem != nil { return rtKind(3) }; if scalarType.IsInteger(t.Scalar) { return rtKind(1) }; if scalarType.IsBool(t.Scalar) { return rtKind(2) }; return rtKind(3) }
+./specialization.go:61:6: cannot inline bindKernelLeaf: function too complex: cost 289 exceeds budget 80
+./specialization.go:101:6: cannot inline bindKernelOperand: function too complex: cost 402 exceeds budget 80
+./specialization.go:117:6: cannot inline bindScalarKernel: function too complex: cost 506 exceeds budget 80
+./specialization.go:171:10: can inline (*engine).prepareSpecialization.func1 with cost 95 as: func(*rExpr, int) *scalarKernel { k := bindScalarKernel(e, table.Columns, params); ks.reasons[slot] = "unsupported root"; if e == nil { ks.reasons[slot] = "absent" }; if k != nil { ks.reasons[slot] = "G1 static kernel" }; return k }
+./specialization.go:152:6: cannot inline (*engine).prepareSpecialization: function too complex: cost 478 exceeds budget 80
+./specialization.go:189:6: cannot inline (*kernelLeaf).load: function too complex: cost 238 exceeds budget 80
+./specialization.go:211:6: cannot inline (*kernelOperand).eval: function too complex: cost 479 exceeds budget 80
+./specialization.go:233:6: cannot inline (*scalarKernel).eval: function too complex: cost 922 exceeds budget 80
+./specialization.go:289:6: cannot inline (*selectPlan).specializedFilter: function too complex: cost 177 exceeds budget 80
+./specialization.go:298:6: cannot inline (*selectPlan).specializedProjection: function too complex: cost 169 exceeds budget 80
+./specialization.go:50:23: inlining call to scalarType.IsInteger
+./specialization.go:53:20: inlining call to scalarType.IsBool
+./specialization.go:73:17: inlining call to dataType.isScalar
+./specialization.go:76:54: inlining call to dataType.ScalarTy
+./specialization.go:76:27: inlining call to primitiveKernelType
+./specialization.go:81:27: inlining call to primitiveKernelType
+./specialization.go:76:27: inlining call to scalarType.IsInteger
+./specialization.go:76:27: inlining call to scalarType.IsBool
+./specialization.go:81:27: inlining call to scalarType.IsInteger
+./specialization.go:81:27: inlining call to scalarType.IsBool
+./specialization.go:106:57: inlining call to scalarType.IsInteger
+./specialization.go:106:80: inlining call to kernelArithmetic
+./specialization.go:114:100: inlining call to binaryOp.catalogName
+./specialization.go:114:83: inlining call to operatorCost
+./specialization.go:124:47: inlining call to scalarType.IsInteger
+./specialization.go:124:70: inlining call to kernelArithmetic
+./specialization.go:135:66: inlining call to binaryOp.catalogName
+./specialization.go:135:49: inlining call to operatorCost
+./specialization.go:144:27: inlining call to operatorCost
+./specialization.go:182:18: inlining call to (*engine).prepareSpecialization.func1
+./specialization.go:184:23: inlining call to (*engine).prepareSpecialization.func1
+./specialization.go:190:19: inlining call to (*costMeter).Guard
+./specialization.go:197:43: inlining call to Value.unfetched
+./specialization.go:203:18: inlining call to IntValue
+./specialization.go:205:19: inlining call to BoolValue
+./specialization.go:207:19: inlining call to NullValue
+./specialization.go:215:19: inlining call to (*costMeter).Guard
+./specialization.go:227:13: inlining call to Value.IsNull
+./specialization.go:227:27: inlining call to Value.IsNull
+./specialization.go:228:19: inlining call to NullValue
+./specialization.go:234:19: inlining call to (*costMeter).Guard
+./specialization.go:243:28: inlining call to Value.IsNull
+./specialization.go:243:19: inlining call to BoolValue
+./specialization.go:246:17: inlining call to boolNot
+./specialization.go:253:14: inlining call to Value.IsNull
+./specialization.go:253:28: inlining call to Value.IsNull
+./specialization.go:254:20: inlining call to NullValue
+./specialization.go:261:19: inlining call to (*costMeter).Guard
+./specialization.go:265:19: inlining call to (*costMeter).Guard
+./specialization.go:268:13: inlining call to Value.IsNull
+./specialization.go:268:27: inlining call to Value.IsNull
+./specialization.go:269:19: inlining call to NullValue
+./specialization.go:286:18: inlining call to BoolValue
+./specialization.go:246:17: inlining call to to3
+./specialization.go:246:17: inlining call to BoolValue
+./specialization.go:246:17: inlining call to BoolValue
+./specialization.go:246:17: inlining call to NullValue
+./specialization.go:246:17: inlining call to Value.boolVal
+./specialization.go:246:17: inlining call to bool3
+./specialization.go:291:24: inlining call to specializationInvoked
+./specialization.go:293:18: inlining call to Value.IsTrue
+./specialization.go:293:18: inlining call to Value.boolVal
+./specialization.go:300:24: inlining call to specializationInvoked
+./specialization.go:76:54: "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... escapes to heap in bindKernelLeaf:
+./specialization.go:76:54:   flow: {heap} ← &{storage for "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite....}:
+./specialization.go:76:54:     from "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... (spill) at ./specialization.go:76:54
+./specialization.go:76:54:     from panic("BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite....) (call parameter) at ./specialization.go:76:54
+./specialization.go:76:54: "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... escapes to heap in bindKernelLeaf:
+./specialization.go:76:54:   flow: {storage for "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite....} ← &{storage for "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite....}:
+./specialization.go:76:54:     from "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... (spill) at ./specialization.go:76:54
+./specialization.go:76:54:     from "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... (interface-converted) at ./specialization.go:76:54
+./specialization.go:76:54: "BUG: array type used where a scalar was expected (spec/design/array.... escapes to heap in bindKernelLeaf:
+./specialization.go:76:54:   flow: {heap} ← &{storage for "BUG: array type used where a scalar was expected (spec/design/array....}:
+./specialization.go:76:54:     from "BUG: array type used where a scalar was expected (spec/design/array.... (spill) at ./specialization.go:76:54
+./specialization.go:76:54:     from panic("BUG: array type used where a scalar was expected (spec/design/array....) (call parameter) at ./specialization.go:76:54
+./specialization.go:76:54: "BUG: range type used where a scalar was expected (spec/design/ranges... escapes to heap in bindKernelLeaf:
+./specialization.go:76:54:   flow: {heap} ← &{storage for "BUG: range type used where a scalar was expected (spec/design/ranges...}:
+./specialization.go:76:54:     from "BUG: range type used where a scalar was expected (spec/design/ranges... (spill) at ./specialization.go:76:54
+./specialization.go:76:54:     from panic("BUG: range type used where a scalar was expected (spec/design/ranges...) (call parameter) at ./specialization.go:76:54
+./specialization.go:76:54: "BUG: record type used where a scalar was expected (spec/design/compo... escapes to heap in bindKernelLeaf:
+./specialization.go:76:54:   flow: {heap} ← &{storage for "BUG: record type used where a scalar was expected (spec/design/compo...}:
+./specialization.go:76:54:     from "BUG: record type used where a scalar was expected (spec/design/compo... (spill) at ./specialization.go:76:54
+./specialization.go:76:54:     from panic("BUG: record type used where a scalar was expected (spec/design/compo...) (call parameter) at ./specialization.go:76:54
+./specialization.go:61:21: e does not escape
+./specialization.go:61:31: columns does not escape
+./specialization.go:61:52: params does not escape
+./specialization.go:76:54: "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... escapes to heap
+./specialization.go:76:54: "BUG: composite type " + t.Comp.Name + " used where a scalar was expected; the " + "composite path must branch before this point (spec/design/composite.... escapes to heap
+./specialization.go:76:54: "BUG: array type used where a scalar was expected (spec/design/array.... escapes to heap
+./specialization.go:76:54: "BUG: range type used where a scalar was expected (spec/design/ranges... escapes to heap
+./specialization.go:76:54: "BUG: record type used where a scalar was expected (spec/design/compo... escapes to heap
+./specialization.go:101:24: e does not escape
+./specialization.go:101:34: columns does not escape
+./specialization.go:101:55: params does not escape
+./specialization.go:121:2: k escapes to heap in bindScalarKernel:
+./specialization.go:121:2:   flow: ~r0 ← &k:
+./specialization.go:121:2:     from &k (address-of) at ./specialization.go:149:9
+./specialization.go:121:2:     from return &k (return) at ./specialization.go:149:2
+./specialization.go:117:23: e does not escape
+./specialization.go:117:33: columns does not escape
+./specialization.go:117:54: params does not escape
+./specialization.go:121:2: moved to heap: k
+./specialization.go:170:8: &scanKernels{} escapes to heap in (*engine).prepareSpecialization:
+./specialization.go:170:8:   flow: ks ← &{storage for &scanKernels{}}:
+./specialization.go:170:8:     from &scanKernels{} (spill) at ./specialization.go:170:8
+./specialization.go:170:8:     from ks := &scanKernels{} (assign) at ./specialization.go:170:5
+./specialization.go:170:8:   flow: {heap} ← ks:
+./specialization.go:170:8:     from p.specializationPlan.kernels = ks (assign) at ./specialization.go:186:12
+./specialization.go:152:7: db does not escape
+./specialization.go:152:41: p does not escape
+./specialization.go:152:56: params does not escape
+./specialization.go:170:8: &scanKernels{} escapes to heap
+./specialization.go:189:27: parameter row leaks to {heap} for (*kernelLeaf).load with derefs=2:
+./specialization.go:189:27:   flow: v ← *row:
+./specialization.go:189:27:     from row[l.index] (dot of pointer) at ./specialization.go:195:11
+./specialization.go:189:27:     from v := row[l.index] (assign) at ./specialization.go:195:5
+./specialization.go:189:27:   flow: v ← v:
+./specialization.go:189:27:     from v := v (assign-pair) at ./specialization.go:197:43
+./specialization.go:189:27:   flow: ~r0 ← v:
+./specialization.go:189:27:     from v.ref (dot) at ./specialization.go:197:43
+./specialization.go:189:27:     from v.ref.(*Unfetched) (dot) at ./specialization.go:197:43
+./specialization.go:189:27:     from ~r0 = v.ref.(*Unfetched) (assign-pair) at ./specialization.go:197:43
+./specialization.go:189:27:   flow: {temp} ← ~r0:
+./specialization.go:189:27:     from resolveUnfetchedSelf(~r0) (call parameter) at ./specialization.go:197:31
+./specialization.go:189:27:   flow: {heap} ← *{temp}:
+./specialization.go:189:42: parameter env leaks to ~r0 for (*kernelLeaf).load with derefs=2:
+./specialization.go:189:42:   flow: ~r0 ← **env:
+./specialization.go:189:42:     from env.params (dot of pointer) at ./specialization.go:201:13
+./specialization.go:189:42:     from env.params[l.index] (dot of pointer) at ./specialization.go:201:20
+./specialization.go:189:42:     from return env.params[l.index], nil (return) at ./specialization.go:201:3
+./specialization.go:189:27: parameter row leaks to ~r0 for (*kernelLeaf).load with derefs=1:
+./specialization.go:189:27:   flow: v ← *row:
+./specialization.go:189:27:     from row[l.index] (dot of pointer) at ./specialization.go:195:11
+./specialization.go:189:27:     from v := row[l.index] (assign) at ./specialization.go:195:5
+./specialization.go:189:27:   flow: ~r0 ← v:
+./specialization.go:189:27:     from return v, nil (return) at ./specialization.go:199:3
+./specialization.go:189:7: l does not escape
+./specialization.go:189:27: leaking param content: row
+./specialization.go:189:27: leaking param: row to result ~r0 level=1
+./specialization.go:189:42: leaking param: env to result ~r0 level=2
+./specialization.go:189:56: m does not escape
+./specialization.go:211:30: parameter row leaks to {heap} for (*kernelOperand).eval with derefs=2:
+./specialization.go:211:30:   flow: {temp} ← row:
+./specialization.go:211:30:     from (*kernelLeaf).load(o.left, row, env, m) (call parameter) at ./specialization.go:213:21
+./specialization.go:211:30:   flow: {heap} ← **{temp}:
+./specialization.go:211:45: parameter env leaks to ~r0 for (*kernelOperand).eval with derefs=2:
+./specialization.go:211:45:   flow: .autotmp_6 ← **env:
+./specialization.go:211:45:     from (*kernelLeaf).load(o.left, row, env, m) (call parameter) at ./specialization.go:213:21
+./specialization.go:211:45:   flow: ~r0 ← .autotmp_6:
+./specialization.go:211:45:     from return Value(.autotmp_6), .autotmp_7 (return) at ./specialization.go:213:3
+./specialization.go:211:30: parameter row leaks to ~r0 for (*kernelOperand).eval with derefs=1:
+./specialization.go:211:30:   flow: {temp} ← row:
+./specialization.go:211:30:     from (*kernelLeaf).load(o.left, row, env, m) (call parameter) at ./specialization.go:213:21
+./specialization.go:211:30:   flow: .autotmp_6 ← *{temp}:
+./specialization.go:211:30:   flow: ~r0 ← .autotmp_6:
+./specialization.go:211:30:     from return Value(.autotmp_6), .autotmp_7 (return) at ./specialization.go:213:3
+./specialization.go:211:7: o does not escape
+./specialization.go:211:30: leaking param content: row
+./specialization.go:211:30: leaking param: row to result ~r0 level=1
+./specialization.go:211:45: leaking param: env to result ~r0 level=2
+./specialization.go:211:59: m does not escape
+./specialization.go:233:29: parameter row leaks to {heap} for (*scalarKernel).eval with derefs=2:
+./specialization.go:233:29:   flow: {temp} ← row:
+./specialization.go:233:29:     from (*kernelOperand).eval(k.left, row, env, m) (call parameter) at ./specialization.go:238:23
+./specialization.go:233:29:   flow: {heap} ← **{temp}:
+./specialization.go:233:7: k does not escape
+./specialization.go:233:29: leaking param content: row
+./specialization.go:233:44: env does not escape
+./specialization.go:233:58: m does not escape
+./specialization.go:289:40: parameter row leaks to {heap} for (*selectPlan).specializedFilter with derefs=0:
+./specialization.go:289:40:   flow: {heap} ← row:
+./specialization.go:289:40:     from (*rExpr).evalFilter(p.filter, row, env, m) (call parameter) at ./specialization.go:295:28
+./specialization.go:289:55: parameter env leaks to {heap} for (*selectPlan).specializedFilter with derefs=1:
+./specialization.go:289:55:   flow: {heap} ← *env:
+./specialization.go:289:55:     from (*rExpr).evalFilter(p.filter, row, env, m) (call parameter) at ./specialization.go:295:28
+./specialization.go:289:69: parameter m leaks to {heap} for (*selectPlan).specializedFilter with derefs=0:
+./specialization.go:289:69:   flow: {heap} ← m:
+./specialization.go:289:69:     from (*rExpr).evalFilter(p.filter, row, env, m) (call parameter) at ./specialization.go:295:28
+./specialization.go:289:7: parameter p leaks to {heap} for (*selectPlan).specializedFilter with derefs=2:
+./specialization.go:289:7:   flow: {temp} ← *p:
+./specialization.go:289:7:     from p.filter (dot of pointer) at ./specialization.go:295:10
+./specialization.go:289:7:     from (*rExpr).evalFilter(p.filter, row, env, m) (call parameter) at ./specialization.go:295:28
+./specialization.go:289:7:   flow: {heap} ← *{temp}:
+./specialization.go:289:7: leaking param content: p
+./specialization.go:289:40: leaking param: row
+./specialization.go:289:55: leaking param content: env
+./specialization.go:289:69: leaking param: m
+./specialization.go:298:51: parameter row leaks to {heap} for (*selectPlan).specializedProjection with derefs=0:
+./specialization.go:298:51:   flow: {heap} ← row:
+./specialization.go:298:51:     from (*rExpr).eval(p.projections[i], row, env, m) (call parameter) at ./specialization.go:303:30
+./specialization.go:298:66: parameter env leaks to {heap} for (*selectPlan).specializedProjection with derefs=1:
+./specialization.go:298:66:   flow: {heap} ← *env:
+./specialization.go:298:66:     from (*rExpr).eval(p.projections[i], row, env, m) (call parameter) at ./specialization.go:303:30
+./specialization.go:298:80: parameter m leaks to {heap} for (*selectPlan).specializedProjection with derefs=0:
+./specialization.go:298:80:   flow: {heap} ← m:
+./specialization.go:298:80:     from (*rExpr).eval(p.projections[i], row, env, m) (call parameter) at ./specialization.go:303:30
+./specialization.go:298:7: parameter p leaks to {heap} for (*selectPlan).specializedProjection with derefs=3:
+./specialization.go:298:7:   flow: {temp} ← **p:
+./specialization.go:298:7:     from p.projections (dot of pointer) at ./specialization.go:303:10
+./specialization.go:298:7:     from p.projections[i] (dot of pointer) at ./specialization.go:303:22
+./specialization.go:298:7:     from (*rExpr).eval(p.projections[i], row, env, m) (call parameter) at ./specialization.go:303:30
+./specialization.go:298:7:   flow: {heap} ← *{temp}:
+./specialization.go:298:7: leaking param content: p
+./specialization.go:298:51: leaking param: row
+./specialization.go:298:66: leaking param content: env
+./specialization.go:298:80: leaking param: m
+./specialization.go:46:26: t does not escape
+ok  	github.com/jackc/jed/impl/go	0.007s [no tests to run]
