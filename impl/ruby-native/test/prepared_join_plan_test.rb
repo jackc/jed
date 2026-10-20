@@ -332,7 +332,7 @@ module NativePreparedJoinPlanTests
         'WITH q AS (SELECT 1 AS n) SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id',
         'SELECT a.id::text FROM jp_a a JOIN jp_b b ON a.k = b.id',
         "SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id WHERE 'row' LIKE 'r%'",
-        'SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id LEFT JOIN jp_a c ON c.id = a.id',
+        'SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id FULL JOIN jp_a c ON c.id = a.id',
         'SELECT a.id FROM jp_a a RIGHT JOIN jp_b b ON a.k = b.id'
       ]
       unsupported.each do |sql|

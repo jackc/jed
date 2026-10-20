@@ -77,6 +77,14 @@ The [expression traversal follow-up](../../impl/ruby-native/EXPRESSION_WALK_FOLL
 uses fresh accumulators and direct index-key field comparisons to reduce
 temporary arrays while preserving node identity, equality rules and order.
 It introduces no additional retained state.
+The [outer-join follow-up](../../impl/ruby-native/OUTER_JOIN_FOLLOWUP.md) extends
+bounded resolution and source-metadata reuse to eligible three-through-eight
+input INNER/CROSS/LEFT chains. Every multiway LEFT execution selects its physical
+plan afresh, including routed syntax that changes after an INNER
+winner was retained. Outer-join boundaries and execution-local planning state
+remain in the ordinary planner. The older table-column map also gains an
+eight-entry cap and owned alias strings; it shares the existing source-metadata
+unit/byte allowance rather than adding a separate retention budget.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

@@ -18,7 +18,8 @@ module JedNative
     UNARY = %w[+ - ~ not is\ null is\ not\ null is\ true is\ false is\ unknown is\ not\ true is\ not\ false is\ not\ unknown].freeze
     Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, :physical,
       :sources, :source_units, :source_bytes, keyword_init: true)
-    Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, :physical_observation, keyword_init: true)
+    Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, :physical_observation,
+      :physical_reuse, keyword_init: true)
     Physical = Struct.new(:key, :plan, :checks, :units, :bytes, keyword_init: true)
 
     def select(statement)
@@ -71,7 +72,17 @@ module JedNative
       columns = frame.entry.columns
       key = [stored.object_id, name]
       return columns[key] if columns.key?(key)
-      columns[[stored.object_id, name.dup.freeze].freeze] = super.map(&:freeze).freeze
+      result = super
+      return result if columns.length >= MAX_INPUTS
+      # Public AST aliases can change between calls. Own their descriptor
+      # strings, and share the existing source-metadata allowance so alias
+      # churn cannot grow this map outside the bounded statement entry.
+      snapshot = prepared_join_source_snapshot([key, result], frame.entry)
+      return result unless snapshot
+      owned, units, bytes = snapshot
+      frame.entry.source_units += units
+      frame.entry.source_bytes += bytes
+      columns[owned[0]] = owned[1]
     end
 
     def two_base_join_plan(first, edge, where, statement)
@@ -169,6 +180,7 @@ module JedNative
     end
 
     def prepared_join_physical_plan(frame, key)
+      return yield unless frame.physical_reuse
       return yield if @native_join_physical_disabled || !@native_binding_types || @params.any?(&:nil?) ||
                       transaction_open? || @native_cursor&.block_bound? || frame.entry.tables.any? { |_, table| table[:temporary] }
       saved = frame.entry.physical
@@ -276,8 +288,13 @@ module JedNative
       inputs = sources + joins.map { |edge| edge[:relation] }
       return unless inputs.length.between?(2, MAX_INPUTS)
       return unless sources.length == 1 || sources.length > 2 && joins.empty?
-      kinds = inputs.length == 2 ? %i[inner cross left left_outer] : %i[inner cross]
+      kinds = %i[inner cross left left_outer]
       return unless joins.all? { |edge| kinds.include?(edge[:kind]) && !edge[:using] && !edge[:natural] }
+      # Resolution can be reused across a fixed outer edge, but the multiway
+      # physical winner remains execution-specific. Check the current syntax
+      # even when an entry already holds a winner from an earlier INNER shape.
+      physical_reuse = inputs.length == 2 ||
+        joins.none? { |edge| edge[:kind] == :left || edge[:kind] == :left_outer }
       return unless inputs.all? do |source|
         source && source[:kind] == :table && !source[:lateral] && !source[:columns] && !source[:column_aliases] &&
           @tables.key?(source[:name]) && !@views.key?(source[:name])
@@ -304,7 +321,7 @@ module JedNative
         @native_join_resolution_plans.shift if @native_join_resolution_plans.length >= CACHE_ENTRIES
         @native_join_resolution_plans[statement] = entry
       end
-      Frame.new(entry: entry, depth: 0, plans: {})
+      Frame.new(entry: entry, depth: 0, plans: {}, physical_reuse: physical_reuse)
     end
 
     def prepared_join_syntax?(statement)
