@@ -192,6 +192,143 @@ module NativeCompiledJoinPredicateTests
     assert(current.native_compiled_join_predicate(large).nil?, 'join compiler ignored literal byte limit')
   end
 
+  def acquisition(current, node, input_size)
+    preparations = 0
+    trace = TracePoint.new(:call) do |event|
+      preparations += 1 if event.self.equal?(JedNative::CompiledExpression) && event.method_id == :prepare
+    end
+    kernel = trace.enable { current.native_compiled_join_predicate(node, input_size: input_size) }
+    [kernel, preparations]
+  ensure
+    trace&.disable
+  end
+
+  def simple_admission
+    threshold = JedNative::CompiledPlans::MIN_SIMPLE_JOIN_PREDICATE_INPUTS
+    assert(threshold == 128 && JedNative::CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES == 16,
+      'join input admission boundaries changed')
+    %w[i16 i32 i64].each do |type|
+      columns = COLUMNS.map { |column| column[:type] == 'i32' ? column.merge(type: type) : column }
+      %w[= <> != < <= > >=].each do |operator|
+        current = engine
+        node, = expression("l.id #{operator} r.id", columns: columns)
+        [0, 15, 16, threshold - 1].each do |size|
+          2.times do
+            assert(acquisition(current, node, size) == [nil, 0], 'cheap integer predicate reached the emitter')
+          end
+        end
+        assert(!current.instance_variable_defined?(:@native_compiled_join_predicates),
+          'rejected cheap predicate occupied a cache entry')
+        assert(acquisition(current, node, threshold) == [nil, 1], 'large predicate lost second-use admission')
+        kernel, preparations = acquisition(current, node, threshold)
+        assert(kernel && preparations == 1, 'large integer predicate did not compile')
+        assert(acquisition(current, node, threshold - 1) == [nil, 0],
+          'a warmed kernel bypassed the cheap-input guard')
+        assert(acquisition(current, node, nil) == [kernel, 1], 'unknown input lost existing admission')
+        current.instance_variable_set(:@native_compilation_immediate, true)
+        assert(acquisition(current, node, 0) == [kernel, 1], 'immediate compilation did not bypass the input guard')
+        %i[@native_compilation_disabled @native_join_compilation_disabled].each do |flag|
+          current.instance_variable_set(flag, true)
+          assert(acquisition(current, node, threshold) == [nil, 0], "#{flag} lost precedence over immediate compilation")
+          current.instance_variable_set(flag, false)
+        end
+      end
+    end
+
+    # Literal and parameter leaves are cheap too. More substantial integer
+    # expressions, boolean control flow and C text comparisons remain eligible.
+    [
+      ['l.id=1', COLUMNS, [], false],
+      ['l.id=$1', COLUMNS, ['i32'], false],
+      ['$1=$2', [], %w[i32 i32], false],
+      ['l.id+1=r.id', COLUMNS, [], true],
+      ['l.id::i64=r.id', COLUMNS, [], true],
+      ['-l.id=r.id', COLUMNS, [], true],
+      ['l.flag AND r.flag', COLUMNS, [], true],
+      ['l.id=r.id AND abs(l.id-r.id)<50', COLUMNS, [], true],
+      ['l.label=r.label', [{ table: 'l', name: 'label', type: 'text' },
+                          { table: 'r', name: 'label', type: 'text' }], [], true]
+    ].each do |sql, columns, types, admitted|
+      current = engine(types: types)
+      node, = expression(sql, columns: columns, types: types)
+      cold, first_count = acquisition(current, node, 16)
+      warm, second_count = acquisition(current, node, 16)
+      assert(cold.nil? && !!warm == admitted && [first_count, second_count] == (admitted ? [1, 1] : [0, 0]),
+        "cheap predicate classification changed #{sql}")
+    end
+
+    current = engine
+    node, = expression('l.id=r.id')
+    assert(acquisition(current, node, 16) == [nil, 0], 'initial simple expression was not skipped')
+    arithmetic, = expression('l.id+1=r.id')
+    original = node.args.first
+    node.args[0] = arithmetic.args.first
+    assert(acquisition(current, node, 16) == [nil, 1], 'cheap rejection stuck after shape mutation')
+    kernel, = acquisition(current, node, 16)
+    assert(kernel && kernel.call(current, [1, nil, 2, nil], []), 'mutated arithmetic predicate did not execute')
+    node.args[0] = original
+    assert(acquisition(current, node, 16) == [nil, 0], 'shape mutation reused the arithmetic kernel')
+    text, = expression('l.label=r.label',
+      columns: [{ table: 'l', name: 'label', type: 'text' }, { table: 'r', name: 'label', type: 'text' }])
+    node.args = text.args
+    node.extra = text.extra
+    assert(acquisition(current, node, 16) == [nil, 1], 'integer-to-text mutation kept the cheap classification')
+    text_kernel, = acquisition(current, node, 16)
+    assert(text_kernel && text_kernel.call(current, ['é', 'é'], []), 'mutated text predicate did not execute')
+    current.instance_variable_set(:@native_text_compilation_disabled, true)
+    assert(acquisition(current, node, 16).first.nil?, 'text disable ignored a mutated warm predicate')
+
+    # The classifier is conservative about custom containers and the current
+    # registry. Such shapes still reach the ordinary emitter and its guards.
+    node, = expression('l.id=r.id')
+    expression_class = Class.new(JedNative::Expression)
+    array_class = Class.new(Array)
+    [expression_class.new(**node.to_h),
+     node.dup.tap { |copy| copy.args = [expression_class.new(**node.args.first.to_h), node.args.last] },
+     node.dup.tap { |copy| copy.args = array_class.new(node.args) }].each do |variant|
+      owner = engine
+      assert(acquisition(owner, variant, 16) == [nil, 1], 'custom expression/container was classified as an exact simple tree')
+      assert(acquisition(owner, variant, 16).first, 'custom expression/container lost existing emitter admission')
+    end
+    %w[boolean i32].each do |type|
+      owner = engine
+      acquisition(owner, node, threshold)
+      old, = acquisition(owner, node, threshold)
+      registry = owner.instance_variable_get(:@types)
+      registry[type] = { kind: :enum }
+      assert(acquisition(owner, node, 16) == [nil, 1] && acquisition(owner, node, threshold) == [nil, 1],
+        'registry mutation bypassed the emitter type guard or reused a cached predicate')
+      registry.delete(type)
+      assert(acquisition(owner, node, 16) == [nil, 0] && acquisition(owner, node, threshold) == [old, 1],
+        'restoring the registry lost current-shape classification or a valid kernel')
+    end
+
+    # Admission does not evaluate parameters or touch rows. Compare every
+    # small cost/lifetime prefix on both sides of the new boundary, including
+    # a contextual cast failure and a deferred right-column failure.
+    ordinary, = expression('l.id=r.id')
+    contextual, = expression('l.id=$1', types: ['i32'])
+    contextual.args.last.type = 'i16'
+    contextual.args.last.extra = { context_type: 'i16' }
+    [[ordinary, [1, nil, 1, nil], [], [], nil],
+     [ordinary, [nil, nil, 1, nil], [], [], 2],
+     [contextual, [1, nil, nil, nil], [40_000], ['i64'], nil]].each do |predicate, row, params, types, failure|
+      [16, threshold - 1, threshold, nil].each do |size|
+        owner = engine(params: params, types: types)
+        acquisition(owner, predicate, size)
+        compiled, = acquisition(owner, predicate, size)
+        assert(owner.cost.zero? && owner.lifetime_cost.zero?, 'admission evaluated or charged a predicate')
+        expected = scalar_outcome(predicate, nil, row, params, types, failure, 0, 0, 0)
+        assert(expected[0, 2] == [:error, '22003'], 'contextual parameter fixture lost its narrowing error') if predicate.equal?(contextual)
+        [[0, 0, 0], [1, 0, 0], [0, 8, 7], [1, 8, 7]].each do |guards|
+          original = scalar_outcome(predicate, nil, row, params, types, failure, *guards)
+          actual = scalar_outcome(predicate, compiled, row, params, types, failure, *guards)
+          assert(actual == original, "cheap predicate changed value/error/cost prefix #{[size, guards, expected].inspect}")
+        end
+      end
+    end
+  end
+
   def traced
     kernels, counts, scratch = {}, Hash.new(0), []
     trace = TracePoint.new(:call, :return) do |event|
@@ -211,6 +348,10 @@ module NativeCompiledJoinPredicateTests
         end
       elsif event.method_id == :hash_join_table && event.return_value
         counts[:hash] += 1
+      elsif event.defined_class == JedNative::Engine && event.method_id == :join
+        programs = event.binding.local_variable_get(:on_programs)
+        counts[:on_program_vectors] += 1 if programs
+        counts[:on_program_kernels] += programs.count { |_, kernel| kernel } if programs
       end
     end
     value = trace.enable { yield }
@@ -221,16 +362,26 @@ module NativeCompiledJoinPredicateTests
 
   def tree(sql) = JedNative::Statement.new("SELECT 1 WHERE #{sql}").ast[:where]
 
-  def join_tree_outcome(disabled, trees, window, limit, kind: :left, algorithm: :nested, on: '10 / r.id > 0')
+  def join_tree_outcome(disabled, trees, window, limit, kind: :left, algorithm: :nested, on: '10 / r.id > 0',
+                        immediate: true, expanded: false, lifetime: 0)
     current = engine(disabled: disabled)
-    current.instance_variable_set(:@native_compilation_immediate, true)
+    current.instance_variable_set(:@native_compilation_immediate, immediate)
     current.max_cost = limit
+    current.lifetime_max_cost = lifetime
+    current.instance_variable_set(:@lifetime_cost, 7) if lifetime.positive?
     right = JedNative::Relation.new(columns: COLUMNS.drop(2), rows: [[1, true], [2, false], [0, nil]])
     current.define_singleton_method(:source_relation) { |_| right }
     left = JedNative::Relation.new(columns: COLUMNS.take(2), rows: [[1, true], [2, nil], [3, false]])
+    left.rows *= 2 if expanded
     source = { kind: :table, name: 'r', native_join_algorithm: algorithm }
     source[:native_on_trees] = trees unless trees.nil?
     source[:native_join_window] = { target: 1, filter: current.compile_filter(tree(window), COLUMNS) } if window
+    unless immediate
+      trees&.each do |node|
+        current.native_compiled_join_predicate(current.compile_filter(node, COLUMNS),
+          input_size: left.rows.length * right.rows.length)
+      end
+    end
     begin
       result = current.join(left, source, kind, tree(on), nil)
       value = [:rows, result.rows, result.columns]
@@ -261,6 +412,29 @@ module NativeCompiledJoinPredicateTests
     actual, calls = traced { join_tree_outcome(false, nil, nil, 0, algorithm: :hash, on: 'l.id=r.id AND l.id<>2') }
     assert(actual == plain && calls[:hash].positive? && calls[:kernel].positive?,
       "forced hash candidates did not recheck the same ON predicate: #{[plain, actual, calls].inspect}")
+
+    # Known inputs18 decline the direct comparison while retaining arithmetic.
+    # The lazy ON program vector must preserve every original all? boundary,
+    # including when the first compiled entry follows a declined entry.
+    [[tree('l.id=r.id'), tree('10/r.id>0')],
+     [tree('10/r.id>0'), tree('l.id=r.id')],
+     [tree('l.id=r.id'), tree('l.id>0')], []].each do |trees|
+      options = { immediate: false, expanded: true }
+      plain = join_tree_outcome(true, trees, nil, 0, **options)
+      actual, calls = traced { join_tree_outcome(false, trees, nil, 0, **options) }
+      mixed = trees.any? { |node| node[:left]&.dig(:kind) == :binary }
+      assert(actual == plain && calls[:kernel].positive? == mixed,
+        "mixed declined/compiled ON trees changed execution: #{[trees, actual, plain, calls].inspect}")
+      assert(calls[:on_program_vectors] == (mixed ? 1 : 0) && calls[:on_program_kernels] == (mixed ? 1 : 0),
+        'independent ON predicates allocated an unnecessary program vector or omitted a compiled entry')
+      (1..plain[-2] + 1).each do |limit|
+        [[limit, 0], [0, limit + 7]].each do |statement, lifetime|
+          expected = join_tree_outcome(true, trees, nil, statement, **options, lifetime: lifetime)
+          observed = join_tree_outcome(false, trees, nil, statement, **options, lifetime: lifetime)
+          assert(observed == expected, 'mixed ON vector changed a statement/lifetime failure prefix')
+        end
+      end
+    end
   end
 
   # The execution loops require these iterator operations, but admission must
@@ -268,6 +442,7 @@ module NativeCompiledJoinPredicateTests
   class UnsizedRows
     def initialize(rows) = (@rows = rows)
     def empty? = @rows.empty?
+    def first = @rows.first
     def [](index) = @rows[index]
     def each_with_index(&block) = @rows.each_with_index(&block)
     def each_index(&block) = @rows.each_index(&block)
@@ -276,6 +451,7 @@ module NativeCompiledJoinPredicateTests
 
   def candidate_gate
     threshold = JedNative::CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES
+    simple_threshold = JedNative::CompiledPlans::MIN_SIMPLE_JOIN_PREDICATE_INPUTS
     [
       [0, threshold, false, {}], [1, 1, false, {}], [1, 2, false, {}],
       [1, threshold - 1, false, {}], [1, threshold, true, {}],
@@ -283,10 +459,23 @@ module NativeCompiledJoinPredicateTests
       [threshold - 1, 1, false, { indexed: true }],
       [threshold, 1, true, { indexed: true }],
       [1, 1, true, { unsized_left: true }], [1, 1, true, { unsized_right: true }],
-      [1, 1, true, { lateral: true }], [1, 1, true, { immediate: true }]
+      [1, 1, true, { lateral: true }], [1, 1, true, { immediate: true }],
+      [1, threshold, false, { simple: true }],
+      [1, simple_threshold - 1, false, { simple: true }],
+      [1, simple_threshold, true, { simple: true }],
+      [simple_threshold - 1, 1, false, { simple: true, indexed: true }],
+      [simple_threshold, 1, true, { simple: true, indexed: true }],
+      [1, 1, true, { simple: true, unsized_left: true }],
+      [1, 1, true, { simple: true, unsized_right: true }],
+      [1, 1, true, { simple: true, indexed: true, unsized_left: true }],
+      [1, 1, true, { simple: true, lateral: true, unsized_left: true, unsized_right: true }],
+      [1, 1, true, { simple: true, immediate: true }],
+      [1, 1, false, { immediate: true, disabled: :@native_compilation_disabled }],
+      [1, 1, false, { immediate: true, disabled: :@native_join_compilation_disabled }]
     ].each do |left_size, right_size, admitted, options|
       current = engine
       current.instance_variable_set(:@native_compilation_immediate, options[:immediate])
+      current.instance_variable_set(options[:disabled], true) if options[:disabled]
       left_rows = Array.new(left_size) { |index| [index + 1, true] }
       right_rows = Array.new(right_size) { |index| [index + 1, false] }
       left_rows = UnsizedRows.new(left_rows) if options[:unsized_left]
@@ -300,11 +489,16 @@ module NativeCompiledJoinPredicateTests
       source = { kind: :table, name: 'r', native_join_algorithm: :nested }
       source[:native_index_plan] = { columns: right.columns } if options[:indexed]
       source[:lateral] = true if options[:lateral]
-      on = tree('l.id+r.id>0')
+      on = tree(options[:simple] ? 'l.id<=r.id' : 'l.id+r.id>0')
       2.times { current.join(left, source, :inner, on, nil) }
       actual, counts = traced { current.join(left, source, :inner, on, nil) }
       cache = current.instance_variable_get(:@native_compiled_join_predicates) || {}
-      assert(actual.rows.length == left_size * right_size, 'candidate gate changed join execution')
+      expected = (1..left_size).flat_map do |left_id|
+        (1..right_size).filter_map do |right_id|
+          [left_id, true, right_id, false] unless options[:simple] && left_id > right_id
+        end
+      end
+      assert(actual.rows == expected, 'candidate gate changed join execution')
       assert(cache.empty? != admitted && counts[:kernel].positive? == admitted,
         "candidate gate changed admission #{[left_size, right_size, options].inspect}: #{counts.inspect}")
     end
@@ -481,6 +675,7 @@ module NativeCompiledJoinPredicateTests
   def run
     scalar_semantics
     cache_admission
+    simple_admission
     separate_on_trees
     candidate_gate
     [false, true].each do |disk|

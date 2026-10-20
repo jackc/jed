@@ -1023,18 +1023,26 @@ module JedNative
       window = source[:native_join_window]
       compile_predicates = !@native_compilation_disabled && !@native_join_compilation_disabled
       if compile_predicates && !@native_compilation_immediate && !lateral && left.rows.instance_of?(Array)
-        # Fresh emission is not worthwhile for tiny materialized inputs.
-        # Do not inspect lazy sources or perform a charged hash/index probe.
+        # This is an input-size heuristic: indexed joins use the outer count,
+        # and other joins use the product. Never inspect lazy source lengths or
+        # perform a charged hash/index probe to decide compilation admission.
         if index_plan
-          compile_predicates = left.rows.length >= CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES
+          input_size = left.rows.length
         elsif right.rows.instance_of?(Array)
-          compile_predicates = left.rows.length * right.rows.length >= CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES
+          input_size = left.rows.length * right.rows.length
         end
+        compile_predicates = input_size >= CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES if input_size
       end
       if compile_predicates
-        on_programs = on_trees&.map { |expression| [expression, native_compiled_join_predicate(expression)] }
-        predicate_kernel = native_compiled_join_predicate(predicate) unless on_trees
-        window_kernel = native_compiled_join_predicate(window[:filter]) if window && window[:filter]
+        on_programs = nil
+        on_trees&.each_with_index do |expression, index|
+          kernel = native_compiled_join_predicate(expression, input_size: input_size)
+          next unless kernel
+          on_programs ||= on_trees.map { |tree| [tree, nil] }
+          on_programs[index][1] = kernel
+        end
+        predicate_kernel = native_compiled_join_predicate(predicate, input_size: input_size) unless on_trees
+        window_kernel = native_compiled_join_predicate(window[:filter], input_size: input_size) if window && window[:filter]
       end
       left.rows.each_with_index do |lrow, left_index|
         break if window && rows.length >= window[:target]
