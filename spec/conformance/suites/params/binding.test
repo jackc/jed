@@ -1,8 +1,8 @@
 # Bound parameters ($N) through the host API (spec/design/api.md §5): a parameter's type comes from
-# its context, each value is coerced to it before any row is touched, and a bound value reads exactly
-# like the literal it replaces. Each `# params:` record binds host values (conformance.md §1.2).
+# its contexts, each value is coerced before any row is touched, and every occurrence reads that
+# binding with its local expression type. Each `# params:` record binds host values (conformance.md §1.2).
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_no_from, query.where_eq, query.order_by, query.interval_set, expr.in_list, cast.operator, cast.explicit, types.i16, types.i32, types.i64, types.text, types.f64, types.decimal, types.uuid, types.timestamp, types.date, null.three_valued, resource.cost_metering
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_no_from, query.where_eq, query.order_by, query.interval_set, query.join_inner, query.qualified_column, expr.in_list, expr.arithmetic, cast.operator, cast.explicit, types.i16, types.i32, types.i64, types.text, types.f64, types.decimal, types.uuid, types.timestamp, types.date, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -291,3 +291,117 @@ SELECT id FROM t WHERE id = $
 
 statement error 42601
 SELECT id FROM t WHERE id = $01
+
+# Repeated scalar integer constraints bind at the widest width, independently
+# of occurrence order. Each arithmetic occurrence retains its local result type.
+# params: 1
+# types: i16,i64
+# cost: 6
+query II nosort
+SELECT s + $1, $1 + 1 FROM narrow WHERE id = $1
+----
+101
+2
+
+# params: 1
+# types: i64,i16
+# cost: 6
+query II nosort
+SELECT $1 + 1, s + $1 FROM narrow WHERE id = $1
+----
+2
+101
+
+# params: 1
+# types: i16,i32,i64
+# cost: 4
+query III nosort
+SELECT $1::i16, $1::i32, $1::i64
+----
+1
+1
+1
+
+# A widened comparison value need not fit the narrower column's width.
+# params: 40000
+# types: i32
+# cost: 5
+query I nosort
+SELECT id FROM narrow WHERE s = $1 OR id = $1
+----
+
+# params: 2147483648
+# types: i32
+query I nosort
+SELECT id FROM narrow WHERE id = $1 OR $1 = 5
+----
+
+# Real explicit casts and locally narrow arithmetic still report overflow.
+# params: 40000
+statement error 22003
+SELECT $1::i16, $1::i64
+
+# params: 32700
+statement error 22003
+SELECT s + $1, $1::i64 FROM narrow
+
+# params: 9223372036854775807
+statement error 22003
+SELECT $1::i16, $1::i64
+
+# Narrow indexed keys treat an out-of-width widened binding as a miss.
+statement ok
+CREATE TABLE narrow_key (id i16 PRIMARY KEY)
+
+statement ok
+INSERT INTO narrow_key VALUES (-1),(1),(100)
+
+# params: 40000
+# types: i16
+query I nosort
+SELECT id FROM narrow_key WHERE id = $1 AND $1 < 100000
+----
+
+# params: -40000
+# types: i16
+query I nosort
+SELECT id FROM narrow_key WHERE id = $1 AND $1 < 100000
+----
+
+# params: 9223372036854775807
+# types: i64
+query I nosort
+SELECT $1::i64 FROM narrow_key WHERE id = $1
+----
+
+# The same parameter has an i32 join-key context and an i64 bare-literal
+# arithmetic context; physical reordering must preserve the unified binding.
+# params: 1
+# types: i32,i32,i32
+query III nosort
+SELECT a.id,b.v,c.v FROM t a JOIN t b ON b.id=a.id+1 JOIN t c ON c.id=b.id WHERE a.id=$1 AND b.id=$1+1 AND c.id=$1+1 ORDER BY a.id
+----
+1
+20
+20
+
+# Two bare integer parameters still default locally to i64 when one occurrence
+# elsewhere was first constrained by an i16 column.
+# params: 40000, 40000
+# types: i32
+query I nosort
+SELECT id FROM narrow WHERE s = $1 AND $1 = $2
+----
+
+# params: 100, 100
+# types: i32
+query I nosort
+SELECT id FROM narrow WHERE s = $1 AND $1 = $2
+----
+1
+
+# params: NULL
+# types: i32,i32,i32
+query III nosort
+SELECT a.id,b.v,c.v FROM t a JOIN t b ON b.id=a.id+1 JOIN t c ON c.id=b.id WHERE a.id=$1 AND b.id=$1+1 AND c.id=$1+1 ORDER BY a.id
+----

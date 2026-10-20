@@ -40,6 +40,10 @@ bare `SELECT $1` has no type context and reports `42P18`, and a function whose o
 open (`abs($1)`, `round($1, 2)`) reports `42725`; write an explicit cast when the surrounding expression
 cannot supply one.
 
+If one placeholder is used in several integer contexts, its bound value uses the widest
+required integer type. Each expression still uses its own local type. Incompatible
+contexts, such as using the same placeholder as both an integer and text, report `42804`.
+
 A note on integers, because it is the one place the type systems differ. jed integers are 64-bit and
 **exact**. In Rust and Go that is the natural integer type. In TypeScript a `number` is a float, so
 jed uses **`bigint`** for integer values — an integer-valued `number` like `1` still binds as an

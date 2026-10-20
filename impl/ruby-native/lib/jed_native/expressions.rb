@@ -85,11 +85,25 @@ module JedNative
           end
           constant.value = cast_value(constant.value, other.type)
         else
-          cast_value(@params[constant.value], other.type)
-          constant.extra = { context_type: true }
+          if contextual_parameter_cast?(constant, other.type)
+            cast_value(@params[constant.value], other.type)
+            constant.extra = { context_type: true }
+          else
+            constant.extra = nil
+          end
         end
         constant.type = other.type
       end
+    end
+
+    def contextual_parameter_cast?(parameter, target)
+      bound = @native_binding_types&.[](parameter.value) || parameter.type
+      bound_width = Types::INTEGER_BITS[bound]
+      target_width = Types::INTEGER_BITS[target]
+      # Repeated integer contexts widen the binding, not each occurrence.
+      # Comparisons may inspect a wider value; arithmetic still checks its
+      # locally resolved result width, and explicit CAST remains a real cast.
+      !bound_width || !target_width || bound_width <= target_width
     end
 
     def binary_type(op, left, right)
