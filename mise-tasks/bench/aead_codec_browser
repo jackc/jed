@@ -1,0 +1,34 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Measure measurement-only async WebCrypto/sync XChaCha page codecs over real OPFS in Chromium"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+if ARGV.include?("--help")
+  puts "Usage: mise run bench:aead_codec_browser"
+  puts "Uses existing impl/ts Vite/Playwright/Chromium and the approved bench/aead/ts @noble/ciphers"
+  puts "(mise run bench:aead_setup); installs/downloads nothing. Outside mise run ci."
+  puts "JED_AEAD_CODEC_RESULTS sets the output directory (default bench/results/aead-codec-TIMESTAMP-PID)."
+  puts "JED_AEAD_CODEC_RUNS process runs (fresh Chromium each, default 5); JED_AEAD_CODEC_VARIANTS a comma list."
+  puts "Sample counts: JED_AEAD_CODEC_SINGLE, TX64, LARGE, OPENS, WARM_SCANS, BURST, RESP_REPS (+ *_WARMUPS);"
+  puts "sizes: JED_AEAD_CODEC_LARGE_ROWS, SCAN_ROWS. JED_AEAD_CODEC_ISOLATED=0 drops COOP/COEP."
+  exit
+end
+abort "Unexpected arguments; use --help" unless ARGV.empty?
+vite = File.join(TS_DIR, "node_modules/vite/bin/vite.js")
+playwright = File.join(TS_DIR, "node_modules/playwright-core/index.mjs")
+noble = File.join(ROOT, "bench/aead/ts/node_modules/@noble/ciphers/package.json")
+abort "Install the existing impl/ts tooling before benchmarking; no downloads performed" unless File.file?(vite) && File.file?(playwright)
+abort "Run mise run bench:aead_setup first (approved, locked @noble/ciphers)" unless File.file?(noble)
+
+directory = File.expand_path(ENV.fetch("JED_AEAD_CODEC_RESULTS", "bench/results/aead-codec-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(directory)
+revision, revision_ok = capture("git", "rev-parse", "HEAD")
+status, status_ok = capture("git", "status", "--porcelain")
+abort "Could not read benchmark revision" unless revision_ok && status_ok
+base = File.join(ROOT, "bench/aead/codec")
+sh "node", vite, "build", "--config", File.join(base, "vite.config.ts"), "--outDir", File.join(directory, "site")
+sh "node", File.join(base, "run.mjs"), directory,
+   env: { "JED_BENCH_REVISION" => revision.strip, "JED_BENCH_DIRTY" => (!status.empty?).to_s }
+sh "ruby", File.join(base, "summarize.rb"), File.join(directory, "results.json"), File.join(directory, "summary.md")
+puts "Summary: #{directory}/summary.md"
