@@ -382,8 +382,9 @@ sits so the options stay open (CLAUDE.md §9).
   it names, so page-level replay is `XX001` and the encrypted file is a distinct format variant
   with its own goldens and cost family; whole-file rollback needs a separate contract. Manifest
   page identities are over on-disk (ciphertext) bytes. Page capacity excludes a reserved region
-  that is never a user setting (a plaintext file reserves nothing); scratch files of an
-  encrypted database use an ephemeral key (encryption.md §1.1, §4–§4.2, §6). Vetted libraries
+  that is never a user setting (a plaintext file reserves nothing); scratch encryption is a
+  handle-level setting using an ephemeral per-file key, because scratch belongs to the session
+  while encryption belongs to each attached file (encryption.md §1.1, §4–§4.2, §6). Vetted libraries
   use safe APIs, with reviewed accelerated backends under CLAUDE.md §14. The present requirement is only
   that the format and seam not foreclose it — concretely, don't bake in assumptions that page
   bytes are plaintext-comparable on disk (already satisfied — hosts keep page bytes opaque).

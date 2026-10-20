@@ -135,13 +135,16 @@ Pages cross the service in their **on-disk (ciphertext) form**, below the encryp
 decrypts and encrypts with its own key; the owner's file and replication tee see exactly the bytes a
 single-process commit would write.
 
-The **owner still needs the key.** Manifest digests are computed over logical (decrypted) page bytes
-([validated-cow.md](validated-cow.md) §4), and every body page, including catalog, interior,
-free-list, and manifest-overflow pages, is encrypted ([encryption.md](encryption.md) §4). Recovery at
-open, commit validation and adoption (§5.6), the free-list rebuild (§6), and reachable-page backup
-(§9) therefore all decrypt. A keyless process can still be a replication subscriber or a replica's
-apply loop (§10), which store deltas as bytes at their indices without interpreting them. There is
-no keyless owner.
+The **owner still needs the key.** In an encrypted file the manifest digests are over the on-disk
+(ciphertext) bytes and the meta slot is plaintext, so validating a client's delta is keyless work;
+but every body page, including catalog, interior, free-list, and manifest-overflow pages, is
+encrypted ([encryption.md](encryption.md) §4), so recovery's logical checks at open, adoption (§5.6),
+the free-list rebuild (§6), and reachable-page backup (§9) all decrypt. A keyless process can still
+be a replication subscriber or a replica's apply loop (§10), which store deltas as bytes at their
+indices without interpreting them. There is no keyless owner. An owner answers `read_pages` with the
+**stored bytes** of a page, read below its codec, never a page re-sealed from its plaintext cache:
+every pointer in an encrypted file binds its child's AEAD tag, so a re-sealed page would fail the
+client's binding check (encryption.md §4).
 
 ### 5.2 Operations
 
@@ -567,6 +570,11 @@ these consequences of the owner model:
 - **Lineage.** Each delta carries `(database id, timeline, txid)`. Promoting a replica, compacting,
   or breaking the stream starts a new timeline; a subscriber on another timeline must re-seed.
   Persisting a database id is a format change, scheduled with the replication slice.
+- **Key-block changes are stream items.** In an encrypted database a credential change rewrites
+  the key block (pages 2–3) outside any commit. It enters the stream as a key-block delta ordered
+  after the commit it follows, under the same lineage and log-durability rule, and a replica
+  applies it as writes at those indices plus a barrier, so a replica always unlocks with the
+  primary's current credential ([encryption.md](encryption.md) §6).
 - **Asynchronous by construction.** Without a server, no primary waits on a remote acknowledgment, so
   replication can lose the commits not yet shipped. Off-host shipping is a pull (`subscribe` over SSH)
   or a push by a local sidecar subscriber to object storage (the Litestream model).
