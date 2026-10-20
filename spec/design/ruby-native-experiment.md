@@ -95,6 +95,15 @@ sites, with source-and-pool reuse and complete-predicate fallback.
 The [JOIN-admission follow-up](../../impl/ruby-native/JOIN_ADMISSION_FOLLOWUP.md)
 reduces emission and ON-program setup for cheap predicates over known small
 inputs while retaining compilation for larger and unknown inputs.
+The [scalar-function JOIN follow-up](../../impl/ruby-native/JOIN_FUNCTIONS_FOLLOWUP.md)
+extends bounded resolution reuse to reviewed ordinary scalar built-ins, with
+current environment/type guards and unchanged runtime evaluation.
+It covers 26 integer/text functions listed in that report, while same-name
+host registrations and call modifiers conservatively decline. Newly resolved
+call-bearing roots receive a bounded plain-scalar validation before retention;
+warm hits keep the existing lookup path. A rejected current root also prevents
+physical-plan publication for that execution. Existing cache limits and
+parameter-sensitive planning remain in force.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

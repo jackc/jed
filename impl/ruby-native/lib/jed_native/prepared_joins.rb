@@ -16,6 +16,15 @@ module JedNative
     SCALAR_TYPES = %w[i16 i32 i64 boolean text].freeze
     BINARY = %w[+ - * / % & | # << >> = <> != < <= > >= and or is\ distinct\ from is\ not\ distinct\ from].freeze
     UNARY = %w[+ - ~ not is\ null is\ not\ null is\ true is\ false is\ unknown is\ not\ true is\ not\ false is\ not\ unknown].freeze
+    # These calls resolve to ordinary scalar expressions. Their evaluation,
+    # collation and resource charging still belong to the current execution.
+    # In particular, omit regex/format programs, clocks, aggregates and builders
+    # with additional resolved state rather than admitting arbitrary calls.
+    SCALAR_FUNCTIONS = %w[
+      abs mod gcd lcm lower upper initcap length char_length character_length
+      octet_length bit_length ascii chr reverse left right substr strpos
+      starts_with btrim ltrim rtrim replace translate split_part
+    ].freeze
     Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, :physical,
       :sources, :source_units, :source_bytes, keyword_init: true)
     Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, :physical_observation,
@@ -193,7 +202,7 @@ module JedNative
       frame.physical_observation = observation
       before = @cost
       plan = yield
-      if plan && @cost == before && !observation[:sensitive]
+      if plan && frame.physical_reuse && @cost == before && !observation[:sensitive]
         # Normalized integer/boolean casts are pure and unmetered. Keep the
         # first of each duplicate, but preserve text conversions in order:
         # even an exact String can have a host-defined singleton to_s method.
@@ -331,9 +340,10 @@ module JedNative
       prepared_join_nodes?(roots)
     end
 
-    def prepared_join_nodes?(roots)
+    def prepared_join_nodes?(roots, expression = nil)
       pending = roots.compact.map { |node| [node, 0] }
       nodes, bytes = 0, 0
+      calls = false
       until pending.empty?
         node, depth = pending.pop
         nodes += 1
@@ -359,8 +369,56 @@ module JedNative
                    when :binary
                      return false unless BINARY.include?(node[:op])
                      [node[:left], node[:right]]
+                   when :call
+                     return false unless prepared_join_scalar_call?(node)
+                     calls = true
+                     node[:args]
                    else return false
                    end
+        return false if nodes + pending.length + children.length > 192
+        children.each { |child| pending << [child, depth + 1] }
+      end
+      !calls || !expression || prepared_join_scalar_tree?(expression)
+    end
+
+    def prepared_join_scalar_call?(node)
+      SCALAR_FUNCTIONS.include?(node[:name]) && !host_function_name?(node[:name]) &&
+        !node[:over] && !node[:filter] && !node[:distinct] && !node[:within_group] && !node[:variadic] &&
+        (node[:order_by] || []).empty? && (node[:arg_names] || []).empty? && node[:args].instance_of?(Array)
+    end
+
+    def prepared_join_scalar_tree?(expression)
+      # Validate only on publication, never on a warm root hit. Literal overload
+      # resolution may rewrite arguments, so syntax admission alone is not the
+      # ownership/type boundary of the retained resolved tree.
+      pending = [[expression, 0]]
+      nodes, bytes = 0, 0
+      until pending.empty?
+        item, depth = pending.pop
+        nodes += 1
+        return false if nodes > 192 || depth > 32
+        return false unless item.instance_of?(Expression) &&
+          (SCALAR_TYPES.include?(item.type) || %w[unknown null].include?(item.type)) && !@types.key?(item.type)
+        case item.kind
+        when :literal
+          value = item.value
+          return false unless value.nil? || value == true || value == false || value.is_a?(Integer) || value.is_a?(String)
+          bytes += value.bytesize if value.is_a?(String)
+          return false if bytes > 32_768
+        when :column, :param, :star
+        when :unary
+          return false unless UNARY.include?(item.value)
+        when :binary
+          return false unless BINARY.include?(item.value)
+        when :cast
+          return false unless Types::INTEGER_BITS.key?(item.type) && !item.extra&.dig(:type_mod)
+        when :call
+          return false unless SCALAR_FUNCTIONS.include?(item.value) && !host_function_name?(item.value)
+        else return false
+        end
+        children = item.args
+        next unless children
+        return false unless children.instance_of?(Array) && nodes + pending.length + children.length <= 192
         children.each { |child| pending << [child, depth + 1] }
       end
       true
@@ -384,9 +442,17 @@ module JedNative
       frame.depth += 1
       frame.checks = []
       expression = yield
+      admitted = prepared_join_nodes?([node], expression)
+      unless admitted
+        # An existing statement entry can see a changed AST or a planner-made
+        # root. Never let unsupported syntax/resolution enter a physical winner
+        # merely because its original statement once passed the entry gate.
+        frame.physical_reuse = false
+        frame.physical_observation[:sensitive] = true if frame.physical_observation
+      end
       # Only successful, unmetered resolution is retained. Keys own snapshots
       # because planner rewrites manufacture fresh equivalent AST/scope hashes.
-      if @cost == before && frame.entry.roots.length < ROOT_ENTRIES && prepared_join_nodes?([node])
+      if @cost == before && frame.entry.roots.length < ROOT_ENTRIES && admitted
         retained = [key]
         retained << columns unless scope
         retained << node unless syntax

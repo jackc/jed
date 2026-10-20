@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/join_functions_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-join-functions-smoke-final.json"
+  ],
+  "success": false,
+  "reason": "worker exited 1",
+  "peak_rss_bytes": 50982912,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 2.3523658360063564,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "405f5536969b71c80fa30bd45d962bda33af642b0185039d76e6443005c35336",
+  "final_source_sha256": "405f5536969b71c80fa30bd45d962bda33af642b0185039d76e6443005c35336",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "",
+  "stderr": "bench/ruby-native/join_functions_diagnostics.rb:259:in 'block (2 levels) in JoinFunctionsDiagnostics.workload_cases': retained roots were not reused: join_text_projection execute_prepared (RuntimeError)\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:234:in 'Array#each'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:234:in 'block in JoinFunctionsDiagnostics.workload_cases'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:233:in 'Array#each'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:233:in 'JoinFunctionsDiagnostics.workload_cases'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:458:in 'block (2 levels) in JoinFunctionsDiagnostics.main'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:454:in 'Array#each'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:454:in 'block in JoinFunctionsDiagnostics.main'\n\tfrom /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/4.0.0/tmpdir.rb:105:in 'Dir.mktmpdir'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:453:in 'JoinFunctionsDiagnostics.main'\n\tfrom bench/ruby-native/join_functions_diagnostics.rb:498:in '<main>'\n"
+}

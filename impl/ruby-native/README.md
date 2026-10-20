@@ -54,6 +54,8 @@ The [JOIN-predicate follow-up](JOIN_PREDICATE_FOLLOWUP.md) applies the existing
 scalar compiler at JOIN predicate evaluation sites.
 The [JOIN-admission follow-up](JOIN_ADMISSION_FOLLOWUP.md) reduces compilation
 setup for cheap predicates over known small inputs.
+The [scalar-function JOIN follow-up](JOIN_FUNCTIONS_FOLLOWUP.md) extends bounded
+resolution reuse to ordinary scalar built-ins.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
