@@ -47,11 +47,15 @@ These bind the eventual build; everything else in this doc that says "open" stil
   general-purpose seeded entropy seam (§3.1, *Threat model*).
 - **Browser performance is not a deciding factor for the suite.** Encrypted browser databases
   are expected to be uncommon.
-- **Suite direction: AES-256-GCM with keys derived by HKDF-SHA-256 from fresh random salts**, chosen
+- **Suite direction: AES-256-GCM with one key derived per page from a fresh random salt**, chosen
   for standard-library support across current and future native cores (§3.1). XChaCha20-Poly1305 is
-  dropped. This becomes a format decision after a security review and the fault fixtures.
-- **One key per page (2026-10-20).** Every page encryption draws its own salt and derives a
-  single-use key; per-commit-attempt keys are not pursued (§3.1, *Key granularity*).
+  dropped. **XAES-256-GCM** (C2SP) is the primary candidate for the derivation, with a jed-specific
+  HKDF-SHA-256 layout as the fallback if a backend finding rules XAES out (§3.1, *Construction*).
+  AES-GCM-SIV is declined for platform support alone, a knowing trade (§3.1, *Why not
+  AES-GCM-SIV*). This becomes a format decision after a security review and the fault fixtures.
+- **One key per page (2026-10-20).** Every page encryption draws its own random salt (the
+  XAES-256-GCM nonce, or the fallback layout's HKDF salt) and derives a single-use key;
+  per-commit-attempt keys are not pursued (§3.1, *Key granularity*).
 
 ## 2. Where it sits: a page codec in the core, above the seam
 
@@ -113,17 +117,20 @@ codec is hand-rolled (large-values.md §6). **Encryption is the opposite case:**
   any necessary determinism-ledger change before implementation; never trade nonce safety for
   identical files. Recovery, retry, copying, and backup tests must establish the chosen contract.
 
-### 3.1 Suite direction: AES-256-GCM with random-salt HKDF keys (not yet a format decision)
+### 3.1 Suite direction: AES-256-GCM with per-page derived keys (not yet a format decision)
 
 Prefer **one initial suite** across cores, with a versioned format for later replacement. A second
 suite needs a measured platform limitation or concrete interoperability requirement.
 
-**Direction (2026-10-19):** AES-256-GCM, where every key is derived with HKDF-SHA-256 from the
-data key and a **fresh random salt**, one key per page encryption (below).
-Nothing about key or nonce use is persisted or allocated across commits. This becomes a format
-decision only after a security review of the exact construction and the fault fixtures below.
-XChaCha20-Poly1305 is no longer a candidate, nor is AES-GCM-SIV (absent from WebCrypto and most
-standard libraries, and it still needs a nonce policy).
+**Direction (2026-10-19; construction revised 2026-10-20):** AES-256-GCM, where every page
+encryption derives a single-use key from the data key and a **fresh random salt**, one key per
+page (below). Nothing about key or nonce use is persisted or allocated across commits. The
+derivation is **XAES-256-GCM** (C2SP) as the primary candidate, with a jed-specific HKDF-SHA-256
+layout as the fallback (*Construction* below). This becomes a format decision only after a
+security review of the exact construction and the fault fixtures below. XChaCha20-Poly1305 is no
+longer a candidate. AES-GCM-SIV is not pursued either, for platform reasons alone (*Why not
+AES-GCM-SIV* below): its failure behavior under repeated randomness is strictly better, and
+choosing AES-GCM over it is a knowing trade.
 
 Three findings settle the direction:
 
@@ -146,16 +153,16 @@ Three findings settle the direction:
 Support for the primitives, by platform (late 2026; check each platform's runtime guards, such as
 .NET's `IsSupported`, before relying on a row):
 
-| Platform | AES-256-GCM | HKDF-SHA-256 | XChaCha20-Poly1305, for comparison |
-|---|---|---|---|
-| Go | standard library (`crypto/cipher`) | standard library (`crypto/hkdf`) | `golang.org/x/crypto` |
-| Rust | RustCrypto `aes-gcm` | RustCrypto `hkdf` | RustCrypto `chacha20poly1305` |
-| Node | `node:crypto`, synchronous | `node:crypto` | none native; Noble (pure JS) |
-| Browser | WebCrypto, asynchronous | WebCrypto | none native; Noble or Rust/WASM |
-| Java | JCA, built in and accelerated | JDK 25+ `javax.crypto.KDF` ([JEP 510](https://openjdk.org/jeps/510)); Bouncy Castle or Tink before | not in the JDK ([JDK-8256529](https://bugs.openjdk.org/browse/JDK-8256529) open); Bouncy Castle or Tink |
-| .NET | `AesGcm`; macOS via CryptoKit since .NET 8; not in browser WASM ([platform table](https://learn.microsoft.com/dotnet/standard/security/cross-platform-cryptography)) | `HKDF` (.NET 5+) | not in the base library; third-party only |
-| Swift | CryptoKit / swift-crypto `AES.GCM` | CryptoKit `HKDF` | not in CryptoKit or swift-crypto (96-bit `ChaChaPoly` only) |
-| Python (reach) | `cryptography` `AESGCM` | `cryptography` | not in `cryptography`; PyNaCl (libsodium) |
+| Platform | AES-256-GCM | Raw AES block (the XAES-256-GCM derivation) | HKDF-SHA-256 (fallback layout; key hierarchy) | XChaCha20-Poly1305, for comparison |
+|---|---|---|---|---|
+| Go | standard library (`crypto/cipher`) | standard library (`crypto/aes`) | standard library (`crypto/hkdf`) | `golang.org/x/crypto` |
+| Rust | RustCrypto `aes-gcm` | RustCrypto `aes` | RustCrypto `hkdf` | RustCrypto `chacha20poly1305` |
+| Node | `node:crypto`, synchronous | `node:crypto` (`aes-256-ecb`) | `node:crypto` | none native; Noble (pure JS) |
+| Browser | WebCrypto, asynchronous | not in WebCrypto (no ECB/CMAC); Noble (pure JS) | WebCrypto | none native; Noble or Rust/WASM |
+| Java | JCA, built in and accelerated | JCA `AES/ECB/NoPadding` | JDK 25+ `javax.crypto.KDF` ([JEP 510](https://openjdk.org/jeps/510)); Bouncy Castle or Tink before | not in the JDK ([JDK-8256529](https://bugs.openjdk.org/browse/JDK-8256529) open); Bouncy Castle or Tink |
+| .NET | `AesGcm`; macOS via CryptoKit since .NET 8; not in browser WASM ([platform table](https://learn.microsoft.com/dotnet/standard/security/cross-platform-cryptography)) | `Aes.EncryptEcb` (.NET 6+) | `HKDF` (.NET 5+) | not in the base library; third-party only |
+| Swift | CryptoKit / swift-crypto `AES.GCM` | **not in CryptoKit** (no raw block or CMAC API); Swift leans wrap (CLAUDE.md §2) | CryptoKit `HKDF` | not in CryptoKit or swift-crypto (96-bit `ChaChaPoly` only) |
+| Python (reach) | `cryptography` `AESGCM` | `cryptography` (ECB, CMAC) | `cryptography` | not in `cryptography`; PyNaCl (libsodium) |
 
 Measured speed (§8, 8 KiB pages): AES-GCM seal is 0.87 µs in Go and 2.60 µs in Rust, about 4 µs
 through Node's native API, and 7–9 µs per page in situ through WebCrypto. Deriving a fresh key
@@ -174,9 +181,11 @@ reservation before the commit guard (§8.1) or an allocator owner across page-se
 committer derives its own keys.
 
 - **Per page (chosen).** Each page encryption draws a salt and derives a single-use key; with each
-  key sealing one message, the GCM nonce can be fixed. Per-page fields: the salt (24–32 bytes) and
-  the 16-byte tag, 40–48 bytes. Reads derive the page's key on every cache miss; there is no key
-  cache. This is the simplest form.
+  key sealing one message, the GCM nonce can be fixed (under XAES-256-GCM the salt *is* the
+  192-bit nonce: half derives the key, half is the GCM nonce — *Construction* below). Per-page
+  fields: the salt (24 bytes under XAES, 24–32 under the HKDF fallback) and the 16-byte tag, 40 or
+  40–48 bytes. Reads derive the page's key on every cache miss; there is no key cache. This is
+  the simplest form.
 - **Per commit attempt (not pursued).** Each commit attempt draws one salt and seals its pages with
   nonces that count up within the attempt, held only in memory. Per-page fields: the salt, a 4-byte
   page ordinal and the tag, 52 bytes with a 32-byte salt. Readers cache derived keys by salt in a
@@ -198,25 +207,90 @@ reserve and no key cache, and per-commit keys help only when consecutive misses 
 commit, being no better on cold reads. The salt length (24 or 32 bytes) and the HKDF layout remain
 for the security review; the expand-per-key layout measured cheaper (below).
 
-A random salt of at least 192 bits makes a repeated salt negligible across any realistic number of
-keys, and each derived key seals a single page, far below GCM's per-key limits. The construction is
-our composition of standard primitives, close to [Tink's AES-GCM-HKDF streaming
-AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming) and C2SP's
-XAES-256-GCM, but neither analysis covers a mutable page codec automatically. The review must cover
-the exact HKDF layout (random salt as the extract salt, or as expand context under one extracted
-key), domain separation, salt length and cumulative bounds. The expand-context layout measured 0.24
-µs per key cheaper in Go and 0.16 µs in Rust (§8), since it extracts once at unlock.
-
 The earlier **writer-lifetime** candidate, one derived key per acquisition of write ownership with
 a counter for every encryption under it, is not pursued: its counter allocation across
 page-service clients, key-budget rotation and recovery argument are exactly the protocol the
-random-salt granularities avoid, for a derivation saving that measured below 1 µs per page.
+random-salt granularities avoid, for a derivation saving that measured below 1 µs per page. The
+same objection covers any persisted write counter: two byte-identical copies of a file share the
+data key and the counter's high-water mark, so both resume at the same value and collide. Only
+per-write randomness (or a misuse-resistant AEAD) survives a writable fork.
+
+#### Construction: XAES-256-GCM first, a jed HKDF layout as fallback (2026-10-20)
+
+The random salt **is the construction's external nonce**. Its repetition under one data key is the
+hazard, not the fixed GCM nonce: a repeated salt repeats the derived key, and the fixed nonce then
+reuses catastrophically (GCM exposes the keystream XOR and its authentication subkey, so forgery
+follows for the whole derived key). For a uniformly random `s`-bit salt over `q` encryptions under
+one data key, the collision term is about `q(q-1)/2^(s+1)` — negligible for a 192-bit salt across
+any realistic number of pages, though only one term of the full security argument. Each derived
+key seals a single page, far below GCM's per-key limits.
+
+Two constructions realize this derive-key design with AES-256-GCM:
+
+- **XAES-256-GCM (primary candidate).** Specified by
+  [C2SP](https://github.com/C2SP/C2SP/blob/main/XAES-256-GCM.md) with test vectors. A 192-bit
+  nonce is split: the first 96 bits and the 256-bit key go through the NIST SP 800-108 KDF in
+  counter mode with CMAC-AES-256 (label `"X"`, a 16-bit counter) to derive a one-message
+  AES-256-GCM key; the remaining 96 bits are the GCM nonce. The spec's stated bound is about
+  2^80 messages per key at a 2^-32 collision risk, and it states what the construction is not:
+  **not nonce-misuse-resistant and not key-committing**, matching the assumptions above. Its
+  derivation is two AES block encryptions plus an AES-256 key schedule (one further block per
+  long-term key, amortized), so by operation count it is cheaper than an HMAC-SHA-256 expand and
+  it removes SHA-256 from the page path. It needs only **raw AES block encryption** beyond GCM,
+  which Go's standard library, Node, JCA, .NET and Noble expose and CryptoKit does not (table
+  above); Go has no CMAC, so there the two-block derivation is written in the layout the spec
+  fixes and checked against its vectors — a composition of a vetted primitive, the same category
+  as the fallback layout, whose admissibility under CLAUDE.md §14 is part of the review. Caveats:
+  the RustCrypto `xaes-256-gcm` crate states it has had no security audit, and an independent
+  published cryptanalysis of the construction was not confirmed when this was written, so a review
+  of the composition is still owed; it is a smaller obligation than reviewing a layout only jed
+  specifies. Per-page reserve: **40 bytes** (24-byte nonce + 16-byte tag). Not yet measured in
+  the §8 harness.
+- **HKDF-SHA-256 + AES-256-GCM under a fixed nonce (fallback).** Our own composition of standard
+  primitives, close to [Tink's AES-GCM-HKDF streaming
+  AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming), but Tink's
+  construction includes a separate random nonce prefix and segment framing, so its analysis
+  cannot be inherited by dropping those elements; neither it nor the XAES analysis covers a
+  mutable page codec automatically. The layout is frozen only after the four conditions in §9
+  are met: one exact construction (random salt as the extract salt, or as expand context under
+  one key extracted at unlock; domain separation; 96-bit nonce; full tag; authenticated page
+  context), quantitative lifetime bounds, review of the complete composition, and per-backend API
+  feasibility (WebCrypto's HKDF always runs Extract then Expand, so the expand-only layout needs
+  an HMAC path there). The expand-context layout measured 0.24 µs per key cheaper in Go and
+  0.16 µs in Rust (§8), since it extracts once at unlock. Per-page reserve: 40–48 bytes (24- or
+  32-byte salt + tag).
+
+HKDF stays regardless for the **once-per-unlock key hierarchy**: unwrapping the data key and
+separating purposes (pages, meta authentication, key wrapping, scratch files — §6), where it is
+the standard tool and its cost is paid once.
+
+| Construction | Derivation per page | Reserve per page | On repeated randomness | Platform fit | Specification |
+|---|---|---|---|---|---|
+| HKDF-SHA-256 + AES-256-GCM, fixed nonce (fallback) | one HMAC-SHA-256 expand + AES key schedule | 40–48 bytes | catastrophic: keystream and GHASH key exposed | every platform library | jed-owned composition; Tink/XAES analyses do not transfer |
+| **XAES-256-GCM (primary)** | two AES blocks + AES key schedule | 40 bytes | catastrophic, as GCM | every platform but CryptoKit (raw AES block) | C2SP, with vectors; ~2^80 messages/key at 2^-32 collision; not misuse-resistant, not key-committing |
+| XChaCha20-Poly1305 | HChaCha20 | 40 bytes | keystream reuse exposed; forgery limited to that nonce (per-nonce Poly1305 key) | third-party outside Rust and TS; dropped | IETF draft; libsodium implementations |
+| AES-256-GCM-SIV | per-nonce key derivation; two passes over the plaintext | 28 bytes | discloses only whether the two plaintexts were equal | absent from Go stdlib and `x/crypto`, WebCrypto, and the Java/.NET/Swift platform libraries | RFC 8452 (CFRG informational) |
+
+**Why not AES-GCM-SIV.** Its advantage is exactly the failure mode in the table:
+[RFC 8452 §9](https://www.rfc-editor.org/rfc/rfc8452#section-9) states that encrypting two
+messages under one nonce discloses only whether they were equal, and it recommends random nonces.
+Needing a nonce policy is not a mark against it — every AEAD here needs one, and GCM-SIV's usage
+bounds still apply. It is not pursued for **platform reasons alone**: it is absent from Go's
+standard library and `golang.org/x/crypto`, from WebCrypto, and from the Java, .NET and Swift
+platform libraries, so every native core would carry a third-party implementation, and its
+two-pass encryption costs more than GCM. Choosing AES-GCM over it is a **knowing trade** of
+graceful failure under duplicated randomness for platform support. The trade is recorded here so
+the live-clone discussion below is read with it; reconsider GCM-SIV if the tolerance for RNG
+failure and live snapshots changes.
+
+#### Threat model, entropy and fault fixtures
 
 **Threat model.** Nonce reuse can expose plaintext relationships to an offline attacker holding
 two backups; it does not require control of a running process. A single writer cannot prevent
 historical reuse on its own. Protect ordinary consistent copies, backup restoration and crash
-remnants. Per-page keys draw fresh randomness for every encryption, so a live process
-fork/checkpoint repeats a key only if it duplicates the random-number generator state (below).
+remnants. Per-page keys draw fresh randomness for every encryption, so a live process fork or
+virtual-machine snapshot repeats a key only if it duplicates the random-number generator state —
+which a restored clone can do (below).
 
 **Key material uses a dedicated cryptographic entropy source (decided).** Data keys, KDF salts,
 page and commit salts and scratch-file keys are drawn from a source separate from the
@@ -224,9 +298,26 @@ general-purpose entropy seam that SQL generators use ([entropy.md](entropy.md)).
 install a seeded source there to make `uuidv4` reproducible; if that source also fed key
 material, the data key would be predictable, and two runs would repeat salts, so the same derived
 keys would seal different pages under the same nonces. In production the cryptographic source
-reads the OS CSPRNG directly, not a buffered userspace generator whose state a VM snapshot or
-process fork can duplicate. Fixtures and simulation inject fixed bytes only through an
+reads the OS CSPRNG directly, never a buffered userspace generator, so a process fork cannot
+duplicate engine-held generator state. Fixtures and simulation inject fixed bytes only through an
 explicitly insecure test option, which never applies by default.
+
+**Live VM clones can duplicate the OS CSPRNG too (open).** Reading the kernel generator does not
+cover a restored virtual-machine snapshot: the clone resumes with the guest kernel's RNG state
+duplicated. Linux reseeds from the hypervisor's VM generation ID, but the [virtio-rng
+entropy-leak proposal](https://lore.kernel.org/lkml/Y9lBeymca9eFaJ33@zx2c4.com/T/) documents a
+window between resume and that reseed, and the generation ID never notifies userspace. A salt
+drawn in that window repeats in two clones, the derived key repeats with it, and the fixed GCM
+nonce then reuses catastrophically. This is not specific to random salts: every nonce discipline
+that takes no fresh entropy after restore fails identically (a persisted or in-memory counter
+resumes at the same value in both clones), and only a misuse-resistant AEAD degrades to an
+equality leak instead (*Why not AES-GCM-SIV*). Ordinary database-file restoration is the
+well-handled case: a restored file draws new salts on its next write. A live clone is the hazard.
+The decision to record: either **exclude live VM clones from the threat model** explicitly, or
+**specify the host guarantee** the engine relies on (the guest is reseeded, or the host injects
+fresh entropy into the cryptographic source, before any write after restore). The lean is to
+exclude and document: the platform criterion already rules out GCM-SIV, and an attacker who needs
+two clone images is a narrower threat than a crash retry. Open for the user's decision (§9).
 
 Required future fault fixtures: aborted encryption before/after each body/meta write, failed
 barriers, retry and owner promotion, restore followed by divergent writes, independently opened
@@ -251,19 +342,27 @@ remains a separate trusted-state guarantee.
   crash remnant: the tag verifies and the page index in the AAD matches. A "generation" in the
   AAD helps only if the reader learns the expected generation from somewhere trusted, not from
   the page itself. Copy-on-write makes a fix natural: every child rewrite already rewrites its
-  parent, so a parent pointer (and the meta root pointer) could carry the child's write
-  generation or tag, chaining authentication from the authenticated meta down the tree as ZFS
-  block pointers do. The cost is wider pointers and so lower interior fan-out (another input
-  to `C`, §4.1). The alternative is to exclude page-level replay from the threat model
-  explicitly, as SQLCipher effectively does. Either is a decision to record before building;
-  silently inheriting the gap is not.
-- **Manifest page identities (open).** The validated-COW manifest hashes logical (decrypted)
-  page bytes ([validated-cow.md](validated-cow.md) §5), so recovery's completeness check needs
-  the key, as it does at a page-service owner ([page-service.md](page-service.md)). Defining the
-  identity over on-disk bytes instead would let a keyless replica or backup check that an
-  applied delta is complete, without authenticating it. Note the manifest also covers a case
-  AEAD alone cannot: a page write that never reached disk leaves the older, still-valid
-  ciphertext in place. Decide which bytes the manifest names when the format is specified.
+  parent, so a parent pointer (and the meta root pointer) could carry a binding to the child,
+  chaining authentication from the authenticated meta down the tree as ZFS block pointers do.
+  That binding must be a **unique write identity, not a transaction number**: `txid` repeats
+  across divergent histories (a restored copy and the original both write `txid + 1`), so a
+  parent carrying the child's `txid` would accept either history's page. With per-page random
+  salts the child's salt or tag is unique per write by construction; the recommendation is to
+  bind the child's **tag** (16 bytes per pointer), which binds the exact ciphertext rather than
+  only its identity. The cost is wider pointers and so lower interior fan-out (another input to
+  `C`, §4.1), which is why this decision precedes reserve sizing. The alternative is to exclude
+  page-level replay from the threat model explicitly, as SQLCipher effectively does. Either is a
+  decision to record before building; silently inheriting the gap is not.
+- **Manifest page identities (open; recommendation: on-disk bytes).** The validated-COW manifest
+  hashes logical (decrypted) page bytes ([validated-cow.md](validated-cow.md) §5), so recovery's
+  completeness check needs the key, as it does at a page-service owner
+  ([page-service.md](page-service.md)). Defining the identity over the **on-disk (ciphertext)
+  bytes** instead lets a keyless replica or backup check that an applied delta is complete,
+  without authenticating it, and keeps recovery's candidate selection keyless; that is the
+  recommended layout, with authentication left to the page tags and the authenticated meta. Note
+  the manifest also covers a case AEAD alone cannot: a page write that never reached disk leaves
+  the older, still-valid ciphertext in place — a ciphertext digest detects that as a logical one
+  does. The choice is recorded when the format is specified.
 - **The AEAD tag supersedes the CRC for encrypted pages.** The tag detects *both* corruption and
   tampering — strictly stronger than the CRC, which detects only the former (§1). So an encrypted
   file relies on the AEAD tag rather than the CRC for stored-byte integrity. This *closes* the
@@ -375,10 +474,13 @@ backups. Incremental multi-key rotation remains a possible later design, not an 
 
 ## 7. Crypto implementation and the §14 gate
 
-Use vetted AEAD and KDF implementations, never hand-written cryptographic primitives. AES-256-GCM
-and ChaCha20-Poly1305 are benchmark candidates, not selected file algorithms; Argon2id and scrypt
-remain KDF candidates. Go may use its standard library where sufficient. Any new dependency,
-including a benchmark-only dependency, requires explicit human approval under CLAUDE.md §14.
+Use vetted AEAD and KDF implementations, never hand-written cryptographic primitives. The suite
+direction is AES-256-GCM with one derived key per page — XAES-256-GCM first, a jed HKDF-SHA-256
+layout as fallback (§1.1, §3.1); no production library or backend is selected, and
+ChaCha20-Poly1305 remains only a measured comparison (§8). The passphrase KDF for the wrapping key
+(§6) is an open selection, made with the wrapped-key format (§9). Go may use its standard library
+where sufficient. Any new dependency, including a benchmark-only dependency, requires explicit
+human approval under CLAUDE.md §14.
 
 **Safe engine code and safe library APIs are the boundary.** No cgo or external C-library FFI is
 introduced into the Go core. Reviewed cryptographic implementations may use assembly or hardware
@@ -523,13 +625,16 @@ crash behavior. They **select no suite**. See the
 
 ## 9. Open / deferred
 
-**Suite direction: AES-256-GCM with random-salt HKDF keys, one key per page** (§3.1). Platform
-support across current and future native cores decides it: AES-GCM and HKDF are in every standard
-library, while XChaCha20-Poly1305 is in none. Browser performance is not a deciding factor. The
-direction becomes a format decision after a security review of the exact construction and the §3.1
-fault fixtures; no production dependency is selected. Still to decide in that review: the salt
-length (24 or 32 bytes) and the HKDF layout. A pure-JS fallback and a software-WASM backend are
-material deployment costs, not reasons by themselves to maintain two file suites.
+**Suite direction: AES-256-GCM with one derived key per page — XAES-256-GCM first, a jed
+HKDF-SHA-256 layout as fallback** (§3.1). Platform support across current and future native cores
+decides the AEAD: AES-GCM and the raw AES block are in every standard library but CryptoKit, while
+XChaCha20-Poly1305 is in none and AES-GCM-SIV in almost none. Browser performance is not a deciding
+factor. The direction becomes a format decision after a security review of the exact construction
+and the §3.1 fault fixtures; no production dependency is selected. Still to decide in that review:
+XAES versus the HKDF fallback (and, for the fallback, the salt length and HKDF layout), the
+RNG-duplication decision (§3.1, *Live VM clones*), the replay binding and the manifest bytes (§4).
+A pure-JS fallback and a software-WASM backend are material deployment costs, not reasons by
+themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one
 algorithm; the selected Noble exports were 3.7–4.6 KiB gzipped. These exclude the passphrase KDF,
@@ -537,16 +642,30 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
 [size methodology and exact inventory](../../bench/aead/README.md#dependency-and-binary-footprint).
 
 - **The whole feature** remains unimplemented and unscheduled; non-foreclosure is satisfied.
-- **AEAD, KDF and exact library/backend selection**, including supported fallback CPUs.
+- **Construction, KDF and exact library/backend selection** — XAES-256-GCM versus the HKDF
+  fallback (§3.1), the passphrase KDF for the wrapping key, backends, and supported fallback CPUs.
+- **Freezing the HKDF fallback layout**, if XAES is ruled out, requires all four: (1) one exact
+  construction — derivation layout, framing, purpose separation, the 96-bit GCM nonce, the full
+  tag and the authenticated page context; (2) quantitative lifetime bounds across all uses of a
+  DEK, including failed attempts and writable copies (the collision term `q(q-1)/2^(s+1)` for an
+  `s`-bit salt is one term of that argument, not the whole of it); (3) review of the complete
+  composition — primitive vectors and cross-core agreement establish implementation consistency,
+  not cryptographic security; (4) exact API feasibility per backend (WebCrypto's HKDF always runs
+  Extract then Expand, so an expand-only layout needs a vetted HMAC path there).
+- **RNG duplication under live VM clones** — exclude from the threat model, or specify the host
+  reseed guarantee the engine relies on (§3.1); lean: exclude and document.
 - **Nonce/domain lifecycle** under failed commits, recovery, restore, writable copies and
   compaction; encoding, lifetime limits, and any determinism-ledger revision.
 - **Authenticated metadata and wrapped-key format**, including bounded KDF inputs, bootstrap
   validation, both meta slots, and atomic credential changes.
 - **Data-key rotation protocol**, old-key retirement and coordination with open clients.
-- **Page-level replay** — parent-pointer binding versus an explicit threat-model exclusion (§4).
-- **Manifest identity bytes** — logical versus on-disk, and so whether a keyless replica can
-  check delta completeness (§4).
-- **Reserve sizing** — the reserve per suite and binding choice, and whether plaintext files
+- **Page-level replay** — binding the child's tag in parent pointers (recommended) versus an
+  explicit threat-model exclusion; a `txid` is not a usable binding; decided before reserve
+  sizing (§4).
+- **Manifest identity bytes** — on-disk (ciphertext) bytes recommended, so a keyless replica can
+  check delta completeness and recovery's candidate selection stays keyless (§4).
+- **Reserve sizing** — the reserve per construction (40 bytes under XAES-256-GCM, 40–48 under the
+  HKDF fallback, plus 16 per child pointer if tags are bound), and whether plaintext files
   reserve by default (§4.1).
 - **Integrated performance**, async page/commit prototype and browser portability measurements.
 
@@ -577,3 +696,8 @@ This is an optional, unscheduled SQL feature, not a prerequisite for encryption 
 - [RustCrypto AES backends](https://docs.rs/aes/latest/aes/)
 - [Go AES timing qualifications](https://pkg.go.dev/crypto/aes)
 - [Noble ciphers and WebCrypto API](https://github.com/paulmillr/noble-ciphers)
+- [XAES-256-GCM (C2SP)](https://github.com/C2SP/C2SP/blob/main/XAES-256-GCM.md) and its
+  [design write-up](https://words.filippo.io/xaes-256-gcm/)
+- [RFC 8452, AES-GCM-SIV](https://www.rfc-editor.org/rfc/rfc8452) (§9: nonce-reuse behavior)
+- [virtio-rng entropy-leak reporting (RFC patch)](https://lore.kernel.org/lkml/Y9lBeymca9eFaJ33@zx2c4.com/T/):
+  the VM-snapshot reseed window

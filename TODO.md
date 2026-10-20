@@ -655,14 +655,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   authenticated metadata transitions remain open; `(page_index, txid)` alone is insufficient.
   Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
-  `bench/aead/`. Suite direction (encryption.md §3.1): AES-256-GCM with HKDF keys from fresh random
-  salts, one key per page (chosen after Go/Rust measurement), pending a security review and
-  fault fixtures; XChaCha is dropped because no platform standard library ships it. The TS write side
+  `bench/aead/`. Suite direction (encryption.md §3.1): AES-256-GCM with one key derived per page
+  from a fresh random salt (chosen after Go/Rust measurement), **XAES-256-GCM** (C2SP) as the
+  primary derivation and a jed HKDF-SHA-256 layout as fallback, pending a security review and
+  fault fixtures; XChaCha is dropped because no platform standard library ships it, and AES-GCM-SIV
+  is declined for platform support despite its graceful nonce-reuse behavior. The TS write side
   already awaits an async page codec (§8.1). No dependency is selected and no implementation is
   scheduled. Decided: a reserved-bytes region with
   guarantees in terms of usable capacity, all page types authenticated, ephemeral-key scratch
-  files, and a dedicated CSPRNG for key material (§1.1). Open: page-level replay and manifest
-  identity bytes (§4). The only present storage requirement is non-foreclosure — already satisfied.
+  files, and a dedicated CSPRNG for key material (§1.1). Open: RNG duplication under live VM
+  clones (exclude, or specify a host reseed guarantee — §3.1), page-level replay (bind the child's
+  tag, recommended) and manifest identity bytes (on-disk bytes, recommended) (§4). The only
+  present storage requirement is non-foreclosure — already satisfied.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
   order, as a tee at the block seam (below the encryption codec → keyless backup replicas). No
