@@ -5457,7 +5457,33 @@ def gen_safe_conjunct_pushdown(seed)
   out.join("\n") + "\n"
 end
 
+# The ordered streaming scan can reuse private input storage; ordering by the
+# equivalent expression forces a blocking sort with independently retained rows.
+# Include NULL transitions, rejected rows, and both scan directions/window edges.
+def gen_row_materialization(seed)
+  rng = Random.new(seed)
+  rows = (1..32).map { |id| [id, id % 5 == 0 ? nil : rng.rand(-10..10)] }
+  req = LIMIT_REQ + %w[expr.arithmetic null.three_valued query.where_eq]
+  out = header(seed, req, "private scan input versus retained blocking input")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id},#{v || 'NULL'})" }.join(',')}")
+  ["ASC", "DESC"].each do |direction|
+    ["", "WHERE v > 0"].each do |filter|
+      selected = rows.select { |_, v| filter.empty? || (!v.nil? && v > 0) }
+      selected = selected.reverse if direction == "DESC"
+      [[0, 0], [0, 32], [3, 7], [40, 2]].each do |offset, limit|
+        expected = (selected.drop(offset).take(limit)).flat_map { |id, v| [id.to_s, v.nil? ? "NULL" : (v + 1).to_s] }
+        ["id", "id+0"].each do |order|
+          q(out, "II", "SELECT id,v+1 FROM t #{filter} ORDER BY #{order} #{direction} LIMIT #{limit} OFFSET #{offset}", expected)
+        end
+      end
+    end
+  end
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
+  "row_materialization" => method(:gen_row_materialization),
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
   "limit" => method(:gen_limit),

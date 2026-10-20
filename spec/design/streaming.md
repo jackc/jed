@@ -157,6 +157,13 @@ implements it idiomatically; the only contract is results + cost, §6):
   persistent map; `close` is `Drop`.
 - **Go** — `Cursor` is an interface (or a struct with a `kind` tag); the scan cursor is a stateful
   struct with an explicit frame stack; `Close()` is **explicit** (no destructor).
+  The ordinary range-backed streaming cursor reuses one private input slice. Packed rows decode
+  into it in their original column order; decoded tree rows are copied before resolving values in
+  place. Projection still creates independent output slices, so retained `Rows.Row`, `Values`, and
+  `Scan` results survive later pulls and close. Point scans and host-call read-ahead retain their
+  previous ownership. This changes allocation only: plan choice, decode/error visitation, guards,
+  and logical memory accounting are unchanged. See the
+  [Go allocation investigation](../../bench/go-row-materialization/README.md).
 - **TS** — `Cursor` wraps a **`function*` generator** (`yield`-per-row makes the pull pipeline
   natural — the one core where streaming is structurally easy); `close()` is **explicit** (and
   `return()`s the generator). The existing `scanSource` generator (today only a cost-metering wrap

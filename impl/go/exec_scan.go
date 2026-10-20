@@ -546,6 +546,10 @@ type streamingCursor struct {
 	ahead      *readAhead
 	filterEnv  *evalEnv
 	projectEnv *evalEnv
+	// input is private to this execution. Only the ordinary range pull reuses it;
+	// read-ahead retains rows, point scans have only one row, and outputs always own
+	// separate slices. No scratch is stored on a shared plan or prepared statement.
+	input storedRow
 }
 
 func (c *streamingCursor) nextRow() ([]Value, bool, error) {
@@ -579,7 +583,7 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		} else if c.point != nil {
 			row, ok, err = c.point.next()
 		} else {
-			_, row, ok, err = c.scan.next()
+			_, row, ok, err = c.scan.cur.nextInto(&c.input)
 		}
 		if err != nil {
 			return nil, false, err
@@ -597,6 +601,8 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		// chain reads were already metered in the up-front block (cost.md §3).
 		if c.point != nil {
 			row, err = c.point.resolveColumns(row, c.plan.relMasks[0])
+		} else if c.ahead == nil {
+			row, err = c.scan.store.resolveColumnsInPlace(row, c.plan.relMasks[0])
 		} else {
 			row, err = c.scan.resolveColumns(row, c.plan.relMasks[0])
 		}
@@ -685,6 +691,7 @@ func (c *streamingCursor) costAccrued() int64 { return c.meter.Accrued }
 // the watermark deregister (if any) lives on the Rows (streaming.md §5). Idempotent.
 func (c *streamingCursor) close() {
 	c.done = true
+	c.input = nil
 	if c.seen != nil {
 		c.seen.close()
 	}

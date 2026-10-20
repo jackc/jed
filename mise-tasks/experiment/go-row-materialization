@@ -1,0 +1,127 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Build clean/candidate Go row-allocation binaries; short alternating complete-query runs"
+
+require_relative "../../scripts/lib/tasks"
+require "json"
+require "open3"
+
+mode = ARGV.shift || "build"
+root = Tasks::ROOT
+work = File.expand_path(ENV.fetch("JED_ROW_WORK", ".dev/row-materialization"), root)
+out = File.expand_path(ENV.fetch("JED_ROW_RESULTS", "bench/results/go-row-materialization/2026-10-19"), root)
+baseline = ENV.fetch("JED_ROW_BASELINE", "c105eed383cae6ef98cfc8872b71aa3657f1c999")
+FileUtils.mkdir_p([work, out])
+bench = File.join(root, "impl/go/row_materialization_bench_test.go")
+case mode
+when "build"
+  archive = File.join(work, "baseline.tar")
+  Tasks.sh("git", "archive", "--output=#{archive}", baseline, "impl/go")
+  Tasks.sh("tar", "-xf", archive, "-C", work)
+  FileUtils.cp(bench, File.join(work, "impl/go", File.basename(bench)))
+  FileUtils.cp(File.join(Tasks::GO_DIR, "row_materialization_trace_test.go"), File.join(work, "impl/go"))
+  {"baseline" => File.join(work, "impl/go"), "candidate" => Tasks::GO_DIR}.each do |name, dir|
+    Tasks.sh("go", "test", "-c", "-o", File.join(work, name), chdir: dir)
+  end
+  inventory = Dir.glob(File.join(Tasks::GO_DIR, "*.go")).sort.to_h { |p| [File.basename(p), Digest::SHA256.file(p).hexdigest] }
+  File.write(File.join(out, "environment.json"), JSON.pretty_generate({baseline: baseline,
+    head: Tasks.capture("git", "rev-parse", "HEAD")[0].strip, go: Tasks.capture("go", "version")[0].strip,
+    host: Tasks.capture("uname", "-a")[0].strip, cpu: File.read("/proc/cpuinfo").lines.find { |l| l.start_with?("model name") }&.strip,
+    env: ENV.select { |k, _| k.match?(/\A(GO|CGO)/) }, source_sha256: inventory}))
+when "run"
+  pattern = ENV.fetch("JED_ROW_BENCH", "BenchmarkRowMaterialization")
+  pairs = Integer(ENV.fetch("JED_ROW_PAIRS", "5"))
+  duration = ENV.fetch("JED_ROW_TIME", "150ms")
+  commands = []
+  pairs.times do |pair|
+    names = pair.even? ? %w[baseline candidate] : %w[candidate baseline]
+    names.each do |name|
+      cmd = [File.join(work, name), "-test.run=^$", "-test.bench=#{pattern}", "-test.benchmem", "-test.benchtime=#{duration}", "-test.count=1"]
+      commands << cmd
+      text, status = Open3.capture2e(*cmd, chdir: Tasks::GO_DIR)
+      File.write(File.join(out, "#{name}-#{pair}.txt"), text)
+      abort text unless status.success?
+      puts "#{name} pair #{pair + 1}/#{pairs} complete"
+      $stdout.flush
+    end
+  end
+  File.write(File.join(out, "commands.json"), JSON.pretty_generate(commands))
+  Tasks.ruby(File.join(root, "scripts/go_row_materialization_report.rb"), out)
+when "report"
+  input = File.expand_path(ARGV.shift || out, root)
+  Tasks.ruby(File.join(root, "scripts/go_row_materialization_report.rb"), input, out)
+when "checks", "checks-corpus", "resources"
+  checks = File.join(out, "checks")
+  FileUtils.mkdir_p(checks)
+  run = lambda do |name, cmd, dir, env = {}|
+    puts "#{name}: #{cmd.join(' ')}"
+    $stdout.flush
+    log, status = Open3.capture2e(env, *cmd, chdir: dir)
+    File.write(File.join(checks, "#{name}.txt"), log)
+    abort log unless status.success?
+  end
+  if mode == "checks"
+    run.call("unit", ["go", "test", "./..."], Tasks::GO_DIR)
+    run.call("race", ["go", "test", "-race", "./..."], Tasks::GO_DIR)
+  end
+  unless mode == "resources"
+    run.call("oracle", ["mise", "run", "corpus:check", "spec/conformance/suites/query/row_materialization.test"], root)
+    run.call("norec", ["ruby", "scripts/norec_gen.rb", "--seeds", "1,2", "--cores", "go"], root)
+    run.call("corpus", ["mise", "run", "conformance:go"], root)
+  end
+  %w[baseline candidate].each do |name|
+    src = name == "baseline" ? File.join(work, "impl/go") : Tasks::GO_DIR
+    run.call("build-#{name}-corpus", ["go", "build", "-o", File.join(work, "#{name}-corpus"), "./cmd/conformance"], src)
+    %w[memory disk spill].each do |host|
+      cmd = [File.join(work, "#{name}-corpus")]
+      cmd << "disk" unless host == "memory"
+      peak_path = File.join(checks, "#{name}-#{host}-peaks.tsv")
+      FileUtils.rm_f(peak_path)
+      env = {"JED_CONFORMANCE_FILTER" => "resource/", "JED_CONFORMANCE_QUERY_MEMORY" => "1099511627776",
+             "JED_CONFORMANCE_QUERY_MEMORY_PEAKS" => peak_path}
+      env["JED_CONFORMANCE_WORK_MEM"] = "256" if host == "spill"
+      run.call("#{name}-#{host}-resource", cmd, Tasks::GO_DIR, env)
+    end
+  end
+  %w[memory disk spill].each do |host|
+    a, b = %w[baseline candidate].map { |name| File.read(File.join(checks, "#{name}-#{host}-peaks.tsv")) }
+    abort "resource peaks differ for #{host}" unless a == b
+  end
+  File.write(File.join(checks, "resource-comparison.txt"), "Baseline/candidate resource peaks identical in memory, disk, and forced-spill modes.\n")
+when "trace"
+  %w[baseline candidate].each do |name|
+    Tasks.sh(File.join(work, name), "-test.run=^TestRowMaterializationTrace$", "-test.count=1",
+      env: {"JED_ROW_TRACE" => File.join(work, "#{name}-trace.txt")}, chdir: Tasks::GO_DIR)
+  end
+  a, b = %w[baseline candidate].map { |n| File.read(File.join(work, "#{n}-trace.txt")) }
+  abort "trace mismatch (see .dev/row-materialization/*-trace.txt)" unless a == b
+  File.write(File.join(out, "trace.txt"), "Identical baseline/candidate traces: #{a.lines.size} lines, SHA256 #{Digest::SHA256.hexdigest(a)}\n")
+  # Keep the common transcript once, compressed; no additional dependency.
+  require "zlib"
+  Zlib::GzipWriter.open(File.join(out, "trace.txt.gz")) { |gz| gz.write(a) }
+when "profile"
+  %w[baseline candidate].each do |name|
+    prefix = File.join(work, name)
+    Tasks.sh(prefix, "-test.run=^$", "-test.bench=BenchmarkRowMaterialization/memory/boolean$", "-test.benchtime=100x",
+      env: {"JED_ROW_PROFILE" => prefix}, chdir: Tasks::GO_DIR)
+    {"setup" => ["#{prefix}-setup.pprof"], "steady" => ["-base=#{prefix}-setup.pprof", "#{prefix}-total.pprof"]}.each do |phase, args|
+      text, status = Open3.capture2e("go", "tool", "pprof", "-top", "-alloc_space", "-nodecount=35", *args)
+      abort text unless status.success?
+      File.write(File.join(out, "#{name}-#{phase}-alloc.txt"), text)
+    end
+  end
+  Tasks.sh("mise", "run", "experiment:go-row-materialization", "profile-report")
+when "profile-report"
+  %w[baseline candidate].each do |name|
+    prefix = File.join(work, name)
+    %w[alloc_space alloc_objects].each do |sample|
+      cmd = ["go", "tool", "pprof", "-top", "-#{sample}", "-nodecount=30", "-nodefraction=0", "-relative_percentages", "-ignore=runtime/pprof",
+             "-base=#{prefix}-setup.pprof", "#{prefix}-total.pprof"]
+      text, status = Open3.capture2e(*cmd)
+      abort text unless status.success?
+      File.write(File.join(out, "#{name}-steady-query-#{sample}.txt"), text)
+    end
+  end
+else
+  abort "usage: mise run experiment:go-row-materialization [build|run|profile|profile-report|trace|checks|checks-corpus|resources|report [input-directory]]"
+end

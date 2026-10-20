@@ -416,6 +416,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   timings, allocation evidence, checksums, and decisions live in
   [benchmarks.md](spec/design/benchmarks.md), [pager.md](spec/design/pager.md), and
   [locking.md §9.3](spec/design/locking.md).
+  Go's ordinary streaming range scans now reuse private input storage while preserving owned
+  output rows; the allocation/complete-query measurements and adoption gate are recorded in
+  [the Go row materialization report](bench/go-row-materialization/results/2026-10-19/report.md).
+  This is independent of the rejected G1/G2/G3 execution-specialization experiments.
   - [x] _follow-on:_ unique-dirty mutation for remove/rebalance (Rust). Removes and merges now edit a
     uniquely owned dirty path in place under INSERT's `Arc::get_mut` + `page == 0` rule; tree shape,
     bytes, and costs are unchanged. Allocator calls fall 89% for 1,000 consecutive deletes and 99% for
