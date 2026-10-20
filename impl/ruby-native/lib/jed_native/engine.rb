@@ -1021,6 +1021,21 @@ module JedNative
       hash_gate = source[:native_original_on] ? compile_filter(source[:native_original_on], columns) : predicate
       hash_table = hash_join_table(left, right, predicate, kind, gate: hash_gate, force: source[:native_join_algorithm] == :hash || source[:native_fixed_hash]) unless lateral || index_plan || source[:native_wide_outer] || source[:native_join_algorithm] == :nested
       window = source[:native_join_window]
+      compile_predicates = !@native_compilation_disabled && !@native_join_compilation_disabled
+      if compile_predicates && !@native_compilation_immediate && !lateral && left.rows.instance_of?(Array)
+        # Fresh emission is not worthwhile for tiny materialized inputs.
+        # Do not inspect lazy sources or perform a charged hash/index probe.
+        if index_plan
+          compile_predicates = left.rows.length >= CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES
+        elsif right.rows.instance_of?(Array)
+          compile_predicates = left.rows.length * right.rows.length >= CompiledPlans::MIN_JOIN_PREDICATE_CANDIDATES
+        end
+      end
+      if compile_predicates
+        on_programs = on_trees&.map { |expression| [expression, native_compiled_join_predicate(expression)] }
+        predicate_kernel = native_compiled_join_predicate(predicate) unless on_trees
+        window_kernel = native_compiled_join_predicate(window[:filter]) if window && window[:filter]
+      end
       left.rows.each_with_index do |lrow, left_index|
         break if window && rows.length >= window[:target]
         right = join_index_relation(index_plan, left, lrow) if index_plan
@@ -1030,8 +1045,18 @@ module JedNative
         candidates.each do |index|
           rrow = right.rows[index]
           row = lrow + rrow.to_a
-          next if on_trees ? !on_trees.all? { |expression| evaluate(expression, row) == true } : predicate && evaluate(predicate, row) != true
-          next if window && window[:filter] && evaluate(window[:filter], row) != true
+          if on_trees
+            accepted = if on_programs
+              on_programs.all? { |expression, kernel| (kernel ? kernel.call(self, row, @params) : evaluate(expression, row)) == true }
+            else
+              on_trees.all? { |expression| evaluate(expression, row) == true }
+            end
+            next unless accepted
+          elsif predicate
+            next if (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(predicate, row)) != true
+          end
+          next if window && window[:filter] &&
+            (window_kernel ? window_kernel.call(self, row, @params) : evaluate(window[:filter], row)) != true
           query_memory_add_row(memory_owner, row, columns, memory_mask) if @query_memory
           query_memory_add(memory_owner, (source[:native_full_join_width] - columns.length) * MemorySchedule::VALUE) if @query_memory && source[:native_full_join_width]
           rows << row

@@ -1,0 +1,7 @@
+{
+  "reason": "Standalone helper resolution omitted the current parameter slot before compiling $1; the new helper fixture was corrected before source/helper pins.",
+  "source_sha256": "f980101e855c807c25c6a7cdb5e55bd0c5b53a1ee5e3f01f918aff843dbcf13f",
+  "initial_script_sha256": "3148e3a3e9e7dca2672fad71ce48e6a4a33dda323e16c8f75553e624bb2921ba",
+  "expected_error": "42601: bind parameter count mismatch",
+  "initial_report": "initial-bounded.json"
+}
