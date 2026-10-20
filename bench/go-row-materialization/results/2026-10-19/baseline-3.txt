@@ -1,0 +1,43 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkRowMaterialization/memory/projection-24         	     364	    470628 ns/op	1444865813 checksum	1444865813 checksum1	      8204 cost	      8204 cost1	  657088 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/memory/nullable-24           	     240	    808976 ns/op	3050285746 checksum	3050285746 checksum1	     12312 cost	     12312 cost1	 1282645 B/op	   16029 allocs/op
+BenchmarkRowMaterialization/memory/varlen-24             	     100	   1873910 ns/op	4261151990 checksum	4261151990 checksum1	      8216 cost	      8216 cost1	 3275428 B/op	   47679 allocs/op
+BenchmarkRowMaterialization/memory/columnar_projection-24         	     494	    386478 ns/op	1444865813 checksum	1444865813 checksum1	      8204 cost	      8204 cost1	 1108701 B/op	    4142 allocs/op
+BenchmarkRowMaterialization/memory/arithmetic-24                  	     315	    600017 ns/op	1508503557 checksum	1508503557 checksum1	     20492 cost	     20492 cost1	  526040 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/memory/filter-24                      	     314	    594272 ns/op	 183698413 checksum	2128580603 checksum1	     14674 cost	     14633 cost1	  470287 B/op	    6468 allocs/op
+BenchmarkRowMaterialization/memory/finite-24                      	     306	    576606 ns/op	1508503557 checksum	1508503557 checksum1	     20492 cost	     20492 cost1	  526024 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/memory/small-24                       	   54578	      3167 ns/op	1818129093 checksum	1818129093 checksum1	        92.00 cost	        92.00 cost1	    3760 B/op	      50 allocs/op
+BenchmarkRowMaterialization/memory/offset-24                      	   17024	     10615 ns/op	1431864225 checksum	3061274552 checksum1	       266.0 cost	       269.0 cost1	    9408 B/op	     109 allocs/op
+BenchmarkRowMaterialization/memory/point_hit-24                   	  129800	      1376 ns/op	 779388637 checksum	 393503400 checksum1	         6.000 cost	         6.000 cost1	    1632 B/op	      22 allocs/op
+BenchmarkRowMaterialization/memory/point_miss-24                  	  174888	       946.5 ns/op	2166136261 checksum	2166136261 checksum1	         2.000 cost	         2.000 cost1	    1360 B/op	      15 allocs/op
+BenchmarkRowMaterialization/memory/scalar-24                      	  290911	       618.3 ns/op	 393503400 checksum	 410281019 checksum1	         2.000 cost	         2.000 cost1	    1352 B/op	      12 allocs/op
+BenchmarkRowMaterialization/memory/unsupported-24                 	     380	    478062 ns/op	3765470213 checksum	3765470213 checksum1	     12300 cost	     12300 cost1	  526012 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/memory/columnar-24                    	    3074	     56787 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+BenchmarkRowMaterialization/memory/boolean-24                     	     268	    684150 ns/op	3209232681 checksum	3944020771 checksum1	     26962 cost	     26921 cost1	  441240 B/op	    5560 allocs/op
+BenchmarkRowMaterialization/memory/coalesce-24                    	     304	    632745 ns/op	3062987672 checksum	3062987672 checksum1	     22497 cost	     22497 cost1	  526034 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/memory/case-24                        	     307	    565030 ns/op	2279927151 checksum	2279927151 checksum1	     16396 cost	     16396 cost1	  526025 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/memory/adhoc-24                       	   17300	     10190 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13608 B/op	     116 allocs/op
+BenchmarkRowMaterialization/memory/first_call-24                  	   16675	     10555 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13993 B/op	     119 allocs/op
+BenchmarkRowMaterialization/file/projection-24                    	     400	    470395 ns/op	1444865813 checksum	1444865813 checksum1	      8204 cost	      8204 cost1	  657087 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/file/nullable-24                      	     218	    827800 ns/op	3050285746 checksum	3050285746 checksum1	     12312 cost	     12312 cost1	 1282607 B/op	   16029 allocs/op
+BenchmarkRowMaterialization/file/varlen-24                        	      98	   1851451 ns/op	4261151990 checksum	4261151990 checksum1	      8216 cost	      8216 cost1	 3275397 B/op	   47679 allocs/op
+BenchmarkRowMaterialization/file/columnar_projection-24           	     468	    363277 ns/op	1444865813 checksum	1444865813 checksum1	      8204 cost	      8204 cost1	 1108703 B/op	    4142 allocs/op
+BenchmarkRowMaterialization/file/arithmetic-24                    	     322	    563895 ns/op	1508503557 checksum	1508503557 checksum1	     20492 cost	     20492 cost1	  526022 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/file/filter-24                        	     334	    521662 ns/op	 183698413 checksum	2128580603 checksum1	     14674 cost	     14633 cost1	  470288 B/op	    6468 allocs/op
+BenchmarkRowMaterialization/file/finite-24                        	     326	    516334 ns/op	1508503557 checksum	1508503557 checksum1	     20492 cost	     20492 cost1	  526025 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/file/small-24                         	   57698	      3025 ns/op	1818129093 checksum	1818129093 checksum1	        92.00 cost	        92.00 cost1	    3760 B/op	      50 allocs/op
+BenchmarkRowMaterialization/file/offset-24                        	   17870	      9738 ns/op	1431864225 checksum	3061274552 checksum1	       266.0 cost	       269.0 cost1	    9408 B/op	     109 allocs/op
+BenchmarkRowMaterialization/file/point_hit-24                     	  124269	      1319 ns/op	 779388637 checksum	 393503400 checksum1	         6.000 cost	         6.000 cost1	    1632 B/op	      22 allocs/op
+BenchmarkRowMaterialization/file/point_miss-24                    	  184890	       930.8 ns/op	2166136261 checksum	2166136261 checksum1	         2.000 cost	         2.000 cost1	    1360 B/op	      15 allocs/op
+BenchmarkRowMaterialization/file/scalar-24                        	  319866	       585.5 ns/op	 393503400 checksum	 410281019 checksum1	         2.000 cost	         2.000 cost1	    1352 B/op	      12 allocs/op
+BenchmarkRowMaterialization/file/unsupported-24                   	     414	    441031 ns/op	3765470213 checksum	3765470213 checksum1	     12300 cost	     12300 cost1	  526019 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/file/columnar-24                      	    3892	     45774 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+BenchmarkRowMaterialization/file/boolean-24                       	     267	    633587 ns/op	3209232681 checksum	3944020771 checksum1	     26962 cost	     26921 cost1	  441235 B/op	    5560 allocs/op
+BenchmarkRowMaterialization/file/coalesce-24                      	     307	    562274 ns/op	3062987672 checksum	3062987672 checksum1	     22497 cost	     22497 cost1	  526017 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/file/case-24                          	     334	    505735 ns/op	2279927151 checksum	2279927151 checksum1	     16396 cost	     16396 cost1	  526021 B/op	    8210 allocs/op
+BenchmarkRowMaterialization/file/adhoc-24                         	   18051	      9911 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13605 B/op	     116 allocs/op
+BenchmarkRowMaterialization/file/first_call-24                    	   18024	     10330 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13989 B/op	     119 allocs/op
+PASS

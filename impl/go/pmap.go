@@ -974,6 +974,13 @@ func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool) *rangeCurso
 // advances the frame stack until it emits a leaf row, descends into (and faults) a child, or pops an
 // exhausted frame.
 func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
+	return c.nextInto(nil)
+}
+
+// nextInto optionally fills a caller-owned row, valid until that caller reuses it.
+// A nil destination keeps next's existing ownership contract. Traversal and decode
+// order are identical; in particular no column decode moves past the scan guard.
+func (c *rangeCursor) nextInto(dst *storedRow) (key []byte, row storedRow, ok bool, err error) {
 	for len(c.stack) > 0 {
 		// &c.stack[top] is mutated before any append reslices the stack, so no stale pointer is
 		// used across a reallocation (the loop re-fetches the top each iteration).
@@ -991,9 +998,22 @@ func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
 			fr.lo++
 		}
 		if fr.isLeaf {
-			row, err := fr.node.rowAt(p)
+			var row storedRow
+			var err error
+			if dst == nil {
+				row, err = fr.node.rowAt(p)
+			} else if fr.node.packed != nil {
+				row, err = fr.node.packed.rowInto(p, *dst)
+			} else {
+				// Decoded leaves belong to the immutable snapshot. Never resolve or
+				// overwrite their shared row in place.
+				row = append((*dst)[:0], fr.node.vals[p]...)
+			}
 			if err != nil {
 				return nil, nil, false, err
+			}
+			if dst != nil {
+				*dst = row
 			}
 			return fr.node.keyAt(p), row, true, nil
 		}

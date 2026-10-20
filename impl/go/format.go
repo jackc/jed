@@ -5289,7 +5289,17 @@ func (p *packedLeaf) valueSpan(c, i int) ([]byte, bool) {
 
 // row reconstructs the whole value row i (every column). The rowAt whole-record path.
 func (p *packedLeaf) row(i int) (storedRow, error) {
-	row := make(storedRow, len(p.colTypes))
+	return p.rowInto(i, nil)
+}
+
+// rowInto reconstructs in column order into caller-owned storage. No value payload
+// is mutated: overwriting a slot leaves previously copied Values intact.
+func (p *packedLeaf) rowInto(i int, row storedRow) (storedRow, error) {
+	if cap(row) < len(p.colTypes) {
+		row = make(storedRow, len(p.colTypes))
+	} else {
+		row = row[:len(p.colTypes)]
+	}
 	for c := range p.colTypes {
 		v, err := p.value(c, i)
 		if err != nil {

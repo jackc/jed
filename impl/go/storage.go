@@ -494,9 +494,16 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 	if s.paging == nil {
 		panic("an unfetched value implies a paged store")
 	}
-	fetch := func(p uint32) ([]byte, error) { return s.paging.readBlock(p) }
 	out := make(storedRow, len(row))
 	copy(out, row)
+	return s.resolveColumnsInPlace(out, mask)
+}
+
+// resolveColumnsInPlace requires a private row slice. Values are replaced, never
+// mutated, and resolution visits the same touched columns in the same order as
+// resolveColumns. Streaming scan scratch is private; tree and read-ahead rows are not.
+func (s *tableStore) resolveColumnsInPlace(out storedRow, mask []bool) (storedRow, error) {
+	fetch := func(p uint32) ([]byte, error) { return s.paging.readBlock(p) }
 	for i := range out {
 		if mask[i] && out[i].Kind == ValUnfetched {
 			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), fetch)
