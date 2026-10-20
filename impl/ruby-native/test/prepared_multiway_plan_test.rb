@@ -294,8 +294,8 @@ module NativePreparedMultiwayPlanTests
     JedNative.memory(environment: environment) do |database|
       setup(database)
       queries = [
-        'SELECT a.id FROM pm_a a LEFT JOIN pm_b b ON b.id = a.k JOIN pm_c c ON c.id = a.id',
-        'SELECT a.id FROM pm_a a JOIN pm_b b ON b.id = a.k LEFT JOIN pm_c c ON c.id = a.id',
+        'SELECT a.id FROM pm_a a RIGHT JOIN pm_b b ON b.id = a.k JOIN pm_c c ON c.id = a.id',
+        'SELECT a.id FROM pm_a a JOIN pm_b b ON b.id = a.k FULL JOIN pm_c c ON c.id = a.id',
         'SELECT id FROM pm_a JOIN pm_b USING(id) JOIN pm_c USING(id)',
         "WITH unused AS (SELECT 1) SELECT a.id #{JOIN}",
         "SELECT a.id #{JOIN} WHERE EXISTS(SELECT 1)",
