@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 module JedNative
-  # Retain resolution, not a parameter's winning physical plan. Rewriting,
-  # estimates, access selection and all row operators still run on every call.
+  # Retain bounded resolution and value-blind physical winners. Rewriting and
+  # all row operators remain fresh; value-sensitive selection is never reused.
   module PreparedJoins
     CACHE_ENTRIES = 64
     ROOT_ENTRIES = 128
@@ -10,11 +10,15 @@ module JedNative
     KEY_BYTES = 65_536
     MAX_INPUTS = 8
     EXTENSION_ENTRIES = 128
+    PHYSICAL_UNITS = 16_384
+    PHYSICAL_BYTES = 131_072
+    PHYSICAL_CHECKS = 4096
     SCALAR_TYPES = %w[i16 i32 i64 boolean text].freeze
     BINARY = %w[+ - * / % & | # << >> = <> != < <= > >= and or is\ distinct\ from is\ not\ distinct\ from].freeze
     UNARY = %w[+ - ~ not is\ null is\ not\ null is\ true is\ false is\ unknown is\ not\ true is\ not\ false is\ not\ unknown].freeze
-    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, keyword_init: true)
-    Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, keyword_init: true)
+    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, :physical, keyword_init: true)
+    Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, :physical_observation, keyword_init: true)
+    Physical = Struct.new(:key, :plan, :checks, :units, :bytes, keyword_init: true)
 
     def select(statement)
       previous = @native_join_resolution_frame
@@ -42,7 +46,8 @@ module JedNative
     def contextual_binary(operator, left, right)
       frame = @native_join_resolution_frame
       checks = frame&.checks
-      if checks && !%w[-> ->> #> #>> ? ?| ?& ||].include?(operator)
+      observation = frame&.physical_observation
+      if (checks || observation) && !%w[-> ->> #> #>> ? ?| ?& ||].include?(operator)
         comparison = Resolution::COMPARISONS.include?(operator)
         numeric = %w[i16 i32 i64 f32 f64 decimal]
         # Children finish before their parent's contextual checks. Reuse runs
@@ -51,7 +56,9 @@ module JedNative
           next unless constant.kind == :param && !%i[literal param].include?(other.kind)
           next unless comparison || numeric.include?(constant.type) && numeric.include?(other.type)
           next unless contextual_parameter_cast?(constant, other.type)
-          checks << [constant.value, other.type].freeze
+          check = [constant.value, other.type].freeze
+          checks << check if checks
+          prepared_join_physical_check(observation, check) if observation
         end
       end
       super
@@ -72,7 +79,13 @@ module JedNative
       # File spill preflight and materialization ask for the same custom plan.
       # This memo belongs to one SELECT invocation, never to the shared entry.
       key = [first, edge, where, statement]
-      frame.plans[key] ||= super
+      frame.plans[key] ||= prepared_join_physical_plan(frame, [:two, *key]) { super }
+    end
+
+    def nway_join_plan(sources, joins, where, statement)
+      frame = @native_join_resolution_frame
+      return super unless frame
+      prepared_join_physical_plan(frame, [:multi, sources, joins, where, statement]) { super }
     end
 
     def refresh_primary_indexes
@@ -83,6 +96,109 @@ module JedNative
     end
 
     private
+
+    def plan_constant(expression)
+      observation = @native_join_resolution_frame&.physical_observation
+      observation[:sensitive] = true if observation && expression&.kind == :param
+      super
+    end
+
+    def plan_constant_null?(expression)
+      # A NULL test cannot distinguish non-NULL bindings. Every NULL binding
+      # takes fresh selection, so only a full value read prevents retention.
+      if expression&.kind == :param
+        return expression.value < @params.length && @params[expression.value].nil?
+      end
+      super
+    end
+
+    def contradiction_literal(expression)
+      # Current candidate search leaves contradiction pruning outside this
+      # frame. Fail closed if a future planner starts invoking it here.
+      observation = @native_join_resolution_frame&.physical_observation
+      observation[:sensitive] = true if observation && expression.kind == :param
+      super
+    end
+
+    def prepared_join_physical_plan(frame, key)
+      return yield if @native_join_physical_disabled || !@native_binding_types || @params.any?(&:nil?) ||
+                      transaction_open? || @native_cursor&.block_bound? || frame.entry.tables.any? { |_, table| table[:temporary] }
+      saved = frame.entry.physical
+      if saved && saved.key == key
+        saved.checks.each { |index, type| cast_value(@params[index], type) }
+        return saved.plan
+      end
+      previous = frame.physical_observation
+      observation = { sensitive: false, checks: [] }
+      frame.physical_observation = observation
+      before = @cost
+      plan = yield
+      if plan && @cost == before && !observation[:sensitive]
+        # Normalized integer/boolean casts are pure and unmetered. Keep the
+        # first of each duplicate, but preserve text conversions in order:
+        # even an exact String can have a host-defined singleton to_s method.
+        seen = {}
+        checks = observation[:checks].reject do |check|
+          source, target = @native_binding_types[check[0]], check[1]
+          next false unless (source == 'boolean' || Types::INTEGER_BITS.key?(source)) &&
+                            (target == 'boolean' || Types::INTEGER_BITS.key?(target))
+          duplicate = seen.key?(check)
+          seen[check] = true
+          duplicate
+        end
+        retained = prepared_join_physical_snapshot([key, plan, checks], frame.entry)
+        if retained
+          values, units, bytes = retained
+          frame.entry.physical = Physical.new(key: values[0], plan: values[1], checks: values[2], units: units, bytes: bytes).freeze
+        end
+      end
+      plan
+    ensure
+      frame.physical_observation = previous if observation
+    end
+
+    def prepared_join_physical_check(observation, check)
+      if observation[:checks].length < PHYSICAL_CHECKS
+        observation[:checks] << check
+      else
+        observation[:sensitive] = true
+      end
+    end
+
+    def prepared_join_physical_snapshot(value, entry)
+      # Only plan-owned containers are copied/frozen. Table descriptors keep
+      # their snapshot identity; resolved Expressions have symbolic parameters
+      # and may acquire compiled kernels. No execution rows are retained.
+      borrowed = entry.tables.to_h { |_, table| [table.object_id, true] }
+      seen, units, bytes = {}, 0, 0
+      copy = lambda do |item|
+        units += 1
+        throw :oversized if units > PHYSICAL_UNITS
+        return item if borrowed.key?(item.object_id)
+        return seen[item.object_id] if seen.key?(item.object_id)
+        result = case item
+                 when Hash
+                   item.to_h { |key, child| [copy.call(key), copy.call(child)] }.freeze
+                 when Array
+                   item.map { |child| copy.call(child) }.freeze
+                 when String
+                   bytes += item.bytesize
+                   throw :oversized if bytes > PHYSICAL_BYTES
+                   item.dup.freeze
+                 when Expression
+                   # Account for retained expression metadata without copying
+                   # or freezing its existing compilation state.
+                   item.each_pair { |_, child| copy.call(child) }
+                   item
+                 when Symbol, Integer, NilClass, TrueClass, FalseClass
+                   item
+                 else
+                   throw :oversized
+                 end
+        seen[item.object_id] = result
+      end
+      catch(:oversized) { [copy.call(value), units, bytes] }
+    end
 
     def nway_extension_inputs(context, state, ordinal, fixed:)
       frame = @native_join_resolution_frame
@@ -192,7 +308,10 @@ module JedNative
       syntax = frame.entry.nodes[node]
       key = [mode, syntax || frame.entry.nodes.length, scope || frame.entry.scopes.length]
       if scope && syntax && (saved = frame.entry.roots[key])
-        saved[1].each { |index, type| cast_value(@params[index], type) }
+        saved[1].each do |check|
+          cast_value(@params[check[0]], check[1])
+          prepared_join_physical_check(frame.physical_observation, check) if frame.physical_observation
+        end
         return saved[0]
       end
       before = @cost

@@ -70,7 +70,7 @@ module NativePreparedMultiwayPlanTests
       elsif event.event == :call && event.method_id == :nway_extension_inputs
         calls[:extension_requests] += 1 if event.defined_class == JedNative::PreparedJoins
         calls[:extension_resolutions] += 1 if event.defined_class == JedNative::NWayJoins
-      elsif event.event == :return && event.defined_class == JedNative::NWayJoins && event.method_id == :nway_join_plan
+      elsif event.event == :return && event.defined_class == JedNative::PreparedJoins && event.method_id == :nway_join_plan
         plan = event.return_value
         next unless plan.is_a?(Hash)
         frame = event.self.instance_variable_get(:@native_join_resolution_frame)

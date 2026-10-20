@@ -387,7 +387,7 @@ module JedNative
         operator, left, right = expression.value, *expression.args
         return estimate_predicate(estimate_predicate(rows, left), right) if operator == 'and'
         return [rows, estimate_predicate(rows, left) + estimate_predicate(rows, right)].min if operator == 'or'
-        return 0 if %w[= <> < > <= >=].include?(operator) && expression.args.any? { |argument| plan_constant(argument).nil? }
+        return 0 if %w[= <> < > <= >=].include?(operator) && expression.args.any? { |argument| plan_constant_null?(argument) }
         denominator = %w[= <> != like ilike ~ ~*].include?(operator) ? 200 : %w[< <= > >=].include?(operator) ? 3 : %w[@> <@ &&].include?(operator) ? 100 : 3
         return (rows + denominator - 1) / denominator
       end
@@ -405,6 +405,10 @@ module JedNative
         return cast_value(expression.args.first.value, expression.type)
       end
       :unknown
+    end
+
+    def plan_constant_null?(expression)
+      plan_constant(expression).nil?
     end
 
     def expression_nodes(expression)
