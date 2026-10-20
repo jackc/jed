@@ -71,6 +71,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [scalar planner work estimation](impl/ruby-native/WORK_ESTIMATION_FOLLOWUP.md),
   [compiled JOIN predicates](impl/ruby-native/JOIN_PREDICATE_FOLLOWUP.md),
   [JOIN compilation admission](impl/ruby-native/JOIN_ADMISSION_FOLLOWUP.md),
+  [scalar-function JOIN resolution reuse](impl/ruby-native/JOIN_FUNCTIONS_FOLLOWUP.md),
   [private text-comparison snapshots](impl/ruby-native/TEXT_ELISION_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 
