@@ -656,12 +656,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
   `bench/aead/`. Prefer one initial suite; AES with fresh derived writer keys versus random-nonce
-  XChaCha (protocol complexity versus Node/browser crypto speed; no FIPS requirement) and async
-  browser page/commit work remain investigations (encryption.md §3.1/§8.1), not a selected cipher
-  or scheduled implementation. Decided: a reserved-bytes region with guarantees in terms of usable
-  capacity, all page types authenticated, ephemeral-key scratch files, and a dedicated CSPRNG for
-  key material (§1.1). Open: page-level replay and manifest identity bytes (§4). The only present
-  storage requirement is non-foreclosure — already satisfied.
+  XChaCha (protocol complexity versus Node/browser crypto speed; no FIPS requirement) remains an
+  investigation (encryption.md §3.1); the TS write side already awaits an async page codec (§8.1).
+  No cipher is selected and no implementation is scheduled. Decided: a reserved-bytes region with
+  guarantees in terms of usable capacity, all page types authenticated, ephemeral-key scratch
+  files, and a dedicated CSPRNG for key material (§1.1). Open: page-level replay and manifest
+  identity bytes (§4). The only present storage requirement is non-foreclosure — already satisfied.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
   order, as a tee at the block seam (below the encryption codec → keyless backup replicas). No
