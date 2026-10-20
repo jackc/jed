@@ -223,7 +223,7 @@ per-expression or per-row driver overhead.
 Resume each operation exactly once. Never recover from a cache miss by rerunning SQL: that
 could repeat entropy, host-function effects, cost or staged writes. Do not preload the whole
 database to avoid suspension. Async page loads/prefetch and pending crypto buffers must stay
-bounded, including retained pins (per-page keys need no key cache, encryption.md §3.1).
+bounded, including retained pins (per-page keys need no key cache, encryption.md §3).
 
 The codec remains core-owned above the byte-device seam; adapters supply the selected primitive
 provider. Node native AES and browser WebCrypto must match fixed-input byte fixtures. Choosing
@@ -234,7 +234,7 @@ Build manifests over the final encoded bytes and preserve validated COW's body, 
 alternate-meta and one-barrier ordering, including the existing storage-failure poisoning
 rules. Publish/resolve commit only at the completion point allowed by its selected durability
 mode. Abort/retry needs no nonce bookkeeping: every seal draws a fresh random salt and a
-failed attempt's salts are simply never reused (encryption.md §3.1). Crypto errors
+failed attempt's salts are simply never reused (encryption.md §3). Crypto errors
 and cancellation before storage work must be distinguished from failures after writes begin.
 
 ## 8. Rust delivery and host extensions
@@ -248,7 +248,7 @@ The current whole-engine WASM experiment is Node/WASI, not a ready browser/OPFS 
 A browser Rust/WASM delivery needs storage, entropy, clock, typed-value and async-bridge work.
 Software WASM crypto does not inherit native AES acceleration. A WebCrypto bridge through
 JSPI or a helper worker needs separate support, fallback and performance validation (see
-encryption.md §8.1). An async public interface accommodates either bridge without guaranteeing
+encryption.md §3). An async public interface accommodates either bridge without guaranteeing
 its internal implementation. The Node-native package likewise needs API parity and off-thread
 dispatch before it can implement the proposed surface.
 
@@ -577,7 +577,7 @@ synchronous. Host extensions retain their existing safety/determinism exclusion.
 The read side (§10) suspends query execution at data-page reads. This section extends the same
 retained-continuation driver to the write side: commit, open/recovery and storage maintenance.
 The goal is that a page codec or byte device with **asynchronous-only** operations — the browser
-WebCrypto case of [encryption.md](encryption.md) §8.1 — is sufficient for commit, recovery and
+WebCrypto case of [encryption.md](encryption.md) §3 — is sufficient for commit, recovery and
 maintenance (the exceptions are listed in §11.1), without SQL replay, whole-file preload, or a
 second implementation of any algorithm.
 No codec, cipher suite, nonce protocol or format change is selected here; file bytes, results
@@ -621,7 +621,7 @@ These remain synchronous and are not required by the browser storage stack:
   `0A000` pending a crash-safe replace (hosts.md §7); an async compaction needs a generator
   from-scratch serializer and belongs with that design.
 - `create`'s whole bootstrap image written in place (OPFS) or through a temp file (Node): an
-  encrypted create must first define how bootstrap pages are encoded (encryption.md §6).
+  encrypted create must first define how bootstrap pages are encoded (encryption.md §4).
 - Host backup (`backupForTesting`, Node only and not on the async surface): it walks the snapshot
   through the synchronous page read.
 - The directory barrier (Node only) and spill device I/O (spill files are not encoded).
@@ -658,7 +658,7 @@ same order as the synchronous one, each awaited before the next begins:
 A rejection from any awaited write, barrier or encoding after step 2 leaves the guard armed: the
 handle is poisoned until reopen, exactly like a synchronous I/O error. Encoding happens after the
 guard is armed, so an encode failure is a post-guard failure. The codec reserves no per-commit
-state: every seal draws a fresh random salt in the canonical order encryption.md §4 fixes, after
+state: every seal draws a fresh random salt in the canonical order encryption.md §3 fixes, after
 the pre-write checks and before sealing begins. A failed cap flush revokes the storage (§4 of
 validated-cow.md); a failed shrink is ignored. Trailing truncation awaits its shrink only after
 the barrier that covers the newest generation.
@@ -713,7 +713,7 @@ above the byte device and below the page cache (hosts.md §6). It offers `encode
   (validated-cow.md §5) in the plaintext format; the encrypted variant moves the manifest
   digests after `encode` and drops the body-page CRC (encryption.md §4), and carries the child's tag across the
   seam — `encode` returns it so the parent can bind it, `decode` takes the expected one from the
-  pointer (encryption.md §4.1) — which are the two changes this seam takes with that format
+  pointer (encryption.md §4) — which are the two changes this seam takes with that format
   version. The cache inserts a decoded page only after its read resumed.
 - `Pager.fromStore` reads the 12-byte bootstrap header (page size) directly from the device;
   the encrypted format must keep the page size discoverable before any key is used

@@ -385,7 +385,7 @@ sits so the options stay open (CLAUDE.md §9).
   page identities are over on-disk (ciphertext) bytes. Page capacity excludes a reserved region
   that is never a user setting (a plaintext file reserves nothing); scratch encryption is a
   handle-level setting using an ephemeral per-file key, because scratch belongs to the session
-  while encryption belongs to each attached file (encryption.md §1.1, §4–§4.2, §6). Vetted libraries
+  while encryption belongs to each attached file (encryption.md §4–§6). Vetted libraries
   use safe APIs, with reviewed accelerated backends under CLAUDE.md §14. The present requirement is only
   that the format and seam not foreclose it — concretely, don't bake in assumptions that page
   bytes are plaintext-comparable on disk (already satisfied — hosts keep page bytes opaque).
