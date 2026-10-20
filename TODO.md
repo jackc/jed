@@ -61,6 +61,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [compiled literal LIKE predicates](impl/ruby-native/LIKE_FOLLOWUP.md),
   [shared compiled Ruby methods](impl/ruby-native/METHOD_SHARING_FOLLOWUP.md),
   [broader literal LIKE patterns](impl/ruby-native/LITERAL_LIKE_FOLLOWUP.md),
+  [broad performance checkpoint](impl/ruby-native/PERFORMANCE_CHECKPOINT.md),
   [private text-comparison snapshots](impl/ruby-native/TEXT_ELISION_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 
