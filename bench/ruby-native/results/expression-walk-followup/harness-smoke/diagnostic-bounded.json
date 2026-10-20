@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/expression_walk_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-expression-walk-smoke.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 64868352,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 4.234123123984318,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31",
+  "final_source_sha256": "577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "Expression-walk yjit: 72 memory/file API groups passed\n",
+  "stderr": ""
+}
