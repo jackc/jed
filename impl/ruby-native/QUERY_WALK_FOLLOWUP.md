@@ -1,5 +1,9 @@
 # Query setup follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested follow-up to [physical join-plan reuse](PHYSICAL_PLAN_FOLLOWUP.md)
 reduces repeated query setup. The Ruby core remains experimental, frozen and
 opt-in; normal tests, benchmarks, CI and future feature updates do not include it.
@@ -51,7 +55,7 @@ archived at `/tmp/jed-query-shape-before/impl/ruby-native`.
 Final library SHA-256:
 `bb56f9a0b9592def93f4e0fb24f23098439b1d657e77f2d5fdbfdd14eeafc17d`.
 Evidence is in
-[`query-walk-followup`](../../bench/ruby-native/results/query-walk-followup/).
+[`query-walk-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-walk-followup`).
 Earlier reports and artifacts are unchanged.
 
 The main comparison retains the exact existing nine-workload
@@ -124,7 +128,7 @@ This is a modest, uneven setup optimization. Across the 94 paired cells, 32
 have both final process medians below both baseline medians, 12 have separated
 slower medians, and the other 50 have overlapping ranges. Thirty-eight cells
 are slower on their paired means. All samples and slower cells are retained in
-[`tables.md`](../../bench/ruby-native/results/query-walk-followup/tables.md);
+[`tables.md`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-walk-followup/tables.md`);
 overlap is not proof of equivalence, and separation is not a significance test.
 
 The five main join targets—indexed, three-table hit/miss/computed-key and
@@ -221,7 +225,7 @@ sequences during the target warmup and none during its five subsequent batches.
 GC activity varies across the replays. Statistics collection and its extra
 execution frames may themselves affect runtime behavior, so these observations
 do not identify the cause of the uninstrumented timing difference.
-The [separate evidence](../../bench/ruby-native/results/query-walk-followup/warmup-diagnostic/)
+The [separate evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-walk-followup/warmup-diagnostic`)
 verifies every source/runtime/helper pin, complete result/cost signature,
 schedule and serial completion interval. All 12 child processes succeeded;
 their peak was 88.8 MiB RSS.

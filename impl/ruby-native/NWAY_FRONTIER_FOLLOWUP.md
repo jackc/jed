@@ -1,5 +1,9 @@
 # N-way JOIN candidate construction
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested follow-up investigates allocations in bounded
 JOIN-plan search. The preceding [bound-preparation pass](JOIN_BOUNDS_FOLLOWUP.md)
 left candidate construction as a prominent allocation site in fresh planning.
@@ -46,7 +50,7 @@ The baseline is pushed commit
 `66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341`,
 archived at `/tmp/jed-nway-frontier-before/impl/ruby-native`.
 New evidence belongs in
-[`nway-frontier-followup`](../../bench/ruby-native/results/nway-frontier-followup/).
+[`nway-frontier-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/nway-frontier-followup`).
 Earlier reports and measurements remain unchanged.
 
 The baseline-only opportunity probe uses unchanged production methods and
@@ -159,7 +163,7 @@ range (−2.179%). Two have separated slower medians: interpreter ordinary-query
 range (+3.696%) and ZJIT prepared LEFT (+2.784%). The other 22 overlap.
 
 All **126 cells** remain in the
-[complete tables](../../bench/ruby-native/results/nway-frontier-followup/tables.md):
+[complete tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/nway-frontier-followup/tables.md`):
 11 have separated faster process medians, 20 have separated slower medians,
 and 95 overlap. Eighty-nine paired means are slower. The largest observed
 regressions are ZJIT prepared text projection (**142.912 → 153.560 µs,

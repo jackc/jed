@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require 'fileutils'
+
 # Explicit opt-in diagnostic. Run through ruby-native:bounded; this is not a
 # whole-query or cross-core benchmark. Engine#evaluate stays the semantic control.
 require 'json'

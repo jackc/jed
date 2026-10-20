@@ -41,6 +41,9 @@
 # local state; harness build artifacts mirror the per-core ignores above.
 /bench/data/
 /bench/results/
+# Frozen Ruby experiment: keep generated evidence out of normal history.
+/bench/ruby-native/results/
+/impl/ruby-native/results/
 # Keep compact reports in the historical result trees; raw evidence stays on the research branch.
 /bench/ts/results/**
 !/bench/ts/results/*/

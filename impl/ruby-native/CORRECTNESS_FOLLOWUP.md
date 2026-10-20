@@ -1,5 +1,9 @@
 # Ruby cursor and scan correctness follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The remaining 46 failures in this historical report were subsequently addressed
 by the [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md). The explanation
 below that the shared corpus was authored for materialized execution was wrong:
@@ -58,9 +62,9 @@ binding and all four native APIs: `execute`, `query`, `execute_prepared`, and
 
 The SQL is `SELECT id, score * 3 + bucket FROM items WHERE bucket >= $1
 ORDER BY id LIMIT 20`, with `OFFSET 500` for the second row. The
-[portable reproducer](../../bench/ruby-native/results/correctness-followup/limit-cost-probe.rb)
+[portable reproducer](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/correctness-followup/limit-cost-probe.rb`)
 includes fixture construction. The
-[focused result](../../bench/ruby-native/results/correctness-followup/limit-cost-focused.json)
+[focused result](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/correctness-followup/limit-cost-focused.json`)
 retains the original command, implementation hash, full API cost vectors, and
 52,166,656-byte peak RSS. This is correctness validation, not a timing benchmark.
 
@@ -115,7 +119,7 @@ Each worker retained the 512 MiB RSS guard, 2 GiB address-space limit, and
 10-second file deadline.
 
 All 51 Ruby host-test files pass on the same source, at 107.7 MiB peak RSS.
-The [retained reports](../../bench/ruby-native/results/correctness-followup/)
+The [retained reports](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/correctness-followup`)
 include every raw failure, API selection, source hash, runtime, and bounded-run
 command. `verification-manifest.json` records artifact hashes and the exact
 old/new failure comparison.
@@ -124,7 +128,7 @@ The new [scan-cost host test](test/scan_cost_test.rb) passes on memory and file
 hosts. It checks all four APIs, multi-leaf forward/reverse bounds, OFFSET/LIMIT 0,
 compressed payload blocks, lazy interval admission, row-fault ordering, and every
 statement/lifetime budget prefix from 1 through 22 for the correlated query.
-Its [focused report](../../bench/ruby-native/results/correctness-followup/scan-cost-focused.json)
+Its [focused report](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/correctness-followup/scan-cost-focused.json`)
 records 43,327,488-byte peak RSS. The existing compressed-cost, compiled-pipeline,
 and window-prefix host tests also pass. Focused lazy shared-corpus runs passed
 `resource/dos_amplification.test` (24/24) and

@@ -1,5 +1,9 @@
 # Ruby scalar-query optimization pass
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested continuation removes the general cursor setup cost
 from eligible scalar queries and reduces evaluator dispatch and allocations.
 The original scalar workload is now **4.61–5.27 µs across the JIT modes**, or
@@ -116,10 +120,10 @@ the 4.0 interpreter improves 58.77 → 14.42 µs and the 4.1 interpreter improve
 53.62 → 13.13 µs, still about 2.5–2.8× slower than their JIT lanes. The complete
 interpreter samples are retained alongside all JIT measurements.
 
-Artifacts: [4.0 baseline](../../bench/ruby-native/results/scalar-before-4_0_7.json),
-[4.1 baseline](../../bench/ruby-native/results/scalar-before-4_1_preview1.json),
-[4.0 final and supported cores](../../bench/ruby-native/results/scalar-after-4_0_7.json),
-[4.1 final modes](../../bench/ruby-native/results/scalar-after-4_1_preview1.json).
+Artifacts: [4.0 baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-before-4_0_7.json`),
+[4.1 baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-before-4_1_preview1.json`),
+[4.0 final and supported cores](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-after-4_0_7.json`),
+[4.1 final modes](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-after-4_1_preview1.json`).
 
 ## Lazy and eager API diagnostics
 
@@ -146,8 +150,8 @@ resolution is still expensive and did not improve. Moving that path into cached
 execution needs a separate treatment of its compile/error and memory-accounting
 order; this change does not silently reroute it through a different contract.
 
-The [baseline diagnostic](../../bench/ruby-native/results/scalar-followup/before-profile.json)
-and [final diagnostic](../../bench/ruby-native/results/scalar-followup/final-profile.json)
+The [baseline diagnostic](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/before-profile.json`)
+and [final diagnostic](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-profile.json`)
 retain every sample, method count, and allocation site. Intermediate A/B reports
 isolate the lightweight numeric cursor, conditional/text extension, and keyword
 forwarding before the final integer folds. An allocation-only forwarding probe
@@ -174,8 +178,8 @@ ratio is ZJIT aggregate at 8.65×. These controls include small regressions as w
 as improvements outside scalar queries. For example, 4.0 YJIT sort-and-limit is
 912.76 µs versus 867.20 in the previous pass; 4.1 ZJIT aggregate is 561.00 versus
 499.77. This pass does not establish a general relational-query speedup.
-[4.0 controls](../../bench/ruby-native/results/scalar-regression-4_0_7.json) and
-[4.1 controls](../../bench/ruby-native/results/scalar-regression-4_1_preview1.json)
+[4.0 controls](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-regression-4_0_7.json`) and
+[4.1 controls](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-regression-4_1_preview1.json`)
 retain their samples and answer checks.
 
 A fresh sequential ZJIT baseline/final pair measured aggregate at
@@ -186,11 +190,11 @@ This does not eliminate the regression; it shows the short-run gap includes
 warmup sensitivity. A temporary helper-extraction candidate measured 534.12 µs
 under the original plan and did not materially improve it, so that candidate
 was not adopted. These controls remain separate from the original tables.
-[Fresh baseline](../../bench/ruby-native/results/scalar-regression-control-before-1.json),
-[fresh final](../../bench/ruby-native/results/scalar-regression-control-after-1.json),
-[helper experiment](../../bench/ruby-native/results/scalar-regression-control-split.json),
-[longer-warmup baseline](../../bench/ruby-native/results/scalar-zjit-warm-before.json),
-[longer-warmup final](../../bench/ruby-native/results/scalar-zjit-warm-after.json).
+[Fresh baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-regression-control-before-1.json`),
+[fresh final](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-regression-control-after-1.json`),
+[helper experiment](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-regression-control-split.json`),
+[longer-warmup baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-zjit-warm-before.json`),
+[longer-warmup final](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-zjit-warm-after.json`).
 
 The million-row file lookup control keeps the original 50,000 warmup and 50,000
 measured operations, exclusive file ownership, and normal durability. Mean
@@ -211,8 +215,8 @@ ratios also reflect that variation. Ruby remains below 10× even against the
 earlier Go measurement. These are one complete run per mode, not repeated
 proof of a lookup improvement. Cold-open and durable-write performance were
 not remeasured in this scalar pass.
-[4.0 file control](../../bench/ruby-native/results/scalar-followup/final-file-point-4.0.7.json),
-[4.1 file controls](../../bench/ruby-native/results/scalar-followup/final-file-point-4.1-preview1.json).
+[4.0 file control](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-file-point-4.0.7.json`),
+[4.1 file controls](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-file-point-4.1-preview1.json`).
 
 ## Correctness and resource checks
 
@@ -241,15 +245,15 @@ cost/lifetime thresholds. The full host suite preceded those final test-only
 additions; the separately recorded scalar-host run covers the expanded file on
 the same frozen library hash.
 
-Evidence: [memory audit](../../bench/ruby-native/results/scalar-followup/final-conformance-memory-4.1-zjit.json),
-[disk audit](../../bench/ruby-native/results/scalar-followup/final-conformance-disk-4.1-yjit.json),
-[host suite](../../bench/ruby-native/results/scalar-followup/final-host-4.0.7.json),
-[expanded scalar host suite](../../bench/ruby-native/results/scalar-followup/final-scalar-host.json),
-[lazy expressions](../../bench/ruby-native/results/scalar-followup/metadata-fixed-lazy-expr.json),
-[lazy casts](../../bench/ruby-native/results/scalar-followup/final-lazy-cast.json),
-and [lazy types](../../bench/ruby-native/results/scalar-followup/final-lazy-types.json).
+Evidence: [memory audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-conformance-memory-4.1-zjit.json`),
+[disk audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-conformance-disk-4.1-yjit.json`),
+[host suite](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-host-4.0.7.json`),
+[expanded scalar host suite](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-scalar-host.json`),
+[lazy expressions](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/metadata-fixed-lazy-expr.json`),
+[lazy casts](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-lazy-cast.json`),
+and [lazy types](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-lazy-types.json`).
 
-The [cross-report summary](../../bench/ruby-native/results/scalar-followup/final-summary.json)
+The [cross-report summary](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/scalar-followup/final-summary.json`)
 verifies 216 memory cells, six file cells, 23 additional ZJIT control cells,
 twenty diagnostic answers, source
 hashes, requested JIT modes, conformance totals, and resource bounds. Every

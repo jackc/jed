@@ -1,5 +1,9 @@
 # Compiled Ruby expressions and query plans
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 Measured 2026-10-19. The maintainer requested runtime compilation using Ruby's
 ability to generate executable methods. This update keeps the Ruby core frozen
 and experimental, with explicit opt-in tests and benchmarks. It adds no dependency
@@ -18,7 +22,7 @@ The initial YJIT proof measured 3.4–7.1× faster expression evaluation across 
 arithmetic, CASE, NULL folds, and a predicate. Source compilation cost 35–140 µs per
 expression. Those are isolated kernels, not complete queries. Final whole-query
 measurements and compilation/churn diagnostics are recorded below and in the
-[raw results](../../bench/ruby-native/results/compiled-followup/).
+[raw results](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-followup`).
 
 Ruby methods generated with `class_eval` are ordinary method instruction sequences;
 the library evaluates trusted source once to define the method, never once per row.
@@ -57,10 +61,10 @@ column-only sorting retain their existing execution costs and see little change.
 The warmed PK path already uses a specialized cursor and is essentially unchanged.
 
 Raw prepared comparisons:
-[stable before](../../bench/ruby-native/results/compiled-before-4_0_7.json),
-[stable after](../../bench/ruby-native/results/compiled-after-4_0_7.json),
-[preview before](../../bench/ruby-native/results/compiled-before-4_1_preview1.json),
-[preview after](../../bench/ruby-native/results/compiled-after-4_1_preview1.json).
+[stable before](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-before-4_0_7.json`),
+[stable after](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-after-4_0_7.json`),
+[preview before](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-before-4_1_preview1.json`),
+[preview after](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-after-4_1_preview1.json`).
 
 ## Interpreter, YJIT, and ZJIT
 
@@ -108,7 +112,7 @@ calls retain the general executor to preserve callback-visible session behavior;
 they remain much slower than the lightweight lazy API.
 
 Preview comparisons are also retained in
-[`summary.json`](../../bench/ruby-native/results/compiled-followup/summary.json).
+[`summary.json`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-followup/summary.json`).
 For example, preview ZJIT eager host row/batch workloads measured 932.67/1113.22 µs,
 while its lazy equivalents measured 1496.85/1717.77 µs. The choice of API and
 surrounding executor still matters; generated expressions do not remove those
@@ -192,7 +196,7 @@ variation, not a repeatable cold regression. They also establish **no cold-query
 speedup** from the new compiler. First-use plan admission keeps unique scalar/read
 SQL on the evaluator, while parsing and planning still dominate these controls.
 Both initial and alternating runs, with wrapper controls, are retained in
-[`summary.json`](../../bench/ruby-native/results/compiled-followup/summary.json).
+[`summary.json`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-followup/summary.json`).
 
 ## Implementation
 
@@ -235,7 +239,7 @@ heap guarantee; Ruby controls JIT code reclamation. See the
 The unchanged source immediately before this experiment has SHA-256
 `d3db0d7784b23d9d9aa6da1f3f45045b298eef7279dc7e7987b81052ee2032fc`.
 It includes the preceding ordinary API/host optimizations and is preserved as a
-[deterministic source archive](../../bench/ruby-native/results/compiled-followup/before-source.tar.gz),
+[deterministic source archive](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/compiled-followup/before-source.tar.gz`),
 with a checked restore recorded in `before-source.json`. It is a working-tree
 baseline, not a new commit. The final implementation source is identified in every
 measurement and verification report; source hashes are checked before and after.

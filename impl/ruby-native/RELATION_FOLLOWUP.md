@@ -1,5 +1,9 @@
 # Compiled materialized filters and grouping keys
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The cursor failures reported below are historical. The
 [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
 supersedes the mixed-routing interpretation. Original measurements are retained.
@@ -63,7 +67,7 @@ their absolute timings do not isolate JIT implementation effects.
 
 Raw reports, commands, source/runtime/harness hashes, resource guards, summaries,
 and the artifact manifest live in
-[relation-followup](../../bench/ruby-native/results/relation-followup/).
+[relation-followup](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/relation-followup`).
 Timed jobs run serially, without overlapping tests, builds, or other benchmarks.
 
 ## Whole-query results

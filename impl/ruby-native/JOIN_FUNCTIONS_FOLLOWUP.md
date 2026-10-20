@@ -1,5 +1,9 @@
 # Scalar functions in prepared JOIN resolution
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested follow-up extends the bounded prepared JOIN
 resolution cache to ordinary scalar built-ins. The preceding
 [admission pass](JOIN_ADMISSION_FOLLOWUP.md) identified repeated resolution
@@ -58,7 +62,7 @@ The baseline is pushed commit
 `5feb7b064f414131a1c5f5d4aba8a64be8facc0885e3b4e5299ba0b5527ef29c`,
 archived at `/tmp/jed-join-functions-before/impl/ruby-native`.
 New evidence belongs in
-[`join-functions-followup`](../../bench/ruby-native/results/join-functions-followup/).
+[`join-functions-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-functions-followup`).
 Earlier reports, plans and measurements remain unchanged.
 
 Final library SHA-256:
@@ -183,7 +187,7 @@ observations, not CPU-time attribution. All nine other workloads retain
 identical complete call maps; eight retain identical allocation counts,
 and range changes from 10,559.8 to 10,559.9 objects/query.
 
-The [complete 117-cell tables](../../bench/ruby-native/results/join-functions-followup/tables.md)
+The [complete 117-cell tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-functions-followup/tables.md`)
 retain all results: 66 cells have separated faster process medians, ten
 have separated slower medians, and 41 overlap. Thirty paired means are
 slower. These counts include unaffected controls and do not estimate the

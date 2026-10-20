@@ -1,5 +1,9 @@
 # Opt-in Ruby runtimes
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The packaged Ruby 4.0.7 used for the original experiment was built with
 `--enable-yjit`, without ZJIT. Passing `--zjit` to that executable prints a warning
 but exits successfully, so a successful process alone does not prove activation.
@@ -88,4 +92,4 @@ mode; JIT probes also require actual compiled methods. Ruby 4.1 uses
 Omit statistics flags from timed benchmark samples. A single process can enable
 only one JIT. The checked source digest, build commands, resource measurements,
 runtime configuration and activation probes are recorded in
-[runtime-build.json](results/lookup-followup/runtime-build.json).
+[runtime-build.json](ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/runtime-build.json`).

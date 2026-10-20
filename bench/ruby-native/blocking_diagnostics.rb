@@ -1,6 +1,10 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require 'fileutils'
+require 'tmpdir'
+require 'open3'
+
 # Explicit-only disk checkpoint. Run under ruby-native:bounded; setup and all
 # TracePoint probes are outside the samples, and every query is fully drained.
 require 'json'

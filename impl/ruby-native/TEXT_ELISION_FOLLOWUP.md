@@ -1,5 +1,9 @@
 # Private text-comparison snapshots
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The cursor failures reported below are historical. The
 [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
 supersedes the mixed-routing interpretation. Original measurements are retained.
@@ -52,7 +56,7 @@ Direct diagnostics separately exercise metadata, changing inputs and Unicode;
 whole-query timings do not establish long-string or linguistic performance.
 
 Raw reports and a verified artifact manifest are retained in
-[text-elision-followup](../../bench/ruby-native/results/text-elision-followup/).
+[text-elision-followup](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/text-elision-followup`).
 
 ## Whole-query results
 

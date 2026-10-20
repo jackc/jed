@@ -1,5 +1,9 @@
 # Prepared JOIN key storage
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested investigation follows the rejected
 [N-way candidate-allocation experiment](NWAY_FRONTIER_FOLLOWUP.md). The Ruby
 core remains experimental, frozen and opt-in. Normal tests, benchmarks, CI
@@ -17,7 +21,7 @@ The baseline is pushed commit
 `66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341`.
 Its private archive is `/tmp/jed-join-key-before/impl/ruby-native`.
 New evidence belongs in
-[`join-key-followup`](../../bench/ruby-native/results/join-key-followup/).
+[`join-key-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-key-followup`).
 Earlier experiment reports and measurements remain unchanged.
 
 The preceding five-table profile suggested that the prepared-resolution key
@@ -167,7 +171,7 @@ baseline medians in every measured API/runtime combination:
 | ZJIT | Eager execute | 6,583.176 | 5,231.155 | −20.538% |
 
 All **126 cells** remain in the
-[complete tables](../../bench/ruby-native/results/join-key-followup/tables.md):
+[complete tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-key-followup/tables.md`):
 24 have separated faster process medians, 21 have separated slower medians,
 and 81 overlap. Fifty-three paired means are slower. The largest observed
 regression is ZJIT ordinary-query four-table JOIN: **309.256 → 356.742 µs,

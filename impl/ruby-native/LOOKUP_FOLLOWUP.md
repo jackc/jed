@@ -1,5 +1,9 @@
 # Primary-key lookup and Ruby JIT follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This report preserves the first follow-up's measurements. The explicitly requested
 [second lookup pass](LOOKUP_SECOND_PASS.md) records subsequent improvements and
 repeated measurements against Go.
@@ -70,10 +74,10 @@ method calls**. The final two changes reduce allocations further to **432/query*
 (67% below the original). Their isolated timing samples overlap the preceding
 version, so this report does not attribute a precise latency gain to them.
 
-The [before profile](../../bench/ruby-native/results/lookup-followup/before-profile.json),
-[intermediate profile](../../bench/ruby-native/results/lookup-followup/after-profile.json),
-[final-source profile](../../bench/ruby-native/results/lookup-followup/candidate-profile.json),
-and [adjacent control](../../bench/ruby-native/results/lookup-followup/candidate-control-profile.json)
+The [before profile](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/before-profile.json`),
+[intermediate profile](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/after-profile.json`),
+[final-source profile](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/candidate-profile.json`),
+and [adjacent control](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/candidate-control-profile.json`)
 retain all samples and checksums. Final-source profiling still sees **zero CRC32,
 CRC64, page-CRC or meta-CRC calls per warmed lookup**. Checksums are not the cause
 of the remaining hot-read gap. The benchmark's separate answer-checksum replay
@@ -98,7 +102,7 @@ The 8 KiB CRC32 kernel falls from **235.75 to 4.24 µs** without a JIT and from
 **15.98 to 4.24 µs** with YJIT. These are kernel measurements, not SQL speedups.
 The independent polynomial checks, seeded continuation cases, shared byte images,
 recovery checks and page-service wire fixtures verify unchanged encodings.
-[Checksum evidence](../../bench/ruby-native/results/lookup-followup/CHECKSUMS.md)
+[Checksum evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/CHECKSUMS.md`)
 records methods, limits and raw results.
 
 ## Ruby 4.1 and ZJIT
@@ -113,7 +117,7 @@ Timed runs omit JIT statistics flags.
 
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md) document the official
 release archive, verified SHA-256, offline bundled-gem build, local installation,
-and exact activation commands. The [runtime artifact](../../bench/ruby-native/results/lookup-followup/runtime-build.json)
+and exact activation commands. The [runtime artifact](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/runtime-build.json`)
 retains the failed initial bundled-gem fetch and successful offline retry. Only
 existing approved benchmark dependencies were installed from cached archives.
 
@@ -154,8 +158,8 @@ about 5% slower, while 4.1 improves that workload. YJIT is generally faster than
 ZJIT here; their group results are close. Final 4.1 YJIT's memory PK hit still
 takes about **12× Go** and **4.6× TypeScript**.
 
-[Ruby 4.0 and supported-core results](../../bench/ruby-native/results/lookup-4_0_7.json)
-and [Ruby 4.1 results](../../bench/ruby-native/results/lookup-4_1_preview1.json)
+[Ruby 4.0 and supported-core results](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-4_0_7.json`)
+and [Ruby 4.1 results](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-4_1_preview1.json`)
 include all samples, checksums, runtime modes, hashes and memory peaks. Ruby
 memory-query workers peak at 73.3 MiB across these runs.
 
@@ -194,9 +198,9 @@ retaining the experiment, not promoting it on performance grounds.
 All **24 file cells** and **56 memory-query cells** completed with matching
 row counts/checksums across cores and runtime versions. Ruby file workers peaked
 at **337.4 MiB**, below the 512 MiB limit. The
-[Ruby 4.0/supported-core file report](../../bench/ruby-native/results/lookup-followup/final-file-4.0.7.json),
-[Ruby 4.1 file report](../../bench/ruby-native/results/lookup-followup/final-file-4.1-preview1.json),
-and [cross-report summary](../../bench/ruby-native/results/lookup-followup/final-summary.json)
+[Ruby 4.0/supported-core file report](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/final-file-4.0.7.json`),
+[Ruby 4.1 file report](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/final-file-4.1-preview1.json`),
+and [cross-report summary](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/final-summary.json`)
 retain the precise totals, source hashes, answer checks, percentiles and resource
 measurements. The summary also records hashes of its input artifacts.
 
@@ -218,9 +222,9 @@ New host assertions cover point-plan reuse and invalidation, one-descent lazy
 execution, competing-index fallback, cost parity, canonical-type ownership,
 cursor bindings and bounded schema-identity caches.
 
-Raw reports: [memory](../../bench/ruby-native/results/lookup-followup/final-conformance-memory-4.1-zjit.json),
-[disk](../../bench/ruby-native/results/lookup-followup/final-conformance-disk-4.1-yjit.json),
-and [host](../../bench/ruby-native/results/lookup-followup/final-host-4.0.7.json).
+Raw reports: [memory](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/final-conformance-memory-4.1-zjit.json`),
+[disk](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/final-conformance-disk-4.1-yjit.json`),
+and [host](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/final-host-4.0.7.json`).
 
 ## Reproduction and provenance
 
@@ -274,6 +278,6 @@ and their original limits.
 Raw artifacts keep their actual source hashes. The `intermediate-*`, `after-profile`,
 unprefixed conformance/host and unprefixed file-comparison reports describe earlier
 stages, not the final source. Supplemental microkernel and allocation artifacts
-have their own [provenance notes](../../bench/ruby-native/results/lookup-followup/diagnostic-provenance.json).
+have their own [provenance notes](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-followup/diagnostic-provenance.json`).
 The original experiment report and its measurements remain unchanged apart from
 the link to this follow-up.

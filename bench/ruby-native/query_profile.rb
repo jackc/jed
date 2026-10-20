@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require 'fileutils'
+
 # Explicit diagnostic: all timing completes before TracePoint/ObjectSpace run.
 # Use the unchanged comparison harness for published cross-core measurements.
 require 'json'

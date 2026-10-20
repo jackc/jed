@@ -1,5 +1,9 @@
 # Multiway LEFT-join resolution follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the
 [expression traversal pass](EXPRESSION_WALK_FOLLOWUP.md). The Ruby core remains
 experimental, frozen and opt-in. Normal tests, benchmarks, CI and future
@@ -40,7 +44,7 @@ archived at `/tmp/jed-outer-join-before/impl/ruby-native`.
 Final library SHA-256:
 `62e562806cb2fca0e30792f1c90c3546f9f847c94a1af4651d9b3a376fce3705`.
 New evidence belongs in
-[`outer-join-followup`](../../bench/ruby-native/results/outer-join-followup/).
+[`outer-join-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/outer-join-followup`).
 Earlier artifacts remain unchanged.
 
 The timing comparison retains the existing nine-job
@@ -135,7 +139,7 @@ This is a targeted gain, not an across-the-board improvement. Across all
 81 paired cells, 19 have separated faster process medians, 24 have separated
 slower medians and 38 overlap. Thirty-eight paired means are slower.
 All observations remain in
-[the complete tables](../../bench/ruby-native/results/outer-join-followup/tables.md).
+[the complete tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/outer-join-followup/tables.md`).
 
 The interpreter's eight eager control workloads are 3.313–5.151% slower,
 all with separated medians. YJIT's eight prepared controls are

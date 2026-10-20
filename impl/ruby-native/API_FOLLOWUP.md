@@ -1,5 +1,9 @@
 # Ordinary Ruby API and host-function follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 Measured 2026-10-19. This is an explicitly requested optimization of the frozen
 Ruby experiment. Its support status and exclusion from normal tests, benchmarks,
 CI, and future feature work are unchanged. No dependency was added.
@@ -78,7 +82,7 @@ Before measurements use the unchanged scalar-follow-up source at
 `7d1197be345d44a7c389a66ec0a18d038282d26d59fad97ab08f8bdd6f8a7a28`.
 Every report records native/wrapper/Rust source, executable, harness, extension,
 and fixture hashes as applicable, plus actual JIT state and source stability.
-The [raw results](../../bench/ruby-native/results/api-followup/) retain each
+The [raw results](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/api-followup`) retain each
 sample and validation digest. The earlier
 [binding comparison](BINDING_COMPARISON.md) remains the historical baseline.
 

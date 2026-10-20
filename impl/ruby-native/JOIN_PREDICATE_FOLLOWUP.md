@@ -1,5 +1,9 @@
 # Compiled JOIN predicates
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the
 [rejected scalar-estimation candidate](WORK_ESTIMATION_FOLLOWUP.md).
 The Ruby core remains experimental, frozen and opt-in. Normal tests,
@@ -39,7 +43,7 @@ The baseline is pushed commit
 archived at `/tmp/jed-join-predicate-before/impl/ruby-native`.
 It restores the estimator from the preceding retained LEFT-join optimization.
 New evidence belongs in
-[`join-predicate-followup`](../../bench/ruby-native/results/join-predicate-followup/);
+[`join-predicate-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-predicate-followup`);
 earlier evidence remains unchanged.
 
 Final library SHA-256:
@@ -134,7 +138,7 @@ with measured setup costs on simpler predicates:
 | YJIT | 2,280.515 → 1,910.134 | 1.194× | 1.160× | 1.135× |
 | ZJIT | 3,631.461 → 2,447.512 | 1.484× | 1.434× | 1.485× |
 
-The complete [90-cell tables](../../bench/ruby-native/results/join-predicate-followup/tables.md)
+The complete [90-cell tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-predicate-followup/tables.md`)
 retain every observation: 17 cells have separated faster process medians,
 33 have separated slower medians and 40 overlap. Fifty-five paired means are
 slower. These counts include controls that do not execute the new kernels;

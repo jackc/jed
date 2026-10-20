@@ -1,5 +1,9 @@
 # Indexed-JOIN bound preparation
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested follow-up investigates repeated structural work in
 indexed JOIN probes. The preceding
 [scalar-function pass](JOIN_FUNCTIONS_FOLLOWUP.md) leaves the range workload
@@ -46,7 +50,7 @@ archived at `/tmp/jed-join-bounds-before/impl/ruby-native`.
 Final library SHA-256:
 `66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341`.
 New evidence belongs in
-[`join-bounds-followup`](../../bench/ruby-native/results/join-bounds-followup/).
+[`join-bounds-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-bounds-followup`).
 Earlier reports and measurements remain unchanged.
 
 The existing [13-workload plan](../../bench/ruby-native/compare/join-functions-plan.json)
@@ -160,7 +164,7 @@ call maps. The new dispatch branches and method signatures can still affect
 execution and JIT behavior; unchanged call maps do not establish that those
 workloads are immune to timing changes.
 
-The [complete 117-cell tables](../../bench/ruby-native/results/join-bounds-followup/tables.md)
+The [complete 117-cell tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-bounds-followup/tables.md`)
 retain every observation: 28 cells have separated faster process medians,
 20 have separated slower medians, and 69 overlap. Sixty-one paired means are
 slower. These counts do not estimate the fraction of all SQL improved.

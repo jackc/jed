@@ -130,7 +130,7 @@ module NativeRubyCompare
   def run
     require 'etc'
     lanes = ENV.fetch('RUBY_NATIVE_LANES', 'ruby,ruby-yjit,ruby-zjit,go,rust,ts').split(',')
-    phase = ENV.fetch('RUBY_NATIVE_PHASE', 'baseline')
+    phase = ENV.fetch('RUBY_NATIVE_PHASE', 'current')
     raise 'invalid phase name' unless phase.match?(/\A[a-zA-Z0-9_-]+\z/)
 
     plan_path = File.expand_path(ENV.fetch('RUBY_NATIVE_COMPARE_PLAN', File.join(SOURCES, 'plan.json')))

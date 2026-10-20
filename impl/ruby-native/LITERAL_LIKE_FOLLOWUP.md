@@ -1,5 +1,9 @@
 # Broader compiled literal LIKE patterns
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This follows method sharing in `f8fa53cd`. The pure Ruby core remains a frozen,
 opt-in experiment; no dependency, public API or normal CI/test/benchmark changes.
 
@@ -33,7 +37,7 @@ library SHA-256 `fec686e7484eda683c1692576175671b6c11fb5accaca78b6ccb71466f0ee70
 Final library SHA-256:
 `e430431f7e9264c3cc3b9a75436c46841004a707f9c9ec0b72744beeb4c27f88`.
 Commands, runtime identities, complete samples and resource bounds are retained
-in [literal-like-followup](../../bench/ruby-native/results/literal-like-followup/).
+in [literal-like-followup](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/literal-like-followup`).
 
 Whole-query measurements use the unchanged 1,000-row fixture and three native
 APIs, with five samples per process and source ABBA order in the interpreter,

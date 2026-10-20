@@ -1,5 +1,9 @@
 # Ruby core experiment
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This is the initial experiment report, preserved with its original measurements.
 The explicitly requested [lookup and ZJIT follow-up](LOOKUP_FOLLOWUP.md) records
 subsequent optimizations, stdlib CRC32, and Ruby 4.1.0-preview1 measurements.
@@ -24,13 +28,13 @@ Ruby's explicitly approved OpenSSL binding supplies vetted digest primitives;
 all 19 digest conformance checks pass. No digest implementation is omitted.
 
 The working baseline is preserved in
-[working-baseline.json](../../bench/ruby-native/results/working-baseline.json)
-and its verified [source archive](../../bench/ruby-native/results/working-baseline-source.tar.gz),
+[working-baseline.json](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/working-baseline.json`)
+and its verified [source archive](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/working-baseline-source.tar.gz`),
 SHA-256 `d14527fb00cb90489d6eae07fc59fbf7d0a5309ce2e7bae03c7b34f6713008fd`.
 It was recorded after the working SQL/host audits and before this optimization
 pass. Subsequent stress testing also exposed correctness and resource bugs, so
 before/after ratios include those fixes as well as optimization.
-The older [prototype measurements](../../bench/ruby-native/results/baseline.json)
+The older [prototype measurements](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/baseline.json`)
 and archive remain available, but that port was incomplete and is not the working
 baseline used below. File measurements replay the archived working source using
 the same final adapter as optimized Ruby.
@@ -52,14 +56,14 @@ failures in the successful full audits. Checks include values, types, names,
 SQLSTATEs and deterministic costs. The record total includes the shared
 concurrency assertions.
 
-[Memory](results/final-memory-conformance.json) and
-[disk](results/final-disk-conformance.json) reports identify source `3ba8840c…`.
+[Memory](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/final-memory-conformance.json`) and
+[disk](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/final-disk-conformance.json`) reports identify source `3ba8840c…`.
 The only subsequent engine change fixes terminal `25P03` handling in the page
 service: after idle revocation, cleanup must not send a second abort. The final
-[host](results/final-host.json) and [process](results/final-process.json) suites
+[host](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/final-host.json`) and [process](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/final-process.json`) suites
 verify the measured `05b5aa0e…` source, including a deterministic regression that
-failed before the fix. The [initial race failure](results/process-idle-race.json)
-is retained. An earlier complete [disk audit with default auto locking](results/audited-disk-auto-conformance.json)
+failed before the fix. The [initial race failure](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/process-idle-race.json`)
+is retained. An earlier complete [disk audit with default auto locking](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/audited-disk-auto-conformance.json`)
 also passed all 18,250 checks.
 
 Additional coverage includes 106 shared file images (97 valid and nine rejected),
@@ -69,7 +73,7 @@ Additional coverage includes 106 shared file images (97 valid and nine rejected)
 sessions, pinned/lazy cursors, settings and grants, scalar/batch host functions,
 attachment durability, stored-value sharing, backup/compaction, recovery,
 serialization and I/O failures, fork behavior and storage limits. A separate
-[guard audit](results/host-gap-audit.json) checked suspicious unsupported branches
+[guard audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/host-gap-audit.json`) checked suspicious unsupported branches
 against active dispatch paths and the shared spec; no additional Ruby-only
 omitted feature was found.
 
@@ -89,7 +93,7 @@ Confirmed allocation/retention bugs fixed during the experiment include:
 
 - Closed benchmark handles retained all prior page caches; closed cursors also
   retained engines and snapshots. Both now release them. The 200-open regression
-  completed at 154 MiB in its [recorded run](results/working-cold-open-memory.json).
+  completed at 154 MiB in its [recorded run](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `impl/ruby-native/results/working-cold-open-memory.json`).
 - File scans, index builds and ANALYZE materialized entire populations or row-token
   arrays. They now stream pages and retain bounded state; decoded leaf caches
   share a budget across generations.
@@ -143,7 +147,7 @@ Ruby by about 1.15×–1.91× across these queries.
 
 Optimized YJIT is still roughly 4.3×–25.3× slower than TypeScript here.
 These are prepared in-memory queries, not predictions for all applications.
-[Raw optimized results](../../bench/ruby-native/results/optimized.json) include
+[Raw optimized results](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/optimized.json`) include
 samples, runtimes, source hashes, plan and memory peaks. The host was
 not dedicated or CPU-isolated; the benchmark lanes ran sequentially.
 
@@ -172,7 +176,7 @@ versus 2.0–2.5 ms in the supported cores; the read-side gap is considerably la
 Cold open means a fresh database handle, not an empty OS page cache. Each cell is
 one canonical run; its percentiles, checksums, dataset hashes, filesystem,
 source/adapter hashes and resource limits are in
-[file-comparison.json](../../bench/ruby-native/results/file-comparison.json).
+[file-comparison.json](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/file-comparison.json`).
 The first attempt could not start TypeScript because the checkout lacked its
 existing native OS-lock helper. The helper was built offline, then only the
 three TypeScript cells were rerun; the original failures and retry reports are
@@ -204,17 +208,17 @@ The YJIT CRC kernels improve about 7.4× (CRC32) and 4.1× (CRC64) over the
 working YJIT baseline. Full-snapshot timings do not improve uniformly; the kernel
 speedups should not be presented as equal gains for durable operations.
 
-Raw results: [working interpreter](../../bench/ruby-native/results/working-baseline-storage.json),
-[working YJIT](../../bench/ruby-native/results/working-baseline-yjit-storage.json),
-[optimized interpreter](../../bench/ruby-native/results/optimized-storage.json),
-[optimized YJIT](../../bench/ruby-native/results/optimized-yjit-storage.json).
+Raw results: [working interpreter](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/working-baseline-storage.json`),
+[working YJIT](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/working-baseline-yjit-storage.json`),
+[optimized interpreter](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/optimized-storage.json`),
+[optimized YJIT](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/optimized-yjit-storage.json`).
 
 ## Standard workload coverage and optimization scope
 
 All **139 standard workloads** have successful one-operation smoke results that
 match canonical Go row counts and checksums. This is coverage, not timing of all
 139 workloads. The initial complete attempt passed 116 and failed 23; targeted
-fixes and retries completed the rest. The [merged evidence](../../bench/ruby-native/results/shared-smoke-comparison.json)
+fixes and retries completed the rest. The [merged evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/shared-smoke-comparison.json`)
 retains all 164 attempts, including 25 failures, and the exact source/configuration
 of each success. It combines five source revisions and interpreter/YJIT runs;
 it must not be read as one final-source/default-settings run.

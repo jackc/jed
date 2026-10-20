@@ -28,6 +28,13 @@ unless the maintainer explicitly requests that work. Promotion to a supported co
 requires a separate decision. An experiment need not pass a later expanded corpus;
 its report must identify the revision it tested and retain failures and omissions.
 
+The cleaned integration history retains the implementation, opt-in tooling and
+readable reports. Generated evidence and run-specific drivers remain on the
+[original experiment branch](../../bench/ruby-native/ARCHIVE.md); both Ruby result
+directories are ignored in the cleaned checkout. The [final benchmark summary](../../impl/ruby-native/FINAL_BENCHMARKS.md)
+records the last measured source. Rebasing this frozen experiment onto newer
+master does not promote it or extend its coverage to later features.
+
 The implementation and validation report are under `impl/ruby-native`. Results
 must distinguish interpreter, YJIT, and ZJIT, record actual runtime availability,
 warmup, dataset size, checksums, and command lines, and preserve baseline measurements

@@ -1,5 +1,9 @@
 # JOIN compilation admission
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested follow-up reduces setup overhead identified in the
 [JOIN-predicate pass](JOIN_PREDICATE_FOLLOWUP.md). The Ruby core remains
 experimental, frozen and opt-in. Normal tests, benchmarks, CI and future
@@ -37,7 +41,7 @@ The baseline is pushed commit
 `f980101e855c807c25c6a7cdb5e55bd0c5b53a1ee5e3f01f918aff843dbcf13f`,
 archived at `/tmp/jed-join-admission-before/impl/ruby-native`.
 New evidence belongs in
-[`join-admission-followup`](../../bench/ruby-native/results/join-admission-followup/).
+[`join-admission-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-admission-followup`).
 Earlier source reports and measurements remain unchanged.
 
 Final library SHA-256:
@@ -151,7 +155,7 @@ is **2.925% slower with separated medians**. ZJIT is 0.500–2.660% faster acros
 the three APIs, all with overlapping ranges. This pass does not establish
 an additional residual-query speedup.
 
-The complete [90-cell tables](../../bench/ruby-native/results/join-admission-followup/tables.md)
+The complete [90-cell tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-admission-followup/tables.md`)
 retain every observation: 23 cells have separated faster medians, 12 have
 separated slower medians and 55 overlap. Forty-two paired means are slower.
 These counts include controls outside the changed setup and do not estimate

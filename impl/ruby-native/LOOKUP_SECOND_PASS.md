@@ -1,5 +1,9 @@
 # Ruby lookup: second optimization pass
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The subsequent [query-shape pass](QUERY_FOLLOWUP.md) improves general scans,
 aggregates, grouping, sorting, and prepared execution. Measurements below remain
 the historical results of this second lookup pass.
@@ -84,10 +88,10 @@ to 25.00 µs, but its extra timers/checks make it unsuitable as the canonical
 latency figure. Separate allocation tracing and TracePoint run outside timing.
 The allocation trace attributes **256 → 27 objects per lookup** to core Ruby
 source; that subset excludes Ruby internal allocations and the unchanged
-benchmark checksum. [Allocation evidence](../../bench/ruby-native/results/lookup-second-pass/final-allocations.json)
-records the complete categories against the [baseline](../../bench/ruby-native/results/lookup-second-pass/before-allocations.json).
-[Before](../../bench/ruby-native/results/lookup-second-pass/before-profile.json)
-and [after](../../bench/ruby-native/results/lookup-second-pass/final-profile.json)
+benchmark checksum. [Allocation evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-allocations.json`)
+records the complete categories against the [baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/before-allocations.json`).
+[Before](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/before-profile.json`)
+and [after](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-profile.json`)
 retain all samples, including slower batches rather than discarding them.
 
 ## Canonical file results
@@ -129,16 +133,16 @@ baseline/final controls give **6612.62 → 7306.83 µs** for the interpreter (+1
 and **5390.81 → 5458.12 µs** for YJIT (+1.25%). The interpreter remains slower in
 this check; the historical gaps alone would overstate the YJIT difference.
 These are single paired runs, not enough to establish the cause of a regression
-or claim a write-speedup. [Baseline control](../../bench/ruby-native/results/lookup-second-pass/commit-control-before.json)
-and [final control](../../bench/ruby-native/results/lookup-second-pass/commit-control-after.json)
+or claim a write-speedup. [Baseline control](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/commit-control-before.json`)
+and [final control](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/commit-control-after.json`)
 retain the exact source hashes and results.
 
-Raw full reports: [4.0 and supported cores](../../bench/ruby-native/results/lookup-second-pass/final-file-4.0.7.json),
-[4.1 modes](../../bench/ruby-native/results/lookup-second-pass/final-file-4.1-preview1.json).
-Repeats: [4.0 #1](../../bench/ruby-native/results/lookup-second-pass/repeat-4.0.7-1.json),
-[4.0 #2](../../bench/ruby-native/results/lookup-second-pass/repeat-4.0.7-2.json),
-[4.1 #1](../../bench/ruby-native/results/lookup-second-pass/repeat-4.1-preview1-1.json),
-[4.1 #2](../../bench/ruby-native/results/lookup-second-pass/repeat-4.1-preview1-2.json).
+Raw full reports: [4.0 and supported cores](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-file-4.0.7.json`),
+[4.1 modes](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-file-4.1-preview1.json`).
+Repeats: [4.0 #1](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/repeat-4.0.7-1.json`),
+[4.0 #2](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/repeat-4.0.7-2.json`),
+[4.1 #1](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/repeat-4.1-preview1-1.json`),
+[4.1 #2](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/repeat-4.1-preview1-2.json`).
 
 ## Memory queries
 
@@ -159,8 +163,8 @@ unchanged; these are not uniformly steady-state measurements for either JIT.
 Memory PK hits are now **2.6–2.8× Go** with a JIT; interpreter hits are 8.17 µs
 on 4.0 and 7.82 µs on 4.1. The narrow cursor helps these reads substantially,
 while scalar and aggregate queries remain much more than 10× Go. Full samples,
-interpreter results, checksums and memory peaks are in the [4.0 comparison](../../bench/ruby-native/results/lookup2-4_0_7.json)
-and [4.1 comparison](../../bench/ruby-native/results/lookup2-4_1_preview1.json).
+interpreter results, checksums and memory peaks are in the [4.0 comparison](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup2-4_0_7.json`)
+and [4.1 comparison](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup2-4_1_preview1.json`).
 
 ## Validation
 
@@ -177,9 +181,9 @@ in memory and 77 on disk. The shared corpus exercises the general eager
 tests and benchmark answer checks. These are complementary coverage, not a claim
 that every corpus case ran through the specialized cursor.
 
-[Memory audit](../../bench/ruby-native/results/lookup-second-pass/final-conformance-memory-4.1-zjit.json),
-[disk audit](../../bench/ruby-native/results/lookup-second-pass/final-conformance-disk-4.1-yjit.json),
-and [host evidence](../../bench/ruby-native/results/lookup-second-pass/final-host-4.0.7.json)
+[Memory audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-conformance-memory-4.1-zjit.json`),
+[disk audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-conformance-disk-4.1-yjit.json`),
+and [host evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-host-4.0.7.json`)
 record the final source hash before and after execution. Host coverage includes
 shared file images, byte encodings, wire fixtures, live owner/client operation,
 recovery, bounds, and cursor ownership/guard/fallback assertions.
@@ -191,7 +195,7 @@ remain unread. All workers stay below the 512 MiB RSS limit.
 
 All **24 full-file, 10 repeat-lookup, four durable-control, and 56 memory-query
 cells** complete with matching answer checksums and row counts across the
-corresponding cores/runtimes. The [cross-report summary](../../bench/ruby-native/results/lookup-second-pass/final-summary.json)
+corresponding cores/runtimes. The [cross-report summary](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/lookup-second-pass/final-summary.json`)
 checks source hashes, actual JIT modes, answers, and resource bounds. Canonical
 timing remains separate from tests, allocation tracing, and call instrumentation.
 

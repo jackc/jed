@@ -1,5 +1,9 @@
 # Native Ruby versus the Ruby Rust binding
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 Measured 2026-10-19 against `e5dbbe514e41822793e92c996fffbba5e5419e96`.
 This comparison changes no engine code or experimental-support policy.
 
@@ -211,13 +215,13 @@ Artifacts include native/binding/Rust source hashes, release-library hash,
 runtime executable hash, worker hash, actual JIT state, parameters, answers,
 costs, callback sizes, all five samples and peak RSS.
 
-Results: [4.0 YJIT memory](../../bench/ruby-native/results/binding-comparison/memory-4.0-yjit.json),
-[4.1 YJIT memory](../../bench/ruby-native/results/binding-comparison/memory-4.1-yjit.json),
-[4.1 ZJIT memory](../../bench/ruby-native/results/binding-comparison/memory-4.1-zjit.json),
-[4.0 YJIT file](../../bench/ruby-native/results/binding-comparison/file-4.0-yjit.json),
-[4.1 YJIT file](../../bench/ruby-native/results/binding-comparison/file-4.1-yjit.json),
-[4.1 ZJIT file](../../bench/ruby-native/results/binding-comparison/file-4.1-zjit.json).
-The [cross-report audit](../../bench/ruby-native/results/binding-comparison/summary.json)
+Results: [4.0 YJIT memory](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/memory-4.0-yjit.json`),
+[4.1 YJIT memory](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/memory-4.1-yjit.json`),
+[4.1 ZJIT memory](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/memory-4.1-zjit.json`),
+[4.0 YJIT file](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/file-4.0-yjit.json`),
+[4.1 YJIT file](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/file-4.1-yjit.json`),
+[4.1 ZJIT file](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/file-4.1-zjit.json`).
+The [cross-report audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/binding-comparison/summary.json`)
 checks 180 timing cells and 3,324 validation queries.
 
 ```sh

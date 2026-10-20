@@ -1,15 +1,14 @@
 # frozen_string_literal: true
 
 require 'digest'
-require 'fileutils'
-require 'json'
-require 'open3'
-require 'tmpdir'
-
-# Keep the initial implementation reproducible after the ignored .dev directory
-# is removed. The tracked source archive contains Ruby source, not build output.
+# Historical evidence lives on the original experiment branch (ARCHIVE.md).
+# Never substitute current source when a historical baseline was requested.
 module NativeRubySource
-  ARCHIVED_PHASES = %w[baseline working-baseline].freeze
+  ARCHIVED_SOURCES = {
+    'baseline' => '140356387cf9d419505ab7282050d94bb0ec5a46541f87fd866313a084c7a032',
+    'working-baseline' => 'd14527fb00cb90489d6eae07fc59fbf7d0a5309ce2e7bae03c7b34f6713008fd'
+  }.freeze
+  ARCHIVED_PHASES = ARCHIVED_SOURCES.keys.freeze
   module_function
 
   def digest(path)
@@ -17,52 +16,29 @@ module NativeRubySource
   end
 
   def verify_baseline(path, phase = 'baseline')
-    report = File.join(__dir__, "results/#{phase}.json")
-    return unless File.file?(report)
-
-    expected = JSON.parse(File.read(report)).fetch('ruby_source_sha256')
+    expected = ARCHIVED_SOURCES.fetch(phase)
     actual = digest(path)
     raise "baseline source checksum differs: #{actual}, expected #{expected}" unless actual == expected
   end
 
-  def resolve(root, phase:)
-    source = ENV['RUBY_NATIVE_SOURCE']
+  def resolve(root, phase:, source: ENV['RUBY_NATIVE_SOURCE'])
     if source
       source = File.expand_path(source)
     elsif ARCHIVED_PHASES.include?(phase)
-      source = File.join(root, ".dev/ruby-native-#{phase}")
-      unless File.directory?(source)
-        FileUtils.mkdir_p(File.dirname(source))
-        archive = File.join(__dir__, "results/#{phase}-source.tar.gz")
-        if File.file?(archive)
-          temporary = Dir.mktmpdir('ruby-native-restore-', File.dirname(source))
-          begin
-            output, status = Open3.capture2e('tar', '-xzf', archive, '-C', temporary)
-            raise "cannot restore baseline source: #{output}" unless status.success?
-
-            verify_baseline(temporary, phase)
-            FileUtils.mv(temporary, source)
-          ensure
-            FileUtils.remove_entry(temporary) if File.exist?(temporary)
-          end
-        else
-          # The first experiment run has no published baseline yet.
-          raise 'baseline source archive is missing' if File.file?(File.join(__dir__, "results/#{phase}.json"))
-
-          FileUtils.cp_r(File.join(root, 'impl/ruby-native'), source)
-        end
-      end
+      raise "Historical phase #{phase} requires RUBY_NATIVE_SOURCE; see bench/ruby-native/ARCHIVE.md"
     else
       source = File.join(root, 'impl/ruby-native')
     end
+    raise "Ruby source is missing: #{source}" unless File.file?(File.join(source, 'lib/jed_native.rb'))
     verify_baseline(source, phase) if ARCHIVED_PHASES.include?(phase)
     source
   end
 end
 
 if $PROGRAM_NAME == __FILE__
-  Dir.mktmpdir('jed-ruby-source-check') do |root|
-    source = NativeRubySource.resolve(root, phase: 'baseline')
-    puts "restored baseline source verified: #{NativeRubySource.digest(source)}"
-  end
+  root = File.expand_path('../..', __dir__)
+  phase = ENV.fetch('RUBY_NATIVE_PHASE', 'current')
+  source = NativeRubySource.resolve(root, phase: phase)
+  puts "Ruby source (#{phase}): #{source}"
+  puts "SHA-256: #{NativeRubySource.digest(source)}"
 end
