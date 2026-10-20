@@ -553,7 +553,10 @@ from RAM and lowering `storage_bytes` (memory.md §8). A file's `storage_bytes` 
      transaction, or streaming cursor on this handle, transactions.md §8);
    - under the page service, compaction is the owner's: no client may hold the writer gate or pin a
      snapshot, and a page client's compaction is `55006` (locking.md §6). Connected clients reload the
-     compacted image at their next transaction begin.
+     compacted image at their next transaction begin; for an encrypted database the reload also
+     re-reads the key block and checks it against the DEK the client holds, so a rotation or
+     conversion that happened meanwhile is a credential error, not `XX001`
+     ([encryption.md](encryption.md) §6).
    A host that sees `55006` closes its cursors and sessions (or waits for its clients' transactions)
    and retries.
 
