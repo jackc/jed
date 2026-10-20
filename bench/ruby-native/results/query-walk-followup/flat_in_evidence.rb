@@ -1,0 +1,107 @@
+# frozen_string_literal: true
+
+require_relative 'flat_in_checks'
+
+module QueryWalkFlatInChecks
+  module_function
+
+  def read(name) = JSON.parse(File.read(File.join(__dir__, name)))
+  def sha(path) = Digest::SHA256.file(path).hexdigest
+  def assert(value, message) = (raise message unless value)
+
+  def bounded(name, source, command: nil, address_space: nil, timeout: nil)
+    report = read("#{name}-bounded.json")
+    assert(report['success'] && report['reason'].nil?, "failed regression worker #{name}")
+    assert(report.values_at('source_sha256', 'final_source_sha256') == [source] * 2, "regression source mismatch #{name}")
+    assert(report['memory_bytes'] == 536870912 && report['peak_rss_bytes'].between?(0, 536870912), "regression memory bounds #{name}")
+    assert(report['command'] == command, "regression command mismatch #{name}") if command
+    assert(report['address_space_bytes'] == address_space, "regression AS bound #{name}") if address_space
+    assert(report['timeout_seconds'] == timeout.to_f, "regression timeout #{name}") if timeout
+    report
+  end
+
+  def verify!(source)
+    current = JSON.parse(JSON.generate(FlatInChecks.inputs))
+    assert(current['source_sha256'] == source, 'flat-IN current source differs')
+    all_commands = []
+    %w[native supported oracle].each do |phase|
+      journal = read("flat-in-#{phase}.json")
+      assert(journal['verified'] && journal['phase'] == phase, "flat-IN phase incomplete #{phase}")
+      assert(journal['inputs'] == current && journal['final_inputs'] == current, "flat-IN inputs changed #{phase}")
+      expected_names = case phase
+      when 'native' then FlatInChecks::RUNTIMES.keys.flat_map { |runtime| %w[memory disk].map { |mode| "flat-in-ruby-#{runtime}-#{mode}" } }
+      when 'supported' then %w[rust go ts].flat_map { |core| %w[memory disk].map { |mode| "flat-in-#{core}-#{mode}" } }
+      else ['flat-in-oracle']
+      end
+      assert(journal['commands'].map { |entry| entry['name'] } == expected_names, "flat-IN coverage changed #{phase}")
+      journal['commands'].each do |entry|
+        name, env = entry.values_at('name', 'environment')
+        assert(entry['success'] && entry['finished_at'], "flat-IN command incomplete #{name}")
+        assert(entry['command'].first(4) == %w[mise run ruby-native:bounded --], "unguarded flat-IN worker #{name}")
+        as = phase == 'supported' ? (name == 'flat-in-ts-disk' ? 64 : 16) * 1024**3 : 2 * 1024**3
+        timeout = phase == 'supported' ? 90 : 180
+        bound = bounded(name, source, command: entry['command'].drop(4), address_space: as, timeout: timeout)
+        assert(env.values_at('JED_NATIVE_MEMORY_BYTES', 'JED_NATIVE_ADDRESS_SPACE_BYTES', 'JED_NATIVE_TIMEOUT') ==
+          ['536870912', as.to_s, timeout.to_s], "flat-IN environment bounds differ #{name}")
+        case phase
+        when 'native'
+          runtime, mode = name.delete_prefix('flat-in-ruby-').split('-')
+          assert(bound['command'] == [*FlatInChecks::RUNTIMES.fetch(runtime), 'impl/ruby-native/bin/conformance.rb', 'expr/in_list.test'], 'native regression child differs')
+          report = read("#{name}.json")
+          assert(report.values_at('files', 'passed', 'records', 'query_api_records', 'execute_api_records') == [1, 26, 26, 26, 0] &&
+            report['failures'].empty?, "native regression failed #{name}")
+          assert(report.values_at('mode', 'filter', 'query_api', 'query_memory_api', 'query_collection', 'compilation') ==
+            [mode, 'expr/in_list.test', 'query', 'query', 'external', 'immediate'], "native regression adapter changed #{name}")
+          assert(report.values_at('source_sha256', 'final_source_sha256') == [source] * 2, 'native regression source changed')
+          assert(report['ruby_executable'] == FlatInChecks::RUNTIMES.fetch(runtime).first && report['jit'] == runtime, 'native regression runtime changed')
+          %w[failed unsupported_files skipped_files timed_out_files memory_limited_files omitted_failure_details].each do |key|
+            assert(report.fetch(key).zero?, "native regression #{key} nonzero")
+          end
+        when 'supported'
+          core, mode = name.delete_prefix('flat-in-').split('-')
+          child = [current.fetch('binaries').fetch(core).fetch('path')]
+          child << 'impl/ts/src/bin/conformance.ts' if core == 'ts'
+          child << 'disk' if mode == 'disk'
+          assert(bound['command'] == child && env['JED_CONFORMANCE_FILTER'] == 'expr/in_list.test', 'supported regression selection differs')
+          assert(bound['stdout'].include?("PASS expr/in_list.test\n") &&
+            bound['stdout'].include?("[#{mode}] 1 passed, 0 failed, 0 skipped"), 'supported regression failed')
+        when 'oracle'
+          assert(bound['command'] == ['mise', 'run', 'corpus:check', FlatInChecks::CORPUS], 'oracle regression command differs')
+          assert(bound['stdout'] == "OK: #{FlatInChecks::CORPUS} regenerated byte-identically from the PostgreSQL oracle\n", 'oracle regression failed')
+        end
+        all_commands << entry
+      end
+    end
+    intervals = all_commands.sort_by { |entry| entry['started_at'] }
+    intervals.each_cons(2) do |left, right|
+      assert(Time.parse(left['finished_at']) <= Time.parse(right['started_at']), 'flat-IN workers overlap')
+    end
+    sql = File.read(File.join(__dir__, 'flat-in-original.sql')).strip
+    probes = %w[before final].to_h do |state|
+      hash = state == 'before' ? FlatInChecks::BASELINE : source
+      bound = bounded("flat-in-#{state}-probe", hash,
+        command: [FlatInChecks::STABLE, '--yjit', 'bench/ruby-native/results/query-walk-followup/flat_in_probe.rb'],
+        address_space: 2 * 1024**3, timeout: 60)
+      report = JSON.parse(bound['stdout'])
+      assert(report['script_sha256'] == sha(File.join(__dir__, 'flat_in_probe.rb')) && report['sql'] == sql, 'flat-IN probe input mismatch')
+      assert(report.values_at('source_sha256', 'final_source_sha256') == [hash] * 2, 'flat-IN probe source mismatch')
+      assert(report['yjit'] && report['ruby_executable'] == FlatInChecks::STABLE &&
+        report['ruby_executable_sha256'] == current.fetch('runtimes').fetch(FlatInChecks::STABLE), 'flat-IN probe runtime mismatch')
+      assert(report['cases'].map { |item| item['traced'] } == [false, true], 'flat-IN probe trace coverage changed')
+      report['cases'].each do |item|
+        if state == 'before'
+          assert(item.values_at('status', 'class') == %w[error SystemStackError] &&
+            item['backtrace'].any? { |line| line.include?('estimate_predicate') }, 'baseline failure was not reproduced')
+        else
+          assert(item.values_at('status', 'rows', 'columns', 'types') == ['rows', [[0]], ['score'], ['i32']], 'fixed probe result differs')
+        end
+      end
+      [state, report['cases'].map { |item| item.reject { |key, _| %w[backtrace calls].include?(key) } }]
+    end
+    assert(probes['final'].map { |item| item['cost'] }.uniq.length == 1, 'trace changed fixed query cost')
+    { verified: true, corpus: FlatInChecks::CORPUS, records: 26, added_records: 2,
+      expected_costs: [1442, 1445], native_modes: 6, supported_modes: 6, oracle_checked: true,
+      source_sha256: source, probes: probes,
+      notes: ['The original full-backtrace supervisor evidence is also preserved verbatim; its stdout was middle-truncated by the output limit. The compact self-contained probe independently reproduces both baseline failures without truncation.'] }
+  end
+end

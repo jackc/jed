@@ -42,6 +42,8 @@ The [multiway join follow-up](MULTIWAY_PLAN_FOLLOWUP.md) extends bounded reuse t
 three through eight inputs and shares repeated setup within each plan search.
 The [physical-plan follow-up](PHYSICAL_PLAN_FOLLOWUP.md) reuses a bounded winning
 join plan when selection is independent of non-NULL parameter values.
+The [query setup follow-up](QUERY_WALK_FOLLOWUP.md) reduces syntax traversal and
+reuses bounded source metadata, and fixes deep flat-`IN` predicate planning.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
