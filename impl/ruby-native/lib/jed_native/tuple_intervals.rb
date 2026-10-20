@@ -104,14 +104,14 @@ module JedNative
         return counts.max
       end
       if expression.kind == :quantified
-        return estimate_array_elements(expression.args[1]).count { |element| !plan_constant(element).nil? }
+        return estimate_array_elements(expression.args[1]).count { |element| !plan_constant_null?(element) }
       end
       if expression.kind == :query_membership
         rows = @native_estimate_membership ? nil : expression.extra[:rows]
         return rows ? rows.count { |row| !row.first.nil? } : 10
       end
       comparison = key_comparisons(key, [expression]).first
-      comparison && comparison[1] && plan_constant(comparison[1]).nil? ? 0 : 1
+      comparison && comparison[1] && plan_constant_null?(comparison[1]) ? 0 : 1
     end
 
     def candidate_selectivity(count, access, stored)

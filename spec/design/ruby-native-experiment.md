@@ -57,8 +57,17 @@ execution state belongs to the cursor/SELECT invocation.
 The [multiway follow-up](../../impl/ruby-native/MULTIWAY_PLAN_FOLLOWUP.md) extends
 that reuse to bounded three-through-eight-table INNER/CROSS joins, stores each
 AST and ordered column scope once within the same key budget, and reuses structural
-setup across alternatives within one plan search. Physical winners remain
-specific to each execution and binding.
+setup across alternatives within one plan search. The subsequent
+[physical-plan follow-up](../../impl/ruby-native/PHYSICAL_PLAN_FOLLOWUP.md) retains
+one bounded winner when selection reads no parameter values. Full value reads
+prevent retention; every NULL binding and transaction-local snapshot selects
+afresh. Contextual parameter checks replay before reuse. Rewritten inputs,
+ordered table-descriptor identities and session/type context guard reuse;
+descriptor publication conservatively invalidates unrelated-table changes too.
+This experiment does not yet implement relation-specific revision signatures or
+the supported cores' eight-entry memo of sensitive custom plans. Plan-owned
+containers are immutable; execution bounds, rows, memory ownership and profiling
+remain outside the retained plan.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
