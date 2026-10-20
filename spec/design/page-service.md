@@ -502,7 +502,8 @@ byte-identical to the local handle's, whether `jed pages` relays or owns (`tests
 - **Compacted** (the SQLite `VACUUM INTO` analogue). A client pins a snapshot and runs the existing
   streaming `compact` image writer locally against it, writing a fresh, renumbered file at the
   snapshot's `txid + 1`: byte-for-byte the file host compaction ([api.md](api.md) §2.6) would leave
-  for that snapshot. Smallest output; cannot seed a replica. It is also the one form an in-memory
+  for that snapshot (for an encrypted database, identical up to the fresh salts every seal draws,
+  encryption.md §3.1). Smallest output; cannot seed a replica. It is also the one form an in-memory
   database has (a page-identical backup of one is `0A000`).
 - **Logical dump** (the `pg_dump` analogue) — SQL text or similar, the only form that survives a
   `format_version` change or is readable without jed. It is a CLI feature on top of an ordinary
@@ -569,7 +570,9 @@ these consequences of the owner model:
   the meta's v33 manifest, protected until the next commit. The next owner rebuilds the entry before
   serving. If recovery finds the log more than one commit behind the recovered meta (the invariant
   was violated, or the log was damaged), the gap cannot be rebuilt: the owner records a stream break
-  (a new timeline), as for a log-append failure below, rather than claim a repair.
+  (a new timeline), as for a log-append failure below, rather than claim a repair. A key block one
+  generation ahead of the log is rebuilt the same way — its bytes are durable at pages 2–3 — and
+  only a wider gap breaks the stream (encryption.md §6).
 - **Relaxed `synchronous`.** The log records the durability floor; `subscribe` ships only entries at
   or below it, and recovery truncates entries above the recovered `txid`.
 - **`subscribe(from_txid)`** streams retained entries then the live tail. A subscriber older than
