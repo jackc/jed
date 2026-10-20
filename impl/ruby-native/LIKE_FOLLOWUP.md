@@ -1,5 +1,9 @@
 # Compiled literal LIKE predicates
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This optimization follows the cursor correctness fixes in `96b2f163`. Ruby remains
 an explicitly selected, frozen experiment. The parser, planner and matcher remain
 handwritten Ruby; no dependency or normal test/benchmark/CI task changes.
@@ -34,7 +38,7 @@ The optimized library SHA-256 is
 `3e749562c6b764681d6917604cf02aa73b3194cfdbb8c5e756616588de91dc88`.
 Raw measurements, commands, runtime identities, bounds and independently checked
 source manifests are retained in
-[like-followup](../../bench/ruby-native/results/like-followup/).
+[like-followup](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/like-followup`).
 
 The explicitly selected [plan](../../bench/ruby-native/compare/like-plan.json)
 uses the unchanged 1,000-row fixture. Its scalar control and historical

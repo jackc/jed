@@ -1,5 +1,9 @@
 # Ruby query-shape optimization pass
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The subsequent [scalar pass](SCALAR_FOLLOWUP.md) addresses the cheap-query
 overhead measured here. These tables retain this pass's original measurements.
 
@@ -114,10 +118,10 @@ cache was added.
 
 Ruby 4.1 interpreter results are also recorded: filtered scan 867.95 µs,
 aggregate 744.20 µs, group 1321.65 µs, and sort-and-limit 1613.55 µs. Full samples,
-answers, runtime checks, and resource peaks are in the [4.0 baseline](../../bench/ruby-native/results/query-before-4_0_7.json),
-[4.1 baseline](../../bench/ruby-native/results/query-before-4_1_preview1.json),
-[4.0 final and supported cores](../../bench/ruby-native/results/query-after-4_0_7.json),
-and [4.1 final modes](../../bench/ruby-native/results/query-after-4_1_preview1.json).
+answers, runtime checks, and resource peaks are in the [4.0 baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-before-4_0_7.json`),
+[4.1 baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-before-4_1_preview1.json`),
+[4.0 final and supported cores](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-after-4_0_7.json`),
+and [4.1 final modes](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-after-4_1_preview1.json`).
 
 ## Canonical file results
 
@@ -151,9 +155,9 @@ substantially higher than YJIT. Go still generates parameters inside timed file
 operations while the other adapters prepare them immediately before timing;
 that existing harness difference is unchanged.
 
-Raw reports: [4.0 baseline](../../bench/ruby-native/results/query-followup/before-file-4.0.7.json),
-[4.0 final and supported cores](../../bench/ruby-native/results/query-followup/final-file-4.0.7.json),
-[4.1 final modes](../../bench/ruby-native/results/query-followup/final-file-4.1-preview1.json).
+Raw reports: [4.0 baseline](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/before-file-4.0.7.json`),
+[4.0 final and supported cores](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-file-4.0.7.json`),
+[4.1 final modes](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-file-4.1-preview1.json`).
 
 ## Lazy and eager API diagnostics
 
@@ -183,10 +187,10 @@ specialized lazy PK path receives little benefit; its small diagnostic slowdown
 is reported rather than treated as an improvement. The final canonical results
 are the appropriate cross-core comparison.
 
-[Baseline profile](../../bench/ruby-native/results/query-followup/before-profile.json)
-and [final profile](../../bench/ruby-native/results/query-followup/final-profile.json)
+[Baseline profile](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/before-profile.json`)
+and [final profile](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-profile.json`)
 retain all samples, per-method call counts, and allocation sites. The
-[intermediate profile](../../bench/ruby-native/results/query-followup/candidate-profile.json)
+[intermediate profile](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/candidate-profile.json`)
 isolates the stage before the integer addition/comparison kernels: adding those
 kernels reduces sort-and-limit from 1416 to 927 µs and grouped aggregation from
 805 to 702 µs in this diagnostic. Scalar queries still pay the general cursor
@@ -208,9 +212,9 @@ host cursor tests and benchmark answer checks cover the lazy paths as well.
 No PostgreSQL oracle run is needed for these implementation-only changes; SQL
 semantics and the shared corpus are unchanged.
 
-[Memory audit](../../bench/ruby-native/results/query-followup/final-conformance-memory-4.1-zjit.json),
-[disk audit](../../bench/ruby-native/results/query-followup/final-conformance-disk-4.1-yjit.json),
-and [host evidence](../../bench/ruby-native/results/query-followup/final-host-4.0.7.json)
+[Memory audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-conformance-memory-4.1-zjit.json`),
+[disk audit](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-conformance-disk-4.1-yjit.json`),
+and [host evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-host-4.0.7.json`)
 record the final source hash before and after execution. New host cases retain
 prepared statements across writes, savepoint rollback, table/view/type
 replacement, and file publication. The C-collation regression covers text and
@@ -219,7 +223,7 @@ It belongs in host tests because the disk corpus reopens between autocommit
 records, which had hidden the bug in live descriptors.
 
 All **112 before/after memory cells, 30 file cells, and 14 before/after diagnostic
-answers** pass their cross-report checks. The [summary](../../bench/ruby-native/results/query-followup/final-summary.json)
+answers** pass their cross-report checks. The [summary](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/query-followup/final-summary.json`)
 records source hashes, active JIT modes, checksums, resource bounds, and artifact
 digests. Intermediate artifacts retain their own source hashes, including the
 host failure that exposed the constraint-key bug; they are separate from the

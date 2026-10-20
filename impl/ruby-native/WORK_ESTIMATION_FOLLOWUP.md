@@ -1,5 +1,9 @@
 # Scalar planner work estimation experiment
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the
 [multiway LEFT-join pass](OUTER_JOIN_FOLLOWUP.md). The Ruby core remains
 experimental, frozen and opt-in. Normal tests, benchmarks, CI and future
@@ -45,7 +49,7 @@ The baseline is pushed commit
 `62e562806cb2fca0e30792f1c90c3546f9f847c94a1af4651d9b3a376fce3705`,
 archived at `/tmp/jed-work-estimation-before/impl/ruby-native`.
 New evidence belongs in
-[`work-estimation-followup`](../../bench/ruby-native/results/work-estimation-followup/).
+[`work-estimation-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/work-estimation-followup`).
 Earlier artifacts remain unchanged.
 
 Final library SHA-256:
@@ -128,7 +132,7 @@ improves 0.174% and LEFT 0.067%; both process ranges overlap. ZJIT prepared
 range and LEFT are 0.198% and 0.949% slower, also overlapping. ZJIT eager LEFT
 is **4.069% slower**, with both final medians above both original medians.
 
-All 81 cells remain in the [complete tables](../../bench/ruby-native/results/work-estimation-followup/tables.md):
+All 81 cells remain in the [complete tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/work-estimation-followup/tables.md`):
 20 have separated faster process medians, six have separated slower medians,
 and 55 overlap. Thirty paired means are slower. The largest regression is
 ZJIT prepared computed-key: **251.731 → 303.223 µs, +20.455%**. Other

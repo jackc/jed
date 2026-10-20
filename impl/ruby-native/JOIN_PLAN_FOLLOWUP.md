@@ -1,5 +1,9 @@
 # Prepared join resolution follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the [performance checkpoint](PERFORMANCE_CHECKPOINT.md).
 The Ruby core remains experimental, frozen and opt-in. No supported core, default
 task, SQL behavior or public API changes in this slice.
@@ -52,7 +56,7 @@ Final library SHA-256:
 `730a4a03496f62feec03acb2355e9c5f2fc9dda69fa055e7d9595f7457bb5edf`.
 
 Results and runnable evidence are retained in
-[`join-plan-followup`](../../bench/ruby-native/results/join-plan-followup/).
+[`join-plan-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-plan-followup`).
 The explicit [nine-workload plan](../../bench/ruby-native/compare/join-plan.json)
 uses the unchanged 1,000-row fixture and historical indexed-join SQL/parameter
 schedule, plus hit/miss, range, computed-key, LEFT, bucket and three-table fallback
@@ -233,10 +237,10 @@ retain binding-sensitive selection and exact cost/error ordering.
 
 ## Reproduction and retained evidence
 
-The [summary](../../bench/ruby-native/results/join-plan-followup/summary.json)
+The [summary](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-plan-followup/summary.json`)
 contains all API/runtime cells, raw per-process medians, exact verification
 signatures, allocation counts and diagnostic observations. The
-[manifest](../../bench/ruby-native/results/join-plan-followup/manifest.json)
+[manifest](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/join-plan-followup/manifest.json`)
 covers 66 evidence files. Its SHA-256 is
 `98f6a51529579776ff6dbc269386909dc978b9e96836ea9f74ecaac83e6edb00`.
 The serialization ledger verifies lossless compaction of 60 JSON reports;

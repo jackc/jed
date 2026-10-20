@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require 'fileutils'
+
 # Explicit diagnostic, separate from canonical benchmark timings. TracePoint
 # runs after all timed batches because tracing changes JIT execution.
 require 'json'

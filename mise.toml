@@ -180,7 +180,7 @@ description = "Explicit opt-in: experimental Ruby CRC and durable snapshot micro
 run = "ruby bench/ruby-native/storage_bench.rb"
 
 [tasks."ruby-native:compare:source-check"]
-description = "Explicit opt-in: restore and verify the preserved original Ruby benchmark source"
+description = "Explicit opt-in: identify the selected current or explicitly restored Ruby benchmark source"
 run = "ruby bench/ruby-native/source.rb"
 
 [tasks."ruby-native:bench:setup"]

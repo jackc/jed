@@ -1,5 +1,9 @@
 # Compiled Ruby ORDER BY comparisons
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The cursor failures reported below are historical. The
 [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
 supersedes the mixed-routing interpretation. Original measurements are retained.
@@ -86,7 +90,7 @@ the internal ordering switch: disabled, enabled, enabled, disabled. Expression
 and pipeline compilation remain enabled. Mean paired medians summarize this
 small alternating experiment; they are not confidence intervals.
 
-The [raw evidence](../../bench/ruby-native/results/ordering-followup/) retains
+The [raw evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/ordering-followup`) retains
 source/runtime/harness hashes, commands, schedules, samples, answer and cost
 digests, and process limits. No timed job overlaps tests, builds, or another
 benchmark job.

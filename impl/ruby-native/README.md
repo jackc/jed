@@ -9,6 +9,11 @@ remains the Rust binding.
 **This frozen experiment is not a supported core.** It implements the SQL, storage
 and host surface of its recorded source revision. The [experiment report](REPORT.md)
 records conformance, interoperability, resource limits and benchmark measurements.
+The [final benchmark summary](FINAL_BENCHMARKS.md) records the experiment's endpoint.
+Raw evidence and run-specific drivers remain on the [original archive branch](../../bench/ruby-native/ARCHIVE.md);
+they are excluded from the cleaned history. Rebasing does not update this core
+to later features or refresh historical benchmark measurements.
+The [integration review](INTEGRATION.md) summarizes the cleaned history and checks.
 The [lookup follow-up](LOOKUP_FOLLOWUP.md) records further profiling and measurements
 with Ruby 4.1.0-preview1 YJIT and ZJIT. The [second lookup pass](LOOKUP_SECOND_PASS.md)
 records the specialized lazy point cursor and repeated comparisons within 10× Go.

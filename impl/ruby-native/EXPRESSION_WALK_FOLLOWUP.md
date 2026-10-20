@@ -1,5 +1,9 @@
 # Expression traversal follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the
 [query setup pass](QUERY_WALK_FOLLOWUP.md). The Ruby core remains experimental,
 frozen and opt-in; normal tests, benchmarks, CI and future feature work do not
@@ -36,7 +40,7 @@ archived at `/tmp/jed-expression-walk-before/impl/ruby-native`.
 Final library SHA-256:
 `577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31`.
 New evidence belongs in
-[`expression-walk-followup`](../../bench/ruby-native/results/expression-walk-followup/).
+[`expression-walk-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/expression-walk-followup`).
 Earlier reports and artifacts remain unchanged.
 
 The timing comparison keeps the existing nine-job
@@ -117,7 +121,7 @@ benefit under YJIT. Interpreter and ZJIT results are mixed. Across the 81 paired
 cells, 23 have both final process medians below both baseline medians, 14 have
 both final medians above both baselines, and 44 have overlapping ranges.
 Thirty-three cells are slower on their paired means. All samples and slower
-cells remain in [the complete tables](../../bench/ruby-native/results/expression-walk-followup/tables.md).
+cells remain in [the complete tables](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/expression-walk-followup/tables.md`).
 These process ranges are observations, not a statistical significance test.
 
 All seven YJIT join workloads improve through ordinary query and eager execute,

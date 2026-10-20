@@ -23,18 +23,18 @@ module NativeRubyFileCompare
   DATA = File.join(ROOT, '.dev/ruby-native-bench-data')
   DEFAULT_WORKLOADS = %w[point_lookup_pk cold_open_pk_small insert_commit_durable].freeze
   ALLOWED_WORKLOADS = (DEFAULT_WORKLOADS + ['full_scan_agg']).freeze
-  DEFAULT_LANES = %w[baseline-ruby baseline-yjit ruby ruby-yjit go rust ts].freeze
-  ALLOWED_LANES = (DEFAULT_LANES + %w[baseline-zjit ruby-zjit]).freeze
+  DEFAULT_LANES = %w[ruby ruby-yjit go rust ts].freeze
+  ALLOWED_LANES = (DEFAULT_LANES + %w[baseline-ruby baseline-yjit baseline-zjit ruby-zjit]).freeze
   MEMORY = 512 * 1024**2
   module_function
 
   def sha(path) = Digest::SHA256.file(path).hexdigest
 
   def baseline_source
-    current = ENV.delete('RUBY_NATIVE_SOURCE')
-    NativeRubySource.resolve(ROOT, phase: 'working-baseline')
-  ensure
-    ENV['RUBY_NATIVE_SOURCE'] = current if current
+    source = ENV.fetch('RUBY_NATIVE_BASELINE_SOURCE') do
+      raise 'Historical file lanes require RUBY_NATIVE_BASELINE_SOURCE; see bench/ruby-native/ARCHIVE.md'
+    end
+    NativeRubySource.resolve(ROOT, phase: 'working-baseline', source: source)
   end
 
   def host

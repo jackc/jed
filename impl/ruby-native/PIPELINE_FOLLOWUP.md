@@ -1,5 +1,9 @@
 # Compiled single-table Ruby pipelines
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 Measured 2026-10-19. This explicitly requested update extends the frozen Ruby
 experiment's runtime compiler from expression methods into single-table row
 loops. No dependency, public API, supported-core implementation, or default task
@@ -55,10 +59,10 @@ run; they are not stronger evidence than the eager and ordinary-query controls.
 Absolute timings differ materially from the larger workload sequence, so tables
 from different sequences should not be combined as if only fusion changed.
 
-Raw controls: [disabled A](../../bench/ruby-native/results/pipeline-followup/fusion-control-1-disabled.json),
-[enabled B](../../bench/ruby-native/results/pipeline-followup/fusion-control-2-enabled.json),
-[enabled B](../../bench/ruby-native/results/pipeline-followup/fusion-control-3-enabled.json),
-[disabled A](../../bench/ruby-native/results/pipeline-followup/fusion-control-4-disabled.json).
+Raw controls: [disabled A](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/fusion-control-1-disabled.json`),
+[enabled B](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/fusion-control-2-enabled.json`),
+[enabled B](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/fusion-control-3-enabled.json`),
+[disabled A](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/fusion-control-4-disabled.json`).
 
 ## Whole-query source and cross-core comparisons
 
@@ -197,7 +201,7 @@ Peak diagnostic RSS was **64.5 MiB**. Native benchmark workers peaked at
 **99.1 MiB**; the largest worker including other cores was **341.5 MiB**
 (TypeScript), below the enforced 512 MiB ceiling. Raw diagnostics, logs, resource
 observations, and all comparison matrices are in
-[`summary.json`](../../bench/ruby-native/results/pipeline-followup/summary.json).
+[`summary.json`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/summary.json`).
 
 ## Implementation and semantic boundary
 
@@ -230,7 +234,7 @@ All **48 host/storage test files passed** on Ruby 4.0.7, including traced input,
 column and output faults; statement/lifetime budget prefixes; warm prepared and
 ordinary APIs; cursor suspension; bindings; schema/publication changes; and cache
 bounds. Peak RSS was 115.1 MiB. The
-[bounded host-test report](../../bench/ruby-native/results/pipeline-followup/host-tests.json)
+[bounded host-test report](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/host-tests.json`)
 retains the command and complete output.
 
 Three full-corpus audits used Ruby 4.1.0-preview1 and forced first-use compilation
@@ -246,9 +250,9 @@ The two execute audits pass completely. They retain the corpus's authored mode
 exclusions (two in memory, 77 on disk); no new exclusions were added. Every run
 finished without a timeout or RSS-limit hit and verified the implementation hash
 before and after execution. Raw reports:
-[memory execute](../../bench/ruby-native/results/pipeline-followup/conformance-memory-zjit.json),
-[disk execute](../../bench/ruby-native/results/pipeline-followup/conformance-disk-yjit.json),
-[memory query](../../bench/ruby-native/results/pipeline-followup/conformance-lazy-yjit.json).
+[memory execute](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/conformance-memory-zjit.json`),
+[disk execute](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/conformance-disk-yjit.json`),
+[memory query](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/conformance-lazy-yjit.json`).
 
 The full lazy audit **does not pass**: it records 71 failures in 16 files. Five
 workers exit on `SystemStackError`, leaving 97 fewer attempted records than the
@@ -264,10 +268,10 @@ bytes. Both attempt 586 records: 515 pass and the **same 71 fail**, with identic
 file, line, SQL and error details. The new compiler introduces no failure in this
 comparison. The selected-file manifest and both raw reports are retained beside
 the full audit:
-[comparison and artifact hashes](../../bench/ruby-native/results/pipeline-followup/lazy-baseline-comparison.json),
-[corpus manifest](../../bench/ruby-native/results/pipeline-followup/lazy-control-corpus.json),
-[before](../../bench/ruby-native/results/pipeline-followup/conformance-lazy-before-control.json),
-[after](../../bench/ruby-native/results/pipeline-followup/conformance-lazy-after-control.json).
+[comparison and artifact hashes](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/lazy-baseline-comparison.json`),
+[corpus manifest](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/lazy-control-corpus.json`),
+[before](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/conformance-lazy-before-control.json`),
+[after](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/conformance-lazy-after-control.json`).
 
 The full lazy harness calls `Rows#rows`, which enables the engine-owned result
 collector and charges its retained rows. The shared corpus's execute-mode memory
@@ -282,8 +286,8 @@ memory-threshold assertions now succeed where the execute-oriented corpus expect
 failure. The other 25 failures persist: 19 lazy resolution/typing/metadata failures,
 five stack overflows, and one correlated-subquery cost-limit failure. These remain
 experimental gaps; no expectation or engine behavior was changed to hide them.
-The [diagnostic report](../../bench/ruby-native/results/pipeline-followup/conformance-lazy-external-drain-diagnostic.json)
-and [diagnostic adapter](../../bench/ruby-native/results/pipeline-followup/lazy-drain-diagnostic.rb)
+The [diagnostic report](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/conformance-lazy-external-drain-diagnostic.json`)
+and [diagnostic adapter](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/lazy-drain-diagnostic.rb`)
 record exactly how this comparison differs from the full audit. It is not a
 replacement conformance pass.
 
@@ -317,7 +321,7 @@ recorded gap outside this compiler change.
 ## Reproduction
 
 The baseline is preserved in
-[`before-source.tar.gz`](../../bench/ruby-native/results/pipeline-followup/before-source.tar.gz)
+[`before-source.tar.gz`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/pipeline-followup/before-source.tar.gz`)
 with a verified restoration manifest. Its implementation SHA-256 is
 `e461f1f256a672948823623a88bc20fa949f594ac2708bda5225069de378d473`.
 The final implementation SHA-256 is

@@ -13,7 +13,7 @@ require 'open3'
 require_relative 'source'
 
 root = File.expand_path('../..', __dir__)
-phase = ENV.fetch('RUBY_NATIVE_PHASE', 'baseline')
+phase = ENV.fetch('RUBY_NATIVE_PHASE', 'current')
 raise 'invalid phase name' unless phase.match?(/\A[a-zA-Z0-9_-]+\z/)
 source = NativeRubySource.resolve(root, phase: phase)
 source_hash = NativeRubySource.digest(source)

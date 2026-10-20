@@ -1,5 +1,9 @@
 # Multiway join resolution follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the
 [prepared join resolution experiment](JOIN_PLAN_FOLLOWUP.md). The Ruby core stays
 experimental, frozen and opt-in. Normal tests, benchmarks, CI and the supported
@@ -76,8 +80,8 @@ residual placement and exact costs as Rust and Go. Four shared regression record
 pin parameter, column and literal identity casts, plus an allowed widening cast.
 This changes incorrect earlier costs; it is not counted as a performance win.
 
-The [failed preflights](../../bench/ruby-native/results/multiway-plan-followup/preflight-provenance.json)
-and [cast regression evidence](../../bench/ruby-native/results/multiway-plan-followup/cast-gate-provenance.json)
+The [failed preflights](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup/preflight-provenance.json`)
+and [cast regression evidence](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup/cast-gate-provenance.json`)
 remain available. The timed computed-key workload uses `b.id = a.id % 10`, a
 PK-bound outer input and two inner inputs bounded below ten. Its complete
 outcomes and costs already agree on the archived baseline, final implementation,
@@ -99,7 +103,7 @@ before and after; the two defective original queries are regression cases, not
 timed substitutes. Control fluctuations cannot be attributed solely to the cache.
 
 New evidence belongs in
-[`multiway-plan-followup`](../../bench/ruby-native/results/multiway-plan-followup/).
+[`multiway-plan-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup`).
 Earlier experiment evidence remains unchanged. The explicit
 [nine-workload plan](../../bench/ruby-native/compare/multiway-plan.json) uses the
 existing 1,000-row fixture. Scalar, PK, two-table indexed join and historical
@@ -479,10 +483,10 @@ hashes; it does not discard raw samples or validation data.
 
 The final verifier accepts all 24 serialized measurement/diagnostic commands,
 the four completed corpus journals and the shared regression/oracle evidence.
-See the [summary](../../bench/ruby-native/results/multiway-plan-followup/summary.json),
-[source provenance](../../bench/ruby-native/results/multiway-plan-followup/source.json),
-[serialization ledger](../../bench/ruby-native/results/multiway-plan-followup/serialization.json)
-and [manifest](../../bench/ruby-native/results/multiway-plan-followup/manifest.json).
+See the [summary](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup/summary.json`),
+[source provenance](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup/source.json`),
+[serialization ledger](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup/serialization.json`)
+and [manifest](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/multiway-plan-followup/manifest.json`).
 The manifest covers 123 files totaling 19,450,704 bytes, excluding the manifest
 itself; 103 JSON files have lossless serialization records. Manifest SHA-256:
 `d3b410e1322959e21f4f410ff4ddb3844be28a316b0e0ddc3b1702b51e3100ce`.

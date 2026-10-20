@@ -1,5 +1,9 @@
 # Sharing compiled Ruby methods
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This follow-up starts at `fc12f427`, after the complete cursor correctness and
 simple literal LIKE audits. Ruby remains a frozen, explicitly selected experiment.
 No dependency, public API or normal test/benchmark/CI task changes.
@@ -30,7 +34,7 @@ Baseline library SHA-256:
 Final library SHA-256:
 `fec686e7484eda683c1692576175671b6c11fb5accaca78b6ccb71466f0ee70a`.
 Commands, runtime identities, source hashes, raw samples and bounds are retained
-in [method-sharing-followup](../../bench/ruby-native/results/method-sharing-followup/).
+in [method-sharing-followup](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/method-sharing-followup`).
 
 Whole-query controls retain the existing 1,000-row fixture and schedules, with
 five samples per process and source ABBA order for interpreter, YJIT and ZJIT.

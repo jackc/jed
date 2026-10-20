@@ -1,5 +1,9 @@
 # Ruby compilation performance checkpoint
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This checkpoint follows method sharing and broader literal LIKE compilation.
 The core remains an explicitly selected, frozen experiment. This report does
 not promote it or add it to normal tests, benchmarks, CI or feature maintenance.
@@ -395,7 +399,7 @@ platform matrix. This checkpoint does not change the frozen-experiment policy.
 ## Reproduction
 
 The evidence directory is
-[performance-checkpoint](../../bench/ruby-native/results/performance-checkpoint/).
+[performance-checkpoint](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/performance-checkpoint`).
 It retains the explicit commands, selected plans, runtime identities, source
 pins, raw samples, bounds, complete validation signatures and derived summaries.
 

@@ -1,5 +1,9 @@
 # Physical join-plan reuse follow-up
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This explicitly requested optimization follows the
 [multiway resolution experiment](MULTIWAY_PLAN_FOLLOWUP.md). The Ruby core remains
 experimental, frozen and opt-in. Normal tests, benchmarks, CI and future feature
@@ -60,7 +64,7 @@ pushed baseline. Final library SHA-256:
 `d21f4edda6dc0a007fce8499c2200c334e5e1e242f0d1397617910a21cda7396`.
 
 New evidence belongs in
-[`physical-plan-followup`](../../bench/ruby-native/results/physical-plan-followup/).
+[`physical-plan-followup`](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/physical-plan-followup`).
 Earlier experiment reports and artifacts remain unchanged. This comparison uses
 the exact existing [nine-workload plan](../../bench/ruby-native/compare/multiway-plan.json),
 including its SQL, 1,000-row fixture, parameter schedules, warmups, iterations and

@@ -1,5 +1,9 @@
 # Cursor conformance and memory ownership
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 This correctness pass follows `fc705ce719bfa6c829e630163b87d4cb2e5250a6`.
 Ruby remains an explicitly selected, frozen experiment. No corpus expectation,
 memory allowance, supported core, normal task, or dependency changes.
@@ -58,7 +62,7 @@ subquery before cursor depth tracking began, treating the subquery's rows as
 outer output. Cursor depth now encloses spill planning and validation as well as
 execution. Loading the spill wrapper earlier preserves the page-service cursor
 pin wrappers' existing order. The negative audit is retained under
-[pre-nesting-fix](../../bench/ruby-native/results/cursor-conformance-fix/pre-nesting-fix/).
+[pre-nesting-fix](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/cursor-conformance-fix/pre-nesting-fix`).
 
 ## Regression coverage
 
@@ -74,7 +78,7 @@ collection, comparing exact rows, metadata, costs, errors and lazy callbacks on
 memory and file hosts. No test weakens a resource check to obtain a pass.
 
 Final bounded corpus and host-suite results are retained in
-[cursor-conformance-fix](../../bench/ruby-native/results/cursor-conformance-fix/).
+[cursor-conformance-fix](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/cursor-conformance-fix`).
 Historical reports and their original failure objects remain unchanged.
 
 ## Final verification

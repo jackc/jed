@@ -1,5 +1,9 @@
 # Compiled primitive Ruby aggregates
 
+> Historical report: raw evidence and run-specific drivers are on the preserved
+> experiment branch. See the [archive and retrieval instructions](../../bench/ruby-native/ARCHIVE.md).
+> Reproduction commands below refer to that original checkout.
+
 The cursor failures reported below are historical. The
 [cursor conformance correction](CURSOR_CONFORMANCE_FIX.md) fixes them and
 supersedes the mixed-routing interpretation. Original measurements are retained.
@@ -66,7 +70,7 @@ different runtime builds, so absolute comparisons do not isolate the two JITs.
 
 Raw measurements, validation digests, commands, runtime/source/harness hashes,
 resource reports, and a reproducible summary are retained in
-[aggregate-followup](../../bench/ruby-native/results/aggregate-followup/).
+[aggregate-followup](../../bench/ruby-native/ARCHIVE.md#retrieve-evidence) (archived `bench/ruby-native/results/aggregate-followup`).
 Timed jobs run sequentially, without overlapping tests, builds, or other
 benchmarks. Final controls follow the completed correctness audits.
 
