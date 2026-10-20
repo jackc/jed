@@ -48,19 +48,36 @@ async function errorScenario(name: string): Promise<string> {
   }
 }
 
+// asyncCodecScenario runs the asynchronous write side over real OPFS with a WebCrypto-suspending identity
+// page codec in a dedicated worker (spec/design/ts-runtime.md §11), comparing it with a run without one.
+async function asyncCodecScenario(): Promise<Record<string, unknown>> {
+  const worker = new Worker(new URL("./workers/async_codec_worker.ts", import.meta.url), {
+    type: "module",
+  });
+  try {
+    return await new Promise((resolve) => {
+      worker.onmessage = (event) => resolve(event.data as Record<string, unknown>);
+      worker.postMessage(null);
+    });
+  } finally {
+    worker.terminate();
+  }
+}
+
 declare global {
   interface Window {
     jed: {
       writeScenario: (name: string) => Promise<string[][]>;
       readScenario: (name: string) => Promise<string[][]>;
       errorScenario: (name: string) => Promise<string>;
+      asyncCodecScenario: () => Promise<Record<string, unknown>>;
     };
     jedRuntime: typeof runtime;
     jedHostFunctions: typeof hostFunctions;
   }
 }
 
-window.jed = { writeScenario, readScenario, errorScenario };
+window.jed = { writeScenario, readScenario, errorScenario, asyncCodecScenario };
 window.jedRuntime = runtime;
 window.jedHostFunctions = hostFunctions;
 

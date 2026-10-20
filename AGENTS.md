@@ -38,8 +38,11 @@ files in the same change.
   sync and async drivers. Common resident expressions return immediate values; pending operands
   retain continuations without replay or duplicate evaluation semantics. Cancellation is best
   effort: sorting, parsing/planning and long scalar kernels stay synchronous. Node data-page reads
-  can await I/O; storage lifecycle, commit and
-  async crypto remain separate work. No encryption suite or Rust delivery default is selected.
+  can await I/O. Commit, open/recovery and storage maintenance are the same kind of continuation
+  (`spec/design/ts-runtime.md` §11): they await any page-codec or byte-device stage that has an
+  asynchronous form, keep validated-COW ordering, and run inline over today's synchronous hosts.
+  Async crypto providers remain separate work. No encryption suite or Rust delivery default is
+  selected.
   Host functions register inside the execution worker: Node uses `extensionModule`; browsers
   supply a fresh worker through `workerFactory` and call the public
   `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;

@@ -54,8 +54,10 @@ Pass `{signal}` to `query`/`execute` for cancellation. Node and cross-origin-iso
 poll shared flags during metered work. All hosts also yield at logical page boundaries and
 common execution loops, including warm scans, so browsers without shared memory can cancel
 mid-query. Cancellation is best effort: sorting, parsing/planning and long scalar functions
-remain synchronous. Node data-page reads can await I/O through retained continuations; storage
-lifecycle, commit and async crypto integration remain follow-ons.
+remain synchronous. Node data-page reads can await I/O through retained continuations. Commit,
+open/recovery and storage maintenance use the same continuations and await any asynchronous
+page-codec or device stage (`spec/design/ts-runtime.md` §11); async crypto providers remain
+follow-ons.
 
 Node's `extensionModule` accepts a trusted file URL exporting `configure(builder)`. That module
 registers host functions on the worker's `EnvironmentBuilder` before storage opens. Application

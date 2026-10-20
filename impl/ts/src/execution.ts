@@ -7,7 +7,7 @@ import { currentPlanningFrames, withPlanningScope, type PlanningFrames } from ".
 export type ExecutionEffect =
   | { kind: "io"; sync: () => unknown; async?: () => Promise<unknown> }
   | { kind: "cooperate" }
-  | { kind: "call"; steps: Steps<unknown> };
+  | { kind: "call"; steps: Steps<unknown>; uncancelable?: boolean };
 export type Steps<T> = Generator<ExecutionEffect, T, unknown>;
 export interface StepIterator<T> {
   nextSteps(): Steps<IteratorResult<T>>;
@@ -87,6 +87,20 @@ export function* callSteps<T>(steps: Steps<T>): Steps<T> {
   return (yield { kind: "call", steps }) as T;
 }
 
+// Run steps as a continuation that cancellation cannot interrupt: a commit past its last safe
+// checkpoint (ts-runtime.md §11.2). Both drivers suppress meter polling for its segments, and the
+// async driver neither injects 57014 into it nor checks the flag around its effects.
+export function* uncancelableSteps<T>(steps: Steps<T>): Steps<T> {
+  return (yield { kind: "call", steps, uncancelable: true }) as T;
+}
+
+// Run a device operation inline when it has no asynchronous form, so a synchronous storage stack
+// pays no effect or task yield on the write side (ts-runtime.md §11.4).
+export function* deviceSteps<T>(sync: () => T, async?: () => Promise<T>): Steps<T> {
+  if (async === undefined) return sync();
+  return (yield { kind: "io", sync, async }) as T;
+}
+
 function scoped<T>(
   context: ExecutionContext,
   check: (() => boolean) | undefined,
@@ -132,21 +146,30 @@ function advanceSync<T>(steps: Steps<T>, cancellation?: { delivered: boolean }):
   // Most row pulls finish in their first segment. Allocate the recursive-query stack only for an
   // actual call effect; an ordinary resident row needs neither a stack array nor scope closures.
   let stack: Steps<unknown>[] | undefined;
+  // shields[i] is whether stack frame i+1 (the frame pushed above stack[i]) is uncancelable;
+  // shielded counts the uncancelable frames on the stack, including current.
+  let shields: boolean[] | undefined;
+  let shielded = 0;
   let current: Steps<unknown> = steps;
   let input: unknown;
   let failure: unknown;
   let failed = false;
+  const popFrame = (): Steps<unknown> | undefined => {
+    const parent = stack?.pop();
+    if (parent !== undefined && shields!.pop()) shielded--;
+    return parent;
+  };
   for (;;) {
     let step: IteratorResult<ExecutionEffect, unknown>;
     try {
       step =
-        failed || cancellation?.delivered
+        failed || cancellation?.delivered || shielded > 0
           ? withCancellationScope(undefined, () =>
               failed ? current.throw(failure) : current.next(input),
             )
           : current.next(input);
     } catch (error) {
-      const parent = stack?.pop();
+      const parent = popFrame();
       if (parent === undefined) throw error;
       current = parent;
       failure = error;
@@ -154,7 +177,7 @@ function advanceSync<T>(steps: Steps<T>, cancellation?: { delivered: boolean }):
       continue;
     }
     if (step.done) {
-      const parent = stack?.pop();
+      const parent = popFrame();
       if (parent === undefined) return step.value as T;
       current = parent;
       input = step.value;
@@ -164,17 +187,24 @@ function advanceSync<T>(steps: Steps<T>, cancellation?: { delivered: boolean }):
     failed = false;
     input = undefined;
     if (step.value.kind === "call") {
-      if (stack === undefined) stack = [];
+      if (stack === undefined) {
+        stack = [];
+        shields = [];
+      }
       stack.push(current);
+      const shield = step.value.uncancelable === true;
+      shields!.push(shield);
+      if (shield) shielded++;
       current = step.value.steps;
       continue;
     }
     if (step.value.kind === "cooperate") continue;
     try {
       // A sticky cancellation must not interrupt resource cleanup a second time.
-      input = cancellation?.delivered
-        ? withCancellationScope(undefined, step.value.sync)
-        : step.value.sync();
+      input =
+        cancellation?.delivered || shielded > 0
+          ? withCancellationScope(undefined, step.value.sync)
+          : step.value.sync();
     } catch (error) {
       failure = error;
       failed = true;
@@ -213,6 +243,13 @@ export async function runAsync<T>(
       setTimeout(callback, 0);
     });
   const stack: Steps<unknown>[] = [steps];
+  // shields[i] is whether stack[i] is an uncancelable frame; shielded counts them.
+  const shields: boolean[] = [false];
+  let shielded = 0;
+  const popFrame = (): void => {
+    stack.pop();
+    if (shields.pop()) shielded--;
+  };
   let needsCheck = true;
   let input: unknown;
   let failure: unknown;
@@ -229,7 +266,7 @@ export async function runAsync<T>(
           return requested;
         };
   for (;;) {
-    if (needsCheck && !failed && !canceled && check?.()) {
+    if (needsCheck && !failed && !canceled && shielded === 0 && check?.()) {
       failure = engineError("query_canceled", "canceling statement due to user request");
       failed = true;
       canceled = true;
@@ -240,18 +277,18 @@ export async function runAsync<T>(
     const current = stack[stack.length - 1]!;
     let step: IteratorResult<ExecutionEffect, unknown>;
     try {
-      step = scoped(context, canceled || failed ? undefined : segmentPoll, () =>
+      step = scoped(context, canceled || failed || shielded > 0 ? undefined : segmentPoll, () =>
         failed ? current.throw(failure) : current.next(input),
       );
     } catch (error) {
-      stack.pop();
+      popFrame();
       if (stack.length === 0) throw error;
       failure = error;
       failed = true;
       continue;
     }
     if (step.done) {
-      stack.pop();
+      popFrame();
       if (stack.length === 0) return step.value as T;
       input = step.value;
       failed = false;
@@ -261,6 +298,9 @@ export async function runAsync<T>(
     input = undefined;
     if (step.value.kind === "call") {
       stack.push(step.value.steps);
+      const shield = step.value.uncancelable === true;
+      shields.push(shield);
+      if (shield) shielded++;
       continue;
     }
     needsCheck = true;
@@ -280,11 +320,16 @@ export async function runAsync<T>(
           }
         } else {
           await new Promise<void>((resolve) => schedule(resolve));
-          if (!canceled && check?.()) {
+          if (!canceled && shielded === 0 && check?.()) {
             failure = engineError("query_canceled", "canceling statement due to user request");
             failed = true;
             canceled = true;
-          } else input = scoped(context, canceled ? undefined : segmentPoll, effect.sync);
+          } else
+            input = scoped(
+              context,
+              canceled || shielded > 0 ? undefined : segmentPoll,
+              effect.sync,
+            );
         }
       }
     } catch (error) {

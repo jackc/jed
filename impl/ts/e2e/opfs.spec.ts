@@ -45,3 +45,20 @@ test("opening an absent database raises the structured 58P01 across the worker b
   const code = await page.evaluate(() => window.jed.errorScenario("does-not-exist.jed"));
   expect(code).toBe("58P01"); // undefined_file — the structured-error contract survives postMessage
 });
+
+test("commit, recovery and maintenance await an asynchronous page codec over real OPFS", async ({
+  page,
+}) => {
+  await page.goto("/");
+  // The demo owns a worker during its initial OPFS write/read; let it release its handle first.
+  await expect(page.locator("#out")).toContainText("read back");
+  const result = await page.evaluate(() => window.jed.asyncCodecScenario());
+  expect(result).toEqual({
+    rows: 30,
+    sameRows: true,
+    sameReread: true,
+    sameBytes: true,
+    encoded: true,
+    decoded: true,
+  });
+});

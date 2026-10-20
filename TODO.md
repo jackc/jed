@@ -639,9 +639,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `jed-ts/browser/worker` startup helper; registration runs once before storage opens, and jed
   owns the dedicated worker's cleanup. Browser-safe registration modules can be reused through
   Node's `extensionModule`. Cancellation is best effort; sorting, parsing/planning and long scalar
-  kernels stay synchronous unless measurements justify extra pause points. Remaining: async
-  storage lifecycle/commit and crypto providers, cold/durable and other-browser
-  public-boundary measurements, ARM/package-size measurements, and optional Rust delivery parity.
+  kernels stay synchronous unless measurements justify extra pause points. Commit, open/recovery
+  and storage maintenance await asynchronous page-codec/device stages (ts-runtime.md §11).
+  Remaining: crypto providers, an async compaction (with OPFS compaction), cold/durable and
+  other-browser public-boundary measurements, ARM/package-size measurements, and optional Rust
+  delivery parity.
   Public async host API follow-ons: compaction, changing database storage limits after open,
   the storage-byte gauge, and resetting an individual custom session variable. The docs describe
   their current availability; displayed TypeScript examples execute in the Node unit suite.

@@ -24,9 +24,10 @@
 import { Engine, DEFAULT_PAGE_SIZE } from "./executor.ts";
 import { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
-import { loadEnginePaged, ROOT_PAGE, toImage } from "./format.ts";
+import { runAsync, runSync, type Steps } from "./execution.ts";
+import { loadEnginePagedSteps, ROOT_PAGE, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
-import { Pager } from "./pager.ts";
+import { Pager, type PageTransform } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
 import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
 
@@ -91,10 +92,23 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
 // (pager.md §1, P6.4b). A malformed file is XX001, a read failure 58030 (api.md §2.1). db.path stays
 // null (spill disabled for OPFS, see header).
 export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions = {}): Engine {
+  return runSync(openOpfsWithHandleSteps(handle, opts));
+}
+
+// openOpfsWithHandleSteps is the open as one continuation (ts-runtime.md §11.1): the worker drives it
+// with runAsync, so a page codec with asynchronous operations (transform, the seam of §11.5 — none is
+// installed in production) is awaited through recovery. Over the synchronous handle with no codec
+// every read runs inline.
+export function* openOpfsWithHandleSteps(
+  handle: SyncAccessHandle,
+  opts: OpenOptions = {},
+  transform: PageTransform | null = null,
+): Steps<Engine> {
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const readOnly = opts.readOnly ?? false;
-  const pager = Pager.fromStore(new OpfsBlockStore(handle));
-  const db = loadEnginePaged(
+  const pager = yield* Pager.fromStoreSteps(new OpfsBlockStore(handle));
+  pager.setPageTransform(transform);
+  const db = yield* loadEnginePagedSteps(
     new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)),
     opts.environment ?? new Environment(),
   );
@@ -210,7 +224,7 @@ export async function openOpfs(name: string, opts: OpenOptions = {}): Promise<En
   }
   const handle = await fileHandle.createSyncAccessHandle();
   try {
-    return openOpfsWithHandle(handle, opts);
+    return await runAsync(openOpfsWithHandleSteps(handle, opts));
   } catch (e) {
     try {
       handle.close(); // a malformed file / read failure must not leak the handle
