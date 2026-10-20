@@ -1372,3 +1372,5 @@ experiment may use exact-pinned RustCrypto `aes-gcm` / `chacha20poly1305`, Go
 `golang.org/x/crypto/chacha20poly1305`, and TypeScript `@noble/ciphers`, with lockfiles/checksums.
 This approval includes their standard accelerated backends for measurement only; it selects no
 production cipher or engine dependency. See `bench/aead/README.md` for versions and methodology.
+On 2026-10-19 the same approval was extended to RustCrypto `hkdf = 0.13.0` (with `hmac` 0.13.0) and
+`sha2 = 0.11.0` in `bench/aead/rust`, for the HKDF key-granularity probe only.

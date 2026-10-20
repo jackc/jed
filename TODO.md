@@ -656,7 +656,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
   `bench/aead/`. Suite direction (encryption.md §3.1): AES-256-GCM with HKDF keys from fresh random
-  salts, per page or per commit attempt (to be measured), pending a security review and fault
+  salts, per page or per commit attempt (measured in Go and Rust, not yet chosen), pending a security review and fault
   fixtures; XChaCha is dropped because no platform standard library ships it. The TS write side
   already awaits an async page codec (§8.1). No dependency is selected and no implementation is
   scheduled. Decided: a reserved-bytes region with

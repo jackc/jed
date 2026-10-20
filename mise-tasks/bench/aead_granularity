@@ -1,0 +1,94 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Compare per-page and per-commit random-salt HKDF AES-GCM keys in Go and Rust"
+
+require "json"
+require "open3"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+samples = Integer(ENV.fetch("JED_AEAD_SAMPLES", "5"))
+millis = Integer(ENV.fetch("JED_AEAD_SAMPLE_MS", "100"))
+abort "samples and sample duration must be positive" unless samples.positive? && millis.positive?
+dir = File.expand_path(ENV.fetch("JED_AEAD_RESULTS", "bench/results/aead-granularity-#{stamp}-#{Process.pid}"))
+FileUtils.mkdir_p(dir)
+base = File.join(ROOT, "bench/aead")
+sh "cargo", "build", "--release", "--locked", "--offline", "--bin", "granularity", "--manifest-path", "#{base}/rust/Cargo.toml"
+sh "go", "build", "-mod=readonly", "-o", "#{dir}/granularity-go", "./cmd/granularity", chdir: "#{base}/go", env: { "CGO_ENABLED" => "0", "GOPROXY" => "off" }
+# Sequential workers pinned to one allowed logical CPU (override with JED_AEAD_CPU).
+allowed = File.exist?("/proc/self/status") ? File.read("/proc/self/status")[/^Cpus_allowed_list:\s*(.+)$/, 1] : nil
+cpu = ENV.fetch("JED_AEAD_CPU", allowed&.split(/[,-]/)&.first)
+prefix = cpu ? ["taskset", "-c", cpu] : []
+commands = { "go" => ["#{dir}/granularity-go"], "rustcrypto" => ["#{base}/rust/target/release/granularity"] }
+capture = ->(*cmd) { out, status = Open3.capture2e(*cmd); abort out unless status.success?; out.strip }
+metadata = {
+  "date_utc" => Time.now.utc.iso8601, "revision" => capture.call("git", "rev-parse", "HEAD"),
+  "working_tree" => capture.call("git", "status", "--short"), "samples" => samples, "sample_ms" => millis,
+  "warmup_samples" => 1, "batch_operations" => 64, "cpu_affinity" => cpu,
+  "os" => capture.call("uname", "-a"), "rust" => capture.call("rustc", "--version"), "go" => capture.call("go", "version"),
+  "cpu_info" => File.exist?("/proc/cpuinfo") ? File.read("/proc/cpuinfo").split("\n\n").first : nil,
+  "environment" => ENV.select { |k, _| %w[RUSTFLAGS GOAMD64 GODEBUG].include?(k) },
+  "source_sha256" => Dir.glob("#{base}/{rust/src/bin/granularity.rs,rust/Cargo.*,go/cmd/granularity/*.go,go/go.*}").sort.to_h { |p| [p.delete_prefix("#{ROOT}/"), Digest::SHA256.file(p).hexdigest] },
+}
+File.write("#{dir}/metadata.json", JSON.pretty_generate(metadata) + "\n")
+
+# Each worker validates RFC 5869 vectors, round trips and tamper rejection before timing; the
+# fixed-salt fixtures (derived keys and full ciphertext+tag) must agree across backends.
+fixtures = {}
+rows = []
+[0, samples].each do |sample_count|
+  commands.each do |name, command|
+    puts "#{sample_count.zero? ? 'Validate' : 'Measure'} #{name}"
+    $stdout.flush
+    output, status = Open3.capture2(*prefix, *command, sample_count.to_s, millis.to_s)
+    abort "#{name} failed" unless status.success?
+    File.write("#{dir}/#{sample_count.zero? ? 'validate-' : ''}#{name}.jsonl", output)
+    parsed = output.lines.map { |line| JSON.parse(line) }
+    found = parsed.select { |row| row.fetch("kind") == "fixture" }
+    abort "missing fixtures from #{name}" unless found.length == 14
+    found.each do |row|
+      key = row.values_at("fixture", "layout", "bytes")
+      value = row.fetch("hex")
+      abort "ciphertext/key mismatch: #{name} #{key}" if fixtures.key?(key) && fixtures[key] != value
+      fixtures[key] = value
+    end
+    next if sample_count.zero?
+    measured = parsed.select { |row| row.fetch("kind") == "timing" }
+    abort "missing timings from #{name}" unless measured.length == 6 + 3 * 23
+    measured.each do |row|
+      values = row.fetch("ns_samples")
+      abort "invalid samples" unless values.length == samples && values.all? { |x| x.finite? && x.positive? }
+      row["median_ns"] = values.sort[values.length / 2]
+      row["min_ns"] = values.min
+      row["max_ns"] = values.max
+    end
+    rows.concat(measured)
+  end
+  puts "Go and Rust agree on all derived keys and ciphertext/tag fixtures." if sample_count.zero?
+end
+fixture_rows = fixtures.map { |(fixture, layout, bytes), hex| { fixture: fixture, layout: layout, bytes: bytes, sha256: Digest::SHA256.hexdigest([hex].pack("H*")) } }
+File.write("#{dir}/results.json", JSON.pretty_generate({ rows: rows, fixtures: fixture_rows, metadata: metadata }) + "\n")
+
+us = ->(row) { row ? format("%.3f", row["median_ns"] / 1000) : "—" }
+find = ->(backend, **want) { rows.find { |r| r["backend"] == backend && want.all? { |k, v| r[k.to_s] == v } } }
+backends = commands.keys
+report = ["# AEAD key granularity", "", "CPU affinity: #{cpu || 'unbound'}; #{samples} samples × #{millis} ms after one warmup per case. Median µs per page (per key for key setup).", ""]
+report << "## Key setup" << "" << "| Operation | #{backends.join(' | ')} |" << "|---|#{'---:|' * backends.length}"
+rows.select { |r| r["scheme"] == "key-setup" }.map { |r| r["operation"] }.uniq.each do |op|
+  report << "| #{op} | #{backends.map { |b| us.call(find.call(b, scheme: 'key-setup', operation: op)) }.join(' | ')} |"
+end
+%w[extract-per-key expand-per-key].each do |layout|
+  report << "" << "## Pages, #{layout} layout" << "" << "| Backend | Bytes | Op | Fixed key | Per page | Commit 1 | Commit 4 | Commit 16 | Commit 256 | All-hit cache |" << "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+  backends.each do |b|
+    [4096, 8192, 16384].each do |size|
+      %w[seal open].each do |op|
+        commit = [1, 4, 16, 256].map { |n| us.call(find.call(b, scheme: "per-commit", layout: layout, commit_pages: n, operation: op, bytes: size)) }
+        hit = op == "open" ? us.call(find.call(b, scheme: "per-commit", cache: "all-hit", operation: op, bytes: size)) : "—"
+        report << "| #{b} | #{size} | #{op} | #{us.call(find.call(b, scheme: 'fixed-key', operation: op, bytes: size))} | #{us.call(find.call(b, scheme: 'per-page', layout: layout, operation: op, bytes: size))} | #{commit.join(' | ')} | #{hit} |"
+      end
+    end
+  end
+end
+File.write("#{dir}/summary.md", report.join("\n") + "\n")
+puts report
+puts "Granularity results: #{dir}/summary.md"
