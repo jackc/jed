@@ -14,3 +14,9 @@ func (*selectPlan) projectionKernel(int) *scalarKernel       { return nil }
 func (*scalarKernel) eval(storedRow, *evalEnv, *costMeter) (Value, error) {
 	panic("execution specialization is not built") // unreachable: selectors inline to nil
 }
+
+func (*scalarKernel) evalFilter(storedRow, *evalEnv, *costMeter) (bool, error) {
+	panic("execution specialization is not built")
+}
+
+func specializeScanCursor(c *streamingCursor) cursor { return c }

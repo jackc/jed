@@ -462,7 +462,7 @@ func TestCancellationWithoutRowEmission(t *testing.T) {
 				defer r.Close()
 				// Skip the first sample, as if the preceding step already polled.
 				// The rejected-candidate loop must reach the next one on its own.
-				switch c := r.cursor.(type) {
+				switch c := specializationUnwrapCursor(r.cursor).(type) {
 				case *streamingCursor:
 					c.meter.cancelSteps = 1
 				case *bufferedScanCursor:

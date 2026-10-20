@@ -62,6 +62,8 @@ func BenchmarkSpecialization(b *testing.B) {
 				{name: "scalar", sql: "SELECT $1+2"},
 				{name: "unsupported", sql: "SELECT abs(a) FROM t ORDER BY id"},
 				{name: "columnar", sql: "SELECT sum(a) FROM t"},
+				{name: "boolean", sql: "SELECT id FROM t WHERE (a+b > $1 AND b<12) OR a IS NULL ORDER BY id"},
+				{name: "coalesce", sql: "SELECT coalesce(CASE WHEN a>50 THEN a+b ELSE NULL END,b) FROM t ORDER BY id"},
 				{name: "case", sql: "SELECT CASE WHEN a>50 THEN a ELSE b END FROM t ORDER BY id"},
 				{name: "adhoc", sql: "SELECT a+b FROM t ORDER BY id LIMIT 16", adhoc: true},
 				{name: "first_call", sql: "SELECT a+b FROM t ORDER BY id LIMIT 16", first: true},

@@ -2,11 +2,8 @@
 
 package jed
 
-// G1 deliberately has a tighter grammar than the shared structural ceilings:
-// at most seven source nodes, depth three, seven descriptors and four primitive
-// constants per root; eight roots per plan. No recursive compiler, pool, register
-// file, runtime closure, per-row scratch allocation or retained source pointers.
-// Descriptors are filled before the existing atomic plan-cache publication.
+// G1 patterns are terminals of the bounded G2 composition. All descriptors
+// are immutable before the existing atomic plan-cache publication.
 const specializationMaxRoots = 8
 
 type specializationPlan struct {
@@ -35,6 +32,9 @@ type kernelOperand struct {
 }
 
 type scalarKernel struct {
+	children    [3]*scalarKernel
+	run         kernelFunc
+	leaf        bool
 	kind        rExprKind
 	op          binaryOp
 	width       scalarType
@@ -114,7 +114,7 @@ func bindKernelOperand(e *rExpr, columns []catColumn, params []colType) (kernelO
 	return kernelOperand{arith: true, op: e.op, width: e.result, charge: operatorCost(e.op.catalogName()), left: l, right: r}, rtInt, true
 }
 
-func bindScalarKernel(e *rExpr, columns []catColumn, params []colType) *scalarKernel {
+func bindStaticKernel(e *rExpr, columns []catColumn, params []colType) *scalarKernel {
 	if e == nil {
 		return nil
 	}
@@ -144,7 +144,7 @@ func bindScalarKernel(e *rExpr, columns []catColumn, params []colType) *scalarKe
 			k.charge = operatorCost("not")
 		}
 	default:
-		return nil // bare leaves and all G2 forms are ordinary controls
+		return nil // composed forms are handled by the bounded G2 binder
 	}
 	return &k
 }
@@ -175,7 +175,7 @@ func (db *engine) prepareSpecialization(p *selectPlan, params []colType) {
 			ks.reasons[slot] = "absent"
 		}
 		if k != nil {
-			ks.reasons[slot] = "G1 static kernel"
+			ks.reasons[slot] = "bounded G1/G2 kernel"
 		}
 		return k
 	}
@@ -232,6 +232,19 @@ func (o *kernelOperand) eval(row storedRow, env *evalEnv, m *costMeter) (Value, 
 
 func (k *scalarKernel) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	specializationInvoked()
+	return k.evalMode(row, env, m, false)
+}
+
+func (k *scalarKernel) evalMode(row storedRow, env *evalEnv, m *costMeter, filter bool) (Value, error) {
+	if specializationClosures {
+		return k.run(row, env, m, filter)
+	}
+	if k.leaf {
+		return k.left.left.load(row, env, m)
+	}
+	if k.children[0] != nil {
+		return k.evalComposition(row, env, m, filter)
+	}
 	if err := m.Guard(); err != nil {
 		return Value{}, err
 	}
@@ -256,6 +269,10 @@ func (k *scalarKernel) eval(row storedRow, env *evalEnv, m *costMeter) (Value, e
 		}
 		return evalArith(k.op, a.Int, b.Int, k.width)
 	}
+	return compareKernel(k.op, a, b, m)
+}
+
+func compareKernel(op binaryOp, a, b Value, m *costMeter) (Value, error) {
 	// Preserve BOTH zero-charge/guard sites of the ordinary comparator, including
 	// ceilingHit bookkeeping. No cancellation checks occur at expression nodes.
 	m.Charge(0)
@@ -270,7 +287,7 @@ func (k *scalarKernel) eval(row storedRow, env *evalEnv, m *costMeter) (Value, e
 		return NullValue(), nil
 	}
 	var result bool
-	switch k.op {
+	switch op {
 	case opEq:
 		result = a.Int == b.Int
 	case opNe:

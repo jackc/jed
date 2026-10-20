@@ -1,0 +1,6 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkSpecialization/memory/boolean-24 	     226	    527240 ns/op	3209232681 checksum	3944020771 checksum1	     26962 cost	     26921 cost1	  441263 B/op	    5561 allocs/op
+PASS

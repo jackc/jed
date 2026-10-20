@@ -265,10 +265,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **Rust cached typed programs** — selective scan execution, plan-owned reuse and
     per-execution scratch; static-kernel controls, no native JIT dependency.
     [Proposal](spec/design/rust-expression-specialization.md).
-  - [x] **Go static execution kernels — G1 investigation** — opt-in bounded integer/boolean
+  - [x] **Go static execution kernels — G1/G2/G3 investigation** — opt-in bounded integer/boolean
     patterns with immutable plan-owned reuse, forced-path conformance and short complete-query
     measurements. [Implementation/results](bench/go-specialization/README.md). Production adoption
-    and G2 composition/G3 loop fusion remain separate follow-ons; no runtime compiler.
+    remains a separate decision; bounded composition, closure controls and the precompiled
+    scan-loop experiment are implemented. No runtime compiler.
     [Proposal](spec/design/go-execution-specialization.md).
   - [ ] **TS CSP-compatible specialization** — typed closures and static kernels, validated
     plan reuse, strict-CSP browser and ordinary Node execution; no runtime source generation.

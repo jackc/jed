@@ -4,7 +4,8 @@
 require "json"
 root = File.expand_path("..", __dir__)
 dir = File.expand_path(ARGV.fetch(0, "bench/results/go-specialization"), root)
-variants = %w[clean disabled ordinary selective]
+metadata = File.exist?("#{dir}/environment.json") ? JSON.parse(File.read("#{dir}/environment.json")) : {}
+variants = metadata.fetch("variants", %w[clean disabled ordinary selective])
 samples = variants.to_h { |v| [v, {}] }
 variants.each do |v|
   Dir["#{dir}/#{v}-[0-9]*.txt"].sort.each do |file|
@@ -52,9 +53,9 @@ report = samples.fetch("clean").keys.to_h do |name|
   [name, stats]
 end
 File.write("#{dir}/summary.json", JSON.pretty_generate(report) + "\n")
-puts "| Query | Clean µs | Disabled µs | Ordinary µs | Kernels µs | vs clean | Faster pairs |"
-puts "|---|---:|---:|---:|---:|---:|---:|"
+puts "| Query | #{variants.map { |v| "#{v} µs" }.join(" | ")} | vs clean | Faster pairs |"
+puts "|---|#{variants.map { "---:" }.join("|")}|---:|---:|"
 report.each do |name, r|
-  printf("| %s | %.2f | %.2f | %.2f | %.2f | %+.1f%% | %d |\n", name,
-         *variants.map { |v| r[v][:median_ns] / 1000 }, r["selective_vs_clean_percent"], r["faster_pairs"])
+  times = variants.map { |v| format("%.2f", r[v][:median_ns] / 1000) }
+  puts "| #{name} | #{times.join(" | ")} | #{format("%+.1f%%", r["selective_vs_clean_percent"])} | #{r["faster_pairs"]} |"
 end

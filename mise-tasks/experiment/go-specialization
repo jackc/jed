@@ -26,14 +26,20 @@ when "test", "race"
   run(*args, "./...", chdir: "impl/go")
 when "escape"
   stdout, stderr, status = Open3.capture3("go", "test", "-tags", tags, "-gcflags=-m=2", "-run", "^$", ".", chdir: "impl/go")
-  File.write("#{out}/escape.txt", stderr.lines.grep(/specialization(?:_off)?\.go:/).join + stdout)
+  File.write("#{out}/escape.txt", stderr.lines.grep(/specialization[^:]*\.go:/).join + stdout)
   abort "escape analysis build failed" unless status.success?
 when "norec"
   run("ruby", "scripts/norec_gen.rb", "--seeds", "1,2", "--cores", ENV.fetch("JED_SPECIALIZATION_CORES", "go"))
 when "verify"
-  %w[ordinary forced selective].each do |variant|
-    variant_tags = "jed_specialization"
-    variant_tags += ",jed_specialization_#{variant}" unless variant == "selective"
+  variants = {
+    "ordinary" => "jed_specialization,jed_specialization_ordinary",
+    "forced" => "jed_specialization,jed_specialization_forced",
+    "selective" => "jed_specialization",
+    "closures" => "jed_specialization,jed_specialization_closures,jed_specialization_forced",
+    "scan-forced" => "jed_specialization,jed_specialization_scan,jed_specialization_forced",
+    "scan-selective" => "jed_specialization,jed_specialization_scan"
+  }
+  variants.each do |variant, variant_tags|
     log = "#{out}/conformance-#{variant}.txt"
     File.open(log, "w") do |io|
       run({"JED_SPECIALIZATION_TAGS" => variant_tags}, "mise", "run", "experiment:go-specialization", "corpus", out: io, err: io)
@@ -48,7 +54,7 @@ when "corpus"
 when "diagnostics"
   run("go", "test", "-tags", "#{tags},jed_specialization_diagnostics", "-run", "Specialization", "-v", ".", chdir: "impl/go")
 when "profile"
-  argv = ["#{out}/selective.test", "-test.run=^$", "-test.bench=^BenchmarkSpecialization$/memory/arithmetic$", "-test.benchtime=100ms", "-test.memprofile=#{out}/alloc.pprof", "-test.cpuprofile=#{out}/cpu.pprof"]
+  argv = ["#{out}/selective.test", "-test.run=^$", "-test.bench=^BenchmarkSpecialization$/memory/#{ENV.fetch("JED_SPECIALIZATION_PROFILE_QUERY", "arithmetic")}$", "-test.benchtime=100ms", "-test.memprofile=#{out}/alloc.pprof", "-test.cpuprofile=#{out}/cpu.pprof"]
   stdout, stderr, status = Open3.capture3(*argv, chdir: "#{root}/impl/go")
   File.write("#{out}/profile-run.txt", stdout + stderr)
   abort "profile failed" unless status.success?
@@ -63,12 +69,13 @@ when "recheck"
   # Only noisy controls from the final matrix; reuse exactly those binaries.
   dest = "#{out}/recheck"
   FileUtils.mkdir_p(dest)
+  metadata = JSON.parse(File.read("#{out}/environment.json"))
   commands = []
   3.times do |pair|
-    names = %w[clean disabled ordinary selective]
+    names = metadata.fetch("variants", %w[clean disabled ordinary selective]).dup
     names.reverse! if pair.odd?
     names.each do |name|
-      argv = ["#{out}/#{name}.test", "-test.run=^$", "-test.bench=^BenchmarkSpecialization$/(memory|file)/(columnar|scalar|first_call|point_miss|adhoc)$", "-test.benchmem", "-test.benchtime=250ms", "-test.count=1"]
+      argv = ["#{out}/#{name}.test", "-test.run=^$", "-test.bench=#{ENV.fetch("JED_SPECIALIZATION_RECHECK", "^BenchmarkSpecialization$/(memory|file)/(columnar|scalar|first_call|point_miss|adhoc)$")}", "-test.benchmem", "-test.benchtime=250ms", "-test.count=1"]
       commands << argv
       stdout, stderr, status = Open3.capture3(*argv, chdir: "#{root}/impl/go")
       File.write("#{dest}/#{name}-#{pair}.txt", stdout + stderr)
@@ -76,6 +83,7 @@ when "recheck"
       puts "control recheck #{pair+1}/3 #{name} finished"
     end
   end
+  File.write("#{dest}/environment.json", JSON.pretty_generate(metadata) + "\n")
   File.write("#{dest}/commands.json", JSON.pretty_generate(commands) + "\n")
   run("ruby", "scripts/go_specialization_report.rb", dest)
 when "report"
@@ -93,10 +101,29 @@ when "bench"
   end
   FileUtils.cp("impl/go/specialization_bench_test.go", "#{baseline}/impl/go/")
   variants = {"clean" => ["#{baseline}/impl/go", ""], "disabled" => ["#{root}/impl/go", ""], "ordinary" => ["#{root}/impl/go", "jed_specialization,jed_specialization_ordinary"], "selective" => ["#{root}/impl/go", "jed_specialization"]}
+  stage = ENV.fetch("JED_SPECIALIZATION_STAGE", "g2")
+  if stage == "g2"
+    g1 = Dir.mktmpdir("g1-", out)
+    archive, status = Open3.capture2("git", "archive", "90e654fe9b206a5b63d332ea170709e453f5091f", "impl/go")
+    abort "G1 archive failed" unless status.success?
+    Open3.popen3("tar", "-x", "-C", g1) do |input, output, errors, child|
+      input.binmode; input.write(archive); input.close
+      abort errors.read unless child.value.success?
+    end
+    FileUtils.cp("impl/go/specialization_bench_test.go", "#{g1}/impl/go/")
+    variants["g1"] = ["#{g1}/impl/go", "jed_specialization"]
+    variants["closures"] = ["#{root}/impl/go", "jed_specialization,jed_specialization_closures"]
+  elsif stage == "g3"
+    variants["g2"] = ["#{root}/impl/go", "jed_specialization"]
+    variants["selective"] = ["#{root}/impl/go", "jed_specialization,jed_specialization_scan"]
+  else
+    abort "unknown stage #{stage}"
+  end
   variants.each do |name, (dir, build_tags)|
     run("go", "test", "-c", "-tags", build_tags, "-o", "#{out}/#{name}.test", ".", chdir: dir)
   end
   FileUtils.remove_entry(baseline)
+  FileUtils.remove_entry(g1) if g1
   commands = []
   5.times do |pair|
     names = variants.keys
@@ -111,6 +138,7 @@ when "bench"
     end
   end
   File.write("#{out}/environment.json", JSON.pretty_generate({
+    stage: stage, variants: variants.keys, build_tags: variants.transform_values { |v| v[1] },
     revision: `git rev-parse HEAD`.strip, baseline: baseline_ref, go: `go version`.strip,
     cpu: File.read("/proc/cpuinfo")[/^model name\s*:\s*(.+)$/, 1],
     commands: commands, env: ENV.select { |k,_| %w[GOFLAGS GOMAXPROCS GOGC GOMEMLIMIT].include?(k) },

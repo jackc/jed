@@ -1,0 +1,43 @@
+[experiment:go-specialization] $ ~/.codex/worktrees/214f/jed/mise-tasks/experim…
+=== RUN   TestSpecializationCompositionPrefixes
+--- PASS: TestSpecializationCompositionPrefixes (0.06s)
+=== RUN   TestSpecializationCompositionBounds
+--- PASS: TestSpecializationCompositionBounds (0.00s)
+=== RUN   TestSpecializationInvocationCoverage
+    specialization_diagnostics_test.go:40: arithmetic: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: filter: 7 optimized root invocations
+    specialization_diagnostics_test.go:40: boolean: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: coalesce: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: fallback: 0 optimized root invocations
+    specialization_diagnostics_test.go:40: null: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: offset: 1 optimized root invocations
+    specialization_diagnostics_test.go:40: limit_zero: 0 optimized root invocations
+    specialization_diagnostics_test.go:40: case: 4 optimized root invocations
+--- PASS: TestSpecializationInvocationCoverage (0.00s)
+=== RUN   TestSpecializationReplacedPlanLifetime
+--- PASS: TestSpecializationReplacedPlanLifetime (0.00s)
+=== RUN   TestSpecializationClosureGraphReleased
+--- PASS: TestSpecializationClosureGraphReleased (0.00s)
+=== RUN   TestSpecializationScanSelectionAndClose
+    specialization_scan_test.go:40: scan loop selected=true: SELECT v+1 FROM t ORDER BY id
+    specialization_scan_test.go:40: scan loop selected=true: SELECT coalesce(v,0),CASE WHEN v>1 THEN v ELSE 0 END FROM t WHERE v>0 AND v<4 ORDER BY id
+    specialization_scan_test.go:40: scan loop selected=true: SELECT v/0 FROM t ORDER BY id LIMIT 0
+    specialization_scan_test.go:40: scan loop selected=false: SELECT abs(v) FROM t ORDER BY id
+    specialization_scan_test.go:40: scan loop selected=false: SELECT v+1 FROM t WHERE abs(v)>0 ORDER BY id
+    specialization_scan_test.go:40: scan loop selected=false: SELECT v+1 FROM t WHERE id=2 ORDER BY id
+--- PASS: TestSpecializationScanSelectionAndClose (0.00s)
+=== RUN   TestSpecializationBudgetPrefixes
+--- PASS: TestSpecializationBudgetPrefixes (0.03s)
+=== RUN   TestSpecializationAdmissionAndCache
+--- PASS: TestSpecializationAdmissionAndCache (0.00s)
+=== RUN   TestSpecializationSharedStatement
+--- PASS: TestSpecializationSharedStatement (0.00s)
+=== RUN   TestSpecializationCursorBudgetAndCancellation
+--- PASS: TestSpecializationCursorBudgetAndCancellation (0.03s)
+=== RUN   TestSpecializationFileFaultOrder
+--- PASS: TestSpecializationFileFaultOrder (0.00s)
+=== RUN   TestSpecializationStructuralBounds
+    specialization_test.go:389: retained descriptor bytes: root=240 plan=216 (plus existing source tree); pool=0 scratch=0
+--- PASS: TestSpecializationStructuralBounds (0.00s)
+PASS
+ok  	github.com/jackc/jed/impl/go	0.129s
