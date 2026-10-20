@@ -655,10 +655,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   authenticated metadata transitions remain open; `(page_index, txid)` alone is insufficient.
   Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
-  `bench/aead/`. Prefer one initial suite; AES with fresh derived writer keys versus random-nonce
-  XChaCha (protocol complexity versus Node/browser crypto speed; no FIPS requirement) remains an
-  investigation (encryption.md §3.1); the TS write side already awaits an async page codec (§8.1).
-  No cipher is selected and no implementation is scheduled. Decided: a reserved-bytes region with
+  `bench/aead/`. Suite direction (encryption.md §3.1): AES-256-GCM with HKDF keys from fresh random
+  salts, per page or per commit attempt (to be measured), pending a security review and fault
+  fixtures; XChaCha is dropped because no platform standard library ships it. The TS write side
+  already awaits an async page codec (§8.1). No dependency is selected and no implementation is
+  scheduled. Decided: a reserved-bytes region with
   guarantees in terms of usable capacity, all page types authenticated, ephemeral-key scratch
   files, and a dedicated CSPRNG for key material (§1.1). Open: page-level replay and manifest
   identity bytes (§4). The only present storage requirement is non-foreclosure — already satisfied.

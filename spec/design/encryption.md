@@ -45,6 +45,12 @@ These bind the eventual build; everything else in this doc that says "open" stil
   never persisted (§4.2).
 - **Key material and nonces come from a dedicated cryptographic entropy source**, never the
   general-purpose seeded entropy seam (§3.1, *Threat model*).
+- **Browser performance is not a deciding factor for the suite.** Encrypted browser databases
+  are expected to be uncommon.
+- **Suite direction: AES-256-GCM with keys derived by HKDF-SHA-256 from fresh random salts**, per
+  page or per commit attempt, chosen for standard-library support across current and future
+  native cores (§3.1). XChaCha20-Poly1305 is dropped. This becomes a format decision after a
+  security review and the fault fixtures.
 
 ## 2. Where it sits: a page codec in the core, above the seam
 
@@ -97,114 +103,121 @@ codec is hand-rolled (large-values.md §6). **Encryption is the opposite case:**
   a backup, independently writable copies, and compaction also need explicit treatment. A
   committed transaction counter is not a durable allocation of encryption nonces.
 - **Security precedes unconditional byte identity.** Each core must produce the same ciphertext
-  for identical key, nonce, plaintext and AAD. Creation entropy (data keys, salts, and any nonce
-  domain) must use the sanctioned host seam, with fixed inputs in fixtures. Production files
-  need not match when these inputs differ. The full nonce/domain protocol remains undecided:
-  evaluate crash-safe allocation, fresh domains for writable copies/restores, sufficiently large
-  random nonces, and misuse-resistant constructions with their actual bounds. A random domain
-  saved in a file is copied with that file and does not by itself solve writable forks. Record
+  for identical key, nonce, plaintext and AAD. Key material (data keys and
+  salts) comes from the dedicated cryptographic entropy source (§3.1), with fixed inputs in
+  fixtures. Production files need not match when these inputs differ. §3.1 sets the direction:
+  every key is derived from a fresh random salt, so nothing is allocated across commits and a
+  restored or copied file draws new keys on its next write. (A random domain saved once in a
+  file would be copied with that file and would not by itself solve writable forks.) Record
   any necessary determinism-ledger change before implementation; never trade nonce safety for
   identical files. Recovery, retry, copying, and backup tests must establish the chosen contract.
 
-### 3.1 Candidate protocols under investigation (not a format decision)
+### 3.1 Suite direction: AES-256-GCM with random-salt HKDF keys (not yet a format decision)
 
 Prefer **one initial suite** across cores, with a versioned format for later replacement. A second
-suite needs a measured platform limitation or concrete interoperability requirement. Platform
-coverage includes future native packages, browser runtimes, WASM and software fallbacks; native
-CPU throughput alone does not settle the choice.
+suite needs a measured platform limitation or concrete interoperability requirement.
 
-The current comparison is **AES-256-GCM with derived writer keys and counter nonces** versus
-**XChaCha20-Poly1305 with fresh random 192-bit nonces**. AES-GCM-SIV remains an alternative if
-nonce-misuse resistance justifies its implementation-vetting and performance costs. XChaCha
-reduces collision probability but is not nonce-misuse resistant. AES-GCM-SIV still needs key-use
-limits and a nonce policy; it does not prevent whole-file rollback.
+**Direction (2026-10-19):** AES-256-GCM, where every key is derived with HKDF-SHA-256 from the
+data key and a **fresh random salt**, at a granularity of one page or one commit attempt (below).
+Nothing about key or nonce use is persisted or allocated across commits. This becomes a format
+decision only after a security review of the exact construction and the fault fixtures below.
+XChaCha20-Poly1305 is no longer a candidate, nor is AES-GCM-SIV (absent from WebCrypto and most
+standard libraries, and it still needs a nonce policy).
 
-With FIPS ruled out (§1.1), the trade-off between the two candidates is:
+Three findings settle the direction:
 
-| | AES-256-GCM, derived writer keys | XChaCha20-Poly1305, random nonces |
-|---|---|---|
-| Nonce protocol | Writer-key derivation per write ownership, counter allocation with a defined owner (including page-service clients), budget rotation, a salt or key identifier per page, a bounded derived-key cache, and a crash/restore/copy argument still to be proven | None: each encryption draws a fresh 192-bit nonce, so crash, retry, restore, writable copies, compaction and owner change are nonce-safe by construction |
-| Per-page fields | 56 bytes in the direct encoding (32-byte salt, 8-byte counter, 16-byte tag) | 40 bytes (24-byte nonce, 16-byte tag) |
-| Native speed (8 KiB, §8) | Faster: Go 0.87 µs, Rust 2.60 µs, plus about 0.8 µs per writer-key setup | Go 2.00 µs, Rust 4.65 µs |
-| Node | Native synchronous `node:crypto`, about 4 µs | No native XChaCha (OpenSSL has only the 96-bit-nonce construction); Noble, about 30 µs |
-| Browser primitive | WebCrypto, about 8 µs, asynchronous | Synchronous Rust/WASM about 18 µs or Noble about 40 µs; WebCrypto has no ChaCha |
-| Browser, integrated over OPFS (Chromium/x86, §8.1) | About 7–9 µs per page in situ: about 2% of a 461-page commit, 5–8% of a single-row commit; cold open and scan within run-to-run noise | Noble about 40–46 µs per page: about 10% of a large commit, about 25% of a small one, 1.8–2.0× on cold open and scan; Rust/WASM not yet measured integrated |
-| Worker responsiveness during commit/open | Chromium's WebCrypto neither runs concurrently nor yields; an explicit task turn every 16 operations restores control-message admission during open | A synchronous codec has no such point; equivalent responsiveness needs engine-side yields between pages |
-| Dependencies | Go standard library (`crypto/cipher`, `crypto/hkdf`); Rust `aes-gcm` + `hkdf` | Go needs `golang.org/x/crypto` (pure Go plus assembly, no cgo); Rust `chacha20poly1305` |
+1. **Platform support decides it.** AES-256-GCM and HKDF are in every platform's standard
+   library or platform crypto, usually hardware-accelerated. XChaCha20-Poly1305 is in none of
+   them, so every native core but Rust and TS would need a third-party crypto dependency, and in
+   .NET and Swift the mature options largely wrap libsodium (C) through native interop, against
+   CLAUDE.md §13/§14. Building XChaCha from the 96-bit-nonce ChaCha20-Poly1305 needs HChaCha20,
+   which no standard library exposes, so it would mean hand-writing a primitive (§14 forbids it).
+   Wrapped cores (CLAUDE.md §2) inherit Rust's backend and are indifferent; this binds the native
+   ones.
+2. **Random salts give XChaCha's statelessness.** The property that made XChaCha attractive was
+   having no nonce protocol: crash, retry, restore, writable copies, compaction and owner change
+   are safe by construction. A fresh random salt per derived key has the same property with AES,
+   so the choice no longer trades simplicity for platform support.
+3. **The browser is not the deciding platform.** Encrypted browser databases are expected to be
+   uncommon, so browser speed is a deployment detail, not a selection criterion. (The integrated
+   Chromium measurement favored AES there anyway, §8.1.)
 
-AES's protocol cost is design and verification work paid once; XChaCha's cost is slower crypto
-on Node and in the browser, paid on every cache miss and commit. Because the dataset is
-expected to be resident, those operations are not the steady-state hot path, but they are
-what a browser user waits on at open. The TS core's commit, open/recovery and maintenance paths
-now await an asynchronous page codec (§8.1), which removed the main browser obstacle to
-WebCrypto AES. The first integrated measurement puts numbers on the remaining choice: in
-Chromium, WebCrypto AES is close to free (cold open and scan changes are below noise), while
-pure-JS XChaCha roughly doubles cold open and adds about a quarter to small commits. The choice
-is now protocol complexity versus that browser cost (and Node's about 7× gap).
-One interaction with that write side: an encode failure after the commit guard is armed
-poisons the handle, so a counter-nonce design must reserve its allocations for a commit before
-the guard. Random nonces need no reservation.
+Support for the primitives, by platform (late 2026; check each platform's runtime guards, such as
+.NET's `IsSupported`, before relying on a row):
 
-An AES candidate has the following lifecycle, using a vetted HKDF-SHA-256 implementation:
+| Platform | AES-256-GCM | HKDF-SHA-256 | XChaCha20-Poly1305, for comparison |
+|---|---|---|---|
+| Go | standard library (`crypto/cipher`) | standard library (`crypto/hkdf`) | `golang.org/x/crypto` |
+| Rust | RustCrypto `aes-gcm` | RustCrypto `hkdf` | RustCrypto `chacha20poly1305` |
+| Node | `node:crypto`, synchronous | `node:crypto` | none native; Noble (pure JS) |
+| Browser | WebCrypto, asynchronous | WebCrypto | none native; Noble or Rust/WASM |
+| Java | JCA, built in and accelerated | JDK 25+ `javax.crypto.KDF` ([JEP 510](https://openjdk.org/jeps/510)); Bouncy Castle or Tink before | not in the JDK ([JDK-8256529](https://bugs.openjdk.org/browse/JDK-8256529) open); Bouncy Castle or Tink |
+| .NET | `AesGcm`; macOS via CryptoKit since .NET 8; not in browser WASM ([platform table](https://learn.microsoft.com/dotnet/standard/security/cross-platform-cryptography)) | `HKDF` (.NET 5+) | not in the base library; third-party only |
+| Swift | CryptoKit / swift-crypto `AES.GCM` | CryptoKit `HKDF` | not in CryptoKit or swift-crypto (96-bit `ChaChaPoly` only) |
+| Python (reach) | `cryptography` `AESGCM` | `cryptography` | not in `cryptography`; PyNaCl (libsodium) |
 
-1. Every acquisition of write ownership creates a fresh 256-bit cryptographic salt and derives
-   an encryption key from the database data key, salt, and a versioned purpose label/context.
-   The salt is public; this is a cheap key derivation, distinct from the passphrase KDF.
-2. Allocate a unique counter for every encryption under that derived key. Allocate independently
-   of SQL transaction IDs, consume allocations even on abort, and do not rewind on retry.
-   Rotate to a fresh salt/key before the chosen message/byte/security budget is exhausted,
-   not merely before the counter integer overflows.
-3. After crash, reopen, owner handoff, restoration, or opening an independently writable copy,
-   create a fresh writer key. Never resume a persisted writer salt with a reset counter.
-   Preserve old salts only as read metadata so historical pages can be decrypted.
-4. Persist each page's salt/key identifier and counter in bounded, authenticated context.
-   A direct encoding could store a 32-byte salt, 8-byte counter (zero-extended to a 12-byte
-   GCM nonce), and 16-byte tag: 56 bytes before other context, versus XChaCha's 40-byte
-   nonce/tag. An epoch table saves space but adds retention/reclamation dependencies; the
-   direct encoding is the simpler starting point to evaluate. Neither encoding is ratified.
+Measured speed (§8, 8 KiB pages): AES-GCM seal is 0.87 µs in Go and 2.60 µs in Rust, about 4 µs
+through Node's native API, and 7–9 µs per page in situ through WebCrypto. Deriving a fresh key
+(random 32-byte salt, HKDF, AES key setup) costs about 0.8 µs in Go, so a fresh key for **every**
+page sealed at 1.69 µs, still faster than XChaCha's 2.07 µs in the same harness; through
+WebCrypto, salt plus HKDF plus key import measured 4.3 µs. The derivation cost recurs on every
+cache-miss read under per-page keys.
 
-This does not require persisting a nonce reservation before the ciphertext: a recovering writer
-uses a new key regardless of which writes reached disk. It could preserve validated COW's one
-barrier; that is a design argument, **not a tested encrypted crash protocol**. Metadata/wrappers,
-scratch data, and SQL value encryption need distinct purposes/keys or a proven shared allocator.
-All encryption must have an unambiguous allocator owner, including page-service client work.
-Key derivation on read needs a bounded cache; files with many historical writer keys must not
-force unbounded resident metadata. Re-encrypting byte-identical ciphertext is unnecessary when
-retrying a physical write; encrypting different contents always consumes a fresh allocation.
+#### Key granularity: per page or per commit attempt
 
-A fresh key per **commit attempt** is another candidate granularity. It simplifies abandonment
-and retry, but produces more historical key domains. Benchmark derivation plus key setup before
-choosing between it and writer-lifetime keys. The measurements in §8 include per-page, 16-page,
-and 256-page amortization without implementing either storage protocol.
+Both granularities draw the salt from the cryptographic entropy source (*Threat model* below),
+bind a versioned purpose label in the HKDF context (pages, meta authentication, key wrapping and
+scratch files are distinct purposes), and persist nothing between commits. A crashed, failed or
+retried commit attempt simply never uses its salt again, so neither needs a nonce reservation
+before the commit guard (§8.1) or an allocator owner across page-service clients: each committer
+derives its own keys.
 
-The pattern has precedent in [Tink's AES-GCM-HKDF streaming construction](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming),
-which uses a random salt, derived key, and segment nonces. Tink is not a mutable database codec,
-and its security analysis does not automatically cover this adaptation. Review the exact
-construction, cumulative security bounds and failure cases before implementing it.
+- **Per page.** Each page encryption draws a salt and derives a single-use key; with each key
+  sealing one message, the GCM nonce can be fixed. Per-page fields: the salt (24–32 bytes) and the
+  16-byte tag, 40–48 bytes. Reads derive the page's key on every cache miss; there is no key
+  cache. This is the simplest form.
+- **Per commit attempt.** Each commit attempt draws one salt and seals its pages with nonces that
+  count up within the attempt, held only in memory. Per-page fields: the salt, a 4-byte page
+  ordinal and the tag, 52 bytes with a 32-byte salt. Readers cache derived keys by salt in a
+  bounded cache, deriving once per distinct commit rather than once per page.
+
+Choose by measuring the read-side derivation cost on each native core against the reserve size
+(§4.1). A random salt of at least 192 bits makes a repeated salt negligible across any realistic
+number of keys, and each derived key seals one page or one commit's pages, far below GCM's
+per-key limits. The construction is our composition of standard primitives, close to
+[Tink's AES-GCM-HKDF streaming AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming)
+and C2SP's XAES-256-GCM, but neither analysis covers a mutable page codec automatically. The review
+must cover the exact HKDF layout (random salt as the extract salt, or as expand context under one
+extracted key), domain separation, salt length and cumulative bounds.
+
+The earlier **writer-lifetime** candidate, one derived key per acquisition of write ownership with
+a counter for every encryption under it, is not pursued: its counter allocation across
+page-service clients, key-budget rotation and recovery argument are exactly the protocol the
+random-salt granularities avoid, for a derivation saving that measured below 1 µs per page.
 
 **Threat model.** Nonce reuse can expose plaintext relationships to an offline attacker holding
-two backups; it does not require control of a running process. A single writer simplifies
-allocation but cannot prevent historical reuse on its own. Protect ordinary consistent copies,
-backup restoration and crash remnants. A live process fork/checkpoint that duplicates an active
-key and counter requires codec reinitialization; a large random salt at initial open does not
-protect subsequently cloned live state.
+two backups; it does not require control of a running process. A single writer cannot prevent
+historical reuse on its own. Protect ordinary consistent copies, backup restoration and crash
+remnants. Under per-commit-attempt keys, a live process fork/checkpoint taken mid-commit
+duplicates an active key and its in-memory page counter and requires codec reinitialization;
+per-page keys draw fresh randomness for every encryption, so only a duplicated random-number
+generator state (below) can repeat one.
 
 **Key material uses a dedicated cryptographic entropy source (decided).** Data keys, KDF salts,
-writer salts, nonces and scratch-file keys are drawn from a source separate from the
+page and commit salts and scratch-file keys are drawn from a source separate from the
 general-purpose entropy seam that SQL generators use ([entropy.md](entropy.md)). A host may
 install a seeded source there to make `uuidv4` reproducible; if that source also fed key
-material, the data key would be predictable, and with either candidate two runs would repeat
-nonces (the same writer salt yields the same derived key and counter sequence; the same random
-nonces repeat directly). In production the cryptographic source reads the OS CSPRNG directly,
-not a buffered userspace generator whose state a VM snapshot or process fork can duplicate.
-Fixtures and simulation inject fixed bytes only through an explicitly insecure test option,
-which never applies by default.
+material, the data key would be predictable, and two runs would repeat salts, so the same derived
+keys would seal different pages under the same nonces. In production the cryptographic source
+reads the OS CSPRNG directly, not a buffered userspace generator whose state a VM snapshot or
+process fork can duplicate. Fixtures and simulation inject fixed bytes only through an
+explicitly insecure test option, which never applies by default.
 
 Required future fault fixtures: aborted encryption before/after each body/meta write, failed
 barriers, retry and owner promotion, restore followed by divergent writes, independently opened
-copies, counter/key-budget exhaustion, mixed historical epochs, compaction, credential changes,
-and domain separation between body/meta/wrapping. Check both ciphertext authenticity and pair
-uniqueness across every attempted encryption, not just committed pages. Whole-file anti-rollback
+copies, mixed historical keys, compaction, credential changes, and domain separation between
+body/meta/wrapping/scratch. Check both ciphertext authenticity and salt/key uniqueness across
+every attempted encryption, not just committed pages. Whole-file anti-rollback
 remains a separate trusted-state guarantee.
 
 ## 4. What is encrypted, what is plaintext
@@ -259,7 +272,7 @@ remains a separate trusted-state guarantee.
 
 Today every page-capacity rule derives from `C = page_size - 16` (format.md *Page model*):
 `RECORD_MAX`, leaf and interior fan-out, split points, large-value externalization and the
-overflow chunk size. Per-page crypto fields (40–56 bytes plus any binding, §3.1) would shrink
+overflow chunk size. Per-page crypto fields (40–52 bytes plus any binding, §3.1) would shrink
 that capacity, so an encrypted file would build a differently shaped tree from the same rows,
 with different page counts, page-read costs and possibly plans.
 
@@ -286,7 +299,7 @@ For jed:
 The field arrives with the encryption format version, not before. Open: whether plaintext
 files reserve by default (about 0.5–0.7% of an 8 KiB page) so they can be encrypted in place,
 and the reserve's size once the suite and any parent-pointer binding (§4) are chosen. Page
-sizes must keep `C` above the structural minimum; at the 256-byte golden page size a 40–56-byte
+sizes must keep `C` above the structural minimum; at the 256-byte golden page size a 40–52-byte
 reserve is a large fraction, which fixtures must account for.
 
 ### 4.2 Scratch files (decided)
@@ -411,17 +424,17 @@ synchronous, and browsers have no scratch target, so spill is unaffected.
 
 WebCrypto needs suspension **inside the worker** at decryption/cache misses and before encrypted
 commit writes. The write side is now ready for that ([ts-runtime.md](ts-runtime.md) §11): the
-pager's `PageTransform` seam, above the byte device and below the page cache, accepts
-asynchronous `encodeAsync`/`decodeAsync` forms, and commit, open/recovery and maintenance await
-them as retained continuations. Decryption completes before a page enters the cache; page CRCs,
-manifest digests and the live count stay over plaintext logical pages. Commit encryption overlaps
-in a bounded window of 16 pages while writes keep validated COW's body, free-list, manifest,
-alternate-meta and one-barrier order. The commit after its last safe cancellation point is
-uncancelable, and an encode failure after the commit guard is armed poisons the handle like an
-I/O error, so per-commit nonce reservation must happen before the guard (§3). Only an identity
-test transform exists; tests prove every write-side page operation awaits it with unchanged bytes,
-results and cost. Remaining synchronous paths that an encrypted browser database would still need
-to settle: `create`'s bootstrap image (the encoding of bootstrap pages is part of §6) and
+pager's `PageTransform` seam, above the byte device and below the page cache, accepts asynchronous
+`encodeAsync`/`decodeAsync` forms, and commit, open/recovery and maintenance await them as retained
+continuations. Decryption completes before a page enters the cache; page CRCs, manifest digests and
+the live count stay over plaintext logical pages. Commit encryption overlaps in a bounded window of
+16 pages while writes keep validated COW's body, free-list, manifest, alternate-meta and one-barrier
+order. The commit after its last safe cancellation point is uncancelable, and an encode failure
+after the commit guard is armed poisons the handle like an I/O error. The random-salt keys of §3.1
+need no reservation before the guard: a poisoned or retried commit never reuses its salt. Only an
+identity test transform exists; tests prove every write-side page operation awaits it with unchanged
+bytes, results and cost. Remaining synchronous paths that an encrypted browser database would still
+need to settle: `create`'s bootstrap image (the encoding of bootstrap pages is part of §6) and
 compaction, which is already unsupported on OPFS. Spill and temporary domains have no browser
 storage. Do not replay partially evaluated SQL to recover from a miss: entropy consumption, costs,
 host functions and staged writes must occur exactly once. Do not preload the whole file to hide
@@ -474,18 +487,14 @@ crash behavior. They **select no suite**. See the
 
 ## 9. Open / deferred
 
-**Suite: open between two candidates** (§3.1): AES-256-GCM with fresh derived writer keys and
-counter nonces (faster natively, native on Node, WebCrypto in the browser through the TS core's
-asynchronous page codec) and XChaCha20-Poly1305 with random nonces (no nonce protocol to build or
-prove, synchronous everywhere, slower on Node and in the browser). With FIPS ruled out, the
-decision is protocol complexity versus Node/browser crypto speed. The first integrated Chromium/x86
-measurement (§3.1, §8.1) favors AES in the browser: about 7–9 µs per page in situ against
-Noble XChaCha's 40–46 µs, which roughly doubles cold open. AES is therefore the leading candidate
-if its writer-key protocol survives security review and the §3.1 fault fixtures; XChaCha is the
-fallback if that protocol cannot be made convincing. Neither the suite nor a production dependency
-is selected. Still to measure: Firefox, Safari, ARM/mobile, Rust/WASM XChaCha integrated, and
-per-writer key derivation through WebCrypto. A slower pure-JS fallback and a software-WASM
-backend are material deployment costs, not reasons by themselves to maintain two file suites.
+**Suite direction: AES-256-GCM with random-salt HKDF keys** (§3.1), per page or per commit attempt.
+Platform support across current and future native cores decides it: AES-GCM and HKDF are in
+every standard library, while XChaCha20-Poly1305 is in none. Browser performance is not a
+deciding factor. The direction becomes a format decision after a security review of the exact
+construction and the §3.1 fault fixtures; no production dependency is selected. Still to decide:
+per-page versus per-commit-attempt keys, by measuring read-side derivation on each native core
+against the reserve size. A pure-JS fallback and a software-WASM backend are material deployment
+costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one
 algorithm; the selected Noble exports were 3.7–4.6 KiB gzipped. These exclude the passphrase KDF,
@@ -520,7 +529,7 @@ Such built-ins need shared byte fixtures, bounded allocations and logical cost c
 authentication-failure behavior, and explicit entropy/dependency classification. Randomized
 sealing uses the sanctioned entropy seam and cannot be admitted into persisted expression keys
 or partial-index predicates. Decryption authenticates before releasing plaintext. Application-key
-nonce allocation must be designed independently: the database writer-key lifecycle is not a
+nonce allocation must be designed independently: the database page-key derivation is not a
 general-purpose nonce allocator for arbitrary caller keys.
 
 Digest/HMAC functions can be evaluated on their own merits. Password hashing, legacy ciphers,
