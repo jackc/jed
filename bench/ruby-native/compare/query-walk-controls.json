@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "description": "Explicit fresh-walker controls on the unchanged 1000-row fixture. Positive window and aggregate discovery must retain ordinary behavior; the broad 128-column projection exceeds the rejected prototype's 1024-unit syntax threshold without deep recursion. Fresh SQL runs only on unprepared query/eager and wrapper lanes with the existing --fresh-sql protocol. Main multiway-plan.json SQL and schedules are unchanged.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {
+      "name": "positive_window",
+      "sql": "SELECT id, row_number() OVER (ORDER BY id) AS position FROM items WHERE id < $1 ORDER BY id",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 7,
+      "span": 21
+    },
+    {
+      "name": "ordinary_aggregate",
+      "sql": "SELECT bucket, count(*) AS n, sum(score) AS total FROM items WHERE id < $1 GROUP BY bucket ORDER BY bucket",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 7,
+      "span": 21
+    },
+    {
+      "name": "oversized_syntax",
+      "sql": "SELECT id AS c0, id AS c1, id AS c2, id AS c3, id AS c4, id AS c5, id AS c6, id AS c7, id AS c8, id AS c9, id AS c10, id AS c11, id AS c12, id AS c13, id AS c14, id AS c15, id AS c16, id AS c17, id AS c18, id AS c19, id AS c20, id AS c21, id AS c22, id AS c23, id AS c24, id AS c25, id AS c26, id AS c27, id AS c28, id AS c29, id AS c30, id AS c31, id AS c32, id AS c33, id AS c34, id AS c35, id AS c36, id AS c37, id AS c38, id AS c39, id AS c40, id AS c41, id AS c42, id AS c43, id AS c44, id AS c45, id AS c46, id AS c47, id AS c48, id AS c49, id AS c50, id AS c51, id AS c52, id AS c53, id AS c54, id AS c55, id AS c56, id AS c57, id AS c58, id AS c59, id AS c60, id AS c61, id AS c62, id AS c63, id AS c64, id AS c65, id AS c66, id AS c67, id AS c68, id AS c69, id AS c70, id AS c71, id AS c72, id AS c73, id AS c74, id AS c75, id AS c76, id AS c77, id AS c78, id AS c79, id AS c80, id AS c81, id AS c82, id AS c83, id AS c84, id AS c85, id AS c86, id AS c87, id AS c88, id AS c89, id AS c90, id AS c91, id AS c92, id AS c93, id AS c94, id AS c95, id AS c96, id AS c97, id AS c98, id AS c99, id AS c100, id AS c101, id AS c102, id AS c103, id AS c104, id AS c105, id AS c106, id AS c107, id AS c108, id AS c109, id AS c110, id AS c111, id AS c112, id AS c113, id AS c114, id AS c115, id AS c116, id AS c117, id AS c118, id AS c119, id AS c120, id AS c121, id AS c122, id AS c123, id AS c124, id AS c125, id AS c126, id AS c127 FROM items WHERE id = $1",
+      "iterations": 30,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "fresh_sql",
+      "sql": "SELECT id, score + 7 AS adjusted FROM items WHERE id = $1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "fresh_join",
+      "sql": "SELECT a.label, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id LIMIT 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    }
+  ]
+}
