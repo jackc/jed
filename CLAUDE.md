@@ -614,13 +614,16 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   a random data key is stored only wrapped by a host key or passphrase-derived wrapping key.
   Credential changes rewrap bounded metadata; data-key rotation rewrites all live pages.
   `(page_index, txid)` alone does **not** guarantee nonce uniqueness across failed commits,
-  restores or writable copies; the nonce/domain protocol remains open, with security preceding
-  unconditional file byte identity. Identical crypto inputs still require identical bytes.
+  restores or writable copies; every key is instead derived from a fresh random salt (below),
+  with security preceding unconditional file byte identity. Identical crypto inputs still require identical bytes.
   Decided (encryption.md §1.1): no FIPS requirement; usable page capacity `C` excludes a
   per-file reserved-bytes region (SQLite's model) and tree shape/cost/plan guarantees are stated
   in terms of `C`; every page type is authenticated; an encrypted database's spill scratch files
   use a random, never-persisted per-file key; key material comes from a dedicated CSPRNG source,
-  never the seeded SQL entropy seam. The suite (AES writer keys vs random-nonce XChaCha) is open.
+  never the seeded SQL entropy seam; browser performance does not decide the suite. Suite
+  direction, pending security review: AES-256-GCM with HKDF-SHA-256 keys from fresh random
+  salts, per page or per commit attempt, because AES-GCM and HKDF are in every platform standard
+  library and XChaCha20-Poly1305 is in none.
   Vetted libraries expose safe APIs; explicitly reviewed assembly/intrinsics behind those APIs
   are permitted under §14, while engine code stays safe and Go stays free of cgo/external FFI.
 - Writable commits persist only changed database domains. Empty/read-only work in a writable
