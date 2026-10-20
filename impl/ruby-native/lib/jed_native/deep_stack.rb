@@ -74,25 +74,7 @@ module JedNative
         return Fiber.new { expression_work(expression) }.resume
       end
       @native_expression_work_depth = depth + 1
-      return super if @native_planner_work_disabled || !expression.instance_of?(Expression)
-      # Ordinary scalar nodes have only their own unit plus child work. Keep
-      # the stack guard, but avoid dispatching through special estimators at
-      # every node. No estimate survives this call or a mutation of the tree.
-      own = case expression.kind
-            when :literal, :column, :param, :outer, :source, :star then 0
-            when :unary, :binary, :cast, :numeric_context then 1
-            else return super
-            end
-      args = expression.args
-      return super unless args.nil? || args.instance_of?(Array)
-      # Even zero-unit leaves can carry children; duplicate visits still count.
-      result = own + (args ? args.sum { |argument| expression_work(argument) } : 0)
-      # Metadata is observed after children, as in ExplainSubqueries. Ordinary
-      # integer operators carry kernel metadata; correlated costs stay live.
-      if expression.extra.is_a?(Hash) && expression.extra[:native_subplan] && expression.extra[:correlated]
-        result += expression.extra[:native_subplan].cost
-      end
-      result
+      super
     ensure
       @native_expression_work_depth = depth
     end
