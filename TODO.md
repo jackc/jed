@@ -709,17 +709,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
   `bench/aead/`. Suite direction (encryption.md §3): AES-256-GCM with one key derived per page
   from a fresh random salt (chosen after Go/Rust measurement), **XAES-256-GCM** (C2SP) as the
-  primary derivation and a jed HKDF-SHA-256 layout as fallback, pending a security review and
-  fault fixtures; XChaCha is dropped because no platform standard library ships it, and AES-GCM-SIV
-  is declined for platform support despite its graceful nonce-reuse behavior. The TS write side
-  already awaits an async page codec (§8.1). No dependency is selected and no implementation is
-  scheduled. Decided (§1.1): a reserved-bytes region that is never a user setting, all page
-  types authenticated, every pointer binding the full AEAD tag of its child (so the encrypted
-  file is its own format variant), manifest identities over ciphertext bytes, ephemeral-key
-  scratch files, a dedicated CSPRNG for key material, PBKDF2-HMAC-SHA-256 as the built-in
-  passphrase KDF behind a KDF id (raw wrapping key first-class), live VM clones excluded, and
-  every process of an encrypted database holding the key. Open: XAES versus the HKDF fallback,
-  the security review, and the format specification (§9). The only present storage requirement
+  derivation, pending a security review and fault fixtures; XChaCha is dropped because no
+  platform standard library ships it, and AES-GCM-SIV is declined for platform support despite
+  its graceful nonce-reuse behavior. The TS write side already awaits an async page codec. No
+  dependency is selected and no implementation is scheduled. Decided (§4–§6): a reserved-bytes
+  region that is never a user setting, all page types authenticated, every pointer binding the
+  full AEAD tag of its child (so the encrypted file is its own format variant), manifest
+  identities over ciphertext bytes, ephemeral-key scratch files, a dedicated CSPRNG for key
+  material, Argon2id as the built-in passphrase KDF behind a KDF id (raw wrapping key
+  first-class), live VM clones excluded, every process of an encrypted database holding the DEK,
+  and edge cases failing closed rather than resuming (§1). Open: XAES lifetime bounds and the
+  per-core library route, the security review, and the format specification (§9). The only present storage requirement
   is non-foreclosure — already satisfied.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
