@@ -92,6 +92,9 @@ remain reproducible in Git; the original estimator remains the chosen baseline.
 The [JOIN-predicate follow-up](../../impl/ruby-native/JOIN_PREDICATE_FOLLOWUP.md)
 uses bounded scalar kernels at the existing ON and join-window evaluation
 sites, with source-and-pool reuse and complete-predicate fallback.
+The [JOIN-admission follow-up](../../impl/ruby-native/JOIN_ADMISSION_FOLLOWUP.md)
+reduces emission and ON-program setup for cheap predicates over known small
+inputs while retaining compilation for larger and unknown inputs.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

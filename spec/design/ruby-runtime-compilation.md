@@ -275,15 +275,21 @@ per-method limits apply. Filter memory-accounting mode is encoded in fixed
 source, while the current owner, columns, mask, rows, and parameters are passed
 at invocation. The internal relation-disable switch leaves earlier tiers active.
 JOIN predicates use a separate 64-entry source-and-immutable-pool LRU, also
-shared with lazy cursors. Every acquisition emits the current resolved expression
+shared with lazy cursors. Every eligible acquisition emits the current resolved expression
 before lookup, observing mutable arguments, metadata and type context. Unsupported
 trees have no negative memo, and expression identity is never an execution key.
 The first encounter records admission; the second can materialize a kernel.
-The general executor avoids setup for exact Array inputs with fewer than eight
-outer rows on an indexed join, or a product below eight on a nonindexed join.
-Unknown containers and lateral sources gain no extra length reads. Spill paths
-retain ordinary admission. Immediate-compilation diagnostics bypass the
-small-input heuristic; global and JOIN-specific disable controls still win.
+The general executor avoids setup for exact Array inputs with fewer than sixteen
+outer rows on an indexed join, or a product below sixteen on a nonindexed join.
+When this input-size heuristic is below 128, a plain integer comparison of two
+immediate literal, column or parameter leaves also declines before emission.
+The indexed quantity is the outer-input size, not a count of all matching
+candidates. Larger or unknown inputs retain ordinary admission. Unknown
+containers and lateral sources gain no extra length reads; spill paths do not
+add an input-size observation. Immediate-compilation diagnostics bypass both
+size heuristics; global and JOIN-specific disable controls still win.
+Independent ON-program pairs allocate only after a kernel is returned; when
+all roots decline, the executor keeps its original ON-tree evaluator loop.
 Only immutable source, scalar pool data and kernels survive in this cache;
 selected plans and execution owners remain with the caller. Kernels receive
 the current engine, row and bindings at invocation.
