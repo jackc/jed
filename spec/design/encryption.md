@@ -127,17 +127,23 @@ With FIPS ruled out (§1.1), the trade-off between the two candidates is:
 | Per-page fields | 56 bytes in the direct encoding (32-byte salt, 8-byte counter, 16-byte tag) | 40 bytes (24-byte nonce, 16-byte tag) |
 | Native speed (8 KiB, §8) | Faster: Go 0.87 µs, Rust 2.60 µs, plus about 0.8 µs per writer-key setup | Go 2.00 µs, Rust 4.65 µs |
 | Node | Native synchronous `node:crypto`, about 4 µs | No native XChaCha (OpenSSL has only the 96-bit-nonce construction); Noble, about 30 µs |
-| Browser | WebCrypto, about 8 µs, asynchronous (§8.1) | Synchronous Rust/WASM about 18 µs or Noble about 40 µs; WebCrypto has no ChaCha |
+| Browser primitive | WebCrypto, about 8 µs, asynchronous | Synchronous Rust/WASM about 18 µs or Noble about 40 µs; WebCrypto has no ChaCha |
+| Browser, integrated over OPFS (Chromium/x86, §8.1) | About 7–9 µs per page in situ: about 2% of a 461-page commit, 5–8% of a single-row commit; cold open and scan within run-to-run noise | Noble about 40–46 µs per page: about 10% of a large commit, about 25% of a small one, 1.8–2.0× on cold open and scan; Rust/WASM not yet measured integrated |
+| Worker responsiveness during commit/open | Chromium's WebCrypto neither runs concurrently nor yields; an explicit task turn every 16 operations restores control-message admission during open | A synchronous codec has no such point; equivalent responsiveness needs engine-side yields between pages |
 | Dependencies | Go standard library (`crypto/cipher`, `crypto/hkdf`); Rust `aes-gcm` + `hkdf` | Go needs `golang.org/x/crypto` (pure Go plus assembly, no cgo); Rust `chacha20poly1305` |
 
 AES's protocol cost is design and verification work paid once; XChaCha's cost is slower crypto
 on Node and in the browser, paid on every cache miss and commit. Because the dataset is
-expected to be resident, those operations are not the steady-state hot path. The TS core's
-commit, open/recovery and maintenance paths now await an asynchronous page codec (§8.1), which
-removes the main browser obstacle to WebCrypto AES; the choice therefore reduces to protocol
-complexity versus Node/browser crypto speed. One interaction with that write side: an encode
-failure after the commit guard is armed poisons the handle, so a counter-nonce design must
-reserve its allocations for a commit before the guard. Random nonces need no reservation.
+expected to be resident, those operations are not the steady-state hot path, but they are
+what a browser user waits on at open. The TS core's commit, open/recovery and maintenance paths
+now await an asynchronous page codec (§8.1), which removed the main browser obstacle to
+WebCrypto AES. The first integrated measurement puts numbers on the remaining choice: in
+Chromium, WebCrypto AES is close to free (cold open and scan changes are below noise), while
+pure-JS XChaCha roughly doubles cold open and adds about a quarter to small commits. The choice
+is now protocol complexity versus that browser cost (and Node's about 7× gap).
+One interaction with that write side: an encode failure after the commit guard is armed
+poisons the handle, so a counter-nonce design must reserve its allocations for a commit before
+the guard. Random nonces need no reservation.
 
 An AES candidate has the following lifecycle, using a vetted HKDF-SHA-256 implementation:
 
@@ -470,13 +476,16 @@ crash behavior. They **select no suite**. See the
 
 **Suite: open between two candidates** (§3.1): AES-256-GCM with fresh derived writer keys and
 counter nonces (faster natively, native on Node, WebCrypto in the browser through the TS core's
-asynchronous page codec) and XChaCha20-Poly1305 with random nonces (no nonce protocol to build or prove,
-synchronous everywhere, slower on Node and in the browser). With FIPS ruled out, the decision is
-protocol complexity versus Node/browser crypto speed. Neither the suite nor a production
-dependency is selected. Approval depends on the exact protocol/security review, supported-platform
-matrix, and integrated measurements (a first Chromium/x86 measurement is in §8.1; other
-browsers and ARM remain open). A slower pure-JS fallback and a software-WASM backend are
-material deployment costs, not reasons by themselves to maintain two file suites.
+asynchronous page codec) and XChaCha20-Poly1305 with random nonces (no nonce protocol to build or
+prove, synchronous everywhere, slower on Node and in the browser). With FIPS ruled out, the
+decision is protocol complexity versus Node/browser crypto speed. The first integrated Chromium/x86
+measurement (§3.1, §8.1) favors AES in the browser: about 7–9 µs per page in situ against
+Noble XChaCha's 40–46 µs, which roughly doubles cold open. AES is therefore the leading candidate
+if its writer-key protocol survives security review and the §3.1 fault fixtures; XChaCha is the
+fallback if that protocol cannot be made convincing. Neither the suite nor a production dependency
+is selected. Still to measure: Firefox, Safari, ARM/mobile, Rust/WASM XChaCha integrated, and
+per-writer key derivation through WebCrypto. A slower pure-JS fallback and a software-WASM
+backend are material deployment costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one
 algorithm; the selected Noble exports were 3.7–4.6 KiB gzipped. These exclude the passphrase KDF,
