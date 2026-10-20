@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "description": "Opt-in broader literal LIKE comparison over the unchanged 1000-row fixture. Six new fixed-position underscore/ordered-percent-run targets and three controls: scalar, historical simple prefix LIKE, and genuinely mixed-percent/underscore fallback. The historical row_5% fallback is now correctly a target. Direct diagnostics cover Unicode/escapes and bounded admission.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {"name":"scalar","sql":"SELECT abs($1::i64) + 7","iterations":2000,"warmup":300,"offset":-999,"step":17,"span":2000},
+    {"name":"text_like_fallback","sql":"SELECT sum(score) FROM items WHERE label LIKE 'row5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_underscore_prefix","sql":"SELECT sum(score) FROM items WHERE label LIKE 'row_5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_fixed_width","sql":"SELECT count(*) FROM items WHERE label LIKE 'row___'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_interior_percent","sql":"SELECT sum(score) FROM items WHERE label LIKE 'r%w%5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_not_interior_percent","sql":"SELECT count(*) FROM items WHERE label NOT LIKE 'r%w%5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_wildcard_projection","sql":"SELECT id, CASE WHEN label LIKE 'row__%' THEN score + 1 ELSE score - 1 END FROM items ORDER BY id","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_wildcard_group","sql":"SELECT CASE WHEN label LIKE 'r%w%5%' THEN 1 ELSE 0 END, count(*), sum(score) FROM items GROUP BY CASE WHEN label LIKE 'r%w%5%' THEN 1 ELSE 0 END ORDER BY 1","iterations":50,"warmup":100,"offset":0,"step":0,"span":0},
+    {"name":"like_mixed_fallback","sql":"SELECT sum(score) FROM items WHERE label LIKE 'row%_5%'","iterations":50,"warmup":100,"offset":0,"step":0,"span":0}
+  ]
+}
