@@ -1,0 +1,24 @@
+# Proposed structural limits for the independent experiments, not runtime spec
+# defaults. Read by future experiment tooling; currently no core consumes this.
+# These cap specialization overhead, never the SQL the ordinary engine accepts.
+version = 1
+
+[expression]
+max_nodes = 192
+max_depth = 32
+max_lowered_units = 1536
+max_pool_entries = 256
+max_scratch_slots = 192
+
+[plan]
+# Sum all retained variants/roots, including diagnostic alternatives. No global
+# cache is introduced. Active cursors can retain replaced plans independently.
+max_artifacts = 8
+
+# A node is a visited source-expression node, root depth is 1, and a lowered
+# unit is one retained instruction, closure, or static-kernel descriptor.
+# Count children/descriptors captured by a closure recursively once per retained
+# instance; fusion does not hide a retained fallback chain. Pool entries contain
+# only admitted primitive constants/type or slot descriptors, never row data.
+# Scratch slots include simultaneously live temporaries within one invocation.
+# A core without a pool/register file reports zero for that representation.

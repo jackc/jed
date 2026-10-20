@@ -255,6 +255,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ### Cost-based planner follow-ons
 
+- [x] **Runtime query-compilation investigation (Rust/Go/TS)** — reviewed the Ruby compiler
+  and all-core VM experiments; measured isolated TS tree/closure/generated-function kernels,
+  confirmed V8 optimization, and probed Node/Chromium code-generation restrictions.
+  [Investigation](spec/design/query-compilation-investigation.md). Research only; no production
+  rollout. Independent proposals share an
+  [experiment contract](spec/design/execution-specialization-experiments.md); each can proceed
+  and reach its own decision without another core's implementation:
+  - [ ] **Rust cached typed programs** — selective scan execution, plan-owned reuse and
+    per-execution scratch; static-kernel controls, no native JIT dependency.
+    [Proposal](spec/design/rust-expression-specialization.md).
+  - [ ] **Go static execution kernels** — bounded typed patterns, allocation/call reduction
+    and conditional row-loop fusion; pure Go, no runtime compiler.
+    [Proposal](spec/design/go-execution-specialization.md).
+  - [ ] **TS CSP-compatible specialization** — typed closures and static kernels, validated
+    plan reuse, strict-CSP browser and ordinary Node execution; no runtime source generation.
+    [Proposal](spec/design/ts-expression-specialization.md).
+  All are proposed investigations, not production adoption; each requires forced-path
+  conformance coverage, whole-query controls and a separate outcome report.
+
 - [x] **Cost as a plan input (Path B)** — landed end-to-end: exact transactional row counts,
   relation-scoped prepared-plan validity, complete candidate inventory, whole-plan estimates and
   EXPLAIN columns, costed access/order pipelines, bounded deterministic N-way join search, and

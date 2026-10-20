@@ -1,0 +1,16 @@
+{
+  "node": "v26.10.0",
+  "execArgv": [
+    "--jitless"
+  ],
+  "normal": {
+    "eval": "allowed",
+    "Function": "allowed",
+    "wasm": "ReferenceError"
+  },
+  "restrictedContext": {
+    "eval": "EvalError",
+    "Function": "EvalError",
+    "wasm": "ReferenceError"
+  }
+}
