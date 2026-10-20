@@ -324,8 +324,10 @@ scan/filter/projection loops, typed ORDER BY comparators, primitive aggregate
 input/reduction loops, and materialized WHERE and grouping-key loops into Ruby methods.
 The bounded template emitter is handwritten Ruby; SQL text, names, and values remain
 data rather than Ruby source. Admitted scalar operations include bounded C-text
-comparisons and simple literal LIKE predicates. This does not change the supported
-differential set, the experiment's frozen status, or any semantic/resource contract. See
+comparisons and simple literal LIKE predicates. Identical generated methods may share
+a bounded process cache; each kernel keeps its own immutable constant pool.
+This does not change the supported differential set, the experiment's frozen status,
+or any semantic/resource contract. See
 `spec/design/ruby-runtime-compilation.md`.
 
 **Open types shift the contract in kind, not degree.** For scalars the cross-core contract is

@@ -196,6 +196,27 @@ record a negative admission to avoid repeated emitter work. Internal diagnostic
 switches can force first-use admission or disable compilation for differential
 testing; neither changes public SQL or embedding APIs.
 
+Materializing any of the five kernel families uses a process-wide 64-entry LRU
+of generated classes, keyed by concrete kernel superclass and exact source.
+Each materialization still constructs a fresh frozen kernel referencing its
+Program's immutable pool and node metadata. The cache retains only immutable
+source and a frozen generated class: no kernel, pool, AST, engine, row, parameter
+binding, or execution owner.
+This allows different literal pools to reuse the same Ruby method and JIT work
+without changing plan admission or invalidation. Ordering Procs remain bound to
+their individual kernel instances.
+
+A mutex serializes cache lookup, compilation and publication, never execution.
+The process ID is checked before acquiring the mutex; a forked child replaces
+the inherited cache and lock before new materialization. Already-live inherited
+kernels remain valid. Concurrent first admissions in a child may duplicate an
+initial compilation before converging on the replacement cache; this cannot mix
+pools or execution state. Compiler source bounds apply to cache admission; oversized
+direct internal Program construction bypasses sharing. At most 64 × 32 KiB of
+source is retained by this cache, in addition to existing per-plan limits. Eviction
+does not promise reclamation of VM/JIT code, and live kernels can retain evicted
+classes. Code churn must therefore be measured separately.
+
 An expression, fused projection, or pipeline is limited to 192 emitted nodes,
 depth 32, 256 pool entries, 32 KiB of copied string pool data, and 32 KiB source.
 The string budget is checked before duplication and restored when partial root
