@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/join_admission_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-join-admission-smoke.json"
+  ],
+  "success": false,
+  "reason": "worker exited 1",
+  "peak_rss_bytes": 57233408,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 13.667244851007126,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "5feb7b064f414131a1c5f5d4aba8a64be8facc0885e3b4e5299ba0b5527ef29c",
+  "final_source_sha256": "5feb7b064f414131a1c5f5d4aba8a64be8facc0885e3b4e5299ba0b5527ef29c",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "",
+  "stderr": "bench/ruby-native/join_admission_diagnostics.rb:266:in 'block (2 levels) in JoinAdmissionDiagnostics.input_cases': input-size kernel disposition differs product_96 query_prepared (RuntimeError)\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:253:in 'Array#each'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:253:in 'block in JoinAdmissionDiagnostics.input_cases'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:252:in 'Array#each'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:252:in 'JoinAdmissionDiagnostics.input_cases'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:483:in 'block (2 levels) in JoinAdmissionDiagnostics.main'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:476:in 'Array#each'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:476:in 'block in JoinAdmissionDiagnostics.main'\n\tfrom /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/4.0.0/tmpdir.rb:105:in 'Dir.mktmpdir'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:474:in 'JoinAdmissionDiagnostics.main'\n\tfrom bench/ruby-native/join_admission_diagnostics.rb:531:in '<main>'\n"
+}

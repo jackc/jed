@@ -52,6 +52,8 @@ The [planner work-estimation investigation](WORK_ESTIMATION_FOLLOWUP.md)
 records a rejected candidate with fewer allocations but no clear JIT speedup.
 The [JOIN-predicate follow-up](JOIN_PREDICATE_FOLLOWUP.md) applies the existing
 scalar compiler at JOIN predicate evaluation sites.
+The [JOIN-admission follow-up](JOIN_ADMISSION_FOLLOWUP.md) reduces compilation
+setup for cheap predicates over known small inputs.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)

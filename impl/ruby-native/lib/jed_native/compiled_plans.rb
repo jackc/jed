@@ -12,7 +12,8 @@ module JedNative
     MAX_AGGREGATE_CACHE_ENTRIES = 64
     MAX_RELATION_CACHE_ENTRIES = 64
     MAX_JOIN_PREDICATE_CACHE_ENTRIES = 64
-    MIN_JOIN_PREDICATE_CANDIDATES = 8
+    MIN_JOIN_PREDICATE_CANDIDATES = 16
+    MIN_SIMPLE_JOIN_PREDICATE_INPUTS = 128
 
     def native_compiled_kernels(plan, predicate, projections, keys = nil, pipeline: nil, offset: false, limit: false, orders: nil)
       return if @native_compilation_disabled
@@ -57,12 +58,36 @@ module JedNative
     end
 
     # Join predicates can reuse resolved expressions, but those expressions
-    # remain mutable. Prepare their current complete source and immutable pool
-    # on every acquisition; only generated kernels survive in this bounded LRU.
+    # remain mutable. Eligible acquisitions prepare their current complete
+    # source and immutable pool; only kernels survive in this bounded LRU.
     # No predicate, row, binding, plan or execution owner is retained.
-    def native_compiled_join_predicate(expression)
+    def native_compiled_join_predicate(expression, input_size: nil)
       return if @native_compilation_disabled || @native_join_compilation_disabled
       return unless expression.is_a?(Expression) && !%i[literal column param].include?(expression.kind)
+      # A single integer comparison already has a small evaluator path. Avoid
+      # fresh emission for modest known inputs; larger or unknown inputs keep
+      # the opportunity to amortize it. Inspect only this fixed three-node shape.
+      if !@native_compilation_immediate && input_size.is_a?(Integer) &&
+         input_size < MIN_SIMPLE_JOIN_PREDICATE_INPUTS &&
+         expression.instance_of?(Expression) && expression.kind == :binary &&
+         expression.type == 'boolean' && !@types.key?(expression.type) &&
+         CompiledExpression::COMPARISONS.key?(expression.value) &&
+         expression.args.instance_of?(Array) && expression.args.length == 2
+        left, right = expression.args
+        if left.instance_of?(Expression) && right.instance_of?(Expression) &&
+           Types::INTEGER_BITS.key?(left.type) && Types::INTEGER_BITS.key?(right.type) &&
+           !@types.key?(left.type) && !@types.key?(right.type)
+          left_leaf = case left.kind
+                      when :literal, :column, :param then true
+                      else false
+                      end
+          right_leaf = case right.kind
+                       when :literal, :column, :param then true
+                       else false
+                       end
+          return if left_leaf && right_leaf
+        end
+      end
       program = CompiledExpression.prepare(expression, types: @types, text: !@native_text_compilation_disabled)
       return unless program
       @native_compiled_join_predicates ||= {}
