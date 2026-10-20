@@ -112,6 +112,11 @@ Current bound evaluation, normalization, encoding, costs and errors stay in
 the original scan loops. Known zero/singleton inputs skip setup, unusual
 metadata keeps the ordinary path, and descriptors are bounded by 32 keys,
 192 expression nodes and 4,096 units. This adds no SQL or host API behavior.
+The [N-way candidate investigation](../../impl/ruby-native/NWAY_FRONTIER_FOLLOWUP.md)
+records a rejected early-dominance optimization. It avoids some candidate
+allocations while preserving complete frontiers, but does not establish a
+consistent interpreter/YJIT/ZJIT throughput benefit. Its measured source and
+evidence remain reproducible in Git; the preceding planner remains the baseline.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
