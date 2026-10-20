@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "description": "Explicit disk blocking checkpoint: private 4096-row fixture, 1024-row unindexed join inputs, identical high/low work_mem queries. Setup, answer validation and positive scratch-I/O proofs stay outside timing.",
+  "rows": 4096,
+  "join_rows": 1024,
+  "work_mem_bytes": [8388608, 65536],
+  "repetitions": 5,
+  "workloads": [
+    {
+      "name": "file_group_having_order",
+      "sql": "SELECT grp + 1 AS k, count(*), sum(score) FROM items GROUP BY grp + 1 HAVING sum(score) > $1 ORDER BY sum(score) DESC, k",
+      "parameters": [[0], [1000]],
+      "iterations": 3,
+      "warmup": 40,
+      "low_work_mem_must_spill": true
+    },
+    {
+      "name": "file_computed_sort",
+      "sql": "SELECT id, score, label FROM items ORDER BY score::i64 * 3 + grp::i64 DESC, id",
+      "parameters": [[]],
+      "iterations": 3,
+      "warmup": 40,
+      "low_work_mem_must_spill": true
+    },
+    {
+      "name": "file_distinct_sort",
+      "sql": "SELECT DISTINCT score % 997 AS s, grp % 31 AS g FROM items ORDER BY s, g",
+      "parameters": [[]],
+      "iterations": 3,
+      "warmup": 40,
+      "low_work_mem_must_spill": true
+    },
+    {
+      "name": "file_hash_join_residual",
+      "sql": "SELECT count(*), sum(l.score::i64 + r.score::i64) FROM join_left l JOIN join_right r ON l.k = r.k AND r.score <> l.score",
+      "parameters": [[]],
+      "iterations": 3,
+      "warmup": 40,
+      "low_work_mem_must_spill": true,
+      "must_use_hash_rows": true
+    }
+  ]
+}

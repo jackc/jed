@@ -1,0 +1,198 @@
+{
+  "schema": 1,
+  "description": "Explicit broad checkpoint over the unchanged 1000-row fixture. Original pre-sharing source versus final source, same schedules across APIs and runtimes. Covers cheap lookup/scalar, scan, grouped HAVING, ordering, many groups, DISTINCT, mixed scalar types, PK-equality self-join with residual predicate, all six new wildcard targets and two LIKE controls. Cross-core adapters validate rendered-value checksums/row counts and use their existing collectors; Ruby binding comparison separately validates exact values, metadata and costs while externally draining query cursors.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {
+      "name": "scalar",
+      "sql": "SELECT abs($1::i64) + 7",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": -999,
+      "step": 17,
+      "span": 2000
+    },
+    {
+      "name": "pk_hit",
+      "sql": "SELECT score FROM items WHERE id = $1",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "pk_miss",
+      "sql": "SELECT score FROM items WHERE id = $1",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": 1000,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "filtered_scan",
+      "sql": "SELECT id, score FROM items WHERE score >= $1 ORDER BY id",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 9700,
+      "step": 7,
+      "span": 300
+    },
+    {
+      "name": "aggregate",
+      "sql": "SELECT sum(score) FROM items WHERE bucket = $1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 1,
+      "span": 10
+    },
+    {
+      "name": "group_having",
+      "sql": "SELECT bucket, count(*), sum(score) FROM items GROUP BY bucket HAVING sum(score) > $1 ORDER BY sum(score) DESC, bucket",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 400000,
+      "step": 7919,
+      "span": 100000
+    },
+    {
+      "name": "sort_limit",
+      "sql": "SELECT id, score FROM items ORDER BY score DESC, id LIMIT 20",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "arithmetic_projection",
+      "sql": "SELECT id, (score::i64 * 3 + bucket::i64) / (bucket::i64 + 1) FROM items WHERE bucket >= $1 ORDER BY id",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 1,
+      "span": 5
+    },
+    {
+      "name": "case_projection",
+      "sql": "SELECT id, CASE WHEN score >= $1 THEN score::i64 * 3 + bucket::i64 ELSE -score::i64 END FROM items ORDER BY id",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 2500,
+      "step": 137,
+      "span": 5000
+    },
+    {
+      "name": "aggregate_many_groups",
+      "sql": "SELECT score % 100, count(*), sum(score) FROM items GROUP BY score % 100 ORDER BY 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "aggregate_distinct",
+      "sql": "SELECT count(DISTINCT bucket), sum(DISTINCT bucket) FROM items",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "mixed_scalar",
+      "sql": "SELECT CASE WHEN $1::i64 BETWEEN -1000 AND 0 THEN coalesce(nullif($1::i64, -7), 3) ELSE abs($1::i64) END AS n, (12.5::decimal / 2::decimal)::text AS d, 'é' || 'x' AS t",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": -999,
+      "step": 17,
+      "span": 2000
+    },
+    {
+      "name": "indexed_join",
+      "sql": "SELECT a.label, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id LIMIT 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "like_underscore_prefix",
+      "sql": "SELECT sum(score) FROM items WHERE label LIKE 'row_5%'",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "like_fixed_width",
+      "sql": "SELECT count(*) FROM items WHERE label LIKE 'row___'",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "like_interior_percent",
+      "sql": "SELECT sum(score) FROM items WHERE label LIKE 'r%w%5%'",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "like_not_interior_percent",
+      "sql": "SELECT count(*) FROM items WHERE label NOT LIKE 'r%w%5%'",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "like_wildcard_projection",
+      "sql": "SELECT id, CASE WHEN label LIKE 'row__%' THEN score + 1 ELSE score - 1 END FROM items ORDER BY id",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "like_wildcard_group",
+      "sql": "SELECT CASE WHEN label LIKE 'r%w%5%' THEN 1 ELSE 0 END, count(*), sum(score) FROM items GROUP BY CASE WHEN label LIKE 'r%w%5%' THEN 1 ELSE 0 END ORDER BY 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "text_like_fallback",
+      "sql": "SELECT sum(score) FROM items WHERE label LIKE 'row5%'",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    },
+    {
+      "name": "like_mixed_fallback",
+      "sql": "SELECT sum(score) FROM items WHERE label LIKE 'row%_5%'",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 0,
+      "span": 0
+    }
+  ]
+}

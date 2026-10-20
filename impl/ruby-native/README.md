@@ -33,6 +33,9 @@ The [LIKE follow-up](LIKE_FOLLOWUP.md) records another complete zero-failure aud
 after extending compilation to simple literal LIKE predicates.
 The [method-sharing follow-up](METHOD_SHARING_FOLLOWUP.md) reuses generated methods
 across independent constant pools through a bounded process cache.
+The [performance checkpoint](PERFORMANCE_CHECKPOINT.md) compares the resulting
+core across query shapes, host callbacks, real file access and spills, including
+fresh supported-core and Ruby Rust-binding measurements.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
