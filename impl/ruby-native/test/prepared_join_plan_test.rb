@@ -149,6 +149,55 @@ module NativePreparedJoinPlanTests
     disabled&.close
   end
 
+  def unified_integer_bindings(database)
+    enabled = disabled = cursor = nil
+    database.execute('CREATE TABLE jp_width_key(id i16 PRIMARY KEY)')
+    database.execute('INSERT INTO jp_width_key VALUES(-1),(1),(100)')
+    cases = [
+      ['SELECT a.narrow + $1, $1 + 1 FROM jp_a a JOIN jp_b b ON b.id=a.k WHERE a.id=$1', %w[i16 i64], [[1, [[2, 2]]], [2, [[4, 3]]], [nil, []]]],
+      ['SELECT $1 + 1, a.narrow + $1 FROM jp_a a JOIN jp_b b ON b.id=a.k WHERE a.id=$1', %w[i64 i16], [[1, [[2, 2]]], [2, [[3, 4]]]]],
+      ['SELECT a.id, $1+$2 FROM jp_a a JOIN jp_b b ON b.id=a.k WHERE a.narrow=$1 AND $1=$2', %w[i32 i64], [[[1, 1], [[1, 2]]], [[40000, 40000], []], [[nil, nil], []]]],
+      ['SELECT a.id FROM jp_a a JOIN jp_b b ON b.id=a.k WHERE a.narrow=$1 OR a.id=$1', %w[i32], [[1, [[1]]], [40000, []], [-40000, []], [1, [[1]]]]],
+      ['SELECT id FROM jp_width_key WHERE id=$1 AND $1<100000', %w[i16], [[1, [[1]]], [40000, []], [-40000, []], [nil, []]]],
+      ['SELECT $1::i64 FROM jp_width_key WHERE id=$1', %w[i64], [[1, [[1]]], [2**63-1, []], [-2**63, []], [nil, []]]],
+      ['SELECT a.narrow+$1, $1::i64 FROM jp_a a JOIN jp_b b ON b.id=a.k WHERE a.id=1', %w[i16 i64], [[1, [[2, 1]]], [32767, :overflow], [2, [[3, 2]]]]],
+      ['SELECT $1::i16, $1::i64', %w[i16 i64], [[1, [[1, 1]]], [40000, :overflow], [2**63-1, :overflow], [nil, [[nil, nil]]]]]
+    ]
+    APIS.each do |api|
+      cases.each do |sql, types, bindings|
+        enabled, disabled = session(database), session(database, disabled: true)
+        enabled.engine.instance_variable_set(:@native_compilation_immediate, true)
+        disabled.engine.instance_variable_set(:@native_compilation_disabled, true)
+        statements = [enabled, disabled].map { |current| current.prepare(sql) }
+        2.times do
+          bindings.each do |binding, expected|
+            params = binding.is_a?(Array) ? binding : [binding]
+            if expected != :overflow
+              # Metadata is available before first pull and must describe each
+              # local occurrence, even when one binding serves wider contexts.
+              cursor = enabled.query_prepared(statements.first, *params)
+              assert(cursor.column_types == types && cursor.cost.zero?, 'unified integer binding changed lazy metadata')
+              cursor.close
+            end
+            answer = compare_current(enabled, disabled, statements, sql, params, api)
+            if expected == :overflow
+              assert(answer[0] == :error && answer[2] == '22003', 'integer unification suppressed a real cast/result overflow')
+            else
+              assert(answer[0] == :rows && answer[1] == expected && answer[3] == types,
+                "integer occurrence values/types changed: #{answer.inspect}")
+            end
+          end
+        end
+        enabled.close
+        disabled.close
+      end
+    end
+  ensure
+    cursor&.close
+    enabled&.close
+    disabled&.close
+  end
+
   def publication_and_transactions(database)
     enabled, disabled, writer = session(database), session(database, disabled: true), database.session
     sql = 'SELECT a.id, b.v FROM jp_a a JOIN jp_b b ON b.id = a.k WHERE a.id >= $1 ORDER BY a.id'
@@ -283,7 +332,7 @@ module NativePreparedJoinPlanTests
         'WITH q AS (SELECT 1 AS n) SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id',
         'SELECT a.id::text FROM jp_a a JOIN jp_b b ON a.k = b.id',
         "SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id WHERE 'row' LIKE 'r%'",
-        'SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id JOIN jp_a c ON c.id = a.id',
+        'SELECT a.id FROM jp_a a JOIN jp_b b ON a.k = b.id LEFT JOIN jp_a c ON c.id = a.id',
         'SELECT a.id FROM jp_a a RIGHT JOIN jp_b b ON a.k = b.id'
       ]
       unsupported.each do |sql|
@@ -333,7 +382,7 @@ module NativePreparedJoinPlanTests
     JedNative.memory do |database|
       current = session(database)
       engine = current.engine
-      entry = JedNative::PreparedJoins::Entry.new(tables: [], context: [], roots: {}, columns: {}, key_units: 0, key_bytes: 0)
+      entry = JedNative::PreparedJoins::Entry.new(tables: [], context: [], roots: {}, columns: {}, scopes: {}, nodes: {}, key_units: 0, key_bytes: 0)
       frame = JedNative::PreparedJoins::Frame.new(entry: entry, depth: 0, plans: {})
       engine.instance_variable_set(:@native_join_resolution_frame, frame)
       columns = [{ name: 'x', type: 'boolean' }, { name: 'y', type: 'boolean' }]
@@ -345,14 +394,13 @@ module NativePreparedJoinPlanTests
         'cached filter marking changed value AND semantics')
       assert(engine.compile_filter(node, columns).equal?(predicate) && engine.compile(node, columns).equal?(value), 'mode-specific roots did not reuse')
 
-      # Binding inference rejects conflicting public parameter contexts. Probe
-      # the lower-level resolution seam directly so its replay is independently
-      # checked for narrowing, left-to-right errors and an empty access result.
+      # Probe the lower-level resolution seam directly with its declared binding
+      # widths so replay is independently checked for left-to-right range errors.
       columns = [{ name: 'small', type: 'i16' }, { name: 'large', type: 'i32' }]
       left = { kind: :binary, op: '+', left: { kind: :column, name: 'small' }, right: { kind: :param, index: 1 } }
       right = { kind: :binary, op: '+', left: { kind: :column, name: 'large' }, right: { kind: :param, index: 2 } }
       node = { kind: :binary, op: '+', left: left, right: right }
-      engine.instance_variable_set(:@native_binding_types, %w[i64 i64])
+      engine.instance_variable_set(:@native_binding_types, %w[i16 i32])
       engine.instance_variable_set(:@params, [1, 1])
       resolved = engine.compile(node, columns)
       checks = entry.roots.values.find { |expression, _| expression.equal?(resolved) }&.last
@@ -441,6 +489,7 @@ module NativePreparedJoinPlanTests
         setup(database)
         api_equivalence_and_reuse(database)
         contextual_checks(database)
+        unified_integer_bindings(database)
         budgets(database)
         cursor_snapshots(database)
         parameter_sensitive_planning(database)

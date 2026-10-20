@@ -1,0 +1,46 @@
+[ruby-native:bounded] $ ruby impl/ruby-native/tools/run_bounded.rb mise run cor…
+[corpus:check] $ ruby scripts/oracle_import.rb --check "${usage_file}"
+[corpus:check] ERROR task failed
+bounded worker: worker exited 1; peak RSS 46317568 bytes
+DIFF: spec/conformance/suites/params/binding.test differs from oracle regeneration
+--- spec/conformance/suites/params/binding.test	2026-10-19 21:57:21.853735830 -0500
++++ /tmp/__oracle.test	2026-10-19 22:01:09.265213358 -0500
+@@ -329,12 +329,14 @@
+ query I nosort
+ SELECT id FROM narrow WHERE s = $1 OR id = $1
+ ----
++ERROR:  smallint out of range
+ 
+ # params: 2147483648
+ # types: i32
+ query I nosort
+ SELECT id FROM narrow WHERE id = $1 OR $1 = 5
+ ----
++ERROR:  integer out of range
+ 
+ # Real explicit casts and locally narrow arithmetic still report overflow.
+ # params: 40000
+@@ -361,12 +363,14 @@
+ query I nosort
+ SELECT id FROM narrow_key WHERE id = $1 AND $1 < 100000
+ ----
++ERROR:  smallint out of range
+ 
+ # params: -40000
+ # types: i16
+ query I nosort
+ SELECT id FROM narrow_key WHERE id = $1 AND $1 < 100000
+ ----
++ERROR:  smallint out of range
+ 
+ # params: 9223372036854775807
+ # types: i64
+@@ -392,6 +396,7 @@
+ query I nosort
+ SELECT id FROM narrow WHERE s = $1 AND $1 = $2
+ ----
++ERROR:  smallint out of range
+ 
+ # params: 100, 100
+ # types: i32
+[ruby-native:bounded] ERROR task failed

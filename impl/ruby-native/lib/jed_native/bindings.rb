@@ -151,7 +151,11 @@ module JedNative
       return if [UNKNOWN, 'record', 'unknown[]'].include?(type)
       index = node[:index] - 1
       old = @types[index] || UNKNOWN
-      raise Error.new('42804', 'conflicting parameter types') unless old == UNKNOWN || old == type
+      if Types::INTEGER_BITS.key?(old) && Types::INTEGER_BITS.key?(type)
+        type = old if Types::INTEGER_BITS[old] > Types::INTEGER_BITS[type]
+      elsif old != UNKNOWN && old != type
+        raise Error.new('42804', 'conflicting parameter types')
+      end
       @type_revision += 1 if old != type
       @types[index] = type
       (@modifiers[index] ||= []) << modifier if modifier && !(@modifiers[index] || []).include?(modifier)
@@ -349,7 +353,11 @@ module JedNative
       case node[:kind]
       when :param
         constrain(node, wanted)
-        @types[node[:index] - 1]
+        # Bind once at the widest inferred integer width, while each use keeps
+        # its own context (for example i16 arithmetic beside an i64 cast).
+        inferred = @types[node[:index] - 1]
+        local = Types.normalize(wanted || UNKNOWN)
+        Types::INTEGER_BITS.key?(local) && Types::INTEGER_BITS.key?(inferred) ? local : inferred
       when :literal then Types.normalize(node[:type] || Types.infer(node[:value]))
       when :column
         matches = scope.select { |column| column[:name] == node[:name] && (node[:table] ? column[:table] == node[:table] : !column[:qualified_only]) }
@@ -473,6 +481,12 @@ module JedNative
         expression(left, scope, anchor) if left[:kind] == :param
         expression(right, scope, anchor) if right[:kind] == :param
         return anchor
+      end
+      if left[:kind] == :param && right[:kind] == :param && [lt, rt].all? { |type| !known?(type) || Types::INTEGER_BITS.key?(type) }
+        # Two bare integer parameters provide no local column context. A
+        # narrower constraint at another occurrence does not replace i64 here.
+        lt = expression(left, scope, 'i64')
+        rt = expression(right, scope, 'i64')
       end
       lt = expression(left, scope, rt) if @count.positive? && known?(rt) && rt != 'record' && %i[param array].include?(left[:kind])
       rt = expression(right, scope, lt) if @count.positive? && known?(lt) && lt != 'record' && %i[param array].include?(right[:kind])

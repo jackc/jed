@@ -6,7 +6,7 @@
 # into an arm the set operation widens, reading the arm's column through the widening. Rows are
 # PostgreSQL's (PostgreSQL pushes the same quals); the `# cost:` pins are jed's cross-core contract:
 # a pushed conjunct, casts and functions included, charges per row of its relation.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.column_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_full, query.union, query.derived_table, query.point_lookup, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.safe_conjunct_gate, query.is_null, expr.like, expr.ilike, func.casing, cast.explicit, cast.scalar_text, null.three_valued, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, resource.cost_metering
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.column_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_full, query.union, query.derived_table, query.point_lookup, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.safe_conjunct_gate, query.is_null, expr.like, expr.ilike, func.casing, cast.explicit, cast.scalar_text, null.three_valued, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, resource.cost_metering
 
 statement ok
 CREATE TABLE a (id i32 PRIMARY KEY, s text, k i32, d decimal, f f64)
@@ -227,3 +227,38 @@ SELECT s.v FROM (SELECT v FROM r UNION SELECT f FROM a) s WHERE s.v IS NULL OR s
 -1.25
 0.5
 NULL
+
+# The planner classifies only explicitly non-trapping catalog cast pairs. An identity
+# cast has no such row: neither its parameter nor column form moves into a scan.
+# params: 2
+# cost: 46
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.id = CAST($1 AS i32) ORDER BY b.w
+----
+2
+200
+
+# params: 2
+# cost: 46
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.id AS i32) = $1 ORDER BY b.w
+----
+2
+200
+
+# The matching literal-cast form keeps the same residual cost.
+# cost: 46
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.id = CAST(2 AS i32) ORDER BY b.w
+----
+2
+200
+
+# An explicitly classified widening cast still pushes and charges on each base row.
+# params: 2
+# cost: 37
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.id AS i64) = $1 ORDER BY b.w
+----
+2
+200

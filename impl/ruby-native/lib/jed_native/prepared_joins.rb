@@ -8,15 +8,17 @@ module JedNative
     ROOT_ENTRIES = 128
     KEY_UNITS = 4096
     KEY_BYTES = 65_536
+    MAX_INPUTS = 8
+    EXTENSION_ENTRIES = 128
     SCALAR_TYPES = %w[i16 i32 i64 boolean text].freeze
     BINARY = %w[+ - * / % & | # << >> = <> != < <= > >= and or is\ distinct\ from is\ not\ distinct\ from].freeze
     UNARY = %w[+ - ~ not is\ null is\ not\ null is\ true is\ false is\ unknown is\ not\ true is\ not\ false is\ not\ unknown].freeze
-    Entry = Struct.new(:tables, :context, :roots, :columns, :key_units, :key_bytes, keyword_init: true)
-    Frame = Struct.new(:entry, :depth, :checks, :plans, keyword_init: true)
+    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, keyword_init: true)
+    Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, keyword_init: true)
 
     def select(statement)
       previous = @native_join_resolution_frame
-      return super unless previous || statement[:joins]&.length == 1
+      return super unless previous || !(statement[:joins] || []).empty? || (statement[:from] || []).length > 2
       wrapped = true
       @native_join_resolution_frame = prepared_join_frame(statement)
       super
@@ -48,6 +50,7 @@ module JedNative
         [[left, right], [right, left]].each do |constant, other|
           next unless constant.kind == :param && !%i[literal param].include?(other.kind)
           next unless comparison || numeric.include?(constant.type) && numeric.include?(other.type)
+          next unless contextual_parameter_cast?(constant, other.type)
           checks << [constant.value, other.type].freeze
         end
       end
@@ -81,6 +84,24 @@ module JedNative
 
     private
 
+    def nway_extension_inputs(context, state, ordinal, fixed:)
+      frame = @native_join_resolution_frame
+      return super unless frame
+      # Alternative accesses can reach the same ordered prefix within this
+      # search. Only its scopes/predicates/index candidates are shared; cardinality,
+      # step cost and mutable access hashes are still computed for each state.
+      unless frame.extension_context.equal?(context)
+        frame.extension_context = context
+        frame.extensions = {}
+      end
+      key = [state[:order], ordinal, fixed]
+      return frame.extensions[key] if frame.extensions.key?(key)
+      before = @cost
+      inputs = super
+      frame.extensions[key] = inputs if @cost == before && frame.extensions.length < EXTENSION_ENTRIES
+      inputs
+    end
+
     def prepared_join_frame(statement)
       return if @native_join_resolution_disabled || !@outer.empty? || !@ctes.empty? ||
                 @explain_runtime_plans || @explain_profile_frames || @native_explain_contradiction
@@ -88,10 +109,11 @@ module JedNative
                     !statement[:distinct_on] && !statement[:having] && (statement[:group_by] || []).empty? &&
                     (statement[:windows] || []).empty?
       sources, joins = statement[:from] || [], statement[:joins] || []
-      return unless sources.length == 1 && joins.length == 1
-      edge = joins.first
-      return unless %i[inner cross left left_outer].include?(edge[:kind]) && !edge[:using] && !edge[:natural]
-      inputs = [sources.first, edge[:relation]]
+      inputs = sources + joins.map { |edge| edge[:relation] }
+      return unless inputs.length.between?(2, MAX_INPUTS)
+      return unless sources.length == 1 || sources.length > 2 && joins.empty?
+      kinds = inputs.length == 2 ? %i[inner cross left left_outer] : %i[inner cross]
+      return unless joins.all? { |edge| kinds.include?(edge[:kind]) && !edge[:using] && !edge[:natural] }
       return unless inputs.all? do |source|
         source && source[:kind] == :table && !source[:lateral] && !source[:columns] && !source[:column_aliases] &&
           @tables.key?(source[:name]) && !@views.key?(source[:name])
@@ -105,14 +127,15 @@ module JedNative
       context = [@types, @environment, timezone, default_collation, types]
       @native_join_resolution_plans ||= {}.compare_by_identity
       entry = @native_join_resolution_plans[statement]
-      unless entry && entry.context == context && entry.tables.zip(tables).all? { |old, current| old[0] == current[0] && old[1].equal?(current[1]) }
+      unless entry && entry.context == context && entry.tables.length == tables.length &&
+             entry.tables.zip(tables).all? { |old, current| old[0] == current[0] && old[1].equal?(current[1]) }
         return unless prepared_join_syntax?(statement)
         # Alias/table names and column names also live in retained scopes, even
         # when the original expression is only '*'. Bound them before copying.
         names = inputs.flat_map { |source| [source[:name], source[:alias]] } +
           tables.flat_map { |_, table| table[:columns].map { |column| column[:name] } }
         return if names.compact.sum(&:bytesize) > 32_768
-        entry = Entry.new(tables: tables.freeze, context: context.freeze, roots: {}, columns: {}, key_units: 0, key_bytes: 0)
+        entry = Entry.new(tables: tables.freeze, context: context.freeze, roots: {}, columns: {}, scopes: {}, nodes: {}, key_units: 0, key_bytes: 0)
         @native_join_resolution_plans.shift if @native_join_resolution_plans.length >= CACHE_ENTRIES
         @native_join_resolution_plans[statement] = entry
       end
@@ -121,8 +144,8 @@ module JedNative
 
     def prepared_join_syntax?(statement)
       return false if statement[:columns].length + (statement[:order_by] || []).length > 192
-      roots = statement[:columns].map { |item| item[:expr] } + [statement[:where], statement[:joins].first[:on],
-        statement[:limit], statement[:offset]] + (statement[:order_by] || []).map { |order| order[:expr] }
+      roots = statement[:columns].map { |item| item[:expr] } + [statement[:where], statement[:limit], statement[:offset]] +
+        (statement[:joins] || []).map { |edge| edge[:on] } + (statement[:order_by] || []).map { |order| order[:expr] }
       prepared_join_nodes?(roots)
     end
 
@@ -162,8 +185,13 @@ module JedNative
     end
 
     def prepared_join_root(frame, mode, node, columns)
-      key = [mode, node, columns]
-      if (saved = frame.entry.roots[key])
+      # Physical prefixes revisit the same AST in different ordered scopes.
+      # Own each AST/scope once within the existing key budget; a root's tokens
+      # still identify the complete expression and exact column order.
+      scope = frame.entry.scopes[columns]
+      syntax = frame.entry.nodes[node]
+      key = [mode, syntax || frame.entry.nodes.length, scope || frame.entry.scopes.length]
+      if scope && syntax && (saved = frame.entry.roots[key])
         saved[1].each { |index, type| cast_value(@params[index], type) }
         return saved[0]
       end
@@ -173,10 +201,18 @@ module JedNative
       expression = yield
       # Only successful, unmetered resolution is retained. Keys own snapshots
       # because planner rewrites manufacture fresh equivalent AST/scope hashes.
-      if @cost == before && frame.entry.roots.length < ROOT_ENTRIES && prepared_join_nodes?([node]) &&
-         (size = prepared_join_key_size(key, frame.entry))
-        snapshot = prepared_join_key(key)
-        frame.entry.roots[snapshot] = [expression, frame.checks.freeze].freeze
+      if @cost == before && frame.entry.roots.length < ROOT_ENTRIES && prepared_join_nodes?([node])
+        retained = [key]
+        retained << columns unless scope
+        retained << node unless syntax
+        size = prepared_join_key_size(retained, frame.entry)
+        return expression unless size
+        unless scope
+          scope = frame.entry.scopes.length
+          frame.entry.scopes[prepared_join_key(columns)] = scope
+        end
+        frame.entry.nodes[prepared_join_key(node)] = frame.entry.nodes.length unless syntax
+        frame.entry.roots[key.freeze] = [expression, frame.checks.freeze].freeze
         frame.entry.key_units += size[0]
         frame.entry.key_bytes += size[1]
       end
