@@ -717,7 +717,9 @@ declare, so `'x%' LIKE $1` and `$1 LIKE $2` bind text. The pattern or escape of 
 is a `like_escape(text, text)` argument ([grammar.md](grammar.md) §22), so a parameter there is
 `text` by the function rule. A parameter with **no derivable type** (e.g. a bare
 `SELECT $1`, or a gap in `$1..$N`) is `42P18 indeterminate_datatype`. Conflicting inferences for
-the same index (`i16` here, `text` there) are `42804 datatype_mismatch`. Two adaptable operands
+the same index (`i16` here, `text` there) are `42804 datatype_mismatch`. Repeated scalar
+integer constraints bind at their widest width, while each occurrence retains its local
+expression type. Two adaptable operands
 with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `i64`, matching the
 existing integer-literal default (a documented local-consistency divergence from PG).
 

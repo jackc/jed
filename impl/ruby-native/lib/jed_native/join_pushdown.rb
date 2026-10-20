@@ -177,7 +177,7 @@ module JedNative
       case expression.kind
       when :column, :literal, :param then true
       when :cast
-        (expression.type == args.first.type || FunctionCatalog::SAFE_CASTS.include?([args.first.type, expression.type])) && pushdown_safe?(args.first)
+        FunctionCatalog::SAFE_CASTS.include?([args.first.type, expression.type]) && pushdown_safe?(args.first)
       when :call
         signatures = FunctionCatalog::SAFE_FUNCTIONS[expression.value] || []
         signatures.any? { |families| families.length == args.length && families.zip(args).all? { |family, arg| family == arg.type || family == Functions.family(arg.type) || family == 'anyrange' && Types::RANGES.key?(arg.type) } } && args.all? { |arg| pushdown_safe?(arg) }

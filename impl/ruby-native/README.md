@@ -38,6 +38,8 @@ core across query shapes, host callbacks, real file access and spills, including
 fresh supported-core and Ruby Rust-binding measurements.
 The [join planning follow-up](JOIN_PLAN_FOLLOWUP.md) reuses bounded resolved
 expressions and column metadata while retaining per-execution access selection.
+The [multiway join follow-up](MULTIWAY_PLAN_FOLLOWUP.md) extends bounded reuse to
+three through eight inputs and shares repeated setup within each plan search.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)

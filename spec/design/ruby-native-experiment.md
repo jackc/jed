@@ -54,6 +54,11 @@ The [join planning follow-up](../../impl/ruby-native/JOIN_PLAN_FOLLOWUP.md)
 retains bounded resolved roots and column metadata for eligible two-table joins.
 Access selection remains specific to each execution and binding; mutable
 execution state belongs to the cursor/SELECT invocation.
+The [multiway follow-up](../../impl/ruby-native/MULTIWAY_PLAN_FOLLOWUP.md) extends
+that reuse to bounded three-through-eight-table INNER/CROSS joins, stores each
+AST and ordered column scope once within the same key budget, and reuses structural
+setup across alternatives within one plan search. Physical winners remain
+specific to each execution and binding.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
