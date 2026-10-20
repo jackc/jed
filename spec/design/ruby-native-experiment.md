@@ -43,7 +43,10 @@ The scalar emitter's C-text comparison extension preserves collation metadata
 and string-work charges; linguistic collation and general string functions keep
 their ordinary execution. The [literal LIKE extension](../../impl/ruby-native/LIKE_FOLLOWUP.md)
 admits bounded exact, prefix, suffix and contains predicates under static C labels;
-complex patterns retain the handwritten matcher with unchanged values, errors and costs.
+the [broader literal extension](../../impl/ruby-native/LITERAL_LIKE_FOLLOWUP.md)
+adds fixed-position `_` with optional final `%`, and interior `%` without `_`.
+Other complex patterns retain the handwritten matcher with unchanged values,
+errors and costs.
 The [method-sharing follow-up](../../impl/ruby-native/METHOD_SHARING_FOLLOWUP.md)
 shares identical generated methods through a bounded process cache while keeping
 each kernel's constants and execution ownership independent.

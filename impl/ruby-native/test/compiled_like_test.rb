@@ -11,6 +11,7 @@ module NativeCompiledLikeTests
   Helpers = NativeCompiledTextTests
   COLUMNS = [{ name: 'a', type: 'text' }, { name: 'b', type: 'text' }, { name: 'id', type: 'i32' }].freeze
   MARKER = '# literal LIKE specialization'
+  WILDCARD_MARKER = '# literal LIKE wildcard specialization'
 
   def assert(value, message) = Helpers.assert(value, message)
   def quoted(value) = "'#{value.gsub("'", "''")}'"
@@ -53,7 +54,7 @@ module NativeCompiledLikeTests
   end
 
   def rejection_and_bounds
-    ["a LIKE 'a_b'", "a LIKE 'a%b'", "a LIKE '%a%b%'", "a LIKE 'a\\'", "a ILIKE 'a%'", "a NOT ILIKE 'a%'",
+    ["a LIKE '%a_b%'", "a LIKE 'a%b_c'", "a LIKE '_%a'", "a LIKE 'a\\'", "a ILIKE 'a%'", "a NOT ILIKE 'a%'",
      "a LIKE b", "a LIKE b::text", "a LIKE 'a#%' ESCAPE '#'", "a LIKE NULL", "(a COLLATE \"C\") LIKE 'a%'"].each do |body|
       _, kernel = build("SELECT #{body}")
       assert(kernel.nil?, "unsupported LIKE expression compiled: #{body}")
@@ -93,6 +94,63 @@ module NativeCompiledLikeTests
     assert(!kernel.source.include?(attack) && kernel.pool.include?(attack), 'LIKE literal became Ruby source')
   end
 
+  def wildcard_patterns
+    patterns = ['_', '__', '___', '_%', 'row_5%', '_o_', 'a_b', 'a__b%', '😀_x%', '_😀_',
+                'a\\__%', 'a\\%_%', '\\\\_%', '_é_', 'a%b', 'a%%b%c', '%a%b%', '%aa%aa',
+                'a%a', '%a%a%', '😀%x%é', 'a\\%b%c', 'a%\\_%c']
+    subjects = [nil, '', 'a', 'aa', 'aaa', 'aaaa', 'ab', 'aab', 'axb', 'axxbz', 'row05', 'row55tail',
+                'row😀5tail', 'rowé5', 'bob', '😀x', '😀axz', 'a😀b', 'aéb', 'a_ba', 'a%xb',
+                '\\ax', 'aéz', 'axbc', 'a%bzc', '😀axbé', "a\u0000b", "a\nb"]
+    patterns.each do |pattern|
+      ['LIKE', 'NOT LIKE'].each do |operator|
+        subjects.each do |subject|
+          kernel = compare("SELECT a #{operator} #{quoted(pattern)}", values: [subject])
+          assert(kernel.source.include?(WILDCARD_MARKER), "broader literal shape did not specialize: #{pattern}")
+          assert(!kernel.source.include?('.chars') && !kernel.source.include?('.each_char') && !kernel.source.include?('.byteslice'), 'wildcard kernel constructed per-row characters or slices')
+        end
+      end
+    end
+    compare("SELECT a LIKE 'row_5%' AND 1 / id > 0", values: ['row15', nil, 0], expected: [:error, '22012'])
+    compare("SELECT a LIKE 'row_5%' AND 1 / id > 0", values: ['other', nil, 0], expected: [:value, false])
+    compare("SELECT a NOT LIKE 'a%b%c' OR 1 / id > 0", values: ['other', nil, 0], expected: [:value, true])
+    compare("SELECT CASE WHEN a LIKE 'a_b%' THEN 7 ELSE 1 / id END", values: ['a😀bz', nil, 0], expected: [:value, 7])
+
+    # Different patterns share bounded method templates, never pattern data.
+    %w[row_5% abc_9%].map { |pattern| build("SELECT a LIKE #{quoted(pattern)}").last }.then do |first, second|
+      assert(first.class.equal?(second.class) && first.pool != second.pool, 'fixed-position LIKE did not share isolated pattern programs')
+      assert(first.call(Helpers.engine, ['row15'], []) && !second.call(Helpers.engine, ['row15'], []), 'shared wildcard method retained another pattern')
+    end
+    %w[a%b%c x%y%z].map { |pattern| build("SELECT a LIKE #{quoted(pattern)}").last }.then do |first, second|
+      assert(first.class.equal?(second.class) && first.pool != second.pool, 'interior-percent LIKE did not share isolated literal runs')
+      assert(first.call(Helpers.engine, ['a1b2c'], []) && !second.call(Helpers.engine, ['a1b2c'], []), 'shared segment method retained another pattern')
+    end
+  end
+
+  def wildcard_bounds
+    cap = JedNative::CompiledExpression::MAX_POOL_BYTES
+    pattern = 'a' * ((cap - 8) / 2) + '__'
+    _, kernel = build("SELECT a LIKE #{quoted(pattern)}")
+    assert(kernel && kernel.pool.grep(String).sum(&:bytesize) == cap, 'packed LIKE program missed exact cumulative byte bound')
+    _, rejected = build("SELECT a LIKE #{quoted('a' + pattern)}")
+    assert(!rejected, 'packed LIKE program exceeded cumulative byte bound')
+    unicode = '😀' * ((cap - 8) / 8) + '__'
+    _, kernel = build("SELECT a LIKE #{quoted(unicode)}")
+    assert(kernel && kernel.pool.grep(String).sum(&:bytesize) == cap, 'packed LIKE program counted codepoints instead of bytes')
+
+    runs = JedNative::CompiledExpression::MAX_LIKE_RUNS
+    ['a_', 'a%'].each do |pair|
+      _, kernel = build("SELECT a LIKE #{quoted(pair * (runs / 2))}")
+      assert(kernel && kernel.source.include?(WILDCARD_MARKER), 'exact wildcard run bound rejected')
+      _, rejected = build("SELECT a LIKE #{quoted(pair * (runs / 2) + 'a')}")
+      assert(!rejected, 'wildcard run bound was exceeded')
+    end
+    invalid, = resolve("SELECT coalesce(a, 'x') LIKE 'a_b%'")
+    valid, = resolve("SELECT a LIKE #{quoted(pattern)}")
+    kernel = JedNative::CompiledExpression.build_many([invalid, valid], types: {})
+    assert(kernel && kernel.pool.grep(String).sum(&:bytesize) == cap, 'failed wildcard root retained pattern pool bytes')
+    assert(JedNative::CompiledExpression.prepare_many([invalid, valid], types: {}).nil?, 'complete wildcard arguments retained a partial fallback')
+  end
+
   class BytesWithChars < JedNative::Bytea
     def chars = ['a', 'x']
   end
@@ -111,12 +169,14 @@ module NativeCompiledLikeTests
     labels.each { |label| values << JedNative::CollatedText.new('ax', label) }
     [String.new('ax'), JedNative::CollatedText.new('ax', labels.first)].each do |value|
       value.define_singleton_method(:chars) { raise 'singleton chars escaped C normalization' }
-      value.define_singleton_method(:start_with?) { |_| raise 'singleton prefix escaped C normalization' }
+      %i[start_with? getbyte byteindex].each do |name|
+        value.define_singleton_method(name) { |*| raise 'singleton string operation escaped C normalization' }
+      end
       value.freeze
       values << value
     end
     values.each do |value|
-      ['a%', '%x', '%a%', 'ax', '%', ''].each do |pattern|
+      ['a%', '%x', '%a%', 'ax', '%', '', 'a_', '_%', 'a%x', '%a%x%'].each do |pattern|
         compare("SELECT a LIKE #{quoted(pattern)}", values: [value])
         compare("SELECT a NOT LIKE #{quoted(pattern)}", values: [value])
       end
@@ -132,8 +192,8 @@ module NativeCompiledLikeTests
     assert(kernel.pool.all? { |item| !item.is_a?(JedNative::Engine) && !item.is_a?(JedNative::Expression) }, 'LIKE pool retained execution context')
   end
 
-  def consumers
-    expression, = resolve("SELECT a LIKE 'a%'")
+  def consumers(pattern)
+    expression, = resolve("SELECT a LIKE #{quoted(pattern)}")
     rows = [['alpha', nil, 1], ['beta', nil, 2], [nil, nil, 3]]
     engine = Helpers.engine
     reference = rows.map { |row| engine.evaluate(expression, row) }
@@ -145,9 +205,9 @@ module NativeCompiledLikeTests
     assert(producers.all? { |kernel| kernel && kernel.source.include?(MARKER) }, 'a compiler consumer rejected complete LIKE')
     assert(rows.map { |row| producers[0].call(Helpers.engine, row, []) } == reference.map { |value| [value] }, 'argument LIKE differs')
     assert(producers[1].call(Helpers.engine, rows, []) == reference.map { |value| [value] }, 'group-key LIKE differs')
-    assert(producers[2].call(Helpers.engine, rows, []) == [rows.first], 'relation-filter LIKE differs')
+    assert(producers[2].call(Helpers.engine, rows, []) == rows.each_with_index.filter_map { |row, index| row if reference[index] == true }, 'relation-filter LIKE differs')
     producers.drop(3).each { |kernel| assert(kernel.call(Helpers.engine, rows, [], []) == reference.map { |value| [value] }, 'pipeline LIKE differs') }
-    aggregate, = resolve("SELECT count(*) FILTER (WHERE a LIKE 'a%')")
+    aggregate, = resolve("SELECT count(*) FILTER (WHERE a LIKE #{quoted(pattern)})")
     kernel = JedNative::CompiledAggregate.build(aggregate, types: {})
     assert(kernel && kernel.source.include?(MARKER), 'aggregate input rejected complete LIKE')
     assert(kernel.call(Helpers.engine, rows, []) == Helpers.engine.compute_aggregate(aggregate, rows), 'aggregate input LIKE differs')
@@ -159,7 +219,11 @@ module NativeCompiledLikeTests
     queries = ["SELECT id FROM patterns WHERE label LIKE 'a%' ORDER BY id", "SELECT id, label NOT LIKE '%a%' FROM patterns ORDER BY id",
                "SELECT CASE WHEN label LIKE '%alpha' THEN 1 ELSE 0 END, count(*) FROM patterns GROUP BY CASE WHEN label LIKE '%alpha' THEN 1 ELSE 0 END ORDER BY 1",
                "SELECT bool_or(label LIKE 'a%'), count(*) FILTER (WHERE label LIKE '%a') FROM patterns",
-               "SELECT id FROM patterns WHERE label LIKE 'a%' AND id >= $1 ORDER BY id", "SELECT id FROM patterns WHERE label LIKE 'a_%' ORDER BY id"]
+               "SELECT id FROM patterns WHERE label LIKE 'a%' AND id >= $1 ORDER BY id", "SELECT id FROM patterns WHERE label LIKE 'a_%' ORDER BY id",
+               "SELECT id, label NOT LIKE '_l%' FROM patterns ORDER BY id",
+               "SELECT CASE WHEN label LIKE 'a_%' THEN 1 ELSE 0 END, count(*) FROM patterns GROUP BY CASE WHEN label LIKE 'a_%' THEN 1 ELSE 0 END ORDER BY 1",
+               "SELECT id FROM patterns WHERE label LIKE 'a%h%a' AND id >= $1 ORDER BY id",
+               "SELECT bool_or(label LIKE 'a%h%a'), count(*) FILTER (WHERE label LIKE '_l%') FROM patterns"]
     queries.each do |sql|
       args = sql.include?('$1') ? [1] : []
       statement = session.prepare(sql)
@@ -191,9 +255,11 @@ module NativeCompiledLikeTests
 
   def run
     patterns
+    wildcard_patterns
+    wildcard_bounds
     rejection_and_bounds
     host_values
-    consumers
+    ['a%', 'a_%', '_l%', 'a%h%a', '%a%a%'].each { |pattern| consumers(pattern) }
     JedNative.memory { |database| api_equivalence(database) }
     Dir.mktmpdir('jed-compiled-like-') do |directory|
       JedNative.create(File.join(directory, 'patterns.jed'), locking: :exclusive) { |database| api_equivalence(database) }

@@ -64,7 +64,7 @@ files in the same change.
   and grouping-key loops into Ruby methods
   at runtime using a handwritten, bounded template emitter. SQL text and values
   remain data; admitted scalar operations include bounded C-text comparisons
-  and simple literal LIKE predicates. Identical generated methods may share a
+  and bounded literal LIKE predicates. Identical generated methods may share a
   bounded process cache; each kernel keeps its own immutable constant pool.
   All conformance contracts still apply. See
   `spec/design/ruby-runtime-compilation.md`.

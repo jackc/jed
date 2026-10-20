@@ -134,8 +134,11 @@ Literal LIKE specialization admits an exact literal, a literal prefix followed
 by `%`, a literal suffix preceded by `%`, or a literal contained between `%`
 wildcards. Repeated boundary `%` characters are equivalent. The default
 backslash escape is decoded during bounded admission; escaped wildcards remain
-literal characters. Unescaped `_`, interior `%`, a trailing escape, ILIKE,
-nonliteral patterns and explicit ESCAPE expressions retain the evaluator.
+literal characters. A further extension admits fixed-position `_` characters,
+optionally followed by a final `%`, and ordered literal segments separated by
+`%` when there is no unescaped `_`. Mixed patterns requiring wildcard retry,
+a trailing escape, ILIKE, nonliteral patterns and explicit ESCAPE expressions
+retain the evaluator.
 Only plain text with static C labels is admitted, including a valid UTF-8
 String literal pattern. Unlabeled parameters and linguistic or nominal types
 retain the existing path.
@@ -143,13 +146,29 @@ retain the existing path.
 Generated LIKE code charges the operator before evaluating its operands, takes
 the subject snapshot at the original wrapping point, and preserves NULL
 propagation. LIKE has no comparison-length surcharge. Exact normalized runtime
-strings with valid UTF-8 use fixed equality/prefix/suffix/substring operations;
+strings with valid UTF-8 use fixed equality/prefix/suffix/substring operations,
+a forward fixed-position matcher, or ordered literal searches;
 unexpected runtime values restore the subject's label and call the unchanged
 matcher without rereading an operand. No SQL pattern enters generated source or
-a Ruby regexp. The original pattern and decoded literal both count against the
+a Ruby regexp. The original pattern and decoded data both count against the
 existing string-pool limit, checked before admission allocates their copies.
 Trailing-escape errors keep their original data-dependent evaluation in the
 matcher; admission never raises them early.
+
+The fixed-position matcher stores an immutable binary program of literal-byte
+runs and one-code-point runs, with an optional final-any marker. Its generated
+loop compares literal bytes and advances each `_` by one validated UTF-8 code
+point, without token arrays, character arrays or substring allocation per row.
+Interior `%` with no `_` uses monotonic byte-index searches and explicit start/end
+anchors; consumed segments cannot overlap. The earliest match leaves the most
+room for subsequent segments. Arbitrary pattern data never enters emitted code.
+
+Admission limits decoded patterns to 64 runs (coalescing adjacent `%` and `_`
+runs) and preserves the existing source, node and pool limits. The original
+pattern plus packed program or decoded literal bytes count toward the cumulative
+32 KiB string pool budget; packed-program overhead is checked before allocating
+the program. SQL values, errors, costs, collation labels and runtime fallback
+remain those of the unchanged handwritten matcher.
 
 Array pipelines preserve the existing bulk scan charge before the loop and bulk
 output charge after successful completion. Streaming pipelines preserve source
