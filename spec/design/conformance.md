@@ -364,6 +364,16 @@ a `CommitDelta` the owner validates and publishes ([../pageservice/README.md](..
 page service and across cores. `mise run conformance:service` (and `conformance:all`, so `mise run ci`) runs Rust→Go,
 Go→TS, and TS→Rust as client→owner. It skips what the disk mode skips.
 
+A fourth mode, **`async-codec`** (TS harness arg `async-codec`), is a TS-only guard for the
+asynchronous storage runtime ([ts-runtime.md](ts-runtime.md) §11.5). It is the disk mode with each
+reopen run through the async loader under an identity page codec that has **only asynchronous**
+forms, and every record driven by `runAsync`. The codec changes no byte, but a synchronous encode or
+decode fails explicitly, so a query, DDL, statistics, or commit path that still reads a page
+synchronously becomes a corpus failure. Rows, errors, and costs must be unchanged. The harness
+reports how many pages crossed the codec and fails when none did. `mise run conformance:ts:async-codec`
+(and `conformance:all`, so `mise run ci`) runs it. It skips what the disk mode skips and nothing
+more; ts-runtime.md §11.1 lists the paths that remain synchronous and why the mode never reaches them.
+
 ## 4. Determinism rules
 
 The agent loop and cross-impl sync both depend on bit-reproducibility (CLAUDE.md §10).
@@ -514,7 +524,8 @@ profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness 
 
 One run of a core's harness over the corpus in one configuration (storage mode plus harness
 settings) is a **walk**. `mise run test` and `mise run ci` do not invoke `conformance`,
-`conformance:spill`, `conformance:query_memory`, and `conformance:rust:checked` one after another;
+`conformance:spill`, `conformance:query_memory`, `conformance:service`, `conformance:ts:async-codec`,
+and `conformance:rust:checked` one after another;
 they run `mise run conformance:all [--checked] [filter]`, which builds each runner once and runs all
 of those walks concurrently (they are independent single-threaded processes), buffering each walk's
 output and reporting in a fixed order. It then applies the query-memory peak comparison above. `ci`

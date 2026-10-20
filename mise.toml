@@ -226,6 +226,17 @@ depends = ["ts:lock_build"]
 dir = "{{config_root}}/impl/ts"
 run = ["npm run --silent conformance", "npm run --silent conformance -- disk"]
 
+# The TS disk mode with every reopen through the async loader under a page codec that has ONLY
+# asynchronous forms, and every record driven by runAsync (spec/design/ts-runtime.md §11.5): a
+# synchronous page read left on a query, DDL, or commit path fails. Results, errors, and costs must be
+# unchanged. Also part of conformance:all.
+[tasks."conformance:ts:async-codec"]
+description = "Walk the conformance corpus on the TS core through an asynchronous-only page codec"
+usage = 'arg "[filter]" help="Run only corpus files whose path contains this substring"'
+depends = ["ts:lock_build"]
+dir = "{{config_root}}/impl/ts"
+run = 'JED_CONFORMANCE_FILTER="${usage_filter:-}" node src/bin/conformance.ts async-codec'
+
 # Disk storage mode with a tiny work_mem, so every spill-capable operator spills
 # (spec/design/spill.md). Results, errors, and costs must be unchanged.
 [tasks."conformance:spill"]

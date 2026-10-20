@@ -3071,7 +3071,7 @@ export class Session {
       // demote to OnDisk references faulted back through the pool on next touch. The session's own
       // committed base IS this snapshot (one object, single-threaded), so a long-lived writer sheds
       // residency too (read-your-writes for the NEXT statement re-faults — one read path).
-      snap.demoteCleanLeaves();
+      yield* snap.demoteCleanLeavesSteps();
       this.engine.committed = snap;
       this.baseVersion += 1n;
     }

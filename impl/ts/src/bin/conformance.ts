@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { Decimal } from "../decimal.ts";
+import { runAsync, type Steps } from "../execution.ts";
+import type { PageTransform } from "../pager.ts";
 import { OwnerActor } from "./conformance_service.ts";
 import { DEFAULT_WORK_MEM } from "../spill.ts";
 import { resolveZone } from "../timezone.ts";
@@ -35,6 +37,8 @@ import {
   type ClockSource,
   createDatabase,
   Database,
+  drainOutcomeSteps,
+  openWithTransformSteps,
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_TEMP_BUFFERS,
   EngineError,
@@ -361,6 +365,19 @@ type Drained = { outcome: Outcome; cells: string[][] };
 // record like an output-time error fails a PG query. Mirrors the Rust harness's drain_query.
 function drainQuery(sess: Session, sql: string, params: Value[] = []): Drained {
   const outcome = queryOutcome(sess, sql, params);
+  const cells =
+    outcome.kind === "query" ? outcome.rows.map((row) => row.map((v) => sess.render(v))) : [];
+  return { outcome, cells };
+}
+
+// drainQueryAsync is drainQuery in the async-codec mode: the statement and its drain run as one
+// continuation under runAsync, so every page read must await the asynchronous-only codec.
+async function drainQueryAsync(sess: Session, sql: string, params: Value[] = []): Promise<Drained> {
+  const outcome = await drive(
+    (function* (): Steps<Outcome> {
+      return yield* drainOutcomeSteps(yield* sess.querySteps(sql, params));
+    })(),
+  );
   const cells =
     outcome.kind === "query" ? outcome.rows.map((row) => row.map((v) => sess.render(v))) : [];
   return { outcome, cells };
@@ -828,12 +845,56 @@ function createsTempTable(text: string): boolean {
 let serviceOwner: OwnerActor | null = null;
 let clientRecords = 0;
 
+// asyncCodec is the async-codec mode (main): disk reopens install AsyncIdentityCodec and records run
+// through runAsync.
+let asyncCodec = false;
+
+// AsyncIdentityCodec is a page codec with ONLY asynchronous forms (ts-runtime.md §11.5): it changes no
+// byte, but a synchronous encode or decode fails with the pager's explicit "this page codec is
+// asynchronous" error, so every page read and write must go through an awaited continuation. It
+// returns fresh buffers, as a real codec would.
+class AsyncIdentityCodec implements PageTransform {
+  // Pages crossing the seam over the whole walk, reported at the end so the mode cannot pass vacuously.
+  static encoded = 0;
+  static decoded = 0;
+  async encodeAsync(_index: number, page: Uint8Array): Promise<Uint8Array> {
+    AsyncIdentityCodec.encoded++;
+    return page.slice();
+  }
+  async decodeAsync(_index: number, stored: Uint8Array): Promise<Uint8Array> {
+    AsyncIdentityCodec.decoded++;
+    return stored.slice();
+  }
+}
+
+// drive runs a continuation with the async driver, yielding through setImmediate rather than the
+// default clamped timer so cooperative turns stay cheap.
+function drive<T>(steps: Steps<T>): Promise<T> {
+  return runAsync(steps, { schedule: (resume) => setImmediate(resume) });
+}
+
+// openAsyncCodec reopens the temp image through the async loader with the async-only codec installed.
+// No lock bundle: page-service paths stay synchronous (ts-runtime.md §11.1). The image itself was
+// created by the synchronous create before the codec existed, also out of scope there.
+async function openAsyncCodec(path: string, env: Environment): Promise<Database> {
+  const engine = await drive(
+    openWithTransformSteps(path, { skipFsync: true, environment: env }, new AsyncIdentityCodec()),
+  );
+  return Database.fromEngine(engine);
+}
+
+// closeAsyncCodec closes a handle in the async-codec mode, flushing through the awaitable close. The
+// other modes close synchronously and await nothing per record.
+function closeAsyncCodec(handle: Database): Promise<void> {
+  return drive(handle.closeSteps());
+}
+
 // serviceLocking is the file locking mode the harness opens with: the default, the page service.
 function serviceLocking(): "auto" {
   return "auto";
 }
 
-function runFile(text: string, disk: boolean): void {
+async function runFile(text: string, disk: boolean): Promise<void> {
   // In DISK mode the file is backed by a temp .jed image reopened before every record (below), so each
   // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
   // (spec/design/conformance.md §3). The try/finally removes the temp image on every exit path.
@@ -1075,18 +1136,21 @@ function runFile(text: string, disk: boolean): void {
       // (spec/pageservice/README.md §7).
       if (disk && onTemp) {
         db.close();
-        dbHandle!.close();
+        if (asyncCodec) await closeAsyncCodec(dbHandle!);
+        else dbHandle!.close();
         if (serviceOwner !== null) {
           if (!actorOwns) serviceOwner.open(tmpPath!);
           actorOwns = true;
           clientRecords++;
         }
         // fsync=off (throwaway image); the same environment, as a host reopening with its own.
-        dbHandle = openDatabase(tmpPath!, {
-          skipFsync: true,
-          environment: env,
-          locking: serviceLocking(),
-        });
+        dbHandle = asyncCodec
+          ? await openAsyncCodec(tmpPath!, env)
+          : openDatabase(tmpPath!, {
+              skipFsync: true,
+              environment: env,
+              locking: serviceLocking(),
+            });
         dbHandle.setMaxStorageBytes("main", mainStorageLimit);
         attachDb = dbHandle;
         db = dbHandle.session();
@@ -1195,7 +1259,9 @@ function runFile(text: string, disk: boolean): void {
         let err: unknown = null;
         let outcome: Outcome | null = null;
         try {
-          outcome = drainQuery(db, sql, params).outcome;
+          outcome = (
+            asyncCodec ? await drainQueryAsync(db, sql, params) : drainQuery(db, sql, params)
+          ).outcome;
         } catch (e) {
           err = e;
         }
@@ -1228,7 +1294,9 @@ function runFile(text: string, disk: boolean): void {
         }
         let drained: Drained;
         try {
-          drained = drainQuery(db, sql, params);
+          drained = asyncCodec
+            ? await drainQueryAsync(db, sql, params)
+            : drainQuery(db, sql, params);
         } catch (e) {
           throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
         }
@@ -1264,7 +1332,10 @@ function runFile(text: string, disk: boolean): void {
     // Closing the session drops its temp domain — a spilled one's scratch file included (temp-tables.md
     // §6; JS has no destructor to release it).
     db.close();
-    if (dbHandle !== null) dbHandle.close();
+    if (dbHandle !== null) {
+      if (asyncCodec) await closeAsyncCodec(dbHandle);
+      else dbHandle.close();
+    }
     if (actorOwns) serviceOwner!.close();
     if (tmpDir !== null) rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -1611,7 +1682,7 @@ function parseSkip(text: string, mode: string): boolean {
   return false;
 }
 
-function main(): number {
+async function main(): Promise<number> {
   // The corpus runs in one of two storage MODES (spec/design/conformance.md §3): the default "memory"
   // mode drives a fresh in-memory Database, and the "disk" mode (arg `disk`) drives a FILE-BACKED
   // database REOPENED before every record, so each committed read faults its leaves from disk through
@@ -1621,8 +1692,13 @@ function main(): number {
   // The SERVICE mode (spec/pageservice/README.md §7) is the disk mode with every record run as a
   // page client of another core's owner (JED_SERVICE_OWNER = rust | go | node).
   const service = process.argv.slice(2).includes("service");
-  const disk = service || process.argv.slice(2).includes("disk");
-  let mode = disk ? "disk" : "memory";
+  // The ASYNC-CODEC mode (ts-runtime.md §11.5) is the disk mode with every reopen through the async
+  // loader under a page codec that has only asynchronous forms, and every record driven by runAsync:
+  // a synchronous page read left on a query, DDL, or commit path fails with that codec's error. It
+  // skips exactly the files the disk mode skips.
+  asyncCodec = process.argv.slice(2).includes("async-codec");
+  const disk = service || asyncCodec || process.argv.slice(2).includes("disk");
+  let mode = asyncCodec ? "disk, async codec" : disk ? "disk" : "memory";
   if (service) {
     serviceOwner = new OwnerActor(process.env.JED_SERVICE_OWNER ?? "", repoRoot());
     mode = `service, owner ${process.env.JED_SERVICE_OWNER}`;
@@ -1686,7 +1762,7 @@ function main(): number {
       // (spec/design/concurrency-testing.md §4); everything else is the sequential single-handle
       // runner. Both share the result grammar; only the driver differs.
       if (isConc) runConcurrencyFile(text);
-      else runFile(text, disk);
+      else await runFile(text, disk);
       console.log(`PASS ${rel}`);
       passed++;
     } catch (e) {
@@ -1696,6 +1772,14 @@ function main(): number {
   }
 
   console.log(`\n[${mode}] ${passed} passed, ${failed} failed, ${skipped} skipped`);
+  if (asyncCodec) {
+    const { encoded, decoded } = AsyncIdentityCodec;
+    console.log(`[${mode}] ${decoded} page(s) decoded, ${encoded} encoded through the async codec`);
+    if (passed > 0 && (decoded === 0 || encoded === 0)) {
+      console.error("async-codec mode moved no pages through the codec");
+      return 1;
+    }
+  }
   if (serviceOwner !== null) {
     console.log(`[${mode}] ${clientRecords} records run on a page client`);
     serviceOwner.stop();
@@ -1710,4 +1794,4 @@ function main(): number {
   return failed !== 0 ? 1 : 0;
 }
 
-process.exit(main());
+process.exit(await main());

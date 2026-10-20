@@ -13,6 +13,7 @@ import type { Engine, Outcome } from "./executor.ts";
 import { FileSpillSink } from "./spillfile.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";
+import type { Steps } from "./execution.ts";
 
 // The entire public embedding API.
 export * from "./lib.ts";
@@ -26,7 +27,7 @@ export type { Outcome } from "./executor.ts";
 // golden/byte tooling. Kept out of ./lib.ts so the public surface is the converged handles only.
 export { Engine } from "./executor.ts";
 export { loadEngine, toImage } from "./format.ts";
-export { create, open, commit, rollback, close } from "./file.ts";
+export { create, open, openWithTransformSteps, commit, rollback, close } from "./file.ts";
 // Query-memory accounting underflows (spec/design/memory.md) — the conformance harness's check.
 export { queryMemoryPeak, queryMemoryUnderflows } from "./cost.ts";
 // Recount every file commit's live pages by reachability (spec/design/memory.md §8.7).
@@ -53,13 +54,40 @@ export {
 // it is pulled), and the pin is released via close() — on a mid-drain error too, so a failed read
 // never leaves a reader pinned in the watermark (JS has no destructor to release it later).
 export function drainOutcome(rows: Rows): Outcome {
+  const collected: Value[][] = [];
+  try {
+    for (const row of rows) collected.push(row);
+  } catch (error) {
+    rows.close();
+    throw error;
+  }
+  return finishOutcome(rows, collected);
+}
+
+// drainOutcomeSteps is drainOutcome pulling through the cursor's retained continuation, so the
+// asynchronous driver awaits every page read the drain makes (the async-codec conformance mode).
+export function* drainOutcomeSteps(rows: Rows): Steps<Outcome> {
+  const collected: Value[][] = [];
+  try {
+    for (;;) {
+      const step = yield* rows.nextSteps();
+      if (step.done) break;
+      collected.push(step.value);
+    }
+  } catch (error) {
+    rows.close();
+    throw error;
+  }
+  return finishOutcome(rows, collected);
+}
+
+// finishOutcome packages a drained cursor, reading its final cost and command tag, then closes it.
+function finishOutcome(rows: Rows, collected: Value[][]): Outcome {
   const columnNames = rows.columnNames;
   const columnTypes = rows.columnTypes;
-  const collected: Value[][] = [];
   let cost: bigint;
   let rowsAffected: number | null;
   try {
-    for (const row of rows) collected.push(row);
     cost = rows.cost;
     rowsAffected = rows.rowsAffected;
   } finally {

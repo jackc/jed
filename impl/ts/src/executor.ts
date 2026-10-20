@@ -196,7 +196,7 @@ import {
   utf8Length,
   valueBytes,
 } from "./memsize.ts";
-import { collectColumnStatistics, type ColumnStatistics, termEligible } from "./statistics.ts";
+import { collectColumnStatisticsSteps, type ColumnStatistics, termEligible } from "./statistics.ts";
 import {
   andSelectivity,
   addPlanEstimates,
@@ -332,16 +332,12 @@ import {
 import {
   DETAIL_DUPLICATED,
   DETAIL_EXISTS,
-  exclusionDetail,
   exclusionDetailSteps,
   failingRowDetailSteps,
-  fkChildDetail,
   fkChildDetailSteps,
   fkParentDetailSteps,
-  indexDetail,
   indexDetailSteps,
   indexDetailByNameSteps,
-  pkDetail,
   pkDetailSteps,
 } from "./error_detail.ts";
 import { QUOTED_KEYWORDS } from "./pg_keywords_gen.ts";
@@ -4490,11 +4486,12 @@ export class Engine {
     switch (stmt.kind) {
       case "analyze":
         rejectParamsForDDL(params);
-        return this.executeAnalyze(stmt);
+        return yield* this.executeAnalyzeSteps(stmt);
       case "createTable":
         // `CREATE TABLE … AS` runs a query, so its `$N` parameters bind like the query's
         // (spec/design/create-table-as.md §1); the column-definition form takes none.
-        if (stmt.asQuery !== null) return this.executeCreateTableAs(stmt, stmt.asQuery, params);
+        if (stmt.asQuery !== null)
+          return yield* this.executeCreateTableAsSteps(stmt, stmt.asQuery, params);
         rejectParamsForDDL(params);
         return this.executeCreateTable(stmt);
       case "dropTable":
@@ -4502,16 +4499,16 @@ export class Engine {
         return this.executeDropTable(stmt);
       case "alterTable":
         rejectParamsForDDL(params);
-        return this.executeAlterTable(stmt);
+        return yield* this.executeAlterTableSteps(stmt);
       case "createIndex":
         rejectParamsForDDL(params);
-        return this.executeCreateIndex(stmt);
+        return yield* this.executeCreateIndexSteps(stmt);
       case "dropIndex":
         rejectParamsForDDL(params);
         return this.executeDropIndex(stmt);
       case "reindex":
         rejectParamsForDDL(params);
-        return this.executeReindex(stmt);
+        return yield* this.executeReindexSteps(stmt);
       case "createType":
         rejectParamsForDDL(params);
         return this.executeCreateType(stmt);
@@ -4563,7 +4560,7 @@ export class Engine {
     }
   }
 
-  private executeAnalyze(analyze: Analyze): Outcome {
+  private *executeAnalyzeSteps(analyze: Analyze): Steps<Outcome> {
     this.checkAttachmentWritable(analyze.db);
     if (isCatalogRelName(analyze.name)) {
       throw engineError("wrong_object_type", `cannot modify system relation ${analyze.name}`);
@@ -4597,10 +4594,13 @@ export class Engine {
     const store = this.lkpStoreScoped(analyze.db, analyze.name);
     const collations = this.columnCollationsScoped(analyze.db, table.name, table.columns);
     const meter = this.session.newMeter();
-    const facts = columns.map((column) => ({
-      column,
-      statistics: collectColumnStatistics(table, store, collations, column, meter),
-    }));
+    const facts: { column: number; statistics: ColumnStatistics }[] = [];
+    for (const column of columns) {
+      facts.push({
+        column,
+        statistics: yield* collectColumnStatisticsSteps(table, store, collations, column, meter),
+      });
+    }
     const database =
       analyze.db === undefined ? (this.isTempTable(analyze.name) ? "temp" : "main") : analyze.db;
     let target: Snapshot;
@@ -6951,7 +6951,11 @@ export class Engine {
   // the query was analyzed), then the column checks of ctasColumns (create_table_as.ts). The table is
   // created through CREATE TABLE's shared registration; WITH DATA then fills it by running `INSERT
   // INTO <table> <query>`, whose outcome (rows, cost, errors) is the statement's.
-  private executeCreateTableAs(ct: CreateTable, cta: CreateTableAs, params: Value[]): Outcome {
+  private *executeCreateTableAsSteps(
+    ct: CreateTable,
+    cta: CreateTableAs,
+    params: Value[],
+  ): Steps<Outcome> {
     const plan = this.ctasPrepare(ct, cta, params);
     if (plan === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     const { targetTemp, attachName } = this.createTableTarget(ct);
@@ -6982,9 +6986,9 @@ export class Engine {
         body: insert(q.body),
         recursive: q.recursive,
       };
-      return this.executeWithDml(wq, params);
+      return yield* this.executeWithDmlSteps(wq, params);
     }
-    return this.executeInsertCached(insert(q), params, EMPTY_CTE_CTX, null, false);
+    return yield* this.executeInsertCachedSteps(insert(q), params, EMPTY_CTE_CTX, null, false);
   }
 
   // ctasPrepare runs the checks of a `CREATE TABLE … AS` before anything is created
@@ -8501,7 +8505,7 @@ export class Engine {
   }
 
   // executeAlterTable implements ALTER TABLE slices 1-5 (alter.md §1-§3.4).
-  private executeAlterTable(at: AlterTable): Outcome {
+  private *executeAlterTableSteps(at: AlterTable): Steps<Outcome> {
     checkCatalogRelWrite(at.name);
     this.checkAttachmentWritable(at.db);
     let snap: Snapshot | undefined;
@@ -9769,7 +9773,7 @@ export class Engine {
     for (const seq of pendingSerials) scopeWriteSnap().putSequence(seq);
     if (tableRewriteNeeded) {
       const store = this.lkpStoreScoped(at.db, original.name);
-      const scan = store.scanWithUnits(original.columns.map(() => true));
+      const scan = yield* store.scanWithUnitsSteps(original.columns.map(() => true));
       rewriteNextRowid = store.nextSyntheticRowid();
       if (pkRekeyed && table.pk.length === 0) rewriteNextRowid = 0n;
       meter.charge(
@@ -9780,13 +9784,14 @@ export class Engine {
       const colls = this.columnCollations(table.columns);
       const seenKeys = new Set<string>();
       let compressUnits = 0n;
-      rewriteRows = scan.entries.map((entry) => {
+      rewriteRows = [];
+      for (const entry of scan.entries) {
         meter.guard();
         meter.charge(COSTS.storageRowRead);
-        const row = [...store.resolveAll(entry.row)];
+        const row = [...(yield* store.resolveAllSteps(entry.row))];
         for (const step of rowSteps) {
           if (step.kind === "add") {
-            const value = this.evalDefault(step.column, step.defaultExpr, rng, meter);
+            const value = yield* this.evalDefaultSteps(step.column, step.defaultExpr, rng, meter);
             row.push(
               coerceForStore(
                 value,
@@ -9800,7 +9805,7 @@ export class Engine {
               ),
             );
           } else if (step.kind === "drop") row.splice(step.column, 1);
-          else row[step.column] = evalExpr(step.value, row, env, meter);
+          else row[step.column] = yield* evalExprSteps(step.value, row, env, meter);
         }
         row.forEach((value, i) => {
           if (table.columns[i]!.notNull && value.kind === "null")
@@ -9815,15 +9820,22 @@ export class Engine {
           const hash = Array.from(key).join(",");
           if (seenKeys.has(hash))
             throw uniqueViolation(table.name, pkeyName(table.name)).withDetail(
-              pkDetail(this.session, table.name, table.columns, table.pk, row, DETAIL_DUPLICATED),
+              yield* pkDetailSteps(
+                this.session,
+                table.name,
+                table.columns,
+                table.pk,
+                row,
+                DETAIL_DUPLICATED,
+              ),
             );
           seenKeys.add(hash);
         }
         compressUnits += BigInt(
           recordCompressUnits(rewriteColTypes!, key, row, pagePayload(alterPageSize)),
         );
-        return { key, row };
-      });
+        rewriteRows.push({ key, row });
+      }
       meter.charge(COSTS.valueCompress * compressUnits);
       meter.guard();
     }
@@ -9842,7 +9854,7 @@ export class Engine {
     }
     if (mask.some(Boolean)) {
       const store = this.lkpStoreScoped(at.db, original.name);
-      const { entries, pages, slabs } = store.scanWithUnits(mask);
+      const { entries, pages, slabs } = yield* store.scanWithUnitsSteps(mask);
       meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.valueDecompress * BigInt(slabs));
       for (const entry of entries) {
         meter.guard();
@@ -9861,7 +9873,7 @@ export class Engine {
       const store = this.lkpStoreScoped(at.db, original.name),
         all =
           rewriteRows === null
-            ? store.scanWithUnits(table.columns.map(() => true))
+            ? yield* store.scanWithUnitsSteps(table.columns.map(() => true))
             : { entries: rewriteRows, pages: 0, slabs: 0 };
       if (rewriteRows === null)
         meter.charge(
@@ -9904,7 +9916,7 @@ export class Engine {
         // PostgreSQL's ADD CHECK validation carries no DETAIL (error-fields.md §9.2).
         for (const ck of checks) {
           try {
-            evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
+            yield* evalChecksSteps([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
           } catch (e) {
             if (e instanceof EngineError) e.withDetail(undefined);
             throw e;
@@ -9915,7 +9927,7 @@ export class Engine {
           if (!addedConstraints.has(k)) continue;
           const ri = this.resolveIndex(table, ix);
           if (ix.unique) {
-            const p = this.indexPrefix(alterColTypes, colls, ri, row);
+            const p = yield* this.indexPrefixSteps(alterColTypes, colls, ri, row);
             if (p) {
               let s = seen.get(k);
               if (!s) {
@@ -9925,7 +9937,7 @@ export class Engine {
               const h = Array.from(p).join(",");
               if (s.has(h))
                 throw uniqueViolation(table.name, ix.name).withDetail(
-                  indexDetail(
+                  yield* indexDetailSteps(
                     this.session,
                     table.name,
                     table.columns,
@@ -9940,7 +9952,7 @@ export class Engine {
             }
           }
           const es = constraintEntries.get(k) ?? [];
-          for (const ek of this.indexEntries(
+          for (const ek of yield* this.indexEntriesSteps(
             table.columns,
             alterColTypes,
             colls,
@@ -9959,26 +9971,29 @@ export class Engine {
           for (const entry of all.entries) {
             const row = store.resolveInlineColumns(entry.row);
             if (fkMatchFullViolated(fk, row)) throw fkViolationMatchFull(table.name, fk.name);
-            const p = fkProbe(fk, parent, pc, row, fk.columns);
+            const p = yield* fkProbeSteps(fk, parent, pc, row, fk.columns);
             if (p !== null) {
-              let hit: boolean;
+              let hit = false;
               if (parent === table) {
-                hit = all.entries.some((candidate) => {
+                for (const candidate of all.entries) {
                   meter.charge(COSTS.constraintCheck);
                   meter.guard();
-                  const pp = fkProbe(
+                  const pp = yield* fkProbeSteps(
                     fk,
                     parent,
                     pc,
                     store.resolveInlineColumns(candidate.row),
                     fk.refColumns,
                   );
-                  return pp !== null && compareBytes(fkProbeBytes(p), fkProbeBytes(pp)) === 0;
-                });
-              } else hit = this.fkProbeHits(p, parent.name, tempScope);
+                  if (pp !== null && compareBytes(fkProbeBytes(p), fkProbeBytes(pp)) === 0) {
+                    hit = true;
+                    break;
+                  }
+                }
+              } else hit = yield* this.fkProbeHitsSteps(p, parent.name, tempScope);
               if (!hit)
                 throw fkViolationInsert(table.name, fk.name).withDetail(
-                  fkChildDetail(this.session, table.name, table.columns, fk, row),
+                  yield* fkChildDetailSteps(this.session, table.name, table.columns, fk, row),
                 );
             }
           }
@@ -9995,10 +10010,10 @@ export class Engine {
           const members: { row: Row; key: ExclusionKey | null }[] = [];
           for (const entry of all.entries) {
             const a = store.resolveInlineColumns(entry.row);
-            if (!this.exclusionParticipates(chk, a)) continue;
+            if (!(yield* this.exclusionParticipatesSteps(chk, a))) continue;
             members.push({
               row: a,
-              key: this.exclusionKey(chk, table.columns, alterColTypes, colls, a),
+              key: yield* this.exclusionKeySteps(chk, table.columns, alterColTypes, colls, a),
             });
           }
           for (let i = 0; i < members.length; i++)
@@ -10010,10 +10025,18 @@ export class Engine {
               if (
                 a.key !== null &&
                 b.key !== null &&
-                exclusionKeysConflict(table.columns, ex, a.key, a.row, b.key, b.row)
+                (yield* exclusionKeysConflictSteps(table.columns, ex, a.key, a.row, b.key, b.row))
               )
                 throw exclusionViolation(table.name, ex.name).withDetail(
-                  exclusionDetail(this.session, table.name, table.columns, ex, a.row, b.row, false),
+                  yield* exclusionDetailSteps(
+                    this.session,
+                    table.name,
+                    table.columns,
+                    ex,
+                    a.row,
+                    b.row,
+                    false,
+                  ),
                 );
             }
         }
@@ -10028,7 +10051,7 @@ export class Engine {
         const resolved = this.resolveIndex(table, index);
         const entries: IndexEntry[] = [];
         for (const row of rewriteRows!)
-          for (const ek of this.indexEntries(
+          for (const ek of yield* this.indexEntriesSteps(
             table.columns,
             rewriteColTypes!,
             colls,
@@ -10669,7 +10692,7 @@ export class Engine {
   // PG's choice — the exact <table>_<col>..._idx with the smallest free suffix. The
   // index is then built by scanning the table once: page_read per node + storage_row_read
   // per row (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
-  private executeCreateIndex(ci: CreateIndex): Outcome {
+  private *executeCreateIndexSteps(ci: CreateIndex): Steps<Outcome> {
     // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, persistent,
     // or a host-attached database (spec/design/temp-tables.md §8, attached-databases.md §3). The build
     // below is scope-agnostic (the scoped lkpTable/lkpStore/writeIndexStore funnels route by the
@@ -10875,7 +10898,7 @@ export class Engine {
       orders: canonicalKeyOrders(ci.keyOrders.map(indexKeyOrderEffective)),
     };
     const meter = this.session.newMeter();
-    const entries = this.buildIndexEntries(ci.db, table, def, meter);
+    const entries = yield* this.buildIndexEntriesSteps(ci.db, table, def, meter);
     meter.guard();
 
     const nameKey = def.name;
@@ -10909,7 +10932,7 @@ export class Engine {
   // identities and timezone data (extensibility.md §8.1, index-dependencies.md). Every new tree is
   // built before any is installed, so a failure (23505, a resolution error, the cost ceiling) changes
   // nothing. Cost: each index charges exactly its CREATE INDEX build scan.
-  private executeReindex(rx: Reindex): Outcome {
+  private *executeReindexSteps(rx: Reindex): Steps<Outcome> {
     const targets = this.reindexTargets(rx);
     const meter = this.session.newMeter();
     const rebuilt: { scope: string; tableKey: string; def: IndexDef; entries: IndexEntry[] }[] = [];
@@ -10921,7 +10944,7 @@ export class Engine {
       for (const name of target.names) {
         const old = table.indexes.find((i) => i.name === name)!;
         const def = this.readmitIndexDef(table, old);
-        const entries = this.buildIndexEntries(target.scope, table, def, meter);
+        const entries = yield* this.buildIndexEntriesSteps(target.scope, table, def, meter);
         rebuilt.push({ scope: target.scope, tableKey: target.tableKey, def, entries });
       }
     }
@@ -11096,18 +11119,18 @@ export class Engine {
     mergeTimezoneDeps(tz, pt.timezoneDeps);
   }
 
-  // buildIndexEntries computes a new index's entry keys from table's current rows (the CREATE INDEX
+  // buildIndexEntriesSteps computes a new index's entry keys from table's current rows (the CREATE INDEX
   // build, shared with REINDEX — spec/design/indexes.md §2/§10), sorted by entry key. The build scan is
   // metered on meter (cost.md §3): page_read per table-tree node + storage_row_read per row, over the
   // touched set of columns the keys and predicate read (a spilled value adds its value_decompress
   // slabs). A UNIQUE definition verifies the rows (23505, indexes.md §8). An expression key evaluating
   // with an error aborts the build, so nothing is registered.
-  private buildIndexEntries(
+  private *buildIndexEntriesSteps(
     scope: string | undefined,
     table: Table,
     def: IndexDef,
     meter: Meter,
-  ): IndexEntry[] {
+  ): Steps<IndexEntry[]> {
     const columns = table.columns;
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
@@ -11127,7 +11150,7 @@ export class Engine {
     const rindex = this.resolveIndex(table, def);
     const env = this.maintenanceEnv(new StmtRng());
     const store = this.lkpStoreScoped(scope, table.name);
-    const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
+    const { entries: stored, pages: nodes, slabs } = yield* store.scanWithUnitsSteps(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
     const entries: IndexEntry[] = [];
     // A UNIQUE build verifies the existing rows before the index is registered
@@ -11141,12 +11164,12 @@ export class Engine {
       // value; the evaluator's Unfetched backstop also handles it).
       const row = store.resolveInlineColumns(e.row);
       if (def.unique) {
-        const prefix = indexPrefixKey(store.columnTypes(), colls, rindex, row, env);
+        const prefix = yield* indexPrefixKeySteps(store.columnTypes(), colls, rindex, row, env);
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
             throw uniqueViolation(table.name, def.name).withDetail(
-              indexDetail(
+              yield* indexDetailSteps(
                 this.session,
                 table.name,
                 columns,
@@ -11161,7 +11184,15 @@ export class Engine {
           seenPrefixes.add(k);
         }
       }
-      for (const ek of indexEntryKeys(columns, store.columnTypes(), colls, rindex, e.key, row, env))
+      for (const ek of yield* indexEntryKeysSteps(
+        columns,
+        store.columnTypes(),
+        colls,
+        rindex,
+        e.key,
+        row,
+        env,
+      ))
         entries.push({ key: ek, skeyLen: e.key.length });
     }
     meter.guard();
@@ -31839,18 +31870,6 @@ export function* indexRowQualifiesSteps(
 // maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
 // free). env evaluates any expression key element or the partial predicate (B-tree only — GIN/GiST
 // are plain-column, this slice).
-export function indexEntryKeys(
-  columns: Column[],
-  colTypes: ColType[],
-  colls: (Collation | null)[],
-  rindex: ResolvedIndex,
-  storageKey: Uint8Array,
-  row: Row,
-  env: EvalEnv,
-): Uint8Array[] {
-  return runSync(indexEntryKeysSteps(columns, colTypes, colls, rindex, storageKey, row, env));
-}
-
 export function* indexEntryKeysSteps(
   columns: Column[],
   colTypes: ColType[],
@@ -32018,17 +32037,6 @@ export type ExclusionKey =
 // exclusionKeysConflict reports whether two participating rows conflict under one exclusion
 // constraint, given their probe keys (gist.md §7): equal prefixes for a btree exclusion, the full
 // (expr_i op_i) conjunction for a GiST one.
-export function exclusionKeysConflict(
-  columns: Column[],
-  exc: ExclusionConstraint,
-  ka: ExclusionKey,
-  a: Row,
-  kb: ExclusionKey,
-  b: Row,
-): boolean {
-  return runSync(exclusionKeysConflictSteps(columns, exc, ka, a, kb, b));
-}
-
 export function* exclusionKeysConflictSteps(
   columns: Column[],
   exc: ExclusionConstraint,
@@ -33018,16 +33026,6 @@ function leastKey(keys: Iterable<Uint8Array>): Uint8Array | null {
 // suffix — or null when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same non-null prefix. An expression key's value
 // enters the probe exactly like a column value (evaluated against the row through env).
-export function indexPrefixKey(
-  colTypes: ColType[],
-  colls: (Collation | null)[],
-  rindex: ResolvedIndex,
-  row: Row,
-  env: EvalEnv,
-): Uint8Array | null {
-  return runSync(indexPrefixKeySteps(colTypes, colls, rindex, row, env));
-}
-
 export function* indexPrefixKeySteps(
   colTypes: ColType[],
   colls: (Collation | null)[],
@@ -33637,16 +33635,6 @@ export function fkMatchFullViolated(fk: ForeignKey, row: Row): boolean {
 // `ordinals = fk.refColumns` (the row viewed as a parent). Returns null when any supplied value is
 // NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is the
 // PK, else the matching unique index (re-derived deterministically — §6.8).
-export function fkProbe(
-  fk: ForeignKey,
-  parent: Table,
-  parentColls: (Collation | null)[],
-  row: Row,
-  ordinals: number[],
-): FkProbe | null {
-  return runSync(fkProbeSteps(fk, parent, parentColls, row, ordinals));
-}
-
 export function* fkProbeSteps(
   fk: ForeignKey,
   parent: Table,
@@ -40888,16 +40876,6 @@ export type NamedCheck = { name: string; node: RExpr };
 // evalChecks evaluates a row's CHECK constraints in name order (constraints.md §4.4):
 // TRUE and NULL pass; the first FALSE aborts with 23514 and PG's message. Shared by the
 // INSERT and UPDATE write paths.
-export function evalChecks(
-  checks: NamedCheck[],
-  relation: string,
-  row: Row,
-  env: EvalEnv,
-  meter: Meter,
-): void {
-  return runSync(evalChecksSteps(checks, relation, row, env, meter));
-}
-
 export function* evalChecksSteps(
   checks: NamedCheck[],
   relation: string,

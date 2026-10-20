@@ -3,6 +3,7 @@
 import type { Table } from "./catalog.ts";
 import type { Collation } from "./collation.ts";
 import type { Meter } from "./cost.ts";
+import type { Steps } from "./execution.ts";
 import { COSTS } from "./costs.ts";
 import {
   STATISTICS_HISTOGRAM_BOUNDS,
@@ -266,13 +267,15 @@ function byteKey(bytes: Uint8Array): string {
   return out;
 }
 
-export function collectColumnStatistics(
+// collectColumnStatisticsSteps scans one column for ANALYZE as a continuation, so each leaf fault and
+// overflow read can await an asynchronous page codec (ts-runtime.md §11.1).
+export function* collectColumnStatisticsSteps(
   table: Table,
   store: TableStore,
   collations: (Collation | null)[],
   column: number,
   meter: Meter,
-): ColumnStatistics {
+): Steps<ColumnStatistics> {
   meter.charge(COSTS.pageRead * BigInt(store.nodeCount()));
   const columnType = table.columns[column]!.type;
   const eligible = distributionEligible(columnType);
@@ -284,56 +287,68 @@ export function collectColumnStatistics(
   let nullCount = 0n;
   let widthSum = 0n;
   const mask = table.columns.map((_, i) => i === column);
-  for (const [storageKey, stored] of store.scanIter(unboundedBound(), false)) {
-    meter.guard();
-    const units = store.statisticsScanUnits(storageKey, stored, column);
-    meter.charge(
-      COSTS.pageRead * BigInt(units.pages) +
-        COSTS.valueDecompress * BigInt(units.decompress) +
-        COSTS.storageRowRead,
-    );
-    const row = store.resolveColumns(stored, mask);
-    const value = row[column]!;
-    const priority = fnv1a64(storageKey);
-    const ordinal = analyzedRows;
-    if (analyzedRows < I64_MAX) analyzedRows++;
-    if (value.kind === "null") {
-      if (nullCount < I64_MAX) nullCount++;
-      meter.charge(COSTS.statisticsValue);
+  const rows = store.scanStepsIter(unboundedBound(), false);
+  let drained = false;
+  try {
+    for (;;) {
+      const step = yield* rows.nextSteps();
+      if (step.done) {
+        drained = true;
+        break;
+      }
+      const [storageKey, stored] = step.value;
+      meter.guard();
+      const units = store.statisticsScanUnits(storageKey, stored, column);
+      meter.charge(
+        COSTS.pageRead * BigInt(units.pages) +
+          COSTS.valueDecompress * BigInt(units.decompress) +
+          COSTS.storageRowRead,
+      );
+      const row = yield* store.resolveColumnsSteps(stored, mask);
+      const value = row[column]!;
+      const priority = fnv1a64(storageKey);
+      const ordinal = analyzedRows;
+      if (analyzedRows < I64_MAX) analyzedRows++;
+      if (value.kind === "null") {
+        if (nullCount < I64_MAX) nullCount++;
+        meter.charge(COSTS.statisticsValue);
+        retainSample(sample, {
+          priority,
+          ordinal,
+          nonnull: false,
+          oversized: false,
+          retained: null,
+        });
+        continue;
+      }
+      const bodyLength = encodeValue(store.columnTypes()[column]!, value).length - 1;
+      const key = eligible
+        ? encodeTypedKey(table.columns[column]!.type, value, collations[column]!)
+        : null;
+      const width = key === null ? bodyLength : key.length;
+      widthSum += BigInt(width);
+      if (widthSum > I64_MAX) widthSum = I64_MAX;
+      meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, width)));
+      if (key !== null) retainKmv(kmv, kmvSeen, fnv1a64(key));
+      if (termCounter !== null) {
+        for (const term of ginValueTerms(columnType, value)) {
+          meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, term.length)));
+          termCounter.add(term);
+        }
+      }
+      const oversized =
+        bodyLength > STATISTICS_MAX_VALUE_BYTES ||
+        (key !== null && key.length > STATISTICS_MAX_VALUE_BYTES);
       retainSample(sample, {
         priority,
         ordinal,
-        nonnull: false,
-        oversized: false,
-        retained: null,
+        nonnull: true,
+        oversized,
+        retained: key !== null && !oversized ? { value, key: key.slice() } : null,
       });
-      continue;
     }
-    const bodyLength = encodeValue(store.columnTypes()[column]!, value).length - 1;
-    const key = eligible
-      ? encodeTypedKey(table.columns[column]!.type, value, collations[column]!)
-      : null;
-    const width = key === null ? bodyLength : key.length;
-    widthSum += BigInt(width);
-    if (widthSum > I64_MAX) widthSum = I64_MAX;
-    meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, width)));
-    if (key !== null) retainKmv(kmv, kmvSeen, fnv1a64(key));
-    if (termCounter !== null) {
-      for (const term of ginValueTerms(columnType, value)) {
-        meter.charge(COSTS.statisticsValue * BigInt(Math.max(1, term.length)));
-        termCounter.add(term);
-      }
-    }
-    const oversized =
-      bodyLength > STATISTICS_MAX_VALUE_BYTES ||
-      (key !== null && key.length > STATISTICS_MAX_VALUE_BYTES);
-    retainSample(sample, {
-      priority,
-      ordinal,
-      nonnull: true,
-      oversized,
-      retained: key !== null && !oversized ? { value, key: key.slice() } : null,
-    });
+  } finally {
+    if (!drained && rows.returnSteps !== undefined) yield* rows.returnSteps();
   }
   meter.guard();
   const nonnullRows = analyzedRows - nullCount;

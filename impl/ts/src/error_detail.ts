@@ -225,32 +225,6 @@ export function* exclusionDetailSteps(
   return fresh + " conflicts with " + with_ + " " + old.slice("Key ".length) + ".";
 }
 
-export function pkDetail(
-  session: SessionState,
-  relation: string,
-  columns: Column[],
-  pk: number[],
-  row: Row,
-  ending: string,
-): string | undefined {
-  return runSync(pkDetailSteps(session, relation, columns, pk, row, ending));
-}
-
-export function indexDetail(
-  session: SessionState,
-  relation: string,
-  columns: Column[],
-  def: IndexDef,
-  rindex: ResolvedIndex,
-  row: Row,
-  env: EvalEnv,
-  ending: string,
-): string | undefined {
-  return runSync(
-    indexDetailSteps(session, relation, columns, def, rindex, row, synchronousEvalEnv(env), ending),
-  );
-}
-
 export function indexDetailByName(
   session: SessionState,
   table: Table,
@@ -272,16 +246,6 @@ export function failingRowDetail(
   return runSync(failingRowDetailSteps(session, relation, row));
 }
 
-export function fkChildDetail(
-  session: SessionState,
-  relation: string,
-  columns: Column[],
-  fk: ForeignKey,
-  row: Row,
-): string | undefined {
-  return runSync(fkChildDetailSteps(session, relation, columns, fk, row));
-}
-
 export function fkParentDetail(
   session: SessionState,
   parent: Table,
@@ -290,16 +254,4 @@ export function fkParentDetail(
   values: Value[],
 ): string | undefined {
   return runSync(fkParentDetailSteps(session, parent, fk, child, values));
-}
-
-export function exclusionDetail(
-  session: SessionState,
-  relation: string,
-  columns: Column[],
-  exc: ExclusionConstraint,
-  row: Row,
-  other: Row,
-  existing: boolean,
-): string | undefined {
-  return runSync(exclusionDetailSteps(session, relation, columns, exc, row, other, existing));
 }
