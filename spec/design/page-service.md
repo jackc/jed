@@ -487,7 +487,9 @@ byte-identical to the local handle's, whether `jed pages` relays or owns (`tests
   meta** (zero manifest fields, both slots on the same root — validated-cow.md) for that root, with
   the snapshot's `txid`, page count, free-list head, and live count, so the copy opens without the
   original's last manifest. The result has the original's page numbering, so it can seed a replica
-  (§10).
+  (§10). In an encrypted database the walk also copies the **key block** (pages 2–3, both copies,
+  read after the page walk), which no pointer reaches; a backup without it would hold no wrapped
+  key ([encryption.md](encryption.md) §6, *the key block in backups*).
 - **Compacted** (the SQLite `VACUUM INTO` analogue). A client pins a snapshot and runs the existing
   streaming `compact` image writer locally against it, writing a fresh, renumbered file at the
   snapshot's `txid + 1`: byte-for-byte the file host compaction ([api.md](api.md) §2.6) would leave
@@ -572,9 +574,11 @@ these consequences of the owner model:
   Persisting a database id is a format change, scheduled with the replication slice.
 - **Key-block changes are stream items.** In an encrypted database a credential change rewrites
   the key block (pages 2–3) outside any commit. It enters the stream as a key-block delta ordered
-  after the commit it follows, under the same lineage and log-durability rule, and a replica
-  applies it as writes at those indices plus a barrier, so a replica always unlocks with the
-  primary's current credential ([encryption.md](encryption.md) §6).
+  after the commit it follows, under the same lineage. Several changes may follow one `txid`, so
+  the stream cursor is `(txid, key_generation)`, and the primary makes the entry durable before
+  acknowledging the change. A replica applies it with the primary's own copy–barrier–copy–barrier
+  protocol, so a replica always unlocks with the primary's current credential
+  ([encryption.md](encryption.md) §6).
 - **Asynchronous by construction.** Without a server, no primary waits on a remote acknowledgment, so
   replication can lose the commits not yet shipped. Off-host shipping is a pull (`subscribe` over SSH)
   or a push by a local sidecar subscriber to object storage (the Litestream model).

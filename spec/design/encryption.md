@@ -82,10 +82,16 @@ Decided in the 2026-10-20 design review:
   change), fails before the rename when a key cannot fit the target's record cap or the result
   exceeds the live-page storage limit, and leaves the source untouched.
 - **A credential change is acknowledged only after a second durable barrier** (§6): write the
-  inactive copy, barrier, overwrite the other copy, barrier, acknowledge. Open completes an
-  interrupted change before any later rewrap.
-- **A key-block change is an item in the replication stream** (§6), ordered after the commit it
-  follows, so a replica's key block tracks the primary's credential.
+  inactive copy, barrier, overwrite the other copy, barrier, acknowledge. The first writer
+  completes an interrupted change; a read-only open adopts the newest valid copy without
+  writing. An unacknowledged change may leave either credential valid, never neither.
+- **A key-block change is an item in the replication stream** (§6), applied by the replica with
+  the same two-barrier protocol; the stream cursor is `(txid, key_generation)` and the change is
+  acknowledged only after its log entry is durable. A page-identical backup copies the key block.
+- **KDF parameters are bounded before the KDF runs** (§6): the format fixes a maximum iteration
+  count and salt length, so a tampered block cannot make open burn CPU before it fails.
+- **Positional scratch files** (hash JOIN, aggregate, DISTINCT) use the same authenticated block
+  framing as sort runs, with a fresh salt on every block rewrite (§4.2).
 - **The reserve is not a setting** (§4.1). A plaintext file reserves nothing; an encrypted file
   reserves what its suite needs (40 bytes under XAES-256-GCM). The meta field is
   self-description, not a knob.
@@ -395,7 +401,10 @@ owner's stored bytes (a re-sealed page must fail its parent's binding, §4), and
 separation between body/meta/wrapping/scratch. Credential-change fixtures cover a power loss
 at every boundary of the two-barrier protocol (§6): after the first copy, between the barriers,
 and after the second copy before its barrier — in each case the old credential must not unlock
-the recovered file once the change was acknowledged, and must still unlock it if it was not.
+the recovered file once the change was acknowledged; for an unacknowledged change exactly one of
+the two credentials unlocks it (§6), never neither. A replica applying a key-block delta is cut
+at the same boundaries; a backup taken across a change opens with one credential or the other
+(§6, *the key block in backups*).
 Scratch fixtures cover operator spill and temp-table spill with an encrypted attachment on a
 plaintext main (§4.2). Check ciphertext authenticity, uniqueness of the full salt (the
 `(derived key, GCM nonce)` pair) across every attempted encryption (not just committed pages),
@@ -412,7 +421,10 @@ remains a separate trusted-state guarantee.
   (`page_type 8`) are plaintext, authenticated whole** like the meta slot (below): they hold page
   indices and ciphertext identities, nothing secret, and a keyless completeness check that could
   read the inline manifest but not its overflow would be no check at all for a large
-  transaction. The page payload is encrypted; the AEAD **authentication tag** and nonce fields
+  transaction. The **whole page except the reserve is encrypted, header included**: `page_type`,
+  `item_count` and `next_page` in the clear would leak the tree's shape, and nothing needs them
+  before decryption — a page's identity comes from the pointer that names it, and recovery's
+  manifest check compares ciphertext identities. The AEAD **authentication tag** and nonce fields
   live in the page's reserved region (§4.1). The **associated data is the page index and the
   suite/format identifier**, nothing more: it stops silent relocation within the file, the
   per-file random data key already binds the file, and a generation in the AAD would mean
@@ -571,6 +583,14 @@ encrypted database file:
   a **block framing**: a run is written as fixed-size blocks, each carrying its salt and tag,
   with the block size a per-core constant. Run files are outside the §8 byte contract already, so
   the framing is per-core too; only the construction is shared.
+- **Positional scratch files** are the third shape: the blocking hash operators (JOIN, aggregate,
+  DISTINCT — spill.md §7) use a repeatable positional scratch that is read at arbitrary offsets
+  and **partially overwritten** (the TS `SpillScratch` seam). The framing is the same fixed-size
+  authenticated block, addressed by block number, with every read authenticating the whole block
+  and every rewrite of a block drawing a **fresh salt** — a rewrite under the old salt would be
+  the nonce reuse §3.1 exists to prevent. The operator's offsets are mapped onto blocks by the
+  codec, not by the operator. Fixtures spill each of the three operators and the sort under
+  forced-spill mode against an encrypted handle.
 
 Like spill I/O itself, scratch encryption is unmetered physical work, so query results and cost
 do not change. Hosts with no scratch target (in-memory, OPFS, WASI) have nothing to encrypt. A
@@ -621,22 +641,41 @@ issues a **second** durable barrier, and only then acknowledges success. Without
 barrier an acknowledged change could be undone by a power loss: the overwritten copy would
 revert to the old wrapper, and the old credential would unwrap the unchanged DEK. An
 interruption anywhere leaves at least one valid copy of one generation or the other; the
-reader takes the **newest valid copy**, and when the two copies differ **open completes the
-interrupted change** — copies the newer over the older and barriers — before any later
-credential change may overwrite what is then the only copy of the adopted generation.
-Fixtures cover every boundary (§3.1, *fault fixtures*). The meta slots carry no wrapper (§4).
+reader takes the **newest valid copy**. When the two copies differ, the **first writer completes
+the interrupted change** — copies the newer over the older and barriers — before any later
+credential change may overwrite what is then the only copy of the adopted generation. That
+repair is a write, so it belongs to a process that may write: a **read-only open adopts the
+newest valid copy without repairing** ([api.md](api.md) §2.1 read-only opens need no write
+access), and under the page service the repair is the owner's, taken at its first write gate
+acquisition; a page client never touches the key block. The guarantee for an **unacknowledged**
+change is the ordinary commit one: either credential may unlock the recovered file, never
+neither and never a torn block; only an *acknowledged* change promises that the old credential
+no longer unlocks it, since both new wrappers may well be durable before the acknowledgement
+reaches the caller. A credential change takes the **writer gate** like any write, so it never
+overlaps a commit, a conversion or another change. Fixtures cover every boundary (§3.1, *fault
+fixtures*). The meta slots carry no wrapper (§4).
 
 **Credential changes and replication.** The key block changes outside data commits, while the
 replication tee captures commits in `txid` order ([page-service.md](page-service.md) §10). A
 replica that received every data delta but kept its old wrapper could not be unlocked with the
 new credential. So a credential change is **an item in the replication stream**: a key-block
-delta carrying both copies (pages 2–3) and the generation, ordered after the commit it follows
-under the same lineage, applied by the replica as writes at those indices followed by a barrier,
-and subject to the same log-durability rule as a commit entry. A replica therefore always
-unlocks with the primary's current credential; it holds no credential of its own. A replica
-being promoted finishes an interrupted key-block pair exactly as open does.
+delta carrying the new block and its generation, ordered after the commit it follows under the
+same lineage. The replica applies it with the **primary's own protocol** — one copy, barrier,
+the other copy, barrier — never both copies before one barrier, which could leave both torn
+with no wrapper to recover. Several changes may follow one `txid`, so a `txid` alone cannot say
+whether a replica or the log is current: the **stream cursor is `(txid, key_generation)`**, each
+entry and each file position carries both, and the primary makes the **log entry durable before
+acknowledging the change** (a rewrap has no page-reuse pressure, so unlike a commit it can
+simply wait for the log). Recovery compares the recovered meta's `txid` *and* the key block's
+generation against the log tail; a key block newer than the log is a stream break like a missing
+commit entry (page-service.md §10). A replica therefore always unlocks with the primary's
+current credential and holds no credential of its own. A replica being promoted finishes an
+interrupted key-block pair exactly as a first writer does.
 
-**Credential input.** At create/open, accept either a host-supplied 32-byte wrapping key — the
+**Credential input.** The credential is an argument of `create`/`open`/`attach`, **not a
+handle or session setting**: it never appears in `current_setting()`, `SHOW`, `jed_settings`,
+EXPLAIN output, or any error message, so untrusted SQL (CLAUDE.md §13) has no path to it, and
+neither the DEK nor any subkey is reachable from SQL (§9.1). At create/open, accept either a host-supplied 32-byte wrapping key — the
 **first-class interface**: a host that wants a memory-hard KDF, an OS keychain or escrow
 supplies the key — or a passphrase. Raw-key input means a wrapping key, never a page key. The
 built-in passphrase KDF is **PBKDF2-HMAC-SHA-256** (NIST SP 800-132), chosen by the same
@@ -651,7 +690,12 @@ a **fixed count** chosen with the format (the order of OWASP's current PBKDF2-HM
 recommendation), with a host override at `create`; it is **never calibrated to a time budget**,
 because a calibrated count is machine-dependent — a slow host or a browser would write a weaker
 file, and `create` bytes would differ across machines even under fixed test inputs. The KDF
-runs once per process unlock, including at
+parameters are read **before** they are authenticated (they are the wrap's associated data, so
+tampering is detected only after the derivation they drive), so an attacker who can edit the
+file could set an absurd count and make every open burn CPU before failing. Therefore the format
+fixes an **accepted maximum iteration count and salt length, checked before the KDF runs**; a
+block outside those bounds is the credential error at once, with no derivation. The bounds are
+format constants, not settings. The KDF runs once per process unlock, including at
 every page-service client and the SSH page server ([page-service.md](page-service.md) §13).
 
 Two operations have deliberately different semantics:
@@ -666,6 +710,17 @@ The host owns credential storage, rotation policy, escrow, and OS-keychain integ
 engine owns wrapping and crash-safe file transitions. A credential change does not disturb an
 already unlocked process (it retains its DEK); a client that reconnects or a process that reopens
 presents the new credential.
+
+**The key block in backups.** A page-identical backup walks the pinned snapshot's reachable pages
+and zero-fills every other index ([page-service.md](page-service.md) §9); pages 2–3 are outside
+that walk, so the rule is stated here: **a page-identical backup of an encrypted database copies
+the key block too**, reading both copies with `read_pages` after the page walk and writing them
+at their indices, and a compacted backup writes a new key block for its new DEK like any
+conversion. A backup pins a snapshot but not the key block, and a credential change may land
+during the walk; the backup's copy of the block is then whatever newest valid copy it read, so it
+opens with that credential (a torn pair in the copy is repaired by the backup's first writer as
+above). A backup is never keyless to make: its walk decrypts. The replica base image (§6,
+*replication*) inherits the same rule.
 
 **Rewrapping is not recovery from a compromised DEK.** An old wrapper plus its old credential
 still reveals the unchanged DEK. A retained backup/header copy can therefore defeat credential
