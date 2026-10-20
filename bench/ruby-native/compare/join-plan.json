@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "description": "Explicit prepared join-plan reuse experiment on the unchanged 1000-row fixture. Historical scalar, PK and indexed_join schedules are preserved. Parameter cycles cover hits, misses, zero through many range rows, computed join bounds, LEFT join NULL extension, a PK-bound outer with at most 100 bucket matches, and a three-table fallback with all inputs PK-bound. Exact values, metadata and cost are checked through every public API and against the Rust Ruby binding. Physical-plan choice must remain parameter-sensitive.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {
+      "name": "scalar",
+      "sql": "SELECT abs($1::i64) + 7",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": -999,
+      "step": 17,
+      "span": 2000
+    },
+    {
+      "name": "pk_hit",
+      "sql": "SELECT score FROM items WHERE id = $1",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "indexed_join",
+      "sql": "SELECT a.label, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id LIMIT 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "indexed_join_miss",
+      "sql": "SELECT a.label, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id LIMIT 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 1000,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 137,
+      "span": 1001,
+      "name": "indexed_join_range",
+      "sql": "SELECT a.id, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id < $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "indexed_join_computed_key",
+      "sql": "SELECT a.id, b.score FROM items a JOIN items b ON b.id = a.id + 1 AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "left_join_residual",
+      "sql": "SELECT a.id, b.score FROM items a LEFT JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "bucket_join",
+      "sql": "SELECT a.id, b.id, b.score FROM items a JOIN items b ON b.bucket = a.bucket AND b.score <> a.score WHERE a.id = $1 ORDER BY b.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_join",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 ORDER BY a.id"
+    }
+  ]
+}
