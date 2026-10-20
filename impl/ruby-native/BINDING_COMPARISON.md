@@ -5,7 +5,9 @@ This comparison changes no engine code or experimental-support policy.
 
 **Historical baseline:** the subsequent [API follow-up](API_FOLLOWUP.md) implements
 and remeasures ordinary statement reuse, host planning, and batch improvements.
-Use that report for current timings; this report preserves the original evidence.
+The later [performance checkpoint](PERFORMANCE_CHECKPOINT.md) repeats the binding
+and host comparisons after the compilation work. This report preserves the
+original evidence.
 
 ## Assessment
 
