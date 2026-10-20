@@ -10,9 +10,7 @@ module JedNative
 
     class Program < CompiledExpression::Program
       def materialize
-        klass = Class.new(Kernel)
-        klass.class_eval(@source, '(jed compiled relation)', 1)
-        klass.new(@source, @node_count, @pool)
+        materialize_with(Kernel, '(jed compiled relation)')
       end
     end
 

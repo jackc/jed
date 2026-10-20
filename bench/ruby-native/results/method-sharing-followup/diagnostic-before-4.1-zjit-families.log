@@ -1,0 +1,720 @@
+block (2 levels) in <module:FileUtils>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2591
+block in <module:FileUtils>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2591
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:Verbose>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2666
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:NoWrite>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2689
+block in collect_method@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2642
+block in <module:DryRun>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/fileutils.rb:2713
+select@<internal:array>:266
+map@<internal:array>:240
+each@<internal:array>:222
+gemspec_stubs_in@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:808
+data@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:114
+block in map_stubs@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification_record.rb:257
+valid_ruby_abi?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/content_address.rb:41
+glob_files_in_dir@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/util.rb:86
+readline@<internal:io>:133
+block in stubs_for@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification_record.rb:96
+canonical_segments@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:423
+block in visit@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:1949
+search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:928
+block in search@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/optparse.rb:929
+require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:37
+block in require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:40
+find_default_spec@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:1350
+block in digest@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/source.rb:16
+select@<internal:array>:266
+block in gemspec_stubs_in@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:808
+satisfied_by?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:250
+block in satisfied_by?@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:251
+block in <class:Requirement>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:18
+<=>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:367
+map@<internal:array>:240
+block (2 levels) in require@<internal:/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/core_ext/kernel_require.rb>:55
+create@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:56
+unresolved_deps@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:1275
+default_specifications_dir@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/defaults.rb:63
+block in <module:Functions>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:19
+block in <module:Functions>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:19
+block in <class:RegexText>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/regex.rb:8
+block in <class:Parser>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:20
+block in <class:Parser>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:21
+map@<internal:array>:240
+block (2 levels) in <class:FileFormat>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/file_format.rb:139
+block (2 levels) in <class:FileFormat>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/file_format.rb:139
+block in <class:FileFormat>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/file_format.rb:137
+times@<internal:numeric>:257
+block in <class:FileFormat>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/file_format.rb:145
+block in <class:FileFormat>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/file_format.rb:146
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:12
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:12
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:17
+block (2 levels) in <module:ChecksumKernels>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/checksum_kernels.rb:18
+initialize@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/requirement.rb:134
+version@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/version.rb:185
+map@<internal:array>:240
+load_path_insert_index@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:616
+requirement@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/dependency.rb:117
+block in default_stubs@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:832
+version@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/stub_specification.rb:198
+new@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/platform.rb:65
+env_requirement@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems.rb:926
+runtime_dependencies@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/rubygems/specification.rb:2305
+block (2 levels) in <class:Delegator>@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:52
+synchronize@<internal:thread_sync>:557
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:399
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:405
+block in DelegateClass@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/delegate.rb:405
+block (2 levels) in <module:PageServiceWire>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/page_service_wire.rb:21
+block (3 levels) in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:15
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:14
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:16
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:17
+block (2 levels) in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:16
+block in <module:ScalarCursorPlanning>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_cursor.rb:19
+block in <class:CompiledExpression>@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:26
+token@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:95
+at?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:99
+block in fixture@bench/ruby-native/sharing_diagnostics.rb:97
+block in log_entries@bench/ruby-native/sharing_diagnostics.rb:164
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/cursors.rb:100
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:79
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/error.rb:8
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:56
+invoke@bench/ruby-native/sharing_diagnostics.rb:101
+outcome@bench/ruby-native/sharing_diagnostics.rb:115
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:79
+collatable_type?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:104
+call@(jed compiled expression):2
+check_integer@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:621
+block in jit_stats@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:42
+block in sample@bench/ruby-native/sharing_diagnostics.rb:157
+alpha?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:86
+accept@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:105
+at?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:99
+current@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:92
+loop@<internal:kernel>:153
+line@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:169
+block (3 levels) in validate@bench/ruby-native/sharing_diagnostics.rb:143
+invoke@bench/ruby-native/sharing_diagnostics.rb:101
+call@(jed compiled expression):2
+integer_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1528
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:80
+block in expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:81
+now@bench/ruby-native/sharing_diagnostics.rb:20
+stat@<internal:gc>:324
+class@<internal:kernel>:20
+materialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:74
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:34
+block in run_family@bench/ruby-native/sharing_diagnostics.rb:239
+digit?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:90
+space?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:94
+normalize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:454
+skip_space@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:98
+block in skip_space@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:98
+block in compute_parenthesized_queries@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:647
+block in compute_parenthesized_queries@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:653
+integer?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:190
+select@<internal:array>:266
+pooled@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:177
+advance@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:115
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:132
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_expressions.rb:10
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/record_shapes.rb:81
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+require_parsed_definition@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/opaque_definitions.rb:22
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_resolution.rb:65
+needed?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_resolution.rb:9
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:8
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:8
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/temporal_modifiers.rb:33
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/width_bucket.rb:8
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:127
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/argument_resolution.rb:46
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/datetime_functions.rb:179
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/range_constructors.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/body_pushdown.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:220
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:9
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/subqueries.rb:17
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/ctes.rb:51
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/views.rb:120
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:189
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/formatting_number.rb:381
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_images.rb:10
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_text.rb:68
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_operations.rb:81
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_sql.rb:8
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:45
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/regex_functions.rb:193
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/bindings.rb:638
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:281
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/windows.rb:16
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:150
+combine@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:11
+emit@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+c_label_source@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:198
+outcome@bench/ruby-native/sharing_diagnostics.rb:115
+block in prefix@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:775
+block (2 levels) in expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:676
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:154
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:25
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:17
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:78
+block in binary_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:65
+child@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:265
+aggregate?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:7
+function?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:9
+block in skip_space@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:98
+expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:671
+identifier_token?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:125
+nested@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:139
+block in expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:673
+prefix@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:763
+primary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:805
+block in needed?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_resolution.rb:13
+cast_value@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:275
+checked_integer@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:279
+block in scan_digits@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:250
+radix_digit?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:262
+block in compute_parenthesized_queries@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:647
+host_function_name?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:97
+reorder@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/argument_resolution.rb:7
+infer@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:474
+return_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/timezones.rb:8
+label@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:26
+emit_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+emit_call@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:550
+emit_cast@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:287
+type_name@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/temporal_modifiers.rb:6
+children@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:269
+identifier_length@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:281
+expect@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:111
+literal@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:667
+complexity!@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:663
+contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:54
+contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:47
+contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:24
+contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:15
+contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:75
+binary_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:66
+binary_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:65
+binary_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/datetime_arithmetic.rb:42
+binary_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:96
+common_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/query_composition.rb:9
+common_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1285
+function_call@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:923
+host_functions_named@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:88
+return_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:24
+generate@/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/lib/ruby/4.1.0+5/json/common.rb:370
+type_name@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:1023
+resolve_signature@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:77
+identifier@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:121
+compile_boolean_value@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:6
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:68
+job@bench/ruby-native/sharing_diagnostics.rb:42
+resolve@bench/ruby-native/sharing_diagnostics.rb:61
+block in resolve@bench/ruby-native/sharing_diagnostics.rb:62
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:42
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:19
+tokens@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:26
+block in tokens@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:66
+number@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:211
+scan_digits@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:250
+numeric_junk!@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:276
+compute_parenthesized_queries@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:644
+downto@<internal:numeric>:339
+parse_expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:60
+block in function_call@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:940
+block in needed?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_resolution.rb:13
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1366
+block in return_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:25
+block in resolve_signature@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:80
+block (2 levels) in resolve_signature@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:82
+family@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:71
+base@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:468
+builtin_function_name?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:99
+build@bench/ruby-native/sharing_diagnostics.rb:74
+build@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:84
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:105
+block in emit_call@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:552
+block in emit_call@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:562
+finish_method@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:163
+block in run_family@bench/ruby-native/sharing_diagnostics.rb:247
+block (2 levels) in validate@bench/ruby-native/sharing_diagnostics.rb:142
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/opaque_definitions.rb:26
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/cursors.rb:100
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:79
+block in value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:71
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:79
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:92
+invoke@bench/ruby-native/sharing_diagnostics.rb:101
+integer_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1528
+expression_loop@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:46
+call@(jed compiled pipeline):1
+call@(jed compiled pipeline):1
+expression_loop@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:46
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1333
+invoke@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:92
+call@(jed compiled pipeline):1
+materialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_pipeline.rb:13
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:6
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+emit@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/body_pushdown.rb:6
+child@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:265
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/subqueries.rb:17
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/bindings.rb:638
+block (2 levels) in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_relations.rb:58
+emit_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+emit_cast@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:287
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:127
+cast_value@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:275
+checked_integer@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:279
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:31
+block (2 levels) in expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:676
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_relations.rb:58
+radix_digit?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:262
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+block (3 levels) in expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:693
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:14
+job@bench/ruby-native/sharing_diagnostics.rb:42
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:9
+checked_integer@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:279
+ensure_comparable_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:155
+block in emit_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:352
+block in build@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_pipeline.rb:66
+validate_comparison@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:71
+validate_comparison@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:143
+block in scan_digits@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:250
+validate_comparison@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:142
+compile_filter@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:13
+compile_filter@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1310
+mark_filter_conjunction@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:29
+build@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:39
+build@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_pipeline.rb:24
+build@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_pipeline.rb:30
+sample@bench/ruby-native/sharing_diagnostics.rb:154
+call@(jed compiled pipeline):1
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+expression_loop@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:46
+call@(jed compiled pipeline):1
+block in expression_loop@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:72
+block (2 levels) in expression_loop@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:82
+block in expression_loop@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/pipeline_diagnostics.rb:72
+block in call@(jed compiled pipeline):4
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:68
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in validate@bench/ruby-native/sharing_diagnostics.rb:136
+call@(jed compiled pipeline):1
+block in call@(jed compiled pipeline):4
+block in run_family@bench/ruby-native/sharing_diagnostics.rb:239
+now@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/compiled_diagnostics.rb:32
+numeric_junk!@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:276
+build@bench/ruby-native/sharing_diagnostics.rb:74
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+build@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_pipeline.rb:30
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in call@(jed compiled pipeline):4
+block in fixture@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:46
+entry@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:41
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+block in invoke@bench/ruby-native/sharing_diagnostics.rb:108
+block in boundary_entries@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:64
+block (2 levels) in ordinary_comparator@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:30
+order_compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:223
+order_compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1267
+compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:53
+compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:653
+block in ordinary_comparator@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:29
+order_compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1267
+order_compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:223
+order_compare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1267
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+block in ordinary_comparator@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:29
+invoke@bench/ruby-native/sharing_diagnostics.rb:101
+to_proc@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:16
+enabled?@<internal:yjit>:13
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+ordinary_comparator@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:28
+materialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:21
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:12
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:34
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+block in keys@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:23
+block in prepare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:41
+block in prepare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:55
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+keys@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/ordering_diagnostics.rb:23
+prepare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:27
+prepare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_ordering.rb:38
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+call@(jed compiled ordering):2
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/cursors.rb:100
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:19
+block in aggregate_inputs@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:479
+call@(jed compiled aggregate):2
+compute_aggregate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:403
+native_compiled_aggregate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_plans.rb:93
+aggregate_inputs@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:462
+native_compiled_aggregate_arguments@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_plans.rb:62
+block (2 levels) in aggregate_inputs@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:481
+block in compute_aggregate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:408
+cast_value@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+block in compute_aggregate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:420
+binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:695
+call@(jed compiled aggregate):2
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+contains_aggregate?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1409
+block in contains_aggregate?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1411
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:26
+sharing?@bench/ruby-native/sharing_diagnostics.rb:21
+call@(jed compiled aggregate):2
+compute_aggregate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:403
+materialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_aggregate.rb:14
+window_nodes@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/windows.rb:220
+block in window_nodes@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/windows.rb:227
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/timezones.rb:98
+build@bench/ruby-native/sharing_diagnostics.rb:74
+block in compute_parenthesized_queries@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:653
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:281
+ensure_comparable_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:155
+emit@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/windows.rb:16
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:6
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/bindings.rb:638
+prepare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_aggregate.rb:20
+emit_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+job@bench/ruby-native/sharing_diagnostics.rb:42
+host_functions_named@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:88
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+compile_boolean_value@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:6
+prepare@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_aggregate.rb:31
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:6
+builtin_function_name?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:99
+boolean?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:194
+emit_reduction@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_aggregate.rb:108
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:309
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:312
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/windows.rb:22
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:316
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:317
+call@(jed compiled aggregate):2
+block in label_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:64
+label_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:63
+block in like@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:454
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:56
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_expressions.rb:25
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/filter_predicates.rb:18
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:174
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_batches.rb:9
+charge@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/cursors.rb:100
+wrap@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:31
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+block in evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:179
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_work.rb:8
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_kernels.rb:239
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/logical_memory.rb:57
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/subqueries.rb:32
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/views.rb:126
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/formatting_datetime.rb:198
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/formatting_number.rb:390
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_images.rb:92
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_text.rb:76
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_operations.rb:137
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/json_sql.rb:139
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/jsonpath_functions.rb:82
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/regex_functions.rb:227
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/aggregates.rb:33
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/windows.rb:82
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/expressions.rb:112
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+initialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:46
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:150
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:48
+value_image@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:70
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:174
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:89
+block in evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:177
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/array_semantics.rb:80
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:174
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:41
+like@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:74
+like@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:449
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:28
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/width_bucket.rb:31
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:174
+call@(jed compiled relation):1
+wrap@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:31
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+block in expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:81
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:89
+block (2 levels) in outcome@bench/ruby-native/sharing_diagnostics.rb:118
+materialize@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:13
+like@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/functions.rb:449
+block in quoted@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:130
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/logical_memory.rb:37
+block in literal_like_shape@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:418
+c_label_source@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:198
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:127
+primary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:805
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/function_relations.rb:56
+collation_label@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:109
+combine@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:11
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/composite_values.rb:110
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:17
+block in emit_literal_like@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:439
+job@bench/ruby-native/sharing_diagnostics.rb:42
+block in quoted@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:130
+resolve_collation@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:92
+block in outcome@bench/ruby-native/sharing_diagnostics.rb:118
+emit@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:207
+block (2 levels) in expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:676
+label@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:26
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:137
+block in expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:81
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:127
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:17
+emit_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:344
+predicate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:713
+default_collation@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:85
+emit_literal_like@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:438
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:17
+literal_like_shape@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:411
+resolve@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:28
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:25
+reset@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:30
+quoted@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/lexer.rb:127
+block in combine@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/collations.rb:21
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+prepare_filter@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:19
+prepare_filter@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:32
+begin_rows@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:64
+finish_rows@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:76
+call@(jed compiled relation):1
+block in run_family@bench/ruby-native/sharing_diagnostics.rb:265
+block in run_family@bench/ruby-native/sharing_diagnostics.rb:266
+log_entries@bench/ruby-native/sharing_diagnostics.rb:164
+block in expression_metadata@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:81
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/host_functions.rb:214
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+block (2 levels) in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:92
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+integer_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1528
+block in ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:92
+cast_value@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/fast_evaluation.rb:13
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:84
+evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1414
+integer_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1528
+block in evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1475
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/deep_stack.rb:45
+call@(jed compiled relation):1
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/date_clock.rb:53
+block in evaluate@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1475
+call@(jed compiled relation):1
+ordinary@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/relation_diagnostics.rb:81
+call@(jed compiled relation):1
+build@bench/ruby-native/sharing_diagnostics.rb:74
+primary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:805
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1317
+common_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1285
+block in constant_expression?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/logical_memory.rb:39
+ensure_comparable_type@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:155
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:56
+block in contextual_binary@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:31
+case_expression@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/parser.rb:902
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/resolution.rb:9
+prepare@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:39
+promote@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/types.rb:641
+literal_adapts?@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/strict_context.rb:44
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1385
+block in resolve@/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/text_diagnostics.rb:31
+emit_case_branch@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:613
+block in prepare_keys@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:56
+prepare_keys@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:25
+compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:6
+prepare_keys@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_relation.rb:54
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1381
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/engine.rb:1385
+last@<internal:array>:166
+block in compile@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/scalar_edges.rb:42
+emit_case@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:602
+block in emit_case@/tmp/jed-method-sharing-before/impl/ruby-native/lib/jed_native/compiled_expression.rb:606
+call@(jed compiled relation):1

@@ -44,6 +44,9 @@ and string-work charges; linguistic collation and general string functions keep
 their ordinary execution. The [literal LIKE extension](../../impl/ruby-native/LIKE_FOLLOWUP.md)
 admits bounded exact, prefix, suffix and contains predicates under static C labels;
 complex patterns retain the handwritten matcher with unchanged values, errors and costs.
+The [method-sharing follow-up](../../impl/ruby-native/METHOD_SHARING_FOLLOWUP.md)
+shares identical generated methods through a bounded process cache while keeping
+each kernel's constants and execution ownership independent.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

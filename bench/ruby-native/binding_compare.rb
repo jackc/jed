@@ -20,6 +20,7 @@ OptionParser.new do |parser|
   parser.on('--ruby PATH') { |value| options[:ruby] = File.expand_path(value) }
   parser.on('--native-source PATH') { |value| options[:native_source] = File.expand_path(value) }
   parser.on('--workloads LIST', Array) { |value| options[:workloads] = value }
+  parser.on('--plan PATH') { |value| options[:plan] = File.expand_path(value) }
   parser.on('--fresh-sql') { options[:fresh_sql] = true }
   parser.on('--jit NAME', %w[yjit zjit none]) { |value| options[:jit] = value }
   parser.on('--output PATH') { |value| options[:output] = File.expand_path(value) }
@@ -36,6 +37,7 @@ abort 'Specify --output PATH' unless options[:output]
 abort 'Unknown lane' unless (options[:lanes] - %w[wrapper native-prepared native-query native-eager]).empty?
 abort 'Specify unique, nonempty lanes' if options[:lanes].empty? || options[:lanes].uniq != options[:lanes]
 abort '--fresh-sql requires unprepared lanes' if options[:fresh_sql] && options[:lanes].include?('native-prepared')
+abort '--plan selects a memory fixture; do not combine with --file' if options[:plan] && options[:file]
 
 native_source = options.fetch(:native_source, File.join(root, 'impl/ruby-native'))
 wrapper_source = File.join(root, 'impl/ruby')
@@ -50,6 +52,7 @@ source_hashes = lambda do
     wrapper_library: Digest::SHA256.file(wrapper_library).hexdigest,
     worker: Digest::SHA256.file(File.join(__dir__, 'binding_compare_lane.rb')).hexdigest,
     plans: %w[plan.json compiled-plan.json pipeline-plan.json ordering-plan.json aggregate-plan.json relation-plan.json text-plan.json like-plan.json].to_h { |name| [name, Digest::SHA256.file(File.join(__dir__, 'compare', name)).hexdigest] },
+    selected_plan: options[:plan] && Digest::SHA256.file(options[:plan]).hexdigest,
     database: options[:file] && Digest::SHA256.file(options[:file]).hexdigest
   }
 end
@@ -72,6 +75,7 @@ options[:lanes].each do |lane|
   end
   command << '--verify-only' if options[:verify_only]
   command += ['--workloads', options[:workloads].join(',')] if options[:workloads]
+  command += ['--plan', options[:plan]] if options[:plan]
   command << '--fresh-sql' if options[:fresh_sql]
   command << '--disable-pipeline' if options[:disable_pipeline]
   command << '--disable-ordering' if options[:disable_ordering]
