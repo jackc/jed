@@ -7,9 +7,11 @@ Allocation counts alone do not establish a useful throughput improvement.
 
 **Decision: reject this candidate.** It saves candidate allocations but does not
 establish a consistent whole-query speedup. The tested implementation, its
-focused test and all evidence are archived in Git; a following commit restores
-the preceding planner. The implementation and measurements below describe the
-rejected candidate, not a retained optimization.
+focused test and all evidence are archived at commit
+`c4094c6a3f205639908fd8aa7f1a3832f6e73d70`. The preceding planner is restored,
+with library hash identical to the baseline below. The candidate-specific test
+lives in that archival commit. The implementation and measurements below
+describe the rejected candidate, not a retained optimization.
 
 The Ruby core remains experimental, frozen and opt-in. Normal tests,
 benchmarks, CI and future feature updates do not include it.
@@ -180,10 +182,11 @@ identical warmed allocation medians. Estimates and step-cost work still run;
 early dominance checks add work before some candidates reach ordinary retention.
 Call counts are not CPU-time percentages.
 
-The trace covers one cold and two subsequent executions per workload. Seven
-complete call maps are unchanged: scalar, PK, indexed join, arithmetic residual,
+The trace covers three executions per workload after the allocation samples;
+these can include a cache rebuild. Seven complete call maps are unchanged:
+scalar, PK, indexed join, arithmetic residual,
 text predicate, text projection and integer outputs. Other value-blind queries
-show fewer retention calls during cold planning even though their warmed
+show fewer retention calls during plan rebuilding even though their warmed
 allocation medians are unchanged. These traces do not isolate warmed execution
 cost and cannot explain ZJIT timing differences.
 
@@ -217,25 +220,26 @@ for future work.
 
 ## Next candidate
 
-A larger candidate is reusing prepared JOIN predicate-placement work. The
-current path rebuilds scopes, offsets and nullable-source information and
-classifies terms before reaching existing physical-plan reuse. A bounded,
-owned rewrite template in an existing prepared entry could avoid that work
-while leaving parameter-sensitive estimates, physical winners and scan bounds
-fresh.
+Investigate prepared-resolution cache pressure on the five-table case. Its
+final trace records 668 base expression-compilation calls and 155 key-size
+admission checks per query, but no key-copy calls. This suggests repeated
+resolution after the existing 4,096-unit/64-KiB key budget is exhausted;
+it does not yet prove the rejection reason. A bounded occupancy/miss-reason
+probe should establish that before any implementation change.
 
-The final profile still observes one outer rewrite per query. Its three-query
-trace includes cold resolution, so recursive key-copy counts cannot be treated
-as steady warmed overhead. Separate warmed ObjectSpace observations retain
-predicate-walk allocations, but those also include index eligibility work;
-they do not establish the fraction attributable to the outer rewrite. Measure
-that boundary before estimating a benefit.
+The three-query trace includes cold work, but separate warmed ObjectSpace
+observations still record 566 contextual-expression outer Arrays and 1,698
+associated pair Arrays, plus 566 admission-validation child Arrays. That is
+a larger potential target than avoiding another small candidate vector.
+Compact duplicated scope/AST descriptors within the existing budget if the
+probe supports it; do not raise the cap or replace structural validation with
+identity-only keys. Scope order, nullability, types, labels, mutable syntax,
+environment invalidation and contextual-cast effects must remain correct.
 
-Any such reuse must retain current syntax/context invalidation, contextual
-cast effects, outer-join fences and the independent contradiction check.
-LIKE/ILIKE placement can read parameter values, so initial admission should
-exclude those cases or explicitly represent that dependency. This is a next
-investigation target, not a retained change or a promised speedup.
+Reusing JOIN predicate-placement work is another possibility, but its current
+allocation counts include index eligibility walks as well as the outer rewrite.
+Parameter-sensitive LIKE/ILIKE placement and outer-join fences also need explicit
+handling. Neither target is implemented here or promises a speedup.
 
 ## Reproduction
 
@@ -244,6 +248,11 @@ Invoke them through `mise run ruby-native:bounded`; every workload has its own
 resource guard. Use at least 16 GiB of outer address space for supported-core
 comparisons. Existing page-service host tests also need local Unix-socket
 access.
+
+Check out archival commit `c4094c6a3f205639908fd8aa7f1a3832f6e73d70` to reproduce
+the rejected candidate and its focused test. The later branch restores the
+baseline library; running candidate verification against that restored source
+is intentionally rejected by the source pins.
 
 Run `check.rb --phase PHASE --source-sha256 FINAL_HASH` for `focus`, `host`
 and `corpus`. After correctness passes and measured source/helpers are frozen,
