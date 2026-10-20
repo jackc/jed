@@ -25,7 +25,7 @@ module JedNative
       octet_length bit_length ascii chr reverse left right substr strpos
       starts_with btrim ltrim rtrim replace translate split_part
     ].freeze
-    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, :physical,
+    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :scope_columns, :key_units, :key_bytes, :physical,
       :sources, :source_units, :source_bytes, keyword_init: true)
     Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, :physical_observation,
       :physical_reuse, keyword_init: true)
@@ -325,7 +325,7 @@ module JedNative
         names = inputs.flat_map { |source| [source[:name], source[:alias]] } +
           tables.flat_map { |_, table| table[:columns].map { |column| column[:name] } }
         return if names.compact.sum(&:bytesize) > 32_768
-        entry = Entry.new(tables: tables.freeze, context: context.freeze, roots: {}, columns: {}, scopes: {}, nodes: {},
+        entry = Entry.new(tables: tables.freeze, context: context.freeze, roots: {}, columns: {}, scopes: {}, nodes: {}, scope_columns: {},
           key_units: 0, key_bytes: 0, sources: {}, source_units: 0, source_bytes: 0)
         @native_join_resolution_plans.shift if @native_join_resolution_plans.length >= CACHE_ENTRIES
         @native_join_resolution_plans[statement] = entry
@@ -456,16 +456,21 @@ module JedNative
         retained = [key]
         retained << columns unless scope
         retained << node unless syntax
-        size = prepared_join_key_size(retained, frame.entry)
-        return expression unless size
+        snapshot = prepared_join_key_snapshot(retained, frame.entry, columns: (columns unless scope))
+        return expression unless snapshot
+        owned, descriptors, units, bytes = snapshot
+        # Publish only after the entire root, scope and AST fit. A refused root
+        # must not leave orphan descriptors or consume either key allowance.
+        pool = frame.entry.scope_columns ||= {}
+        descriptors.each { |descriptor, canonical| pool[descriptor] = canonical }
         unless scope
           scope = frame.entry.scopes.length
-          frame.entry.scopes[prepared_join_key(columns)] = scope
+          frame.entry.scopes[owned[1]] = scope
         end
-        frame.entry.nodes[prepared_join_key(node)] = frame.entry.nodes.length unless syntax
-        frame.entry.roots[key.freeze] = [expression, frame.checks.freeze].freeze
-        frame.entry.key_units += size[0]
-        frame.entry.key_bytes += size[1]
+        frame.entry.nodes[owned[-1]] = frame.entry.nodes.length unless syntax
+        frame.entry.roots[owned[0]] = [expression, frame.checks.freeze].freeze
+        frame.entry.key_units += units
+        frame.entry.key_bytes += bytes
       end
       expression
     ensure
@@ -473,6 +478,58 @@ module JedNative
         frame.depth -= 1
         frame.checks = nil
       end
+    end
+
+    def prepared_join_key_snapshot(value, entry, columns: nil)
+      units, bytes = 0, 0
+      descriptors = {}
+      pool = entry.scope_columns
+      charge = lambda do |count|
+        units += count
+        throw :unsupported if entry.key_units + units > KEY_UNITS
+      end
+      copy = lambda do |item, depth|
+        charge.call(1)
+        throw :unsupported if depth > 96
+        case item
+        when Array
+          throw :unsupported unless item.instance_of?(Array)
+          if item.equal?(columns)
+            # Keep full structural scope keys, so a warm lookup neither
+            # tokenizes caller metadata nor changes its equality semantics.
+            # Only publication shares the immutable complete descriptors.
+            item.map do |column|
+              charge.call(1) # This scope's reference, including duplicates.
+              throw :unsupported unless column.instance_of?(Hash) && column.default.nil? &&
+                !column.default_proc && !column.compare_by_identity?
+              canonical = pool && pool[column]
+              canonical ||= descriptors[column]
+              unless canonical
+                canonical = copy.call(column, depth + 1)
+                charge.call(2) # The descriptor pool's key and value references.
+                descriptors[canonical] = canonical
+              end
+              canonical
+            end.freeze
+          else
+            item.map { |child| copy.call(child, depth + 1) }.freeze
+          end
+        when Hash
+          throw :unsupported unless item.instance_of?(Hash) && item.default.nil? &&
+            !item.default_proc && !item.compare_by_identity?
+          item.to_h { |key, child| [copy.call(key, depth + 1), copy.call(child, depth + 1)] }.freeze
+        when String
+          throw :unsupported unless item.instance_of?(String)
+          bytes += item.bytesize
+          throw :unsupported if entry.key_bytes + bytes > KEY_BYTES
+          item.dup.freeze
+        when Symbol, Integer, NilClass, TrueClass, FalseClass
+          item
+        else
+          throw :unsupported
+        end
+      end
+      catch(:unsupported) { [copy.call(value, 0), descriptors, units, bytes] }
     end
 
     def prepared_join_key_size(value, entry)
@@ -488,15 +545,6 @@ module JedNative
         return if entry.key_units + units > KEY_UNITS || entry.key_bytes + bytes > KEY_BYTES
       end
       [units, bytes]
-    end
-
-    def prepared_join_key(value)
-      case value
-      when Array then value.map { |item| prepared_join_key(item) }.freeze
-      when Hash then value.to_h { |key, item| [key, prepared_join_key(item)] }.freeze
-      when String then value.dup.freeze
-      else value
-      end
     end
   end
 

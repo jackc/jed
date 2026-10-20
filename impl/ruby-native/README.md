@@ -60,6 +60,9 @@ The [indexed-JOIN bounds follow-up](JOIN_BOUNDS_FOLLOWUP.md) reuses bounded
 comparison structure within one JOIN execution while evaluating fresh bounds.
 The [N-way candidate investigation](NWAY_FRONTIER_FOLLOWUP.md) records a rejected
 early-dominance optimization: fewer allocations did not yield a consistent speedup.
+The [prepared JOIN key follow-up](JOIN_KEY_FOLLOWUP.md) shares immutable column
+descriptions across ordered scopes within the existing cache limits, allowing
+larger JOINs to retain more resolved expressions.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)

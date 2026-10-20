@@ -117,6 +117,14 @@ records a rejected early-dominance optimization. It avoids some candidate
 allocations while preserving complete frontiers, but does not establish a
 consistent interpreter/YJIT/ZJIT throughput benefit. Its measured source and
 evidence remain reproducible in Git; the preceding planner remains the baseline.
+The [prepared JOIN key follow-up](../../impl/ruby-native/JOIN_KEY_FOLLOWUP.md)
+shares complete immutable column descriptions across retained ordered scopes.
+Hot structural lookups remain unchanged. Publication stages complete owned
+keys and new descriptions before changing the entry; each scope reference
+and each new description/pool entry is charged against the existing key
+allowance. The 4,096-unit/64-KiB key limits, 128-root ceiling and 64-statement
+limit remain unchanged. Contextual checks, mutation/context invalidation and
+parameter-sensitive physical planning keep their existing rules.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
