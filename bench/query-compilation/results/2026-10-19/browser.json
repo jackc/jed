@@ -1,0 +1,105 @@
+{
+  "browser": "149.0.7827.55",
+  "rows": [
+    {
+      "policy": "none",
+      "page": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "worker": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "workerWithoutPolicy": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "blobWorker": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      }
+    },
+    {
+      "policy": "strict",
+      "page": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "CompileError"
+      },
+      "worker": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "CompileError"
+      },
+      "workerWithoutPolicy": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "blobWorker": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "CompileError"
+      }
+    },
+    {
+      "policy": "eval",
+      "page": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "worker": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "workerWithoutPolicy": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "blobWorker": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      }
+    },
+    {
+      "policy": "wasm",
+      "page": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "allowed"
+      },
+      "worker": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "allowed"
+      },
+      "workerWithoutPolicy": {
+        "eval": "allowed",
+        "Function": "allowed",
+        "wasm": "allowed"
+      },
+      "blobWorker": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "allowed"
+      }
+    },
+    {
+      "policy": "trusted",
+      "page": {
+        "eval": "EvalError",
+        "Function": "EvalError",
+        "wasm": "allowed"
+      }
+    }
+  ]
+}

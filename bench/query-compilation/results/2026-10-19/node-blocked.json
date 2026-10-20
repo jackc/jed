@@ -1,0 +1,16 @@
+{
+  "node": "v26.10.0",
+  "execArgv": [
+    "--disallow-code-generation-from-strings"
+  ],
+  "normal": {
+    "eval": "EvalError",
+    "Function": "EvalError",
+    "wasm": "allowed"
+  },
+  "restrictedContext": {
+    "eval": "EvalError",
+    "Function": "EvalError",
+    "wasm": "CompileError"
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "revision": "c105eed383cae6ef98cfc8872b71aa3657f1c999",
+  "commands": {
+    "kernels-0": [
+      "taskset",
+      "-c",
+      "3",
+      "node",
+      "/home/jack/.codex/worktrees/c5b6/jed/bench/results/query-compilation/kernels.mjs"
+    ],
+    "kernels-1": [
+      "taskset",
+      "-c",
+      "3",
+      "node",
+      "/home/jack/.codex/worktrees/c5b6/jed/bench/results/query-compilation/kernels.mjs"
+    ],
+    "kernels-2": [
+      "taskset",
+      "-c",
+      "3",
+      "node",
+      "/home/jack/.codex/worktrees/c5b6/jed/bench/results/query-compilation/kernels.mjs"
+    ],
+    "kernels-jitless": [
+      "taskset",
+      "-c",
+      "3",
+      "node",
+      "--jitless",
+      "/home/jack/.codex/worktrees/c5b6/jed/bench/results/query-compilation/kernels.mjs"
+    ],
+    "jit-evidence": [
+      "taskset",
+      "-c",
+      "3",
+      "node",
+      "--trace-opt",
+      "--trace-deopt",
+      "/home/jack/.codex/worktrees/c5b6/jed/bench/results/query-compilation/kernels.mjs"
+    ],
+    "node": [
+      "node",
+      "bench/query-compilation/platforms.mjs"
+    ],
+    "node-blocked": [
+      "node",
+      "--disallow-code-generation-from-strings",
+      "bench/query-compilation/platforms.mjs"
+    ],
+    "node-jitless": [
+      "node",
+      "--jitless",
+      "bench/query-compilation/platforms.mjs"
+    ],
+    "browser": [
+      "node",
+      "bench/query-compilation/platforms.mjs",
+      "browser",
+      "/home/jack/.codex/worktrees/c5b6/jed/impl/ts/node_modules/playwright/index.mjs"
+    ]
+  },
+  "requested_subset": [
+    "browser",
+    "jit-evidence"
+  ],
+  "cpu": "3",
+  "platform": "x86_64-linux",
+  "cpu_model": "Intel(R) Core(TM) Ultra 9 285K",
+  "source_sha256": {
+    "bench/query-compilation/kernels.mjs": "ff89da2d03c2df34de26c9bddc5aa40359c5ded7e358e27db650a4f6fd540409",
+    "bench/query-compilation/platforms.mjs": "c3365c8f366aa5a5e0e7b97a98f2d7e2b39f67465716d1deed1fe28767a8fe86",
+    "bench/query-compilation/bundle.mjs": "b37e0020e2d3242a517e9be7ade9e7f7022114d60d80408b6b340d333568c1d0",
+    "mise-tasks/experiment/query-compilation": "fd70448ea1dfe239b286ec82041b4f68d5cbe5d04196b2b29313d7bf83a0a919",
+    "bench/results/query-compilation/kernels.mjs": "71dae2843815d12a02c888d2eeb26a4c78dff23b41f646dda21159f2e183e5bb"
+  },
+  "browser_tested": true
+}

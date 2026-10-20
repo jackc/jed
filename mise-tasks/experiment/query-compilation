@@ -1,0 +1,64 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Probe JS query kernels and host code-generation restrictions (research only)"
+
+require "json"
+require "open3"
+require "fileutils"
+require "digest"
+
+root = File.expand_path("../..", __dir__)
+Dir.chdir(root)
+out = File.expand_path(ENV.fetch("JED_COMPILE_RESULTS", "bench/results/query-compilation"))
+FileUtils.mkdir_p(out)
+bundle = "#{out}/kernels.mjs"
+system("node", "bench/query-compilation/bundle.mjs", bundle, exception: true)
+cpu = ENV["JED_COMPILE_CPU"]
+prefix = cpu ? ["taskset", "-c", cpu] : []
+commands = {}
+3.times do |i|
+  commands["kernels-#{i}"] = prefix + ["node", bundle]
+end
+commands["kernels-jitless"] = prefix + ["node", "--jitless", bundle]
+commands["jit-evidence"] = prefix + ["node", "--trace-opt", "--trace-deopt", bundle]
+commands["node"] = ["node", "bench/query-compilation/platforms.mjs"]
+commands["node-blocked"] = ["node", "--disallow-code-generation-from-strings", "bench/query-compilation/platforms.mjs"]
+commands["node-jitless"] = ["node", "--jitless", "bench/query-compilation/platforms.mjs"]
+playwright = ENV.fetch("JED_COMPILE_PLAYWRIGHT", "#{root}/impl/ts/node_modules/playwright/index.mjs")
+commands["browser"] = ["node", "bench/query-compilation/platforms.mjs", "browser", playwright] if File.file?(playwright)
+only = ENV["JED_COMPILE_ONLY"]&.split(",")
+commands.each do |name, argv|
+  next if only && !only.include?(name)
+  stdout, stderr, status = Open3.capture3(*argv)
+  File.write("#{out}/#{name}.stderr", stderr)
+  abort "#{name} failed:\n#{stdout}\n#{stderr}" unless status.success?
+  if name == "jit-evidence"
+    lines = stdout.lines
+    json = lines.find { |line| line.start_with?('{"node":') }
+    evidence = lines.grep(/jedCompiled/)
+    3.times do |id|
+      abort "no completed optimization of jedCompiled#{id}" unless evidence.any? do |line|
+        line.include?("completed") && line.include?("jedCompiled#{id} ") && line.include?("TURBOFAN")
+      end
+    end
+    File.write("#{out}/jit-evidence.log", (lines - [json]).join)
+    File.write("#{out}/jit-evidence.json", JSON.pretty_generate({ "generated_method_log" => evidence,
+               "validation" => JSON.parse(json) }) + "\n")
+  else
+    File.write("#{out}/#{name}.json", JSON.pretty_generate(JSON.parse(stdout)) + "\n")
+  end
+  puts "#{name}: passed"
+end
+sources = ["bench/query-compilation/kernels.mjs", "bench/query-compilation/platforms.mjs",
+           "bench/query-compilation/bundle.mjs", __FILE__, bundle]
+File.write("#{out}/environment.json", JSON.pretty_generate({
+  "revision" => `git rev-parse HEAD`.strip,
+  "commands" => commands,
+  "requested_subset" => only,
+  "cpu" => cpu,
+  "platform" => RUBY_PLATFORM,
+  "cpu_model" => File.exist?("/proc/cpuinfo") ? File.read("/proc/cpuinfo")[/^model name\s*:\s*(.+)$/, 1] : nil,
+  "source_sha256" => sources.to_h { |p| [p.delete_prefix(root + "/"), Digest::SHA256.file(p).hexdigest] },
+  "browser_tested" => commands.key?("browser")
+}) + "\n")
+puts "Results: #{out}"

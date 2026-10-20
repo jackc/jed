@@ -1,0 +1,333 @@
+{
+  "generated_method_log": [
+    "[marking 0x0fc18deb2811 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> for optimization to MAGLEV, ConcurrencyMode::kConcurrent, reason: hot and stable]\n",
+    "[compiling method 0x0fc18deb2811 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> (target MAGLEV), mode: ConcurrencyMode::kConcurrent]\n",
+    "[completed compiling 0x0fc18deb2811 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> (target MAGLEV) - took 0.000, 0.078, 0.002 ms]\n",
+    "[marking 0x0f61138a9931 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> for optimization to TURBOFAN_JS, ConcurrencyMode::kConcurrent, reason: hot and stable]\n",
+    "[compiling method 0x0f61138a9931 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> (target TURBOFAN_JS), mode: ConcurrencyMode::kConcurrent]\n",
+    "[completed compiling 0x0f61138a9931 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> (target TURBOFAN_JS) - took 0.001, 2.529, 0.023 ms]\n",
+    "[completed optimizing 0x0f61138a9931 <JSFunction jedCompiled0 (sfi = 0xf61138a6209)> (target TURBOFAN_JS)]\n",
+    "[marking 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> for optimization to MAGLEV, ConcurrencyMode::kConcurrent, reason: hot and stable]\n",
+    "[compiling method 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> (target MAGLEV), mode: ConcurrencyMode::kConcurrent]\n",
+    "[completed compiling 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> (target MAGLEV) - took 0.001, 0.131, 0.003 ms]\n",
+    "[marking 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> for optimization to TURBOFAN_JS, ConcurrencyMode::kConcurrent, reason: hot and stable]\n",
+    "[compiling method 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> (target TURBOFAN_JS), mode: ConcurrencyMode::kConcurrent]\n",
+    "[completed compiling 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> (target TURBOFAN_JS) - took 0.001, 2.868, 0.023 ms]\n",
+    "[completed optimizing 0x0f61138aded1 <JSFunction jedCompiled1 (sfi = 0xf61138abfc9)> (target TURBOFAN_JS)]\n",
+    "[marking 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> for optimization to MAGLEV, ConcurrencyMode::kConcurrent, reason: hot and stable]\n",
+    "[compiling method 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> (target MAGLEV), mode: ConcurrencyMode::kConcurrent]\n",
+    "[completed compiling 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> (target MAGLEV) - took 0.001, 0.185, 0.003 ms]\n",
+    "[marking 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> for optimization to TURBOFAN_JS, ConcurrencyMode::kConcurrent, reason: hot and stable]\n",
+    "[compiling method 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> (target TURBOFAN_JS), mode: ConcurrencyMode::kConcurrent]\n",
+    "[completed compiling 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> (target TURBOFAN_JS) - took 0.002, 4.461, 0.030 ms]\n",
+    "[completed optimizing 0x0f61138b1ec1 <JSFunction jedCompiled2 (sfi = 0xf61138af461)> (target TURBOFAN_JS)]\n"
+  ],
+  "validation": {
+    "node": "v26.10.0",
+    "v8": "14.6.202.34-node.34",
+    "execArgv": [
+      "--trace-opt",
+      "--trace-deopt"
+    ],
+    "warmup": 50000,
+    "iterations": 100000,
+    "validationCount": 10692,
+    "observations": [
+      {
+        "name": "add",
+        "firstCompileUs": 17.70599999999689,
+        "postValidationSingleCallUs": 47.785999999995,
+        "sourceBytes": 210,
+        "samples": [
+          {
+            "mode": "tree",
+            "ns": 39.558760000000035,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "closures",
+            "ns": 41.234990000000096,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "generated",
+            "ns": 27.59937000000008,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "generated",
+            "ns": 27.122889999999988,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "closures",
+            "ns": 28.75769000000005,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "tree",
+            "ns": 36.847080000000005,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "tree",
+            "ns": 36.86767000000003,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "closures",
+            "ns": 29.833789999999997,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "generated",
+            "ns": 25.859749999999906,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "generated",
+            "ns": 26.850159999999903,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "closures",
+            "ns": 28.65724,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "tree",
+            "ns": 35.88523000000009,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "tree",
+            "ns": 35.510030000000086,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "closures",
+            "ns": 29.135200000000054,
+            "check": 204126912,
+            "cost": "100000"
+          },
+          {
+            "mode": "generated",
+            "ns": 26.266420000000036,
+            "check": 204126912,
+            "cost": "100000"
+          }
+        ]
+      },
+      {
+        "name": "arithmetic",
+        "firstCompileUs": 70.84199999999896,
+        "postValidationSingleCallUs": 1.2260000000026139,
+        "sourceBytes": 415,
+        "samples": [
+          {
+            "mode": "tree",
+            "ns": 94.78398999999996,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "closures",
+            "ns": 81.89458000000002,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "generated",
+            "ns": 77.31135999999992,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "generated",
+            "ns": 75.11446000000007,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "closures",
+            "ns": 84.01106999999996,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "tree",
+            "ns": 97.16052000000019,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "tree",
+            "ns": 96.92993999999999,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "closures",
+            "ns": 82.92648999999983,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "generated",
+            "ns": 77.20005999999984,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "generated",
+            "ns": 75.79482000000013,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "closures",
+            "ns": 83.00272000000007,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "tree",
+            "ns": 96.19571000000008,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "tree",
+            "ns": 94.77270999999973,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "closures",
+            "ns": 81.59690000000012,
+            "check": 305490368,
+            "cost": "300000"
+          },
+          {
+            "mode": "generated",
+            "ns": 76.19494000000032,
+            "check": 305490368,
+            "cost": "300000"
+          }
+        ]
+      },
+      {
+        "name": "predicate",
+        "firstCompileUs": 96.20000000001028,
+        "postValidationSingleCallUs": 261.62699999997585,
+        "sourceBytes": 673,
+        "samples": [
+          {
+            "mode": "tree",
+            "ns": 182.5795599999998,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "closures",
+            "ns": 147.03115000000025,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "generated",
+            "ns": 138.70114999999998,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "generated",
+            "ns": 138.61374000000012,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "closures",
+            "ns": 147.42877999999962,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "tree",
+            "ns": 183.82151000000022,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "tree",
+            "ns": 174.72117000000026,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "closures",
+            "ns": 147.0640800000001,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "generated",
+            "ns": 138.49120000000028,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "generated",
+            "ns": 138.64510999999993,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "closures",
+            "ns": 147.36141000000032,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "tree",
+            "ns": 176.11839999999975,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "tree",
+            "ns": 174.23485000000025,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "closures",
+            "ns": 146.2624299999993,
+            "check": 99804,
+            "cost": "500000"
+          },
+          {
+            "mode": "generated",
+            "ns": 139.1214500000001,
+            "check": 99804,
+            "cost": "500000"
+          }
+        ]
+      }
+    ],
+    "sink": -286504629
+  }
+}
