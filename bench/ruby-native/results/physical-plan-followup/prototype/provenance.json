@@ -1,0 +1,51 @@
+{
+  "purpose": "Pre-freeze viability observations; not formal source ABBA. Final evidence supersedes these provisional-source reports.",
+  "baseline_source_sha256": "40ceac58a86ce19bba2ed2497adfb26b5ca7eafcc31e39def71312c1a9d56382",
+  "candidate_source_sha256": "af697664d103b171c81cd428f2039fc4fd61251388260e28b6ea4db63efb2217",
+  "diagnostic_script_preserved_sha256": "163f2dc01afeb462d456801b3df055a028333f4b45fae30c61b17bb54e064482",
+  "files": [
+    {
+      "file": "jed-physical-before-profile-smoke-bounded.json",
+      "bytes": 1335,
+      "sha256": "dfa8666feed3045240ede78b988199cef116800159edaf03daba17b65c929e4c"
+    },
+    {
+      "file": "jed-physical-before-profile-smoke.json",
+      "bytes": 182516,
+      "sha256": "68790e778972cba4c9aec2c749d60c164c51547f790305f489cb4cfb1c8521dc"
+    },
+    {
+      "file": "jed-physical-direct-smoke-bounded.json",
+      "bytes": 932,
+      "sha256": "5329f47bda6e94a898287b89b2262ba29cadd945fc8c6c85cceaeade43ac2c3f"
+    },
+    {
+      "file": "jed-physical-direct-smoke.json",
+      "bytes": 5328803,
+      "sha256": "4db70c97d230247c5d6d8a4f2b7c85620568fbe752c229e6358c1619934ad4b5"
+    },
+    {
+      "file": "jed-physical-final-profile-smoke-bounded.json",
+      "bytes": 1337,
+      "sha256": "e46d4180cf8281a789e30a7034957367c48e059dd10a814dee86068999da5d10"
+    },
+    {
+      "file": "jed-physical-final-profile-smoke.json",
+      "bytes": 165836,
+      "sha256": "f22b1365cc81b5a994d9feb8f4ab5547935701abd48fc54a8ce095caad4f2719"
+    },
+    {
+      "file": "physical_plan_diagnostics-smoke.rb",
+      "bytes": 21654,
+      "sha256": "163f2dc01afeb462d456801b3df055a028333f4b45fae30c61b17bb54e064482"
+    }
+  ],
+  "prototype_patch": {
+    "file": "baseline-to-af697.patch",
+    "bytes": 15146,
+    "sha256": "7bdd96a436cc9441be2660d4ff92f0239a31010d8e79960f2ae4b7d8f3e4b42a",
+    "applies_to_commit": "b5262268371ff5e7d93c2b61e04bcfb304665cf4",
+    "verified_replayed_source_sha256": "af697664d103b171c81cd428f2039fc4fd61251388260e28b6ea4db63efb2217",
+    "reproduce": "git apply bench/ruby-native/results/physical-plan-followup/prototype/baseline-to-af697.patch in a separate checkout of the baseline commit"
+  }
+}

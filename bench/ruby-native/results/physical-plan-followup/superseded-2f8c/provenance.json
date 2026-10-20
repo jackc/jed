@@ -1,0 +1,51 @@
+{
+  "reason": "Superseded before timing by the conservative validation-deduplication fix preserving repeated text conversions. The partial corpus audit was intentionally interrupted through its bounded supervisor, with no orphan workers. Final-source runs supersede these reports.",
+  "source_sha256": "2f8c524be36d8c03d689cc37d6bd0fd5f4cd4be5c5945cbf7347a6e217d64413",
+  "files": [
+    {
+      "file": "focused-interpreter-bounded.json",
+      "sha256": "13277516140bcd67b78aeb9b5a60d25b0d8c931c1de97251b094bd401ae5223d",
+      "bytes": 1370
+    },
+    {
+      "file": "focused-yjit-bounded.json",
+      "sha256": "c3cb5f5552b0357f0a04e88b27ad2d15469c21df51439c68c0c812e793560cce",
+      "bytes": 1340
+    },
+    {
+      "file": "focused-zjit-bounded.json",
+      "sha256": "a932de5fbe3f3f32e93c498f0f502c80ba4753c6472ece948d036d0e813656fe",
+      "bytes": 1389
+    },
+    {
+      "file": "host-tests-bounded.json",
+      "sha256": "025503bca302460ba197ed491b1a02b39783b0626f63567a048faa4ffc02789d",
+      "bytes": 8943
+    },
+    {
+      "file": "memory-pure-query-zjit.json",
+      "sha256": "e3b0f4e9d7a08d16eaa995d92e6c9827c0e746047c701a66eec04de3307dae8a",
+      "bytes": 1368
+    },
+    {
+      "file": "memory-pure-query-zjit-bounded.json",
+      "sha256": "6d1c999ff83f6f94a72995a4779cf5f511e2678ce894f37182c58e8701f2d3ef",
+      "bytes": 781
+    },
+    {
+      "file": "memory-pure-query-zjit-run.json",
+      "sha256": "62785a06a8a7532e946beff8697fd2728fbb77307c645551b10e2597523bc7d3",
+      "bytes": 25222
+    },
+    {
+      "file": "jed-physical-statistics-final.json",
+      "sha256": "0445a000ca2c2ca3cdd0fcd7c4daa1c76f6381e1e16f3635374a4c08b6e1bb61",
+      "bytes": 1464
+    },
+    {
+      "file": "jed-physical-statistics-final-bounded.json",
+      "sha256": "bcb0d310b4b5d12846f29830e5c44cdfe8fa631b41b98a2c6877e95dae5744c3",
+      "bytes": 2070
+    }
+  ]
+}

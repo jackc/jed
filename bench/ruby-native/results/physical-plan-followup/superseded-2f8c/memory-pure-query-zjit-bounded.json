@@ -1,0 +1,21 @@
+{
+  "command": [
+    "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "impl/ruby-native/bin/conformance.rb"
+  ],
+  "success": null,
+  "reason": "interrupted by TERM",
+  "peak_rss_bytes": 62283776,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 900.0,
+  "elapsed_seconds": 133.60428950100322,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "2f8c524be36d8c03d689cc37d6bd0fd5f4cd4be5c5945cbf7347a6e217d64413",
+  "final_source_sha256": "2f8c524be36d8c03d689cc37d6bd0fd5f4cd4be5c5945cbf7347a6e217d64413",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "",
+  "stderr": ""
+}

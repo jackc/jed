@@ -2,7 +2,7 @@
 # cardinality (spec/design/statistics.md §§5–6). Low-cardinality NDV stays fixed; key-like NDV scales
 # proportionally to the current non-NULL population. These deterministic integer estimates and plan
 # choices are jed-owned and cross-core checked.
-# requires: maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.set_returning, query.comparison_order, query.aggregates, query.group_by, query.distinct, query.join_inner, query.table_alias, query.qualified_column, query.explain, query.order_by, expr.arithmetic, expr.between, cast.explicit, types.i32, types.i64
+# requires: harness.params, maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.set_returning, query.where_eq, query.comparison_order, query.aggregates, query.group_by, query.distinct, query.join_inner, query.table_alias, query.qualified_column, query.explain, query.order_by, expr.arithmetic, expr.between, cast.explicit, types.i32, types.i64, resource.cost_metering
 
 # --- fixed versus proportional NDV under retained stale facts -----------------------------------
 
@@ -229,3 +229,125 @@ FROM jed_statistics WHERE table_name = 'p9_bounded'
 30000
 0
 101
+
+# --- analyzed join-local filters and parameter-sensitive access selection ------------------------
+
+# Reuse the complete ten-row/six-row populations above. The pushed filter must consult the left
+# relation's facts throughout candidate selection, including its delivered/logical row estimates.
+# An 80% MCV selects a full scan; the rare value and the complete-MCV absence proof select the index.
+statement ok
+CREATE INDEX p9_left_k ON p9_left(k)
+
+# params: 0
+query ITTII nosort
+EXPLAIN SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k WHERE l.k = $1
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+12
+88
+1
+Scan p9_left
+Full scan; touched=2; filter:conjuncts=1
+8
+21
+1
+Scan p9_right
+Full scan; touched=2
+6
+7
+
+# params: 0
+# cost: 92
+query II nosort
+SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k WHERE l.k = $1 ORDER BY l.id, r.id
+----
+1
+1
+1
+2
+2
+1
+2
+2
+3
+1
+3
+2
+4
+1
+4
+2
+5
+1
+5
+2
+6
+1
+6
+2
+7
+1
+7
+2
+8
+1
+8
+2
+
+# params: 1
+query ITTII nosort
+EXPLAIN SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k WHERE l.k = $1
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+2
+19
+1
+Scan p9_left
+Index bound: using p9_left_k; touched=2; filter:conjuncts=1
+1
+4
+1
+Scan p9_right
+Full scan; touched=2
+6
+7
+
+# params: 1
+# cost: 19
+query II nosort
+SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k WHERE l.k = $1 ORDER BY l.id, r.id
+----
+9
+3
+9
+4
+
+# params: 2
+query ITTII nosort
+EXPLAIN SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k WHERE l.k = $1
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+0
+7
+1
+Scan p9_left
+Index bound: using p9_left_k; touched=2; filter:conjuncts=1
+0
+0
+1
+Scan p9_right
+Full scan; touched=2
+6
+7
+
+# params: 2
+# cost: 8
+query II nosort
+SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k WHERE l.k = $1 ORDER BY l.id, r.id
+----

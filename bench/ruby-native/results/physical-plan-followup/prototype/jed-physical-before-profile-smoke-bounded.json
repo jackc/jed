@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/query_profile.rb",
+    "--api",
+    "execute",
+    "--report",
+    "/tmp/jed-physical-before-profile-smoke.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 72339456,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 2.3496137260226533,
+  "source": "/tmp/jed-physical-plan-before/impl/ruby-native",
+  "source_sha256": "40ceac58a86ce19bba2ed2497adfb26b5ca7eafcc31e39def71312c1a9d56382",
+  "final_source_sha256": "40ceac58a86ce19bba2ed2497adfb26b5ca7eafcc31e39def71312c1a9d56382",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "execute scalar: 5061.5ns; 39.0 allocations\nexecute pk_hit: 3500.3ns; 31.0 allocations\nexecute indexed_join: 339755.3ns; 2419.6 allocations\nexecute three_table_join: 753032.4ns; 5045.2 allocations\nexecute three_table_join_miss: 692912.6ns; 4822.2 allocations\nexecute three_table_join_range: 1402882.4ns; 13995.7 allocations\nexecute three_table_computed_key: 678111.7ns; 4547.1 allocations\nexecute four_table_join: 2255243.2ns; 16543.8 allocations\nexecute three_table_left_fence: 676269.1ns; 6402.9 allocations\n",
+  "stderr": ""
+}
