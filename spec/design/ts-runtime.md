@@ -223,7 +223,7 @@ per-expression or per-row driver overhead.
 Resume each operation exactly once. Never recover from a cache miss by rerunning SQL: that
 could repeat entropy, host-function effects, cost or staged writes. Do not preload the whole
 database to avoid suspension. Async page loads/prefetch and pending crypto buffers must stay
-bounded, including retained pins and historical derived-key caches.
+bounded, including retained pins (per-page keys need no key cache, encryption.md §3.1).
 
 The codec remains core-owned above the byte-device seam; adapters supply the selected primitive
 provider. Node native AES and browser WebCrypto must match fixed-input byte fixtures. Choosing
@@ -710,7 +710,9 @@ above the byte device and below the page cache (hosts.md §6). It offers `encode
 
 - `decode` returns exactly the logical page bytes `encode` received. Page CRCs, manifest
   digests, the live-page count and the page cache all operate on those plaintext bytes
-  (validated-cow.md §5); the cache inserts a decoded page only after its read resumed.
+  (validated-cow.md §5) in the plaintext format; the encrypted variant moves the CRC and the
+  manifest digests after `encode` (encryption.md §4), which is the one change this seam takes
+  with that format version. The cache inserts a decoded page only after its read resumed.
 - `Pager.fromStore` reads the 12-byte bootstrap header (page size) directly from the device;
   the encrypted format must keep the page size discoverable before any key is used
   (encryption.md §4).
