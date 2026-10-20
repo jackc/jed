@@ -219,7 +219,7 @@ module NativePreparedPhysicalPlanTests
     engine = current.engine
     engine.instance_variable_set(:@native_binding_types, ['i32'])
     engine.instance_variable_set(:@params, [2])
-    frame = JedNative::PreparedJoins::Frame.new(entry: cache(current).values.first, depth: 0, plans: {})
+    frame = JedNative::PreparedJoins::Frame.new(entry: cache(current).values.first, depth: 0, plans: {}, physical_reuse: true)
     observed = []
     engine.define_singleton_method(:cast_value) do |value, type|
       observed << [value, type]
@@ -294,7 +294,7 @@ module NativePreparedPhysicalPlanTests
       assert(!observation[:sensitive] && observation[:checks].length == JedNative::PreparedJoins::PHYSICAL_CHECKS, 'exact physical validation cap was rejected')
       engine.send(:prepared_join_physical_check, observation, [0,'i32'])
       assert(observation[:sensitive] && observation[:checks].length == JedNative::PreparedJoins::PHYSICAL_CHECKS, 'physical validation log exceeded its cap')
-      frame = JedNative::PreparedJoins::Frame.new(entry: entry, depth: 0, plans: {})
+      frame = JedNative::PreparedJoins::Frame.new(entry: entry, depth: 0, plans: {}, physical_reuse: true)
       engine.instance_variable_set(:@native_join_resolution_frame, frame)
       engine.instance_variable_set(:@native_binding_types, ['i32'])
       engine.instance_variable_set(:@params, [1])

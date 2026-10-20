@@ -46,6 +46,8 @@ The [query setup follow-up](QUERY_WALK_FOLLOWUP.md) reduces syntax traversal and
 reuses bounded source metadata, and fixes deep flat-`IN` predicate planning.
 The [expression traversal follow-up](EXPRESSION_WALK_FOLLOWUP.md) removes
 temporary collection and comparison arrays during planning.
+The [multiway LEFT-join follow-up](OUTER_JOIN_FOLLOWUP.md) reuses bounded
+resolution while retaining fresh physical selection across outer-join boundaries.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
