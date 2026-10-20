@@ -611,7 +611,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   is that nothing foreclose it (don't assume page bytes are plaintext-comparable on disk) —
   already satisfied (hosts keep page bytes opaque). **Designed in `spec/design/encryption.md`:**
   a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
-  a random data key is stored only wrapped by a host key or passphrase-derived wrapping key.
+  a random data key is stored only wrapped by a per-file key-encryption key, itself derived from
+  a host-supplied key or a passphrase.
   Credential changes rewrap the data key in a dedicated double-buffered key block, never in the
   per-commit meta slots; data-key rotation, and encrypting or decrypting an existing file, is
   compaction under a new key.
@@ -634,8 +635,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   key as the first-class credential; live VM clones are excluded from the threat model; every
   process of an encrypted database (owner, page client, SSH page server) holds the key; browser
   performance does not decide the suite. Suite direction, pending security review: AES-256-GCM
-  with one key derived per page from a fresh random salt, because AES-GCM and the AES block are
-  in every platform standard library and XChaCha20-Poly1305 is in none; the derivation is
+  with one key derived per page from a fresh random salt, because AES-GCM is in every platform
+  standard library and the raw AES block in every one but CryptoKit (Swift leans wrap), while
+  XChaCha20-Poly1305 is in none; the derivation is
   **XAES-256-GCM** (C2SP) as the primary candidate, with a jed-specific HKDF-SHA-256 layout as
   the fallback (encryption.md §3.1). AES-GCM-SIV fails more gracefully under duplicated
   randomness (a live VM clone, which a kernel CSPRNG does not by itself survive) and is declined

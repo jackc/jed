@@ -657,9 +657,9 @@ same order as the synchronous one, each awaited before the next begins:
 
 A rejection from any awaited write, barrier or encoding after step 2 leaves the guard armed: the
 handle is poisoned until reopen, exactly like a synchronous I/O error. Encoding happens after the
-guard is armed, so an encode failure is a post-guard failure. A codec that must reserve
-per-commit state (for example a nonce range) does so before the guard, as part of the nonce
-protocol encryption.md §3 still has to choose. A failed cap flush revokes the storage (§4 of
+guard is armed, so an encode failure is a post-guard failure. The codec reserves no per-commit
+state: every seal draws a fresh random salt in the canonical order encryption.md §4 fixes, after
+the pre-write checks and before sealing begins. A failed cap flush revokes the storage (§4 of
 validated-cow.md); a failed shrink is ignored. Trailing truncation awaits its shrink only after
 the barrier that covers the newest generation.
 
@@ -710,8 +710,8 @@ above the byte device and below the page cache (hosts.md §6). It offers `encode
 
 - `decode` returns exactly the logical page bytes `encode` received. Page CRCs, manifest
   digests, the live-page count and the page cache all operate on those plaintext bytes
-  (validated-cow.md §5) in the plaintext format; the encrypted variant moves the CRC and the
-  manifest digests after `encode` (encryption.md §4), and carries the child's tag across the
+  (validated-cow.md §5) in the plaintext format; the encrypted variant moves the manifest
+  digests after `encode` and drops the body-page CRC (encryption.md §4), and carries the child's tag across the
   seam — `encode` returns it so the parent can bind it, `decode` takes the expected one from the
   pointer (encryption.md §4.1) — which are the two changes this seam takes with that format
   version. The cache inserts a decoded page only after its read resumed.
