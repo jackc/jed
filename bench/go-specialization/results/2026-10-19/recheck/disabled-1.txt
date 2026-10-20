@@ -1,0 +1,15 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkSpecialization/memory/point_miss-24         	  286920	       954.4 ns/op	2166136261 checksum	2166136261 checksum1	         2.000 cost	         2.000 cost1	    1360 B/op	      15 allocs/op
+BenchmarkSpecialization/memory/scalar-24             	  434709	       609.6 ns/op	 393503400 checksum	 410281019 checksum1	         2.000 cost	         2.000 cost1	    1352 B/op	      12 allocs/op
+BenchmarkSpecialization/memory/columnar-24           	    3562	     73264 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+BenchmarkSpecialization/memory/adhoc-24              	   30142	     10309 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13604 B/op	     116 allocs/op
+BenchmarkSpecialization/memory/first_call-24         	   29038	     10141 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13989 B/op	     119 allocs/op
+BenchmarkSpecialization/file/point_miss-24           	  330008	       924.3 ns/op	2166136261 checksum	2166136261 checksum1	         2.000 cost	         2.000 cost1	    1360 B/op	      15 allocs/op
+BenchmarkSpecialization/file/scalar-24               	  494883	       595.7 ns/op	 393503400 checksum	 410281019 checksum1	         2.000 cost	         2.000 cost1	    1352 B/op	      12 allocs/op
+BenchmarkSpecialization/file/columnar-24             	    5904	     57101 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+BenchmarkSpecialization/file/adhoc-24                	   32113	      9425 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13603 B/op	     116 allocs/op
+BenchmarkSpecialization/file/first_call-24           	   30350	      9613 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   13987 B/op	     119 allocs/op
+PASS

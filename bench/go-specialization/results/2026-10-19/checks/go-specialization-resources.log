@@ -1,0 +1,65 @@
+[experiment:go-specialization] $ ~/.codex/worktrees/214f/jed/mise-tasks/experim…
+PASS resource/composite_depth.test
+PASS resource/cost_limit.test
+PASS resource/depth_limit.test
+PASS resource/dos_amplification.test
+PASS resource/identifier_length.test
+PASS resource/input_size_limit.test
+PASS resource/json_depth_limit.test
+PASS resource/jsonpath_cost.test
+PASS resource/no_escape_hatch.test
+PASS resource/operand_resolution.test
+PASS resource/query_memory.test
+PASS resource/query_memory_eager.test
+PASS resource/query_memory_pending.test
+SKIP resource/query_memory_spill.test  (memory-mode)
+PASS resource/query_memory_state.test
+PASS resource/query_memory_transient.test
+PASS resource/regex_program_limit.test
+PASS resource/scalar_memory.test
+PASS resource/scalar_output.test
+PASS resource/scalar_output_extract.test
+PASS resource/scalar_output_formatting.test
+PASS resource/scalar_output_json.test
+PASS resource/scalar_output_regexp.test
+PASS resource/scalar_output_render.test
+PASS resource/scalar_output_text_build.test
+SKIP resource/storage_file.test  (memory-mode)
+PASS resource/storage_memory.test
+PASS resource/temp_budget.test
+PASS resource/view_depth_limit.test
+PASS resource/view_expansion_limit.test
+
+[memory] 28 passed, 0 failed, 2 skipped
+PASS resource/composite_depth.test
+PASS resource/cost_limit.test
+PASS resource/depth_limit.test
+PASS resource/dos_amplification.test
+PASS resource/identifier_length.test
+PASS resource/input_size_limit.test
+PASS resource/json_depth_limit.test
+PASS resource/jsonpath_cost.test
+PASS resource/no_escape_hatch.test
+PASS resource/operand_resolution.test
+PASS resource/query_memory.test
+SKIP resource/query_memory_eager.test  (disk-mode)
+SKIP resource/query_memory_pending.test  (disk-mode)
+PASS resource/query_memory_spill.test
+SKIP resource/query_memory_state.test  (disk-mode)
+SKIP resource/query_memory_transient.test  (disk-mode)
+PASS resource/regex_program_limit.test
+PASS resource/scalar_memory.test
+PASS resource/scalar_output.test
+PASS resource/scalar_output_extract.test
+PASS resource/scalar_output_formatting.test
+PASS resource/scalar_output_json.test
+PASS resource/scalar_output_regexp.test
+PASS resource/scalar_output_render.test
+PASS resource/scalar_output_text_build.test
+PASS resource/storage_file.test
+SKIP resource/storage_memory.test  (disk-mode)
+SKIP resource/temp_budget.test  (disk-mode)
+PASS resource/view_depth_limit.test
+PASS resource/view_expansion_limit.test
+
+[disk] 24 passed, 0 failed, 6 skipped

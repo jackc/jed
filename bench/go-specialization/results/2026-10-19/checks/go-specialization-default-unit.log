@@ -1,0 +1,5 @@
+[unit:go] $ go test ./...
+ok  	github.com/jackc/jed/impl/go	1.914s
+ok  	github.com/jackc/jed/impl/go/cmd/conformance	0.014s
+ok  	github.com/jackc/jed/impl/go/cmd/mutate	(cached)
+?   	github.com/jackc/jed/impl/go/cmd/process_actor	[no test files]
