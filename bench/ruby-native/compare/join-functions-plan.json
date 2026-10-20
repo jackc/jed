@@ -1,0 +1,126 @@
+{
+  "schema": 1,
+  "description": "Explicit prepared JOIN builtin resolution comparison: ten unchanged admission workloads plus three bounded builtin placements.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {
+      "name": "scalar",
+      "sql": "SELECT abs($1::i64) + 7",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": -999,
+      "step": 17,
+      "span": 2000
+    },
+    {
+      "name": "pk_hit",
+      "sql": "SELECT score FROM items WHERE id = $1",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "indexed_join",
+      "sql": "SELECT a.label, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id LIMIT 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_join",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 1000,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_join_miss",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 101,
+      "name": "three_table_join_range",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id < $1 AND b.id < $1 AND c.id < $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_computed_key",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id % 10 JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id < 10 AND c.id < 10 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "four_table_join",
+      "sql": "SELECT a.id, b.score, c.label, d.bucket FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id JOIN items d ON d.id = c.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 AND d.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_left_fence",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id LEFT JOIN items c ON c.id = b.id AND c.bucket <> 3 WHERE a.id = $1 AND b.id = $1 ORDER BY a.id"
+    },
+    {
+      "name": "join_residual",
+      "sql": "SELECT a.id,b.id FROM items a JOIN items b ON b.bucket=a.bucket AND abs(b.score-a.score)<50 WHERE a.id<$1 AND b.id<$1 ORDER BY a.id,b.id",
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 10,
+      "step": 17,
+      "span": 91
+    },
+    {
+      "name": "join_text_predicate",
+      "sql": "SELECT a.id,b.id FROM items a JOIN items b ON b.id=a.id AND length(b.label)>=4 WHERE a.id=$1 AND b.id=$1 ORDER BY a.id,b.id",
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "join_text_projection",
+      "sql": "SELECT a.id,lower(b.label) FROM items a JOIN items b ON b.id=a.id WHERE a.id=$1 AND b.id=$1 ORDER BY a.id",
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "join_integer_outputs",
+      "sql": "SELECT a.id,abs(b.score-a.score) FROM items a JOIN items b ON b.id=a.id WHERE a.id=$1 AND b.id=$1 AND abs(b.score)>=0 ORDER BY abs(a.id)",
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    }
+  ]
+}
