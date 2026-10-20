@@ -125,7 +125,7 @@ module JedNative
           states.dup.each do |state|
             ordinals.each do |ordinal|
               next if state[:mask][ordinal] == 1
-              nway_extensions(context, state, ordinal, frontier: frontier).each { |candidate| nway_retain(frontier, candidate) }
+              nway_extensions(context, state, ordinal).each { |candidate| nway_retain(frontier, candidate) }
             end
           end
         end
@@ -164,18 +164,9 @@ module JedNative
       [scope, expressions, gates, keys, kind, indexes, ready.map { |entry| entry[:ast] }]
     end
 
-    def nway_strictly_dominated?(states, cost, rows, logical)
-      states.any? do |prior|
-        prior[:cost] <= cost && prior[:rows] <= rows && prior[:logical] <= logical &&
-          (prior[:cost] < cost || prior[:rows] < rows || prior[:logical] < logical)
-      end
-    end
-
-    def nway_extensions(context, state, ordinal, fixed: false, frontier: nil)
+    def nway_extensions(context, state, ordinal, fixed: false)
       scope, expressions, gates, keys, kind, indexes, ons = nway_extension_inputs(context, state, ordinal, fixed: fixed)
       mask = state[:mask] | (1 << ordinal)
-      ordered = state[:ordered] && !fixed
-      prior_states = frontier[[mask, ordered ? 1 : 0]] if frontier && !@native_nway_frontier_disabled
       indexes = indexes.map do |index|
         index = index.merge(access: index[:access].dup)
         index[:access][:pipeline_cost] = index[:access][:scan_cost] + index[:access][:scan_rows] * expression_work(index[:filter])
@@ -188,7 +179,7 @@ module JedNative
       end
       choices = [] if fixed && !indexes.empty?
       indexes.each { |index| choices << [index[:access], :index, index] }
-      choices.filter_map do |access, algorithm, bound|
+      choices.map do |access, algorithm, bound|
         pairs = [state[:rows] * access[:output_rows], QueryPlans::MAX_ESTIMATE].min
         logical = algorithm == :index ? pairs : [state[:logical] * access[:logical_rows], QueryPlans::MAX_ESTIMATE].min
         rows = pairs
@@ -204,12 +195,8 @@ module JedNative
                  work: expressions.sum { |expression| expression_work(expression) }, input_rows: state[:rows], rows: rows, logical: logical, pairs: pairs,
                  prefix_cost: state[:cost], access: access }
         step[:cost] = nway_step_cost(step, state[:rows], rows)
-        # This bucket predates the whole extension batch. Keep all estimation
-        # work in order; only omit state vectors that strict dominance makes
-        # unnecessary. Exact triples still use the ordinary structural tie-break.
-        next if prior_states && nway_strictly_dominated?(prior_states, step[:cost], rows, logical)
         { order: state[:order] + [ordinal], mask: mask, accesses: state[:accesses] + [access], steps: state[:steps] + [step],
-          cost: step[:cost], rows: rows, logical: logical, ordered: ordered }
+          cost: step[:cost], rows: rows, logical: logical, ordered: state[:ordered] && !fixed }
       end
     end
 
