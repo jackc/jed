@@ -1,0 +1,90 @@
+{
+  "schema": 1,
+  "description": "Explicit multiway join-resolution reuse experiment on the unchanged 1000-row fixture. Scalar, PK, two-table indexed_join and historical three_table_join retain exact prior SQL and schedules. New hit/miss, computed-key and four-table shapes restrict every input by a primary-key equality. The three-table range explicitly bounds every input to at most 100 rows. The multiway LEFT fence is an unsupported cache control with at most one primary-key match and preserves NULL extension. All results are completely drained; exact values, metadata and costs are checked against the Rust Ruby binding before timing.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 32,
+  "workloads": [
+    {
+      "name": "scalar",
+      "sql": "SELECT abs($1::i64) + 7",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": -999,
+      "step": 17,
+      "span": 2000
+    },
+    {
+      "name": "pk_hit",
+      "sql": "SELECT score FROM items WHERE id = $1",
+      "iterations": 2000,
+      "warmup": 300,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "name": "indexed_join",
+      "sql": "SELECT a.label, b.score FROM items a JOIN items b ON b.id = a.id AND b.bucket <> 3 WHERE a.id = $1 ORDER BY b.id LIMIT 1",
+      "iterations": 50,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_join",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 1000,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_join_miss",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 101,
+      "name": "three_table_join_range",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id WHERE a.id < $1 AND b.id < $1 AND c.id < $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_computed_key",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id + 1 JOIN items c ON c.id = b.id WHERE a.id = $1 AND b.id = $1 + 1 AND c.id = $1 + 1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "four_table_join",
+      "sql": "SELECT a.id, b.score, c.label, d.bucket FROM items a JOIN items b ON b.id = a.id JOIN items c ON c.id = b.id JOIN items d ON d.id = c.id WHERE a.id = $1 AND b.id = $1 AND c.id = $1 AND d.id = $1 ORDER BY a.id"
+    },
+    {
+      "iterations": 20,
+      "warmup": 100,
+      "offset": 0,
+      "step": 17,
+      "span": 1000,
+      "name": "three_table_left_fence",
+      "sql": "SELECT a.id, b.score, c.label FROM items a JOIN items b ON b.id = a.id LEFT JOIN items c ON c.id = b.id AND c.bucket <> 3 WHERE a.id = $1 AND b.id = $1 ORDER BY a.id"
+    }
+  ]
+}

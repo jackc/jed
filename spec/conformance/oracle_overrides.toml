@@ -1634,6 +1634,36 @@ reason = "jed: two contexts inferring different types (i32 and text) for one par
 
 [[override]]
 file = "params/binding.test"
+sql = "SELECT id FROM narrow WHERE s = $1 OR id = $1"
+params = "40000"
+reason = "jed unifies repeated scalar integer parameter constraints at their widest width (api.md §5): the i16 and i32 uses bind i32, and comparing 40000 with the i16 column returns no match. PostgreSQL binds $1 as smallint from its first use and raises 22003 at EXECUTE."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT id FROM narrow WHERE id = $1 OR $1 = 5"
+params = "2147483648"
+reason = "jed's two bare adaptable operands default locally to i64; that use widens the repeated i32 parameter constraint to i64 (api.md §5), so 2147483648 is a valid binding and matches no row. PostgreSQL retains its first integer parameter type and raises 22003 at EXECUTE."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT id FROM narrow_key WHERE id = $1 AND $1 < 100000"
+params = "40000"
+reason = "jed widens the repeated parameter's i16 key context with its bare-literal i64 context (api.md §5), so 40000 is a valid binding and an out-of-range indexed-key miss. PostgreSQL retains its first smallint parameter type and raises 22003 at EXECUTE."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT id FROM narrow_key WHERE id = $1 AND $1 < 100000"
+params = "-40000"
+reason = "jed widens the repeated parameter's i16 key context with its bare-literal i64 context (api.md §5), so -40000 is a valid binding and an out-of-range indexed-key miss. PostgreSQL retains its first smallint parameter type and raises 22003 at EXECUTE."
+
+[[override]]
+file = "params/binding.test"
+sql = "SELECT id FROM narrow WHERE s = $1 AND $1 = $2"
+params = "40000, 40000"
+reason = "jed gives two bare integer parameters an i64 local context, widening $1's other i16 constraint (api.md §5). Both 40000 bindings are valid and the i16 comparison matches no row. PostgreSQL infers smallint from $1's first use, propagates it to $2, and raises 22003 at EXECUTE."
+
+[[override]]
+file = "params/binding.test"
 sql = "SELECT id FROM t WHERE id = $0"
 reason = "jed's lexer accepts only $1-based indices without leading zeros, so $0 is a 42601 syntax error (grammar.md §5). PostgreSQL lexes $0 as a parameter and reports it absent, 42P02."
 

@@ -148,7 +148,7 @@ module JedNative
       states.sort_by! { |state| nway_state_key(state) }
     end
 
-    def nway_extensions(context, state, ordinal, fixed: false)
+    def nway_extension_inputs(context, state, ordinal, fixed:)
       mask = state[:mask] | (1 << ordinal)
       ready = context[:predicates].select { |entry| entry[:dependencies] & mask == entry[:dependencies] && entry[:dependencies] & state[:mask] != entry[:dependencies] }
       left_scope = state[:order].flat_map { |i| context[:scopes][i] }
@@ -161,6 +161,12 @@ module JedNative
       source = context[:sources][ordinal].merge(native_original_on: gate, native_join_where: context[:where])
       indexes = join_index_plan(Relation.new(columns: left_scope, rows: []), source, kind, join_conjunctions(ready.map { |entry| entry[:ast] }), nil, choose: false, all: !fixed)
       indexes = fixed ? [indexes].compact : indexes || []
+      [scope, expressions, gates, keys, kind, indexes, ready.map { |entry| entry[:ast] }]
+    end
+
+    def nway_extensions(context, state, ordinal, fixed: false)
+      scope, expressions, gates, keys, kind, indexes, ons = nway_extension_inputs(context, state, ordinal, fixed: fixed)
+      mask = state[:mask] | (1 << ordinal)
       indexes = indexes.map do |index|
         index = index.merge(access: index[:access].dup)
         index[:access][:pipeline_cost] = index[:access][:scan_cost] + index[:access][:scan_rows] * expression_work(index[:filter])
@@ -185,7 +191,7 @@ module JedNative
         end
         rows, logical = [rows, state[:rows]].max, [logical, state[:logical]].max if %i[left left_outer full full_outer].include?(kind)
         rows, logical = [rows, access[:output_rows]].max, [logical, access[:logical_rows] || access[:output_rows]].max if %i[right right_outer full full_outer].include?(kind)
-        step = { algorithm: algorithm, index: bound, keys: keys, kind: kind, ons: ready.map { |entry| entry[:ast] }, gates: gates,
+        step = { algorithm: algorithm, index: bound, keys: keys, kind: kind, ons: ons, gates: gates,
                  work: expressions.sum { |expression| expression_work(expression) }, input_rows: state[:rows], rows: rows, logical: logical, pairs: pairs,
                  prefix_cost: state[:cost], access: access }
         step[:cost] = nway_step_cost(step, state[:rows], rows)

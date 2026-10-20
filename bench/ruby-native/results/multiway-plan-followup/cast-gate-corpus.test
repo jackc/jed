@@ -1,0 +1,264 @@
+# The broader safe-conjunct gate (spec/design/planner.md §3.5) and widened set-operation arms (§3.6).
+# A WHERE or ON conjunct over one relation moves to that relation (into its scan, or into a derived
+# body) when it cannot trap: besides comparisons and null tests over bare columns, it may call the
+# casts and built-in functions the catalog classifies `traps = false` (functions.md §15) and a LIKE /
+# ILIKE whose literal pattern has no unpaired trailing escape. A conjunct over a set operation moves
+# into an arm the set operation widens, reading the arm's column through the widening. Rows are
+# PostgreSQL's (PostgreSQL pushes the same quals); the `# cost:` pins are jed's cross-core contract:
+# a pushed conjunct, casts and functions included, charges per row of its relation.
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.column_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_full, query.union, query.derived_table, query.point_lookup, query.join_pushdown, query.hash_join, query.index_nested_loop, query.where_pushdown, query.derived_pushdown, query.on_pushdown, query.safe_conjunct_gate, query.is_null, expr.like, expr.ilike, func.casing, cast.explicit, cast.scalar_text, null.three_valued, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, s text, k i32, d decimal, f f64)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, aid i32, w i32)
+
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, v f32)
+
+statement ok
+CREATE TABLE n (id i64 PRIMARY KEY)
+
+statement ok
+INSERT INTO a VALUES (1, 'alpha', 1, 1.5, 0.5), (2, 'Beta', 2, 2.50, -1.25), (3, 'ab', 3, NULL, 2.0), (4, NULL, NULL, 1.50, NULL), (5, 'abcde', 2, 3, 1.5), (6, 'a\b', 1, 0.10, 4.0)
+
+statement ok
+INSERT INTO b VALUES (10, 1, 100), (11, 2, 200), (12, 3, 300), (13, 5, 500), (14, 5, 501), (15, 7, 700), (16, 4, 4000), (17, 6, 60)
+
+statement ok
+INSERT INTO r VALUES (1, 0.5), (2, 1.25), (3, NULL), (4, 3.5)
+
+statement ok
+INSERT INTO n VALUES (2), (5000000000)
+
+# A non-trapping function of one relation's column runs as that relation is read.
+# cost: 56
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE length(a.s) > 3 ORDER BY b.w
+----
+1
+100
+2
+200
+5
+500
+5
+501
+
+# The text case folders are classified too.
+# cost: 49
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE lower(a.s) = 'beta' ORDER BY b.w
+----
+2
+200
+
+# A boolean function is a conjunct by itself.
+# cost: 41
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE starts_with(a.s, 'ab') ORDER BY b.w
+----
+3
+300
+5
+500
+5
+501
+
+# A LIKE with a literal pattern that cannot trap moves, over a classified function as well.
+# cost: 44
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE upper(a.s) LIKE 'AB%' AND b.w > 100 ORDER BY b.w
+----
+3
+300
+5
+500
+5
+501
+
+# cost: 33
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.s NOT ILIKE '%B%' ORDER BY b.w
+----
+1
+100
+
+# A pattern whose escape pairs with the next character is safe: 'a\\b' matches the literal 'a\b'.
+# cost: 31
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.s LIKE 'a\\b' ORDER BY b.w
+----
+6
+60
+
+# A pattern ending in a lone escape is not proven, so it stays in the residual, where it raises
+# 22025 as the join's rows reach it.
+statement error 22025
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.s LIKE 'ab\'
+
+# Non-trapping casts: an integer to text, decimal, and f64.
+# cost: 47
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.k AS text) = '2' ORDER BY b.w
+----
+2
+200
+5
+500
+5
+501
+
+# cost: 59
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.k AS decimal) >= 2 AND CAST(a.k AS f64) < 3 ORDER BY b.w
+----
+2
+200
+5
+500
+5
+501
+
+# A decimal render separates 1.5 from 1.50; on a scan that only filters rows, it is still safe.
+# cost: 48
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.d AS text) = '1.50' ORDER BY b.w
+----
+4
+4000
+
+# ... and so it is in a derived body that matches no rows.
+# cost: 32
+query ID nosort
+SELECT q.id, q.d FROM (SELECT id, d FROM a) q WHERE CAST(q.d AS text) = '1.50' ORDER BY q.id
+----
+4
+1.50
+
+# An ON conjunct over the NULL-extended side of a LEFT JOIN moves to that side.
+# cost: 83
+query II nosort
+SELECT a.id, b.w FROM a LEFT JOIN b ON a.id = b.aid AND length(CAST(b.w AS text)) = 3 ORDER BY a.id, b.w
+----
+1
+100
+2
+200
+3
+300
+4
+NULL
+5
+500
+5
+501
+6
+NULL
+
+# FULL JOIN preserves both sides, so its ON keeps the conjunct.
+# cost: 137
+query II nosort
+SELECT a.id, b.w FROM a FULL JOIN b ON a.id = b.aid AND length(a.s) > 3 ORDER BY a.id, b.w
+----
+1
+100
+2
+200
+3
+NULL
+4
+NULL
+5
+500
+5
+501
+6
+NULL
+NULL
+60
+NULL
+300
+NULL
+700
+NULL
+4000
+
+# Widened set-operation arms: an i32 arm under an i64 output takes the conjunct as written, and seeks
+# its primary key with a value beyond its own range (finding nothing).
+# cost: 5
+query I nosort
+SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM n) s WHERE s.id = 5000000000
+----
+5000000000
+
+# An i32 arm under a decimal output reads its column through CAST(… AS decimal).
+# cost: 49
+query D nosort
+SELECT s.x FROM (SELECT k AS x FROM a UNION SELECT d FROM a WHERE d <> 1.5) s WHERE s.x >= 2 ORDER BY s.x
+----
+2
+2.50
+3
+
+# Nested: the inner set operation is i32, the outer decimal; the conversion composes.
+# cost: 61
+query D nosort
+SELECT s.x FROM ((SELECT k AS x FROM a UNION ALL SELECT w FROM b) UNION ALL SELECT d FROM a) s WHERE s.x = 2 ORDER BY s.x
+----
+2
+2
+
+# An f32 arm under an f64 output reads its column through CAST(… AS f64): 1.25 widens exactly.
+# cost: 51
+query R nosort
+SELECT s.v FROM (SELECT v FROM r UNION ALL SELECT f FROM a) s WHERE s.v > 1 AND s.v <> 1.25 ORDER BY s.v
+----
+1.5
+2
+3.5
+4
+
+# cost: 55
+query R nosort
+SELECT s.v FROM (SELECT v FROM r UNION SELECT f FROM a) s WHERE s.v IS NULL OR s.v < 1 ORDER BY s.v
+----
+-1.25
+0.5
+NULL
+
+# The planner classifies only explicitly non-trapping catalog cast pairs. An identity
+# cast has no such row: neither its parameter nor column form moves into a scan.
+# params: 2
+# cost: 46
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.id = CAST($1 AS i32) ORDER BY b.w
+----
+2
+200
+
+# params: 2
+# cost: 46
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.id AS i32) = $1 ORDER BY b.w
+----
+2
+200
+
+# The matching literal-cast form keeps the same residual cost.
+# cost: 46
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE a.id = CAST(2 AS i32) ORDER BY b.w
+----
+2
+200
+
+# An explicitly classified widening cast still pushes and charges on each base row.
+# params: 2
+# cost: 37
+query II nosort
+SELECT a.id, b.w FROM a JOIN b ON a.id = b.aid WHERE CAST(a.id AS i64) = $1 ORDER BY b.w
+----
+2
+200
