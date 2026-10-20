@@ -5482,8 +5482,29 @@ def gen_row_materialization(seed)
   out.join("\n") + "\n"
 end
 
+# A G1 typed root versus a CASE-wrapped complete root (always ordinary in G1).
+# Expected answers come from nullable integer arithmetic, not either evaluator.
+def gen_execution_specialization(seed)
+  rng = Random.new(seed)
+  rows = (1..24).map { |id| [id, rng.rand(4).zero? ? nil : rng.rand(-20..20), rng.rand(-10..10)] }
+  lit = ->(v) { v.nil? ? "NULL" : v.to_s }
+  out = header(seed, PREDICATE_REQ + %w[expr.case], "typed execution roots versus CASE fallback")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |r| "(#{r.map(&lit).join(',')})" }.join(',')}")
+  expected = rows.flat_map { |id, a, b| [id.to_s, lit.call(a.nil? ? nil : (a + b) * (a - b))] }
+  ["(a+b)*(a-b)", "CASE WHEN id > 0 THEN (a+b)*(a-b) ELSE 0 END"].each do |expr|
+    q(out, "II", "SELECT id, #{expr} FROM t ORDER BY id", expected)
+  end
+  survivors = rows.select { |_id, a, b| !a.nil? && a + b > 5 }.map { |id, _a, _b| id.to_s }
+  ["a+b > 5", "CASE WHEN a+b > 5 THEN true ELSE false END"].each do |predicate|
+    q(out, "I", "SELECT id FROM t WHERE #{predicate} ORDER BY id", survivors)
+  end
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "row_materialization" => method(:gen_row_materialization),
+  "execution_specialization" => method(:gen_execution_specialization),
   "pushdown" => method(:gen_pushdown),
   "composite_pk" => method(:gen_composite_pk),
   "limit" => method(:gen_limit),

@@ -1,0 +1,143 @@
+{
+  "revision": "dfb0699f18e7c5bb120bc0f885f257791b19e2b9",
+  "go": "go version go1.27.1 linux/amd64",
+  "cpu": "Intel(R) Core(TM) Ultra 9 285K",
+  "commands": [
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/clean.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/ordinary.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/selective.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/selective.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/ordinary.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/clean.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/clean.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/ordinary.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/selective.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/selective.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/ordinary.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/clean.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/clean.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/ordinary.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ],
+    [
+      "/home/jack/.codex/worktrees/214f/jed/bench/results/go-specialization/selective.test",
+      "-test.run=^$",
+      "-test.bench=^BenchmarkSpecialization$",
+      "-test.benchmem",
+      "-test.benchtime=100ms",
+      "-test.count=1"
+    ]
+  ],
+  "env": {},
+  "sources": {
+    "impl/go/specialization.go": "10ef81a5206e063c08bfba8ff7ea9c90934cf1611495022f2f97ea42882ae799",
+    "impl/go/specialization_bench_test.go": "a7c65b3e6c01f9b2f7c448baa776c746b97f4cf05ecd572042fd6f3c6f73e46c",
+    "impl/go/specialization_diagnostics.go": "6141653b911be5280f1ffa477a812115a4f17af435a9aeba09e98db601cead7b",
+    "impl/go/specialization_diagnostics_off.go": "2cd105af995b2f46a6048979c082259c9ddbcaf17c72b26fb178b5fbb6495a1c",
+    "impl/go/specialization_diagnostics_test.go": "ad7ce2bd1b83da7151b1651da0262342885354f67a2f1e78438f2e12a87c018a",
+    "impl/go/specialization_mode_forced.go": "dfd558046a33879a992b502aecd12542f6f7bbadfa761eeb4b540ee4e4565f6e",
+    "impl/go/specialization_mode_ordinary.go": "60e867021c027fafb120416ae8ea5a4ec5ce09caf6546cc64ba1c225c072600e",
+    "impl/go/specialization_mode_selective.go": "9ab29b98f790e5dfe1f7ca53acad994e5fdb276becc8ec4cdb15d1722d12791d",
+    "impl/go/specialization_off.go": "762ccf3e939b0609d013e75acd35816b25eabf3d9a22057fa7b9160d9096d7f7",
+    "impl/go/specialization_test.go": "676ca6699c0a2a4d523367737a03bd31c66b49d884bc9613bd15f67a0a116f34",
+    "impl/go/exec_scan.go": "081b4ec646e660d23c849d5da0194fddc2fbb243dfa95225249a8531c268b745",
+    "impl/go/rexpr.go": "5f58d0c9e95cba6aafe00b94b276e59069ca768f704a55141f1bc98669c6cbcb",
+    "mise-tasks/experiment/go-specialization": "a540cda997565d2ba10380b7ed1f63da9a8e85ab21e91e87e6669d4ae0927d9b"
+  }
+}

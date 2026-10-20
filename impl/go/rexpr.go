@@ -1837,6 +1837,7 @@ type orderSlot struct {
 // selectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
 // of the old runSelect, lifted to a value so a correlated subquery can re-run it per outer row).
 type selectPlan struct {
+	specializationPlan
 	rels      []planRel
 	joins     []planJoin
 	filter    *rExpr

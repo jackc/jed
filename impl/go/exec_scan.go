@@ -351,6 +351,7 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 			if plan.sel == nil {
 				return nil, false, nil
 			}
+			db.prepareSpecialization(plan.sel, c.ptys)
 			if c.sensitive && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(plan.sel) {
 				c.memo.put(key, plan.sel)
 				return db.buildScanRows(plan.sel, c.resultTypes, bound, false)
@@ -391,6 +392,10 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 		}
 		sp = custom.sel
 		customReusable = sensitive && !cp.uncacheable && db.planCacheable(sp)
+	}
+	db.prepareSpecialization(probe, ptys)
+	if sp != probe {
+		db.prepareSpecialization(sp, ptys)
 	}
 	// The frame stops answering before a plan is shared.
 	planning.end()
@@ -617,7 +622,13 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 			if at >= 0 {
 				c.ahead.setRow(c.ahead.filter, at, c.env, c.meter)
 			}
-			v, err := c.plan.filter.evalFilter(row, filterEnv, c.meter)
+			var v bool
+			if k := c.plan.filterKernel(); k != nil {
+				value, evalErr := k.eval(row, filterEnv, c.meter)
+				v, err = value.IsTrue(), evalErr
+			} else {
+				v, err = c.plan.filter.evalFilter(row, filterEnv, c.meter)
+			}
 			if err != nil {
 				return nil, false, err
 			}
@@ -665,7 +676,12 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		}
 		projected := make([]Value, len(c.plan.projections))
 		for i, p := range c.plan.projections {
-			v, err := p.eval(row, projectEnv, c.meter)
+			var v Value
+			if k := c.plan.projectionKernel(i); k != nil {
+				v, err = k.eval(row, projectEnv, c.meter)
+			} else {
+				v, err = p.eval(row, projectEnv, c.meter)
+			}
 			if err != nil {
 				return nil, false, err
 			}
