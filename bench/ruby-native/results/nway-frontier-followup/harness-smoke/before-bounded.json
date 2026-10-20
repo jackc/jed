@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/nway_frontier_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-nway-frontier-smoke-before.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 323252224,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 42.797057340008905,
+  "source": "/tmp/jed-nway-frontier-before/impl/ruby-native",
+  "source_sha256": "66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341",
+  "final_source_sha256": "66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "N-way frontier yjit: 128 memory/file API/policy groups passed\n",
+  "stderr": ""
+}
