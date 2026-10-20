@@ -31,6 +31,8 @@ stack-depth, and cost defects. The later
 nested spill-preflight results and external collection in the conformance adapter.
 The [LIKE follow-up](LIKE_FOLLOWUP.md) records another complete zero-failure audit
 after extending compilation to simple literal LIKE predicates.
+The [method-sharing follow-up](METHOD_SHARING_FOLLOWUP.md) reuses generated methods
+across independent constant pools through a bounded process cache.
 The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)

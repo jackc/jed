@@ -12,6 +12,7 @@ module JedNative
     MAX_SOURCE_BYTES = 32_768
     MAX_POOL = 256
     MAX_POOL_BYTES = 32_768
+    MAX_METHOD_CACHE_ENTRIES = 64
     TYPES = %w[i16 i32 i64 boolean text null unknown].freeze
     BOOLEAN_TYPES = %w[boolean null unknown].freeze
     COMPARISONS = { '=' => '==', '<>' => '!=', '!=' => '!=', '<' => '<',
@@ -58,6 +59,57 @@ module JedNative
       end
     end
 
+    # Literal pools belong to individual kernels, while identical templates can
+    # share a Ruby method and its JIT compilation across plans and sessions. The
+    # process cache owns only fixed source and generated classes, never a pool or
+    # execution context. Ruby may retain JIT code after an entry is evicted.
+    class MethodCache
+      State = Struct.new(:pid, :mutex, :entries)
+      private_constant :State
+
+      def initialize
+        @state = State.new(Process.pid, Mutex.new, {}).freeze
+      end
+
+      def fetch(kernel_class, source, filename)
+        # Normal emitters already enforce this limit. Keep direct internal
+        # Program construction from retaining an oversized cache key as well.
+        return compile(kernel_class, source, filename) if source.bytesize > MAX_SOURCE_BYTES
+        source = ::String.new(source).freeze
+
+        pid = Process.pid
+        state = @state
+        if state.pid != pid
+          # Never acquire an inherited mutex: its owner may not exist after a
+          # fork. Publish a complete replacement rather than mutate old state.
+          replacement = State.new(pid, Mutex.new, {}).freeze
+          @state = replacement if @state.pid != pid
+          state = @state
+        end
+        state.mutex.synchronize do
+          key = [kernel_class, source]
+          if (klass = state.entries.delete(key))
+            state.entries[key.freeze] = klass
+            return klass
+          end
+          klass = compile(kernel_class, source, filename)
+          state.entries.shift if state.entries.length >= MAX_METHOD_CACHE_ENTRIES
+          state.entries[[kernel_class, source].freeze] = klass
+          klass
+        end
+      end
+
+      private
+
+      def compile(kernel_class, source, filename)
+        klass = Class.new(kernel_class)
+        klass.class_eval(source, filename, 1)
+        klass.freeze
+      end
+    end
+    METHOD_CACHE = MethodCache.new
+    private_constant :MethodCache, :METHOD_CACHE
+
     # Emission can be compared and cached before asking Ruby to compile it.
     # prepare_many only admits complete supported trees, so its pool contains
     # immutable scalar data and never a resolved expression or execution state.
@@ -71,8 +123,13 @@ module JedNative
       end
 
       def materialize
-        klass = Class.new(Kernel)
-        klass.class_eval(@source, '(jed compiled expression)', 1)
+        materialize_with(Kernel, '(jed compiled expression)')
+      end
+
+      private
+
+      def materialize_with(kernel_class, filename)
+        klass = METHOD_CACHE.fetch(kernel_class, @source, filename)
         klass.new(@source, @node_count, @pool)
       end
     end
