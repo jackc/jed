@@ -462,7 +462,9 @@ database-level **`synchronous`** setting governs *when* the fsync fires relative
     process alone loses no acknowledged commit;
   - a flush happens when a batch reaches the **cap** (its pending pages fill one page's worth of
     manifest entries), on `close`, before a page client's write transaction is granted the owner's
-    gate, and at compaction or the stabilization of an adopted generation; the cap flush runs on a
+    gate, at compaction or the stabilization of an adopted generation, and (in an encrypted
+    database) at a credential change, whose key-block barriers are whole-file syncs
+    ([encryption.md](encryption.md) §6); the cap flush runs on a
     background goroutine/thread in Go and Rust and inline in TypeScript, and the next commit waits for
     it, so every core writes the same bytes;
   - while a batch is pending, commits reuse only pages already free at the last flush (a page the
