@@ -104,6 +104,14 @@ call-bearing roots receive a bounded plain-scalar validation before retention;
 warm hits keep the existing lookup path. A rejected current root also prevents
 physical-plan publication for that execution. Existing cache limits and
 parameter-sensitive planning remain in force.
+The [indexed-JOIN bounds follow-up](../../impl/ruby-native/JOIN_BOUNDS_FOLLOWUP.md)
+reuses comparison descriptors within an execution of an ordinary primary or
+secondary indexed JOIN. Private plan/access copies attempt bounded admission
+at the second probe; retained physical plans hold no execution state.
+Current bound evaluation, normalization, encoding, costs and errors stay in
+the original scan loops. Known zero/singleton inputs skip setup, unusual
+metadata keeps the ordinary path, and descriptors are bounded by 32 keys,
+192 expression nodes and 4,096 units. This adds no SQL or host API behavior.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
