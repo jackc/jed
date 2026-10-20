@@ -619,6 +619,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   kernels stay synchronous unless measurements justify extra pause points. Remaining: async
   storage lifecycle/commit and crypto providers, cold/durable and other-browser
   public-boundary measurements, ARM/package-size measurements, and optional Rust delivery parity.
+  Public async host API follow-ons: compaction, changing database storage limits after open,
+  the storage-byte gauge, and resetting an individual custom session variable. The docs describe
+  their current availability; displayed TypeScript examples execute in the Node unit suite.
   Encryption protocol/provider selection is separate; no SQL replay or whole-file preload.
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core

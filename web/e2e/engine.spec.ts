@@ -1,8 +1,8 @@
 import { expect, test } from '@playwright/test';
 
-// Engine bridge smoke tests (Phase 2 / Phase 3): the in-memory jed engine runs in a real browser via
-// the shared Web Worker, results render in the grid, structured SQLSTATE errors surface, and the cost
-// ceiling stops a runaway query instead of hanging the tab.
+// Engine bridge smoke tests: each in-memory database runs in its dedicated execution worker via
+// the shared browser runtime. Results render in the grid, structured SQLSTATE errors surface,
+// and the cost ceiling stops a runaway query.
 
 test('home hero autoruns a seeded query and renders rows', async ({ page }) => {
   await page.goto('/');

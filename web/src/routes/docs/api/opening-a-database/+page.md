@@ -53,7 +53,7 @@ Set `runtime: { maxBatchRows: 128 }` (or `1`) when a smaller evaluation prefix m
 Increasing `maxBatchBytes` reserves more of the held-result allowance per fetch; it can reduce
 how many result batches fit concurrently. Result iteration remains demand-driven.
 
-An `AbortSignal` can be passed to `query` or `execute` as the third argument. Node and isolated
+Pass an `AbortSignal` to `query` or `execute` in the third argument, `{ signal }`. Node and isolated
 browsers use atomic cancellation checkpoints during resident CPU work. Every host also yields at
 page boundaries and common execution loops, including warm scans, so ordinary browsers can
 process cancellation during a query. Cancellation is best effort: sorting, parsing/planning, and
@@ -161,9 +161,9 @@ jed reuses the pages that deletes and updates free. When the free pages are at t
 later commit cuts them off and the file gets shorter by itself, but free pages in the middle of the
 file stay there, so after a big delete the file can stay close to its peak size. To give all of that
 space back, compact the database:
-`db.compact("main")` (Rust), `db.Compact("main")` (Go), or `db.compact("main")` (TypeScript). Pass
-an attachment's name to compact that database instead. The name is matched exactly, as given when
-the database was attached.
+`db.compact("main")` (Rust) or `db.Compact("main")` (Go). Pass an attachment's name to compact that
+database instead. The name is matched exactly, as given when the database was attached.
+TypeScript's public async API does not currently expose compaction.
 
 Compaction rewrites the committed data as a fresh, contiguous file next to the original
 (`<path>.jedtmp`), syncs it, and atomically renames it into place, so a crash at any point leaves
@@ -184,7 +184,7 @@ its owner.
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your
 browser — the same engine, no file. Create one by calling the unified create constructor with no path:
 `Database::create(CreateOptions::default())` (Rust), `jed.CreateDatabase(jed.CreateOptions{})` (Go), or
-`createDatabase({})` (TypeScript).
+`await createDatabase({})` (TypeScript).
 
 ## The environment
 
@@ -212,10 +212,11 @@ let db = Database::open_with_options(path, OpenOptions { environment: env.clone(
 ```
 
 An environment cannot change once built, so a database's inputs never shift while it is open, and two
-libraries or tests in one process cannot interfere through it. To vary one input, derive a new
-environment with `env.to_builder()` (Go `env.ToBuilder()`, TypeScript `env.toBuilder()`), which shares
-everything you don't replace. For reproducible tests, install a seeded random source and a manual
-clock, keep a reference to them, and reseed or set them between cases.
+libraries or tests in one process cannot interfere through it. In Rust or Go, derive a new
+environment with `env.to_builder()` or `env.ToBuilder()`, which shares everything you don't replace.
+For reproducible tests, install a seeded random source and a manual clock, keep a reference to them,
+and reseed or set them between cases. In TypeScript, configure these sources inside the worker's
+`configure(builder)` function; the application does not hold the worker's environment or its sources.
 
 ## Running untrusted queries
 
@@ -224,17 +225,20 @@ clock beyond the sanctioned host seam. Configure the session's work and input li
 serving untrusted SQL. The scalar allocation budget below covers specific expanding kernels;
 [resource limits](../resource-limits/) explains the remaining memory coverage.
 
-- **Cost ceiling — `set_max_cost(limit)`** / `SetMaxCost` / `setMaxCost`. Bounds the deterministic
+- **Cost ceiling — `set_max_cost(limit)`** / `SetMaxCost` /
+  `await session.configure({ maxCost: limit })`. Bounds the deterministic
   *execution* cost; a query that reaches the ceiling aborts with `54P01`. `0` (the default) is
   unlimited.
-- **Scalar allocation — `set_max_scalar_bytes(bytes)`** / `SetMaxScalarBytes` / `setMaxScalarBytes`.
+- **Scalar allocation — `set_max_scalar_bytes(bytes)`** / `SetMaxScalarBytes` /
+  `await session.configure({ maxScalarBytes: bytes })`.
   Limits cumulative repeat/padding output and decimal-transcendental scratch reservations per
   statement; default **64 MiB**, non-positive restores the default, over-budget fails `54P04`.
 - **Query memory — `set_max_query_memory_bytes(bytes)`** / `SetMaxQueryMemoryBytes` /
-  `setMaxQueryMemoryBytes`. Bounds the logical bytes of rows a statement holds at once (row
-  buffers and result collectors); **unlimited** by default, non-positive restores unlimited,
+  `await session.configure({ maxQueryMemoryBytes: bytes })`. Bounds the logical bytes of rows and
+  operator state a statement holds at once; **unlimited** by default, non-positive restores unlimited,
   over-budget fails `54P05`.
-- **Input size — `set_max_sql_length(bytes)`** / `SetMaxSQLLength` / `setMaxSqlLength`. Bounds the
+- **Input size — `set_max_sql_length(bytes)`** / `SetMaxSQLLength` /
+  `await session.configure({ maxSqlLength: bytes })`. Bounds the
   *input SQL length* (in bytes), rejecting an over-long statement with `54000` before it is parsed —
   so a giant query can't exhaust parse memory. The default is **1 MiB**; `0` is unlimited. Because
   jed parses one statement per call, this also bounds the parse tree's size (a million-column

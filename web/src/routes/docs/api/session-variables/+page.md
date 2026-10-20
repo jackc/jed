@@ -38,7 +38,10 @@ Session variables live on the session, not in the database:
 - They are **not** stored in the file, and they do **not** roll back when a transaction rolls back
   (PostgreSQL's `SET SESSION` behavior).
 - Each session has its own independent set — a variable on one session is invisible to another.
-- `reset_var(name)` clears one variable by name.
+- Rust's `reset_var(name)` and Go's `ResetVar(name)` clear one variable by name. TypeScript's
+  public async API currently has no reset method; a newly created session starts with no custom
+  variables. Initialize them with `await session.setVar(name, value)` or
+  `await session.configure({ vars: { 'myapp.tenant': 'acme' } })`.
 
 ## The session time zone
 

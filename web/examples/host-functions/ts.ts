@@ -6,8 +6,8 @@ export function configure(builder: EnvironmentBuilder): void {
   // discount(cents, pct) -> the price after a whole-percent discount. STRICT — a NULL argument
   // short-circuits to NULL before the kernel runs, so the closure never sees one — and reached by an
   // EXACT (i64, i64) signature (no implicit promotion; a built-in of the same signature would win).
-  // `cost: 2n` is charged once per call and gated against a session's maxCost, so the function stays
-  // inside the untrusted-query bound.
+  // `cost: 2n` is charged once per call and gated against a session's maxCost before the kernel runs.
+  // The host remains responsible for the kernel's actual work and memory use.
   builder.registerFunction({
     name: 'discount',
     argTypes: ['i64', 'i64'],

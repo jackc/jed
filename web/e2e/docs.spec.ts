@@ -847,7 +847,7 @@ test('the queries API page wires up the idiomatic example for each language', as
   await expect(page.getByTestId('code-go')).toContainText('db.Exec');
   await expect(page.getByTestId('code-go')).toContainText('RowToStructByName');
 
-  // TypeScript: the better-sqlite3-style prepare/get/iterate.
+  // TypeScript: async preparation and iteration through the public worker API.
   await page.getByTestId('lang-ts').click();
   await expect(page.getByTestId('code-ts')).toContainText('db.prepare');
   await expect(page.getByTestId('code-ts')).toContainText('jed-ts');
@@ -867,7 +867,7 @@ test('the host-functions API page wires up the idiomatic example for each langua
   await expect(page.getByTestId('code-go')).toContainText('NewHostFunction');
   await expect(page.getByTestId('code-go')).toContainText('RegisterFunction');
 
-  // TypeScript: the options-object registerFunction against the jed-ts package.
+  // TypeScript: registerFunction runs inside the database worker's configure callback.
   await page.getByTestId('lang-ts').click();
   await expect(page.getByTestId('code-ts')).toContainText('registerFunction');
   await expect(page.getByTestId('code-ts')).toContainText('jed-ts');

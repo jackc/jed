@@ -9,8 +9,9 @@
   // (setup SQL the reader doesn't edit), then lets the reader edit + run `query` against it — real
   // jed, in the browser. Reset re-seeds. State persists across runs within the widget until reset.
   //
-  // The engine runs in the shared Web Worker (session.ts), so a runaway query trips the default cost
-  // ceiling (54P01) instead of hanging the page, and the main thread stays responsive.
+  // Each panel's database owns an execution worker through the shared browser runtime (session.ts).
+  // The default cost ceiling stops runaway queries with 54P01. Reset replaces the worker;
+  // unmount closes the database and releases it.
 
   let {
     seed = '',
