@@ -51,9 +51,10 @@ These bind the eventual build; everything else in this doc that says "open" stil
   at `open`: `auto` is `on` when main is encrypted, and attaching an encrypted database to a
   handle whose scratch encryption is off is refused on hosts with a scratch target. Encrypted
   scratch uses a random per-file key that is never persisted. A temp domain keeps the plaintext
-  layout (so its cost and `54P03` limit do not move) and its scratch file uses a `page_size + 40`
-  stride; sort runs and positional scratch get block framings; scratch files carry no pointer
-  bindings.
+  layout (so its cost and `54P03` limit do not move) and its scratch file uses a `page_size` plus
+  the suite's reserve stride; sort runs and positional scratch get block framings whose AAD is
+  the file id and block ordinal, with the block count held in memory; scratch files carry no
+  pointer bindings.
 - **Key material and nonces come from a dedicated cryptographic entropy source**, never the
   general-purpose seeded entropy seam (§3.1, *Threat model*).
 - **Browser performance is not a deciding factor for the suite.** Encrypted browser databases
@@ -102,6 +103,16 @@ Decided in the 2026-10-20 design review:
   count and salt length, so a tampered block cannot make open burn CPU before it fails.
 - **Positional scratch files** (hash JOIN, aggregate, DISTINCT) use the same authenticated block
   framing as sort runs, with a fresh salt on every block rewrite (§4.2).
+- **The tag crosses the codec seam as a value** (§4.1): `encode` returns it, `decode` takes the
+  expected one; overflow chains seal tail first; and the **salt-draw order is a cross-core
+  contract** — a commit draws its salts in the canonical children-first, ascending-index sealing
+  order, then free-list, manifest and meta (§4).
+- **Key hierarchy** (§6): three DEK subkeys (pages, meta and manifest authentication, key-block
+  tag); a host wrapping key is derived into a per-file KEK over the block's salt, never used
+  directly; a repair barriers the selected copy before overwriting the other.
+- **Connected clients survive rotation by re-checking the key block** at their compaction reload
+  (§6); a page client unlocks through `read_key_block`; an SSH page server receives the
+  credential in `hello` over the stream, never `argv` or the environment.
 - **The reserve is not a setting** (§4.1). A plaintext file reserves nothing; an encrypted file
   reserves what its suite needs (40 bytes under XAES-256-GCM). The meta field is
   self-description, not a knob.
@@ -301,7 +312,8 @@ Two constructions realize this derive-key design with AES-256-GCM:
   ECB, but encrypting one zero block under AES-CTR with the counter set to the input yields the
   block encryption, so the browser needs no pure-JS AES for the derivation; CryptoKit exposes no
   raw block and no mode that gives one (swift-crypto's `_CryptoExtras` may; unverified), and
-  Swift leans wrap. Go has no CMAC, so there the two-block derivation is written in the layout
+  Swift leans wrap. **No platform library but RustCrypto exposes CMAC** — not Go, Node, the JDK
+  or .NET — so in every native core but Rust the two-block derivation is written in the layout
   the spec fixes and checked against its vectors: the CMAC subkey `K1` (AES of the zero block,
   then one GF(2^128) doubling with the `0x87` reduction) and the two single-block CMACs, each one
   AES block over the message XOR `K1`. The doubling is the one step that is hand-written
@@ -324,7 +336,11 @@ Two constructions realize this derive-key design with AES-256-GCM:
   nonces, which is safe. Fixtures therefore check uniqueness of the full `(derived key, GCM
   nonce)` pair — in effect of the whole 192-bit salt — not unconditional derived-key uniqueness.
   Per-page reserve: **40 bytes** (24-byte nonce + 16-byte tag). Not yet measured in the §8
-  harness.
+  harness. This reframes the open choice honestly: XAES has a public specification and vectors
+  but **hand-written glue in nearly every core** (Go, TS for Node and browser alike, future Java
+  and .NET; only Rust has a library route — the pinned `aes` + `cmac` + `aes-gcm` composition or
+  the `xaes-256-gcm` crate, the review's call), while the HKDF fallback is jed-specific but
+  needs **no hand-written primitive code** anywhere (HKDF is in every platform library).
 - **HKDF-SHA-256 + AES-256-GCM under a fixed nonce (fallback).** Our own composition of standard
   primitives, close to [Tink's AES-GCM-HKDF streaming
   AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming), but Tink's
@@ -443,10 +459,11 @@ remains a separate trusted-state guarantee.
   before decryption — a page's identity comes from the pointer that names it, and recovery's
   manifest check compares ciphertext identities. The AEAD **authentication tag** and nonce fields
   live in the page's reserved region (§4.1). The **associated data is the page index and the
-  suite/format identifier**, nothing more: it stops silent relocation within the file, the
-  per-file random data key already binds the file, and a generation in the AAD would mean
-  nothing to a reader with no trusted expected value — that is what the pointer binding below
-  provides.
+  suite/format identifier**, nothing more: it stops silent relocation within the file; the
+  random data key binds a **lineage** of copies (plain compaction, both backup forms and
+  replicas share it — not one file, so a page copied between them is caught by the pointer
+  binding, not by the key); and a generation in the AAD would mean nothing to a reader with no
+  trusted expected value — that is what the pointer binding below provides.
 - **Page replay is detected by binding the child's tag in every pointer (decided).** Per-page
   AEAD alone accepts an older genuine ciphertext of page `P` copied over the current one from a
   backup, a crash remnant or the bytes a freed page left behind: the tag verifies and the AAD
@@ -469,7 +486,22 @@ remains a separate trusted-state guarantee.
   identity because it is the standard construction: its security rests on AEAD unforgeability
   plus the negligible chance that two genuine versions of a page share a tag, and nothing else;
   the fan-out cost (16 bytes per pointer) was accepted knowingly. Two
-  consequences. A commit encrypts pages **children first**, since a parent's plaintext holds its
+  consequences, plus two obligations. **Overflow chains seal tail first**: a chain is linked and
+  allocated head first (format.md), and each page binds its successor, so the last page is sealed
+  first. A commit has the value in memory, so this costs nothing; streaming compaction and
+  conversion keep their bounded-memory claim by walking the source chain once to collect its page
+  indices and then re-reading it **backwards**, sealing as they go, so memory is bounded by the
+  index list, not the value; in the browser the async window shrinks to one page at a time along
+  a chain. **The salt-draw order is a cross-core contract**: goldens and the simulator need
+  byte-identical images under the fixed-bytes source, every seal draws a salt, so which page gets
+  the k-th salt is specified — a commit draws its salts in one batch in the **canonical sealing
+  order**: dirty body pages in children-first order with ties by ascending page index (repeatedly,
+  every unsealed dirty page whose dirty children are sealed, ascending), then free-list pages,
+  manifest-overflow pages, and the meta slot; `create`, compaction and conversion draw in their
+  image's stream order; a credential change draws the KDF salt, the wrap nonce, then the DEK-tag
+  salt of the first copy and of the second. The TS async window never changes the order: salts
+  are assigned when a page is scheduled, in canonical order, whatever order the seals complete in.
+  A commit encrypts pages **children first**, since a parent's plaintext holds its
   children's tags (§8.1). And an encrypted file's pointers are wider than a plaintext file's, so
   **the encrypted file is a distinct format variant**: the same rows build a different tree
   with different page counts and cost, pinned by the variant's own golden fixtures and cost
@@ -555,7 +587,17 @@ bytes), and never reads the reserved tail, which is where its encryption extensi
 SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps its checksum. For jed:
 
 - The meta page records `reserved_bytes`; `C = page_size - 16 - reserved_bytes`. The page
-  codec owns the reserved region; nothing above the codec reads it. This is also what lets the
+  codec owns the reserved region and nothing above it parses the region's bytes — but the
+  **tag crosses the seam as a value, in both directions**: `encode` returns the sealed page's
+  tag so the parent's serialization can bind it, and `decode` takes the expected tag from the
+  pointer that named the page and fails `XX001` on mismatch. The TS `PageTransform`
+  (`encode(index, page)` / `decode(index, stored)`) carries neither today and gains both with the
+  encryption format, and commit changes from "serialize every dirty page, then encode" to
+  sealing interleaved with serialization, children first (§4). Every path that reads a page
+  carries its expected tag: a referenced page not yet loaded, a re-read after eviction,
+  page-service and recovery read-ahead, the backup walk, and `verify.rb`. This is the second
+  change the codec seam takes with the variant, beside the digest move, and it forecloses
+  nothing today. This is also what lets the
   codec keep pages at `page_size`: the TS `PageTransform` maps one page to one stored page at
   the same index (ts-runtime.md §11.5), so the nonce and tag must fit inside the page, in the
   reserved tail that the logical page leaves unused.
@@ -583,12 +625,17 @@ SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps its checksum. For
   as a harness **mode** (the async-codec mode is the precedent): every corpus file runs with an
   encrypted main and asserts rows and errors as written, while cost is asserted **across cores**
   by the differential harness rather than against the in-file literal, and entries whose rows
-  or errors legitimately differ carry a variant override in the ledger. Two sources of such
-  differences are expected: the record-cap cases above, and **plan-driven error visitation** —
+  or errors legitimately differ carry a variant override in the ledger. Three classes of
+  difference are expected. The record-cap cases above. **Plan-driven error visitation** —
   fan-out and page counts are estimator inputs, so the selected path can differ between
   variants, and the selected path defines which row's error is reported first
   ([estimator.md](estimator.md)); the override records the variant's error, and the plan itself
-  must still be identical across cores within the variant. The fault fixtures of §3.1 are growth of `sim_gen.rb` and its checkers
+  must still be identical across cores within the variant. And **cost-bearing result rows**,
+  which are far more numerous than the first two: EXPLAIN puts `cost=… rows=…` in its result
+  rows, and the cost-ceiling and storage-limit entries trip at points that follow page counts,
+  so any entry whose data spans more than one page differs. The mode treats such output like a
+  `# cost:` line — compared across cores, not against the file's literal — by the same tagging
+  the ceiling suites already use, rather than listing each entry in the ledger. The fault fixtures of §3.1 are growth of `sim_gen.rb` and its checkers
   ([simulation-testing.md](simulation-testing.md)), run under the fixed-bytes CSPRNG, as
   CLAUDE.md §7 requires of every storage feature.
 - **Encrypting, decrypting or rotating an existing file is compaction into a new file** (§6),
@@ -623,7 +670,13 @@ key never outlives the process or the unlinked file, so none of §3's crash, res
 hazards apply. Every scratch block is sealed by the **same construction** as a database page —
 a fresh random salt and a single-use derived key — with the per-file key in the data key's
 place, so each core keeps exactly one crypto path and no second nonce discipline is specified.
-A scratch block that fails authentication is an error, never data.
+A scratch block that fails authentication is an error, never data — and so that the claim
+covers reordering, replay and truncation by someone with access to the scratch directory while
+the process runs, not only bit flips, each block's **associated data is the scratch file's
+random id and the block's ordinal**, and the owner keeps the **block count in memory**: a sort
+run's last block carries a final-block flag and a run read that ends early is an error, and a
+positional scratch read of a block that was never written is an error, not zeros. The key is in
+memory anyway, so this costs nothing.
 
 The two scratch shapes differ in how the salt and tag find room, because neither is an
 encrypted database file:
@@ -634,7 +687,8 @@ encrypted database file:
   `page_read` cost and the `54P03` trip point (`page_count × page_size`), which scratch
   encryption must not move (temp-tables.md §6 promises spill changes timing, never
   observation). The room for the salt and tag comes from the **scratch file's stride** instead:
-  the scratch `BlockStore` stores page `i` in a slot of `page_size + 40` bytes, sealing each
+  the scratch `BlockStore` stores page `i` in a slot of `page_size` plus the suite's reserve
+  (40 bytes under XAES, 40–48 under the fallback), sealing each
   page as the migration copies it and on every later write. A scratch file is explicitly never
   the §8 file format, so the wider stride is free. Scratch files carry **no pointer bindings**:
   the file lives only as long as the process and the owning handle, and the offline attacker of
@@ -677,10 +731,14 @@ bindings, not a scratch file.
 ## 6. Envelope encryption and key lifecycle
 
 Use a random per-database **data-encryption key (DEK)**, drawn from the cryptographic entropy
-source (§3.1), for page encryption. The unlock-time HKDF-SHA-256 derives the purpose subkeys
-from it: the page key and the meta-authentication key (§4). A separate **key-encryption key
-(KEK)** wraps the DEK, and only the wrapped DEK is persisted. Fixtures inject fixed inputs
-through the insecure test constructor.
+source (§3.1), for page encryption. The unlock-time HKDF-SHA-256 derives **three** purpose
+subkeys from it: the page key, the meta-authentication key (which also authenticates
+manifest-overflow pages, §4), and the key-block tag key (below); the §3.1 fixture for domain
+separation covers all three and the wrap. A separate **key-encryption key (KEK)** wraps the DEK,
+and only the wrapped DEK is persisted. A host-supplied wrapping key is **not used directly**: the
+KEK is derived from it per file with HKDF over the block's KDF salt, so one host key across many
+files yields distinct KEKs, exactly as a passphrase does through PBKDF2. Fixtures inject fixed
+inputs through the insecure test constructor.
 
 **The key block (decided).** The wrapped DEK, the suite identifier, the KDF identifier and its
 parameters, and the KDF salt live in a dedicated **key block**: **pages 2 and 3** of the
@@ -709,8 +767,10 @@ attempts the unwrap against that copy only, and a failure is the credential erro
 falls back to the older copy**, which would let a stale wrapper outlive its revocation. This is
 what makes the fault fixture's "exactly one credential" claim hold: a crash before the first
 barrier leaves the new copy torn (CRC fails, the old copy is selected, the old credential
-works); a crash between the barriers leaves a complete new copy (selected, only the new
-credential works). A copy with a passing CRC that does not unwrap under either credential is
+works) **or**, if the write landed, complete (selected, the new credential works) — the
+fixtures accept either at that boundary, since the change was unacknowledged; a crash between
+the barriers leaves a complete new copy (selected, only the new credential works). A copy with
+a passing CRC that does not unwrap under either credential is
 tampering, and fails closed as tampering is meant to — an attacker who can rewrite the key block
 can equally zero it. Bit rot in one copy is harmless (the other is selected if it is the same
 generation or the only valid one); in both, `XX001`. The simulator's `corrupt` step reaches pages
@@ -722,11 +782,18 @@ not the new credential verify a copy — and such processes exist: a page client
 after the owner crashed between the two barriers holds the DEK from its own open under the old
 generation, and the doc promises a credential change does not disturb a running process, so it
 may never learn the new credential. When the two copies differ, the **first writer completes the
-interrupted change** by copying the newest CRC-valid copy over the other **after verifying its
-DEK tag**, never a copy it has not authenticated, before any later credential change may
-overwrite what is then the only copy of the adopted generation; a newest copy whose DEK tag
-fails is tampering and fails closed. (A replica, which is keyless, finishes a pair from its
-durable log entry instead, below.) That
+interrupted change** in a fixed order: verify the newest CRC-valid copy's DEK tag (never
+authenticate-free), **barrier so the selected copy is durable**, copy it over the other,
+**barrier again**, and only then allow another credential change. The first barrier is not
+optional: authentication proves the selected bytes are intact, not that they are durable — a
+complete `g + 1` copy written just before a crash may be visible only through the surviving OS
+cache, and copying it over the durable `g` fallback before it is itself durable could leave both
+copies torn at the next power loss. This stabilization is tracked **independently of the data
+generation's** (a credential change leaves `txid` and the manifest unchanged, and the file may
+still carry bootstrap meta), and the fixtures crash before the first change barrier, recover,
+repair, and then lose power at each repair boundary. A newest copy whose DEK tag fails is
+tampering and fails closed. (A replica, which is keyless, finishes a pair from its durable log
+entry instead, below.) That
 repair is a write, so it belongs to a process that may write: a **read-only open adopts the
 newest valid copy without repairing** ([api.md](api.md) §2.1 read-only opens need no write
 access), and under the page service the repair is the owner's, taken at its first write gate
@@ -784,20 +851,32 @@ file could set an absurd count and make every open burn CPU before failing. Ther
 fixes an **accepted maximum iteration count and salt length, checked before the KDF runs**; a
 block outside those bounds is the credential error at once, with no derivation. The bounds are
 format constants, not settings. The KDF runs once per process unlock, including at
-every page-service client and the SSH page server ([page-service.md](page-service.md) §13).
+every page-service client and the SSH page server ([page-service.md](page-service.md) §13). A
+**page client never opens the file**, so it unlocks by fetching the key block through
+`read_key_block` and unwrapping it locally with its own credential; the operation is how a
+client opens, not only a backup tool. An **SSH page server** that becomes owner must hold the
+DEK, and nothing in `hello` carried a credential; decided: the credential travels **in the
+`hello` handshake over the SSH stream** — never in `argv` or the environment, which other users
+on the server can read — and a server may instead be configured with it from a file for the
+`authorized_keys`-restricted deployment. Either way the database credential **leaves the client
+machine** for a server that holds the DEK in memory for as long as it owns; a deployment that
+cannot accept that keeps the owner local and uses SSH for a client only.
 
 Two operations have deliberately different semantics:
 
 | Operation | Work and guarantee |
 |---|---|
 | Change passphrase / wrapping key | Unwrap and rewrap the same DEK into both copies of the key block (above). No data page is rewritten. |
-| Rotate the data key | **Compaction under a fresh DEK** ([api.md](api.md) §2.6): the committed snapshot streams into `<path>.jedtmp` through the codec with the new key and a new key block, and the rename replaces the file. Atomic; old-key retirement for free (the old file is unlinked); no mixed-key state and no incremental rotation protocol. Encrypting a plaintext file and decrypting an encrypted one are the same operation with a different target. It inherits compaction's limits: `55006` while a writer, a pinned reader, a page client or another process holds the file, and no OPFS support. |
+| Rotate the data key | **Compaction under a fresh DEK** ([api.md](api.md) §2.6): the committed snapshot streams into `<path>.jedtmp` through the codec with the new key and a new key block, and the rename replaces the file. Atomic; old-key retirement for free (the old file is unlinked); no mixed-key state and no incremental rotation protocol. Encrypting a plaintext file and decrypting an encrypted one are the same operation with a different target. It inherits compaction's limits: `55006` while a writer, a pinned reader, a page client's writer gate or another process holds the file, and no OPFS support. Compaction does allow **idle connected clients**, which reload the compacted image at their next transaction begin (api.md §2.6) — after a rotation or conversion they hold the wrong DEK or the wrong variant, so the reload **re-reads the key block through `read_key_block`** and checks the DEK tag against the DEK it holds and the variant flag in the meta slot; a mismatch is the credential error (`28000`, "reopen with a credential"), never `XX001`. The same check runs when a client reconnects after an owner change. Compaction also starts a **new replication timeline** (page-service.md §10), so every rotation forces a keyless replica to be re-seeded by a keyed process. |
 | Convert between variants (encrypt a plaintext file, decrypt an encrypted one) | The same streaming rewrite, but a **rebuild, not a node-preserving copy**. Today's compaction keeps every tree node as it was and does not repack leaves (api.md §2.6); the encrypted variant has a smaller `C` and wider pointers (§4.1), so a packed plaintext page cannot be carried across. The converter re-inserts every table and index under the target layout, in key order, so the result is a from-scratch image of that variant. A row that cannot be stored under the target — a key over the target's record cap (keys cannot be externalized), or a record whose external pointers no longer fit beside its inline values (§4.1) — is a defined error reported **before the rename**, naming the table, as is a result whose live pages would exceed the database's `max_storage_bytes` (`54P06`, [memory.md](memory.md) §8.7); either way the source file is untouched. Rotation within the encrypted variant has the same `C` and pointer width and may use the node-preserving form. |
 
 The host owns credential storage, rotation policy, escrow, and OS-keychain integration. The
 engine owns wrapping and crash-safe file transitions. A credential change does not disturb an
-already unlocked process (it retains its DEK); a client that reconnects or a process that reopens
-presents the new credential.
+already unlocked process (it retains its DEK), and a page client that reconnects needs no
+credential either — its DEK is unchanged and the engine keeps no credential to re-present; only
+a process that **reopens** presents the new one. Each change draws a **fresh KDF salt**, and the
+new KEK is derived **before** the writer gate is taken, since PBKDF2 at the default count takes
+hundreds of milliseconds that no writer should wait on.
 
 **The key block in backups.** A page-identical backup walks the pinned snapshot's reachable pages
 and zero-fills every other index ([page-service.md](page-service.md) §9); pages 2–3 are outside
@@ -844,7 +923,11 @@ backups.
 
 **Key commitment is not required.** XAES-256-GCM is not key-committing. One DEK per file,
 rotation by compaction and no mixed-key state mean no reader ever tries two keys against one
-page, so there is no key ambiguity to exploit. The C2SP spec names a key-committing variant,
+page, so there is no key ambiguity to exploit. The one place commitment is usually wanted is the
+passphrase wrap — a **partitioning-oracle attack** that tests many candidate keys per decryption
+query — and it does not apply here because the only party who can submit a crafted key block is
+one who can already read it, and such an attacker guesses the passphrase offline at full speed
+with nothing to gain from an oracle. The C2SP spec names a key-committing variant,
 **KC-XAES** ([ePrint 2025/758](https://eprint.iacr.org/2025/758)); it is **declined** for the
 same reason, and because it is younger and less supported than XAES itself. Recorded so the
 security review need not reopen it.

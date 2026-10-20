@@ -379,7 +379,8 @@ sits so the options stay open (CLAUDE.md §9).
   derived from a fresh random salt, so nothing is allocated across commits and `(page_index,
   txid)` is not relied on; identical crypto inputs must produce identical bytes. Every page type
   is authenticated, and every pointer in an encrypted file binds the full AEAD tag of the page
-  it names, so page-level replay is `XX001` and the encrypted file is a distinct format variant
+  it names, so page-level replay is `XX001` (or, for a page the newest commit's manifest lists, a
+  clean fallback to the previous generation, as for any incomplete commit) and the encrypted file is a distinct format variant
   with its own goldens and cost family; whole-file rollback needs a separate contract. Manifest
   page identities are over on-disk (ciphertext) bytes. Page capacity excludes a reserved region
   that is never a user setting (a plaintext file reserves nothing); scratch encryption is a

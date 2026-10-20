@@ -711,8 +711,10 @@ above the byte device and below the page cache (hosts.md §6). It offers `encode
 - `decode` returns exactly the logical page bytes `encode` received. Page CRCs, manifest
   digests, the live-page count and the page cache all operate on those plaintext bytes
   (validated-cow.md §5) in the plaintext format; the encrypted variant moves the CRC and the
-  manifest digests after `encode` (encryption.md §4), which is the one change this seam takes
-  with that format version. The cache inserts a decoded page only after its read resumed.
+  manifest digests after `encode` (encryption.md §4), and carries the child's tag across the
+  seam — `encode` returns it so the parent can bind it, `decode` takes the expected one from the
+  pointer (encryption.md §4.1) — which are the two changes this seam takes with that format
+  version. The cache inserts a decoded page only after its read resumed.
 - `Pager.fromStore` reads the 12-byte bootstrap header (page size) directly from the device;
   the encrypted format must keep the page size discoverable before any key is used
   (encryption.md §4).
