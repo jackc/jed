@@ -767,15 +767,27 @@ export class TableStore {
   // fails the pager is poisoned: no later commit can reuse the old chains, which stay intact until
   // reopen.
   demoteCleanLeaves(): void {
+    const page = this.demoteForRefault();
+    if (page !== 0) runSync(this.refaultRootSteps(page));
+  }
+
+  // demoteForRefault runs the residency flip and returns the root leaf page to re-fault, or 0. The
+  // re-fault is split off so Snapshot.demoteCleanLeavesSteps awaits only that read and the common
+  // case pays no continuation.
+  demoteForRefault(): number {
     const paging = this.paging;
-    if (paging === null) return;
+    if (paging === null) return 0;
     this.rows.demoteCleanLeaves();
     const root = this.rows.rootNode();
     if (root === null || root.children.length > 0 || root.page === 0 || root.packed !== undefined)
-      return;
-    if (!rowsReferenceChains(root.vals)) return;
+      return 0;
+    return rowsReferenceChains(root.vals) ? root.page : 0;
+  }
+
+  *refaultRootSteps(page: number): Steps<void> {
+    const paging = this.paging!;
     try {
-      this.rows.replaceRoot(paging.faultLeaf(root.page, this.colTypes));
+      this.rows.replaceRoot(yield* paging.faultLeafSteps(page, this.colTypes));
     } catch {
       paging.poison();
     }

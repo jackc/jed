@@ -509,7 +509,7 @@ export function* commitDurableAttachmentSteps(
   budget: BudgetCtx,
 ): Steps<void> {
   yield* persistSteps(db, snap, canReclaim, canReuse, budget);
-  snap.demoteCleanLeaves();
+  yield* snap.demoteCleanLeavesSteps();
 }
 
 // maybeCompact reclaims within-session copy-on-write orphans IN RAM by rebuilding the free-list from the

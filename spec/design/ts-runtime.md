@@ -499,7 +499,9 @@ The page seam has an optional asynchronous byte read. Node file reads use it; a 
 only synchronous reads (including OPFS sync handles) receives a task yield before the read.
 Cache insertion happens only after a successful resume, with invalidation guarding suspended
 loads. Expression traversal propagates lazy overflow reads and subquery suspension without
-replaying expressions or host calls. Commit, open/recovery and storage maintenance follow §11.
+replaying expressions or host calls. Every statement data read awaits on this path: query and DML
+scans, the DDL that reads rows (`CREATE INDEX`/`REINDEX`, `ALTER TABLE` rewrite and validation,
+`CREATE TABLE … AS`) and `ANALYZE` (§11.1). Commit, open/recovery and storage maintenance follow §11.
 Spill device I/O, temporary domains, compaction and page-service coordination keep synchronous
 paths inside the execution worker (§11.1).
 
@@ -578,6 +580,8 @@ synchronous API and conformance harness, and by `runAsync` in the execution work
 | Open/recovery | page-size header, both meta slots, manifest overflow chain and every listed dependency, catalog chain, interior skeletons, eager GiST R-trees, the free-list chain, keyless rowid reconstruction |
 | Maintenance | the in-commit free-list rebuild (reachability walk, including overflow chains), trailing truncation after the barrier, the live-count verification walk |
 | Commit serialization | deferred overflow chains a rewritten record must re-read (see below) |
+| Post-commit residency flip | the re-fault of a root leaf whose rewritten rows moved to fresh overflow chains |
+| Statement reads (queries, DML, DDL, statistics) | every leaf fault and overflow-chain read: query and DML scans and probes (§10), the `CREATE INDEX`/`REINDEX` build scan, `ALTER TABLE`'s rewrite and constraint validation (including the expressions, defaults, keys and error details it evaluates), `CREATE TABLE … AS`, and the `ANALYZE` column scan |
 
 Serialization (`incrementalImage`) is pure, unmetered CPU work and is not rewritten as a
 generator, which would add per-value overhead to every commit. Statement execution settles every
@@ -603,7 +607,9 @@ These remain synchronous and are not required by the browser storage stack:
   from-scratch serializer and belongs with that design.
 - `create`'s whole bootstrap image written in place (OPFS) or through a temp file (Node): an
   encrypted create must first define how bootstrap pages are encoded (encryption.md §6).
-- The directory barrier (Node only), spill device I/O, and DDL/statistics work outside commit.
+- Host backup (`backupForTesting`, Node only and not on the async surface): it walks the snapshot
+  through the synchronous page read.
+- The directory barrier (Node only) and spill device I/O (spill files are not encoded).
 
 ### 11.2 Ordering across awaits
 
@@ -703,3 +709,16 @@ results and costs identical to a synchronous control, in both durability modes a
 worker runtime. The real-browser suite (`e2e/opfs.spec.ts`) runs the same paths over a real OPFS
 sync access handle with a transform that awaits SubtleCrypto for every page, again byte-identical
 to a run without it.
+
+The **async-codec conformance mode** (`mise run conformance:ts:async-codec`, part of
+`conformance:all`; conformance.md §3.4) covers everything SQL reaches. It is the TS disk walk with
+each per-record reopen through the async loader (`Pager.fromStoreSteps` + `loadEnginePagedSteps`)
+under an identity transform with only `encodeAsync`/`decodeAsync`, and every record run through
+`runAsync` (`Session.querySteps` and the cursor's retained continuation). Expected rows, errors
+and costs are the plain disk mode's. It skips exactly the files the disk mode skips (reopen-fragile
+session state, fixtures, concurrency schedules); no file is skipped for the async codec. The
+paths above that stay synchronous are not reached: the harness creates its image with the
+synchronous `create` before installing the codec, opens without a lock bundle (no page service),
+never encodes a temporary domain, and runs no compaction or backup. Statement paths that read
+pages synchronously had failed under it (index builds, `ANALYZE`, the post-commit root re-fault);
+they now run as the continuations listed in §11.1.

@@ -28,9 +28,10 @@ import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { Environment } from "./environment.ts";
 import type { FileHost, WriteAt } from "./filehost.ts";
-import { loadEnginePaged, ROOT_PAGE, toImage, writeImage } from "./format.ts";
+import { loadEnginePagedSteps, ROOT_PAGE, toImage, writeImage } from "./format.ts";
+import { runSync, type Steps } from "./execution.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
-import { Pager } from "./pager.ts";
+import { Pager, type PageTransform } from "./pager.ts";
 import { persistImpl, registerDirectorySync } from "./persist.ts";
 import {
   type AttachSource,
@@ -239,8 +240,30 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
   return openVia(osFiles, path, opts);
 }
 
+// openWithTransformSteps is open as one continuation with a page codec transform installed — the
+// asynchronous-codec conformance mode's opener (ts-runtime.md §11.5). Test tooling only.
+export function* openWithTransformSteps(
+  path: string,
+  opts: OpenOptions,
+  transform: PageTransform | null,
+): Steps<Engine> {
+  return yield* openViaSteps(osFiles, path, opts, transform);
+}
+
 // openVia is open through the file host files (filehost.ts).
 export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): Engine {
+  return runSync(openViaSteps(files, path, opts, null));
+}
+
+// openViaSteps is openVia as one continuation (ts-runtime.md §11.1), with the page codec transform
+// installed before any page is read. Without a transform (production) every read runs inline; the
+// asynchronous-codec conformance mode drives it with runAsync and an async-only identity transform.
+export function* openViaSteps(
+  files: FileHost,
+  path: string,
+  opts: OpenOptions,
+  transform: PageTransform | null,
+): Steps<Engine> {
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const readOnly = opts.readOnly ?? false;
   const store = files.openStore(path, opts.skipFsync ?? false, readOnly);
@@ -248,8 +271,9 @@ export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): 
     // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
-    const pager = Pager.fromStore(store);
-    const db = loadEnginePaged(
+    const pager = yield* Pager.fromStoreSteps(store);
+    pager.setPageTransform(transform);
+    const db = yield* loadEnginePagedSteps(
       new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)),
       opts.environment ?? new Environment(),
     );

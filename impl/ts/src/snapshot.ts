@@ -353,6 +353,18 @@ export class Snapshot {
     for (const store of this.indexStores.values()) store.demoteCleanLeaves();
   }
 
+  // demoteCleanLeavesSteps is demoteCleanLeaves with each root re-fault awaitable (ts-runtime.md §11.1).
+  *demoteCleanLeavesSteps(): Steps<void> {
+    for (const store of this.stores.values()) {
+      const page = store.demoteForRefault();
+      if (page !== 0) yield* store.refaultRootSteps(page);
+    }
+    for (const store of this.indexStores.values()) {
+      const page = store.demoteForRefault();
+      if (page !== 0) yield* store.refaultRootSteps(page);
+    }
+  }
+
   // resolveCollation resolves a collation name for USE — query resolution and key encoding
   // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
   // open from the file's reference entries, carrying their version pin) first, then the collations

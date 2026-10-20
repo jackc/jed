@@ -1,13 +1,13 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-#MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory, page-service (and --checked Rust)"
+#MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory, page-service, TS async codec (and --checked Rust)"
 #MISE depends=["ts:lock_build"]
 #USAGE flag "--checked" help="Also walk with the Rust `checked` profile (debug assertions + overflow checks)"
 #USAGE arg "[filter]" help="Run only corpus files whose path contains this substring"
 
 # A WALK is one run of a core's conformance runner over the shared corpus in one configuration (core
 # x storage mode x harness settings). This task runs the walks of `conformance`, `conformance:spill`,
-# `conformance:query_memory`, `conformance:service`, and with --checked `conformance:rust:checked`, all
+# `conformance:query_memory`, `conformance:service`, `conformance:ts:async-codec`, and with --checked `conformance:rust:checked`, all
 # at once. Each walk is
 # an independent single-threaded process, so on a many-core machine the whole set takes about as
 # long as its slowest walk. Those tasks remain for running one family on its own.
@@ -79,6 +79,9 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
     add.("spill #{core} operators", core, ["disk"], "JED_CONFORMANCE_WORK_MEM" => "256")
     add.("spill #{core} temp tables", core, [], "JED_CONFORMANCE_TEMP_BUFFERS" => "1")
   end
+  # `conformance:ts:async-codec`: the TS disk walk through an asynchronous-only page codec, so no
+  # query, DDL, or commit path reads a page synchronously (spec/design/ts-runtime.md §11.5).
+  add.("async-codec ts disk", "ts", ["async-codec"])
   # `conformance:service`: each core as a page client of another core's owner, so every core is
   # client once and owner once (spec/pageservice/README.md §7).
   SERVICE_PAIRS.each do |client, owner|
