@@ -619,7 +619,7 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   `(page_index, txid)` alone does **not** guarantee nonce uniqueness across failed commits,
   restores or writable copies; every key is instead derived from a fresh random salt (below),
   with security preceding unconditional file byte identity. Identical crypto inputs still require identical bytes.
-  Decided (encryption.md §1.1): no FIPS requirement; usable page capacity `C` excludes a
+  Decided (encryption.md §1, §4): no FIPS requirement; usable page capacity `C` excludes a
   per-file reserved-bytes region (SQLite's model) that is never a user setting — a plaintext
   file reserves nothing, an encrypted file what its suite needs; every pointer in an encrypted
   file binds the full AEAD tag of the page it names, so page-level replay is detected and the
@@ -639,9 +639,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   standard library and the raw AES block in every one but CryptoKit (Swift leans wrap), while
   XChaCha20-Poly1305 is in none; the derivation is
   **XAES-256-GCM** (C2SP) as the primary candidate, with a jed-specific HKDF-SHA-256 layout as
-  the fallback (encryption.md §3.1). AES-GCM-SIV fails more gracefully under duplicated
+  the fallback (encryption.md §3). AES-GCM-SIV fails more gracefully under duplicated
   randomness (a live VM clone, which a kernel CSPRNG does not by itself survive) and is declined
-  for platform support alone, a knowing trade (encryption.md §3.1).
+  for platform support alone, a knowing trade (encryption.md §3).
   Vetted libraries expose safe APIs; explicitly reviewed assembly/intrinsics behind those APIs
   are permitted under §14, while engine code stays safe and Go stays free of cgo/external FFI.
 - Writable commits persist only changed database domains. Empty/read-only work in a writable

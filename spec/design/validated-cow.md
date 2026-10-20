@@ -207,7 +207,7 @@ A relaxed commit writes its pages and meta as usual and publishes **without** th
 generation (in the slot it was written to) and the pending set empties. The flush points:
 
 - **A credential change** in an encrypted database: its key-block barriers are whole-file syncs,
-  so the first of them flushes the pending batch ([encryption.md](encryption.md) §6).
+  so the first of them flushes the pending batch ([encryption.md](encryption.md) §5).
 - **The batch cap.** When a commit leaves the pending set with at least
   `I = floor((page_size − 64) / 12)` entries — the inline manifest capacity (§2) — the batch ends
   with it and a flush follows. The cap bounds a pending commit's manifest, the pages recovery

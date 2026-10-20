@@ -151,7 +151,7 @@ which it already does.
   or the on-disk bytes. (Replication and encryption, which *do* ride this seam, preserve this —
   replication is outside the conformance contract like benchmarks, replication.md §6; encryption
   requires identical bytes for identical crypto inputs; its crash/fork-safe nonce protocol
-  remains open, encryption.md §3.)
+  remains open, encryption.md §7.)
 
 ## 3. The pager keeps its page-level operations
 
@@ -312,7 +312,7 @@ base host (in-memory | file | OPFS)
   to *apply* — a **keyless replica** (replication.md §4). This property exists *only*
   because the tee is below the codec; the layering is chosen for it. It covers the apply loop,
   not the seeding: a page-identical base image is taken by a keyed process, because its walk
-  follows pointers through decrypted pages (encryption.md §6, *the key block in backups*).
+  follows pointers through decrypted pages (encryption.md §8).
 
 Both decorations ride the same object the commit already produces — the per-commit set of
 dirty pages + the meta swap (storage.md §4). That single fact is why neither needs a new

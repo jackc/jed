@@ -656,7 +656,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   wrapped key lives in a dedicated double-buffered key block, never in the meta slots.
   Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
-  `bench/aead/`. Suite direction (encryption.md §3.1): AES-256-GCM with one key derived per page
+  `bench/aead/`. Suite direction (encryption.md §3): AES-256-GCM with one key derived per page
   from a fresh random salt (chosen after Go/Rust measurement), **XAES-256-GCM** (C2SP) as the
   primary derivation and a jed HKDF-SHA-256 layout as fallback, pending a security review and
   fault fixtures; XChaCha is dropped because no platform standard library ships it, and AES-GCM-SIV

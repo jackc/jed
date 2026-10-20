@@ -155,7 +155,7 @@ readers.
 
 | Operation | Effect |
 |---|---|
-| `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). With the encryption format, over SSH it also carries the database credential to a server that may become owner — in the stream, never `argv` or the environment. There is no cached-DEK resume: a reconnect that must open the file afresh and has no credential fails `28P02` and the host reopens ([encryption.md](encryption.md) §6). |
+| `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). With the encryption format, over SSH it also carries the database credential to a server that may become owner — in the stream, never `argv` or the environment. There is no cached-DEK resume: a reconnect that must open the file afresh and has no credential fails `28P02` and the host reopens ([encryption.md](encryption.md) §8). |
 | `begin_read(incarnation, last_txid)` | Pin the owner's current committed snapshot. Returns the meta (root, `txid`, `page_count`, free-list head, live count), the owner's **incarnation id**, and the **invalidation set**: page indices written by commits after `last_txid`, or "invalidate all" (§5.4). |
 | `read_pages(txid, [index…])` | Return page bytes. `txid` must be pinned by this connection. Batched. |
 | `end_read(txid)` | Release one pin. Asynchronous: no reply. |
@@ -165,8 +165,7 @@ readers.
 | `commit_status(txid, manifest_digest)` | Resolve an unacknowledged commit after a lost connection (§8.4). |
 | `snapshot_stream(txid, form)` | Reserved. The ratified design streamed a pinned snapshot for backup from the owner; backup instead reads pages with `read_pages` (§9). |
 | `subscribe(from_txid)` | Stream retained commit deltas, then the live tail (§10). |
-| `read_key_block()` | Encrypted databases, with the encryption format: return a stable image of the key block (the selected copy; a backup writes it to both pages), served under the lock a credential change holds. How a page client unlocks at open and re-checks after a compaction reload or owner change, and what a backup copies instead of reading pages 2–3 ([encryption.md](encryption.md) §6). |
-| `rewrap(block, kek)` | Encrypted databases, with the encryption format: a page client's credential change, executed by the owner with the two-barrier protocol while the client holds the writer gate. The owner verifies the block first — DEK tag under its own DEK, DEK id, generation exactly current + 1, and a test-unwrap with the supplied per-file KEK to the DEK it holds; else `08P01` — and acknowledges after the log entry is durable (encryption.md §6). |
+| `read_key_block()` | Encrypted databases, with the encryption format: return a stable image of the key block (the selected copy; a backup writes it to both pages), served under the lock a credential change holds. How a page client unlocks at open and re-checks after a compaction reload or owner change, and what a backup copies instead of reading pages 2–3 ([encryption.md](encryption.md) §8). A credential change itself is owner-only; a client's request is refused (`55000`, encryption.md §5). |
 | `request_ownership()` | Ask a yielding owner to step aside (§8.2). |
 
 The message catalog, framing, and field encodings are data-shaped and belong in a shared spec table
@@ -498,12 +497,12 @@ byte-identical to the local handle's, whether `jed pages` relays or owns (`tests
   pointer reaches — taken **before** the page walk through the dedicated `read_key_block`
   operation, which the owner serves under the lock a credential change holds, so the image is a
   complete pair at one generation rather than two possibly-torn page reads; a backup without it
-  would hold no wrapped key ([encryption.md](encryption.md) §6, *the key block in backups*).
+  would hold no wrapped key ([encryption.md](encryption.md) §8).
 - **Compacted** (the SQLite `VACUUM INTO` analogue). A client pins a snapshot and runs the existing
   streaming `compact` image writer locally against it, writing a fresh, renumbered file at the
   snapshot's `txid + 1`: byte-for-byte the file host compaction ([api.md](api.md) §2.6) would leave
   for that snapshot (for an encrypted database, identical up to the fresh salts every seal draws,
-  encryption.md §3.1). Smallest output; cannot seed a replica. It is also the one form an in-memory
+  encryption.md §3). Smallest output; cannot seed a replica. It is also the one form an in-memory
   database has (a page-identical backup of one is `0A000`).
 - **Logical dump** (the `pg_dump` analogue) — SQL text or similar, the only form that survives a
   `format_version` change or is readable without jed. It is a CLI feature on top of an ordinary
@@ -572,7 +571,7 @@ these consequences of the owner model:
   was violated, or the log was damaged), the gap cannot be rebuilt: the owner records a stream break
   (a new timeline), as for a log-append failure below, rather than claim a repair. A key block one
   generation ahead of the log is rebuilt the same way — its bytes are durable at pages 2–3 — and
-  only a wider gap breaks the stream (encryption.md §6).
+  only a wider gap breaks the stream (encryption.md §8).
 - **Relaxed `synchronous`.** The log records the durability floor; `subscribe` ships only entries at
   or below it, and recovery truncates entries above the recovered `txid`.
 - **`subscribe(from_txid)`** streams retained entries then the live tail. A subscriber older than
@@ -590,7 +589,7 @@ these consequences of the owner model:
   the stream cursor is `(txid, key_generation)`, and the primary makes the entry durable before
   acknowledging the change. A replica applies it with the primary's own copy–barrier–copy–barrier
   protocol, so a replica always unlocks with the primary's current credential
-  ([encryption.md](encryption.md) §6).
+  ([encryption.md](encryption.md) §8).
 - **Asynchronous by construction.** Without a server, no primary waits on a remote acknowledgment, so
   replication can lose the commits not yet shipped. Off-host shipping is a pull (`subscribe` over SSH)
   or a push by a local sidecar subscriber to object storage (the Litestream model).
