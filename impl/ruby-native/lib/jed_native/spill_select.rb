@@ -344,6 +344,7 @@ module JedNative
           build.push(statistics_hash(encoded), [Bytea.new(encoded), CompositeValue.new(row)]) if encoded
         end
       end
+      predicate_kernel = native_compiled_join_predicate(predicate)
       left.each do |left_row|
         matched = false
         matches = if keys
@@ -361,7 +362,7 @@ module JedNative
         end
         matches.each do |right_row|
           row = left_row + right_row
-          next if predicate && evaluate(predicate, row) != true
+          next if predicate && (predicate_kernel ? predicate_kernel.call(self, row, @params) : evaluate(predicate, row)) != true
           matched = true
           output.push(row)
         end
@@ -381,12 +382,13 @@ module JedNative
       output = spill_owner(owners, RowSpool)
       predicate = compile_filter(join[:on], left_columns + right_columns)
       outer = Relation.new(columns: left_columns, rows: [])
+      predicate_kernel = native_compiled_join_predicate(predicate)
       left.each do |row|
         matches = RowSpool.new(self)
         matched = false
         join_index_relation(plan, outer, row, spool: matches) do |inner|
           combined = row + inner.to_a
-          next if predicate && evaluate(predicate, combined) != true
+          next if predicate && (predicate_kernel ? predicate_kernel.call(self, combined, @params) : evaluate(predicate, combined)) != true
           matched = true
           output.push(combined)
         end

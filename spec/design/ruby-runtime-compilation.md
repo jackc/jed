@@ -5,8 +5,8 @@ prepared query plans and let Ruby's JIT optimize query-specific code. This is a
 narrow exception to the prohibition on generated engine implementations: the
 compiler and its semantics are handwritten Ruby, operating on already resolved
 expressions, eligible single-table scan/filter/projection plans, typed ORDER BY
-comparators, primitive aggregate input/reduction loops, and materialized WHERE
-and grouping-key loops. The Ruby core
+comparators, primitive aggregate input/reduction loops, materialized WHERE
+and grouping-key loops, and complete JOIN predicates. The Ruby core
 remains frozen, experimental, and explicitly selected for every test, benchmark,
 and feature update.
 
@@ -17,6 +17,8 @@ tier fuses eligible single-table scan/filter/projection loops, including streami
 OFFSET/LIMIT. A third tier specializes comparisons of precomputed ORDER BY keys.
 A fourth tier specializes primitive aggregate input collection and reduction.
 A fifth tier specializes materialized relation filtering and grouping-key evaluation.
+Complete JOIN ON predicates and join-window filters reuse the expression tier
+at their existing evaluation sites in the general and spill executors.
 The planner, access paths, row sources, grouping and spill algorithms,
 storage, and host API remain the existing engine. A resolved expression can emit a
 Ruby method containing straight-line locals and branches instead of recursively
@@ -84,6 +86,12 @@ ordinary executor. File hosts, unsupported predicates, and unsupported complete
 key vectors retain their existing loops. Non-array row sequences also retain
 their original iterators. Neither path captures a resolved
 expression or silently delegates an unsupported subtree.
+
+JOIN admission requires a complete supported predicate. Separate ON trees
+retain their own evaluation and short-circuit positions; compilation does not
+combine them or add an AND charge. Join-window filtering follows those trees.
+Candidate generation, row construction, matching, NULL extension, memory
+accounting and spill replay retain their existing loops and order.
 
 ## Semantic obligations
 
@@ -209,7 +217,7 @@ substitutions can replace a whole expression with NULL.
 
 Resolved plan caches retain at most 64 entries each and already validate table
 publication, parameter types, type registry, environment, timezone, and collation.
-Generated kernels belong to those plans and inherit their invalidation. The first
+Generated kernels attached to those plans inherit their invalidation. The first
 execution uses the evaluator; the second use may compile. Unsupported shapes
 record a negative admission to avoid repeated emitter work. Internal diagnostic
 switches can force first-use admission or disable compilation for differential
@@ -266,6 +274,19 @@ cache, shared by lazy cursors with their session. The same second-use policy and
 per-method limits apply. Filter memory-accounting mode is encoded in fixed
 source, while the current owner, columns, mask, rows, and parameters are passed
 at invocation. The internal relation-disable switch leaves earlier tiers active.
+JOIN predicates use a separate 64-entry source-and-immutable-pool LRU, also
+shared with lazy cursors. Every acquisition emits the current resolved expression
+before lookup, observing mutable arguments, metadata and type context. Unsupported
+trees have no negative memo, and expression identity is never an execution key.
+The first encounter records admission; the second can materialize a kernel.
+The general executor avoids setup for exact Array inputs with fewer than eight
+outer rows on an indexed join, or a product below eight on a nonindexed join.
+Unknown containers and lateral sources gain no extra length reads. Spill paths
+retain ordinary admission. Immediate-compilation diagnostics bypass the
+small-input heuristic; global and JOIN-specific disable controls still win.
+Only immutable source, scalar pool data and kernels survive in this cache;
+selected plans and execution owners remain with the caller. Kernels receive
+the current engine, row and bindings at invocation.
 The internal text-disable switch rejects text admission across emitting tiers
 while retaining integer/boolean compilation. Its separate plan/expression memo
 slots prevent a warmed text method from bypassing the switch. Shared source-and-pool

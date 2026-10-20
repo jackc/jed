@@ -144,6 +144,12 @@ module JedNative
       nil
     end
 
+    def self.prepare(expression, types:, text: true)
+      new(types, text: text).prepare(expression)
+    rescue Unsupported
+      nil
+    end
+
     # A projection can contain scalar operations beside types whose evaluation
     # remains in the ordinary engine. Each unsupported root is delegated intact,
     # preserving all of its special evaluation rules and observable ordering.
@@ -168,10 +174,14 @@ module JedNative
     end
 
     def build(expression)
+      prepare(expression).materialize
+    end
+
+    def prepare(expression)
       begin_method
       value = emit(expression, 1)
       line(value)
-      finish_method.materialize
+      finish_method
     end
 
     def build_many(expressions)
