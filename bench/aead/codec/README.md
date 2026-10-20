@@ -43,11 +43,11 @@ starts one dedicated worker. The worker drives the TS core directly over a real
 scheduler. The public message transport is excluded. Variants run in an order rotated by the run
 index. Each variant gets a new 8 KiB-page file:
 
-- setup: `t` (2,000 rows, 100-byte text) and `s` (16,000 rows, 200-byte text, about 430 leaves);
+- setup: `t` (2,000 rows, 100-byte text) and `s` (16,000 rows, 200-byte text, about 460 leaves);
 - **single-row**: 20 warmups, then 200 durable autocommit `INSERT`s into `t`, timed per statement;
 - **64-row**: 5 warmups, then 40 `BEGIN; INSERT … SELECT` of 64 rows, with `COMMIT` timed;
 - **large**: 1 warmup, then 6 transactions inserting 16,000 rows of 200-byte text into a new table
-  (about 430 dirty pages each), with `COMMIT` timed;
+  (about 460 dirty pages each), with `COMMIT` timed;
 - **cold open** ×8: close, then open, timed (the last commit is large, so recovery validates its
   manifest and reads every listed dependency). Handle acquisition is not timed. "Cold" means a new
   engine handle with an empty page cache; the OS file cache is not dropped;
@@ -68,8 +68,9 @@ spent inside the `encrypt()` call itself.
 At the end of each variant the worker records query checksums and the SHA-256 of the whole file.
 The summary requires them to be identical across all variants and runs. Pages sealed/opened per
 operation are counted, giving a per-page delta against `none`. `results.json` holds every raw
-sample and observation, source hashes, built-artifact hashes and environment metadata. The report
-uses nearest-rank percentiles over pooled samples, plus each run's median.
+sample and observation, source hashes, built-artifact hashes and environment metadata. The task
+writes `summary.md` (nearest-rank percentiles over pooled samples, plus each run's median).
+`ruby bench/aead/codec/compact.rb results.json samples.json` produces the compact raw-evidence form (raw evidence stays off `master`, per `.gitignore`).
 
 ## Limitations
 
@@ -81,4 +82,4 @@ Results are integrated storage costs for this workload, not a general database s
 
 ## Results
 
-See [the 2026-10-19 report](../results/2026-10-19-async-codec/report.md).
+See [the 2026-10-19 report](../results/2026-10-19-async-codec.md).

@@ -131,6 +131,15 @@ The report records all samples and validation, copying/allocation, CPU affinity,
 build flags and artifact sizes. Cross-browser/ARM portability, whole-file crash behavior and
 integrated database performance remain open. See [the design investigation](../../spec/design/encryption.md#81-browser-execution-and-the-rustwasm-option).
 
+### Integrated async page codec (browser OPFS)
+
+`mise run bench:aead_codec_browser` ([method](codec/README.md),
+[2026-10-19 report](results/2026-10-19-async-codec.md)) installs measurement-only codecs at
+the TS pager's page seam over real OPFS in headless Chromium. They pay WebCrypto AES-GCM or
+synchronous Noble XChaCha per page, return the plaintext, and are verified byte-identical. In situ,
+AES cost about 7–9 µs and XChaCha about 40–46 µs per 8 KiB page. Chromium's worker WebCrypto ran
+inside the call and yielded no concurrency or event-loop turn. No suite is selected.
+
 ### Node native-engine comparison
 
 The [three-way Node report](results/2026-10-18-node.md) adds the existing Rust/Node-API package to

@@ -357,6 +357,20 @@ prototype and immediate idle-worker dispatch add only about 1% over hex alone in
 with larger observed Node timer gaps, and are reverted. Batch limits, packed validation and
 256-checkpoint task yields remain unchanged. The report preserves the variants and raw evidence.
 
+The [integrated async-codec report](../../bench/aead/results/2026-10-19-async-codec.md)
+measures §11's write side with measurement-only codecs over real OPFS. Each codec pays real
+WebCrypto AES-GCM or synchronous pure-JS XChaCha per page and returns the plaintext, so file bytes
+are verified unchanged. Across five fresh headless-Chromium runs, an async identity codec cost about
+0.1–0.2 ms per small commit, within process-run noise. AES-GCM added about 7–9 µs per page and
+XChaCha about 40–46 µs. Chromium's worker WebCrypto executes inside the call and resolves without a
+task boundary. So the 16-page encode window gave no concurrency (windows 1, 4 and 16 performed
+alike), and awaiting it did not make the worker responsive: commits and opens admitted no control
+message with or without a codec, while scans did. A codec-side task turn every 16 operations
+restored admission during open (max ping round trip about 16 ms vs about 110–145 ms). Large commits
+still blocked about 119 ms on synchronous serialization and writes. The window stays as a bound for
+hosts that do overlap. Whether long commits and opens need engine-side yield points is an open,
+suite-independent question. No suite or provider is chosen.
+
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
 admission errors, retained continuations and Node/browser extension registration; §11 resolves
 the asynchronous write side. Remaining decisions include crypto providers, worker pools,
