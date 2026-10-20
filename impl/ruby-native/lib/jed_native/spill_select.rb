@@ -383,6 +383,7 @@ module JedNative
       predicate = compile_filter(join[:on], left_columns + right_columns)
       outer = Relation.new(columns: left_columns, rows: [])
       predicate_kernel = native_compiled_join_predicate(predicate)
+      plan = prepare_join_index_execution(plan)
       left.each do |row|
         matches = RowSpool.new(self)
         matched = false

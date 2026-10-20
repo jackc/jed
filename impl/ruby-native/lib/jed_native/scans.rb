@@ -102,14 +102,22 @@ module JedNative
       result
     end
 
-    def primary_key_scan(stored, predicate)
+    def primary_key_scan(stored, predicate, bounds: nil)
       metadata = stored[:native_primary_metadata]
       return nil unless metadata && !metadata[:columns].empty? && predicate
-      terms = conjunctions(predicate)
+      bounds = nil if @native_join_bounds_disabled || !bounds&.prepared
+      terms = bounds ? join_bound_terms(bounds, predicate) : conjunctions(predicate)
       values, range = [], nil
       metadata[:columns].each_with_index do |column, i|
-        key = Expression.new(kind: :column, type: metadata[:types][i], value: column)
-        comparisons = key_comparisons(key, terms)
+        key = bounds&.keys&.[](i)
+        unless key
+          key = Expression.new(kind: :column, type: metadata[:types][i], value: column)
+          if bounds && bounds.units + 5 <= IndexNestedLoops::MAX_JOIN_BOUND_UNITS
+            bounds.units += 5
+            bounds.keys[i] = key.freeze
+          end
+        end
+        comparisons = bounds ? join_bound_comparisons(bounds, bounds.comparisons, i, key, terms) : key_comparisons(key, terms)
         break if comparisons.empty?
         equality = comparisons.find { |operator, _| operator == '=' || operator == 'is null' }
         if equality
@@ -176,10 +184,11 @@ module JedNative
       scan_rows(stored, ordinals)
     end
 
-    def secondary_scan(stored, predicate, selected_name: nil, allow_full: false)
+    def secondary_scan(stored, predicate, selected_name: nil, allow_full: false, bounds: nil)
       indexes = stored[:native_secondary_indexes]
       return nil unless indexes && predicate
-      terms = conjunctions(predicate)
+      bounds = nil if @native_join_bounds_disabled || !bounds&.prepared
+      terms = bounds ? join_bound_terms(bounds, predicate) : conjunctions(predicate)
       choices = []
       indexes.keys.sort_by(&:b).each do |name|
         next if selected_name && name != selected_name
@@ -189,7 +198,7 @@ module JedNative
         range = nil
         empty = false
         details[:expressions].each_with_index do |expression, ordinal|
-          comparisons = key_comparisons(expression, terms)
+          comparisons = bounds ? join_bound_comparisons(bounds, bounds.comparisons, ordinal, expression, terms) : key_comparisons(expression, terms)
           break if comparisons.empty?
           equality = comparisons.find { |operator, _| operator == '=' || operator == 'is null' }
           if equality

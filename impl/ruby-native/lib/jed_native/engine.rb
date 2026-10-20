@@ -1044,6 +1044,9 @@ module JedNative
         predicate_kernel = native_compiled_join_predicate(predicate, input_size: input_size) unless on_trees
         window_kernel = native_compiled_join_predicate(window[:filter], input_size: input_size) if window && window[:filter]
       end
+      if index_plan && !(left.rows.instance_of?(Array) && left.rows.length <= 1)
+        index_plan = prepare_join_index_execution(index_plan)
+      end
       left.rows.each_with_index do |lrow, left_index|
         break if window && rows.length >= window[:target]
         right = join_index_relation(index_plan, left, lrow) if index_plan
