@@ -1,0 +1,21 @@
+{
+  "command": [
+    "ruby",
+    "-e",
+    "require_relative \"bench/ruby-native/results/expression-walk-followup/check\"; hash=\"577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31\"; %w[focus host corpus].each do |phase|; ARGV.replace([\"--phase\",phase,\"--source-sha256\",hash]); ExpressionWalkChecks.main; end"
+  ],
+  "success": false,
+  "reason": "worker memory limit exceeded (536870912 bytes)",
+  "peak_rss_bytes": 106151936,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 900.0,
+  "elapsed_seconds": 65.56186747798347,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31",
+  "final_source_sha256": "577249f5b49bd67c369ca53eb256d91db73668a072bb1051c819a9698a40fc31",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "Starting focused-interpreter\nruby-native expression walks: preorder identity, key equality, mutable arguments, index decisions and exact cost prefixes passed\nVerified focused-interpreter\nStarting focused-yjit\nruby-native expression walks: preorder identity, key equality, mutable arguments, index decisions and exact cost prefixes passed\nVerified focused-yjit\nStarting focused-zjit\nruby-native expression walks: preorder identity, key equality, mutable arguments, index decisions and exact cost prefixes passed\nVerified focused-zjit\nStarting host-tests\nruby-native API: prepared reuse, binding, schema replacement, transaction and script rollback passed\nruby-native bounded workers: result/status, deadline descendants, allocation ceiling, parent-death cleanup, and bounded diagnostics passed\nruby-native buffered cursor memory: WITH admission, captured accounts, row transfers, loaded collations, nested preflight, collectors and early-close cleanup passed\nruby-native chain sharing: corrupt_kept_values passed\nruby-native chain sharing: read_unassigned_and_compact passed\nruby-native chain sharing: cost_and_ownership passed\nruby-native checksums: shared vectors, byte tails, seeded continuation, and page spans passed\nruby-native compiled aggregate: admission, two-phase reduction, guard prefixes, warmed APIs, callbacks and cursor lifetimes passed\nruby-native compiled expressions: interpreter parity, cost prefixes, NULL control flow, delayed faults, trusted source, bounds and code lifetime passed\nruby-native compiled text: metadata, character work, deferred reads, exact guards, collation fallback, warm APIs and captured contexts passed\nruby-native compiled LIKE: bounded literal shapes, escaping, independent costs/errors, host guards, compiler consumers and warmed APIs passed\n",
+  "stderr": "[ruby-native:bounded] $ ruby impl/ruby-native/tools/run_bounded.rb /home/jack/.…\nbounded worker: passed; peak RSS 45834240 bytes\n[ruby-native:bounded] $ ruby impl/ruby-native/tools/run_bounded.rb /home/jack/.…\nbounded worker: passed; peak RSS 47693824 bytes\n[ruby-native:bounded] $ ruby impl/ruby-native/tools/run_bounded.rb /home/jack/.…\nbounded worker: passed; peak RSS 60841984 bytes\n[ruby-native:test] $ JED_NATIVE_TIMEOUT=${JED_NATIVE_TIMEOUT:-180} ruby impl/ru…\n[FATAL] failed to allocate memory\nbounded worker: worker memory limit exceeded (536870912 bytes); peak RSS 119779328 bytes\n[ruby-native:test] ERROR task failed\n/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/expression-walk-followup/check.rb:164:in 'ExpressionWalkChecks.run': check process failed: host-tests (RuntimeError)\n\tfrom /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/expression-walk-followup/check.rb:188:in 'block in ExpressionWalkChecks.main'\n\tfrom /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/expression-walk-followup/check.rb:188:in 'Array#each'\n\tfrom /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/expression-walk-followup/check.rb:188:in 'ExpressionWalkChecks.main'\n\tfrom -e:1:in 'block in <main>'\n\tfrom -e:1:in 'Array#each'\n\tfrom -e:1:in '<main>'\n"
+}

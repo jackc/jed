@@ -73,6 +73,10 @@ keeps syntax walks fresh while avoiding scalar recursion and unnecessary CTE
 scope copies. It adds bounded, immutable aliased base-table source metadata to
 the existing join entries, under the same descriptor/context invalidation.
 No successful opaque-definition or authorization check is retained.
+The [expression traversal follow-up](../../impl/ruby-native/EXPRESSION_WALK_FOLLOWUP.md)
+uses fresh accumulators and direct index-key field comparisons to reduce
+temporary arrays while preserving node identity, equality rules and order.
+It introduces no additional retained state.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
