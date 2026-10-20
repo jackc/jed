@@ -113,8 +113,17 @@ Decided in the 2026-10-20 design review:
   writer's first key-block write is preceded by an unconditional stabilization barrier (file and,
   after a rename, directory). A credential offered to a plaintext file is refused (`28000`).
 - **Entropy streams are split by purpose** (§3.1): per database for pages, meta and key block;
-  per handle for scratch. Scratch blocks bind a per-block write counter for freshness (§4.2).
+  per handle for scratch. Mutable scratch blocks bind a per-block write counter for freshness,
+  kept as a budget-charged sparse map; sort runs need none (§4.2). Conversion to the encrypted
+  variant is refused on a handle whose scratch encryption is off, like attach (§4.2).
   Body pages have no CRC in the variant; recovery's manifest check is digest-only (§4).
+- **Edge cases fail closed, not resilient** (§3.1, 2026-10-21): a crash, lost connection or
+  owner change at a bad moment may cost the host a reopen; it may never cost security. So: no
+  cached-DEK resume for an SSH client whose owner is gone (`28000`, reopen); the owner verifies a
+  forwarded `rewrap` before writing it; a 16-byte DEK id in the key block and meta slot tells a
+  wrong file or a rotation (`28000`) from tampering (`XX001`) before any decryption (§6).
+- **From-scratch images allocate each overflow chain before its leaf, tail first**, so sealing
+  order is ascending index order and compaction stays an append stream (§4).
 - **Connected clients survive rotation by re-checking the key block** at their compaction reload
   (§6); a page client unlocks through `read_key_block`; an SSH page server receives the
   credential in `hello` over the stream, never `argv` or the environment.
@@ -211,7 +220,7 @@ Three findings settle the direction:
 
 1. **Platform support decides it.** AES-256-GCM and HKDF are in every platform's standard
    library or platform crypto, usually hardware-accelerated. XChaCha20-Poly1305 is in none of
-   them, so every native core but Rust and TS would need a third-party crypto dependency, and in
+   them, so every native core would need a third-party crypto dependency (RustCrypto, Noble), and in
    .NET and Swift the mature options largely wrap libsodium (C) through native interop, against
    CLAUDE.md §13/§14. Building XChaCha from the 96-bit-nonce ChaCha20-Poly1305 needs HChaCha20,
    which no standard library exposes, so it would mean hand-writing a primitive (§14 forbids it).
@@ -388,7 +397,20 @@ failure and live snapshots changes.
 
 #### Threat model, entropy and fault fixtures
 
-**Threat model.** Nonce reuse can expose plaintext relationships to an offline attacker holding
+**Threat model.** The attacker, in one place so each defense can be checked against it. They
+**can**: read the file and every copy of it at rest (backups, snapshots, crash remnants, the
+replication log) and compare them offline; **write** to the file at rest, including replaying
+older genuine pages and swapping the file for another; and, while the process runs, read and
+write the **scratch directory** (the one live capability granted, §4.2). They **cannot**: read
+the running process's memory (keys, counters, the plaintext cache — §6), restore a live VM clone
+with duplicated RNG state (below), or roll back the whole file undetected (anti-rollback is a
+separate trusted-state contract, §4). Against that attacker the guarantees are confidentiality of
+page contents (not of structure — the plaintext meta leaks the shape, §4) and detection of any
+tampering as `XX001` or a credential error, never wrong rows. **A standing rule for edge cases
+(2026-10-21):** an inopportune crash, a lost connection or a mid-operation owner change must
+never *compromise* security, but need not be *survived*; a fatal error that requires the host to
+reopen is an acceptable outcome, and this doc prefers it to a resume protocol wherever the
+resume would add state or trust. Nonce reuse can expose plaintext relationships to an offline attacker holding
 two backups; it does not require control of a running process. A single writer cannot prevent
 historical reuse on its own. Protect ordinary consistent copies, backup restoration and crash
 remnants. Per-page keys draw fresh randomness for every encryption, so a live process fork or
@@ -497,21 +519,27 @@ remains a separate trusted-state guarantee.
   write `txid + 1`). The binding is the full tag rather than a truncated tag or the CRC-64
   identity because it is the standard construction: its security rests on AEAD unforgeability
   plus the negligible chance that two genuine versions of a page share a tag, and nothing else;
-  the fan-out cost (16 bytes per pointer) was accepted knowingly. Two
-  consequences, plus two obligations. **Overflow chains seal tail first**: a chain is linked and
-  allocated head first (format.md), and each page binds its successor, so the last page is sealed
-  first. A commit has the value in memory, so this costs nothing; streaming compaction and
-  conversion keep their bounded-memory claim by walking the source chain once to collect its page
-  indices and then re-reading it **backwards**, sealing as they go, so memory is bounded by the
-  index list, not the value; in the browser the async window shrinks to one page at a time along
-  a chain. **The salt-draw order is a cross-core contract**: goldens and the simulator need
+  the fan-out cost (16 bytes per pointer) was accepted knowingly — concretely, at 8 KiB with
+  8-byte keys an interior entry grows from about 16 to 32 bytes and fan-out halves from roughly
+  510 to 254, so a table whose leaf count falls between those bands pays one more `page_read`
+  per descent. Five further points follow. **Overflow chains seal tail first**: each page binds
+  its successor, so the last page is sealed first. A commit has the value in memory, so this
+  costs nothing. For from-scratch images the **variant allocates each chain before its leaf and
+  tail first**, so sealing order equals ascending index order and the image stays an append
+  stream (the plaintext format allocates the leaf first, then each chain head first — format.md —
+  and its pinned order need not move, since the variant has its own goldens); streaming
+  compaction and conversion walk a source chain once to collect its indices and then read it
+  backwards while writing forwards, so memory is bounded by the index list, not the value; in the
+  browser the async window shrinks to one page at a time along a chain. The successor tag also
+  shrinks an overflow page's `C`-byte slab, changing chain page counts and so the cost family.
+  **The salt-draw order is a cross-core contract**: goldens and the simulator need
   byte-identical images under the fixed-bytes source, every seal draws a salt, so which page gets
   the k-th salt is specified — a commit draws its salts in one batch in the **canonical sealing
   order**: dirty body pages in children-first order with ties by ascending page index (repeatedly,
   every unsealed dirty page whose dirty children are sealed, ascending), then free-list pages,
   manifest-overflow pages, and the meta slot; `create`, compaction and conversion draw in their
-  image's stream order, `create` first drawing the DEK, the KDF salt, the wrap nonce and the
-  key-block tag salt; a credential change draws the KDF salt, the wrap nonce, then **one** DEK-tag
+  image's stream order, `create` first drawing the DEK, its DEK id, the KDF salt, the wrap nonce
+  and the key-block tag salt; a credential change draws the KDF salt, the wrap nonce, then **one** DEK-tag
   salt, since the two copies are byte-identical (§6). Within a free-list or manifest-overflow
   chain the order is **tail first**, like an overflow chain, because each page binds its successor.
   The batch is drawn **after every check that can fail the commit without writing** (`54P06`,
@@ -686,7 +714,11 @@ through main's scratch sink. Scratch encryption is therefore a **handle-level se
 encrypted; a host that will attach an encrypted database to a plaintext main sets `on` at open,
 and **attaching an encrypted database to a handle whose scratch encryption is off is refused**
 (a defined error at `attach`, never a silent plaintext spill) — on hosts that have a scratch
-target; in-memory, OPFS and WASI hosts never spill, so they have nothing to refuse. The setting
+target; in-memory, OPFS and WASI hosts never spill, so they have nothing to refuse. **Converting
+main or an attachment to the encrypted variant through such a handle is refused the same way**
+(`55000`): `auto` on a plaintext main resolved to off, the conversion keeps the handle open, and
+the first spill after it would write the now-encrypted data to plaintext scratch; the host that
+intends to convert opens with `on`. The setting
 never turns off during a handle's life, so temp data retained after a `detach` stays encrypted.
 When it is on, each scratch file gets a random
 key from the cryptographic entropy source (§3.1), held only in memory and never persisted. The
@@ -697,14 +729,20 @@ place, so each core keeps exactly one crypto path and no second nonce discipline
 A scratch block that fails authentication is an error, never data — and so that the claim
 covers reordering, replay and truncation by someone with access to the scratch directory while
 the process runs, not only bit flips, each block's **associated data is the scratch file's
-random id, the block's ordinal, and the block's write counter**, and the owner keeps the **block
-count and each block's counter in memory**. The counter is what gives freshness: a file id and
-ordinal alone would still accept an older authenticated version of a rewritten positional block
-or temp-domain page, restoring stale hash-partition links or temp rows with every tag valid; a
-fresh salt prevents nonce reuse but says nothing about which version is current. A sort run's
-last block carries a final-block flag and a run read that ends early is an error, and a
-positional scratch read of a block that was never written is an error, not zeros. The key and
-the counters are in memory anyway, so this costs nothing.
+random id, the block's ordinal, and — for mutable scratch — the block's write counter**. The
+counter is what gives freshness: a file id and ordinal alone would still accept an older
+authenticated version of a rewritten positional block or temp-domain page, restoring stale
+hash-partition links or temp rows with every tag valid; a fresh salt prevents nonce reuse but
+says nothing about which version is current. **Sort runs need no counter**: they are write-once
+and sequential, so the ordinal and a final-block flag on the last block suffice, and a run read
+that ends early is an error. For positional scratch and spilled temp domains the counters are
+**resident state, and bounded**: the owner keeps the block count and a **sparse map of rewritten
+blocks** (absent means counter zero — most positional blocks are written once), charged at its
+exact size to the operator's `work_mem` residency and the query-memory account like any other
+spill structure (spill.md §7, memory.md); a workload whose rewrites exhaust the budget fails
+with the account's error rather than growing the map, which is the edge-case rule above applied
+to memory. The counters do not survive the process, and need not: the scratch file dies with it.
+A positional scratch read of a block that was never written is an error, not zeros.
 
 The two scratch shapes differ in how the salt and tag find room, because neither is an
 encrypted database file:
@@ -774,9 +812,16 @@ parameters, and the KDF salt live in a dedicated **key block**: **pages 2 and 3*
 encrypted variant (the two copies), so the block is page-aligned under the byte-addressed
 `BlockStore` and found from `page_size` alone; the relocatable catalog root therefore satisfies
 `root_page ≥ 4` in an encrypted file. The block is **double-buffered with its own generation
-counter**, written at `create` and by credential changes only, never by a data commit. The wrap is an AEAD under the
+counter**, written at `create` and by credential changes only, never by a data commit. It also
+carries a random 16-byte **DEK id**, drawn with the DEK and repeated in the meta slot's
+authenticated plaintext, so a block's file is known **before any decryption**: a block
+transplanted from another file under the same host key (an operator mix-up) is the
+wrong-file form of `28000`, not `XX001`, and at a compaction reload a client tells a rotation
+(new DEK id → `28000`, reopen) from tampering (same DEK id, failed DEK tag → `XX001`). Rotation
+draws a new DEK id with the new DEK; the replication slice's persisted database id is a separate,
+lineage-wide identifier. The wrap is an AEAD under the
 KEK whose associated data is the block's plaintext fields (suite id, KDF id and parameters,
-salt, generation), so a pre-unlock field cannot be altered without the unwrap failing:
+salt, generation, DEK id), so a pre-unlock field cannot be altered without the unwrap failing:
 tampering fails closed, exactly as a wrong passphrase does, and no parameter downgrade is
 possible. Both surface as one **registered credential error** (PostgreSQL's `28P01
 invalid_password`, added to `spec/errors/` with the format), never `XX001`: a host must be able
@@ -847,7 +892,10 @@ no longer unlocks it, since both new wrappers may well be durable before the ack
 reaches the caller. A credential change takes the **writer gate** like any write, so it never
 overlaps a commit, a conversion or another change. Under the page service only the owner
 writes the file, so a **page client's credential change is forwarded**: the client holds the
-writer gate and sends the new key block through a page-service operation; the owner performs
+writer gate and sends the new key block through a page-service operation; the owner **verifies
+it first** — the block's DEK tag under the DEK the owner holds, its DEK id, and a generation of
+exactly current plus one — refusing anything else as a protocol violation (`08P01`), so a buggy
+client cannot install a block nobody can verify; then it performs
 the two-barrier write and acknowledges after its log entry is durable (the operation joins
 [page-service.md](page-service.md) §5.2 with the format). Fixtures cover every boundary (§3.1,
 *fault fixtures*). The meta slots carry no wrapper (§4).
@@ -922,9 +970,15 @@ Two operations have deliberately different semantics:
 
 The host owns credential storage, rotation policy, escrow, and OS-keychain integration. The
 engine owns wrapping and crash-safe file transitions. A credential change does not disturb an
-already unlocked process (it retains its DEK), and a page client that reconnects needs no
-credential either — its DEK is unchanged and the engine keeps no credential to re-present; only
-a process that **reopens** presents the new one. Each change draws a **fresh KDF salt**, and the
+already unlocked process (it retains its DEK), and a page client that reconnects **to a
+surviving owner** needs no credential either — its DEK is unchanged and the engine keeps no
+credential to re-present. The promise stops there: when no owner survives — an SSH helper that
+was owner is gone and the reconnect would launch a fresh `jed pages` that must open the file
+itself — the client cannot unlock it with a DEK it merely holds, and the engine defines **no
+cached-DEK resume handshake**; the reconnect fails with the missing-credential error (`28000`)
+and the host reopens with a credential, or configures the server's credential file (above).
+That is the edge-case rule (§3.1): the lost connection is not survived, and nothing is weakened
+to survive it. Only a process that **reopens** presents a credential. Each change draws a **fresh KDF salt**, and the
 new KEK is derived **before** the writer gate is taken, since PBKDF2 at the default count takes
 hundreds of milliseconds that no writer should wait on.
 
@@ -1202,8 +1256,14 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
   (validated-cow.md §4), so batches flush more often; the interior payload formula and the
   minimum-fan-out rule (format.md) are restated with 20-byte pointers (the rule needs `C ≥ 76`
   and the smallest encrypted `C` is 200, so it still holds); the free-list entries per page
-  change; and a free-list or manifest page's successor tag is page content, since `next_page`
-  sits in the encrypted header. The registry gains, besides the credential error (`28P01`, a
+  change; a free-list page's successor tag is page content, since its `next_page` sits in the
+  encrypted header (a manifest-overflow page is plaintext and may carry it beside `next_page`);
+  and an overflow page's successor tag shrinks its slab, changing chain page counts (§4). The
+  **host-API surface** is specified with the format too: credential arguments on `create`,
+  `open` and `attach`; a change-credential call; compaction with a new credential or a target
+  variant; the `scratch_encryption` setting; a host-facing `read_key_block` for backups; and
+  the `Environment`'s dedicated CSPRNG field (environment.md has one random source today).
+  The registry gains, besides the credential error (`28P01`, a
   wrong or tampered credential) and the stale-credential error (`28000`, a credential offered to a
   plaintext file, or a client whose DEK no longer matches the key block): a missing credential for an encrypted
   file (`28000 invalid_authorization_specification`, as PostgreSQL distinguishes it from a wrong
