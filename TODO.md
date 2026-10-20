@@ -73,6 +73,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [JOIN compilation admission](impl/ruby-native/JOIN_ADMISSION_FOLLOWUP.md),
   [scalar-function JOIN resolution reuse](impl/ruby-native/JOIN_FUNCTIONS_FOLLOWUP.md),
   [indexed-JOIN bound preparation](impl/ruby-native/JOIN_BOUNDS_FOLLOWUP.md),
+  [N-way candidate construction investigation](impl/ruby-native/NWAY_FRONTIER_FOLLOWUP.md),
   [private text-comparison snapshots](impl/ruby-native/TEXT_ELISION_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 
