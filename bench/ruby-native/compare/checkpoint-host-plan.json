@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "description": "Explicit checkpoint of the existing Ruby host callback fixture/schedules: scalar, buffered and streamed row/batch callbacks plus equivalent no-callback queries. Counters and exact values/metadata/cost validation run outside timed samples. The actual Rust binding uses the same Ruby callbacks.",
+  "rows": 1000,
+  "repetitions": 5,
+  "validation_iterations": 3,
+  "workloads": [
+    {
+      "name": "host_scalar",
+      "sql": "SELECT bench_mix_row($1::i32)",
+      "offset": -999,
+      "step": 17,
+      "span": 2000,
+      "warmup": 300,
+      "iterations": 2000,
+      "validation_iterations": 3,
+      "kind": "host_scalar"
+    },
+    {
+      "name": "host_buffered_none",
+      "sql": "SELECT id, amount FROM host_items WHERE bucket BETWEEN $1 AND $2 ORDER BY id",
+      "fixed_params": [
+        0,
+        4
+      ],
+      "warmup": 100,
+      "iterations": 50,
+      "validation_iterations": 3,
+      "kind": "host_rows",
+      "site": "buffered",
+      "kernel": "none"
+    },
+    {
+      "name": "host_buffered_row",
+      "sql": "SELECT id, bench_mix_row(amount) FROM host_items WHERE bucket BETWEEN $1 AND $2 ORDER BY id",
+      "fixed_params": [
+        0,
+        4
+      ],
+      "warmup": 100,
+      "iterations": 50,
+      "validation_iterations": 3,
+      "kind": "host_rows",
+      "site": "buffered",
+      "kernel": "row"
+    },
+    {
+      "name": "host_buffered_batch",
+      "sql": "SELECT id, bench_mix_batch(amount) FROM host_items WHERE bucket BETWEEN $1 AND $2 ORDER BY id",
+      "fixed_params": [
+        0,
+        4
+      ],
+      "warmup": 100,
+      "iterations": 50,
+      "validation_iterations": 3,
+      "kind": "host_rows",
+      "site": "buffered",
+      "kernel": "batch"
+    },
+    {
+      "name": "host_streamed_none",
+      "sql": "SELECT id, amount FROM host_items WHERE id BETWEEN $1 AND $2 ORDER BY id",
+      "fixed_params": [
+        0,
+        999
+      ],
+      "warmup": 100,
+      "iterations": 50,
+      "validation_iterations": 3,
+      "kind": "host_rows",
+      "site": "streamed",
+      "kernel": "none"
+    },
+    {
+      "name": "host_streamed_row",
+      "sql": "SELECT id, bench_mix_row(amount) FROM host_items WHERE id BETWEEN $1 AND $2 ORDER BY id",
+      "fixed_params": [
+        0,
+        999
+      ],
+      "warmup": 100,
+      "iterations": 50,
+      "validation_iterations": 3,
+      "kind": "host_rows",
+      "site": "streamed",
+      "kernel": "row"
+    },
+    {
+      "name": "host_streamed_batch",
+      "sql": "SELECT id, bench_mix_batch(amount) FROM host_items WHERE id BETWEEN $1 AND $2 ORDER BY id",
+      "fixed_params": [
+        0,
+        999
+      ],
+      "warmup": 100,
+      "iterations": 50,
+      "validation_iterations": 3,
+      "kind": "host_rows",
+      "site": "streamed",
+      "kernel": "batch"
+    }
+  ]
+}
