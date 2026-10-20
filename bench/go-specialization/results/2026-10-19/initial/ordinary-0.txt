@@ -1,0 +1,31 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkSpecialization/memory/arithmetic-24         	     207	    587253 ns/op	1508503557 checksum	     20492 cost	  526003 B/op	    8210 allocs/op
+BenchmarkSpecialization/memory/filter-24             	     214	    568513 ns/op	 183698413 checksum	     14674 cost	  470274 B/op	    6468 allocs/op
+BenchmarkSpecialization/memory/finite-24             	     211	    579979 ns/op	1508503557 checksum	     20492 cost	  526010 B/op	    8210 allocs/op
+BenchmarkSpecialization/memory/small-24              	   37564	      3122 ns/op	1818129093 checksum	        92.00 cost	    3760 B/op	      50 allocs/op
+BenchmarkSpecialization/memory/offset-24             	   12381	      9819 ns/op	1431864225 checksum	       266.0 cost	    9408 B/op	     109 allocs/op
+BenchmarkSpecialization/memory/point_hit-24          	   79009	      1437 ns/op	 779388637 checksum	         6.000 cost	    1632 B/op	      22 allocs/op
+BenchmarkSpecialization/memory/point_miss-24         	     142	    807563 ns/op	2166136261 checksum	     12300 cost	 1752296 B/op	    4154 allocs/op
+BenchmarkSpecialization/memory/scalar-24             	  164569	       609.3 ns/op	 393503400 checksum	         2.000 cost	    1352 B/op	      12 allocs/op
+BenchmarkSpecialization/memory/unsupported-24        	     277	    418329 ns/op	3765470213 checksum	     12300 cost	  526021 B/op	    8210 allocs/op
+BenchmarkSpecialization/memory/columnar-24           	    1785	     80762 ns/op	 806741284 checksum	      8205 cost	    2160 B/op	      18 allocs/op
+BenchmarkSpecialization/memory/case-24               	     241	    460135 ns/op	2279927151 checksum	     16396 cost	  526048 B/op	    8210 allocs/op
+BenchmarkSpecialization/memory/adhoc-24              	   10000	     10267 ns/op	1524379493 checksum	        60.00 cost	   14037 B/op	     118 allocs/op
+BenchmarkSpecialization/memory/first_call-24         	   10000	     10173 ns/op	1524379493 checksum	        60.00 cost	   14422 B/op	     121 allocs/op
+BenchmarkSpecialization/file/arithmetic-24           	     241	    496817 ns/op	1508503557 checksum	     20492 cost	  526027 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/filter-24               	     258	    521972 ns/op	 183698413 checksum	     14674 cost	  470281 B/op	    6468 allocs/op
+BenchmarkSpecialization/file/finite-24               	     182	    632317 ns/op	1508503557 checksum	     20492 cost	  526003 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/small-24                	   36748	      3177 ns/op	1818129093 checksum	        92.00 cost	    3760 B/op	      50 allocs/op
+BenchmarkSpecialization/file/offset-24               	   12544	      9185 ns/op	1431864225 checksum	       266.0 cost	    9408 B/op	     109 allocs/op
+BenchmarkSpecialization/file/point_hit-24            	   77089	      1339 ns/op	 779388637 checksum	         6.000 cost	    1632 B/op	      22 allocs/op
+BenchmarkSpecialization/file/point_miss-24           	     156	    728548 ns/op	2166136261 checksum	     12300 cost	 1752304 B/op	    4154 allocs/op
+BenchmarkSpecialization/file/scalar-24               	  186404	       611.8 ns/op	 393503400 checksum	         2.000 cost	    1352 B/op	      12 allocs/op
+BenchmarkSpecialization/file/unsupported-24          	     264	    437844 ns/op	3765470213 checksum	     12300 cost	  526018 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/columnar-24             	    1842	     72858 ns/op	 806741284 checksum	      8205 cost	    2160 B/op	      18 allocs/op
+BenchmarkSpecialization/file/case-24                 	     282	    496895 ns/op	2279927151 checksum	     16396 cost	  526023 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/adhoc-24                	   12008	      9631 ns/op	1524379493 checksum	        60.00 cost	   14035 B/op	     118 allocs/op
+BenchmarkSpecialization/file/first_call-24           	   10000	     10280 ns/op	1524379493 checksum	        60.00 cost	   14420 B/op	     121 allocs/op
+PASS

@@ -1,6 +1,8 @@
 # Go: static execution kernels — proposed experiment
 
-> **Proposal, not implemented or ratified for production.** This investigation
+> **G1 research implementation available; not ratified for production.** See the
+> [implementation and results](../../bench/go-specialization/README.md). G2/G3
+> remain conditional follow-ons. This investigation
 > can run independently of Rust and TS. It inherits the
 > [experiment contract](execution-specialization-experiments.md), including
 > semantic invariants, structural caps, coverage and performance gates.
