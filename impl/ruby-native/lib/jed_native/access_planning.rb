@@ -40,8 +40,15 @@ module JedNative
     def execute_scan_access(stored, predicate, access)
       case access[:kind]
       when :full then nil
-      when :primary then primary_key_scan(stored, predicate)
-      when :secondary then secondary_scan(stored, predicate, selected_name: access[:name], allow_full: access[:parts].empty?)
+      when :primary
+        bounds = access[:native_join_bounds]
+        bounds ? primary_key_scan(stored, predicate, bounds: bounds) : primary_key_scan(stored, predicate)
+      when :secondary
+        if (bounds = access[:native_join_bounds])
+          secondary_scan(stored, predicate, selected_name: access[:name], allow_full: access[:parts].empty?, bounds: bounds)
+        else
+          secondary_scan(stored, predicate, selected_name: access[:name], allow_full: access[:parts].empty?)
+        end
       when :primary_interval, :secondary_interval then execute_interval_access(stored, predicate, access)
       when :gin, :gist then execute_auxiliary_scan(stored, access)
       end
