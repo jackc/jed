@@ -7,9 +7,11 @@ feature work do not include it.
 
 **Decision: reject this candidate.** It reduces estimator dispatch and allocations
 but does not establish a useful JIT throughput gain. The measured candidate and
-its evidence are retained in Git for reproduction; subsequent work restores the
-original estimator. The following implementation and measurements describe the
-candidate, not a retained optimization.
+its evidence are retained in archival commit
+`d8084fb6e44bbf3f825bf7ff61d1bdcb16e3451a` for reproduction. The original
+estimator is restored, with library hash identical to the baseline below.
+The candidate-specific test lives in that archival commit. The following
+implementation and measurements describe the candidate, not a retained optimization.
 
 ## Measured implementation
 
@@ -186,7 +188,7 @@ pass, not an implemented change here.
 The evidence directory contains `check.rb` for focused, host and complete-corpus
 checks, and `run.rb` for measurements. Both use explicit
 `mise run ruby-native:*` tasks, run serially and refuse to replace existing
-reports. Check out the measured candidate's archival commit to reproduce this
+reports. Check out archival commit `d8084fb6e44bbf3f825bf7ff61d1bdcb16e3451a` to reproduce this
 rejected implementation; the later branch restores the original estimator.
 Preserve earlier artifacts before an intentional rerun.
 
