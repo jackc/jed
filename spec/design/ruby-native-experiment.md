@@ -50,6 +50,10 @@ errors and costs.
 The [method-sharing follow-up](../../impl/ruby-native/METHOD_SHARING_FOLLOWUP.md)
 shares identical generated methods through a bounded process cache while keeping
 each kernel's constants and execution ownership independent.
+The [join planning follow-up](../../impl/ruby-native/JOIN_PLAN_FOLLOWUP.md)
+retains bounded resolved roots and column metadata for eligible two-table joins.
+Access selection remains specific to each execution and binding; mutable
+execution state belongs to the cursor/SELECT invocation.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

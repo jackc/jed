@@ -62,6 +62,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [shared compiled Ruby methods](impl/ruby-native/METHOD_SHARING_FOLLOWUP.md),
   [broader literal LIKE patterns](impl/ruby-native/LITERAL_LIKE_FOLLOWUP.md),
   [broad performance checkpoint](impl/ruby-native/PERFORMANCE_CHECKPOINT.md),
+  [prepared join resolution reuse](impl/ruby-native/JOIN_PLAN_FOLLOWUP.md),
   [private text-comparison snapshots](impl/ruby-native/TEXT_ELISION_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 
