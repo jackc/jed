@@ -47,10 +47,11 @@ These bind the eventual build; everything else in this doc that says "open" stil
   general-purpose seeded entropy seam (§3.1, *Threat model*).
 - **Browser performance is not a deciding factor for the suite.** Encrypted browser databases
   are expected to be uncommon.
-- **Suite direction: AES-256-GCM with keys derived by HKDF-SHA-256 from fresh random salts**, per
-  page or per commit attempt, chosen for standard-library support across current and future
-  native cores (§3.1). XChaCha20-Poly1305 is dropped. This becomes a format decision after a
-  security review and the fault fixtures.
+- **Suite direction: AES-256-GCM with keys derived by HKDF-SHA-256 from fresh random salts**, chosen
+  for standard-library support across current and future native cores (§3.1). XChaCha20-Poly1305 is
+  dropped. This becomes a format decision after a security review and the fault fixtures.
+- **One key per page (2026-10-20).** Every page encryption draws its own salt and derives a
+  single-use key; per-commit-attempt keys are not pursued (§3.1, *Key granularity*).
 
 ## 2. Where it sits: a page codec in the core, above the seam
 
@@ -118,7 +119,7 @@ Prefer **one initial suite** across cores, with a versioned format for later rep
 suite needs a measured platform limitation or concrete interoperability requirement.
 
 **Direction (2026-10-19):** AES-256-GCM, where every key is derived with HKDF-SHA-256 from the
-data key and a **fresh random salt**, at a granularity of one page or one commit attempt (below).
+data key and a **fresh random salt**, one key per page encryption (below).
 Nothing about key or nonce use is persisted or allocated across commits. This becomes a format
 decision only after a security review of the exact construction and the fault fixtures below.
 XChaCha20-Poly1305 is no longer a candidate, nor is AES-GCM-SIV (absent from WebCrypto and most
@@ -163,25 +164,25 @@ page sealed at 1.69 µs, still faster than XChaCha's 2.07 µs in the same harnes
 WebCrypto, salt plus HKDF plus key import measured 4.3 µs. The derivation cost recurs on every
 cache-miss read under per-page keys.
 
-#### Key granularity: per page or per commit attempt
+#### Key granularity: one key per page (decided 2026-10-20)
 
-Both granularities draw the salt from the cryptographic entropy source (*Threat model* below),
-bind a versioned purpose label in the HKDF context (pages, meta authentication, key wrapping and
-scratch files are distinct purposes), and persist nothing between commits. A crashed, failed or
-retried commit attempt simply never uses its salt again, so neither needs a nonce reservation
-before the commit guard (§8.1) or an allocator owner across page-service clients: each committer
-derives its own keys.
+Two granularities were measured; both draw the salt from the cryptographic entropy source (*Threat
+model* below), bind a versioned purpose label in the HKDF context (pages, meta authentication, key
+wrapping and scratch files are distinct purposes), and persist nothing between commits. A crashed,
+failed or retried commit attempt simply never uses its salt again, so neither needs a nonce
+reservation before the commit guard (§8.1) or an allocator owner across page-service clients: each
+committer derives its own keys.
 
-- **Per page.** Each page encryption draws a salt and derives a single-use key; with each key
-  sealing one message, the GCM nonce can be fixed. Per-page fields: the salt (24–32 bytes) and the
-  16-byte tag, 40–48 bytes. Reads derive the page's key on every cache miss; there is no key
+- **Per page (chosen).** Each page encryption draws a salt and derives a single-use key; with each
+  key sealing one message, the GCM nonce can be fixed. Per-page fields: the salt (24–32 bytes) and
+  the 16-byte tag, 40–48 bytes. Reads derive the page's key on every cache miss; there is no key
   cache. This is the simplest form.
-- **Per commit attempt.** Each commit attempt draws one salt and seals its pages with nonces that
-  count up within the attempt, held only in memory. Per-page fields: the salt, a 4-byte page
-  ordinal and the tag, 52 bytes with a 32-byte salt. Readers cache derived keys by salt in a
+- **Per commit attempt (not pursued).** Each commit attempt draws one salt and seals its pages with
+  nonces that count up within the attempt, held only in memory. Per-page fields: the salt, a 4-byte
+  page ordinal and the tag, 52 bytes with a 32-byte salt. Readers cache derived keys by salt in a
   bounded cache, deriving once per distinct commit rather than once per page.
 
-The choice weighs the read-side derivation cost on each native core against the reserve size
+The choice weighed the read-side derivation cost on each native core against the reserve size
 (§4.1). **Measured (2026-10-19, native Go and Rust, §8):** a full derive (salt, HKDF, AES-GCM key
 setup) costs 0.57–0.81 µs in Go and 0.18–0.34 µs in Rust, depending on the HKDF layout below.
 Per-page keys therefore raise an 8 KiB cache-miss open by 56–95% of the crypto time in Go (whose
@@ -189,16 +190,22 @@ AES is fast) and by 3–10% in Rust. Per-commit keys help reads only when consec
 from the same commit: read cold, with every page from a different commit, they cost slightly more
 than per-page keys (the cache work); from 16 pages per commit, opens and seals come within 7% of
 a single fixed key. The per-page reserve is 48 bytes with a 32-byte salt (40 with 24), against
-52 per commit. Neither granularity is selected yet.
+52 per commit.
 
-A random salt of at least 192 bits makes a repeated salt negligible across any realistic
-number of keys, and each derived key seals one page or one commit's pages, far below GCM's
-per-key limits. The construction is our composition of standard primitives, close to
-[Tink's AES-GCM-HKDF streaming AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming)
-and C2SP's XAES-256-GCM, but neither analysis covers a mutable page codec automatically. The review
-must cover the exact HKDF layout (random salt as the extract salt, or as expand context under one
-extracted key), domain separation, salt length and cumulative bounds. The expand-context layout
-measured 0.24 µs per key cheaper in Go and 0.16 µs in Rust (§8), since it extracts once at unlock.
+**Per-page keys are chosen.** Their read-side cost is at most about 0.5–0.65 µs per cache miss
+with the cheaper layout, small beside the I/O and decoding a real miss pays. They need the smaller
+reserve and no key cache, and per-commit keys help only when consecutive misses come from the same
+commit, being no better on cold reads. The salt length (24 or 32 bytes) and the HKDF layout remain
+for the security review; the expand-per-key layout measured cheaper (below).
+
+A random salt of at least 192 bits makes a repeated salt negligible across any realistic number of
+keys, and each derived key seals a single page, far below GCM's per-key limits. The construction is
+our composition of standard primitives, close to [Tink's AES-GCM-HKDF streaming
+AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming) and C2SP's
+XAES-256-GCM, but neither analysis covers a mutable page codec automatically. The review must cover
+the exact HKDF layout (random salt as the extract salt, or as expand context under one extracted
+key), domain separation, salt length and cumulative bounds. The expand-context layout measured 0.24
+µs per key cheaper in Go and 0.16 µs in Rust (§8), since it extracts once at unlock.
 
 The earlier **writer-lifetime** candidate, one derived key per acquisition of write ownership with
 a counter for every encryption under it, is not pursued: its counter allocation across
@@ -208,10 +215,8 @@ random-salt granularities avoid, for a derivation saving that measured below 1 �
 **Threat model.** Nonce reuse can expose plaintext relationships to an offline attacker holding
 two backups; it does not require control of a running process. A single writer cannot prevent
 historical reuse on its own. Protect ordinary consistent copies, backup restoration and crash
-remnants. Under per-commit-attempt keys, a live process fork/checkpoint taken mid-commit
-duplicates an active key and its in-memory page counter and requires codec reinitialization;
-per-page keys draw fresh randomness for every encryption, so only a duplicated random-number
-generator state (below) can repeat one.
+remnants. Per-page keys draw fresh randomness for every encryption, so a live process
+fork/checkpoint repeats a key only if it duplicates the random-number generator state (below).
 
 **Key material uses a dedicated cryptographic entropy source (decided).** Data keys, KDF salts,
 page and commit salts and scratch-file keys are drawn from a source separate from the
@@ -282,7 +287,7 @@ remains a separate trusted-state guarantee.
 
 Today every page-capacity rule derives from `C = page_size - 16` (format.md *Page model*):
 `RECORD_MAX`, leaf and interior fan-out, split points, large-value externalization and the
-overflow chunk size. Per-page crypto fields (40–52 bytes plus any binding, §3.1) would shrink
+overflow chunk size. Per-page crypto fields (40–48 bytes plus any binding, §3.1) would shrink
 that capacity, so an encrypted file would build a differently shaped tree from the same rows,
 with different page counts, page-read costs and possibly plans.
 
@@ -309,7 +314,7 @@ For jed:
 The field arrives with the encryption format version, not before. Open: whether plaintext
 files reserve by default (about 0.5–0.7% of an 8 KiB page) so they can be encrypted in place,
 and the reserve's size once the suite and any parent-pointer binding (§4) are chosen. Page
-sizes must keep `C` above the structural minimum; at the 256-byte golden page size a 40–52-byte
+sizes must keep `C` above the structural minimum; at the 256-byte golden page size a 40–48-byte
 reserve is a large fraction, which fixtures must account for.
 
 ### 4.2 Scratch files (decided)
@@ -518,14 +523,13 @@ crash behavior. They **select no suite**. See the
 
 ## 9. Open / deferred
 
-**Suite direction: AES-256-GCM with random-salt HKDF keys** (§3.1), per page or per commit attempt.
-Platform support across current and future native cores decides it: AES-GCM and HKDF are in
-every standard library, while XChaCha20-Poly1305 is in none. Browser performance is not a
-deciding factor. The direction becomes a format decision after a security review of the exact
-construction and the §3.1 fault fixtures; no production dependency is selected. Still to decide:
-per-page versus per-commit-attempt keys, weighing the measured read-side derivation on Go and Rust
-(§8) against the reserve size. A pure-JS fallback and a software-WASM backend are material deployment
-costs, not reasons by themselves to maintain two file suites.
+**Suite direction: AES-256-GCM with random-salt HKDF keys, one key per page** (§3.1). Platform
+support across current and future native cores decides it: AES-GCM and HKDF are in every standard
+library, while XChaCha20-Poly1305 is in none. Browser performance is not a deciding factor. The
+direction becomes a format decision after a security review of the exact construction and the §3.1
+fault fixtures; no production dependency is selected. Still to decide in that review: the salt
+length (24 or 32 bytes) and the HKDF layout. A pure-JS fallback and a software-WASM backend are
+material deployment costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one
 algorithm; the selected Noble exports were 3.7–4.6 KiB gzipped. These exclude the passphrase KDF,

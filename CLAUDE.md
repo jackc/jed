@@ -622,8 +622,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   use a random, never-persisted per-file key; key material comes from a dedicated CSPRNG source,
   never the seeded SQL entropy seam; browser performance does not decide the suite. Suite
   direction, pending security review: AES-256-GCM with HKDF-SHA-256 keys from fresh random
-  salts, per page or per commit attempt, because AES-GCM and HKDF are in every platform standard
-  library and XChaCha20-Poly1305 is in none.
+  salts, one key per page, because AES-GCM and HKDF are in every platform standard library and
+  XChaCha20-Poly1305 is in none.
   Vetted libraries expose safe APIs; explicitly reviewed assembly/intrinsics behind those APIs
   are permitted under §14, while engine code stays safe and Go stays free of cgo/external FFI.
 - Writable commits persist only changed database domains. Empty/read-only work in a writable
