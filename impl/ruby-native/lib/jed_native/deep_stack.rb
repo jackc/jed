@@ -53,6 +53,32 @@ module JedNative
       @native_constant_depth = depth
     end
 
+    def estimate_predicate(rows, expression)
+      depth = @native_predicate_estimate_depth || 0
+      if depth >= STACK_SLICE
+        @native_predicate_estimate_depth = 0
+        return Fiber.new { estimate_predicate(rows, expression) }.resume
+      end
+      # A flat IN list becomes a long OR tree without deep SQL nesting.
+      # Keep all estimator layers and their table/parameter context in order.
+      @native_predicate_estimate_depth = depth + 1
+      super
+    ensure
+      @native_predicate_estimate_depth = depth
+    end
+
+    def expression_work(expression)
+      depth = @native_expression_work_depth || 0
+      if depth >= STACK_SLICE
+        @native_expression_work_depth = 0
+        return Fiber.new { expression_work(expression) }.resume
+      end
+      @native_expression_work_depth = depth + 1
+      super
+    ensure
+      @native_expression_work_depth = depth
+    end
+
     def evaluate(expression, row, group = nil)
       return super unless @native_evaluation_depth || expression.instance_variable_get(:@native_deep_evaluation)
       depth = @native_evaluation_depth
