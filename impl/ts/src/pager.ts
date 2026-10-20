@@ -12,9 +12,14 @@
 // recipe, which is host-independent (hosts.md §3).
 
 import { type BlockStore, FailingBlockStore } from "./blockstore.ts";
-import { type ManifestEntry, manifestInlineCapacity } from "./commit_manifest.ts";
+import {
+  type ManifestEntry,
+  manifestInlineCapacity,
+  type ManifestPageRead,
+  PAGE_IO_WINDOW,
+} from "./commit_manifest.ts";
 import { type EngineError, engineError } from "./errors.ts";
-import { ioSteps, runSync, type Steps } from "./execution.ts";
+import { deviceSteps, ioSteps, runSync, type Steps } from "./execution.ts";
 
 // PREALLOC_CHUNK_BYTES is the MAXIMUM file-growth step — ~1 MiB worth of pages. The file grows
 // geometrically (≈doubling its current size — reserve), so a small database's file stays proportional
@@ -76,6 +81,40 @@ function injectedCrash(): EngineError {
   return engineError("io_error", "injected commit crash (fault injection)");
 }
 
+// PageTransform is the page-codec seam (ts-runtime.md §11.5): it sits above the byte device and below
+// the page cache (hosts.md §6), transforming each page as it crosses the seam, keyed by page index.
+// decode returns exactly the logical page bytes encode received, so page CRCs, manifest digests, and
+// the cache all see plaintext pages (validated-cow.md §5). A transform may offer synchronous forms,
+// asynchronous forms, or both; one with an async form puts the pager's write side in the asynchronous
+// mode. Only an identity transform exists, in tests: no codec or format is selected (encryption.md).
+export interface PageTransform {
+  encode?(index: number, page: Uint8Array): Uint8Array;
+  decode?(index: number, stored: Uint8Array): Uint8Array;
+  encodeAsync?(index: number, page: Uint8Array): Promise<Uint8Array>;
+  decodeAsync?(index: number, stored: Uint8Array): Promise<Uint8Array>;
+}
+
+// PageRead is one page of a read window (commit_manifest.ts ManifestPageRead).
+export type PageRead = ManifestPageRead;
+export { PAGE_IO_WINDOW };
+
+// deviceWritesAsync reports whether a byte device offers an asynchronous write-side operation, which
+// puts its pager's write side in the asynchronous mode (ts-runtime.md §11.4).
+function deviceWritesAsync(store: BlockStore): boolean {
+  return (
+    store.writeAtAsync !== undefined ||
+    store.syncAsync !== undefined ||
+    store.setSizeAsync !== undefined
+  );
+}
+
+function syncCodecMissing(): EngineError {
+  return engineError(
+    "feature_not_supported",
+    "this page codec is asynchronous; use the asynchronous runtime",
+  );
+}
+
 // BatchMirror is where a page-service owner's batched-durability facts are mirrored for its service
 // (spec/design/validated-cow.md §4, page-service.md §6): the floor slot and whether a batch is pending.
 // The service flushes a pending batch before granting a client begin_write and moves the floor at each
@@ -130,11 +169,36 @@ export class Pager {
   // the newest generation durable. shrinkPages is that newest generation's high-water.
   private shrinkPending = false;
   private shrinkPages = 0;
+  // transform is the page codec (null: pages cross the seam unchanged). writeAsync is the write-side
+  // mode (ts-runtime.md §11.4): whether the transform or device offers an asynchronous operation. When
+  // false every write-side step runs inline, exactly as the synchronous path.
+  private transform: PageTransform | null = null;
+  private writeAsync = false;
 
   private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
     this.store = store;
     this.pageSize = pageSize;
     this.allocatedPages = allocatedPages;
+    this.refreshMode();
+  }
+
+  // setPageTransform installs the page codec (null removes it). Set before any page is read through
+  // it: the bootstrap header fromStore reads is the only page that bypasses the transform.
+  setPageTransform(transform: PageTransform | null): void {
+    this.transform = transform;
+    this.refreshMode();
+  }
+
+  // writeSideAsync reports the write-side mode (ts-runtime.md §11.4).
+  writeSideAsync(): boolean {
+    return this.writeAsync;
+  }
+
+  private refreshMode(): void {
+    const t = this.transform;
+    this.writeAsync =
+      (t !== null && (t.encodeAsync !== undefined || t.decodeAsync !== undefined)) ||
+      deviceWritesAsync(this.store);
   }
 
   // armFault arms a one-shot commit fault (the fault-injection seam, spec/design/storage.md §7) and
@@ -169,16 +233,51 @@ export class Pager {
     throw injectedCrash();
   }
 
+  private encodeSync(index: number, page: Uint8Array): Uint8Array {
+    const t = this.transform;
+    if (t === null) return page;
+    if (t.encode === undefined) throw syncCodecMissing();
+    return t.encode(index, page);
+  }
+
+  private decodeSync(index: number, stored: Uint8Array): Uint8Array {
+    const t = this.transform;
+    if (t === null) return stored;
+    if (t.decode === undefined) throw syncCodecMissing();
+    return t.decode(index, stored);
+  }
+
+  // decodeSteps decodes one stored page through the transform, awaiting its async form when offered.
+  private *decodeSteps(index: number, stored: Uint8Array): Steps<Uint8Array> {
+    const t = this.transform!;
+    if (t.decodeAsync === undefined) return this.decodeSync(index, stored);
+    const decode = t.decodeAsync.bind(t);
+    return yield* ioSteps(
+      () => this.decodeSync(index, stored),
+      () => decode(index, stored),
+    );
+  }
+
   // fromStore adopts an already-open store as the byte backing, reading the page size from its meta
   // header (offset 8, format.md). The host layer (file.ts) opens the host — mapping a missing path to
   // 58P01 — and hands it here wrapped in a BlockStore. A store smaller than a meta header, or a zero
   // page size, is XX001.
   static fromStore(store: BlockStore): Pager {
+    return runSync(Pager.fromStoreSteps(store));
+  }
+
+  // fromStoreSteps is fromStore with an awaitable header read on a device in the asynchronous mode.
+  static *fromStoreSteps(store: BlockStore): Steps<Pager> {
     const size = store.size();
     if (size < 12) {
       throw engineError("data_corrupted", "database file smaller than a meta header");
     }
-    const header = store.readAt(0, 12);
+    const header = yield* deviceSteps(
+      () => store.readAt(0, 12),
+      deviceWritesAsync(store) && store.readAtAsync !== undefined
+        ? () => store.readAtAsync!(0, 12)
+        : undefined,
+    );
     const pageSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(
       8,
       false,
@@ -202,9 +301,67 @@ export class Pager {
     const store = this.store;
     const offset = index * this.pageSize;
     const length = this.pageSize;
-    return yield* ioSteps(
+    const stored = yield* ioSteps(
       () => store.readAt(offset, length),
       store.readAtAsync === undefined ? undefined : () => store.readAtAsync!(offset, length),
+    );
+    if (this.transform === null) return stored;
+    return yield* this.decodeSteps(index, stored);
+  }
+
+  // readPageSteps is the write side's page read (commit, recovery, maintenance — ts-runtime.md §11):
+  // inline in the synchronous mode, otherwise each stage awaits its asynchronous form when offered.
+  // Unlike a query's data read it never adds a task yield before a synchronous device read.
+  *readPageSteps(index: number): Steps<Uint8Array> {
+    const store = this.store;
+    const offset = index * this.pageSize;
+    const length = this.pageSize;
+    if (!this.writeAsync) return this.decodeSync(index, store.readAt(offset, length));
+    const stored = yield* deviceSteps(
+      () => store.readAt(offset, length),
+      store.readAtAsync === undefined ? undefined : () => store.readAtAsync!(offset, length),
+    );
+    if (this.transform === null) return stored;
+    return yield* this.decodeSteps(index, stored);
+  }
+
+  // readWindowSteps reads the pages indices names concurrently, one window of read-ahead for recovery
+  // (ts-runtime.md §11.3), capturing each page's error instead of throwing it. Null in the synchronous
+  // mode, where the caller reads lazily one page at a time.
+  *readWindowSteps(indices: number[]): Steps<PageRead[] | null> {
+    if (!this.writeAsync) return null;
+    const store = this.store;
+    const t = this.transform;
+    const ps = this.pageSize;
+    const one = async (index: number): Promise<Uint8Array> => {
+      const offset = index * ps;
+      const stored =
+        store.readAtAsync === undefined
+          ? store.readAt(offset, ps)
+          : await store.readAtAsync(offset, ps);
+      if (t === null) return stored;
+      return t.decodeAsync === undefined
+        ? this.decodeSync(index, stored)
+        : await t.decodeAsync(index, stored);
+    };
+    const settle = (index: number): PageRead => {
+      try {
+        return { ok: true, bytes: runSync(this.readPageSteps(index)) };
+      } catch (error) {
+        return { ok: false, error };
+      }
+    };
+    return yield* ioSteps<PageRead[]>(
+      () => indices.map(settle),
+      () =>
+        Promise.all(
+          indices.map((index) =>
+            one(index).then(
+              (bytes): PageRead => ({ ok: true, bytes }),
+              (error: unknown): PageRead => ({ ok: false, error }),
+            ),
+          ),
+        ),
     );
   }
 
@@ -212,8 +369,53 @@ export class Pager {
   // reserves the high-water first, so the target is already-allocated space (a reused free page, or a
   // preallocated slot past the old high-water). bytes is one page wide.
   writeBlock(index: number, bytes: Uint8Array): void {
-    this.faultOnWrite(index, bytes);
-    this.store.writeAt(index * this.pageSize, bytes);
+    const stored = this.encodeSync(index, bytes);
+    this.faultOnWrite(index, stored);
+    this.store.writeAt(index * this.pageSize, stored);
+  }
+
+  // writePagesSteps writes pages in order — the commit's write sequence (validated-cow.md §1). In the
+  // asynchronous mode it encodes one bounded window at a time (ts-runtime.md §11.3), then issues that
+  // window's writes strictly in order, each awaited before the next. afterWrite runs once a page's
+  // write completed (the page-cache invalidation).
+  *writePagesSteps(
+    pages: { index: number; bytes: Uint8Array }[],
+    afterWrite: (index: number) => void,
+  ): Steps<void> {
+    if (!this.writeAsync) {
+      for (const pg of pages) {
+        this.writeBlock(pg.index, pg.bytes);
+        afterWrite(pg.index);
+      }
+      return;
+    }
+    const store = this.store;
+    for (let start = 0; start < pages.length; start += PAGE_IO_WINDOW) {
+      const window = pages.slice(start, start + PAGE_IO_WINDOW);
+      const encoded = yield* this.encodeWindowSteps(window);
+      for (let k = 0; k < window.length; k++) {
+        const index = window[k]!.index;
+        const stored = encoded[k]!;
+        this.faultOnWrite(index, stored);
+        const offset = index * this.pageSize;
+        yield* deviceSteps(
+          () => store.writeAt(offset, stored),
+          store.writeAtAsync === undefined ? undefined : () => store.writeAtAsync!(offset, stored),
+        );
+        afterWrite(index);
+      }
+    }
+  }
+
+  private *encodeWindowSteps(window: { index: number; bytes: Uint8Array }[]): Steps<Uint8Array[]> {
+    const t = this.transform;
+    if (t === null) return window.map((pg) => pg.bytes);
+    if (t.encodeAsync === undefined) return window.map((pg) => this.encodeSync(pg.index, pg.bytes));
+    const encode = t.encodeAsync.bind(t);
+    return yield* ioSteps(
+      () => window.map((pg) => this.encodeSync(pg.index, pg.bytes)),
+      () => Promise.all(window.map((pg) => encode(pg.index, pg.bytes))),
+    );
   }
 
   // reserve ensures the file has at least minPages physically-allocated pages, growing it GEOMETRICALLY
@@ -228,6 +430,10 @@ export class Pager {
   // (hosts.md §2.1/§3). Crash-safe: the preallocated pages are unreferenced zeros past the committed
   // pageCount, so a crash before the next commit publishes simply ignores them.
   reserve(minPages: number): void {
+    runSync(this.reserveSteps(minPages));
+  }
+
+  *reserveSteps(minPages: number): Steps<void> {
     if (minPages <= this.allocatedPages) return;
     const floor = preallocFloorPages(this.pageSize);
     const chunk = preallocChunkPages(this.pageSize);
@@ -239,8 +445,18 @@ export class Pager {
         break;
       }
     }
-    this.store.setSize(target * this.pageSize);
+    yield* this.setSizeSteps(target * this.pageSize);
     this.allocatedPages = target;
+  }
+
+  private *setSizeSteps(bytes: number): Steps<void> {
+    const store = this.store;
+    yield* deviceSteps(
+      () => store.setSize(bytes),
+      this.writeAsync && store.setSizeAsync !== undefined
+        ? () => store.setSizeAsync!(bytes)
+        : undefined,
+    );
   }
 
   // trimSlack shortens the file after a commit lowered the committed high-water to pageCount (format.md
@@ -250,10 +466,14 @@ export class Pager {
   // file longer and the allocation high-water unchanged, which is harmless. Shrinking needs no barrier
   // (hosts.md §2.1).
   trimSlack(pageCount: number): void {
+    runSync(this.trimSlackSteps(pageCount));
+  }
+
+  *trimSlackSteps(pageCount: number): Steps<void> {
     const target = Math.min(0xffff_ffff, pageCount + growthStep(pageCount, this.pageSize));
     if (this.allocatedPages <= target) return;
     try {
-      this.store.setSize(target * this.pageSize);
+      yield* this.setSizeSteps(target * this.pageSize);
       this.allocatedPages = target;
     } catch {
       // A failed shrink leaves the file longer; nothing depends on it.
@@ -273,6 +493,10 @@ export class Pager {
   // preallocated region (reserve) flushes only the data, never a file-size/inode-timestamp metadata
   // journal (spec/design/pager.md §7).
   sync(): void {
+    runSync(this.syncSteps());
+  }
+
+  *syncSteps(): Steps<void> {
     if (this.fault !== null && this.fault.point === "sync") {
       this.syncs++;
       if (this.syncs === this.fault.n) {
@@ -280,7 +504,11 @@ export class Pager {
         throw injectedCrash();
       }
     }
-    this.store.sync();
+    const store = this.store;
+    yield* deviceSteps(
+      () => store.sync(),
+      this.writeAsync && store.syncAsync !== undefined ? () => store.syncAsync!() : undefined,
+    );
   }
 
   // A recovered descriptor can represent a complete but unacknowledged transaction. Make that
@@ -384,13 +612,17 @@ export class Pager {
   // flushPending is a flush: one durable barrier makes every pending commit durable, so the newest
   // meta — in the non-floor slot — becomes the floor. A failed barrier refuses every later commit.
   flushPending(): void {
+    runSync(this.flushPendingSteps());
+  }
+
+  *flushPendingSteps(): Steps<void> {
     this.reconcileBatch();
     if (this.pending.size === 0) return;
     if (this.commitRequiresReopen()) {
       throw engineError("io_error", "database writer requires reopen after failed commit");
     }
     try {
-      this.sync();
+      yield* this.syncSteps();
     } catch (e) {
       this.poisoned = true;
       throw e;
@@ -398,7 +630,7 @@ export class Pager {
     this.floorSlot ^= 1;
     this.pending.clear();
     this.publishBatch();
-    this.shrinkAfterBarrier();
+    yield* this.shrinkAfterBarrierSteps();
   }
 
   // settleTruncation records the high-water pageCount a commit published. lowered is whether the commit
@@ -409,17 +641,21 @@ export class Pager {
   // flush (the worker's, outside this pager) shrinks nothing: the shrink waits for the owner's next
   // barrier, as in every core.
   settleTruncation(pageCount: number, lowered: boolean, durable: boolean): void {
-    this.shrinkPending ||= lowered;
-    this.shrinkPages = pageCount;
-    if (durable) this.shrinkAfterBarrier();
+    runSync(this.settleTruncationSteps(pageCount, lowered, durable));
   }
 
-  // shrinkAfterBarrier shortens the file to the newest generation's high-water plus one growth step when
-  // a commit since the last barrier lowered it. Called right after a successful barrier.
-  private shrinkAfterBarrier(): void {
+  *settleTruncationSteps(pageCount: number, lowered: boolean, durable: boolean): Steps<void> {
+    this.shrinkPending ||= lowered;
+    this.shrinkPages = pageCount;
+    if (durable) yield* this.shrinkAfterBarrierSteps();
+  }
+
+  // shrinkAfterBarrierSteps shortens the file to the newest generation's high-water plus one growth
+  // step when a commit since the last barrier lowered it. Called right after a successful barrier.
+  private *shrinkAfterBarrierSteps(): Steps<void> {
     if (!this.shrinkPending) return;
     this.shrinkPending = false;
-    this.trimSlack(this.shrinkPages);
+    yield* this.trimSlackSteps(this.shrinkPages);
   }
 
   // batchFlushed reports whether nothing awaits a barrier: no pending set, no adopted generation awaiting
@@ -440,6 +676,7 @@ export class Pager {
     }
     this.store = new FailingBlockStore(error);
     this.poisoned = true;
+    this.refreshMode();
   }
 
   // Check before serialization can fault inherited pages; an encoding error leaves
@@ -460,6 +697,7 @@ export class Pager {
   swapStore(store: BlockStore): BlockStore {
     const old = this.store;
     this.store = store;
+    this.refreshMode();
     return old;
   }
 
@@ -483,6 +721,7 @@ export class Pager {
     }
     const old = this.store;
     this.store = store;
+    this.refreshMode();
     old.close();
   }
 
@@ -499,12 +738,18 @@ export class Pager {
 
   // Begin after serialization succeeds, before any reserve/write or recovery sync.
   beginDurableCommit(): void {
+    runSync(this.beginDurableCommitSteps());
+  }
+
+  // beginDurableCommitSteps arms the commit guard, then stabilizes an adopted generation (an awaited
+  // barrier in the asynchronous mode): a failure from here on keeps the guard armed until reopen.
+  *beginDurableCommitSteps(): Steps<void> {
     this.checkDurableCommit();
     this.durableCommitActive = true;
     this.validatedMeta = null;
     this.validatedPages = null;
     if (this.adoptedNeedsSync) {
-      this.sync();
+      yield* this.syncSteps();
       this.adoptedNeedsSync = false;
     }
   }

@@ -395,8 +395,9 @@ with execution off the application thread, typed bounded transport and session s
 implemented. Synchronous internal computation remains; atomic cancellation polls checkpoints.
 Retained continuations support cooperative interruption at logical page boundaries and common
 execution loops, including hosts without shared memory; Node data-page reads may await I/O.
-Sorting, parsing/planning and long scalar kernels remain synchronous. Async storage lifecycle,
-commit and crypto remain follow-ons. Synchronous modules remain internal for conformance and tooling.
+Sorting, parsing/planning and long scalar kernels remain synchronous. Commit, open/recovery and
+storage maintenance await asynchronous page-codec or device stages (ts-runtime.md §11); crypto
+providers remain follow-ons. Synchronous modules remain internal for conformance and tooling.
 
 | Concern | Node candidate | Browser candidate |
 |---|---|---|

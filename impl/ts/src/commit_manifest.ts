@@ -2,6 +2,16 @@
 // stored bytes before decoding any candidate catalog, tree, or free-list page.
 import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
+import { ioSteps, runSync, type Steps } from "./execution.ts";
+
+// PAGE_IO_WINDOW bounds the write side's concurrent page work (ts-runtime.md §11.3): pages encoded at
+// once (and encoded pages awaiting their write), and dependencies recovery reads ahead. Physical
+// scheduling state, never SQL cost.
+export const PAGE_IO_WINDOW = 16;
+
+// ManifestPageRead is one page of a recovery read window: its bytes, or the error reading it raised,
+// reported only if validation reaches that page.
+export type ManifestPageRead = { ok: true; bytes: Uint8Array } | { ok: false; error: unknown };
 
 const TABLE_HI = new Uint32Array(256);
 const TABLE_LO = new Uint32Array(256);
@@ -206,6 +216,18 @@ export function validateCommitMeta(
   pageSize: number,
   read: (index: number) => Uint8Array,
 ): Set<number> | null {
+  return runSync(validateCommitMetaSteps(meta, pageSize, (index) => ioSteps(() => read(index))));
+}
+
+// validateCommitMetaSteps is validateCommitMeta over an awaitable page read. window, when it returns
+// a non-null array, reads up to PAGE_IO_WINDOW listed dependencies ahead (ts-runtime.md §11.3);
+// results and errors are consumed in manifest order, so selection matches the sequential walk.
+export function* validateCommitMetaSteps(
+  meta: CommitMeta,
+  pageSize: number,
+  read: (index: number) => Steps<Uint8Array>,
+  window?: (indices: number[]) => Steps<ManifestPageRead[] | null>,
+): Steps<Set<number> | null> {
   if (meta.dirtyCount === 0) return new Set(); // fully flushed bootstrap/snapshot image
   const entries = meta.inline.slice();
   const manifestIds = new Set<number>();
@@ -216,7 +238,7 @@ export function validateCommitMeta(
     if (next < 2 || next >= meta.pageCount || manifestIds.has(next)) return null;
     const index = next;
     manifestIds.add(index);
-    const bytes = read(index);
+    const bytes = yield* read(index);
     if (bytes.length !== pageSize) return null;
     const dv = view(bytes);
     const count = dv.getUint32(4, false);
@@ -242,10 +264,32 @@ export function validateCommitMeta(
   let previous = 1;
   let rootCovered = false;
   let freeCovered = meta.freeListHead === 0;
-  for (const entry of entries) {
+  let readAhead = window;
+  let ahead: ManifestPageRead[] | null = null;
+  let aheadStart = 0;
+  for (let k = 0; k < entries.length; k++) {
+    const entry = entries[k]!;
     if (entry.index <= previous || entry.index >= meta.pageCount || manifestIds.has(entry.index))
       return null;
-    const bytes = read(entry.index);
+    if (readAhead !== undefined && (ahead === null || k - aheadStart >= ahead.length)) {
+      // Read ahead only pages the range check admits; a later entry the sequential walk never
+      // reaches is read at most once and its error discarded.
+      const indices: number[] = [];
+      for (let j = k; j < entries.length && indices.length < PAGE_IO_WINDOW; j++) {
+        const index = entries[j]!.index;
+        if (index < 2 || index >= meta.pageCount) break;
+        indices.push(index);
+      }
+      ahead = yield* readAhead(indices);
+      aheadStart = k;
+      if (ahead === null) readAhead = undefined; // a synchronous stack reads lazily
+    }
+    let bytes: Uint8Array;
+    const prefetched = ahead?.[k - aheadStart];
+    if (prefetched !== undefined) {
+      if (!prefetched.ok) throw prefetched.error;
+      bytes = prefetched.bytes;
+    } else bytes = yield* read(entry.index);
     if (
       bytes.length !== pageSize ||
       crc64Update(0n, bytes) !== entry.checksum ||

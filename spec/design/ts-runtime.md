@@ -5,8 +5,9 @@
 > batching, cleanup and cancellation are specified in §10. Retained continuations now allow
 > asynchronous data-page reads and cooperative cancellation at logical page boundaries and common
 > execution loops without shared memory. The synchronous core remains internal for conformance
-> and host tooling and drives the same algorithms. Cancellation is best effort; storage lifecycle,
-> commit and crypto still use synchronous boundaries. No production encryption
+> and host tooling and drives the same algorithms. Cancellation is best effort. Commit,
+> open/recovery and storage maintenance are continuations too (§11): they await asynchronous
+> page-codec or device stages and run inline over today's synchronous hosts. No production encryption
 > dependency, encrypted format, Rust delivery default or parallel-reader pool is selected.
 > See [cores.md](cores.md), [api.md](api.md), [hosts.md](hosts.md) and
 > [encryption.md](encryption.md) for the surrounding contracts.
@@ -357,8 +358,8 @@ with larger observed Node timer gaps, and are reverted. Batch limits, packed val
 256-checkpoint task yields remain unchanged. The report preserves the variants and raw evidence.
 
 Section 10 resolves API/migration policy, wire encoding, initial per-handle workers, limits,
-admission errors, retained continuations and Node/browser extension registration. Remaining decisions
-include async storage lifecycle/commit and crypto providers, worker pools,
+admission errors, retained continuations and Node/browser extension registration; §11 resolves
+the asynchronous write side. Remaining decisions include crypto providers, worker pools,
 broader platform measurements and optional engine-package defaults. A public synchronous
 application interface would still need a concrete use case and evidence.
 
@@ -498,11 +499,9 @@ The page seam has an optional asynchronous byte read. Node file reads use it; a 
 only synchronous reads (including OPFS sync handles) receives a task yield before the read.
 Cache insertion happens only after a successful resume, with invalidation guarding suspended
 loads. Expression traversal propagates lazy overflow reads and subquery suspension without
-replaying expressions or host calls. Open/recovery, DDL/statistics maintenance, spill device I/O,
-commit serialization/writes,
-and page-service coordination still have synchronous paths inside the execution worker. This
-slice does not yet make an async-only byte device or WebCrypto provider sufficient for every
-storage operation.
+replaying expressions or host calls. Commit, open/recovery and storage maintenance follow §11.
+Spill device I/O, temporary domains, compaction and page-service coordination keep synchronous
+paths inside the execution worker (§11.1).
 
 `close` stops ordinary admission, rejects queued operations, requests cancellation of an active
 operation and waits for its cleanup (or completion past the commit boundary), completes an active
@@ -523,9 +522,9 @@ commit completes and reports its real outcome even if the signal changes. Worker
 is never ordinary cancellation. A browser without shared memory processes cancellation at the
 same cooperative page and execution-loop boundaries, including resident scans. Sorting,
 parsing/planning and long scalar kernels remain synchronous: **cancellation has no guaranteed
-maximum latency**. Further pause points require evidence of a material delay. Async-only storage
-lifecycle and WebCrypto commits remain unimplemented. No SQL replay or whole-file preload
-substitutes for those features.
+maximum latency**. Further pause points require evidence of a material delay. The commit
+transition past that boundary runs as an uncancelable continuation (§11.2). No WebCrypto codec
+is implemented; no SQL replay or whole-file preload substitutes for one.
 
 Data-only Unicode/time-zone bundles can be provided at open. Node additionally accepts a
 trusted `extensionModule` file URL exporting `configure(EnvironmentBuilder)`; it loads and
@@ -555,3 +554,152 @@ Arbitrary application closures cannot cross the port. There is no application-th
 RPC. Worker-local closures can retain state, and changing application inputs can be passed as
 SQL parameters. Configuration may be asynchronous; scalar and batch SQL kernels remain
 synchronous. Host extensions retain their existing safety/determinism exclusion.
+
+## 11. Asynchronous write-side storage
+
+The read side (§10) suspends query execution at data-page reads. This section extends the same
+retained-continuation driver to the write side: commit, open/recovery and storage maintenance.
+The goal is that a page codec or byte device with **asynchronous-only** operations — the browser
+WebCrypto case of [encryption.md](encryption.md) §8.1 — is sufficient for commit, recovery and
+maintenance (the exceptions are listed in §11.1), without SQL replay, whole-file preload, or a
+second implementation of any algorithm.
+No codec, cipher suite, nonce protocol or format change is selected here; file bytes, results
+and cost are unchanged.
+
+### 11.1 Which paths suspend
+
+Each path below is one authored generator (`Steps`) driven by `runSync` for the internal
+synchronous API and conformance harness, and by `runAsync` in the execution worker:
+
+| Path | Suspension points |
+|---|---|
+| Commit (main domain, durable file attachment) | stabilization barrier, growth (`setSize`), each body/free-list/manifest/meta page write and its encoding, the final barrier, reads of the just-written catalog and of orphaned leaves for the live-page delta |
+| Relaxed batches (`synchronous = off`) | the cap flush after a commit, and the flush in an async database close |
+| Open/recovery | page-size header, both meta slots, manifest overflow chain and every listed dependency, catalog chain, interior skeletons, eager GiST R-trees, the free-list chain, keyless rowid reconstruction |
+| Maintenance | the in-commit free-list rebuild (reachability walk, including overflow chains), trailing truncation after the barrier, the live-count verification walk |
+| Commit serialization | deferred overflow chains a rewritten record must re-read (see below) |
+
+Serialization (`incrementalImage`) is pure, unmetered CPU work and is not rewritten as a
+generator, which would add per-value overhead to every commit. Statement execution settles every
+deferred value an UPDATE carries (large-values.md §15), so a stored row's deferred values always
+match its own disposition plan and an incremental serialization does not read storage. The
+encoder still has a defensive read for a deferred value whose plan differs. So that both drivers
+produce the same bytes even then, an asynchronous write side (§11.4) serves those reads from a
+commit-local chain cache: a missing chain stops the pass with a private miss signal, the pass's
+page assignments are undone, the continuation awaits that whole chain, and serialization runs
+again. The retry repeats only this commit's pure serialization — no SQL, entropy, cost,
+host-function call or staged write — so it is not replay in the sense of §7. Each retry adds a
+distinct chain, so passes are bounded by such chains. The cache lives only for the commit.
+
+These remain synchronous and are not required by the browser storage stack:
+
+- In-memory and temporary domains (a `MemoryBlockStore`, never encoded, no barrier) and the
+  temporary-domain migration to a Node scratch file. Browser hosts have no spill target.
+- Page-service paths (Node only): a page client's commit through the blocking channel, owner
+  adoption of client commits and the owner's maintenance commit, election and promotion.
+- Host compaction (`compactFile`, Node only and not on the async surface): its from-scratch
+  serializer faults leaves through the synchronous store path. OPFS compaction is already
+  `0A000` pending a crash-safe replace (hosts.md §7); an async compaction needs a generator
+  from-scratch serializer and belongs with that design.
+- `create`'s whole bootstrap image written in place (OPFS) or through a temp file (Node): an
+  encrypted create must first define how bootstrap pages are encoded (encryption.md §6).
+- The directory barrier (Node only), spill device I/O, and DDL/statistics work outside commit.
+
+### 11.2 Ordering across awaits
+
+The engine already serializes operations: while a continuation is suspended, the runtime admits
+control messages but starts no other engine operation (§10). Writer ownership, the session's
+snapshot pin and the reader watermark therefore stay exactly as they were at the await, and
+release (`finishBlock`) still runs in `finally` after publication.
+
+**Cancellation.** The last safe cancellation point is unchanged: `commitTx`'s checkpoint, before
+any commit preparation. The rest of the commit transition — commit preparation, any durable
+attachment commit inside `commitTx`, and `Session.publish` with its persist — runs as an
+**uncancelable continuation** (`uncancelableSteps`): both drivers suppress meter polling for its
+segments, and `runAsync` neither injects `57014` into it nor checks the cancel flag before or
+after its effects. A cancel or close request arriving meanwhile is recorded; close still waits for
+the commit to finish and reports its real outcome. Open is not cancelable (§10).
+
+**Validated COW (validated-cow.md §1, §3, §4).** The async path performs the same steps in the
+same order as the synchronous one, each awaited before the next begins:
+
+1. Writer admission refuses a poisoned handle; serialization, admission under
+   `max_storage_bytes` and the live-page delta (which may await orphan-leaf reads) run before
+   any storage work. A failure here discards the working snapshot without poisoning.
+2. The commit guard is armed, then any adopted generation is stabilized (an awaited barrier).
+3. Growth, then body pages, then the free-list plan (which may await reads of the new catalog),
+   free-list pages, manifest overflow pages, and finally the alternate meta slot. Encoding may
+   overlap within a bounded window (§11.3), but **writes are issued strictly in the synchronous
+   order**, one after another, and the meta write starts only after every earlier write resolved.
+4. The final barrier is awaited (deferred under `synchronous = off`). Only then does the pager
+   record the commit, the shrink run, the published root swap, and the page cache invalidate.
+
+A rejection from any awaited write, barrier or encoding after step 2 leaves the guard armed: the
+handle is poisoned until reopen, exactly like a synchronous I/O error. Encoding happens after the
+guard is armed, so an encode failure is a post-guard failure. A codec that must reserve
+per-commit state (for example a nonce range) does so before the guard, as part of the nonce
+protocol encryption.md §3 still has to choose. A failed cap flush revokes the storage (§4 of
+validated-cow.md); a failed shrink is ignored. Trailing truncation awaits its shrink only after
+the barrier that covers the newest generation.
+
+### 11.3 Bounded pending work
+
+The write set itself is already materialized by the synchronous algorithm (the dirty pages and
+the commit's manifest), so the async path adds only bounded physical buffers:
+
+- **Encode window.** At most 16 pages are encoded concurrently, and at most 16 encoded pages wait
+  for their write. The window is physical scheduling state, never SQL cost.
+- **Validation window.** Recovery may read up to 16 listed dependencies ahead of the one it is
+  checking. Results and errors are consumed in manifest order, so a read failure past the first
+  invalid entry is never reported and selection is identical to the sequential algorithm.
+- **Walks.** The catalog chain, skeletons, GiST trees, overflow chains and free-list chain are read
+  one page at a time; each page is awaited before the next pointer is followed.
+- **Chain cache.** Only during one commit's serialization, bounded by the stored length of the
+  chains it actually re-reads (§11.1).
+
+No path reads ahead outside these windows, and no path preloads the file.
+
+### 11.4 Hosts and the write-side mode
+
+The pager decides once per stage whether the write side suspends. It is **asynchronous** when its
+page transform offers an asynchronous encode or decode, or its byte device offers an asynchronous
+write, barrier or resize (`writeAtAsync`, `syncAsync`, `setSizeAsync`). Otherwise every write-side
+step runs inline: no promise, no task yield and no change from the synchronous behavior. In the
+asynchronous mode each stage prefers its asynchronous form and falls back to its synchronous one.
+`size()` remains synchronous metadata on every device. Query data-page reads keep §10's policy.
+
+- **Browser OPFS.** The sync access handle stays the synchronous device (hosts.md §5); the worker
+  opens through the async loader and closes through an async flush. Today no transform is
+  installed, so the write side is inline and OPFS commits are physically unchanged. A WebCrypto
+  codec makes the mode asynchronous: each page is encoded (or decoded) by an awaited operation,
+  then written to (or read from) the handle synchronously.
+- **Node file host.** `FileBlockStore` keeps synchronous positioned writes and barriers, so its
+  write side remains inline; its optional asynchronous read continues to serve query reads only.
+  Node's native crypto provider is synchronous (§7), so a Node codec does not need the async
+  mode, and the lock-bundle election and page-service owner open stay synchronous. Making Node
+  writes awaitable would also let page-service event-loop handlers run on the engine thread during
+  a commit; that interleaving would need its own analysis before any Node device opts in.
+- **Memory and temporary domains.** Always inline (§11.1).
+
+### 11.5 The page-codec seam
+
+`PageTransform` (`impl/ts/src/pager.ts`) is the seam where the core-owned page codec plugs in,
+above the byte device and below the page cache (hosts.md §6). It offers `encode`/`decode` and/or
+`encodeAsync`/`decodeAsync`, keyed by page index. Its contract:
+
+- `decode` returns exactly the logical page bytes `encode` received. Page CRCs, manifest
+  digests, the live-page count and the page cache all operate on those plaintext bytes
+  (validated-cow.md §5); the cache inserts a decoded page only after its read resumed.
+- `Pager.fromStore` reads the 12-byte bootstrap header (page size) directly from the device;
+  the encrypted format must keep the page size discoverable before any key is used
+  (encryption.md §4).
+- A transform without a synchronous form fails the synchronous internal API with an explicit
+  error rather than blocking; such a database is usable only through the async runtime.
+
+Only identity transforms exist, in tests. They leave bytes unchanged and prove the suspension
+points. In the Node unit suite (`tests/async_write_side.test.ts`) the device and transform reject
+every synchronous call; commit, recovery and maintenance through the async driver produce files,
+results and costs identical to a synchronous control, in both durability modes and through the
+worker runtime. The real-browser suite (`e2e/opfs.spec.ts`) runs the same paths over a real OPFS
+sync access handle with a transform that awaits SubtleCrypto for every page, again byte-identical
+to a run without it.

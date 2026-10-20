@@ -1,6 +1,7 @@
-import { cancellationCheckpoint, withoutCancellation } from "./cancel.ts";
+import { cancellationCheckpoint } from "./cancel.ts";
 import {
   callSteps,
+  uncancelableSteps,
   runSync,
   COOPERATE,
   shouldCooperate,
@@ -279,8 +280,10 @@ import {
   compareViewDeps,
 } from "./format.ts";
 import {
-  commitDurableAttachment,
+  commitDurableAttachmentSteps,
   adoptStaged,
+  persistImpl,
+  persistSteps,
   type StagedCommit,
   stageInMemory,
   stageTemp,
@@ -3603,7 +3606,7 @@ export class Engine {
       case "begin":
         return this.beginTx(stmt.writable);
       case "commit":
-        return this.commitTx();
+        return yield* this.commitTxSteps();
       case "rollback":
         return this.rollbackTx();
       case "savepoint":
@@ -3691,7 +3694,7 @@ export class Engine {
     // Persist any nextval advances into the working snapshot before publishing it (sequences.md §5);
     // a non-sequence statement flushes nothing.
     this.flushPendingSequences();
-    this.commitTx();
+    yield* this.commitTxSteps();
     return outcome;
   }
 
@@ -3751,6 +3754,12 @@ export class Engine {
   // persistHook, §9), then swap it in as committed. A durable-write failure leaves committed untouched
   // and rethrows. Returns to autocommit.
   commitTx(): Outcome {
+    return runSync(this.commitTxSteps());
+  }
+
+  // commitTxSteps is commitTx as a continuation: after the last safe checkpoint the rest of the commit
+  // transition is uncancelable, and an asynchronous storage stack is awaited (ts-runtime.md §11.2).
+  *commitTxSteps(): Steps<Outcome> {
     // Last safe cancellation point: discard the transaction before any commit preparation,
     // page writes, or root publication. Cancellation after this point cannot undo the commit.
     try {
@@ -3759,10 +3768,10 @@ export class Engine {
       this.rollbackTx();
       throw error;
     }
-    return withoutCancellation(() => this.commitTxUncancelable());
+    return yield* uncancelableSteps(this.commitTxUncancelableSteps());
   }
 
-  private commitTxUncancelable(): Outcome {
+  private *commitTxUncancelableSteps(): Steps<Outcome> {
     this.stagedAttachments = [];
     this.commitChanges = { main: false, attached: false };
     const tx = this.session.tx;
@@ -3812,7 +3821,7 @@ export class Engine {
       const main = tx.mainDirty ? working : null;
       const mainStagesRows = tx.mainDirty && working.stagedBytes() !== 0;
       try {
-        this.core.precheckBudgets(main, mainStagesRows, attached);
+        yield* this.core.precheckBudgetsSteps(main, mainStagesRows, attached);
       } catch (e) {
         this.restoreSessionState(tx);
         throw e;
@@ -3857,7 +3866,8 @@ export class Engine {
       working.clearStaged();
       // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
       // left untouched (the commit failed; the working snapshot is discarded).
-      if (this.persistHook !== null) this.persistHook(this, working);
+      if (this.persistHook === persistImpl) yield* persistSteps(this, working);
+      else if (this.persistHook !== null) this.persistHook(this, working);
       working.freezeMutationGenerations();
       this.committed = working;
     }
@@ -3921,7 +3931,7 @@ export class Engine {
           const budget = { name, prev, canCompact, stagesRows };
           // A local reader pins every attached root, so reuse is safe only after that common
           // watermark drains.
-          commitDurableAttachment(att.storage, ws, canReclaim, canReclaim, budget);
+          yield* commitDurableAttachmentSteps(att.storage, ws, canReclaim, canReclaim, budget);
         } else {
           // The budget's forced compaction rebuilds the free list from the attachment's committed
           // root (memory.md §8.3).

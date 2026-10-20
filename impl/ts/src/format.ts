@@ -54,7 +54,7 @@ import {
   manifestOverflowCapacity,
   metaChecksum,
   parseCommitMeta,
-  validateCommitMeta,
+  validateCommitMetaSteps,
   writeManifestMeta,
 } from "./commit_manifest.ts";
 import {
@@ -83,7 +83,7 @@ import {
   type GistOpclass,
   type GistPage,
   gistRangeOpclass,
-  readGistLeafKeys,
+  readGistLeafKeysSteps,
   serializeGistTree,
   serializeGistTreeTo,
 } from "./gist.ts";
@@ -1427,32 +1427,67 @@ function encodeInterior(seps: Uint8Array[], childPages: number[]): Uint8Array {
 // the raw payload or the compressed block, never decompressed — into a fresh chain. paging is the
 // database the pointers name; shared collects the first page of every chain the encoder kept, so the
 // live-page count does not count the chain as orphaned with the old leaf (memory.md §8.7).
+// ChainMiss stops an incremental serialization that reached a deferred overflow chain missing from its
+// commit-local chain cache (ts-runtime.md §11.1): the caller undoes the pass, awaits that whole chain,
+// and serializes again. Never escapes incrementalImageSteps.
+export class ChainMiss {
+  readonly first: number;
+  readonly length: number;
+
+  constructor(first: number, length: number) {
+    this.first = first;
+    this.length = length;
+  }
+}
+
 export class ChainSource {
   readonly shared: number[] = [];
   private readonly paging: SharedPaging | null;
   private readonly share: boolean;
+  // chains, when set, serves every chain page from a commit-local cache (an asynchronous write side):
+  // a page it lacks raises ChainMiss for the chain being read (current) instead of a synchronous read.
+  private readonly chains: Map<number, Uint8Array> | null;
+  private current: ChainMiss | null = null;
 
-  constructor(paging: SharedPaging | null, share: boolean) {
+  constructor(
+    paging: SharedPaging | null,
+    share: boolean,
+    chains: Map<number, Uint8Array> | null = null,
+  ) {
     this.paging = paging;
     this.share = share;
+    this.chains = chains;
   }
 
   private fetch(p: number): Uint8Array {
     if (this.paging === null) {
       throw engineError("data_corrupted", "deferred large value with no pager at encode");
     }
-    return this.paging.readBlock(p);
+    if (this.chains === null) return this.paging.readBlock(p);
+    const cached = this.chains.get(p);
+    if (cached !== undefined) return cached;
+    throw this.current!;
   }
 
   readChain(first: number, length: number): Uint8Array {
-    return readOverflowChain(first, length, (p) => this.fetch(p), []);
+    this.current = new ChainMiss(first, length);
+    try {
+      return readOverflowChain(first, length, (p) => this.fetch(p), []);
+    } finally {
+      this.current = null;
+    }
   }
 
   // resident returns v materialized: a deferred value resolved through the database's pager
   // (unmetered, like all commit work), a resident value as is.
   resident(ty: ColType, v: Value): Value {
     if (v.kind !== "unfetched") return v;
-    return resolveUnfetched(ty, v.ref, (p) => this.fetch(p));
+    this.current = new ChainMiss(v.ref.firstPage, v.ref.storedLen);
+    try {
+      return resolveUnfetched(ty, v.ref, (p) => this.fetch(p));
+    } finally {
+      this.current = null;
+    }
   }
 
   // keepChain returns the first page of the chain carrying a deferred value's stored bytes in the
@@ -3016,7 +3051,19 @@ export function liveAfter(
   paging: SharedPaging,
   pageSize: number,
 ): LiveCount {
-  const orphaned = orphanedTreePages(
+  return runSync(liveAfterSteps(count, write, prev, paging, pageSize));
+}
+
+// liveAfterSteps is liveAfter with the orphaned-leaf reads on the write side's awaitable page read
+// (ts-runtime.md §11.1).
+export function* liveAfterSteps(
+  count: LiveCount,
+  write: IncrementalWrite,
+  prev: Snapshot,
+  paging: SharedPaging,
+  pageSize: number,
+): Steps<LiveCount> {
+  const orphaned = yield* orphanedTreePagesSteps(
     prev,
     write.kept,
     write.sharedChains,
@@ -3038,55 +3085,58 @@ export function liveAfter(
 // exactly one record of a snapshot, so a kept chain's only old referrer is in an orphaned leaf — and
 // each chain's page count follows from its external pointer's stored length. The walk reads only
 // orphaned leaves of tables with spillable columns.
-function orphanedTreePages(
+function* orphanedTreePagesSteps(
   prev: Snapshot,
   kept: Set<number>,
   shared: Set<number>,
   paging: SharedPaging,
   cap: number,
-): number {
+): Steps<number> {
   let count = 0;
   for (const st of prev.stores.values()) {
     const colTypes = st.columnTypes();
     const spill = anySpillable(colTypes) ? colTypes : null;
-    count += orphanedNodePages(st.treeRoot(), kept, shared, paging, spill, cap);
+    count += yield* orphanedNodePagesSteps(st.treeRoot(), kept, shared, paging, spill, cap);
   }
   // A GiST leaf-key store is never serialized (its nodes keep page 0); its R-tree pages are counted
   // wholesale through LiveCount.gist.
   for (const ist of prev.indexStores.values()) {
-    count += orphanedNodePages(ist.treeRoot(), kept, shared, paging, null, cap);
+    count += yield* orphanedNodePagesSteps(ist.treeRoot(), kept, shared, paging, null, cap);
   }
   return count;
 }
 
-function orphanedNodePages(
+function* orphanedNodePagesSteps(
   n: PNode | null,
   kept: Set<number>,
   shared: Set<number>,
   paging: SharedPaging,
   colTypes: ColType[] | null,
   cap: number,
-): number {
+): Steps<number> {
   if (n === null || n.page === 0 || kept.has(n.page)) return 0;
-  if (n.children.length === 0) return orphanedLeafPages(n.page, shared, paging, colTypes, cap);
+  if (n.children.length === 0)
+    return yield* orphanedLeafPagesSteps(n.page, shared, paging, colTypes, cap);
   let count = 1;
   for (const c of n.children) {
-    if (c.node !== null) count += orphanedNodePages(c.node, kept, shared, paging, colTypes, cap);
-    else if (!kept.has(c.page)) count += orphanedLeafPages(c.page, shared, paging, colTypes, cap);
+    if (c.node !== null)
+      count += yield* orphanedNodePagesSteps(c.node, kept, shared, paging, colTypes, cap);
+    else if (!kept.has(c.page))
+      count += yield* orphanedLeafPagesSteps(c.page, shared, paging, colTypes, cap);
   }
   return count;
 }
 
-// orphanedLeafPages is one orphaned leaf page plus the overflow pages its external values own.
-function orphanedLeafPages(
+// orphanedLeafPagesSteps is one orphaned leaf page plus the overflow pages its external values own.
+function* orphanedLeafPagesSteps(
   pageIdx: number,
   shared: Set<number>,
   paging: SharedPaging,
   colTypes: ColType[] | null,
   cap: number,
-): number {
+): Steps<number> {
   if (colTypes === null) return 1;
-  const pg = parsePage(paging.readBlock(pageIdx));
+  const pg = parsePage(yield* paging.readPageSteps(pageIdx));
   if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "expected a B-tree leaf page");
   const n = pg.itemCount;
   const dirs = parsePaxLeaf(pg.payload, n, colTypes);
@@ -3120,14 +3170,14 @@ export const verifyLivePages = { enabled: false };
 // verifyLiveCount recounts live by reachability and compares it with the incremental count
 // (verifyLivePages). Runs after the commit's body pages are written, so the walk reads the new
 // catalog; the GiST pages it cannot see are this commit's whole GiST write.
-export function verifyLiveCount(
+export function* verifyLiveCountSteps(
   snap: Snapshot,
   paging: SharedPaging,
   write: IncrementalWrite,
   live: LiveCount,
-): void {
+): Steps<void> {
   if (!verifyLivePages.enabled) return;
-  const walked = reachablePages(snap, paging, write.rootPage).size + write.gistPages;
+  const walked = (yield* reachablePagesSteps(snap, paging, write.rootPage)).size + write.gistPages;
   if (walked !== live.live) {
     throw new Error(
       `incremental live page count ${live.live} diverged from the reachability walk ${walked}`,
@@ -3198,6 +3248,83 @@ export function incrementalImage(
   paging: SharedPaging | null,
   reuse = true,
   allowed: Set<number> | null = null,
+  chains: Map<number, Uint8Array> | null = null,
+): IncrementalWrite {
+  const pages: { index: number; bytes: Uint8Array }[] = [];
+  try {
+    return serializeIncremental(
+      snap,
+      pageSize,
+      startPage,
+      free,
+      paging,
+      reuse,
+      allowed,
+      chains,
+      pages,
+    );
+  } catch (e) {
+    // A pass stopped for a missing chain is retried: undo its page assignments.
+    if (e instanceof ChainMiss) unassignPartialPages(snap, pages);
+    throw e;
+  }
+}
+
+// incrementalImageSteps is incrementalImage on the write side of ts-runtime.md §11.1. Over a
+// synchronous storage stack it is incrementalImage. Over an asynchronous one serialization stays
+// synchronous and reads deferred chains from a commit-local cache; each missing chain is awaited whole,
+// then the pure, unmetered pass runs again (no SQL, entropy, cost, or staged write repeats).
+// serializationRetries counts serialization passes repeated for a missing chain (incrementalImageSteps)
+// — test tooling, like persist.ts tempSpills, so a workload meant to exercise the chain cache cannot
+// pass without doing so.
+export const serializationRetries = { count: 0 };
+
+export function* incrementalImageSteps(
+  snap: Snapshot,
+  pageSize: number,
+  startPage: number,
+  free: number[],
+  paging: SharedPaging | null,
+  reuse = true,
+  allowed: Set<number> | null = null,
+): Steps<IncrementalWrite> {
+  if (paging === null || !paging.writeSideAsync())
+    return incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed);
+  const chains = new Map<number, Uint8Array>();
+  const awaited = new Set<number>();
+  for (;;) {
+    try {
+      return incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed, chains);
+    } catch (e) {
+      if (!(e instanceof ChainMiss)) throw e;
+      // Every page of an awaited chain is cached, so the same chain cannot miss twice.
+      if (awaited.has(e.first)) throw new Error("serialization missed a cached overflow chain");
+      awaited.add(e.first);
+      serializationRetries.count++;
+      yield* readOverflowChainSteps(
+        e.first,
+        e.length,
+        function* (p) {
+          const bytes = yield* paging.readPageSteps(p);
+          chains.set(p, bytes);
+          return bytes;
+        },
+        [],
+      );
+    }
+  }
+}
+
+function serializeIncremental(
+  snap: Snapshot,
+  pageSize: number,
+  startPage: number,
+  free: number[],
+  paging: SharedPaging | null,
+  reuse: boolean,
+  allowed: Set<number> | null,
+  chains: Map<number, Uint8Array> | null,
+  pages: { index: number; bytes: Uint8Array }[],
 ): IncrementalWrite {
   const ps = pageSize;
   const capacity = ps - PAGE_HEADER;
@@ -3209,7 +3336,6 @@ export function incrementalImage(
   // free-list carries through unconsumed for persistence (PageAlloc.reuse, transactions.md §8).
   const alloc = new PageAlloc(free, startPage, reuse, allowed);
 
-  const pages: { index: number; bytes: Uint8Array }[] = [];
   const kept = new Set<number>();
   const shared = new Set<number>();
   let gistPages = 0;
@@ -3230,6 +3356,7 @@ export function incrementalImage(
         kept,
         shared,
         paging,
+        chains,
       );
     }
     // The table's index trees follow its data tree, in catalog (name) order — only their
@@ -3269,6 +3396,7 @@ export function incrementalImage(
             kept,
             shared,
             paging,
+            chains,
           );
         }
       }
@@ -3346,6 +3474,7 @@ function serializeDirty(
   kept: Set<number>,
   shared: Set<number>,
   paging: SharedPaging | null,
+  chains: Map<number, Uint8Array> | null,
 ): number {
   if (n.page !== 0) {
     kept.add(n.page);
@@ -3360,7 +3489,7 @@ function serializeDirty(
       childPages.push(c.page);
     } else {
       childPages.push(
-        serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, shared, paging),
+        serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, shared, paging, chains),
       );
     }
   }
@@ -3379,7 +3508,7 @@ function serializeDirty(
     pageType = PAGE_INTERIOR;
     payload = encodeInterior(n.keys, childPages);
   } else {
-    const src = new ChainSource(paging, true);
+    const src = new ChainSource(paging, true, chains);
     payload = encodeLeafPax(colTypes, n.keys, n.vals, capacity, take, ovf, src);
     for (const p of src.shared) shared.add(p);
   }
@@ -3472,19 +3601,8 @@ export function anySpillable(colTypes: ColType[]): boolean {
 // by HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
 // decompresses a large value. Only variable-width (spillable) columns can own a chain, so
 // fixed-width regions are skipped entirely.
-function collectLeafOverflow(
-  paging: SharedPaging,
-  pageIdx: number,
-  colTypes: ColType[],
-  reached: Set<number>,
-  seen: Set<number>,
-  depth: number,
-): void {
-  collectLeafOverflowWith((p) => paging.readBlock(p), pageIdx, colTypes, reached, seen, depth);
-}
-
-// collectLeafOverflowWith is collectLeafOverflow over a page reader (a backup's walk,
-// spec/design/page-service.md §9, reads through it too).
+// collectLeafOverflowWith is the reachability walk's leaf-overflow collection over a page reader (a
+// backup's walk, spec/design/page-service.md §9, reads through it too).
 export function collectLeafOverflowWith(
   read: (page: number) => Uint8Array,
   pageIdx: number,
@@ -3493,11 +3611,31 @@ export function collectLeafOverflowWith(
   seen: Set<number>,
   depth: number,
 ): void {
+  runSync(
+    collectLeafOverflowSteps(
+      (p) => ioSteps(() => read(p)),
+      pageIdx,
+      colTypes,
+      reached,
+      seen,
+      depth,
+    ),
+  );
+}
+
+function* collectLeafOverflowSteps(
+  read: (page: number) => Steps<Uint8Array>,
+  pageIdx: number,
+  colTypes: ColType[],
+  reached: Set<number>,
+  seen: Set<number>,
+  depth: number,
+): Steps<void> {
   if (seen.has(pageIdx)) throw engineError("data_corrupted", "B-tree page reached twice");
   seen.add(pageIdx);
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "B-tree deeper than any valid tree");
-  const pg = parsePage(read(pageIdx));
+  const pg = parsePage(yield* read(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = read;
     const n = pg.itemCount;
@@ -3515,7 +3653,7 @@ export function collectLeafOverflowWith(
           { pos: paxValueOff(pg.payload, dirs, c, i) },
           null,
         );
-        markChains([v], fetch, reached);
+        yield* markChainsSteps([v], fetch, reached);
       }
     }
     return;
@@ -3526,7 +3664,8 @@ export function collectLeafOverflowWith(
     const cur = { pos: 0 };
     const cps: number[] = [];
     for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readU32(pg.payload, cur));
-    for (const cp of cps) collectLeafOverflowWith(read, cp, colTypes, reached, seen, depth + 1);
+    for (const cp of cps)
+      yield* collectLeafOverflowSteps(read, cp, colTypes, reached, seen, depth + 1);
     return;
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
@@ -3542,13 +3681,23 @@ export function collectLeafOverflowWith(
 // into the reached set (a GiST index rewrites its whole R-tree every commit — gist.md §4.1(b) — so all
 // live GiST pages are in that write set), so a rebuild never frees a live GiST or free-list page.
 export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: number): Set<number> {
+  return runSync(reachablePagesSteps(snap, paging, catRoot));
+}
+
+// reachablePagesSteps is reachablePages over the write side's awaitable page read (ts-runtime.md
+// §11.1): each page is awaited before the next pointer is followed.
+export function* reachablePagesSteps(
+  snap: Snapshot,
+  paging: SharedPaging,
+  catRoot: number,
+): Steps<Set<number>> {
   const reached = new Set<number>();
   // The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
   // what compaction reclaims).
   for (let p = catRoot; p !== 0; ) {
     if (reached.has(p)) throw engineError("data_corrupted", "catalog chain revisits a page");
     reached.add(p);
-    const pg = parsePage(paging.readBlock(p));
+    const pg = parsePage(yield* paging.readPageSteps(p));
     if (pg.pageType !== PAGE_CATALOG)
       throw engineError("data_corrupted", "expected a catalog page");
     p = pg.nextPage;
@@ -3558,7 +3707,14 @@ export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: nu
     const root = st.treeRoot();
     collectTreePages(root, reached);
     if (root !== null && root.page !== 0 && anySpillable(st.columnTypes())) {
-      collectLeafOverflow(paging, root.page, st.columnTypes(), reached, new Set<number>(), 1);
+      yield* collectLeafOverflowSteps(
+        (p) => paging.readPageSteps(p),
+        root.page,
+        st.columnTypes(),
+        reached,
+        new Set<number>(),
+        1,
+      );
     }
   }
   // Secondary/unique index trees (empty-payload, never spillable).
@@ -3583,6 +3739,24 @@ export function unassignPages(snap: Snapshot, pages: { index: number; bytes: Uin
   for (const pg of pages) assigned.add(pg.index);
   for (const st of snap.stores.values()) unassignTreePages(st.treeRoot(), assigned);
   for (const ist of snap.indexStores.values()) unassignTreePages(ist.treeRoot(), assigned);
+}
+
+// unassignPartialPages undoes the assignments of a pass that stopped part way (ChainMiss). Assignment
+// is post-order, so a dirty parent may still be page 0 above assigned children: unlike unassignPages it
+// descends through unassigned nodes too.
+function unassignPartialPages(snap: Snapshot, pages: { index: number; bytes: Uint8Array }[]): void {
+  const assigned = new Set<number>();
+  for (const pg of pages) assigned.add(pg.index);
+  const visit = (n: PNode | null): void => {
+    if (n === null) return;
+    if (n.page !== 0) {
+      if (!assigned.has(n.page)) return; // clean before the pass: its subtree is untouched
+      n.page = 0;
+    }
+    for (const c of n.children) if (c.node !== null) visit(c.node);
+  };
+  for (const st of snap.stores.values()) visit(st.treeRoot());
+  for (const ist of snap.indexStores.values()) visit(ist.treeRoot());
 }
 
 // unassignTreePages clears the page ids a discarded plan assigned: a node whose id is in assigned was
@@ -3612,12 +3786,12 @@ export function collectTreePages(n: PNode | null, reached: Set<number>): void {
 // offset 28) through the pager, collecting every free page index. head === 0 is an empty free-list. The
 // inverse of the serialization in serializeFreeList; replaces the v24 reconstruct-on-open reachability
 // walk (spec/fileformat/format.md *Reclamation*).
-function readFreeList(
+function* readFreeListSteps(
   paging: SharedPaging,
   head: number,
   pageCount: number,
   protectedPages: Set<number>,
-): number[] {
+): Steps<number[]> {
   const free: number[] = [];
   const chain = new Set<number>();
   let previous = 1;
@@ -3625,7 +3799,7 @@ function readFreeList(
     if (p < ROOT_PAGE || p >= pageCount || chain.has(p))
       throw engineError("data_corrupted", "invalid free-list chain");
     chain.add(p);
-    const pg = parsePage(paging.readBlock(p));
+    const pg = parsePage(yield* paging.readPageSteps(p));
     if (pg.pageType !== PAGE_FREELIST)
       throw engineError("data_corrupted", "expected a free-list page");
     if (pg.itemCount > Math.floor(pg.payload.length / 4))
@@ -3740,7 +3914,7 @@ export function trailingRun(safe: number[], high: number): { below: number[]; st
 // unioned in so a wholesale-rewritten GiST R-tree is never freed); CARRY (otherwise): the persisted list
 // is freeRemaining. Either way the chain pages come from freeRemaining. Returns the chain pages, head,
 // the new free-list, the new high-water, and the live count to remember (unchanged when not compacting).
-export function planFreeList(
+export function* planFreeListSteps(
   snap: Snapshot,
   paging: SharedPaging,
   catRoot: number,
@@ -3755,15 +3929,7 @@ export function planFreeList(
   pending: { index: number }[] = [],
   allowed: Set<number> | null = null,
   truncate = false,
-): {
-  pages: { index: number; bytes: Uint8Array }[];
-  head: number;
-  persisted: number[];
-  newPageCount: number;
-  newLive: number;
-  newGen: bigint;
-  manifestIds: number[];
-} {
+): Steps<FreeListPlan> {
   // liveAtCompaction=0 is the shared-mode orphan sentinel: a co-resident commit deliberately
   // persisted no reusable free list, so the first proven-alone commit must reconstruct regardless
   // of the ordinary periodic threshold.
@@ -3774,7 +3940,7 @@ export function planFreeList(
   let newLive = liveAtCompaction;
   let newGen = genTxid;
   if (compact) {
-    const reached = reachablePages(snap, paging, catRoot);
+    const reached = yield* reachablePagesSteps(snap, paging, catRoot);
     for (const w of written) reached.add(w.index);
     newLive = reached.size;
     // A relaxed batch's pending pages are manifest dependencies the rebuilt list must exclude, though
@@ -3851,6 +4017,17 @@ export function planFreeList(
   }
 }
 
+// FreeListPlan is a commit's free-list plan (planFreeListSteps).
+export type FreeListPlan = {
+  pages: { index: number; bytes: Uint8Array }[];
+  head: number;
+  persisted: number[];
+  newPageCount: number;
+  newLive: number;
+  newGen: bigint;
+  manifestIds: number[];
+};
+
 // loadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
 // only the interior B-tree skeleton resident, leaving each leaf an OnDisk page faulted through the
 // bounded buffer pool on access — so the resident set is bounded by the pool, not the file size. The
@@ -3866,6 +4043,15 @@ export function loadEnginePaged(
   return loadEnginePagedAt(paging, environment, {});
 }
 
+// loadEnginePagedSteps is loadEnginePaged with every recovery read on the write side's awaitable page
+// read (ts-runtime.md §11.1): an asynchronous open drives it with runAsync.
+export function loadEnginePagedSteps(
+  paging: SharedPaging,
+  environment: Environment = new Environment(),
+): Steps<Engine> {
+  return loadEnginePagedAtSteps(paging, environment, {});
+}
+
 // LoadAt adjusts loadEnginePagedAt for a backup's walk (spec/design/page-service.md §9): meta names
 // the version to load instead of the one recovery selects, and gist sees every GiST R-tree page the
 // load reads. A load at a given meta leaves the engine's free list empty (an older version's free
@@ -3878,16 +4064,25 @@ export function loadEnginePagedAt(
   environment: Environment,
   at: LoadAt,
 ): Engine {
+  return runSync(loadEnginePagedAtSteps(paging, environment, at));
+}
+
+export function* loadEnginePagedAtSteps(
+  paging: SharedPaging,
+  environment: Environment,
+  at: LoadAt,
+): Steps<Engine> {
   const pageSize = paging.pageSize();
   if (!pageSizeValid(pageSize)) {
     throw engineError("data_corrupted", "invalid page size");
   }
-  if (at.meta !== undefined) return loadAtMeta(paging, environment, at.meta, null, new Set(), at);
+  if (at.meta !== undefined)
+    return yield* loadAtMetaSteps(paging, environment, at.meta, null, new Set(), at);
 
   // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn write),
   // read as individual blocks through the pager.
   const physicalPages = paging.physicalPages();
-  const blocks = [paging.readBlock(0), paging.readBlock(1)];
+  const blocks = [yield* paging.readPageSteps(0), yield* paging.readPageSteps(1)];
   const candidates = blocks
     .map((bytes, slot) => ({ bytes, slot, meta: parseCommitMeta(bytes, pageSize, physicalPages) }))
     .filter(
@@ -3900,7 +4095,12 @@ export function loadEnginePagedAt(
   for (const candidate of candidates) {
     const validated =
       paging.cachedValidation(candidate.bytes) ??
-      validateCommitMeta(candidate.meta, pageSize, (p) => paging.readBlock(p));
+      (yield* validateCommitMetaSteps(
+        candidate.meta,
+        pageSize,
+        (p) => paging.readPageSteps(p),
+        (indices) => paging.readWindowSteps(indices),
+      ));
     if (validated !== null) {
       paging.cacheValidation(candidate.bytes, validated);
       selected = candidate;
@@ -3915,20 +4115,20 @@ export function loadEnginePagedAt(
     slot: selected.slot,
     bothSlots: other !== null && other.txid === selected.meta.txid,
   };
-  return loadAtMeta(paging, environment, selected.meta, adopt, protectedPages, at);
+  return yield* loadAtMetaSteps(paging, environment, selected.meta, adopt, protectedPages, at);
 }
 
 // loadAtMeta loads the catalog and interior skeleton the meta mt publishes. adopt is the selected
 // meta slot (its bytes, its slot, and whether both slots carry its txid; null for a backup's load at a given meta, which reads no free list and adopts
 // nothing into the pager).
-function loadAtMeta(
+function* loadAtMetaSteps(
   paging: SharedPaging,
   environment: Environment,
   mt: CommitMeta,
   adopt: { bytes: Uint8Array; slot: number; bothSlots: boolean } | null,
   protectedPages: Set<number>,
   at: LoadAt,
-): Engine {
+): Steps<Engine> {
   const pageSize = paging.pageSize();
 
   const snap = new Snapshot(environment, mt.txid);
@@ -3949,7 +4149,7 @@ function loadAtMeta(
   while (catPage !== 0) {
     if (catSeen.has(catPage)) throw engineError("data_corrupted", "catalog chain revisits a page");
     catSeen.add(catPage);
-    const pg = parsePage(paging.readBlock(catPage));
+    const pg = parsePage(yield* paging.readPageSteps(catPage));
     if (pg.pageType !== PAGE_CATALOG || (pg.flags & ~1) !== 0)
       throw engineError("data_corrupted", "expected a catalog page");
     live.catalog++;
@@ -3968,7 +4168,7 @@ function loadAtMeta(
         }
         if (catSeen.has(next)) throw engineError("data_corrupted", "catalog chain revisits a page");
         catSeen.add(next);
-        const cont = parsePage(paging.readBlock(next));
+        const cont = parsePage(yield* paging.readPageSteps(next));
         if (cont.pageType !== PAGE_CATALOG || cont.itemCount !== 0 || (cont.flags & ~1) !== 0) {
           throw engineError("data_corrupted", "bad catalog continuation page");
         }
@@ -4047,11 +4247,14 @@ function loadAtMeta(
       if (root !== 0) {
         // Reads only the interior spine — leaves stay OnDisk; the exact row count was restored from
         // the v28 catalog entry (spec/design/storage.md §6).
-        store.setSkeleton(readSkeleton(paging, root, colTypes), rowCount);
+        store.setSkeleton(yield* readSkeletonSteps(paging, root, colTypes), rowCount);
         if (!hasPK) {
           // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
           // tables (most have a PK), and bounded by the pool. root !== 0 ⇒ the table is non-empty.
-          const entries = store.entriesInKeyOrder();
+          // A synchronous storage stack keeps the inline fault path (ts-runtime.md §11.4).
+          const entries = paging.writeSideAsync()
+            ? yield* store.entriesInKeyOrderSteps()
+            : store.entriesInKeyOrder();
           if (entries.length === 0)
             throw engineError("data_corrupted", "non-empty table tree holds no rows");
           // A rowid key is exactly an encoded i64, and the next rowid must still be one.
@@ -4071,11 +4274,11 @@ function loadAtMeta(
           // GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree, recover
           // its leaf keys into a fully-resident leaf store.
           const out: Uint8Array[] = [];
-          readGistLeafKeys(
-            (p) => {
+          yield* readGistLeafKeysSteps(
+            function* (p) {
               live.gist++;
               at.gist?.(p);
-              const pg2 = parsePage(paging.readBlock(p));
+              const pg2 = parsePage(yield* paging.readPageSteps(p));
               return { pageType: pg2.pageType, itemCount: pg2.itemCount, payload: pg2.payload };
             },
             indexRoots[k]!,
@@ -4085,7 +4288,7 @@ function loadAtMeta(
         } else {
           istore.attachPaging(paging);
           if (indexRoots[k]! !== 0) {
-            istore.setSkeleton(readSkeleton(paging, indexRoots[k]!, []), null);
+            istore.setSkeleton(yield* readSkeletonSteps(paging, indexRoots[k]!, []), null);
           }
         }
         snap.putIndexStore(table.indexes[k]!.name, istore);
@@ -4124,7 +4327,7 @@ function loadAtMeta(
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk
   // (spec/fileformat/format.md *Reclamation*).
   if (adopt !== null)
-    db.freePages = readFreeList(paging, mt.freeListHead, mt.pageCount, protectedPages);
+    db.freePages = yield* readFreeListSteps(paging, mt.freeListHead, mt.pageCount, protectedPages);
   // Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so its
   // reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the committed
   // version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -4291,10 +4494,12 @@ export const MAX_TREE_DEPTH = 256;
 // §6). A table whose root is itself a single leaf has no
 // interior parent to hold an OnDisk reference, so the root leaf is faulted resident
 // (spec/design/pager.md §1/§4).
-function readSkeleton(paging: SharedPaging, root: number, colTypes: ColType[]): PNode {
-  const child = readSkeletonNode(paging, root, new Set<number>(), 1).child;
+function* readSkeletonSteps(paging: SharedPaging, root: number, colTypes: ColType[]): Steps<PNode> {
+  const child = (yield* readSkeletonNodeSteps(paging, root, new Set<number>(), 1)).child;
   if (child.node !== null) return child.node;
-  return paging.faultLeaf(child.page, colTypes);
+  return paging.writeSideAsync()
+    ? yield* paging.faultLeafSteps(child.page, colTypes)
+    : paging.faultLeaf(child.page, colTypes);
 }
 
 // readSkeletonNode resolves one B+tree node into a Child WITHOUT reading the leaf level. A leaf page
@@ -4316,15 +4521,15 @@ function readSkeleton(paging: SharedPaging, root: number, colTypes: ColType[]): 
 // (data_corrupted) rather than a reason to recurse without bound. The returned height (1 for a leaf)
 // lets each interior check that its resolved children sit at one depth, the invariant the scan and
 // rebalance code relies on. depth is this node's level from the root (MAX_TREE_DEPTH).
-function readSkeletonNode(
+function* readSkeletonNodeSteps(
   paging: SharedPaging,
   pageIdx: number,
   seen: Set<number>,
   depth: number,
-): { child: Child; height: number } {
+): Steps<{ child: Child; height: number }> {
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "B-tree deeper than any valid tree");
-  const pg = parsePage(paging.readBlock(pageIdx));
+  const pg = parsePage(yield* paging.readPageSteps(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     return { child: onDiskRef(pageIdx), height: 1 };
   }
@@ -4346,7 +4551,7 @@ function readSkeletonNode(
     const keys = readSeparators(pg.payload, cur, n);
     // Resolve the first child to classify the level, then avoid reading leaf siblings. A leaf
     // sibling that is not a leaf is caught when it faults (decodeLeafNode).
-    const first = readSkeletonNode(paging, childPtrs[0]!, seen, depth + 1);
+    const first = yield* readSkeletonNodeSteps(paging, childPtrs[0]!, seen, depth + 1);
     const childrenAreLeaves = first.child.node === null;
     const children: Child[] = [first.child];
     for (let i = 1; i < childPtrs.length; i++) {
@@ -4354,7 +4559,7 @@ function readSkeletonNode(
         children.push(onDiskRef(childPtrs[i]!)); // a leaf sibling — not read at open
         continue;
       }
-      const next = readSkeletonNode(paging, childPtrs[i]!, seen, depth + 1);
+      const next = yield* readSkeletonNodeSteps(paging, childPtrs[i]!, seen, depth + 1);
       if (next.height !== first.height)
         throw engineError("data_corrupted", "B-tree leaves at unequal depths");
       children.push(next.child);
@@ -5347,6 +5552,14 @@ export function chainPages(
   length: number,
   fetch: (page: number) => Uint8Array,
 ): number[] {
+  return runSync(chainPagesSteps(first, length, (page) => ioSteps(() => fetch(page))));
+}
+
+function* chainPagesSteps(
+  first: number,
+  length: number,
+  fetch: (page: number) => Steps<Uint8Array>,
+): Steps<number[]> {
   const out: number[] = [];
   const seen = new Set<number>();
   let gathered = 0;
@@ -5357,7 +5570,7 @@ export function chainPages(
     if (seen.has(p)) throw engineError("data_corrupted", "overflow chain revisits a page");
     seen.add(p);
     out.push(p);
-    const pg = parsePage(fetch(p));
+    const pg = parsePage(yield* fetch(p));
     if (pg.pageType !== PAGE_OVERFLOW)
       throw engineError("data_corrupted", "expected an overflow page");
     const n = pg.itemCount;
@@ -5372,11 +5585,15 @@ export function chainPages(
 
 // markChains adds the overflow chain pages a lazily-decoded row references to `reached` (the
 // free-list reachability walk), via the header-only chainPages hop.
-function markChains(row: Row, fetch: (page: number) => Uint8Array, reached: Set<number>): void {
+function* markChainsSteps(
+  row: Row,
+  fetch: (page: number) => Steps<Uint8Array>,
+  reached: Set<number>,
+): Steps<void> {
   for (const v of row) {
     // Inline forms (0x00 inline-deferred, 0x03 inline-compressed) live in the record — no chain.
     if (v.kind !== "unfetched" || v.ref.form === 0x00 || v.ref.form === TAG_INLINE_COMP) continue;
-    for (const p of chainPages(v.ref.firstPage, v.ref.storedLen, fetch)) reached.add(p);
+    for (const p of yield* chainPagesSteps(v.ref.firstPage, v.ref.storedLen, fetch)) reached.add(p);
   }
 }
 

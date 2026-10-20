@@ -276,26 +276,35 @@ dedicated execution workers, bounded typed transport, serialized operation sched
 cooperative cancellation. Retained page and expression continuations let execution await data
 reads without replaying SQL. Common resident expressions still return immediate values. Node
 data-page reads can await I/O; browser OPFS sync access handles remain synchronous inside the
-worker. Async storage lifecycle, commit and crypto integration remain follow-on work.
+worker.
 
 WebCrypto needs suspension **inside the worker** at decryption/cache misses and before encrypted
-commit writes. The retained-continuation machinery supplies the traversal and lazy-decoding
-foundation, but an async-only crypto provider is not yet sufficient for all storage paths.
-A follow-on must add the core-owned encrypted-page codec, await authenticated decryption before
-cache insertion, and bound pending page work and commit encryption. Open/recovery, maintenance,
-spill and commit still have synchronous paths. Do not replay partially evaluated SQL to recover
-from a miss: entropy consumption, costs, host functions and staged writes must occur exactly
-once. Do not preload the whole file to hide asynchronous reads, which would violate
-bounded-residency requirements.
+commit writes. The write side is now ready for that ([ts-runtime.md](ts-runtime.md) §11): the
+pager's `PageTransform` seam, above the byte device and below the page cache, accepts
+asynchronous `encodeAsync`/`decodeAsync` forms, and commit, open/recovery and maintenance await
+them as retained continuations. Decryption completes before a page enters the cache; page CRCs,
+manifest digests and the live count stay over plaintext logical pages. Commit encryption overlaps
+in a bounded window of 16 pages while writes keep validated COW's body, free-list, manifest,
+alternate-meta and one-barrier order. The commit after its last safe cancellation point is
+uncancelable, and an encode failure after the commit guard is armed poisons the handle like an
+I/O error, so per-commit nonce reservation must happen before the guard (§3). Only an identity
+test transform exists; tests prove every write-side page operation awaits it with unchanged bytes,
+results and cost. Remaining synchronous paths that an encrypted browser database would still need
+to settle: `create`'s bootstrap image (the encoding of bootstrap pages is part of §6) and
+compaction, which is already unsupported on OPFS. Spill and temporary domains have no browser
+storage. Do not replay partially evaluated SQL to recover from a miss: entropy consumption, costs,
+host functions and staged writes must occur exactly once. Do not preload the whole file to hide
+asynchronous reads, which would violate bounded-residency requirements.
 
-Awaiting crypto also introduces event-loop interleavings. The runtime already retains the active
+Awaiting crypto also introduces event-loop interleavings. The runtime retains the active
 operation's snapshot/pins and writer ownership across suspension, processes cancellation/control
-messages, and queues other engine operations. Encryption must preserve that ownership model and
-validated-COW publication/barrier/error-poisoning ordering. Bounded batches of independent dirty
-pages may overlap encryption; parent-dependent reads cannot all be launched together. Promise
-dispatch overhead, allocation, cancellation and working memory belong in integrated measurements.
-The runtime implementation selects no encryption suite, nonce protocol or production provider;
-the primitive measurements below do not establish encrypted-database performance.
+messages, and queues other engine operations; the write side preserves that ownership model and
+validated-COW publication/barrier/error-poisoning ordering (ts-runtime.md §11.2). Bounded batches
+of independent dirty pages overlap encryption; parent-dependent reads (catalog, skeleton and chain
+walks) are awaited one page at a time, and only recovery's listed dependencies are read ahead.
+Promise dispatch overhead, allocation, cancellation and working memory belong in integrated
+measurements. The runtime implementation selects no encryption suite, nonce protocol or production
+provider; the primitive measurements below do not establish encrypted-database performance.
 
 The existing **full Rust/WASM wrapper** (`impl/wasm`) targets WASI and is driven through Node;
 it is not yet a browser/OPFS package. It keeps Rust execution synchronous and adds parameter/result

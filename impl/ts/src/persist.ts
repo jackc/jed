@@ -10,22 +10,24 @@
 import type { Engine, Snapshot } from "./executor.ts";
 import { buildCommitManifest, manifestEntriesOf, metaChecksum } from "./commit_manifest.ts";
 import { engineError } from "./errors.ts";
+import { runSync, type Steps } from "./execution.ts";
 import type { FileHost } from "./filehost.ts";
 import { cacheLeaves } from "./paging.ts";
 import type { SpillSink } from "./spill.ts";
 import {
   catalogPageCount,
   incrementalImage,
+  incrementalImageSteps,
   type IncrementalWrite,
-  liveAfter,
+  liveAfterSteps,
   type LiveCount,
   metaPage,
-  planFreeList,
+  planFreeListSteps,
   reachablePages,
   reclaimDue,
   ROOT_PAGE,
   unassignPages,
-  verifyLiveCount,
+  verifyLiveCountSteps,
 } from "./format.ts";
 
 // StorageBudget is the max_storage_bytes state of one storage domain (memory.md §8.1–§8.3, §8.7): the
@@ -73,13 +75,13 @@ export function storageBytes(db: Engine): bigint {
 // pages than the last commit). There is no forced compaction: reclaiming dead pages cannot lower
 // the measure. prev is the committed snapshot the domain's live count describes; a null budget (a
 // bare engine's commit) only computes the count.
-function admitFile(
+function* admitFileSteps(
   db: Engine,
   write: IncrementalWrite,
   prev: Snapshot,
   budget: BudgetCtx | null,
-): LiveCount {
-  const live = liveAfter(db.live, write, prev, db.paging!, db.pageSize);
+): Steps<LiveCount> {
+  const live = yield* liveAfterSteps(db.live, write, prev, db.paging!, db.pageSize);
   const limit = db.storageBudget.limit;
   if (
     budget === null ||
@@ -216,10 +218,19 @@ export function precheckBudget(
   reuse: boolean,
   budget: BudgetCtx,
 ): void {
+  runSync(precheckBudgetSteps(db, snap, reuse, budget));
+}
+
+export function* precheckBudgetSteps(
+  db: Engine,
+  snap: Snapshot,
+  reuse: boolean,
+  budget: BudgetCtx,
+): Steps<void> {
   if (db.paging === null || db.storageBudget.limit <= 0n) return;
   if (db.persistHook !== null) {
     // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
-    const write = incrementalImage(
+    const write = yield* incrementalImageSteps(
       snap,
       db.pageSize,
       db.pageCount,
@@ -229,7 +240,7 @@ export function precheckBudget(
       floorFreeFor(db, db.paging.hasPending()),
     );
     try {
-      admitFile(db, write, budget.prev, budget);
+      yield* admitFileSteps(db, write, budget.prev, budget);
     } finally {
       unassignPages(snap, write.pages);
     }
@@ -255,6 +266,20 @@ export function persistImpl(
   budget: BudgetCtx | null = null,
   truncate = true,
 ): IncrementalWrite {
+  return runSync(persistSteps(db, snap, canReclaim, canReuse, budget, truncate));
+}
+
+// persistSteps is persistImpl as one continuation (ts-runtime.md §11.2): the synchronous internal API
+// drains it with runSync; the execution worker awaits it inside the uncancelable commit transition.
+// Over a synchronous storage stack every step runs inline.
+export function* persistSteps(
+  db: Engine,
+  snap: Snapshot,
+  canReclaim?: boolean,
+  canReuse = true,
+  budget: BudgetCtx | null = null,
+  truncate = true,
+): Steps<IncrementalWrite> {
   let allowed: Set<number> | null = null;
   if (db.paging !== null && db.persistHook !== null) {
     const pending = db.paging.hasPending();
@@ -264,7 +289,7 @@ export function persistImpl(
   const write =
     db.paging !== null && db.persistHook === null
       ? planInMemory(db, snap, canReuse, budget)
-      : incrementalImage(
+      : yield* incrementalImageSteps(
           snap,
           db.pageSize,
           db.pageCount,
@@ -279,8 +304,8 @@ export function persistImpl(
   // durability is keyed on persistHook, not path) persists the free-list in-commit; an IN-MEMORY main
   // store (persistHook null) keeps its free-list in RAM.
   if (db.persistHook !== null) {
-    const live = admitFile(db, write, budget?.prev ?? db.committed, budget);
-    commitFile(db, snap, write, live, reclaim, canReuse, allowed, truncate);
+    const live = yield* admitFileSteps(db, write, budget?.prev ?? db.committed, budget);
+    yield* commitFileSteps(db, snap, write, live, reclaim, canReuse, allowed, truncate);
   } else commitInMemory(db, snap, write, reclaim);
   return write;
 }
@@ -319,10 +344,10 @@ function floorFreeFor(db: Engine, pending: boolean): Set<number> | null {
 // still succeeds. A failed barrier may have dropped pending pages from the OS cache ("fsyncgate"), so
 // pages the published snapshot needs could now read stale: the storage is revoked, and every later
 // read, commit, and close fails 58030 until the database is reopened through recovery.
-function capFlush(db: Engine): void {
+function* capFlushSteps(db: Engine): Steps<void> {
   const paging = db.paging!;
   try {
-    paging.flushPending();
+    yield* paging.flushPendingSteps();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     paging.revoke(
@@ -360,7 +385,9 @@ function syncDirectoryOnce(db: Engine): void {
 // descriptor and free-list pages from the prior safe free set, protecting every new write from reuse.
 // The inline/overflow descriptor hashes those body pages and the single final sync publishes them.
 // live is the admitted live-page count the meta publishes (memory.md §8.7).
-function commitFile(
+// Each write, barrier, and read below completes before the next begins, in the synchronous order
+// (ts-runtime.md §11.2); after beginDurableCommitSteps any failure keeps the commit guard armed.
+function* commitFileSteps(
   db: Engine,
   snap: Snapshot,
   write: IncrementalWrite,
@@ -369,20 +396,17 @@ function commitFile(
   canReuse: boolean,
   allowed: Set<number> | null,
   truncate: boolean,
-): void {
+): Steps<void> {
   syncDirectoryOnce(db);
   const paging = db.paging!;
-  paging.beginDurableCommit();
+  yield* paging.beginDurableCommitSteps();
   // Preallocate ahead of the high-water so the body sync carries no file-growth journaling (pager.md §7).
-  paging.reserve(write.pageCount);
-  for (const pg of write.pages) {
-    paging.writeBlock(pg.index, pg.bytes);
-    paging.invalidate(pg.index);
-  }
+  yield* paging.reserveSteps(write.pageCount);
+  yield* paging.writePagesSteps(write.pages);
   // A relaxed batch's pending set joins the manifest and stays off the free list (validated-cow.md §4).
   const relaxed = relaxedFile(db);
   const pending = paging.pendingEntries();
-  const plan = planFreeList(
+  const plan = yield* planFreeListSteps(
     snap,
     paging,
     write.rootPage,
@@ -400,12 +424,9 @@ function commitFile(
     // relaxed batch may not cut pages the batch has yet to make durable (validated-cow.md §4).
     truncate && pending.length === 0,
   );
-  verifyLiveCount(snap, paging, write, live);
-  paging.reserve(plan.newPageCount);
-  for (const pg of plan.pages) {
-    paging.writeBlock(pg.index, pg.bytes);
-    paging.invalidate(pg.index);
-  }
+  yield* verifyLiveCountSteps(snap, paging, write, live);
+  yield* paging.reserveSteps(plan.newPageCount);
+  yield* paging.writePagesSteps(plan.pages);
   // The commit's own entries (its body and free-list pages) join the pending set of a relaxed commit.
   const dirty = manifestEntriesOf([...write.pages, ...plan.pages]);
   const manifest = buildCommitManifest(
@@ -414,10 +435,7 @@ function commitFile(
     [...pending, ...dirty],
     plan.manifestIds,
   );
-  for (const pg of manifest.pages) {
-    paging.writeBlock(pg.index, pg.bytes);
-    paging.invalidate(pg.index);
-  }
+  yield* paging.writePagesSteps(manifest.pages);
   const meta = metaPage(
     db.pageSize,
     snap.txid,
@@ -429,15 +447,19 @@ function commitFile(
   );
   // The slot not holding the floor (format.md, *Slot alternation*): txid & 1 under synchronous = on.
   const slot = paging.commitSlot();
-  paging.writeBlock(slot, meta);
+  yield* paging.writePagesSteps([{ index: slot, bytes: meta }]);
   // One durability barrier covers body + descriptor + meta; a relaxed commit defers it to a flush.
-  if (!relaxed) paging.sync();
+  if (!relaxed) yield* paging.syncSteps();
   paging.finishDurableCommit(snap.txid, metaChecksum(meta));
   paging.recordCommit(snap.txid, metaChecksum(meta), slot, !relaxed, dirty);
   // Trailing truncation lowered the high-water: shorten the file once the new meta is durable — now
   // under synchronous = on, at the batch's flush under synchronous = off — keeping one growth step of
   // slack (pager.md §7).
-  paging.settleTruncation(plan.newPageCount, plan.newPageCount < db.pageCount, !relaxed);
+  yield* paging.settleTruncationSteps(
+    plan.newPageCount,
+    plan.newPageCount < db.pageCount,
+    !relaxed,
+  );
   const capReached = relaxed && paging.batchCapReached();
   db.lastCommitMeta = meta;
   db.lastCommitWritten = [...write.pages, ...plan.pages, ...manifest.pages].map((pg) => pg.index);
@@ -446,7 +468,7 @@ function commitFile(
   db.liveAtCompaction = plan.newLive;
   db.freeGenTxid = plan.newGen;
   db.live = live;
-  if (capReached) capFlush(db);
+  if (capReached) yield* capFlushSteps(db);
 }
 
 // commitInMemory is the IN-MEMORY branch of persistImpl: a MemoryBlockStore is never reopened, so it
@@ -479,14 +501,14 @@ function commitInMemory(
 // flip (demoteCleanLeaves — bplus-reshape.md B4). The caller advances snap.txid before calling. Runs
 // under the writer gate. An in-memory attachment uses stageInMemory instead (no fsync). budget is the
 // attachment's committed-storage context (memory.md §8.7).
-export function commitDurableAttachment(
+export function* commitDurableAttachmentSteps(
   db: Engine,
   snap: Snapshot,
   canReclaim: boolean,
   canReuse: boolean,
   budget: BudgetCtx,
-): void {
-  persistImpl(db, snap, canReclaim, canReuse, budget);
+): Steps<void> {
+  yield* persistSteps(db, snap, canReclaim, canReuse, budget);
   snap.demoteCleanLeaves();
 }
 

@@ -403,7 +403,7 @@ export class RuntimeServer {
     const { op, args } = job.request;
     const sessionId = job.request.session ?? 0;
     if (op === "close") {
-      this.closeAll();
+      yield* this.closeAllSteps();
       return null;
     }
     const db = this.requireDatabase();
@@ -466,7 +466,7 @@ export class RuntimeServer {
       case "rollback": {
         this.closeSessionCursors(sessionId);
         try {
-          if (op === "commit") session.commit();
+          if (op === "commit") yield* session.commitSteps();
           else session.rollback();
         } finally {
           if (!session.inTransaction()) owner.transaction = undefined;
@@ -627,7 +627,7 @@ export class RuntimeServer {
     handle?.session.close();
   }
 
-  private closeAll(): void {
+  private *closeAllSteps(): Steps<void> {
     let failure: unknown;
     const attempt = (fn: () => void) => {
       try {
@@ -639,7 +639,12 @@ export class RuntimeServer {
     for (const id of [...this.cursors.keys()]) attempt(() => this.closeCursor(id));
     for (const id of [...this.sessions.keys()]) attempt(() => this.closeSession(id));
     this.statements.clear();
-    attempt(() => this.database?.close());
+    // An asynchronous storage stack flushes a relaxed batch through an awaited barrier.
+    try {
+      if (this.database !== null) yield* this.database.closeSteps();
+    } catch (error) {
+      failure ??= error;
+    }
     this.database = null;
     this.closed = true;
     if (failure !== undefined) throw failure;

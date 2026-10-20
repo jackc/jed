@@ -1,5 +1,4 @@
-import { withoutCancellation } from "./cancel.ts";
-import { runSync, type Steps } from "./execution.ts";
+import { runSync, type Steps, uncancelableSteps } from "./execution.ts";
 // Shared database core + the per-caller Session handle for the TS core (CLAUDE.md §3,
 // spec/design/session.md §2.4, transactions.md §8/§10).
 //
@@ -94,7 +93,8 @@ import {
   adoptStaged,
   type BudgetCtx,
   persistImpl,
-  precheckBudget,
+  persistSteps,
+  precheckBudgetSteps,
   type StagedCommit,
   storageBytes,
 } from "./persist.ts";
@@ -1380,6 +1380,12 @@ class SharedCore {
   // stagesRows is whether the commit staged any record version (the committed-storage repair
   // exemption, memory.md §8.3).
   persist(snap: Snapshot, stagesRows: boolean): void {
+    runSync(this.persistSteps(snap, stagesRows));
+  }
+
+  // persistSteps is persist as a continuation (ts-runtime.md §11): a page client's commit stays on its
+  // synchronous channel; an owner or uncoordinated commit awaits an asynchronous storage stack.
+  *persistSteps(snap: Snapshot, stagesRows: boolean): Steps<void> {
     // A page-service commit checks the role its writer began under before it writes (README §6.5).
     if (this.writerRoleChanged()) throw errStaleRole();
     if (this.client !== null) {
@@ -1400,7 +1406,7 @@ class SharedCore {
       canCompact: this.canCompactCommitted(),
       stagesRows,
     };
-    persistImpl(
+    yield* persistSteps(
       this.storage,
       snap,
       oldest === snap.txid,
@@ -1427,11 +1433,11 @@ class SharedCore {
   // working main snapshot persisted at publish (null when main is unchanged and does not persist,
   // transactions.md §2.1); attached the dirtied attachments' working snapshots.
   // Attachments are visited in name order, so which domain a 54P06 names never depends on set order.
-  precheckBudgets(
+  *precheckBudgetsSteps(
     main: Snapshot | null,
     mainStagesRows: boolean,
     attached: [string, Snapshot][],
-  ): void {
+  ): Steps<void> {
     const canCompact = this.canCompactCommitted();
     const sorted = [...attached].sort((a, b) => compareFilePaths(a[0], b[0])); // UTF-8 byte order
     for (const [name, snap] of sorted) {
@@ -1451,7 +1457,7 @@ class SharedCore {
           compactable = false;
         }
       }
-      precheckBudget(att.storage, snap, reuse, {
+      yield* precheckBudgetSteps(att.storage, snap, reuse, {
         name,
         prev,
         canCompact: compactable,
@@ -1463,7 +1469,7 @@ class SharedCore {
     const oldest = this.oldestLiveVersion(this.committed.txid + 1n);
     const reuse =
       this.client !== null ? this.client.reuseGrant : oldest >= this.storage.freeGenTxid;
-    precheckBudget(this.storage, main, reuse, {
+    yield* precheckBudgetSteps(this.storage, main, reuse, {
       name: this.domainName(),
       prev: this.committed,
       canCompact,
@@ -2366,6 +2372,33 @@ export class Database {
     this.closeStorage();
   }
 
+  // closeSteps is close with an awaitable flush of each relaxed domain's pending commits over an
+  // asynchronous storage stack (ts-runtime.md §11.1); close then finds nothing pending. Page-service
+  // handles keep close's synchronous order (stop serving, then flush).
+  *closeSteps(): Steps<void> {
+    let error: unknown = null;
+    const core = this.core;
+    if (core.handoff === null && core.service === null && core.client === null) {
+      const domains = [core.storage];
+      for (const att of core.attachments.values()) if (att.svc === null) domains.push(att.storage);
+      for (const st of domains) {
+        const paging = st.paging;
+        if (paging === null || !paging.writeSideAsync()) continue;
+        try {
+          yield* paging.flushPendingSteps();
+        } catch (e) {
+          error ??= e;
+        }
+      }
+    }
+    try {
+      this.close();
+    } catch (e) {
+      error ??= e;
+    }
+    if (error !== null) throw error;
+  }
+
   // closeStorage releases main and every attachment, each relaxed domain's pending commits flushed
   // first (validated-cow.md §4); it throws the first failed flush or close after releasing them all.
   private closeStorage(): void {
@@ -2869,8 +2902,8 @@ export class Session {
       return yield* this.engine.executeStmtParamsSteps(stmt, params, insertHolder);
     }
     if (stmt.kind === "begin") return this.beginBlock(stmt.writable);
-    if (stmt.kind === "commit") return this.endBlock(true);
-    if (stmt.kind === "rollback") return this.endBlock(false);
+    if (stmt.kind === "commit") return yield* this.endBlockSteps(true);
+    if (stmt.kind === "rollback") return yield* this.endBlockSteps(false);
     if (this.engine.session.tx !== null) {
       // Inside an open block (an eager write session, or this session after BEGIN): run on the
       // working set. The gate is already held for a writable block.
@@ -2887,7 +2920,7 @@ export class Session {
     try {
       this.refreshCommitted();
       const out = yield* this.engine.executeStmtParamsSteps(stmt, params, insertHolder);
-      this.publish();
+      yield* this.publishSteps();
       return out;
     } finally {
       this.releaseGate();
@@ -2919,6 +2952,10 @@ export class Session {
   // failed COMMIT is a ROLLBACK, PostgreSQL). Either way the gate is released and any pin deregistered
   // — finishBlock runs in `finally` so a persist I/O failure (file-backed) never leaks the writer gate.
   private endBlock(commit: boolean): Outcome {
+    return runSync(this.endBlockSteps(commit));
+  }
+
+  private *endBlockSteps(commit: boolean): Steps<Outcome> {
     try {
       if (commit && this.engine.session.tx !== null) {
         try {
@@ -2931,9 +2968,9 @@ export class Session {
       }
       if (commit) {
         const failed = this.engine.session.tx?.failed ?? false;
-        const out = this.engine.commitTx(); // inner in-memory swap: committed := working
+        const out = yield* this.engine.commitTxSteps(); // inner in-memory swap: committed := working
         if (!failed && this.gateHeld)
-          this.publish(); // persist + publish; may throw on I/O failure
+          yield* this.publishSteps(); // persist + publish; may throw on I/O failure
         else this.engine.stagedAttachments = [];
         return out;
       }
@@ -2992,12 +3029,16 @@ export class Session {
   // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
   // this session's version) unchanged. In-memory persist is a no-op.
   private publish(): void {
-    // Engine.commitTx already passed the last safe cancellation point. A shared-core
-    // publication follows its in-memory swap and must finish the same commit transition.
-    withoutCancellation(() => this.publishUncancelable());
+    runSync(this.publishSteps());
   }
 
-  private publishUncancelable(): void {
+  // Engine.commitTx already passed the last safe cancellation point. A shared-core publication follows
+  // its in-memory swap and must finish the same commit transition (ts-runtime.md §11.2).
+  private *publishSteps(): Steps<void> {
+    yield* uncancelableSteps(this.publishUncancelableSteps());
+  }
+
+  private *publishUncancelableSteps(): Steps<void> {
     // Taken first, so any failure below drops the staged attachment commits unadopted.
     const staged = this.engine.stagedAttachments;
     this.engine.stagedAttachments = [];
@@ -3012,7 +3053,7 @@ export class Session {
     if (changes.main) {
       snap.txid = this.baseVersion + 1n; // main-domain version and reclamation watermark
       // durable before publish (packs into the byte store, any host)
-      this.core.persist(snap, this.engine.commitStagesRows);
+      yield* this.core.persistSteps(snap, this.engine.commitStagesRows);
       if (this.core.writerRoleChanged()) {
         // A lost acknowledgement resolved as committed under a new role (README §6.5): that role's
         // committed state already holds the commit, so this copy of it is not published.
@@ -3069,7 +3110,12 @@ export class Session {
   // commit commits an open write block / write session (publish + release the gate, §2.4). With no
   // open block this is a lenient no-op (PostgreSQL). The session stays usable (autocommit) afterward.
   commit(): void {
-    if (this.engine.session.tx !== null) this.endBlock(true);
+    runSync(this.commitSteps());
+  }
+
+  // commitSteps is commit as a continuation: the worker awaits an asynchronous storage stack.
+  *commitSteps(): Steps<void> {
+    if (this.engine.session.tx !== null) yield* this.endBlockSteps(true);
   }
 
   // rollback rolls back an open write block / write session (discard the working set + release the
@@ -3143,7 +3189,7 @@ export class Session {
     if (ownsWrapper) this.beginBlock(true);
     try {
       const summary = yield* this.engine.runScriptBodySteps(sql);
-      if (ownsWrapper) this.endBlock(true);
+      if (ownsWrapper) yield* this.endBlockSteps(true);
       return summary;
     } catch (e) {
       if (ownsWrapper) this.endBlock(false);

@@ -20,7 +20,7 @@ import { runSync, type Steps } from "./execution.ts";
 import { engineError } from "./errors.ts";
 import { decodeLeafNode, sameLeafShape } from "./format.ts";
 import type { ManifestEntry } from "./commit_manifest.ts";
-import type { BatchMirror, CommitFault, Pager } from "./pager.ts";
+import type { BatchMirror, CommitFault, Pager, PageRead, PageTransform } from "./pager.ts";
 
 // DEFAULT_CACHE_BYTES is the default memory budget for the resident leaf cache, in bytes (256 MiB) — the
 // OpenOptions.cacheBytes default (spec/design/pager.md §3, api.md §2.1). Sized so the dominant case —
@@ -84,6 +84,42 @@ export class SharedPaging {
 
   readBlockSteps(index: number): Steps<Uint8Array> {
     return this.pager.readBlockSteps(index);
+  }
+
+  // The write side's page reads and writes (ts-runtime.md §11): inline over a synchronous storage
+  // stack, awaitable when the page transform or device is asynchronous (Pager has the details).
+  readPageSteps(index: number): Steps<Uint8Array> {
+    return this.pager.readPageSteps(index);
+  }
+  readWindowSteps(indices: number[]): Steps<PageRead[] | null> {
+    return this.pager.readWindowSteps(indices);
+  }
+  // writePagesSteps writes pages in order, dropping each rewritten page's stale pool entry once its
+  // write completed (invalidate).
+  writePagesSteps(pages: { index: number; bytes: Uint8Array }[]): Steps<void> {
+    return this.pager.writePagesSteps(pages, (index) => this.pool.invalidate(index));
+  }
+  reserveSteps(minPages: number): Steps<void> {
+    return this.pager.reserveSteps(minPages);
+  }
+  syncSteps(): Steps<void> {
+    return this.pager.syncSteps();
+  }
+  flushPendingSteps(): Steps<void> {
+    return this.pager.flushPendingSteps();
+  }
+  beginDurableCommitSteps(): Steps<void> {
+    return this.pager.beginDurableCommitSteps();
+  }
+  settleTruncationSteps(pageCount: number, lowered: boolean, durable: boolean): Steps<void> {
+    return this.pager.settleTruncationSteps(pageCount, lowered, durable);
+  }
+  writeSideAsync(): boolean {
+    return this.pager.writeSideAsync();
+  }
+  // setPageTransform installs the page codec (the seam of ts-runtime.md §11.5).
+  setPageTransform(transform: PageTransform | null): void {
+    this.pager.setPageTransform(transform);
   }
 
   // reserve / writeBlock / sync / close drive the commit write path (file.ts persistImpl) and handle

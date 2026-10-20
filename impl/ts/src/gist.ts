@@ -23,6 +23,7 @@
 
 import type { ColType } from "./catalog.ts";
 import { engineError } from "./errors.ts";
+import { ioSteps, runSync, type Steps } from "./execution.ts";
 import { encodeRangeBody, MAX_TREE_DEPTH, readRangeBody } from "./format.ts";
 import { rangeContains, rangeOverlaps, rangeTotalCmp, rangeUnion } from "./range.ts";
 import type { Value } from "./value.ts";
@@ -529,17 +530,31 @@ export function buildGistFromLeafKeys(ops: GistOpclass[], keys: Uint8Array[]): G
 // pages already walked: a page reached twice is a misdirected child pointer (data_corrupted), not a
 // reason to recurse without bound; depth bounds the recursion the same way (MAX_TREE_DEPTH).
 export function readGistLeafKeys(
-  read: (pageNo: number) => { pageType: number; itemCount: number; payload: Uint8Array },
+  read: (pageNo: number) => GistPageRead,
   pageNo: number,
   out: Uint8Array[],
   seen: Set<number> = new Set<number>(),
   depth = 1,
 ): void {
+  runSync(readGistLeafKeysSteps((p) => ioSteps(() => read(p)), pageNo, out, seen, depth));
+}
+
+export type GistPageRead = { pageType: number; itemCount: number; payload: Uint8Array };
+
+// readGistLeafKeysSteps is readGistLeafKeys over an awaitable page read (an asynchronous open,
+// ts-runtime.md §11.1): each page is awaited before its children are followed.
+export function* readGistLeafKeysSteps(
+  read: (pageNo: number) => Steps<GistPageRead>,
+  pageNo: number,
+  out: Uint8Array[],
+  seen: Set<number> = new Set<number>(),
+  depth = 1,
+): Steps<void> {
   if (seen.has(pageNo)) throw engineError("data_corrupted", "GiST page reached twice");
   seen.add(pageNo);
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "GiST tree deeper than any valid tree");
-  const { pageType, itemCount, payload } = read(pageNo);
+  const { pageType, itemCount, payload } = yield* read(pageNo);
   const cur = { pos: 0 };
   if (pageType === PAGE_GIST_LEAF) {
     for (let i = 0; i < itemCount; i++) {
@@ -562,7 +577,7 @@ export function readGistLeafKeys(
       takeBytes(payload, cur, blen); // skip the union bound
       children.push(readU32(payload, cur));
     }
-    for (const cp of children) readGistLeafKeys(read, cp, out, seen, depth + 1);
+    for (const cp of children) yield* readGistLeafKeysSteps(read, cp, out, seen, depth + 1);
     return;
   }
   throw engineError("data_corrupted", "expected a GiST node page");

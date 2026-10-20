@@ -35,6 +35,12 @@ export interface BlockStore {
   // barrier (hosts.md §2.1). After it returns, bytes in [old, bytes) read back as zero AND the
   // allocation is durable, so a later in-region writeAt + data-only sync need not flush a growth journal.
   setSize(bytes: number): void;
+  // Optional await-capable write-side forms (ts-runtime.md §11.4). A device offering any of them puts
+  // its pager's write side in the asynchronous mode, where each stage prefers its async form. Each
+  // has exactly the contract of its synchronous counterpart.
+  writeAtAsync?(offset: number, bytes: Uint8Array): Promise<void>;
+  syncAsync?(): Promise<void>;
+  setSizeAsync?(bytes: number): Promise<void>;
   // close releases the backing (the OS file descriptor). Lifecycle, not part of the §2 data surface.
   close(): void;
   // skipsSync reports whether sync skips its durability barrier (fsync=off, api.md §2.1), so a
