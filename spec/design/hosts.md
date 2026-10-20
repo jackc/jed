@@ -309,8 +309,10 @@ base host (in-memory | file | OPFS)
   requirement (storage.md §6).
 - **Replication is a tee *below* the codec, at the seam** — so it captures **ciphertext**. The
   consequence: a replica stores opaque encrypted pages and needs the key only to *query*, never
-  to *replicate* — a **keyless replica/backup** (replication.md §4). This property exists *only*
-  because the tee is below the codec; the layering is chosen for it.
+  to *apply* — a **keyless replica** (replication.md §4). This property exists *only*
+  because the tee is below the codec; the layering is chosen for it. It covers the apply loop,
+  not the seeding: a page-identical base image is taken by a keyed process, because its walk
+  follows pointers through decrypted pages (encryption.md §6, *the key block in backups*).
 
 Both decorations ride the same object the commit already produces — the per-commit set of
 dirty pages + the meta swap (storage.md §4). That single fact is why neither needs a new
