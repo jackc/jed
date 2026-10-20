@@ -181,14 +181,24 @@ derives its own keys.
   ordinal and the tag, 52 bytes with a 32-byte salt. Readers cache derived keys by salt in a
   bounded cache, deriving once per distinct commit rather than once per page.
 
-Choose by measuring the read-side derivation cost on each native core against the reserve size
-(§4.1). A random salt of at least 192 bits makes a repeated salt negligible across any realistic
+The choice weighs the read-side derivation cost on each native core against the reserve size
+(§4.1). **Measured (2026-10-19, native Go and Rust, §8):** a full derive (salt, HKDF, AES-GCM key
+setup) costs 0.57–0.81 µs in Go and 0.18–0.34 µs in Rust, depending on the HKDF layout below.
+Per-page keys therefore raise an 8 KiB cache-miss open by 56–95% of the crypto time in Go (whose
+AES is fast) and by 3–10% in Rust. Per-commit keys help reads only when consecutive misses come
+from the same commit: read cold, with every page from a different commit, they cost slightly more
+than per-page keys (the cache work); from 16 pages per commit, opens and seals come within 7% of
+a single fixed key. The per-page reserve is 48 bytes with a 32-byte salt (40 with 24), against
+52 per commit. Neither granularity is selected yet.
+
+A random salt of at least 192 bits makes a repeated salt negligible across any realistic
 number of keys, and each derived key seals one page or one commit's pages, far below GCM's
 per-key limits. The construction is our composition of standard primitives, close to
 [Tink's AES-GCM-HKDF streaming AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming)
 and C2SP's XAES-256-GCM, but neither analysis covers a mutable page codec automatically. The review
 must cover the exact HKDF layout (random salt as the extract salt, or as expand context under one
-extracted key), domain separation, salt length and cumulative bounds.
+extracted key), domain separation, salt length and cumulative bounds. The expand-context layout
+measured 0.24 µs per key cheaper in Go and 0.16 µs in Rust (§8), since it extracts once at unlock.
 
 The earlier **writer-lifetime** candidate, one derived key per acquisition of write ownership with
 a counter for every encryption under it, is not pursued: its counter allocation across
@@ -410,6 +420,27 @@ Native AES wins on this CPU; ChaCha is about 3.7× faster in pure JS. These API-
 make the browser/JS path important to algorithm selection, but choose no production algorithm.
 The linked report retains all 104 cases, samples, versions, allocation modes and limitations.
 
+**Key granularity (2026-10-19).** `mise run bench:aead_granularity` measures the two §3.1
+granularities in native Go (standard library) and Rust (RustCrypto `aes-gcm` and `hkdf`) at 4, 8
+and 16 KiB, under both HKDF layouts: per-page keys derived on every seal and every open with no
+cache, and per-commit keys for commits of 1, 4, 16 and 256 pages, read through a bounded
+salt-keyed cache that misses once per commit. Both cores pass RFC 5869 vectors and tamper
+rejection, and agree byte for byte on derived keys and ciphertext for fixed salts. Median µs per
+8 KiB page (extract-per-key / expand-per-key layout):
+
+| | Go seal | Go open | Rust seal | Rust open |
+|---|---:|---:|---:|---:|
+| Fixed key, no derivation | 0.98 | 0.90 | 2.68 | 2.72 |
+| Per page | 1.88 / 1.62 | 1.76 / 1.41 | 3.08 / 2.94 | 2.98 / 2.81 |
+| Per commit, 1 page (cold) | 1.86 / 1.62 | 1.84 / 1.54 | 3.07 / 2.94 | 3.07 / 2.92 |
+| Per commit, 16 pages | 1.04 / 1.02 | 0.97 / 0.95 | 2.72 / 2.72 | 2.79 / 2.75 |
+| Per commit, all-hit cache | — | 0.92 | — | 2.78 |
+
+The derivation is a fixed cost per key, so its share falls with page size (Go's per-page open
+overhead is 36–49% at 16 KiB). These are hot-memory crypto costs; a real cache miss also pays
+I/O and decoding, which they exclude. One CPU, single-threaded; no ARM or WebCrypto figures.
+The [report](../../bench/aead/results/2026-10-19-granularity.md) has every case and its method.
+
 ### 8.1 Browser execution and the Rust/WASM option
 
 The [browser/Node runtime](ts-runtime.md) implements async-only public JS entry points,
@@ -492,8 +523,8 @@ Platform support across current and future native cores decides it: AES-GCM and 
 every standard library, while XChaCha20-Poly1305 is in none. Browser performance is not a
 deciding factor. The direction becomes a format decision after a security review of the exact
 construction and the §3.1 fault fixtures; no production dependency is selected. Still to decide:
-per-page versus per-commit-attempt keys, by measuring read-side derivation on each native core
-against the reserve size. A pure-JS fallback and a software-WASM backend are material deployment
+per-page versus per-commit-attempt keys, weighing the measured read-side derivation on Go and Rust
+(§8) against the reserve size. A pure-JS fallback and a software-WASM backend are material deployment
 costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one

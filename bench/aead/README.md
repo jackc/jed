@@ -13,6 +13,8 @@ needed. All dependencies below were explicitly approved for this experiment on 2
 | Node native | `node:crypto` / OpenSSL | Synchronous allocating API; a fresh cipher context per message |
 | Node WebCrypto | `crypto.subtle`, AES-GCM only | Imported key reused; allocating async API; one operation awaited at a time |
 
+The key-granularity probe (below) also uses RustCrypto `hkdf` 0.13.0 (with `hmac` 0.13.0) and
+`sha2` 0.11.0, approved for it on 2026-10-19, and Go's standard `crypto/hkdf`.
 Versions of transitive dependencies are recorded in Cargo.lock, go.sum and package-lock.json.
 Native implementations use their default CPU dispatch, without forcing portable or custom CPU
 backends. Node native/WebCrypto are comparison baselines, not an approved engine integration.
@@ -130,6 +132,24 @@ prototype; native AES acceleration is not inherited merely by compiling Rust to 
 The report records all samples and validation, copying/allocation, CPU affinity, batching,
 build flags and artifact sizes. Cross-browser/ARM portability, whole-file crash behavior and
 integrated database performance remain open. See [the design investigation](../../spec/design/encryption.md#81-browser-execution-and-the-rustwasm-option).
+
+### Key granularity: per page vs per commit attempt (native Go and Rust)
+
+`mise run bench:aead_granularity` ([2026-10-19 report](results/2026-10-19-granularity.md))
+compares the two random-salt HKDF key granularities of [encryption.md §3.1](../../spec/design/encryption.md#key-granularity-per-page-or-per-commit-attempt)
+at 4, 8 and 16 KiB: a salt, HKDF-SHA-256 derivation and AES-256-GCM key setup for every page
+seal and every page open (no key cache), versus one derivation per commit of 1, 4, 16 or 256
+pages with ordinal nonces, read through a bounded salt-keyed cache that misses once per commit
+(`Commit 1` is the cold case, every page from a different commit), plus an all-hit cache and a
+fixed-key reference. Each runs under two HKDF layouts: the salt as the Extract salt per key, or
+one Extract at unlock and the salt in a per-key Expand's info. Workers check RFC 5869 vectors,
+round trips and tamper rejection, and Go and Rust must produce identical derived keys and
+ciphertext for fixed salts, before any timing. Settings are the `JED_AEAD_*` variables above.
+
+At 8 KiB, a full derive cost 0.81/0.57 µs (extract/expand layout) in Go and 0.34/0.18 µs in
+Rust. Per-page keys raised a cache-miss open from 0.90 to 1.76/1.41 µs in Go and from 2.72 to
+2.98/2.81 µs in Rust; per-commit keys read cold cost slightly more than per-page, and with 16 or
+more pages per commit came within 7% of the fixed key. No granularity is selected.
 
 ### Integrated async page codec (browser OPFS)
 
