@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/join_bounds_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-join-bounds-smoke-final.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 65220608,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 7.746471847000066,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341",
+  "final_source_sha256": "66afc525fcc2f4d0290ef70d03cc2f95e7521bd467029ecc653fe7b418f55341",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "JOIN bounds yjit: 56 memory/file API groups passed\n",
+  "stderr": ""
+}

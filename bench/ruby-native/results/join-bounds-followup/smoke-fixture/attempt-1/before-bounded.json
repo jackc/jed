@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/join_bounds_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-join-bounds-smoke-before.json"
+  ],
+  "success": false,
+  "reason": "worker exited 1",
+  "peak_rss_bytes": 64745472,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 2.8450673010083847,
+  "source": "/tmp/jed-join-bounds-before/impl/ruby-native",
+  "source_sha256": "405f5536969b71c80fa30bd45d962bda33af642b0185039d76e6443005c35336",
+  "final_source_sha256": "405f5536969b71c80fa30bd45d962bda33af642b0185039d76e6443005c35336",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "",
+  "stderr": "bench/ruby-native/join_bounds_diagnostics.rb:222:in 'JoinBoundsDiagnostics.workload_cases': undefined local variable or method 'sessions' for module JoinBoundsDiagnostics (NameError)\n\n    sessions&.each(&:close)\n    ^^^^^^^^\n\tfrom bench/ruby-native/join_bounds_diagnostics.rb:307:in 'block (2 levels) in JoinBoundsDiagnostics.main'\n\tfrom bench/ruby-native/join_bounds_diagnostics.rb:303:in 'Array#each'\n\tfrom bench/ruby-native/join_bounds_diagnostics.rb:303:in 'block in JoinBoundsDiagnostics.main'\n\tfrom /home/jack/.local/share/mise/installs/ruby/4.0.7/lib/ruby/4.0.0/tmpdir.rb:105:in 'Dir.mktmpdir'\n\tfrom bench/ruby-native/join_bounds_diagnostics.rb:302:in 'JoinBoundsDiagnostics.main'\n\tfrom bench/ruby-native/join_bounds_diagnostics.rb:345:in '<main>'\n"
+}
