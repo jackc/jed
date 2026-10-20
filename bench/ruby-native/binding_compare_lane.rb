@@ -219,6 +219,7 @@ module RubyBindingComparison
       parser.on('--file PATH') { |path| options[:file] = File.expand_path(path) }
       parser.on('--verify-only') { options[:verify_only] = true }
       parser.on('--workloads LIST', Array) { |names| options[:workloads] = names }
+      parser.on('--plan PATH') { |path| options[:plan] = File.expand_path(path) }
       parser.on('--fresh-sql') { options[:fresh_sql] = true }
       parser.on('--disable-pipeline') { options[:disable_pipeline] = true }
       parser.on('--disable-ordering') { options[:disable_ordering] = true }
@@ -227,6 +228,7 @@ module RubyBindingComparison
       parser.on('--disable-text') { options[:disable_text] = true }
     end.parse!
     abort "Usage: #{File.basename(__FILE__)} #{ENGINES.join('|')} [--verify-only] [--file PATH]" unless ENGINES.include?(engine) && ARGV.empty?
+    abort '--plan cannot be combined with --file' if options[:plan] && options[:file]
     root = File.expand_path('../..', __dir__)
     source = if engine == 'wrapper'
       File.join(root, 'impl/ruby')
@@ -247,13 +249,21 @@ module RubyBindingComparison
     abort 'Source has no text compiler to disable' if @disable_text && engine != 'wrapper' && !JedNative::CompiledExpression::TYPES.include?('text')
     library = engine == 'wrapper' ? File.expand_path(Jed::FFI.lib_path) : nil
     library_hash = library && Digest::SHA256.file(library).hexdigest
-    plan_path = File.join(__dir__, 'compare/plan.json')
+    plan_path = options.fetch(:plan, File.join(__dir__, 'compare/plan.json'))
     plan = JSON.parse(File.read(plan_path))
-    jobs = options[:file] ? file_workloads : workloads(plan)
+    if options[:plan]
+      raise 'explicit plan must retain five repetitions and positive fixture size' unless plan.fetch('repetitions') == REPETITIONS && plan.fetch('rows').positive?
+      jobs = plan.fetch('workloads').map do |job|
+        job.merge('validation_iterations' => job.fetch('validation_iterations', plan.fetch('validation_iterations')),
+          'kind' => job.fetch('kind', 'explicit_plan'))
+      end
+    else
+      jobs = options[:file] ? file_workloads : workloads(plan)
+    end
     jobs += cold_workloads if options[:fresh_sql] && !options[:file]
     additional_plan_path = nil
     additional_plans = {}
-    if options[:workloads] && !options[:file]
+    if options[:workloads] && !options[:file] && !options[:plan]
       # Additional compiler controls are opt-in within this opt-in
       # harness. Selecting an existing workload leaves its schedule unchanged.
       %w[pipeline ordering aggregate relation text like].each do |kind|
@@ -309,7 +319,7 @@ module RubyBindingComparison
         'Opt-in API comparison; the wrapper reparses and materializes each query. Native prepared parsing is outside timing.',
         'Native modes use a long-lived session, matching the wrapper connection lifetime.',
         'Memory SQL/data/parameters match compare/plan.json; warmups/iterations are increased for this diagnostic.',
-        'Expression/pipeline/ordering/aggregate/relation/text shapes require an explicit --workloads selection; existing workload schedules remain unchanged.',
+        'Additional shapes require explicit --workloads or --plan selection. An explicit plan retains its own schedules; existing default schedules remain unchanged.',
         'Validation uses a separate database and instrumented callbacks. Timed callbacks have no counting or hashing.',
         'All query results are fully drained, including the eager API. Validation digests include values, metadata and costs.',
         'File mode uses read-only auto-locking opens, 50000 warmups and 5 batches of 5000 deterministic lookups.',
