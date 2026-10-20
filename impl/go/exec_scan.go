@@ -505,7 +505,7 @@ func (db *engine) buildScanRows(sp *selectPlan, resultTypes []string, bound []Va
 				cur.ahead, cur.filterEnv, cur.projectEnv = ra, &fe, &pe
 			}
 		}
-		return &Rows{columnNames: sp.columnNames, columnTypes: resultTypes, cursor: cur}, true, nil
+		return &Rows{columnNames: sp.columnNames, columnTypes: resultTypes, cursor: specializeScanCursor(cur)}, true, nil
 	}
 
 	// Blocking (buffered) shape: buffers its input but yields the output one row at a time via
@@ -624,8 +624,7 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 			}
 			var v bool
 			if k := c.plan.filterKernel(); k != nil {
-				value, evalErr := k.eval(row, filterEnv, c.meter)
-				v, err = value.IsTrue(), evalErr
+				v, err = k.evalFilter(row, filterEnv, c.meter)
 			} else {
 				v, err = c.plan.filter.evalFilter(row, filterEnv, c.meter)
 			}

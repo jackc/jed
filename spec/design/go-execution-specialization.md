@@ -1,8 +1,7 @@
 # Go: static execution kernels — proposed experiment
 
-> **G1 research implementation available; not ratified for production.** See the
-> [implementation and results](../../bench/go-specialization/README.md). G2/G3
-> remain conditional follow-ons. This investigation
+> **G1/G2/G3 research implementation available; not ratified for production.** See the
+> [implementation and results](../../bench/go-specialization/README.md). This investigation
 > can run independently of Rust and TS. It inherits the
 > [experiment contract](execution-specialization-experiments.md), including
 > semantic invariants, structural caps, coverage and performance gates.
@@ -158,3 +157,26 @@ a separate dependency/architecture proposal, not an automatic next stage.
 Deliver a Go-only research branch, shared fixtures, pattern/admission coverage,
 allocation and race evidence, raw timings and a scoped adoption-or-rejection
 report. No Rust/TS implementation is a prerequisite.
+
+## G2/G3 experiment continuation (2026-10-19)
+
+The Go-only continuation admits bounded AND/OR/NOT/NULL-test composition,
+single-WHEN searched CASE and two-argument COALESCE over the G1 terminals and
+primitive leaves. Larger arithmetic patterns, casts, multiple WHEN arms and
+three-or-more COALESCE arguments remain explicit fallback controls. Preparation
+checks 192 source nodes and depth 32 before allocating descriptors. Static and
+closure builds admit exactly the same surface; the closure build expands G1
+patterns to one closure per source node and retains no second descriptor graph.
+
+Before implementing G3, measure G2 static composition against the pinned G1
+commit, clean production, disabled/ordinary controls and closures. Targets are
+boolean filtering, CASE and nested CASE/COALESCE over 4,096 rows; retain G1
+arithmetic/filter targets and cheap, unsupported and columnar controls. Use five
+alternating process sets at 100 ms per workload. The existing 10%/four-of-five
+research gate and 3% control investigation threshold apply. Rerun suspicious
+controls in three 250 ms sets, preserving the original samples.
+
+Then measure G3 separately against G2 with the same benchmark source. G3 selects
+a precompiled row-at-a-time loop only for a fully admitted filter/projection
+bundle at the original pull cursor; no row buffer or new source/sink is allowed.
+Production builds remain disabled throughout this investigation.

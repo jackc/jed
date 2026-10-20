@@ -5488,16 +5488,26 @@ def gen_execution_specialization(seed)
   rng = Random.new(seed)
   rows = (1..24).map { |id| [id, rng.rand(4).zero? ? nil : rng.rand(-20..20), rng.rand(-10..10)] }
   lit = ->(v) { v.nil? ? "NULL" : v.to_s }
-  out = header(seed, PREDICATE_REQ + %w[expr.case], "typed execution roots versus CASE fallback")
+  out = header(seed, PREDICATE_REQ + %w[expr.case expr.coalesce], "typed execution roots versus multi-arm CASE fallback")
   stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
   stmt(out, "INSERT INTO t VALUES #{rows.map { |r| "(#{r.map(&lit).join(',')})" }.join(',')}")
   expected = rows.flat_map { |id, a, b| [id.to_s, lit.call(a.nil? ? nil : (a + b) * (a - b))] }
-  ["(a+b)*(a-b)", "CASE WHEN id > 0 THEN (a+b)*(a-b) ELSE 0 END"].each do |expr|
+  ["(a+b)*(a-b)", "CASE WHEN id > 0 THEN (a+b)*(a-b) WHEN id < 0 THEN 0 ELSE 0 END"].each do |expr|
     q(out, "II", "SELECT id, #{expr} FROM t ORDER BY id", expected)
   end
   survivors = rows.select { |_id, a, b| !a.nil? && a + b > 5 }.map { |id, _a, _b| id.to_s }
-  ["a+b > 5", "CASE WHEN a+b > 5 THEN true ELSE false END"].each do |predicate|
+  ["a+b > 5", "CASE WHEN a+b > 5 THEN true WHEN id < 0 THEN false ELSE false END"].each do |predicate|
     q(out, "I", "SELECT id FROM t WHERE #{predicate} ORDER BY id", survivors)
+  end
+  compound = rows.select { |_id, a, b| a.nil? || (a + b > 5 && b != 0) }.map { |id, _a, _b| id.to_s }
+  ["(a+b > 5 AND b <> 0) OR a IS NULL",
+   "CASE WHEN a IS NULL THEN true WHEN a+b > 5 AND b <> 0 THEN true ELSE false END"].each do |predicate|
+    q(out, "I", "SELECT id FROM t WHERE #{predicate} ORDER BY id", compound)
+  end
+  values = rows.map { |_id, a, b| lit.call(a && a > 0 ? a + b : b) }
+  ["coalesce(CASE WHEN a > 0 THEN a+b ELSE NULL END,b)",
+   "CASE WHEN a > 0 THEN a+b WHEN a IS NULL THEN b ELSE b END"].each do |expr|
+    q(out, "I", "SELECT #{expr} FROM t ORDER BY id", values)
   end
   out.join("\n") + "\n"
 end

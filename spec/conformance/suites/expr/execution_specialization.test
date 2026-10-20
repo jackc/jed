@@ -87,7 +87,7 @@ SELECT a/(id+1) FROM kernels ORDER BY id LIMIT 1 OFFSET 1
 ----
 NULL
 
-# Unsupported boolean / lazy roots must retain the ordinary branch behavior.
+# Boolean / lazy roots retain their branch behavior under composition.
 query BBII nosort
 SELECT flag AND NULL, flag OR NULL, CASE WHEN flag THEN a ELSE b END, coalesce(a,b) FROM kernels ORDER BY id
 ----
@@ -159,3 +159,59 @@ query I nosort
 SELECT (a-b)+1 FROM dates ORDER BY id
 ----
 3
+
+# Composed value booleans, filtered CASE and nested COALESCE, with NULL at each
+# side. Multiple-WHEN and longer COALESCE remain independent ordinary controls.
+query BBII nosort
+SELECT flag AND (a>b OR b IS NULL), flag OR (a<b AND b IS NOT NULL), CASE WHEN flag AND a<0 THEN a/b ELSE coalesce(a,b) END, coalesce(CASE WHEN flag THEN a+b ELSE NULL END,b) FROM kernels ORDER BY id
+----
+false
+true
+-2
+-4
+NULL
+NULL
+2
+2
+false
+false
+4
+NULL
+true
+true
+9
+7
+
+query I nosort
+SELECT coalesce(a,b/0) FROM kernels WHERE a IS NOT NULL ORDER BY id
+----
+-7
+4
+9
+
+query I nosort
+SELECT CASE WHEN a IS NULL THEN b WHEN flag THEN a ELSE b END FROM kernels ORDER BY id
+----
+-7
+2
+NULL
+9
+
+query I nosort
+SELECT coalesce(a,b,0) FROM kernels ORDER BY id
+----
+-7
+2
+4
+9
+
+# Preserve narrow intermediate overflow and error visitation inside lazy roots,
+# even when CASE/COALESCE unifies the result to a wider integer type.
+statement error 22003
+SELECT CASE WHEN id=1 THEN hi+hi ELSE wide/0 END FROM boundaries ORDER BY id
+
+statement error 22012
+SELECT CASE WHEN id=0 THEN hi+hi ELSE wide/0 END FROM boundaries ORDER BY id
+
+statement error 22003
+SELECT coalesce(hi+hi,wide/0) FROM boundaries ORDER BY id

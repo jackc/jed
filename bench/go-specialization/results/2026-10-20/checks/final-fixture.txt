@@ -1,0 +1,7 @@
+[experiment:go-specialization] $ ~/.codex/worktrees/214f/jed/mise-tasks/experim…
+ordinary: [memory] 1 passed, 0 failed, 0 skipped; [disk] 1 passed, 0 failed, 0 skipped
+forced: [memory] 1 passed, 0 failed, 0 skipped; [disk] 1 passed, 0 failed, 0 skipped
+selective: [memory] 1 passed, 0 failed, 0 skipped; [disk] 1 passed, 0 failed, 0 skipped
+closures: [memory] 1 passed, 0 failed, 0 skipped; [disk] 1 passed, 0 failed, 0 skipped
+scan-forced: [memory] 1 passed, 0 failed, 0 skipped; [disk] 1 passed, 0 failed, 0 skipped
+scan-selective: [memory] 1 passed, 0 failed, 0 skipped; [disk] 1 passed, 0 failed, 0 skipped
