@@ -623,8 +623,12 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   file reserves nothing, an encrypted file what its suite needs; every pointer in an encrypted
   file binds the full AEAD tag of the page it names, so page-level replay is detected and the
   encrypted file is a distinct format variant with its own goldens and cost family; manifest
-  page identities are over on-disk (ciphertext) bytes; every page type is authenticated; an
-  encrypted database's spill scratch files use a random, never-persisted per-file key; key
+  page identities are over on-disk (ciphertext) bytes; every page type is authenticated (meta
+  slots and manifest pages plaintext, authenticated whole, so slot selection stays keyless);
+  scratch encryption is a handle-level setting (`auto | on`, fixed at open, so an encrypted
+  attachment never spills plaintext through a plaintext main) using a random, never-persisted
+  per-file key; a credential change is acknowledged after a second barrier and rides the
+  replication stream; converting between variants rebuilds the trees; key
   material comes from a dedicated CSPRNG source, never the seeded SQL entropy seam; the built-in
   passphrase KDF is PBKDF2-HMAC-SHA-256 behind a KDF identifier, with a host-supplied wrapping
   key as the first-class credential; live VM clones are excluded from the threat model; every

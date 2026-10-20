@@ -265,9 +265,12 @@ it checks only the floor.)
 
 ## 5. Integration and verification
 
-The manifest hashes encoded logical pages at the existing pager seam. A future encryption
-decorator must continue exposing exactly those bytes after decryption; the protocol makes
-no assumption that the underlying stored bytes are plaintext-comparable. A block-delta
+The manifest hashes encoded logical pages at the existing pager seam, which in a plaintext file
+are the stored bytes. The encrypted format variant instead computes manifest identities over the
+**on-disk (ciphertext) bytes**, after the page codec, and keeps the meta slot plaintext, so
+completeness checks and slot selection stay keyless ([encryption.md](encryption.md) §4); the
+plaintext format is unchanged. The protocol makes no assumption that stored bytes are
+plaintext-comparable. A block-delta
 replication sink must ship manifest pages and meta alongside body pages and preserve the
 same committed-batch durability rule. This remains block replication, not WAL replay.
 

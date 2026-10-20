@@ -233,7 +233,8 @@ For encrypted commits, batch independent page encryption within a memory/concurr
 Build manifests over the final encoded bytes and preserve validated COW's body, manifest,
 alternate-meta and one-barrier ordering, including the existing storage-failure poisoning
 rules. Publish/resolve commit only at the completion point allowed by its selected durability
-mode. Abort/retry must consume nonce allocations as specified by encryption.md. Crypto errors
+mode. Abort/retry needs no nonce bookkeeping: every seal draws a fresh random salt and a
+failed attempt's salts are simply never reused (encryption.md §3.1). Crypto errors
 and cancellation before storage work must be distinguished from failures after writes begin.
 
 ## 8. Rust delivery and host extensions
