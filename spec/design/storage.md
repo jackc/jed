@@ -374,14 +374,17 @@ sits so the options stay open (CLAUDE.md §9).
   [encryption.md](encryption.md)**. The insertion point is a **page codec in the core, just
   above the block seam** (a thin layer, not a per-host duty — hosts.md §6), encrypting page
   bodies with standardized AEAD and envelope encryption. Credential changes rewrap the data
-  key; data-key rotation rewrites live pages. Nonce/domain safety across crashes, restores and
-  writable copies remains unresolved: `(page_index, txid)` alone is insufficient. Identical
-  crypto inputs must produce identical bytes. Authenticated pages and metadata address tampering;
-  whole-file rollback needs a separate contract, and page-level replay is an open decision.
-  Page capacity excludes a per-file reserved region, so tree shape and cost are functions of the
-  usable capacity, not of encryption; scratch files of an encrypted database use an ephemeral key
-  (encryption.md §1.1, §4.1–§4.2). Vetted libraries use safe APIs, with reviewed
-  accelerated backends under CLAUDE.md §14. The present requirement is only
+  key in a dedicated double-buffered key block, never in the meta slots; data-key rotation (and
+  encrypting or decrypting an existing file) is compaction under a new key. Every page key is
+  derived from a fresh random salt, so nothing is allocated across commits and `(page_index,
+  txid)` is not relied on; identical crypto inputs must produce identical bytes. Every page type
+  is authenticated, and every pointer in an encrypted file binds the full AEAD tag of the page
+  it names, so page-level replay is `XX001` and the encrypted file is a distinct format variant
+  with its own goldens and cost family; whole-file rollback needs a separate contract. Manifest
+  page identities are over on-disk (ciphertext) bytes. Page capacity excludes a reserved region
+  that is never a user setting (a plaintext file reserves nothing); scratch files of an
+  encrypted database use an ephemeral key (encryption.md §1.1, §4–§4.2, §6). Vetted libraries
+  use safe APIs, with reviewed accelerated backends under CLAUDE.md §14. The present requirement is only
   that the format and seam not foreclose it — concretely, don't bake in assumptions that page
   bytes are plaintext-comparable on disk (already satisfied — hosts keep page bytes opaque).
 - **Replication** — kept open, not built; **designed in [replication.md](replication.md)**.

@@ -651,8 +651,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
   open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
   above the block seam, standardized AEAD and envelope encryption (cheap credential rewrap,
-  full live-page rewrite for data-key rotation). Crash/restore/fork-safe nonce allocation and
-  authenticated metadata transitions remain open; `(page_index, txid)` alone is insufficient.
+  rotation, and encrypting or decrypting an existing file, as compaction under a new key). Every
+  page key derives from a fresh random salt, so no nonce is allocated across commits; the
+  wrapped key lives in a dedicated double-buffered key block, never in the meta slots.
   Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
   AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
   `bench/aead/`. Suite direction (encryption.md §3.1): AES-256-GCM with one key derived per page
@@ -661,12 +662,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   fault fixtures; XChaCha is dropped because no platform standard library ships it, and AES-GCM-SIV
   is declined for platform support despite its graceful nonce-reuse behavior. The TS write side
   already awaits an async page codec (§8.1). No dependency is selected and no implementation is
-  scheduled. Decided: a reserved-bytes region with
-  guarantees in terms of usable capacity, all page types authenticated, ephemeral-key scratch
-  files, and a dedicated CSPRNG for key material (§1.1). Open: RNG duplication under live VM
-  clones (exclude, or specify a host reseed guarantee — §3.1), page-level replay (bind the child's
-  tag, recommended) and manifest identity bytes (on-disk bytes, recommended) (§4). The only
-  present storage requirement is non-foreclosure — already satisfied.
+  scheduled. Decided (§1.1): a reserved-bytes region that is never a user setting, all page
+  types authenticated, every pointer binding the full AEAD tag of its child (so the encrypted
+  file is its own format variant), manifest identities over ciphertext bytes, ephemeral-key
+  scratch files, a dedicated CSPRNG for key material, PBKDF2-HMAC-SHA-256 as the built-in
+  passphrase KDF behind a KDF id (raw wrapping key first-class), live VM clones excluded, and
+  every process of an encrypted database holding the key. Open: XAES versus the HKDF fallback,
+  the security review, and the format specification (§9). The only present storage requirement
+  is non-foreclosure — already satisfied.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
   order, as a tee at the block seam (below the encryption codec → keyless backup replicas). No
