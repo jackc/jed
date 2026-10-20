@@ -612,24 +612,30 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   already satisfied (hosts keep page bytes opaque). **Designed in `spec/design/encryption.md`:**
   a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
   a random data key is stored only wrapped by a host key or passphrase-derived wrapping key.
-  Credential changes rewrap bounded metadata; data-key rotation rewrites all live pages.
+  Credential changes rewrap the data key in a dedicated double-buffered key block, never in the
+  per-commit meta slots; data-key rotation, and encrypting or decrypting an existing file, is
+  compaction under a new key.
   `(page_index, txid)` alone does **not** guarantee nonce uniqueness across failed commits,
   restores or writable copies; every key is instead derived from a fresh random salt (below),
   with security preceding unconditional file byte identity. Identical crypto inputs still require identical bytes.
   Decided (encryption.md §1.1): no FIPS requirement; usable page capacity `C` excludes a
-  per-file reserved-bytes region (SQLite's model) and tree shape/cost/plan guarantees are stated
-  in terms of `C`; every page type is authenticated; an encrypted database's spill scratch files
-  use a random, never-persisted per-file key; key material comes from a dedicated CSPRNG source,
-  never the seeded SQL entropy seam; browser performance does not decide the suite. Suite
-  direction, pending security review: AES-256-GCM with one key derived per page from a fresh
-  random salt, because AES-GCM and the AES block are in every platform standard library and
-  XChaCha20-Poly1305 is in none; the derivation is **XAES-256-GCM** (C2SP) as the primary
-  candidate, with a jed-specific HKDF-SHA-256 layout as the fallback (encryption.md §3.1).
-  AES-GCM-SIV fails more gracefully under duplicated randomness (a live VM clone, which a
-  kernel CSPRNG does not by itself survive) and is declined for platform support alone, a
-  knowing trade; the live-clone exclusion, the page-replay binding (the child's tag, never a
-  `txid`) and the manifest bytes (ciphertext) are recorded recommendations, not yet format
-  decisions (encryption.md §3.1, §4).
+  per-file reserved-bytes region (SQLite's model) that is never a user setting — a plaintext
+  file reserves nothing, an encrypted file what its suite needs; every pointer in an encrypted
+  file binds the full AEAD tag of the page it names, so page-level replay is detected and the
+  encrypted file is a distinct format variant with its own goldens and cost family; manifest
+  page identities are over on-disk (ciphertext) bytes; every page type is authenticated; an
+  encrypted database's spill scratch files use a random, never-persisted per-file key; key
+  material comes from a dedicated CSPRNG source, never the seeded SQL entropy seam; the built-in
+  passphrase KDF is PBKDF2-HMAC-SHA-256 behind a KDF identifier, with a host-supplied wrapping
+  key as the first-class credential; live VM clones are excluded from the threat model; every
+  process of an encrypted database (owner, page client, SSH page server) holds the key; browser
+  performance does not decide the suite. Suite direction, pending security review: AES-256-GCM
+  with one key derived per page from a fresh random salt, because AES-GCM and the AES block are
+  in every platform standard library and XChaCha20-Poly1305 is in none; the derivation is
+  **XAES-256-GCM** (C2SP) as the primary candidate, with a jed-specific HKDF-SHA-256 layout as
+  the fallback (encryption.md §3.1). AES-GCM-SIV fails more gracefully under duplicated
+  randomness (a live VM clone, which a kernel CSPRNG does not by itself survive) and is declined
+  for platform support alone, a knowing trade (encryption.md §3.1).
   Vetted libraries expose safe APIs; explicitly reviewed assembly/intrinsics behind those APIs
   are permitted under §14, while engine code stays safe and Go stays free of cgo/external FFI.
 - Writable commits persist only changed database domains. Empty/read-only work in a writable

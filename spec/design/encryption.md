@@ -29,18 +29,19 @@ content; and the page header already grew once (12→16 bytes for the CRC, forma
 that carrying a per-page authentication tag is within the format's existing flex. The rest of this
 doc is the *intended* design, not a commitment to build.
 
-### 1.1 Settled decisions (2026-10-19)
+### 1.1 Settled decisions (2026-10-19, extended 2026-10-20)
 
 These bind the eventual build; everything else in this doc that says "open" still is.
 
 - **No FIPS requirement.** jed does not target FIPS 140 deployments, so FIPS approval is not
   a criterion for the suite (§3.1). (It could not be met uniformly anyway: only Go ships a
   validated module; the RustCrypto and Noble backends are not validated.)
-- **Usable page capacity excludes a reserved region; guarantees are stated in terms of it**
-  (§4.1). Tree shape, record caps and cost are functions of the usable capacity `C`, not of
-  whether the file is encrypted.
+- **Usable page capacity excludes a reserved region owned by the page codec** (§4.1). Record
+  caps are functions of the usable capacity `C`; tree shape and cost are functions of `C` and of
+  the file variant, because an encrypted file's pointers carry a binding tag (below).
 - **Every page type is authenticated**, including free-list and manifest-overflow pages, and
-  the meta pages' security-relevant content (§4).
+  everything in the meta pages except the pre-unlock bootstrap fields, which are bound as
+  associated data (§4).
 - **Scratch files of an encrypted database are encrypted** with a random per-file key that is
   never persisted (§4.2).
 - **Key material and nonces come from a dedicated cryptographic entropy source**, never the
@@ -56,6 +57,28 @@ These bind the eventual build; everything else in this doc that says "open" stil
 - **One key per page (2026-10-20).** Every page encryption draws its own random salt (the
   XAES-256-GCM nonce, or the fallback layout's HKDF salt) and derives a single-use key;
   per-commit-attempt keys are not pursued (§3.1, *Key granularity*).
+
+Decided in the 2026-10-20 design review:
+
+- **Page replay is detected: every pointer carries the full 16-byte AEAD tag of the page it
+  names** (§4). The wider pointers make an encrypted file a **distinct format variant** with
+  its own golden fixtures and cost family; a plaintext file's layout is untouched.
+- **Manifest page identities are computed over on-disk (ciphertext) bytes** (§4).
+- **The wrapped data key lives in a dedicated, double-buffered key block**, never in the
+  per-commit meta slots; the pre-unlock fields are associated data of the wrap (§6).
+- **Data-key rotation is compaction under a new key** (§6). Encrypting a plaintext file and
+  decrypting an encrypted one are the same operation; there is no in-place conversion and no
+  incremental rotation.
+- **The reserve is not a setting** (§4.1). A plaintext file reserves nothing; an encrypted file
+  reserves what its suite needs (40 bytes under XAES-256-GCM). The meta field is
+  self-description, not a knob.
+- **The built-in passphrase KDF is PBKDF2-HMAC-SHA-256** behind a KDF identifier, and a
+  host-supplied raw wrapping key is the first-class credential interface (§6).
+- **Live VM clones are excluded from the threat model**; a `fork`ed handle is already invalid
+  under the locking rule (§3.1, *Threat model*).
+- **Every process of an encrypted database holds the key** — the owner, every page client and
+  the SSH page server. There is no keyless owner, and none is planned
+  ([page-service.md](page-service.md) §5.1, §13).
 
 ## 2. Where it sits: a page codec in the core, above the seam
 
@@ -158,24 +181,23 @@ Support for the primitives, by platform (late 2026; check each platform's runtim
 | Go | standard library (`crypto/cipher`) | standard library (`crypto/aes`) | standard library (`crypto/hkdf`) | `golang.org/x/crypto` |
 | Rust | RustCrypto `aes-gcm` | RustCrypto `aes` | RustCrypto `hkdf` | RustCrypto `chacha20poly1305` |
 | Node | `node:crypto`, synchronous | `node:crypto` (`aes-256-ecb`) | `node:crypto` | none native; Noble (pure JS) |
-| Browser | WebCrypto, asynchronous | not in WebCrypto (no ECB/CMAC); Noble (pure JS) | WebCrypto | none native; Noble or Rust/WASM |
+| Browser | WebCrypto, asynchronous | WebCrypto has no ECB or CMAC, but AES-CTR over one zero block with the counter set to the input *is* the raw block encryption; Noble (pure JS) otherwise | WebCrypto | none native; Noble or Rust/WASM |
 | Java | JCA, built in and accelerated | JCA `AES/ECB/NoPadding` | JDK 25+ `javax.crypto.KDF` ([JEP 510](https://openjdk.org/jeps/510)); Bouncy Castle or Tink before | not in the JDK ([JDK-8256529](https://bugs.openjdk.org/browse/JDK-8256529) open); Bouncy Castle or Tink |
 | .NET | `AesGcm`; macOS via CryptoKit since .NET 8; not in browser WASM ([platform table](https://learn.microsoft.com/dotnet/standard/security/cross-platform-cryptography)) | `Aes.EncryptEcb` (.NET 6+) | `HKDF` (.NET 5+) | not in the base library; third-party only |
 | Swift | CryptoKit / swift-crypto `AES.GCM` | **not in CryptoKit** (no raw block or CMAC API); Swift leans wrap (CLAUDE.md §2) | CryptoKit `HKDF` | not in CryptoKit or swift-crypto (96-bit `ChaChaPoly` only) |
 | Python (reach) | `cryptography` `AESGCM` | `cryptography` (ECB, CMAC) | `cryptography` | not in `cryptography`; PyNaCl (libsodium) |
 
-Measured speed (§8, 8 KiB pages): AES-GCM seal is 0.87 µs in Go and 2.60 µs in Rust, about 4 µs
-through Node's native API, and 7–9 µs per page in situ through WebCrypto. Deriving a fresh key
-(random 32-byte salt, HKDF, AES key setup) costs about 0.8 µs in Go, so a fresh key for **every**
-page sealed at 1.69 µs, still faster than XChaCha's 2.07 µs in the same harness; through
-WebCrypto, salt plus HKDF plus key import measured 4.3 µs. The derivation cost recurs on every
-cache-miss read under per-page keys.
+Measured speed is in §8: on native Go and Rust a fresh key for every 8 KiB page adds well under
+a microsecond to a seal or an open (the *Key granularity* table), native Node AES-GCM is a few
+microseconds per page, and WebCrypto in a real worker is 7–9 µs per page in situ. The derivation
+cost recurs on every cache-miss read under per-page keys.
 
 #### Key granularity: one key per page (decided 2026-10-20)
 
 Two granularities were measured; both draw the salt from the cryptographic entropy source (*Threat
-model* below), bind a versioned purpose label in the HKDF context (pages, meta authentication, key
-wrapping and scratch files are distinct purposes), and persist nothing between commits. A crashed,
+model* below) and persist nothing between commits. Purposes are separated by subkey, not by a
+per-page label: the unlock-time HKDF derives distinct keys for pages and for meta authentication
+from the data key (§6), so the per-page derivation carries no purpose context of its own. A crashed,
 failed or retried commit attempt simply never uses its salt again, so neither needs a nonce
 reservation before the commit guard (§8.1) or an allocator owner across page-service clients: each
 committer derives its own keys.
@@ -237,10 +259,13 @@ Two constructions realize this derive-key design with AES-256-GCM:
   derivation is two AES block encryptions plus an AES-256 key schedule (one further block per
   long-term key, amortized), so by operation count it is cheaper than an HMAC-SHA-256 expand and
   it removes SHA-256 from the page path. It needs only **raw AES block encryption** beyond GCM,
-  which Go's standard library, Node, JCA, .NET and Noble expose and CryptoKit does not (table
-  above); Go has no CMAC, so there the two-block derivation is written in the layout the spec
-  fixes and checked against its vectors — a composition of a vetted primitive, the same category
-  as the fallback layout, whose admissibility under CLAUDE.md §14 is part of the review. Caveats:
+  which Go's standard library, Node, JCA, .NET and Noble expose (table above); WebCrypto has no
+  ECB, but encrypting one zero block under AES-CTR with the counter set to the input yields the
+  block encryption, so the browser needs no pure-JS AES for the derivation; CryptoKit exposes no
+  raw block and no mode that gives one (swift-crypto's `_CryptoExtras` may; unverified), and
+  Swift leans wrap. Go has no CMAC, so there the two-block derivation is written in the layout
+  the spec fixes and checked against its vectors — a composition of a vetted primitive, the same
+  category as the fallback layout, whose admissibility under CLAUDE.md §14 is part of the review. Caveats:
   the RustCrypto `xaes-256-gcm` crate states it has had no security audit, and an independent
   published cryptanalysis of the construction was not confirmed when this was written, so a review
   of the composition is still owed; it is a smaller obligation than reviewing a layout only jed
@@ -293,38 +318,48 @@ virtual-machine snapshot repeats a key only if it duplicates the random-number g
 which a restored clone can do (below).
 
 **Key material uses a dedicated cryptographic entropy source (decided).** Data keys, KDF salts,
-page and commit salts and scratch-file keys are drawn from a source separate from the
-general-purpose entropy seam that SQL generators use ([entropy.md](entropy.md)). A host may
-install a seeded source there to make `uuidv4` reproducible; if that source also fed key
-material, the data key would be predictable, and two runs would repeat salts, so the same derived
-keys would seal different pages under the same nonces. In production the cryptographic source
-reads the OS CSPRNG directly, never a buffered userspace generator, so a process fork cannot
-duplicate engine-held generator state. Fixtures and simulation inject fixed bytes only through an
-explicitly insecure test option, which never applies by default.
+page salts and scratch-file keys are drawn from a source separate from the general-purpose
+entropy seam that SQL generators use ([entropy.md](entropy.md)). A host may install a seeded
+source there to make `uuidv4` reproducible; if that source also fed key material, the data key
+would be predictable, and two runs would repeat salts, so the same derived keys would seal
+different pages under the same nonces. The engine's obligations are three. The source is the
+**platform CSPRNG** (Go `crypto/rand`, Rust `getrandom`, Node and WebCrypto `crypto`, each
+later core's own); the engine keeps **no entropy pool of its own that outlives a commit**
+(drawing a commit's salts in one batch is fine); and the source is a field of the handle's
+immutable `Environment` ([environment.md](environment.md) §3), whose fixed-bytes form for
+fixtures and simulation is an explicitly insecure constructor that never applies by default. A
+platform generator that buffers in userspace (Node's OpenSSL DRBG, Java's and .NET's) is
+acceptable when it is fork-safe, which is the property that matters: a POSIX `fork` is the one
+way a process duplicates generator state, and [locking.md](locking.md) §3 already declares a
+handle inherited across `fork` invalid (every write checks the opener PID), so a forked child
+cannot draw salts through a duplicated handle. Go cannot fork and Node does not; the rule bites
+only a Rust-hosted process, and for the locks before the crypto.
 
-**Live VM clones can duplicate the OS CSPRNG too (open).** Reading the kernel generator does not
-cover a restored virtual-machine snapshot: the clone resumes with the guest kernel's RNG state
-duplicated. Linux reseeds from the hypervisor's VM generation ID, but the [virtio-rng
+**Live VM clones are excluded from the threat model (decided).** Reading the kernel generator
+does not cover a restored virtual-machine snapshot: the clone resumes with the guest kernel's RNG
+state duplicated. Linux reseeds from the hypervisor's VM generation ID, but the [virtio-rng
 entropy-leak proposal](https://lore.kernel.org/lkml/Y9lBeymca9eFaJ33@zx2c4.com/T/) documents a
 window between resume and that reseed, and the generation ID never notifies userspace. A salt
-drawn in that window repeats in two clones, the derived key repeats with it, and the fixed GCM
-nonce then reuses catastrophically. This is not specific to random salts: every nonce discipline
-that takes no fresh entropy after restore fails identically (a persisted or in-memory counter
-resumes at the same value in both clones), and only a misuse-resistant AEAD degrades to an
-equality leak instead (*Why not AES-GCM-SIV*). Ordinary database-file restoration is the
-well-handled case: a restored file draws new salts on its next write. A live clone is the hazard.
-The decision to record: either **exclude live VM clones from the threat model** explicitly, or
-**specify the host guarantee** the engine relies on (the guest is reseeded, or the host injects
-fresh entropy into the cryptographic source, before any write after restore). The lean is to
-exclude and document: the platform criterion already rules out GCM-SIV, and an attacker who needs
-two clone images is a narrower threat than a crash retry. Open for the user's decision (§9).
+drawn in that window repeats in both clones; under XAES-256-GCM the derived key and the GCM
+nonce repeat with it, so the first post-resume writes of the same page index in the two clones
+leak the XOR of their plaintexts and the authentication subkey of that derived key. This is not
+specific to random salts: every nonce discipline that takes no fresh entropy after restore fails
+identically (a persisted or in-memory counter resumes at the same value in both clones), and only
+a misuse-resistant AEAD degrades to an equality leak instead (*Why not AES-GCM-SIV*). No
+engine-side mixing survives a clone either — a counter or a clock resumes identically in both —
+so there is nothing cheap to add. The decision is to **exclude live clones and document the
+consequence**: a host that restores live snapshots must reseed the guest before the first write,
+and that is the host's duty, not a guarantee jed checks. Ordinary database-file restoration is the
+well-handled case: a restored file draws new salts on its next write.
 
 Required future fault fixtures: aborted encryption before/after each body/meta write, failed
 barriers, retry and owner promotion, restore followed by divergent writes, independently opened
-copies, mixed historical keys, compaction, credential changes, and domain separation between
-body/meta/wrapping/scratch. Check both ciphertext authenticity and salt/key uniqueness across
-every attempted encryption, not just committed pages. Whole-file anti-rollback
-remains a separate trusted-state guarantee.
+copies, compaction and rotation, credential changes (each key-block copy, and an interruption
+between them — §6), page replay from an older copy at every pointer kind (rejected `XX001`, §4),
+and domain separation between body/meta/wrapping/scratch. Check ciphertext authenticity,
+salt/key uniqueness across every attempted encryption (not just committed pages), and that every
+pointer's binding matches the stored bytes of its child. Whole-file anti-rollback remains a
+separate trusted-state guarantee.
 
 ## 4. What is encrypted, what is plaintext
 
@@ -334,35 +369,52 @@ remains a separate trusted-state guarantee.
   and manifest pages are not just bookkeeping: a tampered free list could steer the allocator
   into overwriting live pages, so authenticating only data pages would leave tampering
   undetected. The page payload is encrypted; the AEAD **authentication tag** and nonce fields
-  live in the page's reserved region (§4.1). Page identity, generation and the relevant
-  file/domain identity must be bound as **AAD** so a page cannot be silently relocated; their
-  encoding and nonce relationship remain to be specified (§3).
-- **Replaying an older version of a page is not detected by per-page AEAD (open).** An attacker
-  with write access can replace page `P` with an older valid ciphertext of `P` from a backup or
-  crash remnant: the tag verifies and the page index in the AAD matches. A "generation" in the
-  AAD helps only if the reader learns the expected generation from somewhere trusted, not from
-  the page itself. Copy-on-write makes a fix natural: every child rewrite already rewrites its
-  parent, so a parent pointer (and the meta root pointer) could carry a binding to the child,
-  chaining authentication from the authenticated meta down the tree as ZFS block pointers do.
-  That binding must be a **unique write identity, not a transaction number**: `txid` repeats
-  across divergent histories (a restored copy and the original both write `txid + 1`), so a
-  parent carrying the child's `txid` would accept either history's page. With per-page random
-  salts the child's salt or tag is unique per write by construction; the recommendation is to
-  bind the child's **tag** (16 bytes per pointer), which binds the exact ciphertext rather than
-  only its identity. The cost is wider pointers and so lower interior fan-out (another input to
-  `C`, §4.1), which is why this decision precedes reserve sizing. The alternative is to exclude
-  page-level replay from the threat model explicitly, as SQLCipher effectively does. Either is a
-  decision to record before building; silently inheriting the gap is not.
-- **Manifest page identities (open; recommendation: on-disk bytes).** The validated-COW manifest
-  hashes logical (decrypted) page bytes ([validated-cow.md](validated-cow.md) §5), so recovery's
-  completeness check needs the key, as it does at a page-service owner
-  ([page-service.md](page-service.md)). Defining the identity over the **on-disk (ciphertext)
-  bytes** instead lets a keyless replica or backup check that an applied delta is complete,
-  without authenticating it, and keeps recovery's candidate selection keyless; that is the
-  recommended layout, with authentication left to the page tags and the authenticated meta. Note
-  the manifest also covers a case AEAD alone cannot: a page write that never reached disk leaves
-  the older, still-valid ciphertext in place — a ciphertext digest detects that as a logical one
-  does. The choice is recorded when the format is specified.
+  live in the page's reserved region (§4.1). The **associated data is the page index and the
+  suite/format identifier**, nothing more: it stops silent relocation within the file, the
+  per-file random data key already binds the file, and a generation in the AAD would mean
+  nothing to a reader with no trusted expected value — that is what the pointer binding below
+  provides.
+- **Page replay is detected by binding the child's tag in every pointer (decided).** Per-page
+  AEAD alone accepts an older genuine ciphertext of page `P` copied over the current one from a
+  backup, a crash remnant or the bytes a freed page left behind: the tag verifies and the AAD
+  page index matches. A replayed leaf serves stale rows (and silently breaks a UNIQUE or FK
+  invariant). A replayed interior page names child page numbers the free list has since reused,
+  each of which authenticates on its own, so the reader walks unrelated subtrees and returns
+  wrong rows. A replayed free-list page steers the allocator onto live pages. Accidental
+  corruption is already promised to be `XX001` or harmless, never wrong rows
+  ([simulation-testing.md](simulation-testing.md)); replay is the deliberate form of it, so it is
+  not excluded. The fix follows copy-on-write: a child rewrite already rewrites its parent, so
+  **every pointer in an encrypted file carries the full 16-byte AEAD tag of the stored page it
+  names** — the meta slot to the catalog root, the free-list head and the manifest chain; a
+  catalog page to the next catalog page and to each table, index and GiST root; an interior node
+  to its children; a leaf to its overflow heads; overflow, free-list and manifest-overflow pages
+  to their successors — chaining authentication from the authenticated meta down to every page,
+  as ZFS block pointers do. A replayed page then mismatches its parent, and replaying the whole
+  path up through both meta slots is whole-file rollback, which is excluded (below). A `txid`
+  would not do: it repeats across divergent histories (a restored copy and the original both
+  write `txid + 1`). The binding is the full tag rather than a truncated tag or the CRC-64
+  identity because it is the standard construction and needs no argument resting on AEAD
+  unforgeability alone; the fan-out cost (16 bytes per pointer) was accepted knowingly. Two
+  consequences. A commit encrypts pages **children first**, since a parent's plaintext holds its
+  children's tags (§8.1). And an encrypted file's pointers are wider than a plaintext file's, so
+  **the encrypted file is a distinct format variant**: the same rows build a different tree
+  with different page counts and cost, pinned by the variant's own golden fixtures and cost
+  family (§4.1, §5). The one-commit in-file rollback — corrupt the newer meta slot so recovery
+  takes the older — remains possible, as it is for a plaintext file; with the bindings its
+  result is a clean older generation or `XX001`, never a mix.
+- **Manifest page identities are computed over on-disk (ciphertext) bytes (decided).** Today
+  the validated-COW manifest hashes logical page bytes ([validated-cow.md](validated-cow.md)
+  §5), and the TS seam computes page CRCs, manifest digests and the live count over the logical
+  page before the transform ([ts-runtime.md](ts-runtime.md) §11.5). The encrypted format defines
+  the identity over the **stored bytes** instead: a keyless replica or backup can check that an
+  applied delta is complete without authenticating it, recovery's candidate selection stays
+  keyless, and a page-service owner validates a client's delta against the ciphertext it
+  received ([page-service.md](page-service.md) §5.1). Authentication is left to the page tags
+  and the authenticated meta. The ciphertext digest still covers the case AEAD alone cannot: a
+  page write that never reached disk leaves the older, still-valid ciphertext in place, which a
+  digest of the expected bytes detects. Building this moves the manifest digest **after** the
+  codec in the commit path, so the TS write side's "digests over logical pages" rule changes with
+  the encryption format version; the plaintext format is unaffected.
 - **The AEAD tag supersedes the CRC for encrypted pages.** The tag detects *both* corruption and
   tampering — strictly stronger than the CRC, which detects only the former (§1). So an encrypted
   file relies on the AEAD tag rather than the CRC for stored-byte integrity. This *closes* the
@@ -370,13 +422,17 @@ remains a separate trusted-state guarantee.
   codec seam computes page CRCs on the logical page before encoding (ts-runtime.md §11.5), so the
   CRC ends up inside the ciphertext, covered by the tag. Whether the encrypted format keeps or
   drops that inner CRC is a format detail; it no longer guards the stored bytes either way.
-- **The meta pages (slots 0/1): readable bootstrap, authenticated metadata.** Page size,
-  algorithm identifiers, KDF salt and bounded KDF parameters must be readable before unlock.
-  The file stores a **wrapped data key**, never a plaintext data key, wrapping key or passphrase.
-  Authentication must cover the wrapped-key context and security-relevant metadata; a CRC alone
-  is not sufficient. Exact tag placement and the crash-safe credential-update protocol across
-  both meta slots remain open. Page authentication alone does not detect rollback of an entire
-  valid older file; anti-rollback would require an additional trusted state contract.
+- **The meta pages (slots 0/1): plaintext bootstrap as associated data, everything else
+  authenticated.** Page size, `reserved_bytes`, the suite identifier and the format variant must
+  be readable before unlock; they are the AAD of the slot's own AEAD, and everything else in the
+  slot — `txid`, the roots and their binding tags, the free-list head, the live count, the inline
+  manifest — is encrypted and authenticated under the meta subkey (§6). The slot carries **no
+  wrapped key**: the wrapped data key lives in the key block (§6), so a data commit never writes
+  a wrapper and a credential change never leaves a stale one in the other slot. The file stores
+  a wrapped data key only, never a plaintext data key, wrapping key or passphrase. Page
+  authentication does not detect rollback of an entire valid older file, nor the one-commit
+  in-file rollback above; anti-rollback is a separate trusted-state contract jed does not
+  provide.
 - **A new `format_version`** (or a meta flag within one) marks an encrypted file; an encrypted
   file is a distinct on-disk variant with its own golden fixtures, generated with a **fixed test
   key** so the bytes are deterministic and checkable (the encryption analogue of the seeded
@@ -386,35 +442,41 @@ remains a separate trusted-state guarantee.
 
 Today every page-capacity rule derives from `C = page_size - 16` (format.md *Page model*):
 `RECORD_MAX`, leaf and interior fan-out, split points, large-value externalization and the
-overflow chunk size. Per-page crypto fields (40–48 bytes plus any binding, §3.1) would shrink
-that capacity, so an encrypted file would build a differently shaped tree from the same rows,
-with different page counts, page-read costs and possibly plans.
+overflow chunk size. The per-page nonce and tag (§3.1) shrink that capacity.
 
-The format will therefore follow SQLite's *reserved bytes per page*. SQLite records it at
-database-header offset 20, computes all B-tree capacity from the *usable size* (page size
-minus reserved bytes), and never reads the reserved tail, which is where its encryption
-extensions (SEE, SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps its checksum.
-For jed:
+The format follows SQLite's *reserved bytes per page*. SQLite records it at database-header
+offset 20, computes all B-tree capacity from the *usable size* (page size minus reserved
+bytes), and never reads the reserved tail, which is where its encryption extensions (SEE,
+SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps its checksum. For jed:
 
 - The meta page records `reserved_bytes`; `C = page_size - 16 - reserved_bytes`. The page
   codec owns the reserved region; nothing above the codec reads it. This is also what lets the
   codec keep pages at `page_size`: the TS `PageTransform` maps one page to one stored page at
   the same index (ts-runtime.md §11.5), so the nonce and tag must fit inside the page, in the
   reserved tail that the logical page leaves unused.
-- **Tree shape, record caps, cost and plan identity are functions of `C`.** The cross-core
-  contract binds for a given `(query, database state, C)`; encryption itself is invisible.
-- A plaintext file may reserve bytes too. That gives a differential test: an encrypted file
-  and a plaintext file with the same `reserved_bytes` and the same history must produce
-  identical tree shapes, page counts, plans and costs.
-- A plaintext file created with a sufficient reserve can later be encrypted in place, and
-  data-key rotation never changes the layout. Without the reserve, encrypting is a full
-  rebuild (as with SQLCipher's export to a fresh file).
+- **The reserve is not a setting.** A plaintext file reserves nothing. An encrypted file
+  reserves exactly what its suite needs — **40 bytes** under XAES-256-GCM (24-byte nonce +
+  16-byte tag); the pointer bindings (§4) live in page content, not in the reserve. The meta
+  field exists so a reader computes `C` without knowing the suite and a later suite can state a
+  different value; no API exposes it. "How many bytes to waste" is not a question to put to a
+  host.
+- **Record caps are functions of `C`; tree shape and cost are functions of `C` and the
+  variant.** `RECORD_MAX`, split points, externalization and the overflow chunk size follow
+  `C`; pointer width follows the variant. The cross-core contract binds for a given `(query,
+  database state, variant)`, and the encrypted variant has its own golden fixtures and cost
+  family. Within a variant, encryption is otherwise invisible (§5).
+- **Encrypting, decrypting or rotating an existing file is compaction into a new file** (§6),
+  so there is no in-place conversion whose layout a reserve would preserve, and no reason for a
+  plaintext file to reserve. (In place would rewrite every page anyway; a crash mid-way would
+  leave plaintext and ciphertext pages that are indistinguishable by design, and doing it as one
+  copy-on-write commit needs a file's worth of free space, which is compaction.) OPFS has no
+  compaction and so cannot convert a file either way; encrypted browser databases are expected
+  to be rare, and OPFS compaction is a follow-on.
+- Page sizes must keep `C` above the structural minimum. At the 256-byte golden page size the
+  40-byte reserve and the 16-byte bindings are a large fraction of the page, which the encrypted
+  fixtures account for.
 
-The field arrives with the encryption format version, not before. Open: whether plaintext
-files reserve by default (about 0.5–0.7% of an 8 KiB page) so they can be encrypted in place,
-and the reserve's size once the suite and any parent-pointer binding (§4) are chosen. Page
-sizes must keep `C` above the structural minimum; at the 256-byte golden page size a 40–48-byte
-reserve is a large fraction, which fixtures must account for.
+The field arrives with the encryption format version, not before.
 
 ### 4.2 Scratch files (decided)
 
@@ -422,9 +484,10 @@ When the database is encrypted, its spill and temporary-table spill files are en
 ([spill.md](spill.md), [temp-tables.md](temp-tables.md) §6). Each scratch file gets a random
 key from the cryptographic entropy source (§3.1), held only in memory and never persisted. The
 key never outlives the process or the unlinked file, so none of §3's crash, restore or copy
-hazards apply: any nonce scheme unique under that key is sufficient, including a simple
-counter. Scratch encryption uses the same AEAD suite as pages, so each core keeps one crypto
-path. A scratch block that fails authentication is an error, never data. Like spill I/O
+hazards apply. Scratch blocks go through the **same page codec** as database pages — the same
+construction, a fresh random salt per block — with the per-file key in the data key's place,
+so each core keeps exactly one crypto path and no second nonce discipline is specified. A
+scratch block that fails authentication is an error, never data. Like spill I/O
 itself, scratch encryption is unmetered physical work, so query results and cost do not change.
 Hosts with no scratch target (in-memory, OPFS, WASI) have nothing to encrypt. A compaction's
 `<path>.jedtmp` is an ordinary database image written through the page codec, not a scratch
@@ -432,11 +495,12 @@ file.
 
 ## 5. Cost & determinism
 
-- **Encryption is invisible to the deterministic cost at a given usable capacity `C`**
-  (CLAUDE.md §13, cost.md, §4.1). Like the CRC and the buffer pool, encrypt/decrypt is
-  **physical** page I/O, not a metered logical unit. What encryption does change is the page's
-  reserved region, and therefore `C`; cost is a function of `C`, so `# cost:` contracts hold
-  unchanged for an encrypted file and a plaintext file with the same reserve. (Contrast the
+- **Encryption is invisible to the deterministic cost within a file variant** (CLAUDE.md §13,
+  cost.md, §4.1). Like the CRC and the buffer pool, encrypt/decrypt is **physical** page I/O,
+  not a metered logical unit. What encryption does change is the page's reserved region (and so
+  `C`) and the pointer width (§4); the encrypted variant therefore has its own `# cost:`
+  contracts, pinned by its own fixtures, and within the variant the crypto costs nothing
+  metered. (Contrast the
   *compression* codec, which **is** metered — `value_compress`/`value_decompress`, cost.md §3 —
   because it is a per-value transform the query can statically attribute; whole-page
   encrypt/decrypt is per-page physical I/O, like the CRC.) If a future requirement wants
@@ -447,39 +511,72 @@ file.
 
 ## 6. Envelope encryption and key lifecycle
 
-Use a random per-database **data-encryption key (DEK)** for page encryption. A separate
-**key-encryption key (KEK)** wraps the DEK, and only the wrapped DEK is persisted. At create/open,
-accept either a host-supplied wrapping key or a passphrase from which the KDF derives the wrapping
-key using the file's salt and bounded parameters. Raw-key input means a wrapping key, not direct
-page-key input. Key generation uses the sanctioned entropy seam; fixtures inject fixed inputs.
+Use a random per-database **data-encryption key (DEK)**, drawn from the cryptographic entropy
+source (§3.1), for page encryption. The unlock-time HKDF-SHA-256 derives the purpose subkeys
+from it: the page key and the meta-authentication key (§4). A separate **key-encryption key
+(KEK)** wraps the DEK, and only the wrapped DEK is persisted. Fixtures inject fixed inputs
+through the insecure test constructor.
+
+**The key block (decided).** The wrapped DEK, the suite identifier, the KDF identifier and its
+parameters, and the KDF salt live in a dedicated **key block**: a region of the file at a
+location the format fixes, **double-buffered with its own generation counter**, written at
+`create` and by credential changes only, never by a data commit. The wrap is an AEAD under the
+KEK whose associated data is the block's plaintext fields (suite id, KDF id and parameters,
+salt, generation), so a pre-unlock field cannot be altered without the unwrap failing:
+tampering fails closed, exactly as a wrong passphrase does, and no parameter downgrade is
+possible. A credential change writes the inactive copy, barriers, then overwrites the other copy
+too, so neither copy retains a wrapper under the old credential; an interruption leaves at least
+one valid copy of one generation or the other, and the reader takes the newest valid copy. The
+meta slots carry no wrapper (§4).
+
+**Credential input.** At create/open, accept either a host-supplied 32-byte wrapping key — the
+**first-class interface**: a host that wants a memory-hard KDF, an OS keychain or escrow
+supplies the key — or a passphrase. Raw-key input means a wrapping key, never a page key. The
+built-in passphrase KDF is **PBKDF2-HMAC-SHA-256** (NIST SP 800-132), chosen by the same
+platform criterion as the AEAD: it is in every platform library (Go `crypto/pbkdf2` since 1.24,
+Node, WebCrypto, .NET, Java; Rust uses the small RustCrypto `pbkdf2` crate or an HMAC loop;
+CryptoKit lacks it, and Swift leans wrap), it is deterministic with public vectors, and it adds
+no dependency where that matters most. It is not memory-hard: a GPU attacker guessing a weak
+passphrase gets a larger speedup than against Argon2id or scrypt, which is why the raw-key path
+is first-class and why the block carries a **KDF identifier**, so a memory-hard KDF can be added
+for new files without a format break. The iteration count is persisted per file and defaults to
+a few hundred milliseconds on a native core. The KDF runs once per process unlock, including at
+every page-service client and the SSH page server ([page-service.md](page-service.md) §13).
 
 Two operations have deliberately different semantics:
 
 | Operation | Work and guarantee |
 |---|---|
-| Change passphrase / wrapping key | Unwrap and rewrap the same DEK; update bounded metadata, without rewriting data pages. |
-| Rotate the data key | Encrypt every live page under a fresh DEK, potentially through a compacting rewrite. Old-key retirement completes only after all live pages migrate. |
+| Change passphrase / wrapping key | Unwrap and rewrap the same DEK into both copies of the key block (above). No data page is rewritten. |
+| Rotate the data key | **Compaction under a fresh DEK** ([api.md](api.md) §2.6): the committed snapshot streams into `<path>.jedtmp` through the codec with the new key and a new key block, and the rename replaces the file. Atomic; old-key retirement for free (the old file is unlinked); no mixed-key state and no incremental rotation protocol. Encrypting a plaintext file and decrypting an encrypted one are the same operation with a different target. It inherits compaction's limits: `55006` while a writer, a pinned reader, a page client or another process holds the file, and no OPFS support. |
 
 The host owns credential storage, rotation policy, escrow, and OS-keychain integration. The
-engine owns wrapping and crash-safe file transitions. A credential change must specify both meta
-slots, interrupted updates, old wrapper retirement, and existing open handles/page-service
-clients; a single meta overwrite is not yet a protocol. An already unlocked process retains its
-DEK unless a separate close/reopen policy is enforced.
+engine owns wrapping and crash-safe file transitions. A credential change does not disturb an
+already unlocked process (it retains its DEK); a client that reconnects or a process that reopens
+presents the new credential.
 
 **Rewrapping is not recovery from a compromised DEK.** An old wrapper plus its old credential
 still reveals the unchanged DEK. A retained backup/header copy can therefore defeat credential
-revocation for that DEK. Full data-key rotation protects the newly encrypted live data; it cannot
+revocation for that DEK. Data-key rotation protects the newly encrypted live data; it cannot
 revoke access to old copies or promise secure erasure of COW remnants, filesystem snapshots or
-backups. Incremental multi-key rotation remains a possible later design, not an initial promise.
+backups.
+
+**Key commitment is not required.** XAES-256-GCM is not key-committing. One DEK per file,
+rotation by compaction and no mixed-key state mean no reader ever tries two keys against one
+page, so there is no key ambiguity to exploit. Recorded so the security review need not reopen
+it.
+
+**In-memory key secrecy is out of scope.** Go and TS cannot zeroize, and swap or a core dump
+exposes keys in every core; an attacker who can read a running process's memory is outside the
+threat model.
 
 ## 7. Crypto implementation and the §14 gate
 
 Use vetted AEAD and KDF implementations, never hand-written cryptographic primitives. The suite
 direction is AES-256-GCM with one derived key per page — XAES-256-GCM first, a jed HKDF-SHA-256
 layout as fallback (§1.1, §3.1); no production library or backend is selected, and
-ChaCha20-Poly1305 remains only a measured comparison (§8). The passphrase KDF for the wrapping key
-(§6) is an open selection, made with the wrapped-key format (§9). Go may use its standard library
-where sufficient. Any new dependency, including a benchmark-only dependency, requires explicit
+ChaCha20-Poly1305 remains only a measured comparison (§8). The passphrase KDF is
+PBKDF2-HMAC-SHA-256 (§6). Go may use its standard library where sufficient. Any new dependency, including a benchmark-only dependency, requires explicit
 human approval under CLAUDE.md §14.
 
 **Safe engine code and safe library APIs are the boundary.** No cgo or external C-library FFI is
@@ -582,8 +679,10 @@ Awaiting crypto also introduces event-loop interleavings. The runtime retains th
 operation's snapshot/pins and writer ownership across suspension, processes cancellation/control
 messages, and queues other engine operations; the write side preserves that ownership model and
 validated-COW publication/barrier/error-poisoning ordering (ts-runtime.md §11.2). Bounded batches
-of independent dirty pages overlap encryption; parent-dependent reads (catalog, skeleton and chain
-walks) are awaited one page at a time, and only recovery's listed dependencies are read ahead.
+of independent dirty pages overlap encryption, **children before parents** once pointers bind
+tags (§4): a batch holds only pages whose children are already sealed, so the overlap window is a
+level of the dirty set at a time. Parent-dependent reads (catalog, skeleton and chain walks) are
+awaited one page at a time, and only recovery's listed dependencies are read ahead.
 Promise dispatch overhead, allocation, cancellation and working memory belong in integrated
 measurements. The runtime implementation selects no encryption suite, nonce protocol or production
 provider; the primitive measurements below do not establish encrypted-database performance.
@@ -631,10 +730,10 @@ decides the AEAD: AES-GCM and the raw AES block are in every standard library bu
 XChaCha20-Poly1305 is in none and AES-GCM-SIV in almost none. Browser performance is not a deciding
 factor. The direction becomes a format decision after a security review of the exact construction
 and the §3.1 fault fixtures; no production dependency is selected. Still to decide in that review:
-XAES versus the HKDF fallback (and, for the fallback, the salt length and HKDF layout), the
-RNG-duplication decision (§3.1, *Live VM clones*), the replay binding and the manifest bytes (§4).
-A pure-JS fallback and a software-WASM backend are material deployment costs, not reasons by
-themselves to maintain two file suites.
+XAES versus the HKDF fallback (and, for the fallback, the salt length and HKDF layout). The
+replay binding, the manifest bytes, the key block, rotation, the reserve, the passphrase KDF and
+the RNG-duplication question are decided (§1.1). A pure-JS fallback and a software-WASM backend
+are material deployment costs, not reasons by themselves to maintain two file suites.
 
 The isolated linked AEAD increments were roughly 31–49 KiB in Rust and 52–72 KiB in Go for one
 algorithm; the selected Noble exports were 3.7–4.6 KiB gzipped. These exclude the passphrase KDF,
@@ -642,8 +741,8 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
 [size methodology and exact inventory](../../bench/aead/README.md#dependency-and-binary-footprint).
 
 - **The whole feature** remains unimplemented and unscheduled; non-foreclosure is satisfied.
-- **Construction, KDF and exact library/backend selection** — XAES-256-GCM versus the HKDF
-  fallback (§3.1), the passphrase KDF for the wrapping key, backends, and supported fallback CPUs.
+- **Construction and exact library/backend selection** — XAES-256-GCM versus the HKDF fallback
+  (§3.1), backends, and supported fallback CPUs.
 - **Freezing the HKDF fallback layout**, if XAES is ruled out, requires all four: (1) one exact
   construction — derivation layout, framing, purpose separation, the 96-bit GCM nonce, the full
   tag and the authenticated page context; (2) quantitative lifetime bounds across all uses of a
@@ -652,21 +751,13 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
   composition — primitive vectors and cross-core agreement establish implementation consistency,
   not cryptographic security; (4) exact API feasibility per backend (WebCrypto's HKDF always runs
   Extract then Expand, so an expand-only layout needs a vetted HMAC path there).
-- **RNG duplication under live VM clones** — exclude from the threat model, or specify the host
-  reseed guarantee the engine relies on (§3.1); lean: exclude and document.
-- **Nonce/domain lifecycle** under failed commits, recovery, restore, writable copies and
-  compaction; encoding, lifetime limits, and any determinism-ledger revision.
-- **Authenticated metadata and wrapped-key format**, including bounded KDF inputs, bootstrap
-  validation, both meta slots, and atomic credential changes.
-- **Data-key rotation protocol**, old-key retirement and coordination with open clients.
-- **Page-level replay** — binding the child's tag in parent pointers (recommended) versus an
-  explicit threat-model exclusion; a `txid` is not a usable binding; decided before reserve
-  sizing (§4).
-- **Manifest identity bytes** — on-disk (ciphertext) bytes recommended, so a keyless replica can
-  check delta completeness and recovery's candidate selection stays keyless (§4).
-- **Reserve sizing** — the reserve per construction (40 bytes under XAES-256-GCM, 40–48 under the
-  HKDF fallback, plus 16 per child pointer if tags are bound), and whether plaintext files
-  reserve by default (§4.1).
+- **The security review itself** — the composition as a mutable page codec, the pointer-tag
+  chain (§4), the key block's wrap AAD (§6), and the lifetime bounds; with the §3.1 fault
+  fixtures, this is what turns the direction into a format decision.
+- **Format specification** — the exact layout of the reserved region, the pointer binding in
+  each page type, the meta slot's AAD/ciphertext split, the key block's location and encoding,
+  the PBKDF2 parameter defaults, the encrypted variant's goldens and cost family, and any
+  determinism-ledger revision (§3, §5).
 - **Integrated performance**, async page/commit prototype and browser portability measurements.
 
 ### 9.1 SQL crypto functions are a separate proposal
@@ -699,5 +790,7 @@ This is an optional, unscheduled SQL feature, not a prerequisite for encryption 
 - [XAES-256-GCM (C2SP)](https://github.com/C2SP/C2SP/blob/main/XAES-256-GCM.md) and its
   [design write-up](https://words.filippo.io/xaes-256-gcm/)
 - [RFC 8452, AES-GCM-SIV](https://www.rfc-editor.org/rfc/rfc8452) (§9: nonce-reuse behavior)
+- [NIST SP 800-132, PBKDF2](https://csrc.nist.gov/pubs/sp/800/132/final) (the built-in
+  passphrase KDF, §6)
 - [virtio-rng entropy-leak reporting (RFC patch)](https://lore.kernel.org/lkml/Y9lBeymca9eFaJ33@zx2c4.com/T/):
   the VM-snapshot reseed window
