@@ -1,0 +1,26 @@
+{
+  "command": [
+    "/home/jack/.codex/worktrees/b8e6/jed/.dev/ruby-native-runtimes/ruby-4.1.0-preview1/bin/ruby",
+    "--zjit",
+    "--zjit-stats-quiet",
+    "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/query-walk-followup/warmup-diagnostic/stats.rb",
+    "--plan",
+    "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/query-walk-followup/warmup-diagnostic/long-plan.json",
+    "--report",
+    "/home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/query-walk-followup/warmup-diagnostic/stats-long-before.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 89309184,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 5.842778374993941,
+  "source": "/tmp/jed-query-shape-before/impl/ruby-native",
+  "source_sha256": "d21f4edda6dc0a007fce8499c2200c334e5e1e242f0d1397617910a21cda7396",
+  "final_source_sha256": "d21f4edda6dc0a007fce8499c2200c334e5e1e242f0d1397617910a21cda7396",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "Saved instrumented replay /home/jack/.codex/worktrees/b8e6/jed/bench/ruby-native/results/query-walk-followup/warmup-diagnostic/stats-long-before.json\n",
+  "stderr": ""
+}

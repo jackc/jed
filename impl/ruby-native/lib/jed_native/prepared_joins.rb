@@ -16,7 +16,8 @@ module JedNative
     SCALAR_TYPES = %w[i16 i32 i64 boolean text].freeze
     BINARY = %w[+ - * / % & | # << >> = <> != < <= > >= and or is\ distinct\ from is\ not\ distinct\ from].freeze
     UNARY = %w[+ - ~ not is\ null is\ not\ null is\ true is\ false is\ unknown is\ not\ true is\ not\ false is\ not\ unknown].freeze
-    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, :physical, keyword_init: true)
+    Entry = Struct.new(:tables, :context, :roots, :columns, :scopes, :nodes, :key_units, :key_bytes, :physical,
+      :sources, :source_units, :source_bytes, keyword_init: true)
     Frame = Struct.new(:entry, :depth, :checks, :plans, :extension_context, :extensions, :physical_observation, keyword_init: true)
     Physical = Struct.new(:key, :plan, :checks, :units, :bytes, keyword_init: true)
 
@@ -96,6 +97,53 @@ module JedNative
     end
 
     private
+
+    def query_source_columns(source, ctes, outer, analyzer)
+      frame = @native_join_resolution_frame
+      return super unless frame && !@native_query_walks_disabled && source[:kind] == :table &&
+        !source[:database] && !source[:native_database] && !source[:lateral] && !source[:columns] && !source[:column_aliases] &&
+        !ctes.key?(source[:name]) && !@views.key?(source[:name])
+      entry = frame.entry
+      name = source[:name]
+      return super if name.start_with?('jed_')
+      return super unless entry.tables.any? { |stored_name, stored| stored_name == name && @tables[name].equal?(stored) }
+      key = [name, source[:alias]]
+      return entry.sources[key] if entry.sources.key?(key)
+      columns = super
+      return columns if entry.sources.length >= MAX_INPUTS
+      snapshot = prepared_join_source_snapshot([key, columns], entry)
+      return columns unless snapshot
+      owned, units, bytes = snapshot
+      entry.source_units += units
+      entry.source_bytes += bytes
+      entry.sources[owned[0]] = owned[1]
+    end
+
+    def prepared_join_source_snapshot(value, entry)
+      units, bytes = 0, 0
+      copy = lambda do |item, depth|
+        units += 1
+        throw :unsupported if depth > 16 || entry.source_units + units > KEY_UNITS
+        case item
+        when Hash
+          throw :unsupported unless item.instance_of?(Hash)
+          item.to_h { |key, child| [copy.call(key, depth + 1), copy.call(child, depth + 1)] }.freeze
+        when Array
+          throw :unsupported unless item.instance_of?(Array)
+          item.map { |child| copy.call(child, depth + 1) }.freeze
+        when String
+          throw :unsupported unless item.instance_of?(String)
+          bytes += item.bytesize
+          throw :unsupported if entry.source_bytes + bytes > KEY_BYTES
+          item.dup.freeze
+        when Symbol, Integer, NilClass, TrueClass, FalseClass
+          item
+        else
+          throw :unsupported
+        end
+      end
+      catch(:unsupported) { [copy.call(value, 0), units, bytes] }
+    end
 
     def plan_constant(expression)
       observation = @native_join_resolution_frame&.physical_observation
@@ -251,7 +299,8 @@ module JedNative
         names = inputs.flat_map { |source| [source[:name], source[:alias]] } +
           tables.flat_map { |_, table| table[:columns].map { |column| column[:name] } }
         return if names.compact.sum(&:bytesize) > 32_768
-        entry = Entry.new(tables: tables.freeze, context: context.freeze, roots: {}, columns: {}, scopes: {}, nodes: {}, key_units: 0, key_bytes: 0)
+        entry = Entry.new(tables: tables.freeze, context: context.freeze, roots: {}, columns: {}, scopes: {}, nodes: {},
+          key_units: 0, key_bytes: 0, sources: {}, source_units: 0, source_bytes: 0)
         @native_join_resolution_plans.shift if @native_join_resolution_plans.length >= CACHE_ENTRIES
         @native_join_resolution_plans[statement] = entry
       end

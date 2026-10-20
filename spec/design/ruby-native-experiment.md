@@ -68,6 +68,11 @@ This experiment does not yet implement relation-specific revision signatures or
 the supported cores' eight-entry memo of sensitive custom plans. Plan-owned
 containers are immutable; execution bounds, rows, memory ownership and profiling
 remain outside the retained plan.
+The [query setup follow-up](../../impl/ruby-native/QUERY_WALK_FOLLOWUP.md)
+keeps syntax walks fresh while avoiding scalar recursion and unnecessary CTE
+scope copies. It adds bounded, immutable aliased base-table source metadata to
+the existing join entries, under the same descriptor/context invalidation.
+No successful opaque-definition or authorization check is retained.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present

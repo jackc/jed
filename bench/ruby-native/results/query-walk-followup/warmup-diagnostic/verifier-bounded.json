@@ -1,0 +1,20 @@
+{
+  "command": [
+    "ruby",
+    "bench/ruby-native/results/query-walk-followup/warmup-diagnostic/evidence.rb"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 25726976,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 30.0,
+  "elapsed_seconds": 0.2567079539876431,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "bb56f9a0b9592def93f4e0fb24f23098439b1d657e77f2d5fdbfdd14eeafc17d",
+  "final_source_sha256": "bb56f9a0b9592def93f4e0fb24f23098439b1d657e77f2d5fdbfdd14eeafc17d",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "Verified 12 adaptive processes\n",
+  "stderr": ""
+}
