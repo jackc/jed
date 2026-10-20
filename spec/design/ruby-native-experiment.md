@@ -85,6 +85,10 @@ winner was retained. Outer-join boundaries and execution-local planning state
 remain in the ordinary planner. The older table-column map also gains an
 eight-entry cap and owned alias strings; it shares the existing source-metadata
 unit/byte allowance rather than adding a separate retention budget.
+The [work-estimation follow-up](../../impl/ruby-native/WORK_ESTIMATION_FOLLOWUP.md)
+records a rejected scalar-estimation candidate: fewer dispatches and allocations
+did not establish a useful JIT throughput gain. Its measured source and evidence
+remain reproducible in Git; the original estimator remains the chosen baseline.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
