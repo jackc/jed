@@ -132,10 +132,12 @@ With FIPS ruled out (§1.1), the trade-off between the two candidates is:
 
 AES's protocol cost is design and verification work paid once; XChaCha's cost is slower crypto
 on Node and in the browser, paid on every cache miss and commit. Because the dataset is
-expected to be resident, those operations are not the steady-state hot path. The async
-browser obstacle to WebCrypto AES disappears if the TS commit, open/recovery and maintenance
-paths become asynchronous, work being pursued separately (§8.1); after that the choice reduces
-to protocol complexity versus Node/browser crypto speed.
+expected to be resident, those operations are not the steady-state hot path. The TS core's
+commit, open/recovery and maintenance paths now await an asynchronous page codec (§8.1), which
+removes the main browser obstacle to WebCrypto AES; the choice therefore reduces to protocol
+complexity versus Node/browser crypto speed. One interaction with that write side: an encode
+failure after the commit guard is armed poisons the handle, so a counter-nonce design must
+reserve its allocations for a commit before the guard. Random nonces need no reservation.
 
 An AES candidate has the following lifecycle, using a vetted HKDF-SHA-256 implementation:
 
@@ -230,8 +232,11 @@ remains a separate trusted-state guarantee.
   ciphertext in place. Decide which bytes the manifest names when the format is specified.
 - **The AEAD tag supersedes the CRC for encrypted pages.** The tag detects *both* corruption and
   tampering — strictly stronger than the CRC, which detects only the former (§1). So an encrypted
-  file replaces the per-page CRC with the AEAD tag rather than carrying both. This *closes* the
-  end-to-end-integrity gap `format_version` 7 explicitly left open (storage.md §6).
+  file relies on the AEAD tag rather than the CRC for stored-byte integrity. This *closes* the
+  end-to-end-integrity gap `format_version` 7 explicitly left open (storage.md §6). The TS page
+  codec seam computes page CRCs on the logical page before encoding (ts-runtime.md §11.5), so the
+  CRC ends up inside the ciphertext, covered by the tag. Whether the encrypted format keeps or
+  drops that inner CRC is a format detail; it no longer guards the stored bytes either way.
 - **The meta pages (slots 0/1): readable bootstrap, authenticated metadata.** Page size,
   algorithm identifiers, KDF salt and bounded KDF parameters must be readable before unlock.
   The file stores a **wrapped data key**, never a plaintext data key, wrapping key or passphrase.
@@ -259,7 +264,10 @@ extensions (SEE, SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps 
 For jed:
 
 - The meta page records `reserved_bytes`; `C = page_size - 16 - reserved_bytes`. The page
-  codec owns the reserved region; nothing above the codec reads it.
+  codec owns the reserved region; nothing above the codec reads it. This is also what lets the
+  codec keep pages at `page_size`: the TS `PageTransform` maps one page to one stored page at
+  the same index (ts-runtime.md §11.5), so the nonce and tag must fit inside the page, in the
+  reserved tail that the logical page leaves unused.
 - **Tree shape, record caps, cost and plan identity are functions of `C`.** The cross-core
   contract binds for a given `(query, database state, C)`; encryption itself is invisible.
 - A plaintext file may reserve bytes too. That gives a differential test: an encrypted file
@@ -393,10 +401,7 @@ data-page reads can await I/O; browser OPFS sync access handles remain synchrono
 worker.
 
 The asynchronous-crypto problem is browser-only: Node's native `node:crypto` AEAD calls are
-synchronous, and browsers have no scratch target, so spill is unaffected. Pushing the TS
-commit, open/recovery and maintenance paths to asynchronous execution is being pursued
-separately; it would remove WebCrypto's main integration obstacle (§3.1) without selecting a
-suite.
+synchronous, and browsers have no scratch target, so spill is unaffected.
 
 WebCrypto needs suspension **inside the worker** at decryption/cache misses and before encrypted
 commit writes. The write side is now ready for that ([ts-runtime.md](ts-runtime.md) §11): the
@@ -448,8 +453,8 @@ database benchmark. Compare those layers separately when choosing a suite and br
 ## 9. Open / deferred
 
 **Suite: open between two candidates** (§3.1): AES-256-GCM with fresh derived writer keys and
-counter nonces (faster natively, native on Node, WebCrypto in the browser once the TS write path
-is asynchronous) and XChaCha20-Poly1305 with random nonces (no nonce protocol to build or prove,
+counter nonces (faster natively, native on Node, WebCrypto in the browser through the TS core's
+asynchronous page codec) and XChaCha20-Poly1305 with random nonces (no nonce protocol to build or prove,
 synchronous everywhere, slower on Node and in the browser). With FIPS ruled out, the decision is
 protocol complexity versus Node/browser crypto speed. Neither the suite nor a production
 dependency is selected. Approval depends on the exact protocol/security review, supported-platform
