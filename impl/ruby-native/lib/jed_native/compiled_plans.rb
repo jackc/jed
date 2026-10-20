@@ -11,6 +11,8 @@ module JedNative
     MAX_ARGUMENT_CACHE_ENTRIES = 64
     MAX_AGGREGATE_CACHE_ENTRIES = 64
     MAX_RELATION_CACHE_ENTRIES = 64
+    MAX_JOIN_PREDICATE_CACHE_ENTRIES = 64
+    MIN_JOIN_PREDICATE_CANDIDATES = 8
 
     def native_compiled_kernels(plan, predicate, projections, keys = nil, pipeline: nil, offset: false, limit: false, orders: nil)
       return if @native_compilation_disabled
@@ -52,6 +54,29 @@ module JedNative
         native_admit_kernel(state, :ordering, CompiledOrdering.build(keys, orders, types: @types))
       end
       state.kernels
+    end
+
+    # Join predicates can reuse resolved expressions, but those expressions
+    # remain mutable. Prepare their current complete source and immutable pool
+    # on every acquisition; only generated kernels survive in this bounded LRU.
+    # No predicate, row, binding, plan or execution owner is retained.
+    def native_compiled_join_predicate(expression)
+      return if @native_compilation_disabled || @native_join_compilation_disabled
+      return unless expression.is_a?(Expression) && !%i[literal column param].include?(expression.kind)
+      program = CompiledExpression.prepare(expression, types: @types, text: !@native_text_compilation_disabled)
+      return unless program
+      @native_compiled_join_predicates ||= {}
+      key = [program.source, program.pool].freeze
+      if @native_compiled_join_predicates.key?(key)
+        kernel = @native_compiled_join_predicates.delete(key)
+        kernel ||= program.materialize
+        @native_compiled_join_predicates[key] = kernel
+      else
+        @native_compiled_join_predicates.shift if @native_compiled_join_predicates.length >= MAX_JOIN_PREDICATE_CACHE_ENTRIES
+        kernel = program.materialize if @native_compilation_immediate
+        @native_compiled_join_predicates[key] = kernel
+      end
+      kernel
     end
 
     # Aggregate expressions are resolved afresh by the general executor. Cache

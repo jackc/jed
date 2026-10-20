@@ -89,6 +89,9 @@ The [work-estimation follow-up](../../impl/ruby-native/WORK_ESTIMATION_FOLLOWUP.
 records a rejected scalar-estimation candidate: fewer dispatches and allocations
 did not establish a useful JIT throughput gain. Its measured source and evidence
 remain reproducible in Git; the original estimator remains the chosen baseline.
+The [JOIN-predicate follow-up](../../impl/ruby-native/JOIN_PREDICATE_FOLLOWUP.md)
+uses bounded scalar kernels at the existing ON and join-window evaluation
+sites, with source-and-pool reuse and complete-predicate fallback.
 
 The historical [`PIPELINE_FOLLOWUP.md`](../../impl/ruby-native/PIPELINE_FOLLOWUP.md)
 records a multi-page LIMIT cost defect and 71 lazy-audit failures already present
