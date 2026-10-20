@@ -155,7 +155,7 @@ readers.
 
 | Operation | Effect |
 |---|---|
-| `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). With the encryption format, over SSH it also carries the database credential to a server that may become owner — in the stream, never `argv` or the environment. There is no cached-DEK resume: a reconnect that must open the file afresh and has no credential fails `28000` and the host reopens ([encryption.md](encryption.md) §6). |
+| `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). With the encryption format, over SSH it also carries the database credential to a server that may become owner — in the stream, never `argv` or the environment. There is no cached-DEK resume: a reconnect that must open the file afresh and has no credential fails `28P02` and the host reopens ([encryption.md](encryption.md) §6). |
 | `begin_read(incarnation, last_txid)` | Pin the owner's current committed snapshot. Returns the meta (root, `txid`, `page_count`, free-list head, live count), the owner's **incarnation id**, and the **invalidation set**: page indices written by commits after `last_txid`, or "invalidate all" (§5.4). |
 | `read_pages(txid, [index…])` | Return page bytes. `txid` must be pinned by this connection. Batched. |
 | `end_read(txid)` | Release one pin. Asynchronous: no reply. |
@@ -165,8 +165,8 @@ readers.
 | `commit_status(txid, manifest_digest)` | Resolve an unacknowledged commit after a lost connection (§8.4). |
 | `snapshot_stream(txid, form)` | Reserved. The ratified design streamed a pinned snapshot for backup from the owner; backup instead reads pages with `read_pages` (§9). |
 | `subscribe(from_txid)` | Stream retained commit deltas, then the live tail (§10). |
-| `read_key_block()` | Encrypted databases, with the encryption format: return a stable image of the key block (both copies, one generation), served under the lock a credential change holds. How a page client unlocks at open and re-checks after a compaction reload or owner change, and what a backup copies instead of reading pages 2–3 ([encryption.md](encryption.md) §6). |
-| `rewrap(block)` | Encrypted databases, with the encryption format: a page client's credential change, executed by the owner with the two-barrier protocol while the client holds the writer gate. The owner verifies the block first (DEK tag under its own DEK, DEK id, generation exactly current + 1; else `08P01`) and acknowledges after the log entry is durable (encryption.md §6). |
+| `read_key_block()` | Encrypted databases, with the encryption format: return a stable image of the key block (the selected copy; a backup writes it to both pages), served under the lock a credential change holds. How a page client unlocks at open and re-checks after a compaction reload or owner change, and what a backup copies instead of reading pages 2–3 ([encryption.md](encryption.md) §6). |
+| `rewrap(block, kek)` | Encrypted databases, with the encryption format: a page client's credential change, executed by the owner with the two-barrier protocol while the client holds the writer gate. The owner verifies the block first — DEK tag under its own DEK, DEK id, generation exactly current + 1, and a test-unwrap with the supplied per-file KEK to the DEK it holds; else `08P01` — and acknowledges after the log entry is durable (encryption.md §6). |
 | `request_ownership()` | Ask a yielding owner to step aside (§8.2). |
 
 The message catalog, framing, and field encodings are data-shaped and belong in a shared spec table

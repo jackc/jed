@@ -111,17 +111,23 @@ Decided in the 2026-10-20 design review:
   tag); a host wrapping key is derived into a per-file KEK over the block's salt, never used
   directly. The two key-block copies are byte-identical and written page 3 then page 2; a
   writer's first key-block write is preceded by an unconditional stabilization barrier (file and,
-  after a rename, directory). A credential offered to a plaintext file is refused (`28000`).
+  after a rename, directory). A credential offered to a plaintext file is refused (`28P03`).
 - **Entropy streams are split by purpose** (§3.1): per database for pages, meta and key block;
-  per handle for scratch. Mutable scratch blocks bind a per-block write counter for freshness,
-  kept as a budget-charged sparse map; sort runs need none (§4.2). Conversion to the encrypted
+  per handle for scratch. Mutable scratch blocks bind a per-block write counter for freshness;
+  sort runs need none (§4.2). Conversion to the encrypted
   variant is refused on a handle whose scratch encryption is off, like attach (§4.2).
   Body pages have no CRC in the variant; recovery's manifest check is digest-only (§4).
-- **Edge cases fail closed, not resilient** (§3.1, 2026-10-21): a crash, lost connection or
+- **Edge cases fail closed, not resilient** (§3.1, 2026-10-20): a crash, lost connection or
   owner change at a bad moment may cost the host a reopen; it may never cost security. So: no
-  cached-DEK resume for an SSH client whose owner is gone (`28000`, reopen); the owner verifies a
-  forwarded `rewrap` before writing it; a 16-byte DEK id in the key block and meta slot tells a
-  wrong file or a rotation (`28000`) from tampering (`XX001`) before any decryption (§6).
+  cached-DEK resume for an SSH client whose owner is gone (`28P02`, reopen); the owner
+  test-unwraps a forwarded `rewrap` with the per-file KEK the client sends before writing it; a
+  16-byte DEK id in the key block and meta slot tells a wrong file or a rotation (`28P04`) from
+  tampering (`XX001`) before any decryption (§6). Substitution of one valid database for another
+  under the same credential is **excluded** unless the host pins the expected DEK id at `open`.
+- **Credential errors are four registered codes** (§9): `28P01` wrong or tampered, `28P02`
+  missing, `28P03` offered to a plaintext file, `28P04` stale (rotation, wrong file).
+- **Scratch write counters are physical state**, a dense per-block array outside the logical
+  memory accounts, like the page cache (§4.2).
 - **From-scratch images allocate each overflow chain before its leaf, tail first**, so sealing
   order is ascending index order and compaction stays an append stream (§4).
 - **Connected clients survive rotation by re-checking the key block** at their compaction reload
@@ -197,8 +203,10 @@ codec is hand-rolled (large-values.md §6). **Encryption is the opposite case:**
   fixtures. Production files need not match when these inputs differ. §3.1 sets the direction:
   every key is derived from a fresh random salt, so nothing is allocated across commits and a
   restored or copied file draws new keys on its next write. (A random domain saved once in a
-  file would be copied with that file and would not by itself solve writable forks.) Record
-  any necessary determinism-ledger change before implementation; never trade nonce safety for
+  file would be copied with that file and would not by itself solve writable forks.) A
+  **determinism-ledger entry is required**, not optional: random salts make production encrypted
+  bytes depend on the environment, the same class as `uuidv4`
+  (`spec/conformance/determinism_exceptions.toml`). Never trade nonce safety for
   identical files. Recovery, retry, copying, and backup tests must establish the chosen contract.
 
 ### 3.1 Suite direction: AES-256-GCM with per-page derived keys (not yet a format decision)
@@ -247,6 +255,7 @@ Support for the primitives, by platform (late 2026; check each platform's runtim
 | .NET | `AesGcm`; macOS via CryptoKit since .NET 8; not in browser WASM ([platform table](https://learn.microsoft.com/dotnet/standard/security/cross-platform-cryptography)) | `Aes.EncryptEcb` (.NET 6+) | `HKDF` (.NET 5+) | not in the base library; third-party only |
 | Swift | CryptoKit / swift-crypto `AES.GCM` | **not in CryptoKit** (no raw block or CMAC API); Swift leans wrap (CLAUDE.md §2) | CryptoKit `HKDF` | not in CryptoKit or swift-crypto (96-bit `ChaChaPoly` only) |
 | Python (reach) | `cryptography` `AESGCM` | `cryptography` (ECB, CMAC) | `cryptography` | not in `cryptography`; PyNaCl (libsodium) |
+| Ruby (the golden generator and `verify.rb --check-image`) | `openssl` gem | `openssl` gem (ECB; CMAC hand-written as in Go) | `openssl` gem (HKDF, PBKDF2) | not in `openssl` |
 
 Measured speed is in §8: on native Go and Rust a fresh key for every 8 KiB page adds well under
 a microsecond to a seal or an open (the *Key granularity* table), native Node AES-GCM is a few
@@ -356,7 +365,12 @@ Two constructions realize this derive-key design with AES-256-GCM:
   but **hand-written glue in nearly every core** (Go, TS for Node and browser alike, future Java
   and .NET; only Rust has a library route — the pinned `aes` + `cmac` + `aes-gcm` composition or
   the `xaes-256-gcm` crate, the review's call), while the HKDF fallback is jed-specific but
-  needs **no hand-written primitive code** anywhere (HKDF is in every platform library).
+  needs **no hand-written primitive code** anywhere (HKDF is in every platform library). The
+  ranking is therefore **provisional on a CLAUDE.md §14 ruling**: XAES stays primary only if the
+  spec-fixed two-block CMAC composition counts as composing vetted primitives rather than
+  hand-writing one (the alternative being to treat the specification author's reference Go
+  implementation as a vetted dependency); if the ruling goes the other way, the HKDF fallback
+  becomes primary.
 - **HKDF-SHA-256 + AES-256-GCM under a fixed nonce (fallback).** Our own composition of standard
   primitives, close to [Tink's AES-GCM-HKDF streaming
   AEAD](https://developers.google.com/tink/streaming-aead/aes_gcm_hkdf_streaming), but Tink's
@@ -400,17 +414,22 @@ failure and live snapshots changes.
 **Threat model.** The attacker, in one place so each defense can be checked against it. They
 **can**: read the file and every copy of it at rest (backups, snapshots, crash remnants, the
 replication log) and compare them offline; **write** to the file at rest, including replaying
-older genuine pages and swapping the file for another; and, while the process runs, read and
+older genuine pages and swapping the file for another (answered below); and, while the process runs, read and
 write the **scratch directory** (the one live capability granted, §4.2). They **cannot**: read
 the running process's memory (keys, counters, the plaintext cache — §6), restore a live VM clone
 with duplicated RNG state (below), or roll back the whole file undetected (anti-rollback is a
 separate trusted-state contract, §4). Against that attacker the guarantees are confidentiality of
 page contents (not of structure — the plaintext meta leaks the shape, §4) and detection of any
 tampering as `XX001` or a credential error, never wrong rows. **A standing rule for edge cases
-(2026-10-21):** an inopportune crash, a lost connection or a mid-operation owner change must
+(2026-10-20):** an inopportune crash, a lost connection or a mid-operation owner change must
 never *compromise* security, but need not be *survived*; a fatal error that requires the host to
 reopen is an acceptable outcome, and this doc prefers it to a resume protocol wherever the
-resume would add state or trust. Nonce reuse can expose plaintext relationships to an offline attacker holding
+resume would add state or trust. **Whole-file substitution** is answered like whole-file
+rollback: a database swapped for *another valid database* under the same credential (two files
+wrapped with one host key, or one passphrase) passes every check, because a fresh opener has no
+trusted expected identity — so it is **excluded** from the guarantee by default, and a host that
+wants it closed passes the **expected DEK id** at `open` (an optional argument; a mismatch is
+`28P04`). A swap for a plaintext file is refused (§6). Nonce reuse can expose plaintext relationships to an offline attacker holding
 two backups; it does not require control of a running process. A single writer cannot prevent
 historical reuse on its own. Protect ordinary consistent copies, backup restoration and crash
 remnants. Per-page keys draw fresh randomness for every encryption, so a live process fork or
@@ -524,10 +543,12 @@ remains a separate trusted-state guarantee.
   510 to 254, so a table whose leaf count falls between those bands pays one more `page_read`
   per descent. Five further points follow. **Overflow chains seal tail first**: each page binds
   its successor, so the last page is sealed first. A commit has the value in memory, so this
-  costs nothing. For from-scratch images the **variant allocates each chain before its leaf and
-  tail first**, so sealing order equals ascending index order and the image stays an append
-  stream (the plaintext format allocates the leaf first, then each chain head first — format.md —
-  and its pinned order need not move, since the variant has its own goldens); streaming
+  costs nothing. For from-scratch images the **variant allocates every chain tail first** — an
+  overflow chain before its leaf, and the **catalog chain** too (the plaintext format lays it out
+  head first as consecutive pages, format.md, including entries that continue across pages) — so
+  sealing order equals ascending index order and the image stays an append stream for every page
+  kind (the plaintext format's pinned order need not move, since the variant has its own
+  goldens); streaming
   compaction and conversion walk a source chain once to collect its indices and then read it
   backwards while writing forwards, so memory is bounded by the index list, not the value; in the
   browser the async window shrinks to one page at a time along a chain. The successor tag also
@@ -535,8 +556,12 @@ remains a separate trusted-state guarantee.
   **The salt-draw order is a cross-core contract**: goldens and the simulator need
   byte-identical images under the fixed-bytes source, every seal draws a salt, so which page gets
   the k-th salt is specified — a commit draws its salts in one batch in the **canonical sealing
-  order**: dirty body pages in children-first order with ties by ascending page index (repeatedly,
-  every unsealed dirty page whose dirty children are sealed, ascending), then free-list pages,
+  order**, which is format.md's already-pinned **commit write order** (*Allocation & incremental
+  commit*, step 2): per table in catalog order, the dirty tree pages post-order, then each index
+  tree post-order, then the catalog chain; that order is children-first by construction and needs
+  no new tie rule (a greedy "lowest eligible index" rule and a rounds rule would differ — leaf 10
+  under parent 5 beside leaf 20 gives 10, 5, 20 versus 10, 20, 5 — so neither is used). The only
+  change is that every **chain** is taken **tail first**; then free-list pages,
   manifest-overflow pages, and the meta slot; `create`, compaction and conversion draw in their
   image's stream order, `create` first drawing the DEK, its DEK id, the KDF salt, the wrap nonce
   and the key-block tag salt; a credential change draws the KDF salt, the wrap nonce, then **one** DEK-tag
@@ -555,8 +580,10 @@ remains a separate trusted-state guarantee.
   re-sealed from its plaintext cache** — a re-seal draws a fresh salt and so a fresh tag that no
   parent binds, and the client would reject the page as replayed. The wire already carries
   on-disk form ([page-service.md](page-service.md) §5.1); the binding turns that layering into a
-  correctness rule. The one-commit in-file rollback remains possible, as it is for a plaintext
-  file, and it has **two forms**, not one: corrupt the newer meta slot so recovery takes the
+  correctness rule. The in-file rollback remains possible, as it is for a plaintext file — one
+  commit under `synchronous = on`, and under `synchronous = off` **the whole pending batch**, up
+  to `I` commits, since the fallback is the durable floor — and it has **two forms**, not one:
+  corrupt the newer meta slot so recovery takes the
   older, or **replay an older genuine ciphertext over a page the newest commit's manifest
   lists** — validated-COW recovery then sees a digest mismatch on a listed dirty page and falls
   back to the preceding slot *before* any pointer binding is checked, exactly as it would for a
@@ -592,8 +619,8 @@ remains a separate trusted-state guarantee.
   (ts-runtime.md §11.5); the variant drops that for body pages.
 - **The meta pages (slots 0/1): plaintext, authenticated whole (decided 2026-10-20).** A meta
   slot is **not encrypted**. The whole slot — page size, `reserved_bytes`, the suite identifier
-  and format variant, `txid`, the roots and their binding tags, the free-list head, the live
-  count and the inline manifest — together with the **slot index** (so a slot binds which slot it
+  and format variant, the **DEK id** (§6), `txid`, the roots and their binding tags, the free-list
+  head, the live count and the inline manifest — together with the **slot index** (so a slot binds which slot it
   is, as a body page binds its page index; a transplanted slot is an identical generation today,
   but the asymmetry costs nothing to close) is the associated data of an AEAD under the meta
   subkey (§6) with an empty plaintext, so the slot's reserve holds a salt and a tag and nothing
@@ -646,8 +673,13 @@ SQLCipher) keep their nonce and MAC and where `cksumvfs` keeps its checksum. For
   (`encode(index, page)` / `decode(index, stored)`) carries neither today and gains both with the
   encryption format, and commit changes from "serialize every dirty page, then encode" to
   sealing interleaved with serialization, children first (§4). Every path that reads a page
-  carries its expected tag: a referenced page not yet loaded, a re-read after eviction,
-  page-service and recovery read-ahead, the backup walk, and `verify.rb`. This is the second
+  carries its expected tag: a referenced page not yet loaded, a re-read after eviction, the
+  backup walk, and `verify.rb`. **Read-ahead** (page-service and recovery) by nature fetches a
+  page before its parent is decoded, and recovery's digest check runs without the key, so
+  read-ahead **holds the stored bytes and checks the binding on first use**, when the parent
+  names the page; it never decrypts into the cache early. (This also bears on the open "tag only
+  in the parent pointer" question, §9: without the copy in the page's reserve, read-ahead could
+  hold bytes but not verify them until the parent arrives, which is the same rule.) This is the second
   change the codec seam takes with the variant, beside the digest move, and it forecloses
   nothing today. This is also what lets the
   codec keep pages at `page_size`: the TS `PageTransform` maps one page to one stored page at
@@ -736,12 +768,18 @@ hash-partition links or temp rows with every tag valid; a fresh salt prevents no
 says nothing about which version is current. **Sort runs need no counter**: they are write-once
 and sequential, so the ordinal and a final-block flag on the last block suffice, and a run read
 that ends early is an error. For positional scratch and spilled temp domains the counters are
-**resident state, and bounded**: the owner keeps the block count and a **sparse map of rewritten
-blocks** (absent means counter zero — most positional blocks are written once), charged at its
-exact size to the operator's `work_mem` residency and the query-memory account like any other
-spill structure (spill.md §7, memory.md); a workload whose rewrites exhaust the budget fails
-with the account's error rather than growing the map, which is the edge-case rule above applied
-to memory. The counters do not survive the process, and need not: the scratch file dies with it.
+**physical state, outside the logical memory accounts** — like the page cache, not like a spill
+structure. They cannot be charged to `work_mem` or the query-memory account: their count would
+depend on the per-core block framing (spill.md §6) and on `scratch_encryption` and the host's
+scratch target, so the same query would spill or trip `54P05` differently across cores and
+settings, against memory.md's deterministic admission contract and temp-tables.md §6's "timing,
+never observation"; and a spilled temp domain, which lives for the session and rewrites its pages
+constantly under copy-on-write, has no statement account to charge and a dense, not sparse, map.
+So the owner keeps a **dense array of one `u64` per block**: about 0.1% of the scratch file at
+8 KiB blocks, bounded by the limits that already bound the file (`max_temp_storage_bytes`, the
+spill budget), and freed with it. (An earlier draft charged a sparse map to the accounts; that
+made admission per-core and is withdrawn.) The counters do not survive the process, and need
+not: the scratch file dies with it.
 A positional scratch read of a block that was never written is an error, not zeros.
 
 The two scratch shapes differ in how the salt and tag find room, because neither is an
@@ -792,8 +830,9 @@ bindings, not a scratch file.
   encrypt/decrypt is per-page physical I/O, like the CRC.) If a future requirement wants
   encryption metered, it would be a new physical-vs-logical decision recorded here.
 - **Byte identity is conditional on identical crypto inputs** (§3). Fixed-input vectors and
-  cross-core encrypted-file round trips remain required. Production entropy and writable-copy
-  behavior must be specified before claiming an exception-free deterministic file contract.
+  cross-core encrypted-file round trips remain required. Production encrypted bytes depend on
+  the environment's CSPRNG and so carry a **determinism-ledger entry** (§3), the same class as
+  `uuidv4`; there is no exception-free deterministic file contract for the variant.
 
 ## 6. Envelope encryption and key lifecycle
 
@@ -816,8 +855,8 @@ counter**, written at `create` and by credential changes only, never by a data c
 carries a random 16-byte **DEK id**, drawn with the DEK and repeated in the meta slot's
 authenticated plaintext, so a block's file is known **before any decryption**: a block
 transplanted from another file under the same host key (an operator mix-up) is the
-wrong-file form of `28000`, not `XX001`, and at a compaction reload a client tells a rotation
-(new DEK id → `28000`, reopen) from tampering (same DEK id, failed DEK tag → `XX001`). Rotation
+wrong-file form of `28P04`, not `XX001`, and at a compaction reload a client tells a rotation
+(new DEK id → `28P04`, reopen) from tampering (same DEK id, failed DEK tag → `XX001`). Rotation
 draws a new DEK id with the new DEK; the replication slice's persisted database id is a separate,
 lineage-wide identifier. The wrap is an AEAD under the
 KEK whose associated data is the block's plaintext fields (suite id, KDF id and parameters,
@@ -892,10 +931,16 @@ no longer unlocks it, since both new wrappers may well be durable before the ack
 reaches the caller. A credential change takes the **writer gate** like any write, so it never
 overlaps a commit, a conversion or another change. Under the page service only the owner
 writes the file, so a **page client's credential change is forwarded**: the client holds the
-writer gate and sends the new key block through a page-service operation; the owner **verifies
-it first** — the block's DEK tag under the DEK the owner holds, its DEK id, and a generation of
-exactly current plus one — refusing anything else as a protocol violation (`08P01`), so a buggy
-client cannot install a block nobody can verify; then it performs
+writer gate and sends the new key block **together with the new per-file KEK** through a
+page-service operation. The KEK is derived for this file only and unwraps a DEK the owner already
+holds, so sending it over the same-user socket or the SSH stream reveals nothing, and it is what
+lets the owner **verify the block unlocks**: the DEK tag alone proves only that the sender held
+the DEK — a buggy client could wrap under a wrong KEK and still pass the tag, DEK-id and
+generation checks, and once acknowledged the old credential would be dead and the new one never
+alive. So the owner checks the DEK tag, the DEK id, a generation of exactly current plus one,
+and **test-unwraps the block with the supplied KEK to the DEK it holds**, refusing anything else
+as a protocol violation (`08P01`); the client test-unwraps its own block before sending it as
+well. Then the owner performs
 the two-barrier write and acknowledges after its log entry is durable (the operation joins
 [page-service.md](page-service.md) §5.2 with the format). Fixtures cover every boundary (§3.1,
 *fault fixtures*). The meta slots carry no wrapper (§4).
@@ -920,7 +965,7 @@ current credential and holds no credential of its own. A replica being promoted 
 verify anything; it finishes an interrupted key-block pair **from its durable log entry**, which
 carries the full block bytes, and only then serves.
 
-**A credential offered to a plaintext file is refused** (`28000`), never ignored. Otherwise an
+**A credential offered to a plaintext file is refused** (`28P03 credential_not_applicable`), never ignored. Otherwise an
 attacker who can replace the file swaps in a plaintext one, the host opens it with its key, the
 engine silently writes plaintext from then on, and `scratch_encryption = auto` turns off with it.
 Conversion (§6 table) is the only way across the variants, as in SQLCipher.
@@ -965,7 +1010,7 @@ Two operations have deliberately different semantics:
 | Operation | Work and guarantee |
 |---|---|
 | Change passphrase / wrapping key | Unwrap and rewrap the same DEK into both copies of the key block (above). No data page is rewritten. |
-| Rotate the data key | **Compaction under a fresh DEK** ([api.md](api.md) §2.6): the committed snapshot streams into `<path>.jedtmp` through the codec with the new key and a new key block, and the rename replaces the file. Atomic; old-key retirement for free (the old file is unlinked); no mixed-key state and no incremental rotation protocol. Encrypting a plaintext file and decrypting an encrypted one are the same operation with a different target. It inherits compaction's limits: `55006` while a writer, a pinned reader, a page client's writer gate or another process holds the file, and no OPFS support. Compaction does allow **idle connected clients**, which reload the compacted image at their next transaction begin (api.md §2.6) — after a rotation or conversion they hold the wrong DEK or the wrong variant, so the reload **re-reads the key block through `read_key_block`** and checks the DEK tag against the DEK it holds and the variant flag in the meta slot; a mismatch is the stale-credential error (`28000`, "reopen with a credential"), never `XX001`. The same check runs when a client reconnects after an owner change. Compaction also starts a **new replication timeline** (page-service.md §10), so every rotation forces a keyless replica to be re-seeded by a keyed process. |
+| Rotate the data key | **Compaction under a fresh DEK** ([api.md](api.md) §2.6): the committed snapshot streams into `<path>.jedtmp` through the codec with the new key and a new key block, and the rename replaces the file. Atomic; old-key retirement for free (the old file is unlinked); no mixed-key state and no incremental rotation protocol. Encrypting a plaintext file and decrypting an encrypted one are the same operation with a different target. It inherits compaction's limits: `55006` while a writer, a pinned reader, a page client's writer gate or another process holds the file, and no OPFS support. Compaction does allow **idle connected clients**, which reload the compacted image at their next transaction begin (api.md §2.6) — after a rotation or conversion they hold the wrong DEK or the wrong variant, so the reload **re-reads the key block through `read_key_block`** and checks the DEK tag against the DEK it holds and the variant flag in the meta slot; a mismatch is the stale-key error (`28P04`, "reopen with a credential"), never `XX001`. The same check runs when a client reconnects after an owner change. Compaction also starts a **new replication timeline** (page-service.md §10), so every rotation forces a keyless replica to be re-seeded by a keyed process. |
 | Convert between variants (encrypt a plaintext file, decrypt an encrypted one) | The same streaming rewrite, but a **rebuild, not a node-preserving copy**. Today's compaction keeps every tree node as it was and does not repack leaves (api.md §2.6); the encrypted variant has a smaller `C` and wider pointers (§4.1), so a packed plaintext page cannot be carried across. The converter re-inserts every table and index under the target layout, in key order, so the result is a from-scratch image of that variant. A row that cannot be stored under the target — a key over the target's record cap (keys cannot be externalized), or a record whose external pointers no longer fit beside its inline values (§4.1) — is a defined error reported **before the rename**, naming the table, as is a result whose live pages would exceed the database's `max_storage_bytes` (`54P06`, [memory.md](memory.md) §8.7); either way the source file is untouched. Rotation within the encrypted variant has the same `C` and pointer width and may use the node-preserving form. |
 
 The host owns credential storage, rotation policy, escrow, and OS-keychain integration. The
@@ -975,7 +1020,7 @@ surviving owner** needs no credential either — its DEK is unchanged and the en
 credential to re-present. The promise stops there: when no owner survives — an SSH helper that
 was owner is gone and the reconnect would launch a fresh `jed pages` that must open the file
 itself — the client cannot unlock it with a DEK it merely holds, and the engine defines **no
-cached-DEK resume handshake**; the reconnect fails with the missing-credential error (`28000`)
+cached-DEK resume handshake**; the reconnect fails with the missing-credential error (`28P02`)
 and the host reopens with a credential, or configures the server's credential file (above).
 That is the edge-case rule (§3.1): the lost connection is not survived, and nothing is weakened
 to survive it. Only a process that **reopens** presents a credential. Each change draws a **fresh KDF salt**, and the
@@ -989,8 +1034,10 @@ the key block too**, and it does **not** read pages 2–3 with `read_pages`: the
 is in progress for a window, and plain page reads could capture both copies torn while the
 source always kept a valid one. Instead the backup obtains a **stable key-block image** through
 a dedicated `read_key_block` operation, served by the owner (or, in an alone process, by the
-same internal lock) under the mutex the two-barrier write holds, so the image is a complete pair
-at one generation; it takes the image **before** the page walk and writes it at pages 2–3. A
+same internal lock) under the mutex the two-barrier write holds, so the image is **the selected
+copy** — the newest CRC-valid one, which a pair still awaiting repair (or a read-only owner that
+never repairs) makes the only honest answer — and the backup writes that one copy to **both**
+pages 2–3; it takes the image **before** the page walk. A
 backup pins a snapshot but not the key block, and a credential change may land during the walk,
 so the image's generation may be older or newer than the snapshot's stream position; the backup
 opens with the credential of that generation. A compacted backup keeps the same DEK and key
@@ -1192,7 +1239,7 @@ opens. Chromium's worker WebCrypto ran each operation inside the call and resolv
 boundary, so encode windows 1/4/16 performed alike and awaiting AES left commit and open as
 unresponsive as no codec. A task turn every 16 operations restored control-message admission
 during open; long commits still blocked on synchronous serialization. These are single-browser,
-single-machine observations: no per-writer key derivation, nonce allocation, ciphertext layout or
+single-machine observations: no per-page key derivation, ciphertext layout or
 crash behavior. They **select no suite**. See the
 [report](../../bench/aead/results/2026-10-19-async-codec.md).
 
@@ -1251,8 +1298,8 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
   `corrupt` range, `verify.rb`, and the trailing-truncation floor — and the meta bounds
   `live_pages ≤ page_count − 2` and the from-scratch image's `page_count − 2`, which become
   `− 4`. Further variant arithmetic to restate: the inline manifest capacity `I` falls (three
-  16-byte tags and the reserve in the slot bring it from 16 to about 8 entries at 256-byte
-  pages, and `O` shrinks too), and `I` is also the `synchronous = off` batch cap
+  16-byte tags, the 16-byte DEK id, the suite and variant fields and the reserve in the slot
+  bring it from 16 to about 7 entries at 256-byte pages, and `O` shrinks too), and `I` is also the `synchronous = off` batch cap
   (validated-cow.md §4), so batches flush more often; the interior payload formula and the
   minimum-fan-out rule (format.md) are restated with 20-byte pointers (the rule needs `C ≥ 76`
   and the smallest encrypted `C` is 200, so it still holds); the free-list entries per page
@@ -1263,12 +1310,15 @@ page codec and lifecycle machinery; they are not estimates of the complete featu
   `open` and `attach`; a change-credential call; compaction with a new credential or a target
   variant; the `scratch_encryption` setting; a host-facing `read_key_block` for backups; and
   the `Environment`'s dedicated CSPRNG field (environment.md has one random source today).
-  The registry gains, besides the credential error (`28P01`, a
-  wrong or tampered credential) and the stale-credential error (`28000`, a credential offered to a
-  plaintext file, or a client whose DEK no longer matches the key block): a missing credential for an encrypted
-  file (`28000 invalid_authorization_specification`, as PostgreSQL distinguishes it from a wrong
-  one), the encrypted-attach refusal and the in-memory-credential error (`55000
-  object_not_in_prerequisite_state`), and a scratch block that fails authentication (`XX001`).
+  The registry gains **four credential codes**, one name per code since hosts match on code or
+  name, never message text, and because "prompt again", "possible attack" and "reopen" are
+  different host actions: `28P01 invalid_password` (wrong or tampered credential; PostgreSQL's),
+  and three jed-specific codes in the same class — `28P02 credential_required` (an encrypted file
+  opened with none), `28P03 credential_not_applicable` (a credential offered to a plaintext file,
+  a possible swap) and `28P04 stale_key` (a client left behind by a rotation, a key block from
+  another file, a pinned DEK id that does not match). It also gains the encrypted-attach,
+  conversion and in-memory-credential refusals (`55000 object_not_in_prerequisite_state`), and a
+  scratch block that fails authentication (`XX001`).
 - **Integrated performance**, async page/commit prototype and browser portability measurements.
 
 ### 9.1 SQL crypto functions are a separate proposal
