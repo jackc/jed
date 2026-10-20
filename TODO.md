@@ -64,6 +64,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   [broad performance checkpoint](impl/ruby-native/PERFORMANCE_CHECKPOINT.md),
   [prepared join resolution reuse](impl/ruby-native/JOIN_PLAN_FOLLOWUP.md),
   [multiway join resolution reuse](impl/ruby-native/MULTIWAY_PLAN_FOLLOWUP.md),
+  [value-blind join plan reuse](impl/ruby-native/PHYSICAL_PLAN_FOLLOWUP.md),
   [private text-comparison snapshots](impl/ruby-native/TEXT_ELISION_FOLLOWUP.md),
   [policy](spec/design/ruby-native-experiment.md)
 

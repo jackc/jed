@@ -185,7 +185,7 @@ module JedNative
           end
         end
         return [rows, estimate_predicate(rows, left) + estimate_predicate(rows, right)].min if operator == 'or'
-        return 0 if %w[= <> != < > <= >=].include?(operator) && expression.args.any? { |argument| plan_constant(argument).nil? }
+        return 0 if %w[= <> != < > <= >=].include?(operator) && expression.args.any? { |argument| plan_constant_null?(argument) }
         return rows - (rows + 199) / 200 if %w[<> !=].include?(operator)
         denominator = %w[= like ilike ~ ~* !~ !~*].include?(operator) ? 200 : %w[< <= > >=].include?(operator) ? 3 : nil
         return (rows + denominator - 1) / denominator if denominator
@@ -197,8 +197,8 @@ module JedNative
         op, quantifier = expression.extra.values_at(:op, :quantifier)
         if op == '=' && quantifier != 'all' || op == '<>' && quantifier == 'all'
           elements = estimate_array_elements(expression.args[1])
-          return 0 if op == '<>' && (plan_constant(expression.args[1]).nil? || elements.any? { |element| plan_constant(element).nil? })
-          estimate = [rows, elements.sum { |element| plan_constant(element).nil? ? 0 : (rows + 199) / 200 }].min
+          return 0 if op == '<>' && (plan_constant_null?(expression.args[1]) || elements.any? { |element| plan_constant_null?(element) })
+          estimate = [rows, elements.sum { |element| plan_constant_null?(element) ? 0 : (rows + 199) / 200 }].min
           return op == '<>' ? rows - estimate : estimate
         end
         return (rows + 2) / 3
@@ -344,7 +344,7 @@ module JedNative
       when :full then count
       when :gin, :gist
         parts = access[:arms].map do |position, operator, source|
-          null = plan_constant(source).nil?
+          null = plan_constant_null?(source)
           metadata = stored[:native_auxiliary_indexes][access[:name]]
           denominator = access[:kind] == :gist && !Types::RANGES.key?(metadata[:types][position]) ? 200 : 100
           [null, denominator]
@@ -380,7 +380,7 @@ module JedNative
       if source.kind == :quantified
         elements = estimate_array_elements(source.args[1])
         return elements.sum do |element|
-          next 0 if plan_constant(element).nil?
+          next 0 if plan_constant_null?(element)
           [[(index[:node_count] + 199) / 200, index[:height]].max, index[:node_count]].min
         end
       end

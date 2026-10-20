@@ -1,0 +1,25 @@
+{
+  "command": [
+    "/home/jack/.local/share/mise/installs/ruby/4.0.7/bin/ruby",
+    "--yjit",
+    "bench/ruby-native/physical_plan_diagnostics.rb",
+    "--jit",
+    "yjit",
+    "--report",
+    "/tmp/jed-physical-direct-smoke.json"
+  ],
+  "success": true,
+  "reason": null,
+  "peak_rss_bytes": 77090816,
+  "memory_bytes": 536870912,
+  "address_space_bytes": 2147483648,
+  "timeout_seconds": 300.0,
+  "elapsed_seconds": 13.958148590987548,
+  "source": "/home/jack/.codex/worktrees/b8e6/jed/impl/ruby-native",
+  "source_sha256": "af697664d103b171c81cd428f2039fc4fd61251388260e28b6ea4db63efb2217",
+  "final_source_sha256": "af697664d103b171c81cd428f2039fc4fd61251388260e28b6ea4db63efb2217",
+  "runtime": "ruby 4.0.7 (2026-09-15 revision 229531a6cf) +PRISM [x86_64-linux]",
+  "environment": {},
+  "stdout": "Physical-plan diagnostic yjit: memory/file APIs, parameters, plans, budgets and cache observations passed\n",
+  "stderr": ""
+}

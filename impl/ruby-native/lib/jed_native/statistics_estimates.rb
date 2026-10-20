@@ -4,7 +4,7 @@ module JedNative
   # Statistics are already resident catalog facts. All interpolation uses exact
   # integer fractions; no sampled row or index leaf is read while planning.
   module StatisticsEstimates
-    def estimate_scan_candidate(stored, predicate, access, statement)
+    def scan_access_plan(stored, predicate, statement = nil)
       previous = @native_estimate_table
       @native_estimate_table = stored
       super
@@ -12,9 +12,9 @@ module JedNative
       @native_estimate_table = previous
     end
 
-    def scan_access_plan(stored, predicate, statement = nil)
+    def join_index_plan(left, source, kind, on, using, choose: true, all: false)
       previous = @native_estimate_table
-      @native_estimate_table = stored
+      @native_estimate_table = source[:kind] == :table ? @tables[source[:name]] : nil
       super
     ensure
       @native_estimate_table = previous
@@ -43,6 +43,16 @@ module JedNative
     end
 
     private
+
+    def join_scan_candidates(source, scope)
+      previous = @native_estimate_table
+      @native_estimate_table = @tables[source[:name]]
+      # Candidate selection and the pushed filter's delivered/logical rows
+      # must use the same table facts, including after scan selection returns.
+      super
+    ensure
+      @native_estimate_table = previous
+    end
 
     def estimate_distinct_rows(rows, expressions)
       stored = @native_estimate_table
@@ -118,7 +128,7 @@ module JedNative
           distribution = statistics_distribution(stored, column.value)
           return nil unless distribution && distribution[:ndv]
           elements = estimate_array_elements(expression.args[1])
-          return 0 if op == '<>' && (plan_constant(expression.args[1]).nil? || elements.any? { |element| plan_constant(element).nil? })
+          return 0 if op == '<>' && (plan_constant_null?(expression.args[1]) || elements.any? { |element| plan_constant_null?(element) })
           seen = {}
           result = elements.sum do |element|
             value = statistics_operand(element, column.type)
@@ -298,6 +308,8 @@ module JedNative
     end
 
     def estimate_scan_candidate(stored, predicate, access, statement)
+      previous = @native_estimate_table
+      @native_estimate_table = stored
       super
       return access unless access[:kind] == :gin
       estimate = statistics_gin_bound(stored, access)
@@ -315,6 +327,8 @@ module JedNative
       access[:output_rows] = [rows, estimate_predicate(stored[:rows].length, predicate)].min
       access[:pipeline_cost] = [QueryPlans::MAX_ESTIMATE, access[:scan_cost] + rows * expression_work(predicate)].min
       access
+    ensure
+      @native_estimate_table = previous
     end
   end
   Engine.prepend(StatisticsEstimates)
