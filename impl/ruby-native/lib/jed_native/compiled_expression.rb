@@ -12,6 +12,7 @@ module JedNative
     MAX_SOURCE_BYTES = 32_768
     MAX_POOL = 256
     MAX_POOL_BYTES = 32_768
+    MAX_LIKE_RUNS = 64
     MAX_METHOD_CACHE_ENTRIES = 64
     TYPES = %w[i16 i32 i64 boolean text null unknown].freeze
     BOOLEAN_TYPES = %w[boolean null unknown].freeze
@@ -460,35 +461,77 @@ module JedNative
       line('end')
     end
 
-    # Only boundary % tokens surround the decoded literal. Interior wildcards,
-    # one-character matches and a trailing escape retain the ordinary matcher,
-    # including its data-dependent escape error. Check bytes before copying or
-    # decoding; admission itself must remain bounded for oversized SQL literals.
+    # Decode only bounded literal patterns. Runs exist during admission, never
+    # during matching. A trailing escape remains in the ordinary matcher so its
+    # data-dependent error cannot move to preparation or before a NULL check.
     def literal_like_shape(pattern)
       raise Unsupported unless pattern.instance_of?(String) && pattern.bytesize <= MAX_POOL_BYTES - @pool_bytes
       pattern = ::String.new(pattern)
       raise Unsupported unless pattern.encoding == Encoding::UTF_8 && pattern.valid_encoding?
-      decoded = +''
       available = MAX_POOL_BYTES - @pool_bytes - pattern.bytesize
-      leading = trailing = escaped = false
+      runs = []
+      escaped = false
       pattern.each_char do |character|
         if !escaped && character == '\\'
           escaped = true
           next
         elsif !escaped && character == '%'
-          decoded.empty? ? leading = true : trailing = true
+          unless runs.last&.first == :many
+            raise Unsupported if runs.length >= MAX_LIKE_RUNS
+            runs << [:many, nil]
+          end
           next
         elsif !escaped && character == '_'
-          raise Unsupported
+          if runs.last&.first == :one
+            runs.last[1] += 1
+          else
+            raise Unsupported if runs.length >= MAX_LIKE_RUNS
+            runs << [:one, 1]
+          end
+          next
         end
-        raise Unsupported if trailing || character.bytesize > available
-        decoded << character
+        raise Unsupported if character.bytesize > available
+        unless runs.last&.first == :literal
+          raise Unsupported if runs.length >= MAX_LIKE_RUNS
+          runs << [:literal, +'']
+        end
+        runs.last[1] << character
         available -= character.bytesize
         escaped = false
       end
       raise Unsupported if escaped
-      shape = leading ? (trailing ? :contains : :suffix) : (trailing ? :prefix : :exact)
-      [shape, decoded]
+      case runs.map(&:first)
+      when [] then return [:exact, '']
+      when [:many] then return [:suffix, '']
+      when [:literal] then return [:exact, runs[0][1]]
+      when [:literal, :many] then return [:prefix, runs[0][1]]
+      when [:many, :literal] then return [:suffix, runs[1][1]]
+      when [:many, :literal, :many] then return [:contains, runs[1][1]]
+      end
+
+      if runs.any? { |kind, _| kind == :one }
+        # Fixed-position character wildcards need no retry/backtracking state.
+        # A final % is the only admitted arbitrary-length wildcard in this form.
+        raise Unsupported if runs.each_with_index.any? { |(kind, _), index| kind == :many && index != runs.length - 1 }
+        bytes = runs.sum { |kind, value| kind == :many ? 1 : 3 + (kind == :literal ? value.bytesize : 0) }
+        raise Unsupported if bytes > MAX_POOL_BYTES - @pool_bytes - pattern.bytesize
+        program = +''.b
+        runs.each do |kind, value|
+          if kind == :many
+            program << 2
+          else
+            length = kind == :literal ? value.bytesize : value
+            program << (kind == :literal ? 0 : 1) << (length >> 8) << (length & 255)
+            program << value.b if kind == :literal
+          end
+        end
+        [:fixed, program]
+      else
+        # Ordered literal runs separated by % can use forward byte searches.
+        # The pool keeps each run separately; no substring or token is made for
+        # a row, and the earliest match always leaves the most room for later runs.
+        [:segments, runs]
+      end
     end
 
     def emit_literal_like(expression, output, left, right, depth)
@@ -504,7 +547,6 @@ module JedNative
       snapshot = %i[literal column param].include?(left.kind)
       a = emit(left, depth + 1, text_snapshot: snapshot)
       b = emit(right, depth + 1, text_snapshot: true)
-      payload = pooled(literal)
       line("if #{a}.nil? || #{b}.nil?")
       @indent += 1
       line("#{output} = nil")
@@ -514,13 +556,22 @@ module JedNative
       # of acquiring String encoding errors or different custom method calls.
       line("elsif (#{a}.instance_of?(::String) || #{a}.instance_of?(::JedNative::CollatedText)) && #{a}.encoding == ::Encoding::UTF_8 && #{a}.valid_encoding?")
       @indent += 1
-      operation = case shape
-      when :exact then "#{a} == #{payload}"
-      when :prefix then "#{a}.start_with?(#{payload})"
-      when :suffix then "#{a}.end_with?(#{payload})"
-      when :contains then "#{a}.include?(#{payload})"
+      if shape == :fixed
+        line('# literal LIKE wildcard specialization')
+        emit_fixed_like(output, a, pooled(literal))
+      elsif shape == :segments
+        line('# literal LIKE wildcard specialization')
+        emit_segmented_like(output, a, literal)
+      else
+        payload = pooled(literal)
+        operation = case shape
+        when :exact then "#{a} == #{payload}"
+        when :prefix then "#{a}.start_with?(#{payload})"
+        when :suffix then "#{a}.end_with?(#{payload})"
+        when :contains then "#{a}.include?(#{payload})"
+        end
+        line("#{output} = #{operation}")
       end
-      line("#{output} = #{operation}")
       @indent -= 1
       line('else')
       @indent += 1
@@ -530,6 +581,93 @@ module JedNative
       @indent -= 1
       line('end')
       line("#{output} = !#{output} unless #{output}.nil?") if expression.value == 'not like'
+    end
+
+    def emit_fixed_like(output, subject, payload)
+      prefix = "like_#{output}"
+      line("#{prefix}_program = #{payload}")
+      line("#{prefix}_position = #{prefix}_input = 0")
+      line("#{output} = true")
+      line("while #{prefix}_position < #{prefix}_program.bytesize && #{output}")
+      @indent += 1
+      line("#{prefix}_kind = #{prefix}_program.getbyte(#{prefix}_position)")
+      line("#{prefix}_position += 1")
+      line("if #{prefix}_kind == 2")
+      @indent += 1
+      line("#{prefix}_input = #{subject}.bytesize")
+      line('break')
+      @indent -= 1
+      line('end')
+      line("#{prefix}_length = (#{prefix}_program.getbyte(#{prefix}_position) << 8) | #{prefix}_program.getbyte(#{prefix}_position + 1)")
+      line("#{prefix}_position += 2")
+      line("if #{prefix}_kind == 1")
+      @indent += 1
+      line("while #{prefix}_length > 0")
+      @indent += 1
+      line("#{prefix}_byte = #{subject}.getbyte(#{prefix}_input)")
+      line("if #{prefix}_byte.nil?")
+      @indent += 1
+      line("#{output} = false")
+      line('break')
+      @indent -= 1
+      line('end')
+      line("#{prefix}_input += #{prefix}_byte < 128 ? 1 : (#{prefix}_byte < 224 ? 2 : (#{prefix}_byte < 240 ? 3 : 4))")
+      line("#{prefix}_length -= 1")
+      @indent -= 1
+      line('end')
+      @indent -= 1
+      line('else')
+      @indent += 1
+      line("#{prefix}_end = #{prefix}_position + #{prefix}_length")
+      line("while #{prefix}_position < #{prefix}_end")
+      @indent += 1
+      line("if #{subject}.getbyte(#{prefix}_input) != #{prefix}_program.getbyte(#{prefix}_position)")
+      @indent += 1
+      line("#{output} = false")
+      line('break')
+      @indent -= 1
+      line('end')
+      line("#{prefix}_input += 1")
+      line("#{prefix}_position += 1")
+      @indent -= 1
+      line('end')
+      @indent -= 1
+      line('end')
+      @indent -= 1
+      line('end')
+      line("#{output} &&= #{prefix}_input == #{subject}.bytesize")
+    end
+
+    def emit_segmented_like(output, subject, runs)
+      offset = "like_#{output}_offset"
+      found = "like_#{output}_found"
+      line("#{output} = true")
+      line("#{offset} = 0")
+      runs.each_with_index do |(kind, literal), index|
+        next if kind == :many
+        payload = pooled(literal)
+        if index.zero?
+          line("#{output} = #{subject}.start_with?(#{payload})")
+          line("#{offset} = #{payload}.bytesize")
+        elsif index == runs.length - 1
+          line("#{output} &&= #{subject}.bytesize - #{payload}.bytesize >= #{offset} && #{subject}.end_with?(#{payload})")
+        else
+          line("if #{output}")
+          @indent += 1
+          line("#{found} = #{subject}.byteindex(#{payload}, #{offset})")
+          line("if #{found}")
+          @indent += 1
+          line("#{offset} = #{found} + #{payload}.bytesize")
+          @indent -= 1
+          line('else')
+          @indent += 1
+          line("#{output} = false")
+          @indent -= 1
+          line('end')
+          @indent -= 1
+          line('end')
+        end
+      end
     end
 
     def emit_c_comparison(expression, output, left, right, a, b, label, snapshots: false)
