@@ -19,9 +19,9 @@
 
   // The full database tool (CLI/TUI parity): a CodeMirror SQL editor, a results grid with output
   // formats, a schema sidebar, transaction-state + cost indicators, and an OPFS file manager for
-  // real local single-file databases. Entirely client-side — the engine runs in the shared Web
-  // Worker (session.ts). Always has a working in-memory database; OPFS adds persistence when the
-  // browser supports it (graceful degradation otherwise).
+  // real local single-file databases. Entirely client-side — each database owns an execution
+  // worker through the shared browser runtime (session.ts). Switching databases closes the old
+  // worker. OPFS adds persistence to the in-memory tool when the browser supports it.
 
   const DEFAULT_MAX_COST = 50_000_000n;
   const DEFAULT_SQL = `-- A scratch in-memory database. Create a table, or open / import a .jed file on the left.

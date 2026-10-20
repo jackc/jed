@@ -12,9 +12,9 @@ import mdsvexConfig from './mdsvex.config.js';
  *   live-SQL widgets) — the "MDsveX, not a turnkey docs framework" decision.
  * - `paths.base` comes from BASE_PATH so a GitHub Pages project page (served from /<repo>) works;
  *   it is '' in dev and for a root/custom-domain deploy.
- * - `$jed` aliases the TS core source (impl/ts/src). UI/worker code imports the node-clean engine
- *   modules directly (executor.ts, parser.ts, value.ts, errors.ts, opfs.ts) — NEVER lib.ts/file.ts,
- *   which pull `node:fs` and cannot load in the browser.
+ * - `$jed` aliases the TS source (impl/ts/src). The UI uses browser/async.ts plus browser-safe
+ *   value/error helpers; SQL execution stays in the runtime's dedicated database workers.
+ *   Node host modules must not enter the browser bundle.
  */
 const config = {
   extensions: ['.svelte', '.svx', '.md'],

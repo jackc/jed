@@ -1,6 +1,6 @@
 // Playwright config for the jed website's interactive-feature tests (the plan's "browser testing is
 // first-class" contract). Like impl/ts, Playwright is a DEV-ONLY tool (CLAUDE.md §14): it drives
-// headless Chromium against the BUILT static site (vite preview) — so the suite also catches
+// headless Chromium against the BUILT static site — so the suite also catches
 // prerender / base-path / worker-404 regressions, not just component behavior. Run with
 // `npm run test:browser`, or `mise run e2e:web` (a `mise run ci` step); needs the Chromium binary
 // (`mise run dev:browsers`; already in PLAYWRIGHT_BROWSERS_PATH in the devcontainer).
@@ -16,11 +16,10 @@ export default defineConfig({
   // OPFS files are origin-scoped; keep specs from racing the exclusive handle.
   fullyParallel: false,
   workers: 1,
-  // Every live panel on a page shares one engine Web Worker and autoruns in turn, so an assertion on
-  // a panel far down the page (the select page has 28, types 37) waits for the engine to load and
-  // every earlier panel to run: up to ~3 s on an idle machine, past Playwright's 5 s default when
-  // the gate loads the machine. These bound how long a correct page may take; a wrong answer still
-  // fails, just later. No retries: a flake stays visible.
+  // Each live panel owns a database worker and autoruns independently. Pages with many examples
+  // (the select page has 28, types 37) load and execute several workers concurrently, especially
+  // expensive while the full gate is running. These bound how long a correct page may take;
+  // a wrong answer still fails, just later. No retries: a flake stays visible.
   timeout: 60_000,
   expect: { timeout: 20_000 },
   use: { baseURL: `http://localhost:${PORT}` },

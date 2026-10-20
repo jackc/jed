@@ -61,7 +61,7 @@ binds the array of `id`'s type, which is how you pass a list:
   A bare `Vec` is a list of separate parameters, and `Vec<u8>` binds as `bytea`.
 - **Go** — pass a slice: `session.Query(ctx, "… WHERE id = ANY($1)", []int64{1, 3})`. A nil slice
   binds `NULL`; `[]byte` stays `bytea`.
-- **TypeScript** — pass a JS array: `(await db.prepare("… WHERE id = ANY($1)")).all([1, 3])`.
+- **TypeScript** — pass a JS array: `await db.all("… WHERE id = ANY($1)", [1, 3])`.
 
 On a primary key or an indexed column, `id = ANY($1)` looks up each element of the list, like
 `id IN (1, 3)` ([EXPLAIN](/docs/sql/explain) shows it as an interval set). On a composite primary key,
@@ -277,7 +277,34 @@ Rust's `query_cancelable` and `execute_cancelable` accept a clonable `Cancellati
 thread can call `cancel()` while the query runs. After manually draining Rust rows, call `error()`
 to check for an execution error.
 
+TypeScript's `query` and `execute` accept `{ signal }` after their typed parameter array, including
+on prepared statements. Keep the signal alive while consuming rows: it also applies to later
+batch fetches. For example, with an open `db` and the application's query in `sql`:
+
+```ts
+import { EngineError } from 'jed-ts'; // use 'jed-ts/browser' in a browser
+
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 100);
+try {
+  const rows = await db.query(sql, [], { signal: controller.signal });
+  for await (const row of rows) {
+    console.log(row);
+  }
+} catch (e) {
+  if (!(e instanceof EngineError) || e.code() !== '57014') throw e;
+  console.log('query canceled');
+} finally {
+  clearTimeout(timer);
+}
+```
+
+Async iteration closes the cursor on exhaustion, errors, or an early `break`. If you acquire a
+cursor without iterating it, release it with `await rows.close()`. Node and isolated browsers can
+signal atomic checkpoints; other browsers deliver cancellation when the execution worker yields.
+
 Cancellation during execution fails an open transaction, which must then be rolled back. It is
-best effort, checked periodically during scans, joins, and other execution loops rather than at\nevery expression. There is no fixed wall-clock response guarantee: sorting, individual scalar kernels,
+best effort, checked periodically during scans, joins, and other execution loops rather than at
+every expression. There is no fixed wall-clock response guarantee: sorting, individual scalar kernels,
 host callbacks, and commit work can delay observation. Cancellation does not change completed-query
 cost totals or deterministic cost limits.

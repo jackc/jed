@@ -46,7 +46,8 @@ budgeted over its lifetime.
 ## Scalar allocation budget
 
 `max_scalar_bytes` defaults to **64 MiB per statement**. Set it through session options or
-`set_max_scalar_bytes(bytes)` / `SetMaxScalarBytes(bytes)` / `setMaxScalarBytes(bytes)`.
+`set_max_scalar_bytes(bytes)` (Rust), `SetMaxScalarBytes(bytes)` (Go), or
+`await session.configure({ maxScalarBytes: bytes })` (TypeScript).
 Non-positive values restore the finite default. A reservation above it fails with **`54P04`**;
 exact equality is allowed. The budget resets for each statement and accumulates across nested
 calls, rows, subqueries and CTEs. A cursor keeps its original budget until it closes.
@@ -80,15 +81,16 @@ array element against every other element therefore costs in proportion to the p
 
 `max_query_memory_bytes` bounds the **rows and operator state a statement holds at once**:
 materialized relations, join results, grouped and `DISTINCT` rows, set-operation and CTE buffers,
-`RETURNING` results, and the rows the engine's own collect-everything helpers (Rust `query_rows`,
-TypeScript `Statement.all()`) gather — plus the working state of the operators that produce them:
+`RETURNING` results, and the rows the engine's own collect-everything helpers (such as Rust
+`query_rows`) gather — plus the working state of the operators that produce them:
 hash-join tables, group and dedup tables, aggregate inputs such as `json_agg`'s, window
 partitions and the operand values a window caches, sort buffers, the sort keys a collated sort
 builds, and the rows a spilled sort reads back to merge. It also holds the writes an open transaction has staged but not yet
 committed (see below). It is **unlimited by default** — like `max_cost`, a host serving untrusted
 SQL opts in. Set it through session options or `set_max_query_memory_bytes(bytes)` /
-`SetMaxQueryMemoryBytes(bytes)` / `setMaxQueryMemoryBytes(bytes)`; non-positive values restore
-unlimited. A statement that would exceed it fails with **`54P05`**; exact equality is allowed.
+`SetMaxQueryMemoryBytes(bytes)` / `await session.configure({ maxQueryMemoryBytes: bytes })`;
+non-positive values restore unlimited. A statement that would exceed it fails with **`54P05`**;
+exact equality is allowed.
 
 The budget counts **logical bytes** from a fixed schedule — 32 bytes per row, per value, and per
 hash-table entry, plus the UTF-8 length of text, the length of bytea, and similar payloads — not
@@ -96,6 +98,13 @@ the runtime's actual allocations. That makes the limit deterministic: the same q
 core. Rows released along the way (filtered out, consumed by the next stage, handed to your cursor)
 give their bytes back, and a streaming query that hands each row to you as it is produced holds
 almost nothing. A cursor keeps its statement's budget until it closes.
+
+TypeScript's public async `all()` gathers its result objects on the application thread. That
+collection has a separate `runtime.maxResultBytes` limit (default **2 MiB**) and rejects oversized
+results with `TransportError` code `RESULT_TOO_LARGE`. The session's `maxQueryMemoryBytes` still
+bounds query execution inside the worker. Use `query()` with async iteration to consume bounded
+batches instead of collecting the whole result; values your application keeps after iteration
+remain its responsibility.
 
 Uncommitted writes count against the same budget. Every row version and index entry a transaction
 writes reserves its stored size — its on-disk record plus any value stored out of line — until the
@@ -116,15 +125,17 @@ thing the per-statement and per-transaction budgets cannot see, since many small
 transactions each fit them. Without it, a session that can insert can grow an in-memory database
 until RAM runs out, or a file until the disk fills. It belongs to the database rather than to a
 session, so every session shares it. Set it in the create options (`max_storage_bytes` /
-`MaxStorageBytes` / `maxStorageBytes`), in the open options of a file, on an attachment's source, or
-later with `set_max_storage_bytes(name, bytes)` / `SetMaxStorageBytes(name, bytes)` /
-`setMaxStorageBytes(name, bytes)`, where `name` is `main` or an attachment. It is **unlimited by
-default**; non-positive values restore unlimited. It is a handle setting, not stored in the file.
+`MaxStorageBytes` / `maxStorageBytes`) or in the open options of a file. Rust and Go also accept it
+on an attachment's source and can change it later with `set_max_storage_bytes(name, bytes)` /
+`SetMaxStorageBytes(name, bytes)`, where `name` is `main` or an attachment. TypeScript's public async
+API currently sets it only when creating or opening the database. It is **unlimited by default**;
+non-positive values restore unlimited. It is a handle setting, not stored in the file.
 
 A commit that would grow the database past the limit fails with **`54P06`** and commits nothing. A
 commit that only deletes rows or drops objects always succeeds, so a full database can always be
-cleaned up. The `storage_bytes(name)` / `StorageBytes(name)` / `storageBytes(name)` gauge reports
-the number the limit checks, which depends on where the database lives.
+cleaned up. The Rust `storage_bytes(name)` and Go `StorageBytes(name)` gauges report the number
+the limit checks, which depends on where the database lives. TypeScript's public async API does
+not currently expose this gauge.
 
 **In-memory databases** count their pages: the page high-water times the page size. A commit that
 would raise it past the limit first reclaims any dead pages. jed keeps freed pages for reuse and

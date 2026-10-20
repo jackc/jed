@@ -381,6 +381,13 @@ fail `BUSY` until that transaction ends. A transaction callback awaits applicati
 without surrendering ownership. `view`/`update` roll back on exceptions and commit on
 success. Do not await a competing writer from inside the callback that holds the writer.
 
+Session limit setters use `await session.configure({...})`. The initial async surface does not
+yet expose compaction, changing per-database storage limits after open, the storage-byte gauge,
+or resetting an individual custom session variable. `maxStorageBytes` is accepted at create/open;
+new sessions start without custom variables and can initialize them through `configure({vars})`.
+These remain host API follow-ons, not methods
+applications can import from the public async entry points today.
+
 `query(sql, Value[], {signal})` and prepared `query(Value[], {signal})` return async,
 single-pass rows. Column names/types and command count are returned at open; cost is final
 after drain. `next()` fetches only on demand, `return()`/early loop exit and `close()` release
