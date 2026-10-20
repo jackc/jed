@@ -12,16 +12,20 @@
 The attacker can read every copy of the file at rest (backups, snapshots, crash remnants, the
 replication log) and compare them offline; can write to the file at rest, including replaying
 older genuine pages and swapping the file for another; and, while the process runs, can read and
-write the scratch directory. The attacker cannot read the running process's memory, cannot
-restore a live VM clone with duplicated RNG state, and cannot roll back the whole file undetected.
+write the scratch directory. The attacker cannot read the running process's memory — on any
+machine that runs an engine process, including an SSH page server, which holds the key (§8), so
+encryption gives no protection against the host a remote file lives on — and cannot restore a live
+VM clone with duplicated RNG state.
 
 Against that attacker jed guarantees **confidentiality of page contents** and **detection of
-tampering**: a tampered or replayed page is `XX001` or a credential error, never wrong rows. Not
-guaranteed: confidentiality of structure (the plaintext meta slot shows live size, commit count
-and the pages the last commit wrote); whole-file rollback and substitution of one valid database
-for another under the same credential — both need trusted state the engine does not have, and a
-host that holds some closes both by remembering the meta slot's tag; and secrecy of keys in process
-memory (Go and TS cannot zeroize).
+tampering**: a tampered or replayed page is `XX001` or a credential error, never wrong rows. Out
+of scope: confidentiality of structure (the plaintext meta slot shows live size, commit count and
+the pages the last commit wrote); rollback — of the whole file, of the newest commit by corrupting
+one page its manifest lists (the same fallback a plaintext file makes), or by substituting another
+valid database under the same credential — all of which need trusted state the engine does not
+have, and a host that holds some closes all three by remembering the meta slot's tag; and secrecy
+of keys in process memory (Go and TS cannot zeroize; hosts should disable core dumps and encrypt
+swap, which can hold keys and plaintext pages).
 
 **Edge cases fail closed; they are not survived.** A crash, lost connection or owner change at a
 bad moment may cost the host a reopen. It may never cost security. Wherever a resume protocol
@@ -43,46 +47,51 @@ hand-rolled because its encoders are not standardized (large-values.md §6).
 
 ## 3. Construction
 
-**Decided: AES-256-GCM with one single-use key per page, derived from the data key and a fresh
-random 192-bit salt.** Nothing about nonces is allocated, counted or persisted. Every seal,
-including a retried or failed commit, a restored backup or a writable copy, draws new randomness,
-so nonce uniqueness needs no protocol and survives every history fork by construction. The salt
-and the 16-byte tag live in the page's reserved tail (§4).
+**Decided: one single-use AES-256-GCM key per page, derived from the data key and a fresh random
+192-bit salt; nothing about nonces is allocated, counted or persisted.** Every seal, including a
+retried or failed commit, a restored backup or a writable copy, draws new randomness, so nonce
+uniqueness needs no protocol and survives every history fork by construction. The salt and the
+16-byte tag live in the page's reserved tail (§4). The exact derivation is **direction, pending
+the security review**, which turns it into a format decision.
 
-The derivation is **XAES-256-GCM** ([C2SP](https://github.com/C2SP/C2SP/blob/main/XAES-256-GCM.md))
-as the primary candidate: the first 96 salt bits and the data key go through a two-block
-CMAC-AES-256 counter-mode KDF (label `X`, 16-bit counter) to a one-message key, and the last 96
-bits are the GCM nonce. Two distinct salts sharing their first half share a key under distinct
-nonces, which is safe; fixtures check uniqueness of the whole salt. A jed-specific
-HKDF-SHA-256-then-fixed-nonce layout is the fallback. The security review decides between them;
-until the CLAUDE.md §14 ruling on the hand-written CMAC step below, the ranking is provisional.
-Neither construction is nonce-misuse-resistant or key-committing, and neither needs to be: one
+The construction is **XAES-256-GCM** ([C2SP](https://github.com/C2SP/C2SP/blob/main/XAES-256-GCM.md)),
+decided 2026-10-20 as the boring choice: a published specification whose purpose is to be the
+extended-nonce AES-GCM, with test vectors, a reference implementation and a published analysis
+of its derivation (ePrint 2025/878). The salt is its 192-bit nonce: the first 96 bits and the
+page subkey go through a two-block CMAC-AES-256 counter-mode KDF (label `X`, 16-bit counter) to
+a one-message key, and the last 96 bits are the GCM nonce. No platform library but RustCrypto
+exposes CMAC, so that derivation — the CMAC subkey (one AES block, one GF(2^128) doubling,
+branch-free) and two single-block CMACs — is written in Go, TS, Ruby and future cores against
+the C2SP vectors. That is glue over a library AES, not a primitive, and is recorded as admissible
+under CLAUDE.md §14 on that basis. (A jed-specific HKDF-then-fixed-nonce layout was weighed and
+set aside: it avoided the glue by inventing a composition a reviewer would have to review rather
+than recognize.) A repeated salt under one data key is the hazard; fixtures check uniqueness of
+the whole salt, and the collision term for `q` seals is about `q(q−1)/2^193`.
+XAES is not nonce-misuse-resistant or key-committing, and need not be: one
 DEK per file and rotation by compaction mean no reader ever tries two keys against a page, and a
 partitioning-oracle attack on the passphrase wrap needs an attacker who can already read the
 block and guess offline. KC-XAES (ePrint 2025/758) is declined for the same reason.
 
 **Why AES-GCM.** Platform support: AES-GCM is in every platform's standard library, the raw AES
-block in every one but CryptoKit (Swift leans wrap, CLAUDE.md §2), HKDF and PBKDF2 everywhere.
+block in every one but CryptoKit (Swift leans wrap, CLAUDE.md §2), HKDF everywhere.
 XChaCha20-Poly1305 is in no platform library and needs HChaCha20 that none exposes; AES-GCM-SIV
 is in almost none and costs two passes. GCM-SIV fails more gracefully under duplicated randomness
 and is declined for platform support alone, a knowing trade; reconsider it if live VM clones
-enter the threat model. No platform library but RustCrypto exposes CMAC, so XAES's derivation —
-the CMAC subkey (one AES block, one GF(2^128) doubling, written branch-free) and two single-block
-CMACs — is hand-written in Go, TS, Ruby and future cores against the C2SP vectors; the HKDF
-fallback needs no hand-written primitive anywhere. That is the §14 question.
+enter the threat model.
 
-| Platform | AES-256-GCM | Raw AES block | HKDF / PBKDF2 |
-|---|---|---|---|
-| Go | stdlib | stdlib | stdlib (1.24+) |
-| Rust | RustCrypto `aes-gcm` | RustCrypto `aes` | RustCrypto `hkdf`, `pbkdf2` |
-| Node | `node:crypto` (sync) | `node:crypto` ECB | `node:crypto` |
-| Browser | WebCrypto (async) | AES-CTR over one zero block with the counter set to the input | WebCrypto |
-| Ruby (goldens, `verify.rb`) | `openssl` gem | `openssl` gem | `openssl` gem |
-| Java / .NET | JCA / `AesGcm` | ECB | JDK 25+ `KDF`, .NET `HKDF` |
-| Swift | CryptoKit | none | CryptoKit HKDF |
+| Platform | AES-256-GCM | Raw AES block (XAES glue) | HKDF-SHA-256 | Argon2id |
+|---|---|---|---|---|
+| Go | stdlib | stdlib | stdlib (1.24+) | `golang.org/x/crypto/argon2` (pure Go) |
+| Rust | RustCrypto `aes-gcm` | RustCrypto `aes` | RustCrypto `hkdf` | RustCrypto `argon2` |
+| Node | `node:crypto` (sync) | `node:crypto` ECB | `node:crypto` | `@noble/hashes` (already approved) |
+| Browser | WebCrypto (async) | AES-CTR over one zero block with the counter set to the input | WebCrypto | `@noble/hashes` |
+| Ruby (goldens, `verify.rb`) | `openssl` gem | `openssl` gem | `openssl` gem | not needed: fixtures inject the KEK |
+| Java / .NET | JCA / `AesGcm` | ECB | JDK 25+ `KDF`, .NET `HKDF` | Bouncy Castle / `Konscious` |
+| Swift | CryptoKit | CommonCrypto ECB | CryptoKit HKDF | third-party (Swift leans wrap) |
 
-**Measured** (`bench/aead/`, hot memory, 8 KiB pages): fixed-key AES-GCM seal/open is about 0.9 µs
-in Go and 2.7 µs in Rust; a per-page key derivation adds 0.5 µs in Go and 0.1–0.3 µs in Rust on
+**Measured** (`bench/aead/`, hot memory, 8 KiB pages; the derivation timed was an HKDF layout of the same shape, XAES itself is unmeasured):
+fixed-key AES-GCM seal/open is about 0.9 µs
+in Go and 2.7 µs in Rust; a per-page HKDF key derivation adds 0.5 µs in Go and 0.1–0.3 µs in Rust on
 open, small beside the I/O and decode a real cache miss pays. Native Node is a few microseconds
 per page and WebCrypto in a real worker 7–9 µs under a fixed key (per-page `importKey` is
 unmeasured). Per-commit and writer-lifetime key granularities were measured and rejected: they
@@ -96,8 +105,9 @@ meta, key block) and one per handle (scratch), so per-core scratch framing canno
 page salts under the fixed source. A commit draws its salts in one batch, after every check that
 can refuse the commit and immediately before sealing, in **format.md's commit write order** (per
 table post-order, index trees, catalog chain; every chain tail first), then free-list, manifest
-and meta; images draw in stream order after the DEK, KDF salt, wrap nonce and key-block
-salt. The engine keeps no entropy pool across commits. A `fork`ed handle is already invalid
+and meta; images draw in stream order after the DEK, KDF salt and wrap nonce. In simulation each
+process's streams are seeded from the trace seed and its process id, so an owner and its clients
+never share a stream. The engine keeps no entropy pool across commits. A `fork`ed handle is already invalid
 (locking.md §3). Live VM clones are excluded: a clone resumes with the guest RNG duplicated and
 no engine-side mixing survives it; a host that restores live snapshots reseeds before the first
 write.
@@ -109,10 +119,11 @@ salts) and cost family. A plaintext file's layout is untouched.
 
 **Reserve (Decided).** The meta slot records `reserved_bytes`; usable capacity is
 `C = page_size − 16 − reserved_bytes`. A plaintext file reserves 0; an encrypted file reserves
-what its suite needs (40 bytes under XAES: 24-byte salt + 16-byte tag). It is self-description,
+what its suite needs (40 bytes under either §3 construction: 24-byte salt + 16-byte tag). It is self-description,
 never a setting. Record caps, split points and chunk sizes follow `C` as today.
 
-**Body pages (Decided).** Every page but the meta slots and manifest-overflow pages — catalog,
+**Body pages (Decided).** Every page but the meta slots, the key block (pages 2–3) and
+manifest-overflow pages — catalog,
 B-tree and GiST nodes, overflow, free-list — is encrypted whole, header included (a plaintext
 `page_type` or `next_page` would leak the tree's shape). Associated data: page index and the
 suite/variant identifier. The body-page CRC is dropped; the tag supersedes it, and recovery's
@@ -159,15 +170,21 @@ and by credential changes, never by a data commit.
 ## 5. Keys
 
 **Hierarchy.** A random 256-bit **DEK** per file; HKDF-SHA-256 derives two subkeys from it at
-unlock, for pages and for meta/manifest authentication. A **KEK** wraps the DEK (AEAD, with the
-copy's plaintext fields as associated data, so no parameter can be altered or downgraded without
-the unwrap failing). The KEK is derived per file from the credential over the block's KDF salt:
-by **PBKDF2-HMAC-SHA-256** from a passphrase (in every platform library; not memory-hard, which
-is why the raw key is first-class and the block carries a KDF identifier for a later Argon2id),
-or by HKDF from a host-supplied 32-byte key (never used directly, so one host key over many files
-gives distinct KEKs). The iteration count is a fixed default with a host override, never
-time-calibrated, and the format fixes a maximum count and salt length checked **before** the KDF
-runs, so a tampered block cannot make `open` burn CPU before it fails.
+unlock, for pages and for meta/manifest authentication. A **KEK** wraps the DEK with AES-256-GCM
+under a random 96-bit nonce stored in the copy, with the copy's plaintext fields as associated
+data, so no parameter can be altered or downgraded without the unwrap failing. The KEK is derived
+per file from the credential over the block's KDF salt, and every rewrap draws a fresh salt and
+nonce, so an unchanged passphrase still yields a new KEK:
+by **Argon2id** (RFC 9106) from a passphrase, or by HKDF from a host-supplied 32-byte key (never
+used directly, so one host key over many files gives distinct KEKs). Argon2id is the current
+recommendation for passphrases and is memory-hard, which is what defeats the offline GPU guessing
+the §1 attacker can mount against a copied file; it costs a dependency in every core but Rust
+(the table in §3), accepted knowingly under CLAUDE.md §14. The parameters default to RFC 9106's
+second recommendation — 64 MiB memory, 3 passes, 4 lanes — with a host override, never
+time-calibrated, and the format fixes a maximum memory, pass count and salt length checked
+**before** the KDF runs, so a tampered block cannot make `open` exhaust memory or CPU before it
+fails. The block's KDF identifier allows a later KDF without a format break; there is no second
+built-in KDF today.
 
 **Credential input.** The credential is an argument of `create`/`open`/`attach`, never a
 setting, so it cannot reach `current_setting()`, `SHOW`, EXPLAIN or an error message. Rules, each
@@ -184,13 +201,17 @@ fail-closed:
 **Selecting a copy.** The reader takes the **newest CRC-valid copy by generation**, before any
 credential is presented, attempts the unwrap against it alone, and never falls back to the older
 copy (that would let a revoked wrapper outlive its revocation). Bit rot in one copy is harmless;
-in both, `XX001`.
+in both, `XX001`. Two CRC-valid copies at the same generation with different bytes are also
+`XX001`: the protocol below never writes that, so it is tampering.
 
 **Changing the credential** rewraps the same DEK; no page is rewritten. The process holds the
 writer gate and the file (page clients cannot: a client's request is refused, `55000`, and the
-host changes the credential from the owner). It derives the new KEK first (PBKDF2 takes hundreds
-of milliseconds nobody should wait for under the gate), then: write page 3, barrier, write page 2,
-barrier, acknowledge. Before its **first** key-block write of any kind a writer issues one
+host changes the credential from the owner). It derives the new KEK first (Argon2id takes hundreds
+of milliseconds nobody should wait for under the gate), then: write **the copy that is not the
+selected one** (the older or invalid copy; page 3 when both are equal), barrier, write the other,
+barrier, acknowledge. Writing the non-selected copy first is what lets a pair stay unrepaired
+safely: the only valid copy is never the first overwritten, so a second crash cannot tear both.
+Before its **first** key-block write of any kind a writer issues one
 stabilization barrier — of the file and, after a rename, its directory — so the copy it is about
 to overwrite is never the sole durable one. If the two copies differ at open, the opener that
 unwrapped the newer copy copies it over the older (barrier, copy, barrier); a read-only open, or
@@ -203,7 +224,8 @@ the two does, never neither.
 (api.md §2.6), inheriting compaction's limits. Encrypting a plaintext file and decrypting an
 encrypted one are the same operation; both **rebuild** every tree under the target layout (the
 node-preserving compaction cannot carry packed pages across a capacity change) and fail before
-the rename, with the source untouched, when a row cannot be stored under the target or the result
+the rename, with the source untouched, when a row or an index key cannot be stored under the
+target (`C` is smaller and pointers wider, so `RECORD_MAX` and the key cap both fall) or the result
 exceeds `max_storage_bytes`. Plain compaction keeps the DEK and key block and re-seals every page
 with fresh salts. Rotation starts a new replication timeline, so keyless replicas re-seed.
 
@@ -256,28 +278,37 @@ across every attempted seal.
 
 ## 8. Multiple processes and replication
 
-**Every process of an encrypted database holds the key**: owner, every page client, the SSH page
-server. There is no keyless owner. A page client never opens the file; it unlocks by fetching the
-key block through `read_key_block` and unwrapping it with its own credential. Over SSH the
-credential travels in `hello` on the encrypted stream, never `argv` or the environment, or the
-server is configured with it; either way it leaves the client machine. A client reconnecting to a
-surviving owner needs no credential (its DEK is unchanged); if no owner survives, the reconnect
-fails `28P02` and the host reopens — there is no cached-DEK resume.
+**Every process of an encrypted database holds the DEK**: owner, every page client, the SSH page
+server. There is no keyless owner (a keyless *read-only* owner is conceivable, since recovery is
+keyless and it writes nothing; not pursued). A page client unlocks by fetching the key block
+through `read_key_block` and unwrapping it with its credential. The credential is needed only to
+unwrap a key block; **the DEK alone opens the file**. So a client **promotes to owner with the DEK
+it holds** (page-service.md §8.1), verifying it against the meta slot's tag, and ownership
+handoff, yield and the read-only owner's deferral to a writer all work as for a plaintext file; a
+promoted process without the credential leaves a differing key-block pair unrepaired, which §5
+makes safe. Over SSH the credential travels in `hello` on the encrypted stream, never `argv` or
+the environment, or the server is configured with it; either way it reaches the remote host (§1).
+A reconnect that must start a fresh process with neither DEK nor credential — an SSH helper whose
+owner is gone — fails `28P02` and the host reopens; there is no cached-DEK resume.
 
 The owner answers `read_pages` with **stored bytes** read below its codec, never a re-sealed
 page: a re-seal has a fresh tag that no parent binds. Compaction, rotation and conversion allow
-idle connected clients, which re-authenticate the meta slot with their held subkey at their next
-transaction; a failure is `28P04` (reopen) — the client cannot tell a rotation from tampering and
-need not, since the reopen with the credential surfaces tampering as `28P01` or `XX001`.
+idle connected clients, which at their next transaction check that the meta slot still has the
+variant and reserve they opened and still authenticates under their held subkey; a failure is
+`28P04` (reopen) — the client cannot tell a rotation from tampering and need not, since the
+reopen with the credential surfaces tampering as `28P01` or `XX001`.
 
 **Backups** (page-service.md §9) take the key block through `read_key_block`, which the owner
-serves under the lock a credential change holds, and write the returned copy to both pages;
-plain page reads could capture a torn pair mid-change. Taking a page-identical backup needs the
-key, since the walk follows pointers; only applying deltas is keyless.
+serves under a key-block mutex that a credential change holds only across its two writes (not the
+writer gate, so a backup never waits behind a long transaction), and write the returned copy to
+both pages; plain page reads could capture a torn pair mid-change. Taking a page-identical backup
+needs the DEK, since the walk follows pointers; only applying deltas is keyless.
 
 **Replication.** A credential change is an item in the stream, ordered after the commit it
 follows; the cursor is `(txid, key_generation)`. The replica applies it with the same
-two-barrier protocol. The primary makes the entry durable before acknowledging the change (a
+two-barrier protocol, non-selected copy first, so a keyless replica that crashed mid-apply and
+never repaired cannot lose its only valid copy to a second crash (fixture: two interrupted
+applies across a keyless restart). The primary makes the entry durable before acknowledging the change (a
 rewrap has no page-reuse pressure); a key block one generation ahead of the log is rebuilt from
 pages 2–3 like a single missing commit entry. A replica resumes from a base image by applying
 data commits with a greater `txid` and key-block deltas with a greater generation, as two
@@ -286,10 +317,9 @@ promoted replica finishes a torn pair from its log entry.
 
 ## 9. Open
 
-- **XAES versus the HKDF fallback**, and the CLAUDE.md §14 ruling on the hand-written CMAC step
-  (or on treating the specification author's reference Go implementation as a vetted dependency).
-  For the fallback: salt length, extract-versus-expand layout, lifetime bounds across every DEK
-  use, and WebCrypto's extract-then-expand-only HKDF.
+- **XAES lifetime bounds across every DEK use**, and the exact library route per core (the
+  RustCrypto `xaes-256-gcm` crate or the `aes` + `cmac` + `aes-gcm` composition in Rust; the
+  spec-fixed glue elsewhere).
 - **The security review**: the composition as a mutable page codec (the ePrint 2025/878 analysis
   covers only the CMAC derivation; the GCM composition rests on the C2SP argument), the pointer
   chain, the key-block wrap, the lifetime bounds. With the fixtures of §7 this turns direction into
@@ -325,7 +355,7 @@ rollback, and a stale client learns its DEK is stale from the meta tag alone).
   [design write-up](https://words.filippo.io/xaes-256-gcm/), and
   [Benhamouda, Halevi, Kampanakis, Krawczyk, ePrint 2025/878](https://eprint.iacr.org/2025/878)
 - [RFC 8452, AES-GCM-SIV](https://www.rfc-editor.org/rfc/rfc8452) §9
-- [NIST SP 800-132, PBKDF2](https://csrc.nist.gov/pubs/sp/800/132/final)
+- [RFC 9106, Argon2](https://www.rfc-editor.org/rfc/rfc9106) (§4 parameter recommendations)
 - [Envelope encryption](https://docs.aws.amazon.com/kms/latest/developerguide/kms-cryptography.html)
 - [RustCrypto AES backends](https://docs.rs/aes/latest/aes/), [Go AES timing](https://pkg.go.dev/crypto/aes),
   [Noble ciphers](https://github.com/paulmillr/noble-ciphers)

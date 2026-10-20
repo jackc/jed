@@ -658,15 +658,17 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   per-file key; a credential change is acknowledged after a second barrier and rides the
   replication stream; converting between variants rebuilds the trees; key
   material comes from a dedicated CSPRNG source, never the seeded SQL entropy seam; the built-in
-  passphrase KDF is PBKDF2-HMAC-SHA-256 behind a KDF identifier, with a host-supplied wrapping
-  key as the first-class credential; live VM clones are excluded from the threat model; every
+  passphrase KDF is Argon2id behind a KDF identifier (a dependency in every core but Rust,
+  accepted knowingly), with a host-supplied wrapping key as the first-class credential; live VM
+  clones are excluded from the threat model; every
   process of an encrypted database (owner, page client, SSH page server) holds the key; browser
   performance does not decide the suite. Suite direction, pending security review: AES-256-GCM
   with one key derived per page from a fresh random salt, because AES-GCM is in every platform
   standard library and the raw AES block in every one but CryptoKit (Swift leans wrap), while
   XChaCha20-Poly1305 is in none; the derivation is
-  **XAES-256-GCM** (C2SP) as the primary candidate, with a jed-specific HKDF-SHA-256 layout as
-  the fallback (encryption.md §3). AES-GCM-SIV fails more gracefully under duplicated
+  **XAES-256-GCM** (C2SP), a published construction with vectors and analysis, whose two-block
+  CMAC glue over library AES is written per core and admitted under §14 as glue, not a primitive
+  (encryption.md §3). AES-GCM-SIV fails more gracefully under duplicated
   randomness (a live VM clone, which a kernel CSPRNG does not by itself survive) and is declined
   for platform support alone, a knowing trade (encryption.md §3).
   Vetted libraries expose safe APIs; explicitly reviewed assembly/intrinsics behind those APIs
