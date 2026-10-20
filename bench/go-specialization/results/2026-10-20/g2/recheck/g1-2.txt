@@ -1,0 +1,9 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkSpecialization/file/point_hit-24         	  220754	      1200 ns/op	 779388637 checksum	 393503400 checksum1	         6.000 cost	         6.000 cost1	    1632 B/op	      22 allocs/op
+BenchmarkSpecialization/file/scalar-24            	  541435	       523.0 ns/op	 393503400 checksum	 410281019 checksum1	         2.000 cost	         2.000 cost1	    1352 B/op	      12 allocs/op
+BenchmarkSpecialization/file/unsupported-24       	     729	    437426 ns/op	3765470213 checksum	3765470213 checksum1	     12300 cost	     12300 cost1	  526012 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/columnar-24          	    4711	     66910 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+PASS

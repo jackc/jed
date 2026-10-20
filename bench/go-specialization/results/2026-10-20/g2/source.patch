@@ -1,0 +1,660 @@
+diff --git a/impl/go/exec_scan.go b/impl/go/exec_scan.go
+index 3b77501..f7441e2 100644
+--- a/impl/go/exec_scan.go
++++ b/impl/go/exec_scan.go
+@@ -621,2 +621 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
+-				value, evalErr := k.eval(row, filterEnv, c.meter)
+-				v, err = value.IsTrue(), evalErr
++				v, err = k.evalFilter(row, filterEnv, c.meter)
+diff --git a/impl/go/specialization.go b/impl/go/specialization.go
+index 5b2acf0..4539142 100644
+--- a/impl/go/specialization.go
++++ b/impl/go/specialization.go
+@@ -5,5 +5,2 @@ package jed
+-// G1 deliberately has a tighter grammar than the shared structural ceilings:
+-// at most seven source nodes, depth three, seven descriptors and four primitive
+-// constants per root; eight roots per plan. No recursive compiler, pool, register
+-// file, runtime closure, per-row scratch allocation or retained source pointers.
+-// Descriptors are filled before the existing atomic plan-cache publication.
++// G1 patterns are terminals of the bounded G2 composition. All descriptors
++// are immutable before the existing atomic plan-cache publication.
+@@ -37,0 +35,3 @@ type scalarKernel struct {
++	children    [3]*scalarKernel
++	run         kernelFunc
++	leaf        bool
+@@ -117 +117 @@ func bindKernelOperand(e *rExpr, columns []catColumn, params []colType) (kernelO
+-func bindScalarKernel(e *rExpr, columns []catColumn, params []colType) *scalarKernel {
++func bindStaticKernel(e *rExpr, columns []catColumn, params []colType) *scalarKernel {
+@@ -147 +147 @@ func bindScalarKernel(e *rExpr, columns []catColumn, params []colType) *scalarKe
+-		return nil // bare leaves and all G2 forms are ordinary controls
++		return nil // composed forms are handled by the bounded G2 binder
+@@ -178 +178 @@ func (db *engine) prepareSpecialization(p *selectPlan, params []colType) {
+-			ks.reasons[slot] = "G1 static kernel"
++			ks.reasons[slot] = "bounded G1/G2 kernel"
+@@ -234,0 +235,13 @@ func (k *scalarKernel) eval(row storedRow, env *evalEnv, m *costMeter) (Value, e
++	return k.evalMode(row, env, m, false)
++}
++
++func (k *scalarKernel) evalMode(row storedRow, env *evalEnv, m *costMeter, filter bool) (Value, error) {
++	if specializationClosures {
++		return k.run(row, env, m, filter)
++	}
++	if k.leaf {
++		return k.left.left.load(row, env, m)
++	}
++	if k.children[0] != nil {
++		return k.evalComposition(row, env, m, filter)
++	}
+@@ -258,0 +272,4 @@ func (k *scalarKernel) eval(row storedRow, env *evalEnv, m *costMeter) (Value, e
++	return compareKernel(k.op, a, b, m)
++}
++
++func compareKernel(op binaryOp, a, b Value, m *costMeter) (Value, error) {
+@@ -273 +290 @@ func (k *scalarKernel) eval(row storedRow, env *evalEnv, m *costMeter) (Value, e
+-	switch k.op {
++	switch op {
+diff --git a/impl/go/specialization_bench_test.go b/impl/go/specialization_bench_test.go
+index 09f118d..69d1d23 100644
+--- a/impl/go/specialization_bench_test.go
++++ b/impl/go/specialization_bench_test.go
+@@ -64,0 +65,2 @@ func BenchmarkSpecialization(b *testing.B) {
++				{name: "boolean", sql: "SELECT id FROM t WHERE (a+b > $1 AND b<12) OR a IS NULL ORDER BY id"},
++				{name: "coalesce", sql: "SELECT coalesce(CASE WHEN a>50 THEN a+b ELSE NULL END,b) FROM t ORDER BY id"},
+diff --git b/impl/go/specialization_closures.go b/impl/go/specialization_closures.go
+new file mode 100644
+index 0000000..8b2b638
+--- /dev/null
++++ b/impl/go/specialization_closures.go
+@@ -0,0 +1,179 @@
++//go:build jed_specialization
++
++package jed
++
++// One closure per source node, selected at preparation, over exactly the static
++// binder's admitted surface. Captures contain scalar descriptors/child functions
++// only. Unlike the static control, G1 fused patterns expand to individual nodes.
++func closeLeaf(l kernelLeaf) kernelFunc {
++	return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) { return l.load(row, env, m) }
++}
++
++func closeArithmetic(op binaryOp, width scalarType, charge int64, left, right kernelFunc) kernelFunc {
++	return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++		if err := m.Guard(); err != nil {
++			return Value{}, err
++		}
++		m.Charge(charge)
++		a, err := left(row, env, m, false)
++		if err != nil {
++			return Value{}, err
++		}
++		b, err := right(row, env, m, false)
++		if err != nil {
++			return Value{}, err
++		}
++		if a.IsNull() || b.IsNull() {
++			return NullValue(), nil
++		}
++		return evalArith(op, a.Int, b.Int, width)
++	}
++}
++
++func closeOperand(o kernelOperand) kernelFunc {
++	if !o.arith {
++		return closeLeaf(o.left)
++	}
++	return closeArithmetic(o.op, o.width, o.charge, closeLeaf(o.left), closeLeaf(o.right))
++}
++
++func closeKernel(k *scalarKernel) kernelFunc {
++	if k.leaf {
++		return closeLeaf(k.left.left)
++	}
++	kind, op, charge, negated := k.kind, k.op, k.charge, k.negated
++	var left, right, third kernelFunc
++	if k.children[0] != nil {
++		left = closeKernel(k.children[0])
++		if k.children[1] != nil {
++			right = closeKernel(k.children[1])
++		}
++		if k.children[2] != nil {
++			third = closeKernel(k.children[2])
++		}
++	} else {
++		left = closeOperand(k.left)
++		if kind == reArith || kind == reCompare {
++			right = closeOperand(k.right)
++		}
++	}
++	switch kind {
++	case reArith:
++		return closeArithmetic(op, k.width, charge, left, right)
++	case reCompare:
++		return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			b, err := right(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			return compareKernel(op, a, b, m)
++		}
++	case reAnd:
++		return func(row storedRow, env *evalEnv, m *costMeter, filter bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, filter)
++			if err != nil {
++				return Value{}, err
++			}
++			if filter && !a.IsTrue() {
++				return BoolValue(false), nil
++			}
++			if to3(a) == False {
++				return a, nil
++			}
++			b, err := right(row, env, m, filter)
++			if err != nil {
++				return Value{}, err
++			}
++			if filter {
++				return BoolValue(b.IsTrue()), nil
++			}
++			return boolAnd(a, b), nil
++		}
++	case reOr:
++		return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			if to3(a) == True {
++				return a, nil
++			}
++			b, err := right(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			return boolOr(a, b), nil
++		}
++	case reNot:
++		return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			return boolNot(a), nil
++		}
++	case reIsNull:
++		return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			return BoolValue(a.IsNull() != negated), nil
++		}
++	case reCase:
++		return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			if a.IsTrue() {
++				return right(row, env, m, false)
++			}
++			return third(row, env, m, false)
++		}
++	case reCoalesce:
++		return func(row storedRow, env *evalEnv, m *costMeter, _ bool) (Value, error) {
++			if err := m.Guard(); err != nil {
++				return Value{}, err
++			}
++			m.Charge(charge)
++			a, err := left(row, env, m, false)
++			if err != nil {
++				return Value{}, err
++			}
++			if !a.IsNull() {
++				return a, nil
++			}
++			return right(row, env, m, false)
++		}
++	}
++	panic("invalid closure kernel")
++}
+diff --git b/impl/go/specialization_closures_off.go b/impl/go/specialization_closures_off.go
+new file mode 100644
+index 0000000..cac05cf
+--- /dev/null
++++ b/impl/go/specialization_closures_off.go
+@@ -0,0 +1,5 @@
++//go:build jed_specialization && !jed_specialization_closures
++
++package jed
++
++const specializationClosures = false
+diff --git b/impl/go/specialization_closures_on.go b/impl/go/specialization_closures_on.go
+new file mode 100644
+index 0000000..829a621
+--- /dev/null
++++ b/impl/go/specialization_closures_on.go
+@@ -0,0 +1,5 @@
++//go:build jed_specialization && jed_specialization_closures
++
++package jed
++
++const specializationClosures = true
+diff --git b/impl/go/specialization_composition.go b/impl/go/specialization_composition.go
+new file mode 100644
+index 0000000..42fbd82
+--- /dev/null
++++ b/impl/go/specialization_composition.go
+@@ -0,0 +1,179 @@
++//go:build jed_specialization
++
++package jed
++
++// Limits are checked before constructing any descriptor/closure. Children of a
++// rejected root are never executed. No source node or execution state is retained.
++const (
++	specializationMaxNodes = 192
++	specializationMaxDepth = 32
++)
++
++type kernelFunc func(storedRow, *evalEnv, *costMeter, bool) (Value, error)
++
++func boundedKernelShape(e *rExpr, depth int, nodes *int) bool {
++	if e == nil || depth > specializationMaxDepth || *nodes >= specializationMaxNodes {
++		return false
++	}
++	*nodes++
++	child := func(c *rExpr) bool { return boundedKernelShape(c, depth+1, nodes) }
++	switch e.kind {
++	case reColumn, reParam, reConstInt, reConstBool, reConstNull:
++		return true
++	case reArith, reCompare, reAnd, reOr:
++		return child(e.lhs) && child(e.rhs)
++	case reNot, reIsNull:
++		return child(e.operand)
++	case reCase:
++		return !e.caseDecimal && len(e.caseArms) == 1 && child(e.caseArms[0].cond) && child(e.caseArms[0].result) && child(e.caseEls)
++	case reCoalesce:
++		return !e.caseDecimal && len(e.sargs) == 2 && child(e.sargs[0]) && child(e.sargs[1])
++	}
++	return false
++}
++
++func bindScalarKernel(e *rExpr, columns []catColumn, params []colType) *scalarKernel {
++	nodes := 0
++	if !boundedKernelShape(e, 1, &nodes) {
++		return nil
++	}
++	k, _ := bindComposedKernel(e, columns, params)
++	if k != nil && specializationClosures {
++		// The closure build retains only closures, not a second descriptor graph.
++		run := closeKernel(k)
++		return &scalarKernel{run: run}
++	}
++	return k
++}
++
++func bindComposedKernel(e *rExpr, columns []catColumn, params []colType) (*scalarKernel, rtKind) {
++	if k := bindStaticKernel(e, columns, params); k != nil {
++		if e.kind == reArith {
++			return k, rtInt
++		}
++		return k, rtBool
++	}
++	if leaf, ty, ok := bindKernelLeaf(e, columns, params); ok {
++		return &scalarKernel{leaf: true, left: kernelOperand{left: leaf}}, ty
++	}
++	var source [3]*rExpr
++	k := &scalarKernel{kind: e.kind, negated: e.negated, charge: costs.OperatorEval}
++	switch e.kind {
++	case reAnd, reOr:
++		source[0], source[1] = e.lhs, e.rhs
++		if e.kind == reAnd {
++			k.charge = operatorCost("and")
++		} else {
++			k.charge = operatorCost("or")
++		}
++	case reNot, reIsNull:
++		source[0] = e.operand
++		if e.kind == reNot {
++			k.charge = operatorCost("not")
++		}
++	case reCase:
++		source[0], source[1], source[2] = e.caseArms[0].cond, e.caseArms[0].result, e.caseEls
++	case reCoalesce:
++		source[0], source[1] = e.sargs[0], e.sargs[1]
++	default:
++		return nil, rtNull
++	}
++	var types [3]rtKind
++	for i, child := range source {
++		if child == nil {
++			continue
++		}
++		k.children[i], types[i] = bindComposedKernel(child, columns, params)
++		if k.children[i] == nil {
++			return nil, rtNull
++		}
++	}
++	boolean := func(t rtKind) bool { return t == rtBool || t == rtNull }
++	switch e.kind {
++	case reAnd, reOr:
++		if !boolean(types[0]) || !boolean(types[1]) {
++			return nil, rtNull
++		}
++		return k, rtBool
++	case reNot:
++		if !boolean(types[0]) {
++			return nil, rtNull
++		}
++		return k, rtBool
++	case reIsNull:
++		return k, rtBool
++	case reCase:
++		if !boolean(types[0]) {
++			return nil, rtNull
++		}
++		types[0], types[1] = types[1], types[2]
++	}
++	// CASE/COALESCE have no coercion on the admitted integer/boolean surface.
++	if types[0] == rtNull {
++		return k, types[1]
++	}
++	if types[1] == rtNull || types[0] == types[1] {
++		return k, types[0]
++	}
++	return nil, rtNull
++}
++
++func (k *scalarKernel) evalFilter(row storedRow, env *evalEnv, m *costMeter) (bool, error) {
++	specializationInvoked()
++	v, err := k.evalMode(row, env, m, true)
++	return v.IsTrue(), err
++}
++
++func (k *scalarKernel) evalComposition(row storedRow, env *evalEnv, m *costMeter, filter bool) (Value, error) {
++	if err := m.Guard(); err != nil {
++		return Value{}, err
++	}
++	m.Charge(k.charge)
++	// Only an AND in filter context propagates that context to its children.
++	childFilter := filter && k.kind == reAnd
++	a, err := k.children[0].evalMode(row, env, m, childFilter)
++	if err != nil {
++		return Value{}, err
++	}
++	switch k.kind {
++	case reAnd:
++		if childFilter && !a.IsTrue() {
++			return BoolValue(false), nil
++		}
++		if to3(a) == False {
++			return a, nil
++		}
++		b, err := k.children[1].evalMode(row, env, m, childFilter)
++		if err != nil {
++			return Value{}, err
++		}
++		if childFilter {
++			return BoolValue(b.IsTrue()), nil
++		}
++		return boolAnd(a, b), nil
++	case reOr:
++		if to3(a) == True {
++			return a, nil
++		}
++		b, err := k.children[1].evalMode(row, env, m, false)
++		if err != nil {
++			return Value{}, err
++		}
++		return boolOr(a, b), nil
++	case reNot:
++		return boolNot(a), nil
++	case reIsNull:
++		return BoolValue(a.IsNull() != k.negated), nil
++	case reCase:
++		if a.IsTrue() {
++			return k.children[1].evalMode(row, env, m, false)
++		}
++		return k.children[2].evalMode(row, env, m, false)
++	case reCoalesce:
++		if !a.IsNull() {
++			return a, nil
++		}
++		return k.children[1].evalMode(row, env, m, false)
++	}
++	panic("invalid composition")
++}
+diff --git b/impl/go/specialization_composition_test.go b/impl/go/specialization_composition_test.go
+new file mode 100644
+index 0000000..d022c48
+--- /dev/null
++++ b/impl/go/specialization_composition_test.go
+@@ -0,0 +1,119 @@
++//go:build jed_specialization
++
++package jed
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestSpecializationCompositionPrefixes(t *testing.T) {
++	cols := []catColumn{{Type: dataType{Scalar: scalarBool}}, {Type: dataType{Scalar: scalarBool}}, {Type: dataType{Scalar: scalarInt32}}}
++	col := func(i int) *rExpr { return &rExpr{kind: reColumn, index: i} }
++	null := &rExpr{kind: reConstNull}
++	trap := &rExpr{kind: reArith, op: opDiv, result: scalarInt32, lhs: &rExpr{kind: reConstInt, cInt: 1}, rhs: col(2)}
++	cmp := &rExpr{kind: reCompare, op: opGt, lhs: trap, rhs: &rExpr{kind: reConstInt}}
++	and := &rExpr{kind: reAnd, lhs: col(0), rhs: col(1)}
++	or := &rExpr{kind: reOr, lhs: col(0), rhs: cmp}
++	roots := []*rExpr{
++		and, or,
++		{kind: reNot, operand: and},
++		{kind: reIsNull, operand: or},
++		{kind: reAnd, lhs: col(0), rhs: cmp},
++		{kind: reAnd, lhs: and, rhs: or},
++		{kind: reCase, caseArms: []rCaseArm{{cond: and, result: trap}}, caseEls: col(2)},
++		{kind: reCase, caseArms: []rCaseArm{{cond: or, result: col(0)}}, caseEls: col(1)},
++		{kind: reCoalesce, sargs: []*rExpr{col(2), trap}},
++		{kind: reCoalesce, sargs: []*rExpr{null, trap}},
++		{kind: reCoalesce, sargs: []*rExpr{and, or}},
++	}
++	for _, e := range roots {
++		_, ty := bindComposedKernel(e, cols, nil)
++		k := bindScalarKernel(e, cols, nil)
++		if k == nil {
++			t.Fatal("composition rejected", e.kind)
++		}
++		for _, a := range []Value{NullValue(), BoolValue(false), BoolValue(true)} {
++			for _, b := range []Value{NullValue(), BoolValue(false), BoolValue(true)} {
++				for _, n := range []Value{NullValue(), IntValue(0), IntValue(1), IntValue(-1)} {
++					for limit := int64(0); limit <= 12; limit++ {
++						for lifeLimit := int64(0); lifeLimit <= 15; lifeLimit++ {
++							for _, filter := range []bool{false, true} {
++								// Integer roots are values only. Filter context would not be resolved.
++								if filter && ty != rtBool {
++									continue
++								}
++								life1, life2 := int64(3), int64(3)
++								m1, m2 := newMeterWithLimit(limit), newMeterWithLimit(limit)
++								m1.lifetimeTotal, m2.lifetimeTotal = &life1, &life2
++								m1.lifetimeLimit, m2.lifetimeLimit = lifeLimit, lifeLimit
++								row := storedRow{a, b, n}
++								env := &evalEnv{}
++								var v1, v2 Value
++								var err1, err2 error
++								if filter {
++									var b1, b2 bool
++									b1, err1 = e.evalFilter(row, env, m1)
++									b2, err2 = k.evalFilter(row, env, m2)
++									v1, v2 = BoolValue(b1), BoolValue(b2)
++								} else {
++									v1, err1 = e.eval(row, env, m1)
++									v2, err2 = k.eval(row, env, m2)
++								}
++								if !reflect.DeepEqual(v1, v2) || !reflect.DeepEqual(err1, err2) || m1.Accrued != m2.Accrued || life1 != life2 || m1.ceilingHit != m2.ceilingHit {
++									t.Fatalf("kind=%v filter=%v row=%v limit=%d/%d: %v/%v %v/%v costs=%d/%d", e.kind, filter, row, limit, lifeLimit, v1, v2, err1, err2, m1.Accrued, m2.Accrued)
++								}
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++}
++
++func TestSpecializationCompositionBounds(t *testing.T) {
++	leaf := func() *rExpr { return &rExpr{kind: reConstBool, cBool: true} }
++	e := leaf()
++	for depth := 1; depth <= specializationMaxDepth+1; depth++ {
++		k := bindScalarKernel(e, nil, nil)
++		if (k != nil) != (depth <= specializationMaxDepth) {
++			t.Fatalf("depth %d", depth)
++		}
++		if k != nil {
++			v, err := k.eval(nil, &evalEnv{}, newMeter())
++			if err != nil || v.Kind != ValBool {
++				t.Fatal(v, err)
++			}
++		}
++		e = &rExpr{kind: reNot, operand: e}
++	}
++	var tree func(int) *rExpr
++	tree = func(nodes int) *rExpr {
++		if nodes == 1 {
++			return leaf()
++		}
++		if nodes%2 == 0 {
++			return &rExpr{kind: reNot, operand: tree(nodes - 1)}
++		}
++		left := (nodes - 1) / 2
++		return &rExpr{kind: reAnd, lhs: tree(left), rhs: tree(nodes - 1 - left)}
++	}
++	for _, nodes := range []int{191, 192, 193, 1537} {
++		e := tree(nodes)
++		k := bindScalarKernel(e, nil, nil)
++		if (k != nil) != (nodes <= specializationMaxNodes) {
++			t.Fatalf("nodes %d", nodes)
++		}
++		if k == nil {
++			if got := testing.AllocsPerRun(10, func() { bindScalarKernel(e, nil, nil) }); got != 0 {
++				t.Fatalf("oversize allocates %g", got)
++			}
++		} else {
++			env, m := &evalEnv{}, newMeter()
++			if got := testing.AllocsPerRun(10, func() { _, _ = k.eval(nil, env, m) }); got != 0 {
++				t.Fatalf("composition allocates %g per row", got)
++			}
++		}
++	}
++}
+diff --git a/impl/go/specialization_diagnostics_test.go b/impl/go/specialization_diagnostics_test.go
+index 0bb1233..9ca00d9 100644
+--- a/impl/go/specialization_diagnostics_test.go
++++ b/impl/go/specialization_diagnostics_test.go
+@@ -19 +19,4 @@ func TestSpecializationInvocationCoverage(t *testing.T) {
+-		{"filter", "SELECT id FROM t WHERE v+1>2 ORDER BY id", 4},
++		{"filter", "SELECT id FROM t WHERE v+1>2 ORDER BY id", 7},
++		{"boolean", "SELECT v>0 AND (v<3 OR v IS NULL) FROM t ORDER BY id", 4},
++		{"coalesce", "SELECT coalesce(v,v/0) FROM t ORDER BY id", 4},
++		{"fallback", "SELECT coalesce(v,0,v/0) FROM t ORDER BY id", 0},
+@@ -23 +26 @@ func TestSpecializationInvocationCoverage(t *testing.T) {
+-		{"case_fallback", "SELECT CASE WHEN v>0 THEN v ELSE v/0 END FROM t ORDER BY id", 0},
++		{"case", "SELECT CASE WHEN v>0 THEN v ELSE v/0 END FROM t ORDER BY id", 4},
+diff --git a/impl/go/specialization_off.go b/impl/go/specialization_off.go
+index 2c0ef0b..39e6964 100644
+--- a/impl/go/specialization_off.go
++++ b/impl/go/specialization_off.go
+@@ -16,0 +17,4 @@ func (*scalarKernel) eval(storedRow, *evalEnv, *costMeter) (Value, error) {
++
++func (*scalarKernel) evalFilter(storedRow, *evalEnv, *costMeter) (bool, error) {
++	panic("execution specialization is not built")
++}
+diff --git a/impl/go/specialization_test.go b/impl/go/specialization_test.go
+index a41ff64..5d0920e 100644
+--- a/impl/go/specialization_test.go
++++ b/impl/go/specialization_test.go
+@@ -81,4 +81,4 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
+-		{"CASE WHEN flag THEN a ELSE b END", false},
+-		{"coalesce(a,b)", false},
+-		{"flag AND flag", false},
+-		{"flag OR flag", false},
++		{"CASE WHEN flag THEN a ELSE b END", true},
++		{"coalesce(a,b)", true},
++		{"flag AND flag", true},
++		{"flag OR flag", true},
+@@ -127 +127 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
+-	bad, _ := s.Prepare("SELECT coalesce(a,b) FROM t ORDER BY id")
++	bad, _ := s.Prepare("SELECT coalesce(a,b,0) FROM t ORDER BY id")
+@@ -196,0 +197,2 @@ func TestSpecializationCursorBudgetAndCancellation(t *testing.T) {
++		"SELECT CASE WHEN v>2 THEN v+1 ELSE v-1 END FROM t WHERE v>0 AND (v<4 OR v IS NULL) ORDER BY id",
++		"SELECT coalesce(v,v/0),v>1 AND v<3 FROM t ORDER BY id",
+@@ -378 +380 @@ func TestSpecializationStructuralBounds(t *testing.T) {
+-	for key, used := range map[string]int{"max_nodes": 7, "max_depth": 3, "max_lowered_units": 7, "max_pool_entries": 0, "max_scratch_slots": 0, "max_artifacts": specializationMaxRoots} {
++	for key, used := range map[string]int{"max_nodes": specializationMaxNodes, "max_depth": specializationMaxDepth, "max_lowered_units": specializationMaxNodes + 1, "max_pool_entries": 0, "max_scratch_slots": 0, "max_artifacts": specializationMaxRoots} {
+diff --git a/mise-tasks/experiment/go-specialization b/mise-tasks/experiment/go-specialization
+index 6eff654..c664d63 100644
+--- a/mise-tasks/experiment/go-specialization
++++ b/mise-tasks/experiment/go-specialization
+@@ -65,0 +66 @@ when "recheck"
++  metadata = JSON.parse(File.read("#{out}/environment.json"))
+@@ -68 +69 @@ when "recheck"
+-    names = %w[clean disabled ordinary selective]
++    names = metadata.fetch("variants", %w[clean disabled ordinary selective]).dup
+@@ -71 +72 @@ when "recheck"
+-      argv = ["#{out}/#{name}.test", "-test.run=^$", "-test.bench=^BenchmarkSpecialization$/(memory|file)/(columnar|scalar|first_call|point_miss|adhoc)$", "-test.benchmem", "-test.benchtime=250ms", "-test.count=1"]
++      argv = ["#{out}/#{name}.test", "-test.run=^$", "-test.bench=#{ENV.fetch("JED_SPECIALIZATION_RECHECK", "^BenchmarkSpecialization$/(memory|file)/(columnar|scalar|first_call|point_miss|adhoc)$")}", "-test.benchmem", "-test.benchtime=250ms", "-test.count=1"]
+@@ -78,0 +80 @@ when "recheck"
++  File.write("#{dest}/environment.json", JSON.pretty_generate(metadata) + "\n")
+@@ -95,0 +98,18 @@ when "bench"
++  stage = ENV.fetch("JED_SPECIALIZATION_STAGE", "g2")
++  if stage == "g2"
++    g1 = Dir.mktmpdir("g1-", out)
++    archive, status = Open3.capture2("git", "archive", "90e654fe9b206a5b63d332ea170709e453f5091f", "impl/go")
++    abort "G1 archive failed" unless status.success?
++    Open3.popen3("tar", "-x", "-C", g1) do |input, output, errors, child|
++      input.binmode; input.write(archive); input.close
++      abort errors.read unless child.value.success?
++    end
++    FileUtils.cp("impl/go/specialization_bench_test.go", "#{g1}/impl/go/")
++    variants["g1"] = ["#{g1}/impl/go", "jed_specialization"]
++    variants["closures"] = ["#{root}/impl/go", "jed_specialization,jed_specialization_closures"]
++  elsif stage == "g3"
++    variants["g2"] = ["#{root}/impl/go", "jed_specialization"]
++    variants["selective"] = ["#{root}/impl/go", "jed_specialization,jed_specialization_scan"]
++  else
++    abort "unknown stage #{stage}"
++  end
+@@ -99,0 +120 @@ when "bench"
++  FileUtils.remove_entry(g1) if g1
+@@ -113,0 +135 @@ when "bench"
++    stage: stage, variants: variants.keys, build_tags: variants.transform_values { |v| v[1] },

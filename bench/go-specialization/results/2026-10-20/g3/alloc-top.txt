@@ -1,0 +1,81 @@
+File: selective.test
+Build ID: b8efeb49d81a124742ddf150cc0ea4d644f66d65
+Type: alloc_space
+Time: 2026-10-19 22:02:21 CDT
+Showing nodes accounting for 172.95MB, 97.38% of 177.59MB total
+Dropped 37 nodes (cum <= 0.89MB)
+      flat  flat%   sum%        cum   cum%
+  132.51MB 74.62% 74.62%   132.51MB 74.62%  github.com/jackc/jed/impl/go.(*packedLeaf).row
+      16MB  9.01% 83.63%   148.51MB 83.63%  github.com/jackc/jed/impl/go.(*kernelScanCursor).nextRow
+    6.21MB  3.49% 87.12%     6.21MB  3.49%  github.com/jackc/jed/impl/go.lexRaw
+       6MB  3.38% 90.50%        6MB  3.38%  github.com/jackc/jed/impl/go.(*parser).parseInsertRow
+    2.51MB  1.41% 91.91%     2.51MB  1.41%  runtime.mallocgc
+    2.02MB  1.14% 93.05%     2.02MB  1.14%  github.com/jackc/jed/impl/go.insertValAtMutable (inline)
+    1.50MB  0.84% 93.90%     1.50MB  0.84%  testing.(*B).ResetTimer
+    1.50MB  0.84% 94.74%     1.50MB  0.84%  github.com/jackc/jed/impl/go.planDispositions
+    1.01MB  0.57% 95.31%     3.01MB  1.69%  github.com/jackc/jed/impl/go.encodeLeafPAX
+       1MB  0.56% 95.87%        1MB  0.56%  github.com/jackc/jed/impl/go.(*snapshot).clone
+    0.64MB  0.36% 96.24%     1.74MB  0.98%  compress/flate.NewWriter (inline)
+    0.53MB   0.3% 96.53%     1.10MB  0.62%  compress/flate.(*compressor).init
+    0.51MB  0.29% 96.82%     3.04MB  1.71%  github.com/jackc/jed/impl/go.(*engine).insertRows
+    0.50MB  0.28% 97.10%        1MB  0.56%  github.com/jackc/jed/impl/go.(*engine).buildScanRows
+    0.50MB  0.28% 97.38%     3.54MB  1.99%  github.com/jackc/jed/impl/go.(*engine).executeInsertValuesPlan
+         0     0% 97.38%     1.74MB  0.98%  compress/gzip.(*Writer).Write
+         0     0% 97.38%    21.31MB 12.00%  github.com/jackc/jed/impl/go.(*Database).queryValues
+         0     0% 97.38%   148.51MB 83.63%  github.com/jackc/jed/impl/go.(*Rows).Next
+         0     0% 97.38%     9.11MB  5.13%  github.com/jackc/jed/impl/go.(*Session).dispatch
+         0     0% 97.38%     4.57MB  2.57%  github.com/jackc/jed/impl/go.(*Session).publish
+         0     0% 97.38%    10.11MB  5.69%  github.com/jackc/jed/impl/go.(*Session).queryStmt
+         0     0% 97.38%    21.31MB 12.00%  github.com/jackc/jed/impl/go.(*Session).queryValues
+         0     0% 97.38%     3.54MB  1.99%  github.com/jackc/jed/impl/go.(*engine).dispatchStmtBodyCached
+         0     0% 97.38%     3.54MB  1.99%  github.com/jackc/jed/impl/go.(*engine).dispatchStmtCached
+         0     0% 97.38%     3.54MB  1.99%  github.com/jackc/jed/impl/go.(*engine).dispatchStmtTarget
+         0     0% 97.38%     3.54MB  1.99%  github.com/jackc/jed/impl/go.(*engine).executeInsertCached
+         0     0% 97.38%     3.54MB  1.99%  github.com/jackc/jed/impl/go.(*engine).executeInsertValuesCached
+         0     0% 97.38%     4.54MB  2.55%  github.com/jackc/jed/impl/go.(*engine).executeStmtParamsCached
+         0     0% 97.38%        1MB  0.56%  github.com/jackc/jed/impl/go.(*engine).newTx
+         0     0% 97.38%    12.21MB  6.87%  github.com/jackc/jed/impl/go.(*engine).parse
+         0     0% 97.38%        1MB  0.56%  github.com/jackc/jed/impl/go.(*engine).tryScanQuery
+         0     0% 97.38%     2.53MB  1.42%  github.com/jackc/jed/impl/go.(*pMap).Insert
+         0     0% 97.38%        6MB  3.38%  github.com/jackc/jed/impl/go.(*parser).parseInsert
+         0     0% 97.38%        6MB  3.38%  github.com/jackc/jed/impl/go.(*parser).parseInsertValuesSource
+         0     0% 97.38%        6MB  3.38%  github.com/jackc/jed/impl/go.(*parser).parseStatement
+         0     0% 97.38%   132.51MB 74.62%  github.com/jackc/jed/impl/go.(*pnode).rowAt
+         0     0% 97.38%   132.51MB 74.62%  github.com/jackc/jed/impl/go.(*rangeCursor).next
+         0     0% 97.38%     4.57MB  2.57%  github.com/jackc/jed/impl/go.(*sharedCore).persist
+         0     0% 97.38%     3.51MB  1.98%  github.com/jackc/jed/impl/go.(*snapshot).incrementalImage (inline)
+         0     0% 97.38%     3.51MB  1.98%  github.com/jackc/jed/impl/go.(*snapshot).incrementalImageAllowed
+         0     0% 97.38%     4.57MB  2.57%  github.com/jackc/jed/impl/go.(*storage).commitDurable
+         0     0% 97.38%     1.06MB  0.59%  github.com/jackc/jed/impl/go.(*storage).commitInMemory
+         0     0% 97.38%     3.51MB  1.98%  github.com/jackc/jed/impl/go.(*storage).planInMemory
+         0     0% 97.38%   132.51MB 74.62%  github.com/jackc/jed/impl/go.(*storeScan).next (inline)
+         0     0% 97.38%   132.51MB 74.62%  github.com/jackc/jed/impl/go.(*streamingCursor).pull
+         0     0% 97.38%     2.53MB  1.42%  github.com/jackc/jed/impl/go.(*tableStore).Insert
+         0     0% 97.38%    22.33MB 12.57%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1
+         0     0% 97.38%    21.31MB 12.00%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1.1 (inline)
+         0     0% 97.38%   149.51MB 84.19%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1.2
+         0     0% 97.38%   149.51MB 84.19%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1.2.1
+         0     0% 97.38%     6.21MB  3.49%  github.com/jackc/jed/impl/go.lexWithPositions
+         0     0% 97.38%     2.53MB  1.42%  github.com/jackc/jed/impl/go.nodeInsert
+         0     0% 97.38%    12.21MB  6.87%  github.com/jackc/jed/impl/go.parseSQL
+         0     0% 97.38%    21.31MB 12.00%  github.com/jackc/jed/impl/go.queryOutcome
+         0     0% 97.38%     3.51MB  1.98%  github.com/jackc/jed/impl/go.serializeDirty
+         0     0% 97.38%        1MB  0.56%  runtime.acquireSudog
+         0     0% 97.38%        1MB  0.56%  runtime.allocm
+         0     0% 97.38%        1MB  0.56%  runtime.gcBgMarkWorker
+         0     0% 97.38%        1MB  0.56%  runtime.gcMarkDone
+         0     0% 97.38%        1MB  0.56%  runtime.mstart
+         0     0% 97.38%        1MB  0.56%  runtime.mstart0
+         0     0% 97.38%        1MB  0.56%  runtime.mstart1
+         0     0% 97.38%        1MB  0.56%  runtime.newm
+         0     0% 97.38%     2.51MB  1.41%  runtime.newobject
+         0     0% 97.38%        1MB  0.56%  runtime.schedule
+         0     0% 97.38%        1MB  0.56%  runtime.semacquire (inline)
+         0     0% 97.38%        1MB  0.56%  runtime.semacquire1
+         0     0% 97.38%        1MB  0.56%  runtime.startm
+         0     0% 97.38%        1MB  0.56%  runtime.wakep
+         0     0% 97.38%     1.74MB  0.98%  runtime/pprof.(*profileBuilder).build
+         0     0% 97.38%     1.74MB  0.98%  runtime/pprof.profileWriter
+         0     0% 97.38%   149.01MB 83.91%  testing.(*B).launch
+         0     0% 97.38%    23.83MB 13.42%  testing.(*B).run1.func1
+         0     0% 97.38%   173.34MB 97.61%  testing.(*B).runN
