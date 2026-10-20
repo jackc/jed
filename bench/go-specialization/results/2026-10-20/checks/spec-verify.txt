@@ -1,0 +1,34 @@
+[verify] $ ~/.codex/worktrees/214f/jed/mise-tasks/verify
+key encoding: spec/encoding/verify.rb
+OK: 738 vectors verified (round-trip + byte-exact + order)
+prng + uuid fixtures: spec/encoding/prng_verify.rb
+OK: 19 PRNG/UUID/simulation vectors verified (splitmix64 + v4/v7 byte layout + sim decide)
+conformance taxonomy: spec/conformance/verify.rb
+OK: 466 capabilities, 19 profiles, 680 test files — taxonomy coherent
+OK: oracle profile — PG 18, provider b, locale C.UTF-8, 14 session pins
+page-service wire contract: spec/pageservice/verify.rb
+page-service catalog and fixtures OK (22 messages, 25 frames, 2 owner records, 11 malformed)
+file format: spec/fileformat/verify.rb
+OK: 106 file-format fixtures verified (byte-exact + independent decode); 11 LZ4 vectors verified
+function catalog: spec/functions/verify.rb
+OK: 405 operators, 53 aggregates, 18 set-returning, 11 window — catalog coherent
+cost schedule: spec/cost/verify.rb
+OK: 28 cost units, 37 memory size vectors — schedule coherent
+plan estimator: spec/cost/estimator_verify.rb
+OK: 8 estimator selectivities + 23 P4 vectors + total tie orders coherent
+operator codegen (drift): scripts/gen_catalog.rb --check
+OK: 6 generated files current (405 operators, 53 aggregates, 18 set-returning, 11 window, 6 ranges)
+cost codegen (drift): scripts/gen_costs.rb --check
+OK: 3 generated files current (28 cost units)
+estimator codegen (drift): scripts/gen_estimator.rb --check
+OK: 3 generated estimator files current
+error codegen (drift): scripts/gen_errors.rb --check
+OK: 3 generated files current (108 error codes)
+datetime unit codegen (drift): scripts/gen_datetime_units.rb --check
+OK: 3 generated files current (61 delta tokens, 72 date tokens, 13 interval qualifiers)
+keyword codegen (drift): scripts/gen_keywords.rb --check
+OK: 3 generated files current (164 quoted keywords)
+formatting codegen (drift): scripts/gen_formatting.rb --check
+OK: 3 generated files current (112 datetime patterns, 36 number patterns)
+
+All spec checks passed.

@@ -78,10 +78,10 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
 		{"d - d", false},
 		{"(d - d) + a", false},
 		{"a::i16", false},
-		{"CASE WHEN flag THEN a ELSE b END", false},
-		{"coalesce(a,b)", false},
-		{"flag AND flag", false},
-		{"flag OR flag", false},
+		{"CASE WHEN flag THEN a ELSE b END", true},
+		{"coalesce(a,b)", true},
+		{"flag AND flag", true},
+		{"flag OR flag", true},
 		{"abs(a)", false},
 		{"((a+b)+b)+b", false},
 	}
@@ -90,8 +90,8 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c, ok := rows.cursor.(*streamingCursor)
-		if !ok || c.plan.kernels == nil {
+		c := specializationTestCursor(t, rows)
+		if c.plan.kernels == nil {
 			t.Fatalf("%s: missing scan artifacts", tt.expr)
 		}
 		if got := c.plan.kernels.project[0] != nil; got != tt.admitted {
@@ -99,7 +99,7 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
 		}
 		rows.Close() // Admission must not evaluate the zero divisor.
 	}
-	stmt, err := s.Prepare("SELECT a + $1 FROM t ORDER BY id")
+	stmt, err := s.Prepare("SELECT coalesce(CASE WHEN a>0 THEN a+$1 ELSE NULL END,$1) FROM t ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
 		t.Fatal("stale artifact after DDL")
 	}
 	// A complete unsupported root caches its negative result too.
-	bad, _ := s.Prepare("SELECT coalesce(a,b) FROM t ORDER BY id")
+	bad, _ := s.Prepare("SELECT coalesce(a,b,0) FROM t ORDER BY id")
 	drainQ(t, s, bad)
 	rejection := bad.sc.p.Load().sp.kernels
 	drainQ(t, s, bad)
@@ -147,7 +147,7 @@ func TestSpecializationAdmissionAndCache(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c := rows.cursor.(*streamingCursor)
+		c := specializationTestCursor(t, rows)
 		if (c.plan.kernels != nil) != (n <= 7) {
 			t.Fatal("plan root cap")
 		}
@@ -194,7 +194,10 @@ func TestSpecializationCursorBudgetAndCancellation(t *testing.T) {
 	defer s.Close()
 	for _, sql := range []string{
 		"SELECT (v+1)*(v-1) FROM t ORDER BY id",
+		"SELECT CASE WHEN v>2 THEN v+1 ELSE v-1 END FROM t WHERE v>0 AND (v<4 OR v IS NULL) ORDER BY id",
+		"SELECT coalesce(v,v/0),v>1 AND v<3 FROM t ORDER BY id",
 		"SELECT v/0 FROM t ORDER BY id LIMIT 0",
+		"SELECT coalesce(v,0) FROM t WHERE id=2 ORDER BY id",
 		"SELECT v/(v-1) FROM t ORDER BY id OFFSET 1",
 		"SELECT v+1 FROM t WHERE v+1>2 ORDER BY id LIMIT 1 OFFSET 1",
 	} {
@@ -206,11 +209,12 @@ func TestSpecializationCursorBudgetAndCancellation(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					c := rows.cursor.(*streamingCursor)
+					c := specializationTestCursor(t, rows)
 					if ordinary {
 						cp := *c.plan
 						cp.kernels = nil
 						c.plan = &cp
+						rows.cursor = c // bypass the selected G3 loop as well as scalar kernels
 					}
 					c.meter.Limit = limit
 					c.meter.query.limit = mem
@@ -238,16 +242,17 @@ func TestSpecializationCursorBudgetAndCancellation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c := rows.cursor.(*streamingCursor)
+		c := specializationTestCursor(t, rows)
 		if ordinary {
 			cp := *c.plan
 			cp.kernels = nil
 			c.plan = &cp
+			rows.cursor = c // bypass the selected G3 loop as well as scalar kernels
 		}
 		done := make(chan struct{})
 		close(done)
 		c.meter.cancel = done
-		_, _, err = c.nextRow()
+		_, _, err = rows.cursor.nextRow()
 		if cancelCode(t, err) != "57014" {
 			t.Fatal(err)
 		}
@@ -313,11 +318,11 @@ func TestSpecializationFileFaultOrder(t *testing.T) {
 			if !fail {
 				s.engine.session.cancel = done
 			}
-			rows, err := s.queryValues("SELECT (v+1)*(v-1) FROM t ORDER BY id"+limit, nil)
+			rows, err := s.queryValues("SELECT CASE WHEN v>2 THEN v+1 ELSE coalesce(v,0) END FROM t WHERE v>0 AND v<6 ORDER BY id"+limit, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			c := rows.cursor.(*streamingCursor)
+			c := specializationTestCursor(t, rows)
 			if c.plan.kernels == nil || c.plan.kernels.project[0] == nil {
 				t.Fatal("no file scan kernel")
 			}
@@ -325,6 +330,7 @@ func TestSpecializationFileFaultOrder(t *testing.T) {
 				cp := *c.plan
 				cp.kernels = nil
 				c.plan = &cp
+				rows.cursor = c // bypass the selected G3 loop as well as scalar kernels
 			}
 			paging := db.core.storage.paging
 			paging.pool = newBufferPool(2)
@@ -375,7 +381,7 @@ func TestSpecializationStructuralBounds(t *testing.T) {
 			limits[strings.TrimSpace(key)] = n
 		}
 	}
-	for key, used := range map[string]int{"max_nodes": 7, "max_depth": 3, "max_lowered_units": 7, "max_pool_entries": 0, "max_scratch_slots": 0, "max_artifacts": specializationMaxRoots} {
+	for key, used := range map[string]int{"max_nodes": specializationMaxNodes, "max_depth": specializationMaxDepth, "max_lowered_units": specializationMaxNodes + 1, "max_pool_entries": 0, "max_scratch_slots": 0, "max_artifacts": specializationMaxRoots} {
 		if limit, ok := limits[key]; !ok || used > limit {
 			t.Fatalf("%s: representation uses %d exceeds shared limit %d", key, used, limit)
 		}
@@ -388,5 +394,18 @@ func TestSpecializationStructuralBounds(t *testing.T) {
 	env := &evalEnv{}
 	if got := testing.AllocsPerRun(100, func() { _, _ = k.eval(nil, env, m) }); got != 0 {
 		t.Fatalf("kernel allocates %g per row", got)
+	}
+}
+
+func specializationTestCursor(t *testing.T, rows *Rows) *streamingCursor {
+	t.Helper()
+	switch c := rows.cursor.(type) {
+	case *streamingCursor:
+		return c
+	case *kernelScanCursor:
+		return c.streamingCursor
+	default:
+		t.Fatalf("unexpected cursor %T", rows.cursor)
+		return nil
 	}
 }

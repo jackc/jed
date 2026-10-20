@@ -1,0 +1,81 @@
+File: selective.test
+Build ID: b8efeb49d81a124742ddf150cc0ea4d644f66d65
+Type: cpu
+Time: 2026-10-19 22:02:21 CDT
+Duration: 189.09ms, Total samples = 210ms (111.06%)
+Showing nodes accounting for 210ms, 100% of 210ms total
+      flat  flat%   sum%        cum   cum%
+      40ms 19.05% 19.05%       80ms 38.10%  github.com/jackc/jed/impl/go.(*scalarKernel).evalComposition
+      30ms 14.29% 33.33%       30ms 14.29%  github.com/jackc/jed/impl/go.(*costMeter).Charge
+      20ms  9.52% 42.86%       20ms  9.52%  github.com/jackc/jed/impl/go.decodeInt (inline)
+      10ms  4.76% 47.62%       10ms  4.76%  github.com/jackc/jed/impl/go.(*kernelLeaf).load
+      10ms  4.76% 52.38%      170ms 80.95%  github.com/jackc/jed/impl/go.(*kernelScanCursor).nextRow
+      10ms  4.76% 57.14%       10ms  4.76%  github.com/jackc/jed/impl/go.(*paxLeaf).value
+      10ms  4.76% 61.90%       90ms 42.86%  github.com/jackc/jed/impl/go.(*scalarKernel).evalFilter
+      10ms  4.76% 66.67%       30ms 14.29%  github.com/jackc/jed/impl/go.readInlineScalar
+      10ms  4.76% 71.43%       20ms  9.52%  runtime.(*sweepLocked).sweep
+      10ms  4.76% 76.19%       30ms 14.29%  runtime.makeslice
+      10ms  4.76% 80.95%       30ms 14.29%  runtime.mallocgcSmallScanNoHeader
+      10ms  4.76% 85.71%       10ms  4.76%  runtime.memclrNoHeapPointers
+      10ms  4.76% 90.48%       10ms  4.76%  runtime.memmove
+      10ms  4.76% 95.24%       10ms  4.76%  runtime.nextFreeFast (inline)
+      10ms  4.76%   100%       10ms  4.76%  runtime.procyieldAsm
+         0     0%   100%       20ms  9.52%  github.com/jackc/jed/impl/go.(*Database).queryValues
+         0     0%   100%      170ms 80.95%  github.com/jackc/jed/impl/go.(*Rows).Next
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*Session).dispatch
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*Session).queryStmt
+         0     0%   100%       20ms  9.52%  github.com/jackc/jed/impl/go.(*Session).queryValues
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).dispatchStmtBodyCached
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).dispatchStmtCached
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).dispatchStmtTarget
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).executeInsertCached
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).executeInsertValuesCached
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).executeInsertValuesPlan
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).executeStmtParamsCached
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).insertRows
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*engine).parse
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*kernelOperand).eval
+         0     0%   100%       70ms 33.33%  github.com/jackc/jed/impl/go.(*packedLeaf).row
+         0     0%   100%       40ms 19.05%  github.com/jackc/jed/impl/go.(*packedLeaf).value
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*parser).parseInsert
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*parser).parseInsertRow
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*parser).parseInsertValuesSource
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.(*parser).parseStatement
+         0     0%   100%       70ms 33.33%  github.com/jackc/jed/impl/go.(*pnode).rowAt
+         0     0%   100%       70ms 33.33%  github.com/jackc/jed/impl/go.(*rangeCursor).next
+         0     0%   100%       80ms 38.10%  github.com/jackc/jed/impl/go.(*scalarKernel).evalMode
+         0     0%   100%       70ms 33.33%  github.com/jackc/jed/impl/go.(*storeScan).next (inline)
+         0     0%   100%       70ms 33.33%  github.com/jackc/jed/impl/go.(*streamingCursor).pull
+         0     0%   100%       20ms  9.52%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1
+         0     0%   100%       20ms  9.52%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1.1 (inline)
+         0     0%   100%      170ms 80.95%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1.2
+         0     0%   100%      170ms 80.95%  github.com/jackc/jed/impl/go.BenchmarkSpecialization.func1.2.1
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.compareKernel
+         0     0%   100%       10ms  4.76%  github.com/jackc/jed/impl/go.parseSQL
+         0     0%   100%       20ms  9.52%  github.com/jackc/jed/impl/go.queryOutcome
+         0     0%   100%       30ms 14.29%  github.com/jackc/jed/impl/go.readInlineBody
+         0     0%   100%       10ms  4.76%  internal/runtime/maps.(*table).grow
+         0     0%   100%       10ms  4.76%  internal/runtime/maps.(*table).rehash
+         0     0%   100%       10ms  4.76%  internal/runtime/maps.(*table).uncheckedPutSlot
+         0     0%   100%       10ms  4.76%  internal/runtime/maps.typedmemmove
+         0     0%   100%       10ms  4.76%  runtime.(*mcache).nextFree
+         0     0%   100%       10ms  4.76%  runtime.(*mcache).refill
+         0     0%   100%       10ms  4.76%  runtime.(*mcentral).cacheSpan
+         0     0%   100%       10ms  4.76%  runtime.(*mcentral).grow
+         0     0%   100%       10ms  4.76%  runtime.(*mheap).freeSpan (inline)
+         0     0%   100%       10ms  4.76%  runtime.(*mheap).freeSpan.func1
+         0     0%   100%       10ms  4.76%  runtime.(*mspan).initHeapBits
+         0     0%   100%       20ms  9.52%  runtime.bgsweep
+         0     0%   100%       10ms  4.76%  runtime.growslice
+         0     0%   100%       10ms  4.76%  runtime.lock
+         0     0%   100%       10ms  4.76%  runtime.lock2
+         0     0%   100%       10ms  4.76%  runtime.lockWithRank (inline)
+         0     0%   100%       30ms 14.29%  runtime.mallocgc
+         0     0%   100%       10ms  4.76%  runtime.mapassign_faststr
+         0     0%   100%       10ms  4.76%  runtime.procyield (inline)
+         0     0%   100%       20ms  9.52%  runtime.sweepone
+         0     0%   100%       10ms  4.76%  runtime.systemstack
+         0     0%   100%       10ms  4.76%  runtime.typedmemmove
+         0     0%   100%      170ms 80.95%  testing.(*B).launch
+         0     0%   100%       20ms  9.52%  testing.(*B).run1.func1
+         0     0%   100%      190ms 90.48%  testing.(*B).runN

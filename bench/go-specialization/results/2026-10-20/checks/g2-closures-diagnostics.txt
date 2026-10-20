@@ -1,0 +1,33 @@
+[experiment:go-specialization] $ ~/.codex/worktrees/214f/jed/mise-tasks/experim…
+=== RUN   TestSpecializationCompositionPrefixes
+--- PASS: TestSpecializationCompositionPrefixes (0.07s)
+=== RUN   TestSpecializationCompositionBounds
+--- PASS: TestSpecializationCompositionBounds (0.00s)
+=== RUN   TestSpecializationInvocationCoverage
+    specialization_diagnostics_test.go:40: arithmetic: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: filter: 7 optimized root invocations
+    specialization_diagnostics_test.go:40: boolean: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: coalesce: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: fallback: 0 optimized root invocations
+    specialization_diagnostics_test.go:40: null: 4 optimized root invocations
+    specialization_diagnostics_test.go:40: offset: 1 optimized root invocations
+    specialization_diagnostics_test.go:40: limit_zero: 0 optimized root invocations
+    specialization_diagnostics_test.go:40: case: 4 optimized root invocations
+--- PASS: TestSpecializationInvocationCoverage (0.00s)
+=== RUN   TestSpecializationReplacedPlanLifetime
+--- PASS: TestSpecializationReplacedPlanLifetime (0.00s)
+=== RUN   TestSpecializationBudgetPrefixes
+--- PASS: TestSpecializationBudgetPrefixes (0.03s)
+=== RUN   TestSpecializationAdmissionAndCache
+--- PASS: TestSpecializationAdmissionAndCache (0.00s)
+=== RUN   TestSpecializationSharedStatement
+--- PASS: TestSpecializationSharedStatement (0.00s)
+=== RUN   TestSpecializationCursorBudgetAndCancellation
+--- PASS: TestSpecializationCursorBudgetAndCancellation (0.03s)
+=== RUN   TestSpecializationFileFaultOrder
+--- PASS: TestSpecializationFileFaultOrder (0.00s)
+=== RUN   TestSpecializationStructuralBounds
+    specialization_test.go:385: retained descriptor bytes: root=240 plan=216 (plus existing source tree); pool=0 scratch=0
+--- PASS: TestSpecializationStructuralBounds (0.00s)
+PASS
+ok  	github.com/jackc/jed/impl/go	0.143s

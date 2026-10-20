@@ -1,0 +1,15 @@
+goos: linux
+goarch: amd64
+pkg: github.com/jackc/jed/impl/go
+cpu: Intel(R) Core(TM) Ultra 9 285K
+BenchmarkSpecialization/memory/arithmetic-24         	     537	    535599 ns/op	1508503557 checksum	1508503557 checksum1	     20492 cost	     20492 cost1	  526046 B/op	    8210 allocs/op
+BenchmarkSpecialization/memory/unsupported-24        	     639	    438781 ns/op	3765470213 checksum	3765470213 checksum1	     12300 cost	     12300 cost1	  526029 B/op	    8210 allocs/op
+BenchmarkSpecialization/memory/columnar-24           	    5958	     68556 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+BenchmarkSpecialization/memory/adhoc-24              	   33612	      9080 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   14068 B/op	     118 allocs/op
+BenchmarkSpecialization/memory/first_call-24         	   28107	     10291 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   14453 B/op	     121 allocs/op
+BenchmarkSpecialization/file/arithmetic-24           	     571	    525147 ns/op	1508503557 checksum	1508503557 checksum1	     20492 cost	     20492 cost1	  526005 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/unsupported-24          	     678	    457651 ns/op	3765470213 checksum	3765470213 checksum1	     12300 cost	     12300 cost1	  526021 B/op	    8210 allocs/op
+BenchmarkSpecialization/file/columnar-24             	    4647	     66734 ns/op	 806741284 checksum	 806741284 checksum1	      8205 cost	      8205 cost1	    2160 B/op	      18 allocs/op
+BenchmarkSpecialization/file/adhoc-24                	   26784	     10414 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   14068 B/op	     118 allocs/op
+BenchmarkSpecialization/file/first_call-24           	   27522	     10842 ns/op	1524379493 checksum	1524379493 checksum1	        60.00 cost	        60.00 cost1	   14452 B/op	     121 allocs/op
+PASS

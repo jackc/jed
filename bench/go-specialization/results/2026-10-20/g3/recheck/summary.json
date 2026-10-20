@@ -1,0 +1,502 @@
+{
+  "memory/arithmetic": {
+    "clean": {
+      "median_ns": 556280.0,
+      "min_ns": 554652.0,
+      "max_ns": 557443.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526037.0
+    },
+    "disabled": {
+      "median_ns": 513872.0,
+      "min_ns": 509134.0,
+      "max_ns": 546592.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526036.0
+    },
+    "ordinary": {
+      "median_ns": 535599.0,
+      "min_ns": 502501.0,
+      "max_ns": 553655.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526036.0
+    },
+    "selective": {
+      "median_ns": 483309.0,
+      "min_ns": 456615.0,
+      "max_ns": 505368.0,
+      "allocations": [
+        8211.0
+      ],
+      "median_bytes": 526062.0
+    },
+    "g2": {
+      "median_ns": 511280.0,
+      "min_ns": 491364.0,
+      "max_ns": 525735.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526049.0
+    },
+    "selective_vs_clean_percent": -13.117674552383695,
+    "selective_vs_ordinary_percent": -9.762900976290101,
+    "faster_pairs": 3
+  },
+  "memory/unsupported": {
+    "clean": {
+      "median_ns": 460872.0,
+      "min_ns": 428501.0,
+      "max_ns": 462558.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526024.0
+    },
+    "disabled": {
+      "median_ns": 447782.0,
+      "min_ns": 445567.0,
+      "max_ns": 453983.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526018.0
+    },
+    "ordinary": {
+      "median_ns": 438781.0,
+      "min_ns": 403418.0,
+      "max_ns": 443237.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526020.0
+    },
+    "selective": {
+      "median_ns": 433088.0,
+      "min_ns": 401140.0,
+      "max_ns": 443882.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526019.0
+    },
+    "g2": {
+      "median_ns": 459520.0,
+      "min_ns": 452811.0,
+      "max_ns": 464022.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526027.0
+    },
+    "selective_vs_clean_percent": -6.028571924525683,
+    "selective_vs_ordinary_percent": -1.297458185290612,
+    "faster_pairs": 2
+  },
+  "memory/columnar": {
+    "clean": {
+      "median_ns": 68140.0,
+      "min_ns": 60635.0,
+      "max_ns": 68889.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "disabled": {
+      "median_ns": 63758.0,
+      "min_ns": 58118.0,
+      "max_ns": 69339.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "ordinary": {
+      "median_ns": 68556.0,
+      "min_ns": 59445.0,
+      "max_ns": 76665.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "selective": {
+      "median_ns": 55342.0,
+      "min_ns": 54661.0,
+      "max_ns": 62385.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "g2": {
+      "median_ns": 68244.0,
+      "min_ns": 61508.0,
+      "max_ns": 72104.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "selective_vs_clean_percent": -18.781919577340766,
+    "selective_vs_ordinary_percent": -19.274753486201057,
+    "faster_pairs": 3
+  },
+  "memory/adhoc": {
+    "clean": {
+      "median_ns": 10153.0,
+      "min_ns": 9923.0,
+      "max_ns": 10252.0,
+      "allocations": [
+        116.0
+      ],
+      "median_bytes": 13604.0
+    },
+    "disabled": {
+      "median_ns": 9792.0,
+      "min_ns": 9755.0,
+      "max_ns": 9859.0,
+      "allocations": [
+        116.0
+      ],
+      "median_bytes": 13604.0
+    },
+    "ordinary": {
+      "median_ns": 10567.0,
+      "min_ns": 9080.0,
+      "max_ns": 10640.0,
+      "allocations": [
+        118.0
+      ],
+      "median_bytes": 14069.0
+    },
+    "selective": {
+      "median_ns": 10407.0,
+      "min_ns": 9878.0,
+      "max_ns": 10633.0,
+      "allocations": [
+        119.0
+      ],
+      "median_bytes": 14085.0
+    },
+    "g2": {
+      "median_ns": 10459.0,
+      "min_ns": 10135.0,
+      "max_ns": 10507.0,
+      "allocations": [
+        118.0
+      ],
+      "median_bytes": 14069.0
+    },
+    "selective_vs_clean_percent": 2.501723628484198,
+    "selective_vs_ordinary_percent": -1.5141478186808,
+    "faster_pairs": 1
+  },
+  "memory/first_call": {
+    "clean": {
+      "median_ns": 10260.0,
+      "min_ns": 10023.0,
+      "max_ns": 10389.0,
+      "allocations": [
+        119.0
+      ],
+      "median_bytes": 13989.0
+    },
+    "disabled": {
+      "median_ns": 10130.0,
+      "min_ns": 10041.0,
+      "max_ns": 10164.0,
+      "allocations": [
+        119.0
+      ],
+      "median_bytes": 13989.0
+    },
+    "ordinary": {
+      "median_ns": 10606.0,
+      "min_ns": 10291.0,
+      "max_ns": 10821.0,
+      "allocations": [
+        121.0
+      ],
+      "median_bytes": 14454.0
+    },
+    "selective": {
+      "median_ns": 10617.0,
+      "min_ns": 10400.0,
+      "max_ns": 10754.0,
+      "allocations": [
+        122.0
+      ],
+      "median_bytes": 14470.0
+    },
+    "g2": {
+      "median_ns": 10469.0,
+      "min_ns": 10295.0,
+      "max_ns": 10485.0,
+      "allocations": [
+        121.0
+      ],
+      "median_bytes": 14454.0
+    },
+    "selective_vs_clean_percent": 3.4795321637426824,
+    "selective_vs_ordinary_percent": 0.1037148783707309,
+    "faster_pairs": 0
+  },
+  "file/arithmetic": {
+    "clean": {
+      "median_ns": 534345.0,
+      "min_ns": 502468.0,
+      "max_ns": 557090.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526026.0
+    },
+    "disabled": {
+      "median_ns": 519539.0,
+      "min_ns": 514800.0,
+      "max_ns": 542027.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526025.0
+    },
+    "ordinary": {
+      "median_ns": 525147.0,
+      "min_ns": 497957.0,
+      "max_ns": 558726.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526032.0
+    },
+    "selective": {
+      "median_ns": 480982.0,
+      "min_ns": 425985.0,
+      "max_ns": 508811.0,
+      "allocations": [
+        8211.0
+      ],
+      "median_bytes": 526033.0
+    },
+    "g2": {
+      "median_ns": 484213.0,
+      "min_ns": 466937.0,
+      "max_ns": 491973.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526036.0
+    },
+    "selective_vs_clean_percent": -9.986619131834306,
+    "selective_vs_ordinary_percent": -8.410026145060334,
+    "faster_pairs": 2
+  },
+  "file/unsupported": {
+    "clean": {
+      "median_ns": 420822.0,
+      "min_ns": 419301.0,
+      "max_ns": 438699.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526023.0
+    },
+    "disabled": {
+      "median_ns": 440808.0,
+      "min_ns": 384034.0,
+      "max_ns": 445646.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526027.0
+    },
+    "ordinary": {
+      "median_ns": 445426.0,
+      "min_ns": 444656.0,
+      "max_ns": 457651.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526021.0
+    },
+    "selective": {
+      "median_ns": 464573.0,
+      "min_ns": 429092.0,
+      "max_ns": 477956.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526030.0
+    },
+    "g2": {
+      "median_ns": 434308.0,
+      "min_ns": 431956.0,
+      "max_ns": 435590.0,
+      "allocations": [
+        8210.0
+      ],
+      "median_bytes": 526027.0
+    },
+    "selective_vs_clean_percent": 10.396557214214086,
+    "selective_vs_ordinary_percent": 4.2985815825748785,
+    "faster_pairs": 0
+  },
+  "file/columnar": {
+    "clean": {
+      "median_ns": 60114.0,
+      "min_ns": 56799.0,
+      "max_ns": 61709.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "disabled": {
+      "median_ns": 56034.0,
+      "min_ns": 55226.0,
+      "max_ns": 59183.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "ordinary": {
+      "median_ns": 63547.0,
+      "min_ns": 62092.0,
+      "max_ns": 66734.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "selective": {
+      "median_ns": 58466.0,
+      "min_ns": 50101.0,
+      "max_ns": 61405.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "g2": {
+      "median_ns": 61485.0,
+      "min_ns": 60652.0,
+      "max_ns": 64032.0,
+      "allocations": [
+        18.0
+      ],
+      "median_bytes": 2160.0
+    },
+    "selective_vs_clean_percent": -2.741457896663002,
+    "selective_vs_ordinary_percent": -7.995656757990144,
+    "faster_pairs": 2
+  },
+  "file/adhoc": {
+    "clean": {
+      "median_ns": 9865.0,
+      "min_ns": 9780.0,
+      "max_ns": 10042.0,
+      "allocations": [
+        116.0
+      ],
+      "median_bytes": 13603.0
+    },
+    "disabled": {
+      "median_ns": 9807.0,
+      "min_ns": 8499.0,
+      "max_ns": 9833.0,
+      "allocations": [
+        116.0
+      ],
+      "median_bytes": 13603.0
+    },
+    "ordinary": {
+      "median_ns": 10414.0,
+      "min_ns": 10184.0,
+      "max_ns": 10622.0,
+      "allocations": [
+        118.0
+      ],
+      "median_bytes": 14068.0
+    },
+    "selective": {
+      "median_ns": 10189.0,
+      "min_ns": 10178.0,
+      "max_ns": 10323.0,
+      "allocations": [
+        119.0
+      ],
+      "median_bytes": 14083.0
+    },
+    "g2": {
+      "median_ns": 10171.0,
+      "min_ns": 10148.0,
+      "max_ns": 10411.0,
+      "allocations": [
+        118.0
+      ],
+      "median_bytes": 14067.0
+    },
+    "selective_vs_clean_percent": 3.2843385707045147,
+    "selective_vs_ordinary_percent": -2.1605531015940094,
+    "faster_pairs": 0
+  },
+  "file/first_call": {
+    "clean": {
+      "median_ns": 9992.0,
+      "min_ns": 9851.0,
+      "max_ns": 10124.0,
+      "allocations": [
+        119.0
+      ],
+      "median_bytes": 13987.0
+    },
+    "disabled": {
+      "median_ns": 9743.0,
+      "min_ns": 9740.0,
+      "max_ns": 9967.0,
+      "allocations": [
+        119.0
+      ],
+      "median_bytes": 13987.0
+    },
+    "ordinary": {
+      "median_ns": 10727.0,
+      "min_ns": 10357.0,
+      "max_ns": 10842.0,
+      "allocations": [
+        121.0
+      ],
+      "median_bytes": 14452.0
+    },
+    "selective": {
+      "median_ns": 10057.0,
+      "min_ns": 9940.0,
+      "max_ns": 10767.0,
+      "allocations": [
+        122.0
+      ],
+      "median_bytes": 14468.0
+    },
+    "g2": {
+      "median_ns": 10528.0,
+      "min_ns": 10337.0,
+      "max_ns": 10695.0,
+      "allocations": [
+        121.0
+      ],
+      "median_bytes": 14452.0
+    },
+    "selective_vs_clean_percent": 0.6505204163330669,
+    "selective_vs_ordinary_percent": -6.24592150647898,
+    "faster_pairs": 0
+  }
+}
