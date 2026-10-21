@@ -488,6 +488,19 @@ export class PageCodec {
     return wrapKeyBlockAsync(this.dek, this.nextGeneration(), cred, params, this.rng);
   }
 
+  // rewrapSteps is rewrap through the codec's own backend: inline for a synchronous codec, awaited for
+  // an asynchronous one (the browser's WebCrypto).
+  *rewrapSteps(cred: Credential, params: Argon2Params): Steps<Uint8Array> {
+    if (!this.keys.async) return this.rewrap(cred, params);
+    checkCredential(cred);
+    return yield* ioSteps(
+      () => {
+        throw asyncCodecError();
+      },
+      () => this.rewrapAsync(cred, params),
+    );
+  }
+
   private nextGeneration(): bigint {
     const generation = keyBlockGeneration(this.block);
     if (generation === 0xffff_ffff_ffff_ffffn) throw corrupt("key block generation exhausted");

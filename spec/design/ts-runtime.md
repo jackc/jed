@@ -397,12 +397,22 @@ fail `BUSY` until that transaction ends. A transaction callback awaits applicati
 without surrendering ownership. `view`/`update` roll back on exceptions and commit on
 success. Do not await a competing writer from inside the callback that holds the writer.
 
-Session limit setters use `await session.configure({...})`. The initial async surface does not
-yet expose compaction, changing per-database storage limits after open, the storage-byte gauge,
-or resetting an individual custom session variable. `maxStorageBytes` is accepted at create/open;
+Session limit setters use `await session.configure({...})`. The async surface does not yet expose
+changing per-database storage limits after open, the storage-byte gauge, or resetting an individual
+custom session variable. `maxStorageBytes` is accepted at create/open;
 new sessions start without custom variables and can initialize them through `configure({vars})`.
 These remain host API follow-ons, not methods
 applications can import from the public async entry points today.
+
+Database maintenance is on the database handle: `await db.compact(name)`,
+`await db.changeCredential(name, credential, kdf?)` and `await db.rekey(name, credential | null,
+kdf?)` (api.md §2.6 and *Encryption at rest*). Each is one worker request with no session; the
+worker calls the engine's own method, so the preconditions, error order and SQLSTATEs are the
+synchronous API's. They never wait for the writer: a session of the same handle holding a write
+transaction, or an open read session, transaction or cursor pinning a snapshot, makes them `55006`,
+exactly as an in-process session would. A credential change runs as a continuation (§11.1): a
+cancellation can stop it before the writer gate is taken, never during the key-block write. On OPFS
+`compact` and `rekey` are `0A000` (the rekey before its KDF runs).
 
 `query(sql, Value[], {signal})` and prepared `query(Value[], {signal})` return async,
 single-pass rows. Column names/types and command count are returned at open; cost is final
@@ -619,10 +629,12 @@ These remain synchronous and are not required by the browser storage stack:
   temporary-domain migration to a Node scratch file. Browser hosts have no spill target.
 - Page-service paths (Node only): a page client's commit through the blocking channel, owner
   adoption of client commits and the owner's maintenance commit, election and promotion.
-- Host compaction (`compactFile`, Node only and not on the async surface): its from-scratch
-  serializer faults leaves through the synchronous store path. OPFS compaction is already
-  `0A000` pending a crash-safe replace (hosts.md §7); an async compaction needs a generator
-  from-scratch serializer and belongs with that design.
+- Host compaction and rekey (`compactFile`; on the async surface they run inline in the Node
+  worker): the from-scratch serializer faults leaves through the synchronous store path. OPFS
+  compaction and rekey are already `0A000` pending a crash-safe replace (hosts.md §7); an async
+  compaction needs a generator from-scratch serializer and belongs with that design. A credential
+  change is not in this list: it writes only the key block (encrypted.md §5), so it is a
+  continuation whose rewrap and two-barrier write the WebCrypto codec awaits.
 - `create`'s whole bootstrap image written in place (OPFS) or through a temp file (Node): an
   encrypted create must first define how bootstrap pages are encoded (encryption.md §4).
 - Host backup (`backupForTesting`, Node only and not on the async surface): it walks the snapshot

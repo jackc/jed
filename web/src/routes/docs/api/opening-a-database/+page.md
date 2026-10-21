@@ -161,9 +161,9 @@ jed reuses the pages that deletes and updates free. When the free pages are at t
 later commit cuts them off and the file gets shorter by itself, but free pages in the middle of the
 file stay there, so after a big delete the file can stay close to its peak size. To give all of that
 space back, compact the database:
-`db.compact("main")` (Rust) or `db.Compact("main")` (Go). Pass an attachment's name to compact that
-database instead. The name is matched exactly, as given when the database was attached.
-TypeScript's public async API does not currently expose compaction.
+`db.compact("main")` (Rust), `db.Compact("main")` (Go) or `await db.compact("main")` (TypeScript).
+Pass an attachment's name to compact that database instead. The name is matched exactly, as given
+when the database was attached.
 
 Compaction rewrites the committed data as a fresh, contiguous file next to the original
 (`<path>.jedtmp`), syncs it, and atomically renames it into place, so a crash at any point leaves
@@ -225,20 +225,20 @@ it cannot protect a process that is already running with the key.
 
 ### Changing the credential
 
-`db.change_credential("main", new_credential, kdf)` (Rust) or `db.ChangeCredential("main", cred, kdf)`
-(Go) rewraps the data key for a new credential. Only the small key block is rewritten, so it is quick
+`db.change_credential("main", new_credential, kdf)` (Rust), `db.ChangeCredential("main", cred, kdf)`
+(Go) or `await db.changeCredential("main", credential, kdf)` (TypeScript, Node and the browser) rewraps the data key for a new credential. Only the small key block is rewritten, so it is quick
 apart from Argon2id for a new passphrase. When it returns, only the new credential opens the file; if
 the process dies partway, exactly one of the two does, and the next writable open finishes the job.
-Pass an attachment's name to change that file's credential instead. TypeScript's public async API
-does not expose this yet.
+Pass an attachment's name to change that file's credential instead.
 
 ### Rotating the key, encrypting, decrypting
 
-`db.rekey("main", Some(credential), kdf)` (Rust) or `db.Rekey("main", cred, kdf)` (Go) rewrites the
+`db.rekey("main", Some(credential), kdf)` (Rust), `db.Rekey("main", cred, kdf)` (Go) or
+`await db.rekey("main", credential, kdf)` (TypeScript) rewrites the
 file under a **new data key**: it rotates an encrypted file's key, or encrypts a plaintext file. Pass
-no credential (`None` / `nil`) to decrypt. Every page is rebuilt, so it takes about as long as
+no credential (`None` / `nil` / `null`) to decrypt. Every page is rebuilt, so it takes about as long as
 compaction (above) and has the same rules: it never waits, and fails with
-`55006` while a reader or another transaction is open. A row that fits a plaintext page but not an
+`55006` while a reader or another transaction is open, and with `0A000` in the browser (OPFS). A row that fits a plaintext page but not an
 encrypted one (which holds 40 bytes less) fails before the file is touched. Copies of the file made
 before still open with their old credential: rotation protects the file from now on, not old copies.
 

@@ -3,6 +3,7 @@ import type { Value } from "../value.ts";
 import type { JsonNode } from "../json.ts";
 import { toValue, valueToJs, type JsParam, type Row, type RunResult } from "../ergonomic.ts";
 import type { SessionOptions, TxStatus } from "../snapshot.ts";
+import type { Argon2Params, Credential } from "../crypto.ts";
 import type { ScriptSummary } from "../split.ts";
 import { decodeError, TransportError } from "./errors.ts";
 import { encodeValues, measureValues, WireBudget } from "./wire.ts";
@@ -983,6 +984,34 @@ export class AsyncDatabase extends AsyncHandle {
     } finally {
       await session.close();
     }
+  }
+  /**
+   * Rewrite database `name` (`"main"`, matched exactly) as the garbage-free image of its committed
+   * snapshot, returning its dead pages (spec/design/api.md §2.6). Never waits: `55006` while a
+   * session holds a write transaction or a read session, transaction or cursor is open; `25006`
+   * read-only; `0A000` on OPFS, which cannot replace a file atomically yet.
+   */
+  async compact(name: string): Promise<void> {
+    await this.call("compact", { name });
+  }
+  /**
+   * Rewrap the data key of the encrypted file database `name` for `credential`, rewriting only the
+   * key block (spec/design/api.md, Encryption at rest). A passphrase is stretched with `kdf` before
+   * the writer is taken. Never waits: `55006` while a session holds a write transaction; `28P03`
+   * for a plaintext file; `55000` in memory; `25006` read-only; `22023` for a malformed credential
+   * or Argon2id parameters out of range.
+   */
+  async changeCredential(name: string, credential: Credential, kdf?: Argon2Params): Promise<void> {
+    await this.call("changeCredential", { name, credential, kdf });
+  }
+  /**
+   * Rewrite the file database `name` under a new data key: encrypted for `credential` (rotating the
+   * key, or encrypting a plaintext file — which needs `scratchEncryption: "on"`), or plaintext when
+   * it is null. It replaces the file as compaction does, with compaction's limits (`55006`, and
+   * `0A000` on OPFS).
+   */
+  async rekey(name: string, credential: Credential | null, kdf?: Argon2Params): Promise<void> {
+    await this.call("rekey", { name, credential, kdf });
   }
   close(): Promise<void> {
     this.closed = true;

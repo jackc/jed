@@ -66,13 +66,22 @@ test("commit, recovery and maintenance await an asynchronous page codec over rea
   });
 });
 
-test("an encrypted database seals and opens its pages through WebCrypto in the worker", async ({
+test("an encrypted database seals its pages through WebCrypto and changes its credential", async ({
   page,
 }) => {
   await page.goto("/");
   await expect(page.locator("#out")).toContainText("read back");
   const result = await page.evaluate((n) => window.jed.encryptedScenario(n), "enc1.jed");
-  expect(result).toEqual({ written: EXPECTED, read: EXPECTED, missing: "28P02", wrong: "28P01" });
+  expect(result).toEqual({
+    written: EXPECTED,
+    read: EXPECTED,
+    missing: "28P02",
+    wrong: "28P01",
+    compact: "0A000",
+    rekey: "0A000",
+    oldKey: "28P01",
+    afterChange: EXPECTED,
+  });
 });
 
 test("WebCrypto writes the Node host's bytes, and its per-page cost", async ({ page }) => {

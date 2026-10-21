@@ -363,3 +363,58 @@ test("an encrypted OPFS database fails closed without its credential", async () 
     closeOpfs(engine);
   });
 });
+
+// A credential change on OPFS runs as a continuation (ts-runtime.md §11): the WebCrypto rewrap and the
+// two-barrier key-block write are awaited, and the file equals the Node file host's after the same
+// change under the same seeded key stream. Compaction and rekey need an atomic file replace OPFS lacks:
+// 0A000, the rekey before its KDF runs.
+test("an OPFS credential change through WebCrypto writes the Node file host's bytes", async () => {
+  const pass: Credential = { passphrase: "changed" };
+  const kdf = { memoryKib: 64, iterations: 1, parallelism: 1 };
+  const path = join(scratch, "webcrypto_credential.jed");
+  const control = createDatabase({
+    path,
+    pageSize: PAGE,
+    skipFsync: true,
+    environment: seeded(),
+    credential: ENC_KEY,
+    locking: "none",
+  });
+  const s = control.session();
+  for (const sql of WORKLOAD) s.execute(sql);
+  s.close();
+  control.changeCredential("main", pass, kdf);
+  control.close();
+  const fileBytes = new Uint8Array(readFileSync(path));
+
+  await withAsync(async () => {
+    const handle = new FakeSyncAccessHandle();
+    const db = SharedDatabase.fromEngine(
+      await runAsync(
+        createOpfsWithHandleSteps(handle, {
+          pageSize: PAGE,
+          credential: ENC_KEY,
+          environment: seeded(),
+        }),
+      ),
+    );
+    const session = db.session();
+    for (const sql of WORKLOAD) await runAsync(session.executeSteps(sql));
+    session.close();
+    await runAsync(db.changeCredentialSteps("main", pass, kdf));
+    assert.throws(() => db.compact("main"), /0A000/);
+    assert.throws(() => db.rekey("main", ENC_KEY), /0A000/);
+    await runAsync(db.closeSteps());
+    const bytes = handle.bytes();
+    assert.ok(bytesEqual(bytes, fileBytes), "the OPFS credential change wrote different bytes");
+
+    const open = (credential: Credential): Promise<Engine> =>
+      runAsync(openOpfsWithHandleSteps(new FakeSyncAccessHandle(bytes), { credential }));
+    await assert.rejects(open(ENC_KEY), /28P01/);
+    const reopened = SharedDatabase.fromEngine(await open(pass));
+    const r = reopened.session();
+    assert.equal((await runAsync(querySteps(r, "SELECT count(*) FROM t")))[0], "202");
+    r.close();
+    await runAsync(reopened.closeSteps());
+  });
+});
