@@ -22,6 +22,8 @@ import { type MessagePort, workerData } from "node:worker_threads";
 import "../crc32_node.ts";
 // The worker checks and reseals an encrypted client commit's meta (spec/fileformat/encrypted.md §14).
 import "../crypto_node.ts";
+import { osKeyEntropy } from "../crypto.ts";
+import type { RandomSource } from "../seam.ts";
 import { signalAnswer } from "./blocking.ts";
 import { PS_NOTICE_YIELD_CANCELLED, psMaxReadPages, type PsIndexedPage } from "./codec.ts";
 import type { Delta } from "./delta.ts";
@@ -134,6 +136,11 @@ class Served implements ServedDb {
       this.fdGeneration = generation;
     }
     return this.fd;
+  }
+
+  // keyEntropy: a worker thread shares no object with the engine, so its reseals draw from the OS.
+  keyEntropy(): RandomSource {
+    return osKeyEntropy();
   }
 
   // readPage reads one page from the file at its index.

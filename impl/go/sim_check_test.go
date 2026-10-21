@@ -4,7 +4,8 @@ package jed
 // a copy of the disk image the way a new process would — so the meta selection and manifest
 // validation of validated-cow.md §1 run first — and then walks the selected generation:
 //
-//   - the live page count at meta offset 56 equals the pages reachable from the catalog root;
+//   - the live page count at meta offset 56 equals the pages reachable from the catalog root, GiST
+//     R-tree pages included;
 //   - every reachable page lies in [2, page_count);
 //   - the free list has no duplicates and is disjoint from the reachable set and from the selected
 //     generation's manifest dependencies;
@@ -23,7 +24,15 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
-	e, err := loadEnginePagedCredential(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment(), cred)
+	env := NewEnvironment()
+	if err := unlockPager(p, cred, env); err != nil {
+		return 0, 0, 0, fmt.Errorf("open: %w", err)
+	}
+	// A GiST R-tree is read whole at load (gist.md §4.1); its pages are the ones the load visits, which
+	// the reachability walk does not list.
+	var gist []uint32
+	e, err := loadEngineSharedPagingAt(newSharedPaging(p, cacheLeaves(defaultCacheBytes, p.pageSize)), env,
+		loadAt{gist: func(pg uint32) { gist = append(gist, pg) }})
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
@@ -39,6 +48,12 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 	reached, err := snap.reachablePages(e.paging, pageRef{page: mt.rootPage, tag: mt.rootTag})
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("reachability walk: %w", err)
+	}
+	for _, pg := range gist {
+		if reached[pg] {
+			return 0, 0, 0, fmt.Errorf("GiST page %d is reachable twice", pg)
+		}
+		reached[pg] = true
 	}
 	if uint32(len(reached)) != mt.livePages {
 		return 0, 0, 0, fmt.Errorf("live page count %d, but %d pages are reachable", mt.livePages, len(reached))
@@ -264,4 +279,182 @@ func simExternalRef(v Value) (first pageRef, length int, ok bool) {
 		return pageRef{}, 0, false
 	}
 	return u.first(), int(u.StoredLen), true
+}
+
+// --- page replay (simulation-testing.md §8.3 *Replays*, slice S13) ----------------------------
+
+// simPointerKinds classifies the pages of image's selected generation by the kind of bound pointer
+// that names each (encrypted.md §2), and returns the pages that generation's manifest depends on: its
+// listed pages and its manifest-overflow pages. A page's kind is its pointer's, so a chain's head is
+// `catalog`, `free`, or an overflow kind, and every later page of the chain its `_next` kind; a tree's
+// root is `root` and every other node `child` (`gist_child` in a GiST R-tree).
+func simPointerKinds(image []byte, cred *Credential) (map[string][]uint32, map[uint32]bool, error) {
+	pgr, err := pagerFromStore(newMemoryBlockStore(image))
+	if err != nil {
+		return nil, nil, err
+	}
+	env := NewEnvironment()
+	if err := unlockPager(pgr, cred, env); err != nil {
+		return nil, nil, err
+	}
+	paging := newSharedPaging(pgr, cacheLeaves(defaultCacheBytes, pgr.pageSize))
+	var gist []uint32
+	e, err := loadEngineSharedPagingAt(paging, env, loadAt{gist: func(pg uint32) { gist = append(gist, pg) }})
+	if err != nil {
+		return nil, nil, err
+	}
+	mt, err := pgr.selectValidatedMeta()
+	if err != nil {
+		return nil, nil, err
+	}
+	deps := map[uint32]bool{}
+	for pg := range pgr.manifestProtected {
+		deps[pg] = true
+	}
+	sets := map[string]map[uint32]bool{}
+	add := func(kind string, pg uint32) {
+		if sets[kind] == nil {
+			sets[kind] = map[uint32]bool{}
+		}
+		sets[kind][pg] = true
+	}
+	pcap := paging.cap()
+	chain := func(head pageRef, first, next string) error {
+		kind := first
+		for p := head; p.page != 0; kind = next {
+			add(kind, p.page)
+			block, err := paging.readBody(p)
+			if err != nil {
+				return err
+			}
+			pg, err := parsePage(block)
+			if err != nil {
+				return err
+			}
+			if p, _, err = chainContent(pg, pcap); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := chain(pageRef{page: mt.rootPage, tag: mt.rootTag}, "catalog", "catalog_next"); err != nil {
+		return nil, nil, err
+	}
+	if err := chain(pageRef{page: mt.freeListHead, tag: mt.freeListTag}, "free", "free_next"); err != nil {
+		return nil, nil, err
+	}
+	// Manifest-overflow pages are plaintext; the meta's tag binds them through its associated data.
+	for id, n := mt.manifestHead, uint32(0); id != 0 && n < mt.manifestPages; n++ {
+		add("manifest", id)
+		block, err := pgr.readBlock(id)
+		if err != nil {
+			return nil, nil, err
+		}
+		pg, err := parsePage(block)
+		if err != nil {
+			return nil, nil, err
+		}
+		id = pg.nextPage
+	}
+	var walk func(n *pnode, kind string)
+	walk = func(n *pnode, kind string) {
+		if n.page != 0 {
+			add(kind, n.page)
+		}
+		for _, c := range n.children {
+			if c.node == nil {
+				add("child", c.page)
+			} else {
+				walk(c.node, "child")
+			}
+		}
+	}
+	snap := e.committed
+	for _, st := range snap.stores {
+		if root := st.treeRoot(); root != nil {
+			walk(root, "root")
+		}
+		entries, err := st.EntriesInKeyOrder()
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, entry := range entries {
+			for _, v := range entry.Row {
+				first, length, ok := simExternalRef(v)
+				if !ok {
+					continue
+				}
+				pages, err := chainPages(first, length, paging.readBody, pcap)
+				if err != nil {
+					return nil, nil, err
+				}
+				head := "overflow"
+				if v.unfetched().Form == tagExternalComp {
+					head = "overflow_lz4"
+				}
+				for k, pg := range pages {
+					if k == 0 {
+						add(head, pg)
+					} else {
+						add("overflow_next", pg)
+					}
+				}
+			}
+		}
+	}
+	for _, ist := range snap.indexStores {
+		if root := ist.treeRoot(); root != nil && root.page != 0 {
+			walk(root, "root")
+		}
+	}
+	// A GiST R-tree is read whole at load (gist.md §4.1): its pages are the ones the load visited. Each
+	// interior's children come from the loader's own parser, reading only that page; whatever no
+	// interior names is a root.
+	named := map[uint32]bool{}
+	for _, pg := range gist {
+		stored, err := pgr.readBlock(pg)
+		if err != nil {
+			return nil, nil, err
+		}
+		ref := pageRef{page: pg}
+		if pgr.codec != nil {
+			copy(ref.tag[:], stored[len(stored)-len(ref.tag):]) // the load already checked it against its pointer
+		}
+		block, err := paging.openBlock(ref, stored)
+		if err != nil {
+			return nil, nil, err
+		}
+		if parsed, err := parsePage(block); err != nil || parsed.pageType != pageGistInterior {
+			continue
+		}
+		var keys [][]byte
+		read := func(p pageRef) (byte, uint32, []byte, error) {
+			if p.page != pg {
+				named[p.page] = true
+				return pageGistLeaf, 0, nil, nil
+			}
+			parsed, err := parsePage(block)
+			return parsed.pageType, parsed.itemCount, parsed.payload, err
+		}
+		if err := readGistLeafKeys(read, pageRef{page: pg}, pcap, &keys, map[uint32]bool{}, 1); err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, pg := range gist {
+		if named[pg] {
+			add("gist_child", pg)
+		} else {
+			add("root", pg)
+		}
+	}
+	kinds := make(map[string][]uint32, len(sets))
+	for kind, set := range sets {
+		pages := make([]uint32, 0, len(set))
+		for pg := range set {
+			pages = append(pages, pg)
+		}
+		sort.Slice(pages, func(a, b int) bool { return pages[a] < pages[b] })
+		kinds[kind] = pages
+	}
+	return kinds, deps, nil
 }

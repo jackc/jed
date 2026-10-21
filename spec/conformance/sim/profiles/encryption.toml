@@ -1,20 +1,27 @@
-# Encryption at rest (spec/design/encryption.md; simulation-testing.md §14 S12): main is encrypted,
+# Encryption at rest (spec/design/encryption.md; simulation-testing.md §14 S12–S13): main is encrypted,
 # every commit seals its pages, and credential changes and rekeys run between ordinary work, often
 # with a fault armed for them. A crash between a change's two key-block writes must leave exactly one
 # of the old and new keys working; a crashed rekey leaves the old file or the new one, never neither.
-# Pages are at least 1 KiB, the encrypted variant's minimum.
+# A rekey may also decrypt main, and a later one encrypt it again (S13). Backups are taken under every
+# key, and `restore` copies one back over main, so later commits diverge from the history the backup
+# came from and reuse its page indexes and versions. Pages are at least 1 KiB, the encrypted variant's
+# minimum.
 
-description = "Encrypted main: sealed commits, credential changes and rekeys under crashes"
+description = "Encrypted main: credential changes, rekeys and conversions under crashes; backups and restores"
 
 page_sizes = [1024, 2048]
 encrypted = [1]
 synchronous = ["on", "off"]
 steps = 400
+conversion = 300
 
 [weights]
 change_key = 4
-rekey = 2
+rekey = 3
 compact = 1
+backup = 2
+restore = 1
+replay = 1
 crash_power = 2
 crash_process = 2
 corrupt = 0
@@ -22,3 +29,4 @@ corrupt = 0
 [faults]
 key_fault = 400
 compact_fault = 300
+backup_fault = 200

@@ -38,7 +38,7 @@ import type { SharedPaging } from "./paging.ts";
 import type { PageClientHandle, ServiceHandoffHost } from "./shared.ts";
 import { compareTextC } from "./value.ts";
 import { capFirstBody, NO_TAG } from "./cap.ts";
-import { selectedKeyPage } from "./crypto.ts";
+import { KEY_BLOCK_LEN, selectedKeyPage } from "./crypto.ts";
 
 // BackupCore is the part of a Database's shared core a backup uses.
 type BackupCore = {
@@ -99,8 +99,11 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
         fill = (writeAt) => writePageIdentical(c, paging, pageSize, mt, pages, writeAt);
       } else {
         // An encrypted database's copy keeps its data key and key block, every page resealed under
-        // fresh nonces, as compaction does (spec/fileformat/encrypted.md §13).
-        const codec = paging?.codec() ?? null;
+        // fresh nonces, as compaction does (spec/fileformat/encrypted.md §13). The copy takes the file's
+        // selected key-block copy, as the page-identical form does: a page client's codec still holds
+        // the copy it unlocked from, which a credential change since has replaced.
+        let codec = paging?.codec() ?? null;
+        if (codec !== null) codec = codec.withKeyBlock(currentKeyBlock(paging!));
         fill = (writeAt) => {
           writeImage(
             snap,
@@ -117,6 +120,12 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
       c.deregister(v, gen);
     }
   }
+}
+
+// currentKeyBlock is the selected copy of the key-block pair the file holds now (pages 2 and 3, read
+// through the service for a page client; encrypted.md §5).
+function currentKeyBlock(paging: SharedPaging): Uint8Array {
+  return selectedKeyPage(paging.readBlock(2), paging.readBlock(3)).slice(0, KEY_BLOCK_LEN);
 }
 
 // backupMeta reads the meta that published version v. A commit writes the slot that does not hold the

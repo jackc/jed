@@ -38,6 +38,9 @@ module SimGen
     "max_storage_bytes" => [0],
     "synchronous" => ["on"],
     "encrypted" => [0],
+    "conversion" => 0,   # S13: the permille chance a rekey decrypts its database instead
+    "gist" => 0,         # S13: i32range columns with GiST indexes, for the GiST child pointer
+    "replay_after_commit" => 0, # S13: the permille chance an encrypted trace replays right after a commit
     "steps" => 300,
     "max_tables" => 3,
     "max_rows" => 300,
@@ -56,10 +59,11 @@ module SimGen
       "crash_power" => 1, "crash_process" => 1, "compact" => 0, "backup" => 0,
       "spawn" => 0, "exit" => 0, "kill" => 0, "disconnect" => 0,
       "attach" => 0, "corrupt" => 0, "temp_table" => 0, "temp_insert" => 0, "temp_read" => 0,
-      "change_key" => 0, "rekey" => 0
+      "change_key" => 0, "rekey" => 0, "replay" => 0, "restore" => 0
     },
     "values" => {
-      "short" => 10, "long_compressible" => 3, "long_incompressible" => 3, "null" => 2, "uuid" => 1
+      "short" => 10, "long_compressible" => 3, "long_incompressible" => 3, "null" => 2, "uuid" => 1,
+      "long_repeated" => 0, "long_chain" => 0
     },
     "faults" => {
       "commit_fault" => 150, "chain" => 150, "power_loss" => 5, "process_crash" => 3,
@@ -88,6 +92,11 @@ module SimGen
   def self.profile_names
     Dir[File.join(PROFILE_DIR, "*.toml")].map { |p| File.basename(p, ".toml") }.sort
   end
+
+  # The pointer kinds a `replay` step targets (simulation-testing.md §14 S13; encrypted.md §2): the page
+  # each names. A kind with no candidate page when the step runs is skipped.
+  REPLAY_KINDS = %w[catalog catalog_next free free_next manifest root child gist_child
+                    overflow overflow_lz4 overflow_next].freeze
 
   # splitmix64 — the same stream the entropy seam pins (spec/encoding/prng.toml).
   class Rng
@@ -163,6 +172,7 @@ module SimGen
       @txdb = nil           # the durable database the open write transaction writes, once it writes one
       @temps = {}           # the write session's temp tables: name => next id
       @knobs = {}           # the handle settings drawn for the header
+      @backups = 0          # backup steps emitted: a restore needs one (the runner skips it otherwise)
     end
 
     def generate
@@ -241,6 +251,8 @@ module SimGen
       when "compact" then compact
       when "change_key" then key_step("change_key") if @encrypted
       when "rekey" then key_step("rekey") if @encrypted
+      when "replay" then replay if @encrypted
+      when "restore" then restore
       when "backup" then backup
       when "spawn" then spawn if @service
       when "exit" then exit_process if @service
@@ -370,7 +382,15 @@ module SimGen
         @committed = @working unless @aborted
         @writer = nil
         @working = nil
+        # Right after a commit the newest manifest is that commit's, so a big commit's overflow pages
+        # and its many listed pages are there to replay (S13).
+        # After a drop or a delete, half of them target the free list it just grew.
+        rate = @p["replay_after_commit"]
+        if @encrypted && rate.positive? && @rng.chance(rate)
+          replay(@freed && @rng.chance(500) ? @rng.pick(%w[free free_next]) : nil)
+        end
       end
+      @freed = false
     end
 
     def rollback
@@ -400,13 +420,28 @@ module SimGen
       dbs = @attached.select { |_, v| v == :yes }.keys.sort
       db = dbs.empty? || @rng.chance(500) ? nil : @rng.pick(dbs)
       emit(db ? "compact #{db}" : "compact")
-      fault_kills(line, @procs.min) if faulted
+      fault_kills_owner(line) if faulted
     end
 
-    # A credential change or a rekey of main (slice S12, encryption.md §5) to host key 1–3. A fault may
-    # land at any of the change's barriers (between its two key-block writes) or the rekey's (as
-    # compaction's); recovery must then open with exactly one of the old and new keys. A rekey fails
-    # 55006 with a session open, which the model records like any outcome.
+    # A fault on a host step that runs in the lowest running process (compaction, a key step) kills the
+    # owner of whichever database it touched, or with one process or a power loss every process. The
+    # model cannot name that owner, so it forgets sessions only when every process dies: a writer in a
+    # process that died is then skipped by the runner, which costs only the steps that name it.
+    def fault_kills_owner(line)
+      if !@service || line.start_with?("fault power_loss") || @procs.length < 2
+        kill_sessions
+      else
+        @after_crash = true
+      end
+    end
+
+    # A credential change or a rekey (slice S12, encryption.md §5) to host key 1–3 of main or, half the
+    # time when one is attached, a file attachment (S13). A rekey may instead decrypt the database
+    # (`plain`, the profile's `conversion` chance), and a rekey of a plaintext database encrypts it. A
+    # fault may land at any of the change's barriers (between its two key-block writes) or the rekey's
+    # (as compaction's); recovery must then open with exactly one of the old and new keys. A rekey fails
+    # 55006 with a session open, and a credential change of a plaintext database 28P03, which the model
+    # records like any outcome.
     def key_step(kind)
       faulted = @rng.chance(@p.dig("faults", "key_fault"))
       if faulted
@@ -414,8 +449,38 @@ module SimGen
         line = "fault #{k} nth=#{@rng.range(1, 3)}"
         emit(line)
       end
-      emit("#{kind} #{@rng.range(1, 3)}")
-      fault_kills(line, @procs.min) if faulted
+      dbs = @attached.select { |_, v| v == :yes }.keys.sort
+      db = dbs.empty? || @rng.chance(500) ? nil : @rng.pick(dbs)
+      target = kind == "rekey" && @p["conversion"].positive? && @rng.chance(@p["conversion"]) ? "plain" : @rng.range(1, 3)
+      emit(["#{kind} #{target}", db].compact.join(" "))
+      fault_kills_owner(line) if faulted
+    end
+
+    # Replace a genuine page of main with an older genuine version of it, at a page the given pointer
+    # kind names (S13, encrypted.md §2). Like corrupt, the runner ends every session cleanly first and
+    # puts the page back afterwards.
+    def replay(kind = nil)
+      return if @service
+
+      emit("replay #{kind || @rng.pick(REPLAY_KINDS)}")
+      @writer = nil
+      @working = nil
+      @readers.clear
+    end
+
+    # Copy one of main's earlier backups over it (S13): the j-th newest that succeeded, or the oldest.
+    # Every process ends cleanly first. Main goes back to the backup's generation, so every later
+    # commit diverges from the history the backup was taken in; whatever the model knew of main's
+    # tables since is uncertain.
+    def restore
+      return if @backups.zero?
+
+      emit("restore #{@rng.range(1, 3)}")
+      @writer = nil
+      @working = nil
+      @readers.clear
+      @procs = [0]
+      @committed.each_value { |t| t.maybe = true if db_of(t.name) == "main" }
     end
 
     # A backup of main (page-service.md §9) in either form, from a random running process: it pins
@@ -423,6 +488,7 @@ module SimGen
     # file's sync, the directory's) or, in a service trace, end the connection its page reads use.
     def backup
       form = @rng.chance(500) ? "page_identical" : "compacted"
+      @backups += 1
       pid = @service ? @rng.pick(@procs) : 0
       faulted = @rng.chance(@p.dig("faults", "backup_fault"))
       if faulted
@@ -680,7 +746,7 @@ module SimGen
       t.cols.drop(t.orig).each do |name, type, _|
         on("ALTER TABLE #{t.name} ADD COLUMN IF NOT EXISTS #{name} #{type}")
       end
-      t.indexes.sort.each { |n, (col, unique)| on(index_sql(n, t.name, col, unique)) }
+      t.indexes.sort.each { |n, (col, unique, gist)| on(index_sql(n, t.name, col, unique, gist)) }
       t.maybe = false
     end
 
@@ -688,8 +754,9 @@ module SimGen
       cols.map { |name, type, _| name == "id" ? "id i64 PRIMARY KEY" : "#{name} #{type}" }.join(", ")
     end
 
-    def index_sql(name, table, col, unique)
-      "CREATE #{unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS #{name} ON #{table} (#{col})"
+    def index_sql(name, table, col, unique, gist = false)
+      using = gist ? " USING gist" : ""
+      "CREATE #{unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS #{name} ON #{table}#{using} (#{col})"
     end
 
     # max_tables bounds each database's tables.
@@ -703,7 +770,7 @@ module SimGen
       cols = [["id", "i64", :key]]
       n = @rng.range(1, 4)
       n.times do |i|
-        type = @rng.pick(%w[i32 i64 text text bytea])
+        type = @rng.pick(@p["gist"].positive? ? %w[i32 i64 text text bytea i32range] : %w[i32 i64 text text bytea])
         cols << ["c#{i + 1}", type, type == "i64" ? :key : :plain]
       end
       t = Table.new(name: name, cols: cols, orig: cols.length, next_id: 1, indexes: {}, maybe: false)
@@ -721,19 +788,22 @@ module SimGen
       t = @working[@rng.pick(names.sort)]
       @txdb = "main"
       @working.delete(t.name)
+      @freed = true
       on("DROP TABLE IF EXISTS #{t.name}")
     end
 
+    # A GiST index on a range column (S13), otherwise a B-tree on an integer one.
     def create_index
       t = pick_table or return
-      cols = t.cols.drop(1).select { |_, type, _| %w[i32 i64].include?(type) }
+      cols = t.cols.drop(1).select { |_, type, _| %w[i32 i64 i32range].include?(type) }
       return if cols.empty?
 
       col, type, role = @rng.pick(cols)
+      gist = type == "i32range"
       unique = role == :key && type == "i64" && @rng.chance(500)
       name = fresh("ix")
-      t.indexes[name] = [col, unique]
-      on(index_sql(name, t.name, col, unique).sub(" IF NOT EXISTS", ""))
+      t.indexes[name] = gist ? [col, unique, true] : [col, unique]
+      on(index_sql(name, t.name, col, unique, gist).sub(" IF NOT EXISTS", ""))
     end
 
     def drop_index
@@ -845,6 +915,7 @@ module SimGen
       t = pick_table or return
       return if t.next_id <= 1
 
+      @freed = true
       on("DELETE FROM #{t.name} WHERE #{range_predicate(t)}")
     end
 
@@ -868,6 +939,7 @@ module SimGen
       when "i64" then role == :key ? "#{x} * 7" : "#{x} * #{@rng.range(2, 1_000_003)}"
       when "text" then text_expr(x)
       when "bytea" then bytea_expr(x)
+      when "i32range" then range_expr(x)
       end
     end
 
@@ -877,6 +949,7 @@ module SimGen
       when "i64" then "id * #{@rng.range(2, 1_000_003)}"
       when "text" then @rng.chance(300) ? "#{name} || '#{'x' * @rng.range(1, 40)}'" : text_expr("id")
       when "bytea" then bytea_expr("id")
+      when "i32range" then range_expr("id")
       end
     end
 
@@ -888,8 +961,26 @@ module SimGen
         salt = @rng.range(0, 999)
         (1..@rng.range(4, 24)).map { |i| "md5(#{x}::text || '#{salt}.#{i}')" }.join(" || ")
       when "uuid" then "uuidv4()::text"
+      when "long_repeated"
+        # Hex digests repeated a few times: LZ4 halves it or better, yet the compressed value still
+        # outgrows the record, so it is stored compressed out of line (the 0x04 external pointer).
+        salt = @rng.range(0, 999)
+        parts = (1..@rng.range(16, 60)).map { |i| "md5(#{x}::text || '#{salt}.#{i}')" }.join(" || ")
+        "repeat(#{parts}, #{@rng.range(2, 4)})"
+      when "long_chain"
+        # Incompressible and several pages long, so its overflow chain has successors.
+        salt = @rng.range(0, 999)
+        (1..@rng.range(40, 100)).map { |i| "md5(#{x}::text || '#{salt}.#{i}')" }.join(" || ")
       else "NULL"
       end
+    end
+
+    # A short range whose bounds follow the row (S13: the GiST index's keys), now and then empty.
+    def range_expr(x)
+      return "'empty'::i32range" if @rng.chance(50)
+
+      lo = "(#{x} * #{@rng.range(1, 97)}) % 1000"
+      "i32range(#{lo}, #{lo} + #{@rng.range(1, 40)})"
     end
 
     def bytea_expr(x)

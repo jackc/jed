@@ -173,17 +173,31 @@ impl Shared {
                 self.write_page_identical(&paging, &mt, &pages, page_size, write_at)
             })?;
         } else {
+            // An encrypted database's copy keeps its data key and the file's selected key-block
+            // copy, as the page-identical form does — a page client's codec still holds the copy it
+            // unlocked from, which a credential change since has replaced — every page resealed
+            // under fresh nonces, as compaction does (encrypted.md §13).
+            let codec = match paging.codec() {
+                Some(codec) => Some(codec.with_key_block(self.current_key_block(&paging)?)),
+                None => None,
+            };
             write_backup_file(files, dest, no_sync, &mut |write_at| {
-                // An encrypted database's copy keeps its data key and key block, every page
-                // resealed under fresh nonces, as compaction does (spec/design/encryption.md §5).
-                let codec = paging.codec().map(|c| &**c);
-                snap.write_image(page_size, v + 1, codec, &mut |index, page| {
+                snap.write_image(page_size, v + 1, codec.as_ref(), &mut |index, page| {
                     write_at(index as u64 * page_size as u64, page)
                 })
                 .map(|_| ())
             })?;
         }
         Ok(true)
+    }
+
+    /// The selected copy of the key-block pair the file holds now (pages 2 and 3, read through its
+    /// pager, so through the service page by page for a page client; encrypted.md §5), as its 128
+    /// key-block bytes.
+    fn current_key_block(&self, paging: &SharedPaging) -> Result<Vec<u8>> {
+        let pair = read_local(paging, &[2, 3])?;
+        let page = crate::crypto::selected_key_page(&pair[0], &pair[1])?;
+        Ok(page[..crate::crypto::KEY_BLOCK_LEN].to_vec())
     }
 
     /// The page-identical backup's page set (page-service.md §9), ascending: the pages reachable from

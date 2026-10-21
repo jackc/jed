@@ -1,8 +1,8 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S10 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
+> **Status: S1–S13 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
 > retired with shared mode and succeeded by S8, an owner and its page clients), including spill faults, temp-table spill, file
-> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), trailing truncation (S10), and backups (page-service.md §9). A seeded simulator that runs long, randomized
+> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), trailing truncation (S10), backups (page-service.md §9), file attachments under the page service (S11), and encryption at rest (S12–S13). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -136,7 +136,9 @@ check
 | `compact [<db>]` | Host compaction of `main` or a file attachment (api.md §2.6), through the simulated filesystem. |
 | `backup page_identical\|compacted [p<N>]` | A backup of `main` (page-service.md §9) by process `p` (default: the lowest running), into a new file `<main>.backup<K>` through the simulated filesystem, while every other session keeps its pin and writer gate. Its oracle is §8.3's *Backups*. |
 | `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. In a service trace it attaches the file in every running process under the page service, main's owner first (S11). Attaching takes the writer gate, so the generator emits it only while no writer is open; a trace that attaches while one is (a shrinking artifact) is invalid, a violation of its own, as a second write-open is, rather than a wait that would hang a threaded core's single-threaded runner. |
-| `change_key <n>`, `rekey <n>` | Encrypted traces only (S12): main's credential changes to simulation key `n` (1–3; key `k` is 32 bytes of `0x4A + k`, key 0 the goldens'), or main is rekeyed under it (encryption.md §5). A rekey is checked like compaction (version + 1, contents unchanged). |
+| `change_key <n> [<db>]`, `rekey <n>\|plain [<db>]` | Encrypted traces only (S12): the credential of main (or file attachment `db`, S13) changes to simulation key `n` (1–3; key `k` is 32 bytes of `0x4A + k`, key 0 the goldens'), or the database is rekeyed under it (encryption.md §5) — encrypting it if it is plaintext — or, with `plain`, decrypted (S13). A rekey is checked like compaction (version + 1, contents unchanged). |
+| `replay <kind>` | Encrypted traces only (S13): every process ends cleanly; a page of main that a bound pointer of `kind` names gets back an older genuine version of its bytes; a new process opens and reads everything; then the page is restored and the database must reopen exactly as it was. Kinds and the oracle: §8.3 *Replays*. |
+| `restore <j>` | Main's `j`-th newest successful backup (clamped to the oldest; skipped with none) is copied over it as a host would restore a file: every process ends cleanly, the copy replaces `sim.jed` durably, and p0 reopens (S13, §8.3 *Restores*). |
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
@@ -150,8 +152,10 @@ checks are part of the step. There is no separate `recover` step.
 (the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
 `synchronous` (`on`, the default, or `off`: every process batches its barriers, [validated-cow.md](validated-cow.md)
 §4, and runs the cap flush inline so the barrier lands in the step that reached the cap), and the
-informational `profile`, and `encrypted: 1` (S12: main is created encrypted under key 0, its key
-entropy seeded by the trace's seed so the cores' images stay byte-identical). Four handle settings are applied at every open: `work_mem` and
+informational `profile`, and `encrypted: 1` (S12: main and every file attachment are created
+encrypted under key 0, and every process seals its scratch files; each process's key entropy is the
+insecure seeded source, seeded from lane 14 of the decision function so the cores' images stay
+byte-identical and an owner and its page clients never share a stream). Four handle settings are applied at every open: `work_mem` and
 `temp_buffers` (a trace session's; spill goes to the simulated spill host, §6.1, whose bytes are not
 durable state), `max_query_memory_bytes` (a trace session's; the oracles' own reads are unlimited),
 and `max_storage_bytes` (the database's file form, memory.md §8.7). Under either limit a commit can
@@ -196,6 +200,13 @@ A shrinking `set_size` (trailing truncation, format.md) cuts the cache, the dura
 pending writes past the new length at once: the most destructive outcome, as if the truncation
 reached the disk before anything still pending. `read_at` serves the cache.
 
+In an encrypted trace the database file also keeps an **archive** (S13): for each page index ≥ 4, the
+distinct page images that successful barriers made durable there, at most the 32 archived most recently.
+An archive follows its path, not its file: compaction's and a rekey's rename onto `sim.jed`, and a
+restore, merge the old file's archive into the new one's, so the pages of an earlier layout and of an
+abandoned history stay replayable at their old indexes. Only durable images count: which pages a
+failed commit wrote before its fault is write order, not a cross-core contract (§6.2).
+
 ### 6.2 Content-keyed fault decisions
 
 Fault outcomes are decided by **what** was written and **where**, never by the position of a write
@@ -229,6 +240,9 @@ keeps independent decisions uncorrelated, and its values are part of the cross-c
 | 11 | `spill_error`: does this spill-host operation fail? (`offset` is the operation's ordinal in the step) |
 | 12 | `corrupt`: the page a flip lands in (`2 + h % (page_count − 2)`; `offset` is the flip's ordinal) |
 | 13 | `corrupt`: the bit of that page it flips (`h % (page_size × 8)`; `offset` is the flip's ordinal) |
+| 14 | an encrypted trace's key-entropy seed for the `n`-th process opening of the run, 0-based, by process `pid` (`decide(seed, 14, n, pid, 0)`; a create the runner does as a host counts too) |
+| 15 | `replay`: the page (`% candidates`, the kind's candidate pages in ascending order) |
+| 16 | `replay`: the older version of that page (`% versions`, its archived versions in byte order) |
 
 A file other than `sim.jed` adds `(FNV-1a 32(name) + 1) << 40` to every offset it decides on, so two
 files' decisions stay independent while the database file's are unchanged by the others' existence.
@@ -253,6 +267,7 @@ is sound: a failure under it is a real protocol violation, not a modeling artifa
 | `read_error p=‰` | Every read of an offset whose lane-9 `decide` falls under `p` fails during the step. The runner's own oracle reads (digests, the live checker) are exempt — an early version applied the fault to them too and reported false violations. | The statement fails `58030`, never `XX001` or wrong rows. | Per-core: which reads happen depends on buffer-pool policy |
 | `enospc` | The step's first growing `set_size` fails. | The commit fails `58030`. | Per-core: when the file grows depends on preallocation policy |
 | `spill_error p=‰` | Each spill-host operation of the step fails when its lane-11 `decide` falls under `p`. | The statement fails `58030`; durable state is untouched. | Per-core: which operations spill, and how, is each core's own codec |
+| `replay <kind>` | A standalone step, not an armed fault (§8.3 *Replays*). Every process ends cleanly; one page's durable bytes and cache become an older version that was durable at that index (§6.1's *archive*). | `XX001`, or for a page the newest manifest depends on a fallback to the generation in the other meta slot. **Never stale or wrong rows.** | Image + transcript |
 | `corrupt flips=n [reseal=1]` | A standalone step, not an armed fault. Every process ends cleanly; `n` bits flip in durable body pages of `sim.jed` below its page count (lanes 12–13), skipping a page with a pending write; durable bytes and cache both change. A new process opens the file and reads every row through the digest. Then the bits are repaired and the database must reopen exactly as it was. | Without `reseal`, every flip breaks its page's CRC: open and read each yield `XX001` or the right rows — the current version, or the previous one when a flip lands in the newest generation's dirty pages and recovery falls back (validated-cow.md §1). **Never wrong rows.** With `reseal`, the CRC is recomputed, so only the decoders' structural checks stand between the flip and the engine (storage.md §6): any engine error or any rows, but **never a panic or a non-engine error**. | Per-core only, intrinsic oracle |
 
 A trace containing a per-core fault or a `corrupt` step runs every oracle on every core but is not
@@ -387,8 +402,9 @@ The **image checker** opens a copy of the disk the way a new process would, so m
 manifest validation (validated-cow.md §1) run first, and then walks the selected generation:
 
 - the image holds the version the runner expects;
-- the live page count at meta offset 56 equals the pages reachable from the catalog root, and every
-  reachable page lies in `[2, page_count)`;
+- the live page count at meta offset 56 equals the pages reachable from the catalog root (the GiST
+  R-tree pages the load reads included), and every reachable page lies in `[2, page_count)` (`[4, …)`
+  in an encrypted file);
 - the free list has no duplicates and is disjoint from the reachable set and from the selected
   generation's manifest dependencies;
 - each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
@@ -465,6 +481,38 @@ fault on a backup step may cut its writes (the temp file's sync, the directory's
 trace, end the connection its page reads use. Whether a completed backup survives a later power
 loss is not checked: like `create`, it is durable only once its directory barrier completes.
 
+**Replays** (S13; encryption.md §4, encrypted.md §2) check the binding of every pointer in an
+encrypted file. The step targets one kind of pointer, named by the kind of page it points at in the
+committed generation:
+
+| Kind | The pointer | | Kind | The pointer |
+|---|---|---|---|---|
+| `catalog` | meta → catalog chain head | | `child` | B-tree interior → child |
+| `catalog_next` | catalog page → next | | `gist_child` | GiST interior → child |
+| `free` | meta → free-list head | | `overflow` | leaf `0x02` value → chain head |
+| `free_next` | free-list page → next | | `overflow_lz4` | leaf `0x04` value → chain head |
+| `manifest` | meta → manifest-overflow page (through the meta tag's AD) | | `overflow_next` | overflow page → next |
+| `root` | catalog entry → table or index tree root | | | |
+
+The candidates are the pages of that kind whose archive holds a version other than the current bytes;
+lanes 15 and 16 pick the page and the version, the versions taken in byte order. With none, or with main plaintext, the step is skipped.
+After the replay a new process opens main, reads every row through the digest, and runs the image
+checker over the replayed file, which between them read every reachable page. If the page is one the
+selected generation's manifest depends on (a listed page or a manifest-overflow page), recovery may
+fall back to the generation in the other meta slot (validated-cow.md §1), which must then be a recorded
+generation, with the image checker accepting it; otherwise one of the open, the read, or the checker
+must report `XX001`. Opening the current version and reading the right rows from a page that must fail
+is an undetected replay; any other rows, any other error, or a panic is a violation too. Then the page
+is put back and main must reopen exactly as it was.
+
+**Restores** (S13) model a host copying a backup over its database file: the abandoned history's
+pages stay in the archive, and every later commit reuses its versions and page indexes with new
+contents. After the copy, main's version is the backup's, its history above that version is
+forgotten, and at that version only the backup's contents remain (no earlier recovery may come back
+from the abandoned history); the floor and the latest attempted version are the backup's, and main's
+key is the one it had when the backup was taken. A restore of a backup whose copy was not checked
+(a failed backup) is impossible: only successful backups are numbered.
+
 **Two more violations** need no checker: any statement or commit that reports `XX001` (corruption
 must never surface outside corruption mode), and **snapshot isolation** — when a reader closes, its
 digest must be one recorded for the version it pinned, however many commits, reclamations, and page
@@ -489,7 +537,16 @@ JSON object per line, keys in exactly this order, no whitespace, hashes as 16 lo
 {"i":N,"op":"compact","version":V}   {"i":N,"op":"compact","db":"a1","version":V}   or   …,"error":CODE}
 {"i":N,"op":"attach","db":"a1","version":V}   or   {"i":N,"op":"attach","db":"a1","error":CODE}
 {"i":N,"op":"corrupt","flipped":F,"open":"ok"|CODE,"read":"ok"|CODE|"-"}
+{"i":N,"op":"replay","kind":K,"page":P,"outcome":"XX001"}   or   …,"outcome":"fallback","version":V}   or   …,"kind":K,"skip":true}
+{"i":N,"op":"restore","backup":B,"version":V,"digest":D}   or   {"i":N,"op":"restore","skip":true}
 ```
+
+An encrypted trace adds key lines (S12–S13), each with `"db":NAME` after `op` for an attachment (or a
+skip): `{"i":N,"op":"change_key","key":n}` or `…,"error":CODE}`, `"op":"rekey"` lines shaped like
+compaction's, and `{"i":N,"op":"unlocked","key":k}` whenever recovery opened a database with a key
+other than the one it held, `k = -1` meaning plaintext. In a service trace, a session that finds its
+process's data key stale is `{"i":N,"op":"open","sid":S,"error":"28P04"}` (or `28P02`), and the host's
+reopening of that process `{"i":N,"op":"reopened","pid":P}`.
 
 While file attachments are tracked, `open`, `commit` (success), `check`, `reopen`, and `crash` lines
 gain a trailing `"dbs"` object keyed by attachment name in byte order: `{"a1":V}` (the version each
@@ -567,6 +624,9 @@ defaults, which `mixed.toml` restates):
 | `relaxed` | `synchronous = off`: batched commits, cap flushes, crashes and faulted commits mid-batch and at the flush (S9) |
 | `truncation` | Bulk inserts, heavy deletes and drops, then long quiet runs, so commits lower the high-water and shorten the file (S10); half the traces relaxed |
 | `service-attachments` | Owners and page clients of main and of up to two file attachments: attach in every process, client commits of attachments, per-database promotion and recovery (S11); half the traces relaxed |
+| `encryption` | Encrypted main: credential changes, rekeys and conversions under crashes (S12), page replay at every pointer kind, backups and restores, GiST indexes and compressed out-of-line values (S13); half the traces relaxed |
+| `encryption-attachments` | Encrypted file attachments, each with its own key: credential changes, rekeys and conversions of main or an attachment (S13); half the traces relaxed |
+| `encryption-service` | The page service over an encrypted main and encrypted attachments: per-process key entropy, client commits, promotion, credential changes, rekeys, backups and restores (S13); half the traces relaxed |
 
 A profile changes what is emitted, never what is checked: every oracle runs on every trace.
 
@@ -838,12 +898,66 @@ primitive) gets a simulated implementation.
       differing key-block pair. The image checkers open with the current key, and
       `verify.rb --check-image` tries the four simulation keys, selects the key-block copy by
       generation, and authenticates the meta over its manifest chain.
-    - The transcript adds `{"op":"change_key","key":n}` (or `"error"`), `"op":"rekey"` lines shaped like
-      compaction's, and an `{"op":"unlocked","key":k}` line whenever recovery opened main with a key
-      other than the one it held.
-    - Not yet: replay at every pointer kind (the `corrupt` step's bit flips cover tampering, not
-      genuine-page replay), restore followed by divergent writes, conversion to and from plaintext,
-      encrypted attachments, and encrypted service traces.
+    - The transcript adds key lines (§8.4).
+    - Replay at every pointer kind, restores, conversion, encrypted attachments and encrypted service
+      traces followed in S13.
+
+13. **S13 — Encryption adversaries. Landed.** Four additions, each with a profile:
+    - **Replay at every pointer kind** (`encryption-replay`; §8.3 *Replays*). The `replay <kind>` step,
+      the disk's archive of durable page images (§6.1), and a per-core walker that classifies the
+      selected generation's pages by the eleven pointer kinds of encrypted.md §2. Most replays follow a
+      commit (`replay_after_commit`), so the newest manifest is a big commit's, and after a drop or a
+      delete half of those target the free list; the profile's data — several-page chains, compressed
+      out-of-line values, ANALYZE statistics, GiST indexes (the `gist` knob adds `i32range` columns) —
+      gives every kind pages to name. Across 40 seeds every kind was replayed and detected, most of it
+      as `XX001` and as a fallback from manifest-listed pages; the free-list kinds are the rarest (a
+      free list is often empty, and a second free-list page needs hundreds of free pages).
+    - **Restore followed by divergent writes** (`encryption`, `encryption-service`; §8.3 *Restores*).
+      `restore <j>` copies a successful backup over main; the history above its version is forgotten,
+      the archive keeps the abandoned history's pages at their indexes for later replays, and every
+      later commit diverges from it.
+    - **Conversion to and from plaintext** (`rekey plain`, the `conversion` knob): a rekey decrypts its
+      database and a later one encrypts it again, so every process seals its scratch files in an
+      encrypted trace. Key settling generalizes to plaintext (key `-1`), and a key step whose file's
+      directory entry was not durable as it began may recover an older file under an older key.
+    - **Encrypted attachments and service traces** (`encryption-attachments`, `encryption-service`).
+      Attachments are created encrypted, each database keeps its own key, and key steps take an optional
+      database; a service trace opens every process with main's current key, and a client told its key
+      is stale (`28P04`, `28P02`) is reopened by the host.
+    - **Per-opening key entropy.** The seeded key source starts every database's stream afresh, so the
+      runners seed each process opening separately (lane 14). With one stream per process id, a process
+      reopened after a restore drew the same data key in its rekey as an earlier incarnation of it had,
+      so a page client left with the older key still authenticated the new file and a backup through it
+      held the wrong key block — a harness artifact the CSPRNG it models never produces.
+    - **Engine fixes found**, each in all three cores unless noted (encrypted.md §14):
+      - A page client that re-elected after a lost connection or an owner handoff unlocked again with
+        the credential it was opened with, so after any credential change it failed `28P01`; it now keeps
+        the data key it holds, as promotion does.
+      - A client that promoted itself after its owner rekeyed the file and died reported `XX001` (its
+        held key authenticates no meta); it is now `28P04`, as for a client that stayed connected.
+      - A held key meeting a file decrypted since reported `XX001` ("too small for its key block") when
+        the plaintext file had fewer than four pages; the variant is now checked before the size.
+      - A compacted backup through a page client wrote the key block the client had unlocked from, so
+        after a credential change the copy opened only with the old key; it now writes the file's
+        selected copy, as the page-identical form already did (encrypted.md §13).
+      - TypeScript only: the owner resealed a client commit's meta with OS randomness rather than its
+        own key-entropy stream, so encrypted service traces with client commits were not byte-identical
+        under the seeded source (nor self-deterministic).
+    - **The image checker now counts GiST pages** as live (the reachability walk omits them), which no
+      earlier profile had generated.
+
+    | Planted bug | Profile | Traces that caught it |
+    |---|---|---|
+    | a reader skips the bound pointer's tag check | `encryption-replay` | 13 / 30 |
+    | a re-electing client unlocks with its credential, not its held key | `encryption-service` | 7 / 30 |
+    | a client promoting with a key rekeyed away reports `XX001`, not `28P04` | `encryption-service` | 3 / 48 |
+    | a compacted backup through a client writes the client's key block | `encryption-service` | 2 / 48 |
+
+    Each found bug has a shrunk regression trace (`encryption-service-reconnect-keeps-held-key`,
+    `-promote-after-rekey`, `-backup-current-key-block`; three to six steps each).
+
+    Swept on all three cores: every profile at seeds 1–8 (the `ci` sweep), and the four encryption
+    profiles at seeds 9–48 with `--check-images`, which decoded about 9,500 crash and backup images.
 
 ## 15. Open questions
 

@@ -455,6 +455,13 @@ export class PageCodec {
     return this.rng;
   }
 
+  // withKeyBlock is this codec with block as its selected key-block copy — the same keys and
+  // key-entropy stream — for a writer that copies the file's current pair rather than the one this codec
+  // unlocked from (a compacted backup through a page client, encrypted.md §13). This codec is unchanged.
+  withKeyBlock(block: Uint8Array): PageCodec {
+    return new PageCodec(this.dek, this.rng, block, this.keys);
+  }
+
   // keyBlock is the selected key-block copy (128 bytes; the rest of its page is zero).
   get keyBlock(): Uint8Array {
     return this.block;

@@ -82,6 +82,17 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 			if paging != nil {
 				codec = paging.codec()
 			}
+			if codec != nil {
+				// The copy takes the file's selected key-block copy, as the page-identical form does: a
+				// page client's codec still holds the copy it unlocked from, which a credential change
+				// since has replaced.
+				block, err := currentKeyBlock(paging)
+				if err != nil {
+					c.deregisterPin(gen, v)
+					return err
+				}
+				codec = codec.withKeyBlock(block)
+			}
 			fill = func(writeAt func(off int64, p []byte) error) error {
 				_, err := snap.writeImage(st.pageSize, v+1, codec, func(index uint32, page []byte) error {
 					return writeAt(int64(index)*int64(st.pageSize), page)
@@ -93,6 +104,26 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 		c.deregisterPin(gen, v)
 		return err
 	}
+}
+
+// currentKeyBlock is the selected copy of the key-block pair the file holds now (pages 2 and 3, read
+// through the service for a page client; encrypted.md §5).
+func currentKeyBlock(paging *sharedPaging) ([]byte, error) {
+	var block []byte
+	err := paging.withPager(func(p *pager) error {
+		page2, err := p.readBlock(2)
+		if err != nil {
+			return err
+		}
+		page3, err := p.readBlock(3)
+		if err != nil {
+			return err
+		}
+		selected, err := selectKeyBlock(page2, page3)
+		block = append([]byte(nil), selected...)
+		return err
+	})
+	return block, err
 }
 
 // backupMeta reads the meta that published version v. A commit writes the slot that does not hold the

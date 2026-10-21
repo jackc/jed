@@ -370,6 +370,34 @@ pub(crate) fn meta_authenticates(paging: &SharedPaging) -> Result<bool> {
     Ok(codec.verify_meta(0, &meta, &chain).is_ok() || codec.verify_meta(1, &meta, &chain).is_ok())
 }
 
+/// Whether `paging`'s held key authenticates neither meta slot that parses — each under its own
+/// slot index, with its manifest chain: the promoting client's test that the owner rekeyed the file
+/// before it left (encrypted.md §14). `false` when no slot parses (damage stays `XX001`) and in
+/// plaintext.
+pub(crate) fn held_key_stale(paging: &SharedPaging) -> bool {
+    let Some(codec) = paging.codec() else {
+        return false;
+    };
+    let mut pager = paging.pager();
+    let mut parsed = false;
+    for slot in 0..2u32 {
+        let Ok(raw) = pager.read_block(slot) else {
+            continue;
+        };
+        if parse_meta(&raw).is_none() {
+            continue;
+        }
+        let Ok(chain) = commit_manifest::chain_pages(&raw, |id| pager.read_block(id)) else {
+            continue;
+        };
+        parsed = true;
+        if codec.verify_meta(slot, &raw, &chain).is_ok() {
+            return false;
+        }
+    }
+    parsed
+}
+
 /// A commit's resolution digest (spec/pageservice/README.md §3.5 `commit_status`): the CRC-64 of
 /// its meta page, with the CRC field and the reserve zeroed in the encrypted variant, so the digest
 /// of the meta a client sent equals that of the meta the owner resealed for its slot
@@ -3263,7 +3291,8 @@ pub(crate) fn unlock_pager(
 /// change or backup starts from the file's current generation. The load then authenticates the meta
 /// under the held key (`XX001` when it does not).
 pub(crate) fn adopt_held_codec(pager: &mut Pager, codec: &crate::crypto::PageCodec) -> Result<()> {
-    if pager.allocated_pages() < crate::crypto::FIRST_BODY_PAGE {
+    // The variant first: a file decrypted since may be smaller than an encrypted one can be.
+    if pager.allocated_pages() < 2 {
         return Err(corrupt("encrypted file too small for its key block"));
     }
     let slot0 = pager.read_block(0)?;
@@ -3273,6 +3302,9 @@ pub(crate) fn adopt_held_codec(pager: &mut Pager, codec: &crate::crypto::PageCod
             SqlState::StaleKey,
             "the database is no longer encrypted; reopen it",
         ));
+    }
+    if pager.allocated_pages() < crate::crypto::FIRST_BODY_PAGE {
+        return Err(corrupt("encrypted file too small for its key block"));
     }
     let page2 = pager.read_block(2)?;
     let page3 = pager.read_block(3)?;
@@ -5171,6 +5203,10 @@ pub(crate) struct SimMeta {
     pub(crate) page_count: u32,
     pub(crate) live_pages: u32,
     pub(crate) protected: Arc<HashSet<u32>>,
+    pub(crate) free_list_head: u32,
+    pub(crate) free_list_tag: crate::crypto::Tag,
+    pub(crate) manifest_head: u32,
+    pub(crate) manifest_pages: u32,
 }
 
 /// The meta [`Engine::open_shared_paging`] selected through `paging`: the newest valid candidate
@@ -5186,6 +5222,7 @@ pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
     candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
     for (m, bytes) in candidates {
         if let Some(protected) = pg.cached_validation(bytes) {
+            let u32_at = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
             return Ok(SimMeta {
                 txid: m.txid,
                 root_page: m.root_page,
@@ -5193,10 +5230,204 @@ pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
                 page_count: m.page_count,
                 live_pages: m.live_pages,
                 protected,
+                free_list_head: m.free_list_head,
+                free_list_tag: m.free_list_tag,
+                manifest_head: u32_at(36),
+                manifest_pages: u32_at(44),
             });
         }
     }
     Err(corrupt("no meta page was selected by the open"))
+}
+
+/// Open `image` the way a new process would, with `credential`, and list the GiST R-tree pages the
+/// load read (a GiST tree is read whole at load, gist.md §4.1; the reachability walk omits it).
+#[cfg(feature = "sim")]
+pub(crate) fn sim_open_with_gist(
+    image: &[u8],
+    credential: Option<&crate::crypto::Credential>,
+) -> Result<(Engine, Arc<SharedPaging>, Vec<u32>)> {
+    let mut pager = Pager::from_store(Box::new(crate::blockstore::MemoryBlockStore::new(
+        image.to_vec(),
+    )))?;
+    let env = crate::environment::Environment::default();
+    let codec = unlock_pager(&mut pager, credential, &env)?;
+    let capacity =
+        crate::paging::cache_leaves(crate::paging::DEFAULT_CACHE_BYTES, pager.page_size());
+    let paging = SharedPaging::with_codec(pager, capacity, codec);
+    let gist = std::cell::RefCell::new(Vec::new());
+    let hook = |p: u32| gist.borrow_mut().push(p);
+    let engine = Engine::open_shared_paging_at(
+        Arc::clone(&paging),
+        &env,
+        LoadAt {
+            meta: None,
+            gist: Some(&hook),
+        },
+    )?;
+    Ok((engine, paging, gist.into_inner()))
+}
+
+/// [`sim_pointer_kinds`]'s result: each pointer kind's pages, and the manifest's dependencies.
+#[cfg(feature = "sim")]
+pub(crate) type SimPointerKinds = (std::collections::BTreeMap<String, Vec<u32>>, HashSet<u32>);
+
+/// The page replay classifier (spec/design/simulation-testing.md §8.3 *Replays*, slice S13): the
+/// pages of `image`'s selected generation by the kind of bound pointer that names each
+/// (encrypted.md §2), each kind's pages ascending, and the pages that generation's manifest depends
+/// on (its listed pages and its manifest-overflow pages). A chain's head is `catalog`, `free`, or an
+/// overflow kind and every later page its `_next` kind; a tree's root is `root` and every other node
+/// `child` (`gist_child` in a GiST R-tree).
+#[cfg(feature = "sim")]
+pub(crate) fn sim_pointer_kinds(
+    image: &[u8],
+    credential: Option<&crate::crypto::Credential>,
+) -> Result<SimPointerKinds> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let (engine, paging, gist) = sim_open_with_gist(image, credential)?;
+    let mt = sim_selected_meta(&paging)?;
+    let deps: HashSet<u32> = mt.protected.iter().copied().collect();
+    let mut sets: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    let mut add = |kind: &str, pg: u32| {
+        sets.entry(kind.to_string()).or_default().insert(pg);
+    };
+    let cap = paging.cap();
+    let mut chain = |head: PageRef, first: &str, next: &str| -> Result<()> {
+        let mut kind = first;
+        let mut p = head;
+        while p.page != 0 {
+            add(kind, p.page);
+            let block = paging.read_body(p)?;
+            let page = parse_page(&block)?;
+            p = chain_content(&page, cap)?.0;
+            kind = next;
+        }
+        Ok(())
+    };
+    chain(
+        PageRef {
+            page: mt.root_page,
+            tag: mt.root_tag,
+        },
+        "catalog",
+        "catalog_next",
+    )?;
+    chain(
+        PageRef {
+            page: mt.free_list_head,
+            tag: mt.free_list_tag,
+        },
+        "free",
+        "free_next",
+    )?;
+    // Manifest-overflow pages are plaintext; the meta's tag binds them through its associated data.
+    let mut id = mt.manifest_head;
+    let mut n = 0;
+    while id != 0 && n < mt.manifest_pages {
+        add("manifest", id);
+        let block = paging.pager().read_block(id)?;
+        id = parse_page(&block)?.next_page;
+        n += 1;
+    }
+    fn walk(node: &Node, kind: &str, add: &mut dyn FnMut(&str, u32)) {
+        let page = node.page.load(Ordering::Acquire);
+        if page != 0 {
+            add(kind, page);
+        }
+        for child in &node.children {
+            match child {
+                Child::Resident(n) => walk(n, "child", add),
+                Child::OnDisk(p) => add("child", p.page),
+            }
+        }
+    }
+    let snap = &engine.committed;
+    for st in snap.stores_iter() {
+        if let Some(root) = st.tree_root() {
+            walk(root, "root", &mut add);
+        }
+        for (_, row) in st.iter_entries()? {
+            for v in &row {
+                let (first, len, head) = match v {
+                    Value::Unfetched(Unfetched::External { first, len, .. }) => {
+                        (*first, *len, "overflow")
+                    }
+                    Value::Unfetched(Unfetched::ExternalComp {
+                        first, stored_len, ..
+                    }) => (*first, *stored_len, "overflow_lz4"),
+                    _ => continue,
+                };
+                let fetch = |p: PageRef| paging.read_body(p);
+                for (k, pg) in chain_pages(first, len as usize, &fetch, cap)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    add(if k == 0 { head } else { "overflow_next" }, pg);
+                }
+            }
+        }
+    }
+    for st in snap.index_stores_iter() {
+        if let Some(root) = st.tree_root()
+            && root.page.load(Ordering::Acquire) != 0
+        {
+            walk(root, "root", &mut add);
+        }
+    }
+    // A GiST R-tree is read whole at load (gist.md §4.1): its pages are the ones the load visited.
+    // Each interior's children come from the loader's own parser, reading only that page; whatever
+    // no interior names is a root.
+    let named = std::cell::RefCell::new(HashSet::new());
+    for &pg in &gist {
+        let stored = paging.pager().read_block(pg)?;
+        let mut tag = crate::crypto::NO_TAG;
+        if cap.tag != 0 {
+            // The load already checked it against its pointer.
+            let at = stored.len() - tag.len();
+            tag.copy_from_slice(&stored[at..]);
+        }
+        let block = paging.read_body(PageRef { page: pg, tag })?;
+        let Ok(page) = parse_page(&block) else {
+            continue;
+        };
+        if page.page_type != crate::gist::PAGE_GIST_INTERIOR {
+            continue;
+        }
+        let (item_count, payload) = (page.item_count, page.payload.to_vec());
+        let read = |p: PageRef| -> Result<(u8, u32, Vec<u8>)> {
+            if p.page != pg {
+                named.borrow_mut().insert(p.page);
+                return Ok((crate::gist::PAGE_GIST_LEAF, 0, Vec::new()));
+            }
+            Ok((crate::gist::PAGE_GIST_INTERIOR, item_count, payload.clone()))
+        };
+        let mut keys = Vec::new();
+        read_gist_leaf_keys(
+            &read,
+            PageRef { page: pg, tag },
+            cap,
+            &mut keys,
+            &mut HashSet::new(),
+            1,
+        )?;
+    }
+    let named = named.into_inner();
+    for &pg in &gist {
+        add(
+            if named.contains(&pg) {
+                "gist_child"
+            } else {
+                "root"
+            },
+            pg,
+        );
+    }
+    Ok((
+        sets.into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect(),
+        deps,
+    ))
 }
 
 /// The free list the meta slot of `image` holding version `v` persists (the simulator's commit-role

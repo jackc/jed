@@ -25,10 +25,16 @@ import { MessageChannel, type MessagePort } from "node:worker_threads";
 
 import type { BlockStore } from "../blockstore.ts";
 import { parseCommitMeta, resolutionDigest } from "../commit_manifest.ts";
-import { type Credential, sealScratch } from "../crypto.ts";
+import { type Credential, type PageCodec, sealScratch } from "../crypto.ts";
 import { EngineError, engineError, type SqlState } from "../errors.ts";
 import type { Engine } from "../executor.ts";
-import { FORMAT_VERSION, loadEnginePaged, unlockPagerSteps } from "../format.ts";
+import {
+  adoptHeldCodecSteps,
+  FORMAT_VERSION,
+  loadEnginePaged,
+  metaAuthenticates,
+  unlockPagerSteps,
+} from "../format.ts";
 import { runSync } from "../execution.ts";
 import type { Environment } from "../environment.ts";
 import { Pager } from "../pager.ts";
@@ -746,10 +752,12 @@ export type ClientOpenOptions = {
 // adopts the owner's committed snapshot, then the ordinary loader reads the catalog skeleton through the
 // service. The open-time pin stays held; the caller's core releases it once open finishes (no local
 // reader follows an open). The handle is read-only exactly when the connection is.
+// held is the data key a reconnecting client already holds, null on a first connection.
 export function openPageClient(
   client: PageClient,
   opts: ClientOpenOptions,
   environment: Environment,
+  held: PageCodec | null = null,
 ): Engine {
   const reply = client.beginRead();
   client.setMeta(reply.meta);
@@ -759,14 +767,38 @@ export function openPageClient(
   const pager = Pager.fromStore(store);
   pager.trustMeta = true;
   // A client of an encrypted file unlocks with its own credential, from the key-block pages it reads
-  // through the service (spec/fileformat/encrypted.md §14).
-  const codec = runSync(unlockPagerSteps(pager, opts.credential, environment));
+  // through the service; a reconnecting one keeps the data key it holds, as promotion does, so a
+  // credential changed since does not stop it, and a rekey is 28P04 (spec/fileformat/encrypted.md §14).
+  let codec: PageCodec | null;
+  if (held !== null) {
+    runSync(adoptHeldCodecSteps(pager, held));
+    codec = held;
+  } else codec = runSync(unlockPagerSteps(pager, opts.credential, environment));
   const paging = new SharedPaging(
     pager,
     cacheLeaves(opts.cacheBytes ?? DEFAULT_CACHE_BYTES, pager.pageSize),
     codec,
   );
-  const db = loadEnginePaged(paging, environment);
+  let db: Engine;
+  try {
+    db = loadEnginePaged(paging, environment);
+  } catch (error) {
+    if (held !== null && error instanceof EngineError && error.code() === "XX001") {
+      let authenticates = true;
+      try {
+        authenticates = metaAuthenticates(paging);
+      } catch {
+        // A read failure: the load's error stands.
+      }
+      if (!authenticates) {
+        throw engineError(
+          "stale_key",
+          "the database was rekeyed since this handle opened it; reopen it",
+        );
+      }
+    }
+    throw error;
+  }
   db.path = client.dbPath;
   db.persistHook = persistImpl;
   db.readOnly = client.readOnly;

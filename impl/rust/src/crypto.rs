@@ -237,6 +237,13 @@ impl PageCodec {
         generation(block) == generation(&self.key_block()).wrapping_add(1)
     }
 
+    /// This codec with `block` as its selected key-block copy — the same keys and key-entropy stream
+    /// — for a writer that copies the file's current pair rather than the one this codec unlocked
+    /// from (a compacted backup through a page client, encrypted.md §13). `self` is not changed.
+    pub(crate) fn with_key_block(&self, block: Vec<u8>) -> PageCodec {
+        PageCodec::new(&self.dek, Arc::clone(&self.rng), block)
+    }
+
     /// Adopt `block` as the selected copy once a credential change has written both pages.
     pub(crate) fn set_key_block(&self, block: Vec<u8>) {
         *self.key_block.lock().expect("key block lock") = block;

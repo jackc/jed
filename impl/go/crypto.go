@@ -273,6 +273,13 @@ func (c *pageCodec) rewrap(cred *Credential, params Argon2Params) ([]byte, error
 // keyBlockGeneration is a key block's generation (offset 8).
 func keyBlockGeneration(block []byte) uint64 { return binary.BigEndian.Uint64(block[8:]) }
 
+// withKeyBlock is c with block as its selected key-block copy — the same keys and key-entropy stream —
+// for a writer that copies the file's current pair rather than the one c unlocked from (a compacted
+// backup through a page client, encrypted.md §13).
+func (c *pageCodec) withKeyBlock(block []byte) *pageCodec {
+	return &pageCodec{page: c.page, meta: c.meta, rng: c.rng, dek: c.dek, keyBlock: block}
+}
+
 // setKeyBlock adopts block as the selected copy once a credential change has written both pages.
 func (c *pageCodec) setKeyBlock(block []byte) {
 	c.keyBlockMu.Lock()

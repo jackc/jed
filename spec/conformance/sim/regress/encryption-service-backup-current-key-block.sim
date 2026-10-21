@@ -1,0 +1,16 @@
+# A compacted backup through a page client that unlocked before the owner's credential change wrote
+# the key block the client had unlocked from, so the copy opened only with the old key; it must write
+# the file's selected copy, as the page-identical form does (encrypted.md §13). All three cores. Found
+# by the S13 encryption-service sweep.
+# format: simulation
+# profile: encryption-service
+# seed: 28
+# page_size: 1024
+# cache_bytes: 8192
+# synchronous: off
+# encrypted: 1
+# processes: service
+# clock: 1700000000000000
+spawn p2
+change_key 3
+backup compacted p2

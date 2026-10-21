@@ -9,6 +9,7 @@ package jed
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -267,6 +268,12 @@ func openViaHeld(files fileHost, path string, opts OpenOptions, held *pageCodec)
 	if held != nil {
 		if err = adoptHeldCodec(p, held); err == nil {
 			db, err = loadEngineSharedPaging(newSharedPaging(p, cacheLeaves(cacheBytes, p.pageSize)), env)
+			// A meta the held key cannot authenticate means the owner rekeyed the file before it left:
+			// 28P04, so the host reopens with the credential (spec/fileformat/encrypted.md §14).
+			var e *EngineError
+			if errors.As(err, &e) && e.Code() == "XX001" && heldKeyStale(p) {
+				err = errStaleKey()
+			}
 		}
 	} else {
 		db, err = loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)

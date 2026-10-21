@@ -198,11 +198,28 @@ func simParse(text string) (simTrace, error) {
 				st.sid = fields[1]
 			}
 		case "change_key", "rekey":
-			// S12: a credential change or rekey of main to simulation key 1–3.
-			if len(fields) != 2 || (fields[1] != "1" && fields[1] != "2" && fields[1] != "3") {
-				return tr, fmt.Errorf("line %d: %s 1|2|3", n+1, st.kind)
+			// S12–S13: a credential change or rekey of main (or a file attachment) to simulation key 1–3,
+			// or a rekey that decrypts it.
+			ok := len(fields) == 2 || (len(fields) == 3 && fields[2] != "temp")
+			ok = ok && (fields[1] == "1" || fields[1] == "2" || fields[1] == "3" || (fields[1] == "plain" && st.kind == "rekey"))
+			if !ok {
+				return tr, fmt.Errorf("line %d: %s 1|2|3|plain [<database>]", n+1, st.kind)
 			}
-			st.sid = fields[1]
+			st.mode, st.sid = fields[1], "main"
+			if len(fields) == 3 {
+				st.sid = fields[2]
+			}
+		case "replay":
+			if len(fields) != 2 {
+				return tr, fmt.Errorf("line %d: replay <kind>", n+1)
+			}
+			st.mode = fields[1]
+		case "restore":
+			j, err := strconv.Atoi(strings.Join(fields[1:], ""))
+			if len(fields) != 2 || err != nil || j < 1 {
+				return tr, fmt.Errorf("line %d: restore <j>", n+1)
+			}
+			st.params["j"] = fields[1]
 		case "corrupt":
 			if err := params(fields[1:]); err != nil {
 				return tr, err
@@ -379,6 +396,7 @@ type simProc struct {
 	pid  int
 	db   *Database
 	host *simLockHost
+	env  *Environment // the Environment it opened with (newEnv)
 }
 
 // simDB is one database's oracle state (simulation-testing.md §8.1–8.3): main, or a file attachment
@@ -414,6 +432,20 @@ type simDB struct {
 	// ownerLost is set when an owner died: until a process observes the database again, it may have
 	// recovered any version from the floor up.
 	ownerLost bool
+
+	// Encryption at rest (S12–S13): the simulation key the database is encrypted under (simKeys), or -1
+	// when it is plaintext; and keyChange, a credential change or rekey of this step, which recovery
+	// after it checks the file against.
+	key       int
+	keyChange *simKeyChange
+}
+
+// simKeyChange is a key step in progress: the key before it and the one it installs. When the file's
+// directory entry was not durable as it began (an earlier compaction's or rekey's rename awaits the
+// next opener's directory barrier), a power loss may bring an older file back under an older key.
+type simKeyChange struct {
+	old, next    int
+	entryPending bool
 }
 
 // simGrowth is what a commit left behind, for the next commit's bounded-growth check.
@@ -450,10 +482,9 @@ type simRunner struct {
 	db       *Database // the database of the process running the current step
 	sessions map[string]*simSession
 
-	// env is every process's Environment: random is its seeded source, whose stream is switched per
-	// session (useSession) so each session keeps the independent stream it was opened with, and the
-	// clock reads r.clock.
-	env    *Environment
+	// random is every process's seeded SQL source (newEnv), whose stream is switched per session
+	// (useSession) so each session keeps the independent stream it was opened with; the clock reads
+	// r.clock.
 	random *SeededRandom
 	active *simSession // the session whose stream random currently holds
 
@@ -484,13 +515,24 @@ type simRunner struct {
 	imagePrefix    string            // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
 	backups        int               // backup steps run, naming each destination
 
-	// Encryption at rest (slice S12, spec/fileformat/encrypted.md): main is encrypted under simulation
-	// key key (simKeys), its key entropy seeded by the trace's seed.
+	// Encryption at rest (slices S12–S13, spec/fileformat/encrypted.md): an encrypted trace creates main
+	// and every attachment encrypted, seals every process's scratch files, and gives each process its
+	// own seeded key-entropy stream (envs). Each database's key is its simDB's.
 	encrypted bool
-	key       int
-	// keyChange is a credential change or rekey of this step: [old key, new key]. Recovery after it
-	// probes the key block, which exactly one of them must unlock.
-	keyChange *[2]int
+	opens     uint64 // Environments built so far, each a process opening (newEnv)
+	// backupsOK are main's successful backups in order, the ones a restore may copy back (S13).
+	backupsOK []simBackup
+	stepIndex int // the step running, for reopenStale's transcript line
+}
+
+// simBackup is a successful backup of main (S13): its file, the version and contents a new process
+// opens there, and the key main had when it was taken.
+type simBackup struct {
+	n       int
+	file    string
+	version uint64
+	digest  string
+	key     int
 }
 
 // simKeys are the simulation's host keys (S12): key n is 32 bytes of 0x4A + n, so key 0 is the
@@ -503,86 +545,135 @@ var simKeys = func() [4]*Credential {
 	return out
 }()
 
-// credential is main's credential: simulation key r.key, or nil for a plaintext trace.
-func (r *simRunner) credential() *Credential {
-	if !r.encrypted {
+// simCredential is simulation key k's credential, or nil for -1, plaintext.
+func simCredential(k int) *Credential {
+	if k < 0 {
 		return nil
 	}
-	return simKeys[r.key]
+	return simKeys[k]
 }
 
-// simUnlocks reports whether key k unwraps image's key block.
+// credential is database d's credential: its simulation key's, or nil while it is plaintext.
+func (r *simRunner) credential(d *simDB) *Credential { return simCredential(d.key) }
+
+// newEnv is the Environment of one opening of process pid (or of a create the runner does as a host
+// would): the shared seeded SQL source and clock, and in an encrypted trace an insecure key-entropy
+// stream of its own, seeded from lane 14 (§5) by the run's count of openings and pid. The seeded source
+// starts every database's stream afresh from its seed, so a stream shared by two openings — an owner and
+// its client, or one process before and after a crash — would draw the same data keys and nonces, which
+// the CSPRNG it models never does (encryption.md §3).
+func (r *simRunner) newEnv(pid int) *Environment {
+	b := NewEnvironmentBuilder()
+	b.SetRandomSource(r.random)
+	b.SetClockSource(simClock{now: &r.clock})
+	if r.encrypted {
+		// Seeded so the cores' images stay byte-identical (encrypted.md §8).
+		b.SetInsecureSeededKeyEntropy(simDecide(r.seed, simLaneKeySeed, r.opens, uint64(pid), 0))
+	}
+	r.opens++
+	return b.Build()
+}
+
+// procEnv is the Environment the step's process opened with.
+func (r *simRunner) procEnv() *Environment { return r.procs[r.cur].env }
+
+// simUnlocks reports whether simulation key k (-1: none) opens image: k unwraps its key block, or the
+// file is plaintext and k is -1.
 func (r *simRunner) simUnlocks(image []byte, k int) bool {
 	ps := int(r.pageSize)
-	_, err := unlockCodec(image[2*ps:3*ps], image[3*ps:4*ps], simKeys[k], OSRandomSource())
+	if len(image) < 2*ps {
+		return false
+	}
+	suite, err := fileSuite(image[:ps], image[ps:2*ps])
+	if err != nil {
+		return false
+	}
+	if k < 0 || suite == 0 {
+		return k < 0 && suite == 0
+	}
+	if len(image) < 4*ps {
+		return false
+	}
+	_, err = unlockCodec(image[2*ps:3*ps], image[3*ps:4*ps], simKeys[k], OSRandomSource())
 	return err == nil
 }
 
-// settleKey runs after a crash that interrupted a credential change or rekey (S12): exactly one of the
-// old and new keys unlocks main's key block, and the new one when the step had succeeded (its last
-// barrier ran). The runner continues with whichever unlocks.
-func (r *simRunner) settleKey(i int, image []byte) bool {
-	change := r.keyChange
-	r.keyChange = nil
+// unlocked records the key recovery opened database d with.
+func (r *simRunner) unlocked(i int, d *simDB) {
+	dbField := ""
+	if d.name != "main" {
+		dbField = fmt.Sprintf(`,"db":%q`, d.name)
+	}
+	r.emit(`{"i":%d,"op":"unlocked"%s,"key":%d}`, i, dbField, d.key)
+}
+
+// settleKey runs after a crash that interrupted a credential change or rekey of d (S12): exactly one of
+// the old and new keys (-1: plaintext, a conversion) opens d's file, and the new one when the step had
+// succeeded (its last barrier ran). The runner continues with whichever opens.
+func (r *simRunner) settleKey(i int, d *simDB, image []byte) bool {
+	change := d.keyChange
+	d.keyChange = nil
 	if change == nil {
-		return r.followKey(i, image)
+		return r.followKey(i, d, image)
 	}
-	old, next := change[0], change[1]
-	if len(image) < 4*int(r.pageSize) {
-		r.fail(i, "encryption: the key block is gone")
-		return false
-	}
-	acknowledged := r.key == next
-	if old == next {
-		// A change to the key already in use: it must still unlock.
-		if !r.simUnlocks(image, next) {
-			r.fail(i, "encryption: key %d no longer unlocks main", next)
-			return false
-		}
-		r.emit(`{"i":%d,"op":"unlocked","key":%d}`, i, next)
-		return true
-	}
+	old, next := change.old, change.next
+	acknowledged := d.key == next
 	a, b := r.simUnlocks(image, old), r.simUnlocks(image, next)
 	switch {
-	case a && !b && !acknowledged:
-		r.key = old
-	case !a && b:
-		r.key = next
+	case old == next && b:
+		// A change to the key already in use (a rotation): it still opens.
+	case old != next && a && !b && !acknowledged:
+		d.key = old
+	case old != next && !a && b:
+		d.key = next
+	case change.entryPending && !a && !b:
+		// An older file came back (its rename was never made durable): whichever key opens it.
+		return r.followKey(i, d, image)
+	case old == next:
+		r.fail(i, "encryption: key %d no longer opens %s", next, d.name)
+		return false
 	case a && !b:
-		r.fail(i, "durability: the acknowledged change to key %d was lost", next)
+		r.fail(i, "durability: the acknowledged change of %s to key %d was lost", d.name, next)
 		return false
 	default:
-		r.fail(i, "encryption: key %d unlocks: %v, key %d unlocks: %v; want exactly one", old, a, next, b)
+		r.fail(i, "encryption: key %d opens %s: %v, key %d: %v; want exactly one", old, d.name, a, next, b)
 		return false
 	}
-	r.emit(`{"i":%d,"op":"unlocked","key":%d}`, i, r.key)
+	r.unlocked(i, d)
 	return true
 }
 
 // followKey is recovery outside a key step: a rekey whose rename was not yet durable in its directory
-// may come back as the older file under its older key (validated-cow.md §3), so main opens with
-// whichever simulation key unlocks the recovered key block, the current one first.
-func (r *simRunner) followKey(i int, image []byte) bool {
-	if !r.encrypted || len(image) < 4*int(r.pageSize) {
+// may come back as the older file under its older key (validated-cow.md §3), or plaintext, so d opens
+// with whichever simulation key opens the recovered file, the current one first.
+func (r *simRunner) followKey(i int, d *simDB, image []byte) bool {
+	if !r.encrypted || image == nil {
 		return true
 	}
-	order := []int{r.key}
-	for k := 0; k < 4; k++ {
-		if k != r.key {
+	order := []int{d.key}
+	for k := -1; k < 4; k++ {
+		if k != d.key {
 			order = append(order, k)
 		}
 	}
 	for _, k := range order {
 		if r.simUnlocks(image, k) {
-			if k != r.key {
-				r.key = k
-				r.emit(`{"i":%d,"op":"unlocked","key":%d}`, i, k)
+			if k != d.key {
+				d.key = k
+				r.unlocked(i, d)
 			}
 			return true
 		}
 	}
-	r.fail(i, "encryption: no simulation key unlocks main")
+	r.fail(i, "encryption: no simulation key opens %s", d.name)
 	return false
+}
+
+// clearKeyChanges forgets every database's key step once its step is over.
+func (r *simRunner) clearKeyChanges() {
+	for _, d := range r.dbs {
+		d.keyChange = nil
+	}
 }
 
 func newSimRunner(tr simTrace) *simRunner {
@@ -621,15 +712,8 @@ func newSimRunner(tr simTrace) *simRunner {
 		violationStep:   -1,
 	}
 	r.random = NewSeededRandom(0)
-	b := NewEnvironmentBuilder()
-	b.SetRandomSource(r.random)
-	b.SetClockSource(simClock{now: &r.clock})
-	if tr.header["encrypted"] == "1" {
-		// Seeded so the cores' images stay byte-identical (encrypted.md §8).
-		b.SetInsecureSeededKeyEntropy(seed)
-		r.encrypted = true
-	}
-	r.env = b.Build()
+	r.encrypted = tr.header["encrypted"] == "1"
+	r.fs.archiving = r.encrypted
 	return r
 }
 
@@ -727,7 +811,8 @@ func (r *simRunner) attach(name string) error {
 	if r.service {
 		locking = LockingAuto
 	}
-	return r.db.Attach(name, AttachFileWithOptions(r.dbs[name].file, AttachFileOptions{Locking: locking}), false)
+	d := r.dbs[name]
+	return r.db.Attach(name, AttachFileWithOptions(d.file, AttachFileOptions{Locking: locking}).WithCredential(r.credential(d)), false)
 }
 
 // openProc starts process pid. A service trace elects it through the simulated lock host and
@@ -735,15 +820,16 @@ func (r *simRunner) attach(name string) error {
 func (r *simRunner) openProc(pid int) error {
 	var db *Database
 	var err error
+	env := r.newEnv(pid)
 	if r.service {
-		db, err = r.openServiceProc(pid)
+		db, err = r.openServiceProc(pid, env)
 	} else {
-		db, err = r.openDatabase(nil)
+		db, err = r.openDatabase(env, nil)
 	}
 	if err != nil {
 		return err
 	}
-	r.procs[pid] = &simProc{pid: pid, db: db}
+	r.procs[pid] = &simProc{pid: pid, db: db, env: env}
 	r.cur, r.db = pid, db
 	if r.service {
 		// Every process attaches every tracked attachment whose file exists: the owner of the file, or
@@ -770,7 +856,7 @@ const simServiceGraceMs = 1000
 // lock table and network, the simulated filesystem and spill host, and no background re-election, so a
 // client re-elects at its next transaction begin, in trace order. Every owner limit that would start a
 // timer is off.
-func (r *simRunner) openServiceProc(pid int) (*Database, error) {
+func (r *simRunner) openServiceProc(pid int, env *Environment) (*Database, error) {
 	if r.locks == nil {
 		r.locks = newSimLockTable(&r.clock, r.procBusy)
 	}
@@ -782,8 +868,13 @@ func (r *simRunner) openServiceProc(pid int) (*Database, error) {
 		IdleInTransactionTimeoutMs: &zero,
 		IdleSessionTimeoutMs:       &zero,
 		ShutdownGraceMs:            &grace,
-		Environment:                r.env,
+		Environment:                env,
 		MaxStorageBytes:            r.maxStorageBytes,
+		Credential:                 r.credential(r.main()),
+	}
+	if r.encrypted {
+		// Every process seals its scratch files, so encrypting a plaintext database is allowed (S13).
+		opts.ScratchEncryption = ScratchEncryptionOn
 	}
 	if r.relaxed {
 		opts.Synchronous = SynchronousOff
@@ -839,7 +930,7 @@ func (r *simRunner) procBusy(pid int) bool {
 	return false
 }
 
-func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
+func (r *simRunner) openDatabase(env *Environment, coord *fileCoordinator) (*Database, error) {
 	main := r.fs.main()
 	if main == nil {
 		return nil, newError(IoError, "the database file is gone")
@@ -852,7 +943,7 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 	if cache <= 0 {
 		cache = defaultCacheBytes
 	}
-	e, err := loadEnginePagedCredential(p, cacheLeaves(cache, p.pageSize), r.env, r.credential())
+	e, err := loadEnginePagedCredential(p, cacheLeaves(cache, p.pageSize), env, r.credential(r.main()))
 	if err != nil {
 		return nil, err
 	}
@@ -861,9 +952,9 @@ func (r *simRunner) openDatabase(coord *fileCoordinator) (*Database, error) {
 	if err := e.repairKeyBlock(); err != nil {
 		return nil, err
 	}
-	// Spill and temp-table spill scratch files, whose operations can fail; sealed for an encrypted
-	// database (encryption.md §6).
-	e.spill = sealScratch(r.fs.spillHost(), r.encrypted, r.env)
+	// Spill and temp-table spill scratch files, whose operations can fail; sealed in an encrypted trace
+	// (encryption.md §6), whatever main is now, so encrypting a plaintext database is allowed (S13).
+	e.spill = sealScratch(r.fs.spillHost(), r.encrypted, env)
 	db := databaseOver(sharedCoreFromEngineCoordinated(e, coord))
 	db.core.storage.files = r.fs // create, compaction, and attachments go through the simulated filesystem
 	db.core.storage.relaxed = r.relaxed
@@ -883,13 +974,14 @@ func (r *simRunner) run() {
 	}
 	// Create the database through the simulated filesystem, as the host's create does: a temp file,
 	// its sync, the rename, and the directory barrier (S4).
-	e, err := createVia(r.fs, simDiskPath, databaseOptions{PageSize: r.pageSize, env: r.env, credential: r.credential()})
+	m := newSimDB("main", simDiskPath)
+	m.key = r.createKey()
+	e, err := createVia(r.fs, simDiskPath, databaseOptions{PageSize: r.pageSize, env: r.newEnv(0), credential: r.credential(m)})
 	if err != nil {
 		r.violation = "create: " + err.Error()
 		return
 	}
 	_ = e.Close()
-	m := newSimDB("main", simDiskPath)
 	r.dbs["main"] = m
 	if err := r.open(); err != nil {
 		r.violation = "initial open: " + err.Error()
@@ -912,6 +1004,14 @@ func (r *simRunner) run() {
 	}
 }
 
+// createKey is the key a database is created under: simulation key 0 in an encrypted trace, else none.
+func (r *simRunner) createKey() int {
+	if r.encrypted {
+		return 0
+	}
+	return -1
+}
+
 // image copies a database file's cache — what a new process would open — or nil if it is gone.
 func (r *simRunner) image(d *simDB) []byte {
 	if f := r.fs.files[d.file]; f != nil {
@@ -932,6 +1032,7 @@ func (r *simRunner) step(i int) (cont bool) {
 		}
 	}()
 	st := r.tr.steps[i]
+	r.stepIndex = i
 	switch st.kind {
 	case "fault":
 		f, err := simFaultOf(st)
@@ -997,6 +1098,12 @@ func (r *simRunner) step(i int) (cont bool) {
 	case "corrupt":
 		r.fs.beginStep(uint64(i), nil)
 		return r.stepCorrupt(i, st)
+	case "replay":
+		r.fs.beginStep(uint64(i), nil)
+		return r.stepReplay(i, st.mode)
+	case "restore":
+		r.fs.beginStep(uint64(i), nil)
+		return r.stepRestore(i, st.intParam("j"))
 	}
 
 	// A step that needs a process when none is running (the last one exited) restarts p0 first.
@@ -1056,13 +1163,11 @@ func (r *simRunner) step(i int) (cont bool) {
 	case "check":
 		r.stepCheck(i)
 	case "compact":
-		r.stepCompact(i, st.sid, 0)
+		r.stepCompact(i, st.sid, false, 0)
 	case "rekey":
-		n, _ := strconv.Atoi(st.sid)
-		r.stepCompact(i, "main", n)
+		r.stepRekey(i, st.sid, simTargetKey(st.mode))
 	case "change_key":
-		n, _ := strconv.Atoi(st.sid)
-		r.stepChangeKey(i, n)
+		r.stepChangeKey(i, st.sid, simTargetKey(st.mode))
 	case "backup":
 		r.stepBackup(i, st)
 	case "attach":
@@ -1112,10 +1217,11 @@ func (r *simRunner) step(i int) (cont bool) {
 		}
 	}
 	if armed == nil {
-		r.keyChange = nil
+		r.clearKeyChanges()
 		return true
 	}
 	if armed.kind == simDisconnect {
+		r.clearKeyChanges()
 		// A lost connection ends no process: its client re-elects at its next begin.
 		fired := "end"
 		if r.net.disconnected {
@@ -1149,6 +1255,13 @@ func (r *simRunner) step(i int) (cont bool) {
 			r.fs.processDeath()
 			for _, pid := range pids {
 				r.emit(`{"i":%d,"op":"killed","pid":%d,"fired":%q}`, i, pid, fired)
+			}
+			// The survivors run on: a key step the dead owner interrupted is settled on the kernel's view
+			// of each file, which the next opener reads.
+			for _, d := range r.order() {
+				if d.keyChange != nil && r.image(d) != nil && !r.settleKey(i, d, r.image(d)) {
+					return false
+				}
 			}
 			return true
 		}
@@ -1254,8 +1367,27 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 		s.SetMaxQueryMemoryBytes(r.maxQueryMemory)
 	}
 	if r.service {
+		// A session that finds its process's data key stale fails to open, and the host reopens the
+		// process (reopenStale).
+		stale := func(ok bool) bool {
+			if ok || r.digestErr == nil {
+				return false
+			}
+			code := simCode(r.digestErr)
+			if !r.encrypted || (code != "28P04" && code != "28P02") {
+				return false
+			}
+			if st.mode == "write" {
+				_ = s.Rollback()
+			} else {
+				s.Close()
+			}
+			r.emit(`{"i":%d,"op":"open","sid":%q,"error":%q}`, i, st.sid, code)
+			r.reopenStale()
+			return true
+		}
 		d, ok := r.digest(s, r.main())
-		if !r.observe(i, "session "+st.sid, s.Version(), d, ok) {
+		if stale(ok) || !r.observe(i, "session "+st.sid, s.Version(), d, ok) {
 			return
 		}
 		for _, name := range r.attachedNames() {
@@ -1265,7 +1397,7 @@ func (r *simRunner) stepOpen(i int, st simStep) {
 				continue
 			}
 			dg, ok := r.digest(s, a)
-			if !r.observeDB(i, a, "session "+st.sid, v, dg, ok) {
+			if stale(ok) || !r.observeDB(i, a, "session "+st.sid, v, dg, ok) {
 				return
 			}
 		}
@@ -1448,15 +1580,50 @@ func (r *simRunner) checkLive() error {
 // committedView is the version and digest of database d a fresh read session sees.
 func (r *simRunner) committedView(d *simDB) (uint64, string, bool) {
 	rs := r.db.ReadSession()
-	defer rs.Close()
 	digest, ok := r.digest(rs, d)
+	rs.Close()
+	if !ok && r.reopenStale() {
+		rs = r.db.ReadSession()
+		defer rs.Close()
+		digest, ok = r.digest(rs, d)
+	}
 	return r.dbVersion(d), digest, ok
 }
 
 func (r *simRunner) committedDigest(d *simDB) (string, bool) {
 	rs := r.db.ReadSession()
-	defer rs.Close()
-	return r.digest(rs, d)
+	digest, ok := r.digest(rs, d)
+	rs.Close()
+	if !ok && r.reopenStale() {
+		rs = r.db.ReadSession()
+		defer rs.Close()
+		digest, ok = r.digest(rs, d)
+	}
+	return digest, ok
+}
+
+// reopenStale restarts the step's process when the digest that just failed found its data key stale
+// (S13): a page client of a database rekeyed, decrypted, or encrypted since it opened is told to reopen
+// (28P04, or 28P02 for a plaintext client — encrypted.md §14), and the host does, with the database's
+// current key. Its sessions end. It reports whether it did, so the caller reads again.
+func (r *simRunner) reopenStale() bool {
+	if !r.service || !r.encrypted || r.digestErr == nil {
+		return false
+	}
+	if code := simCode(r.digestErr); code != "28P04" && code != "28P02" {
+		return false
+	}
+	pid := r.cur
+	if err := r.closeProc(pid); err != nil {
+		r.fail(r.stepIndex, "reopen p%d after a stale key: %v", pid, err)
+		return false
+	}
+	if err := r.openProc(pid); err != nil {
+		r.fail(r.stepIndex, "reopen p%d after a stale key: %v", pid, err)
+		return false
+	}
+	r.emit(`{"i":%d,"op":"reopened","pid":%d}`, r.stepIndex, pid)
+	return true
 }
 
 // quiet reports whether the commit being checked ran with nothing that may hold reclamation back: no
@@ -1923,10 +2090,29 @@ func (r *simRunner) stepEnd(i int, st simStep) {
 // as a fresh image at the next version, through the simulated filesystem's temp file, rename, and
 // directory barrier. Its contents are unchanged, so a crash may recover either version with the
 // same digest.
-func (r *simRunner) stepCompact(i int, name string, rekey int) {
+// simTargetKey parses a key step's target: simulation key 1–3, or -1 for `plain`.
+func simTargetKey(s string) int {
+	if s == "plain" {
+		return -1
+	}
+	n, _ := strconv.Atoi(s)
+	return n
+}
+
+// stepRekey is `rekey <n>|plain [<db>]` (S12–S13): compaction under a new data key for simulation key
+// target, which encrypts a plaintext database, or with -1 a decryption.
+func (r *simRunner) stepRekey(i int, name string, target int) {
+	if !r.encrypted {
+		r.emit(`{"i":%d,"op":"rekey","skip":true}`, i)
+		return
+	}
+	r.stepCompact(i, name, true, target)
+}
+
+func (r *simRunner) stepCompact(i int, name string, rekey bool, target int) {
 	// A rekey (S12) is compaction under a new data key: the same version and contents rules.
 	op := "compact"
-	if rekey != 0 {
+	if rekey {
 		op = "rekey"
 	}
 	d := r.dbs[name]
@@ -1938,10 +2124,10 @@ func (r *simRunner) stepCompact(i int, name string, rekey int) {
 	d.addHistory(base+1, d.lastDigest)
 	d.maxAttempted = max(d.maxAttempted, base+1)
 	var err error
-	if rekey != 0 {
-		r.keyChange = &[2]int{r.key, rekey}
-		if err = r.db.Rekey(name, simKeys[rekey], Argon2Params{}); err == nil {
-			r.key = rekey
+	if rekey {
+		d.keyChange = &simKeyChange{old: d.key, next: target, entryPending: !r.fs.entryDurable(d.file)}
+		if err = r.db.Rekey(name, simCredential(target), Argon2Params{}); err == nil {
+			d.key = target
 		}
 	} else {
 		err = r.db.Compact(name)
@@ -1961,7 +2147,8 @@ func (r *simRunner) stepCompact(i int, name string, rekey int) {
 		switch {
 		case code == "XX001":
 			r.fail(i, "corruption: %s reported XX001: %v", op, err)
-		case now != base:
+		case now > base || (now != base && !r.service):
+			// (A page client's view may lag the owner's until its next begin.)
 			r.fail(i, "a failed %s published version %d of %s (was %d)", op, now, name, base)
 		}
 		return
@@ -1984,31 +2171,37 @@ func (r *simRunner) stepCompact(i int, name string, rekey int) {
 	r.observeGrowth(d)
 }
 
-// stepChangeKey is `change_key <n>` (S12, encrypted.md §5): main's credential changes to simulation key
-// n. Only the key block is written, so no version or content moves.
-func (r *simRunner) stepChangeKey(i, n int) {
-	if !r.encrypted {
-		r.emit(`{"i":%d,"op":"change_key","skip":true}`, i)
+// stepChangeKey is `change_key <n> [<db>]` (S12–S13, encrypted.md §5): the credential of main or a
+// file attachment changes to simulation key n. Only the key block is written, so no version or content
+// moves. A plaintext database refuses it (28P03).
+func (r *simRunner) stepChangeKey(i int, name string, n int) {
+	d := r.dbs[name]
+	if !r.encrypted || d == nil || r.dbVersion(d) == 0 {
+		r.emit(`{"i":%d,"op":"change_key","db":%q,"skip":true}`, i, name)
 		return
 	}
-	base := r.dbVersion(r.main())
-	r.keyChange = &[2]int{r.key, n}
-	if err := r.db.ChangeCredential("main", simKeys[n], Argon2Params{}); err != nil {
+	dbField := ""
+	if name != "main" {
+		dbField = fmt.Sprintf(`,"db":%q`, name)
+	}
+	base := r.dbVersion(d)
+	d.keyChange = &simKeyChange{old: d.key, next: n, entryPending: !r.fs.entryDurable(d.file)}
+	if err := r.db.ChangeCredential(name, simKeys[n], Argon2Params{}); err != nil {
 		code := simCode(err)
 		if strings.HasPrefix(code, "non-engine") {
 			r.fail(i, "%s", code)
 			return
 		}
-		r.emit(`{"i":%d,"op":"change_key","error":%q}`, i, code)
+		r.emit(`{"i":%d,"op":"change_key"%s,"error":%q}`, i, dbField, code)
 		if code == "XX001" {
 			r.fail(i, "corruption: change_key reported XX001: %v", err)
 		}
 	} else {
-		r.key = n
-		r.emit(`{"i":%d,"op":"change_key","key":%d}`, i, n)
+		d.key = n
+		r.emit(`{"i":%d,"op":"change_key"%s,"key":%d}`, i, dbField, n)
 	}
-	if r.dbVersion(r.main()) != base {
-		r.fail(i, "a credential change published a version")
+	if r.dbVersion(d) != base {
+		r.fail(i, "a credential change published a version of %s", name)
 	}
 }
 
@@ -2048,9 +2241,21 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 	if r.imagePrefix != "" {
 		_ = os.WriteFile(fmt.Sprintf("%s.step%d.backup.img", r.imagePrefix, i), image, 0o644)
 	}
-	e, err := loadEngine(image, r.env)
+	bp, err := pagerFromStore(newMemoryBlockStore(image))
 	if err != nil {
 		r.fail(i, "the backup does not open: %v", err)
+		return
+	}
+	// The copy opens with the database's credential at the time of the backup (encrypted.md §13).
+	e, err := loadEnginePagedCredential(bp, cacheLeaves(defaultCacheBytes, bp.pageSize), r.procEnv(), r.credential(d))
+	if err != nil {
+		opens := -2
+		for k := -1; k < 4; k++ {
+			if r.simUnlocks(image, k) {
+				opens = k
+			}
+		}
+		r.fail(i, "the backup does not open with key %d: %v (key %d opens it)", d.key, err, opens)
 		return
 	}
 	v := e.committed.txid
@@ -2082,11 +2287,12 @@ func (r *simRunner) stepBackup(i int, st simStep) {
 		d.version, d.lastDigest = snapshot, dg
 		d.ownerLost = false
 	}
-	live, pages, free, err := simIntegrity(image, v, r.credential())
+	live, pages, free, err := simIntegrity(image, v, r.credential(d))
 	if err != nil {
 		r.fail(i, "backup integrity: %v", err)
 		return
 	}
+	r.backupsOK = append(r.backupsOK, simBackup{n: r.backups, file: dest, version: v, digest: dg, key: d.key})
 	r.emit(`{"i":%d,"op":"backup","form":%q,"version":%d,"digest":%q,"live":%d,"pages":%d,"free":%d,"image":"%016x"}`,
 		i, st.mode, v, dg, live, pages, free, simImageHash(image, pages, r.pageSize))
 }
@@ -2122,7 +2328,8 @@ func (r *simRunner) stepAttach(i int, name string) {
 		d.history = map[uint64]map[string]bool{}
 		d.addHistory(1, simEmptyDigest(d))
 		d.version, d.lastDigest, d.floor, d.maxAttempted = 1, simEmptyDigest(d), 0, 1
-		e, err := createVia(r.fs, d.file, databaseOptions{PageSize: r.pageSize, env: r.env})
+		d.key = r.createKey()
+		e, err := createVia(r.fs, d.file, databaseOptions{PageSize: r.pageSize, env: r.newEnv(r.cur), credential: r.credential(d)})
 		if err != nil {
 			r.attachFailed(i, name, err)
 			return
@@ -2235,7 +2442,7 @@ func (r *simRunner) stepCheck(i int) {
 			return
 		}
 		image := r.image(d)
-		live, pages, free, err := simIntegrity(image, d.version, r.credential())
+		live, pages, free, err := simIntegrity(image, d.version, r.credential(d))
 		if err != nil {
 			r.fail(i, "integrity of %s: %v", d.name, err)
 			return
@@ -2379,9 +2586,11 @@ func (r *simRunner) recover(i int, fired string) bool {
 			_ = os.WriteFile(fmt.Sprintf("%s.step%d%s.img", r.imagePrefix, i, suffix), images[d.name], 0o644)
 		}
 	}
-	if !r.settleKey(i, images["main"]) {
-		r.crashImage = images["main"]
-		return false
+	for _, d := range r.order() {
+		if !r.settleKey(i, d, images[d.name]) {
+			r.crashImage = images[d.name]
+			return false
+		}
 	}
 	if err := r.open(); err != nil {
 		r.crashImage = images["main"]
@@ -2397,7 +2606,7 @@ func (r *simRunner) recover(i int, fired string) bool {
 			r.crashImage = images[d.name]
 			return false
 		}
-		live, pages, free, err := simIntegrity(images[d.name], v, r.credential())
+		live, pages, free, err := simIntegrity(images[d.name], v, r.credential(d))
 		if err != nil {
 			r.crashImage = images[d.name]
 			r.fail(i, "recovery integrity of %s: %v", d.name, err)
@@ -2488,6 +2697,191 @@ func (r *simRunner) stepCorrupt(i int, st simStep) bool {
 		return false
 	}
 	r.emit(`{"i":%d,"op":"corrupt","flipped":%d,"open":%q,"read":%q}`, i, len(flips), opened, read)
+	return true
+}
+
+// stepReplay is `replay <kind>` (simulation-testing.md §8.3 *Replays*, S13): every process ends
+// cleanly; a page of main that a bound pointer of kind names gets back an older durable version of
+// itself (§6.1's archive); a new process opens main and reads every row, and the image checker reads
+// every other reachable page. A page the selected generation's manifest depends on may make recovery
+// fall back to the generation in the other meta slot; any other replay must surface as XX001. Then the
+// page is put back and main must reopen exactly as it was.
+func (r *simRunner) stepReplay(i int, kind string) bool {
+	for _, pid := range r.livePids() {
+		if err := r.closeProc(pid); err != nil {
+			r.fail(i, "close: %v", err)
+			return false
+		}
+	}
+	r.closeFlushed()
+	r.fs.processDeath()
+	m := r.main()
+	file := r.fs.main()
+	reopen := func() bool {
+		if err := r.open(); err != nil {
+			r.fail(i, "replay: reopen failed: %v", err)
+			return false
+		}
+		if v := r.db.Version(); v != m.version {
+			r.fail(i, "replay: after the repair version %d, want %d", v, m.version)
+			return false
+		}
+		if dg, ok := r.committedDigest(m); !ok || dg != m.lastDigest {
+			r.fail(i, "replay: after the repair the contents differ")
+			return false
+		}
+		for _, d := range r.order() {
+			r.observeGrowth(d)
+		}
+		return true
+	}
+	if m.key < 0 || file == nil {
+		r.emit(`{"i":%d,"op":"replay","kind":%q,"skip":true}`, i, kind)
+		return reopen() // a plaintext file binds no pointer
+	}
+	image := r.image(m)
+	kinds, deps, err := simPointerKinds(image, r.credential(m))
+	if err != nil {
+		r.fail(i, "replay: classifying the pages of version %d: %v", m.version, err)
+		return false
+	}
+	type candidate struct {
+		page     uint32
+		versions [][]byte
+	}
+	var cands []candidate
+	for _, pg := range kinds[kind] {
+		if vs := file.replayVersions(int64(pg)); len(vs) > 0 {
+			cands = append(cands, candidate{pg, vs})
+		}
+	}
+	if len(cands) == 0 {
+		r.emit(`{"i":%d,"op":"replay","kind":%q,"skip":true}`, i, kind)
+		return reopen()
+	}
+	c := cands[simDecide(r.seed, simLaneReplayPage, uint64(i), 0, 0)%uint64(len(cands))]
+	older := c.versions[simDecide(r.seed, simLaneReplayVersion, uint64(i), 0, 0)%uint64(len(c.versions))]
+	// The generation in the other meta slot, the one a fallback recovers.
+	var other uint64
+	ps := int(r.pageSize)
+	for slot := 0; slot < 2; slot++ {
+		if mt, ok := parseMeta(image[slot*ps : (slot+1)*ps]); ok && mt.txid < m.version && mt.txid > other {
+			other = mt.txid
+		}
+	}
+	flip := file.replace(int64(c.page), older)
+	what := fmt.Sprintf("replay of %s page %d", kind, c.page)
+	outcome := ""
+	detected := func(err error) bool {
+		if code := simCode(err); code != "XX001" {
+			r.fail(i, "%s: %s, not XX001: %v", what, code, err)
+			return false
+		}
+		outcome = "XX001"
+		return true
+	}
+	var got uint64
+	if err := r.openProc(0); err != nil {
+		if !detected(err) {
+			return false
+		}
+	} else {
+		got = r.db.Version()
+		dg, ok := r.committedDigest(m)
+		r.dropProc(0)
+		switch {
+		case !ok:
+			if !detected(r.digestErr) {
+				return false
+			}
+		case got == m.version && dg == m.lastDigest && !deps[c.page]:
+			// The rows are right, so the replayed page was not on their path: the image checker reads
+			// every other reachable page and must find it. (A page the manifest depends on must have
+			// failed the manifest's digest instead.)
+			if _, _, _, err := simIntegrity(r.image(m), got, r.credential(m)); err == nil {
+				r.fail(i, "%s went undetected", what)
+				return false
+			} else if !detected(err) {
+				return false
+			}
+		case got < m.version && got == other && deps[c.page] && m.history[got][dg]:
+			// The manifest's digest of the page fails, so recovery falls back (validated-cow.md §1) to
+			// an intact older generation.
+			if _, _, _, err := simIntegrity(r.image(m), got, r.credential(m)); err != nil {
+				r.fail(i, "%s: the fallback generation %d fails the image checker: %v", what, got, err)
+				return false
+			}
+			outcome = "fallback"
+		default:
+			r.fail(i, "%s: version %d read back with contents (digest %s) the replay must not produce (manifest dependency: %v, other slot %d)",
+				what, got, dg, deps[c.page], other)
+			return false
+		}
+	}
+	r.fs.processDeath()
+	file.repair([]simFlip{flip})
+	if !reopen() {
+		return false
+	}
+	if outcome == "fallback" {
+		r.emit(`{"i":%d,"op":"replay","kind":%q,"page":%d,"outcome":"fallback","version":%d}`, i, kind, c.page, got)
+	} else {
+		r.emit(`{"i":%d,"op":"replay","kind":%q,"page":%d,"outcome":"XX001"}`, i, kind, c.page)
+	}
+	return true
+}
+
+// stepRestore is `restore <j>` (§8.3 *Restores*, S13): main's j-th newest successful backup (the
+// oldest if there are fewer) is copied over it as a host would, with every process ended cleanly. Main
+// is then that backup's generation, under the key it had then; the history above it is forgotten, so
+// every later commit diverges from the one the backup was taken in.
+func (r *simRunner) stepRestore(i int, j int) bool {
+	for _, pid := range r.livePids() {
+		if err := r.closeProc(pid); err != nil {
+			r.fail(i, "close: %v", err)
+			return false
+		}
+	}
+	r.closeFlushed()
+	r.fs.processDeath()
+	m := r.main()
+	k := max(len(r.backupsOK)-j, 0)
+	if len(r.backupsOK) == 0 || r.fs.files[r.backupsOK[k].file] == nil {
+		// Nothing to restore: the processes still end, as the generator's model expects.
+		if err := r.open(); err != nil {
+			r.fail(i, "restore: reopen failed: %v", err)
+			return false
+		}
+		for _, d := range r.order() {
+			r.observeGrowth(d)
+		}
+		r.emit(`{"i":%d,"op":"restore","skip":true}`, i)
+		return true
+	}
+	b := r.backupsOK[k]
+	r.fs.restore(b.file, m.file)
+	for v := range m.history {
+		if v >= b.version {
+			delete(m.history, v)
+		}
+	}
+	m.addHistory(b.version, b.digest)
+	m.version, m.lastDigest, m.floor, m.maxAttempted = b.version, b.digest, b.version, b.version
+	m.key, m.keyChange, m.ownerLost, m.shrinkDue = b.key, nil, false, false
+	if err := r.open(); err != nil {
+		r.fail(i, "restore: open failed: %v", err)
+		return false
+	}
+	v := r.db.Version()
+	dg, ok := r.committedDigest(m)
+	if !ok || v != b.version || dg != b.digest {
+		r.fail(i, "restore: main opened at version %d (digest %s), want the backup's %d (digest %s)", v, dg, b.version, b.digest)
+		return false
+	}
+	for _, d := range r.order() {
+		r.observeGrowth(d)
+	}
+	r.emit(`{"i":%d,"op":"restore","backup":%d,"version":%d,"digest":%q}`, i, b.n, v, dg)
 	return true
 }
 
@@ -2584,7 +2978,7 @@ func (r *simRunner) observeDB(i int, m *simDB, who string, v uint64, dg string, 
 	}
 	switch {
 	case !ok:
-		r.fail(i, "%s: version %d%s is unreadable", who, v, what)
+		r.fail(i, "%s: version %d%s is unreadable: %v", who, v, what, r.digestErr)
 	case v < m.version && (!m.ownerLost || v < m.floor):
 		r.fail(i, "%s sees version %d%s after version %d was published", who, v, what, m.version)
 	case v > m.maxAttempted:

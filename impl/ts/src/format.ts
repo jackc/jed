@@ -46,14 +46,25 @@ import type { Collation } from "./collation.ts";
 import { Environment } from "./environment.ts";
 import { Decimal } from "./decimal.ts";
 import { crc32Update } from "./crc32.ts";
-import { type Cap, capChain, capEncrypted, capFirstBody, capOf, isNoTag, NO_TAG } from "./cap.ts";
+import {
+  type Cap,
+  capChain,
+  capEncrypted,
+  capFirstBody,
+  capOf,
+  FIRST_BODY_ENCRYPTED,
+  isNoTag,
+  NO_TAG,
+} from "./cap.ts";
 import {
   type Credential,
   cryptoAvailable,
   ENCRYPTED_MIN_PAGE_SIZE,
   fileSuite,
+  KEY_BLOCK_LEN,
   type PageCodec,
   sealPassesSteps,
+  selectedKeyPage,
   unlockCodecSteps,
 } from "./crypto.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
@@ -3882,6 +3893,52 @@ export function loadEngine(
 // pages with (null for a plaintext file). A plaintext file opened with a credential is 28P03, an
 // encrypted one without 28P02, a credential that does not unwrap the data key 28P01. A host with no
 // cryptography backend (the browser/OPFS worker) cannot open an encrypted file at all: 0A000 (§10).
+// adoptHeldCodecSteps prepares pager to open with a page client's held codec (encrypted.md §14): the
+// file must be encrypted (28P04 when it no longer is — checked first, since a file decrypted since may
+// be smaller than an encrypted one can be), and the codec adopts its selected key-block copy, so a
+// later credential change or backup starts from the file's current generation. The load then
+// authenticates the meta under the held key (XX001 when it does not).
+export function* adoptHeldCodecSteps(pager: Pager, codec: PageCodec): Steps<void> {
+  const slot0 = yield* pager.readPageSteps(0);
+  const slot1 = yield* pager.readPageSteps(1);
+  if (fileSuite(slot0, slot1) === 0) {
+    throw engineError("stale_key", "the database is no longer encrypted; reopen it");
+  }
+  if (pager.pageSize < ENCRYPTED_MIN_PAGE_SIZE || pager.physicalPages() < FIRST_BODY_ENCRYPTED) {
+    throw engineError("data_corrupted", "encrypted file too small for its key block");
+  }
+  const page2 = yield* pager.readPageSteps(2);
+  const page3 = yield* pager.readPageSteps(3);
+  codec.setKeyBlock(selectedKeyPage(page2, page3).slice(0, KEY_BLOCK_LEN));
+}
+
+// heldKeyStaleSteps reports whether a held key authenticates neither meta slot of the file under pager
+// that parses: the promoting client's test that the owner rekeyed the file before it left (encrypted.md
+// §14). False when no slot parses, so damage stays XX001.
+export function* heldKeyStaleSteps(pager: Pager, codec: PageCodec): Steps<boolean> {
+  let parsed = false;
+  for (const slot of [0, 1]) {
+    let raw: Uint8Array;
+    let chain: { index: number; bytes: Uint8Array }[];
+    try {
+      raw = yield* pager.readPageSteps(slot);
+      const meta = parseCommitMeta(raw, pager.pageSize, 0xffff_ffff);
+      if (meta === null) continue;
+      chain = yield* manifestChainSteps(meta, (p) => pager.readPageSteps(p));
+    } catch {
+      continue;
+    }
+    parsed = true;
+    try {
+      codec.verifyMeta(slot, raw, chain);
+      return false;
+    } catch {
+      // Not under this slot's index.
+    }
+  }
+  return parsed;
+}
+
 export function* unlockPagerSteps(
   pager: Pager,
   credential: Credential | undefined,

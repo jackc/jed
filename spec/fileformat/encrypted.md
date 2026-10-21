@@ -332,8 +332,10 @@ Both backup forms of page-service.md §9 work on an encrypted database, from its
   credential change replaces only after writing both pages — so the copy holds a complete pair at one
   generation even while a change runs. Both meta slots carry the bootstrap meta of the pinned version
   (its root and free-list tags at 64 and 80), each sealed for its own slot index.
-- **Compacted**: the from-scratch image at `txid + 1` under the same DEK and key block, every page
-  resealed with fresh nonces from the database's key-entropy stream, as compaction does.
+- **Compacted**: the from-scratch image at `txid + 1` under the same DEK and the database's selected
+  key-block copy (read from pages 2 and 3, as for the page-identical form, so a page client that
+  unlocked before a credential change copies the current pair), every page resealed with fresh nonces
+  from the database's key-entropy stream, as compaction does.
 
 Either copy opens with the database's credential at the time of the backup.
 
@@ -359,7 +361,14 @@ writes its pages holds the DEK. No message is added to the wire protocol (spec/p
 - **Promotion.** A client that promotes itself opens the file with the **data key it holds**, not its
   credential, so a credential changed since it unlocked does not stop it. It adopts the file's selected
   key-block copy and leaves a differing pair unrepaired (§5 makes that safe). The meta is
-  authenticated under the held key (`XX001` otherwise).
+  authenticated under the held key; a file whose meta slots the held key authenticates in neither
+  (the owner rekeyed it before it left) is `28P04`, as for a client that stayed connected, and a reopen
+  with the credential then surfaces any tampering as `28P01` or `XX001` (encryption.md §8).
+- **Reconnecting.** A client that connects again — to the same owner after a lost connection, or to a
+  new one after a handoff — likewise keeps the data key it holds: it reads pages 0–3 through the
+  service, adopts the selected key-block copy, and authenticates the served meta under the held key. A
+  file decrypted since is `28P04`, checked before the file's size, and so is a meta the held key does
+  not authenticate (a rekey since), as at the next transaction of a client that stayed connected.
 - **Rekey under the service** is the owner's, under compaction's rules (no client may pin a snapshot).
   A client that stays connected finds, at its next transaction, a meta its held key no longer
   authenticates (or a plaintext one): `28P04 stale_key`, and it reopens with the new credential. A
