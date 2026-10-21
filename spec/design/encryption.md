@@ -47,26 +47,29 @@ hand-rolled because its encoders are not standardized (large-values.md §6).
 
 ## 3. Construction
 
-**Decided: one single-use AES-256-GCM key per page, derived from the data key and a fresh random
-192-bit salt; nothing about nonces is allocated, counted or persisted.** Every seal, including a
+**Decided: AES-256-GCM with a fresh random 192-bit nonce per seal, from which the page key is
+derived; nothing about nonces is allocated, counted or persisted.** Every seal, including a
 retried or failed commit, a restored backup or a writable copy, draws new randomness, so nonce
 uniqueness needs no protocol and survives every history fork by construction. The salt and the
-16-byte tag live in the page's reserved tail (§4). The exact derivation is **direction, pending
-the security review**, which turns it into a format decision.
+16-byte tag live in the page's reserved tail (§4). The derivation is decided below; the security
+review and the §7 fixtures are what turn the whole into a format decision, and could reopen it.
 
 The construction is **XAES-256-GCM** ([C2SP](https://github.com/C2SP/C2SP/blob/main/XAES-256-GCM.md)),
 decided 2026-10-20 as the boring choice: a published specification whose purpose is to be the
 extended-nonce AES-GCM, with test vectors, a reference implementation and a published analysis
 of its derivation (ePrint 2025/878). The salt is its 192-bit nonce: the first 96 bits and the
 page subkey go through a two-block CMAC-AES-256 counter-mode KDF (label `X`, 16-bit counter) to
-a one-message key, and the last 96 bits are the GCM nonce. No platform library but RustCrypto
+the page key, and the last 96 bits are the GCM nonce. Two nonces that share their first 96 bits
+share a derived key under distinct GCM nonces; the specification permits this, and the deferred
+lifetime analysis (§9) covers derived-key reuse rather than assuming one message per key. No platform library but RustCrypto
 exposes CMAC, so that derivation — the CMAC subkey (one AES block, one GF(2^128) doubling,
-branch-free) and two single-block CMACs — is written in Go, TS, Ruby and future cores against
+branch-free, and computed **once at unlock**, since it depends only on the page subkey) and two
+single-block CMACs per page — is written in Go, TS, Ruby and future cores against
 the C2SP vectors. That is glue over a library AES, not a primitive, and is recorded as admissible
 under CLAUDE.md §14 on that basis. (A jed-specific HKDF-then-fixed-nonce layout was weighed and
 set aside: it avoided the glue by inventing a composition a reviewer would have to review rather
-than recognize.) A repeated salt under one data key is the hazard; fixtures check uniqueness of
-the whole salt, and the collision term for `q` seals is about `q(q−1)/2^193`.
+than recognize.) A repeated 192-bit nonce under one data key is the hazard; fixtures check uniqueness
+of the whole nonce, and the collision term for `q` seals is about `q(q−1)/2^193`.
 XAES is not nonce-misuse-resistant or key-committing, and need not be: one
 DEK per file and rotation by compaction mean no reader ever tries two keys against a page, and a
 partitioning-oracle attack on the passphrase wrap needs an attacker who can already read the
@@ -99,8 +102,10 @@ need a cache or a counter protocol for a sub-microsecond saving. Reports are und
 `bench/aead/results/`.
 
 **Entropy.** Keys and salts come from the platform CSPRNG, held in the handle's `Environment`
-(environment.md) as a field separate from the seeded SQL entropy source, with an explicitly
-insecure fixed-bytes constructor for fixtures. Two independent streams: one per database (pages,
+(environment.md) as a field separate from the seeded SQL entropy source. Fixtures and the
+simulator install an explicitly insecure **seeded** source instead — the same splitmix64 stream
+`seeded_random_source(u64)` already provides (entropy.md §2), so every core draws identical salts
+from one seed and no salt repeats. Two independent streams: one per database (pages,
 meta, key block) and one per handle (scratch), so per-core scratch framing cannot desynchronize
 page salts under the fixed source. A commit draws its salts in one batch, after every check that
 can refuse the commit and immediately before sealing, in **format.md's commit write order** (per
@@ -119,15 +124,18 @@ salts) and cost family. A plaintext file's layout is untouched.
 
 **Reserve (Decided).** The meta slot records `reserved_bytes`; usable capacity is
 `C = page_size − 16 − reserved_bytes`. A plaintext file reserves 0; an encrypted file reserves
-what its suite needs (40 bytes under either §3 construction: 24-byte salt + 16-byte tag). It is self-description,
+what its suite needs (40 bytes under XAES: 24-byte nonce + 16-byte tag). It is self-description,
 never a setting. Record caps, split points and chunk sizes follow `C` as today.
 
 **Body pages (Decided).** Every page but the meta slots, the key block (pages 2–3) and
 manifest-overflow pages — catalog,
 B-tree and GiST nodes, overflow, free-list — is encrypted whole, header included (a plaintext
 `page_type` or `next_page` would leak the tree's shape). Associated data: page index and the
-suite/variant identifier. The body-page CRC is dropped; the tag supersedes it, and recovery's
-manifest check becomes digest-only.
+suite/variant identifier. The 16-byte header keeps its shape with the CRC field zero — the tag
+supersedes it, and recovery's manifest check becomes digest-only — so `C` is as stated above.
+The encrypted variant has a **minimum page size of 1 KiB** and its goldens are generated there:
+at 256 bytes the header and reserve take 22% of the page and 20-byte pointers collapse the
+interior fan-out, a corner not worth designing for.
 
 **Pointer binding (Decided).** Every pointer carries the full 16-byte tag of the page it names:
 meta to catalog root, free-list head and manifest chain; catalog to its next page and every
@@ -139,8 +147,9 @@ seals children before parents and chains tail first (the codec's `encode` return
 `decode` takes the expected one; read-ahead holds stored bytes until the parent names them);
 pointers are 16 bytes wider, so fan-out at 8 KiB roughly halves (about 510 to 254 with 8-byte
 keys) and an in-record external pointer grows from 9 or 13 bytes to 25 or 29, which means the
-variant can **store a different set of rows** near the record cap — a user-visible divergence
-recorded in the variant's goldens; and from-scratch images allocate every chain tail first so
+variant can **store a different set of rows** near the record cap — a user-visible divergence of
+the same class as choosing a different page size (`RECORD_MAX` already follows `C`), recorded in
+the variant's goldens; and from-scratch images allocate every chain tail first so
 sealing order is index order and compaction stays an append stream. The data key binds a lineage
 of copies (backups, replicas, plain compactions share it), not one file; copies between them are
 caught by the binding.
@@ -178,8 +187,14 @@ nonce, so an unchanged passphrase still yields a new KEK:
 by **Argon2id** (RFC 9106) from a passphrase, or by HKDF from a host-supplied 32-byte key (never
 used directly, so one host key over many files gives distinct KEKs). Argon2id is the current
 recommendation for passphrases and is memory-hard, which is what defeats the offline GPU guessing
-the §1 attacker can mount against a copied file; it costs a dependency in every core but Rust
-(the table in §3), accepted knowingly under CLAUDE.md §14. The parameters default to RFC 9106's
+the §1 attacker can mount against a copied file. What it costs, per core: nothing new in TS
+(`@noble/hashes` 2.4.0 is already approved and shipped); Go's **first module dependency**
+(`golang.org/x/crypto/argon2`, pure Go); and in Rust the `argon2` crate, beside the `aes-gcm`,
+`aes` and `hkdf` crates the page codec needs, none of which `Cargo.toml` carries yet. All are
+accepted knowingly, subject to the explicit CLAUDE.md §14 confirmation when they land. Noble's
+Argon2id is pure JS and runs its lanes serially, so the default below may take seconds in Node
+and the browser rather than hundreds of milliseconds; measure it in `bench/aead` before the
+defaults are frozen, and use the async variant in the browser worker. The parameters default to RFC 9106's
 second recommendation — 64 MiB memory, 3 passes, 4 lanes — with a host override, never
 time-calibrated, and the format fixes a maximum memory, pass count and salt length checked
 **before** the KDF runs, so a tampered block cannot make `open` exhaust memory or CPU before it
@@ -264,7 +279,7 @@ CRC and the buffer pool it is physical page work, not a metered unit. The varian
 
 Production encrypted bytes depend on the CSPRNG, so the variant carries a **determinism-ledger
 entry** (`spec/conformance/determinism_exceptions.toml`), the same class as `uuidv4`. Under the
-fixed-bytes source every core writes byte-identical files; that, the salt-draw order of §3, and
+seeded source every core writes byte-identical files; that, the salt-draw order of §3, and
 cross-core encrypted round trips are the contract.
 
 The corpus runs encrypted as a harness **mode**: rows and errors as written, cost-bearing output
@@ -289,14 +304,19 @@ promoted process without the credential leaves a differing key-block pair unrepa
 makes safe. Over SSH the credential travels in `hello` on the encrypted stream, never `argv` or
 the environment, or the server is configured with it; either way it reaches the remote host (§1).
 A reconnect that must start a fresh process with neither DEK nor credential — an SSH helper whose
-owner is gone — fails `28P02` and the host reopens; there is no cached-DEK resume.
+owner is gone — fails `28P02` and the host reopens; there is no cached-DEK resume. Sealing follows
+page-service.md §5.6's split: a client seals the body pages, manifest and meta of its own commit
+and the owner seals its maintenance commits, each from its own entropy stream; before writing a
+client's commit the owner, which holds the DEK, checks the meta tag as well as its CRC, the last
+point at which a wrongly sealed meta is a client bug (`08P01`) rather than `XX001` at the next open.
 
 The owner answers `read_pages` with **stored bytes** read below its codec, never a re-sealed
 page: a re-seal has a fresh tag that no parent binds. Compaction, rotation and conversion allow
 idle connected clients, which at their next transaction check that the meta slot still has the
 variant and reserve they opened and still authenticates under their held subkey; a failure is
-`28P04` (reopen) — the client cannot tell a rotation from tampering and need not, since the
-reopen with the credential surfaces tampering as `28P01` or `XX001`.
+`28P04` (reopen), or `28P02` for a plaintext client whose file was encrypted meanwhile — the
+client cannot tell a rotation from tampering and need not, since the reopen with the credential
+surfaces tampering as `28P01` or `XX001`. Read-ahead's held ciphertext counts against `cache_bytes`.
 
 **Backups** (page-service.md §9) take the key block through `read_key_block`, which the owner
 serves under a key-block mutex that a credential change holds only across its two writes (not the
@@ -329,13 +349,18 @@ promoted replica finishes a torn pair from its log entry.
 - **Key-block export/import** (the LUKS header-backup model), accepted only if the imported
   block's DEK authenticates the meta slot.
 - **Format specification**: the reserve and pointer layouts per page type, the key block's
-  encoding, the four `28Pxx` registry entries, the scratch framings, the restated variant
+  encoding, the four `28Pxx` registry entries (jed-defined codes in PostgreSQL's class 28, the
+  `XX003` precedent), the scratch framings, the restated variant
   arithmetic (inline manifest capacity falls to about 8 entries at 256-byte pages and with it the
   `synchronous = off` batch cap; interior fan-out with 20-byte pointers; free-list entries per
   page; `live_pages ≤ page_count − 4`), the host-API surface (credentials on `create`/`open`/
   `attach`, change-credential, compaction with a new credential or target variant,
   `scratch_encryption`, `read_key_block`, the `Environment` CSPRNG field), and the goldens.
-- **Integrated performance** of an encrypted database; nothing above is a database benchmark.
+- **Integrated performance** of an encrypted database; nothing above is a database benchmark. In
+  particular the **browser per-page path** — two AES-CTR calls for the CMAC step, `importKey`, then
+  decrypt, four asynchronous WebCrypto calls per cache miss — is unmeasured, and decides whether
+  the browser path is usable, not which suite is chosen; a pure-JS table-based AES is not an escape
+  hatch, since it is not constant-time. Argon2id's cost in pure JS is unmeasured too.
 - **SQL crypto functions** are a separate, unscheduled proposal: authenticated seal/open over
   byte values with explicit application keys, never the file's DEK, through the sanctioned
   entropy seam and the cost schedule. Not a prerequisite for encryption at rest.
