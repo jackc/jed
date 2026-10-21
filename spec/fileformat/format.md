@@ -19,6 +19,11 @@ A fourth independent encoder/decoder (the Ruby reference in
 
 ## Version scope (`format_version` 49)
 
+> **The encrypted variant** ([encrypted.md](encrypted.md)) is the same `format_version` with a
+> nonzero `suite` byte at meta offset 6; it amends this layout only where encrypted.md says (page
+> capacity, bound pointers, the key block at pages 2–3, the authenticated meta). A reader that
+> predates it rejects that byte as a nonzero reserved field.
+
 `format_version` **49** — **batched durability** ([../design/validated-cow.md §4](../design/validated-cow.md)).
 No byte layout changes. A commit's meta goes to the slot that does not hold the newest durable meta
 (*Slot alternation* below), which is `txid & 1` under `synchronous = on` but, under `synchronous =
@@ -1857,7 +1862,8 @@ not by a static golden, because it depends on the commit history.)
 
 ## Fixtures
 
-[fixtures/](fixtures/) holds byte-exact goldens at `page_size = 256`, generated and checked by
+[fixtures/](fixtures/) holds byte-exact goldens at `page_size = 256` (the `encrypted_*` goldens at
+1024 — [encrypted.md](encrypted.md)), generated and checked by
 the independent Ruby reference in [verify.rb](verify.rb) (run via `mise run verify`). Each fixture
 is the **from-scratch image** of its logical content (built by inserting the rows in the
 listed order, then serialized clean). Fixtures sized to force a **multi-level tree** exercise
@@ -1908,6 +1914,11 @@ the interior-node format and the split contract.
 | `tall_tree.jed` | enough small int rows to force a **two-level interior** (height-2 tree) — exercises interior-of-interior child pointers and post-order page allocation |
 | `torn_meta_slot0.jed` | slot 0 checksum corrupted → loader falls back to slot 1 |
 | `torn_meta_slot1.jed` | slot 1 checksum corrupted → loader falls back to slot 0 |
+| `encrypted_empty_db.jed` | the encrypted variant ([encrypted.md](encrypted.md)) with zero tables: the key block at pages 2–3 (host key, seeded stream), a sealed catalog page at 4, both metas authenticated |
+| `encrypted_pk_table.jed` | 300 rows under an interior root: interior child pointers carry tags |
+| `encrypted_overflow_table.jed` | incompressible values in multi-page chains of `C − 16`-byte slabs: tag-bound external pointers and chain links, chains sealed last page first |
+| `encrypted_index_table.jed` | a B-tree index with an interior root and a multi-level GiST R-tree: index roots and both kinds of index pointer carry tags |
+| `encrypted_catalog.jed` | 30 empty tables whose entries span three catalog pages, sealed last page first |
 
 **Incompressible filler (`filler64`).** Fixtures (and mirrored core tests) that need a value the
 LZ4 encoder cannot shrink generate it with a pinned PRNG, identical in all four implementations:

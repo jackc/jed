@@ -133,14 +133,14 @@ func testDelta(t *testing.T, ps, committedPages uint32, indices []uint32) (psCom
 		dirty[i] = dirtyPage{index: index, bytes: makePage(int(ps), pageType, 1, 0, []byte{byte(i), byte(i >> 8), 7})}
 		pageCount = max(pageCount, index+1)
 	}
-	left := max(0, len(dirty)-manifestInlineCapacity(int(ps)))
+	left := max(0, len(dirty)-manifestInlineCapacity(int(ps), plainCap(ps)))
 	overflow := (left + manifestOverflowCapacity(int(ps)) - 1) / manifestOverflowCapacity(int(ps))
 	ids := make([]uint32, overflow)
 	for i := range ids {
 		ids[i] = pageCount
 		pageCount++
 	}
-	meta, chain := commitManifest(ps, 6, indices[0], pageCount, 0, uint32(len(indices)), manifestEntriesOf(dirty), ids)
+	meta, chain := commitManifest(plainCap(ps), ps, 6, plainRef(indices[0]), pageCount, pageRef{}, uint32(len(indices)), manifestEntriesOf(dirty), ids)
 	cb := psCommitBegin{txid: 6, meta: meta}
 	for _, pg := range chain {
 		cb.manifestPages = append(cb.manifestPages, psIndexedPage{index: pg.index, page: pg.bytes})

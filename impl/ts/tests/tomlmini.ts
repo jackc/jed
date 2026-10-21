@@ -130,6 +130,26 @@ export function readTomlTables(path: string, section: string): TomlRow[] {
   return rows;
 }
 
+// readTomlSection parses one plain `[section]` table's scalar keys from a TOML file.
+export function readTomlSection(path: string, section: string): TomlRow {
+  const data = readFileSync(path, "utf8");
+  const row = new TomlRow();
+  let inside = false;
+  for (const raw of data.split("\n")) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    if (line.startsWith("[")) {
+      inside = line === `[${section}]`;
+      continue;
+    }
+    if (!inside) continue;
+    const idx = line.indexOf("=");
+    if (idx < 0) continue;
+    row.set(line.slice(0, idx).trim(), unquote(stripComment(line.slice(idx + 1)).trim()));
+  }
+  return row;
+}
+
 // EncCase is one encoding fixture row (spec/encoding/integers.toml).
 export type EncCase = {
   kind: "bare" | "nullable" | "descending";

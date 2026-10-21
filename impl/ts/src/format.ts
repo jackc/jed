@@ -46,10 +46,20 @@ import type { Collation } from "./collation.ts";
 import { Environment } from "./environment.ts";
 import { Decimal } from "./decimal.ts";
 import { crc32Update } from "./crc32.ts";
+import { type Cap, capChain, capEncrypted, capFirstBody, capOf, isNoTag, NO_TAG } from "./cap.ts";
+import {
+  type Credential,
+  cryptoAvailable,
+  ENCRYPTED_MIN_PAGE_SIZE,
+  fileSuite,
+  type PageCodec,
+  unlockCodec,
+} from "./crypto.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import {
   type CommitManifest,
   type CommitMeta,
+  manifestChainSteps,
   manifestInlineCapacity,
   manifestOverflowCapacity,
   metaChecksum,
@@ -84,7 +94,6 @@ import {
   type GistPage,
   gistRangeOpclass,
   readGistLeafKeysSteps,
-  serializeGistTree,
   serializeGistTreeTo,
 } from "./gist.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
@@ -944,6 +953,108 @@ export function pagePayload(pageSize: number): number {
   return pageSize - PAGE_HEADER;
 }
 
+// Sealer builds a body page's stored bytes — the one place they are made (format.md *Page header*;
+// encrypted.md §4). A plaintext page is the header + payload with its CRC; an encrypted page is the
+// same plaintext over capacity C, with a zero CRC field and, on a chain page, its successor's tag
+// leading the payload, sealed under the database's page key. page returns the bytes and the tag a
+// pointer to the page binds (NO_TAG in a plaintext file).
+export class Sealer {
+  readonly ps: number;
+  readonly cap: Cap;
+  readonly codec: PageCodec | null;
+
+  constructor(ps: number, codec: PageCodec | null) {
+    this.ps = ps;
+    this.cap = capOf(ps, codec !== null);
+    this.codec = codec;
+  }
+
+  static plain(ps: number): Sealer {
+    return new Sealer(ps, null);
+  }
+
+  // of is the sealer for a database whose paging context is paging (null: an in-memory or temp
+  // store's bare engine, always plaintext).
+  static of(ps: number, paging: SharedPaging | null): Sealer {
+    return new Sealer(ps, paging?.codec() ?? null);
+  }
+
+  // page builds body page index. next/nextTag name the successor of a chain page (catalog, overflow,
+  // free-list), else 0/NO_TAG.
+  page(
+    index: number,
+    pageType: number,
+    flags: number,
+    itemCount: number,
+    next: number,
+    nextTag: Uint8Array,
+    payload: Uint8Array,
+  ): { bytes: Uint8Array; tag: Uint8Array } {
+    const codec = this.codec;
+    if (codec === null) {
+      const p = makePage(this.ps, pageType, itemCount, next, payload);
+      if (flags !== 0) {
+        p[1] = flags;
+        new DataView(p.buffer, p.byteOffset, p.byteLength).setUint32(12, pageCrc(p), false);
+      }
+      return { bytes: p, tag: NO_TAG };
+    }
+    const chain =
+      pageType === PAGE_CATALOG || pageType === PAGE_OVERFLOW || pageType === PAGE_FREELIST;
+    const lead = chain ? this.cap.tag : 0;
+    if (lead + payload.length > this.cap.c) {
+      throw engineError("data_corrupted", "page payload overflows its page");
+    }
+    const p = new Uint8Array(this.ps);
+    const dv = new DataView(p.buffer);
+    p[0] = pageType;
+    p[1] = flags;
+    dv.setUint32(4, itemCount, false);
+    dv.setUint32(8, next, false);
+    if (chain) p.set(nextTag, PAGE_HEADER);
+    p.set(payload, PAGE_HEADER + lead);
+    const tag = codec.sealBody(index, p);
+    return { bytes: p, tag };
+  }
+}
+
+// chainContent is the content of a parsed chain page (catalog, overflow, free-list) in tagLen's
+// layout: its successor pointer and tag, and the bytes after the successor's tag (encrypted.md §2).
+function chainContent(
+  pg: Page,
+  tagLen: number,
+): { next: number; nextTag: Uint8Array; content: Uint8Array } {
+  if (tagLen === 0) return { next: pg.nextPage, nextTag: NO_TAG, content: pg.payload };
+  if (pg.payload.length < tagLen) throw engineError("data_corrupted", "chain page too short");
+  const nextTag = pg.payload.slice(0, tagLen);
+  if (pg.nextPage === 0 && !isNoTag(nextTag)) {
+    throw engineError("data_corrupted", "the last chain page carries a successor tag");
+  }
+  return { next: pg.nextPage, nextTag, content: pg.payload.subarray(tagLen) };
+}
+
+// readPointer reads a pointer in tagLen's layout at cur: the u32 index, then the tag when bound. A
+// pointer to no page carries a zero tag.
+function readPointer(
+  buf: Uint8Array,
+  cur: Cursor,
+  tagLen: number,
+): { page: number; tag: Uint8Array } {
+  const page = readU32(buf, cur);
+  if (tagLen === 0) return { page, tag: NO_TAG };
+  const tag = take(buf, cur, tagLen).slice();
+  if (page === 0 && !isNoTag(tag)) {
+    throw engineError("data_corrupted", "a pointer to no page carries a tag");
+  }
+  return { page, tag };
+}
+
+// writePointer appends a pointer in cap's layout: the u32 index, then the tag when bound.
+function writePointer(w: ByteWriter, page: number, tag: Uint8Array | undefined, cap: Cap): void {
+  w.u32(page);
+  if (cap.tag !== 0) w.bytes(tag ?? NO_TAG);
+}
+
 // recordMaxFor is the largest a single LEAF record may serialize to and still satisfy the B+tree
 // split contract — RECORD_MAX(K) = (C − max(12, 12+16·K))/2 where C = capacity is the page payload
 // and K the value-column count (format.md "Why the record cap"). The value is deliberately KEPT
@@ -1078,12 +1189,8 @@ function planningPayload(ty: ColType, v: Value): Uint8Array {
 // ran, so pass 1 visited every candidate first), and an inline- or external-compressed one was
 // adopted with the block it stores. Only an inline-deferred value, whose stored form records no
 // outcome, is compressed when an attempt reaches it — from the bytes it holds.
-function planDispositions(
-  colTypes: ColType[],
-  key: Uint8Array,
-  row: Row,
-  capacity: number,
-): RecordPlan {
+function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, cap: Cap): RecordPlan {
+  const capacity = cap.c;
   const plan: RecordPlan = {
     disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
     comp: new Array<Uint8Array | null>(colTypes.length).fill(null),
@@ -1152,15 +1259,17 @@ function planDispositions(
   // Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
   // current size first, ties by ascending index. (A NULL is 1 byte and never qualifies.)
   cand = [];
+  // An encrypted file's external pointer also carries its chain's first-page tag (encrypted.md §2).
   for (let i = 0; i < colTypes.length; i++) {
-    const ptr = plan.disp[i] === "inlineComp" ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN;
+    const ptr =
+      (plan.disp[i] === "inlineComp" ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN) + cap.tag;
     if (isSpillable(colTypes[i]!) && cur[i]! > ptr) cand.push(i);
   }
   cand.sort((a, b) => cur[b]! - cur[a]!);
   for (const i of cand) {
     if (size <= max) break;
     const compressed = plan.disp[i] === "inlineComp";
-    const ptr = compressed ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN;
+    const ptr = (compressed ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN) + cap.tag;
     plan.external += compressed ? plan.compLen[i]! : plan.payloadLen[i]!;
     plan.disp[i] = compressed ? "externalComp" : "external";
     size = size - cur[i]! + ptr;
@@ -1177,9 +1286,9 @@ export function deferredInStoredForm(
   colTypes: ColType[],
   key: Uint8Array,
   row: Row,
-  capacity: number,
+  cap: Cap,
 ): boolean[] {
-  const plan = planDispositions(colTypes, key, row, capacity);
+  const plan = planDispositions(colTypes, key, row, cap);
   return row.map((v, i) => {
     if (v.kind !== "unfetched") return false;
     switch (v.ref.form) {
@@ -1200,13 +1309,8 @@ export function deferredInStoredForm(
 // its compressed inline form, an externalized one its fixed pointer size (large-values.md
 // §12/§13). Must equal what the serializer produces, so in-memory node boundaries match
 // serialized page boundaries.
-export function recordSize(
-  colTypes: ColType[],
-  key: Uint8Array,
-  row: Row,
-  capacity: number,
-): number {
-  return planDispositions(colTypes, key, row, capacity).size;
+export function recordSize(colTypes: ColType[], key: Uint8Array, row: Row, cap: Cap): number {
+  return planDispositions(colTypes, key, row, cap).size;
 }
 
 // recordFootprint returns a record's on-disk record size (the split weight) and its stored bytes —
@@ -1216,9 +1320,9 @@ export function recordFootprint(
   colTypes: ColType[],
   key: Uint8Array,
   row: Row,
-  capacity: number,
+  cap: Cap,
 ): [number, number] {
-  const plan = planDispositions(colTypes, key, row, capacity);
+  const plan = planDispositions(colTypes, key, row, cap);
   return [plan.size, plan.size + plan.external];
 }
 
@@ -1232,9 +1336,13 @@ export function spanScanUnits(
   payload: Uint8Array,
   start: number,
   end: number,
-  capacity: number,
+  cap: Cap,
   units: { pages: number; decompress: number },
 ): void {
+  // A chain page carries C − tag bytes of content after its successor's tag (encrypted.md §2); a
+  // decompress slab is C.
+  const capacity = cap.c;
+  const slab = capChain(cap);
   const field = (at: number): number | null => {
     const p = start + at;
     if (p + 4 > end) return null;
@@ -1247,7 +1355,7 @@ export function spanScanUnits(
   const tag = payload[start]!;
   if (tag === TAG_EXTERNAL) {
     const len = field(5);
-    if (len !== null) units.pages += Math.ceil(len / capacity);
+    if (len !== null) units.pages += Math.ceil(len / slab);
   } else if (tag === TAG_INLINE_COMP) {
     const raw = field(1);
     if (raw !== null) units.decompress += Math.ceil(raw / capacity);
@@ -1255,7 +1363,7 @@ export function spanScanUnits(
     const stored = field(5);
     const raw = field(9);
     if (stored !== null && raw !== null) {
-      units.pages += Math.ceil(stored / capacity);
+      units.pages += Math.ceil(stored / slab);
       units.decompress += Math.ceil(raw / capacity);
     }
   }
@@ -1271,9 +1379,11 @@ export function recordScanUnits(
   colTypes: ColType[],
   key: Uint8Array,
   row: Row,
-  capacity: number,
+  cap: Cap,
   mask: boolean[],
 ): { pages: number; decompress: number } {
+  const capacity = cap.c;
+  const slab = capChain(cap);
   let pages = 0;
   let decompress = 0;
   // A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
@@ -1293,28 +1403,28 @@ export function recordScanUnits(
         // Inline-deferred values live in the record — no chain page, no decompress slab
         // (lazy-record.md §8: cost is invariant; matches the resident plan's "inline").
       } else if (v.ref.form === TAG_EXTERNAL) {
-        pages += Math.ceil(v.ref.storedLen / capacity);
+        pages += Math.ceil(v.ref.storedLen / slab);
       } else if (v.ref.form === TAG_INLINE_COMP) {
         decompress += Math.ceil(v.ref.rawLen / capacity);
       } else {
-        pages += Math.ceil(v.ref.storedLen / capacity);
+        pages += Math.ceil(v.ref.storedLen / slab);
         decompress += Math.ceil(v.ref.rawLen / capacity);
       }
     }
     return { pages, decompress };
   }
-  const plan = planDispositions(colTypes, key, row, capacity);
+  const plan = planDispositions(colTypes, key, row, cap);
   for (let i = 0; i < plan.disp.length; i++) {
     if (!mask[i]) continue; // an untouched column's chain/slabs are never read (cost.md §3)
     switch (plan.disp[i]) {
       case "external":
-        pages += Math.ceil(plan.payloadLen[i]! / capacity);
+        pages += Math.ceil(plan.payloadLen[i]! / slab);
         break;
       case "inlineComp":
         decompress += Math.ceil(plan.payloadLen[i]! / capacity);
         break;
       case "externalComp":
-        pages += Math.ceil(plan.compLen[i]! / capacity);
+        pages += Math.ceil(plan.compLen[i]! / slab);
         decompress += Math.ceil(plan.payloadLen[i]! / capacity);
         break;
     }
@@ -1330,9 +1440,9 @@ export function recordCompressUnits(
   colTypes: ColType[],
   key: Uint8Array,
   row: Row,
-  capacity: number,
+  cap: Cap,
 ): number {
-  return planDispositions(colTypes, key, row, capacity).compressUnits;
+  return planDispositions(colTypes, key, row, cap).compressUnits;
 }
 
 // valuePayload is a value's content payload P(v) — the bytes stored in the overflow chain when it is
@@ -1395,21 +1505,22 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
   throw engineError("data_corrupted", "a non-spillable type was stored external");
 }
 
-// OverflowPageOut is one overflow page produced while serializing a record's external value.
-// Exported for the lazy-record white-box test (lazy_inline_values.test.ts); the barrel is unaffected.
-export type OverflowPageOut = {
-  index: number;
-  itemCount: number;
-  nextPage: number;
-  payload: Uint8Array;
-};
+// OverflowPageOut is one overflow page produced (built and sealed) while serializing a record's
+// external value: its page index and stored bytes. Exported for the lazy-record white-box test
+// (lazy_inline_values.test.ts); the barrel is unaffected.
+export type OverflowPageOut = { index: number; bytes: Uint8Array };
 
 // encodeInterior builds a v24 INTERIOR node payload (format.md "Interior node"): N+1 child
 // pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob. Record-free —
-// no value codec, no overflow chains; a separator is raw order-preserving key bytes.
-function encodeInterior(seps: Uint8Array[], childPages: number[]): Uint8Array {
+// no value codec, no overflow chains; a separator is raw order-preserving key bytes. In an encrypted
+// file each child pointer is bound: its page then its tag (encrypted.md §2).
+function encodeInterior(
+  seps: Uint8Array[],
+  childPages: { page: number; tag: Uint8Array | undefined }[],
+  cap: Cap,
+): Uint8Array {
   const w = new ByteWriter();
-  for (const cp of childPages) w.u32(cp);
+  for (const cp of childPages) writePointer(w, cp.page, cp.tag, cap);
   let off = 0;
   for (const s of seps) {
     off += s.length;
@@ -1432,10 +1543,12 @@ function encodeInterior(seps: Uint8Array[], childPages: number[]): Uint8Array {
 // and serializes again. Never escapes incrementalImageSteps.
 export class ChainMiss {
   readonly first: number;
+  readonly firstTag: Uint8Array;
   readonly length: number;
 
-  constructor(first: number, length: number) {
+  constructor(first: number, firstTag: Uint8Array, length: number) {
     this.first = first;
+    this.firstTag = firstTag;
     this.length = length;
   }
 }
@@ -1446,6 +1559,7 @@ export class ChainSource {
   private readonly share: boolean;
   // chains, when set, serves every chain page from a commit-local cache (an asynchronous write side):
   // a page it lacks raises ChainMiss for the chain being read (current) instead of a synchronous read.
+  // The cache holds opened (plaintext) pages.
   private readonly chains: Map<number, Uint8Array> | null;
   private current: ChainMiss | null = null;
 
@@ -1459,20 +1573,31 @@ export class ChainSource {
     this.chains = chains;
   }
 
-  private fetch(p: number): Uint8Array {
+  private fetch(p: number, tag: Uint8Array): Uint8Array {
     if (this.paging === null) {
       throw engineError("data_corrupted", "deferred large value with no pager at encode");
     }
-    if (this.chains === null) return this.paging.readBlock(p);
+    if (this.chains === null) return this.paging.readBody(p, tag);
     const cached = this.chains.get(p);
     if (cached !== undefined) return cached;
     throw this.current!;
   }
 
-  readChain(first: number, length: number): Uint8Array {
-    this.current = new ChainMiss(first, length);
+  private tagLen(): number {
+    return this.paging?.cap().tag ?? 0;
+  }
+
+  readChain(first: number, firstTag: Uint8Array, length: number): Uint8Array {
+    this.current = new ChainMiss(first, firstTag, length);
     try {
-      return readOverflowChain(first, length, (p) => this.fetch(p), []);
+      return readOverflowChain(
+        first,
+        firstTag,
+        length,
+        (p, t) => this.fetch(p, t),
+        this.tagLen(),
+        [],
+      );
     } finally {
       this.current = null;
     }
@@ -1482,28 +1607,29 @@ export class ChainSource {
   // (unmetered, like all commit work), a resident value as is.
   resident(ty: ColType, v: Value): Value {
     if (v.kind !== "unfetched") return v;
-    this.current = new ChainMiss(v.ref.firstPage, v.ref.storedLen);
+    this.current = new ChainMiss(v.ref.firstPage, v.ref.firstTag ?? NO_TAG, v.ref.storedLen);
     try {
-      return resolveUnfetched(ty, v.ref, (p) => this.fetch(p));
+      return resolveUnfetched(ty, v.ref, (p, t) => this.fetch(p, t), this.tagLen());
     } finally {
       this.current = null;
     }
   }
 
-  // keepChain returns the first page of the chain carrying a deferred value's stored bytes in the
-  // image being written: the existing chain itself (shared), or a fresh copy.
+  // keepChain returns the pointer to the first page of the chain carrying a deferred value's stored
+  // bytes in the image being written: the existing chain itself (shared), or a fresh copy.
   keepChain(
     first: number,
+    firstTag: Uint8Array,
     stored: number,
-    capacity: number,
+    seal: Sealer,
     take: () => number,
     ovf: OverflowPageOut[],
-  ): number {
+  ): { page: number; tag: Uint8Array } {
     if (this.share) {
       this.shared.push(first);
-      return first;
+      return { page: first, tag: firstTag };
     }
-    return writeOverflowChain(this.readChain(first, stored), capacity, take, ovf);
+    return writeOverflowChain(this.readChain(first, firstTag, stored), seal, take, ovf);
   }
 }
 
@@ -1515,7 +1641,7 @@ function planBlock(plan: RecordPlan, c: number, v: Value, src: ChainSource): Uin
   if (v.kind !== "unfetched" || v.ref.form !== TAG_EXTERNAL_COMP) {
     throw engineError("data_corrupted", "a chained LZ4 block with no chain");
   }
-  return src.readChain(v.ref.firstPage, v.ref.storedLen);
+  return src.readChain(v.ref.firstPage, v.ref.firstTag ?? NO_TAG, v.ref.storedLen);
 }
 
 // encodeDisposedValue encodes one value's on-disk body given its planned disposition — the value
@@ -1524,33 +1650,48 @@ function planBlock(plan: RecordPlan, c: number, v: Value, src: ChainSource): Uin
 // allocate overflow chains via `take`. The plan's LZ4 block is reused, so the serializer never
 // re-compresses. A deferred value planned in its own stored form is written from its stored bytes —
 // an inline body or block verbatim, an external pointer to its kept chain (§15) — so a rewritten
-// record never re-reads, decompresses, or recompresses an unchanged value.
+// record never re-reads, decompresses, or recompresses an unchanged value. An encrypted file's
+// external pointer ends with its chain's first-page tag (encrypted.md §2).
 function encodeDisposedValue(
   ty: ColType,
   v: Value,
   plan: RecordPlan,
   c: number,
-  capacity: number,
+  seal: Sealer,
   take: () => number,
   ovf: OverflowPageOut[],
   src: ChainSource,
 ): Uint8Array {
+  const cap = seal.cap;
   const u = v.kind === "unfetched" ? v.ref : null;
   const rawLen = plan.payloadLen[c]!;
   const w = new ByteWriter();
+  const tagOf = (tag: Uint8Array): void => {
+    if (cap.tag !== 0) w.bytes(tag);
+  };
   switch (plan.disp[c]) {
     case "external": {
       if (u !== null && u.form === TAG_EXTERNAL) {
+        const first = src.keepChain(
+          u.firstPage,
+          u.firstTag ?? NO_TAG,
+          u.storedLen,
+          seal,
+          take,
+          ovf,
+        );
         w.u8(TAG_EXTERNAL);
-        w.u32(src.keepChain(u.firstPage, u.storedLen, capacity, take, ovf));
+        w.u32(first.page);
         w.u32(u.storedLen);
+        tagOf(first.tag);
         break;
       }
       const payload = valuePayload(ty, src.resident(ty, v));
-      const first = writeOverflowChain(payload, capacity, take, ovf);
+      const first = writeOverflowChain(payload, seal, take, ovf);
       w.u8(TAG_EXTERNAL);
-      w.u32(first);
+      w.u32(first.page);
       w.u32(payload.length);
+      tagOf(first.tag);
       break;
     }
     case "inlineComp": {
@@ -1563,19 +1704,29 @@ function encodeDisposedValue(
     }
     case "externalComp": {
       if (u !== null && u.form === TAG_EXTERNAL_COMP) {
+        const first = src.keepChain(
+          u.firstPage,
+          u.firstTag ?? NO_TAG,
+          u.storedLen,
+          seal,
+          take,
+          ovf,
+        );
         w.u8(TAG_EXTERNAL_COMP);
-        w.u32(src.keepChain(u.firstPage, u.storedLen, capacity, take, ovf));
+        w.u32(first.page);
         w.u32(u.storedLen);
         w.u32(u.rawLen);
+        tagOf(first.tag);
         break;
       }
       // The chain carries the COMPRESSED block (its page count follows comp size).
       const comp = planBlock(plan, c, v, src);
-      const first = writeOverflowChain(comp, capacity, take, ovf);
+      const first = writeOverflowChain(comp, seal, take, ovf);
       w.u8(TAG_EXTERNAL_COMP);
-      w.u32(first);
+      w.u32(first.page);
       w.u32(comp.length);
       w.u32(rawLen);
+      tagOf(first.tag);
       break;
     }
     default:
@@ -1592,7 +1743,8 @@ function encodeDisposedValue(
 // encodeLeafPax builds a v24 PAX (column-major) leaf payload from records in ascending key order
 // (format.md "Leaf node"). Values encode in (record, column) order — so each external value's
 // overflow chain allocates via `take` in exactly that order, keeping overflow page indices
-// golden-pinned — then assembled: key directory (N u32 end offsets) ‖ key blob ‖ column directory
+// golden-pinned, and is built and sealed (last page first) into ovf before the leaf that points at it
+// (encrypted.md §7) — then assembled: key directory (N u32 end offsets) ‖ key blob ‖ column directory
 // (K+1 u32 absolute offsets, colStart[K] = payload end) ‖ per column a region: a flags byte (0),
 // then — fixed-width — the null bitmap + N×width dense untagged slots (a NULL slot zero-filled),
 // or — variable-width — an N-entry end-offset value directory + the tagged value bodies (NULL = a
@@ -1602,7 +1754,7 @@ export function encodeLeafPax(
   colTypes: ColType[],
   keys: Uint8Array[],
   rows: Row[],
-  capacity: number,
+  seal: Sealer,
   take: () => number,
   ovf: OverflowPageOut[],
   src: ChainSource = new ChainSource(null, false),
@@ -1615,7 +1767,7 @@ export function encodeLeafPax(
   const valBytes: Uint8Array[][] = Array.from({ length: k }, () => new Array<Uint8Array>(n));
   const nulls: boolean[][] = Array.from({ length: k }, () => new Array<boolean>(n).fill(false));
   for (let i = 0; i < n; i++) {
-    const plan = planDispositions(colTypes, keys[i]!, rows[i]!, capacity);
+    const plan = planDispositions(colTypes, keys[i]!, rows[i]!, seal.cap);
     for (let c = 0; c < k; c++) {
       const v = rows[i]![c]!;
       const isNull = v.kind === "null";
@@ -1626,7 +1778,7 @@ export function encodeLeafPax(
       } else if (isNull) {
         valBytes[c]![i] = new Uint8Array(0);
       } else {
-        valBytes[c]![i] = encodeDisposedValue(colTypes[c]!, v, plan, c, capacity, take, ovf, src);
+        valBytes[c]![i] = encodeDisposedValue(colTypes[c]!, v, plan, c, seal, take, ovf, src);
       }
     }
   }
@@ -1674,31 +1826,40 @@ export function encodeLeafPax(
   return w.toBytes();
 }
 
-// writeOverflowChain writes payload across a chain of overflow pages (capacity-byte slabs, in order),
-// allocating each page via `take` and linking it with nextPage (0 terminates). Returns the first page
-// index for the record's pointer. payload is always non-empty (only values larger than the pointer
-// spill — planDispositions).
+// writeOverflowChain writes payload across a chain of overflow pages (C − tag byte slabs, in order),
+// allocating each page via `take` in chain order and linking it with nextPage (0 terminates), then
+// builds and seals the pages last first so each binds its successor (encrypted.md §7), appending
+// them to ovf. Returns the pointer to the first page for the record. payload is always non-empty
+// (only values larger than the pointer spill — planDispositions).
 function writeOverflowChain(
   payload: Uint8Array,
-  capacity: number,
+  seal: Sealer,
   take: () => number,
   ovf: OverflowPageOut[],
-): number {
-  const n = Math.ceil(payload.length / capacity);
+): { page: number; tag: Uint8Array } {
+  const slab = capChain(seal.cap);
+  const n = Math.ceil(payload.length / slab);
   const indices: number[] = [];
   for (let i = 0; i < n; i++) indices.push(take());
-  for (let j = 0; j < n; j++) {
-    const lo = j * capacity;
-    const hi = Math.min(lo + capacity, payload.length);
-    const nextPage = j + 1 < n ? indices[j + 1]! : 0;
-    ovf.push({
-      index: indices[j]!,
-      itemCount: hi - lo,
-      nextPage,
-      payload: payload.subarray(lo, hi),
-    });
+  let next = 0;
+  let nextTag = NO_TAG;
+  for (let j = n - 1; j >= 0; j--) {
+    const lo = j * slab;
+    const hi = Math.min(lo + slab, payload.length);
+    const { bytes, tag } = seal.page(
+      indices[j]!,
+      PAGE_OVERFLOW,
+      0,
+      hi - lo,
+      next,
+      nextTag,
+      payload.subarray(lo, hi),
+    );
+    ovf.push({ index: indices[j]!, bytes });
+    next = indices[j]!;
+    nextTag = tag;
   }
-  return indices[0]!;
+  return { page: next, tag: nextTag };
 }
 
 function statisticsDistributionEligible(type: Type): boolean {
@@ -2226,14 +2387,22 @@ function checkTableRowCount(rootDataPage: number, rowCount: bigint): void {
     throw engineError("data_corrupted", "table row count disagrees with its tree");
 }
 
+// TreeRef is a pointer to a tree's root page and, in an encrypted file, the tag the pointer binds
+// (encrypted.md §2; NO_TAG otherwise and for page 0 — no tree).
+export type TreeRef = { page: number; tag: Uint8Array };
+
+const NO_TREE: TreeRef = { page: 0, tag: NO_TAG };
+
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
-// index's tree root page, parallel to table.indexes.
+// index's tree root, parallel to table.indexes; each root pointer is in cap's layout.
 function tableEntryBytes(
   table: Table,
-  rootDataPage: number,
-  indexRoots: number[],
+  root: TreeRef,
+  indexRoots: TreeRef[],
   rowCount: bigint,
+  cap: Cap,
 ): Uint8Array {
+  const rootDataPage = root.page;
   if (rowCount < 0n || rowCount > 9223372036854775807n) {
     throw new Error("table row count must fit a nonnegative i64");
   }
@@ -2414,7 +2583,7 @@ function tableEntryBytes(
 
     // v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     w.u8(idx.kind === "gist" ? 2 : idx.kind === "gin" ? 1 : 0);
-    w.u32(indexRoots[k]!);
+    writePointer(w, indexRoots[k]!.page, indexRoots[k]!.tag, cap);
     // v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
     if (idx.predicate) wstr(w, idx.predicate.exprText);
     // v31: the host-function dependency list (extensibility.md §8.1), after the predicate — only when
@@ -2472,7 +2641,7 @@ function tableEntryBytes(
       w.u8(el.op === "equal" ? 1 : 0);
     }
   }
-  w.u32(rootDataPage);
+  writePointer(w, root.page, root.tag, cap);
   w.i64(rowCount);
   return w.toBytes();
 }
@@ -2731,13 +2900,25 @@ function decodeCollationEntry(
 // toImage serializes a snapshot's whole state to one on-disk image (format.md). pageSize is
 // recorded in the meta page; txid is written into both meta slots. Accepts a Snapshot directly
 // (the writer's working snapshot at commit) or a Engine (serializing its committed snapshot —
-// the form callers/tests holding a Engine use).
-export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint): Uint8Array {
+// the form callers/tests holding a Engine use). With codec the image is the encrypted variant
+// (spec/fileformat/encrypted.md §4–§7): the codec's key block at pages 2 and 3, every body page sealed.
+export function toImage(
+  src: Engine | Snapshot,
+  pageSize: number,
+  txid: bigint,
+  codec: PageCodec | null = null,
+): Uint8Array {
   const snap = src instanceof Snapshot ? src : src.committed;
   const chunks: Uint8Array[] = [];
-  const pageCount = writeImage(snap, pageSize, txid, (index, page) => {
-    chunks[index] = page;
-  });
+  const pageCount = writeImage(
+    snap,
+    pageSize,
+    txid,
+    (index, page) => {
+      chunks[index] = page;
+    },
+    codec,
+  );
   const image = new Uint8Array(pageCount * pageSize);
   for (let index = 0; index < pageCount; index++) {
     const page = chunks[index];
@@ -2753,15 +2934,17 @@ export type PageSinkFn = (index: number, page: Uint8Array) => void;
 // at a time and returns the image's page count. Pages arrive in no particular index order; both meta
 // slots arrive last. The sink sees each page exactly once, so a file sink writes the image in bounded
 // memory — host compaction (Database.compact, spec/design/api.md §2.6) relies on this to rewrite a
-// larger-than-RAM file without a whole-image buffer.
+// larger-than-RAM file without a whole-image buffer. With codec the image is the encrypted variant
+// (encrypted.md): the codec's key block at pages 2 and 3, body pages from 4, sealed in seal order (§7).
 export function writeImage(
   snap: Snapshot,
   pageSize: number,
   txid: bigint,
   sink: PageSinkFn,
+  codec: PageCodec | null = null,
 ): number {
   const ps = pageSize;
-  if (ps < MIN_PAGE_SIZE) {
+  if (ps < MIN_PAGE_SIZE || (codec !== null && ps < ENCRYPTED_MIN_PAGE_SIZE)) {
     throw engineError("feature_not_supported", "page size too small for the format");
   }
   if (ps > MAX_PAGE_SIZE) {
@@ -2770,47 +2953,58 @@ export function writeImage(
   if ((ps & (ps - 1)) !== 0) {
     throw engineError("feature_not_supported", "page size must be a power of two");
   }
-  const capacity = ps - PAGE_HEADER;
+  const seal = new Sealer(ps, codec);
+  const cap = seal.cap;
+  // Every check that can refuse the image runs before the first page is sealed.
+  checkCatalogTextLengths(snap);
+
+  // An encrypted image's key block: the same copy at pages 2 and 3 (encrypted.md §5).
+  if (codec !== null) {
+    for (const index of [2, 3]) {
+      const block = new Uint8Array(ps);
+      block.set(codec.keyBlock, 0);
+      sink(index, block);
+    }
+  }
 
   // Tables in ascending name byte order (no map-iteration order leak).
   const keys = [...snap.tables.keys()].sort(compareTextC);
 
-  // Serialize each table's B-tree post-order, body pages allocated from page 2. Each page is emitted
-  // to the sink as soon as its bytes are final; children precede their parent so parent child-pointers
-  // reference already-allocated pages (format.md).
-  const body = new PageSink(ps, sink);
-  const rootDataPage: number[] = new Array(keys.length).fill(0);
-  const indexRoots: number[][] = keys.map(() => []);
-  let nextIndex = ROOT_PAGE;
+  // Serialize each table's B-tree post-order, body pages allocated from the first body page. Each
+  // page is emitted to the sink as soon as its bytes are final; children precede their parent so
+  // parent child-pointers reference already-allocated (and sealed) pages (format.md).
+  const rootDataPage: TreeRef[] = new Array(keys.length).fill(NO_TREE);
+  const indexRoots: TreeRef[][] = keys.map(() => []);
+  let nextIndex = capFirstBody(cap);
   for (let ti = 0; ti < keys.length; ti++) {
     const store = snap.stores.get(keys[ti]!)!;
     const root = store.treeRoot();
     if (root !== null) {
-      const r = serializeNode(root, store, capacity, nextIndex, body);
-      rootDataPage[ti] = r.index;
+      const r = serializeNode(root, store, seal, nextIndex, sink);
+      rootDataPage[ti] = r.ref;
       nextIndex = r.next;
     }
     // The table's index trees follow its data tree, in catalog (name) order
     // (spec/fileformat/format.md "From-scratch image").
     for (const idx of snap.tables.get(keys[ti]!)!.indexes) {
-      let ir = 0;
+      let ir = NO_TREE;
       if (idx.kind === "gist") {
         // GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md §4.1).
         const r = serializeGistIndex(
           snap.indexStore(idx.name),
           gistColOpclasses(store, indexColumnOrdinals(idx)!),
           nextIndex,
-          body,
-          ps,
+          seal,
+          sink,
         );
-        ir = r.index;
+        ir = r.ref;
         nextIndex = r.next;
       } else {
         const istore = snap.indexStore(idx.name);
         const iroot = istore.treeRoot();
         if (iroot !== null) {
-          const r = serializeNode(iroot, istore, capacity, nextIndex, body);
-          ir = r.index;
+          const r = serializeNode(iroot, istore, seal, nextIndex, sink);
+          ir = r.ref;
           nextIndex = r.next;
         }
       }
@@ -2818,11 +3012,54 @@ export function writeImage(
     }
   }
 
-  // The catalog chain follows the data; its head is the relocatable root_page. Each entry is
-  // kind-tagged (v9/v12): composite-type entries (kind 1) first in name byte order, then
-  // sequence entries (kind 2, name order — v12), then table entries (kind 0) —
-  // spec/fileformat/format.md.
+  // The catalog chain follows the data; its head is the relocatable root_page.
+  const catEntries = catalogEntries(snap, keys, rootDataPage, indexRoots, cap);
+  const catLayout = catalogLayout(catEntries, capChain(cap));
   const catRoot = nextIndex;
+  const pageCount = catRoot + catLayout.length;
+
+  // Catalog chain, consecutive pages, sealed last page first (encrypted.md §7).
+  let next = 0;
+  let nextTag = NO_TAG;
+  for (let gi = catLayout.length - 1; gi >= 0; gi--) {
+    const index = catRoot + gi;
+    const { bytes, tag } = catalogPage(seal, index, catLayout[gi]!, next, nextTag);
+    sink(index, bytes);
+    next = index;
+    nextTag = tag;
+  }
+
+  // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+  // version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
+  // has an empty free-list, so free_list_head = 0 (v25), and every body page is live (v34).
+  const meta = metaPage(
+    pageSize,
+    txid,
+    catRoot,
+    pageCount,
+    0,
+    pageCount - capFirstBody(cap),
+    undefined,
+    codec !== null ? { root: nextTag, freeList: NO_TAG } : undefined,
+  );
+  for (const slot of [0, 1]) {
+    const m = meta.slice();
+    if (codec !== null) codec.sealMeta(slot, m, []);
+    sink(slot, m);
+  }
+  return pageCount;
+}
+
+// catalogEntries is the catalog chain's entries, kind-tagged in stream order (format.md *Catalog*):
+// composite types (kind 1, name order), sequences (kind 2, name order — v12), collation references
+// (kind 3, v18), tables (kind 0, each tree root in cap's pointer layout), statistics, views.
+function catalogEntries(
+  snap: Snapshot,
+  keys: string[],
+  rootDataPage: TreeRef[],
+  indexRoots: TreeRef[][],
+  cap: Cap,
+): Uint8Array[] {
   const catEntries: Uint8Array[] = [];
   for (const ct of snap.compositeTypesSorted()) {
     catEntries.push(concat([Uint8Array.of(1), compositeTypeEntryBytes(ct)]));
@@ -2843,54 +3080,37 @@ export function writeImage(
     const t = snap.tables.get(keys[ti]!)!;
     const rowCount = snap.stores.get(keys[ti]!)!.count();
     if (rowCount === null) throw new Error("table stores always carry an exact row count");
-    checkTableRowCount(rootDataPage[ti]!, rowCount);
+    checkTableRowCount(rootDataPage[ti]!.page, rowCount);
     catEntries.push(
-      concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount)]),
+      concat([
+        Uint8Array.of(0),
+        tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount, cap),
+      ]),
     );
   }
   catEntries.push(...statisticsCatalogEntries(snap));
   catEntries.push(...viewCatalogEntries(snap));
-  checkCatalogTextLengths(snap);
-  const catLayout = catalogLayout(catEntries, capacity);
-  const pageCount = catRoot + catLayout.length;
-
-  // Catalog chain.
-  for (let gi = 0; gi < catLayout.length; gi++) {
-    const index = catRoot + gi;
-    const next = gi + 1 < catLayout.length ? index + 1 : 0;
-    body.sink(index, makeCatalogPage(body.ps, catLayout[gi]!, next));
-  }
-
-  // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
-  // version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
-  // has an empty free-list, so free_list_head = 0 (v25), and every body page is live (v34).
-  const meta = metaPage(pageSize, txid, catRoot, pageCount, 0, pageCount - ROOT_PAGE);
-  sink(0, meta);
-  sink(1, meta);
-  return pageCount;
+  return catEntries;
 }
 
-// PageSink is the from-scratch serializer's page output: it builds each page's full bytes (makePage,
-// the single source of the page layout) and hands them to the caller's sink. nextPage is 0 for B-tree
-// nodes and the chain link for overflow pages (large-values.md §12).
-class PageSink {
-  ps: number;
-  sink: PageSinkFn;
-
-  constructor(ps: number, sink: PageSinkFn) {
-    this.ps = ps;
-    this.sink = sink;
-  }
-
-  page(
-    index: number,
-    pageType: number,
-    itemCount: number,
-    nextPage: number,
-    payload: Uint8Array,
-  ): void {
-    this.sink(index, makePage(this.ps, pageType, itemCount, nextPage, payload));
-  }
+// catalogPage builds one catalog chain page: header byte 1 bit0 continued (v48), its successor
+// (index and, encrypted, tag).
+function catalogPage(
+  seal: Sealer,
+  index: number,
+  cp: CatalogPage,
+  next: number,
+  nextTag: Uint8Array,
+): { bytes: Uint8Array; tag: Uint8Array } {
+  return seal.page(
+    index,
+    PAGE_CATALOG,
+    cp.continued ? 1 : 0,
+    cp.itemCount,
+    next,
+    nextTag,
+    cp.payload,
+  );
 }
 
 // gistColOpclasses are the per-column opclasses of a GiST index (spec/design/gist.md §5/§6/§7): one
@@ -2906,68 +3126,69 @@ function gistColOpclasses(tableStore: TableStore, cols: number[]): GistOpclass[]
   });
 }
 
+// checkGistPage rejects a rebuilt GiST node that cannot fit its page: the leaf keys a valid file
+// yields always fit, so an oversized node comes from keys read back from a corrupt or misdirected
+// page (storage.md §7), and writing it would overrun the page buffer.
+function checkGistPage(p: GistPage, cap: Cap): void {
+  if (p.payload.length > cap.c) throw engineError("data_corrupted", "GiST node overflows its page");
+}
+
 // serializeGistIndex builds a GiST index's canonical R-tree from its leaf-key store and serializes it
 // to node pages (spec/design/gist.md §3/§4.1). The on-disk form of a GiST index is the R-tree (page
 // types 5/6), NOT the flat leaf-key B-tree the in-memory index store holds. The tree is rebuilt
 // CANONICALLY from the leaf set, so its bytes are a pure function of the set — content-deterministic
-// and cross-core identical (§3). Returns the root page + the next free index; an empty index returns
-// root 0 and writes no pages.
-// checkGistPages rejects a rebuilt GiST node that cannot fit its page: the leaf keys a valid file
-// yields always fit, so an oversized node comes from keys read back from a corrupt or misdirected
-// page (storage.md §7), and writing it would overrun the page buffer.
-function checkGistPages(pages: GistPage[], ps: number): void {
-  for (const p of pages) {
-    if (p.payload.length > ps - PAGE_HEADER)
-      throw engineError("data_corrupted", "GiST node overflows its page");
-  }
-}
-
+// and cross-core identical (§3). Returns the root pointer + the next free index; an empty index
+// returns root 0 and writes no pages.
 function serializeGistIndex(
   istore: TableStore,
   ops: GistOpclass[],
   nextIndex: number,
-  body: PageSink,
-  ps: number,
-): { index: number; next: number } {
+  seal: Sealer,
+  sink: PageSinkFn,
+): { ref: TreeRef; next: number } {
   const keys = istore.entriesInKeyOrder().map((e) => e.key);
-  if (keys.length === 0) return { index: 0, next: nextIndex };
+  if (keys.length === 0) return { ref: NO_TREE, next: nextIndex };
   const tree = buildGistFromLeafKeys(ops, keys);
   let n = nextIndex;
-  // Each node page streams to the sink as it is encoded, so the image never holds an index's pages at
-  // once (host compaction's bounded memory, api.md §2.6).
+  // Each node page streams to the sink as it is encoded and sealed, so the image never holds an
+  // index's pages at once (host compaction's bounded memory, api.md §2.6).
   const root = serializeGistTreeTo(
     tree,
     ops,
     () => n++,
     (p) => {
-      checkGistPages([p], ps);
-      body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload);
+      checkGistPage(p, seal.cap);
+      const { bytes, tag } = seal.page(p.pageNo, p.pageType, 0, p.itemCount, 0, NO_TAG, p.payload);
+      sink(p.pageNo, bytes);
+      return tag;
     },
+    seal.cap.tag,
   );
-  return { index: root, next: n };
+  return { ref: root, next: n };
 }
 
-// serializeNode serializes one node and its subtree post-order, emitting each page to `body`, and
-// returns this node's assigned page index and the next free index. A leaf's payload is its records;
-// an interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node
-// whose payload would exceed the page is an oversized record (over RECORD_MAX) → feature_not_supported.
+// serializeNode serializes one node and its subtree post-order, emitting each page to sink, and
+// returns the pointer to this node's page and the next free index. A leaf's payload is its records
+// (their overflow chains written and sealed first); an interior's is its N+1 child pointers then its
+// separators (format.md). A node whose payload would exceed the page is an oversized record (over
+// RECORD_MAX) → feature_not_supported.
 function serializeNode(
   n: PNode,
   store: TableStore,
-  capacity: number,
+  seal: Sealer,
   nextIndex: number,
-  body: PageSink,
-): { index: number; next: number } {
+  sink: PageSinkFn,
+): { ref: TreeRef; next: number } {
   const colTypes = store.columnTypes();
-  const childPages: number[] = [];
+  const childPages: TreeRef[] = [];
   for (const c of n.children) {
     // Whole-image serialize renumbers pages from scratch. Under B3 (bplus-reshape.md) every
     // database — in-memory included — is demand-paged, so a clean leaf may be an OnDisk reference
     // into the source store: fault it through the store's pool for the duration of its own
     // serialization (whole-image serialize is not a hot path).
-    const child = c.node !== null ? c.node : store.faultLeaf(c.page);
-    const r = serializeNode(child, store, capacity, nextIndex, body);
-    childPages.push(r.index);
+    const child = c.node !== null ? c.node : store.faultLeaf(c.page, c.tag ?? NO_TAG);
+    const r = serializeNode(child, store, seal, nextIndex, sink);
+    childPages.push(r.ref);
     nextIndex = r.next;
   }
   const index = nextIndex;
@@ -2983,7 +3204,7 @@ function serializeNode(
   let payload: Uint8Array;
   if (n.children.length > 0) {
     pageType = PAGE_INTERIOR;
-    payload = encodeInterior(n.keys, childPages);
+    payload = encodeInterior(n.keys, childPages, seal.cap);
   } else {
     // A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
     // re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
@@ -2992,17 +3213,19 @@ function serializeNode(
     // path (create's empty image / golden generator / toImage canonical / compaction), so the
     // clones are acceptable (packed-leaf.md §7).
     const src = new ChainSource(store.pagingContext(), false);
-    payload = encodeLeafPax(colTypes, keyViews(n), decodedRows(n), capacity, take, ovf, src);
+    payload = encodeLeafPax(colTypes, keyViews(n), decodedRows(n), seal, take, ovf, src);
   }
-  if (payload.length > capacity) {
+  if (payload.length > seal.cap.c) {
     throw engineError(
       "feature_not_supported",
       "a record larger than the per-row limit is not supported",
     );
   }
-  body.page(index, pageType, nodeLen(n), 0, payload);
-  for (const o of ovf) body.page(o.index, PAGE_OVERFLOW, o.itemCount, o.nextPage, o.payload);
-  return { index, next: nextIndex };
+  // The leaf's chains were sealed while its values were encoded (their tags are in the payload).
+  for (const o of ovf) sink(o.index, o.bytes);
+  const { bytes, tag } = seal.page(index, pageType, 0, nodeLen(n), 0, NO_TAG, payload);
+  sink(index, bytes);
+  return { ref: { page: index, tag }, next: nextIndex };
 }
 
 // IncrementalWrite is the pages an incremental commit must write durably, plus the new catalog root
@@ -3011,6 +3234,8 @@ function serializeNode(
 export type IncrementalWrite = {
   pages: { index: number; bytes: Uint8Array }[];
   rootPage: number;
+  // rootTag is the new catalog head's tag in an encrypted file (NO_TAG in plaintext).
+  rootTag: Uint8Array;
   pageCount: number;
   // freeRemaining is the free-list entries this commit did not consume by its tree/catalog pages — all
   // pages dead at the fallback (prior) snapshot, so safe to overwrite this commit. The durable path draws
@@ -3049,9 +3274,8 @@ export function liveAfter(
   write: IncrementalWrite,
   prev: Snapshot,
   paging: SharedPaging,
-  pageSize: number,
 ): LiveCount {
-  return runSync(liveAfterSteps(count, write, prev, paging, pageSize));
+  return runSync(liveAfterSteps(count, write, prev, paging));
 }
 
 // liveAfterSteps is liveAfter with the orphaned-leaf reads on the write side's awaitable page read
@@ -3061,14 +3285,13 @@ export function* liveAfterSteps(
   write: IncrementalWrite,
   prev: Snapshot,
   paging: SharedPaging,
-  pageSize: number,
 ): Steps<LiveCount> {
   const orphaned = yield* orphanedTreePagesSteps(
     prev,
     write.kept,
     write.sharedChains,
     paging,
-    pagePayload(pageSize),
+    paging.cap(),
   );
   const live = count.live + write.pages.length - count.catalog - count.gist - orphaned;
   if (live < 0 || live > 0xffff_ffff) {
@@ -3090,7 +3313,7 @@ function* orphanedTreePagesSteps(
   kept: Set<number>,
   shared: Set<number>,
   paging: SharedPaging,
-  cap: number,
+  cap: Cap,
 ): Steps<number> {
   let count = 0;
   for (const st of prev.stores.values()) {
@@ -3112,17 +3335,24 @@ function* orphanedNodePagesSteps(
   shared: Set<number>,
   paging: SharedPaging,
   colTypes: ColType[] | null,
-  cap: number,
+  cap: Cap,
 ): Steps<number> {
   if (n === null || n.page === 0 || kept.has(n.page)) return 0;
   if (n.children.length === 0)
-    return yield* orphanedLeafPagesSteps(n.page, shared, paging, colTypes, cap);
+    return yield* orphanedLeafPagesSteps(n.page, n.tag ?? NO_TAG, shared, paging, colTypes, cap);
   let count = 1;
   for (const c of n.children) {
     if (c.node !== null)
       count += yield* orphanedNodePagesSteps(c.node, kept, shared, paging, colTypes, cap);
     else if (!kept.has(c.page))
-      count += yield* orphanedLeafPagesSteps(c.page, shared, paging, colTypes, cap);
+      count += yield* orphanedLeafPagesSteps(
+        c.page,
+        c.tag ?? NO_TAG,
+        shared,
+        paging,
+        colTypes,
+        cap,
+      );
   }
   return count;
 }
@@ -3130,13 +3360,14 @@ function* orphanedNodePagesSteps(
 // orphanedLeafPagesSteps is one orphaned leaf page plus the overflow pages its external values own.
 function* orphanedLeafPagesSteps(
   pageIdx: number,
+  tag: Uint8Array,
   shared: Set<number>,
   paging: SharedPaging,
   colTypes: ColType[] | null,
-  cap: number,
+  cap: Cap,
 ): Steps<number> {
   if (colTypes === null) return 1;
-  const pg = parsePage(yield* paging.readPageSteps(pageIdx));
+  const pg = parsePage(yield* paging.readBodyPageSteps(pageIdx, tag));
   if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "expected a B-tree leaf page");
   const n = pg.itemCount;
   const dirs = parsePaxLeaf(pg.payload, n, colTypes);
@@ -3152,11 +3383,12 @@ function* orphanedLeafPagesSteps(
         pg.payload,
         { pos: paxValueOff(pg.payload, dirs, c, i) },
         null,
+        cap.tag,
       );
       if (v.kind !== "unfetched") continue;
       if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) continue;
       if (shared.has(v.ref.firstPage)) continue; // kept by a rewritten record (large-values.md §15)
-      count += Math.ceil(v.ref.storedLen / cap);
+      count += Math.ceil(v.ref.storedLen / capChain(cap));
     }
   }
   return count;
@@ -3177,7 +3409,9 @@ export function* verifyLiveCountSteps(
   live: LiveCount,
 ): Steps<void> {
   if (!verifyLivePages.enabled) return;
-  const walked = (yield* reachablePagesSteps(snap, paging, write.rootPage)).size + write.gistPages;
+  const walked =
+    (yield* reachablePagesSteps(snap, paging, write.rootPage, write.rootTag)).size +
+    write.gistPages;
   if (walked !== live.live) {
     throw new Error(
       `incremental live page count ${live.live} diverged from the reachability walk ${walked}`,
@@ -3303,12 +3537,14 @@ export function* incrementalImageSteps(
       serializationRetries.count++;
       yield* readOverflowChainSteps(
         e.first,
+        e.firstTag,
         e.length,
-        function* (p) {
-          const bytes = yield* paging.readPageSteps(p);
+        function* (p, tag) {
+          const bytes = yield* paging.readBodyPageSteps(p, tag);
           chains.set(p, bytes);
           return bytes;
         },
+        paging.cap().tag,
         [],
       );
     }
@@ -3327,7 +3563,11 @@ function serializeIncremental(
   pages: { index: number; bytes: Uint8Array }[],
 ): IncrementalWrite {
   const ps = pageSize;
-  const capacity = ps - PAGE_HEADER;
+  const seal = Sealer.of(ps, paging);
+  const cap = seal.cap;
+  // Every check that can refuse the commit runs before the first page is sealed, so a refusal draws
+  // no nonce (encrypted.md §8).
+  checkCatalogTextLengths(snap);
 
   const keys = [...snap.tables.keys()].sort(compareTextC);
 
@@ -3339,8 +3579,8 @@ function serializeIncremental(
   const kept = new Set<number>();
   const shared = new Set<number>();
   let gistPages = 0;
-  const rootDataPage: number[] = new Array(keys.length).fill(0);
-  const indexRoots: number[][] = keys.map(() => []);
+  const rootDataPage: TreeRef[] = new Array(keys.length).fill(NO_TREE);
+  const indexRoots: TreeRef[][] = keys.map(() => []);
   const indexColTypes: ColType[] = [];
   for (let ti = 0; ti < keys.length; ti++) {
     const store = snap.stores.get(keys[ti]!)!;
@@ -3349,8 +3589,7 @@ function serializeIncremental(
       rootDataPage[ti] = serializeDirty(
         root,
         store.columnTypes(),
-        capacity,
-        ps,
+        seal,
         alloc,
         pages,
         kept,
@@ -3363,7 +3602,7 @@ function serializeIncremental(
     // dirty nodes are written, like any tree (spec/fileformat/format.md "Allocation &
     // incremental commit").
     for (const idx of snap.tables.get(keys[ti]!)!.indexes) {
-      let ir = 0;
+      let ir = NO_TREE;
       if (idx.kind === "gist") {
         // GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from the
         // allocator (free-list first), the old tree's pages reclaimed on the next open.
@@ -3372,16 +3611,29 @@ function serializeIncremental(
         if (keysList.length > 0) {
           const ops = gistColOpclasses(store, indexColumnOrdinals(idx)!);
           const tree = buildGistFromLeafKeys(ops, keysList);
-          const { pages: gpages, root } = serializeGistTree(tree, ops, () => alloc.take());
-          checkGistPages(gpages, ps);
-          gistPages += gpages.length;
-          for (const p of gpages) {
-            pages.push({
-              index: p.pageNo,
-              bytes: makePage(ps, p.pageType, p.itemCount, 0, p.payload),
-            });
-          }
-          ir = root;
+          ir = serializeGistTreeTo(
+            tree,
+            ops,
+            () => alloc.take(),
+            (p) => {
+              // A tree rebuilt from valid leaf keys always fits; an oversized node means the loaded
+              // keys were corrupt.
+              checkGistPage(p, cap);
+              gistPages++;
+              const { bytes, tag } = seal.page(
+                p.pageNo,
+                p.pageType,
+                0,
+                p.itemCount,
+                0,
+                NO_TAG,
+                p.payload,
+              );
+              pages.push({ index: p.pageNo, bytes });
+              return tag;
+            },
+            cap.tag,
+          );
         }
       } else {
         const iroot = snap.indexStore(idx.name).treeRoot();
@@ -3389,8 +3641,7 @@ function serializeIncremental(
           ir = serializeDirty(
             iroot,
             indexColTypes,
-            capacity,
-            ps,
+            seal,
             alloc,
             pages,
             kept,
@@ -3407,47 +3658,24 @@ function serializeIncremental(
   // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its page
   // indices up front — they may be reused free pages, hence not contiguous — so each page can point at
   // the next (`pack` always returns ≥ 1 group, so catPages is non-empty). Entries are kind-tagged
-  // (v9/v12): composite-type entries (kind 1, name order) then sequence entries (kind 2, name order —
-  // v12) then table entries (kind 0) — spec/fileformat/format.md.
-  const catEntries: Uint8Array[] = [];
-  for (const ct of snap.compositeTypesSorted()) {
-    catEntries.push(concat([Uint8Array.of(1), compositeTypeEntryBytes(ct)]));
-  }
-  for (const s of snap.sequencesSorted()) {
-    catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
-  }
-  // Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated table
-  // entry is read after the entry it references. Reference-only: emit one metadata entry per
-  // collation the SCHEMA references (columns + default), not an imported set
-  // (spec/design/collation.md §2/§5).
-  for (const c of snap.referencedCollations()) {
-    catEntries.push(
-      concat([Uint8Array.of(3), collationEntryBytes(c, snap.defaultCollation === c.name)]),
-    );
-  }
-  for (let ti = 0; ti < keys.length; ti++) {
-    const t = snap.tables.get(keys[ti]!)!;
-    const rowCount = snap.stores.get(keys[ti]!)!.count();
-    if (rowCount === null) throw new Error("table stores always carry an exact row count");
-    checkTableRowCount(rootDataPage[ti]!, rowCount);
-    catEntries.push(
-      concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount)]),
-    );
-  }
-  catEntries.push(...statisticsCatalogEntries(snap));
-  catEntries.push(...viewCatalogEntries(snap));
-  checkCatalogTextLengths(snap);
-  const catLayout = catalogLayout(catEntries, capacity);
+  // (v9/v12) — spec/fileformat/format.md. The chain is sealed last page first, so each page binds its
+  // successor's tag (encrypted.md §7).
+  const catEntries = catalogEntries(snap, keys, rootDataPage, indexRoots, cap);
+  const catLayout = catalogLayout(catEntries, capChain(cap));
   const catPages = catLayout.map(() => alloc.take());
-  const catRoot = catPages[0]!;
-  for (let gi = 0; gi < catLayout.length; gi++) {
-    const nextPage = gi + 1 < catLayout.length ? catPages[gi + 1]! : 0;
-    pages.push({ index: catPages[gi]!, bytes: makeCatalogPage(ps, catLayout[gi]!, nextPage) });
+  let next = 0;
+  let nextTag = NO_TAG;
+  for (let gi = catLayout.length - 1; gi >= 0; gi--) {
+    const { bytes, tag } = catalogPage(seal, catPages[gi]!, catLayout[gi]!, next, nextTag);
+    pages.push({ index: catPages[gi]!, bytes });
+    next = catPages[gi]!;
+    nextTag = tag;
   }
 
   return {
     pages,
-    rootPage: catRoot,
+    rootPage: next,
+    rootTag: nextTag,
     pageCount: alloc.next,
     freeRemaining: alloc.remaining(),
     kept,
@@ -3458,76 +3686,72 @@ function serializeIncremental(
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
-// each as a full pageSize page to `pages`, and returns this node's page index. A clean node (already
-// persisted, page !== 0) short-circuits: its whole subtree is on disk unchanged (copy-on-write only
-// rebuilds the modified path), so nothing is written and its existing page is returned. The node's
-// set-once page id is stored here. Page indices come from the allocator (free-list first, then the
-// high-water). Mirrors serializeNode for the byte layout. Every clean node and OnDisk child it meets
-// is added to kept (the shared boundary the live-page delta skips — memory.md §8.7).
+// each as a full pageSize page to `pages`, and returns the pointer to this node's page. A clean node
+// (already persisted, page !== 0) short-circuits: its whole subtree is on disk unchanged
+// (copy-on-write only rebuilds the modified path), so nothing is written and its existing page (and
+// tag) is returned. The node's set-once page id and tag are stored here. Page indices come from the
+// allocator (free-list first, then the high-water). Mirrors serializeNode for the byte layout; a
+// leaf's fresh overflow chains are sealed before the leaf (encrypted.md §7). Every clean node and
+// OnDisk child it meets is added to kept (the shared boundary the live-page delta skips — memory.md
+// §8.7).
 function serializeDirty(
   n: PNode,
   colTypes: ColType[],
-  capacity: number,
-  ps: number,
+  seal: Sealer,
   alloc: PageAlloc,
   pages: { index: number; bytes: Uint8Array }[],
   kept: Set<number>,
   shared: Set<number>,
   paging: SharedPaging | null,
   chains: Map<number, Uint8Array> | null,
-): number {
+): TreeRef {
   if (n.page !== 0) {
     kept.add(n.page);
-    return n.page;
+    return { page: n.page, tag: n.tag ?? NO_TAG };
   }
-  const childPages: number[] = [];
+  const childPages: TreeRef[] = [];
   for (const c of n.children) {
     // A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf already
     // durable at its page — keep it, write nothing (the incremental-commit win).
     if (c.node === null) {
       kept.add(c.page);
-      childPages.push(c.page);
+      childPages.push({ page: c.page, tag: c.tag ?? NO_TAG });
     } else {
       childPages.push(
-        serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, shared, paging, chains),
+        serializeDirty(c.node, colTypes, seal, alloc, pages, kept, shared, paging, chains),
       );
     }
   }
   // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
-  // allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
-  // rows the lazy load left deferred (a sibling row's mutation dirtied them), and an UPDATE's new
-  // row carries its unassigned large values deferred: each is written from its stored bytes, and a
-  // deferred external value keeps its existing chain (large-values.md §15) — no chain read, no
-  // decompression, no chain write. An INTERIOR node is the record-free keys+children skeleton (v24)
-  // — no values, no chains.
-  const ovf: OverflowPageOut[] = [];
+  // allocator (free-list first, then high-water — large-values.md §12) and sealed into pages ahead of
+  // the leaf. A dirty leaf may carry rows the lazy load left deferred (a sibling row's mutation
+  // dirtied them), and an UPDATE's new row carries its unassigned large values deferred: each is
+  // written from its stored bytes, and a deferred external value keeps its existing chain
+  // (large-values.md §15) — no chain read, no decompression, no chain write. An INTERIOR node is the
+  // record-free keys+children skeleton (v24) — no values, no chains.
   const take = (): number => alloc.take();
   let pageType = PAGE_LEAF;
   let payload: Uint8Array;
   if (n.children.length > 0) {
     pageType = PAGE_INTERIOR;
-    payload = encodeInterior(n.keys, childPages);
+    payload = encodeInterior(n.keys, childPages, seal.cap);
   } else {
     const src = new ChainSource(paging, true, chains);
-    payload = encodeLeafPax(colTypes, n.keys, n.vals, capacity, take, ovf, src);
+    payload = encodeLeafPax(colTypes, n.keys, n.vals, seal, take, pages, src);
     for (const p of src.shared) shared.add(p);
   }
-  if (payload.length > capacity) {
+  if (payload.length > seal.cap.c) {
     throw engineError(
       "feature_not_supported",
       "a record larger than the per-row limit is not supported",
     );
   }
   const index = alloc.take();
+  const { bytes, tag } = seal.page(index, pageType, 0, n.keys.length, 0, NO_TAG, payload);
   n.page = index;
-  pages.push({ index, bytes: makePage(ps, pageType, n.keys.length, 0, payload) });
-  for (const o of ovf) {
-    pages.push({
-      index: o.index,
-      bytes: makePage(ps, PAGE_OVERFLOW, o.itemCount, o.nextPage, o.payload),
-    });
-  }
-  return index;
+  n.tag = seal.codec === null ? undefined : tag;
+  pages.push({ index, bytes });
+  return { page: index, tag };
 }
 
 // loadEngine reconstructs a database from an on-disk image (inverse of toImage).
@@ -3553,7 +3777,51 @@ export function loadEngine(
     throw engineError("data_corrupted", "invalid page size");
   }
   const pager = Pager.fromStore(new MemoryBlockStore(image));
-  return loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER), environment);
+  const codec = runSync(unlockPagerSteps(pager, undefined, environment));
+  return loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER, codec), environment);
+}
+
+// unlockPagerSteps learns from the meta slots whether the file is encrypted and, if it is, unlocks it
+// with credential (spec/fileformat/encrypted.md §5, §9): the codec its paging context seals and opens
+// pages with (null for a plaintext file). A plaintext file opened with a credential is 28P03, an
+// encrypted one without 28P02, a credential that does not unwrap the data key 28P01. A host with no
+// cryptography backend (the browser/OPFS worker) cannot open an encrypted file at all: 0A000 (§10).
+export function* unlockPagerSteps(
+  pager: Pager,
+  credential: Credential | undefined,
+  environment: Environment,
+): Steps<PageCodec | null> {
+  if (pager.physicalPages() < 2) {
+    // Too short for two meta slots: slot selection reports the corruption.
+    if (credential === undefined) return null;
+    throw engineError("data_corrupted", "no complete valid meta page");
+  }
+  const slot0 = yield* pager.readPageSteps(0);
+  const slot1 = yield* pager.readPageSteps(1);
+  if (fileSuite(slot0, slot1) === 0) {
+    if (credential !== undefined) {
+      throw engineError(
+        "credential_not_applicable",
+        "a credential was given for a database that is not encrypted",
+      );
+    }
+    return null;
+  }
+  if (!cryptoAvailable()) {
+    throw engineError(
+      "feature_not_supported",
+      "encrypted databases are not supported on this host",
+    );
+  }
+  if (credential === undefined) {
+    throw engineError("credential_required", "the database is encrypted; a credential is required");
+  }
+  if (pager.pageSize < ENCRYPTED_MIN_PAGE_SIZE || pager.physicalPages() < 4) {
+    throw engineError("data_corrupted", "encrypted file too small for its key block");
+  }
+  const page2 = yield* pager.readPageSteps(2);
+  const page3 = yield* pager.readPageSteps(3);
+  return unlockCodec(page2, page3, credential, environment.keyStream());
 }
 
 // newTempStorage builds a fresh per-domain storage Engine for a TEMP snapshot (temp-tables.md §6,
@@ -3604,7 +3872,7 @@ export function anySpillable(colTypes: ColType[]): boolean {
 // collectLeafOverflowWith is the reachability walk's leaf-overflow collection over a page reader (a
 // backup's walk, spec/design/page-service.md §9, reads through it too).
 export function collectLeafOverflowWith(
-  read: (page: number) => Uint8Array,
+  read: (page: number, tag: Uint8Array) => Uint8Array,
   pageIdx: number,
   colTypes: ColType[],
   reached: Set<number>,
@@ -3613,8 +3881,10 @@ export function collectLeafOverflowWith(
 ): void {
   runSync(
     collectLeafOverflowSteps(
-      (p) => ioSteps(() => read(p)),
+      (p, t) => ioSteps(() => read(p, t)),
       pageIdx,
+      NO_TAG,
+      0,
       colTypes,
       reached,
       seen,
@@ -3623,9 +3893,14 @@ export function collectLeafOverflowWith(
   );
 }
 
+// PageFetch reads the body page a (page, tag) pointer names — opened when the file is encrypted.
+export type PageFetch = (page: number, tag: Uint8Array) => Steps<Uint8Array>;
+
 function* collectLeafOverflowSteps(
-  read: (page: number) => Steps<Uint8Array>,
+  read: PageFetch,
   pageIdx: number,
+  pageTag: Uint8Array,
+  tagLen: number,
   colTypes: ColType[],
   reached: Set<number>,
   seen: Set<number>,
@@ -3635,7 +3910,7 @@ function* collectLeafOverflowSteps(
   seen.add(pageIdx);
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "B-tree deeper than any valid tree");
-  const pg = parsePage(yield* read(pageIdx));
+  const pg = parsePage(yield* read(pageIdx, pageTag));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = read;
     const n = pg.itemCount;
@@ -3652,20 +3927,31 @@ function* collectLeafOverflowSteps(
           pg.payload,
           { pos: paxValueOff(pg.payload, dirs, c, i) },
           null,
+          tagLen,
         );
-        yield* markChainsSteps([v], fetch, reached);
+        yield* markChainsSteps([v], fetch, tagLen, reached);
       }
     }
     return;
   }
   if (pg.pageType === PAGE_INTERIOR) {
-    if (8 * pg.itemCount + 4 > pg.payload.length)
+    const ptr = 4 + tagLen;
+    if ((ptr + 4) * pg.itemCount + ptr > pg.payload.length)
       throw engineError("data_corrupted", "B-tree interior item count overruns page");
     const cur = { pos: 0 };
-    const cps: number[] = [];
-    for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readU32(pg.payload, cur));
+    const cps: { page: number; tag: Uint8Array }[] = [];
+    for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readPointer(pg.payload, cur, tagLen));
     for (const cp of cps)
-      yield* collectLeafOverflowSteps(read, cp, colTypes, reached, seen, depth + 1);
+      yield* collectLeafOverflowSteps(
+        read,
+        cp.page,
+        cp.tag,
+        tagLen,
+        colTypes,
+        reached,
+        seen,
+        depth + 1,
+      );
     return;
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
@@ -3680,8 +3966,13 @@ function* collectLeafOverflowSteps(
 // persisted free-list pages — both are handled by the caller unioning the pages this commit just wrote
 // into the reached set (a GiST index rewrites its whole R-tree every commit — gist.md §4.1(b) — so all
 // live GiST pages are in that write set), so a rebuild never frees a live GiST or free-list page.
-export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: number): Set<number> {
-  return runSync(reachablePagesSteps(snap, paging, catRoot));
+export function reachablePages(
+  snap: Snapshot,
+  paging: SharedPaging,
+  catRoot: number,
+  catTag: Uint8Array = NO_TAG,
+): Set<number> {
+  return runSync(reachablePagesSteps(snap, paging, catRoot, catTag));
 }
 
 // reachablePagesSteps is reachablePages over the write side's awaitable page read (ts-runtime.md
@@ -3690,17 +3981,22 @@ export function* reachablePagesSteps(
   snap: Snapshot,
   paging: SharedPaging,
   catRoot: number,
+  catTag: Uint8Array = NO_TAG,
 ): Steps<Set<number>> {
   const reached = new Set<number>();
+  const tagLen = paging.cap().tag;
   // The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
   // what compaction reclaims).
+  let tag = catTag;
   for (let p = catRoot; p !== 0; ) {
     if (reached.has(p)) throw engineError("data_corrupted", "catalog chain revisits a page");
     reached.add(p);
-    const pg = parsePage(yield* paging.readPageSteps(p));
+    const pg = parsePage(yield* paging.readBodyPageSteps(p, tag));
     if (pg.pageType !== PAGE_CATALOG)
       throw engineError("data_corrupted", "expected a catalog page");
-    p = pg.nextPage;
+    const link = chainContent(pg, tagLen);
+    p = link.next;
+    tag = link.nextTag;
   }
   // Table data trees + their live overflow chains.
   for (const st of snap.stores.values()) {
@@ -3708,8 +4004,10 @@ export function* reachablePagesSteps(
     collectTreePages(root, reached);
     if (root !== null && root.page !== 0 && anySpillable(st.columnTypes())) {
       yield* collectLeafOverflowSteps(
-        (p) => paging.readPageSteps(p),
+        (p, t) => paging.readBodyPageSteps(p, t),
         root.page,
+        root.tag ?? NO_TAG,
+        tagLen,
         st.columnTypes(),
         reached,
         new Set<number>(),
@@ -3752,6 +4050,7 @@ function unassignPartialPages(snap: Snapshot, pages: { index: number; bytes: Uin
     if (n.page !== 0) {
       if (!assigned.has(n.page)) return; // clean before the pass: its subtree is untouched
       n.page = 0;
+      n.tag = undefined;
     }
     for (const c of n.children) if (c.node !== null) visit(c.node);
   };
@@ -3765,6 +4064,7 @@ function unassignPartialPages(snap: Snapshot, pages: { index: number; bytes: Uin
 function unassignTreePages(n: PNode | null, assigned: Set<number>): void {
   if (n === null || n.page === 0 || !assigned.has(n.page)) return;
   n.page = 0;
+  n.tag = undefined;
   for (const c of n.children) if (c.node !== null) unassignTreePages(c.node, assigned);
 }
 
@@ -3789,30 +4089,36 @@ export function collectTreePages(n: PNode | null, reached: Set<number>): void {
 function* readFreeListSteps(
   paging: SharedPaging,
   head: number,
+  headTag: Uint8Array,
   pageCount: number,
   protectedPages: Set<number>,
 ): Steps<number[]> {
   const free: number[] = [];
   const chain = new Set<number>();
-  let previous = 1;
+  const cap = paging.cap();
+  const first = capFirstBody(cap);
+  let previous = first - 1;
+  let tag = headTag;
   for (let p = head; p !== 0; ) {
-    if (p < ROOT_PAGE || p >= pageCount || chain.has(p))
+    if (p < first || p >= pageCount || chain.has(p))
       throw engineError("data_corrupted", "invalid free-list chain");
     chain.add(p);
-    const pg = parsePage(yield* paging.readPageSteps(p));
+    const pg = parsePage(yield* paging.readBodyPageSteps(p, tag));
     if (pg.pageType !== PAGE_FREELIST)
       throw engineError("data_corrupted", "expected a free-list page");
-    if (pg.itemCount > Math.floor(pg.payload.length / 4))
+    const link = chainContent(pg, cap.tag);
+    if (pg.itemCount > Math.floor(link.content.length / 4))
       throw engineError("data_corrupted", "invalid free-list item count");
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
-      const id = readU32(pg.payload, cur);
+      const id = readU32(link.content, cur);
       if (id <= previous || id >= pageCount || protectedPages.has(id))
         throw engineError("data_corrupted", "invalid or protected free page");
       free.push(id);
       previous = id;
     }
-    p = pg.nextPage;
+    p = link.next;
+    tag = link.nextTag;
   }
   for (const id of free)
     if (chain.has(id)) throw engineError("data_corrupted", "free-list page frees itself");
@@ -3831,19 +4137,20 @@ function* readFreeListSteps(
 function serializeFreeList(
   persist: number[],
   safe: number[],
-  cap: number,
-  ps: number,
+  seal: Sealer,
   next: number,
 ): {
   pages: { index: number; bytes: Uint8Array }[];
   head: number;
+  headTag: Uint8Array;
   persisted: number[];
   newNext: number;
 } {
   // Nothing worth persisting when it would take the whole list to hold itself (empty, or a lone page):
   // leave the residue in RAM, reclaimed at the next compaction (a bounded transient leak).
-  if (persist.length < 2) return { pages: [], head: 0, persisted: persist.slice(), newNext: next };
-  const per = Math.max(1, Math.floor(cap / 4));
+  if (persist.length < 2)
+    return { pages: [], head: 0, headTag: NO_TAG, persisted: persist.slice(), newNext: next };
+  const per = Math.max(1, Math.floor(capChain(seal.cap) / 4));
   // Draw free-list pages (from `safe`, then the high-water) until they hold every entry that then
   // remains. Each page drawn from `safe` also removes itself from what must be held (it is in persist),
   // so the loop converges; a high-water page adds a slot without shrinking the content.
@@ -3865,21 +4172,32 @@ function serializeFreeList(
   }
   const drawn = new Set(flIds.slice(0, safeDrawn));
   const persisted = persist.filter((p) => !drawn.has(p));
+  // The chain is sealed last page first (encrypted.md §7), then listed in chain order.
   const pages: { index: number; bytes: Uint8Array }[] = [];
-  for (let ci = 0; ci < flIds.length; ci++) {
+  let nextPage = 0;
+  let nextTag = NO_TAG;
+  for (let ci = flIds.length - 1; ci >= 0; ci--) {
     const lo = Math.min(ci * per, persisted.length);
     const hi = Math.min((ci + 1) * per, persisted.length);
     const chunk = persisted.slice(lo, hi);
-    const nextPage = ci + 1 < flIds.length ? flIds[ci + 1]! : 0;
     const payload = new Uint8Array(chunk.length * 4);
     const dv = new DataView(payload.buffer);
     for (let j = 0; j < chunk.length; j++) dv.setUint32(j * 4, chunk[j]!, false);
-    pages.push({
-      index: flIds[ci]!,
-      bytes: makePage(ps, PAGE_FREELIST, chunk.length, nextPage, payload),
-    });
+    const { bytes, tag } = seal.page(
+      flIds[ci]!,
+      PAGE_FREELIST,
+      0,
+      chunk.length,
+      nextPage,
+      nextTag,
+      payload,
+    );
+    pages.push({ index: flIds[ci]!, bytes });
+    nextPage = flIds[ci]!;
+    nextTag = tag;
   }
-  return { pages, head: flIds[0]!, persisted, newNext: hw };
+  pages.reverse();
+  return { pages, head: nextPage, headTag: nextTag, persisted, newNext: hw };
 }
 
 // The periodic reclamation trigger (format.md *Reclamation*; the constants are shared data,
@@ -3918,6 +4236,7 @@ export function* planFreeListSteps(
   snap: Snapshot,
   paging: SharedPaging,
   catRoot: number,
+  catTag: Uint8Array,
   written: { index: number; bytes: Uint8Array }[],
   freeRemaining: number[],
   pageCount: number,
@@ -3940,14 +4259,14 @@ export function* planFreeListSteps(
   let newLive = liveAtCompaction;
   let newGen = genTxid;
   if (compact) {
-    const reached = yield* reachablePagesSteps(snap, paging, catRoot);
+    const reached = yield* reachablePagesSteps(snap, paging, catRoot, catTag);
     for (const w of written) reached.add(w.index);
     newLive = reached.size;
     // A relaxed batch's pending pages are manifest dependencies the rebuilt list must exclude, though
     // they are not live (validated-cow.md §4 rule 4).
     for (const e of pending) reached.add(e.index);
     const free: number[] = [];
-    for (let p = ROOT_PAGE; p < pageCount; p++) if (!reached.has(p)) free.push(p);
+    for (let p = capFirstBody(paging.cap()); p < pageCount; p++) if (!reached.has(p)) free.push(p);
     persistList = free;
     newGen = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 reuse gate)
   }
@@ -3979,6 +4298,8 @@ export function* planFreeListSteps(
   // Joint allocation is monotone: reserve descriptor overflow pages first, then encode the free
   // list with those reservations removed. Growing the reservation can shrink the free-list chain,
   // so a final descriptor may have empty tail pages; never release/reallocate them in this trial.
+  const seal = Sealer.of(ps, paging);
+  const encrypted = capEncrypted(seal.cap);
   let manifestCount = 0;
   for (;;) {
     const reused = Math.min(manifestCount, safe.length);
@@ -3993,13 +4314,14 @@ export function* planFreeListSteps(
     const s = serializeFreeList(
       persistList.filter((p) => !reserved.has(p)),
       safe.slice(reused),
-      ps - PAGE_HEADER,
-      ps,
+      seal,
       next,
     );
     const required = Math.ceil(
-      Math.max(0, pending.length + written.length + s.pages.length - manifestInlineCapacity(ps)) /
-        manifestOverflowCapacity(ps),
+      Math.max(
+        0,
+        pending.length + written.length + s.pages.length - manifestInlineCapacity(ps, encrypted),
+      ) / manifestOverflowCapacity(ps),
     );
     if (required > manifestCount) {
       manifestCount = required;
@@ -4008,6 +4330,7 @@ export function* planFreeListSteps(
     return {
       pages: s.pages,
       head: s.head,
+      headTag: s.headTag,
       persisted: s.persisted,
       newPageCount: s.newNext,
       newLive,
@@ -4021,6 +4344,8 @@ export function* planFreeListSteps(
 export type FreeListPlan = {
   pages: { index: number; bytes: Uint8Array }[];
   head: number;
+  // headTag is the free-list head's tag in an encrypted file (NO_TAG in plaintext).
+  headTag: Uint8Array;
   persisted: number[];
   newPageCount: number;
   newLive: number;
@@ -4083,11 +4408,14 @@ export function* loadEnginePagedAtSteps(
   // read as individual blocks through the pager.
   const physicalPages = paging.physicalPages();
   const blocks = [yield* paging.readPageSteps(0), yield* paging.readPageSteps(1)];
+  const codec = paging.codec();
   const candidates = blocks
     .map((bytes, slot) => ({ bytes, slot, meta: parseCommitMeta(bytes, pageSize, physicalPages) }))
     .filter(
       (candidate): candidate is { bytes: Uint8Array; slot: number; meta: CommitMeta } =>
-        candidate.meta !== null,
+        // A slot of the other variant is not a candidate of this file (encrypted.md §6; the unlock
+        // already refused files whose valid slots disagree).
+        candidate.meta !== null && (candidate.meta.suite !== 0) === (codec !== null),
     )
     .sort((a, b) => (a.meta.txid > b.meta.txid ? -1 : a.meta.txid < b.meta.txid ? 1 : 0));
   let selected: { bytes: Uint8Array; slot: number; meta: CommitMeta } | undefined;
@@ -4102,6 +4430,12 @@ export function* loadEnginePagedAtSteps(
         (indices) => paging.readWindowSteps(indices),
       ));
     if (validated !== null) {
+      // An encrypted meta is authenticated after keyless selection; a CRC-valid meta that fails its
+      // tag was tampered with — XX001, never a fallback (encrypted.md §6).
+      if (codec !== null) {
+        const chain = yield* manifestChainSteps(candidate.meta, (p) => paging.readPageSteps(p));
+        codec.verifyMeta(candidate.slot, candidate.bytes, chain);
+      }
       paging.cacheValidation(candidate.bytes, validated);
       selected = candidate;
       protectedPages = validated;
@@ -4130,8 +4464,12 @@ function* loadAtMetaSteps(
   at: LoadAt,
 ): Steps<Engine> {
   const pageSize = paging.pageSize();
+  const cap = paging.cap();
 
   const snap = new Snapshot(environment, mt.txid);
+  // Bound before any store is registered, so every store takes this file's capacities (Snapshot
+  // capFor); stores created in a LATER session bind this same pager at creation.
+  snap.storePaging = paging;
   const statisticsExpected = new Map<string, readonly [number, number, number]>();
   const loadedViews: ViewDef[] = [];
   // v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
@@ -4139,6 +4477,7 @@ function* loadAtMetaSteps(
   // from the meta (v34); its catalog and GiST parts are counted as the load reads them (memory.md §8.7).
   const live: LiveCount = { live: mt.livePages, catalog: 0, gist: 0 };
   let catPage = mt.rootPage;
+  let catTag = mt.rootTag;
   const catSeen = new Set<number>();
   // typesChecked records that every composite type registered so far has passed
   // validateCompositeTypes. A table resolves its column types as it is registered, so the types it
@@ -4149,32 +4488,36 @@ function* loadAtMetaSteps(
   while (catPage !== 0) {
     if (catSeen.has(catPage)) throw engineError("data_corrupted", "catalog chain revisits a page");
     catSeen.add(catPage);
-    const pg = parsePage(yield* paging.readPageSteps(catPage));
+    const pg = parsePage(yield* paging.readBodyPageSteps(catPage, catTag));
     if (pg.pageType !== PAGE_CATALOG || (pg.flags & ~1) !== 0)
       throw engineError("data_corrupted", "expected a catalog page");
     live.catalog++;
     // A catalog entry longer than a page continues on the following chain pages (v48): header byte
     // 1 bit0 continued on every page of the run but the last.
-    let next = pg.nextPage;
-    let payload = pg.payload;
+    const head = chainContent(pg, cap.tag);
+    let next = head.next;
+    let nextTag = head.nextTag;
+    let payload = head.content;
     if ((pg.flags & 1) !== 0) {
       if (pg.itemCount !== 1) {
         throw engineError("data_corrupted", "a continued catalog page holds other entries");
       }
-      const parts: Uint8Array[] = [pg.payload];
+      const parts: Uint8Array[] = [head.content];
       for (;;) {
         if (next === 0) {
           throw engineError("data_corrupted", "a continued catalog entry ends the chain");
         }
         if (catSeen.has(next)) throw engineError("data_corrupted", "catalog chain revisits a page");
         catSeen.add(next);
-        const cont = parsePage(yield* paging.readPageSteps(next));
+        const cont = parsePage(yield* paging.readBodyPageSteps(next, nextTag));
         if (cont.pageType !== PAGE_CATALOG || cont.itemCount !== 0 || (cont.flags & ~1) !== 0) {
           throw engineError("data_corrupted", "bad catalog continuation page");
         }
         live.catalog++;
-        parts.push(cont.payload);
-        next = cont.nextPage;
+        const more = chainContent(cont, cap.tag);
+        parts.push(more.content);
+        next = more.next;
+        nextTag = more.nextTag;
         if ((cont.flags & 1) === 0) break;
       }
       payload = concat(parts);
@@ -4213,7 +4556,7 @@ function* loadAtMetaSteps(
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
-      const { table, root, rowCount, indexRoots } = decodeTableEntry(payload, cur);
+      const { table, root, rowCount, indexRoots } = decodeTableEntry(payload, cur, cap.tag);
       // Every record costs at least its 4-byte key-directory entry in some leaf, so no table holds
       // more rows than the file has room for. Checking keeps a corrupt count from sizing work later.
       if (rowCount > BigInt(mt.pageCount) * BigInt(Math.floor((pageSize - PAGE_HEADER) / 4)))
@@ -4244,7 +4587,7 @@ function* loadAtMetaSteps(
       // The store resolved each column's ColType from the (types-first) catalog at putTable
       // (spec/design/composite.md §3).
       const colTypes = store.columnTypes();
-      if (root !== 0) {
+      if (root.page !== 0) {
         // Reads only the interior spine — leaves stay OnDisk; the exact row count was restored from
         // the v28 catalog entry (spec/design/storage.md §6).
         store.setSkeleton(yield* readSkeletonSteps(paging, root, colTypes), rowCount);
@@ -4269,32 +4612,39 @@ function* loadAtMetaSteps(
       // (spec/design/indexes.md §3); no spillable columns, so no overflow collection is
       // ever needed.
       for (let k = 0; k < table.indexes.length; k++) {
-        const istore = new TableStore(pageSize - PAGE_HEADER, []);
-        if (indexRoots[k]! !== 0 && table.indexes[k]!.kind === "gist") {
+        const istore = new TableStore(cap, []);
+        const iroot = indexRoots[k]!;
+        if (iroot.page !== 0 && table.indexes[k]!.kind === "gist") {
           // GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree, recover
-          // its leaf keys into a fully-resident leaf store.
+          // its leaf keys into a fully-resident leaf store (registered without a pager).
           const out: Uint8Array[] = [];
           yield* readGistLeafKeysSteps(
-            function* (p) {
+            function* (p, t) {
               live.gist++;
               at.gist?.(p);
-              const pg2 = parsePage(yield* paging.readPageSteps(p));
+              const pg2 = parsePage(yield* paging.readBodyPageSteps(p, t));
               return { pageType: pg2.pageType, itemCount: pg2.itemCount, payload: pg2.payload };
             },
-            indexRoots[k]!,
+            iroot.page,
             out,
+            new Set<number>(),
+            1,
+            iroot.tag,
+            cap.tag,
           );
           for (const key of out) istore.insert(key, []);
-        } else {
-          istore.attachPaging(paging);
-          if (indexRoots[k]! !== 0) {
-            istore.setSkeleton(yield* readSkeletonSteps(paging, indexRoots[k]!, []), null);
-          }
+          snap.indexStores.set(table.indexes[k]!.name, istore);
+          continue;
+        }
+        istore.attachPaging(paging);
+        if (iroot.page !== 0) {
+          istore.setSkeleton(yield* readSkeletonSteps(paging, iroot, []), null);
         }
         snap.putIndexStore(table.indexes[k]!.name, istore);
       }
     }
     catPage = next;
+    catTag = nextTag;
   }
 
   for (const [groupKey, counts] of statisticsExpected) {
@@ -4327,7 +4677,13 @@ function* loadAtMetaSteps(
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk
   // (spec/fileformat/format.md *Reclamation*).
   if (adopt !== null)
-    db.freePages = yield* readFreeListSteps(paging, mt.freeListHead, mt.pageCount, protectedPages);
+    db.freePages = yield* readFreeListSteps(
+      paging,
+      mt.freeListHead,
+      mt.freeListTag,
+      mt.pageCount,
+      protectedPages,
+    );
   // Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so its
   // reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the committed
   // version, so reuse is safe (transactions.md §8, the free-list generation gate).
@@ -4339,9 +4695,6 @@ function* loadAtMetaSteps(
   db.live = live;
   db.committed = snap;
   db.paging = paging;
-  // Stores created in a LATER session bind this same pager at creation (Snapshot.storePaging), so
-  // they join the post-commit residency flip like the loaded stores attached above.
-  snap.storePaging = paging;
   // The floor slot (validated-cow.md §4): the selected slot, or txid & 1 when both slots carry it.
   if (adopt !== null) {
     paging.adoptCommit(
@@ -4494,12 +4847,18 @@ export const MAX_TREE_DEPTH = 256;
 // §6). A table whose root is itself a single leaf has no
 // interior parent to hold an OnDisk reference, so the root leaf is faulted resident
 // (spec/design/pager.md §1/§4).
-function* readSkeletonSteps(paging: SharedPaging, root: number, colTypes: ColType[]): Steps<PNode> {
-  const child = (yield* readSkeletonNodeSteps(paging, root, new Set<number>(), 1)).child;
+function* readSkeletonSteps(
+  paging: SharedPaging,
+  root: TreeRef,
+  colTypes: ColType[],
+): Steps<PNode> {
+  const child = (yield* readSkeletonNodeSteps(paging, root.page, root.tag, new Set<number>(), 1))
+    .child;
   if (child.node !== null) return child.node;
+  const tag = child.tag ?? NO_TAG;
   return paging.writeSideAsync()
-    ? yield* paging.faultLeafSteps(child.page, colTypes)
-    : paging.faultLeaf(child.page, colTypes);
+    ? yield* paging.faultLeafSteps(child.page, colTypes, tag)
+    : paging.faultLeaf(child.page, colTypes, tag);
 }
 
 // readSkeletonNode resolves one B+tree node into a Child WITHOUT reading the leaf level. A leaf page
@@ -4524,14 +4883,17 @@ function* readSkeletonSteps(paging: SharedPaging, root: number, colTypes: ColTyp
 function* readSkeletonNodeSteps(
   paging: SharedPaging,
   pageIdx: number,
+  pageTag: Uint8Array,
   seen: Set<number>,
   depth: number,
 ): Steps<{ child: Child; height: number }> {
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "B-tree deeper than any valid tree");
-  const pg = parsePage(yield* paging.readPageSteps(pageIdx));
+  const tagLen = paging.cap().tag;
+  const nodeTag = tagLen === 0 ? undefined : pageTag;
+  const pg = parsePage(yield* paging.readBodyPageSteps(pageIdx, pageTag));
   if (pg.pageType === PAGE_LEAF) {
-    return { child: onDiskRef(pageIdx), height: 1 };
+    return { child: onDiskRef(pageIdx, nodeTag), height: 1 };
   }
   if (pg.pageType === PAGE_INTERIOR) {
     if (seen.has(pageIdx))
@@ -4540,32 +4902,46 @@ function* readSkeletonNodeSteps(
     const n = pg.itemCount;
     // n+1 child pointers plus an n-entry separator directory must fit the payload; checking first
     // keeps a corrupt count from sizing the arrays below.
-    if (8 * n + 4 > pg.payload.length)
+    const ptr = 4 + tagLen;
+    if ((ptr + 4) * n + ptr > pg.payload.length)
       throw engineError("data_corrupted", "B-tree interior item count overruns page");
     const cur = { pos: 0 };
     // Child pointers precede the separator directory (format.md "Interior node").
-    const childPtrs: number[] = [];
-    for (let i = 0; i < n + 1; i++) childPtrs.push(readU32(pg.payload, cur));
+    const childPtrs: { page: number; tag: Uint8Array }[] = [];
+    for (let i = 0; i < n + 1; i++) childPtrs.push(readPointer(pg.payload, cur, tagLen));
     // v24: the record-free routing skeleton — an end-offset separator directory + key blob.
     // Separators carry no values, so no lazy decode and no chains to mark.
     const keys = readSeparators(pg.payload, cur, n);
     // Resolve the first child to classify the level, then avoid reading leaf siblings. A leaf
     // sibling that is not a leaf is caught when it faults (decodeLeafNode).
-    const first = yield* readSkeletonNodeSteps(paging, childPtrs[0]!, seen, depth + 1);
+    const first = yield* readSkeletonNodeSteps(
+      paging,
+      childPtrs[0]!.page,
+      childPtrs[0]!.tag,
+      seen,
+      depth + 1,
+    );
     const childrenAreLeaves = first.child.node === null;
     const children: Child[] = [first.child];
     for (let i = 1; i < childPtrs.length; i++) {
       if (childrenAreLeaves) {
-        children.push(onDiskRef(childPtrs[i]!)); // a leaf sibling — not read at open
+        // A leaf sibling — not read at open.
+        children.push(onDiskRef(childPtrs[i]!.page, tagLen === 0 ? undefined : childPtrs[i]!.tag));
         continue;
       }
-      const next = yield* readSkeletonNodeSteps(paging, childPtrs[i]!, seen, depth + 1);
+      const next = yield* readSkeletonNodeSteps(
+        paging,
+        childPtrs[i]!.page,
+        childPtrs[i]!.tag,
+        seen,
+        depth + 1,
+      );
       if (next.height !== first.height)
         throw engineError("data_corrupted", "B-tree leaves at unequal depths");
       children.push(next.child);
     }
     return {
-      child: residentRef({ keys, vals: [], weights: [], children, page: pageIdx }),
+      child: residentRef({ keys, vals: [], weights: [], children, page: pageIdx, tag: nodeTag }),
       height: first.height + 1,
     };
   }
@@ -4596,6 +4972,9 @@ function readSeparators(payload: Uint8Array, cur: Cursor, n: number): Uint8Array
 // the entire page except its own field. Bootstrap images omit the descriptor and seed both slots;
 // incremental durable commits publish their descriptor in the alternate slot. livePages is the exact
 // live page count (spec/design/memory.md §8.7).
+// tags, when set, makes it the encrypted variant's meta (spec/fileformat/encrypted.md §6): the suite
+// and its reserve at offsets 6/7, the catalog root's and the free-list head's tags at 64 and 80, and
+// the inline manifest from 96 — unsealed; the commit's codec seals it for the slot it is written to.
 export function metaPage(
   pageSize: number,
   txid: bigint,
@@ -4604,6 +4983,7 @@ export function metaPage(
   freeListHead: number,
   livePages: number,
   manifest?: CommitManifest,
+  tags?: { root: Uint8Array; freeList: Uint8Array },
 ): Uint8Array {
   const p = new Uint8Array(pageSize);
   const dv = new DataView(p.buffer);
@@ -4612,13 +4992,19 @@ export function metaPage(
   p[2] = 0x44; // 'D'
   p[3] = 0x42; // 'B'
   dv.setUint16(4, FORMAT_VERSION, false);
+  if (tags !== undefined) {
+    p[6] = 1; // suite: XAES-256-GCM pages (encrypted.md §1)
+    p[7] = 40; // reserved_bytes: nonce ‖ tag
+    p.set(tags.root, 64);
+    p.set(tags.freeList, 80);
+  }
   dv.setUint32(8, pageSize, false);
   dv.setBigUint64(12, txid, false);
   dv.setUint32(20, root, false);
   dv.setUint32(24, pageCount, false);
   dv.setUint32(28, freeListHead, false); // v25: the persisted free-list head (0 = empty)
   dv.setUint32(56, livePages, false); // v34: the exact live page count (memory.md §8.7)
-  writeManifestMeta(p, manifest);
+  writeManifestMeta(p, manifest, tags !== undefined);
   return p;
 }
 
@@ -4685,16 +5071,6 @@ export function catalogLayout(entries: Uint8Array[], cap: number): CatalogPage[]
   }
   if (curCount > 0 || out.length === 0) flush();
   return out;
-}
-
-// makeCatalogPage is a catalog page's full bytes: makePage with header byte 1 bit0 continued (v48).
-function makeCatalogPage(ps: number, cp: CatalogPage, nextPage: number): Uint8Array {
-  const p = makePage(ps, PAGE_CATALOG, cp.itemCount, nextPage, cp.payload);
-  if (cp.continued) {
-    p[1] = 1;
-    new DataView(p.buffer, p.byteOffset, p.byteLength).setUint32(12, pageCrc(p), false);
-  }
-  return p;
 }
 
 // makePage is a catalog/B-tree page's full pageSize bytes (header + payload, zero-padded). toImage
@@ -4912,7 +5288,10 @@ export function decodeLeafNode(
   page: number,
   colTypes: ColType[],
   paging: SharedPaging | null,
+  tag?: Uint8Array,
 ): PNode {
+  // An encrypted file's external pointers end with their chain's first-page tag (encrypted.md §2).
+  const tagLen = paging === null ? 0 : paging.cap().tag;
   const pg = parsePage(block);
   if (pg.pageType !== PAGE_LEAF)
     throw engineError("data_corrupted", "demand-paged a non-leaf page");
@@ -4942,7 +5321,7 @@ export function decodeLeafNode(
     const cur = { pos: paxValueOff(payload, dirs, c, i) };
     return fixedValueWidth(ty) !== null
       ? readInlineBody(ty, payload, cur, "construct")
-      : readValueLazy(tyrefs[c]!, payload, cur, paging);
+      : readValueLazy(tyrefs[c]!, payload, cur, paging, tagLen);
   };
   const packed: PackedLeaf = {
     n,
@@ -4975,7 +5354,7 @@ export function decodeLeafNode(
       return row;
     },
   };
-  return { keys: [], vals: [], weights: [], children: [], packed, page };
+  return { keys: [], vals: [], weights: [], children: [], packed, page, tag };
 }
 
 type Cursor = { pos: number };
@@ -4986,7 +5365,8 @@ type Cursor = { pos: number };
 function decodeTableEntry(
   buf: Uint8Array,
   cur: Cursor,
-): { table: Table; root: number; rowCount: bigint; indexRoots: number[] } {
+  tagLen: number,
+): { table: Table; root: TreeRef; rowCount: bigint; indexRoots: TreeRef[] } {
   const name = readString(buf, cur);
   const colCount = readU16(buf, cur);
   const columns: Column[] = [];
@@ -5184,7 +5564,7 @@ function decodeTableEntry(
   // are legal (indexes.md §1).
   const indexCount = readU16(buf, cur);
   const indexes: IndexDef[] = [];
-  const indexRoots: number[] = [];
+  const indexRoots: TreeRef[] = [];
   for (let i = 0; i < indexCount; i++) {
     const iname = readString(buf, cur);
     const kc = readU16(buf, cur);
@@ -5224,7 +5604,7 @@ function decodeTableEntry(
     if (hasPredicate && ikind === 1) {
       throw engineError("data_corrupted", "a gin index cannot be partial");
     }
-    indexRoots.push(readU32(buf, cur));
+    indexRoots.push(readPointer(buf, cur, tagLen));
     // v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
     // it; text this binary cannot parse is kept, unparsed (unparsable-definitions.md).
     let predicate: { exprText: string; expr: Expr; unparsed?: true } | undefined;
@@ -5359,10 +5739,10 @@ function decodeTableEntry(
     }
     exclusions.push({ name: ename, index: iname, elements });
   }
-  const root = readU32(buf, cur);
+  const root = readPointer(buf, cur, tagLen);
   const rowCount = readI64(buf, cur);
   if (rowCount < 0n) throw engineError("data_corrupted", "negative table row count");
-  if ((root === 0) !== (rowCount === 0n)) {
+  if ((root.page === 0) !== (rowCount === 0n)) {
     throw engineError("data_corrupted", "table root and row count disagree");
   }
   return {
@@ -5386,6 +5766,7 @@ function readValueLazy(
   buf: Uint8Array,
   cur: Cursor,
   paging: SharedPaging | null,
+  tagLen: number,
 ): Value {
   const ty = tyref.cols[tyref.idx]!;
   const tag = readU8(buf, cur);
@@ -5421,11 +5802,13 @@ function readValueLazy(
   if (tag === TAG_EXTERNAL) {
     const first = readU32(buf, cur);
     const len = readU32(buf, cur);
+    const firstTag = tagLen === 0 ? undefined : take(buf, cur, tagLen).slice();
     return {
       kind: "unfetched",
       ref: {
         form: TAG_EXTERNAL,
         firstPage: first,
+        firstTag,
         storedLen: len,
         rawLen: 0,
         comp: undefined,
@@ -5455,11 +5838,13 @@ function readValueLazy(
     const first = readU32(buf, cur);
     const stored = readU32(buf, cur);
     const rawLen = readU32(buf, cur);
+    const firstTag = tagLen === 0 ? undefined : take(buf, cur, tagLen).slice();
     return {
       kind: "unfetched",
       ref: {
         form: TAG_EXTERNAL_COMP,
         firstPage: first,
+        firstTag,
         storedLen: stored,
         rawLen,
         comp: undefined,
@@ -5475,18 +5860,24 @@ function readValueLazy(
 // (spec/design/large-values.md §14): gather the overflow chain through `fetch` for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
+// fetch reads the body page a (page, tag) pointer names; tagLen is the chain pages' successor-tag
+// width (encrypted.md §2; 0 in a plaintext file).
 export function resolveUnfetched(
   ty: ColType,
   ref: Unfetched,
-  fetch: (page: number) => Uint8Array,
+  fetch: (page: number, tag: Uint8Array) => Uint8Array,
+  tagLen = 0,
 ): Value {
-  return runSync(resolveUnfetchedSteps(ty, ref, (page) => ioSteps(() => fetch(page))));
+  return runSync(
+    resolveUnfetchedSteps(ty, ref, (page, tag) => ioSteps(() => fetch(page, tag)), tagLen),
+  );
 }
 
 export function* resolveUnfetchedSteps(
   ty: ColType,
   ref: Unfetched,
-  fetch: (page: number) => Steps<Uint8Array>,
+  fetch: PageFetch,
+  tagLen = 0,
 ): Steps<Value> {
   const sink: number[] = [];
   if (ref.form === 0x00) {
@@ -5497,14 +5888,28 @@ export function* resolveUnfetchedSteps(
   if (ref.form === TAG_EXTERNAL) {
     return valueFromPayload(
       ty,
-      yield* readOverflowChainSteps(ref.firstPage, ref.storedLen, fetch, sink),
+      yield* readOverflowChainSteps(
+        ref.firstPage,
+        ref.firstTag ?? NO_TAG,
+        ref.storedLen,
+        fetch,
+        tagLen,
+        sink,
+      ),
     );
   }
   if (ref.form === TAG_INLINE_COMP) {
     return valueFromPayload(ty, lz4Decompress(ref.comp!, ref.rawLen));
   }
   if (ref.form === TAG_EXTERNAL_COMP) {
-    const comp = yield* readOverflowChainSteps(ref.firstPage, ref.storedLen, fetch, sink);
+    const comp = yield* readOverflowChainSteps(
+      ref.firstPage,
+      ref.firstTag ?? NO_TAG,
+      ref.storedLen,
+      fetch,
+      tagLen,
+      sink,
+    );
     return valueFromPayload(ty, lz4Decompress(comp, ref.rawLen));
   }
   throw engineError("data_corrupted", "invalid unfetched value form");
@@ -5531,7 +5936,7 @@ export function* resolveUnfetchedSelfSteps(ref: Unfetched): Steps<Value> {
     const fetch = (_page: number): Uint8Array => {
       throw new Error("an inline deferred value reads no overflow pages");
     };
-    return yield* resolveUnfetchedSteps(ty, ref, (page) => ioSteps(() => fetch(page)));
+    return yield* resolveUnfetchedSteps(ty, ref, (page) => ioSteps(() => fetch(page)), 0);
   }
   // A deferred external value is reachable only through a snapshot whose stores hold the paging
   // context, so a dead handle here is an internal wiring bug (the reachability walk's values never
@@ -5540,7 +5945,12 @@ export function* resolveUnfetchedSelfSteps(ref: Unfetched): Steps<Value> {
   if (paging === null) {
     throw new Error("a deferred external value carries no paging handle");
   }
-  return yield* resolveUnfetchedSteps(ty, ref, (p) => paging.readBlockSteps(p));
+  return yield* resolveUnfetchedSteps(
+    ty,
+    ref,
+    (p, tag) => paging.readBodySteps(p, tag),
+    paging.cap().tag,
+  );
 }
 
 // chainPages returns the page indices of the overflow chain carrying `length` payload bytes from
@@ -5550,35 +5960,50 @@ export function* resolveUnfetchedSelfSteps(ref: Unfetched): Steps<Value> {
 export function chainPages(
   first: number,
   length: number,
-  fetch: (page: number) => Uint8Array,
+  fetch: (page: number, tag: Uint8Array) => Uint8Array,
+  firstTag: Uint8Array = NO_TAG,
+  tagLen = 0,
 ): number[] {
-  return runSync(chainPagesSteps(first, length, (page) => ioSteps(() => fetch(page))));
+  return runSync(
+    chainPagesSteps(
+      first,
+      firstTag,
+      length,
+      (page, tag) => ioSteps(() => fetch(page, tag)),
+      tagLen,
+    ),
+  );
 }
 
 function* chainPagesSteps(
   first: number,
+  firstTag: Uint8Array,
   length: number,
-  fetch: (page: number) => Steps<Uint8Array>,
+  fetch: PageFetch,
+  tagLen: number,
 ): Steps<number[]> {
   const out: number[] = [];
   const seen = new Set<number>();
   let gathered = 0;
   let p = first;
+  let tag = firstTag;
   while (gathered < length) {
     if (p === 0)
       throw engineError("data_corrupted", "overflow chain ended before the value length");
     if (seen.has(p)) throw engineError("data_corrupted", "overflow chain revisits a page");
     seen.add(p);
     out.push(p);
-    const pg = parsePage(yield* fetch(p));
+    const pg = parsePage(yield* fetch(p, tag));
     if (pg.pageType !== PAGE_OVERFLOW)
       throw engineError("data_corrupted", "expected an overflow page");
+    const link = chainContent(pg, tagLen);
     const n = pg.itemCount;
-    if (n === 0 || n > pg.payload.length || gathered + n > length) {
+    if (n === 0 || n > link.content.length || gathered + n > length) {
       throw engineError("data_corrupted", "overflow page slab out of range");
     }
     gathered += n;
-    p = pg.nextPage;
+    p = link.next;
+    tag = link.nextTag;
   }
   return out;
 }
@@ -5587,13 +6012,21 @@ function* chainPagesSteps(
 // free-list reachability walk), via the header-only chainPages hop.
 function* markChainsSteps(
   row: Row,
-  fetch: (page: number) => Steps<Uint8Array>,
+  fetch: PageFetch,
+  tagLen: number,
   reached: Set<number>,
 ): Steps<void> {
   for (const v of row) {
     // Inline forms (0x00 inline-deferred, 0x03 inline-compressed) live in the record — no chain.
     if (v.kind !== "unfetched" || v.ref.form === 0x00 || v.ref.form === TAG_INLINE_COMP) continue;
-    for (const p of yield* chainPagesSteps(v.ref.firstPage, v.ref.storedLen, fetch)) reached.add(p);
+    const pages = yield* chainPagesSteps(
+      v.ref.firstPage,
+      v.ref.firstTag ?? NO_TAG,
+      v.ref.storedLen,
+      fetch,
+      tagLen,
+    );
+    for (const p of pages) reached.add(p);
   }
 }
 
@@ -5616,7 +6049,7 @@ function readValue(
     const len = readU32(buf, cur);
     if (fetch === null)
       throw engineError("data_corrupted", "external value with no overflow reader");
-    return valueFromPayload(ty, readOverflowChain(first, len, fetch, ovfOut));
+    return valueFromPayload(ty, readOverflowChain(first, NO_TAG, len, fetch, 0, ovfOut));
   }
   if (tag === TAG_INLINE_COMP) {
     const rawLen = readU32(buf, cur);
@@ -5630,7 +6063,7 @@ function readValue(
     const rawLen = readU32(buf, cur);
     if (fetch === null)
       throw engineError("data_corrupted", "external value with no overflow reader");
-    const comp = readOverflowChain(first, stored, fetch, ovfOut);
+    const comp = readOverflowChain(first, NO_TAG, stored, fetch, 0, ovfOut);
     return valueFromPayload(ty, lz4Decompress(comp, rawLen));
   }
   throw engineError("data_corrupted", "invalid value presence tag");
@@ -5894,19 +6327,32 @@ function decodeDecimalBody(buf: Uint8Array, cur: Cursor, mode: DecodeMode): Valu
 // reachability walk). `fetch` returns a page's full block by index.
 function readOverflowChain(
   first: number,
+  firstTag: Uint8Array,
   length: number,
-  fetch: (page: number) => Uint8Array,
+  fetch: (page: number, tag: Uint8Array) => Uint8Array,
+  tagLen: number,
   visited: number[],
 ): Uint8Array {
   return runSync(
-    readOverflowChainSteps(first, length, (page) => ioSteps(() => fetch(page)), visited),
+    readOverflowChainSteps(
+      first,
+      firstTag,
+      length,
+      (page, tag) => ioSteps(() => fetch(page, tag)),
+      tagLen,
+      visited,
+    ),
   );
 }
 
+// In an encrypted file (tagLen 16) each chain page leads its payload with its successor's tag, which
+// the next fetch checks (encrypted.md §2).
 export function* readOverflowChainSteps(
   first: number,
+  firstTag: Uint8Array,
   length: number,
-  fetch: (page: number) => Steps<Uint8Array>,
+  fetch: PageFetch,
+  tagLen: number,
   visited: number[],
 ): Steps<Uint8Array> {
   // The stored length is validated only as the chain delivers it, so the buffer starts at most
@@ -5915,17 +6361,19 @@ export function* readOverflowChainSteps(
   const seen = new Set<number>();
   let got = 0;
   let p = first;
+  let tag = firstTag;
   while (got < length) {
     if (p === 0)
       throw engineError("data_corrupted", "overflow chain ended before the value length");
     if (seen.has(p)) throw engineError("data_corrupted", "overflow chain revisits a page");
     seen.add(p);
     visited.push(p);
-    const pg = parsePage(yield* fetch(p));
+    const pg = parsePage(yield* fetch(p, tag));
     if (pg.pageType !== PAGE_OVERFLOW)
       throw engineError("data_corrupted", "expected an overflow page");
+    const link = chainContent(pg, tagLen);
     const n = pg.itemCount;
-    if (n === 0 || n > pg.payload.length || got + n > length) {
+    if (n === 0 || n > link.content.length || got + n > length) {
       throw engineError("data_corrupted", "overflow page slab out of range");
     }
     if (got + n > out.length) {
@@ -5933,9 +6381,10 @@ export function* readOverflowChainSteps(
       grown.set(out.subarray(0, got));
       out = grown;
     }
-    out.set(pg.payload.subarray(0, n), got);
+    out.set(link.content.subarray(0, n), got);
     got += n;
-    p = pg.nextPage;
+    p = link.next;
+    tag = link.nextTag;
   }
   return out;
 }

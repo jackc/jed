@@ -119,6 +119,9 @@ const (
 type Unfetched struct {
 	Form      byte
 	FirstPage uint32
+	// firstTag is the tag FirstPage's pointer binds in an encrypted file (spec/fileformat/encrypted.md
+	// §2); zero in a plaintext file.
+	firstTag  pageTag
 	StoredLen uint32
 	RawLen    uint32
 	Comp      []byte
@@ -1815,3 +1818,6 @@ func boolNot(a Value) Value {
 		return NullValue()
 	}
 }
+
+// first is the bound pointer to an external form's first chain page.
+func (u *Unfetched) first() pageRef { return pageRef{page: u.FirstPage, tag: u.firstTag} }

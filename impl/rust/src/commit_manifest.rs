@@ -2,6 +2,9 @@
 use super::*;
 
 const HEADER: usize = 64;
+/// An encrypted meta's inline manifest starts after the catalog-root and free-list tags
+/// (spec/fileformat/encrypted.md §6).
+const ENCRYPTED_HEADER: usize = 96;
 const ENTRY: usize = 12;
 const OVERFLOW_HEADER: usize = 32;
 pub(super) const PAGE_MANIFEST: u8 = 8;
@@ -39,15 +42,25 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-/// The inline (meta page) and per-overflow-page entry capacities for a page of `ps` bytes.
-pub(super) fn capacities(ps: usize) -> (usize, usize) {
-    ((ps - HEADER) / ENTRY, (ps - OVERFLOW_HEADER) / ENTRY)
+/// The byte range of a meta page of `ps` bytes that holds its inline manifest: after the header,
+/// before an encrypted meta's reserve.
+fn inline_area(ps: usize, encrypted: bool) -> (usize, usize) {
+    if encrypted {
+        (ENCRYPTED_HEADER, ps - crate::crypto::RESERVE)
+    } else {
+        (HEADER, ps)
+    }
 }
 
-pub(super) fn overflow_needed(ps: usize, entries: usize) -> usize {
-    entries
-        .saturating_sub((ps - HEADER) / ENTRY)
-        .div_ceil((ps - OVERFLOW_HEADER) / ENTRY)
+/// The inline (meta page) and per-overflow-page entry capacities for a page of `ps` bytes.
+pub(super) fn capacities(ps: usize, cap: Cap) -> (usize, usize) {
+    let (lo, hi) = inline_area(ps, cap.encrypted_variant());
+    ((hi - lo) / ENTRY, (ps - OVERFLOW_HEADER) / ENTRY)
+}
+
+pub(super) fn overflow_needed(ps: usize, cap: Cap, entries: usize) -> usize {
+    let (inline, per) = capacities(ps, cap);
+    entries.saturating_sub(inline).div_ceil(per)
 }
 
 /// The manifest entries — `(page id, CRC-64 of its complete encoded bytes)` — of written pages.
@@ -63,12 +76,14 @@ pub(super) fn entries_of(pages: &[(u32, Vec<u8>)]) -> Vec<(u32, u64)> {
 /// manifest itself). The allocator has already reserved `ids`.
 pub(super) fn encode(
     mut meta: Vec<u8>,
+    cap: Cap,
     mut entries: Vec<(u32, u64)>,
     ids: &[u32],
 ) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
     let ps = meta.len();
     entries.sort_unstable_by_key(|e| e.0);
-    let inline = entries.len().min((ps - HEADER) / ENTRY);
+    let (header, _) = inline_area(ps, cap.encrypted_variant());
+    let inline = entries.len().min(capacities(ps, cap).0);
     let put_entries = |out: &mut [u8], entries: &[(u32, u64)]| {
         for (chunk, (id, hash)) in out.chunks_exact_mut(ENTRY).zip(entries) {
             chunk[..4].copy_from_slice(&id.to_be_bytes());
@@ -76,7 +91,7 @@ pub(super) fn encode(
         }
     };
     put_entries(
-        &mut meta[HEADER..HEADER + inline * ENTRY],
+        &mut meta[header..header + inline * ENTRY],
         &entries[..inline],
     );
     let mut pages = Vec::with_capacity(ids.len());
@@ -108,6 +123,24 @@ pub(super) fn encode(
     (meta, pages)
 }
 
+/// The manifest-overflow chain a valid meta names, in chain order — what an encrypted meta's tag
+/// covers (encrypted.md §6). Reads only the pages the meta counts; a malformed chain was already
+/// refused by [`validate`].
+pub(super) fn chain_pages(
+    meta: &[u8],
+    mut read: impl FnMut(u32) -> Result<Vec<u8>>,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut next = u32_at(meta, 36);
+    for _ in 0..u32_at(meta, 44) {
+        let page = read(next)?;
+        let after = parse_page(&page)?.next_page;
+        out.push((next, page));
+        next = after;
+    }
+    Ok(out)
+}
+
 /// A candidate is either complete, structurally invalid, or unreadable. Only the second permits
 /// fallback. Bounds are checked before host reads; actual host failures must propagate.
 pub(super) fn validate(
@@ -131,16 +164,25 @@ fn validate_inner(
     let n = u32_at(meta, 44) as usize;
     let mut next = u32_at(meta, 36);
     let bad = || corrupt("invalid commit manifest");
+    // An encrypted meta (suite byte 6, checked by `parse_meta`): body pages start past the key block,
+    // the inline manifest after the tags, and a listed page is ciphertext, so only its digest is
+    // checked (encrypted.md §6).
+    let encrypted = meta[6] != 0;
+    let cap = Cap::of(meta.len() as u32, encrypted);
+    let first = cap.first_body();
     if pc > physical
-        || pc < 3
-        || count as u64 + n as u64 > u64::from(pc - 2)
+        || pc <= first
+        || count as u64 + n as u64 > u64::from(pc - first)
         || meta[60..64].iter().any(|b| *b != 0)
         || (n == 0) != (next == 0)
         || (count == 0 && (n != 0 || u64_at(meta, 48) != 0))
-        || overflow_needed(meta.len(), count) > n
+        || overflow_needed(meta.len(), cap, count) > n
     {
         return Err(bad());
     }
+    let typed = |page: &[u8]| -> Result<bool> {
+        Ok(encrypted || (1..=7).contains(&parse_page(page)?.page_type))
+    };
     let mut protected = HashSet::new();
     let mut last = 1;
     let mut remaining = count;
@@ -150,30 +192,27 @@ fn validate_inner(
         }
         for e in bytes[..number * ENTRY].chunks_exact(ENTRY) {
             let id = u32_at(e, 0);
-            if id <= last || id >= pc {
+            if id < first || id <= last || id >= pc {
                 return Err(bad());
             }
             last = id;
             let page = read(id)?;
-            if extend(0, &page) != u64_at(e, 4) {
-                return Err(bad());
-            }
-            let p = parse_page(&page)?;
-            if !(1..=7).contains(&p.page_type) {
+            if extend(0, &page) != u64_at(e, 4) || !typed(&page)? {
                 return Err(bad());
             }
             protected.insert(id);
         }
         Ok(())
     };
-    let inline = count.min((meta.len() - HEADER) / ENTRY);
-    check_entries(&meta[HEADER..], inline)?;
+    let (lo, hi) = inline_area(meta.len(), encrypted);
+    let inline = count.min((hi - lo) / ENTRY);
+    check_entries(&meta[lo..hi], inline)?;
     remaining -= inline;
     // End the closure's borrow so chain pages can be read through the same host.
     drop(check_entries);
     let mut digest = 0;
     for ordinal in 0..n {
-        if next < 2
+        if next < first
             || next >= pc
             || next == u32_at(meta, 20)
             || next == u32_at(meta, 28)
@@ -200,13 +239,12 @@ fn validate_inner(
         }
         for e in page[OVERFLOW_HEADER..OVERFLOW_HEADER + number * ENTRY].chunks_exact(ENTRY) {
             let id = u32_at(e, 0);
-            if id <= last || id >= pc || !protected.insert(id) {
+            if id < first || id <= last || id >= pc || !protected.insert(id) {
                 return Err(bad());
             }
             last = id;
             let data = read(id)?;
-            if extend(0, &data) != u64_at(e, 4) || !(1..=7).contains(&parse_page(&data)?.page_type)
-            {
+            if extend(0, &data) != u64_at(e, 4) || !typed(&data)? {
                 return Err(bad());
             }
         }

@@ -27,7 +27,8 @@ import type { BlockStore } from "../blockstore.ts";
 import { crc64Update, parseCommitMeta } from "../commit_manifest.ts";
 import { EngineError, engineError, type SqlState } from "../errors.ts";
 import type { Engine } from "../executor.ts";
-import { FORMAT_VERSION, loadEnginePaged } from "../format.ts";
+import { FORMAT_VERSION, loadEnginePaged, unlockPagerSteps } from "../format.ts";
+import { runSync } from "../execution.ts";
 import type { Environment } from "../environment.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
@@ -748,9 +749,13 @@ export function openPageClient(
   client.store = store;
   const pager = Pager.fromStore(store);
   pager.trustMeta = true;
+  // A page client of an encrypted file would need its key; the page service serves plaintext files
+  // only, so a client opens without one (spec/fileformat/encrypted.md §10).
+  const codec = runSync(unlockPagerSteps(pager, undefined, environment));
   const paging = new SharedPaging(
     pager,
     cacheLeaves(opts.cacheBytes ?? DEFAULT_CACHE_BYTES, pager.pageSize),
+    codec,
   );
   const db = loadEnginePaged(paging, environment);
   db.path = client.dbPath;

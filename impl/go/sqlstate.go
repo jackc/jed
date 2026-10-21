@@ -119,6 +119,14 @@ const (
 	IdleInTransactionSessionTimeout
 	// DependentObjectsStillExist is 2BP01 — cannot drop type {name} because other objects depend on it: {detail}.
 	DependentObjectsStillExist
+	// InvalidPassword is 28P01 — {detail}.
+	InvalidPassword
+	// CredentialRequired is 28P02 — {detail}.
+	CredentialRequired
+	// CredentialNotApplicable is 28P03 — {detail}.
+	CredentialNotApplicable
+	// StaleKey is 28P04 — {detail}.
+	StaleKey
 	// InvalidSavepointSpecification is 3B001 — savepoint does not exist: {name}.
 	InvalidSavepointSpecification
 	// ExternalRoutineException is 38000 — host function {name} raised {detail}.
@@ -340,6 +348,14 @@ func (s SqlState) Code() string {
 		return "25P03"
 	case DependentObjectsStillExist:
 		return "2BP01"
+	case InvalidPassword:
+		return "28P01"
+	case CredentialRequired:
+		return "28P02"
+	case CredentialNotApplicable:
+		return "28P03"
+	case StaleKey:
+		return "28P04"
 	case InvalidSavepointSpecification:
 		return "3B001"
 	case ExternalRoutineException:
@@ -520,6 +536,10 @@ var errorDescs = []errorDesc{
 	{Code: "25P02", Name: "in_failed_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P03", Name: "idle_in_transaction_session_timeout", Class: "invalid transaction state"},
 	{Code: "2BP01", Name: "dependent_objects_still_exist", Class: "dependent objects still exist"},
+	{Code: "28P01", Name: "invalid_password", Class: "invalid authorization specification"},
+	{Code: "28P02", Name: "credential_required", Class: "invalid authorization specification"},
+	{Code: "28P03", Name: "credential_not_applicable", Class: "invalid authorization specification"},
+	{Code: "28P04", Name: "stale_key", Class: "invalid authorization specification"},
 	{Code: "3B001", Name: "invalid_savepoint_specification", Class: "invalid savepoint specification"},
 	{Code: "38000", Name: "external_routine_exception", Class: "external routine exception"},
 	{Code: "42601", Name: "syntax_error", Class: "syntax error or access rule violation"},

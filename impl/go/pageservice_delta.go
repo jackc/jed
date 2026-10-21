@@ -104,7 +104,8 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		}
 		return nil
 	}
-	if err := list(cb.meta[64:], min(m.dirtyCount, uint32(manifestInlineCapacity(ps)))); err != nil {
+	// The page service serves plaintext files only (spec/fileformat/encrypted.md §10).
+	if err := list(cb.meta[64:], min(m.dirtyCount, uint32(manifestInlineCapacity(ps, plainCap(uint32(ps)))))); err != nil {
 		return nil, err
 	}
 	id := m.manifestHead

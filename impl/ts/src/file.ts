@@ -6,6 +6,7 @@
 // B) — the block seam below pwrites pages (writeSync at a position) into the open file.
 
 import "./crc32_node.ts";
+import "./crypto_node.ts";
 
 import {
   chmodSync,
@@ -28,7 +29,16 @@ import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { Environment } from "./environment.ts";
 import type { FileHost, WriteAt } from "./filehost.ts";
-import { loadEnginePagedSteps, ROOT_PAGE, toImage, writeImage } from "./format.ts";
+import { capFirstBody, capOf } from "./cap.ts";
+import {
+  type Argon2Params,
+  createCodec,
+  type Credential,
+  DEFAULT_ARGON2_PARAMS,
+  ENCRYPTED_MIN_PAGE_SIZE,
+  type PageCodec,
+} from "./crypto.ts";
+import { loadEnginePagedSteps, toImage, unlockPagerSteps, writeImage } from "./format.ts";
 import { runSync, type Steps } from "./execution.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
@@ -52,7 +62,15 @@ import { type HandoffHosts, type Ownership, ServiceHandoff } from "./pageservice
 // but skips the fdatasync barrier. Unlike pageSize it is NOT fixed into the file — it is a runtime handle
 // setting. DEV/TESTING only (durable across a process crash, not an OS crash). environment is the
 // handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one (§7).
-export type DatabaseOptions = { pageSize?: number; noSync?: boolean; environment?: Environment };
+// credential creates the file encrypted (spec/fileformat/encrypted.md) and kdf stretches a passphrase
+// credential (CreateOptions below).
+export type DatabaseOptions = {
+  pageSize?: number;
+  noSync?: boolean;
+  environment?: Environment;
+  credential?: Credential;
+  kdf?: Argon2Params;
+};
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1).
 // path selects the backing: absent → an in-memory database (never touches the filesystem); present
@@ -106,7 +124,23 @@ export type CreateOptions = {
   // pageSize, §8.2), a file-backed one its live pages (livePages × pageSize, §8.7). Zero, negative, or
   // absent is unlimited (the default). Not stored anywhere; Database.setMaxStorageBytes changes it.
   maxStorageBytes?: bigint;
+  // credential creates the file ENCRYPTED (spec/design/encryption.md, spec/fileformat/encrypted.md):
+  // its pages are sealed under a random data key that only the credential — a passphrase or a 32-byte
+  // host key — unwraps. Needs a pageSize of at least 1024 (0A000 otherwise); an in-memory database
+  // with a credential is 55000. An encrypted file is never served by the page service (locking "auto"
+  // becomes an exclusive owner) and has no spill target. Absent (the default) creates a plaintext file.
+  credential?: Credential;
+  // kdf is the Argon2id parameters a passphrase credential is stretched with (default RFC 9106's second
+  // recommendation; 22023 outside the format's bounds). Ignored for a host key or a plaintext file.
+  kdf?: Argon2Params;
 };
+
+// lockingFor is the coordination an open uses: an encrypted file is never served by the page service
+// (spec/fileformat/encrypted.md §10), so a credential turns "auto" into an exclusive owner.
+function lockingFor(locking: Locking | undefined, credential: Credential | undefined): Locking {
+  const resolved = resolvedLocking(locking);
+  return credential !== undefined && resolved === "auto" ? "exclusive" : resolved;
+}
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
@@ -118,16 +152,30 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
 // createVia is create through the file host files (filehost.ts): the existence check, the temp file,
 // its rename, the directory barrier, and the open all go through it.
 export function createVia(files: FileHost, path: string, opts: DatabaseOptions = {}): Engine {
+  const pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
+  if (opts.credential !== undefined && pageSize < ENCRYPTED_MIN_PAGE_SIZE) {
+    throw engineError(
+      "feature_not_supported",
+      "an encrypted database needs a page size of at least 1024",
+    );
+  }
   if (files.exists(path)) {
     throw engineError("duplicate_file", "database file already exists: " + path);
   }
-  const db = new Engine(opts.environment ?? new Environment());
+  const environment = opts.environment ?? new Environment();
+  // A new encrypted file's key block and codec (spec/fileformat/encrypted.md §5, §8): the data key,
+  // KDF salt and wrap nonce are the first draws of the database's key-entropy stream.
+  const codec =
+    opts.credential === undefined
+      ? null
+      : createCodec(opts.credential, opts.kdf ?? DEFAULT_ARGON2_PARAMS, environment.keyStream());
+  const db = new Engine(environment);
   db.path = path;
-  db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
+  db.pageSize = pageSize;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
   const noSync = opts.noSync ?? false;
-  writeFullImage(files, db, noSync); // lay down the from-scratch image; later commits are incremental
+  writeFullImage(files, db, noSync, codec); // lay down the from-scratch image; later commits are incremental
   // Adopt the just-written file as the open pager + buffer pool, so later commits write through the
   // seam without re-opening (spec/design/pager.md). Tables built in this session bind this pager at
   // creation (Snapshot.storePaging), so their committed leaves demote at each commit and fault back
@@ -140,13 +188,14 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
     store.close();
     throw e;
   }
-  db.paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize));
+  db.paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize), codec);
   // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
   db.paging.setFloorSlot(Number(db.committed.txid & 1n));
   db.committed.storePaging = db.paging;
   // Scratch is independent of the persistence path: a read-only database directory must still be
-  // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1).
-  db.spillSink = new FileSpillSink(tmpdir());
+  // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1). An encrypted database never spills
+  // plaintext: it has no scratch target until scratch encryption lands (encrypted.md §10).
+  db.spillSink = codec === null ? new FileSpillSink(tmpdir()) : null;
   return db;
 }
 
@@ -154,14 +203,19 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persistImpl).
-function writeFullImage(files: FileHost, db: Engine, noSync: boolean): void {
+function writeFullImage(
+  files: FileHost,
+  db: Engine,
+  noSync: boolean,
+  codec: PageCodec | null,
+): void {
   if (db.path === null) return;
-  const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
+  const bytes = toImage(db.committed, db.pageSize, db.committed.txid, codec);
   writeAtomic(files, db.path, bytes, noSync);
   db.pageCount = Math.floor(bytes.length / db.pageSize);
   // The image is of an empty database: every body page is live, and every one is a catalog page
   // (spec/design/memory.md §8.7).
-  const body = db.pageCount - ROOT_PAGE;
+  const body = db.pageCount - capFirstBody(capOf(db.pageSize, codec !== null));
   db.live = { live: body, catalog: body, gist: 0 };
 }
 
@@ -225,6 +279,10 @@ export type OpenOptions = {
   // unlimited (the default). A handle setting, not stored in the file; Database.setMaxStorageBytes
   // changes it.
   maxStorageBytes?: bigint;
+  // credential unlocks an encrypted file (spec/design/encryption.md §5): required for one (28P02
+  // without it, 28P01 when it does not unwrap the key), refused for a plaintext file (28P03). A handle
+  // argument only — never stored, never shown.
+  credential?: Credential;
 };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
@@ -273,9 +331,11 @@ export function* openViaSteps(
     // page_size = 0 cannot divide by zero before that check runs).
     const pager = yield* Pager.fromStoreSteps(store);
     pager.setPageTransform(transform);
+    const environment = opts.environment ?? new Environment();
+    const codec = yield* unlockPagerSteps(pager, opts.credential, environment);
     const db = yield* loadEnginePagedSteps(
-      new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)),
-      opts.environment ?? new Environment(),
+      new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
+      environment,
     );
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
@@ -283,8 +343,9 @@ export function* openViaSteps(
     db.storageBudget.limit = opts.maxStorageBytes ?? 0n;
     db.relaxed = opts.synchronous === "off";
     // Scratch is independent of the persistence path, so read-only database filesystems remain
-    // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1).
-    db.spillSink = new FileSpillSink(tmpdir());
+    // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1). An encrypted database has
+    // no scratch target (spec/fileformat/encrypted.md §10).
+    db.spillSink = codec === null ? new FileSpillSink(tmpdir()) : null;
     // 0 (or unset) means "the default budget", not "unlimited" — the zero value stays a safe finite
     // budget (matching Go/Rust). Unbounded/never-spill is a runtime-only mode via setWorkMem(0).
     if (opts.workMem) db.session.workMem = opts.workMem;
@@ -309,7 +370,7 @@ export function* openViaSteps(
 // synchronous setting (validated-cow.md §4).
 registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHandoff) => {
   const path = source.path!;
-  const locking = resolvedLocking(source.locking);
+  const locking = lockingFor(source.locking, source.credential);
   if (locking === "auto") {
     return openServiceAttachment(path, source, readOnly, files, environment, relaxed, mainHandoff);
   }
@@ -321,6 +382,7 @@ registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHan
       locking: "none",
       environment,
       synchronous: relaxed ? "off" : "on",
+      credential: source.credential,
     });
     return { kind: "file", engine, coordinator };
   } catch (error) {
@@ -413,9 +475,12 @@ export function compactFile(
   // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
   const real = files.realPath(path);
   const tmp = real + ".jedtmp";
+  // An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
+  // (spec/design/encryption.md §5).
+  const codec = old.codec();
   try {
     files.writeFile(tmp, real, noSync, (writeAt) => {
-      writeImage(snap, pageSize, txid, (index, page) => writeAt(index * pageSize, page));
+      writeImage(snap, pageSize, txid, (index, page) => writeAt(index * pageSize, page), codec);
     });
   } catch (e) {
     files.remove(tmp);
@@ -444,7 +509,7 @@ export function compactFile(
   if (!noSync) files.syncDir(dirname(real));
   const store = files.openStore(real, noSync, false);
   try {
-    return new SharedPaging(Pager.fromStore(store), capacity);
+    return new SharedPaging(Pager.fromStore(store), capacity, codec);
   } catch (e) {
     store.close();
     throw e;
@@ -565,13 +630,26 @@ function removeQuietly(path: string): void {
 export function createDatabase(opts: CreateOptions = {}): Database {
   const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
   const maxStorageBytes = opts.maxStorageBytes ?? 0n;
+  if (opts.path === undefined && opts.credential !== undefined) {
+    // Nothing is at rest in an in-memory database (spec/design/encryption.md §5).
+    throw engineError(
+      "object_not_in_prerequisite_state",
+      "an in-memory database cannot be encrypted",
+    );
+  }
   if (opts.path !== undefined) {
-    const coordinator = FileCoordinator.create(opts.path, opts.locking, opts.fileLockTimeoutMs);
+    const coordinator = FileCoordinator.create(
+      opts.path,
+      lockingFor(opts.locking, opts.credential),
+      opts.fileLockTimeoutMs,
+    );
     try {
       const engine = create(coordinator?.path ?? opts.path, {
         pageSize,
         noSync: opts.skipFsync,
         environment: opts.environment,
+        credential: opts.credential,
+        kdf: opts.kdf,
       });
       engine.storageBudget.limit = maxStorageBytes;
       engine.relaxed = opts.synchronous === "off";
@@ -609,7 +687,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
 // the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
 export function openDatabase(path: string, opts: OpenOptions = {}): Database {
-  const locking = resolvedLocking(opts.locking);
+  const locking = lockingFor(opts.locking, opts.credential);
   if (locking === "auto") return openServiceDatabase(path, opts);
   const coordinator = FileCoordinator.open(path, locking, opts.fileLockTimeoutMs);
   try {

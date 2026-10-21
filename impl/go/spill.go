@@ -627,6 +627,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		case tagExternal:
 			_ = w.WriteByte(9)
 			spillWriteU32(w, v.unfetched().FirstPage)
+			_, _ = w.Write(v.unfetched().firstTag[:])
 			spillWriteU32(w, v.unfetched().StoredLen)
 		case tagInlineComp:
 			_ = w.WriteByte(10)
@@ -635,6 +636,7 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 		case tagExternalComp:
 			_ = w.WriteByte(11)
 			spillWriteU32(w, v.unfetched().FirstPage)
+			_, _ = w.Write(v.unfetched().firstTag[:])
 			spillWriteU32(w, v.unfetched().StoredLen)
 			spillWriteU32(w, v.unfetched().RawLen)
 		}
@@ -642,6 +644,14 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 }
 
 func spillReadU8(r *bufio.Reader) (byte, error) { return r.ReadByte() }
+
+// spillReadTag reads a spilled external value's 16-byte first-page tag.
+func spillReadTag(r *bufio.Reader) (pageTag, error) {
+	var tag pageTag
+	_, err := io.ReadFull(r, tag[:])
+	return tag, err
+}
+
 func spillReadU32(r *bufio.Reader) (uint32, error) {
 	var b [4]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
@@ -759,8 +769,12 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		tag, err := spillReadTag(r)
+		if err != nil {
+			return Value{}, err
+		}
 		length, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, err
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, firstTag: tag, StoredLen: length}}, err
 	case 10:
 		raw, err := spillReadU32(r)
 		if err != nil {
@@ -773,12 +787,16 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
+		tag, err := spillReadTag(r)
+		if err != nil {
+			return Value{}, err
+		}
 		stored, err := spillReadU32(r)
 		if err != nil {
 			return Value{}, err
 		}
 		raw, err := spillReadU32(r)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: raw}}, err
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, firstTag: tag, StoredLen: stored, RawLen: raw}}, err
 	case 22:
 		body, err := spillReadBytes(r)
 		return JsonPathValue(string(body)), err

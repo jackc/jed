@@ -53,6 +53,16 @@ struct Contents {
     functions: Arc<ExtensionRegistry>,
     random: Arc<dyn RandomSource>,
     clock: Arc<dyn ClockSource>,
+    key_entropy: KeyEntropy,
+}
+
+/// Where an encrypted database draws its key material and nonces (spec/fileformat/encrypted.md §8):
+/// the OS CSPRNG, or — for tests and the goldens only — an explicitly insecure seeded stream. Separate
+/// from the SQL random source, so seeding `uuidv4` never seeds a key.
+#[derive(Clone, Copy, Debug)]
+enum KeyEntropy {
+    Os,
+    InsecureSeeded(u64),
 }
 
 impl Default for Environment {
@@ -73,6 +83,7 @@ impl Default for EnvironmentBuilder {
                 functions: Arc::new(ExtensionRegistry::default()),
                 random: crate::seam::os_random_source(),
                 clock: crate::seam::wall_clock(),
+                key_entropy: KeyEntropy::Os,
             },
         }
     }
@@ -130,6 +141,15 @@ impl EnvironmentBuilder {
     /// current one; the default is [`wall_clock`](crate::wall_clock).
     pub fn clock_source(mut self, source: Arc<dyn ClockSource>) -> Self {
         self.contents.clock = source;
+        self
+    }
+
+    /// Draw encrypted databases' key material and nonces from an **insecure** splitmix64 stream
+    /// seeded with `seed` instead of the OS CSPRNG (spec/fileformat/encrypted.md §8): each database
+    /// opened through the environment starts its own stream from `seed`, so every core writes
+    /// byte-identical encrypted files. For tests and fixtures only — the keys are predictable.
+    pub fn insecure_seeded_key_entropy(mut self, seed: u64) -> Self {
+        self.contents.key_entropy = KeyEntropy::InsecureSeeded(seed);
         self
     }
 
@@ -258,6 +278,14 @@ impl Environment {
     /// Read the clock source, in micros since the Unix epoch.
     pub(crate) fn now_micros(&self) -> i64 {
         self.0.clock.now_micros()
+    }
+
+    /// A fresh key-entropy stream for one encrypted database (encrypted.md §8).
+    pub(crate) fn key_stream(&self) -> Arc<dyn RandomSource> {
+        match self.0.key_entropy {
+            KeyEntropy::Os => crate::seam::os_random_source(),
+            KeyEntropy::InsecureSeeded(seed) => crate::seam::seeded_random_source(seed),
+        }
     }
 }
 

@@ -70,6 +70,14 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
       "a page-identical backup needs a file database; an in-memory database has only the compacted form",
     );
   }
+  if (st.paging !== null && st.paging.codec() !== null) {
+    // A backup of an encrypted file needs its key block taken under the key-block mutex
+    // (spec/design/encryption.md §8), not yet built (spec/fileformat/encrypted.md §10).
+    throw engineError(
+      "feature_not_supported",
+      "a backup of an encrypted database is not supported yet",
+    );
+  }
   if (files.exists(dest)) {
     throw engineError("duplicate_file", "database file already exists: " + dest);
   }

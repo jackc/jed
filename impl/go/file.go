@@ -50,6 +50,10 @@ type databaseOptions struct {
 	noSync bool
 	// env is the handle's Environment (spec/design/environment.md); nil ⇒ a fresh empty one.
 	env *Environment
+	// credential, when set, creates the file encrypted under it (spec/design/encryption.md,
+	// spec/fileformat/encrypted.md); kdf stretches a passphrase credential (zero: the default).
+	credential *Credential
+	kdf        Argon2Params
 }
 
 // defaultDatabaseOptions returns the default create settings (the default page size).
@@ -67,6 +71,9 @@ func create(path string, opts databaseOptions) (*engine, error) {
 // createVia is create through the file host files (filehost.go): the existence check, the temp file,
 // its rename, the directory barrier, and the open all go through it.
 func createVia(files fileHost, path string, opts databaseOptions) (*engine, error) {
+	if opts.credential != nil && int(opts.PageSize) < minEncryptedPageSize {
+		return nil, newError(FeatureNotSupported, "an encrypted database needs a page size of at least 1024")
+	}
 	if exists, err := files.exists(path); err != nil {
 		return nil, err
 	} else if exists {
@@ -76,12 +83,25 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 	if env == nil {
 		env = NewEnvironment()
 	}
+	// A new encrypted file's key block and codec (spec/fileformat/encrypted.md §5, §8): the data key,
+	// KDF salt and wrap nonce are the first draws of the database's key-entropy stream.
+	var codec *pageCodec
+	if opts.credential != nil {
+		var err error
+		if codec, err = createCodec(opts.credential, opts.kdf, env.keyStream()); err != nil {
+			return nil, err
+		}
+	}
 	db := newEngineIn(env)
 	db.path = path
-	db.spill = osSpillHost{dir: os.TempDir()}
+	// An encrypted database never spills plaintext: it has no scratch target until scratch encryption
+	// lands (spec/fileformat/encrypted.md §10).
+	if codec == nil {
+		db.spill = osSpillHost{dir: os.TempDir()}
+	}
 	db.pageSize = opts.PageSize
-	db.committed.txid = 1                                         // the initial empty image is committed as txid 1
-	if err := db.writeFullImage(files, opts.noSync); err != nil { // lay down the from-scratch image; later commits are incremental
+	db.committed.txid = 1                                                // the initial empty image is committed as txid 1
+	if err := db.writeFullImage(files, opts.noSync, codec); err != nil { // lay down the from-scratch image; later commits are incremental
 		return nil, err
 	}
 	// Adopt the just-written file as the open pager + buffer pool, so later commits write through the
@@ -99,6 +119,7 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 	}
 	// Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
 	p.floorSlot = uint32(db.committed.txid & 1)
+	p.codec = codec
 	db.paging = newSharedPaging(p, cacheLeaves(defaultCacheBytes, db.pageSize))
 	db.committed.storePaging = db.paging
 	return db, nil
@@ -163,6 +184,11 @@ type OpenOptions struct {
 	// Zero or negative is unlimited (the default). A handle setting, not stored in the file;
 	// Database.SetMaxStorageBytes changes it.
 	MaxStorageBytes int64
+	// Credential unlocks an encrypted file (spec/design/encryption.md §5): required for one (28P02
+	// without it, 28P01 when it does not unwrap the key), refused for a plaintext file (28P03). A handle
+	// argument only — never stored, never shown. An encrypted file is never served by the page service,
+	// so a credential turns LockingAuto into an exclusive owner.
+	Credential *Credential
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -206,13 +232,16 @@ func openVia(files fileHost, path string, opts OpenOptions) (*engine, error) {
 	if env == nil {
 		env = NewEnvironment()
 	}
-	db, err := loadEnginePaged(p, cacheLeaves(cacheBytes, p.pageSize), env)
+	db, err := loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
 	if err != nil {
 		_ = store.close()
 		return nil, err
 	}
 	db.path = path
-	db.spill = osSpillHost{dir: os.TempDir()}
+	// An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
+	if !db.encrypted() {
+		db.spill = osSpillHost{dir: os.TempDir()}
+	}
 	db.readOnly = opts.ReadOnly
 	if opts.WorkMem != 0 {
 		db.session.workMem = opts.WorkMem
@@ -224,8 +253,8 @@ func openVia(files fileHost, path string, opts OpenOptions) (*engine, error) {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by Create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persist).
-func (db *engine) writeFullImage(files fileHost, noSync bool) error {
-	bytes, err := db.committed.ToImage(db.pageSize, db.committed.txid)
+func (db *engine) writeFullImage(files fileHost, noSync bool, codec *pageCodec) error {
+	bytes, err := db.committed.toImageSealed(db.pageSize, db.committed.txid, codec)
 	if err != nil {
 		return err
 	}
@@ -234,7 +263,7 @@ func (db *engine) writeFullImage(files fileHost, noSync bool) error {
 	}
 	db.pageCount = uint32(len(bytes) / int(db.pageSize))
 	// create writes an empty database: every body page is live, and every one is a catalog page.
-	body := db.pageCount - rootPage
+	body := db.pageCount - capOf(db.pageSize, codec != nil).firstBody()
 	db.live = liveCount{live: body, catalog: body}
 	return nil
 }
@@ -256,7 +285,7 @@ func (db *engine) persist(snap *snapshot) error {
 	}
 	// The live-page count this commit publishes (spec/design/memory.md §8.7): db.committed is still the
 	// previous snapshot here.
-	live, err := db.live.after(write, db.committed, db.paging, db.pageSize)
+	live, err := db.live.after(write, db.committed, db.paging)
 	if err != nil {
 		return err
 	}
@@ -363,8 +392,11 @@ func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, t
 		return nil, err
 	}
 	tmp := real + ".jedtmp"
+	// An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
+	// (spec/design/encryption.md §5).
+	codec := old.codec()
 	if err := files.writeFile(tmp, real, noSync, func(writeAt func(off int64, p []byte) error) error {
-		_, err := snap.writeImage(pageSize, txid, func(index uint32, page []byte) error {
+		_, err := snap.writeImage(pageSize, txid, codec, func(index uint32, page []byte) error {
 			return writeAt(int64(index)*int64(pageSize), page)
 		})
 		return err
@@ -402,7 +434,13 @@ func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, t
 		_ = store.close()
 		return nil, err
 	}
+	p.codec = codec
 	return newSharedPaging(p, capacity), nil
+}
+
+// encrypted reports whether this database's file is encrypted (spec/fileformat/encrypted.md).
+func (db *engine) encrypted() bool {
+	return db.paging != nil && db.paging.codec() != nil
 }
 
 func ioError(err error) error {

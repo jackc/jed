@@ -699,28 +699,32 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   the storage-byte gauge, and resetting an individual custom session variable. The docs describe
   their current availability; displayed TypeScript examples execute in the Node unit suite.
   Encryption protocol/provider selection is separate; no SQL replay or whole-file preload.
-- **Encryption at rest (file-level).** Whole-file or per-page encryption is a door to keep
-  open, **designed in [encryption.md](spec/design/encryption.md)**: a page codec in the core
-  above the block seam, standardized AEAD and envelope encryption (cheap credential rewrap,
-  rotation, and encrypting or decrypting an existing file, as compaction under a new key). Every
-  page key derives from a fresh random salt, so no nonce is allocated across commits; the
-  wrapped key lives in a dedicated double-buffered key block, never in the meta slots.
-  Vetted crypto uses safe APIs with explicitly reviewed accelerated backends (§14). Page-sized
-  AEAD, real-browser WebCrypto/JS/Rust-WASM and writer-key lifecycle probes are recorded in
-  `bench/aead/`. Suite direction (encryption.md §3): AES-256-GCM with one key derived per page
-  from a fresh random salt (chosen after Go/Rust measurement), **XAES-256-GCM** (C2SP) as the
-  derivation, pending a security review and fault fixtures; XChaCha is dropped because no
-  platform standard library ships it, and AES-GCM-SIV is declined for platform support despite
-  its graceful nonce-reuse behavior. The TS write side already awaits an async page codec. No
-  dependency is selected and no implementation is scheduled. Decided (§4–§6): a reserved-bytes
-  region that is never a user setting, all page types authenticated, every pointer binding the
-  full AEAD tag of its child (so the encrypted file is its own format variant), manifest
-  identities over ciphertext bytes, ephemeral-key scratch files, a dedicated CSPRNG for key
-  material, Argon2id as the built-in passphrase KDF behind a KDF id (raw wrapping key
-  first-class), live VM clones excluded, every process of an encrypted database holding the DEK,
-  and edge cases failing closed rather than resuming (§1). Open: XAES lifetime bounds and the
-  per-core library route, the security review, and the format specification (§9). The only present storage requirement
-  is non-foreclosure — already satisfied.
+- **Encryption at rest (file-level).** ✅ **The core variant landed** (2026-10-20) in the Rust, Go
+  and TS (Node) cores — designed in [encryption.md](spec/design/encryption.md), bytes in
+  [encrypted.md](spec/fileformat/encrypted.md): XAES-256-GCM pages sealed from page 4 behind a key
+  block at pages 2–3 (envelope encryption: an Argon2id passphrase or a host key wraps a random data
+  key), every pointer bound to its page's tag, meta slots authenticated whole over their manifest
+  chain, credentials on `create`/`open`/`attach` with `28P01`–`28P03`, compaction resealing under the
+  same key; pinned by five `encrypted_*` goldens and `encryption_vectors.toml`, authored by the Ruby
+  reference. Remaining, each failing closed until built (encrypted.md §10):
+  - [ ] **Credential change** — the two-barrier key-block rewrap, the stabilization barrier, repair
+    of a differing pair on open (encryption.md §5).
+  - [ ] **DEK rotation and conversion** — compaction under a new data key or into/out of the
+    encrypted variant, rebuilding the trees (§5).
+  - [ ] **Scratch encryption** — `scratch_encryption = auto | on`, per-file random keys and the
+    write counters (§6); until then an encrypted handle has no spill target.
+  - [ ] **Page service and replication** — `read_key_block`, client promotion with the held DEK,
+    `28P04`, the owner's meta-tag check of client commits, SSH credentials in `hello`, the
+    key-block replication item (§8).
+  - [ ] **Encrypted backups** (page-service.md §9 under the key-block mutex).
+  - [ ] **Browser/OPFS** — an asynchronous WebCrypto provider through the TS async page path.
+  - [ ] **CLI and `jed-migrate`** — a credential input (a key file or a passphrase prompt, never an
+    argument or environment variable); until then the CLI opens an encrypted file with `28P02`.
+  - [ ] **Conformance** — the corpus's encrypted harness mode and cost family, and the simulator's
+    fault fixtures (crash at every key-block boundary, replay at every pointer kind, restore then
+    divergent writes — §7).
+  - [ ] **The security review** and XAES lifetime bounds (§9); integrated performance, including
+    Argon2id in pure JS.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
   order, as a tee at the block seam (below the encryption codec → keyless backup replicas). No

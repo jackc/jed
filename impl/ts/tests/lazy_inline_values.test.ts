@@ -26,7 +26,9 @@ import {
   type OverflowPageOut,
   resolveUnfetched,
   resolveUnfetchedSelf,
+  Sealer,
 } from "../src/format.ts";
+import { plainCap } from "../src/cap.ts";
 import { colAt, keyAt, nodeLen, rowAt } from "../src/pmap.ts";
 import { createDatabase, openDatabase } from "../src/tooling.ts";
 import {
@@ -311,7 +313,6 @@ test("a faulted leaf shares one page block across its deferred values", () => {
     { kind: "array", elem: i32 }, // i32[]
   ];
   const ps = 8192; // large page → every value stays inline-plain (no spill)
-  const capacity = ps - 16; // PAGE_HEADER
 
   const rows: Value[][] = [];
   for (let i = 0; i < 3; i++) {
@@ -333,7 +334,7 @@ test("a faulted leaf shares one page block across its deferred values", () => {
     new DataView(key.buffer).setUint32(0, i, false);
     return key;
   });
-  const payload = encodeLeafPax(colTypes, keys, rows, capacity, take, ovf);
+  const payload = encodeLeafPax(colTypes, keys, rows, Sealer.plain(ps), take, ovf);
   assert.equal(ovf.length, 0, "values must stay inline (no overflow) for the form-(a) case");
   const block = makePage(ps, 2 /* PAGE_LEAF */, rows.length, 0, payload);
 
@@ -347,7 +348,7 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   assert.equal(nodeLen(node), keys.length);
   keys.forEach((key, i) => {
     assert.deepEqual(keyAt(node, i), key);
-    assert.equal(node.packed!.weight(i), recordSize(colTypes, key, rows[i]!, capacity));
+    assert.equal(node.packed!.weight(i), recordSize(colTypes, key, rows[i]!, plainCap(ps)));
   });
   assert.equal(
     node.vals.length,
@@ -403,7 +404,14 @@ test("a Packed leaf validates page-backed directories at fault", () => {
   });
   let takeSeq = 100;
   const overflow: OverflowPageOut[] = [];
-  const payload = encodeLeafPax(colTypes, keys, rows, 8192 - 16, () => ++takeSeq, overflow);
+  const payload = encodeLeafPax(
+    colTypes,
+    keys,
+    rows,
+    Sealer.plain(8192),
+    () => ++takeSeq,
+    overflow,
+  );
   assert.equal(overflow.length, 0);
 
   const assertFaultCorrupt = (corrupt: Uint8Array): void => {
@@ -439,7 +447,6 @@ test("a Packed leaf reconstructs only the touched columns", () => {
   const sc = (s: "i32" | "text" | "i64"): ColType => ({ kind: "scalar", scalar: s });
   const colTypes: ColType[] = [sc("i32"), sc("text"), sc("i64")];
   const ps = 8192;
-  const capacity = ps - 16;
   const rows: Value[][] = [];
   for (let i = 0; i < 4; i++) {
     rows.push([intValue(BigInt(i)), textValue(`row-${i}`), intValue(BigInt(i * 1000))]);
@@ -452,7 +459,7 @@ test("a Packed leaf reconstructs only the touched columns", () => {
     new DataView(key.buffer).setUint32(0, i, false);
     return key;
   });
-  const payload = encodeLeafPax(colTypes, keys, rows, capacity, take, ovf);
+  const payload = encodeLeafPax(colTypes, keys, rows, Sealer.plain(ps), take, ovf);
   assert.equal(ovf.length, 0);
   const block = makePage(ps, PAGE_LEAF, rows.length, 0, payload);
   const node = decodeLeafNode(block, 2, colTypes, null);

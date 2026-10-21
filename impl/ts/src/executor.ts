@@ -272,7 +272,6 @@ import {
   crc32Ieee,
   type LiveCount,
   newTempStorage,
-  pagePayload,
   recordCompressUnits,
   resolveUnfetchedSelf,
   resolveUnfetchedSelfSteps,
@@ -7893,7 +7892,7 @@ export class Engine {
       const aps = this.attachPageSize(attachName);
       ws.putTableResolved(table, colTypes, aps);
       for (const ix of table.indexes) {
-        ws.putIndexStore(ix.name, new TableStore(pagePayload(aps), []));
+        ws.putIndexStore(ix.name, new TableStore(ws.capFor(aps), []));
       }
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
@@ -7929,7 +7928,7 @@ export class Engine {
       ts.storePaging = this.tempDomainPaging();
       ts.putTableResolved(table, colTypes, this.pageSize);
       for (const ix of table.indexes) {
-        ts.putIndexStore(ix.name, new TableStore(pagePayload(this.pageSize), []));
+        ts.putIndexStore(ix.name, new TableStore(ts.capFor(this.pageSize), []));
       }
       // Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
       // (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
@@ -7943,7 +7942,8 @@ export class Engine {
     this.putTable(table);
     // The table is brand new (no rows), so each backing index store starts empty.
     for (const ix of table.indexes) {
-      this.working().putIndexStore(ix.name, new TableStore(pagePayload(this.pageSize), []));
+      const working = this.working();
+      working.putIndexStore(ix.name, new TableStore(working.capFor(this.pageSize), []));
     }
     // Stage each serial column's OWNED sequence now that the table validated
     // (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
@@ -9773,6 +9773,7 @@ export class Engine {
     for (const seq of pendingSerials) scopeWriteSnap().putSequence(seq);
     if (tableRewriteNeeded) {
       const store = this.lkpStoreScoped(at.db, original.name);
+      const rewriteCap = store.capacities();
       const scan = yield* store.scanWithUnitsSteps(original.columns.map(() => true));
       rewriteNextRowid = store.nextSyntheticRowid();
       if (pkRekeyed && table.pk.length === 0) rewriteNextRowid = 0n;
@@ -9832,7 +9833,7 @@ export class Engine {
           seenKeys.add(hash);
         }
         compressUnits += BigInt(
-          recordCompressUnits(rewriteColTypes!, key, row, pagePayload(alterPageSize)),
+          recordCompressUnits(rewriteColTypes!, key, row, rewriteCap),
         );
         rewriteRows.push({ key, row });
       }

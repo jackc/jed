@@ -400,28 +400,37 @@ export function serializeGistTree(
   alloc: () => number,
 ): { pages: GistPage[]; root: number } {
   const pages: GistPage[] = [];
-  const root = serializeGistTreeTo(tree, ops, alloc, (p) => pages.push(p));
-  return { pages, root };
+  const root = serializeGistTreeTo(tree, ops, alloc, (p) => {
+    pages.push(p);
+    return NO_GIST_TAG;
+  });
+  return { pages, root: root.page };
 }
+
+const NO_GIST_TAG = new Uint8Array(16);
 
 // serializeGistTreeTo is serializeGistTree handing each page to emit as soon as it is encoded (the same
 // pages, in the same order), so a caller that writes pages out — host compaction's image stream — never
-// holds the index's pages at once. Returns the root page.
+// holds the index's pages at once. emit returns the tag of the page it stored, which an interior entry
+// carries after its child page when tagLen is 16 (an encrypted file — spec/fileformat/encrypted.md §2).
+// Returns the root page and its tag.
 export function serializeGistTreeTo(
   tree: GistTree,
   ops: GistOpclass[],
   alloc: () => number,
-  emit: (page: GistPage) => void,
-): number {
-  return serializeNode(tree.root, ops, emit, alloc);
+  emit: (page: GistPage) => Uint8Array,
+  tagLen = 0,
+): { page: number; tag: Uint8Array } {
+  return serializeNode(tree.root, ops, emit, alloc, tagLen);
 }
 
 function serializeNode(
   node: GistNode,
   ops: GistOpclass[],
-  emit: (page: GistPage) => void,
+  emit: (page: GistPage) => Uint8Array,
   alloc: () => number,
-): number {
+  tagLen: number,
+): { page: number; tag: Uint8Array } {
   if (node.leaf) {
     const parts: Uint8Array[] = [];
     for (const e of node.entries) {
@@ -429,29 +438,30 @@ function serializeNode(
       parts.push(be16(b.length), b, be16(e.skey.length), e.skey);
     }
     const pageNo = alloc();
-    emit({
+    const tag = emit({
       pageNo,
       pageType: PAGE_GIST_LEAF,
       itemCount: node.entries.length,
       payload: joinBytes(parts),
     });
-    return pageNo;
+    return { page: pageNo, tag };
   }
   // Children first (post-order), in the node's canonical entry order.
-  const childPages = node.children.map((c) => serializeNode(c.node, ops, emit, alloc));
+  const childPages = node.children.map((c) => serializeNode(c.node, ops, emit, alloc, tagLen));
   const parts: Uint8Array[] = [];
   for (let i = 0; i < node.children.length; i++) {
     const b = encodeBoundTuple(ops, node.children[i]!.bound);
-    parts.push(be16(b.length), b, be32(childPages[i]!));
+    parts.push(be16(b.length), b, be32(childPages[i]!.page));
+    if (tagLen !== 0) parts.push(childPages[i]!.tag.subarray(0, tagLen));
   }
   const pageNo = alloc();
-  emit({
+  const tag = emit({
     pageNo,
     pageType: PAGE_GIST_INTERIOR,
     itemCount: node.children.length,
     payload: joinBytes(parts),
   });
-  return pageNo;
+  return { page: pageNo, tag };
 }
 
 // ---- the leaf-key codec + canonical-order build (the executor/serializer API) -----------------
@@ -536,25 +546,31 @@ export function readGistLeafKeys(
   seen: Set<number> = new Set<number>(),
   depth = 1,
 ): void {
-  runSync(readGistLeafKeysSteps((p) => ioSteps(() => read(p)), pageNo, out, seen, depth));
+  runSync(
+    readGistLeafKeysSteps((p) => ioSteps(() => read(p)), pageNo, out, seen, depth, NO_GIST_TAG, 0),
+  );
 }
 
 export type GistPageRead = { pageType: number; itemCount: number; payload: Uint8Array };
 
 // readGistLeafKeysSteps is readGistLeafKeys over an awaitable page read (an asynchronous open,
 // ts-runtime.md §11.1): each page is awaited before its children are followed.
+// In an encrypted file (tagLen 16) every interior child pointer carries the child page's tag, which
+// read receives with the page number (spec/fileformat/encrypted.md §2).
 export function* readGistLeafKeysSteps(
-  read: (pageNo: number) => Steps<GistPageRead>,
+  read: (pageNo: number, tag: Uint8Array) => Steps<GistPageRead>,
   pageNo: number,
   out: Uint8Array[],
   seen: Set<number> = new Set<number>(),
   depth = 1,
+  tag: Uint8Array = NO_GIST_TAG,
+  tagLen = 0,
 ): Steps<void> {
   if (seen.has(pageNo)) throw engineError("data_corrupted", "GiST page reached twice");
   seen.add(pageNo);
   if (depth > MAX_TREE_DEPTH)
     throw engineError("data_corrupted", "GiST tree deeper than any valid tree");
-  const { pageType, itemCount, payload } = yield* read(pageNo);
+  const { pageType, itemCount, payload } = yield* read(pageNo, tag);
   const cur = { pos: 0 };
   if (pageType === PAGE_GIST_LEAF) {
     for (let i = 0; i < itemCount; i++) {
@@ -569,15 +585,20 @@ export function* readGistLeafKeysSteps(
   if (pageType === PAGE_GIST_INTERIOR) {
     // Each entry is at least a u16 bound length and a u32 child pointer; checking first keeps a
     // corrupt count from sizing the array.
-    if (itemCount * 6 > payload.length)
+    if (itemCount * (6 + tagLen) > payload.length)
       throw engineError("data_corrupted", "GiST interior item count overruns page");
-    const children: number[] = [];
+    const children: { page: number; tag: Uint8Array }[] = [];
     for (let i = 0; i < itemCount; i++) {
       const blen = readU16(payload, cur);
       takeBytes(payload, cur, blen); // skip the union bound
-      children.push(readU32(payload, cur));
+      const page = readU32(payload, cur);
+      const ctag = tagLen === 0 ? NO_GIST_TAG : takeBytes(payload, cur, tagLen).slice();
+      if (page === 0 && ctag.some((b) => b !== 0))
+        throw engineError("data_corrupted", "a pointer to no page carries a tag");
+      children.push({ page, tag: ctag });
     }
-    for (const cp of children) yield* readGistLeafKeysSteps(read, cp, out, seen, depth + 1);
+    for (const c of children)
+      yield* readGistLeafKeysSteps(read, c.page, out, seen, depth + 1, c.tag, tagLen);
     return;
   }
   throw engineError("data_corrupted", "expected a GiST node page");

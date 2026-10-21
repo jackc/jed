@@ -69,6 +69,7 @@ fn open(device: &Arc<Mutex<Device>>) -> Engine {
         Pager::from_store(Box::new(Store(device.clone()))).unwrap(),
         1024,
         &crate::Environment::default(),
+        None,
     )
     .unwrap();
     db.path = Some("fault-device".into());
@@ -193,7 +194,7 @@ fn host_read_errors_do_not_silently_select_an_older_commit() {
     d.fail_read = Some(first as u32);
     drop(d);
     let pager = Pager::from_store(Box::new(Store(device))).unwrap();
-    let result = Engine::open_paged(pager, 1024, &crate::Environment::default());
+    let result = Engine::open_paged(pager, 1024, &crate::Environment::default(), None);
     assert!(matches!(result,Err(e) if e.code()=="58030"));
 }
 

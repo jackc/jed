@@ -35,11 +35,11 @@
 //! format.md "Delete").
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::catalog::ColType;
 use crate::error::Result;
-use crate::format::{LeafShape, PackedLeaf, leaf_overhead};
+use crate::format::{Cap, LeafShape, PackedLeaf, PageRef, leaf_overhead};
 use crate::storage::Row;
 use crate::value::Value;
 
@@ -54,7 +54,9 @@ use crate::value::Value;
 #[derive(Clone)]
 pub(crate) enum Child {
     Resident(Arc<Node>),
-    OnDisk(u32),
+    /// A clean leaf on disk: its page and the tag its parent binds (spec/fileformat/encrypted.md §2;
+    /// zero in a plaintext file).
+    OnDisk(PageRef),
 }
 
 impl Child {
@@ -65,7 +67,9 @@ impl Child {
     fn resident(&self) -> &Arc<Node> {
         match self {
             Child::Resident(n) => n,
-            Child::OnDisk(p) => unreachable!("OnDisk child page {p} accessed without faulting"),
+            Child::OnDisk(p) => {
+                unreachable!("OnDisk child page {} accessed without faulting", p.page)
+            }
         }
     }
 }
@@ -75,7 +79,7 @@ impl Child {
 /// without depending on the storage/format layers (they implement it); a fully-resident in-memory
 /// database passes `None` and never faults.
 pub(crate) trait LeafSource {
-    fn load_leaf(&self, page: u32) -> Result<Arc<Node>>;
+    fn load_leaf(&self, page: PageRef) -> Result<Arc<Node>>;
     /// Whether [`prefetch`](Self::prefetch) does anything: only a store that fetches several pages
     /// in one request (a page client, spec/design/page-service.md §5.3) benefits from read-ahead.
     fn prefetches(&self) -> bool {
@@ -84,7 +88,7 @@ pub(crate) trait LeafSource {
     /// A hint that the scan will fault these leaf pages next, in this order: a source that batches
     /// reads brings the ones not already resident in with one request. Errors are left for the
     /// fault that follows. Invisible to cost, which counts logical page reads (cost.md).
-    fn prefetch(&self, _pages: &[u32]) {}
+    fn prefetch(&self, _pages: &[PageRef]) {}
 }
 
 /// The most leaves one read-ahead hint names.
@@ -118,7 +122,7 @@ impl ReadAhead {
             return usize::MAX;
         };
         let taken: Vec<usize> = positions.take(self.window).collect();
-        let pages: Vec<u32> = taken
+        let pages: Vec<PageRef> = taken
             .iter()
             .filter_map(|&i| match &node.children[i] {
                 Child::OnDisk(page) => Some(*page),
@@ -146,7 +150,10 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
             Some(s) => s.load_leaf(*p),
             // An `OnDisk` child only exists in a file-backed store, which always supplies a source —
             // an internal wiring invariant, not a data or user condition, so this is unreachable.
-            None => unreachable!("demand-paged leaf {p} reached with no buffer-pool source"),
+            None => unreachable!(
+                "demand-paged leaf {} reached with no buffer-pool source",
+                p.page
+            ),
         },
     }
 }
@@ -183,6 +190,17 @@ pub(crate) struct Node {
     /// page 0 is a meta slot, never a node, so it doubles as the dirty sentinel. A clean node lets an
     /// incremental commit skip its whole (unchanged) subtree.
     pub(crate) page: AtomicU32,
+    /// The tag of the page at `page` (spec/fileformat/encrypted.md §2), stored as two words; zero in
+    /// a plaintext file and while the node is dirty. Set with the page id by the commit that seals
+    /// the node, so a parent written later binds it.
+    tag: [AtomicU64; 2],
+}
+
+fn tag_words(tag: &crate::crypto::Tag) -> [AtomicU64; 2] {
+    [
+        AtomicU64::new(u64::from_be_bytes(tag[..8].try_into().unwrap())),
+        AtomicU64::new(u64::from_be_bytes(tag[8..].try_into().unwrap())),
+    ]
 }
 
 impl Node {
@@ -195,6 +213,7 @@ impl Node {
             children: Vec::new(),
             packed: None,
             page: AtomicU32::new(0),
+            tag: tag_words(&crate::crypto::NO_TAG),
         })
     }
 
@@ -214,6 +233,7 @@ impl Node {
             children,
             packed: None,
             page: AtomicU32::new(0),
+            tag: tag_words(&crate::crypto::NO_TAG),
         }
     }
 
@@ -224,7 +244,7 @@ impl Node {
         vals: Vec<Row>,
         weights: Vec<u32>,
         children: Vec<Child>,
-        page: u32,
+        page: PageRef,
     ) -> Arc<Node> {
         Arc::new(Node {
             keys,
@@ -232,7 +252,8 @@ impl Node {
             weights,
             children,
             packed: None,
-            page: AtomicU32::new(page),
+            page: AtomicU32::new(page.page),
+            tag: tag_words(&page.tag),
         })
     }
 
@@ -242,7 +263,7 @@ impl Node {
     pub(crate) fn loaded_interior(
         keys: Vec<Vec<u8>>,
         children: Vec<Child>,
-        page: u32,
+        page: PageRef,
     ) -> Arc<Node> {
         debug_assert_eq!(children.len(), keys.len() + 1, "interior child count");
         Arc::new(Node {
@@ -251,7 +272,8 @@ impl Node {
             weights: Vec::new(),
             children,
             packed: None,
-            page: AtomicU32::new(page),
+            page: AtomicU32::new(page.page),
+            tag: tag_words(&page.tag),
         })
     }
 
@@ -259,15 +281,41 @@ impl Node {
     /// (format.rs `decode_leaf_node`, packed-leaf.md §5). Keys, weights, and rows remain in the
     /// retained page block and are accessed through the accessor seam. Returns the bare `Node` —
     /// the buffer pool wraps it in an `Arc` (paging.rs). A leaf has no children.
-    pub(crate) fn leaf_loaded_packed(packed: PackedLeaf, page: u32) -> Node {
+    pub(crate) fn leaf_loaded_packed(packed: PackedLeaf, page: PageRef) -> Node {
         Node {
             keys: Vec::new(),
             vals: Vec::new(),
             weights: Vec::new(),
             children: Vec::new(),
             packed: Some(packed),
-            page: AtomicU32::new(page),
+            page: AtomicU32::new(page.page),
+            tag: tag_words(&page.tag),
         }
+    }
+
+    /// This node's page and tag ([`PageRef::NONE`] while dirty).
+    pub(crate) fn page_ref(&self) -> PageRef {
+        let mut tag = crate::crypto::NO_TAG;
+        tag[..8].copy_from_slice(&self.tag[0].load(Ordering::Acquire).to_be_bytes());
+        tag[8..].copy_from_slice(&self.tag[1].load(Ordering::Acquire).to_be_bytes());
+        PageRef {
+            page: self.page.load(Ordering::Acquire),
+            tag,
+        }
+    }
+
+    /// Record the page a commit wrote this node to (the tag first, so a reader that sees the page
+    /// sees its tag), or clear it ([`PageRef::NONE`]) for a discarded plan.
+    pub(crate) fn set_page_ref(&self, page: PageRef) {
+        self.tag[0].store(
+            u64::from_be_bytes(page.tag[..8].try_into().unwrap()),
+            Ordering::Release,
+        );
+        self.tag[1].store(
+            u64::from_be_bytes(page.tag[8..].try_into().unwrap()),
+            Ordering::Release,
+        );
+        self.page.store(page.page, Ordering::Release);
     }
 
     pub(crate) fn is_leaf(&self) -> bool {
@@ -303,13 +351,14 @@ impl Node {
     }
 
     /// This node's serialized payload size (format.md): a leaf is `Σ weights +
-    /// leaf_overhead(N, shape)`; an interior node is `8·N + 4 + Σ sep_len` (child pointers +
-    /// separator directory + key blob — record-free, v24).
-    fn payload(&self, shape: LeafShape) -> usize {
+    /// leaf_overhead(N, shape)`; an interior node is `ptr·(N+1) + 4·N + Σ sep_len` (child pointers +
+    /// separator directory + key blob — record-free, v24; `ptr` is 4, or 20 with an encrypted file's
+    /// tags — encrypted.md §2).
+    fn payload(&self, cap: Cap, shape: LeafShape) -> usize {
         if self.is_leaf() {
             self.total_weight() + leaf_overhead(self.len(), shape)
         } else {
-            8 * self.keys.len() + 4 + self.keys.iter().map(Vec::len).sum::<usize>()
+            interior_payload(cap, &self.keys)
         }
     }
 
@@ -396,7 +445,7 @@ impl Node {
         &self,
         i: usize,
         col_types: &[ColType],
-        cap: usize,
+        cap: Cap,
         mask: &[bool],
     ) -> crate::format::ScanUnits {
         match &self.packed {
@@ -495,7 +544,7 @@ fn split_point(
     m_lo: usize,
     m_hi: usize,
     payload: usize,
-    cap: usize,
+    cap_bytes: usize,
     right_edge: bool,
     leftpayload: impl Fn(usize) -> usize,
     rightpayload: impl Fn(usize) -> usize,
@@ -505,7 +554,7 @@ fn split_point(
     // binary-search cleanly; the ranges are tiny (page fan-out), so a linear scan is clearer.
     let mut m_max = None;
     for m in m_lo..=m_hi {
-        if leftpayload(m) <= cap {
+        if leftpayload(m) <= cap_bytes {
             m_max = Some(m);
         } else {
             break;
@@ -514,7 +563,7 @@ fn split_point(
     let m_max = m_max?;
     let mut m_min = None;
     for m in (m_lo..=m_hi).rev() {
-        if rightpayload(m) <= cap {
+        if rightpayload(m) <= cap_bytes {
             m_min = Some(m);
         } else {
             break;
@@ -547,14 +596,14 @@ fn build_leaf(
     keys: Vec<Vec<u8>>,
     vals: Vec<Row>,
     weights: Vec<u32>,
-    cap: usize,
+    cap: Cap,
     shape: LeafShape,
     edited: Option<usize>,
 ) -> Ins {
     let n = keys.len();
     let payload: usize =
         weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
-    if payload <= cap || n < 2 {
+    if payload <= cap.c || n < 2 {
         return Ins::Whole(Node::new_leaf(keys, vals, weights));
     }
     let prefix: Vec<usize> = std::iter::once(0)
@@ -571,7 +620,7 @@ fn build_leaf(
         1,
         n - 1,
         payload,
-        cap,
+        cap.c,
         right_edge,
         leftpayload,
         rightpayload,
@@ -603,15 +652,20 @@ fn build_leaf(
 /// legal `N = 0` right interior (the degenerate fan-out contract). Returns `None` when the node
 /// overflows and no valid split point exists — the caller (only the interior **merge** path can
 /// hit it) abandons the merge.
+/// An interior node's payload for these separators (format.md "Interior node"; encrypted.md §2).
+fn interior_payload(cap: Cap, keys: &[Vec<u8>]) -> usize {
+    cap.ptr() * (keys.len() + 1) + 4 * keys.len() + keys.iter().map(Vec::len).sum::<usize>()
+}
+
 fn build_interior(
     keys: Vec<Vec<u8>>,
     children: Vec<Child>,
-    cap: usize,
+    cap: Cap,
     edited: Option<usize>,
 ) -> Option<Ins> {
     let n = keys.len();
-    let payload = 8 * n + 4 + keys.iter().map(Vec::len).sum::<usize>();
-    if payload <= cap || n < 2 {
+    let payload = interior_payload(cap, &keys);
+    if payload <= cap.c || n < 2 {
         return Some(Ins::Whole(Node::new_interior(keys, children)));
     }
     let m = if n == 2 {
@@ -626,14 +680,15 @@ fn build_interior(
             }))
             .collect();
         let total = prefix[n];
-        let leftpayload = |m: usize| 8 * m + 4 + prefix[m];
-        let rightpayload = |m: usize| 8 * (n - 1 - m) + 4 + (total - prefix[m + 1]);
+        let ptr = cap.ptr();
+        let leftpayload = |m: usize| (ptr + 4) * m + ptr + prefix[m];
+        let rightpayload = |m: usize| (ptr + 4) * (n - 1 - m) + ptr + (total - prefix[m + 1]);
         let right_edge = edited == Some(n - 1);
         split_point(
             1,
             n - 2,
             payload,
-            cap,
+            cap.c,
             right_edge,
             leftpayload,
             rightpayload,
@@ -821,7 +876,7 @@ impl PMap {
         key: Vec<u8>,
         val: Row,
         weight: u32,
-        cap: usize,
+        cap: Cap,
         shape: LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
@@ -855,7 +910,7 @@ impl PMap {
     pub(crate) fn remove(
         &mut self,
         key: &[u8],
-        cap: usize,
+        cap: Cap,
         shape: LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
@@ -909,8 +964,8 @@ impl PMap {
                     Child::OnDisk(p) => Child::OnDisk(*p),
                     Child::Resident(n) => {
                         if n.is_leaf() {
-                            let page = n.page.load(std::sync::atomic::Ordering::Acquire);
-                            if page != 0 {
+                            let page = n.page_ref();
+                            if page.page != 0 {
                                 changed = true;
                                 Child::OnDisk(page)
                             } else {
@@ -935,8 +990,11 @@ impl PMap {
             // The rebuilt interior keeps its keys AND its page id — its serialized bytes are
             // unchanged (children reference the same pages), so it must stay clean or the next
             // incremental commit would rewrite the whole spine every time.
-            let page = node.page.load(std::sync::atomic::Ordering::Acquire);
-            Some(Node::loaded_interior(node.keys.clone(), children, page))
+            Some(Node::loaded_interior(
+                node.keys.clone(),
+                children,
+                node.page_ref(),
+            ))
         }
         if let Some(root) = &self.root {
             if let Some(rebuilt) = demote(root) {
@@ -1306,7 +1364,7 @@ fn node_insert(
     weight: u32,
     old: &mut Option<Row>,
     src: Option<&dyn LeafSource>,
-    cap: usize,
+    cap: Cap,
     shape: LeafShape,
 ) -> Result<Ins> {
     if node.is_leaf() {
@@ -1332,7 +1390,7 @@ fn node_insert(
                 }
             };
             let payload = node.total_weight() + leaf_overhead(node.len(), shape);
-            if payload <= cap || node.len() < 2 {
+            if payload <= cap.c || node.len() < 2 {
                 return Ok(Ins::Kept);
             }
             // The same builder chooses the exact split point and separator bytes. Move the edited
@@ -1370,7 +1428,10 @@ fn node_insert(
                 let mut c = match src {
                     Some(s) => s.load_leaf(*page)?,
                     None => {
-                        unreachable!("demand-paged leaf {page} reached with no buffer-pool source")
+                        unreachable!(
+                            "demand-paged leaf {} reached with no buffer-pool source",
+                            page.page
+                        )
                     }
                 };
                 match node_insert(&mut c, key, val, weight, old, src, cap, shape)? {
@@ -1390,9 +1451,8 @@ fn node_insert(
                 node.keys.insert(i, sep);
                 node.children[i] = Child::Resident(left);
                 node.children.insert(i + 1, Child::Resident(right));
-                let payload =
-                    8 * node.keys.len() + 4 + node.keys.iter().map(Vec::len).sum::<usize>();
-                if payload <= cap || node.keys.len() < 2 {
+                let payload = interior_payload(cap, &node.keys);
+                if payload <= cap.c || node.keys.len() < 2 {
                     Ok(Ins::Kept)
                 } else {
                     let keys = std::mem::take(&mut node.keys);
@@ -1433,8 +1493,8 @@ fn node_insert(
 
 /// A non-root node is **underfull** when its payload is below half a page (`cap/2`), the threshold
 /// at which delete rebalances it (format.md "Delete"). The root is exempt.
-fn underfull(node: &Node, cap: usize, shape: LeafShape) -> bool {
-    node.payload(shape) < cap / 2
+fn underfull(node: &Node, cap: Cap, shape: LeafShape) -> bool {
+    node.payload(cap, shape) < cap.c / 2
 }
 
 /// Recursive delete. Descends to the holding **leaf** (a separator equal to the key routes right and
@@ -1452,7 +1512,7 @@ fn node_remove(
     node: &mut Arc<Node>,
     key: &[u8],
     src: Option<&dyn LeafSource>,
-    cap: usize,
+    cap: Cap,
     shape: LeafShape,
 ) -> Result<Option<Row>> {
     if node.is_leaf() {
@@ -1486,7 +1546,10 @@ fn node_remove(
                 let mut c = match src {
                     Some(s) => s.load_leaf(*page)?,
                     None => {
-                        unreachable!("demand-paged leaf {page} reached with no buffer-pool source")
+                        unreachable!(
+                            "demand-paged leaf {} reached with no buffer-pool source",
+                            page.page
+                        )
                     }
                 };
                 let removed = node_remove(&mut c, key, src, cap, shape)?;
@@ -1524,7 +1587,7 @@ fn rebalance_child(
     node: &mut Node,
     i: usize,
     src: Option<&dyn LeafSource>,
-    cap: usize,
+    cap: Cap,
     shape: LeafShape,
 ) -> Result<()> {
     // `children[i]` was just rebuilt resident by `node_remove`, so inspecting it faults nothing.
@@ -1563,7 +1626,9 @@ fn leaf_parts(slot: &mut Child, loaded: Option<&Arc<Node>>) -> Result<LeafParts>
     let n = match (slot, loaded) {
         (Child::Resident(n), _) => n,
         (Child::OnDisk(_), Some(n)) => n,
-        (Child::OnDisk(p), None) => unreachable!("OnDisk merge operand {p} was not faulted"),
+        (Child::OnDisk(p), None) => {
+            unreachable!("OnDisk merge operand {} was not faulted", p.page)
+        }
     };
     Ok(LeafParts::Copy(n.decoded_parts()?))
 }
@@ -1603,7 +1668,7 @@ fn merge_at(
     node: &mut Node,
     j: usize,
     src: Option<&dyn LeafSource>,
-    cap: usize,
+    cap: Cap,
     shape: LeafShape,
 ) -> Result<()> {
     // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
@@ -1613,7 +1678,10 @@ fn merge_at(
             Child::Resident(_) => Ok(None),
             Child::OnDisk(p) => match src {
                 Some(s) => Ok(Some(s.load_leaf(*p)?)),
-                None => unreachable!("demand-paged leaf {p} reached with no buffer-pool source"),
+                None => unreachable!(
+                    "demand-paged leaf {} reached with no buffer-pool source",
+                    p.page
+                ),
             },
         }
     };
@@ -1822,7 +1890,7 @@ mod tests {
 
     // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
     // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256).
-    const CAP: usize = 240;
+    const CAP: Cap = Cap { c: 240, tag: 0 };
     /// `row` has one fixed-width value column — the v24 leaf overhead scales with the class mix
     /// (format.md "Leaf node").
     const SHAPE: LeafShape = LeafShape { fixed: 1, var: 0 };
@@ -1864,7 +1932,7 @@ mod tests {
         fn walk(
             node: &Node,
             is_root: bool,
-            cap: usize,
+            cap: Cap,
             lo: Option<&[u8]>,
             hi: Option<&[u8]>,
         ) -> usize {
@@ -1904,9 +1972,10 @@ mod tests {
                 }
             }
             assert!(
-                node.payload(SHAPE) <= cap,
-                "node payload {} exceeds cap {cap}",
-                node.payload(SHAPE)
+                node.payload(cap, SHAPE) <= cap.c,
+                "node payload {} exceeds cap {}",
+                node.payload(cap, SHAPE),
+                cap.c
             );
             if node.is_leaf() {
                 return 1;
@@ -2278,8 +2347,8 @@ mod tests {
         }
         assert_eq!(pm.count(), Some(bt.len() as i64));
         // Structure: fits + routing correctness (0-key interiors allowed).
-        fn walk(node: &Node, cap: usize, shape: LeafShape) {
-            assert!(node.payload(shape) <= cap, "node overflows its page");
+        fn walk(node: &Node, cap: Cap, shape: LeafShape) {
+            assert!(node.payload(cap, shape) <= cap.c, "node overflows its page");
             if !node.is_leaf() {
                 assert_eq!(node.children.len(), node.keys.len() + 1);
                 for c in &node.children {

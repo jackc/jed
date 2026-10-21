@@ -176,7 +176,9 @@ fn open_client_engine(conn: &Arc<PsConnection>, opts: &OpenOptions) -> Result<En
             crate::pager::Pager::from_store(Box::new(ServiceBlockStore::new(Arc::clone(conn))))?;
         pager.set_trust_meta();
         let capacity = crate::paging::cache_leaves(opts.cache_bytes, pager.page_size());
-        Engine::open_paged(pager, capacity, &opts.environment)
+        // A page client of an encrypted file would need its key; the page service serves plaintext
+        // files only, so a client opens without one (spec/fileformat/encrypted.md §10).
+        Engine::open_paged(pager, capacity, &opts.environment, None)
     })();
     link.release(begun.txid);
     let mut engine = loaded?;

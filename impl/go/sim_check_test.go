@@ -36,7 +36,7 @@ func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err erro
 	}
 	snap := e.committed
 
-	reached, err := snap.reachablePages(e.paging, mt.rootPage)
+	reached, err := snap.reachablePages(e.paging, plainRef(mt.rootPage))
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("reachability walk: %w", err)
 	}
@@ -81,7 +81,7 @@ func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err erro
 // reaches is named by exactly one stored value, across all tables (claimed). A rewritten record may
 // keep an unchanged value's chain, but two records of one snapshot never share one.
 func simCheckTable(snap *snapshot, name string, paging *sharedPaging, claimed map[uint32]bool) error {
-	fetch := func(p uint32) ([]byte, error) { return paging.readBlock(p) }
+	fetch := paging.readBody
 	table := snap.tables[name]
 	store := snap.stores[name]
 	if store == nil {
@@ -103,7 +103,7 @@ func simCheckTable(snap *snapshot, name string, paging *sharedPaging, claimed ma
 			if !ok {
 				continue
 			}
-			pages, err := chainPages(first, length, fetch)
+			pages, err := chainPages(first, length, fetch, paging.cap())
 			if err != nil {
 				return fmt.Errorf("row %d: an overflow chain: %w", i, err)
 			}
@@ -185,7 +185,7 @@ func simCheckLive(db *Database) error {
 	}
 	st.mu.Unlock()
 	paging := st.paging
-	fetch := func(p uint32) ([]byte, error) { return paging.readBlock(p) }
+	fetch := paging.readBody
 
 	check := func(what string, pg uint32) error {
 		switch {
@@ -221,7 +221,7 @@ func simCheckLive(db *Database) error {
 				if !ok {
 					continue
 				}
-				pages, err := chainPages(first, length, fetch)
+				pages, err := chainPages(first, length, fetch, paging.cap())
 				if err != nil {
 					return fmt.Errorf("table %s: an overflow chain: %w", name, err)
 				}
@@ -253,13 +253,13 @@ func simCheckLive(db *Database) error {
 
 // simExternalRef returns the overflow chain a stored value names — its first page and the bytes the
 // chain carries — or ok false for an inline or resident value.
-func simExternalRef(v Value) (first uint32, length int, ok bool) {
+func simExternalRef(v Value) (first pageRef, length int, ok bool) {
 	if v.Kind != ValUnfetched {
-		return 0, 0, false
+		return pageRef{}, 0, false
 	}
 	u := v.unfetched()
 	if u.Form != tagExternal && u.Form != tagExternalComp {
-		return 0, 0, false
+		return pageRef{}, 0, false
 	}
-	return u.FirstPage, int(u.StoredLen), true
+	return u.first(), int(u.StoredLen), true
 }

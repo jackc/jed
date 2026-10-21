@@ -9,6 +9,7 @@ import type { Steps } from "./execution.ts";
 // column; a NULL boolean (unknown) is the "null" Value, so {true, false, NULL} is the
 // three-valued domain, ordered false < true.
 
+import type { Cap } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
 import { Decimal, floatShortestExact } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
@@ -136,6 +137,9 @@ export type Value =
 export type Unfetched = {
   form: number;
   firstPage: number;
+  // firstTag is the tag the external pointer binds to its chain's first page in an encrypted file
+  // (spec/fileformat/encrypted.md §2); absent in a plaintext file and for the inline forms.
+  firstTag?: Uint8Array;
   storedLen: number;
   rawLen: number;
   comp: Uint8Array | undefined;
@@ -166,8 +170,10 @@ export function isSentinelTypeRef(t: TypeRef): boolean {
 // of a value↔paging import cycle; null for the inline forms (they own their bytes) and for a dead
 // handle (the open-time reachability walk, whose values are discarded right after chain-marking).
 export interface UnfetchedPager {
-  readBlock(index: number): Uint8Array;
-  readBlockSteps(index: number): Steps<Uint8Array>;
+  // readBodySteps reads the body page a (page, tag) pointer names, opened when the file is encrypted.
+  readBodySteps(index: number, tag: Uint8Array): Steps<Uint8Array>;
+  // cap is the database's page capacities (a chain page's successor tag width).
+  cap(): Cap;
 }
 
 // intValue builds a non-null integer value.

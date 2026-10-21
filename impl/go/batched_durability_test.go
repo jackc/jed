@@ -159,7 +159,7 @@ func TestRelaxedBatchReusesOnlyTheFloorsFreePages(t *testing.T) {
 			midway = st.pageCount
 		}
 	}
-	if st.pageCount > midway+uint32(manifestInlineCapacity(256))*2 {
+	if st.pageCount > midway+uint32(manifestInlineCapacity(256, plainCap(256)))*2 {
 		t.Fatalf("the file kept growing under relaxed churn: %d pages at update 200, %d at 400", midway, st.pageCount)
 	}
 }

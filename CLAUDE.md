@@ -632,11 +632,16 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   jed's *own* storage; a **host extension** may relax them (an external or virtual-table-style
   row source, a format that needs the host's code to reopen) as it judges appropriate, owning
   the consequence (the host-extension boundary, §13).
-- **Leave the door open for encryption at rest (file-level).** The single-file format and
-  the storage seam (storage.md §2) are kept so whole-file (or per-page) **encryption at
-  rest** can be added later **without a reshape**. Not built now; the only present requirement
-  is that nothing foreclose it (don't assume page bytes are plaintext-comparable on disk) —
-  already satisfied (hosts keep page bytes opaque). **Designed in `spec/design/encryption.md`:**
+- **Encryption at rest (file-level) — the core variant is built.** The single-file format and
+  the storage seam (storage.md §2) took **encryption at rest** without a reshape: the encrypted
+  file variant (bytes in `spec/fileformat/encrypted.md`, the `encrypted_*` goldens and
+  `encryption_vectors.toml`, authored by the Ruby reference) runs in the Rust, Go and TS (Node)
+  cores — a credential on `create`/`open`/`attach`, sealed body pages from page 4 behind a key block
+  at pages 2–3, tag-bound pointers, `28P01`–`28P03` for credential failures. Still to build, each
+  failing closed meanwhile (encrypted.md §10): credential change, DEK rotation and conversion,
+  scratch encryption (an encrypted handle has no spill target), page service and replication,
+  encrypted backups, the browser/OPFS host, the corpus's encrypted mode and simulator growth; and
+  the security review. **Designed in `spec/design/encryption.md`:**
   a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
   a random data key is stored only wrapped by a per-file key-encryption key, itself derived from
   a host-supplied key or a passphrase.
@@ -1413,6 +1418,17 @@ exact-pinned `@noble/hashes = 2.4.0`. That is the TS core's first runtime depend
 JavaScript with no transitive dependencies, synchronous in Node and the browser alike. `sha2`'s
 SHA-NI/SIMD backends use `unsafe` intrinsics, chosen at runtime by `cpufeatures`; its portable
 fallback is safe Rust. That use of `unsafe` was accepted knowingly, and nothing else inherits it.
+
+**Approved encryption-at-rest dependencies (2026-10-20, clause 3).** The encrypted file variant
+(`spec/design/encryption.md`, `spec/fileformat/encrypted.md`) uses, in Rust, the exact-pinned
+RustCrypto `aes = 0.9.3` (the raw block under the hand-written XAES-256-GCM derivation),
+`aes-gcm = 0.11.1` (default features off), `hkdf = 0.13.0` (with `hmac` 0.13.0 and the approved
+`sha2`) and `argon2 = 0.6.0` (default features off); in Go, the standard library (`crypto/aes`,
+`crypto/cipher`, `crypto/hkdf`) plus `golang.org/x/crypto` v0.58.0 for `argon2` only — the Go core's
+first module dependency, pure Go; in TS, `node:crypto` in a Node-only module and the already-approved
+`@noble/hashes` Argon2id. The XAES derivation glue over library AES is written per core against
+the C2SP vectors, admitted as glue, not a primitive. The RustCrypto AES/GHASH backends' reviewed
+intrinsics are accepted under the guardrail above, as for `sha2`.
 
 **Approved AEAD benchmark dependencies (2026-10-17, clause 3).** The isolated `bench/aead/`
 experiment may use exact-pinned RustCrypto `aes-gcm` / `chacha20poly1305`, Go

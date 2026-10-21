@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PMap, leafOverhead, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound, LeafShape, PNode } from "../src/pmap.ts";
+import type { Cap } from "../src/cap.ts";
 import { intValue } from "../src/lib.ts";
 import type { Row } from "../src/storage.ts";
 
@@ -15,7 +16,7 @@ import type { Row } from "../src/storage.ts";
 // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256). W is a realistic
 // per-entry weight (8-byte key + an 8-byte i64 slot = 16 bytes, well under RECORD_MAX), so a
 // 240-byte leaf holds ~12 entries before splitting.
-const CAP = 240;
+const CAP: Cap = { c: 240, tag: 0 };
 const W = 16;
 // row() has one fixed-width value column — the v24 leaf overhead scales with the class mix
 // (format.md "Leaf node").
@@ -114,7 +115,7 @@ function checkInvariants(pm: PMap): void {
       if (hi !== null) assert.ok(compare(k, hi) < 0, "key at/above its subtree's high separator");
     }
     const payload = nodePayload(n, SHAPE);
-    assert.ok(payload <= CAP, `node payload ${payload} exceeds cap ${CAP}`);
+    assert.ok(payload <= CAP.c, `node payload ${payload} exceeds cap ${CAP.c}`);
     if (n.children.length === 0) return 1;
     let depth: number | null = null;
     for (let i = 0; i < n.children.length; i++) {
@@ -323,7 +324,7 @@ test("pmap: near-cap keys force degenerate interior nodes", () => {
   assert.equal(pmCount(pm), ref.size);
   // Structure: fits + routing correctness (0-key interiors allowed).
   const walk = (n: PNode): void => {
-    assert.ok(nodePayload(n, shape) <= CAP, "node overflows its page");
+    assert.ok(nodePayload(n, shape) <= CAP.c, "node overflows its page");
     if (n.children.length > 0) {
       assert.equal(n.children.length, n.keys.length + 1);
       for (const c of n.children) {

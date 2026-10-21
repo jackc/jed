@@ -116,6 +116,14 @@ pub enum SqlState {
     IdleInTransactionSessionTimeout,
     /// 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
     DependentObjectsStillExist,
+    /// 28P01 — {detail}
+    InvalidPassword,
+    /// 28P02 — {detail}
+    CredentialRequired,
+    /// 28P03 — {detail}
+    CredentialNotApplicable,
+    /// 28P04 — {detail}
+    StaleKey,
     /// 3B001 — savepoint does not exist: {name}
     InvalidSavepointSpecification,
     /// 38000 — host function {name} raised {detail}
@@ -286,6 +294,10 @@ impl SqlState {
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::IdleInTransactionSessionTimeout => "25P03",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InvalidPassword => "28P01",
+            SqlState::CredentialRequired => "28P02",
+            SqlState::CredentialNotApplicable => "28P03",
+            SqlState::StaleKey => "28P04",
             SqlState::InvalidSavepointSpecification => "3B001",
             SqlState::ExternalRoutineException => "38000",
             SqlState::SyntaxError => "42601",
@@ -402,6 +414,10 @@ impl SqlState {
             "25P02" => Some(SqlState::InFailedSqlTransaction),
             "25P03" => Some(SqlState::IdleInTransactionSessionTimeout),
             "2BP01" => Some(SqlState::DependentObjectsStillExist),
+            "28P01" => Some(SqlState::InvalidPassword),
+            "28P02" => Some(SqlState::CredentialRequired),
+            "28P03" => Some(SqlState::CredentialNotApplicable),
+            "28P04" => Some(SqlState::StaleKey),
             "3B001" => Some(SqlState::InvalidSavepointSpecification),
             "38000" => Some(SqlState::ExternalRoutineException),
             "42601" => Some(SqlState::SyntaxError),
@@ -527,6 +543,10 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25P03", name: "idle_in_transaction_session_timeout", class: "invalid transaction state" },
     ErrorDesc { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
+    ErrorDesc { code: "28P01", name: "invalid_password", class: "invalid authorization specification" },
+    ErrorDesc { code: "28P02", name: "credential_required", class: "invalid authorization specification" },
+    ErrorDesc { code: "28P03", name: "credential_not_applicable", class: "invalid authorization specification" },
+    ErrorDesc { code: "28P04", name: "stale_key", class: "invalid authorization specification" },
     ErrorDesc { code: "3B001", name: "invalid_savepoint_specification", class: "invalid savepoint specification" },
     ErrorDesc { code: "38000", name: "external_routine_exception", class: "external routine exception" },
     ErrorDesc { code: "42601", name: "syntax_error", class: "syntax error or access rule violation" },

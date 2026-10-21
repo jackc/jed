@@ -143,6 +143,15 @@ pub struct CreateOptions {
     /// The ownership preference under the page service (spec/design/page-service.md §8.2). Only
     /// the page service ([`Locking::Auto`]) reads it.
     pub ownership: Ownership,
+    /// Create the file **encrypted** under this credential (spec/design/encryption.md,
+    /// spec/fileformat/encrypted.md): its pages are sealed under a random data key that only the
+    /// credential unwraps. Needs a `page_size` of at least 1024 (`0A000` otherwise); an in-memory
+    /// database with a credential is `55000`. `None` (the default) creates a plaintext file.
+    pub credential: Option<crate::crypto::Credential>,
+    /// The Argon2id parameters a [`Credential::Passphrase`](crate::Credential::Passphrase) is
+    /// stretched with (default RFC 9106's second recommendation; `22023` outside the format's
+    /// bounds). Ignored for a host key or a plaintext file.
+    pub kdf: crate::crypto::Argon2Params,
 }
 
 impl Default for CreateOptions {
@@ -162,6 +171,8 @@ impl Default for CreateOptions {
             idle_session_timeout_ms: None,
             max_connections: 0,
             ownership: Ownership::Prefer,
+            credential: None,
+            kdf: crate::crypto::Argon2Params::default(),
         }
     }
 }
@@ -234,6 +245,10 @@ pub struct OpenOptions {
     /// The ownership preference under the page service (spec/design/page-service.md §8.2). Only
     /// the page service ([`Locking::Auto`]) reads it.
     pub ownership: Ownership,
+    /// The credential that unlocks an encrypted file (spec/design/encryption.md §5): required for
+    /// one (`28P02` without it, `28P01` when it does not unwrap the key), refused for a plaintext
+    /// file (`28P03`). A handle argument only — never stored, never shown.
+    pub credential: Option<crate::crypto::Credential>,
 }
 
 impl Default for OpenOptions {
@@ -254,6 +269,7 @@ impl Default for OpenOptions {
             idle_session_timeout_ms: None,
             max_connections: 0,
             ownership: Ownership::Prefer,
+            credential: None,
         }
     }
 }
@@ -280,7 +296,7 @@ impl Engine {
     /// the file). The path must not already exist — `58P02` otherwise. An initial empty image is
     /// written durably immediately, so the file exists with its page size fixed (api.md §2).
     pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Engine> {
-        Engine::create_via(&crate::filehost::OsFileHost, path.as_ref(), opts)
+        Engine::create_via(&crate::filehost::OsFileHost, path.as_ref(), opts, None)
     }
 
     /// [`create`](Engine::create) through the file host `files` ([`crate::filehost`]): the existence
@@ -289,29 +305,59 @@ impl Engine {
         files: &dyn FileHost,
         path: &Path,
         opts: DatabaseOptions,
+        encryption: Option<Encryption<'_>>,
     ) -> Result<Engine> {
+        if encryption.is_some() && (opts.page_size as usize) < crate::crypto::MIN_PAGE_SIZE {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "an encrypted database needs a page size of at least 1024",
+            ));
+        }
         if files.exists(path)? {
             return Err(EngineError::new(
                 SqlState::DuplicateFile,
                 format!("database file already exists: {}", path.display()),
             ));
         }
+        // A new encrypted file's key block and codec (spec/fileformat/encrypted.md §5, §8): the data
+        // key, KDF salt and wrap nonce are the first draws of the database's key-entropy stream.
+        let codec = match encryption {
+            Some(e) => Some(crate::crypto::create(
+                e.credential,
+                e.kdf,
+                e.environment.key_stream(),
+            )?),
+            None => None,
+        };
         let mut db = Engine::new();
         db.path = Some(path.to_path_buf());
-        db.spill = default_spill_host();
+        // An encrypted database never spills plaintext: it has no scratch target until scratch
+        // encryption lands (spec/fileformat/encrypted.md §10).
+        db.spill = if codec.is_some() {
+            None
+        } else {
+            default_spill_host()
+        };
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
-        db.write_full_image(files, opts.no_sync)?; // lay down the from-scratch image; later commits are incremental
+        db.write_full_image(files, opts.no_sync, codec.as_deref())?; // lay down the from-scratch image; later commits are incremental
         // Adopt the just-written file as the open pager + buffer pool, so later commits write through
         // the seam without re-opening (spec/design/pager.md). Tables built in this session bind this
         // pager at creation (`Snapshot::store_paging`), so their committed leaves demote at each
         // commit and fault back through the pool — same residency shape as after a reopen.
         let store = files.open_store(path, opts.no_sync, false)?;
         let mut pager = Pager::from_store(store)?;
+        if codec.is_some() {
+            pager.set_encrypted();
+        }
         // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot
         // alternation*).
         pager.set_floor_slot((db.committed.txid & 1) as u32);
-        let paging = SharedPaging::new(pager, cache_leaves(DEFAULT_CACHE_BYTES, db.page_size));
+        let paging = SharedPaging::with_codec(
+            pager,
+            cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
+            codec,
+        );
         db.committed.set_store_paging(paging.clone());
         db.paging = Some(paging);
         Ok(db)
@@ -347,9 +393,15 @@ impl Engine {
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
-        let mut db = Engine::open_paged(pager, capacity, &opts.environment)?;
+        let mut db =
+            Engine::open_paged(pager, capacity, &opts.environment, opts.credential.as_ref())?;
         db.path = Some(path.to_path_buf());
-        db.spill = default_spill_host();
+        // An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
+        db.spill = if db.encrypted() {
+            None
+        } else {
+            default_spill_host()
+        };
         db.read_only = opts.read_only;
         // `0` means "the default budget", not "unlimited" — the zero value is a safe finite budget
         // (matching Go/TS). Unbounded/never-spill is a runtime-only mode via `set_work_mem(0)`.
@@ -357,6 +409,11 @@ impl Engine {
             db.session.work_mem = opts.work_mem;
         }
         Ok(db)
+    }
+
+    /// Whether this database's file is encrypted (spec/fileformat/encrypted.md).
+    pub(crate) fn encrypted(&self) -> bool {
+        self.paging.as_ref().is_some_and(|p| p.codec().is_some())
     }
 
     /// The number of leaf pages currently resident in the buffer pool — `0` for an in-memory database
@@ -370,16 +427,22 @@ impl Engine {
     /// spec/fileformat/format.md) durably via temp-file + rename, and record the on-disk page
     /// high-water. Used by `create` to establish a fresh file with both meta slots seeded; every later
     /// commit is incremental (`persist`).
-    fn write_full_image(&mut self, files: &dyn FileHost, no_sync: bool) -> Result<()> {
+    fn write_full_image(
+        &mut self,
+        files: &dyn FileHost,
+        no_sync: bool,
+        codec: Option<&crate::crypto::PageCodec>,
+    ) -> Result<()> {
         let path = self.path.clone().expect("write_full_image requires a path");
         let bytes = self
             .committed
-            .to_image(self.page_size, self.committed.txid)?;
+            .to_image_sealed(self.page_size, self.committed.txid, codec)?;
         write_atomic(files, &path, &bytes, no_sync)?;
         self.page_count = (bytes.len() / self.page_size as usize) as u32;
         // `create` writes an empty database: every body page is live, and every one is a catalog page.
         debug_assert_eq!(self.committed.stores_iter().count(), 0);
-        let body = self.page_count - crate::format::ROOT_PAGE;
+        let body =
+            self.page_count - crate::format::Cap::of(self.page_size, codec.is_some()).first_body();
         self.live = crate::format::LiveCount {
             live: body,
             catalog: body,
@@ -407,7 +470,6 @@ impl Engine {
             .pager()
             .check_commit()?;
         let ps = self.page_size as usize;
-        let cap = ps - crate::format::PAGE_HEADER;
         let free = self.free_pages.clone();
         // A bare single-handle engine has no cross-session reader registry (oldest_live == committed), so
         // reuse is always safe (transactions.md §8): the shared-core path is the one that gates reuse.
@@ -424,7 +486,6 @@ impl Engine {
             &write,
             &self.committed,
             self.paging.as_deref().expect("paging present"),
-            self.page_size,
         )?;
         // v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can
         // read the new catalog back through the pager (read-your-writes) — the free-list persisted this
@@ -466,13 +527,12 @@ impl Engine {
         let plan = crate::format::plan_free_list(
             snap,
             &paging,
-            write.root_page,
+            write.root,
             &write.pages,
             &write.free_remaining,
             write.page_count,
             self.live_at_compaction,
             self.free_gen_txid,
-            cap,
             ps,
             can_reclaim,
             true,
@@ -491,9 +551,10 @@ impl Engine {
             // The bare single-handle engine is always synchronous = on: the slot not holding the
             // floor is txid & 1 (format.md, *Slot alternation*).
             let slot = pager.commit_slot();
-            pager.write_block(slot, &plan.meta)?;
+            let meta = crate::format::seal_meta(&paging, slot, &plan.meta, &plan.manifest)?;
+            pager.write_block(slot, &meta)?;
             pager.sync()?;
-            pager.finish_commit(&plan.meta, slot, true, &[]);
+            pager.finish_commit(&meta, slot, true, &[]);
             // Trailing truncation (format.md): shorten the file after the barrier.
             pager.settle_truncation(plan.page_count, plan.page_count < self.page_count, true);
         }
@@ -599,8 +660,11 @@ pub(crate) fn compact_file(
     // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
     let path = files.real_path(path)?;
     let tmp = tmp_path(&path);
+    // An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
+    // (spec/design/encryption.md §5).
+    let codec = old.codec().cloned();
     if let Err(error) = files.write_file(&tmp, Some(&path), no_sync, &mut |write_at| {
-        snap.write_image(page_size, txid, &mut |index, page| {
+        snap.write_image(page_size, txid, codec.as_deref(), &mut |index, page| {
             write_at(index as u64 * page_size as u64, page)
         })
         .map(|_| ())
@@ -625,8 +689,20 @@ pub(crate) fn compact_file(
             files.sync_dir(dir);
         }
     }
-    let pager = Pager::from_store(files.open_store(&path, no_sync, false)?)?;
-    Ok(SharedPaging::new(pager, capacity))
+    let mut pager = Pager::from_store(files.open_store(&path, no_sync, false)?)?;
+    if codec.is_some() {
+        pager.set_encrypted();
+    }
+    Ok(SharedPaging::with_codec(pager, capacity, codec))
+}
+
+/// The encryption of a database being created (spec/fileformat/encrypted.md): its credential, the
+/// passphrase KDF parameters, and the environment whose key-entropy source draws the key material.
+#[derive(Clone, Copy)]
+pub(crate) struct Encryption<'a> {
+    pub(crate) credential: &'a crate::crypto::Credential,
+    pub(crate) kdf: crate::crypto::Argon2Params,
+    pub(crate) environment: &'a crate::environment::Environment,
 }
 
 /// The sibling temp path used during an atomic commit. A single writer (CLAUDE.md §3) means no

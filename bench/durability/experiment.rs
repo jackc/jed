@@ -121,7 +121,7 @@ fn trace_sized(count: usize, batch: usize, rows: usize, stride: usize) -> Trace 
         commits: Arc::clone(&commits),
     };
     let pager = Pager::from_store(Box::new(capture)).unwrap();
-    let mut db = Engine::open_paged(pager, 1024, &crate::Environment::default()).unwrap();
+    let mut db = Engine::open_paged(pager, 1024, &crate::Environment::default(), None).unwrap();
     // The byte backing is captured in RAM, but run the FILE commit semantics,
     // including advancing txid and native slot alternation. No file opens use this path.
     db.path = Some("durability-capture".into());

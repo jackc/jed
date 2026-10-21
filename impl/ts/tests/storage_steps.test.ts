@@ -11,6 +11,9 @@ import type { Row, TableStore } from "../src/storage.ts";
 import { Engine, execute, toImage } from "../src/tooling.ts";
 import { intValue } from "../src/value.ts";
 import { fillerText } from "./util.ts";
+import type { Cap } from "../src/cap.ts";
+
+const CAP: Cap = { c: 240, tag: 0 };
 
 class DelayedStore extends MemoryBlockStore {
   syncReads: number[] = [];
@@ -177,7 +180,7 @@ test("storage steps: resident traversal yields and cancels without restarting ro
   for (let i = 0; i < 1000; i++) {
     const key = new Uint8Array(8);
     new DataView(key.buffer).setBigUint64(0, BigInt(i));
-    map.insert(key, [intValue(BigInt(i))], 16, 240, { fixed: 1, var: 0 }, null);
+    map.insert(key, [intValue(BigInt(i))], 16, CAP, { fixed: 1, var: 0 }, null);
   }
   const iterator = map.scanRowsStepsIter(unboundedBound(), null, false);
   let canceled = false;
@@ -257,14 +260,14 @@ test("storage steps: mutations retain split/merge results and snapshot ownership
   for (let value = 7; value < 40; value++) {
     const row = [intValue(BigInt(value * 2))];
     assert.deepEqual(
-      await runAsync(async.map.insertSteps(key(value), row, 16, 240, shape, async.source)),
-      sync.map.insert(key(value), row, 16, 240, shape, sync.source),
+      await runAsync(async.map.insertSteps(key(value), row, 16, CAP, shape, async.source)),
+      sync.map.insert(key(value), row, 16, CAP, shape, sync.source),
     );
   }
   for (let value = 1; value < 40; value += 2) {
     assert.deepEqual(
-      await runAsync(async.map.removeSteps(key(value), 240, shape, async.source)),
-      sync.map.remove(key(value), 240, shape, sync.source),
+      await runAsync(async.map.removeSteps(key(value), CAP, shape, async.source)),
+      sync.map.remove(key(value), CAP, shape, sync.source),
     );
   }
   assert.deepEqual(async.map.inorder(async.source), sync.map.inorder(sync.source));
@@ -283,9 +286,9 @@ test("storage steps: clone during a write page await freezes the captured mutati
   });
   const shape = { fixed: 1, var: 0 };
   // Make the root owned by the active generation while its right child remains on disk.
-  tree.map.insert(key(0), [intValue(0n)], 16, 240, shape, tree.source);
+  tree.map.insert(key(0), [intValue(0n)], 16, CAP, shape, tree.source);
   capture = true;
-  await runAsync(tree.map.insertSteps(key(7), [intValue(7n)], 16, 240, shape, tree.source));
+  await runAsync(tree.map.insertSteps(key(7), [intValue(7n)], 16, CAP, shape, tree.source));
   assert.ok(snapshot);
   assert.notEqual(snapshot.rootNode(), tree.map.rootNode());
   assert.equal(snapshot.get(key(7), tree.source), undefined);
@@ -301,7 +304,7 @@ test("storage steps: cancellation while loading a delete sibling publishes no pa
   });
   const root = tree.map.rootNode();
   await assert.rejects(
-    runAsync(tree.map.removeSteps(key(1), 240, { fixed: 1, var: 0 }, tree.source), {
+    runAsync(tree.map.removeSteps(key(1), CAP, { fixed: 1, var: 0 }, tree.source), {
       check: () => canceled,
     }),
   );

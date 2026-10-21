@@ -29,8 +29,15 @@ import {
   HostFunctions,
   newHostFunction,
 } from "./extension.ts";
+import { osKeyEntropy } from "./crypto.ts";
 import { crc32Ieee } from "./format.ts";
-import { type ClockSource, osRandomSource, type RandomSource, wallClock } from "./seam.ts";
+import {
+  type ClockSource,
+  osRandomSource,
+  type RandomSource,
+  seededRandomSource,
+  wallClock,
+} from "./seam.ts";
 import { type TimeZoneInfo, timeZoneBundleZones, type Zone } from "./timezone.ts";
 
 // The contents an Environment is built from. Internal: build() hands the builder's copies over.
@@ -41,7 +48,14 @@ type Contents = {
   functions: readonly HostFuncEntry[];
   random: RandomSource;
   clock: ClockSource;
+  keyEntropy: KeyEntropy;
 };
+
+// KeyEntropy is where an encrypted database draws its key material and nonces
+// (spec/fileformat/encrypted.md §8): the OS CSPRNG, or — for tests and the goldens only — an
+// explicitly insecure seeded stream. Separate from the SQL random source, so seeding uuidv4 never
+// seeds a key.
+type KeyEntropy = { kind: "os" } | { kind: "insecureSeeded"; seed: bigint };
 
 function emptyContents(): Contents {
   return {
@@ -51,6 +65,7 @@ function emptyContents(): Contents {
     functions: [],
     random: osRandomSource(),
     clock: wallClock(),
+    keyEntropy: { kind: "os" },
   };
 }
 
@@ -69,6 +84,7 @@ export class Environment {
   private readonly hostFunctionSet: HostFunctions | null;
   private readonly random: RandomSource;
   private readonly clock: ClockSource;
+  private readonly keyEntropy: KeyEntropy;
 
   // The `contents` parameter is internal (EnvironmentBuilder.build); a host calls `new Environment()`
   // for the empty default.
@@ -80,6 +96,7 @@ export class Environment {
     this.hostFunctionSet = c.functions.length > 0 ? new HostFunctions(c.functions) : null;
     this.random = c.random;
     this.clock = c.clock;
+    this.keyEntropy = c.keyEntropy;
   }
 
   // empty returns a fresh default environment (§7).
@@ -102,6 +119,7 @@ export class Environment {
       functions: this.hostFunctionSet?.entries() ?? [],
       random: this.random,
       clock: this.clock,
+      keyEntropy: this.keyEntropy,
     });
   }
 
@@ -134,6 +152,14 @@ export class Environment {
   // clockSource is the installed clock source (§4).
   clockSource(): ClockSource {
     return this.clock;
+  }
+
+  // keyStream is a fresh key-entropy stream for one encrypted database (encrypted.md §8): the OS
+  // CSPRNG, or a new splitmix64 stream from the insecure seed, so each database opened through the
+  // environment draws its own.
+  keyStream(): RandomSource {
+    const k = this.keyEntropy;
+    return k.kind === "os" ? osKeyEntropy() : seededRandomSource(k.seed);
   }
 
   // --- engine-internal lookups (not part of the embedding surface) ---
@@ -231,6 +257,15 @@ export class EnvironmentBuilder {
     return this;
   }
 
+  // insecureSeededKeyEntropy draws encrypted databases' key material and nonces from an INSECURE
+  // splitmix64 stream seeded with seed instead of the OS CSPRNG (spec/fileformat/encrypted.md §8):
+  // each database opened through the environment starts its own stream from seed, so every core writes
+  // byte-identical encrypted files. For tests and fixtures only — the keys are predictable.
+  insecureSeededKeyEntropy(seed: bigint): this {
+    this.contents.keyEntropy = { kind: "insecureSeeded", seed };
+    return this;
+  }
+
   // build returns an immutable Environment holding a snapshot of the builder's contents.
   build(): Environment {
     const c = this.contents;
@@ -241,6 +276,7 @@ export class EnvironmentBuilder {
       functions: c.functions,
       random: c.random,
       clock: c.clock,
+      keyEntropy: c.keyEntropy,
     });
   }
 }

@@ -139,7 +139,9 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
         ));
     }
     let ps = base.page_size as usize;
-    let (inline_capacity, overflow_capacity) = format::manifest_capacities(ps);
+    // The page service serves plaintext files only (spec/fileformat/encrypted.md §10).
+    let (inline_capacity, overflow_capacity) =
+        format::manifest_capacities(ps, format::Cap::plain(base.page_size));
     let mut delta = Delta {
         txid: cb.txid,
         meta: cb.meta,
@@ -268,14 +270,22 @@ mod tests {
             ));
             page_count = page_count.max(index + 1);
         }
-        let (inline, per) = format::manifest_capacities(ps);
+        let (inline, per) = format::manifest_capacities(ps, format::Cap::plain(PS));
         let overflow = dirty.len().saturating_sub(inline).div_ceil(per);
         let mut ids = Vec::new();
         for _ in 0..overflow {
             ids.push(page_count);
             page_count += 1;
         }
-        let meta = format::meta_page(PS, 6, indices[0], page_count, 0, indices.len() as u32);
+        let meta = format::meta_page(
+            format::Cap::plain(PS),
+            PS,
+            6,
+            format::PageRef::plain(indices[0]),
+            page_count,
+            format::PageRef::NONE,
+            indices.len() as u32,
+        );
         let (meta, chain) = format::encode_manifest(meta, &dirty, &ids);
         let cb = CommitBegin {
             txid: 6,

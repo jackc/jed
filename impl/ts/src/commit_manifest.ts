@@ -3,6 +3,7 @@
 import { crc32Update } from "./crc32.ts";
 import { engineError } from "./errors.ts";
 import { ioSteps, runSync, type Steps } from "./execution.ts";
+import { NO_TAG } from "./cap.ts";
 
 // PAGE_IO_WINDOW bounds the write side's concurrent page work (ts-runtime.md §11.3): pages encoded at
 // once (and encoded pages awaiting their write), and dependencies recovery reads ahead. Physical
@@ -43,8 +44,16 @@ export function crc64Update(previous: bigint, bytes: Uint8Array): bigint {
   return (BigInt(hi) << 32n) | BigInt(lo);
 }
 
-export const manifestInlineCapacity = (pageSize: number): number =>
-  Math.floor((pageSize - 64) / 12);
+// The inline manifest's byte range in a meta page: after the 64-byte header, or — in an encrypted
+// meta — after the catalog-root and free-list tags (offset 96) and before the 40-byte reserve
+// (spec/fileformat/encrypted.md §6).
+function inlineArea(pageSize: number, encrypted: boolean): [number, number] {
+  return encrypted ? [96, pageSize - 40] : [64, pageSize];
+}
+export const manifestInlineCapacity = (pageSize: number, encrypted = false): number => {
+  const [lo, hi] = inlineArea(pageSize, encrypted);
+  return Math.floor((hi - lo) / 12);
+};
 export const manifestOverflowCapacity = (pageSize: number): number =>
   Math.floor((pageSize - 32) / 12);
 export type WrittenPage = { index: number; bytes: Uint8Array };
@@ -58,8 +67,13 @@ export function manifestEntriesOf(pages: WrittenPage[]): ManifestEntry[] {
 }
 export type CommitManifest = { entries: Entry[]; pages: WrittenPage[]; chainChecksum: bigint };
 export type CommitMeta = {
+  // suite is the encryption suite (meta offset 6 — spec/fileformat/encrypted.md §6): 0 plaintext,
+  // 1 the encrypted variant, whose rootTag/freeListTag are the tags at offsets 64/80 (zero otherwise).
+  suite: number;
   txid: bigint;
   rootPage: number;
+  rootTag: Uint8Array;
+  freeListTag: Uint8Array;
   pageCount: number;
   freeListHead: number;
   // livePages is the exact live page count (v34 — meta offset 56, spec/design/memory.md §8.7).
@@ -81,7 +95,10 @@ function view(block: Uint8Array): DataView {
   return new DataView(block.buffer, block.byteOffset, block.byteLength);
 }
 function zero(bytes: Uint8Array, start: number): boolean {
-  for (let i = start; i < bytes.length; i++) if (bytes[i] !== 0) return false;
+  return zeroRange(bytes, start, bytes.length);
+}
+function zeroRange(bytes: Uint8Array, start: number, end: number): boolean {
+  for (let i = start; i < end; i++) if (bytes[i] !== 0) return false;
   return true;
 }
 function putEntry(dv: DataView, offset: number, entry: Entry): void {
@@ -104,6 +121,7 @@ export function buildCommitManifest(
   txid: bigint,
   dirty: ManifestEntry[],
   overflowIds: number[],
+  encrypted = false,
 ): CommitManifest {
   const entries = dirty.slice().sort((a, b) => a.index - b.index);
   for (let i = 1; i < entries.length; i++) {
@@ -111,7 +129,7 @@ export function buildCommitManifest(
       throw engineError("data_corrupted", "duplicate commit page");
   }
   const cap = manifestOverflowCapacity(pageSize);
-  let cursor = Math.min(entries.length, manifestInlineCapacity(pageSize));
+  let cursor = Math.min(entries.length, manifestInlineCapacity(pageSize, encrypted));
   const pages: WrittenPage[] = [];
   let chainChecksum = 0n;
   for (let ordinal = 0; ordinal < overflowIds.length; ordinal++) {
@@ -134,15 +152,23 @@ export function buildCommitManifest(
   return { entries, pages, chainChecksum };
 }
 
-export function writeManifestMeta(bytes: Uint8Array, manifest?: CommitManifest): void {
+export function writeManifestMeta(
+  bytes: Uint8Array,
+  manifest?: CommitManifest,
+  encrypted = false,
+): void {
   const dv = view(bytes);
   if (manifest !== undefined) {
     dv.setUint32(36, manifest.pages[0]?.index ?? 0, false);
     dv.setUint32(40, manifest.entries.length, false);
     dv.setUint32(44, manifest.pages.length, false);
     dv.setBigUint64(48, manifest.chainChecksum, false);
-    const count = Math.min(manifest.entries.length, manifestInlineCapacity(bytes.length));
-    for (let i = 0; i < count; i++) putEntry(dv, 64 + i * 12, manifest.entries[i]);
+    const [lo] = inlineArea(bytes.length, encrypted);
+    const count = Math.min(
+      manifest.entries.length,
+      manifestInlineCapacity(bytes.length, encrypted),
+    );
+    for (let i = 0; i < count; i++) putEntry(dv, lo + i * 12, manifest.entries[i]);
   }
   dv.setUint32(32, metaChecksum(bytes), false);
 }
@@ -157,12 +183,19 @@ export function parseCommitMeta(
   if (
     dv.getUint32(0, false) !== 0x4a454442 ||
     dv.getUint16(4, false) !== 49 || // format_version (format.ts FORMAT_VERSION)
-    dv.getUint16(6, false) !== 0 ||
     dv.getUint32(8, false) !== pageSize ||
     dv.getUint32(32, false) !== metaChecksum(block) ||
     dv.getUint32(60, false) !== 0
   )
     return null;
+  // Offsets 6/7: the encryption suite and its reserve (encrypted.md §6) — 0, 0 in plaintext; the
+  // encrypted variant (suite 1, reserve 40) needs a page of at least 1024 bytes.
+  let suite: number;
+  if (block[6] === 0 && block[7] === 0) suite = 0;
+  else if (block[6] === 1 && block[7] === 40 && pageSize >= 1024) suite = 1;
+  else return null;
+  const encrypted = suite !== 0;
+  const first = encrypted ? 4 : 2;
   const pageCount = dv.getUint32(24, false);
   const rootPage = dv.getUint32(20, false);
   const freeListHead = dv.getUint32(28, false);
@@ -171,33 +204,40 @@ export function parseCommitMeta(
   const overflowHead = dv.getUint32(36, false);
   const overflowCount = dv.getUint32(44, false);
   const chainChecksum = dv.getBigUint64(48, false);
-  const bodyPage = (p: number): boolean => p >= 2 && p < pageCount;
+  const bodyPage = (p: number): boolean => p >= first && p < pageCount;
   if (
-    pageCount < 3 ||
+    pageCount <= first ||
     pageCount > physicalPages ||
     !bodyPage(rootPage) ||
     (freeListHead !== 0 && !bodyPage(freeListHead)) ||
     // v34: the live pages are a subset of the body pages.
-    livePages > pageCount - 2 ||
-    dirtyCount > pageCount - 2 ||
-    overflowCount > pageCount - 2 - dirtyCount ||
+    livePages > pageCount - first ||
+    dirtyCount > pageCount - first ||
+    overflowCount > pageCount - first - dirtyCount ||
     (overflowCount === 0) !== (overflowHead === 0) ||
     (overflowHead !== 0 && !bodyPage(overflowHead)) ||
     (overflowCount === 0 && chainChecksum !== 0n)
   )
     return null;
-  const inlineCount = Math.min(dirtyCount, manifestInlineCapacity(pageSize));
+  const [lo, hi] = inlineArea(pageSize, encrypted);
+  const inlineCount = Math.min(dirtyCount, manifestInlineCapacity(pageSize, encrypted));
   if (
     dirtyCount - inlineCount > overflowCount * manifestOverflowCapacity(pageSize) ||
-    !zero(block, 64 + inlineCount * 12)
+    !zeroRange(block, lo + inlineCount * 12, hi)
   )
     return null;
   if (dirtyCount === 0 && overflowCount !== 0) return null;
+  const rootTag = encrypted ? block.slice(64, 80) : NO_TAG;
+  const freeListTag = encrypted ? block.slice(80, 96) : NO_TAG;
+  if (freeListHead === 0 && !zeroRange(freeListTag, 0, freeListTag.length)) return null;
   const inline: Entry[] = [];
-  for (let i = 0; i < inlineCount; i++) inline.push(getEntry(dv, 64 + i * 12));
+  for (let i = 0; i < inlineCount; i++) inline.push(getEntry(dv, lo + i * 12));
   return {
+    suite,
     txid: dv.getBigUint64(12, false),
     rootPage,
+    rootTag,
+    freeListTag,
     pageCount,
     freeListHead,
     livePages,
@@ -207,6 +247,23 @@ export function parseCommitMeta(
     chainChecksum,
     inline,
   };
+}
+
+// manifestChainSteps is the manifest-overflow chain a valid meta names, in chain order, as stored —
+// what an encrypted meta's tag covers (spec/fileformat/encrypted.md §6). Reads only the pages the
+// meta counts; a malformed chain was already refused by validateCommitMetaSteps.
+export function* manifestChainSteps(
+  meta: CommitMeta,
+  read: (index: number) => Steps<Uint8Array>,
+): Steps<WrittenPage[]> {
+  const out: WrittenPage[] = [];
+  let next = meta.overflowHead;
+  for (let ordinal = 0; ordinal < meta.overflowCount; ordinal++) {
+    const bytes = yield* read(next);
+    out.push({ index: next, bytes });
+    next = view(bytes).getUint32(8, false);
+  }
+  return out;
 }
 
 // Null denotes an incomplete/corrupt candidate, permitting the previous meta. Actual host I/O
@@ -229,13 +286,17 @@ export function* validateCommitMetaSteps(
   window?: (indices: number[]) => Steps<ManifestPageRead[] | null>,
 ): Steps<Set<number> | null> {
   if (meta.dirtyCount === 0) return new Set(); // fully flushed bootstrap/snapshot image
+  // An encrypted meta (spec/fileformat/encrypted.md §6): body pages start past the key block, and a
+  // listed page is ciphertext, so only its digest is checked.
+  const encrypted = meta.suite !== 0;
+  const first = encrypted ? 4 : 2;
   const entries = meta.inline.slice();
   const manifestIds = new Set<number>();
   let next = meta.overflowHead;
   let chainChecksum = 0n;
   const cap = manifestOverflowCapacity(pageSize);
   for (let ordinal = 0; ordinal < meta.overflowCount; ordinal++) {
-    if (next < 2 || next >= meta.pageCount || manifestIds.has(next)) return null;
+    if (next < first || next >= meta.pageCount || manifestIds.has(next)) return null;
     const index = next;
     manifestIds.add(index);
     const bytes = yield* read(index);
@@ -269,7 +330,12 @@ export function* validateCommitMetaSteps(
   let aheadStart = 0;
   for (let k = 0; k < entries.length; k++) {
     const entry = entries[k]!;
-    if (entry.index <= previous || entry.index >= meta.pageCount || manifestIds.has(entry.index))
+    if (
+      entry.index < first ||
+      entry.index <= previous ||
+      entry.index >= meta.pageCount ||
+      manifestIds.has(entry.index)
+    )
       return null;
     if (readAhead !== undefined && (ahead === null || k - aheadStart >= ahead.length)) {
       // Read ahead only pages the range check admits; a later entry the sequential walk never
@@ -277,7 +343,7 @@ export function* validateCommitMetaSteps(
       const indices: number[] = [];
       for (let j = k; j < entries.length && indices.length < PAGE_IO_WINDOW; j++) {
         const index = entries[j]!.index;
-        if (index < 2 || index >= meta.pageCount) break;
+        if (index < first || index >= meta.pageCount) break;
         indices.push(index);
       }
       ahead = yield* readAhead(indices);
@@ -293,9 +359,8 @@ export function* validateCommitMetaSteps(
     if (
       bytes.length !== pageSize ||
       crc64Update(0n, bytes) !== entry.checksum ||
-      bytes[0] < 1 ||
-      bytes[0] > 7 ||
-      pageChecksum(bytes) !== view(bytes).getUint32(12, false)
+      (!encrypted &&
+        (bytes[0] < 1 || bytes[0] > 7 || pageChecksum(bytes) !== view(bytes).getUint32(12, false)))
     )
       return null;
     if (entry.index === meta.rootPage) rootCovered = true;

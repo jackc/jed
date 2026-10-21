@@ -552,9 +552,9 @@ where
     A: FnMut() -> u32,
 {
     let mut pages = Vec::new();
-    let root = serialize_tree_to(tree, ops, alloc, &mut |p| {
+    let (root, _) = serialize_tree_to(tree, ops, 0, alloc, &mut |p| {
         pages.push(p);
-        Ok(())
+        Ok(crate::crypto::NO_TAG)
     })
     .expect("collecting pages cannot fail");
     (pages, root)
@@ -562,29 +562,33 @@ where
 
 /// [`serialize_tree`], handing each page to `emit` as soon as it is encoded (the same pages, in the
 /// same order), so a caller that writes pages out — host compaction's image stream — never holds the
-/// index's pages at once. Returns the root page, or `emit`'s first error.
+/// index's pages at once. `emit` returns the tag of the page it stored, which an interior entry
+/// carries after its child page when `tag_len` is 16 (an encrypted file — spec/fileformat/encrypted.md
+/// §2). Returns the root page and its tag, or `emit`'s first error.
 pub fn serialize_tree_to<A, E>(
     tree: &GistTree,
     ops: &[GistOpclass],
+    tag_len: usize,
     alloc: &mut A,
     emit: &mut E,
-) -> Result<u32>
+) -> Result<(u32, crate::crypto::Tag)>
 where
     A: FnMut() -> u32,
-    E: FnMut(GistPage) -> Result<()>,
+    E: FnMut(GistPage) -> Result<crate::crypto::Tag>,
 {
-    serialize_node(&tree.root, ops, alloc, emit)
+    serialize_node(&tree.root, ops, tag_len, alloc, emit)
 }
 
 fn serialize_node<A, E>(
     node: &GistNode,
     ops: &[GistOpclass],
+    tag_len: usize,
     alloc: &mut A,
     emit: &mut E,
-) -> Result<u32>
+) -> Result<(u32, crate::crypto::Tag)>
 where
     A: FnMut() -> u32,
-    E: FnMut(GistPage) -> Result<()>,
+    E: FnMut(GistPage) -> Result<crate::crypto::Tag>,
 {
     match node {
         GistNode::Leaf(entries) => {
@@ -597,35 +601,36 @@ where
                 payload.extend_from_slice(&e.skey);
             }
             let page_no = alloc();
-            emit(GistPage {
+            let tag = emit(GistPage {
                 page_no,
                 page_type: PAGE_GIST_LEAF,
                 item_count: entries.len() as u32,
                 payload,
             })?;
-            Ok(page_no)
+            Ok((page_no, tag))
         }
         GistNode::Interior(children) => {
             // Children first (post-order), in the node's canonical entry order.
             let mut child_pages = Vec::with_capacity(children.len());
             for c in children {
-                child_pages.push(serialize_node(&c.node, ops, alloc, emit)?);
+                child_pages.push(serialize_node(&c.node, ops, tag_len, alloc, emit)?);
             }
             let mut payload = Vec::new();
-            for (c, cp) in children.iter().zip(child_pages.iter()) {
+            for (c, (cp, tag)) in children.iter().zip(child_pages.iter()) {
                 let b = encode_bound(ops, &c.bound);
                 payload.extend_from_slice(&(b.len() as u16).to_be_bytes());
                 payload.extend_from_slice(&b);
                 payload.extend_from_slice(&cp.to_be_bytes());
+                payload.extend_from_slice(&tag[..tag_len]);
             }
             let page_no = alloc();
-            emit(GistPage {
+            let tag = emit(GistPage {
                 page_no,
                 page_type: PAGE_GIST_INTERIOR,
                 item_count: children.len() as u32,
                 payload,
             })?;
-            Ok(page_no)
+            Ok((page_no, tag))
         }
     }
 }

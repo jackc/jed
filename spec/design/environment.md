@@ -147,6 +147,13 @@ control time and randomness.
   can run concurrently. The fix is the counter-keyed generator of
   [determinism.md](determinism.md) §7 (each value derived from a seed and a row key), deferred with
   parallelism. A host needing independent streams meanwhile uses separate environments.
+- **Key entropy is a separate field** (encrypted.md §8, encryption.md §3): an encrypted database draws
+  its data key, key-block salts and every page nonce from the environment's **key-entropy source**,
+  never from the SQL random source, so seeding `uuidv4` never seeds a key. The default is the OS
+  CSPRNG. For tests and the goldens a host may install an explicitly **insecure seeded** key-entropy
+  source; each encrypted database opened or created through the environment then starts its own
+  splitmix64 stream from that seed, so every core writes byte-identical encrypted files for the same
+  history.
 - **Determinism** is stated as "deterministic given the environment" instead of "given the handle's
   seam inputs" (CLAUDE.md §10, determinism.md §5).
 - **Per-statement behavior is unchanged**: `now()` reads the clock once per statement,

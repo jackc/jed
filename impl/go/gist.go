@@ -472,10 +472,18 @@ type gistPage struct {
 // writes pages out (host compaction's image stream) never holds the index's pages at once. alloc
 // hands out the next page number. Returns the root page, or emit's first error.
 func serializeGistTree(t *gistTree, ops []gistOpclass, alloc func() uint32, emit func(gistPage) error) (uint32, error) {
-	return gistSerializeNode(t.root, ops, alloc, emit)
+	root, err := serializeGistTreeTagged(t, ops, 0, alloc, func(p gistPage) (pageTag, error) { return noTag, emit(p) })
+	return root.page, err
 }
 
-func gistSerializeNode(node *gistNode, ops []gistOpclass, alloc func() uint32, emit func(gistPage) error) (uint32, error) {
+// serializeGistTreeTagged is serializeGistTree where emit returns the tag of the page it stored, which
+// an interior entry carries after its child page when tagLen is 16 (an encrypted file —
+// spec/fileformat/encrypted.md §2). Returns the root page and its tag.
+func serializeGistTreeTagged(t *gistTree, ops []gistOpclass, tagLen int, alloc func() uint32, emit func(gistPage) (pageTag, error)) (pageRef, error) {
+	return gistSerializeNode(t.root, ops, tagLen, alloc, emit)
+}
+
+func gistSerializeNode(node *gistNode, ops []gistOpclass, tagLen int, alloc func() uint32, emit func(gistPage) (pageTag, error)) (pageRef, error) {
 	if node.leaf {
 		var payload []byte
 		for i := range node.entries {
@@ -486,14 +494,15 @@ func gistSerializeNode(node *gistNode, ops []gistOpclass, alloc func() uint32, e
 			payload = append(payload, node.entries[i].skey...)
 		}
 		pageNo := alloc()
-		return pageNo, emit(gistPage{pageNo: pageNo, pageType: pageGistLeaf, itemCount: uint32(len(node.entries)), payload: payload})
+		tag, err := emit(gistPage{pageNo: pageNo, pageType: pageGistLeaf, itemCount: uint32(len(node.entries)), payload: payload})
+		return pageRef{page: pageNo, tag: tag}, err
 	}
 	// Children first (post-order), in the node's canonical entry order.
-	childPages := make([]uint32, len(node.children))
+	childPages := make([]pageRef, len(node.children))
 	for i := range node.children {
-		pg, err := gistSerializeNode(node.children[i].node, ops, alloc, emit)
+		pg, err := gistSerializeNode(node.children[i].node, ops, tagLen, alloc, emit)
 		if err != nil {
-			return 0, err
+			return pageRef{}, err
 		}
 		childPages[i] = pg
 	}
@@ -502,10 +511,12 @@ func gistSerializeNode(node *gistNode, ops []gistOpclass, alloc func() uint32, e
 		b := encodeBoundTuple(ops, node.children[i].bound)
 		payload = appendU16(payload, uint16(len(b)))
 		payload = append(payload, b...)
-		payload = appendU32(payload, childPages[i])
+		payload = appendU32(payload, childPages[i].page)
+		payload = append(payload, childPages[i].tag[:tagLen]...)
 	}
 	pageNo := alloc()
-	return pageNo, emit(gistPage{pageNo: pageNo, pageType: pageGistInterior, itemCount: uint32(len(node.children)), payload: payload})
+	tag, err := emit(gistPage{pageNo: pageNo, pageType: pageGistInterior, itemCount: uint32(len(node.children)), payload: payload})
+	return pageRef{page: pageNo, tag: tag}, err
 }
 
 // ---- the leaf-key codec + canonical-order build (the executor/serializer API) -----------------
@@ -597,14 +608,14 @@ func gistCollectLeafKeys(node *gistNode, ops []gistOpclass, out *[][]byte) {
 // so no element type is needed. read returns one page's (pageType, itemCount, payload). seen holds
 // the pages already walked: a page reached twice is a misdirected child pointer (data_corrupted), not
 // a reason to recurse without bound.
-func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo uint32, out *[][]byte, seen map[uint32]bool, depth int) error {
+func readGistLeafKeys(read func(pageRef) (byte, uint32, []byte, error), pageNo pageRef, pcap pageCap, out *[][]byte, seen map[uint32]bool, depth int) error {
 	if depth > maxTreeDepth {
 		return newError(DataCorrupted, "GiST tree deeper than any valid tree")
 	}
-	if seen[pageNo] {
+	if seen[pageNo.page] {
 		return newError(DataCorrupted, "GiST page reached twice")
 	}
-	seen[pageNo] = true
+	seen[pageNo.page] = true
 	pageType, n, payload, err := read(pageNo)
 	if err != nil {
 		return err
@@ -636,10 +647,10 @@ func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo ui
 	case pageGistInterior:
 		// Each entry is at least a u16 bound length and a u32 child pointer; checking first keeps a
 		// corrupt count from sizing the allocation.
-		if uint64(n)*6 > uint64(len(payload)) {
+		if uint64(n)*uint64(2+pcap.ptr()) > uint64(len(payload)) {
 			return newError(DataCorrupted, "GiST interior item count overruns page")
 		}
-		children := make([]uint32, 0, n)
+		children := make([]pageRef, 0, n)
 		for i := uint32(0); i < n; i++ {
 			blen, err := gistReadU16(payload, &pos)
 			if err != nil {
@@ -648,14 +659,14 @@ func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo ui
 			if _, err := gistTakeBytes(payload, &pos, blen); err != nil { // skip the union bound
 				return err
 			}
-			cp, err := gistReadU32(payload, &pos)
+			cp, err := readPageRef(payload, &pos, pcap)
 			if err != nil {
 				return err
 			}
 			children = append(children, cp)
 		}
 		for _, cp := range children {
-			if err := readGistLeafKeys(read, cp, out, seen, depth+1); err != nil {
+			if err := readGistLeafKeys(read, cp, pcap, out, seen, depth+1); err != nil {
 				return err
 			}
 		}
@@ -671,15 +682,6 @@ func gistReadU16(buf []byte, pos *int) (int, error) {
 	}
 	v := int(binary.BigEndian.Uint16(buf[*pos:]))
 	*pos += 2
-	return v, nil
-}
-
-func gistReadU32(buf []byte, pos *int) (uint32, error) {
-	if *pos+4 > len(buf) {
-		return 0, newError(DataCorrupted, "gist: truncated u32")
-	}
-	v := binary.BigEndian.Uint32(buf[*pos:])
-	*pos += 4
 	return v, nil
 }
 

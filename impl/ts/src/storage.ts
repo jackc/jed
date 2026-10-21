@@ -11,6 +11,7 @@
 // size-driven split (spec/fileformat/format.md).
 
 import type { Unfetched, Value } from "./value.ts";
+import { type Cap, NO_TAG } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
 import { PMap, pmapFromSkeleton, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafShape, LeafSource, PNode, Span } from "./pmap.ts";
@@ -40,7 +41,7 @@ const STAGED_SHAPE: LeafShape = leafShape([]);
 // STAGED_KEYS_CAP is the node capacity of a store's staged-key map. Small nodes keep the copy-on-write
 // path a write copies after each statement's snapshot clone short; the map never serializes, so any
 // capacity is correct.
-const STAGED_KEYS_CAP = 512;
+const STAGED_KEYS_CAP: Cap = { c: 512, tag: 0 };
 
 // stagedOf is the stored bytes a staged-key entry records (zero for none).
 function stagedOf(entry: Row | undefined): number {
@@ -66,12 +67,12 @@ class PagedSource implements LeafSource {
     this.colTypes = colTypes;
   }
 
-  loadLeaf(page: number): PNode {
-    return this.paging.faultLeaf(page, this.colTypes);
+  loadLeaf(page: number, tag?: Uint8Array): PNode {
+    return this.paging.faultLeaf(page, this.colTypes, tag ?? NO_TAG);
   }
 
-  loadLeafSteps(page: number): Steps<PNode> {
-    return this.paging.faultLeafSteps(page, this.colTypes);
+  loadLeafSteps(page: number, tag?: Uint8Array): Steps<PNode> {
+    return this.paging.faultLeafSteps(page, this.colTypes, tag ?? NO_TAG);
   }
 }
 
@@ -82,9 +83,10 @@ export class TableStore {
   // never reused, so a DELETE-then-INSERT cannot collide with a freed key. Unused for
   // tables with a primary key. Reconstructed on load (spec/fileformat).
   private nextRowid: bigint;
-  // cap is the page payload capacity C = page_size − 16 (the split threshold). colTypes are the
-  // column types, for computing record weights (recordSize).
-  private cap: number;
+  // cap is the page capacities (spec/fileformat/format.md *Page model*; encrypted.md §1): C (the split
+  // threshold) and the pointer tag width. colTypes are the column types, for computing record weights
+  // (recordSize).
+  private cap: Cap;
   private colTypes: ColType[];
   // shape is the leaf column-class shape ({fixed, var} counts — format.md v24 "Leaf node"), derived
   // once from colTypes: the B+tree's leaf-overhead arithmetic needs it on every size-driven
@@ -111,7 +113,7 @@ export class TableStore {
   private net = false;
 
   constructor(
-    cap: number,
+    cap: Cap,
     colTypes: ColType[],
     rows: PMap = new PMap(),
     nextRowid = 0n,
@@ -584,12 +586,17 @@ export class TableStore {
     if (!row.some((v, i) => mask[i] && v.kind === "unfetched")) return row;
     const paging = this.paging;
     if (paging === null) throw new Error("an unfetched value implies a paged store");
-    const fetch = (p: number): Steps<Uint8Array> => paging.readBlockSteps(p);
+    const fetch = (p: number, tag: Uint8Array): Steps<Uint8Array> => paging.readBodySteps(p, tag);
     const resolved = row.slice();
     for (let i = 0; i < row.length; i++) {
       const value = row[i]!;
       if (mask[i] && value.kind === "unfetched")
-        resolved[i] = yield* resolveUnfetchedSteps(this.colTypes[i]!, value.ref, fetch);
+        resolved[i] = yield* resolveUnfetchedSteps(
+          this.colTypes[i]!,
+          value.ref,
+          fetch,
+          this.cap.tag,
+        );
     }
     return resolved;
   }
@@ -611,7 +618,7 @@ export class TableStore {
     };
     return row.map((v, i) =>
       v.kind === "unfetched" && v.ref.form === 0x00
-        ? resolveUnfetched(this.colTypes[i]!, v.ref, fetch)
+        ? resolveUnfetched(this.colTypes[i]!, v.ref, fetch, this.cap.tag)
         : v,
     );
   }
@@ -629,7 +636,12 @@ export class TableStore {
   *resolveValueSteps(col: number, u: Unfetched): Steps<Value> {
     const paging = this.paging;
     if (paging === null) throw new Error("an unfetched value implies a paged store");
-    return yield* resolveUnfetchedSteps(this.colTypes[col]!, u, (p) => paging.readBlockSteps(p));
+    return yield* resolveUnfetchedSteps(
+      this.colTypes[col]!,
+      u,
+      (p, tag) => paging.readBodySteps(p, tag),
+      this.cap.tag,
+    );
   }
 
   // settleCarried settles the deferred values an UPDATE's new row carries over (large-values.md
@@ -786,8 +798,9 @@ export class TableStore {
 
   *refaultRootSteps(page: number): Steps<void> {
     const paging = this.paging!;
+    const tag = this.rows.rootNode()?.tag ?? NO_TAG;
     try {
-      this.rows.replaceRoot(yield* paging.faultLeafSteps(page, this.colTypes));
+      this.rows.replaceRoot(yield* paging.faultLeafSteps(page, this.colTypes, tag));
     } catch {
       paging.poison();
     }
@@ -797,10 +810,15 @@ export class TableStore {
   // serializer's OnDisk-child materialization (format.ts serializeNode; under B3 every database is
   // demand-paged, in-memory included). A store with no paging context cannot hold an OnDisk child,
   // so the throw is an internal wiring invariant.
-  faultLeaf(page: number): PNode {
+  faultLeaf(page: number, tag: Uint8Array = NO_TAG): PNode {
     const paging = this.paging;
     if (paging === null) throw new Error("an OnDisk leaf implies a paged store");
-    return paging.faultLeaf(page, this.colTypes);
+    return paging.faultLeaf(page, this.colTypes, tag);
+  }
+
+  // capacities is the store's page capacities (format.md *Page model*; encrypted.md §1).
+  capacities(): Cap {
+    return this.cap;
   }
 
   // columnTypes is the store's resolved per-column ColTypes (a scalar, or a composite resolved to

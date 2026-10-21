@@ -139,9 +139,10 @@ pub enum Unfetched {
         len: u32,
         ty: TypeRef,
     },
-    /// `0x02` external-plain: the chain carries `len` payload bytes from `first_page`.
+    /// `0x02` external-plain: the chain carries `len` payload bytes from its first page `first` (with
+    /// the tag that page's pointer binds in an encrypted file — spec/fileformat/encrypted.md §2).
     External {
-        first_page: u32,
+        first: crate::format::PageRef,
         len: u32,
         ty: TypeRef,
         paging: PagerRef,
@@ -155,7 +156,7 @@ pub enum Unfetched {
     },
     /// `0x04` external-compressed: the chain carries the `stored_len`-byte LZ4 block.
     ExternalComp {
-        first_page: u32,
+        first: crate::format::PageRef,
         stored_len: u32,
         raw_len: u32,
         ty: TypeRef,
@@ -234,14 +235,10 @@ impl PartialEq for Unfetched {
             ) => a == b && ao == bo && al == bl,
             (
                 Unfetched::External {
-                    first_page: a,
-                    len: al,
-                    ..
+                    first: a, len: al, ..
                 },
                 Unfetched::External {
-                    first_page: b,
-                    len: bl,
-                    ..
+                    first: b, len: bl, ..
                 },
             ) => a == b && al == bl,
             (
@@ -258,13 +255,13 @@ impl PartialEq for Unfetched {
             ) => a == b && al == bl,
             (
                 Unfetched::ExternalComp {
-                    first_page: a,
+                    first: a,
                     stored_len: asl,
                     raw_len: al,
                     ..
                 },
                 Unfetched::ExternalComp {
-                    first_page: b,
+                    first: b,
                     stored_len: bsl,
                     raw_len: bl,
                     ..
@@ -288,11 +285,9 @@ impl std::hash::Hash for Unfetched {
                 off.hash(state);
                 len.hash(state);
             }
-            Unfetched::External {
-                first_page, len, ..
-            } => {
+            Unfetched::External { first, len, .. } => {
                 1u8.hash(state);
-                first_page.hash(state);
+                first.hash(state);
                 len.hash(state);
             }
             Unfetched::InlineComp { comp, raw_len, .. } => {
@@ -301,13 +296,13 @@ impl std::hash::Hash for Unfetched {
                 raw_len.hash(state);
             }
             Unfetched::ExternalComp {
-                first_page,
+                first,
                 stored_len,
                 raw_len,
                 ..
             } => {
                 3u8.hash(state);
-                first_page.hash(state);
+                first.hash(state);
                 stored_len.hash(state);
                 raw_len.hash(state);
             }

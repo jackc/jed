@@ -34,7 +34,7 @@ struct PagedSource<'a> {
 }
 
 impl LeafSource for PagedSource<'_> {
-    fn load_leaf(&self, page: u32) -> Result<Arc<Node>> {
+    fn load_leaf(&self, page: crate::format::PageRef) -> Result<Arc<Node>> {
         self.paging.fault_leaf(page, self.col_types)
     }
 
@@ -42,7 +42,7 @@ impl LeafSource for PagedSource<'_> {
         self.paging.batches_reads()
     }
 
-    fn prefetch(&self, pages: &[u32]) {
+    fn prefetch(&self, pages: &[crate::format::PageRef]) {
         self.paging.prefetch_leaves(pages, self.col_types);
     }
 }
@@ -151,7 +151,7 @@ pub struct TableStore {
     next_rowid: i64,
     /// Page payload capacity `C = page_size − 16` (`PAGE_HEADER`) — the split threshold for the
     /// page-backed B-tree (spec/fileformat/format.md). Fixed for the life of the database.
-    cap: usize,
+    cap: crate::format::Cap,
     /// The table's resolved column types ([`ColType`] — a scalar, or a composite resolved to its
     /// field-type tree), for the value codec and for computing each row's on-disk record weight
     /// ([`crate::format::record_size`]). `Arc` so a snapshot clone stays O(1).
@@ -184,7 +184,7 @@ pub struct TableStore {
 impl TableStore {
     /// A new empty store for a table whose columns have the given resolved types, serializing at
     /// page payload `cap` (= `page_size − 16`). In-memory (no paging) until [`attach_paging`].
-    pub fn new(cap: usize, col_types: Vec<ColType>) -> Self {
+    pub(crate) fn new(cap: crate::format::Cap, col_types: Vec<ColType>) -> Self {
         let shape = crate::format::leaf_shape(&col_types);
         TableStore {
             rows: PMap::new(),
@@ -303,7 +303,10 @@ impl TableStore {
             key.to_vec(),
             vec![Value::Int(stored)],
             w,
-            STAGED_KEYS_CAP,
+            crate::format::Cap {
+                c: STAGED_KEYS_CAP,
+                tag: 0,
+            },
             crate::format::leaf_shape(&[]),
             None,
         )?;
@@ -316,9 +319,15 @@ impl TableStore {
         if self.staged_keys.is_empty() {
             return Ok(());
         }
-        let old =
-            self.staged_keys
-                .remove(key, STAGED_KEYS_CAP, crate::format::leaf_shape(&[]), None)?;
+        let old = self.staged_keys.remove(
+            key,
+            crate::format::Cap {
+                c: STAGED_KEYS_CAP,
+                tag: 0,
+            },
+            crate::format::leaf_shape(&[]),
+            None,
+        )?;
         self.staged -= staged_of(old);
         Ok(())
     }
@@ -605,8 +614,8 @@ impl TableStore {
                     .paging
                     .as_ref()
                     .expect("an unfetched value implies a paged store");
-                let fetch = |p: u32| paging.pager().read_block(p);
-                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch)?;
+                let fetch = |p: crate::format::PageRef| paging.read_body(p);
+                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch, self.cap)?;
             }
         }
         Ok(())
@@ -618,8 +627,8 @@ impl TableStore {
             .paging
             .as_ref()
             .expect("an unfetched value implies a paged store");
-        let fetch = |p: u32| paging.pager().read_block(p);
-        crate::format::resolve_unfetched(&self.col_types[col], u, &fetch)
+        let fetch = |p: crate::format::PageRef| paging.read_body(p);
+        crate::format::resolve_unfetched(&self.col_types[col], u, &fetch, self.cap)
     }
 
     /// Settle the deferred values an UPDATE's new row carries over (spec/design/large-values.md
@@ -669,10 +678,10 @@ impl TableStore {
                 && let Value::Unfetched(u) = v
             {
                 // An inline form reads no overflow pages — the fetch is never invoked.
-                let fetch = |_p: u32| -> Result<Vec<u8>> {
+                let fetch = |_p: crate::format::PageRef| -> Result<Vec<u8>> {
                     unreachable!("inline-deferred resolution reads no overflow pages")
                 };
-                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch)?;
+                *v = crate::format::resolve_unfetched(&self.col_types[i], u, &fetch, self.cap)?;
             }
         }
         Ok(())
@@ -761,9 +770,9 @@ impl TableStore {
         let Some(root) = self.rows.root() else {
             return;
         };
-        let page = root.page.load(std::sync::atomic::Ordering::Acquire);
+        let page = root.page_ref();
         if !root.is_leaf()
-            || page == 0
+            || page.page == 0
             || root.packed.is_some()
             || !rows_reference_chains(&root.vals)
         {
@@ -779,7 +788,7 @@ impl TableStore {
     /// `OnDisk`-child materialization (format.rs `serialize_node`; under B3 every database is
     /// demand-paged, in-memory included). A store with no paging context cannot hold an `OnDisk`
     /// child, so the expect is an internal wiring invariant.
-    pub(crate) fn fault_leaf(&self, page: u32) -> Result<Arc<Node>> {
+    pub(crate) fn fault_leaf(&self, page: crate::format::PageRef) -> Result<Arc<Node>> {
         let paging = self
             .paging
             .as_ref()
@@ -795,7 +804,7 @@ impl TableStore {
 
     /// The page payload capacity `C` — the divisor of the per-record large-value scan units
     /// (chain pages, decompress slabs; cost.md §3).
-    pub(crate) fn cap(&self) -> usize {
+    pub(crate) fn cap(&self) -> crate::format::Cap {
         self.cap
     }
 

@@ -28,6 +28,7 @@ mod collation;
 mod coordinator;
 mod cost;
 mod costs;
+mod crypto;
 mod cursor;
 mod date;
 mod datetime_fn;
@@ -101,6 +102,7 @@ pub mod sim;
 // embedders should reach for Database/Session. `execute`/`execute_params` are its one-shot helpers.
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use cancel::CancellationToken;
+pub use crypto::{Argon2Params, Credential};
 pub use decimal::Decimal;
 // The rusqlite-style ergonomic layer (spec/design/api.md §11): native-typed params + typed row
 // scanning over the raw `Database`/`Session`/`Transaction` handles. Additive — the raw `&[Value]`

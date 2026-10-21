@@ -47,7 +47,7 @@ test("gin posting run maintenance matches the shared histories", () => {
   assert.ok(rows.length >= 4);
   for (const r of rows) {
     const term = unhex(r.str("term"));
-    const store = new TableStore(4080, []);
+    const store = new TableStore({ c: 4080, tag: 0 }, []);
     for (const op of r.strs("ops")) {
       const key = unhex(op.slice(1));
       if (op.startsWith("+")) ginInsert(store, term, key);

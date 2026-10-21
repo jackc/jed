@@ -1583,7 +1583,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		aps := db.attachPageSize(attachName)
 		ws.putTableResolved(table, colTypes, aps)
 		for _, ix := range table.Indexes {
-			ws.putIndexStore(ix.Name, newTableStore(pagePayload(aps), nil))
+			ws.putIndexStore(ix.Name, newTableStore(ws.capFor(aps), nil))
 		}
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
@@ -1619,7 +1619,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		ts.storePaging = db.tempDomainPaging()
 		ts.putTableResolved(table, colTypes, db.pageSize)
 		for _, ix := range table.Indexes {
-			ts.putIndexStore(ix.Name, newTableStore(pagePayload(db.pageSize), nil))
+			ts.putIndexStore(ix.Name, newTableStore(ts.capFor(db.pageSize), nil))
 		}
 		// Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
 		// (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
@@ -1635,7 +1635,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 	db.putTable(table)
 	// The table is brand new (no rows), so each backing index store starts empty.
 	for _, ix := range table.Indexes {
-		db.working().putIndexStore(ix.Name, newTableStore(pagePayload(db.pageSize), nil))
+		db.working().putIndexStore(ix.Name, newTableStore(db.working().capFor(db.pageSize), nil))
 	}
 	// Stage each serial column's OWNED sequence now that the table validated
 	// (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
@@ -2911,6 +2911,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			return outcome{}, err
 		}
 		rewriteNextRowid = store.nextRowid
+		rewriteCap := store.cap
 		if pkRekeyed && len(table.PK) == 0 {
 			rewriteNextRowid = 0
 		}
@@ -2976,7 +2977,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				seenKeys[string(key)] = true
 				rows[i].Key = key
 			}
-			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, pagePayload(alterPageSize)))
+			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, rewriteCap))
 		}
 		meter.Charge(costs.ValueCompress * compressUnits)
 		if err := meter.Step(); err != nil {

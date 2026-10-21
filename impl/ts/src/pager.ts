@@ -174,6 +174,8 @@ export class Pager {
   // false every write-side step runs inline, exactly as the synchronous path.
   private transform: PageTransform | null = null;
   private writeAsync = false;
+  // encrypted is set when the file is unlocked or created as the encrypted variant (setEncrypted).
+  private encrypted = false;
 
   private constructor(store: BlockStore, pageSize: number, allocatedPages: number) {
     this.store = store;
@@ -606,7 +608,13 @@ export class Pager {
   // batch cap, after which a flush follows.
   batchCapReached(): boolean {
     this.reconcileBatch();
-    return this.pending.size >= manifestInlineCapacity(this.pageSize);
+    return this.pending.size >= manifestInlineCapacity(this.pageSize, this.encrypted);
+  }
+
+  // setEncrypted marks the file as the encrypted variant (spec/fileformat/encrypted.md): its meta's
+  // inline manifest holds fewer entries, which moves the relaxed batch cap.
+  setEncrypted(): void {
+    this.encrypted = true;
   }
 
   // flushPending is a flush: one durable barrier makes every pending commit durable, so the newest

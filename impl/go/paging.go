@@ -52,13 +52,51 @@ func newSharedPaging(p *pager, capacity int) *sharedPaging {
 	return &sharedPaging{pgr: p, pool: newBufferPool(capacity)}
 }
 
+// codec is the database's page codec when its file is encrypted (spec/fileformat/encrypted.md): every
+// body page read through this context is opened, and every commit page sealed, under its keys. nil for
+// a plaintext file and every in-memory or temp store. It lives on the pager, which selects the meta
+// slot it authenticates.
+func (s *sharedPaging) codec() *pageCodec { return s.pgr.codec }
+
+// cap is the page capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
+func (s *sharedPaging) cap() pageCap { return capOf(s.pgr.pageSize, s.pgr.codec != nil) }
+
+// readBody reads the body page ref names and returns its plaintext block: the stored bytes of a
+// plaintext file, or an encrypted page checked against the pointer's tag and opened (encrypted.md §4)
+// — the decryption runs outside the pager lock.
+func (s *sharedPaging) readBody(ref pageRef) ([]byte, error) {
+	block, err := s.readBlock(ref.page)
+	if err != nil {
+		return nil, err
+	}
+	return s.openBlock(ref, block)
+}
+
+// readBodyUnlocked is readBody without the pager lock — for the walks that read pager blocks unlocked
+// (the open-time load and the commit-time reachability walks).
+func (s *sharedPaging) readBodyUnlocked(ref pageRef) ([]byte, error) {
+	block, err := s.pgr.readBlock(ref.page)
+	if err != nil {
+		return nil, err
+	}
+	return s.openBlock(ref, block)
+}
+
+func (s *sharedPaging) openBlock(ref pageRef, block []byte) ([]byte, error) {
+	codec := s.pgr.codec
+	if codec == nil {
+		return block, nil
+	}
+	return codec.openBody(ref.page, block, ref.tag)
+}
+
 // faultLeaf faults the clean leaf at page to a resident node, through the buffer pool: a hit returns
 // the cached node, a miss reads + decodes the page (with this table's colTypes) and caches it,
 // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
 // with a caller-supplied decoder is consistent (pager.md §4).
-func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error) {
-	node, err := s.pool.getOrLoad(page, func() (*pnode, error) {
-		block, err := s.readBlock(page)
+func (s *sharedPaging) faultLeaf(page pageRef, colTypes []colType) (*pnode, error) {
+	node, err := s.pool.getOrLoad(page.page, func() (*pnode, error) {
+		block, err := s.readBody(page)
 		if err != nil {
 			return nil, err
 		}

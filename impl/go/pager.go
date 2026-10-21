@@ -95,6 +95,10 @@ type pager struct {
 	// the newest generation durable. shrinkPages is that newest generation's high-water.
 	shrinkPending bool
 	shrinkPages   uint32
+	// codec is the encrypted variant's page codec (spec/fileformat/encrypted.md), set when the file is
+	// unlocked or created encrypted; nil for a plaintext file. Slot selection authenticates an
+	// encrypted meta with it, and its smaller inline manifest moves the relaxed batch cap.
+	codec *pageCodec
 }
 
 // faultPoint selects a point in the commit write sequence at which the fault-injection seam

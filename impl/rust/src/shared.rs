@@ -223,6 +223,8 @@ pub struct AttachSource {
     file_lock_timeout_ms: u64,
     /// The in-memory attachment's committed-storage limit (memory.md §8.1); `<= 0` is unlimited.
     max_storage_bytes: i64,
+    /// The credential of an encrypted file attachment (spec/design/encryption.md §5).
+    credential: Option<crate::crypto::Credential>,
 }
 
 impl AttachSource {
@@ -234,6 +236,7 @@ impl AttachSource {
             locking: Locking::Auto,
             file_lock_timeout_ms: crate::file::DEFAULT_FILE_LOCK_TIMEOUT_MS,
             max_storage_bytes: 0,
+            credential: None,
         }
     }
 
@@ -249,6 +252,7 @@ impl AttachSource {
             locking: Locking::Auto,
             file_lock_timeout_ms: crate::file::DEFAULT_FILE_LOCK_TIMEOUT_MS,
             max_storage_bytes: 0,
+            credential: None,
         }
     }
 
@@ -270,6 +274,33 @@ impl AttachSource {
     pub fn max_storage_bytes(mut self, bytes: i64) -> AttachSource {
         self.max_storage_bytes = bytes;
         self
+    }
+
+    /// Unlock an encrypted file attachment with `credential` (spec/design/encryption.md §5): `28P02`
+    /// without one, `28P01` when it does not unwrap the key, `28P03` for a plaintext file, `55000`
+    /// for an in-memory source (nothing is at rest) or — until scratch encryption lands — on a handle
+    /// that may spill to disk (spec/fileformat/encrypted.md §10).
+    pub fn credential(mut self, credential: crate::crypto::Credential) -> AttachSource {
+        self.credential = Some(credential);
+        self
+    }
+}
+
+/// A credential for an in-memory database: `55000` — nothing is at rest (encryption.md §5).
+fn credential_without_file() -> EngineError {
+    EngineError::new(
+        SqlState::ObjectNotInPrerequisiteState,
+        "an in-memory database cannot be encrypted",
+    )
+}
+
+/// The coordination an open uses: an encrypted file is never served by the page service
+/// (spec/fileformat/encrypted.md §10), so a credential turns `auto` into an exclusive owner.
+fn locking_for(locking: Locking, credential: Option<&crate::crypto::Credential>) -> Locking {
+    if credential.is_some() && locking == Locking::Auto {
+        Locking::Exclusive
+    } else {
+        locking
     }
 }
 
@@ -401,8 +432,8 @@ pub(crate) struct BudgetCtx<'a> {
 struct StorageBudget {
     /// Positive: the limit in bytes over `page_count × page_size`. Zero or negative: unlimited.
     limit: i64,
-    /// The catalog root the last commit wrote; `0` before the first commit (nothing to reclaim yet).
-    last_cat_root: u32,
+    /// The catalog root the last commit wrote; page `0` before the first commit (nothing to reclaim yet).
+    last_cat_root: crate::format::PageRef,
     /// The pages the last commit wrote.
     last_written: Vec<u32>,
     /// How many catalog pages the last commit wrote (the catalog is rewritten whole every commit).
@@ -412,7 +443,7 @@ struct StorageBudget {
 impl StorageBudget {
     /// Remember a successful in-memory commit's catalog root and written pages.
     fn record(&mut self, staged: &StagedCommit) {
-        self.last_cat_root = staged.root_page;
+        self.last_cat_root = staged.root;
         self.last_written = staged.written.clone();
         self.last_catalog_pages = staged.catalog_pages;
     }
@@ -427,7 +458,7 @@ impl StorageBudget {
 pub(crate) struct StagedCommit {
     /// The attachment the commit belongs to (empty for a temp domain, which adopts in place).
     name: String,
-    root_page: u32,
+    root: crate::format::PageRef,
     page_count: u32,
     free_remaining: Vec<u32>,
     /// The pages the commit wrote (unioned into the compaction's live set; the budget record).
@@ -572,7 +603,7 @@ impl Storage {
         snap.demote_clean_leaves();
         Ok(StagedCommit {
             name,
-            root_page: write.root_page,
+            root: write.root,
             page_count: write.page_count,
             catalog_pages: crate::format::catalog_page_count(&write.pages),
             written: write.pages.iter().map(|(index, _)| *index).collect(),
@@ -591,7 +622,7 @@ impl Storage {
         self.page_count = staged.page_count;
         self.budget.record(&staged);
         self.free_pages = staged.free_remaining;
-        self.maybe_compact(snap, staged.root_page, &staged.written, can_reclaim)
+        self.maybe_compact(snap, staged.root, &staged.written, can_reclaim)
     }
 
     /// Plan an in-memory commit's page allocation under the domain's `max_storage_bytes` limit
@@ -665,9 +696,7 @@ impl Storage {
         write: &crate::format::IncrementalWrite,
         ctx: &BudgetCtx<'_>,
     ) -> Result<crate::format::LiveCount> {
-        let live = self
-            .live
-            .after(write, ctx.prev, &self.paging, self.page_size)?;
+        let live = self.live.after(write, ctx.prev, &self.paging)?;
         let limit = self.budget.limit;
         if limit <= 0
             || live.live <= self.live.live
@@ -691,13 +720,13 @@ impl Storage {
     /// `prev` (the last commit's catalog root and written pages), ignoring the periodic trigger. Returns
     /// whether it freed any page the free list did not already hold.
     fn force_compact(&mut self, prev: &Snapshot) -> Result<bool> {
-        if self.budget.last_cat_root == 0 {
+        if self.budget.last_cat_root.page == 0 {
             return Ok(false); // no commit yet: nothing has been orphaned
         }
         let mut reached =
             crate::format::reachable_pages(prev, &self.paging, self.budget.last_cat_root)?;
         reached.extend(self.budget.last_written.iter().copied());
-        let free: Vec<u32> = (crate::format::ROOT_PAGE..self.page_count)
+        let free: Vec<u32> = (self.paging.cap().first_body()..self.page_count)
             .filter(|p| !reached.contains(p))
             .collect();
         if free.len() <= self.free_pages.len() {
@@ -955,7 +984,6 @@ impl Storage {
     ) -> Result<()> {
         self.sync_directory_once();
         let ps = self.page_size as usize;
-        let cap = ps - crate::format::PAGE_HEADER;
         // Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new
         // catalog back (the pager writes through — read-your-writes). The guard is released before the
         // walk, which re-locks the pager itself.
@@ -972,13 +1000,12 @@ impl Storage {
         let plan = crate::format::plan_free_list(
             snap,
             &self.paging,
-            write.root_page,
+            write.root,
             &write.pages,
             &write.free_remaining,
             write.page_count,
             self.live_at_compaction,
             self.free_gen_txid,
-            cap,
             ps,
             can_reclaim,
             can_reuse,
@@ -1000,11 +1027,12 @@ impl Storage {
             // The slot not holding the floor (format.md, *Slot alternation*); a relaxed commit
             // defers its barrier to a flush (validated-cow.md §4).
             let slot = pager.commit_slot();
-            pager.write_block(slot, &plan.meta)?;
+            let meta = crate::format::seal_meta(&self.paging, slot, &plan.meta, &plan.manifest)?;
+            pager.write_block(slot, &meta)?;
             if !relaxed {
                 pager.sync()?;
             }
-            pager.finish_commit(&plan.meta, slot, !relaxed, &plan.dirty);
+            pager.finish_commit(&meta, slot, !relaxed, &plan.dirty);
             // Trailing truncation lowered the high-water: shorten the file once the new meta is
             // durable — now under synchronous = on, at the batch's flush under synchronous = off —
             // keeping one growth step of slack (pager.md §7).
@@ -1049,11 +1077,12 @@ impl Storage {
     ) -> Result<()> {
         // A memory store is never reopened, so its meta carries no live-page count (memory.md §8.7).
         let meta = crate::format::meta_page(
+            crate::format::Cap::plain(self.page_size),
             self.page_size,
             snap.txid,
-            write.root_page,
+            write.root,
             write.page_count,
-            0,
+            crate::format::PageRef::NONE,
             0,
         );
         {
@@ -1071,7 +1100,7 @@ impl Storage {
         }
         let staged = StagedCommit {
             name: String::new(),
-            root_page: write.root_page,
+            root: write.root,
             page_count: write.page_count,
             catalog_pages: crate::format::catalog_page_count(&write.pages),
             written: write.pages.iter().map(|(index, _)| *index).collect(),
@@ -1092,7 +1121,7 @@ impl Storage {
     pub(crate) fn maybe_compact(
         &mut self,
         snap: &Snapshot,
-        cat_root: u32,
+        cat_root: crate::format::PageRef,
         written: &[u32],
         can_reclaim: bool,
     ) -> Result<()> {
@@ -1108,7 +1137,7 @@ impl Storage {
         }
         let mut reached = crate::format::reachable_pages(snap, &self.paging, cat_root)?;
         reached.extend(written.iter().copied());
-        self.free_pages = (crate::format::ROOT_PAGE..self.page_count)
+        self.free_pages = (self.paging.cap().first_body()..self.page_count)
             .filter(|p| !reached.contains(p))
             .collect();
         self.live_at_compaction = reached.len() as u32;
@@ -1161,7 +1190,7 @@ impl Storage {
         self.live_at_compaction = engine.live_at_compaction;
         self.free_gen_txid = engine.free_gen_txid;
         self.live = engine.live;
-        self.budget.last_cat_root = 0;
+        self.budget.last_cat_root = crate::format::PageRef::NONE;
         self.budget.last_written.clear();
         self.budget.last_catalog_pages = 0;
         self.dir_synced = true; // compaction's own directory barrier made the new entry durable
@@ -1506,7 +1535,7 @@ impl Shared {
         }
         let free = crate::format::read_free_list(
             &st.paging,
-            delta.free_list_head,
+            crate::format::PageRef::plain(delta.free_list_head),
             delta.page_count,
             &delta.protected,
         )?;
@@ -2868,17 +2897,36 @@ impl Database {
     /// directory at open/create; keeping this crate-private avoids widening the embedding API before
     /// the configurable spill-target slice. Sessions minted afterwards inherit it.
     pub(crate) fn set_spill_dir_for_test(&self, dir: std::path::PathBuf) {
-        self.0
-            .storage
-            .lock()
-            .expect("storage lock not poisoned")
-            .spill = Some(crate::spillhost::os_spill_host(dir));
+        let mut storage = self.0.storage.lock().expect("storage lock not poisoned");
+        // An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
+        if storage.paging.codec().is_none() {
+            storage.spill = Some(crate::spillhost::os_spill_host(dir));
+        }
     }
 
     /// Whether this database was opened read-only (a write is `25006`). In-memory databases are
     /// always writable.
     pub fn read_only(&self) -> bool {
         self.0.read_only()
+    }
+
+    /// The from-scratch image of the committed snapshot in the encrypted variant, under a fresh key
+    /// block for `credential` whose key material — and every page nonce after it — comes from the
+    /// insecure stream seeded with `seed` (spec/fileformat/encrypted.md §8): the bytes an
+    /// `encrypted_*` golden pins. Test-only.
+    #[cfg(test)]
+    pub(crate) fn encrypted_image_for_testing(
+        &self,
+        seed: u64,
+        credential: &crate::crypto::Credential,
+    ) -> Result<Vec<u8>> {
+        let codec = crate::crypto::create(
+            credential,
+            crate::crypto::Argon2Params::default(),
+            crate::seam::seeded_random_source(seed),
+        )?;
+        let snap = self.0.pin();
+        snap.to_image_sealed(self.page_size(), 1, Some(&codec))
     }
 
     /// White-box test helper (CLAUDE.md §10): all rows of persistent table `name` in primary-key
@@ -2904,21 +2952,35 @@ impl Database {
         // The handle's environment (environment.md), shared into every minted session. Captured
         // before the `opts.path` move below.
         let env = opts.environment.clone();
+        if opts.path.is_none() && opts.credential.is_some() {
+            return Err(credential_without_file());
+        }
         match opts.path {
             Some(path) => {
-                let mut coordinator =
-                    FileCoordinator::create(&path, opts.locking, opts.file_lock_timeout_ms)?;
+                let mut coordinator = FileCoordinator::create(
+                    &path,
+                    locking_for(opts.locking, opts.credential.as_ref()),
+                    opts.file_lock_timeout_ms,
+                )?;
                 let canonical = coordinator
                     .as_ref()
                     .map_or(path.as_path(), FileCoordinator::path)
                     .to_path_buf();
                 let canonical = canonical.as_path();
-                let mut engine = Engine::create(
+                let mut engine = Engine::create_via(
+                    &crate::filehost::OsFileHost,
                     canonical,
                     DatabaseOptions {
                         page_size,
                         no_sync: opts.skip_fsync,
                     },
+                    opts.credential
+                        .as_ref()
+                        .map(|credential| crate::file::Encryption {
+                            credential,
+                            kdf: opts.kdf,
+                            environment: &env,
+                        }),
                 )?;
                 engine.set_environment(env.clone());
                 let canonical = canonical.to_path_buf();
@@ -2986,7 +3048,10 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        let locking = crate::coordinator::resolve_mode(opts.locking)?;
+        let locking = locking_for(
+            crate::coordinator::resolve_mode(opts.locking)?,
+            opts.credential.as_ref(),
+        );
         if locking == Locking::Auto {
             return open_service(path.as_ref(), opts);
         }
@@ -3057,8 +3122,14 @@ impl Database {
         // Open a file source BEFORE taking the writer gate (an open may block on I/O and can fail): a
         // standalone engine over the file, whose committed snapshot + storage identity become the
         // attachment. If the name is taken, the built `Storage` drops here (closing the just-opened file).
+        if !source.file && source.credential.is_some() {
+            return Err(credential_without_file());
+        }
         let locking = if source.file {
-            crate::coordinator::resolve_mode(source.locking)?
+            locking_for(
+                crate::coordinator::resolve_mode(source.locking)?,
+                source.credential.as_ref(),
+            )
         } else {
             Locking::None
         };
@@ -3103,9 +3174,26 @@ impl Database {
                     locking: Locking::None,
                     // An attachment uses its handle's environment (environment.md §3).
                     environment: self.0.env.clone(),
+                    credential: source.credential.clone(),
                     ..OpenOptions::default()
                 },
             )?;
+            // Until scratch encryption lands, an encrypted attachment may not join a handle that can
+            // spill its rows to a plaintext scratch file (spec/fileformat/encrypted.md §10).
+            if engine.encrypted()
+                && self
+                    .0
+                    .storage
+                    .lock()
+                    .expect("storage lock not poisoned")
+                    .spill
+                    .is_some()
+            {
+                return Err(EngineError::new(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    "an encrypted database cannot be attached to a handle that spills to disk",
+                ));
+            }
             let paging = engine
                 .paging
                 .clone()

@@ -21,10 +21,11 @@ type tableStore struct {
 	// key. Unused for tables with a primary key. Reconstructed on load
 	// (spec/fileformat).
 	nextRowid int64
-	// cap is the page payload capacity C = page_size − 16 (the split threshold). Fixed for the
-	// database's life. colTypes are the resolved column types (scalar or composite —
+	// cap is the database's page capacities: the payload capacity C = page_size − 16 (the split
+	// threshold; page_size − 56 in an encrypted file) and the pointer tag width (spec/fileformat/
+	// encrypted.md §1–§2). Fixed for the database's life. colTypes are the resolved column types (scalar or composite —
 	// spec/design/composite.md §4), for computing record weights and the recursive value codec.
-	cap      int
+	cap      pageCap
 	colTypes []colType
 	// shape is the leaf column-class shape ({fixed, variable} counts — spec/fileformat/format.md
 	// v24 "Leaf node"), derived once from colTypes: the B+tree's leaf-overhead arithmetic needs it
@@ -57,8 +58,8 @@ type tableStore struct {
 const stagedKeysCap = 512
 
 // NewTableStore builds an empty store for a table whose columns have the given resolved types,
-// serializing at page payload cap (= page_size − 16). In-memory (no paging) until attachPaging.
-func newTableStore(cap int, colTypes []colType) *tableStore {
+// serializing at the page capacities cap (snapshot.capFor). In-memory (no paging) until attachPaging.
+func newTableStore(cap pageCap, colTypes []colType) *tableStore {
 	return &tableStore{cap: cap, colTypes: colTypes, shape: leafShapeFor(colTypes)}
 }
 
@@ -95,7 +96,7 @@ type pagedSource struct {
 	colTypes []colType
 }
 
-func (ps *pagedSource) loadLeaf(page uint32) (*pnode, error) {
+func (ps *pagedSource) loadLeaf(page pageRef) (*pnode, error) {
 	return ps.paging.faultLeaf(page, ps.colTypes)
 }
 
@@ -214,7 +215,7 @@ func (s *tableStore) stage(key []byte, stored int64) error {
 		return nil
 	}
 	w := uint32(len(key)) + 8 // any weight: this in-memory map never serializes
-	old, _, err := s.stagedKeys.Insert(append([]byte(nil), key...), storedRow{IntValue(stored)}, w, stagedKeysCap, leafShapeFor(nil), nil)
+	old, _, err := s.stagedKeys.Insert(append([]byte(nil), key...), storedRow{IntValue(stored)}, w, pageCap{c: stagedKeysCap}, leafShapeFor(nil), nil)
 	if err != nil {
 		return err
 	}
@@ -227,7 +228,7 @@ func (s *tableStore) unstage(key []byte) error {
 	if s.stagedKeys.IsEmpty() {
 		return nil
 	}
-	old, _, err := s.stagedKeys.Remove(key, stagedKeysCap, leafShapeFor(nil), nil)
+	old, _, err := s.stagedKeys.Remove(key, pageCap{c: stagedKeysCap}, leafShapeFor(nil), nil)
 	if err != nil {
 		return err
 	}
@@ -503,10 +504,9 @@ func (s *tableStore) resolveColumns(row storedRow, mask []bool) (storedRow, erro
 // mutated, and resolution visits the same touched columns in the same order as
 // resolveColumns. Streaming scan scratch is private; tree and read-ahead rows are not.
 func (s *tableStore) resolveColumnsInPlace(out storedRow, mask []bool) (storedRow, error) {
-	fetch := func(p uint32) ([]byte, error) { return s.paging.readBlock(p) }
 	for i := range out {
 		if mask[i] && out[i].Kind == ValUnfetched {
-			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), fetch)
+			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), s.paging.readBody, s.cap)
 			if err != nil {
 				return nil, err
 			}
@@ -521,7 +521,7 @@ func (s *tableStore) resolveValue(col int, u *Unfetched) (Value, error) {
 	if s.paging == nil {
 		panic("an unfetched value implies a paged store")
 	}
-	return resolveUnfetched(s.colTypes[col], u, func(p uint32) ([]byte, error) { return s.paging.readBlock(p) })
+	return resolveUnfetched(s.colTypes[col], u, s.paging.readBody, s.cap)
 }
 
 // settleCarried settles the deferred values an UPDATE's new row carries over (large-values.md §15):
@@ -579,7 +579,7 @@ func (s *tableStore) resolveInlineColumns(row storedRow) (storedRow, error) {
 	for i := range out {
 		if out[i].Kind == ValUnfetched && out[i].unfetched().Form == 0x00 {
 			// An inline form reads no overflow pages — fetch is never invoked.
-			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), nil)
+			v, err := resolveUnfetched(s.colTypes[i], out[i].unfetched(), nil, pageCap{})
 			if err != nil {
 				return nil, err
 			}
@@ -662,7 +662,7 @@ func (s *tableStore) demoteCleanLeaves() {
 	if root == nil || !root.isLeaf() || root.page == 0 || root.packed != nil || !rowsReferenceChains(root.vals) {
 		return
 	}
-	fresh, err := s.paging.faultLeaf(root.page, s.colTypes)
+	fresh, err := s.paging.faultLeaf(root.ref(), s.colTypes)
 	if err != nil {
 		_ = s.paging.withPager(func(p *pager) error { p.poison(); return nil })
 		return
@@ -688,7 +688,7 @@ func rowsReferenceChains(rows []storedRow) bool {
 // OnDisk-child materialization (format.go serializeNode; under B3 every database is demand-paged,
 // in-memory included). A store with no paging context cannot hold an OnDisk child, so the panic is
 // an internal wiring invariant.
-func (s *tableStore) faultLeaf(page uint32) (*pnode, error) {
+func (s *tableStore) faultLeaf(page pageRef) (*pnode, error) {
 	if s.paging == nil {
 		panic("an OnDisk leaf implies a paged store")
 	}

@@ -422,6 +422,43 @@ name = "dependent_objects_still_exist"
 class = "dependent objects still exist"
 template = "cannot drop type {name} because other objects depend on it: {detail}"
 
+# --- invalid authorization specification (class 28) -------------------------
+# The credential of an encrypted database (../design/encryption.md §5, ../fileformat/encrypted.md
+# §9). The credential is a host-API argument of create/open/attach, never SQL, so the shared corpus
+# does not assert these. 28P01 is PostgreSQL's; 28P02–28P04 are jed-defined codes in PostgreSQL's
+# class 28 (the XX003 precedent — "we own our surface").
+#
+# The key block's data key does not unwrap with the offered credential (a wrong passphrase or key,
+# the wrong kind of credential, or a copy tampered with while keeping its CRC).
+[[error]]
+code = "28P01"
+name = "invalid_password"
+class = "invalid authorization specification"
+template = "{detail}"
+
+# An encrypted database was opened or attached without a credential.
+[[error]]
+code = "28P02"
+name = "credential_required"
+class = "invalid authorization specification"
+template = "{detail}"
+
+# A credential was offered for a plaintext database — refused, so a swapped file cannot silently
+# drop encryption.
+[[error]]
+code = "28P03"
+name = "credential_not_applicable"
+class = "invalid authorization specification"
+template = "{detail}"
+
+# A page-service client whose data key no longer authenticates the meta slot (the key was rotated);
+# reserved for the page-service follow-on and not yet raised.
+[[error]]
+code = "28P04"
+name = "stale_key"
+class = "invalid authorization specification"
+template = "{detail}"
+
 # --- invalid savepoint specification (class 3B) -----------------------------
 # RELEASE / ROLLBACK TO naming no savepoint of the open block (spec/design/transactions.md §11).
 # PostgreSQL's code. Like any statement error inside a block it aborts a clean block; in an
