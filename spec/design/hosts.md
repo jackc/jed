@@ -150,8 +150,8 @@ which it already does.
   returns bytes for offsets; it introduces nothing nondeterministic into the result, the cost,
   or the on-disk bytes. (Replication and encryption, which *do* ride this seam, preserve this —
   replication is outside the conformance contract like benchmarks, replication.md §6; encryption
-  requires identical bytes for identical crypto inputs; its crash/fork-safe nonce protocol
-  remains open, encryption.md §7.)
+  requires identical bytes for identical crypto inputs and draws a fresh random nonce per seal,
+  so it needs no nonce protocol, encryption.md §3.)
 
 ## 3. The pager keeps its page-level operations
 

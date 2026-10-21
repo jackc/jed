@@ -658,8 +658,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   per-file key; a credential change is acknowledged after a second barrier and rides the
   replication stream; converting between variants rebuilds the trees; key
   material comes from a dedicated CSPRNG source, never the seeded SQL entropy seam; the built-in
-  passphrase KDF is Argon2id behind a KDF identifier (a dependency in every core but Rust,
-  accepted knowingly), with a host-supplied wrapping key as the first-class credential; live VM
+  passphrase KDF is Argon2id behind a KDF identifier (Go's first module dependency and new Rust
+  crates, accepted knowingly; TS already ships it in `@noble/hashes`), with a host-supplied wrapping key as the first-class credential; live VM
   clones are excluded from the threat model; every
   process of an encrypted database (owner, page client, SSH page server) holds the key; browser
   performance does not decide the suite. Suite direction, pending security review: AES-256-GCM
