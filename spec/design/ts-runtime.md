@@ -540,8 +540,11 @@ is never ordinary cancellation. A browser without shared memory processes cancel
 same cooperative page and execution-loop boundaries, including resident scans. Sorting,
 parsing/planning and long scalar kernels remain synchronous: **cancellation has no guaranteed
 maximum latency**. Further pause points require evidence of a material delay. The commit
-transition past that boundary runs as an uncancelable continuation (§11.2). No WebCrypto codec
-is implemented; no SQL replay or whole-file preload substitutes for one.
+transition past that boundary runs as an uncancelable continuation (§11.2). The encrypted file
+variant's WebCrypto codec (`crypto_web.ts`, hosts.md §5) runs through these continuations: page
+opens, meta seals and key unwraps are awaited effects, and a commit's body pages are sealed through
+seal sessions (repeated pure serialization passes, nonces fixed by position). No SQL replay or
+whole-file preload substitutes for it.
 
 Data-only Unicode/time-zone bundles can be provided at open. Node additionally accepts a
 trusted `extensionModule` file URL exporting `configure(EnvironmentBuilder)`; it loads and

@@ -4,8 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use jed::{
-    AttachSource, CreateOptions, Database, EngineError, Environment, Locking, OpenOptions,
-    Ownership, Session, SessionOptions, Value,
+    Argon2Params, AttachSource, CreateOptions, Credential, Database, EngineError, Environment,
+    Locking, OpenOptions, Ownership, Session, SessionOptions, Value,
 };
 
 fn main() {
@@ -87,6 +87,8 @@ fn run() -> Result<(), EngineError> {
         .get("max_connections")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // key=<64 hex digits>: the host key of an encrypted database (spec/design/encryption.md §8).
+    let credential = options.get("key").map(|hex| host_key(hex));
     // create/open use the default locking (the page service); open-exclusive is a non-serving owner.
     let locking = match action.as_str() {
         "open-exclusive" => Locking::Exclusive,
@@ -119,6 +121,7 @@ fn run() -> Result<(), EngineError> {
                 &format!("remote:{}", path.display()),
                 OpenOptions {
                     file_lock_timeout_ms: timeout,
+                    credential,
                     ..OpenOptions::default()
                 },
             )?
@@ -136,6 +139,7 @@ fn run() -> Result<(), EngineError> {
             shutdown_grace_ms: millis("shutdown_grace"),
             max_connections,
             ownership,
+            credential,
             ..CreateOptions::default()
         })?
     } else {
@@ -151,6 +155,7 @@ fn run() -> Result<(), EngineError> {
                 shutdown_grace_ms: millis("shutdown_grace"),
                 max_connections,
                 ownership,
+                credential,
                 ..OpenOptions::default()
             },
         )?
@@ -236,6 +241,18 @@ fn run() -> Result<(), EngineError> {
                     .backup_for_testing(dest, form == "page_identical")
                     .map(|_| String::new())
             }
+            // An encrypted database's credential change and rekey (spec/design/encryption.md §5):
+            // CHANGE_KEY <hex>, REKEY <hex> (empty: decrypt).
+            "CHANGE_KEY" => database
+                .change_credential("main", host_key(argument), Argon2Params::default())
+                .map(|_| String::new()),
+            "REKEY" => database
+                .rekey(
+                    "main",
+                    (!argument.is_empty()).then(|| host_key(argument)),
+                    Argon2Params::default(),
+                )
+                .map(|_| String::new()),
             "MAX_STORAGE_BYTES" => database
                 .set_max_storage_bytes("main", argument.parse().expect("MAX_STORAGE_BYTES bytes"))
                 .map(|_| String::new()),
@@ -457,4 +474,13 @@ fn reply_error(error: &EngineError) {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A 32-byte host key from 64 hex digits.
+fn host_key(hex: &str) -> Credential {
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("a 64-hex-digit key");
+    }
+    Credential::Key(key)
 }

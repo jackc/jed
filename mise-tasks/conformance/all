@@ -1,13 +1,13 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-#MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory, page-service, TS async codec (and --checked Rust)"
+#MISE description="Run every corpus walk concurrently: plain, forced-spill, query-memory, page-service, encrypted, TS async codec (and --checked Rust)"
 #MISE depends=["ts:lock_build"]
 #USAGE flag "--checked" help="Also walk with the Rust `checked` profile (debug assertions + overflow checks)"
 #USAGE arg "[filter]" help="Run only corpus files whose path contains this substring"
 
 # A WALK is one run of a core's conformance runner over the shared corpus in one configuration (core
 # x storage mode x harness settings). This task runs the walks of `conformance`, `conformance:spill`,
-# `conformance:query_memory`, `conformance:service`, `conformance:ts:async-codec`, and with --checked `conformance:rust:checked`, all
+# `conformance:query_memory`, `conformance:service`, `conformance:encrypted`, `conformance:ts:async-codec`, and with --checked `conformance:rust:checked`, all
 # at once. Each walk is
 # an independent single-threaded process, so on a many-core machine the whole set takes about as
 # long as its slowest walk. Those tasks remain for running one family on its own.
@@ -87,6 +87,14 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
   SERVICE_PAIRS.each do |client, owner|
     add.("service #{client} client, #{owner} owner", client, ["service"], "JED_SERVICE_OWNER" => owner == "ts" ? "node" : owner)
   end
+  # `conformance:encrypted`: the disk walk over encrypted files, each core writing its cost-bearing
+  # outputs to a transcript the cores must agree on (spec/design/encryption.md §7).
+  transcripts = {}
+  CORES.each_key do |core|
+    transcripts[core] = File.join(dir, "encrypted-#{core}.tsv")
+    add.("encrypted #{core} disk", core, ["disk"],
+         "JED_CONFORMANCE_ENCRYPTED" => "1", "JED_CONFORMANCE_TRANSCRIPT" => transcripts[core])
+  end
   # `conformance:query_memory`: accounting active in every mode, each core writing its peaks.
   peaks = Hash.new { |hash, mode| hash[mode] = {} }
   QueryMemoryPeaks::MODES.each do |mode, (args, mode_env)|
@@ -121,6 +129,17 @@ Dir.mktmpdir("jed-conformance-all") do |dir|
 
     warn mismatches.first(50).join("\n")
     failures << "query-memory peaks disagree across cores on #{mismatches.size} #{mode} record(s)"
+  end
+
+  if walks.select { |walk| walk.name.start_with?("encrypted ") }.all?(&:status)
+    lines = transcripts.transform_values { |path| File.readlines(path, chomp: true) }
+    lines.each do |core, got|
+      next if got == lines["rust"]
+
+      first = lines["rust"].zip(got).index { |a, b| a != b } || [got.size, lines["rust"].size].min
+      warn "rust: #{lines['rust'][first]}\n#{core}: #{got[first]}"
+      failures << "encrypted-mode cost transcripts disagree (rust and #{core})"
+    end
   end
 
   elapsed = Parallel.now - started

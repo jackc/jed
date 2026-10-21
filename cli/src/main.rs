@@ -3,6 +3,7 @@
 //! it links the Rust core through the public embedding API and adds no engine behavior.
 
 mod args;
+mod credential;
 mod csv;
 mod dump;
 mod migrate;
@@ -152,22 +153,32 @@ fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
     if let Some(url) = path.to_str().filter(|p| remote::is_ssh_url(p)) {
         return open_remote(a, url);
     }
+    let credential = match &a.credential {
+        Some(source) => match credential::load(source, a.create) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("jed: {e}");
+                return Err(1);
+            }
+        },
+        None => None,
+    };
     let result = if a.create {
         Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(path)),
             page_size: a.page_size.unwrap_or(jed::DEFAULT_PAGE_SIZE),
+            credential,
             ..Default::default()
         })
-    } else if a.readonly {
+    } else {
         Database::open_with_options(
             path,
             OpenOptions {
-                read_only: true,
+                read_only: a.readonly,
+                credential,
                 ..OpenOptions::default()
             },
         )
-    } else {
-        Database::open(path)
     };
     match result {
         Ok(db) => {
@@ -183,6 +194,9 @@ fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
             if e.code() == "58P01" {
                 eprintln!("hint: pass --create to make a new database");
             }
+            if e.code() == "28P02" {
+                eprintln!("hint: pass --key-file, --passphrase-file or --passphrase");
+            }
             Err(1)
         }
     }
@@ -195,6 +209,16 @@ fn open_remote(a: &args::Args, url: &str) -> Result<(jed::Session, String), u8> 
         eprintln!("jed: --create cannot make a database over ssh://; create it on the remote host");
         return Err(1);
     }
+    let credential = match &a.credential {
+        Some(source) => match credential::load(source, false) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("jed: {e}");
+                return Err(1);
+            }
+        },
+        None => None,
+    };
     let parsed = match remote::parse_ssh_url(url) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -202,7 +226,7 @@ fn open_remote(a: &args::Args, url: &str) -> Result<(jed::Session, String), u8> 
             return Err(1);
         }
     };
-    match remote::open(&parsed, url, a.readonly) {
+    match remote::open(&parsed, url, a.readonly, credential) {
         Ok(db) => {
             let source = if a.readonly {
                 format!("{url} (read-only)")

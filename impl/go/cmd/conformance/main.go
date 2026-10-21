@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	jed "github.com/jackc/jed/impl/go"
 )
@@ -59,6 +60,7 @@ func run() int {
 	if serviceOwner != nil {
 		mode = "service, owner " + os.Getenv("JED_SERVICE_OWNER")
 	}
+	encrypted := encryptedMode()
 
 	suites := suitesDir()
 	var files []string
@@ -130,7 +132,15 @@ func run() int {
 		}
 
 		peakRel = rel
+		currentFile = rel
 		isConc := isConcurrencyFormat(text)
+		// The encrypted mode's ledger: a file whose rows or errors legitimately differ in the
+		// encrypted variant (a limit's trip point, a record near the cap) says so with a reason.
+		if encrypted && parseSkip(text, "encrypted") {
+			fmt.Printf("SKIP %s  (encrypted-mode)\n", rel)
+			skipped++
+			continue
+		}
 		// Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the
 		// concurrency driver (multi-session schedule on one Database), or a file carrying reopen-fragile
 		// session state — session-local temp tables, a spanning transaction, a sticky lifetime budget, or
@@ -167,6 +177,15 @@ func run() int {
 		}
 	}
 
+	if encrypted {
+		mode += ", encrypted"
+		if path := os.Getenv("JED_CONFORMANCE_TRANSCRIPT"); path != "" {
+			if err := os.WriteFile(path, []byte(strings.Join(transcript, "\n")+"\n"), 0o644); err != nil {
+				fmt.Fprintf(os.Stderr, "write the encrypted-mode transcript: %v\n", err)
+				return 1
+			}
+		}
+	}
 	fmt.Printf("\n[%s] %d passed, %d failed, %d skipped\n", mode, passed, failed, skipped)
 	if serviceOwner != nil {
 		fmt.Printf("[%s] %d records run on a page client\n", mode, clientRecords)
@@ -770,8 +789,50 @@ func parseClockAdvanceDirective(line string) (clockAdvance, bool) {
 	return clockAdvance{start: start, step: step}, true
 }
 
+// The encrypted mode's transcript (spec/design/encryption.md §7): its cost-bearing outputs — every
+// `# cost:` record's cost and every EXPLAIN's rows — which follow the variant's page capacity, so
+// they are compared across cores (JED_CONFORMANCE_TRANSCRIPT) instead of against the corpus.
+var (
+	transcript  []string
+	currentFile string
+)
+
+// modeCredential is the encrypted mode's credential (JED_CONFORMANCE_ENCRYPTED=1,
+// spec/design/encryption.md §7): the disk mode with every database file encrypted under a fixed host
+// key. nil when the mode is off.
+func modeCredential() *jed.Credential {
+	if os.Getenv("JED_CONFORMANCE_ENCRYPTED") != "1" {
+		return nil
+	}
+	var key [32]byte
+	for i := range key {
+		key[i] = 0x4A
+	}
+	return jed.KeyCredential(key)
+}
+
+func encryptedMode() bool { return os.Getenv("JED_CONFORMANCE_ENCRYPTED") == "1" }
+
+// transcribe records one cost-bearing output in the encrypted mode's transcript.
+func transcribe(kind, sql, actual string) {
+	flat := strings.NewReplacer("\\", "\\\\", "\n", "\\n", "\t", "\\t").Replace
+	transcript = append(transcript, currentFile+"\t"+kind+"\t"+flat(sql)+"\t"+flat(actual))
+}
+
+// isExplain reports whether sql is an EXPLAIN, whose estimates are cost-bearing output.
+func isExplain(sql string) bool {
+	t := strings.TrimLeftFunc(sql, unicode.IsSpace)
+	return len(t) >= 7 && strings.EqualFold(t[:7], "explain")
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 func assertCost(expected *int64, actual int64, sql string) error {
+	if encryptedMode() {
+		if expected != nil {
+			transcribe("cost", sql, strconv.FormatInt(actual, 10))
+		}
+		return nil
+	}
 	if expected != nil && *expected != actual {
 		return fmt.Errorf("cost mismatch: expected %d, got %d\n  SQL: %s", *expected, actual, sql)
 	}
@@ -1009,7 +1070,7 @@ func runFile(text string, disk bool) error {
 		// fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to
 		// exercise the on-disk faulted read path — durability across an OS crash is irrelevant, so skip
 		// the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env, Locking: serviceLocking()})
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true, Environment: env, Locking: serviceLocking(), Credential: modeCredential()})
 		if err != nil {
 			removeTempDB(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
@@ -1064,7 +1125,7 @@ func runFile(text string, disk bool) error {
 			}
 			actorOwns = client
 		}
-		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env, Locking: serviceLocking()}) // fsync=off (throwaway image)
+		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true, Environment: env, Locking: serviceLocking(), Credential: modeCredential()}) // fsync=off (throwaway image)
 		if err != nil {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}
@@ -1470,7 +1531,9 @@ func runFile(text string, disk bool) error {
 				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
 			}
 			expected = applySort(expected, cols, sortmode)
-			if !equalColtyped(actual, expected, coltypes, cols) {
+			if encryptedMode() && isExplain(sql) {
+				transcribe("rows", sql, strings.Join(actual, " "))
+			} else if !equalColtyped(actual, expected, coltypes, cols) {
 				return fmt.Errorf("query result mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sql, expected, actual)
 			}
 			if cerr := assertCost(expectedCost, cost, sql); cerr != nil {

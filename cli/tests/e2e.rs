@@ -968,3 +968,128 @@ fn pages_subcommand_rejects_bad_usage() {
     );
     remove_db(&db);
 }
+
+// ───────────────────────────── encrypted databases ─────────────────────────────
+
+/// An encrypted database through the CLI (cli.md §3): created with a key file, refused without a
+/// credential (`28P02`, with a hint) or with the wrong one (`28P01`), opened with a passphrase file
+/// after `jed migrate` made one, and never given a credential on the command line.
+#[test]
+fn encrypted_databases_take_a_key_or_passphrase_file() {
+    let db = tmp("enc.jed");
+    let db_str = db.to_str().unwrap();
+    let key = tmp("enc.key");
+    std::fs::write(&key, format!("{}\n", "4a".repeat(32))).unwrap();
+    let key_str = key.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            "--key-file",
+            key_str,
+            db_str,
+            "-q",
+            "-c",
+            "CREATE TABLE t (id i32 PRIMARY KEY, s text); INSERT INTO t VALUES (1, 'secret-cli')",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "{}", r.stderr);
+    let bytes = std::fs::read(&db).unwrap();
+    assert!(!bytes.windows(10).any(|w| w == b"secret-cli"));
+
+    let r = run(&[db_str, "-c", "SELECT s FROM t"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("ERROR 28P02"), "{}", r.stderr);
+    assert!(r.stderr.contains("--key-file"), "{}", r.stderr);
+    let wrong = tmp("enc_wrong.key");
+    std::fs::write(&wrong, [7u8; 32]).unwrap();
+    let r = run(
+        &[
+            "--key-file",
+            wrong.to_str().unwrap(),
+            db_str,
+            "-c",
+            "SELECT 1",
+        ],
+        "",
+    );
+    assert!(r.stderr.contains("ERROR 28P01"), "{}", r.stderr);
+    let r = run(
+        &[
+            "--key-file",
+            key_str,
+            "--readonly",
+            db_str,
+            "-c",
+            "SELECT s FROM t",
+        ],
+        "",
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("secret-cli"), "{}", r.stdout);
+
+    // A malformed key file and a repeated credential flag are usage errors.
+    let bad = tmp("enc_bad.key");
+    std::fs::write(&bad, "not a key").unwrap();
+    let r = run(
+        &[
+            "--key-file",
+            bad.to_str().unwrap(),
+            db_str,
+            "-c",
+            "SELECT 1",
+        ],
+        "",
+    );
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("32 raw bytes or 64 hex digits"),
+        "{}",
+        r.stderr
+    );
+    let r = run(&["--key-file", key_str, "--passphrase", db_str], "");
+    assert_ne!(r.code, 0);
+
+    // jed migrate creates an encrypted database under a passphrase file and reopens it.
+    let mdb = tmp("enc_migrate.jed");
+    let mdb_str = mdb.to_str().unwrap();
+    let pass = tmp("enc.pass");
+    std::fs::write(&pass, "correct horse\n").unwrap();
+    let pass_str = pass.to_str().unwrap();
+    let migs = migrate_testdata("blog");
+    let r = run(
+        &[
+            "migrate",
+            "--passphrase-file",
+            pass_str,
+            "-m",
+            &migs,
+            mdb_str,
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "{}", r.stderr);
+    let r = run(&["migrate", "status", "-m", &migs, mdb_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("28P02"), "{}", r.stderr);
+    let r = run(
+        &[
+            "migrate",
+            "status",
+            "--passphrase-file",
+            pass_str,
+            "-m",
+            &migs,
+            mdb_str,
+        ],
+        "",
+    );
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("version:  3 of 3"), "{}", r.stdout);
+
+    for p in [&key, &wrong, &bad, &pass] {
+        let _ = std::fs::remove_file(p);
+    }
+    remove_db(&db);
+    remove_db(&mdb);
+}

@@ -1420,11 +1420,43 @@ an error message. An encrypted file needs a `page_size` of at least 1024.
 
 Failures are fail-closed: a credential that does not unwrap the file's key is `28P01`, an
 encrypted file opened without one `28P02`, a credential offered for a plaintext file `28P03`, a
-credential for an in-memory database `55000`, a page size below 1024 `0A000`. Until the follow-on
-work lands (encrypted.md §10), an encrypted database is never served by the page service (a
-credential turns `locking = auto` into an exclusive owner), never spills to a scratch file (it
-has no spill target, and attaching one to a handle that can spill is `55000`), and cannot be
-backed up (`0A000`); compaction keeps its key and reseals every page. The environment's
+credential for an in-memory database `55000`, a page size below 1024 `0A000`. Under `locking =
+auto` an encrypted database is served like any other (encrypted.md §14): every process passes its
+own credential, a page client unlocks from the key block it reads through the owner, and a client
+connected across a rekey gets `28P04` and reopens. Compaction and backups keep the key (encrypted.md
+§13).
+
+**Scratch encryption.** `scratch_encryption` (`Auto` | `On`; Rust `ScratchEncryption`, Go
+`ScratchEncryptionAuto`/`ScratchEncryptionOn`, TS `"auto"`/`"on"`) on the create and open options
+decides whether the handle seals its scratch files — sort runs, hash partitions, row spools, spilled
+temp tables (encrypted.md §11). `Auto`, the default, seals them when the main database is
+encrypted. It is fixed for the handle's life. An encrypted file attachment is refused (`55000`) by a
+handle whose scratch files are plaintext; open the handle with `On` to attach one.
+
+**Changing the credential.** `change_credential(name, credential, kdf)` (Rust
+`Database::change_credential`, Go `DB.ChangeCredential`, TS `db.changeCredential`) rewraps the data
+key of the encrypted file database `name` — `"main"` or a file attachment — for a new credential,
+writing only the key block (encrypted.md §5), so it takes no longer than the new credential's
+Argon2id, which runs before the writer gate is taken. When it returns, only the new credential unlocks
+the file; if it fails partway the handle must be reopened, and exactly one of the two credentials
+unlocks it (a writable open then repairs the key block). It never waits: `42704` for a name that is
+not attached, `25006` for a read-only database, `55000` for an in-memory one, `28P03` for a plaintext
+file, `55006` while a write transaction is open, `22023` for Argon2id parameters out of range. The
+current credential is not asked for again: the handle already holds the data key. Like compaction it
+is a host call, never SQL.
+
+**Rekeying.** `rekey(name, credential, kdf)` (Rust `Database::rekey`, Go `DB.Rekey`, TS `db.rekey`)
+rewrites the file database `name` under a new data key (encryption.md §5; bytes in encrypted.md §12):
+encrypted for `credential` when one is given — rotating an encrypted file's key, or encrypting a
+plaintext file — and plaintext when it is null, decrypting an encrypted file. Every tree is rebuilt
+under the target layout and the result replaces the file the way compaction does, with compaction's
+limits: it never waits (`55006` while a reader, a write transaction or another process has the file).
+A row or index key the target cannot store, or a result over `max_storage_bytes` (`54P06`), fails
+before the file is replaced. Encrypting needs a handle with `scratch_encryption = On` (else `55000`)
+and a page size of at least 1024 (`0A000`). Under the page service only the owner rekeys; a client
+connected meanwhile fails `28P04` at its next transaction. Other errors match `change_credential`,
+and a page client's `change_credential` is `55000`. Copies of the
+file made before still open with their old credential: rotation protects the file from here on. The environment's
 key-entropy source draws the key material and nonces — the OS CSPRNG, or for tests only an
 insecure seeded stream (`insecure_seeded_key_entropy(seed)` and its Go/TS equivalents) under
 which every core writes identical bytes.

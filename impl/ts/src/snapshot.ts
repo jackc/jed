@@ -18,6 +18,7 @@ import type {
 } from "./catalog.ts";
 import { indexColumnOrdinals } from "./catalog.ts";
 import { TableStore } from "./storage.ts";
+import { unboundedBound } from "./pmap.ts";
 import type { Collation } from "./collation.ts";
 import type { GistOpclass, GistTree } from "./gist.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -313,6 +314,54 @@ export class Snapshot {
       const keys = store ? (yield* store.entriesInKeyOrderSteps()).map((e) => e.key) : [];
       this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.ops, keys));
     }
+  }
+
+  // emptied is this snapshot's catalog over empty stores of capacity cap in paging: the start of a
+  // rebuild under another page layout (DEK rotation and conversion, spec/fileformat/encrypted.md §12).
+  // Each store keeps its column types and synthetic-rowid counter.
+  emptied(cap: Cap, paging: SharedPaging): Snapshot {
+    const empty = (stores: Map<string, TableStore>): Map<string, TableStore> => {
+      const out = new Map<string, TableStore>();
+      for (const [name, store] of stores) {
+        const fresh = new TableStore(cap, store.columnTypes());
+        fresh.bumpRowidTo(store.nextSyntheticRowid());
+        fresh.attachPaging(paging);
+        out.set(name, fresh);
+      }
+      return out;
+    };
+    const out = this.clone();
+    out.stores = empty(this.stores);
+    out.indexStores = empty(this.indexStores);
+    out.gistTrees = new Map();
+    out.storePaging = paging;
+    return out;
+  }
+
+  // rebuildRows copies every record of every table and index store into target (from emptied), each
+  // store in ascending key order with its values fully materialized, so each rebuilt tree is the one
+  // ascending insertion builds under target's layout (encrypted.md §12). Stores go in name byte order,
+  // tables before indexes. stage runs whenever the copied versions pass stageBytes, and once at the
+  // end (after the GiST trees are rebuilt), so the caller can write the dirty pages out and keep memory
+  // bounded. A record the target layout cannot store fails here, before anything is written.
+  rebuildRows(target: Snapshot, stageBytes: number, stage: (s: Snapshot) => void): void {
+    for (const index of [false, true]) {
+      const sources = index ? this.indexStores : this.stores;
+      const targets = index ? target.indexStores : target.stores;
+      for (const name of [...sources.keys()].sort(compareTextC)) {
+        const source = sources.get(name)!;
+        const into = targets.get(name)!;
+        source.scanRange(unboundedBound(), (key, row) => {
+          if (!into.insert(key, source.resolveAll(row.slice()))) {
+            throw engineError("data_corrupted", "duplicate key in a store");
+          }
+          if (target.stagedBytes() >= stageBytes) stage(target);
+          return true;
+        });
+      }
+    }
+    target.rebuildGistTrees();
+    stage(target);
   }
 
   // stagedBytes is the stored bytes every store of this snapshot has staged since its last publication

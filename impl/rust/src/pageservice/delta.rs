@@ -19,13 +19,22 @@ pub(crate) struct DeltaBase {
     pub(crate) page_count: u32,
     /// The reusable free pages when the reuse grant passed; `None` otherwise.
     pub(crate) granted: Option<HashSet<u32>>,
+    /// The file is the encrypted variant: the inline manifest starts at 96, body pages are
+    /// ciphertext checked by their manifest identity alone, and the key block (pages 2–3) is never
+    /// written by a delta (spec/fileformat/encrypted.md §6, §14).
+    pub(crate) encrypted: bool,
 }
 
 impl DeltaBase {
     /// Whether a delta may write `index`: a body page beyond the committed high-water or a granted
     /// free page, below the new page count.
     pub(crate) fn legal(&self, index: u32, new_page_count: u32) -> bool {
-        index >= 2
+        let first = if self.encrypted {
+            crate::crypto::FIRST_BODY_PAGE
+        } else {
+            2
+        };
+        index >= first
             && index < new_page_count
             && (index >= self.page_count
                 || self
@@ -40,6 +49,8 @@ impl DeltaBase {
 pub(crate) struct Delta {
     pub(crate) txid: u64,
     pub(crate) meta: Vec<u8>,
+    /// Body pages are ciphertext (encrypted.md §6): checked by their manifest identity alone.
+    encrypted: bool,
     /// The new meta's page count and free-list head.
     pub(crate) page_count: u32,
     pub(crate) free_list_head: u32,
@@ -139,12 +150,13 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
         ));
     }
     let ps = base.page_size as usize;
-    // The page service serves plaintext files only (spec/fileformat/encrypted.md §10).
-    let (inline_capacity, overflow_capacity) =
-        format::manifest_capacities(ps, format::Cap::plain(base.page_size));
+    let cap = format::Cap::of(base.page_size, base.encrypted);
+    let (inline_capacity, overflow_capacity) = format::manifest_capacities(ps, cap);
+    let inline_at = if base.encrypted { 96 } else { 64 };
     let mut delta = Delta {
         txid: cb.txid,
         meta: cb.meta,
+        encrypted: base.encrypted,
         page_count: m.page_count,
         free_list_head: m.free_list_head,
         expected: HashMap::with_capacity(m.dirty_count as usize),
@@ -164,7 +176,7 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
         base,
         m.root_page,
         &mut delta,
-        &meta[64..],
+        &meta[inline_at..],
         (m.dirty_count as usize).min(inline_capacity),
     )?;
     let mut id = m.manifest_head;
@@ -228,11 +240,9 @@ impl Delta {
             return Err(invalid(format!("page {index} arrived twice")));
         }
         let b = &page.page;
-        if b.len() != self.meta.len()
-            || !(1..=7).contains(&b[0])
-            || format::page_crc(b) != u32_at(b, 12)
-            || format::commit_crc64(0, b) != crc
-        {
+        let plain_ok =
+            self.encrypted || ((1..=7).contains(&b[0]) && format::page_crc(b) == u32_at(b, 12));
+        if b.len() != self.meta.len() || !plain_ok || format::commit_crc64(0, b) != crc {
             return Err(invalid(format!(
                 "page {index} does not match its manifest identity"
             )));
@@ -321,6 +331,7 @@ mod tests {
             page_size: PS,
             page_count: 10,
             granted: Some(HashSet::from([3])),
+            encrypted: false,
         };
         // 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
         let mut indices = vec![12, 3];

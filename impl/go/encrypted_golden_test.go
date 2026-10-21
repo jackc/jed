@@ -166,3 +166,42 @@ func TestEncryptedGoldenCatalog(t *testing.T) {
 	}
 	checkEncryptedGolden(t, "encrypted_catalog.jed", sql, "SELECT count(*) FROM t29")
 }
+
+// A rekey's cross-core bytes (encrypted.md §12): a plaintext file holding encrypted_index_table's rows,
+// encrypted in place, is byte-identical to the golden built at the rekey's txid — every tree rebuilt by
+// ascending insertion at the encrypted capacity, the key block and every nonce the database's first
+// key-entropy draws.
+func TestEncryptedGoldenRekeyIndexTable(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "golden_rekey_index_table.jed")
+	env := NewEnvironmentBuilder()
+	env.SetInsecureSeededKeyEntropy(encGoldenSeed)
+	db, err := CreateDatabase(CreateOptions{
+		Path: path, PageSize: encGoldenPage, SkipFsync: true, Environment: env.Build(),
+		ScratchEncryption: ScratchEncryptionOn, Locking: LockingExclusive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, v i64, r i32range)")
+	mustExec(t, db, "CREATE INDEX t_r ON t USING gist (r)")
+	mustExec(t, db, "CREATE INDEX t_v ON t (v)")
+	// Descending, so the plaintext trees differ from the ones the rekey rebuilds.
+	for a := 150; a >= 1; a-- {
+		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, i32range(%d, %d))", a, a*3, a, a+5))
+	}
+	if err := db.Rekey("main", encGoldenKey(), Argon2Params{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	image, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden := fixture(t, "encrypted_rekey_index_table.jed")
+	if !bytes.Equal(image, golden) {
+		t.Fatalf("the rekeyed file differs from the golden (%d bytes vs %d)", len(image), len(golden))
+	}
+}

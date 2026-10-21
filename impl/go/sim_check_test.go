@@ -18,12 +18,12 @@ import (
 	"sort"
 )
 
-func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err error) {
+func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, free uint32, err error) {
 	p, err := pagerFromStore(newMemoryBlockStore(image))
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
-	e, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment())
+	e, err := loadEnginePagedCredential(p, cacheLeaves(defaultCacheBytes, p.pageSize), NewEnvironment(), cred)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
@@ -36,16 +36,18 @@ func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err erro
 	}
 	snap := e.committed
 
-	reached, err := snap.reachablePages(e.paging, plainRef(mt.rootPage))
+	reached, err := snap.reachablePages(e.paging, pageRef{page: mt.rootPage, tag: mt.rootTag})
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("reachability walk: %w", err)
 	}
 	if uint32(len(reached)) != mt.livePages {
 		return 0, 0, 0, fmt.Errorf("live page count %d, but %d pages are reachable", mt.livePages, len(reached))
 	}
+	// An encrypted file's body pages start after its key block (encrypted.md §1).
+	first := e.paging.cap().firstBody()
 	for pg := range reached {
-		if pg < rootPage || pg >= mt.pageCount {
-			return 0, 0, 0, fmt.Errorf("reachable page %d outside [%d, %d)", pg, rootPage, mt.pageCount)
+		if pg < first || pg >= mt.pageCount {
+			return 0, 0, 0, fmt.Errorf("reachable page %d outside [%d, %d)", pg, first, mt.pageCount)
 		}
 	}
 	seen := make(map[uint32]bool, len(e.freePages))
@@ -53,8 +55,8 @@ func simIntegrity(image []byte, want uint64) (live, pages, free uint32, err erro
 		switch {
 		case seen[pg]:
 			return 0, 0, 0, fmt.Errorf("free page %d listed twice", pg)
-		case pg < rootPage || pg >= mt.pageCount:
-			return 0, 0, 0, fmt.Errorf("free page %d outside [%d, %d)", pg, rootPage, mt.pageCount)
+		case pg < first || pg >= mt.pageCount:
+			return 0, 0, 0, fmt.Errorf("free page %d outside [%d, %d)", pg, first, mt.pageCount)
 		case reached[pg]:
 			return 0, 0, 0, fmt.Errorf("free page %d is reachable", pg)
 		case p.manifestProtected[pg]:

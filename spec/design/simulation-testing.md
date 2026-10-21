@@ -136,6 +136,7 @@ check
 | `compact [<db>]` | Host compaction of `main` or a file attachment (api.md §2.6), through the simulated filesystem. |
 | `backup page_identical\|compacted [p<N>]` | A backup of `main` (page-service.md §9) by process `p` (default: the lowest running), into a new file `<main>.backup<K>` through the simulated filesystem, while every other session keeps its pin and writer gate. Its oracle is §8.3's *Backups*. |
 | `attach <name>` | Attaches the file database `<name>.jed` read-write (attached-databases.md §4), first creating it through the simulated filesystem if it does not exist. Every later process re-attaches every attachment whose file exists. In a service trace it attaches the file in every running process under the page service, main's owner first (S11). Attaching takes the writer gate, so the generator emits it only while no writer is open; a trace that attaches while one is (a shrinking artifact) is invalid, a violation of its own, as a second write-open is, rather than a wait that would hang a threaded core's single-threaded runner. |
+| `change_key <n>`, `rekey <n>` | Encrypted traces only (S12): main's credential changes to simulation key `n` (1–3; key `k` is 32 bytes of `0x4A + k`, key 0 the goldens'), or main is rekeyed under it (encryption.md §5). A rekey is checked like compaction (version + 1, contents unchanged). |
 | `corrupt flips=N [reseal=1]` | Bit rot in the main file (§6.3). Ends every session cleanly, flips bits, opens and reads, then repairs. |
 | `check` | Runs the integrity checkers (§8.3). |
 | `clock +<micros>` | Advances simulated time. |
@@ -149,7 +150,8 @@ checks are part of the step. There is no separate `recover` step.
 (the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
 `synchronous` (`on`, the default, or `off`: every process batches its barriers, [validated-cow.md](validated-cow.md)
 §4, and runs the cap flush inline so the barrier lands in the step that reached the cap), and the
-informational `profile`. Four handle settings are applied at every open: `work_mem` and
+informational `profile`, and `encrypted: 1` (S12: main is created encrypted under key 0, its key
+entropy seeded by the trace's seed so the cores' images stay byte-identical). Four handle settings are applied at every open: `work_mem` and
 `temp_buffers` (a trace session's; spill goes to the simulated spill host, §6.1, whose bytes are not
 durable state), `max_query_memory_bytes` (a trace session's; the oracles' own reads are unlimited),
 and `max_storage_bytes` (the database's file form, memory.md §8.7). Under either limit a commit can
@@ -822,6 +824,26 @@ primitive) gets a simulated implementation.
      commit of an attachment sets that attachment's floor, and a dead process loses the batch of each
      database it owned — and the durability checks read each database's pending state from its own
      owner.
+
+12. **S12 — Encryption at rest. Landed.** The `encryption` profile's traces carry `# encrypted: 1`:
+    main is created encrypted ([../fileformat/encrypted.md](../fileformat/encrypted.md)), every commit
+    seals its pages, and the spill host seals its scratch files. `change_key <n>` and `rekey <n>` run
+    between ordinary work, usually with a fault armed (`key_fault`).
+    - **Oracles.** Before the step the runner records the old and new key. A recovery after it probes
+      the recovered key block: exactly one of the two keys must unwrap it, and the new one when the
+      step had returned success (its last barrier ran). Any other recovery opens with whichever
+      simulation key unwraps the recovered key block, the current one first: a rekey whose rename was
+      not yet durable in its directory legitimately comes back as the older file under its older key
+      (regression trace `encryption-rekey-rename-not-durable.sim`). A writable open repairs a
+      differing key-block pair. The image checkers open with the current key, and
+      `verify.rb --check-image` tries the four simulation keys, selects the key-block copy by
+      generation, and authenticates the meta over its manifest chain.
+    - The transcript adds `{"op":"change_key","key":n}` (or `"error"`), `"op":"rekey"` lines shaped like
+      compaction's, and an `{"op":"unlocked","key":k}` line whenever recovery opened main with a key
+      other than the one it held.
+    - Not yet: replay at every pointer kind (the `corrupt` step's bit flips cover tampering, not
+      genuine-page replay), restore followed by divergent writes, conversion to and from plaintext,
+      encrypted attachments, and encrypted service traces.
 
 ## 15. Open questions
 

@@ -44,6 +44,18 @@ pub enum Synchronous {
     Off,
 }
 
+/// Whether a handle seals its scratch files — spill runs, hash partitions, row spools and spilled
+/// temp domains (spec/design/encryption.md §6). Fixed at `open`/`create` for the handle's life.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScratchEncryption {
+    /// On when the main database is encrypted (the default).
+    #[default]
+    Auto,
+    /// Always on, so the handle may attach or create encrypted databases while keeping its scratch
+    /// target.
+    On,
+}
+
 pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
 
 /// A page-service owner's default idle-in-transaction timeout (spec/design/page-service.md §11.1).
@@ -152,6 +164,9 @@ pub struct CreateOptions {
     /// stretched with (default RFC 9106's second recommendation; `22023` outside the format's
     /// bounds). Ignored for a host key or a plaintext file.
     pub kdf: crate::crypto::Argon2Params,
+    /// Whether the handle seals its scratch files (encryption.md §6): `Auto` seals them when the
+    /// database is encrypted.
+    pub scratch_encryption: ScratchEncryption,
 }
 
 impl Default for CreateOptions {
@@ -173,6 +188,7 @@ impl Default for CreateOptions {
             ownership: Ownership::Prefer,
             credential: None,
             kdf: crate::crypto::Argon2Params::default(),
+            scratch_encryption: ScratchEncryption::Auto,
         }
     }
 }
@@ -249,6 +265,9 @@ pub struct OpenOptions {
     /// one (`28P02` without it, `28P01` when it does not unwrap the key), refused for a plaintext
     /// file (`28P03`). A handle argument only — never stored, never shown.
     pub credential: Option<crate::crypto::Credential>,
+    /// Whether the handle seals its scratch files (encryption.md §6): `Auto` seals them when the
+    /// database is encrypted.
+    pub scratch_encryption: ScratchEncryption,
 }
 
 impl Default for OpenOptions {
@@ -270,6 +289,7 @@ impl Default for OpenOptions {
             max_connections: 0,
             ownership: Ownership::Prefer,
             credential: None,
+            scratch_encryption: ScratchEncryption::Auto,
         }
     }
 }
@@ -288,6 +308,28 @@ fn default_spill_host() -> Option<Arc<dyn crate::spillhost::SpillHost>> {
     #[cfg(not(target_os = "wasi"))]
     {
         Some(crate::spillhost::os_spill_host(std::env::temp_dir()))
+    }
+}
+
+/// The handle's scratch target: the default spill host, sealed when `encrypt` (scratch encryption,
+/// spec/design/encryption.md §6) with keys from a scratch stream of `env`'s key entropy.
+pub(crate) fn scratch_host(
+    encrypt: bool,
+    env: &Environment,
+) -> Option<Arc<dyn crate::spillhost::SpillHost>> {
+    default_spill_host().map(|host| seal_scratch(host, encrypt, env))
+}
+
+/// `host`, sealed when `encrypt`.
+pub(crate) fn seal_scratch(
+    host: Arc<dyn crate::spillhost::SpillHost>,
+    encrypt: bool,
+    env: &Environment,
+) -> Arc<dyn crate::spillhost::SpillHost> {
+    if encrypt && !host.encrypts() {
+        crate::crypto::encrypting_spill_host(host, env.key_stream())
+    } else {
+        host
     }
 }
 
@@ -331,12 +373,11 @@ impl Engine {
         };
         let mut db = Engine::new();
         db.path = Some(path.to_path_buf());
-        // An encrypted database never spills plaintext: it has no scratch target until scratch
-        // encryption lands (spec/fileformat/encrypted.md §10).
-        db.spill = if codec.is_some() {
-            None
-        } else {
-            default_spill_host()
+        // An encrypted database never spills plaintext: its scratch files are sealed
+        // (spec/design/encryption.md §6).
+        db.spill = match encryption {
+            Some(e) => scratch_host(true, e.environment),
+            None => default_spill_host(),
         };
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
@@ -387,21 +428,46 @@ impl Engine {
     /// [`open_with_options`](Engine::open_with_options) through the file host `files`
     /// ([`crate::filehost`]).
     pub(crate) fn open_via(files: &dyn FileHost, path: &Path, opts: OpenOptions) -> Result<Engine> {
+        Engine::open_via_held(files, path, opts, None)
+    }
+
+    /// [`open_via`](Engine::open_via) for a page client promoting itself to owner with the data key
+    /// it already holds (`held`, spec/design/encryption.md §8): the DEK alone opens the file, so a
+    /// credential changed since the client unlocked does not stop it. The held codec adopts the
+    /// file's selected key-block copy, and a differing pair is left unrepaired (a process without
+    /// the credential cannot know which copy it would be writing).
+    pub(crate) fn open_via_held(
+        files: &dyn FileHost,
+        path: &Path,
+        opts: OpenOptions,
+        held: Option<Arc<crate::crypto::PageCodec>>,
+    ) -> Result<Engine> {
         let store = files.open_store(path, opts.skip_fsync, opts.read_only)?;
-        let pager = Pager::from_store(store)?;
+        let mut pager = Pager::from_store(store)?;
         // Convert the byte budget to a leaf-page capacity by the file's page size; `open_paged`
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
-        let mut db =
-            Engine::open_paged(pager, capacity, &opts.environment, opts.credential.as_ref())?;
-        db.path = Some(path.to_path_buf());
-        // An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
-        db.spill = if db.encrypted() {
-            None
-        } else {
-            default_spill_host()
+        let repair = held.is_none() && !opts.read_only;
+        let mut db = match held {
+            Some(codec) => {
+                crate::format::adopt_held_codec(&mut pager, &codec)?;
+                let paging = SharedPaging::with_codec(pager, capacity, Some(codec));
+                Engine::open_shared_paging(paging, &opts.environment)?
+            }
+            None => {
+                Engine::open_paged(pager, capacity, &opts.environment, opts.credential.as_ref())?
+            }
         };
+        db.path = Some(path.to_path_buf());
+        if repair {
+            db.repair_key_block()?;
+        }
+        // An encrypted database seals its scratch files (spec/design/encryption.md §6).
+        db.spill = scratch_host(
+            db.encrypted() || opts.scratch_encryption == ScratchEncryption::On,
+            &opts.environment,
+        );
         db.read_only = opts.read_only;
         // `0` means "the default budget", not "unlimited" — the zero value is a safe finite budget
         // (matching Go/TS). Unbounded/never-spill is a runtime-only mode via `set_work_mem(0)`.
@@ -409,6 +475,28 @@ impl Engine {
             db.session.work_mem = opts.work_mem;
         }
         Ok(db)
+    }
+
+    /// Finish a credential change a crash interrupted (spec/design/encryption.md §5): when the two
+    /// key-block copies differ, the opener that unwrapped the selected copy writes it over the other,
+    /// between barriers. A read-only open leaves the pair alone, which is safe because selection
+    /// already prefers the newer copy.
+    pub(crate) fn repair_key_block(&mut self) -> Result<()> {
+        let Some(paging) = &self.paging else {
+            return Ok(());
+        };
+        let Some(codec) = paging.codec() else {
+            return Ok(());
+        };
+        let mut pager = paging.pager();
+        let (page2, page3) = (pager.read_block(2)?, pager.read_block(3)?);
+        if page2 == page3 {
+            return Ok(());
+        }
+        let stale = crate::crypto::unselected_key_page(&page2, &page3);
+        pager.sync()?;
+        pager.write_block(stale, &codec.key_block_page(self.page_size as usize))?;
+        pager.sync()
     }
 
     /// Whether this database's file is encrypted (spec/fileformat/encrypted.md).
@@ -654,23 +742,54 @@ pub(crate) fn compact_file(
     old: &SharedPaging,
     capacity: usize,
 ) -> Result<Arc<SharedPaging>> {
+    // An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
+    // (spec/design/encryption.md §5).
+    let codec = old.codec().cloned();
+    rewrite_file(
+        files, path, snap, page_size, txid, old, capacity, codec, None,
+    )
+}
+
+/// [`compact_file`] under `codec` (`None`: plaintext) instead of `old`'s — DEK rotation and
+/// conversion write the rebuilt `snap` this way (spec/design/encryption.md §5). With `limit`, an
+/// image whose live pages exceed its `max_storage_bytes` fails `54P06` before the rename.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rewrite_file(
+    files: &dyn FileHost,
+    path: &Path,
+    snap: &Snapshot,
+    page_size: u32,
+    txid: u64,
+    old: &SharedPaging,
+    capacity: usize,
+    codec: Option<Arc<crate::crypto::PageCodec>>,
+    limit: Option<(&str, i64)>,
+) -> Result<Arc<SharedPaging>> {
     use crate::blockstore::ClosedBlockStore;
 
     let no_sync = old.pager().skips_sync();
     // Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
     let path = files.real_path(path)?;
     let tmp = tmp_path(&path);
-    // An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
-    // (spec/design/encryption.md §5).
-    let codec = old.codec().cloned();
+    let mut page_count = 0;
     if let Err(error) = files.write_file(&tmp, Some(&path), no_sync, &mut |write_at| {
-        snap.write_image(page_size, txid, codec.as_deref(), &mut |index, page| {
+        page_count = snap.write_image(page_size, txid, codec.as_deref(), &mut |index, page| {
             write_at(index as u64 * page_size as u64, page)
-        })
-        .map(|_| ())
+        })?;
+        Ok(())
     }) {
         files.remove(&tmp);
         return Err(error);
+    }
+    if let Some((name, limit)) = limit {
+        let live = page_count - crate::format::Cap::of(page_size, codec.is_some()).first_body();
+        if limit > 0 && i64::from(live) * i64::from(page_size) > limit {
+            files.remove(&tmp);
+            return Err(EngineError::new(
+                SqlState::StorageLimitExceeded,
+                format!("storage of database \"{name}\" exceeded the limit of {limit} bytes"),
+            ));
+        }
     }
 
     // Close the old file before the rename: Windows cannot replace a file that is still open.

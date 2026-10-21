@@ -1,0 +1,73 @@
+schema_version = 1
+name = "encrypted-service-commit-resolution"
+description = "The encrypted variant of service-commit-resolution (spec/fileformat/encrypted.md §14): the owner reseals the client's meta for its slot, and commit_status still resolves the lost acknowledgement because its digest ignores the seal. When the owner drops the connection after a client commit is durable but before acknowledging it (a test hook), the client re-elects, reconnects to the same owner, and resolves the outcome with commit_status: the commit succeeded, and the client carries on over the new connection."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "a"
+command = "hangup_next_ack"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "2"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
+command = "close"

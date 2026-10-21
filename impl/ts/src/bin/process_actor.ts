@@ -46,7 +46,11 @@ const millis = (key: string): number | undefined =>
 const ownershipText = options.get("ownership");
 const ownership: "prefer" | "yield" | "never" =
   ownershipText === "yield" || ownershipText === "never" ? ownershipText : "prefer";
+// key=<64 hex digits>: the host key of an encrypted database (spec/fileformat/encrypted.md §14).
+const keyText = options.get("key");
+const credential = keyText === undefined ? undefined : hostKey(keyText);
 const handoffOptions = {
+  credential,
   ownership,
   yieldGraceMs: millis("yield_grace"),
   shutdownGraceMs: millis("shutdown_grace"),
@@ -150,6 +154,14 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
         backupForTesting(database, dest, form === "page_identical");
         break;
       }
+      // An encrypted database's credential change and rekey (spec/design/api.md): CHANGE_KEY <hex>,
+      // REKEY <hex> (empty: decrypt).
+      case "CHANGE_KEY":
+        database.changeCredential("main", hostKey(argument));
+        break;
+      case "REKEY":
+        database.rekey("main", argument === "" ? null : hostKey(argument));
+        break;
       case "MAX_STORAGE_BYTES":
         database.setMaxStorageBytes("main", BigInt(argument));
         break;
@@ -324,4 +336,12 @@ function ownerEnvironment(root: string): Environment {
     .loadUnicodeData(readFileSync(join(root, "spec", "collation", "fixtures", "unicode.jucd")))
     .loadTimeZoneData(readFileSync(join(root, "spec", "tz", "fixtures", "tzdata.jtz")))
     .build();
+}
+
+// hostKey is a 32-byte host-key credential from 64 hex digits.
+function hostKey(hex: string): { key: Uint8Array } {
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) throw new Error("a host key is 64 hex digits");
+  const key = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) key[i] = Number.parseInt(hex.slice(2 * i, 2 * i + 2), 16);
+  return { key };
 }

@@ -273,7 +273,7 @@ func TestChainSharingKeptChainsStayExclusive(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, _, err := simIntegrity(image, txid); err != nil {
+		if _, _, _, err := simIntegrity(image, txid, nil); err != nil {
 			t.Fatalf("phase %d: image check: %v", i, err)
 		}
 	}

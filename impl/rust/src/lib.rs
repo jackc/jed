@@ -134,7 +134,7 @@ pub(crate) use executor::Engine;
 pub(crate) use executor::Outcome;
 pub use file::{
     CreateOptions, DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
-    DEFAULT_YIELD_GRACE_MS, Locking, OpenOptions, Ownership, Synchronous,
+    DEFAULT_YIELD_GRACE_MS, Locking, OpenOptions, Ownership, ScratchEncryption, Synchronous,
 };
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{

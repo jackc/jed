@@ -19,6 +19,8 @@ export { EngineError } from "../errors.ts";
 export { Decimal } from "../decimal.ts";
 export * from "../value.ts";
 export type { JsParam, Row, RunResult } from "../ergonomic.ts";
+export type { Argon2Params, Credential } from "../crypto.ts";
+import type { Argon2Params, Credential } from "../crypto.ts";
 export type { SessionOptions } from "../snapshot.ts";
 export { PrivilegeSet } from "../privileges.ts";
 export { splitStatements } from "../split.ts";
@@ -31,6 +33,13 @@ export type BrowserDatabaseOptions = {
   maxStorageBytes?: bigint;
   unicodeData?: Uint8Array;
   timeZoneData?: Uint8Array;
+  /**
+   * Creates or opens the file encrypted (a passphrase or a 32-byte key; spec/fileformat/encrypted.md).
+   * Pages are sealed and opened through WebCrypto in the worker. Needs a pageSize of at least 1024.
+   */
+  credential?: Credential;
+  /** Argon2id parameters a passphrase credential is stretched with at create. */
+  kdf?: Argon2Params;
   runtime?: Partial<RuntimeLimits>;
   /** Creates a fresh dedicated worker running startDatabaseWorker. Jed owns its lifetime. */
   workerFactory?: () => Worker;

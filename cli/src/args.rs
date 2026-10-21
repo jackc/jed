@@ -32,6 +32,8 @@ pub struct Args {
     pub quiet: bool,
     pub help: bool,
     pub version: bool,
+    /// The credential of an encrypted DBFILE (`--key-file` / `--passphrase-file` / `--passphrase`).
+    pub credential: Option<crate::credential::CredentialSource>,
 }
 
 pub const USAGE: &str = "\
@@ -54,6 +56,10 @@ usage: jed [OPTIONS] [DBFILE]
   -o FILE                 script mode: write results to FILE instead of stdout ('-' = stdout);
                           errors still go to stderr
   --max-cost N            cost ceiling: statements abort with 54P01 at cost N
+  --key-file FILE         unlock (or with --create, encrypt) DBFILE with the 32-byte key in FILE
+                          (32 raw bytes or 64 hex digits)
+  --passphrase-file FILE  unlock or encrypt with the passphrase in FILE (one trailing newline dropped)
+  --passphrase            prompt for the passphrase on the terminal
   --continue-on-error     script mode: keep going after a SQL error
   -q, --quiet             script mode: suppress OK lines
   --version               print the version, then exit
@@ -78,12 +84,18 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
         quiet: false,
         help: false,
         version: false,
+        credential: None,
     };
     let mut argv = argv.peekable();
     while let Some(arg) = argv.next() {
         let mut value_for = |flag: &str| -> Result<String, String> {
             argv.next().ok_or_else(|| format!("{flag} needs a value"))
         };
+        if let Some(source) = crate::credential::parse_flag(&arg, &args.credential, &mut value_for)?
+        {
+            args.credential = Some(source);
+            continue;
+        }
         match arg.as_str() {
             "--create" => args.create = true,
             "--readonly" => args.readonly = true,
@@ -144,6 +156,9 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if args.readonly && args.create {
         return Err("--readonly cannot be combined with --create".to_string());
+    }
+    if args.credential.is_some() && args.db_path.is_none() {
+        return Err("a credential requires a DBFILE".to_string());
     }
     if args.dump && args.db_path.is_none() {
         return Err("--dump requires a DBFILE".to_string());

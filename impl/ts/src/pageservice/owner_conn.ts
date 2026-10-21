@@ -24,6 +24,7 @@
 import process from "node:process";
 
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
+import { KEY_BLOCK_LEN, osKeyEntropy, PageCodec } from "../crypto.ts";
 import { EngineError } from "../errors.ts";
 import {
   encodeFrame,
@@ -168,6 +169,18 @@ function reclaimDue(pageCount: number, free: number, live: number): boolean {
 
 function freeListHead(meta: Uint8Array): number {
   return ((meta[28]! << 24) | (meta[29]! << 16) | (meta[30]! << 8) | meta[31]!) >>> 0;
+}
+
+// freeListTag is an encrypted meta's free-list tag (offset 80, spec/fileformat/encrypted.md §6).
+function freeListTag(meta: Uint8Array): Uint8Array {
+  return meta.slice(80, 96);
+}
+
+// codecFor is the page codec of an encrypted database's data key (spec/fileformat/encrypted.md §14):
+// the worker checks a client commit's meta under it, reseals the meta for the slot it writes with a
+// nonce of its own, and opens free-list pages. The key block is never written here.
+function codecFor(dek: Uint8Array | null): PageCodec | null {
+  return dek === null ? null : new PageCodec(dek, osKeyEntropy(), new Uint8Array(KEY_BLOCK_LEN));
 }
 
 // WriteTxn is a client write transaction: the connection holds the gate and a write pin on base.
@@ -578,6 +591,7 @@ export class Connection {
     let meta: Uint8Array;
     let invalidate: number;
     let indices: number[];
+    let dek: Uint8Array | null;
     state.lock();
     try {
       try {
@@ -600,8 +614,16 @@ export class Connection {
       if (local !== null && local < oldest) oldest = local;
       grant = oldest >= state.freeGenTxidLocked();
       meta = state.metaLocked();
+      dek = state.keyLocked();
     } finally {
       state.unlock();
+    }
+    let codec: PageCodec | null;
+    try {
+      codec = codecFor(dek);
+    } catch (error) {
+      state.releaseGate();
+      throw error;
     }
     const pageCount = metaPageCount(meta);
     let granted: Set<number> | null = null;
@@ -609,7 +631,13 @@ export class Connection {
       // The committed free list, read under the gate (no commit is writing it).
       let free: number[] | null = null;
       try {
-        free = readFreeListChain((p) => this.db.readPage(p), freeListHead(meta), pageCount);
+        free = readFreeListChain(
+          (p) => this.db.readPage(p),
+          freeListHead(meta),
+          pageCount,
+          codec,
+          freeListTag(meta),
+        );
       } catch {
         free = null;
       }
@@ -618,7 +646,7 @@ export class Connection {
     }
     this.write = {
       base: txid,
-      check: { committedTxid: txid, pageSize: this.db.pageSize, pageCount, granted },
+      check: { committedTxid: txid, pageSize: this.db.pageSize, pageCount, granted, codec },
       delta: null,
       failure: null,
       started: false,
@@ -785,6 +813,14 @@ export class Connection {
   // for a maintenance commit or the gate's release. A write or sync failure poisons the owner.
   private finishClientCommit(requestId: number, w: WriteTxn, d: Delta): void {
     const state = this.db.state;
+    const codec = w.check.codec ?? null;
+    if (codec !== null) {
+      // A client cannot know the slot its meta lands in, so the meta, already checked against the
+      // database key, is resealed for it (spec/fileformat/encrypted.md §14). Both commitDelta forms
+      // write the slot not holding the floor.
+      const chain = d.manifest.map((pg) => ({ index: pg.index, bytes: pg.page }));
+      codec.sealMeta(state.floorSlot() ^ 1, d.meta, chain);
+    }
     if (!this.db.commitDelta(d)) {
       // The meta may be durable: no error frame, only a closed connection, so the client resolves the
       // outcome with commit_status (README §3.5).
@@ -820,6 +856,8 @@ export class Connection {
           (p) => this.db.readPage(p),
           freeListHead(d.meta),
           d.parsed.pageCount,
+          codec,
+          freeListTag(d.meta),
         );
       } catch {
         free = null;

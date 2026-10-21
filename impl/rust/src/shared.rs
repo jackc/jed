@@ -286,22 +286,35 @@ impl AttachSource {
     }
 }
 
+/// A client commit's manifest-overflow chain as the meta tag covers it (encrypted.md §6).
+#[cfg(unix)]
+fn manifest_chain(delta: &crate::pageservice::delta::Delta) -> Vec<(u32, Vec<u8>)> {
+    delta
+        .manifest
+        .iter()
+        .map(|p| (p.index, p.page.clone()))
+        .collect()
+}
+
+/// What [`Database::rekey`] rewrites a database under: the new codec, or `None` for plaintext.
+struct Rekey {
+    target: Option<Arc<crate::crypto::PageCodec>>,
+}
+
+/// A credential operation on a plaintext file: `28P03` (encryption.md §5).
+fn not_encrypted() -> EngineError {
+    EngineError::new(
+        SqlState::CredentialNotApplicable,
+        "the database is not encrypted",
+    )
+}
+
 /// A credential for an in-memory database: `55000` — nothing is at rest (encryption.md §5).
 fn credential_without_file() -> EngineError {
     EngineError::new(
         SqlState::ObjectNotInPrerequisiteState,
         "an in-memory database cannot be encrypted",
     )
-}
-
-/// The coordination an open uses: an encrypted file is never served by the page service
-/// (spec/fileformat/encrypted.md §10), so a credential turns `auto` into an exclusive owner.
-fn locking_for(locking: Locking, credential: Option<&crate::crypto::Credential>) -> Locking {
-    if credential.is_some() && locking == Locking::Auto {
-        Locking::Exclusive
-    } else {
-        locking
-    }
 }
 
 /// The `54P06` for a commit of database `name` that would exceed its `max_storage_bytes` (memory.md §8.3).
@@ -481,20 +494,29 @@ impl Storage {
     /// from-scratch image exactly as an in-memory database, so `page_count` starts past the meta slots.
     /// Zero file writes: this byte store is entirely separate from the main database file.
     pub(crate) fn new_temp(page_size: u32) -> Storage {
-        let image = Snapshot::default()
-            .to_image(page_size, 0)
-            .expect("a fresh temp image always serializes");
+        Storage::new_scratch(page_size, None).expect("a fresh temp image always opens")
+    }
+
+    /// A rebuild's scratch domain (spec/design/encryption.md §5): a temp domain in the target layout,
+    /// sealed under the throwaway `codec` when the target is encrypted.
+    fn new_scratch(
+        page_size: u32,
+        codec: Option<Arc<crate::crypto::PageCodec>>,
+    ) -> Result<Storage> {
+        let image = Snapshot::default().to_image_sealed(page_size, 0, codec.as_deref())?;
         let page_count = (image.len() / page_size as usize) as u32;
         let store: Box<dyn crate::blockstore::BlockStore> =
             Box::new(crate::blockstore::MemoryBlockStore::new(image));
-        let pager =
-            crate::pager::Pager::from_store(store).expect("a fresh temp image always opens");
-        Storage {
+        let mut pager = crate::pager::Pager::from_store(store)?;
+        if codec.is_some() {
+            pager.set_encrypted();
+        }
+        Ok(Storage {
             page_size,
             page_count,
             free_pages: Vec::new(),
             // Pinned/unbounded pool, mirroring an in-memory database (resident by definition).
-            paging: crate::paging::SharedPaging::new(pager, usize::MAX),
+            paging: crate::paging::SharedPaging::with_codec(pager, usize::MAX, codec),
             read_only: false,
             path: None,
             spill: None,
@@ -513,7 +535,7 @@ impl Storage {
             flushing: None,
             inline_flush: false,
             floor_free: None,
-        }
+        })
     }
 
     /// The domain's shared pager (attached to every temp store so its `OnDisk` leaves fault through the
@@ -1018,7 +1040,7 @@ impl Storage {
             allowed,
         )?;
         crate::format::verify_live_count(snap, &self.paging, &write, live)?;
-        let cap_reached = {
+        let (cap_reached, sealed_meta) = {
             let mut pager = self.paging.pager();
             pager.reserve(plan.page_count)?;
             for (index, bytes) in &plan.auxiliary {
@@ -1037,7 +1059,7 @@ impl Storage {
             // durable — now under synchronous = on, at the batch's flush under synchronous = off —
             // keeping one growth step of slack (pager.md §7).
             pager.settle_truncation(plan.page_count, plan.page_count < self.page_count, !relaxed);
-            relaxed && pager.batch_cap_reached()
+            (relaxed && pager.batch_cap_reached(), meta)
         };
         // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
         // evicts a stale pool decode of any free page this commit reused for new content.
@@ -1051,7 +1073,8 @@ impl Storage {
                 .chain(plan.auxiliary.iter())
                 .map(|(index, _)| *index)
                 .collect();
-            self.last_commit = Some((plan.meta.clone(), written));
+            // The meta as written: an encrypted one is sealed (encrypted.md §6).
+            self.last_commit = Some((sealed_meta, written));
         }
         self.page_count = plan.page_count;
         self.free_pages = plan.persisted;
@@ -1195,6 +1218,106 @@ impl Storage {
         self.budget.last_catalog_pages = 0;
         self.dir_synced = true; // compaction's own directory barrier made the new entry durable
         Ok(engine.committed)
+    }
+
+    /// Rotate the data key, or convert between the plaintext and encrypted variants (spec/design/
+    /// encryption.md §5): rebuild every tree of `snap` under `target`'s layout in a scratch domain
+    /// (its pages written through `spill` once they pass the pool budget, sealed under a throwaway
+    /// key when the target is encrypted), then write the from-scratch image under `target`
+    /// (`None`: plaintext) and rename it over the file as compaction does. A record or key the
+    /// target cannot store, or an image over `max_storage_bytes`, fails before the rename with the
+    /// file untouched. The caller holds the writer gate and the reader watermark lock.
+    pub(crate) fn rekey(
+        &mut self,
+        snap: &Snapshot,
+        txid: u64,
+        target: Option<Arc<crate::crypto::PageCodec>>,
+        spill: Option<&Arc<dyn crate::spillhost::SpillHost>>,
+        name: &str,
+    ) -> Result<Snapshot> {
+        self.await_flush()?;
+        self.paging.pager().check_commit()?;
+        let path = self.path.clone().expect("rekey of a file database");
+        let cap = crate::format::Cap::of(self.page_size, target.is_some());
+        let scratch = match target {
+            Some(_) => Some(crate::crypto::scratch_codec()?),
+            None => None,
+        };
+        let mut build = Storage::new_scratch(self.page_size, scratch)?;
+        let capacity = self.paging.capacity();
+        // The scratch domain spills past the handle's page-cache budget, like a temp domain.
+        let budget = capacity
+            .saturating_mul(self.page_size as usize)
+            .max(1 << 20);
+        let mut built = snap.emptied(cap, build.paging());
+        snap.rebuild_rows(&mut built, (budget / 4) as i64, &mut |s| {
+            let staged = build.stage_temp(s, budget, spill)?;
+            build.adopt_staged(s, staged, true)?;
+            s.clear_staged();
+            Ok(())
+        })?;
+        let os = crate::filehost::OsFileHost;
+        let files: &dyn crate::filehost::FileHost = match &self.files {
+            Some(files) => files.as_ref(),
+            None => &os,
+        };
+        let paging = crate::file::rewrite_file(
+            files,
+            &path,
+            &built,
+            self.page_size,
+            txid,
+            &self.paging,
+            capacity,
+            target,
+            Some((name, self.budget.limit)),
+        )?;
+        let engine = Engine::open_shared_paging(Arc::clone(&paging), &snap.env)?;
+        self.paging = paging;
+        self.page_count = engine.page_count;
+        self.free_pages = engine.free_pages.clone();
+        self.live_at_compaction = engine.live_at_compaction;
+        self.free_gen_txid = engine.free_gen_txid;
+        self.live = engine.live;
+        self.budget.last_cat_root = crate::format::PageRef::NONE;
+        self.budget.last_written.clear();
+        self.budget.last_catalog_pages = 0;
+        self.dir_synced = true;
+        Ok(engine.committed)
+    }
+
+    /// Write a credential change's key block (spec/design/encryption.md §5): a stabilization barrier
+    /// (any pending batch flushed, the file synced, and its directory once), then the copy that is
+    /// not the selected one, a barrier, the other copy, a barrier. The caller holds the writer gate.
+    /// A failure poisons the storage, so the handle must be reopened; recovery then unlocks with
+    /// exactly one of the old and new credentials.
+    pub(crate) fn write_key_block(&mut self, block: Vec<u8>) -> Result<()> {
+        self.flush()?;
+        self.paging.pager().check_commit()?;
+        let codec = Arc::clone(
+            self.paging
+                .codec()
+                .expect("checked encrypted by the caller"),
+        );
+        if !codec.follows(&block) {
+            return Err(EngineError::new(
+                SqlState::ObjectInUse,
+                "the credential was changed concurrently",
+            ));
+        }
+        self.sync_directory_once();
+        let mut pager = self.paging.pager();
+        pager.sync()?;
+        let first =
+            crate::crypto::unselected_key_page(&pager.read_block(2)?, &pager.read_block(3)?);
+        let mut page = vec![0u8; self.page_size as usize];
+        page[..block.len()].copy_from_slice(&block);
+        pager.write_block(first, &page)?;
+        pager.sync()?;
+        pager.write_block(5 - first, &page)?;
+        pager.sync()?;
+        codec.set_key_block(block);
+        Ok(())
     }
 }
 
@@ -1421,13 +1544,14 @@ impl Shared {
         crate::pageservice::delta::DeltaBase,
     )> {
         // The gate is held, so the page accounting matches the published version.
-        let (page_size, page_count, free_pages, free_gen_txid) = {
+        let (page_size, page_count, free_pages, free_gen_txid, encrypted) = {
             let st = self.storage.lock().expect("storage lock not poisoned");
             (
                 st.page_size,
                 st.page_count,
                 st.free_pages.clone(),
                 st.free_gen_txid,
+                st.paging.codec().is_some(),
             )
         };
         let mut live = self.live.lock().expect("live lock not poisoned");
@@ -1446,6 +1570,7 @@ impl Shared {
             page_size,
             page_count,
             granted: grant.then(|| free_pages.into_iter().collect()),
+            encrypted,
         };
         Some((
             crate::pageservice::codec::WriteBegun {
@@ -1518,7 +1643,7 @@ impl Shared {
     #[cfg(unix)]
     pub(crate) fn page_service_commit_delta(
         &self,
-        delta: &crate::pageservice::delta::Delta,
+        delta: &mut crate::pageservice::delta::Delta,
     ) -> Result<()> {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         {
@@ -1526,6 +1651,12 @@ impl Shared {
             // The slot not holding the committed meta, which the begin_write flush made the floor
             // (README.md §3.5); a client commit always keeps its own barrier.
             let slot = pager.commit_slot();
+            // A client cannot know that slot, so an encrypted meta, already checked against the
+            // database key, is resealed for it (spec/fileformat/encrypted.md §14).
+            if let Some(codec) = st.paging.codec() {
+                let chain = manifest_chain(delta);
+                codec.seal_meta(slot, &mut delta.meta, &chain)?;
+            }
             pager.write_block(slot, &delta.meta)?;
             pager.sync()?;
             pager.finish_commit(&delta.meta, slot, true, &[]);
@@ -1533,15 +1664,44 @@ impl Shared {
             // re-read them.
             pager.cache_validation(&delta.meta, Arc::new(delta.protected.clone()));
         }
+        let free_tag = crate::format::parse_meta(&delta.meta)
+            .map_or(crate::crypto::NO_TAG, |m| m.free_list_tag);
         let free = crate::format::read_free_list(
             &st.paging,
-            crate::format::PageRef::plain(delta.free_list_head),
+            crate::format::PageRef {
+                page: delta.free_list_head,
+                tag: free_tag,
+            },
             delta.page_count,
             &delta.protected,
         )?;
         st.page_count = delta.page_count;
         st.free_pages = free;
         Ok(())
+    }
+
+    /// Check a client commit's meta against the database key before any page is written
+    /// (spec/fileformat/encrypted.md §14): an encrypted meta must authenticate under one of the two
+    /// slot indices, or the delta is a client bug (`08P01`) rather than `XX001` at the next open.
+    #[cfg(unix)]
+    pub(crate) fn page_service_check_meta(
+        &self,
+        delta: &crate::pageservice::delta::Delta,
+    ) -> Result<()> {
+        let st = self.storage.lock().expect("storage lock not poisoned");
+        let Some(codec) = st.paging.codec() else {
+            return Ok(());
+        };
+        let chain = manifest_chain(delta);
+        if codec.verify_meta(0, &delta.meta, &chain).is_ok()
+            || codec.verify_meta(1, &delta.meta, &chain).is_ok()
+        {
+            return Ok(());
+        }
+        Err(EngineError::new(
+            SqlState::ProtocolViolation,
+            "invalid commit delta: the meta does not authenticate under the database key",
+        ))
     }
 
     /// Publish a client commit under the registry lock (README.md §6.4): release the connection's
@@ -1723,7 +1883,7 @@ impl Shared {
     /// Compact database `lname` (`main` or an attachment) under the local writer barrier the caller
     /// holds (spec/design/api.md §2.6): require a drained reader watermark, then rewrite the storage at the next version and publish the reloaded root while
     /// still holding the watermark lock, so no reader pins in between.
-    fn compact_locked(&self, lname: &str, name: &str) -> Result<()> {
+    fn compact_locked(&self, lname: &str, name: &str, rekey: Option<&Rekey>) -> Result<()> {
         let main = lname == "main";
         let coordinator = if main {
             self.coordinator.clone()
@@ -1757,7 +1917,23 @@ impl Shared {
             self.committed_attachment(lname)
                 .expect("attachment exists (checked by compact)")
         };
-        let compacted = self.with_storage(lname, |st| st.compact(&prev, prev.txid + 1))?;
+        // A rebuild's scratch domain spills through the handle's scratch target (encryption.md §6).
+        let spill = self
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .spill
+            .clone();
+        let compacted = self.with_storage(lname, |st| match rekey {
+            Some(rekey) => st.rekey(
+                &prev,
+                prev.txid + 1,
+                rekey.target.clone(),
+                spill.as_ref(),
+                name,
+            ),
+            None => st.compact(&prev, prev.txid + 1),
+        })?;
         #[cfg(unix)]
         let compacted_txid = compacted.txid;
         let mut roots = self.roots.write().expect("roots lock not poisoned");
@@ -1791,6 +1967,17 @@ impl Shared {
         drop(live);
         self.plan_epoch.fetch_add(1, Ordering::Release);
         Ok(())
+    }
+
+    /// Whether this handle has a scratch target that is not sealed (scratch encryption off,
+    /// spec/design/encryption.md §6): an encrypted database may not join it.
+    pub(crate) fn spills_plaintext(&self) -> bool {
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .spill
+            .as_ref()
+            .is_some_and(|s| !s.encrypts())
     }
 
     /// Pin the committed root (an `Arc` clone under a momentary read lock) — returns the file
@@ -2676,12 +2863,166 @@ impl Database {
     /// `55006` while a write transaction or reader is open on this handle or another process has the
     /// file open. Not metered and not reachable from SQL.
     pub fn compact(&self, name: &str) -> Result<()> {
-        self.compact_named(name, name)
+        self.compact_named(name, name, None)
+    }
+
+    /// Change the credential of the encrypted file database `name` (`"main"` or a file attachment) to
+    /// `credential` (spec/design/encryption.md §5): the data key is rewrapped in the key block and no
+    /// page is rewritten, so the change is quick apart from `kdf`'s Argon2id for a passphrase, which
+    /// runs before the writer gate is taken. Once it returns, only `credential` unlocks the file; if
+    /// it fails partway, the handle must be reopened and exactly one of the two credentials unlocks it.
+    ///
+    /// Never waits: `42704` for a name that is not attached, `25006` for a read-only database, `55000`
+    /// for an in-memory database, `28P03` for a plaintext file, `55006` while a write transaction is
+    /// open, and `22023` for Argon2id parameters out of range. Not reachable from SQL.
+    pub fn change_credential(
+        &self,
+        name: &str,
+        credential: crate::crypto::Credential,
+        kdf: crate::crypto::Argon2Params,
+    ) -> Result<()> {
+        let lname = name.to_string();
+        let mut service = None;
+        let read_only = if lname == "main" {
+            self.0.read_only()
+        } else {
+            match self
+                .0
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .get(&lname)
+            {
+                Some(attachment) if lname != "temp" => {
+                    service = attachment.svc.clone();
+                    attachment.mode == AttachMode::ReadOnly
+                }
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("database \"{name}\" is not attached"),
+                    ));
+                }
+            }
+        };
+        if read_only {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                format!("cannot change the credential of read-only database \"{name}\""),
+            ));
+        }
+        // A file attachment under the page service changes its credential through its own handle.
+        if let Some(inner) = service {
+            return Database(inner).change_credential("main", credential, kdf);
+        }
+        let (codec, file) = self.0.with_storage(&lname, |st| {
+            Ok((st.paging.codec().cloned(), st.path.is_some()))
+        })?;
+        let codec = match (codec, file) {
+            (Some(codec), _) => codec,
+            (None, false) => return Err(credential_without_file()),
+            (None, true) => return Err(not_encrypted()),
+        };
+        // Only the owner of a database the page service shares writes its key block; a page client
+        // asks the host to change it there (encryption.md §5).
+        #[cfg(unix)]
+        if lname == "main" && self.0.handoff.get().is_some() && self.0.service_owner().is_none() {
+            return Err(EngineError::new(
+                SqlState::ObjectNotInPrerequisiteState,
+                "only the process that owns the database can change its credential",
+            ));
+        }
+        // Derive the new wrapping key first: Argon2id takes long enough that nobody should wait for
+        // it behind the writer gate (encryption.md §5).
+        let block = codec.rewrap(&credential, kdf)?;
+        if !self.0.try_acquire_local_writer() {
+            return Err(EngineError::new(
+                SqlState::ObjectInUse,
+                format!(
+                    "cannot change the credential of database \"{name}\" while a write transaction is open"
+                ),
+            ));
+        }
+        let result = self.0.with_storage(&lname, |st| st.write_key_block(block));
+        self.0.release_local_writer();
+        result
+    }
+
+    /// Rewrite the file database `name` (`"main"` or a file attachment) under a **new data key**
+    /// (spec/design/encryption.md §5): encrypted for `credential` when it is `Some` — rotating an
+    /// encrypted file's key, or encrypting a plaintext one — and plaintext when it is `None`,
+    /// decrypting an encrypted file. Every tree is rebuilt under the target page layout and the
+    /// result replaces the file as [`compact`](Self::compact) does, with its limits: it never waits,
+    /// and a reader, a write transaction or another process holding the file is `55006`. When it
+    /// returns, only `credential` unlocks the file. Any copy of the file made before still opens with
+    /// its old credential: rotation protects the file from here on, not old copies.
+    ///
+    /// A row or index key the target layout cannot store (an encrypted page holds 40 bytes less, and
+    /// its pointers are wider) or a result over `max_storage_bytes` (`54P06`) fails before the file
+    /// is replaced, leaving it untouched. Other errors: `42704` for a name that is not attached,
+    /// `25006` read-only, `55000` in memory or when encrypting through a handle whose scratch files
+    /// are plaintext (encryption.md §6), `0A000` for a page size below 1024 under encryption,
+    /// `22023` for Argon2id parameters out of range. Under the page service only the owner rekeys,
+    /// with no client pinning a snapshot; a client connected meanwhile fails `28P04` at its next
+    /// transaction (`28P02` when the file was encrypted) and must reopen. Not reachable from SQL.
+    pub fn rekey(
+        &self,
+        name: &str,
+        credential: Option<crate::crypto::Credential>,
+        kdf: crate::crypto::Argon2Params,
+    ) -> Result<()> {
+        let lname = name.to_string();
+        if lname != "main"
+            && (lname == "temp"
+                || !self
+                    .0
+                    .attachments
+                    .lock()
+                    .expect("attachments lock not poisoned")
+                    .contains_key(&lname))
+        {
+            return Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("database \"{name}\" is not attached"),
+            ));
+        }
+        let (source, file, page_size) = self.0.with_storage(&lname, |st| {
+            Ok((st.paging.codec().cloned(), st.path.is_some(), st.page_size))
+        })?;
+        if !file {
+            return Err(credential_without_file());
+        }
+        let target = match &credential {
+            None => None,
+            Some(credential) => {
+                if (page_size as usize) < crate::crypto::MIN_PAGE_SIZE {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "an encrypted database needs a page size of at least 1024",
+                    ));
+                }
+                if self.0.spills_plaintext() {
+                    return Err(EngineError::new(
+                        SqlState::ObjectNotInPrerequisiteState,
+                        "cannot encrypt a database through a handle whose scratch files are not encrypted",
+                    ));
+                }
+                // The new key block's data key, salt and nonce are the next draws of the database's
+                // key-entropy stream (a new stream for a plaintext file); the KDF runs before any
+                // gate is taken (encrypted.md §12).
+                let rng = match &source {
+                    Some(codec) => codec.rng(),
+                    None => self.0.env.key_stream(),
+                };
+                Some(crate::crypto::create(credential, kdf, rng)?)
+            }
+        };
+        self.compact_named(&lname, name, Some(&Rekey { target }))
     }
 
     /// Compact database `lname` of this handle, naming it `name` in errors (an inner handle of a
     /// service attachment compacts its main under the attachment's name).
-    fn compact_named(&self, lname: &str, name: &str) -> Result<()> {
+    fn compact_named(&self, lname: &str, name: &str, rekey: Option<&Rekey>) -> Result<()> {
         let lname = lname.to_string();
         let mut service = None;
         let read_only = if lname == "main" {
@@ -2722,7 +3063,7 @@ impl Database {
                     format!("cannot compact database \"{name}\" while a write transaction is open"),
                 ));
             }
-            let result = Database(inner).compact_named("main", name);
+            let result = Database(inner).compact_named("main", name, rekey);
             self.0.release_local_writer();
             return result;
         }
@@ -2763,7 +3104,7 @@ impl Database {
                 return Err(error);
             }
         }
-        let result = self.0.compact_locked(&lname, name);
+        let result = self.0.compact_locked(&lname, name, rekey);
         #[cfg(unix)]
         if let Some(owner) = &owner {
             owner.gate.release();
@@ -2898,10 +3239,14 @@ impl Database {
     /// the configurable spill-target slice. Sessions minted afterwards inherit it.
     pub(crate) fn set_spill_dir_for_test(&self, dir: std::path::PathBuf) {
         let mut storage = self.0.storage.lock().expect("storage lock not poisoned");
-        // An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
-        if storage.paging.codec().is_none() {
-            storage.spill = Some(crate::spillhost::os_spill_host(dir));
-        }
+        // A sealed scratch target stays sealed (spec/design/encryption.md §6).
+        let encrypt = storage.paging.codec().is_some()
+            || storage.spill.as_ref().is_some_and(|s| s.encrypts());
+        storage.spill = Some(crate::file::seal_scratch(
+            crate::spillhost::os_spill_host(dir),
+            encrypt,
+            &self.0.env,
+        ));
     }
 
     /// Whether this database was opened read-only (a write is `25006`). In-memory databases are
@@ -2957,11 +3302,8 @@ impl Database {
         }
         match opts.path {
             Some(path) => {
-                let mut coordinator = FileCoordinator::create(
-                    &path,
-                    locking_for(opts.locking, opts.credential.as_ref()),
-                    opts.file_lock_timeout_ms,
-                )?;
+                let mut coordinator =
+                    FileCoordinator::create(&path, opts.locking, opts.file_lock_timeout_ms)?;
                 let canonical = coordinator
                     .as_ref()
                     .map_or(path.as_path(), FileCoordinator::path)
@@ -2983,6 +3325,12 @@ impl Database {
                         }),
                 )?;
                 engine.set_environment(env.clone());
+                if opts.scratch_encryption == crate::file::ScratchEncryption::On {
+                    engine.spill = engine
+                        .spill
+                        .take()
+                        .map(|host| crate::file::seal_scratch(host, true, &env));
+                }
                 let canonical = canonical.to_path_buf();
                 if coordinator.as_ref().is_some_and(FileCoordinator::serving) {
                     // The creator took presence EX: it is the owner and serves, whatever its
@@ -3008,6 +3356,9 @@ impl Database {
                         idle_session_timeout_ms: opts.idle_session_timeout_ms,
                         max_connections: opts.max_connections,
                         ownership: opts.ownership,
+                        scratch_encryption: opts.scratch_encryption,
+                        // A creator that later yields reconnects as a page client with it.
+                        credential: opts.credential.clone(),
                         ..OpenOptions::default()
                     };
                     return start_service_owner(
@@ -3048,10 +3399,7 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        let locking = locking_for(
-            crate::coordinator::resolve_mode(opts.locking)?,
-            opts.credential.as_ref(),
-        );
+        let locking = crate::coordinator::resolve_mode(opts.locking)?;
         if locking == Locking::Auto {
             return open_service(path.as_ref(), opts);
         }
@@ -3126,10 +3474,7 @@ impl Database {
             return Err(credential_without_file());
         }
         let locking = if source.file {
-            locking_for(
-                crate::coordinator::resolve_mode(source.locking)?,
-                source.credential.as_ref(),
-            )
+            crate::coordinator::resolve_mode(source.locking)?
         } else {
             Locking::None
         };
@@ -3140,10 +3485,26 @@ impl Database {
         #[cfg(unix)]
         if source.file && locking == Locking::Auto {
             let path = source.path.as_ref().expect("a file source carries a path");
-            service = Some(
-                self.0
-                    .open_service_attachment(name, path, &source, read_only)?,
-            );
+            let (inner, real) = self
+                .0
+                .open_service_attachment(name, path, &source, read_only)?;
+            // An encrypted attachment may not join a handle that spills to plaintext scratch files
+            // (spec/design/encryption.md §6).
+            let encrypted = inner
+                .storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .paging
+                .codec()
+                .is_some();
+            if encrypted && self.0.spills_plaintext() {
+                let _ = Database(inner).close();
+                return Err(EngineError::new(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    "an encrypted database cannot be attached to a handle whose scratch files are not encrypted",
+                ));
+            }
+            service = Some((inner, real));
         }
         let file_backing: Option<(Storage, Snapshot, Option<Arc<FileCoordinator>>)> = if source.file
             && service.is_none()
@@ -3178,20 +3539,12 @@ impl Database {
                     ..OpenOptions::default()
                 },
             )?;
-            // Until scratch encryption lands, an encrypted attachment may not join a handle that can
-            // spill its rows to a plaintext scratch file (spec/fileformat/encrypted.md §10).
-            if engine.encrypted()
-                && self
-                    .0
-                    .storage
-                    .lock()
-                    .expect("storage lock not poisoned")
-                    .spill
-                    .is_some()
-            {
+            // An encrypted attachment may not join a handle that spills to plaintext scratch files
+            // (spec/design/encryption.md §6).
+            if engine.encrypted() && self.0.spills_plaintext() {
                 return Err(EngineError::new(
                     SqlState::ObjectNotInPrerequisiteState,
-                    "an encrypted database cannot be attached to a handle that spills to disk",
+                    "an encrypted database cannot be attached to a handle whose scratch files are not encrypted",
                 ));
             }
             let paging = engine

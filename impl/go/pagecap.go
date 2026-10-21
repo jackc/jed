@@ -142,6 +142,18 @@ func (s sealer) page(index uint32, pageType, flags byte, itemCount uint32, next 
 	return p, tag, nil
 }
 
+// chainStep is one step along a chain (catalog, overflow, free-list) of a page read through its
+// pointer: the page's type and its bound successor pointer (encrypted.md §2; the tag is zero in
+// plaintext).
+func chainStep(block []byte, c pageCap) (byte, pageRef, error) {
+	pg, err := parsePage(block)
+	if err != nil {
+		return 0, pageRef{}, err
+	}
+	next, _, err := chainContent(pg, c)
+	return pg.pageType, next, err
+}
+
 // chainContent is the content of a parsed chain page (catalog, overflow, free-list) in c's layout: its
 // successor pointer and the bytes after the successor's tag (encrypted.md §2).
 func chainContent(pg page, c pageCap) (pageRef, []byte, error) {

@@ -258,6 +258,20 @@ func readCommittedMeta(paging *sharedPaging, txid uint64) ([]byte, error) {
 	return meta, err
 }
 
+// resolutionDigest is a commit's resolution digest (spec/pageservice/README.md §3.5): the CRC-64 of
+// its meta page, with the CRC field and the reserve zeroed in the encrypted variant, so the digest of
+// the meta a client sent equals that of the meta the owner resealed for its slot
+// (spec/fileformat/encrypted.md §14).
+func resolutionDigest(meta []byte) uint64 {
+	if len(meta) < 7 || meta[6] == 0 {
+		return commitCRC64(0, meta)
+	}
+	m := append([]byte(nil), meta...)
+	clear(m[32:36])
+	clear(m[len(m)-cryptoReserve:])
+	return commitCRC64(0, m)
+}
+
 // seedResolution starts the resolution window with the recovered meta slots (README.md §4): the
 // committed one and, when the other slot holds the commit just before it, that one too.
 func (o *pageServiceOwner) seedResolution(paging *sharedPaging, txid uint64, meta []byte) {
@@ -269,14 +283,14 @@ func (o *pageServiceOwner) seedResolution(paging *sharedPaging, txid uint64, met
 					continue
 				}
 				if m, ok := parseMeta(block); ok && m.txid == txid-1 {
-					o.resolution = append(o.resolution, psResolution{txid: m.txid, digest: commitCRC64(0, block)})
+					o.resolution = append(o.resolution, psResolution{txid: m.txid, digest: resolutionDigest(block)})
 					break
 				}
 			}
 			return nil
 		})
 	}
-	o.resolution = append(o.resolution, psResolution{txid: txid, digest: commitCRC64(0, meta)})
+	o.resolution = append(o.resolution, psResolution{txid: txid, digest: resolutionDigest(meta)})
 }
 
 // published records a main-domain commit: its meta, the indices it wrote, and its resolution pair.
@@ -296,7 +310,7 @@ func (o *pageServiceOwner) published(txid uint64, meta []byte, written []uint32)
 }
 
 func (o *pageServiceOwner) recordResolution(txid uint64, meta []byte) {
-	o.resolution = append(o.resolution, psResolution{txid: txid, digest: commitCRC64(0, meta)})
+	o.resolution = append(o.resolution, psResolution{txid: txid, digest: resolutionDigest(meta)})
 	if len(o.resolution) > psResolutionWindowCommits {
 		o.resolution = append([]psResolution(nil), o.resolution[len(o.resolution)-psResolutionWindowCommits:]...)
 	}
@@ -949,7 +963,8 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 	grant := oldest >= st.freeGenTxid
 	meta := o.meta
 	c.liveMu.Unlock()
-	check := psDeltaBase{committedTxid: txid, pageSize: o.pageSize, pageCount: st.pageCount}
+	codec := st.paging.codec()
+	check := psDeltaBase{committedTxid: txid, pageSize: o.pageSize, pageCount: st.pageCount, encrypted: codec != nil, codec: codec}
 	if grant {
 		check.granted = make(map[uint32]bool, len(st.freePages))
 		for _, p := range st.freePages {
@@ -1114,6 +1129,9 @@ func (sc *psServerConn) commitBegin(m psCommitBegin) error {
 		return newError(ProtocolViolation, "commit_begin twice in one write transaction")
 	}
 	d, err := beginDelta(w.check, m)
+	if err == nil {
+		err = d.checkMeta(w.check.codec)
+	}
 	if err != nil {
 		w.failure = err
 		return nil
@@ -1195,6 +1213,13 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 		// The slot not holding the committed meta, which the begin_write flush made the floor
 		// (README.md §3.5); a client commit always keeps its own barrier.
 		slot := p.commitSlot()
+		// A client cannot know that slot, so an encrypted meta, already checked against the database
+		// key, is resealed for it (spec/fileformat/encrypted.md §14).
+		sealed, err := sealMeta(p, slot, d.meta, d.manifestChain())
+		if err != nil {
+			return err
+		}
+		d.meta = sealed
 		if err := p.writeBlock(slot, d.meta); err != nil {
 			return err
 		}
@@ -1207,7 +1232,7 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	})
 	var free []uint32
 	if err == nil {
-		free, err = readFreeList(st.paging, plainRef(d.m.freeListHead), d.m.pageCount)
+		free, err = readFreeList(st.paging, pageRef{page: d.m.freeListHead, tag: d.m.freeListTag}, d.m.pageCount)
 	}
 	if err != nil {
 		st.mu.Unlock()

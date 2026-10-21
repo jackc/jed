@@ -89,6 +89,11 @@ func (c *sharedCore) openServiceAttachment(name, path string, source AttachSourc
 		FileLockTimeoutMs: source.fileLockTimeoutMs,
 		Environment:       c.env,
 		MaxStorageBytes:   source.maxStorageBytes,
+		Credential:        source.credential,
+	}
+	if spill != nil && spillEncrypts(spill) {
+		// The attachment seals its scratch files when the handle does (encryption.md §6).
+		opts.ScratchEncryption = ScratchEncryptionOn
 	}
 	if c.storage.relaxed {
 		// The attachment follows the handle's synchronous setting (validated-cow.md §4).

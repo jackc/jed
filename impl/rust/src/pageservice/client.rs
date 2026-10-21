@@ -737,7 +737,7 @@ impl PsConnection {
                 "the transaction is too large to commit through the page service",
             )));
         }
-        let digest = crate::format::commit_crc64(0, &meta);
+        let digest = crate::format::resolution_digest(&meta);
         let body: Vec<IndexedPage> = pages
             .into_iter()
             .map(|(index, page)| IndexedPage { index, page })

@@ -21,6 +21,11 @@ pub(crate) trait SpillHost: Send + Sync {
     /// `"merge"`, `"temp"`); it never changes behavior, except that the OS host unlinks a `"temp"`
     /// file at once (a temp domain's scratch store lives as long as its session).
     fn create(&self, kind: &str) -> Result<Box<dyn SpillFile>>;
+
+    /// Whether every file this host makes is sealed (scratch encryption, encryption.md §6).
+    fn encrypts(&self) -> bool {
+        false
+    }
 }
 
 /// One scratch file: positioned reads and writes, its size, and close, which also deletes it.

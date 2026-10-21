@@ -200,7 +200,9 @@ let db = Database::open_with_options("secret.jed", OpenOptions { credential: Som
 In Go, set `CreateOptions.Credential` / `OpenOptions.Credential` to `jed.KeyCredential(key)` or
 `jed.PassphraseCredential(s)`, and attach with `jed.AttachFile(path).WithCredential(c)`. In
 TypeScript (Node), pass `credential: { key }` (a 32-byte `Uint8Array`) or `credential: { passphrase }`
-to `createDatabase` / `openDatabase`, and to `attachFile(path, { credential })`.
+to `createDatabase` / `openDatabase`, and to `attachFile(path, { credential })`. The browser
+(`jed-ts/browser`) takes the same `credential` and `kdf` options; its worker seals and opens every
+page through WebCrypto, so an encrypted database works on OPFS too.
 
 A credential is either a **32-byte key** your application keeps elsewhere (a key management service,
 the OS keychain) or a **passphrase**, which jed stretches with Argon2id (64 MiB, 3 passes, 4 lanes by
@@ -214,15 +216,50 @@ of at least 1024 bytes.
 | `28P02` | an encrypted file was opened without a credential |
 | `28P03` | a credential was given for a file that is not encrypted |
 | `55000` | a credential was given for an in-memory database |
-| `0A000` | the page size is below 1024, or the host is the browser (OPFS), which cannot open encrypted files yet |
+| `0A000` | the page size is below 1024 |
+| `28P04` | another process rotated the key while this one was connected; reopen |
 
 Encryption protects the file's contents at rest: backups, snapshots and copies of the file, and
 anyone who can read the disk. It does not hide the file's size or how many commits it has had, and
-it cannot protect a process that is already running with the key. Some features are not available
-for encrypted databases yet and refuse rather than run unprotected: changing the credential or
-rotating the key, sharing the file between processes (an encrypted file is opened exclusively),
-spilling large sorts and joins to temporary files (they stay in memory), backups, and the `jed`
-command-line tool. Compaction (above) works and keeps the same key.
+it cannot protect a process that is already running with the key.
+
+### Changing the credential
+
+`db.change_credential("main", new_credential, kdf)` (Rust) or `db.ChangeCredential("main", cred, kdf)`
+(Go) rewraps the data key for a new credential. Only the small key block is rewritten, so it is quick
+apart from Argon2id for a new passphrase. When it returns, only the new credential opens the file; if
+the process dies partway, exactly one of the two does, and the next writable open finishes the job.
+Pass an attachment's name to change that file's credential instead. TypeScript's public async API
+does not expose this yet.
+
+### Rotating the key, encrypting, decrypting
+
+`db.rekey("main", Some(credential), kdf)` (Rust) or `db.Rekey("main", cred, kdf)` (Go) rewrites the
+file under a **new data key**: it rotates an encrypted file's key, or encrypts a plaintext file. Pass
+no credential (`None` / `nil`) to decrypt. Every page is rebuilt, so it takes about as long as
+compaction (above) and has the same rules: it never waits, and fails with
+`55006` while a reader or another transaction is open. A row that fits a plaintext page but not an
+encrypted one (which holds 40 bytes less) fails before the file is touched. Copies of the file made
+before still open with their old credential: rotation protects the file from now on, not old copies.
+
+### Temporary files
+
+Large sorts, joins and temporary tables can spill to scratch files. An encrypted database seals them
+with a throwaway random key, so nothing spills in plaintext. A plaintext database's handle spills in
+plaintext unless you open it with `scratch_encryption: ScratchEncryption::On` (Rust),
+`ScratchEncryption: jed.ScratchEncryptionOn` (Go) or `scratchEncryption: "on"` (TypeScript). That
+setting is needed to attach an encrypted database to a plaintext one, or to encrypt it with `rekey`.
+
+### Several processes
+
+Encrypted files work with the page service (above) like plaintext ones:
+every process passes its own credential, and a process that joins reads the key block from the owner
+and unlocks it locally. Only the owner can change the credential or rotate the key; a process that
+was connected across a rotation gets `28P04` and must reopen with the new credential.
+
+The `jed` command line takes `--key-file FILE` (32 raw bytes or 64 hex digits),
+`--passphrase-file FILE` or `--passphrase` (a terminal prompt), never a credential on the command
+line itself.
 
 ## In-memory databases
 

@@ -706,25 +706,33 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   key), every pointer bound to its page's tag, meta slots authenticated whole over their manifest
   chain, credentials on `create`/`open`/`attach` with `28P01`–`28P03`, compaction resealing under the
   same key; pinned by five `encrypted_*` goldens and `encryption_vectors.toml`, authored by the Ruby
-  reference. Remaining, each failing closed until built (encrypted.md §10):
-  - [ ] **Credential change** — the two-barrier key-block rewrap, the stabilization barrier, repair
-    of a differing pair on open (encryption.md §5).
-  - [ ] **DEK rotation and conversion** — compaction under a new data key or into/out of the
-    encrypted variant, rebuilding the trees (§5).
-  - [ ] **Scratch encryption** — `scratch_encryption = auto | on`, per-file random keys and the
-    write counters (§6); until then an encrypted handle has no spill target.
-  - [ ] **Page service and replication** — `read_key_block`, client promotion with the held DEK,
-    `28P04`, the owner's meta-tag check of client commits, SSH credentials in `hello`, the
-    key-block replication item (§8).
-  - [ ] **Encrypted backups** (page-service.md §9 under the key-block mutex).
-  - [ ] **Browser/OPFS** — an asynchronous WebCrypto provider through the TS async page path.
-  - [ ] **CLI and `jed-migrate`** — a credential input (a key file or a passphrase prompt, never an
-    argument or environment variable); until then the CLI opens an encrypted file with `28P02`.
-  - [ ] **Conformance** — the corpus's encrypted harness mode and cost family, and the simulator's
-    fault fixtures (crash at every key-block boundary, replay at every pointer kind, restore then
-    divergent writes — §7).
-  - [ ] **The security review** and XAES lifetime bounds (§9); integrated performance, including
-    Argon2id in pure JS.
+  reference. **Since landed** (2026-10-20, all three cores unless noted): credential change (the
+  two-barrier key-block rewrap, repair at open, `55006` for a lost race — encrypted.md §5); **rekey**
+  — DEK rotation and conversion into or out of the encrypted variant, every tree rebuilt by
+  ascending insertion in a sealed scratch domain (§12, golden `encrypted_rekey_index_table`); scratch
+  encryption (`scratch_encryption = auto | on`, sealed 4 KiB blocks with never-reset write counters,
+  §11); encrypted backups in both forms (§13); the page service (clients unlock from the key-block
+  pages they read, the owner checks and reseals client metas, promotion with the held data key,
+  `28P04` after a rekey — §14, process scenarios `encrypted_service` and
+  `encrypted_commit_resolution`); the CLI's `--key-file` / `--passphrase-file` / `--passphrase`
+  (Rust CLI, `jed migrate`, `jed pages`); the corpus's encrypted mode with its cross-core cost
+  transcript (`conformance:encrypted`, in `ci`); simulator slice S12 (`encryption` profile); and a
+  first integrated benchmark (`bench:encryption`, all three cores). Remaining (encrypted.md §10):
+  - [x] **Browser/OPFS** — landed: an asynchronous WebCrypto provider (`crypto_web.ts`) through the
+    TS async page path (awaited opens, meta seals and unwraps; commits sealed through seal sessions),
+    byte-identical to node:crypto (vectors, goldens, the whole corpus in the async-codec encrypted
+    mode, a real-Chromium e2e). Measured in headless Chromium over two runs: 0.11–0.14 ms per page
+    opened on a cold scan and 0.57–0.95 ms per page sealed on a bulk commit, over plaintext. Still
+    open: the browser's Argon2id cost.
+  - [ ] **TS async API** — `changeCredential` and `rekey` on the public async entry points (as for
+    compaction, which they lack too).
+  - [ ] **Replication** — the key-block item in the stream (replication itself is not built).
+  - [ ] **A credential in `hello`** for a `jed pages` server that must own an encrypted database
+    (today: a key or passphrase file on the server, or `28P02`).
+  - [ ] **Simulator growth** — replay at every pointer kind, restore then divergent writes,
+    conversion to and from plaintext, encrypted attachments and encrypted service traces (S12's
+    *Not yet*).
+  - [ ] **The security review** and XAES lifetime bounds (encryption.md §9). Needs a human reviewer.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`
   order, as a tee at the block seam (below the encryption codec → keyless backup replicas). No

@@ -374,6 +374,17 @@ reports how many pages crossed the codec and fails when none did. `mise run conf
 (and `conformance:all`, so `mise run ci`) runs it. It skips what the disk mode skips and nothing
 more; ts-runtime.md §11.1 lists the paths that remain synchronous and why the mode never reaches them.
 
+A fifth mode, **`encrypted`** (env `JED_CONFORMANCE_ENCRYPTED=1` with the disk mode), runs the
+disk mode with every database file encrypted under a fixed host key ([encryption.md](encryption.md)
+§7). Rows and errors must be as written. Cost-bearing output is not: an encrypted page holds 40 bytes
+less and its pointers are wider, so page counts, fan-out and therefore costs and estimates move. Each
+core instead writes every `# cost:` record's cost and every EXPLAIN's rows to a transcript
+(`JED_CONFORMANCE_TRANSCRIPT`; one `file⇥kind⇥sql⇥actual` line each), and the three transcripts must be
+byte-identical. A file whose rows or errors legitimately differ in the encrypted variant — a limit's
+trip point that follows the live page count, a record near the cap — carries **`# skip: encrypted —
+reason`**; those directives are the mode's ledger. `mise run conformance:encrypted` (and
+`conformance:all`, so `mise run ci`) runs it. It skips what the disk mode skips.
+
 ## 4. Determinism rules
 
 The agent loop and cross-impl sync both depend on bit-reproducibility (CLAUDE.md §10).
@@ -524,11 +535,12 @@ profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness 
 
 One run of a core's harness over the corpus in one configuration (storage mode plus harness
 settings) is a **walk**. `mise run test` and `mise run ci` do not invoke `conformance`,
-`conformance:spill`, `conformance:query_memory`, `conformance:service`, `conformance:ts:async-codec`,
-and `conformance:rust:checked` one after another;
+`conformance:spill`, `conformance:query_memory`, `conformance:service`, `conformance:encrypted`,
+`conformance:ts:async-codec`, and `conformance:rust:checked` one after another;
 they run `mise run conformance:all [--checked] [filter]`, which builds each runner once and runs all
 of those walks concurrently (they are independent single-threaded processes), buffering each walk's
-output and reporting in a fixed order. It then applies the query-memory peak comparison above. `ci`
+output and reporting in a fixed order. It then applies the query-memory peak and encrypted-transcript
+comparisons above. `ci`
 passes `--checked`; `JED_CONFORMANCE_JOBS` caps concurrency (1 runs the walks serially). The
 individual tasks remain for running one family alone.
 

@@ -1121,7 +1121,7 @@ export { PreparedStatement, Rows, Transaction } from "./api.ts";
 export { Statement } from "./ergonomic.ts";
 export type { JsParam, JsValue, Row, RunResult } from "./ergonomic.ts";
 export { createDatabase, openDatabase } from "./file.ts";
-export type { CreateOptions, Locking, OpenOptions } from "./file.ts";
+export type { CreateOptions, Locking, OpenOptions, ScratchEncryption } from "./file.ts";
 // Encryption at rest (spec/design/encryption.md): the credential CreateOptions/OpenOptions/attachFile
 // take, and the Argon2id parameters a passphrase is stretched with at create.
 export { DEFAULT_ARGON2_PARAMS } from "./crypto.ts";

@@ -25,6 +25,9 @@ usage: jed migrate [OPTIONS] DBFILE          apply migrations up/down to a targe
   -d, --destination TARGET   integer | +N | -N | -+N | last   (default: last)
   -m, --migrations DIR       migrations directory              (default: ./migrations)
       --version-table NAME   override the default `schema_version` table
+      --key-file FILE        the 32-byte key of an encrypted DBFILE (or of a new one)
+      --passphrase-file FILE the passphrase of an encrypted DBFILE, from FILE
+      --passphrase           prompt for that passphrase on the terminal
   -h, --help                 print this help, then exit
 
 `jed migrate DBFILE` creates DBFILE if it does not exist, then applies every migration.
@@ -55,6 +58,8 @@ struct Common {
     dir: PathBuf,
     version_table: Option<String>,
     dest: String, // apply only; ignored by status
+    /// The credential of an encrypted DBFILE (cli.md §3).
+    credential: Option<crate::credential::CredentialSource>,
 }
 
 impl Default for Common {
@@ -64,6 +69,7 @@ impl Default for Common {
             dir: PathBuf::from("migrations"),
             version_table: None,
             dest: "last".to_string(),
+            credential: None,
         }
     }
 }
@@ -79,6 +85,10 @@ fn parse_common(argv: &[String], allow_dest: bool) -> Result<Common, String> {
                 .cloned()
                 .ok_or_else(|| format!("{flag} needs a value"))
         };
+        if let Some(source) = crate::credential::parse_flag(arg, &c.credential, &mut value_for)? {
+            c.credential = Some(source);
+            continue;
+        }
         match arg.as_str() {
             "-d" | "--destination" if allow_dest => c.dest = value_for("-d")?,
             "-m" | "--migrations" => c.dir = PathBuf::from(value_for("-m")?),
@@ -105,7 +115,7 @@ fn run_apply(argv: &[String]) -> u8 {
     let Some(db_path) = c.db.clone() else {
         return usage_error("a DBFILE is required");
     };
-    let db = match open_or_create(&db_path) {
+    let db = match open_or_create(&db_path, &c) {
         Ok(db) => db,
         Err(code) => return code,
     };
@@ -164,7 +174,7 @@ fn run_status(argv: &[String]) -> u8 {
     let Some(db_path) = c.db.clone() else {
         return usage_error("a DBFILE is required");
     };
-    let db = match open_existing(&db_path) {
+    let db = match open_existing(&db_path, &c) {
         Ok(db) => db,
         Err(code) => return code,
     };
@@ -216,7 +226,7 @@ fn run_set_version(argv: &[String]) -> u8 {
     let Some(db_path) = c.db.clone() else {
         return usage_error("a DBFILE is required");
     };
-    let db = match open_existing(&db_path) {
+    let db = match open_existing(&db_path, &c) {
         Ok(db) => db,
         Err(code) => return code,
     };
@@ -490,13 +500,22 @@ fn migration_file_sequence(name: &str) -> Option<u32> {
 
 /// Open DBFILE if it exists, else create it (the migration-bootstrap workflow — a fresh
 /// project's first `jed migrate` creates the file and applies every migration).
-fn open_or_create(path: &Path) -> Result<Database, u8> {
-    let result = if path.exists() {
-        Database::open(path)
+fn open_or_create(path: &Path, c: &Common) -> Result<Database, u8> {
+    let exists = path.exists();
+    let credential = load_credential(c, !exists)?;
+    let result = if exists {
+        Database::open_with_options(
+            path,
+            jed::OpenOptions {
+                credential,
+                ..jed::OpenOptions::default()
+            },
+        )
     } else {
         Database::create(CreateOptions {
             path: Some(path.to_path_buf()),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            credential,
             ..Default::default()
         })
     };
@@ -508,7 +527,20 @@ fn open_or_create(path: &Path) -> Result<Database, u8> {
 
 /// Open an existing DBFILE (`status`, `set-version`); a missing file is an error pointing at
 /// the apply action, which is the one that creates it.
-fn open_existing(path: &Path) -> Result<Database, u8> {
+/// Read the credential the flags name, if any (`confirm`: a new database's prompt asks twice).
+fn load_credential(c: &Common, confirm: bool) -> Result<Option<jed::Credential>, u8> {
+    match &c.credential {
+        None => Ok(None),
+        Some(source) => crate::credential::load(source, confirm)
+            .map(Some)
+            .map_err(|e| {
+                eprintln!("jed migrate: {e}");
+                1
+            }),
+    }
+}
+
+fn open_existing(path: &Path, c: &Common) -> Result<Database, u8> {
     if !path.exists() {
         eprintln!(
             "jed migrate: {}: database does not exist (run `jed migrate {}` to create and migrate it)",
@@ -517,7 +549,15 @@ fn open_existing(path: &Path) -> Result<Database, u8> {
         );
         return Err(1);
     }
-    Database::open(path).map_err(|e| {
+    let credential = load_credential(c, false)?;
+    Database::open_with_options(
+        path,
+        jed::OpenOptions {
+            credential,
+            ..jed::OpenOptions::default()
+        },
+    )
+    .map_err(|e| {
         eprintln!("jed migrate: {}: {e}", path.display());
         1
     })

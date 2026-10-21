@@ -510,7 +510,9 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, 
 	if cacheBytes <= 0 {
 		cacheBytes = defaultCacheBytes
 	}
-	db, err := loadEnginePaged(p, cacheLeaves(cacheBytes, p.pageSize), env)
+	// A client of an encrypted file unlocks with its own credential, from the key-block pages it reads
+	// through the service (spec/fileformat/encrypted.md §14).
+	db, err := loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
 	if err != nil {
 		return nil, err
 	}
@@ -522,6 +524,38 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, 
 		db.session.workMem = opts.WorkMem
 	}
 	return db, nil
+}
+
+// errStaleKey is 28P04: the owner rekeyed the database, so this client's data key no longer opens it.
+func errStaleKey() error {
+	return newError(StaleKey, "the database was rekeyed since this handle opened it; reopen it")
+}
+
+// metaAuthenticates reports whether paging's key authenticates the meta it was just served, under
+// either slot index — a page client's test that a rekey has not left its held key stale
+// (spec/fileformat/encrypted.md §14). True in plaintext, and when the meta cannot be read.
+func metaAuthenticates(paging *sharedPaging) bool {
+	ok := true
+	_ = paging.withPager(func(p *pager) error {
+		if p.codec == nil {
+			return nil
+		}
+		raw, err := p.readBlock(0)
+		if err != nil {
+			return err
+		}
+		m, parsed := parseMeta(raw)
+		if !parsed {
+			return nil
+		}
+		chain, err := p.manifestChain(m)
+		if err != nil {
+			return err
+		}
+		ok = p.codec.verifyMeta(0, raw, chain) == nil || p.codec.verifyMeta(1, raw, chain) == nil
+		return nil
+	})
+	return ok
 }
 
 // clientRefresh is a page client's read begin (README.md §3.2): one begin_read round trip, then the
@@ -576,6 +610,18 @@ func (c *sharedCore) clientAdopt(r *serviceRole, incarnation id16, txid uint64, 
 		st.mu.Unlock()
 		return errStaleRole()
 	}
+	// The owner may have rekeyed the file since this client unlocked it (encryption.md §8): the meta
+	// must still be of the variant the client opened, and authenticate under its key.
+	if len(meta) > 6 {
+		switch encrypted := meta[6] != 0; {
+		case r.paging.codec() == nil && encrypted:
+			st.mu.Unlock()
+			return newError(CredentialRequired, "the database was encrypted since this handle opened it; reopen it with a credential")
+		case r.paging.codec() != nil && !encrypted:
+			st.mu.Unlock()
+			return errStaleKey()
+		}
+	}
 	cl.setMeta(meta)
 	if err := r.paging.withPager(func(p *pager) error { return p.refreshAllocatedPages() }); err != nil {
 		st.mu.Unlock()
@@ -584,6 +630,10 @@ func (c *sharedCore) clientAdopt(r *serviceRole, incarnation id16, txid uint64, 
 	loaded, err := loadEngineSharedPaging(r.paging, c.env)
 	if err != nil {
 		st.mu.Unlock()
+		var e *EngineError
+		if errors.As(err, &e) && e.Code() == "XX001" && !metaAuthenticates(r.paging) {
+			return errStaleKey()
+		}
 		return err
 	}
 	c.liveMu.Lock()
@@ -723,7 +773,7 @@ func (cl *psClient) commit(meta []byte, pages map[uint32][]byte) error {
 	if 5+8+ps+4+len(manifest)*(4+ps) > psMaxFrameLength {
 		return &psCommitNotCommitted{newError(ProgramLimitExceeded, "the transaction is too large to commit through the page service")}
 	}
-	digest := commitCRC64(0, meta)
+	digest := resolutionDigest(meta)
 	cl.sendMu.Lock()
 	if _, err := cl.sendLocked(psCommitBegin{txid: m.txid, meta: meta, manifestPages: manifest}, false); err != nil {
 		cl.sendMu.Unlock()

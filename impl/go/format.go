@@ -843,8 +843,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, codec *pageCodec, si
 
 	// An encrypted image's key block: the same copy at pages 2 and 3 (encrypted.md §5).
 	if codec != nil {
-		block := make([]byte, ps)
-		copy(block, codec.keyBlock)
+		block := codec.keyBlockPage(ps)
 		if err := sink(2, block); err != nil {
 			return 0, err
 		}
@@ -1402,21 +1401,33 @@ func serializeDirty(n *pnode, colTypes []colType, seal sealer, alloc *pageAlloc,
 // pagerFromStore reads the page size and pageCount starts past the meta slots. Zero file writes: this
 // byte store is entirely separate from the main database file.
 func newTempStorage(pageSize uint32) *storage {
-	image, err := newSnapshot(nil).ToImage(pageSize, 0) // an empty image resolves nothing
-	if err != nil {
-		panic("a fresh temp image always serializes: " + err.Error())
-	}
-	p, err := pagerFromStore(newMemoryBlockStore(image))
+	st, err := newScratchStorage(pageSize, nil)
 	if err != nil {
 		panic("a fresh temp image always opens: " + err.Error())
 	}
+	return st
+}
+
+// newScratchStorage is newTempStorage sealed under codec when it is set: a rebuild's scratch domain in
+// the target layout (spec/design/encryption.md §5), sealed under a throwaway key when the target is
+// encrypted.
+func newScratchStorage(pageSize uint32, codec *pageCodec) (*storage, error) {
+	image, err := newSnapshot(nil).toImageSealed(pageSize, 0, codec) // an empty image resolves nothing
+	if err != nil {
+		return nil, err
+	}
+	p, err := pagerFromStore(newMemoryBlockStore(image))
+	if err != nil {
+		return nil, err
+	}
+	p.codec = codec
 	mt, _ := parseMeta(image[:pageSize])
 	return &storage{
 		pageSize:             pageSize,
 		pageCount:            mt.pageCount,
 		paging:               newSharedPaging(p, math.MaxInt), // pinned/unbounded, mirroring an in-memory database
 		reclaimWithinSession: true,
-	}
+	}, nil
 }
 
 // newAttachedStorage builds a fresh, empty in-RAM storage identity for a host-attached DATABASE-scoped
@@ -1479,6 +1490,37 @@ func loadEnginePagedCredential(pgr *pager, capacity int, env *Environment, cred 
 	}
 	paging := newSharedPaging(pgr, capacity)
 	return loadEngineSharedPaging(paging, env)
+}
+
+// adoptHeldCodec prepares pgr to open with a page client's held codec (spec/design/encryption.md §8):
+// the file must be encrypted (28P04 otherwise — it was decrypted since), and the codec adopts its
+// selected key-block copy, so a later credential change or backup starts from the file's current
+// generation. The load then authenticates the meta under the held key (XX001 when it does not).
+func adoptHeldCodec(pgr *pager, codec *pageCodec) error {
+	if int(pgr.pageSize) < minEncryptedPageSize || pgr.allocatedPages < firstBodyEncrypted {
+		return newError(DataCorrupted, "encrypted file too small for its key block")
+	}
+	var pages [4][]byte
+	for i := range pages {
+		var err error
+		if pages[i], err = pgr.readBlock(uint32(i)); err != nil {
+			return err
+		}
+	}
+	suite, err := fileSuite(pages[0], pages[1])
+	if err != nil {
+		return err
+	}
+	if suite == 0 {
+		return newError(StaleKey, "the database is no longer encrypted; reopen it")
+	}
+	selected, err := selectKeyBlock(pages[2], pages[3])
+	if err != nil {
+		return err
+	}
+	codec.setKeyBlock(append([]byte(nil), selected...))
+	pgr.codec = codec
+	return nil
 }
 
 // unlockPager learns from the meta slots whether the file is encrypted and, if it is, unlocks it with

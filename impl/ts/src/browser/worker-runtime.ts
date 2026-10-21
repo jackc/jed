@@ -5,6 +5,7 @@ import { RuntimeServer } from "../async/server.ts";
 import { Environment, type EnvironmentBuilder } from "../environment.ts";
 import { engineError } from "../errors.ts";
 import { DEFAULT_PAGE_SIZE } from "../executor.ts";
+import { installWebCrypto } from "../crypto_web.ts";
 import { createOpfs, openOpfs } from "../opfs.ts";
 import { buildInMemory, Database } from "../shared.ts";
 import type { BrowserDatabaseOptions, BrowserOpenOptions } from "./async.ts";
@@ -36,6 +37,8 @@ export function startDatabaseWorker(options: BrowserWorkerOptions = {}): void {
     throw new TypeError("configure must be a function");
   }
   started = true;
+  // Encrypted databases seal and open their pages through WebCrypto (encryption.md §9).
+  installWebCrypto();
 
   // One channel belongs to the worker's lifetime. Message tasks yield to control
   // requests without the nested-timer clamp that setTimeout adds to every batch.
@@ -72,6 +75,13 @@ export function startDatabaseWorker(options: BrowserWorkerOptions = {}): void {
       if (settings.path === undefined) {
         if (args.mode !== "create")
           throw engineError("undefined_file", "opening OPFS requires a path");
+        if (settings.credential !== undefined) {
+          // Nothing is at rest in an in-memory database (spec/design/encryption.md §5).
+          throw engineError(
+            "object_not_in_prerequisite_state",
+            "an in-memory database cannot be encrypted",
+          );
+        }
         return buildInMemory(
           settings.pageSize ?? DEFAULT_PAGE_SIZE,
           environment,

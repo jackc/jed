@@ -189,3 +189,46 @@ fn encrypted_catalog() {
         .collect();
     check("encrypted_catalog.jed", &sql, "SELECT count(*) FROM t29");
 }
+
+/// A rekey's cross-core bytes (encrypted.md §12): a plaintext file holding `encrypted_index_table`'s
+/// rows, encrypted in place, is byte-identical to the golden built at the rekey's txid — every tree
+/// rebuilt by ascending insertion at the encrypted capacity, the key block and every nonce the
+/// database's first key-entropy draws.
+#[test]
+fn encrypted_rekey_index_table() {
+    let path = tmp("golden_rekey_index_table.jed");
+    let db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        page_size: PAGE,
+        skip_fsync: true,
+        environment: jed::Environment::builder()
+            .insecure_seeded_key_entropy(ENC_SEED)
+            .build(),
+        scratch_encryption: jed::ScratchEncryption::On,
+        locking: jed::Locking::Exclusive,
+        ..Default::default()
+    })
+    .unwrap();
+    run(&db, "CREATE TABLE t (a i32 PRIMARY KEY, v i64, r i32range)");
+    run(&db, "CREATE INDEX t_r ON t USING gist (r)");
+    run(&db, "CREATE INDEX t_v ON t (v)");
+    // Descending, so the plaintext trees differ from the ones the rekey rebuilds.
+    for a in (1..=150).rev() {
+        run(
+            &db,
+            &format!(
+                "INSERT INTO t VALUES ({a}, {}, i32range({a}, {}))",
+                a * 3,
+                a + 5
+            ),
+        );
+    }
+    db.rekey("main", Some(Credential::Key(ENC_KEY)), Default::default())
+        .unwrap();
+    db.close().unwrap();
+    let image = std::fs::read(&path).unwrap();
+    assert!(
+        image == fixture("encrypted_rekey_index_table.jed"),
+        "the rekeyed file differs from the golden"
+    );
+}

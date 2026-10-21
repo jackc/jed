@@ -24,7 +24,8 @@ import { tmpdir } from "node:os";
 import { MessageChannel, type MessagePort } from "node:worker_threads";
 
 import type { BlockStore } from "../blockstore.ts";
-import { crc64Update, parseCommitMeta } from "../commit_manifest.ts";
+import { parseCommitMeta, resolutionDigest } from "../commit_manifest.ts";
+import { type Credential, sealScratch } from "../crypto.ts";
 import { EngineError, engineError, type SqlState } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 import { FORMAT_VERSION, loadEnginePaged, unlockPagerSteps } from "../format.ts";
@@ -596,7 +597,7 @@ export class PageClient implements PageClientHandle {
         ),
       );
     }
-    const digest = crc64Update(0n, meta);
+    const digest = resolutionDigest(meta);
     const sendPart = (part: PsMessage): void => {
       if (this.broken !== null) throw new NotCommitted(this.broken);
       this.send(part, false);
@@ -731,7 +732,15 @@ class ServiceBlockStore implements BlockStore {
   }
 }
 
-export type ClientOpenOptions = { cacheBytes?: number; workMem?: number };
+// credential unlocks an encrypted database from the key-block pages the client reads through the
+// owner (spec/fileformat/encrypted.md §14). scratchEncryption "on" seals the client's scratch files
+// (§11), as an encrypted database's always are.
+export type ClientOpenOptions = {
+  cacheBytes?: number;
+  workMem?: number;
+  scratchEncryption?: "auto" | "on";
+  credential?: Credential;
+};
 
 // openPageClient builds an engine over a connected client (README §3.2): one begin_read pins and
 // adopts the owner's committed snapshot, then the ordinary loader reads the catalog skeleton through the
@@ -749,9 +758,9 @@ export function openPageClient(
   client.store = store;
   const pager = Pager.fromStore(store);
   pager.trustMeta = true;
-  // A page client of an encrypted file would need its key; the page service serves plaintext files
-  // only, so a client opens without one (spec/fileformat/encrypted.md §10).
-  const codec = runSync(unlockPagerSteps(pager, undefined, environment));
+  // A client of an encrypted file unlocks with its own credential, from the key-block pages it reads
+  // through the service (spec/fileformat/encrypted.md §14).
+  const codec = runSync(unlockPagerSteps(pager, opts.credential, environment));
   const paging = new SharedPaging(
     pager,
     cacheLeaves(opts.cacheBytes ?? DEFAULT_CACHE_BYTES, pager.pageSize),
@@ -763,7 +772,11 @@ export function openPageClient(
   db.readOnly = client.readOnly;
   // The file and its directory are the owner's; its commit makes them durable.
   db.dirSynced = true;
-  db.spillSink = new FileSpillSink(tmpdir());
+  db.spillSink = sealScratch(
+    new FileSpillSink(tmpdir()),
+    codec !== null || opts.scratchEncryption === "on",
+    environment,
+  );
   if (opts.workMem) db.session.workMem = opts.workMem;
   return db;
 }

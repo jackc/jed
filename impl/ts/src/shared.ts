@@ -68,12 +68,24 @@ import { drainRunSteps, PreparedStatement, Rows, rowsFromOutcome, Transaction } 
 import {
   loadEngine,
   loadEnginePaged,
+  metaAuthenticates,
   newAttachedStorage,
+  newScratchStorage,
   reclaimDue,
   toImage as toImageBytes,
 } from "./format.ts";
 import type { CompositeType, Table, ViewDef } from "./catalog.ts";
-import type { Credential } from "./crypto.ts";
+import {
+  type Argon2Params,
+  type Credential,
+  createCodec,
+  DEFAULT_ARGON2_PARAMS,
+  ENCRYPTED_MIN_PAGE_SIZE,
+  type PageCodec,
+  scratchCodec,
+} from "./crypto.ts";
+import { capOf } from "./cap.ts";
+import type { SpillSink } from "./spill.ts";
 import { Environment } from "./environment.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
@@ -97,7 +109,9 @@ import {
   persistSteps,
   precheckBudgetSteps,
   type StagedCommit,
+  stageTemp,
   storageBytes,
+  writeKeyBlockSteps,
 } from "./persist.ts";
 import type { Statement } from "./ast.ts";
 
@@ -217,7 +231,7 @@ export interface ServiceHandoffHost {
   readonly skipFsync: boolean;
   // elect runs the election loop under the open timeout, keeping the path claim: it returns the new
   // role (an owner opened with recovery and serving, or an opened client). 55006 on timeout.
-  elect(pauseUntilMs: number): ServiceRole;
+  elect(pauseUntilMs: number, held?: PageCodec | null): ServiceRole;
   // canOpenReadWrite reports whether this user can open the file read-write (opened and closed).
   canOpenReadWrite(): boolean;
   // releasePath releases the process-local open-path claim when the handle closes.
@@ -676,6 +690,13 @@ class SharedCore {
     return this.name !== "" ? this.name : "main";
   }
 
+  // spillsPlaintext reports whether this handle has a scratch target that is not sealed (scratch
+  // encryption off, spec/fileformat/encrypted.md §11): an encrypted database may not join it.
+  spillsPlaintext(): boolean {
+    const sink = this.storage.spillSink;
+    return sink !== null && !(sink.encrypts?.() ?? false);
+  }
+
   // tryAcquireLocalWriter claims the in-process writer flag only if it is free right now, with no
   // coordination work (compaction never waits and does its own coordination — spec/design/api.md §2.6).
   // Released by releaseWriter.
@@ -777,7 +798,8 @@ class SharedCore {
     const pause = this.client !== null ? this.client.handoffPauseUntil() : this.pauseUntilMs;
     let role: ServiceRole;
     try {
-      role = handoff.elect(pause);
+      // A promotion opens the file with the data key this handle already holds (encrypted.md §14).
+      role = handoff.elect(pause, this.storage.paging?.codec() ?? null);
     } catch (error) {
       if (isCode(error, "55006")) throw errNoOwner();
       throw error;
@@ -1222,9 +1244,25 @@ class SharedCore {
     if (reply.invalidateAll) paging.invalidateAll();
     else for (const index of reply.indices) paging.invalidate(index);
     if (!reply.invalidateAll && reply.txid <= client.adopted) return;
+    // The owner may have rekeyed the file since this client unlocked it (encrypted.md §14): the meta
+    // must still be of the variant the client opened, and authenticate under its key.
+    const encryptedMeta = reply.meta.length > 6 && reply.meta[6] !== 0;
+    if (paging.codec() === null && encryptedMeta) {
+      throw engineError(
+        "credential_required",
+        "the database was encrypted since this handle opened it; reopen it with a credential",
+      );
+    }
+    if (paging.codec() !== null && !encryptedMeta) throw staleKey();
     client.setMeta(reply.meta);
     paging.refreshAllocatedPages();
-    const loaded = loadEnginePaged(paging, this.environment);
+    let loaded: Engine;
+    try {
+      loaded = loadEnginePaged(paging, this.environment);
+    } catch (error) {
+      if (isCode(error, "XX001") && !heldKeyAuthenticates(paging)) throw staleKey();
+      throw error;
+    }
     client.markAdopted(reply.incarnation, reply.txid);
     this.storage.pageCount = loaded.pageCount;
     this.storage.freePages = loaded.freePages;
@@ -1322,7 +1360,7 @@ class SharedCore {
   // caller holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
   // watermark, then rewrite the storage at the next version and publish the reloaded root. JS is
   // single-threaded, so no reader can pin between the check and the publish.
-  compactLocked(lname: string, name: string): void {
+  compactLocked(lname: string, name: string, rekey: Rekey | null = null): void {
     const main = lname === "main";
     const coordinator = main
       ? this.coordinator
@@ -1346,7 +1384,18 @@ class SharedCore {
         );
       }
       const prev = main ? this.committed : this.attached.get(lname)!;
-      const compacted = compactStorage(this.storageFor(lname), prev, prev.txid + 1n);
+      // A rebuild's scratch domain spills through the handle's scratch target (encrypted.md §12).
+      const compacted =
+        rekey === null
+          ? compactStorage(this.storageFor(lname), prev, prev.txid + 1n)
+          : rekeyStorage(
+              this.storageFor(lname),
+              prev,
+              prev.txid + 1n,
+              rekey.target,
+              this.storage.spillSink,
+              name,
+            );
       if (main) {
         this.committed = compacted;
         service?.compactedLocked(compacted.txid, this.storage.paging!, {
@@ -1701,6 +1750,65 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
     const image = toImageBytes(snap, st.pageSize, txid);
     paging = new SharedPaging(Pager.fromStore(new MemoryBlockStore(image)), capacity);
   }
+  return adoptRewritten(st, paging);
+}
+
+// rekeyStorage rotates the data key of file storage st, or converts it between the plaintext and
+// encrypted variants (spec/fileformat/encrypted.md §12): rebuild every tree of snap under target's
+// layout in a scratch domain (its pages moved to a scratch file of sink once they pass the pool
+// budget, sealed under a throwaway key when the target is encrypted), then write the from-scratch image
+// under target (null: plaintext) and rename it over the file as compaction does. A record or key the
+// target cannot store, or an image over max_storage_bytes, fails before the rename with the file
+// untouched. The caller holds the writer gate with the reader watermark drained.
+function rekeyStorage(
+  st: Engine,
+  snap: Snapshot,
+  txid: bigint,
+  target: PageCodec | null,
+  sink: SpillSink | null,
+  name: string,
+): Snapshot {
+  const old = st.paging;
+  if (old === null) throw engineError("io_error", "database storage is closed");
+  old.checkDurableCommit();
+  if (st.path === null || fileCompactor === null) {
+    throw engineError(
+      "feature_not_supported",
+      `cannot rekey database "${name}": its storage host cannot replace the file atomically`,
+    );
+  }
+  const capacity = old.capacity();
+  const build = newScratchStorage(
+    st.pageSize,
+    target === null ? null : scratchCodec(),
+    st.environment,
+  );
+  let paging: SharedPaging;
+  try {
+    // The scratch domain spills past the handle's page-cache budget, like a temp domain.
+    const budget = Math.max(Math.min(capacity * st.pageSize, Number.MAX_SAFE_INTEGER), 1 << 20);
+    const built = snap.emptied(capOf(st.pageSize, target !== null), build.paging!);
+    snap.rebuildRows(built, Math.floor(budget / 4), (s) => {
+      const staged = stageTemp(build, s, budget, sink);
+      adoptStaged(build, s, staged, true);
+      s.clearStaged();
+    });
+    paging = fileCompactor(st.fileHost, st.path, built, st.pageSize, txid, old, capacity, {
+      codec: target,
+      limit: st.storageBudget.limit,
+      name,
+    });
+  } finally {
+    // The scratch domain (and any scratch file it moved to) is released whatever happened.
+    build.paging?.close();
+  }
+  return adoptRewritten(st, paging);
+}
+
+// adoptRewritten makes paging, over st's rewritten storage, its storage and returns the committed
+// snapshot reloaded from it (compaction and rekey). The image has no free list and no garbage, so the
+// page accounting restarts from it, and the storage budget forgets the last commit's pages.
+function adoptRewritten(st: Engine, paging: SharedPaging): Snapshot {
   // A file's old pager is already closed and poisoned here, so a failed reload leaves the handle
   // needing a reopen; an in-memory domain keeps its old store untouched.
   let loaded: Engine;
@@ -1723,6 +1831,38 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
   return loaded.committed;
 }
 
+// staleKey is 28P04: the owner rekeyed the database, so this client's data key no longer opens it
+// (spec/fileformat/encrypted.md §14).
+function staleKey(): EngineError {
+  return engineError(
+    "stale_key",
+    "the database was rekeyed since this handle opened it; reopen it",
+  );
+}
+
+// heldKeyAuthenticates reports whether the client's held key authenticates the meta it was just
+// served, under either slot index (a read failure counts as authenticating: the load's error stands).
+function heldKeyAuthenticates(paging: SharedPaging): boolean {
+  try {
+    return metaAuthenticates(paging);
+  } catch {
+    return true;
+  }
+}
+
+// notEncrypted is a credential operation on a plaintext file: 28P03 (encryption.md §5).
+function notEncrypted(): EngineError {
+  return engineError("credential_not_applicable", "the database is not encrypted");
+}
+
+// readOnlyCredential is a credential change on a read-only database: 25006.
+function readOnlyCredential(name: string): EngineError {
+  return engineError(
+    "read_only_sql_transaction",
+    `cannot change the credential of read-only database "${name}"`,
+  );
+}
+
 // fileCompactor is the host-injected file rewrite behind Database.compact (spec/design/api.md §2.6): the
 // Node host (file.ts) registers compactFile at load, so shared.ts stays browser-clean. null until a host
 // registers one; a file-backed storage cannot exist without file.ts, which registers it.
@@ -1734,7 +1874,17 @@ type FileCompactor = (
   txid: bigint,
   old: SharedPaging,
   capacity: number,
+  rekey?: RekeyTarget,
 ) => SharedPaging;
+
+// RekeyTarget is what a rekey writes its image under (spec/fileformat/encrypted.md §12): the target
+// codec (null: plaintext) and the database's max_storage_bytes (0 or less: unlimited), checked against
+// the image's live pages before the rename, with name the database the 54P06 names.
+export type RekeyTarget = { codec: PageCodec | null; limit: bigint; name: string };
+
+// Rekey is a rekey request threaded through the compaction path: its target codec (null: plaintext).
+type Rekey = { target: PageCodec | null };
+
 let fileCompactor: FileCompactor | null = null;
 
 // registerFileCompactor installs the host file rewrite that Database.compact uses for a file-backed
@@ -1752,8 +1902,8 @@ export function registerFileCompactor(fn: FileCompactor): void {
 // is unlimited.
 // credential unlocks an encrypted file attachment (spec/design/encryption.md §5): 28P02 without one,
 // 28P01 when it does not unwrap the key, 28P03 for a plaintext file, 55000 for an in-memory source
-// (nothing is at rest) or — until scratch encryption lands — on a handle that may spill to disk
-// (spec/fileformat/encrypted.md §10).
+// (nothing is at rest) or on a handle whose scratch files are not sealed (scratch encryption,
+// spec/fileformat/encrypted.md §11).
 export type AttachSource = {
   file: boolean;
   path?: string;
@@ -1810,6 +1960,9 @@ type FileAttachOpener = (
   environment: Environment,
   relaxed: boolean,
   mainHandoff: ServiceHandoffHost | null,
+  // seals is whether the handle's scratch files are sealed (encrypted.md §11): a service attachment
+  // then seals its own.
+  seals: boolean,
 ) => OpenedAttachment;
 let fileAttachOpener: FileAttachOpener | null = null;
 
@@ -1942,11 +2095,21 @@ export class Database {
         // A page client's own storage never batches; the handle's setting is its handoff's.
         c.handoff !== null ? c.handoff.relaxed : c.storage.relaxed,
         c.handoff,
+        c.storage.spillSink?.encrypts?.() ?? false,
       );
       if (opened.kind === "service") {
         // Under the page service the attachment is owner or page client of its file, elected as an
         // open is (page-service.md §5.5); its storage is the inner handle's, whatever its role.
         const inner = coreOf(opened.service);
+        // An encrypted attachment may not join a handle that spills to plaintext scratch files
+        // (spec/fileformat/encrypted.md §11).
+        if ((inner.storage.paging?.codec() ?? null) !== null && c.spillsPlaintext()) {
+          opened.service.close();
+          throw engineError(
+            "object_not_in_prerequisite_state",
+            "an encrypted database cannot be attached to a handle whose scratch files are not encrypted",
+          );
+        }
         inner.name = lname;
         if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
           opened.service.close(); // release the just-opened file — the name is taken
@@ -1982,15 +2145,15 @@ export class Database {
         return;
       }
       const engine = opened.engine;
-      // Until scratch encryption lands, an encrypted attachment may not join a handle that can spill
-      // its rows to a plaintext scratch file (spec/fileformat/encrypted.md §10).
+      // An encrypted attachment may not join a handle that spills to plaintext scratch files
+      // (spec/fileformat/encrypted.md §11).
       const encrypted = engine.paging !== null && engine.paging.codec() !== null;
-      if (encrypted && c.storage.spillSink !== null) {
+      if (encrypted && c.spillsPlaintext()) {
         engine.paging?.close();
         opened.coordinator?.close();
         throw engineError(
           "object_not_in_prerequisite_state",
-          "an encrypted database cannot be attached to a handle that spills to disk",
+          "an encrypted database cannot be attached to a handle whose scratch files are not encrypted",
         );
       }
       // The attachment's storage reaches the same file host as main (compaction, directory barrier).
@@ -2091,12 +2254,142 @@ export class Database {
   // on a host that cannot replace a file atomically (OPFS), and 55006 while a write transaction or reader
   // is open on this handle or another process has the file open. Not metered and not reachable from SQL.
   compact(name: string): void {
-    this.compactAs(name, name);
+    this.compactAs(name, name, null);
+  }
+
+  // rekey rewrites the file database name (`main` or a file attachment) under a NEW data key
+  // (spec/fileformat/encrypted.md §12): encrypted for credential when it is given — rotating an
+  // encrypted file's key, or encrypting a plaintext one — and plaintext when it is null, decrypting an
+  // encrypted file. Every tree is rebuilt under the target page layout and the result replaces the file
+  // as compact does, with its limits: it never waits, and a reader, a write transaction or another
+  // process holding the file is 55006. When it returns, only credential unlocks the file; any copy made
+  // before still opens with its old credential.
+  //
+  // A row or index key the target layout cannot store, or a result over max_storage_bytes (54P06),
+  // fails before the file is replaced, leaving it untouched. Other errors: 42704 for a name that is not
+  // attached, 25006 read-only, 55000 in memory or when encrypting through a handle whose scratch files
+  // are plaintext, 0A000 for a page size below 1024 under encryption, 22023 for Argon2id parameters out
+  // of range. Under the page service only the owner rekeys, with no client pinning a snapshot; a client
+  // connected meanwhile fails 28P04 at its next transaction (spec/fileformat/encrypted.md §14). Not
+  // reachable from SQL.
+  rekey(
+    name: string,
+    credential: Credential | null,
+    kdf: Argon2Params = DEFAULT_ARGON2_PARAMS,
+  ): void {
+    const c = this.core;
+    let storage: Engine;
+    if (name === "main") {
+      storage = c.storage;
+    } else {
+      const att = name === "temp" ? undefined : c.attachments.get(name);
+      if (att === undefined) {
+        throw engineError("undefined_object", `database "${name}" is not attached`);
+      }
+      storage = att.storage;
+    }
+    if (storage.persistHook === null) {
+      // Nothing is at rest in an in-memory database (encryption.md §5).
+      throw engineError(
+        "object_not_in_prerequisite_state",
+        "an in-memory database has no credential",
+      );
+    }
+    let target: PageCodec | null = null;
+    if (credential !== null) {
+      if (storage.pageSize < ENCRYPTED_MIN_PAGE_SIZE) {
+        throw engineError(
+          "feature_not_supported",
+          "an encrypted database needs a page size of at least 1024",
+        );
+      }
+      if (c.spillsPlaintext()) {
+        throw engineError(
+          "object_not_in_prerequisite_state",
+          "cannot encrypt a database through a handle whose scratch files are not encrypted",
+        );
+      }
+      // The new key block's data key, salt and nonce are the next draws of the database's
+      // key-entropy stream (a new stream for a plaintext file); the KDF runs before any gate is
+      // taken (encrypted.md §12).
+      const source = storage.paging?.codec() ?? null;
+      const rng = source !== null ? source.keyEntropy() : c.environment.keyStream();
+      target = createCodec(credential, kdf, rng);
+    }
+    this.compactAs(name, name, { target });
+  }
+
+  // changeCredential changes the credential of the encrypted file database name (`main` or a file
+  // attachment) to credential (spec/design/encryption.md §5): the data key is rewrapped in the key block
+  // and no page is rewritten, so the change is quick apart from kdf's Argon2id for a passphrase, which
+  // runs before the writer gate is taken. Once it returns, only credential unlocks the file; if it fails
+  // partway, the handle must be reopened and exactly one of the two credentials unlocks it.
+  //
+  // Never waits: 42704 for a name that is not attached, 25006 for a read-only database, 55000 for an
+  // in-memory database, 28P03 for a plaintext file (a database the page service shares is never
+  // encrypted), 55006 while a write transaction is open, and 22023 for Argon2id parameters out of range
+  // or a malformed credential. Not reachable from SQL.
+  changeCredential(
+    name: string,
+    credential: Credential,
+    kdf: Argon2Params = DEFAULT_ARGON2_PARAMS,
+  ): void {
+    const c = this.core;
+    let storage: Engine;
+    if (name === "main") {
+      if (c.readOnly) throw readOnlyCredential(name);
+      storage = c.storage;
+    } else {
+      const att = name === "temp" ? undefined : c.attachments.get(name);
+      if (att === undefined) {
+        throw engineError("undefined_object", `database "${name}" is not attached`);
+      }
+      if (att.readOnly) throw readOnlyCredential(name);
+      // A file attachment under the page service changes its credential through its own handle.
+      if (att.svc !== null) {
+        (att.svc as ServiceAttachment).db.changeCredential("main", credential, kdf);
+        return;
+      }
+      storage = att.storage;
+    }
+    const codec = storage.paging?.codec() ?? null;
+    if (codec === null) {
+      // Nothing is at rest in an in-memory database (encryption.md §5).
+      if (storage.persistHook === null) {
+        throw engineError(
+          "object_not_in_prerequisite_state",
+          "an in-memory database has no credential",
+        );
+      }
+      throw notEncrypted();
+    }
+    // Only the owner of a database the page service shares writes its key block; a page client asks
+    // the host to change it there (spec/fileformat/encrypted.md §14).
+    if (name === "main" && (c.client !== null || (c.handoff !== null && c.service === null))) {
+      throw engineError(
+        "object_not_in_prerequisite_state",
+        "only the process that owns the database can change its credential",
+      );
+    }
+    // Derive the new wrapping key first: Argon2id takes long enough that nobody should wait for it
+    // behind the writer gate (encryption.md §5).
+    const block = codec.rewrap(credential, kdf);
+    if (!c.tryAcquireLocalWriter()) {
+      throw engineError(
+        "object_in_use",
+        `cannot change the credential of database "${name}" while a write transaction is open`,
+      );
+    }
+    try {
+      runSync(writeKeyBlockSteps(storage, block));
+    } finally {
+      c.releaseWriter();
+    }
   }
 
   // compactAs compacts database lname of this handle, naming it name in errors (an inner handle of a
   // service attachment compacts its main under the attachment's name).
-  private compactAs(lname: string, name: string): void {
+  private compactAs(lname: string, name: string, rekey: Rekey | null): void {
     const c = this.core;
     let storage: Engine;
     let readOnly: boolean;
@@ -2126,7 +2419,7 @@ export class Database {
         );
       }
       try {
-        service.db.compactAs("main", name);
+        service.db.compactAs("main", name, rekey);
       } finally {
         c.releaseWriter();
       }
@@ -2167,7 +2460,7 @@ export class Database {
         }
         c.serviceRefresh();
       }
-      c.compactLocked(lname, name);
+      c.compactLocked(lname, name, rekey);
     } finally {
       c.releaseWriter();
     }

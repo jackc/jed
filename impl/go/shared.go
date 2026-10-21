@@ -991,6 +991,133 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	return loaded.committed, nil
 }
 
+// rekey rotates the data key, or converts between the plaintext and encrypted variants
+// (spec/design/encryption.md §5, encrypted.md §12): it rebuilds every tree of snap under target's
+// layout in a scratch domain (its pages written through spill once they pass the pool budget, sealed
+// under a throwaway key when the target is encrypted), then writes the from-scratch image under target
+// (nil: plaintext) and renames it over the file as compaction does. A record or key the target cannot
+// store, or an image over max_storage_bytes, fails before the rename with the file untouched. The
+// caller holds the writer gate and the reader watermark lock; name names the database in errors.
+func (st *storage) rekey(snap *snapshot, txid uint64, target *pageCodec, spill spillHost, name string) (*snapshot, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := st.awaitFlush(); err != nil {
+		return nil, err
+	}
+	if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
+		return nil, err
+	}
+	var scratch *pageCodec
+	if target != nil {
+		var err error
+		if scratch, err = scratchCodec(); err != nil {
+			return nil, err
+		}
+	}
+	build, err := newScratchStorage(st.pageSize, scratch)
+	if err != nil {
+		return nil, err
+	}
+	defer build.close()
+	capacity := st.paging.capacity()
+	// The scratch domain spills past the handle's page-cache budget, like a temp domain.
+	budget := 1 << 20
+	if capacity < math.MaxInt/int(st.pageSize) {
+		budget = max(capacity*int(st.pageSize), budget)
+	} else {
+		budget = math.MaxInt
+	}
+	built := snap.emptied(capOf(st.pageSize, target != nil), build.paging)
+	err = snap.rebuildRows(built, int64(budget/4), func(s *snapshot) error {
+		staged, err := build.stageTemp(s, budget, spill)
+		if err != nil {
+			return err
+		}
+		if err := build.adoptTemp(s, staged, true); err != nil {
+			return err
+		}
+		s.clearStaged()
+		s.freezeMutationGenerations()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	paging, err := rewriteFile(st.fileHost(), st.path, built, st.pageSize, txid, st.paging, capacity, target, name, st.budget.limit)
+	if err != nil {
+		return nil, err
+	}
+	loaded, err := loadEngineSharedPaging(paging, snap.env)
+	if err != nil {
+		return nil, err
+	}
+	st.paging = paging
+	st.pageCount = loaded.pageCount
+	st.freePages = loaded.freePages
+	st.liveAtCompaction = loaded.liveAtCompaction
+	st.freeGenTxid = loaded.freeGenTxid
+	st.live = loaded.live
+	st.budget.lastCatRoot = pageRef{}
+	st.budget.lastWritten = nil
+	st.budget.lastCatalogPages = 0
+	st.dirSynced = true // the rewrite's own directory barrier made the new entry durable
+	return loaded.committed, nil
+}
+
+// writeKeyBlock writes a credential change's key block (spec/design/encryption.md §5): a stabilization
+// barrier (any pending batch flushed, the file synced, and its directory once), then the copy that is
+// not the selected one, a barrier, the other copy, a barrier. The caller holds the writer gate. A
+// failure poisons the pager, so the handle must be reopened; recovery then unlocks with exactly one of
+// the old and new credentials.
+func (st *storage) writeKeyBlock(block []byte) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := st.flush(true); err != nil {
+		return err
+	}
+	if err := st.paging.withPager(func(p *pager) error { return p.checkValidatedCommit() }); err != nil {
+		return err
+	}
+	codec := st.paging.codec()
+	// A credential change that won the gate first already wrote this generation: two different
+	// copies of one generation must never both reach the disk (encrypted.md §5).
+	if keyBlockGeneration(block) != keyBlockGeneration(codec.selectedKeyBlock())+1 {
+		return newError(ObjectInUse, "the credential was changed concurrently")
+	}
+	st.syncDirectoryOnce()
+	err := st.paging.withPager(func(p *pager) error {
+		if err := p.sync(); err != nil {
+			return err
+		}
+		page2, err := p.readBlock(2)
+		if err != nil {
+			return err
+		}
+		page3, err := p.readBlock(3)
+		if err != nil {
+			return err
+		}
+		first := unselectedKeyPage(page2, page3)
+		page := make([]byte, st.pageSize)
+		copy(page, block)
+		if err := p.writeBlock(first, page); err != nil {
+			return err
+		}
+		if err := p.sync(); err != nil {
+			return err
+		}
+		if err := p.writeBlock(5-first, page); err != nil {
+			return err
+		}
+		return p.sync()
+	})
+	if err != nil {
+		return err
+	}
+	codec.setKeyBlock(block)
+	return nil
+}
+
 // close releases a file-backed storage's open pager (closing the underlying file); a no-op for an
 // in-memory store whose memoryBlockStore close is itself a no-op. Used by Database.Detach for a file
 // attachment (attached-databases.md §4) so detaching releases the OS handle.
@@ -1285,6 +1412,12 @@ func (c *sharedCore) withStorage(name string) (*storage, error) {
 	return nil, newError(UndefinedObject, `database "`+name+`" is not attached`)
 }
 
+// spillsPlaintext reports whether this handle has a scratch target that is not sealed (scratch
+// encryption off, spec/design/encryption.md §6): an encrypted database may not join it.
+func (c *sharedCore) spillsPlaintext() bool {
+	return c.storage.spill != nil && !spillEncrypts(c.storage.spill)
+}
+
 // committedVersion is the current published committed version (the monotonic commit counter).
 func (c *sharedCore) committedVersion() uint64 { return c.roots.Load().committed.txid }
 
@@ -1456,8 +1589,8 @@ func (s AttachSource) WithMaxStorageBytes(bytes int64) AttachSource {
 
 // WithCredential returns the source unlocking an encrypted file attachment with credential
 // (spec/design/encryption.md §5): 28P02 without one, 28P01 when it does not unwrap the key, 28P03 for
-// a plaintext file, 55000 for an in-memory source (nothing is at rest) or — until scratch encryption
-// lands — on a handle that may spill to disk (spec/fileformat/encrypted.md §10).
+// a plaintext file, 55000 for an in-memory source (nothing is at rest) or on a handle whose scratch
+// files are not sealed (spec/design/encryption.md §6 — open or create it with ScratchEncryptionOn).
 func (s AttachSource) WithCredential(credential *Credential) AttachSource {
 	s.credential = credential
 	return s
@@ -1469,13 +1602,9 @@ func errCredentialWithoutFile() error {
 	return newError(ObjectNotInPrerequisiteState, "an in-memory database cannot be encrypted")
 }
 
-// lockingFor is the coordination an open uses: an encrypted file is never served by the page service
-// (spec/fileformat/encrypted.md §10), so a credential turns auto into an exclusive owner.
-func lockingFor(mode Locking, credential *Credential) Locking {
-	if credential != nil && mode == LockingAuto {
-		return LockingExclusive
-	}
-	return mode
+// errNotEncrypted is the 28P03 for a credential operation on a plaintext file (encryption.md §5).
+func errNotEncrypted() error {
+	return newError(CredentialNotApplicable, "the database is not encrypted")
 }
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
@@ -1526,6 +1655,9 @@ type CreateOptions struct {
 	// default, RFC 9106's second recommendation; 22023 outside the format's bounds). Ignored for a host
 	// key or a plaintext file.
 	KDF Argon2Params
+	// ScratchEncryption is whether the handle seals its scratch files (spec/design/encryption.md §6):
+	// ScratchEncryptionAuto, the default, seals them when the database is encrypted.
+	ScratchEncryption ScratchEncryption
 }
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
@@ -1550,7 +1682,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		db.core.storage.budget.limit = opts.MaxStorageBytes
 		return db, nil
 	}
-	coordinator, path, err := prepareCreateCoordinator(opts.Path, lockingFor(opts.Locking, opts.Credential), opts.FileLockTimeoutMs)
+	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, opts.FileLockTimeoutMs)
 	if err != nil {
 		return nil, err
 	}
@@ -1560,6 +1692,9 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 			coordinator.close()
 		}
 		return nil, err
+	}
+	if opts.ScratchEncryption == ScratchEncryptionOn {
+		e.spill = sealScratch(e.spill, true, env)
 	}
 	if coordinator != nil && coordinator.lease() == leaseServiceOwner {
 		openOpts := OpenOptions{
@@ -1575,6 +1710,9 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 			Ownership:                  opts.Ownership,
 			Environment:                env,
 			MaxStorageBytes:            opts.MaxStorageBytes,
+			ScratchEncryption:          opts.ScratchEncryption,
+			// A creator that later yields reconnects as a page client with the credential.
+			Credential: opts.Credential,
 		}
 		return startServiceOwner(e, coordinator, newServiceHandoff(osLocks, path, openOpts))
 	}
@@ -1620,7 +1758,6 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	mode = lockingFor(mode, opts.Credential)
 	if mode == LockingAuto {
 		return openServiceDatabase(path, opts)
 	}
@@ -1737,7 +1874,6 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		if locking, err = resolvedLocking(source.locking); err != nil {
 			return err
 		}
-		locking = lockingFor(locking, source.credential)
 	}
 	if source.file && locking == LockingAuto {
 		// Under the page service the attachment is owner or page client of its file, elected as an open
@@ -1746,6 +1882,12 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		svc, svcPath, err = db.core.openServiceAttachment(name, source.path, source, readOnly)
 		if err != nil {
 			return err
+		}
+		// An encrypted attachment may not join a handle that spills to plaintext scratch files
+		// (spec/design/encryption.md §6).
+		if inner := svc.core.storage; inner.paging != nil && inner.paging.codec() != nil && db.core.spillsPlaintext() {
+			_ = svc.Close()
+			return newError(ObjectNotInPrerequisiteState, "an encrypted database cannot be attached to a handle whose scratch files are not encrypted")
 		}
 		st = svc.core.storage
 		root = svc.core.roots.Load().committed
@@ -1764,14 +1906,14 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			}
 			return err
 		}
-		// Until scratch encryption lands, an encrypted attachment may not join a handle that can spill
-		// its rows to a plaintext scratch file (spec/fileformat/encrypted.md §10).
-		if e.encrypted() && db.core.storage.spill != nil {
+		// An encrypted attachment may not join a handle that spills to plaintext scratch files
+		// (spec/design/encryption.md §6).
+		if e.encrypted() && db.core.spillsPlaintext() {
 			_ = e.Close()
 			if coordinator != nil {
 				coordinator.close()
 			}
-			return newError(ObjectNotInPrerequisiteState, "an encrypted database cannot be attached to a handle that spills to disk")
+			return newError(ObjectNotInPrerequisiteState, "an encrypted database cannot be attached to a handle whose scratch files are not encrypted")
 		}
 		st = &storage{
 			pageSize:  e.pageSize,
@@ -1921,12 +2063,153 @@ func (db *Database) Detach(name string) error {
 // database, and 55006 while a write transaction or reader is open on this handle or another process
 // has the file open. A host-API act — not metered and not reachable from SQL.
 func (db *Database) Compact(name string) error {
-	return db.compact(name, name)
+	return db.compact(name, name, nil)
+}
+
+// rekeyTarget is what Rekey rewrites a database under: the new codec, or nil for plaintext.
+type rekeyTarget struct {
+	codec *pageCodec
+}
+
+// Rekey rewrites the file database name — `main` or a file attachment — under a NEW data key
+// (spec/design/encryption.md §5, spec/fileformat/encrypted.md §12): encrypted for cred when it is
+// non-nil — rotating an encrypted file's key, or encrypting a plaintext one — and plaintext when it is
+// nil, decrypting an encrypted file. kdf stretches a passphrase credential (the zero value is the
+// default). Every tree is rebuilt under the target page layout and the result replaces the file as
+// Compact does, with its limits: it never waits, and a reader, a write transaction or another process
+// holding the file is 55006. When it returns, only cred unlocks the file. Any copy of the file made
+// before still opens with its old credential: rotation protects the file from here on, not old copies.
+//
+// A row or index key the target layout cannot store (an encrypted page holds 40 bytes less, and its
+// pointers are wider) or a result over max_storage_bytes (54P06) fails before the file is replaced,
+// leaving it untouched. Other errors: 42704 for a name that is not attached, 25006 read-only, 55000 in
+// memory or when encrypting through a handle whose scratch files are plaintext (encryption.md §6),
+// 0A000 for a page size below 1024 under encryption, 22023 for Argon2id parameters out of range. Under
+// the page service only the owner rekeys, with no client pinning a snapshot; a client connected
+// meanwhile fails 28P04 at its next transaction (28P02 when the file was encrypted) and must reopen. A
+// host-API act — not reachable from SQL.
+func (db *Database) Rekey(name string, cred *Credential, kdf Argon2Params) error {
+	c := db.core
+	if name != "main" {
+		att := c.attachment(name)
+		if att == nil || name == "temp" {
+			return newError(UndefinedObject, `database "`+name+`" is not attached`)
+		}
+	}
+	st, err := c.withStorage(name)
+	if err != nil {
+		return err
+	}
+	st.mu.Lock()
+	var source *pageCodec
+	if st.paging != nil {
+		source = st.paging.codec()
+	}
+	file, pageSize := st.path != "", st.pageSize
+	st.mu.Unlock()
+	if !file {
+		return errCredentialWithoutFile()
+	}
+	var target *pageCodec
+	if cred != nil {
+		if int(pageSize) < minEncryptedPageSize {
+			return newError(FeatureNotSupported, "an encrypted database needs a page size of at least 1024")
+		}
+		if c.spillsPlaintext() {
+			return newError(ObjectNotInPrerequisiteState, "cannot encrypt a database through a handle whose scratch files are not encrypted")
+		}
+		// The new key block's data key, salt and nonce are the next draws of the database's key-entropy
+		// stream (a new stream for a plaintext file); the KDF runs before any gate is taken
+		// (encrypted.md §12).
+		rng := c.env.keyStream()
+		if source != nil {
+			rng = source.rng
+		}
+		if target, err = createCodec(cred, kdf, rng); err != nil {
+			return err
+		}
+	}
+	return db.compact(name, name, &rekeyTarget{codec: target})
+}
+
+// ChangeCredential changes the credential of the encrypted file database name — `main` or a file
+// attachment — to cred (spec/design/encryption.md §5): the data key is rewrapped in the key block and
+// no page is rewritten, so the change is quick apart from kdf's Argon2id for a passphrase (the zero
+// value is the default), which runs before the writer gate is taken. Once it returns, only cred unlocks
+// the file; if it fails partway, the handle must be reopened and exactly one of the two credentials
+// unlocks it.
+//
+// Never waits: 42704 for a name that is not attached, 25006 for a read-only database, 55000 for an
+// in-memory database, 28P03 for a plaintext file, 55006 while a write transaction is open, and 22023
+// for Argon2id parameters out of range. A host-API act — not reachable from SQL.
+func (db *Database) ChangeCredential(name string, cred *Credential, kdf Argon2Params) error {
+	c := db.core
+	var readOnly bool
+	var service *Database
+	if name == "main" {
+		readOnly = c.readOnlyMode()
+	} else {
+		att := c.attachment(name)
+		if att == nil || name == "temp" {
+			return newError(UndefinedObject, `database "`+name+`" is not attached`)
+		}
+		service = att.svc
+		readOnly = att.mode == attachReadOnly
+	}
+	if readOnly {
+		return newError(ReadOnlySqlTransaction, `cannot change the credential of read-only database "`+name+`"`)
+	}
+	// A file attachment under the page service changes its credential through its own handle.
+	if service != nil {
+		return service.ChangeCredential("main", cred, kdf)
+	}
+	st, err := c.withStorage(name)
+	if err != nil {
+		return err
+	}
+	var codec *pageCodec
+	st.mu.Lock()
+	if st.paging != nil {
+		codec = st.paging.codec()
+	}
+	st.mu.Unlock()
+	switch {
+	case codec == nil && st.path == "":
+		return errCredentialWithoutFile()
+	case codec == nil:
+		return errNotEncrypted()
+	}
+	// Only the owner of a database the page service shares writes its key block; a page client asks
+	// the host to change it there (spec/fileformat/encrypted.md §14).
+	if name == "main" && c.handoff != nil && c.pageOwner() == nil {
+		return newError(ObjectNotInPrerequisiteState, "only the process that owns the database can change its credential")
+	}
+	if cred == nil {
+		return newError(InvalidParameterValue, "an empty credential")
+	}
+	// Derive the new wrapping key first: Argon2id takes long enough that nobody should wait for it
+	// behind the writer gate (encryption.md §5).
+	block, err := codec.rewrap(cred, kdf)
+	if err != nil {
+		return err
+	}
+	if !c.writeMu.TryLock() {
+		return newError(ObjectInUse, `cannot change the credential of database "`+name+`" while a write transaction is open`)
+	}
+	defer c.writeMu.Unlock()
+	// Detach also takes the gate: the attachment must still be the one the block was derived for.
+	if again, err := c.withStorage(name); err != nil {
+		return err
+	} else if again != st {
+		return newError(UndefinedObject, `database "`+name+`" is not attached`)
+	}
+	return st.writeKeyBlock(block)
 }
 
 // compact compacts database lname of this handle, naming it name in errors (an inner handle of a
-// service attachment compacts its main under the attachment's name).
-func (db *Database) compact(lname, name string) error {
+// service attachment compacts its main under the attachment's name). With rekey it rebuilds the
+// database under rekey's codec instead (Rekey).
+func (db *Database) compact(lname, name string, rekey *rekeyTarget) error {
 	c := db.core
 	var readOnly bool
 	var service *attachment
@@ -1952,7 +2235,7 @@ func (db *Database) compact(lname, name string) error {
 			return newError(ObjectInUse, `cannot compact database "`+name+`" while a write transaction is open`)
 		}
 		defer c.writeMu.Unlock()
-		return service.svc.compact("main", name)
+		return service.svc.compact("main", name, rekey)
 	}
 	if c.pageClient() != nil && lname == "main" {
 		// Compaction is an owner operation (page-service.md §6).
@@ -1977,14 +2260,14 @@ func (db *Database) compact(lname, name string) error {
 			return err
 		}
 	}
-	return c.compactLocked(lname, name)
+	return c.compactLocked(lname, name, rekey)
 }
 
 // compactLocked compacts database lname (`main` or an attachment) under the writer gate the caller
 // holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
 // watermark, then rewrite the storage at the next version and publish the reloaded root while still
 // holding the watermark lock, so no reader pins in between.
-func (c *sharedCore) compactLocked(lname, name string) error {
+func (c *sharedCore) compactLocked(lname, name string, rekey *rekeyTarget) error {
 	main := lname == "main"
 	st := c.storage
 	coord := c.coordinator
@@ -2010,7 +2293,14 @@ func (c *sharedCore) compactLocked(lname, name string) error {
 	if !main {
 		prev = rt.attached[lname]
 	}
-	compacted, err := st.compact(prev, prev.txid+1)
+	var compacted *snapshot
+	var err error
+	if rekey != nil {
+		// A rebuild's scratch domain spills through the handle's scratch target (encryption.md §6).
+		compacted, err = st.rekey(prev, prev.txid+1, rekey.codec, c.storage.spill, name)
+	} else {
+		compacted, err = st.compact(prev, prev.txid+1)
+	}
 	if err != nil {
 		return err
 	}
@@ -2086,11 +2376,10 @@ func (s *Database) Path() string { return s.core.path() }
 // open/create; keeping this a tooling hook keeps the configurable spill-target follow-on out of the
 // embedding API. Sessions minted afterwards inherit it.
 func (s *Database) setSpillDirForTest(dir string) {
-	// An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
-	if s.core.storage.paging != nil && s.core.storage.paging.codec() != nil {
-		return
-	}
-	s.core.storage.spill = osSpillHost{dir: dir}
+	// A sealed scratch target stays sealed (spec/design/encryption.md §6).
+	st := s.core.storage
+	encrypt := (st.paging != nil && st.paging.codec() != nil) || (st.spill != nil && spillEncrypts(st.spill))
+	st.spill = sealScratch(osSpillHost{dir: dir}, encrypt, s.core.env)
 }
 
 // SetSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the

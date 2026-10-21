@@ -13,7 +13,13 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 
 import type { Credential } from "../src/crypto.ts";
-import { createDatabase, type Database, openDatabase, type Value } from "../src/lib.ts";
+import {
+  createDatabase,
+  type Database,
+  Environment,
+  openDatabase,
+  type Value,
+} from "../src/lib.ts";
 import { encryptedImageForTesting } from "../src/tooling.ts";
 import { specPath } from "./tomlmini.ts";
 import { bytesEqual, fillerBytesHex, fillerText } from "./util.ts";
@@ -122,4 +128,33 @@ test("encrypted_catalog", () => {
     sql.push(`CREATE TABLE t${String(i).padStart(2, "0")} (id i32 PRIMARY KEY, a text, b i64)`);
   }
   check("encrypted_catalog.jed", sql, "SELECT count(*) FROM t29");
+});
+
+// A rekey's cross-core bytes (encrypted.md §12): a plaintext file holding encrypted_index_table's rows,
+// encrypted in place, is byte-identical to the golden built at the rekey's txid — every tree rebuilt by
+// ascending insertion at the encrypted capacity, the key block and every nonce the database's first
+// key-entropy draws.
+test("encrypted_rekey_index_table", () => {
+  const path = join(scratch, "golden_rekey_index_table.jed");
+  const db = createDatabase({
+    path,
+    pageSize: PAGE,
+    skipFsync: true,
+    environment: Environment.builder().insecureSeededKeyEntropy(ENC_SEED).build(),
+    scratchEncryption: "on",
+    locking: "exclusive",
+  });
+  run(db, "CREATE TABLE t (a i32 PRIMARY KEY, v i64, r i32range)");
+  run(db, "CREATE INDEX t_r ON t USING gist (r)");
+  run(db, "CREATE INDEX t_v ON t (v)");
+  // Descending, so the plaintext trees differ from the ones the rekey rebuilds.
+  for (let a = 150; a >= 1; a--) {
+    run(db, `INSERT INTO t VALUES (${a}, ${a * 3}, i32range(${a}, ${a + 5}))`);
+  }
+  db.rekey("main", ENC_KEY);
+  db.close();
+  assert.ok(
+    bytesEqual(new Uint8Array(readFileSync(path)), fixture("encrypted_rekey_index_table.jed")),
+    "the rekeyed file differs from the golden",
+  );
 });

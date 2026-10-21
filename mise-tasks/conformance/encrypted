@@ -1,0 +1,41 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Run the shared SQL corpus on all cores over encrypted database files"
+#USAGE arg "[filter]" help="Run only corpus files whose path contains this substring"
+
+# The corpus's encrypted mode (spec/design/encryption.md §7): the disk mode with every database file
+# encrypted. Rows and errors must be as written. Cost-bearing output — each `# cost:` record's cost
+# and each EXPLAIN's rows — follows the variant's smaller page capacity and wider pointers, so each
+# core writes it to a transcript (JED_CONFORMANCE_TRANSCRIPT) and the task fails unless the three
+# transcripts agree. A file whose rows or errors legitimately differ carries `# skip: encrypted` with
+# its reason (the mode's ledger).
+
+require "tmpdir"
+require_relative "../../scripts/lib/tasks"
+include Tasks
+
+env = { "JED_CONFORMANCE_ENCRYPTED" => "1" }
+env["JED_CONFORMANCE_FILTER"] = ENV["usage_filter"] if ENV["usage_filter"]
+Dir.mktmpdir("jed-encrypted-corpus") do |dir|
+  transcripts = %w[rust go ts].to_h { |core| [core, File.join(dir, "#{core}.tsv")] }
+  with = ->(core) { env.merge("JED_CONFORMANCE_TRANSCRIPT" => transcripts[core]) }
+  sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST, "--", "disk",
+     env: with.("rust")
+  sh "go", "run", "./cmd/conformance", "disk", env: with.("go"), chdir: GO_DIR
+  sh "node", "src/bin/conformance.ts", "disk", env: with.("ts"), chdir: TS_DIR
+  lines = transcripts.transform_values { |path| File.readlines(path, chomp: true) }
+  mismatches = []
+  %w[go ts].each do |core|
+    next if lines[core] == lines["rust"]
+
+    lines["rust"].zip(lines[core]).each do |a, b|
+      next if a == b
+
+      mismatches << "rust: #{a}\n#{core}: #{b}"
+      break
+    end
+    mismatches << "#{core} wrote #{lines[core].size} lines, rust #{lines['rust'].size}" if mismatches.empty?
+  end
+  abort "encrypted-mode cost transcripts disagree:\n#{mismatches.join("\n")}" unless mismatches.empty?
+  puts "encrypted mode: #{lines['rust'].size} cost-bearing outputs agree across cores"
+end

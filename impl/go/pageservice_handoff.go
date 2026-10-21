@@ -110,14 +110,16 @@ func newServiceHandoff(host lockHost, path string, opts OpenOptions) *serviceHan
 }
 
 // attachHost gives a new handle's storage the handoff's file and spill hosts (the simulator's in a
-// simulation; the OS defaults otherwise).
+// simulation; the OS defaults otherwise), sealed when the handle's scratch encryption is on or the
+// database is encrypted (spec/design/encryption.md §6).
 func (h *serviceHandoff) attachHost(c *sharedCore) {
 	c.storage.files = h.files
-	if h.spill != nil {
-		c.storage.spill = h.spill
-	} else {
-		c.storage.spill = osSpillHost{dir: os.TempDir()}
+	spill := h.spill
+	if spill == nil {
+		spill = osSpillHost{dir: os.TempDir()}
 	}
+	encrypt := h.opts.ScratchEncryption == ScratchEncryptionOn || (c.storage.paging != nil && c.storage.paging.codec() != nil)
+	c.storage.spill = sealScratch(spill, encrypt, c.env)
 }
 
 func (h *serviceHandoff) fileHost() fileHost {
@@ -274,7 +276,12 @@ func (c *sharedCore) promote(stale *serviceRole, coord *fileCoordinator) error {
 	opts := h.opts
 	opts.Locking = LockingNone
 	opts.Environment = c.env
-	e, err := openVia(h.fileHost(), h.path, opts)
+	// An encrypted database's client promotes with the data key it holds (encryption.md §8).
+	var held *pageCodec
+	if stale.paging != nil {
+		held = stale.paging.codec()
+	}
+	e, err := openViaHeld(h.fileHost(), h.path, opts, held)
 	if err != nil {
 		coord.close()
 		return err

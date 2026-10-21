@@ -42,6 +42,9 @@ export interface SpillSink {
   // host spill directory, unlinked at creation where the OS allows. The owner MUST close it (JS has no
   // destructor), which also removes a file the OS would not unlink while open.
   createScratchStore?(): BlockStore;
+  // encrypts reports whether every file this sink makes is sealed (scratch encryption,
+  // spec/fileformat/encrypted.md §11). Absent means false.
+  encrypts?(): boolean;
 }
 export interface SpillScratch {
   size: number;

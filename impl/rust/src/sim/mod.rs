@@ -22,6 +22,7 @@ mod locks;
 mod net;
 
 use crate::costs::{COMPACT_GROWTH, COMPACT_MIN_PAGES};
+use crate::crypto::Credential;
 use crate::environment::Environment;
 use crate::error::EngineError;
 use crate::executor::Engine;
@@ -274,6 +275,13 @@ fn parse(text: &str) -> Result<Trace, String> {
                     st.pid = parse_pid(fields[2]).map_err(|e| format!("line {}: {e}", n + 1))?;
                     st.has_pid = true;
                 }
+            }
+            "change_key" | "rekey" => {
+                // S12: a credential change or rekey of main to simulation key 1–3.
+                if fields.len() != 2 || !matches!(fields[1], "1" | "2" | "3") {
+                    return Err(format!("line {}: {} 1|2|3", n + 1, st.kind));
+                }
+                st.sid = fields[1].to_string();
             }
             "corrupt" => params(&mut st, &fields[1..])?,
             "check" | "reopen" | "tick" => {}
@@ -648,6 +656,11 @@ struct Digest {
     err: Option<EngineError>,
 }
 
+/// The simulation's host keys (S12): key `n` is 32 bytes of `0x4A + n`, so key 0 is the goldens'
+/// (spec/fileformat/verify.rb tries all four on an encrypted image).
+static SIM_KEYS: std::sync::LazyLock<[Credential; 4]> =
+    std::sync::LazyLock::new(|| [0u8, 1, 2, 3].map(|n| Credential::Key([0x4A + n; 32])));
+
 struct Runner<'a> {
     tr: &'a Trace,
     seed: u64,
@@ -712,6 +725,14 @@ struct Runner<'a> {
     image_prefix: Option<PathBuf>,
     /// Backup steps run, naming each destination.
     backups: usize,
+
+    // Encryption at rest (slice S12, spec/fileformat/encrypted.md): main is encrypted under simulation
+    // key `key` (`sim_key`), its key entropy seeded by the trace's seed.
+    encrypted: bool,
+    key: u8,
+    /// A credential change or rekey of this step: (old key, new key). Recovery after it probes the
+    /// key block, which exactly one of them must unlock.
+    key_change: Option<(u8, u8)>,
 }
 
 fn engine_code(e: &EngineError) -> String {
@@ -887,10 +908,14 @@ impl<'a> Runner<'a> {
         let random = Arc::new(SimRandom {
             current: Mutex::new(None),
         });
-        let env = Environment::builder()
+        let mut env = Environment::builder()
             .random_source(random.clone())
-            .clock_source(Arc::new(SimClock(clock.clone())))
-            .build();
+            .clock_source(Arc::new(SimClock(clock.clone())));
+        if tr.header("encrypted") == "1" {
+            // Seeded so the cores' images stay byte-identical (encrypted.md §8).
+            env = env.insecure_seeded_key_entropy(seed);
+        }
+        let env = env.build();
         Runner {
             tr,
             seed,
@@ -924,7 +949,99 @@ impl<'a> Runner<'a> {
             diagnostics: Vec::new(),
             image_prefix: None,
             backups: 0,
+            encrypted: tr.header("encrypted") == "1",
+            key: 0,
+            key_change: None,
         }
+    }
+
+    /// Main's credential: simulation key `key`, or none for a plaintext trace.
+    fn credential(&self) -> Option<&'static Credential> {
+        self.encrypted.then(|| &SIM_KEYS[self.key as usize])
+    }
+
+    /// After a crash that interrupted a credential change or rekey (S12): exactly one of the old and
+    /// new keys unlocks main's key block, and the new one when the step had succeeded (its last
+    /// barrier ran). The runner continues with whichever unlocks.
+    fn settle_key(&mut self, i: usize, image: &[u8]) -> bool {
+        let Some((old, new)) = self.key_change.take() else {
+            return self.follow_key(i, image);
+        };
+        let ps = self.page_size as usize;
+        if image.len() < 4 * ps {
+            self.fail(i, "encryption: the key block is gone".to_string());
+            return false;
+        }
+        let unlocks = |k: u8| {
+            crate::crypto::unlock(
+                &image[2 * ps..3 * ps],
+                &image[3 * ps..4 * ps],
+                &SIM_KEYS[k as usize],
+                crate::seam::os_random_source(),
+            )
+            .is_ok()
+        };
+        let acknowledged = self.key == new;
+        if old == new {
+            // A change to the key already in use: it must still unlock.
+            if !unlocks(new) {
+                self.fail(i, format!("encryption: key {new} no longer unlocks main"));
+                return false;
+            }
+            self.emit(format!("{{\"i\":{i},\"op\":\"unlocked\",\"key\":{new}}}"));
+            return true;
+        }
+        match (unlocks(old), unlocks(new)) {
+            (true, false) if !acknowledged => self.key = old,
+            (false, true) => self.key = new,
+            (true, false) => {
+                self.fail(
+                    i,
+                    format!("durability: the acknowledged change to key {new} was lost"),
+                );
+                return false;
+            }
+            (a, b) => {
+                self.fail(
+                    i,
+                    format!("encryption: key {old} unlocks: {a}, key {new} unlocks: {b}; want exactly one"),
+                );
+                return false;
+            }
+        }
+        self.emit(format!(
+            "{{\"i\":{i},\"op\":\"unlocked\",\"key\":{}}}",
+            self.key
+        ));
+        true
+    }
+
+    /// Recovery outside a key step: a rekey whose rename was not yet durable in its directory may
+    /// come back as the older file under its older key (validated-cow.md §3), so main opens with
+    /// whichever simulation key unlocks the recovered key block, the current one first.
+    fn follow_key(&mut self, i: usize, image: &[u8]) -> bool {
+        let ps = self.page_size as usize;
+        if !self.encrypted || image.len() < 4 * ps {
+            return true;
+        }
+        let order = std::iter::once(self.key).chain((0..4u8).filter(|&k| k != self.key));
+        for k in order {
+            let unlocked = crate::crypto::unlock(
+                &image[2 * ps..3 * ps],
+                &image[3 * ps..4 * ps],
+                &SIM_KEYS[k as usize],
+                crate::seam::os_random_source(),
+            );
+            if unlocked.is_ok() {
+                if k != self.key {
+                    self.key = k;
+                    self.emit(format!("{{\"i\":{i},\"op\":\"unlocked\",\"key\":{k}}}"));
+                }
+                return true;
+            }
+        }
+        self.fail(i, "encryption: no simulation key unlocks main".to_string());
+        false
     }
 
     fn disk(&self) -> std::sync::MutexGuard<'_, SimFs> {
@@ -1209,12 +1326,23 @@ impl<'a> Runner<'a> {
             self.cache_bytes as usize
         };
         let page_size = pager.page_size();
-        let mut engine =
-            Engine::open_paged(pager, cache_leaves(cache, page_size), &self.env, None)?;
+        let mut engine = Engine::open_paged(
+            pager,
+            cache_leaves(cache, page_size),
+            &self.env,
+            self.credential(),
+        )?;
         // The path marks the engine durable; the simulated filesystem is its only storage.
         engine.path = Some(PathBuf::from(MAIN_FILE));
-        // Spill and temp-table spill scratch files, whose operations can fail.
-        engine.spill = Some(Arc::new(SimSpill(self.fs.clone())));
+        // A writable open finishes a credential change a crash interrupted (encrypted.md §5).
+        engine.repair_key_block()?;
+        // Spill and temp-table spill scratch files, whose operations can fail; sealed for an
+        // encrypted database (encryption.md §6).
+        engine.spill = Some(crate::file::seal_scratch(
+            Arc::new(SimSpill(self.fs.clone())),
+            self.encrypted,
+            &self.env,
+        ));
         Ok(engine)
     }
 
@@ -1509,7 +1637,11 @@ impl<'a> Runner<'a> {
                 page_size: self.page_size,
                 no_sync: false,
             },
-            None,
+            self.encrypted.then(|| crate::file::Encryption {
+                credential: &SIM_KEYS[0],
+                kdf: crate::crypto::Argon2Params::default(),
+                environment: &self.env,
+            }),
         );
         match created {
             Ok(e) => {
@@ -1738,7 +1870,12 @@ impl<'a> Runner<'a> {
             "commit" => self.step_commit(i, st),
             "rollback" | "close" => self.step_end(i, st),
             "check" => self.step_check(i),
-            "compact" => self.step_compact(i, &st.sid),
+            "compact" => self.step_compact(i, &st.sid, None),
+            "rekey" => {
+                let n: u8 = st.sid.parse().expect("parsed as 1|2|3");
+                self.step_compact(i, "main", Some(n))
+            }
+            "change_key" => self.step_change_key(i, st.sid.parse().expect("parsed as 1|2|3")),
             "backup" => self.step_backup(i, st),
             "attach" => self.step_attach(i, &st.sid),
             "reopen" => {
@@ -1821,6 +1958,7 @@ impl<'a> Runner<'a> {
             }
         }
         let Some(armed) = armed else {
+            self.key_change = None;
             return true;
         };
         if armed.kind == FaultKind::Disconnect {
@@ -2571,10 +2709,12 @@ impl<'a> Runner<'a> {
     /// image at the next version, through the simulated filesystem's temp file, rename, and
     /// directory barrier. Its contents are unchanged, so a crash may recover either version with the
     /// same digest.
-    fn step_compact(&mut self, i: usize, name: &str) {
+    fn step_compact(&mut self, i: usize, name: &str, rekey: Option<u8>) {
+        // A rekey (S12) is compaction under a new data key: the same version and contents rules.
+        let op = if rekey.is_some() { "rekey" } else { "compact" };
         if !self.dbs.contains_key(name) || self.db_version(name) == 0 {
             self.emit(format!(
-                "{{\"i\":{i},\"op\":\"compact\",\"db\":{},\"skip\":true}}",
+                "{{\"i\":{i},\"op\":\"{op}\",\"db\":{},\"skip\":true}}",
                 go_quote(name)
             ));
             return;
@@ -2585,7 +2725,21 @@ impl<'a> Runner<'a> {
             d.max_attempted = d.max_attempted.max(d.version + 1);
             (d.version, d.last_digest.clone())
         };
-        let result = self.db().compact(name);
+        let result = match rekey {
+            Some(n) => {
+                self.key_change = Some((self.key, n));
+                let result = self.db().rekey(
+                    name,
+                    Some(SIM_KEYS[n as usize].clone()),
+                    crate::crypto::Argon2Params::default(),
+                );
+                if result.is_ok() {
+                    self.key = n;
+                }
+                result
+            }
+            None => self.db().compact(name),
+        };
         let now = self.db_version(name);
         let db_field = if name == "main" {
             String::new()
@@ -2595,42 +2749,74 @@ impl<'a> Runner<'a> {
         if let Err(e) = result {
             let code = engine_code(&e);
             self.emit(format!(
-                "{{\"i\":{i},\"op\":\"compact\"{db_field},\"error\":{}}}",
+                "{{\"i\":{i},\"op\":\"{op}\"{db_field},\"error\":{}}}",
                 go_quote(&code)
             ));
             if code == "XX001" {
-                self.fail(i, format!("corruption: compaction reported XX001: {e}"));
+                self.fail(i, format!("corruption: {op} reported XX001: {e}"));
             } else if now != base {
                 self.fail(
                     i,
-                    format!("a failed compaction published version {now} of {name} (was {base})"),
+                    format!("a failed {op} published version {now} of {name} (was {base})"),
                 );
             }
             return;
         }
         self.emit(format!(
-            "{{\"i\":{i},\"op\":\"compact\"{db_field},\"version\":{now}}}"
+            "{{\"i\":{i},\"op\":\"{op}\"{db_field},\"version\":{now}}}"
         ));
         if now != base + 1 {
-            self.fail(
-                i,
-                format!("compaction moved {name} from version {base} to {now}"),
-            );
+            self.fail(i, format!("{op} moved {name} from version {base} to {now}"));
             return;
         }
         let d = self.committed_digest(name);
         if d.as_deref() != Some(last_digest.as_str()) {
-            self.fail(i, format!("compaction changed the contents of {name}"));
+            self.fail(i, format!("{op} changed the contents of {name}"));
             return;
         }
         if let Err(e) = self.check_live() {
-            self.fail(i, format!("after compaction: {e}"));
+            self.fail(i, format!("after {op}: {e}"));
             return;
         }
         let d = self.sdb(name);
         d.version = now;
         d.floor = now; // the rename and the directory barrier completed
         self.observe_growth(name);
+    }
+
+    /// `change_key <n>` (S12, encrypted.md §5): main's credential changes to simulation key `n`. Only
+    /// the key block is written, so no version or content moves.
+    fn step_change_key(&mut self, i: usize, n: u8) {
+        if !self.encrypted {
+            self.emit(format!("{{\"i\":{i},\"op\":\"change_key\",\"skip\":true}}"));
+            return;
+        }
+        let base = self.db_version("main");
+        self.key_change = Some((self.key, n));
+        let result = self.db().change_credential(
+            "main",
+            SIM_KEYS[n as usize].clone(),
+            crate::crypto::Argon2Params::default(),
+        );
+        match result {
+            Ok(()) => {
+                self.key = n;
+                self.emit(format!("{{\"i\":{i},\"op\":\"change_key\",\"key\":{n}}}"));
+            }
+            Err(e) => {
+                let code = engine_code(&e);
+                self.emit(format!(
+                    "{{\"i\":{i},\"op\":\"change_key\",\"error\":{}}}",
+                    go_quote(&code)
+                ));
+                if code == "XX001" {
+                    self.fail(i, format!("corruption: change_key reported XX001: {e}"));
+                }
+            }
+        }
+        if self.db_version("main") != base {
+            self.fail(i, "a credential change published a version".to_string());
+        }
     }
 
     /// `backup page_identical|compacted [p<N>]` (spec/design/page-service.md §9): the process backs
@@ -2721,7 +2907,7 @@ impl<'a> Runner<'a> {
             m.last_digest = dg.clone();
             m.owner_lost = false;
         }
-        let (live, pages, free) = match check::integrity(&image, v) {
+        let (live, pages, free) = match check::integrity(&image, v, self.credential()) {
             Ok(r) => r,
             Err(e) => {
                 self.fail(i, format!("backup integrity: {e}"));
@@ -2870,7 +3056,7 @@ impl<'a> Runner<'a> {
             };
             let version = self.dbs[&name].version;
             let image = self.image(&name).unwrap_or_default();
-            let (live, pages, free) = match check::integrity(&image, version) {
+            let (live, pages, free) = match check::integrity(&image, version, self.credential()) {
                 Ok(r) => r,
                 Err(e) => {
                     self.fail(i, format!("integrity of {name}: {e}"));
@@ -3084,6 +3270,11 @@ impl<'a> Runner<'a> {
             }
             images.insert(name, image);
         }
+        let main_image = images.get("main").cloned().unwrap_or_default();
+        if !self.settle_key(i, &main_image) {
+            self.crash_image = images.remove("main");
+            return false;
+        }
         if let Err(e) = self.open() {
             self.crash_image = images.remove("main");
             self.fail(i, format!("recovery: open failed: {e}"));
@@ -3100,7 +3291,7 @@ impl<'a> Runner<'a> {
             }
             let d = d.expect("checked above");
             let image = &images[&name];
-            let (live, pages, free) = match check::integrity(image, v) {
+            let (live, pages, free) = match check::integrity(image, v, self.credential()) {
                 Ok(r) => r,
                 Err(e) => {
                     self.crash_image = images.remove(&name);
