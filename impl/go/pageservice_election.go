@@ -23,13 +23,15 @@ type serviceElection struct {
 
 // electOptions shape one election: never skips presence tries (OwnershipNever), pauseUntil skips them
 // until then (the handoff pause), and reelect marks a re-election, which keeps the handle's existing
-// process-local path claim. opts and env open the client's engine.
+// process-local path claim. opts and env open the client's engine; held is the data key a re-electing
+// client of an encrypted database already holds (spec/fileformat/encrypted.md §14), nil otherwise.
 type electOptions struct {
 	never      bool
 	pauseUntil time.Time
 	reelect    bool
 	opts       OpenOptions
 	env        *Environment
+	held       *pageCodec
 }
 
 // electService runs the election for the database at path (already resolved as prepareOpenCoordinator
@@ -89,7 +91,7 @@ func electService(host lockHost, path string, timeoutOpt *uint64, readOnly bool,
 			reason = ""
 			cl, retry, err := connectPageClient(host, path, record.endpoint, readOnly)
 			if err == nil {
-				e, err := openPageClient(cl, eo.opts, eo.env)
+				e, err := openPageClient(cl, eo.opts, eo.env, eo.held)
 				if err == nil {
 					// A client holds no bundle lock while connected (page-service.md §4.2).
 					_ = host.unlock(files.arrival)

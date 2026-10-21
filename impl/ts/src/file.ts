@@ -26,23 +26,27 @@ import { dirname } from "node:path";
 import { type BlockStore, ClosedBlockStore } from "./blockstore.ts";
 import { FileBlockStore } from "./fileblockstore.ts";
 import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
-import { engineError } from "./errors.ts";
+import { EngineError, engineError } from "./errors.ts";
 import { Environment } from "./environment.ts";
 import type { FileHost, WriteAt } from "./filehost.ts";
-import { capFirstBody, capOf, FIRST_BODY_ENCRYPTED as ENCRYPTED_FIRST_BODY } from "./cap.ts";
+import { capFirstBody, capOf } from "./cap.ts";
 import {
   type Argon2Params,
   createCodec,
   type Credential,
   DEFAULT_ARGON2_PARAMS,
   ENCRYPTED_MIN_PAGE_SIZE,
-  fileSuite,
-  KEY_BLOCK_LEN,
   type PageCodec,
   sealScratch,
-  selectedKeyPage,
 } from "./crypto.ts";
-import { loadEnginePagedSteps, toImage, unlockPagerSteps, writeImage } from "./format.ts";
+import {
+  adoptHeldCodecSteps,
+  heldKeyStaleSteps,
+  loadEnginePagedSteps,
+  toImage,
+  unlockPagerSteps,
+  writeImage,
+} from "./format.ts";
 import { runSync, type Steps } from "./execution.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
@@ -340,22 +344,16 @@ export function openVia(
   return runSync(openViaSteps(files, path, opts, null, held));
 }
 
-// adoptHeldCodecSteps prepares pager to open with a promoting client's held codec (encrypted.md §14):
-// the file must be encrypted (28P04 when it no longer is), and the codec adopts its selected key-block
-// copy, so a later credential change or backup starts from the file's current generation. The load
-// then authenticates the meta under the held key (XX001 when it does not).
-function* adoptHeldCodecSteps(pager: Pager, codec: PageCodec): Steps<void> {
-  if (pager.physicalPages() < ENCRYPTED_FIRST_BODY) {
-    throw engineError("data_corrupted", "encrypted file too small for its key block");
-  }
-  const slot0 = yield* pager.readPageSteps(0);
-  const slot1 = yield* pager.readPageSteps(1);
-  if (fileSuite(slot0, slot1) === 0) {
-    throw engineError("stale_key", "the database is no longer encrypted; reopen it");
-  }
-  const page2 = yield* pager.readPageSteps(2);
-  const page3 = yield* pager.readPageSteps(3);
-  codec.setKeyBlock(selectedKeyPage(page2, page3).slice(0, KEY_BLOCK_LEN));
+function isXX001(e: unknown): boolean {
+  return e instanceof EngineError && e.code() === "XX001";
+}
+
+// staleKey is 28P04: the owner rekeyed the database, so the held data key no longer opens it.
+function staleKey(): EngineError {
+  return engineError(
+    "stale_key",
+    "the database was rekeyed since this handle opened it; reopen it",
+  );
 }
 
 // openViaSteps is openVia as one continuation (ts-runtime.md §11.1), with the page codec transform
@@ -385,10 +383,18 @@ export function* openViaSteps(
     } else {
       codec = yield* unlockPagerSteps(pager, opts.credential, environment);
     }
-    const db = yield* loadEnginePagedSteps(
-      new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
-      environment,
-    );
+    let db: Engine;
+    try {
+      db = yield* loadEnginePagedSteps(
+        new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
+        environment,
+      );
+    } catch (e) {
+      // A meta the held key cannot authenticate means the owner rekeyed the file before it left:
+      // 28P04, so the host reopens with the credential (spec/fileformat/encrypted.md §14).
+      if (held !== null && isXX001(e) && (yield* heldKeyStaleSteps(pager, held))) throw staleKey();
+      throw e;
+    }
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;

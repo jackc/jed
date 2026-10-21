@@ -39,6 +39,14 @@ const LANE_DIR: u64 = 10; // power loss: how many pending directory changes surv
 const LANE_SPILL: u64 = 11; // spill_error: does this spill-file operation fail?
 const LANE_PAGE: u64 = 12; // corrupt: which page a flip lands in
 const LANE_BIT: u64 = 13; // corrupt: which bit of that page it flips
+pub(crate) const LANE_KEY_SEED: u64 = 14; // an encrypted trace's process key-entropy seed (S13)
+pub(crate) const LANE_REPLAY_PAGE: u64 = 15; // replay: which candidate page
+pub(crate) const LANE_REPLAY_VERSION: u64 = 16; // replay: which older version of it
+
+/// How many durable images of one page index an archive keeps (§6.1, slice S13).
+const ARCHIVE_DEPTH: usize = 32;
+/// The first body page of an encrypted file: the archive keeps only body pages.
+const ARCHIVE_FIRST_PAGE: u64 = 4;
 
 const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -157,6 +165,42 @@ struct SimFile {
     /// How many writes reached it, and which pages.
     writes: usize,
     pages: BTreeSet<u64>,
+
+    /// Per page index ≥ 4, the distinct images a successful barrier made durable there, the most
+    /// recently archived last (§6.1, slice S13). It follows the file's path across a rename onto it
+    /// and a restore.
+    archive: BTreeMap<u64, Vec<Vec<u8>>>,
+}
+
+impl SimFile {
+    /// Add one durable image of page `pg`, unless the archive already holds it, keeping the
+    /// [`ARCHIVE_DEPTH`] most recent.
+    fn archive_image(&mut self, pg: u64, image: &[u8]) {
+        let vs = self.archive.entry(pg).or_default();
+        if vs.iter().any(|v| v == image) {
+            return;
+        }
+        vs.push(image.to_vec());
+        if vs.len() > ARCHIVE_DEPTH {
+            let cut = vs.len() - ARCHIVE_DEPTH;
+            vs.drain(..cut);
+        }
+    }
+
+    /// Take `old`'s archive — the file whose path this one now takes — ahead of this file's own.
+    fn inherit(&mut self, old: &BTreeMap<u64, Vec<Vec<u8>>>) {
+        if old.is_empty() {
+            return;
+        }
+        let own = std::mem::take(&mut self.archive);
+        for pages in [old, &own] {
+            for (pg, vs) in pages {
+                for v in vs {
+                    self.archive_image(*pg, v);
+                }
+            }
+        }
+    }
 }
 
 /// One directory change: create a file, rename one over another, or remove one.
@@ -217,6 +261,10 @@ pub(crate) struct SimFs {
 
     /// FNV-1a fold of every mutating call, for the self-determinism check (§8.5).
     pub(crate) ops: u64,
+
+    /// Whether each file keeps its archive of durable page images (§6.1, slice S13): an encrypted
+    /// trace's replay steps draw on it.
+    pub(crate) archiving: bool,
 }
 
 fn injected(what: &str) -> EngineError {
@@ -243,6 +291,7 @@ impl SimFs {
             oracle: false,
             spill_ops: 0,
             ops: FNV_OFFSET,
+            archiving: false,
         }
     }
 
@@ -256,6 +305,7 @@ impl SimFs {
             barrier_ok: false,
             writes: 0,
             pages: BTreeSet::new(),
+            archive: BTreeMap::new(),
         });
         self.arena.len() - 1
     }
@@ -472,14 +522,23 @@ impl SimFs {
 
     /// Make every pending write of file `id` durable: a successful barrier.
     fn flush(&mut self, id: usize) {
+        let (ps, archiving) = (self.page_size, self.archiving);
         let file = &mut self.arena[id];
         let pending = std::mem::take(&mut file.pending);
         for (off, vs) in &pending {
-            put_durable(
-                &mut file.durable,
-                *off,
-                vs.last().expect("a pending offset holds a version"),
-            );
+            let newest = vs.last().expect("a pending offset holds a version");
+            put_durable(&mut file.durable, *off, newest);
+            // Archive each whole page of a write that just became durable (§6.1).
+            if archiving && off % ps == 0 {
+                let mut k = 0u64;
+                while (k + 1) * ps <= newest.len() as u64 {
+                    let pg = off / ps + k;
+                    if pg >= ARCHIVE_FIRST_PAGE {
+                        file.archive_image(pg, &newest[(k * ps) as usize..((k + 1) * ps) as usize]);
+                    }
+                    k += 1;
+                }
+            }
         }
         if file.durable.len() < file.cache.len() {
             let n = file.cache.len();
@@ -702,6 +761,12 @@ impl SimFs {
                 format!("I/O error: rename of a missing file {from}"),
             ));
         };
+        if let Some(old) = self.files.get(to).copied()
+            && old != id
+        {
+            let archive = self.arena[old].archive.clone();
+            self.arena[id].inherit(&archive);
+        }
         self.files.insert(to.to_string(), id);
         self.files.remove(from);
         self.dir_ops.push(DirOp {
@@ -834,6 +899,69 @@ impl SimFs {
             file.cache[lo..hi].copy_from_slice(&page);
         }
         flips
+    }
+
+    // --- restores and page replay (simulation-testing.md §8.3, slice S13) ---
+
+    /// Copy file `from` over path `to` as a host restoring a backup does, with every process gone:
+    /// the directory is synced, then `to` is a new file holding `from`'s bytes, durable, under a
+    /// durable entry. It inherits the archive of the file it replaces, then `from`'s.
+    pub(crate) fn restore(&mut self, from: &str, to: &str) {
+        self.durable = self.files.clone();
+        self.dir_ops.clear();
+        let src = self.files[from];
+        let id = self.new_file(to);
+        let bytes = self.arena[src].cache.clone();
+        self.arena[id].durable = bytes.clone();
+        self.arena[id].cache = bytes;
+        if let Some(old) = self.files.get(to).copied() {
+            let archive = self.arena[old].archive.clone();
+            self.arena[id].inherit(&archive);
+        }
+        let archive = self.arena[src].archive.clone();
+        self.arena[id].inherit(&archive);
+        self.files.insert(to.to_string(), id);
+        self.durable.insert(to.to_string(), id);
+        let key = self.arena[id].key;
+        self.fold(b'R', key, 0, &[]);
+    }
+
+    /// The archived images of file `id`'s page `pg` other than its current bytes, in byte order, or
+    /// none when a write to it is still pending.
+    pub(crate) fn replay_versions(&self, id: usize, pg: u64) -> Vec<Vec<u8>> {
+        let ps = self.page_size;
+        let file = &self.arena[id];
+        let start = pg * ps;
+        if start + ps > file.cache.len() as u64
+            || start + ps > file.durable.len() as u64
+            || pending_in(file, start, start + ps)
+        {
+            return Vec::new();
+        }
+        let current = &file.cache[start as usize..(start + ps) as usize];
+        let mut out: Vec<Vec<u8>> = file
+            .archive
+            .get(&pg)
+            .map(|vs| {
+                vs.iter()
+                    .filter(|v| v.as_slice() != current)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// Put `image` at file `id`'s page `pg`, durable and cached, and return what
+    /// [`repair`](SimFs::repair) needs to undo it.
+    pub(crate) fn replace(&mut self, id: usize, pg: u64, image: &[u8]) -> (u64, Vec<u8>) {
+        let start = (pg * self.page_size) as usize;
+        let file = &mut self.arena[id];
+        let orig = file.durable[start..start + image.len()].to_vec();
+        file.durable[start..start + image.len()].copy_from_slice(image);
+        file.cache[start..start + image.len()].copy_from_slice(image);
+        (pg, orig)
     }
 
     /// Restore the pages [`corrupt`](SimFs::corrupt) flipped.

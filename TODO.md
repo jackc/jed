@@ -716,7 +716,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `28P04` after a rekey — §14, process scenarios `encrypted_service` and
   `encrypted_commit_resolution`); the CLI's `--key-file` / `--passphrase-file` / `--passphrase`
   (Rust CLI, `jed migrate`, `jed pages`); the corpus's encrypted mode with its cross-core cost
-  transcript (`conformance:encrypted`, in `ci`); simulator slice S12 (`encryption` profile); and a
+  transcript (`conformance:encrypted`, in `ci`); simulator slices S12–S13 (four `encryption*` profiles); and a
   first integrated benchmark (`bench:encryption`, all three cores). Remaining (encrypted.md §10):
   - [x] **Browser/OPFS** — landed: an asynchronous WebCrypto provider (`crypto_web.ts`) through the
     TS async page path (awaited opens, meta seals and unwraps; commits sealed through seal sessions),
@@ -729,9 +729,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **Replication** — the key-block item in the stream (replication itself is not built).
   - [ ] **A credential in `hello`** for a `jed pages` server that must own an encrypted database
     (today: a key or passphrase file on the server, or `28P02`).
-  - [ ] **Simulator growth** — replay at every pointer kind, restore then divergent writes,
-    conversion to and from plaintext, encrypted attachments and encrypted service traces (S12's
-    *Not yet*).
+  - [x] **Simulator growth** — S13 (simulation-testing.md §14): `replay <kind>` puts an older durable
+    page back at a page each of the eleven bound-pointer kinds names (`encryption-replay`); `restore`
+    copies a backup over main so later commits diverge; `rekey plain` converts to and from plaintext;
+    encrypted attachments with per-database keys (`encryption-attachments`) and encrypted service
+    traces (`encryption-service`). It found that a re-electing page client unlocked with its original
+    credential (`28P01` after any credential change) instead of its held data key, and that a client
+    promoting itself after its owner rekeyed reported `XX001` instead of `28P04`, and that a compacted
+    backup through a client wrote the key block it had unlocked from; all fixed.
   - [ ] **The security review** and XAES lifetime bounds (encryption.md §9). Needs a human reviewer.
 - **Replication.** ✅ **Architecture decided (block-shipping, no WAL), not built** — designed in
   [replication.md](spec/design/replication.md). Ship the **per-commit page-delta** in `txid`

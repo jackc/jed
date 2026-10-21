@@ -6,6 +6,7 @@
 // to connect and words its timeout error. Node-only.
 
 import { lockUntil, timeoutValue } from "../coordinator.ts";
+import type { PageCodec } from "../crypto.ts";
 import type { Environment } from "../environment.ts";
 import { EngineError, engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
@@ -22,13 +23,15 @@ export type Election =
 // ElectOptions shape one election: never skips presence tries (ownership = never), pauseUntilMs skips
 // them until then (the handoff pause), and reelect marks a re-election, which keeps the handle's
 // process-local path claim (it neither claims nor releases it). open and environment open a client's
-// engine.
+// engine; held is the data key a re-electing client of an encrypted database already holds
+// (spec/fileformat/encrypted.md §14), absent otherwise.
 export type ElectOptions = {
   never: boolean;
   pauseUntilMs: number;
   reelect: boolean;
   open: ClientOpenOptions;
   environment: Environment;
+  held?: PageCodec | null;
 };
 
 function isCode(error: unknown, code: string): boolean {
@@ -82,7 +85,7 @@ export function electService(
         if (result.ok) {
           let engine: Engine | null = null;
           try {
-            engine = openPageClient(client, eo.open, eo.environment);
+            engine = openPageClient(client, eo.open, eo.environment, eo.held ?? null);
           } catch (error) {
             client.close();
             if (!isCode(error, "08006")) throw error;

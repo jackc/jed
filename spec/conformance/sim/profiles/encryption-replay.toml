@@ -1,0 +1,51 @@
+# Page replay (spec/design/encryption.md §4, encrypted.md §2; simulation-testing.md §8.3 *Replays*, §14
+# S13): an older genuine version of a page comes back at a page each kind of bound pointer names, which
+# must be XX001 — or, for a page the newest manifest depends on, a fallback to the previous generation
+# — and never stale rows. Most replays follow a commit, so the newest manifest is a big commit's, and
+# the data is large enough for every pointer kind to name pages: several-page overflow chains, plain
+# and compressed (the 0x04 pointer), a catalog that ANALYZE statistics spread over several pages, GiST
+# indexes, and drops and deletes that leave a free list of more than a page. Restores, rekeys and
+# conversions are rare: they keep earlier layouts and abandoned histories in the archive at old indexes.
+
+description = "Encrypted main with large data: replay of older genuine pages at every pointer kind"
+
+page_sizes = [1024, 2048]
+encrypted = [1]
+synchronous = ["on", "off"]
+steps = 500
+max_tables = 4
+max_rows = 500
+batch = [5, 60]
+max_readers = 2
+conversion = 200
+gist = 1
+replay_after_commit = 300
+
+[weights]
+change_key = 1
+rekey = 1
+compact = 1
+backup = 1
+restore = 1
+replay = 1
+analyze = 3
+delete = 7
+drop_table = 3
+open_read = 3
+close_read = 6
+crash_power = 1
+crash_process = 1
+reopen = 0
+corrupt = 0
+
+[values]
+short = 6
+long_incompressible = 4
+long_repeated = 3
+long_chain = 3
+
+[faults]
+commit_fault = 60
+key_fault = 200
+compact_fault = 200
+backup_fault = 100

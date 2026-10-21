@@ -396,6 +396,9 @@ impl Shared {
             Some(conn) => conn.handoff_pause_until(),
             None => stale.pause_until,
         };
+        // A client that unlocked an encrypted database keeps its data key, whichever role it takes
+        // next (encryption.md §8): a credential changed since does not stop it.
+        let held = stale.paging.as_ref().and_then(|p| p.codec().cloned());
         let won = elect(
             &handoff.host,
             &handoff.path,
@@ -406,6 +409,7 @@ impl Shared {
                 pause_until,
                 reelect: true,
                 opts: &handoff.opts,
+                held,
             },
         )
         .map_err(|e| {
@@ -1101,6 +1105,7 @@ pub(crate) fn open_service_with(
             pause_until: None,
             reelect: !claim,
             opts: &opts,
+            held: None,
         },
     )?;
     match won {

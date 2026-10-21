@@ -28,7 +28,8 @@ pub(crate) enum Election {
 
 /// One election's shape. `never` skips presence tries (`Ownership::Never`); `pause_until` skips them
 /// until then (the handoff pause); `reelect` marks a re-election, which keeps the handle's existing
-/// process-local path claim. `opts` open the client's engine.
+/// process-local path claim. `opts` open the client's engine; `held` is the data key a re-electing
+/// client of an encrypted database already holds (spec/fileformat/encrypted.md §14), `None` otherwise.
 pub(crate) struct ElectOptions<'a> {
     pub(crate) timeout_ms: u64,
     pub(crate) read_only: bool,
@@ -36,6 +37,7 @@ pub(crate) struct ElectOptions<'a> {
     pub(crate) pause_until: Option<Instant>,
     pub(crate) reelect: bool,
     pub(crate) opts: &'a OpenOptions,
+    pub(crate) held: Option<Arc<crate::crypto::PageCodec>>,
 }
 
 /// Run the election for the database at `path` (already resolved as a coordinated open resolves
@@ -116,16 +118,18 @@ fn run(
                 }
                 Some(record) if !record.serving => "owned by a non-serving process",
                 Some(record) => match connect(host_arc, path, &record.endpoint, eo.read_only) {
-                    Connect::Connected(conn) => match open_client_engine(&conn, eo.opts) {
-                        Ok(engine) => return Ok(Some((conn, engine))),
-                        Err(e) => {
-                            conn.close();
-                            if e.state != SqlState::ConnectionFailure {
-                                return Err(e);
+                    Connect::Connected(conn) => {
+                        match open_client_engine(&conn, eo.opts, eo.held.as_ref()) {
+                            Ok(engine) => return Ok(Some((conn, engine))),
+                            Err(e) => {
+                                conn.close();
+                                if e.state != SqlState::ConnectionFailure {
+                                    return Err(e);
+                                }
+                                ""
                             }
-                            ""
                         }
-                    },
+                    }
                     Connect::Retry => "",
                     // A re-electing client keeps trying past an owner's connection limit
                     // (README.md §6.5); an opener fails at once.
@@ -158,7 +162,11 @@ fn run(
 /// owner's committed snapshot, the ordinary loader reads the catalog skeleton through the service,
 /// and the open's pin is released — no local reader follows the open; every read begins with its
 /// own begin_read. The engine is read-only exactly when the connection is.
-fn open_client_engine(conn: &Arc<PsConnection>, opts: &OpenOptions) -> Result<Engine> {
+fn open_client_engine(
+    conn: &Arc<PsConnection>,
+    opts: &OpenOptions,
+    held: Option<&Arc<crate::crypto::PageCodec>>,
+) -> Result<Engine> {
     let begun = conn.begin_read([0; 16], 0)?;
     let mut link = ClientLink {
         conn: Arc::clone(conn),
@@ -177,8 +185,34 @@ fn open_client_engine(conn: &Arc<PsConnection>, opts: &OpenOptions) -> Result<En
         pager.set_trust_meta();
         let capacity = crate::paging::cache_leaves(opts.cache_bytes, pager.page_size());
         // A client of an encrypted file unlocks with its own credential, from the key-block pages
-        // it reads through the service (spec/fileformat/encrypted.md §14).
-        Engine::open_paged(pager, capacity, &opts.environment, opts.credential.as_ref())
+        // it reads through the service; a reconnecting one keeps the data key it holds, as
+        // promotion does, so a credential changed since does not stop it, and a rekey is 28P04
+        // (spec/fileformat/encrypted.md §14).
+        match held {
+            Some(codec) => {
+                crate::format::adopt_held_codec(&mut pager, codec)?;
+                let paging = crate::paging::SharedPaging::with_codec(
+                    pager,
+                    capacity,
+                    Some(Arc::clone(codec)),
+                );
+                match Engine::open_shared_paging(Arc::clone(&paging), &opts.environment) {
+                    Err(e)
+                        if e.state == SqlState::DataCorrupted
+                            && !crate::format::meta_authenticates(&paging).unwrap_or(true) =>
+                    {
+                        Err(EngineError::new(
+                            SqlState::StaleKey,
+                            "the database was rekeyed since this handle opened it; reopen it",
+                        ))
+                    }
+                    other => other,
+                }
+            }
+            None => {
+                Engine::open_paged(pager, capacity, &opts.environment, opts.credential.as_ref())
+            }
+        }
     })();
     link.release(begun.txid);
     let mut engine = loaded?;

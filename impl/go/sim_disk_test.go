@@ -13,6 +13,7 @@ package jed
 // within a commit still produce the same post-crash bytes.
 
 import (
+	"bytes"
 	"encoding/binary"
 	"hash/fnv"
 	"io"
@@ -23,19 +24,22 @@ import (
 // Decision lanes keep independent choices from correlating (§6.2). The values are part of the
 // cross-core contract: every core's runner uses the same lane for the same decision.
 const (
-	simLaneSurvive = 1  // power loss: does anything land at this offset?
-	simLaneVersion = 2  // power loss: which pending version lands
-	simLaneTear    = 3  // power loss: is the landing version torn?
-	simLaneSector  = 4  // power loss: per-sector old/new choice of a torn version
-	simLaneIOWrite = 5  // io_error op=write: does this write fail?
-	simLaneIssue   = 6  // process_crash: was this write issued before the process died?
-	simLaneLand    = 7  // io_error op=sync: does this pending write land or vanish (fsyncgate)?
-	simLaneSession = 8  // a session's entropy-seam seed
-	simLaneRead    = 9  // read_error: do reads of this offset fail during the step?
-	simLaneDir     = 10 // power loss: how many pending directory changes survive (% changes+1)
-	simLaneSpill   = 11 // spill_error: does this spill-file operation fail?
-	simLanePage    = 12 // corrupt: which page a flip lands in
-	simLaneBit     = 13 // corrupt: which bit of that page it flips
+	simLaneSurvive       = 1  // power loss: does anything land at this offset?
+	simLaneVersion       = 2  // power loss: which pending version lands
+	simLaneTear          = 3  // power loss: is the landing version torn?
+	simLaneSector        = 4  // power loss: per-sector old/new choice of a torn version
+	simLaneIOWrite       = 5  // io_error op=write: does this write fail?
+	simLaneIssue         = 6  // process_crash: was this write issued before the process died?
+	simLaneLand          = 7  // io_error op=sync: does this pending write land or vanish (fsyncgate)?
+	simLaneSession       = 8  // a session's entropy-seam seed
+	simLaneRead          = 9  // read_error: do reads of this offset fail during the step?
+	simLaneDir           = 10 // power loss: how many pending directory changes survive (% changes+1)
+	simLaneSpill         = 11 // spill_error: does this spill-file operation fail?
+	simLanePage          = 12 // corrupt: which page a flip lands in
+	simLaneBit           = 13 // corrupt: which bit of that page it flips
+	simLaneKeySeed       = 14 // an encrypted trace's process key-entropy seed (S13)
+	simLaneReplayPage    = 15 // replay: which candidate page
+	simLaneReplayVersion = 16 // replay: which older version of it
 )
 
 const simGamma = 0x9E3779B97F4A7C15
@@ -107,7 +111,14 @@ type simFS struct {
 	spillOps uint64 // spill-file operations this step (spill_error decisions)
 
 	ops uint64 // FNV-1a fold of every mutating call, for the self-determinism check (§8.5)
+
+	// archiving keeps each file's archive of durable page images (§6.1, slice S13): an encrypted trace's
+	// replay steps draw on it.
+	archiving bool
 }
+
+// simArchiveDepth is how many durable images of one page index an archive keeps (§6.1).
+const simArchiveDepth = 32
 
 // simDirOp is one directory change: create a file, rename one over another, or remove one.
 type simDirOp struct {
@@ -135,6 +146,11 @@ type simDisk struct {
 	// unissued are the writes an armed process_crash decided never reached the kernel; processDeath
 	// removes them.
 	unissued []simWrite
+
+	// archive is, per page index ≥ 4, the distinct images a successful barrier made durable there, the
+	// most recently archived last (§6.1, slice S13). It follows the file's path across a rename onto it
+	// and a restore.
+	archive map[int64][][]byte
 }
 
 type simWrite struct {
@@ -338,6 +354,7 @@ func (d *simDisk) flush() {
 	for _, off := range d.sortedPending() {
 		vs := d.pending[off]
 		d.putDurable(off, vs[len(vs)-1])
+		d.archivePages(off, vs[len(vs)-1])
 	}
 	if len(d.durable) < len(d.cache) {
 		d.durable = append(d.durable, make([]byte, len(d.cache)-len(d.durable))...)
@@ -368,6 +385,58 @@ func (d *simDisk) sync() error {
 	}
 	d.flush()
 	return nil
+}
+
+// archivePages archives each whole page of a write that just became durable.
+func (d *simDisk) archivePages(off int64, p []byte) {
+	ps := d.fs.pageSize
+	if !d.fs.archiving || off%ps != 0 {
+		return
+	}
+	for k := int64(0); (k+1)*ps <= int64(len(p)); k++ {
+		if pg := off/ps + k; pg >= int64(firstBodyEncrypted) {
+			d.archiveImage(pg, p[k*ps:(k+1)*ps])
+		}
+	}
+}
+
+// archiveImage adds one durable image of page pg, unless the archive already holds it, keeping the
+// simArchiveDepth most recent.
+func (d *simDisk) archiveImage(pg int64, image []byte) {
+	if d.archive == nil {
+		d.archive = map[int64][][]byte{}
+	}
+	for _, v := range d.archive[pg] {
+		if bytes.Equal(v, image) {
+			return
+		}
+	}
+	vs := append(d.archive[pg], append([]byte(nil), image...))
+	if len(vs) > simArchiveDepth {
+		vs = vs[len(vs)-simArchiveDepth:]
+	}
+	d.archive[pg] = vs
+}
+
+// inherit gives d the archive of old, the file whose path d now takes, ahead of d's own images.
+func (d *simDisk) inherit(old *simDisk) {
+	if old == nil || old == d || len(old.archive) == 0 {
+		return
+	}
+	own := d.archive
+	d.archive = nil
+	for _, pages := range []map[int64][][]byte{old.archive, own} {
+		pgs := make([]int64, 0, len(pages))
+		for pg := range pages {
+			pgs = append(pgs, pg)
+		}
+		sort.Slice(pgs, func(a, b int) bool { return pgs[a] < pgs[b] })
+		for _, pg := range pgs {
+			for _, v := range pages[pg] {
+				d.archiveImage(pg, v)
+			}
+		}
+	}
 }
 
 // fsyncgate models a failed fsync on Linux: each pending write independently became durable or was
@@ -573,6 +642,7 @@ func (fs *simFS) rename(from, to string) error {
 	if d == nil {
 		return newError(IoError, "I/O error: rename of a missing file "+from)
 	}
+	d.inherit(fs.files[to])
 	fs.files[to] = d
 	delete(fs.files, from)
 	fs.dirOps = append(fs.dirOps, simDirOp{kind: 'r', from: from, to: to, file: d})
@@ -751,6 +821,54 @@ func (d *simDisk) repair(flips []simFlip) {
 		copy(d.durable[start:], f.orig)
 		copy(d.cache[start:], f.orig)
 	}
+}
+
+// --- restores and page replay (simulation-testing.md §8.3, slice S13) ---------------------------
+
+// restore copies file from over path to as a host restoring a backup does, with every process gone: the
+// directory is synced, then to is a new file holding from's bytes, durable, under a durable entry. It
+// inherits the archive of the file it replaces, then from's.
+func (fs *simFS) restore(from, to string) {
+	fs.durable = make(map[string]*simDisk, len(fs.files))
+	for name, d := range fs.files {
+		fs.durable[name] = d
+	}
+	fs.dirOps = nil
+	src := fs.files[from]
+	d := fs.newFile(to)
+	d.durable = append([]byte(nil), src.cache...)
+	d.cache = append([]byte(nil), src.cache...)
+	d.inherit(fs.files[to])
+	d.inherit(src)
+	fs.files[to], fs.durable[to] = d, d
+	fs.fold('R', d.key, 0, nil)
+}
+
+// replayVersions lists the archived images of page pg other than its current bytes, in byte order, or
+// nil when a write to it is still pending.
+func (d *simDisk) replayVersions(pg int64) [][]byte {
+	ps := d.fs.pageSize
+	start := pg * ps
+	if start+ps > int64(len(d.cache)) || start+ps > int64(len(d.durable)) || d.pendingIn(start, start+ps) {
+		return nil
+	}
+	var out [][]byte
+	for _, v := range d.archive[pg] {
+		if !bytes.Equal(v, d.cache[start:start+ps]) {
+			out = append(out, v)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return bytes.Compare(out[a], out[b]) < 0 })
+	return out
+}
+
+// replace puts image at page pg, durable and cached, and returns what repair needs to undo it.
+func (d *simDisk) replace(pg int64, image []byte) simFlip {
+	start := pg * d.fs.pageSize
+	f := simFlip{page: pg, orig: append([]byte(nil), d.durable[start:start+int64(len(image))]...)}
+	copy(d.durable[start:], image)
+	copy(d.cache[start:], image)
+	return f
 }
 
 // pendingIn reports whether any pending write overlaps [lo, hi).

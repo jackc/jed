@@ -1497,11 +1497,9 @@ func loadEnginePagedCredential(pgr *pager, capacity int, env *Environment, cred 
 // selected key-block copy, so a later credential change or backup starts from the file's current
 // generation. The load then authenticates the meta under the held key (XX001 when it does not).
 func adoptHeldCodec(pgr *pager, codec *pageCodec) error {
-	if int(pgr.pageSize) < minEncryptedPageSize || pgr.allocatedPages < firstBodyEncrypted {
-		return newError(DataCorrupted, "encrypted file too small for its key block")
-	}
+	// The variant first: a file decrypted since may be smaller than an encrypted one can be.
 	var pages [4][]byte
-	for i := range pages {
+	for i := range 2 {
 		var err error
 		if pages[i], err = pgr.readBlock(uint32(i)); err != nil {
 			return err
@@ -1513,6 +1511,14 @@ func adoptHeldCodec(pgr *pager, codec *pageCodec) error {
 	}
 	if suite == 0 {
 		return newError(StaleKey, "the database is no longer encrypted; reopen it")
+	}
+	if int(pgr.pageSize) < minEncryptedPageSize || pgr.allocatedPages < firstBodyEncrypted {
+		return newError(DataCorrupted, "encrypted file too small for its key block")
+	}
+	for i := 2; i < 4; i++ {
+		if pages[i], err = pgr.readBlock(uint32(i)); err != nil {
+			return err
+		}
 	}
 	selected, err := selectKeyBlock(pages[2], pages[3])
 	if err != nil {

@@ -24,7 +24,8 @@
 import process from "node:process";
 
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
-import { KEY_BLOCK_LEN, osKeyEntropy, PageCodec } from "../crypto.ts";
+import { KEY_BLOCK_LEN, PageCodec } from "../crypto.ts";
+import type { RandomSource } from "../seam.ts";
 import { EngineError } from "../errors.ts";
 import {
   encodeFrame,
@@ -91,6 +92,11 @@ export interface ServedDb {
   readonly gateWaits: boolean;
   // readPage reads one page of the file.
   readPage(index: number): Uint8Array;
+  // keyEntropy is the stream an encrypted client commit's meta is resealed with (encrypted.md §14):
+  // the owner's own key-entropy stream when the service runs on the engine thread, as the Go and Rust
+  // owners reseal with their codec's, so a seeded environment keeps the file byte-identical
+  // (encrypted.md §8); the OS CSPRNG on a worker thread, which shares no object with the engine.
+  keyEntropy(): RandomSource;
   // writeDelta writes validated delta pages of write transaction w (the new page count is
   // pageCount); a failure stops serving and throws a fatal Failure. abandonDelta ends a delta whose
   // meta was never written.
@@ -179,8 +185,8 @@ function freeListTag(meta: Uint8Array): Uint8Array {
 // codecFor is the page codec of an encrypted database's data key (spec/fileformat/encrypted.md §14):
 // the worker checks a client commit's meta under it, reseals the meta for the slot it writes with a
 // nonce of its own, and opens free-list pages. The key block is never written here.
-function codecFor(dek: Uint8Array | null): PageCodec | null {
-  return dek === null ? null : new PageCodec(dek, osKeyEntropy(), new Uint8Array(KEY_BLOCK_LEN));
+function codecFor(dek: Uint8Array | null, rng: RandomSource): PageCodec | null {
+  return dek === null ? null : new PageCodec(dek, rng, new Uint8Array(KEY_BLOCK_LEN));
 }
 
 // WriteTxn is a client write transaction: the connection holds the gate and a write pin on base.
@@ -620,7 +626,7 @@ export class Connection {
     }
     let codec: PageCodec | null;
     try {
-      codec = codecFor(dek);
+      codec = codecFor(dek, this.db.keyEntropy());
     } catch (error) {
       state.releaseGate();
       throw error;

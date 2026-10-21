@@ -440,7 +440,10 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   durability floor and the newest attempted commit and matches a recorded generation; a reader sees
   its pinned version; no `XX001`; image and live integrity checks; with no reader pinned the file
   stops growing (the reader-aware bounded-growth check); a bit flipped at rest is `XX001` or harmless,
-  never wrong rows or a panic (the `corrupt` step); and `spec/fileformat/verify.rb --check-image`
+  never wrong rows or a panic (the `corrupt` step); in an encrypted file, exactly one of the old and new
+  keys opens it after a crashed credential change, rekey or conversion, and an older genuine page put
+  back at any kind of bound pointer is `XX001` or a fallback from a manifest-listed page, never stale
+  rows (the `replay` step), including across a restored backup; and `spec/fileformat/verify.rb --check-image`
   re-decides every recovery independently. `mise run ci` runs the regression traces and a fixed sweep;
   `mise run sim:sweep` explores further and `sim:shrink` minimizes a failure. When a storage feature
   lands (a page type, commit path, host operation, or setting), grow the generator and checkers with it.
@@ -642,7 +645,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   change, rekey (DEK rotation and conversion, trees rebuilt in a sealed scratch domain), sealed scratch
   files (`scratch_encryption`), encrypted backups, the page service (clients unlock from the key block
   they read; the owner checks and reseals client metas), the CLI's key/passphrase-file inputs, the
-  corpus's encrypted mode and simulator slice S12. Still to build, each failing closed meanwhile
+  corpus's encrypted mode and simulator slices S12–S13 (credential changes, rekeys and conversions under
+  crashes, page replay at every pointer kind, restores, encrypted attachments and service traces). Still to build, each failing closed meanwhile
   (encrypted.md §10): replication's key-block item, a credential in `hello`, credential change and
   rekey on the TS async API; and the security review. The browser/OPFS host opens encrypted files
   through an asynchronous WebCrypto codec. **Designed in `spec/design/encryption.md`:**

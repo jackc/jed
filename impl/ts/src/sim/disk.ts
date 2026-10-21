@@ -33,6 +33,14 @@ const LANE_DIR = 10n; // power loss: how many pending directory changes survive 
 const LANE_SPILL = 11n; // spill_error: does this spill-file operation fail?
 const LANE_PAGE = 12n; // corrupt: which page a flip lands in
 const LANE_BIT = 13n; // corrupt: which bit of that page it flips
+export const LANE_KEY_SEED = 14n; // an encrypted trace's process key-entropy seed (S13)
+export const LANE_REPLAY_PAGE = 15n; // replay: which candidate page
+export const LANE_REPLAY_VERSION = 16n; // replay: which older version of it
+
+// ARCHIVE_DEPTH is how many durable images of one page index an archive keeps (§6.1).
+const ARCHIVE_DEPTH = 32;
+// FIRST_BODY_ENCRYPTED is the first body page of an encrypted file (pages 2–3 are the key block).
+const FIRST_BODY_ENCRYPTED = 4;
 
 const MASK64 = 0xffff_ffff_ffff_ffffn;
 
@@ -114,6 +122,10 @@ export class SimFS implements FileHost {
   private spillOps = 0n; // spill-file operations this step (spill_error decisions)
 
   private ops = new Fnv64(); // FNV-1a fold of every mutating call, for self-determinism (§8.5)
+
+  // archiving keeps each file's archive of durable page images (§6.1, slice S13): an encrypted trace's
+  // replay steps draw on it.
+  archiving = false;
 
   // An empty simulated filesystem; the runner creates the database in it (S4).
   constructor(seed: bigint, sector: number, pageSize: number) {
@@ -258,6 +270,7 @@ export class SimFS implements FileHost {
     const d = this.files.get(from);
     if (d === undefined)
       throw engineError("io_error", "I/O error: rename of a missing file " + from);
+    d.inherit(this.files.get(to));
     this.files.set(to, d);
     this.files.delete(from);
     this.dirOps.push({ kind: "r", from, to, file: d });
@@ -287,6 +300,23 @@ export class SimFS implements FileHost {
     if (this.dead || this.dirOps.length === 0 || this.barrier()) return;
     this.durable = new Map(this.files);
     this.dirOps = [];
+  }
+
+  // restore copies file from over path to as a host restoring a backup does, with every process gone:
+  // the directory is synced, then to is a new file holding from's bytes, durable, under a durable
+  // entry. It inherits the archive of the file it replaces, then from's (S13).
+  restore(from: string, to: string): void {
+    this.durable = new Map(this.files);
+    this.dirOps = [];
+    const src = this.files.get(from)!;
+    const d = new SimFile(this, to);
+    d.durable = src.cache.slice();
+    d.cache = src.cache.slice();
+    d.inherit(this.files.get(to));
+    d.inherit(src);
+    this.files.set(to, d);
+    this.durable.set(to, d);
+    this.fold("R", d.key, 0, null);
   }
 
   openStore(path: string, _noSync: boolean, _readOnly: boolean): BlockStore {
@@ -485,6 +515,10 @@ export class SimFile implements BlockStore {
   // unissued are the writes an armed process_crash decided never reached the kernel; processDeath
   // removes them.
   unissued: SimWrite[] = [];
+  // archive is, per page index ≥ 4, the distinct images a successful barrier made durable there, the
+  // most recently archived last (§6.1, slice S13). It follows the file's path across a rename onto it
+  // and a restore.
+  archive = new Map<number, Uint8Array[]>();
 
   constructor(fs: SimFS, name: string) {
     this.fs = fs;
@@ -581,6 +615,7 @@ export class SimFile implements BlockStore {
     for (const off of this.sortedPending()) {
       const vs = this.pending.get(off)!;
       this.putDurable(off, vs[vs.length - 1]!);
+      this.archivePages(off, vs[vs.length - 1]!);
     }
     this.durable = grow(this.durable, this.cache.length);
     this.pending = new Map();
@@ -603,6 +638,65 @@ export class SimFile implements BlockStore {
       throw injected("sync error");
     }
     this.flush();
+  }
+
+  // archivePages archives each whole page of a write that just became durable.
+  private archivePages(off: number, p: Uint8Array): void {
+    const ps = this.fs.pageSize;
+    if (!this.fs.archiving || off % ps !== 0) return;
+    for (let k = 0; (k + 1) * ps <= p.length; k++) {
+      const pg = off / ps + k;
+      if (pg >= FIRST_BODY_ENCRYPTED) this.archiveImage(pg, p.subarray(k * ps, (k + 1) * ps));
+    }
+  }
+
+  // archiveImage adds one durable image of page pg, unless the archive already holds it, keeping the
+  // ARCHIVE_DEPTH most recent.
+  private archiveImage(pg: number, image: Uint8Array): void {
+    let vs = this.archive.get(pg) ?? [];
+    for (const v of vs) if (bytesEqual(v, image)) return;
+    vs = [...vs, image.slice()];
+    if (vs.length > ARCHIVE_DEPTH) vs = vs.slice(vs.length - ARCHIVE_DEPTH);
+    this.archive.set(pg, vs);
+  }
+
+  // inherit gives this file the archive of old, the file whose path it now takes, ahead of its own
+  // images.
+  inherit(old: SimFile | undefined): void {
+    if (old === undefined || old === this || old.archive.size === 0) return;
+    const own = this.archive;
+    this.archive = new Map();
+    for (const pages of [old.archive, own]) {
+      for (const pg of [...pages.keys()].sort((a, b) => a - b)) {
+        for (const v of pages.get(pg)!) this.archiveImage(pg, v);
+      }
+    }
+  }
+
+  // replayVersions lists the archived images of page pg other than its current bytes, in byte order,
+  // or [] when a write to it is still pending.
+  replayVersions(pg: number): Uint8Array[] {
+    const ps = this.fs.pageSize;
+    const start = pg * ps;
+    if (
+      start + ps > this.cache.length ||
+      start + ps > this.durable.length ||
+      this.pendingIn(start, start + ps)
+    ) {
+      return [];
+    }
+    const current = this.cache.subarray(start, start + ps);
+    const out = (this.archive.get(pg) ?? []).filter((v) => !bytesEqual(v, current));
+    return out.sort(compareBytes);
+  }
+
+  // replace puts image at page pg, durable and cached, and returns what repair needs to undo it.
+  replace(pg: number, image: Uint8Array): SimFlip {
+    const start = pg * this.fs.pageSize;
+    const f = { page: pg, orig: this.durable.slice(start, start + image.length) };
+    this.durable.set(image, start);
+    this.cache.set(image, start);
+    return f;
   }
 
   // fsyncgate models a failed fsync on Linux: each pending write independently became durable or
@@ -753,4 +847,17 @@ export class SimFile implements BlockStore {
     }
     return false;
   }
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// compareBytes orders byte strings as Go's bytes.Compare does.
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i]! - b[i]!;
+  return a.length - b.length;
 }

@@ -14,7 +14,9 @@
 // loses its listener and connections at once, as the kernel closes a dead process's sockets.
 
 import { metaChecksum } from "../commit_manifest.ts";
+import { osKeyEntropy } from "../crypto.ts";
 import { engineError } from "../errors.ts";
+import type { RandomSource } from "../seam.ts";
 import type { BlockStore } from "../blockstore.ts";
 import type { Engine } from "../executor.ts";
 import type { FileHost } from "../filehost.ts";
@@ -367,6 +369,12 @@ class SimServed implements ServedDb, OwnerLink {
       this.fileGeneration = generation;
     }
     return this.file;
+  }
+
+  // keyEntropy is the owner's own key-entropy stream, as the Go owner reseals with its codec's: the
+  // service runs on the engine thread, so the seeded stream keeps every core's file byte-identical.
+  keyEntropy(): RandomSource {
+    return this.storage.paging?.codec()?.keyEntropy() ?? osKeyEntropy();
   }
 
   readPage(index: number): Uint8Array {

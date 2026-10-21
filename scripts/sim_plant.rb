@@ -162,6 +162,36 @@ module SimPlant
       profile: "truncation",
       edits: [["impl/go/validated_commit.go", "\tif shrink {\n\t\tp.shrinkAfterBarrier()\n", "\tif false && shrink {\n\t\tp.shrinkAfterBarrier()\n"]]
     ),
+    # Page replay (S13): without the bound pointer's tag check an older genuine page of the same data
+    # key authenticates, since a page's associated data names only its role and index.
+    Plant.new(
+      name: "skip-tag-binding",
+      protection: "a reader checks a page's stored tag against the pointer that names it (encrypted.md §2)",
+      profile: "encryption-replay",
+      edits: [["impl/go/crypto.go", "\tif tag != expected {\n\t\treturn nil, cryptoCorrupt(\"page does not match the pointer that names it\")",
+               "\tif false && tag != expected {\n\t\treturn nil, cryptoCorrupt(\"page does not match the pointer that names it\")"]]
+    ),
+    # A page client keeps the data key it holds whichever role it takes next (encrypted.md §14): without
+    # it, a client that unlocked before a credential change cannot reconnect after a lost connection or
+    # an owner handoff (28P01 from its old credential).
+    Plant.new(
+      name: "reconnect-with-credential",
+      protection: "a re-electing page client keeps its held data key (encrypted.md §14)",
+      profile: "encryption-service",
+      edits: [["impl/go/pageservice_handoff.go", "opts: h.opts, held: held})", "opts: h.opts, held: nil}); _ = held"]]
+    ),
+    Plant.new(
+      name: "promote-stale-key-corrupt",
+      protection: "a client promoting with a key its owner rekeyed away is told 28P04, not XX001 (encrypted.md §14)",
+      profile: "encryption-service",
+      edits: [["impl/go/file.go", "e.Code() == \"XX001\" && heldKeyStale(p)", "e.Code() == \"XX001\" && false && heldKeyStale(p)"]]
+    ),
+    Plant.new(
+      name: "backup-held-key-block",
+      protection: "a compacted backup through a client writes the file's selected key-block copy (encrypted.md §13)",
+      profile: "encryption-service",
+      edits: [["impl/go/backup.go", "codec = codec.withKeyBlock(block)", "_ = block"]]
+    ),
   ].freeze
 
   module_function

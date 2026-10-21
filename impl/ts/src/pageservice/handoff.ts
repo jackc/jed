@@ -134,7 +134,8 @@ export class ServiceHandoff implements ServiceHandoffHost {
     return won;
   }
 
-  // held is the data key the stale role holds: a promotion opens the file with it (encrypted.md §14).
+  // held is the data key the stale role holds: a promotion opens the file with it, and so does a
+  // reconnection as a client, so a credential changed since does not stop it (encrypted.md §14).
   elect(pauseUntilMs: number, held: PageCodec | null = null): ServiceRole {
     const won = electService(this.host, this.path, this.timeoutMs, this.readOnly, {
       never: this.ownership === "never",
@@ -142,6 +143,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
       reelect: true,
       open: this.clientOpen,
       environment: this.environment,
+      held,
     });
     if (won.client !== null) {
       this.adoptClient?.(won.engine);

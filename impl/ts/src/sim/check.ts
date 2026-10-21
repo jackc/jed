@@ -4,7 +4,8 @@
 // The image checker opens a copy of the disk image the way a new process would — so the meta
 // selection and manifest validation of validated-cow.md §1 run first — and then walks the selected
 // generation:
-//   - the live page count at meta offset 56 equals the pages reachable from the catalog root;
+//   - the live page count at meta offset 56 equals the pages reachable from the catalog root, GiST
+//     R-tree pages included;
 //   - every reachable page lies in [2, page_count);
 //   - the free list has no duplicates and is disjoint from the reachable set and from the selected
 //     generation's manifest dependencies;
@@ -22,26 +23,39 @@ import { type Engine, encodePkKey, indexEntryKeysColumns, type Snapshot } from "
 import { capFirstBody, NO_TAG } from "../cap.ts";
 import type { Credential } from "../crypto.ts";
 import { Environment } from "../environment.ts";
-import { runSync } from "../execution.ts";
+import { ioSteps, runSync } from "../execution.ts";
 import {
   chainPages,
+  chainStep,
   collectTreePages,
-  loadEnginePaged,
+  loadEnginePagedAt,
+  parsePage,
   reachablePages,
   unlockPagerSteps,
 } from "../format.ts";
+import { type GistPageRead, readGistLeafKeysSteps } from "../gist.ts";
 import { MemoryBlockStore } from "../memoryblockstore.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import type { Database } from "../shared.ts";
+import type { PNode } from "../pmap.ts";
 import type { Value } from "../value.ts";
 import { bytesEqual, compareBytes, compareUtf8 } from "./util.ts";
 
-export class CheckError extends Error {}
+// CheckError names the first violated invariant; cause is the engine error behind it, when one is, so
+// the runner can read its SQLSTATE as Go's simCode does through a wrapped error.
+export class CheckError extends Error {
+  constructor(msg: string, cause?: unknown) {
+    super(msg, cause === undefined ? undefined : { cause });
+  }
+}
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+const PAGE_GIST_INTERIOR = 6;
+const PAGE_GIST_LEAF = 5;
 
 // selectMeta repeats the loader's meta selection (format.ts loadEnginePaged) against an already
 // loaded paging context: the highest-txid parseable meta whose manifest validates. It returns the
@@ -72,14 +86,17 @@ export function checkImage(
 ): [number, number, number] {
   let e: Engine;
   let paging: SharedPaging;
+  // A GiST R-tree is read whole at load (gist.md §4.1); its pages are the ones the load visits, which
+  // the reachability walk does not list.
+  const gist: number[] = [];
   try {
     const pager = Pager.fromStore(new MemoryBlockStore(image));
     const environment = new Environment();
     const codec = runSync(unlockPagerSteps(pager, credential, environment));
     paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec);
-    e = loadEnginePaged(paging, environment);
+    e = loadEnginePagedAt(paging, environment, { gist: (pg) => gist.push(pg) });
   } catch (err) {
-    throw new CheckError("open: " + message(err));
+    throw new CheckError("open: " + message(err), err);
   }
   const { meta: mt, protectedPages } = selectMeta(paging);
   if (mt.txid !== want) {
@@ -90,7 +107,11 @@ export function checkImage(
   try {
     reached = reachablePages(snap, paging, mt.rootPage, mt.rootTag);
   } catch (err) {
-    throw new CheckError("reachability walk: " + message(err));
+    throw new CheckError("reachability walk: " + message(err), err);
+  }
+  for (const pg of gist) {
+    if (reached.has(pg)) throw new CheckError(`GiST page ${pg} is reachable twice`);
+    reached.add(pg);
   }
   if (reached.size !== mt.livePages) {
     throw new CheckError(
@@ -121,7 +142,10 @@ export function checkImage(
     try {
       checkTable(snap, name, paging, claimed);
     } catch (err) {
-      throw new CheckError(`table ${name}: ${message(err)}`);
+      throw new CheckError(
+        `table ${name}: ${message(err)}`,
+        err instanceof CheckError ? err.cause : err,
+      );
     }
   }
   return [mt.livePages, mt.pageCount, e.freePages.length];
@@ -154,7 +178,7 @@ function checkTable(
       try {
         pages = chainPages(ext[0], ext[1], fetch, ext[2], tagLen);
       } catch (err) {
-        throw new CheckError(`row ${i}: an overflow chain: ${message(err)}`);
+        throw new CheckError(`row ${i}: an overflow chain: ${message(err)}`, err);
       }
       for (const pg of pages) {
         if (claimed.has(pg)) throw new CheckError(`overflow page ${pg} is referenced twice`);
@@ -165,7 +189,7 @@ function checkTable(
     try {
       row = store.resolveAll(entries[i]!.row);
     } catch (err) {
-      throw new CheckError(`row ${i}: ${message(err)}`);
+      throw new CheckError(`row ${i}: ${message(err)}`, err);
     }
     entries[i] = { key: entries[i]!.key, row };
     if (i > 0 && compareBytes(entries[i - 1]!.key, entries[i]!.key) >= 0) {
@@ -279,4 +303,120 @@ function externalRef(v: Value): [number, number, Uint8Array] | null {
   if (v.kind !== "unfetched") return null;
   if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) return null;
   return [v.ref.firstPage, v.ref.storedLen, v.ref.firstTag ?? NO_TAG];
+}
+
+// --- page replay (simulation-testing.md §8.3 *Replays*, slice S13) ----------------------------
+
+// pointerKinds classifies the pages of image's selected generation by the kind of bound pointer that
+// names each (encrypted.md §2), and returns the pages that generation's manifest depends on: its listed
+// pages and its manifest-overflow pages. A page's kind is its pointer's, so a chain's head is
+// `catalog`, `free`, or an overflow kind, and every later page of the chain its `_next` kind; a tree's
+// root is `root` and every other node `child` (`gist_child` in a GiST R-tree). Engine errors propagate.
+export function pointerKinds(
+  image: Uint8Array,
+  credential?: Credential,
+): { kinds: Map<string, number[]>; deps: Set<number> } {
+  const pager = Pager.fromStore(new MemoryBlockStore(image));
+  const environment = new Environment();
+  const codec = runSync(unlockPagerSteps(pager, credential, environment));
+  const paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec);
+  const gist: number[] = [];
+  const e = loadEnginePagedAt(paging, environment, { gist: (pg) => gist.push(pg) });
+  const { meta: mt, protectedPages } = selectMeta(paging);
+  const deps = new Set(protectedPages);
+  const sets = new Map<string, Set<number>>();
+  const add = (kind: string, pg: number): void => {
+    let set = sets.get(kind);
+    if (set === undefined) {
+      set = new Set();
+      sets.set(kind, set);
+    }
+    set.add(pg);
+  };
+  const cap = paging.cap();
+  const chain = (head: number, headTag: Uint8Array, first: string, next: string): void => {
+    let kind = first;
+    let tag = headTag;
+    for (let p = head; p !== 0; kind = next) {
+      add(kind, p);
+      const link = chainStep(paging.readBody(p, tag), cap);
+      p = link.next;
+      tag = link.nextTag;
+    }
+  };
+  chain(mt.rootPage, mt.rootTag, "catalog", "catalog_next");
+  chain(mt.freeListHead, mt.freeListTag, "free", "free_next");
+  // Manifest-overflow pages are plaintext; the meta's tag binds them through its associated data.
+  for (let id = mt.overflowHead, n = 0; id !== 0 && n < mt.overflowCount; n++) {
+    add("manifest", id);
+    id = parsePage(paging.readBlock(id)).nextPage;
+  }
+  const walk = (n: PNode, kind: string): void => {
+    if (n.page !== 0) add(kind, n.page);
+    for (const c of n.children) {
+      if (c.node === null) add("child", c.page);
+      else walk(c.node, "child");
+    }
+  };
+  const snap = e.committed;
+  const fetch = (p: number, tag: Uint8Array): Uint8Array => paging.readBody(p, tag);
+  for (const st of snap.stores.values()) {
+    const root = st.treeRoot();
+    if (root !== null) walk(root, "root");
+    for (const en of st.entriesInKeyOrder()) {
+      for (const v of en.row) {
+        const ext = externalRef(v);
+        if (ext === null) continue;
+        const pages = chainPages(ext[0], ext[1], fetch, ext[2], cap.tag);
+        const head =
+          v.kind === "unfetched" && v.ref.form === TAG_EXTERNAL_COMP ? "overflow_lz4" : "overflow";
+        for (let k = 0; k < pages.length; k++) add(k === 0 ? head : "overflow_next", pages[k]!);
+      }
+    }
+  }
+  for (const ist of snap.indexStores.values()) {
+    const root = ist.treeRoot();
+    if (root !== null && root.page !== 0) walk(root, "root");
+  }
+  // A GiST R-tree is read whole at load (gist.md §4.1): its pages are the ones the load visited. Each
+  // interior's children come from the loader's own parser, reading only that page; whatever no
+  // interior names is a root.
+  const named = new Set<number>();
+  for (const pg of gist) {
+    const stored = paging.readBlock(pg);
+    // The load already checked the stored tag against its pointer.
+    const tag = cap.tag === 0 ? NO_TAG : stored.slice(stored.length - cap.tag);
+    const parsed = parsePage(paging.readBody(pg, tag));
+    if (parsed.pageType !== PAGE_GIST_INTERIOR) continue;
+    runSync(
+      readGistLeafKeysSteps(
+        (p) =>
+          ioSteps((): GistPageRead => {
+            if (p !== pg) {
+              named.add(p);
+              return { pageType: PAGE_GIST_LEAF, itemCount: 0, payload: new Uint8Array() };
+            }
+            return {
+              pageType: parsed.pageType,
+              itemCount: parsed.itemCount,
+              payload: parsed.payload,
+            };
+          }),
+        pg,
+        [],
+        new Set<number>(),
+        1,
+        tag,
+        cap.tag,
+      ),
+    );
+  }
+  for (const pg of gist) add(named.has(pg) ? "gist_child" : "root", pg);
+  const kinds = new Map<string, number[]>();
+  for (const [kind, set] of sets)
+    kinds.set(
+      kind,
+      [...set].sort((a, b) => a - b),
+    );
+  return { kinds, deps };
 }

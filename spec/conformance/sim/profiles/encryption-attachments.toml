@@ -1,0 +1,37 @@
+# Encrypted file attachments (spec/design/encryption.md; simulation-testing.md §14 S13): main and up to
+# two attached file databases, each created encrypted and each with its own key. Credential changes
+# and rekeys target main or an attachment, a rekey may decrypt its database and a later one encrypt it
+# again, and each database's recovery must open it with exactly one of the old and new keys. Every
+# process seals its scratch files, so encrypting a plaintext attachment is allowed.
+
+description = "Encrypted attachments: per-database keys, credential changes, rekeys and conversions"
+
+page_sizes = [1024, 2048]
+encrypted = [1]
+synchronous = ["on", "off"]
+steps = 500
+max_tables = 4
+max_readers = 3
+attachments = 2
+attached_writes = 600
+conversion = 300
+
+[weights]
+attach = 6
+change_key = 4
+rekey = 3
+compact = 1
+open_read = 6
+close_read = 4
+crash_power = 1
+crash_process = 1
+reopen = 1
+upsert = 2
+sequence = 0
+
+[faults]
+commit_fault = 80
+attach_fault = 300
+compact_fault = 300
+key_fault = 400
+nth_max = 2

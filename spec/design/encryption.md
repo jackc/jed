@@ -116,8 +116,10 @@ check that can refuse the commit, in the **seal order** of encrypted.md §7 (per
 a leaf's fresh chains before the leaf, index trees, the catalog chain, then the free-list chain —
 every chain last page first — then the meta); images draw in stream order after the DEK, KDF salt
 and wrap nonce. In simulation each
-process's streams are seeded from the trace seed and its process id, so an owner and its clients
-never share a stream. The engine keeps no entropy pool across commits. A `fork`ed handle is already invalid
+process opening's streams are seeded from the trace seed, its process id, and how many openings came
+before it, so an owner and its clients, and one process before and after a crash, never share a stream
+(the seeded source restarts a database's stream at every open, which would repeat data keys and nonces
+that a CSPRNG never repeats; simulation-testing.md §6.2, lane 14). The engine keeps no entropy pool across commits. A `fork`ed handle is already invalid
 (locking.md §3). Live VM clones are excluded: a clone resumes with the guest RNG duplicated and
 no engine-side mixing survives it; a host that restores live snapshots reseeds before the first
 write.
@@ -306,7 +308,8 @@ through `read_pages` and unwrapping the selected copy with its credential: a cre
 progress never leaves both copies invalid, so no dedicated message or lock is needed (built so;
 encrypted.md §14). The credential is needed only to
 unwrap a key block; **the DEK alone opens the file**. So a client **promotes to owner with the DEK
-it holds** (page-service.md §8.1), verifying it against the meta slot's tag, and ownership
+it holds** (page-service.md §8.1), verifying it against the meta slot's tag, and reconnects to an
+owner with it too (encrypted.md §14), and ownership
 handoff, yield and the read-only owner's deferral to a writer all work as for a plaintext file; a
 promoted process without the credential leaves a differing key-block pair unrepaired, which §5
 makes safe. Over SSH the credential travels in `hello` on the encrypted stream, never `argv` or

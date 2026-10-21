@@ -1,0 +1,19 @@
+# A page client that unlocked before the owner's credential change loses its connection; at its next
+# begin it re-elects and connects again. It must keep the data key it holds (encrypted.md §14); it
+# unlocked again with its original credential and failed 28P01, in all three cores. Found by the S13
+# encryption-service sweep.
+# format: simulation
+# profile: encryption-service
+# seed: 10
+# page_size: 1024
+# cache_bytes: 8192
+# synchronous: off
+# encrypted: 1
+# processes: service
+# clock: 1700000000000000
+spawn p2
+change_key 1
+open w3 write p2
+fault disconnect nth=1
+commit w3
+open w4 write p2

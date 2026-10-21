@@ -453,7 +453,21 @@ impl Engine {
             Some(codec) => {
                 crate::format::adopt_held_codec(&mut pager, &codec)?;
                 let paging = SharedPaging::with_codec(pager, capacity, Some(codec));
-                Engine::open_shared_paging(paging, &opts.environment)?
+                match Engine::open_shared_paging(Arc::clone(&paging), &opts.environment) {
+                    // A meta the held key cannot authenticate means the owner rekeyed the file
+                    // before it left: 28P04, so the host reopens with the credential
+                    // (spec/fileformat/encrypted.md §14).
+                    Err(e)
+                        if e.state == crate::error::SqlState::DataCorrupted
+                            && crate::format::held_key_stale(&paging) =>
+                    {
+                        return Err(crate::error::EngineError::new(
+                            crate::error::SqlState::StaleKey,
+                            "the database was rekeyed since this handle opened it; reopen it",
+                        ));
+                    }
+                    other => other?,
+                }
             }
             None => {
                 Engine::open_paged(pager, capacity, &opts.environment, opts.credential.as_ref())?

@@ -254,8 +254,10 @@ setting is needed to attach an encrypted database to a plaintext one, or to encr
 
 Encrypted files work with the page service (above) like plaintext ones:
 every process passes its own credential, and a process that joins reads the key block from the owner
-and unlocks it locally. Only the owner can change the credential or rotate the key; a process that
-was connected across a rotation gets `28P04` and must reopen with the new credential.
+and unlocks it locally. Only the owner can change the credential or rotate the key. A credential
+change does not disturb connected processes: each keeps the data key it unlocked, including when it
+reconnects or takes over ownership. A process that was connected across a rotation gets `28P04` and
+must reopen with the new credential.
 
 The `jed` command line takes `--key-file FILE` (32 raw bytes or 64 hex digits),
 `--passphrase-file FILE` or `--passphrase` (a terminal prompt), never a credential on the command

@@ -249,7 +249,13 @@ func (c *sharedCore) reelect(stale *serviceRole) error {
 	if stale.client != nil {
 		pause = stale.client.handoffPauseUntil()
 	}
-	won, err := electService(h.host, h.path, &h.timeoutMs, h.opts.ReadOnly, electOptions{never: h.ownership == OwnershipNever, pauseUntil: pause, reelect: true, env: c.env, opts: h.opts})
+	// A client that unlocked an encrypted database keeps its data key, whichever role it takes next
+	// (encryption.md §8): a credential changed since does not stop it.
+	var held *pageCodec
+	if stale.paging != nil {
+		held = stale.paging.codec()
+	}
+	won, err := electService(h.host, h.path, &h.timeoutMs, h.opts.ReadOnly, electOptions{never: h.ownership == OwnershipNever, pauseUntil: pause, reelect: true, env: c.env, opts: h.opts, held: held})
 	if err != nil {
 		if engine := (*EngineError)(nil); errors.As(err, &engine) && engine.Code() == "55006" {
 			return errNoOwner()

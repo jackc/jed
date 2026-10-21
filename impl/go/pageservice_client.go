@@ -491,8 +491,9 @@ func (s *serviceBlockStore) close() error {
 
 // openPageClient builds an engine over a connected client (README.md §3.2): one begin_read pins and
 // adopts the owner's committed snapshot, then the ordinary loader reads the catalog skeleton through the
-// service. A read-only connection gives a read-only handle.
-func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, error) {
+// service. A read-only connection gives a read-only handle. held is the data key a reconnecting client
+// already holds, nil on a first connection.
+func openPageClient(cl *psClient, opts OpenOptions, env *Environment, held *pageCodec) (*engine, error) {
 	rb, err := cl.beginRead()
 	if err != nil {
 		return nil, err
@@ -511,8 +512,22 @@ func openPageClient(cl *psClient, opts OpenOptions, env *Environment) (*engine, 
 		cacheBytes = defaultCacheBytes
 	}
 	// A client of an encrypted file unlocks with its own credential, from the key-block pages it reads
-	// through the service (spec/fileformat/encrypted.md §14).
-	db, err := loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
+	// through the service; a reconnecting one keeps the data key it holds, as promotion does, so a
+	// credential changed since does not stop it, and a rekey is 28P04 (spec/fileformat/encrypted.md §14).
+	var db *engine
+	if held != nil {
+		if err = adoptHeldCodec(p, held); err == nil {
+			paging := newSharedPaging(p, cacheLeaves(cacheBytes, p.pageSize))
+			if db, err = loadEngineSharedPaging(paging, env); err != nil {
+				var e *EngineError
+				if errors.As(err, &e) && e.Code() == "XX001" && !metaAuthenticates(paging) {
+					err = errStaleKey()
+				}
+			}
+		}
+	} else {
+		db, err = loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -556,6 +571,32 @@ func metaAuthenticates(paging *sharedPaging) bool {
 		return nil
 	})
 	return ok
+}
+
+// heldKeyStale reports whether a held key authenticates neither meta slot of the file under pgr that
+// parses: the promoting client's test that the owner rekeyed the file before it left (encrypted.md
+// §14). False when no slot parses, so damage stays XX001.
+func heldKeyStale(pgr *pager) bool {
+	parsed := false
+	for slot := uint32(0); slot < 2; slot++ {
+		raw, err := pgr.readBlock(slot)
+		if err != nil {
+			continue
+		}
+		m, ok := parseMeta(raw)
+		if !ok {
+			continue
+		}
+		chain, err := pgr.manifestChain(m)
+		if err != nil {
+			continue
+		}
+		parsed = true
+		if pgr.codec.verifyMeta(slot, raw, chain) == nil {
+			return false
+		}
+	}
+	return parsed
 }
 
 // clientRefresh is a page client's read begin (README.md §3.2): one begin_read round trip, then the

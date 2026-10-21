@@ -13,11 +13,25 @@ import { EngineError, engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 // The Node file host registers the file compactor, the attach opener, and the directory barrier the
 // engine reaches through Engine.fileHost (here the simulated filesystem).
-import { type Credential, osKeyEntropy, sealScratch, unlockCodec } from "../crypto.ts";
+import {
+  type Credential,
+  fileSuite,
+  osKeyEntropy,
+  type PageCodec,
+  sealScratch,
+  unlockCodec,
+} from "../crypto.ts";
 import { runSync } from "../execution.ts";
 import { close as closeEngine, createVia, openServiceWith, repairKeyBlockSteps } from "../file.ts";
 import { backupForTesting } from "../backup.ts";
-import { loadEngine, loadEnginePaged, trailingRun, unlockPagerSteps } from "../format.ts";
+import {
+  adoptHeldCodecSteps,
+  heldKeyStaleSteps,
+  loadEnginePaged,
+  trailingRun,
+  unlockPagerSteps,
+} from "../format.ts";
+import { MemoryBlockStore } from "../memoryblockstore.ts";
 import { growthStep, Pager } from "../pager.ts";
 import type { PageClient } from "../pageservice/client.ts";
 import { readFreeListChain } from "../pageservice/delta.ts";
@@ -27,9 +41,17 @@ import { persistImpl } from "../persist.ts";
 import { Environment } from "../environment.ts";
 import { type ClockSource, osRandomSource, type RandomSource, SeededRandom } from "../seam.ts";
 import { attachFile, Database, type Session } from "../shared.ts";
-import { CheckError, checkImage, checkLive as checkLiveDatabase } from "./check.ts";
+import { CheckError, checkImage, checkLive as checkLiveDatabase, pointerKinds } from "./check.ts";
 import { SimDeadlock, SimLockHost, SimLockTable } from "./locks.ts";
-import { LANE_SESSION, MAIN_FILE, SimFS, type SimFault } from "./disk.ts";
+import {
+  LANE_KEY_SEED,
+  LANE_REPLAY_PAGE,
+  LANE_REPLAY_VERSION,
+  LANE_SESSION,
+  MAIN_FILE,
+  SimFS,
+  type SimFault,
+} from "./disk.ts";
 import { SimNet } from "./net.ts";
 import {
   atoi,
@@ -139,13 +161,26 @@ export function parseTrace(text: string): SimTrace {
         st.sid = f.length === 2 ? f[1]! : "main";
         break;
       case "change_key":
-      case "rekey":
-        // S12: a credential change or rekey of main to simulation key 1–3.
-        if (f.length !== 2 || !["1", "2", "3"].includes(f[1]!)) {
-          throw new Error(`line ${n + 1}: ${st.kind} 1|2|3`);
-        }
-        st.sid = f[1]!;
+      case "rekey": {
+        // S12–S13: a credential change or rekey of main (or a file attachment) to simulation key 1–3,
+        // or a rekey that decrypts it.
+        let ok = f.length === 2 || (f.length === 3 && f[2] !== "temp");
+        ok = ok && (["1", "2", "3"].includes(f[1]!) || (f[1] === "plain" && st.kind === "rekey"));
+        if (!ok) throw new Error(`line ${n + 1}: ${st.kind} 1|2|3|plain [<database>]`);
+        st.mode = f[1]!;
+        st.sid = f.length === 3 ? f[2]! : "main";
         break;
+      }
+      case "replay":
+        if (f.length !== 2) throw new Error(`line ${n + 1}: replay <kind>`);
+        st.mode = f[1]!;
+        break;
+      case "restore": {
+        const j = /^[+-]?[0-9]+$/.test(f.slice(1).join("")) ? atoi(f.slice(1).join("")) : 0;
+        if (f.length !== 2 || j < 1) throw new Error(`line ${n + 1}: restore <j>`);
+        st.params.set("j", f[1]!);
+        break;
+      }
       case "corrupt":
         parseParams(st, f.slice(1), n + 1);
         break;
@@ -318,7 +353,8 @@ function isEngineError(e: unknown): e is EngineError {
 // errCode is simCode: an engine error's SQLSTATE, or a "non-engine error" marker the caller turns
 // into a violation.
 function errCode(e: unknown): string {
-  if (isEngineError(e)) return e.code();
+  // A checker's error wraps the engine error behind it (Go's simCode reads through %w).
+  for (let c: unknown = e; c instanceof Error; c = c.cause) if (isEngineError(c)) return c.code();
   return "non-engine error: " + (e instanceof Error ? e.message : String(e));
 }
 
@@ -338,7 +374,8 @@ type SimSession = {
 
 // SimProc is one simulated process: a Database over the shared simulated filesystem, and in a service
 // trace its own lock host (S8).
-type SimProc = { pid: number; db: Database; host: SimLockHost | null };
+// env is the Environment it opened with (newEnv).
+type SimProc = { pid: number; db: Database; host: SimLockHost | null; env: Environment };
 
 // SIM_SERVICE_GRACE_MS is a simulated owner's shutdown grace: its clients' pinned readers live in other
 // processes, which no single step can end, so a closing owner always waits out the grace.
@@ -387,6 +424,12 @@ class SimDB {
   // recovered any version from the floor up.
   ownerLost = false;
 
+  // Encryption at rest (S12–S13): the simulation key the database is encrypted under (SIM_KEYS), or -1
+  // when it is plaintext; and keyChange, a credential change or rekey of this step, which recovery
+  // after it checks the file against.
+  key = -1;
+  keyChange: SimKeyChange | null = null;
+
   constructor(name: string, file: string) {
     this.name = name;
     this.file = file;
@@ -405,6 +448,15 @@ class SimDB {
     return this.history.get(v)?.has(digest) ?? false;
   }
 }
+
+// SimKeyChange is a key step in progress: the key before it and the one it installs. When the file's
+// directory entry was not durable as it began (an earlier compaction's or rekey's rename awaits the
+// next opener's directory barrier), a power loss may bring an older file back under an older key.
+type SimKeyChange = { old: number; next: number; entryPending: boolean };
+
+// SimBackup is a successful backup of main (S13): its file, the version and contents a new process
+// opens there, and the key main had when it was taken.
+type SimBackup = { n: number; file: string; version: bigint; digest: string; key: number };
 
 // The internals of a Database the runner reads: the published roots and each domain's storage owner.
 type CoreView = {
@@ -514,6 +566,16 @@ const SIM_KEYS: Credential[] = [0, 1, 2, 3].map((n) => ({
   key: new Uint8Array(32).fill(0x4a + n),
 }));
 
+// simCredential is simulation key k's credential, or none for -1, plaintext.
+function simCredential(k: number): Credential | undefined {
+  return k < 0 ? undefined : SIM_KEYS[k];
+}
+
+// targetKey parses a key step's target: simulation key 1–3, or -1 for `plain`.
+function targetKey(s: string): number {
+  return s === "plain" ? -1 : atoi(s);
+}
+
 export class SimRunner {
   private tr: SimTrace;
   private seed: bigint;
@@ -524,7 +586,7 @@ export class SimRunner {
   // per-session random streams and the trace clock, which starts at the `clock` header and advances
   // only on `clock` steps.
   private random = new SimRandom();
-  private environment: Environment;
+  private clockSource: ClockSource;
 
   // Handle settings from the header (simulation-testing.md §5, slice S3), applied at every open.
   private workMem: number; // a session's work_mem
@@ -567,13 +629,14 @@ export class SimRunner {
   imagePrefix = ""; // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
   private backups = 0; // backup steps run, naming each destination
 
-  // Encryption at rest (slice S12, spec/fileformat/encrypted.md): main is encrypted under simulation
-  // key `key`, its key entropy seeded by the trace's seed.
+  // Encryption at rest (slices S12–S13, spec/fileformat/encrypted.md): an encrypted trace creates main
+  // and every attachment encrypted, seals every process's scratch files, and gives each process opening
+  // its own seeded key-entropy stream (newEnv). Each database's key is its SimDB's.
   private encrypted: boolean;
-  private key = 0;
-  // A credential change or rekey of this step: [old key, new key]. Recovery after it probes the key
-  // block, which exactly one of them must unlock.
-  private keyChange: [number, number] | null = null;
+  private opens = 0n; // Environments built so far, each a process opening (newEnv)
+  // backupsOK are main's successful backups in order, the ones a restore may copy back (S13).
+  private backupsOK: SimBackup[] = [];
+  private stepIndex = 0; // the step running, for reopenStale's transcript line
 
   constructor(tr: SimTrace) {
     this.tr = tr;
@@ -583,12 +646,8 @@ export class SimRunner {
     this.pageSize = ps;
     this.cacheBytes = atoi(tr.header.get("cache_bytes"));
     this.clock = parseInt64(tr.header.get("clock"));
-    const clock: ClockSource = { nowMicros: () => this.clock };
+    this.clockSource = { nowMicros: () => this.clock };
     this.encrypted = tr.header.get("encrypted") === "1";
-    let env = Environment.builder().randomSource(this.random).clockSource(clock);
-    // Seeded so the cores' images stay byte-identical (encrypted.md §8).
-    if (this.encrypted) env = env.insecureSeededKeyEntropy(this.seed);
-    this.environment = env.build();
     this.workMem = atoi(tr.header.get("work_mem"));
     this.tempBuffers = atoi(tr.header.get("temp_buffers"));
     this.maxQueryMemory = parseInt64(tr.header.get("max_query_memory_bytes"));
@@ -597,17 +656,57 @@ export class SimRunner {
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
     this.fs = new SimFS(this.seed, sector, ps);
+    this.fs.archiving = this.encrypted;
     this.service = tr.header.get("processes") === "service";
   }
 
-  // credential is main's credential: simulation key `key`, or none for a plaintext trace.
-  private credential(): Credential | undefined {
-    return this.encrypted ? SIM_KEYS[this.key] : undefined;
+  // credential is database d's credential: its simulation key's, or none while it is plaintext.
+  private credential(d: SimDB): Credential | undefined {
+    return simCredential(d.key);
   }
 
-  // unlocks reports whether simulation key k unwraps image's key block.
-  private unlocks(image: Uint8Array, k: number): boolean {
+  // newEnv is the Environment of one opening of process pid (or of a create the runner does as a host
+  // would): the shared seeded SQL source and clock, and in an encrypted trace an insecure key-entropy
+  // stream of its own, seeded from lane 14 (§5) by the run's count of openings and pid. The seeded
+  // source starts every database's stream afresh from its seed, so a stream shared by two openings —
+  // an owner and its client, or one process before and after a crash — would draw the same data keys
+  // and nonces, which the CSPRNG it models never does (encryption.md §3).
+  private newEnv(pid: number): Environment {
+    let env = Environment.builder().randomSource(this.random).clockSource(this.clockSource);
+    if (this.encrypted) {
+      // Seeded so the cores' images stay byte-identical (encrypted.md §8).
+      env = env.insecureSeededKeyEntropy(
+        decide(this.seed, LANE_KEY_SEED, this.opens, BigInt(pid), 0n),
+      );
+    }
+    this.opens++;
+    return env.build();
+  }
+
+  // procEnv is the Environment the step's process opened with.
+  private procEnv(): Environment {
+    return this.procs.get(this.cur)!.env;
+  }
+
+  // createKey is the key a database is created under: simulation key 0 in an encrypted trace, else
+  // none.
+  private createKey(): number {
+    return this.encrypted ? 0 : -1;
+  }
+
+  // unlocks reports whether simulation key k (-1: none) opens image: k unwraps its key block, or the
+  // file is plaintext and k is -1.
+  private unlocks(image: Uint8Array | null, k: number): boolean {
     const ps = this.pageSize;
+    if (image === null || image.length < 2 * ps) return false;
+    let suite: number;
+    try {
+      suite = fileSuite(image.subarray(0, ps), image.subarray(ps, 2 * ps));
+    } catch {
+      return false;
+    }
+    if (k < 0 || suite === 0) return k < 0 && suite === 0;
+    if (image.length < 4 * ps) return false;
     try {
       unlockCodec(
         image.subarray(2 * ps, 3 * ps),
@@ -621,63 +720,69 @@ export class SimRunner {
     }
   }
 
-  // settleKey: after a crash that interrupted a credential change or rekey (S12), exactly one of the
-  // old and new keys unlocks main's key block, and the new one when the step had succeeded (its last
-  // barrier ran). The runner continues with whichever unlocks.
-  private settleKey(i: number, image: Uint8Array): boolean {
-    const change = this.keyChange;
-    this.keyChange = null;
-    if (change === null) return this.followKey(i, image);
-    const [old, next] = change;
-    if (image.length < 4 * this.pageSize) {
-      this.fail(i, "encryption: the key block is gone");
-      return false;
-    }
-    const acknowledged = this.key === next;
-    if (old === next) {
-      // A change to the key already in use: it must still unlock.
-      if (!this.unlocks(image, next)) {
-        this.fail(i, `encryption: key ${next} no longer unlocks main`);
-        return false;
-      }
-      this.emit(`{"i":${i},"op":"unlocked","key":${next}}`);
-      return true;
-    }
+  // unlocked records the key recovery opened database d with.
+  private unlocked(i: number, d: SimDB): void {
+    const dbField = d.name !== "main" ? `,"db":${goQuote(d.name)}` : "";
+    this.emit(`{"i":${i},"op":"unlocked"${dbField},"key":${d.key}}`);
+  }
+
+  // settleKey runs after a crash that interrupted a credential change or rekey of d (S12): exactly one
+  // of the old and new keys (-1: plaintext, a conversion) opens d's file, and the new one when the step
+  // had succeeded (its last barrier ran). The runner continues with whichever opens.
+  private settleKey(i: number, d: SimDB, image: Uint8Array | null): boolean {
+    const change = d.keyChange;
+    d.keyChange = null;
+    if (change === null) return this.followKey(i, d, image);
+    const { old, next } = change;
+    const acknowledged = d.key === next;
     const a = this.unlocks(image, old);
     const b = this.unlocks(image, next);
-    if (a && !b && !acknowledged) this.key = old;
-    else if (!a && b) this.key = next;
-    else if (a && !b) {
-      this.fail(i, `durability: the acknowledged change to key ${next} was lost`);
+    if (old === next && b) {
+      // A change to the key already in use (a rotation): it still opens.
+    } else if (old !== next && a && !b && !acknowledged) d.key = old;
+    else if (old !== next && !a && b) d.key = next;
+    else if (change.entryPending && !a && !b) {
+      // An older file came back (its rename was never made durable): whichever key opens it.
+      return this.followKey(i, d, image);
+    } else if (old === next) {
+      this.fail(i, `encryption: key ${next} no longer opens ${d.name}`);
+      return false;
+    } else if (a && !b) {
+      this.fail(i, `durability: the acknowledged change of ${d.name} to key ${next} was lost`);
       return false;
     } else {
       this.fail(
         i,
-        `encryption: key ${old} unlocks: ${a}, key ${next} unlocks: ${b}; want exactly one`,
+        `encryption: key ${old} opens ${d.name}: ${a}, key ${next}: ${b}; want exactly one`,
       );
       return false;
     }
-    this.emit(`{"i":${i},"op":"unlocked","key":${this.key}}`);
+    this.unlocked(i, d);
     return true;
   }
 
-  // followKey: recovery outside a key step. A rekey whose rename was not yet durable in its directory
-  // may come back as the older file under its older key (validated-cow.md §3), so main opens with
-  // whichever simulation key unlocks the recovered key block, the current one first.
-  private followKey(i: number, image: Uint8Array): boolean {
-    if (!this.encrypted || image.length < 4 * this.pageSize) return true;
-    const order = [this.key, ...[0, 1, 2, 3].filter((k) => k !== this.key)];
+  // followKey is recovery outside a key step: a rekey whose rename was not yet durable in its directory
+  // may come back as the older file under its older key (validated-cow.md §3), or plaintext, so d opens
+  // with whichever simulation key opens the recovered file, the current one first.
+  private followKey(i: number, d: SimDB, image: Uint8Array | null): boolean {
+    if (!this.encrypted || image === null) return true;
+    const order = [d.key, ...[-1, 0, 1, 2, 3].filter((k) => k !== d.key)];
     for (const k of order) {
       if (this.unlocks(image, k)) {
-        if (k !== this.key) {
-          this.key = k;
-          this.emit(`{"i":${i},"op":"unlocked","key":${k}}`);
+        if (k !== d.key) {
+          d.key = k;
+          this.unlocked(i, d);
         }
         return true;
       }
     }
-    this.fail(i, "encryption: no simulation key unlocks main");
+    this.fail(i, `encryption: no simulation key opens ${d.name}`);
     return false;
+  }
+
+  // clearKeyChanges forgets every database's key step once its step is over.
+  private clearKeyChanges(): void {
+    for (const d of this.dbs.values()) d.keyChange = null;
   }
 
   private fail(step: number, msg: string): void {
@@ -734,7 +839,12 @@ export class SimRunner {
   // otherwise.
   private attach(name: string): void {
     const locking = this.service ? "auto" : "none";
-    this.database.attach(name, attachFile(this.dbs.get(name)!.file, { locking }), false);
+    const d = this.dbs.get(name)!;
+    this.database.attach(
+      name,
+      attachFile(d.file, { locking, credential: this.credential(d) }),
+      false,
+    );
   }
 
   // openProc starts process pid. A service trace elects it through the simulated lock host and
@@ -742,6 +852,7 @@ export class SimRunner {
   private openProc(pid: number): void {
     let host: SimLockHost | null = null;
     let db: Database;
+    const env = this.newEnv(pid);
     if (this.service) {
       if (this.locks === null) {
         this.locks = new SimLockTable({
@@ -752,9 +863,9 @@ export class SimRunner {
         });
       }
       host = new SimLockHost(this.locks, pid, this.net);
-      db = this.openServiceProc(pid, host);
-    } else db = this.openDatabase();
-    this.procs.set(pid, { pid, db, host });
+      db = this.openServiceProc(pid, host, env);
+    } else db = this.openDatabase(env);
+    this.procs.set(pid, { pid, db, host, env });
     this.cur = pid;
     this.db = db;
     if (this.service) {
@@ -782,7 +893,7 @@ export class SimRunner {
   // lock table and network, the simulated filesystem and spill sink, and no background re-election, so
   // a client re-elects at its next transaction begin, in trace order. Every owner limit that would
   // start a timer is off.
-  private openServiceProc(pid: number, host: SimLockHost): Database {
+  private openServiceProc(pid: number, host: SimLockHost, env: Environment): Database {
     const handoff = new ServiceHandoff(
       MAIN_FILE,
       {
@@ -791,12 +902,19 @@ export class SimRunner {
         shutdownGraceMs: SIM_SERVICE_GRACE_MS,
         // The handle's setting, which its file attachments follow whatever role it holds.
         synchronous: this.relaxed ? "off" : "on",
+        // Every process seals its scratch files, so encrypting a plaintext database is allowed (S13).
+        scratchEncryption: this.encrypted ? "on" : "auto",
       },
       false,
       SIM_FILE_LOCK_TIMEOUT_MS,
-      { cacheBytes: this.cacheBytes > 0 ? this.cacheBytes : undefined },
-      this.environment,
-      () => this.openEngine(this.fs.openStore(MAIN_FILE, false, false)),
+      {
+        cacheBytes: this.cacheBytes > 0 ? this.cacheBytes : undefined,
+        credential: this.credential(this.main()),
+        scratchEncryption: this.encrypted ? "on" : "auto",
+      },
+      env,
+      // A promoting client opens the file with the data key it holds (encrypted.md §14).
+      (held) => this.openEngine(this.fs.openStore(MAIN_FILE, false, false), env, held),
       {
         lock: host,
         files: this.fs,
@@ -849,34 +967,55 @@ export class SimRunner {
     return pids;
   }
 
-  private openDatabase(): Database {
+  private openDatabase(env: Environment): Database {
     const main = this.fs.main();
     if (main === undefined) throw engineError("io_error", "the database file is gone");
-    const db = Database.fromEngine(this.openEngine(main), null);
+    const db = Database.fromEngine(this.openEngine(main, env, null), null);
     if (this.maxStorageBytes > 0n) db.setMaxStorageBytes("main", this.maxStorageBytes);
     return db;
   }
 
   // openEngine opens the main database's engine over store through the ordinary demand-paged loader,
   // with the simulated filesystem as its file host and spill sink.
-  private openEngine(store: BlockStore): Engine {
+  // held is the data key a promoting page client holds (encrypted.md §14): it opens the file in place
+  // of the credential, and a differing key-block pair is left unrepaired.
+  private openEngine(store: BlockStore, env: Environment, held: PageCodec | null): Engine {
     const pager = Pager.fromStore(store);
     const cache = this.cacheBytes > 0 ? this.cacheBytes : DEFAULT_CACHE_BYTES;
-    const codec = runSync(unlockPagerSteps(pager, this.credential(), this.environment));
-    const e = loadEnginePaged(
-      new SharedPaging(pager, cacheLeaves(cache, pager.pageSize), codec),
-      this.environment,
-    );
+    let codec: PageCodec | null;
+    if (held !== null) {
+      runSync(adoptHeldCodecSteps(pager, held));
+      codec = held;
+    } else codec = runSync(unlockPagerSteps(pager, this.credential(this.main()), env));
+    let e: Engine;
+    try {
+      e = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cache, pager.pageSize), codec), env);
+    } catch (err) {
+      // A meta the held key cannot authenticate: the owner rekeyed the file before it left (28P04,
+      // spec/fileformat/encrypted.md §14), as openVia reports it.
+      if (
+        held !== null &&
+        isEngineError(err) &&
+        err.code() === "XX001" &&
+        runSync(heldKeyStaleSteps(pager, held))
+      ) {
+        throw engineError(
+          "stale_key",
+          "the database was rekeyed since this handle opened it; reopen it",
+        );
+      }
+      throw err;
+    }
     e.path = MAIN_FILE; // marks the engine durable; the simulated filesystem is its only storage
     // A writable open finishes a credential change a crash interrupted (encrypted.md §5).
-    runSync(repairKeyBlockSteps(e));
+    if (held === null) runSync(repairKeyBlockSteps(e));
     // Create, compaction, and attachments go through the simulated filesystem.
     e.fileHost = this.fs;
     e.persistHook = persistImpl;
     e.relaxed = this.relaxed;
-    // Spill and temp-table spill scratch files, whose operations can fail; sealed for an encrypted
-    // database (encrypted.md §11).
-    e.spillSink = sealScratch(this.fs.spillSink(), this.encrypted, this.environment);
+    // Spill and temp-table spill scratch files, whose operations can fail; sealed in an encrypted trace
+    // (encrypted.md §11), whatever main is now, so encrypting a plaintext database is allowed (S13).
+    e.spillSink = sealScratch(this.fs.spillSink(), this.encrypted, env);
     return e;
   }
 
@@ -888,21 +1027,20 @@ export class SimRunner {
     }
     // Create the database through the simulated filesystem, as the host's create does: a temp file,
     // its sync, the rename, and the directory barrier (S4).
+    const m = new SimDB("main", MAIN_FILE);
+    m.key = this.createKey();
     try {
       closeEngine(
-        createVia(
-          this.fs,
-          MAIN_FILE,
-          this.encrypted
-            ? { pageSize: this.pageSize, credential: SIM_KEYS[0], environment: this.environment }
-            : { pageSize: this.pageSize },
-        ),
+        createVia(this.fs, MAIN_FILE, {
+          pageSize: this.pageSize,
+          credential: this.credential(m),
+          environment: this.newEnv(0),
+        }),
       );
     } catch (e) {
       this.violation = "create: " + errText(e);
       return;
     }
-    const m = new SimDB("main", MAIN_FILE);
     this.dbs.set("main", m);
     try {
       this.open();
@@ -944,6 +1082,7 @@ export class SimRunner {
 
   private stepInner(i: number): boolean {
     const st = this.tr.steps[i]!;
+    this.stepIndex = i;
     switch (st.kind) {
       case "fault": {
         let f: SimFault;
@@ -1013,6 +1152,12 @@ export class SimRunner {
       case "corrupt":
         this.fs.beginStep(i, null);
         return this.stepCorrupt(i, st);
+      case "replay":
+        this.fs.beginStep(i, null);
+        return this.stepReplay(i, st.mode);
+      case "restore":
+        this.fs.beginStep(i, null);
+        return this.stepRestore(i, intParam(st, "j"));
     }
 
     // A step that needs a process when none is running (the last one exited) restarts p0 first.
@@ -1073,13 +1218,13 @@ export class SimRunner {
         this.stepCheck(i);
         break;
       case "compact":
-        this.stepCompact(i, st.sid, null);
+        this.stepCompact(i, st.sid, false, 0);
         break;
       case "rekey":
-        this.stepCompact(i, "main", Number(st.sid));
+        this.stepRekey(i, st.sid, targetKey(st.mode));
         break;
       case "change_key":
-        this.stepChangeKey(i, Number(st.sid));
+        this.stepChangeKey(i, st.sid, targetKey(st.mode));
         break;
       case "backup":
         this.stepBackup(i, st);
@@ -1130,10 +1275,11 @@ export class SimRunner {
     // Checked against the floor this step leaves (a flush in the step moved it).
     for (const d of this.order()) if (!this.checkTruncated(i, d)) return false;
     if (armed === null) {
-      this.keyChange = null;
+      this.clearKeyChanges();
       return true;
     }
     if (armed.kind === "disconnect") {
+      this.clearKeyChanges();
       // A lost connection ends no process: its client re-elects at its next begin.
       const how = this.net.disconnected ? "frame" : "end";
       this.emit(`{"i":${i},"op":"disconnected","fired":${goQuote(how)}}`);
@@ -1157,6 +1303,12 @@ export class SimRunner {
         this.fs.processDeath();
         for (const pid of dead) {
           this.emit(`{"i":${i},"op":"killed","pid":${pid},"fired":${goQuote(fired)}}`);
+        }
+        // The survivors run on: a key step the dead owner interrupted is settled on the kernel's view
+        // of each file, which the next opener reads.
+        for (const d of this.order()) {
+          const image = this.image(d);
+          if (d.keyChange !== null && image !== null && !this.settleKey(i, d, image)) return false;
         }
         return true;
       }
@@ -1188,19 +1340,28 @@ export class SimRunner {
       this.fail(i, `session ${st.sid} already open`);
       return;
     }
-    let s: Session;
-    if (st.mode === "read") {
-      s = this.database.readSession();
-    } else if (st.mode === "write") {
+    if (st.mode === "write") {
       for (const [sid, ss] of this.sessions) {
         if (ss.write) {
           this.fail(i, `open ${st.sid} write while ${sid} holds the writer gate`);
           return;
         }
       }
-      s = this.database.writeSession();
-    } else {
+    } else if (st.mode !== "read") {
       this.fail(i, `unknown session mode ${goQuote(st.mode)}`);
+      return;
+    }
+    let s: Session;
+    try {
+      s = st.mode === "read" ? this.database.readSession() : this.database.writeSession();
+    } catch (e) {
+      // The TS session begins at open, where Go's begins at its first read: a stale data key (S13)
+      // surfaces here, and the host reopens the process as after Go's first read.
+      if (!isEngineError(e)) throw e;
+      this.digestErr = e;
+      if (!this.staleKeyError()) throw e;
+      this.emit(`{"i":${i},"op":"open","sid":${goQuote(st.sid)},"error":${goQuote(e.code())}}`);
+      this.reopenStale();
       return;
     }
     const random = new SeededRandom(decide(this.seed, LANE_SESSION, BigInt(i), 0n, 0n));
@@ -1208,14 +1369,31 @@ export class SimRunner {
     if (this.tempBuffers > 0) s.setTempBuffers(this.tempBuffers);
     if (this.maxQueryMemory > 0n) s.setMaxQueryMemoryBytes(this.maxQueryMemory);
     if (this.service) {
+      // A session that finds its process's data key stale fails to open, and the host reopens the
+      // process (reopenStale).
+      const stale = (dg: string | null): boolean => {
+        if (dg !== null || !this.staleKeyError()) return false;
+        if (st.mode === "write") {
+          try {
+            s.rollback();
+          } catch (e) {
+            if (!isEngineError(e)) throw e;
+          }
+        } else closeQuietly(s);
+        this.emit(
+          `{"i":${i},"op":"open","sid":${goQuote(st.sid)},"error":${goQuote(errCode(this.digestErr))}}`,
+        );
+        this.reopenStale();
+        return true;
+      };
       const d = this.digest(s, this.main());
-      if (!this.observe(i, "session " + st.sid, s.version, d)) return;
+      if (stale(d) || !this.observe(i, "session " + st.sid, s.version, d)) return;
       for (const name of this.attachedNames()) {
         const a = this.dbs.get(name)!;
         const v = sessionVersionOf(s, name);
         if (v === 0n) continue;
         const dg = this.digest(s, a);
-        if (!this.observeDB(i, a, "session " + st.sid, v, dg)) return;
+        if (stale(dg) || !this.observeDB(i, a, "session " + st.sid, v, dg)) return;
       }
     }
     // A session pins every database's committed root when it opens.
@@ -1337,14 +1515,8 @@ export class SimRunner {
 
   // committedView is the version and digest of database d a fresh read session sees.
   private committedView(d: SimDB): { v: bigint; dg: string | null } {
-    const rs = this.readSession();
-    if (rs === null) return { v: this.dbVersion(d), dg: null };
-    try {
-      const dg = this.digest(rs, d);
-      return { v: this.dbVersion(d), dg };
-    } finally {
-      rs.close();
-    }
+    const dg = this.committedDigest(d);
+    return { v: this.dbVersion(d), dg };
   }
 
   // readSession opens a fresh read session, or records why it could not and returns null: the TS
@@ -1362,6 +1534,12 @@ export class SimRunner {
   }
 
   private committedDigest(d: SimDB): string | null {
+    const dg = this.committedDigestOnce(d);
+    if (dg === null && this.reopenStale()) return this.committedDigestOnce(d);
+    return dg;
+  }
+
+  private committedDigestOnce(d: SimDB): string | null {
     const rs = this.readSession();
     if (rs === null) return null;
     try {
@@ -1369,6 +1547,40 @@ export class SimRunner {
     } finally {
       rs.close();
     }
+  }
+
+  // staleKeyError reports whether the digest that just failed found its process's data key stale: in
+  // a service trace of an encrypted database a page client of a database rekeyed, decrypted, or
+  // encrypted since it opened is told to reopen (28P04, or 28P02 for a plaintext client —
+  // encrypted.md §14).
+  private staleKeyError(): boolean {
+    if (!this.service || !this.encrypted || this.digestErr === null) return false;
+    const code = errCode(this.digestErr);
+    return code === "28P04" || code === "28P02";
+  }
+
+  // reopenStale restarts the step's process when the digest that just failed found its data key stale
+  // (S13), as the host does, with the database's current key. Its sessions end. It reports whether it
+  // did, so the caller reads again.
+  private reopenStale(): boolean {
+    if (!this.staleKeyError()) return false;
+    const pid = this.cur;
+    try {
+      this.closeProc(pid);
+    } catch (e) {
+      if (!isEngineError(e)) throw e;
+      this.fail(this.stepIndex, `reopen p${pid} after a stale key: ${errText(e)}`);
+      return false;
+    }
+    try {
+      this.openProc(pid);
+    } catch (e) {
+      if (e instanceof SimDeadlock || !isEngineError(e)) throw e;
+      this.fail(this.stepIndex, `reopen p${pid} after a stale key: ${errText(e)}`);
+      return false;
+    }
+    this.emit(`{"i":${this.stepIndex},"op":"reopened","pid":${pid}}`);
+    return true;
   }
 
   // quiet reports whether the commit being checked ran with nothing that may hold reclamation back: no
@@ -1817,8 +2029,18 @@ export class SimRunner {
   // same digest.
   // rekey (S12) is compaction under simulation key rekey's new data key: the same version and
   // contents rules.
-  private stepCompact(i: number, name: string, rekey: number | null): void {
-    const op = rekey !== null ? "rekey" : "compact";
+  // stepRekey is `rekey <n>|plain [<db>]` (S12–S13): compaction under a new data key for simulation
+  // key target, which encrypts a plaintext database, or with -1 a decryption.
+  private stepRekey(i: number, name: string, target: number): void {
+    if (!this.encrypted) {
+      this.emit(`{"i":${i},"op":"rekey","skip":true}`);
+      return;
+    }
+    this.stepCompact(i, name, true, target);
+  }
+
+  private stepCompact(i: number, name: string, rekey: boolean, target: number): void {
+    const op = rekey ? "rekey" : "compact";
     const d = this.dbs.get(name);
     if (d === undefined || this.dbVersion(d) === 0n) {
       this.emit(`{"i":${i},"op":"${op}","db":${goQuote(name)},"skip":true}`);
@@ -1829,10 +2051,10 @@ export class SimRunner {
     if (base + 1n > d.maxAttempted) d.maxAttempted = base + 1n;
     let err: unknown = null;
     try {
-      if (rekey !== null) {
-        this.keyChange = [this.key, rekey];
-        this.database.rekey(name, SIM_KEYS[rekey]!);
-        this.key = rekey;
+      if (rekey) {
+        d.keyChange = { old: d.key, next: target, entryPending: !this.fs.entryDurable(d.file) };
+        this.database.rekey(name, simCredential(target) ?? null);
+        d.key = target;
       } else {
         this.database.compact(name);
       }
@@ -1849,7 +2071,8 @@ export class SimRunner {
       }
       this.emit(`{"i":${i},"op":"${op}"${dbField},"error":${goQuote(code)}}`);
       if (code === "XX001") this.fail(i, `corruption: ${op} reported XX001: ` + errText(err));
-      else if (now !== base)
+      else if (now > base || (now !== base && !this.service))
+        // (A page client's view may lag the owner's until its next begin.)
         this.fail(i, `a failed ${op} published version ${now} of ${name} (was ${base})`);
       return;
     }
@@ -1910,9 +2133,24 @@ export class SimRunner {
     }
     let copy: Database;
     try {
-      copy = Database.fromEngine(loadEngine(image.slice(), this.environment), null);
+      // The copy opens with the database's credential at the time of the backup (encrypted.md §13).
+      const env = this.procEnv();
+      const pager = Pager.fromStore(new MemoryBlockStore(image.slice()));
+      const codec = runSync(unlockPagerSteps(pager, this.credential(d), env));
+      copy = Database.fromEngine(
+        loadEnginePaged(
+          new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec),
+          env,
+        ),
+        null,
+      );
     } catch (e) {
-      this.fail(i, "the backup does not open: " + errText(e));
+      let opens = -2;
+      for (let k = -1; k < 4; k++) if (this.unlocks(image, k)) opens = k;
+      this.fail(
+        i,
+        `the backup does not open with key ${d.key}: ${errText(e)} (key ${opens} opens it)`,
+      );
       return;
     }
     let v: bigint;
@@ -1952,11 +2190,12 @@ export class SimRunner {
     }
     let counts: [number, number, number];
     try {
-      counts = checkImage(image, v, this.credential());
+      counts = checkImage(image, v, this.credential(d));
     } catch (e) {
       this.fail(i, "backup integrity: " + errText(e));
       return;
     }
+    this.backupsOK.push({ n: this.backups, file: dest, version: v, digest: dg, key: d.key });
     const [live, pages, free] = counts;
     this.emit(
       `{"i":${i},"op":"backup","form":${goQuote(st.mode)},"version":${v},"digest":${goQuote(dg)},` +
@@ -2000,8 +2239,15 @@ export class SimRunner {
       d.lastDigest = emptyDigest(d);
       d.floor = 0n;
       d.maxAttempted = 1n;
+      d.key = this.createKey();
       try {
-        closeEngine(createVia(this.fs, d.file, { pageSize: this.pageSize }));
+        closeEngine(
+          createVia(this.fs, d.file, {
+            pageSize: this.pageSize,
+            credential: this.credential(d),
+            environment: this.newEnv(this.cur),
+          }),
+        );
       } catch (e) {
         this.attachFailed(i, name, e);
         return;
@@ -2098,7 +2344,7 @@ export class SimRunner {
       const image = this.image(d);
       let counts: [number, number, number];
       try {
-        counts = checkImage(image ?? new Uint8Array(), d.version, this.credential());
+        counts = checkImage(image ?? new Uint8Array(), d.version, this.credential(d));
       } catch (e) {
         this.fail(i, `integrity of ${d.name}: ` + errText(e));
         return;
@@ -2231,30 +2477,35 @@ export class SimRunner {
     return true;
   }
 
-  // stepChangeKey is `change_key <n>` (S12, encrypted.md §5): main's credential changes to simulation
-  // key n. Only the key block is written, so no version or content moves.
-  private stepChangeKey(i: number, n: number): void {
-    if (!this.encrypted) {
-      this.emit(`{"i":${i},"op":"change_key","skip":true}`);
+  // stepChangeKey is `change_key <n> [<db>]` (S12–S13, encrypted.md §5): the credential of main or a
+  // file attachment changes to simulation key n. Only the key block is written, so no version or
+  // content moves. A plaintext database refuses it (28P03).
+  private stepChangeKey(i: number, name: string, n: number): void {
+    const d = this.dbs.get(name);
+    if (!this.encrypted || d === undefined || this.dbVersion(d) === 0n) {
+      this.emit(`{"i":${i},"op":"change_key","db":${goQuote(name)},"skip":true}`);
       return;
     }
-    const d = this.dbs.get("main")!;
+    const dbField = name !== "main" ? `,"db":${goQuote(name)}` : "";
     const base = this.dbVersion(d);
-    this.keyChange = [this.key, n];
+    d.keyChange = { old: d.key, next: n, entryPending: !this.fs.entryDurable(d.file) };
     try {
-      this.database.changeCredential("main", SIM_KEYS[n]!);
-      this.key = n;
-      this.emit(`{"i":${i},"op":"change_key","key":${n}}`);
+      this.database.changeCredential(name, SIM_KEYS[n]!);
+      d.key = n;
+      this.emit(`{"i":${i},"op":"change_key"${dbField},"key":${n}}`);
     } catch (e) {
+      if (e instanceof SimDeadlock) throw e;
       const code = errCode(e);
       if (code.startsWith("non-engine")) {
         this.fail(i, code);
         return;
       }
-      this.emit(`{"i":${i},"op":"change_key","error":${goQuote(code)}}`);
+      this.emit(`{"i":${i},"op":"change_key"${dbField},"error":${goQuote(code)}}`);
       if (code === "XX001") this.fail(i, "corruption: change_key reported XX001: " + errText(e));
     }
-    if (this.dbVersion(d) !== base) this.fail(i, "a credential change published a version");
+    if (this.dbVersion(d) !== base) {
+      this.fail(i, `a credential change published a version of ${name}`);
+    }
   }
 
   // recover abandons the crashed process — its sessions and Database — and opens the disk as a new
@@ -2284,9 +2535,11 @@ export class SimRunner {
         writeFileSync(`${this.imagePrefix}.step${i}${suffix}.img`, image ?? new Uint8Array());
       }
     }
-    if (!this.settleKey(i, images.get("main") ?? new Uint8Array())) {
-      this.crashImage = images.get("main") ?? null;
-      return false;
+    for (const d of this.order()) {
+      if (!this.settleKey(i, d, images.get(d.name) ?? null)) {
+        this.crashImage = images.get(d.name) ?? null;
+        return false;
+      }
     }
     try {
       this.open();
@@ -2307,7 +2560,7 @@ export class SimRunner {
       }
       let counts: [number, number, number];
       try {
-        counts = checkImage(image ?? new Uint8Array(), v, this.credential());
+        counts = checkImage(image ?? new Uint8Array(), v, this.credential(d));
       } catch (e) {
         this.crashImage = image;
         this.fail(i, `recovery integrity of ${d.name}: ` + errText(e));
@@ -2428,6 +2681,231 @@ export class SimRunner {
     return true;
   }
 
+  // stepReplay is `replay <kind>` (simulation-testing.md §8.3 *Replays*, S13): every process ends
+  // cleanly; a page of main that a bound pointer of kind names gets back an older durable version of
+  // itself (§6.1's archive); a new process opens main and reads every row, and the image checker reads
+  // every other reachable page. A page the selected generation's manifest depends on may make recovery
+  // fall back to the generation in the other meta slot; any other replay must surface as XX001. Then
+  // the page is put back and main must reopen exactly as it was.
+  private stepReplay(i: number, kind: string): boolean {
+    for (const pid of this.livePids()) {
+      try {
+        this.closeProc(pid);
+      } catch (e) {
+        if (!isEngineError(e)) throw e;
+        this.fail(i, "close: " + errText(e));
+        return false;
+      }
+    }
+    this.closeFlushed();
+    this.fs.processDeath();
+    const m = this.main();
+    const file = this.fs.main();
+    const reopen = (): boolean => {
+      try {
+        this.open();
+      } catch (e) {
+        this.fail(i, "replay: reopen failed: " + errText(e));
+        return false;
+      }
+      const v = versionOf(this.database);
+      if (v !== m.version) {
+        this.fail(i, `replay: after the repair version ${v}, want ${m.version}`);
+        return false;
+      }
+      const dg = this.committedDigest(m);
+      if (dg === null || dg !== m.lastDigest) {
+        this.fail(i, "replay: after the repair the contents differ");
+        return false;
+      }
+      for (const d of this.order()) this.observeGrowth(d);
+      return true;
+    };
+    if (m.key < 0 || file === undefined) {
+      this.emit(`{"i":${i},"op":"replay","kind":${goQuote(kind)},"skip":true}`);
+      return reopen(); // a plaintext file binds no pointer
+    }
+    const image = this.image(m)!;
+    let classified: { kinds: Map<string, number[]>; deps: Set<number> };
+    try {
+      classified = pointerKinds(image, this.credential(m));
+    } catch (e) {
+      this.fail(i, `replay: classifying the pages of version ${m.version}: ${errText(e)}`);
+      return false;
+    }
+    const cands: { page: number; versions: Uint8Array[] }[] = [];
+    for (const pg of classified.kinds.get(kind) ?? []) {
+      const versions = file.replayVersions(pg);
+      if (versions.length > 0) cands.push({ page: pg, versions });
+    }
+    if (cands.length === 0) {
+      this.emit(`{"i":${i},"op":"replay","kind":${goQuote(kind)},"skip":true}`);
+      return reopen();
+    }
+    const step = BigInt(i);
+    const c =
+      cands[Number(decide(this.seed, LANE_REPLAY_PAGE, step, 0n, 0n) % BigInt(cands.length))]!;
+    const older =
+      c.versions[
+        Number(decide(this.seed, LANE_REPLAY_VERSION, step, 0n, 0n) % BigInt(c.versions.length))
+      ]!;
+    // The generation in the other meta slot, the one a fallback recovers.
+    let other = 0n;
+    const ps = this.pageSize;
+    for (let slot = 0; slot < 2; slot++) {
+      const mt = parseCommitMeta(image.subarray(slot * ps, (slot + 1) * ps), ps, 0xffff_ffff);
+      if (mt !== null && mt.txid < m.version && mt.txid > other) other = mt.txid;
+    }
+    const isDep = classified.deps.has(c.page);
+    const flip = file.replace(c.page, older);
+    const what = `replay of ${kind} page ${c.page}`;
+    let outcome = "";
+    const detected = (e: unknown): boolean => {
+      const code = errCode(e);
+      if (code !== "XX001") {
+        this.fail(i, `${what}: ${code}, not XX001: ${errText(e)}`);
+        return false;
+      }
+      outcome = "XX001";
+      return true;
+    };
+    let got = 0n;
+    let openErr: unknown = null;
+    try {
+      this.openProc(0);
+    } catch (e) {
+      if (e instanceof SimDeadlock) throw e;
+      openErr = e;
+    }
+    if (openErr !== null) {
+      if (!detected(openErr)) return false;
+    } else {
+      got = versionOf(this.database);
+      let dg: string | null;
+      try {
+        dg = this.committedDigest(m);
+      } catch (e) {
+        this.digestErr = e;
+        dg = null;
+      }
+      this.dropProc(0);
+      if (dg === null) {
+        if (!detected(this.digestErr)) return false;
+      } else if (got === m.version && dg === m.lastDigest && !isDep) {
+        // The rows are right, so the replayed page was not on their path: the image checker reads
+        // every other reachable page and must find it. (A page the manifest depends on must have
+        // failed the manifest's digest instead.)
+        let checkErr: unknown = null;
+        try {
+          checkImage(this.image(m)!, got, this.credential(m));
+        } catch (e) {
+          checkErr = e;
+        }
+        if (checkErr === null) {
+          this.fail(i, `${what} went undetected`);
+          return false;
+        }
+        if (!detected(checkErr)) return false;
+      } else if (got < m.version && got === other && isDep && m.inHistory(got, dg)) {
+        // The manifest's digest of the page fails, so recovery falls back (validated-cow.md §1) to an
+        // intact older generation.
+        try {
+          checkImage(this.image(m)!, got, this.credential(m));
+        } catch (e) {
+          this.fail(
+            i,
+            `${what}: the fallback generation ${got} fails the image checker: ${errText(e)}`,
+          );
+          return false;
+        }
+        outcome = "fallback";
+      } else {
+        this.fail(
+          i,
+          `${what}: version ${got} read back with contents (digest ${dg}) the replay must not ` +
+            `produce (manifest dependency: ${isDep}, other slot ${other})`,
+        );
+        return false;
+      }
+    }
+    this.fs.processDeath();
+    file.repair([flip]);
+    if (!reopen()) return false;
+    if (outcome === "fallback") {
+      this.emit(
+        `{"i":${i},"op":"replay","kind":${goQuote(kind)},"page":${c.page},"outcome":"fallback","version":${got}}`,
+      );
+    } else {
+      this.emit(
+        `{"i":${i},"op":"replay","kind":${goQuote(kind)},"page":${c.page},"outcome":"XX001"}`,
+      );
+    }
+    return true;
+  }
+
+  // stepRestore is `restore <j>` (§8.3 *Restores*, S13): main's j-th newest successful backup (the
+  // oldest if there are fewer) is copied over it as a host would, with every process ended cleanly.
+  // Main is then that backup's generation, under the key it had then; the history above it is
+  // forgotten, so every later commit diverges from the one the backup was taken in.
+  private stepRestore(i: number, j: number): boolean {
+    for (const pid of this.livePids()) {
+      try {
+        this.closeProc(pid);
+      } catch (e) {
+        if (!isEngineError(e)) throw e;
+        this.fail(i, "close: " + errText(e));
+        return false;
+      }
+    }
+    this.closeFlushed();
+    this.fs.processDeath();
+    const m = this.main();
+    const k = Math.max(this.backupsOK.length - j, 0);
+    if (this.backupsOK.length === 0 || !this.fs.files.has(this.backupsOK[k]!.file)) {
+      // Nothing to restore: the processes still end, as the generator's model expects.
+      try {
+        this.open();
+      } catch (e) {
+        this.fail(i, "restore: reopen failed: " + errText(e));
+        return false;
+      }
+      for (const d of this.order()) this.observeGrowth(d);
+      this.emit(`{"i":${i},"op":"restore","skip":true}`);
+      return true;
+    }
+    const b = this.backupsOK[k]!;
+    this.fs.restore(b.file, m.file);
+    for (const v of [...m.history.keys()]) if (v >= b.version) m.history.delete(v);
+    m.addHistory(b.version, b.digest);
+    m.version = b.version;
+    m.lastDigest = b.digest;
+    m.floor = b.version;
+    m.maxAttempted = b.version;
+    m.key = b.key;
+    m.keyChange = null;
+    m.ownerLost = false;
+    m.shrinkDue = false;
+    try {
+      this.open();
+    } catch (e) {
+      this.fail(i, "restore: open failed: " + errText(e));
+      return false;
+    }
+    const v = versionOf(this.database);
+    const dg = this.committedDigest(m);
+    if (dg === null || v !== b.version || dg !== b.digest) {
+      this.fail(
+        i,
+        `restore: main opened at version ${v} (digest ${dg ?? ""}), want the backup's ${b.version} ` +
+          `(digest ${b.digest})`,
+      );
+      return false;
+    }
+    for (const d of this.order()) this.observeGrowth(d);
+    this.emit(`{"i":${i},"op":"restore","backup":${b.n},"version":${v},"digest":${goQuote(dg)}}`);
+    return true;
+  }
+
   // livePids lists the running processes in order.
   private livePids(): number[] {
     return [...this.procs.keys()].sort((a, b) => a - b);
@@ -2497,8 +2975,9 @@ export class SimRunner {
   // observeDB is observe for database m: under the page service every attachment is shared too.
   private observeDB(i: number, m: SimDB, who: string, v: bigint, d: string | null): boolean {
     const what = m.name === "main" ? "" : " of " + m.name;
-    if (d === null) this.fail(i, `${who}: version ${v}${what} is unreadable`);
-    else if (v < m.version && (!m.ownerLost || v < m.floor)) {
+    if (d === null) {
+      this.fail(i, `${who}: version ${v}${what} is unreadable: ${errText(this.digestErr)}`);
+    } else if (v < m.version && (!m.ownerLost || v < m.floor)) {
       this.fail(i, `${who} sees version ${v}${what} after version ${m.version} was published`);
     } else if (v > m.maxAttempted) {
       this.fail(
