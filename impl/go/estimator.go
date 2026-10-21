@@ -673,6 +673,12 @@ func estimatorComparisonsContradict(a, b estimatorComparison) bool {
 }
 
 func estimatorBoundsContradict(aOp binaryOp, aLiteral *rExpr, bOp binaryOp, bLiteral *rExpr) bool {
+	// A runtime source (a sibling/outer column) cannot participate in a plan-time
+	// contradiction. Check both shapes before reading either parameter value: an
+	// unnecessary read would classify the whole prepared query as sensitive.
+	if !estimatorLiteral(aLiteral) || !estimatorLiteral(bLiteral) {
+		return false
+	}
 	aLiteral, bLiteral = estimatorValue(aLiteral), estimatorValue(bLiteral)
 	if aLiteral == nil || bLiteral == nil {
 		return false

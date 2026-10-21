@@ -902,3 +902,22 @@ run = "cargo build --offline --release --bin process_actor --manifest-path impl/
 [tasks."ruby-native:bounded"]
 description = "Run one opt-in experimental Ruby command with enforced process-group limits"
 run = "ruby impl/ruby-native/tools/run_bounded.rb"
+
+[tasks."bench:prepared_join_checks"]
+description = "Prepared JOIN cache invariant checks"
+run = [
+  "cd impl/go && go test -race -run 'Test(CustomPlan|PlanCache|PreparedJoin|RuntimeBound)' -v",
+  "node --test impl/ts/tests/prepared_join.test.ts impl/ts/tests/custom_plans.test.ts impl/ts/tests/plan_cache.test.ts",
+]
+
+[tasks."bench:prepared_join_diagnostics"]
+description = "Untimed TS prepared JOIN cache and allocation diagnostics"
+run = 'node "${JOIN_DIAGNOSTIC_SOURCE:-bench/prepared-join/diagnose.ts}"'
+
+[tasks."bench:prepared_join_counters"]
+description = "Untimed Go prepared JOIN counters and statement coverage"
+run = "mkdir -p /tmp/jed-prepared-join && cd impl/go && JOIN_COUNTERS=1 go test -run '^TestPreparedJoinCounters$' -covermode=count -coverprofile=/tmp/jed-prepared-join/coverage.out -v"
+
+[tasks."bench:prepared_join_controls"]
+description = "Generate prepared JOIN control plans outside the repository"
+run = "ruby bench/prepared-join/control-plans.rb"

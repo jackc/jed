@@ -29359,6 +29359,9 @@ function estimatorBoundsContradict(
   bOp: EstimatorComparison["op"],
   bLiteralExpr: RExpr,
 ): boolean {
+  // A runtime source cannot participate in a plan-time contradiction. Check both
+  // shapes first so an unnecessary parameter read does not make the query sensitive.
+  if (!estimatorLiteral(aLiteralExpr) || !estimatorLiteral(bLiteralExpr)) return false;
   const aLiteral = estimatorValue(aLiteralExpr);
   const bLiteral = estimatorValue(bLiteralExpr);
   if (aLiteral === null || bLiteral === null) return false;
