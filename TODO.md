@@ -695,7 +695,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   Remaining: crypto providers, an async compaction (with OPFS compaction), cold/durable and
   other-browser public-boundary measurements, ARM/package-size measurements, and optional Rust
   delivery parity.
-  Public async host API follow-ons: compaction, changing database storage limits after open,
+  Public async host API follow-ons: changing database storage limits after open,
   the storage-byte gauge, and resetting an individual custom session variable. The docs describe
   their current availability; displayed TypeScript examples execute in the Node unit suite.
   Encryption protocol/provider selection is separate; no SQL replay or whole-file preload.
@@ -724,8 +724,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     mode, a real-Chromium e2e). Measured in headless Chromium over two runs: 0.11–0.14 ms per page
     opened on a cold scan and 0.57–0.95 ms per page sealed on a bulk commit, over plaintext. Still
     open: the browser's Argon2id cost.
-  - [ ] **TS async API** — `changeCredential` and `rekey` on the public async entry points (as for
-    compaction, which they lack too).
+  - [x] **TS async API** — landed: `compact`, `changeCredential` and `rekey` on the public async
+    entry points (Node and browser). On OPFS `changeCredential` awaits the WebCrypto rewrap and the
+    key-block writes (byte-identical to the Node host); `compact` and `rekey` stay `0A000` there.
   - [ ] **Replication** — the key-block item in the stream (replication itself is not built).
   - [ ] **A credential in `hello`** for a `jed pages` server that must own an encrypted database
     (today: a key or passphrase file on the server, or `28P02`).

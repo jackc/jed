@@ -4,6 +4,7 @@
 import { PreparedStatement, type Rows } from "../api.ts";
 import { COOPERATE, runAsync, shouldCooperate, type Steps } from "../execution.ts";
 import { EngineError, engineError } from "../errors.ts";
+import { type Argon2Params, type Credential, DEFAULT_ARGON2_PARAMS } from "../crypto.ts";
 import type { SessionOptions } from "../executor.ts";
 import { PrivilegeSet } from "../privileges.ts";
 import type { Database, Session } from "../shared.ts";
@@ -440,6 +441,12 @@ export class RuntimeServer {
       return null;
     }
     if (op === "fetch") return yield* this.fetchSteps(job);
+    if (op === "compact" || op === "changeCredential" || op === "rekey") {
+      if (sessionId !== 0)
+        throw new TransportError("PROTOCOL", "database maintenance belongs to the database handle");
+      yield* this.maintenanceSteps(db, op, args);
+      return null;
+    }
     const owner = this.owner(job);
     const session = owner.session;
     switch (op) {
@@ -583,6 +590,35 @@ export class RuntimeServer {
     } catch (error) {
       this.closeCursor(id);
       throw error;
+    }
+  }
+
+  // Host maintenance on the database itself (spec/design/api.md §2.6, Encryption at rest). It never
+  // waits for the writer: a session of this handle holding a write transaction, or a reader, cursor or
+  // read session pinning a snapshot, is 55006 exactly as on the synchronous API.
+  private *maintenanceSteps(db: Database, op: string, args: Record<string, unknown>): Steps<void> {
+    const name = args.name;
+    if (typeof name !== "string") throw new TransportError("PROTOCOL", "a database name is text");
+    if (op === "compact") {
+      db.compact(name);
+      return;
+    }
+    const kdf = (args.kdf ?? DEFAULT_ARGON2_PARAMS) as Argon2Params;
+    if (typeof kdf !== "object") throw new TransportError("PROTOCOL", "kdf is an object");
+    const credential = args.credential ?? null;
+    if (credential !== null && typeof credential !== "object") {
+      throw engineError("invalid_parameter_value", "a credential is a passphrase or a 32-byte key");
+    }
+    if (op === "rekey") {
+      db.rekey(name, credential as Credential | null, kdf);
+    } else {
+      if (credential === null) {
+        throw engineError(
+          "invalid_parameter_value",
+          "a credential is a passphrase or a 32-byte key",
+        );
+      }
+      yield* db.changeCredentialSteps(name, credential as Credential, kdf);
     }
   }
 

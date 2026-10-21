@@ -647,8 +647,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   they read; the owner checks and reseals client metas), the CLI's key/passphrase-file inputs, the
   corpus's encrypted mode and simulator slices S12–S13 (credential changes, rekeys and conversions under
   crashes, page replay at every pointer kind, restores, encrypted attachments and service traces). Still to build, each failing closed meanwhile
-  (encrypted.md §10): replication's key-block item, a credential in `hello`, credential change and
-  rekey on the TS async API; and the security review. The browser/OPFS host opens encrypted files
+  (encrypted.md §10): replication's key-block item and a credential in `hello`; and the security
+  review. The TS async API exposes compaction, credential change and rekey (`ts-runtime.md` §10). The browser/OPFS host opens encrypted files
   through an asynchronous WebCrypto codec. **Designed in `spec/design/encryption.md`:**
   a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
   a random data key is stored only wrapped by a per-file key-encryption key, itself derived from

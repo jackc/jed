@@ -2295,6 +2295,14 @@ export class Database {
         "an in-memory database has no credential",
       );
     }
+    // A durable store without a path is the OPFS host, which cannot replace a file atomically yet
+    // (hosts.md §5): refuse before the KDF runs rather than after.
+    if (storage.path === null || fileCompactor === null) {
+      throw engineError(
+        "feature_not_supported",
+        `cannot rekey database "${name}": its storage host cannot replace the file atomically`,
+      );
+    }
     let target: PageCodec | null = null;
     if (credential !== null) {
       if (storage.pageSize < ENCRYPTED_MIN_PAGE_SIZE) {
@@ -2334,6 +2342,18 @@ export class Database {
     credential: Credential,
     kdf: Argon2Params = DEFAULT_ARGON2_PARAMS,
   ): void {
+    runSync(this.changeCredentialSteps(name, credential, kdf));
+  }
+
+  // changeCredentialSteps is changeCredential as a continuation (spec/design/ts-runtime.md §11): an
+  // asynchronous page codec (the browser's WebCrypto) awaits the rewrap, and an asynchronous device the
+  // key-block writes and barriers. Cancellation can stop it only before the writer gate is taken; the
+  // two-barrier write runs to its end.
+  *changeCredentialSteps(
+    name: string,
+    credential: Credential,
+    kdf: Argon2Params = DEFAULT_ARGON2_PARAMS,
+  ): Steps<void> {
     const c = this.core;
     let storage: Engine;
     if (name === "main") {
@@ -2347,7 +2367,7 @@ export class Database {
       if (att.readOnly) throw readOnlyCredential(name);
       // A file attachment under the page service changes its credential through its own handle.
       if (att.svc !== null) {
-        (att.svc as ServiceAttachment).db.changeCredential("main", credential, kdf);
+        yield* (att.svc as ServiceAttachment).db.changeCredentialSteps("main", credential, kdf);
         return;
       }
       storage = att.storage;
@@ -2373,7 +2393,7 @@ export class Database {
     }
     // Derive the new wrapping key first: Argon2id takes long enough that nobody should wait for it
     // behind the writer gate (encryption.md §5).
-    const block = codec.rewrap(credential, kdf);
+    const block = yield* codec.rewrapSteps(credential, kdf);
     if (!c.tryAcquireLocalWriter()) {
       throw engineError(
         "object_in_use",
@@ -2381,7 +2401,7 @@ export class Database {
       );
     }
     try {
-      runSync(writeKeyBlockSteps(storage, block));
+      yield* uncancelableSteps(writeKeyBlockSteps(storage, block));
     } finally {
       c.releaseWriter();
     }

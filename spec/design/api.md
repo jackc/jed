@@ -530,7 +530,7 @@ host-API act — CLAUDE.md §13).
 |---|---|
 | Rust | `db.compact(name: &str) -> Result<()>` |
 | Go | `db.Compact(name string) error` |
-| TS | `db.compact(name: string): void` |
+| TS | `db.compact(name: string): void` (internal core); `await db.compact(name)` on the public async API |
 
 `name` is `main` or an attached database (attached-databases.md §4), matched **exactly** — a host-API
 name is verbatim, never folded ([grammar.md §3](grammar.md)). Compaction
@@ -1434,7 +1434,8 @@ encrypted. It is fixed for the handle's life. An encrypted file attachment is re
 handle whose scratch files are plaintext; open the handle with `On` to attach one.
 
 **Changing the credential.** `change_credential(name, credential, kdf)` (Rust
-`Database::change_credential`, Go `DB.ChangeCredential`, TS `db.changeCredential`) rewraps the data
+`Database::change_credential`, Go `DB.ChangeCredential`, TS `db.changeCredential`, awaited on the
+public async API) rewraps the data
 key of the encrypted file database `name` — `"main"` or a file attachment — for a new credential,
 writing only the key block (encrypted.md §5), so it takes no longer than the new credential's
 Argon2id, which runs before the writer gate is taken. When it returns, only the new credential unlocks
@@ -1445,7 +1446,8 @@ file, `55006` while a write transaction is open, `22023` for Argon2id parameters
 current credential is not asked for again: the handle already holds the data key. Like compaction it
 is a host call, never SQL.
 
-**Rekeying.** `rekey(name, credential, kdf)` (Rust `Database::rekey`, Go `DB.Rekey`, TS `db.rekey`)
+**Rekeying.** `rekey(name, credential, kdf)` (Rust `Database::rekey`, Go `DB.Rekey`, TS `db.rekey`,
+awaited on the public async API)
 rewrites the file database `name` under a new data key (encryption.md §5; bytes in encrypted.md §12):
 encrypted for `credential` when one is given — rotating an encrypted file's key, or encrypting a
 plaintext file — and plaintext when it is null, decrypting an encrypted file. Every tree is rebuilt

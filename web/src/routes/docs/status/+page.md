@@ -62,7 +62,6 @@ jed implements a broad surface, but notable gaps remain. As representative (not 
   progress.
 - Composite (row) types cannot yet be a `PRIMARY KEY` or index key.
 - Views: materialized views and temporary views are pending.
-- TypeScript's async API cannot yet change an encrypted database's credential or rotate its key.
 - A file does not yet shrink back to the OS (dead space is reused internally, but not returned).
 
 The authoritative, always-current picture lives in the project's

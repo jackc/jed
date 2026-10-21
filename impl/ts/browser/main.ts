@@ -4,6 +4,7 @@
 // main thread and talks to the engine-in-Worker via the async client (src/browser/client.ts).
 
 import { OpfsDatabase, OpfsError } from "../src/browser/client.ts";
+import { EngineError, openDatabase } from "../src/browser/async.ts";
 import * as runtime from "./runtime_scenarios.ts";
 import * as hostFunctions from "./host_function_scenarios.ts";
 
@@ -66,7 +67,8 @@ async function asyncCodecScenario(): Promise<Record<string, unknown>> {
 
 // encryptedScenario runs an encrypted database through the public async API (encryption.md §9): create
 // with a host key, write, close; reopen with the key and read; reopen without one (28P02) and with a
-// wrong one (28P01). The worker seals and opens every page through WebCrypto.
+// wrong one (28P01); change the credential to a passphrase (compaction and rekey are 0A000 on OPFS),
+// after which only the passphrase opens it. The worker seals and opens every page through WebCrypto.
 async function encryptedScenario(name: string): Promise<Record<string, unknown>> {
   const credential = { key: new Uint8Array(32).fill(0x4a) };
   const db = await OpfsDatabase.create(name, { credential });
@@ -96,11 +98,47 @@ async function encryptedScenario(name: string): Promise<Record<string, unknown>>
       return e instanceof OpfsError ? e.code : `<${String(e)}>`;
     }
   };
+  const missing = await code();
+  const wrong = await code(new Uint8Array(32).fill(1));
+  const sqlstate = async (operation: () => Promise<void>): Promise<string> => {
+    try {
+      await operation();
+      return "<no error>";
+    } catch (e) {
+      return e instanceof EngineError ? e.code() : `<${String(e)}>`;
+    }
+  };
+  const passphrase = { passphrase: "changed in the browser" };
+  const db2 = await openDatabase(name, { credential });
+  let compact: string;
+  let rekey: string;
+  try {
+    compact = await sqlstate(() => db2.compact("main"));
+    rekey = await sqlstate(() => db2.rekey("main", null));
+    await db2.changeCredential("main", passphrase, {
+      memoryKib: 64,
+      iterations: 1,
+      parallelism: 1,
+    });
+  } finally {
+    await db2.close();
+  }
+  const changed = await OpfsDatabase.open(name, { credential: passphrase });
+  let afterChange: string[][];
+  try {
+    afterChange = (await changed.query(SELECT)).rows;
+  } finally {
+    await changed.close();
+  }
   return {
     written,
     read,
-    missing: await code(),
-    wrong: await code(new Uint8Array(32).fill(1)),
+    missing,
+    wrong,
+    compact,
+    rekey,
+    oldKey: await code(credential.key),
+    afterChange,
   };
 }
 
