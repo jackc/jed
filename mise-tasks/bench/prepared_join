@@ -1,0 +1,56 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Serialized supported-core prepared JOIN comparison (or --diagnostics / --profile)"
+require 'json'
+require 'fileutils'
+require 'open3'
+
+out = File.expand_path(ENV.fetch('JOIN_OUTPUT', '/tmp/jed-prepared-join/current'))
+FileUtils.mkdir_p(out)
+plan = JSON.parse(File.read(ENV.fetch('JOIN_PLAN', 'bench/prepared-join/plan.json')))
+path = File.join(out, 'plan.tsv')
+File.open(path, 'w') do |file|
+  file.puts ['config', plan.fetch('repetitions'), plan.fetch('validation_iterations')].join("\t")
+  file.puts "setup\tCREATE TABLE items (id i32 PRIMARY KEY, bucket i32, score i32, label text)"
+  values = plan.fetch('rows').times.map { |i| "(#{i},#{i % 10},#{i * 37 % 10000},'row#{i}')" }
+  file.puts "setup\tINSERT INTO items VALUES #{values.join(',')}"
+  plan.fetch('setup', []).each { |sql| file.puts ['setup', sql].join("\t") }
+  plan.fetch('workloads').each do |workload|
+    fields = workload.values_at('name', 'iterations', 'warmup', 'offset', 'step', 'span', 'sql')
+    abort 'tabs/newlines in plan fields' if fields.any? { |v| v.to_s.match?(/[\t\r\n]/) }
+    file.puts ['workload', *fields].join("\t")
+  end
+end
+abort 'Go build failed' unless system('go', 'build', '-o', File.join(out, 'go-lane'), '.', chdir: 'bench/prepared-join/go')
+target = '/tmp/jed-prepared-join/rust-target'
+abort 'Rust build failed' unless system({'CARGO_TARGET_DIR' => target}, 'cargo', 'build', '--release', '--offline', '--manifest-path', 'bench/prepared-join/rust/Cargo.toml')
+abort 'TS dependencies failed' unless system('ruby', 'scripts/npm_ci.rb', 'impl/ts')
+commands = {
+  'go' => [ENV.fetch('JOIN_GO_LANE', File.join(out, 'go-lane'))],
+  'rust' => [File.join(target, 'release/jed-prepared-join')],
+  'ts' => ['node', *(['--cpu-prof', "--cpu-prof-dir=#{out}", '--cpu-prof-name=ts.cpu'] if ARGV.include?('--profile')), ENV.fetch('JOIN_TS_LANE', 'bench/prepared-join/lane.ts')]
+}
+commands.each do |lane, command|
+  warn "#{ARGV.empty? ? 'Measuring' : 'Diagnosing'} #{lane}"
+  env = lane == 'go' && ARGV.include?('--profile') ? {'JOIN_CPU_PROFILE' => File.join(out, 'go.cpu')} : {}
+  stdout, stderr, status = Open3.capture3(env, *command, path, *ARGV)
+  File.write(File.join(out, "#{lane}.jsonl"), stdout)
+  File.write(File.join(out, "#{lane}.stderr"), stderr)
+  abort "#{lane}: #{stderr}" unless status.success?
+end
+answers = commands.keys.map do |lane|
+  File.readlines(File.join(out, "#{lane}.jsonl")).map do |line|
+    record = JSON.parse(line)
+    ARGV.include?('--diagnostics') ? record : record.values_at('workload', 'checksum', 'validation_rows')
+  end
+end
+abort 'answers differ' unless answers.uniq.length == 1
+File.write(File.join(out, 'provenance.json'), JSON.pretty_generate({
+  commit: IO.popen(%w[git rev-parse HEAD], &:read).strip,
+  diff: IO.popen(%w[git diff --stat], &:read),
+  cycles: ENV.fetch('JOIN_CYCLES', '1'), warm_cycles: ENV.fetch('JOIN_WARM_CYCLES', '1'),
+  commands: commands, plan: plan,
+  host: IO.popen(%w[uname -a], &:read).strip,
+  runtimes: [%w[go version], %w[rustc --version], %w[node --version]].map { |cmd| IO.popen(cmd, &:read).strip }
+}))
+puts "Answers agree; results: #{out}"
