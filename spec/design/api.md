@@ -1406,3 +1406,25 @@ attached is `42704`. A commit that would grow the measure past the limit fails
 `54P06` and commits nothing (an in-memory database first tries one forced
 compaction); commits that do not grow the measure, and pure deletes and drops, are
 always admitted. Not persisted, not transactional, and not reachable from SQL.
+
+### Encryption at rest (credentials)
+
+A file database may be created **encrypted** ([encryption.md](encryption.md); bytes in
+[../fileformat/encrypted.md](../fileformat/encrypted.md)): pass a **credential** on `create` —
+a passphrase (stretched with Argon2id) or a 32-byte key the host keeps elsewhere — and the same
+credential to every later `open` and file `attach` (Rust `CreateOptions { credential, kdf }`,
+`OpenOptions { credential }`, `AttachSource::file(p).credential(c)` with
+`Credential::Passphrase` / `Credential::Key`; Go and TS carry the same fields on their options). The
+credential is a host argument only: it is never stored, never a setting, and never reaches SQL or
+an error message. An encrypted file needs a `page_size` of at least 1024.
+
+Failures are fail-closed: a credential that does not unwrap the file's key is `28P01`, an
+encrypted file opened without one `28P02`, a credential offered for a plaintext file `28P03`, a
+credential for an in-memory database `55000`, a page size below 1024 `0A000`. Until the follow-on
+work lands (encrypted.md §10), an encrypted database is never served by the page service (a
+credential turns `locking = auto` into an exclusive owner), never spills to a scratch file (it
+has no spill target, and attaching one to a handle that can spill is `55000`), and cannot be
+backed up (`0A000`); compaction keeps its key and reseals every page. The environment's
+key-entropy source draws the key material and nonces — the OS CSPRNG, or for tests only an
+insecure seeded stream (`insecure_seeded_key_entropy(seed)` and its Go/TS equivalents) under
+which every core writes identical bytes.

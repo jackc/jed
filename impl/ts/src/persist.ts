@@ -81,7 +81,7 @@ function* admitFileSteps(
   prev: Snapshot,
   budget: BudgetCtx | null,
 ): Steps<LiveCount> {
-  const live = yield* liveAfterSteps(db.live, write, prev, db.paging!, db.pageSize);
+  const live = yield* liveAfterSteps(db.live, write, prev, db.paging!);
   const limit = db.storageBudget.limit;
   if (
     budget === null ||
@@ -410,6 +410,7 @@ function* commitFileSteps(
     snap,
     paging,
     write.rootPage,
+    write.rootTag,
     write.pages,
     write.freeRemaining,
     write.pageCount,
@@ -429,11 +430,13 @@ function* commitFileSteps(
   yield* paging.writePagesSteps(plan.pages);
   // The commit's own entries (its body and free-list pages) join the pending set of a relaxed commit.
   const dirty = manifestEntriesOf([...write.pages, ...plan.pages]);
+  const codec = paging.codec();
   const manifest = buildCommitManifest(
     db.pageSize,
     snap.txid,
     [...pending, ...dirty],
     plan.manifestIds,
+    codec !== null,
   );
   yield* paging.writePagesSteps(manifest.pages);
   const meta = metaPage(
@@ -444,9 +447,12 @@ function* commitFileSteps(
     plan.head,
     live.live,
     manifest,
+    codec !== null ? { root: write.rootTag, freeList: plan.headTag } : undefined,
   );
   // The slot not holding the floor (format.md, *Slot alternation*): txid & 1 under synchronous = on.
   const slot = paging.commitSlot();
+  // An encrypted meta is sealed for its slot over its manifest chain (encrypted.md §6).
+  if (codec !== null) codec.sealMeta(slot, meta, manifest.pages);
   yield* paging.writePagesSteps([{ index: slot, bytes: meta }]);
   // One durability barrier covers body + descriptor + meta; a relaxed commit defers it to a flush.
   if (!relaxed) yield* paging.syncSteps();

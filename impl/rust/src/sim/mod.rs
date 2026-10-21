@@ -1209,7 +1209,8 @@ impl<'a> Runner<'a> {
             self.cache_bytes as usize
         };
         let page_size = pager.page_size();
-        let mut engine = Engine::open_paged(pager, cache_leaves(cache, page_size), &self.env)?;
+        let mut engine =
+            Engine::open_paged(pager, cache_leaves(cache, page_size), &self.env, None)?;
         // The path marks the engine durable; the simulated filesystem is its only storage.
         engine.path = Some(PathBuf::from(MAIN_FILE));
         // Spill and temp-table spill scratch files, whose operations can fail.
@@ -1508,6 +1509,7 @@ impl<'a> Runner<'a> {
                 page_size: self.page_size,
                 no_sync: false,
             },
+            None,
         );
         match created {
             Ok(e) => {
@@ -2788,6 +2790,7 @@ impl<'a> Runner<'a> {
                     page_size: self.page_size,
                     no_sync: false,
                 },
+                None,
             );
             match created {
                 Ok(e) => {

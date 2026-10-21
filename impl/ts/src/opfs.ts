@@ -25,7 +25,7 @@ import { Engine, DEFAULT_PAGE_SIZE } from "./executor.ts";
 import { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
 import { runAsync, runSync, type Steps } from "./execution.ts";
-import { loadEnginePagedSteps, ROOT_PAGE, toImage } from "./format.ts";
+import { loadEnginePagedSteps, ROOT_PAGE, toImage, unlockPagerSteps } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
@@ -108,9 +108,13 @@ export function* openOpfsWithHandleSteps(
   const readOnly = opts.readOnly ?? false;
   const pager = yield* Pager.fromStoreSteps(new OpfsBlockStore(handle));
   pager.setPageTransform(transform);
+  const environment = opts.environment ?? new Environment();
+  // An encrypted file is 0A000 on a host with no cryptography backend (spec/fileformat/encrypted.md
+  // §10); this host takes no credential.
+  const codec = yield* unlockPagerSteps(pager, undefined, environment);
   const db = yield* loadEnginePagedSteps(
-    new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)),
-    opts.environment ?? new Environment(),
+    new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
+    environment,
   );
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;

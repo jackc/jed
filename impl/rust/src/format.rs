@@ -168,6 +168,196 @@ pub(crate) const PAGE_HEADER: usize = 16;
 pub(crate) fn page_payload(page_size: u32) -> usize {
     page_size as usize - PAGE_HEADER
 }
+
+/// A database's page capacities — what the size rules read (format.md *Page model*; encrypted.md
+/// §1–§2). `c` is the payload capacity `C` every split, record-cap and fit rule uses; `tag` is the
+/// bytes a bound pointer adds to a page index: `0` in a plaintext file, 16 in an encrypted one, whose
+/// `C` also excludes the 40-byte reserve. Every pointer width and chain capacity derives from these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cap {
+    pub(crate) c: usize,
+    pub(crate) tag: usize,
+}
+
+impl Cap {
+    /// A plaintext file's (or an in-memory database's) capacities at `page_size`.
+    pub(crate) fn plain(page_size: u32) -> Cap {
+        Cap {
+            c: page_payload(page_size),
+            tag: 0,
+        }
+    }
+
+    /// An encrypted file's capacities at `page_size` (encrypted.md §1).
+    pub(crate) fn encrypted(page_size: u32) -> Cap {
+        Cap {
+            c: page_payload(page_size) - crate::crypto::RESERVE,
+            tag: crate::crypto::TAG_LEN,
+        }
+    }
+
+    pub(crate) fn of(page_size: u32, encrypted: bool) -> Cap {
+        if encrypted {
+            Cap::encrypted(page_size)
+        } else {
+            Cap::plain(page_size)
+        }
+    }
+
+    pub(crate) fn encrypted_variant(self) -> bool {
+        self.tag != 0
+    }
+
+    /// The bytes one page pointer takes: a `u32` index, plus its tag when bound.
+    pub(crate) fn ptr(self) -> usize {
+        4 + self.tag
+    }
+
+    /// The content one chain page (catalog, overflow, free-list) holds after its successor's tag.
+    pub(crate) fn chain(self) -> usize {
+        self.c - self.tag
+    }
+
+    /// The first body page: 2, or 4 past an encrypted file's key block.
+    pub(crate) fn first_body(self) -> u32 {
+        if self.encrypted_variant() {
+            crate::crypto::FIRST_BODY_PAGE
+        } else {
+            ROOT_PAGE
+        }
+    }
+}
+
+/// A bound page pointer (encrypted.md §2): a page index and the tag of the stored bytes it names —
+/// [`NO_TAG`](crate::crypto::NO_TAG) in a plaintext file, and in a pointer to no page (`page == 0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct PageRef {
+    pub(crate) page: u32,
+    pub(crate) tag: crate::crypto::Tag,
+}
+
+impl PageRef {
+    pub(crate) const NONE: PageRef = PageRef {
+        page: 0,
+        tag: crate::crypto::NO_TAG,
+    };
+
+    /// An unbound reference (a plaintext file's pointers carry no tag).
+    pub(crate) fn plain(page: u32) -> PageRef {
+        PageRef {
+            page,
+            tag: crate::crypto::NO_TAG,
+        }
+    }
+
+    /// Append this pointer in `cap`'s layout: the `u32` index, then the tag when bound.
+    pub(crate) fn push(self, out: &mut Vec<u8>, cap: Cap) {
+        out.extend_from_slice(&self.page.to_be_bytes());
+        out.extend_from_slice(&self.tag[..cap.tag]);
+    }
+
+    /// Read a pointer in `cap`'s layout at `*pos`.
+    fn read(buf: &[u8], pos: &mut usize, cap: Cap) -> Result<PageRef> {
+        let page = read_u32(buf, pos)?;
+        let mut tag = crate::crypto::NO_TAG;
+        tag[..cap.tag].copy_from_slice(take(buf, pos, cap.tag)?);
+        if page == 0 && tag != crate::crypto::NO_TAG {
+            return Err(corrupt("a pointer to no page carries a tag"));
+        }
+        Ok(PageRef { page, tag })
+    }
+}
+
+/// Builds a body page's stored bytes — the one place they are made (format.md *Page header*;
+/// encrypted.md §4). A plaintext page is the header + payload with its CRC; an encrypted page is the
+/// same plaintext over capacity `C`, with a zero CRC field and, on a chain page, its successor's tag
+/// leading the payload, sealed under the database's page key. Returns the bytes and the tag a pointer
+/// to the page binds.
+#[derive(Clone, Copy)]
+pub(crate) struct Sealer<'a> {
+    pub(crate) ps: usize,
+    pub(crate) cap: Cap,
+    pub(crate) codec: Option<&'a crate::crypto::PageCodec>,
+}
+
+impl<'a> Sealer<'a> {
+    pub(crate) fn plain(ps: usize) -> Sealer<'static> {
+        Sealer {
+            ps,
+            cap: Cap::plain(ps as u32),
+            codec: None,
+        }
+    }
+
+    /// The sealer for a database whose paging context is `paging` (`None`: an in-memory or temp
+    /// store, always plaintext).
+    pub(crate) fn of(ps: usize, paging: Option<&'a SharedPaging>) -> Sealer<'a> {
+        let codec = paging.and_then(SharedPaging::codec).map(|c| &**c);
+        Sealer {
+            ps,
+            cap: Cap::of(ps as u32, codec.is_some()),
+            codec,
+        }
+    }
+
+    /// A body page. `next` is the successor of a chain page (catalog, overflow, free-list), else
+    /// [`PageRef::NONE`].
+    pub(crate) fn page(
+        &self,
+        index: u32,
+        page_type: u8,
+        flags: u8,
+        item_count: u32,
+        next: PageRef,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, crate::crypto::Tag)> {
+        let Some(codec) = self.codec else {
+            let mut page = make_page(self.ps, page_type, item_count, next.page, payload);
+            if flags != 0 {
+                page[1] = flags;
+                let crc = page_crc(&page);
+                page[12..16].copy_from_slice(&crc.to_be_bytes());
+            }
+            return Ok((page, crate::crypto::NO_TAG));
+        };
+        let chain = matches!(page_type, PAGE_CATALOG | PAGE_OVERFLOW | PAGE_FREELIST);
+        let lead = if chain { self.cap.tag } else { 0 };
+        if lead + payload.len() > self.cap.c {
+            return Err(corrupt("page payload overflows its page"));
+        }
+        let mut page = vec![0u8; self.ps];
+        page[0] = page_type;
+        page[1] = flags;
+        page[4..8].copy_from_slice(&item_count.to_be_bytes());
+        page[8..12].copy_from_slice(&next.page.to_be_bytes());
+        if chain {
+            page[PAGE_HEADER..PAGE_HEADER + lead].copy_from_slice(&next.tag);
+        }
+        page[PAGE_HEADER + lead..PAGE_HEADER + lead + payload.len()].copy_from_slice(payload);
+        let tag = codec.seal_body(index, &mut page)?;
+        Ok((page, tag))
+    }
+}
+
+/// The content of a parsed chain page (catalog, overflow, free-list) in `cap`'s layout: its
+/// successor pointer and the bytes after the successor's tag (encrypted.md §2).
+fn chain_content<'p>(page: &Page<'p>, cap: Cap) -> Result<(PageRef, &'p [u8])> {
+    if page.payload.len() < cap.tag {
+        return Err(corrupt("chain page too short"));
+    }
+    let mut tag = crate::crypto::NO_TAG;
+    tag[..cap.tag].copy_from_slice(&page.payload[..cap.tag]);
+    if page.next_page == 0 && tag != crate::crypto::NO_TAG {
+        return Err(corrupt("the last chain page carries a successor tag"));
+    }
+    Ok((
+        PageRef {
+            page: page.next_page,
+            tag,
+        },
+        &page.payload[cap.tag..],
+    ))
+}
 /// Bytes reserved inside `RECORD_MAX` beyond the per-column term — **independent of
 /// `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Historically the two-key
 /// interior node's three child pointers (`4·3`); since v24 the value is kept as the `K = 0` floor
@@ -1121,7 +1311,7 @@ fn value_facts(ty: &ColType, v: &Value) -> (usize, usize) {
 /// (pass 2 ran, so pass 1 visited every candidate first), and an inline- or external-compressed
 /// one was adopted with the block it stores. Only an inline-deferred value, whose stored form
 /// records no outcome, is compressed when an attempt reaches it — from the bytes it holds.
-fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usize) -> RecordPlan {
+fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: Cap) -> RecordPlan {
     // Each column's inline-plain contribution to `record_size` (the v24 basis — format.md
     // "Record"): a fixed-width column always its width (a NULL occupies a zero-filled slot); a
     // variable-width column 0 when NULL (a zero-length span) else its tagged inline encoding.
@@ -1148,7 +1338,7 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
     let mut disp: Vec<Disp> = (0..row.len()).map(|_| Disp::Inline).collect();
     let mut cur = inline.clone();
     let mut size = key.len() + inline.iter().sum::<usize>();
-    let max = record_max(cap, col_types.len());
+    let max = record_max(cap.c, col_types.len());
     let mut compress_units = 0usize;
     if size <= max {
         return RecordPlan {
@@ -1172,7 +1362,7 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
         if size <= max {
             break;
         }
-        compress_units += payload_len[i].div_ceil(cap);
+        compress_units += payload_len[i].div_ceil(cap.c);
         let comp = match &row[i] {
             // Stored external-plain: the attempt was made and rejected.
             Value::Unfetched(Unfetched::External { .. }) => None,
@@ -1211,8 +1401,8 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
             is_spillable(&col_types[i])
                 && cur[i]
                     > match disp[i] {
-                        Disp::InlineComp(_) => EXTERNAL_COMP_PTR_LEN,
-                        _ => EXTERNAL_PTR_LEN,
+                        Disp::InlineComp(_) => EXTERNAL_COMP_PTR_LEN + cap.tag,
+                        _ => EXTERNAL_PTR_LEN + cap.tag,
                     }
         })
         .collect();
@@ -1225,11 +1415,11 @@ fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usiz
         let (ptr, next) = match std::mem::replace(&mut disp[i], Disp::Inline) {
             Disp::InlineComp(c) => {
                 external += c.len();
-                (EXTERNAL_COMP_PTR_LEN, Disp::ExternalComp(c))
+                (EXTERNAL_COMP_PTR_LEN + cap.tag, Disp::ExternalComp(c))
             }
             _ => {
                 external += payload_len[i];
-                (EXTERNAL_PTR_LEN, Disp::External)
+                (EXTERNAL_PTR_LEN + cap.tag, Disp::External)
             }
         };
         disp[i] = next;
@@ -1252,7 +1442,7 @@ pub(crate) fn deferred_in_stored_form(
     col_types: &[ColType],
     key: &[u8],
     row: &[Value],
-    cap: usize,
+    cap: Cap,
 ) -> Vec<bool> {
     let plan = plan_dispositions(col_types, key, row, cap);
     row.iter()
@@ -1297,7 +1487,7 @@ fn planning_payload(ty: &ColType, v: &Value) -> Vec<u8> {
 /// value contributes its compressed inline form, an externalized one its fixed pointer size
 /// (spec/design/large-values.md §12/§13). Must equal the length the serializer produces, so
 /// in-memory node boundaries match the serialized pages.
-pub(crate) fn record_size(col_types: &[ColType], key: &[u8], row: &Row, cap: usize) -> usize {
+pub(crate) fn record_size(col_types: &[ColType], key: &[u8], row: &Row, cap: Cap) -> usize {
     plan_dispositions(col_types, key, row, cap).size
 }
 
@@ -1307,7 +1497,7 @@ pub(crate) fn record_footprint(
     col_types: &[ColType],
     key: &[u8],
     row: &Row,
-    cap: usize,
+    cap: Cap,
 ) -> (usize, usize) {
     let plan = plan_dispositions(col_types, key, row, cap);
     (plan.size, plan.size + plan.external)
@@ -1328,7 +1518,7 @@ pub(crate) fn record_scan_units(
     col_types: &[ColType],
     key: &[u8],
     row: &Row,
-    cap: usize,
+    cap: Cap,
     mask: &[bool],
 ) -> ScanUnits {
     let mut units = ScanUnits {
@@ -1357,18 +1547,18 @@ pub(crate) fn record_scan_units(
                     // matching the resident plan's `Disp::Inline`).
                     Unfetched::Inline { .. } => {}
                     Unfetched::External { len, .. } => {
-                        units.pages += (*len as usize).div_ceil(cap);
+                        units.pages += (*len as usize).div_ceil(cap.chain());
                     }
                     Unfetched::InlineComp { raw_len, .. } => {
-                        units.decompress += (*raw_len as usize).div_ceil(cap);
+                        units.decompress += (*raw_len as usize).div_ceil(cap.c);
                     }
                     Unfetched::ExternalComp {
                         stored_len,
                         raw_len,
                         ..
                     } => {
-                        units.pages += (*stored_len as usize).div_ceil(cap);
-                        units.decompress += (*raw_len as usize).div_ceil(cap);
+                        units.pages += (*stored_len as usize).div_ceil(cap.chain());
+                        units.decompress += (*raw_len as usize).div_ceil(cap.c);
                     }
                 }
             }
@@ -1383,14 +1573,14 @@ pub(crate) fn record_scan_units(
         match d {
             Disp::Inline => {}
             Disp::External => {
-                units.pages += plan.payload_len[i].div_ceil(cap);
+                units.pages += plan.payload_len[i].div_ceil(cap.chain());
             }
             Disp::InlineComp(_) => {
-                units.decompress += plan.payload_len[i].div_ceil(cap);
+                units.decompress += plan.payload_len[i].div_ceil(cap.c);
             }
             Disp::ExternalComp(c) => {
-                units.pages += c.len().div_ceil(cap);
-                units.decompress += plan.payload_len[i].div_ceil(cap);
+                units.pages += c.len().div_ceil(cap.chain());
+                units.decompress += plan.payload_len[i].div_ceil(cap.c);
             }
         }
     }
@@ -1403,7 +1593,7 @@ pub(crate) fn record_scan_units(
 /// `page_read` per overflow-chain page and `ceil(raw_len / cap)` `value_decompress` slabs per
 /// compressed value; nothing for an inline-plain value. A malformed span adds nothing (resolving
 /// it reports the corruption). Packed-leaf.md §11 Track A4.
-pub(crate) fn span_scan_units(span: &[u8], cap: usize, units: &mut ScanUnits) {
+pub(crate) fn span_scan_units(span: &[u8], cap: Cap, units: &mut ScanUnits) {
     let field = |at: usize| -> Option<usize> {
         let b = span.get(at..at + 4)?;
         Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
@@ -1411,18 +1601,18 @@ pub(crate) fn span_scan_units(span: &[u8], cap: usize, units: &mut ScanUnits) {
     match span.first() {
         Some(&TAG_EXTERNAL) => {
             if let Some(len) = field(5) {
-                units.pages += len.div_ceil(cap);
+                units.pages += len.div_ceil(cap.chain());
             }
         }
         Some(&TAG_INLINE_COMP) => {
             if let Some(raw_len) = field(1) {
-                units.decompress += raw_len.div_ceil(cap);
+                units.decompress += raw_len.div_ceil(cap.c);
             }
         }
         Some(&TAG_EXTERNAL_COMP) => {
             if let (Some(stored_len), Some(raw_len)) = (field(5), field(9)) {
-                units.pages += stored_len.div_ceil(cap);
-                units.decompress += raw_len.div_ceil(cap);
+                units.pages += stored_len.div_ceil(cap.chain());
+                units.decompress += raw_len.div_ceil(cap.c);
             }
         }
         _ => {}
@@ -1445,7 +1635,7 @@ pub(crate) fn record_compress_units(
     col_types: &[ColType],
     key: &[u8],
     row: &Row,
-    cap: usize,
+    cap: Cap,
 ) -> usize {
     plan_dispositions(col_types, key, row, cap).compress_units
 }
@@ -1553,9 +1743,20 @@ impl Snapshot {
     /// backs `create`'s initial image and (this slice) whole-image commit. (Incremental dirty-page
     /// commit reuses `serialize_node` but writes only the dirty path; storage.md §4.)
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
+        self.to_image_sealed(page_size, txid, None)
+    }
+
+    /// [`to_image`](Snapshot::to_image) of an encrypted database when `codec` is set: its key block
+    /// copy at pages 2 and 3, every body page sealed (spec/fileformat/encrypted.md §4–§7).
+    pub(crate) fn to_image_sealed(
+        &self,
+        page_size: u32,
+        txid: u64,
+        codec: Option<&crate::crypto::PageCodec>,
+    ) -> Result<Vec<u8>> {
         let ps = page_size as usize;
         let mut image: Vec<u8> = Vec::new();
-        self.write_image(page_size, txid, &mut |index, page| {
+        self.write_image(page_size, txid, codec, &mut |index, page| {
             let off = index as usize * ps;
             if image.len() < off + ps {
                 image.resize(off + ps, 0);
@@ -1571,15 +1772,18 @@ impl Snapshot {
     /// image's page count. Pages arrive in no particular index order; both meta slots arrive last.
     /// The sink sees each page exactly once, so a file sink writes the image in bounded memory —
     /// host compaction ([`crate::Database::compact`], spec/design/api.md §2.6) relies on this to
-    /// rewrite a larger-than-RAM file without a whole-image buffer.
+    /// rewrite a larger-than-RAM file without a whole-image buffer. With `codec` the image is the
+    /// encrypted variant (encrypted.md): the codec's key block at pages 2 and 3, body pages from 4,
+    /// sealed in seal order (§7).
     pub(crate) fn write_image(
         &self,
         page_size: u32,
         txid: u64,
+        codec: Option<&crate::crypto::PageCodec>,
         sink: &mut dyn FnMut(u32, &[u8]) -> Result<()>,
     ) -> Result<u32> {
         let ps = page_size as usize;
-        if ps < MIN_PAGE_SIZE {
+        if ps < MIN_PAGE_SIZE || (codec.is_some() && ps < crate::crypto::MIN_PAGE_SIZE) {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "page size too small for the format",
@@ -1597,23 +1801,36 @@ impl Snapshot {
                 "page size must be a power of two",
             ));
         }
-        let cap = ps - PAGE_HEADER;
+        let seal = Sealer {
+            ps,
+            cap: Cap::of(page_size, codec.is_some()),
+            codec,
+        };
+        let cap = seal.cap;
+        check_catalog_text_lengths(self)?;
+
+        // An encrypted image's key block: the same copy at pages 2 and 3 (encrypted.md §5).
+        if let Some(codec) = codec {
+            let mut block = vec![0u8; ps];
+            block[..codec.key_block().len()].copy_from_slice(codec.key_block());
+            sink(2, &block)?;
+            sink(3, &block)?;
+        }
 
         // Tables in ascending name byte order (no hash-map order leak).
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Serialize each table's B-tree post-order, body pages allocated from page 2. Each page is
-        // emitted to the sink as soon as its bytes are final; children precede their parent so
-        // parent child-pointers reference already-allocated pages (format.md). `next_page` is `0`
-        // for B-tree nodes and the chain link for overflow pages (large-values.md §12).
-        let mut body = PageSink { ps, sink };
-        let mut root_data_page = vec![0u32; tables.len()];
-        let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
-        let mut next_index = ROOT_PAGE;
+        // Serialize each table's B-tree post-order, body pages allocated from the first body page.
+        // Each page is emitted to the sink as soon as its bytes are final; children precede their
+        // parent so parent child-pointers reference already-allocated (and sealed) pages (format.md).
+        let mut body = PageSink { seal, sink };
+        let mut root_data_page = vec![PageRef::NONE; tables.len()];
+        let mut index_roots: Vec<Vec<PageRef>> = vec![Vec::new(); tables.len()];
+        let mut next_index = cap.first_body();
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
-                root_data_page[ti] = serialize_node(root, store, cap, &mut next_index, &mut body)?;
+                root_data_page[ti] = serialize_node(root, store, &mut next_index, &mut body)?;
             }
             // The table's index trees follow its data tree, in catalog (name) order
             // (spec/fileformat/format.md "From-scratch image"). Index records are the key alone —
@@ -1629,19 +1846,23 @@ impl Snapshot {
                         next_index += 1;
                         p
                     };
-                    serialize_gist_index(self, table, idx, &mut alloc, &mut |p| {
-                        if p.payload.len() > cap {
+                    serialize_gist_index(self, table, idx, cap, &mut alloc, &mut |p| {
+                        if p.payload.len() > cap.c {
                             return Err(corrupt("GiST node overflows its page"));
                         }
-                        body.page(p.page_no, p.page_type, p.item_count, 0, &p.payload)
+                        body.page(
+                            p.page_no,
+                            p.page_type,
+                            p.item_count,
+                            PageRef::NONE,
+                            &p.payload,
+                        )
                     })?
                 } else {
                     let istore = self.index_store(&idx.name.to_string());
                     match istore.tree_root() {
-                        Some(root) => {
-                            serialize_node(root, istore, cap, &mut next_index, &mut body)?
-                        }
-                        None => 0,
+                        Some(root) => serialize_node(root, istore, &mut next_index, &mut body)?,
+                        None => PageRef::NONE,
                     }
                 };
                 index_roots[ti].push(r);
@@ -1651,7 +1872,53 @@ impl Snapshot {
         // The catalog chain follows the data; its head is the relocatable `root_page`. Each entry
         // is kind-tagged (v9): composite-type entries (kind 1) first in name byte order,
         // then table entries (kind 0) — spec/fileformat/format.md.
+        let cat_entries = self.catalog_entries(&tables, &root_data_page, &index_roots, cap)?;
+        let cat_layout = catalog_layout(&cat_entries, cap.chain());
         let cat_root = next_index;
+        let page_count = cat_root + cat_layout.len() as u32;
+
+        // Catalog chain, consecutive pages, sealed last page first (encrypted.md §7).
+        let mut next = PageRef::NONE;
+        for (gi, cp) in cat_layout.iter().enumerate().rev() {
+            let index = cat_root + gi as u32;
+            next = PageRef {
+                page: index,
+                tag: body.catalog_page(index, cp, next)?,
+            };
+        }
+
+        // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct
+        // prior version; slot alternation is the live incremental-commit path — format.md).
+        // Every body page of a from-scratch image is live (no free list, no manifest).
+        let meta = meta_page(
+            cap,
+            page_size,
+            txid,
+            next,
+            page_count,
+            PageRef::NONE,
+            page_count - cap.first_body(),
+        );
+        for slot in 0..2u32 {
+            let mut m = meta.clone();
+            if let Some(codec) = codec {
+                codec.seal_meta(slot, &mut m, &[])?;
+            }
+            (body.sink)(slot, &m)?;
+        }
+        Ok(page_count)
+    }
+
+    /// The catalog chain's entries, kind-tagged in stream order (format.md *Catalog*): composite
+    /// types, sequences, collation references, tables (with each tree root in `cap`'s pointer
+    /// layout), statistics, views.
+    fn catalog_entries(
+        &self,
+        tables: &[(&str, &Table, &TableStore)],
+        root_data_page: &[PageRef],
+        index_roots: &[Vec<PageRef>],
+        cap: Cap,
+    ) -> Result<Vec<Vec<u8>>> {
         let mut cat_entries: Vec<Vec<u8>> = Vec::new();
         for ct in self.composite_types_sorted() {
             let mut e = vec![1u8];
@@ -1680,86 +1947,78 @@ impl Snapshot {
             let row_count = store
                 .count()
                 .expect("table stores always carry an exact row count");
-            check_table_row_count(root_data_page[ti], row_count)?;
+            check_table_row_count(root_data_page[ti].page, row_count)?;
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(
                 t,
                 root_data_page[ti],
                 &index_roots[ti],
                 row_count,
+                cap,
             ));
             cat_entries.push(e);
         }
         cat_entries.extend(statistics_catalog_entries(self));
         cat_entries.extend(view_catalog_entries(self));
-        check_catalog_text_lengths(self)?;
-        let cat_layout = catalog_layout(&cat_entries, cap);
-        let page_count = cat_root + cat_layout.len() as u32;
-
-        // Catalog chain.
-        for (gi, cp) in cat_layout.iter().enumerate() {
-            let index = cat_root + gi as u32;
-            let next = if gi + 1 < cat_layout.len() {
-                index + 1
-            } else {
-                0
-            };
-            (body.sink)(index, &make_catalog_page(page_size as usize, cp, next))?;
-        }
-
-        // Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct
-        // prior version; slot alternation is the live incremental-commit path — format.md).
-        // Every body page of a from-scratch image is live (no free list, no manifest).
-        let meta = meta_page(
-            page_size,
-            txid,
-            cat_root,
-            page_count,
-            0,
-            page_count - ROOT_PAGE,
-        );
-        (body.sink)(0, &meta)?;
-        (body.sink)(1, &meta)?;
-        Ok(page_count)
+        Ok(cat_entries)
     }
 }
 
-/// The from-scratch serializer's page output: builds each page's full bytes (`make_page`, the
-/// single source of the page layout) and hands them to the caller's sink.
-struct PageSink<'a> {
-    ps: usize,
+/// The from-scratch serializer's page output: builds each page's stored bytes through the sealer
+/// and hands them to the caller's sink.
+struct PageSink<'a, 's> {
+    seal: Sealer<'s>,
     sink: &'a mut dyn FnMut(u32, &[u8]) -> Result<()>,
 }
 
-impl PageSink<'_> {
+impl PageSink<'_, '_> {
     fn page(
         &mut self,
         index: u32,
         page_type: u8,
         item_count: u32,
-        next_page: u32,
+        next: PageRef,
         payload: &[u8],
-    ) -> Result<()> {
-        (self.sink)(
+    ) -> Result<crate::crypto::Tag> {
+        let (bytes, tag) = self
+            .seal
+            .page(index, page_type, 0, item_count, next, payload)?;
+        (self.sink)(index, &bytes)?;
+        Ok(tag)
+    }
+
+    fn catalog_page(
+        &mut self,
+        index: u32,
+        cp: &CatalogPage,
+        next: PageRef,
+    ) -> Result<crate::crypto::Tag> {
+        let (bytes, tag) = self.seal.page(
             index,
-            &make_page(self.ps, page_type, item_count, next_page, payload),
-        )
+            PAGE_CATALOG,
+            u8::from(cp.continued),
+            cp.item_count,
+            next,
+            &cp.payload,
+        )?;
+        (self.sink)(index, &bytes)?;
+        Ok(tag)
     }
 }
 
-/// Serialize one B-tree node and its subtree post-order, appending `(index, page_type, item_count,
-/// payload)` for each node to `body` and returning this node's assigned page index. A leaf's payload
-/// is its records; an interior's payload is its `N+1` child pointers (big-endian `u32`) then its `N`
-/// records (format.md). A node whose payload would exceed the page is an oversized record (one over
+/// Serialize one B-tree node and its subtree post-order, handing each finished page to `body` and
+/// returning the pointer to this node's page. A leaf's payload is its records (their overflow chains
+/// written and sealed first); an interior's payload is its `N+1` child pointers then its separators
+/// (format.md). A node whose payload would exceed the page is an oversized record (one over
 /// `RECORD_MAX`) — `feature_not_supported` (`0A000`), matching the v1 oversized-item rule.
 fn serialize_node(
     node: &Arc<Node>,
     store: &TableStore,
-    cap: usize,
     next_index: &mut u32,
-    body: &mut PageSink<'_>,
-) -> Result<u32> {
+    body: &mut PageSink<'_, '_>,
+) -> Result<PageRef> {
     let col_types = store.col_types();
+    let cap = body.seal.cap;
     let mut child_pages = Vec::with_capacity(node.children.len());
     for child in &node.children {
         // Whole-image serialize renumbers pages from scratch. Under B3 (bplus-reshape.md) every
@@ -1767,10 +2026,10 @@ fn serialize_node(
         // reference into the source store: fault it through the store's pool for the duration of
         // its own serialization (whole-image serialize is not a hot path).
         let cp = match child {
-            Child::Resident(n) => serialize_node(n, store, cap, next_index, body)?,
+            Child::Resident(n) => serialize_node(n, store, next_index, body)?,
             Child::OnDisk(p) => {
                 let n = store.fault_leaf(*p)?;
-                serialize_node(&n, store, cap, next_index, body)?
+                serialize_node(&n, store, next_index, body)?
             }
         };
         child_pages.push(cp);
@@ -1803,30 +2062,29 @@ fn serialize_node(
             share: false,
             shared: Vec::new(),
         };
+        let seal = body.seal;
         (
             PAGE_LEAF,
-            encode_leaf_pax(col_types, &keys, &rows, cap, &mut take, &mut ovf, &mut src)?,
+            encode_leaf_pax(col_types, &keys, &rows, seal, &mut take, &mut ovf, &mut src)?,
         )
     } else {
-        (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
+        (
+            PAGE_INTERIOR,
+            encode_interior(&node.keys, &child_pages, cap),
+        )
     };
-    if payload.len() > cap {
+    if payload.len() > cap.c {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "a record larger than the per-row limit is not supported",
         ));
     }
-    body.page(index, page_type, n, 0, &payload)?;
-    for o in ovf {
-        body.page(
-            o.index,
-            PAGE_OVERFLOW,
-            o.item_count,
-            o.next_page,
-            &o.payload,
-        )?;
+    // The leaf's chains were sealed while its values were encoded (their tags are in the payload).
+    for (index, bytes) in ovf {
+        (body.sink)(index, &bytes)?;
     }
-    Ok(index)
+    let tag = body.page(index, page_type, n, PageRef::NONE, &payload)?;
+    Ok(PageRef { page: index, tag })
 }
 
 /// The pages an incremental commit must write durably, plus the new catalog root and high-water for
@@ -1835,7 +2093,8 @@ fn serialize_node(
 /// the alternate meta slot.
 pub(crate) struct IncrementalWrite {
     pub(crate) pages: Vec<(u32, Vec<u8>)>,
-    pub(crate) root_page: u32,
+    /// The new catalog chain's head (with its tag in an encrypted file).
+    pub(crate) root: PageRef,
     pub(crate) page_count: u32,
     /// The free-list entries this commit did **not** consume by its tree/catalog pages — all pages
     /// dead at the fallback (prior) snapshot, so **safe** to overwrite this commit. The durable path
@@ -1881,14 +2140,13 @@ impl LiveCount {
         write: &IncrementalWrite,
         prev: &Snapshot,
         paging: &SharedPaging,
-        page_size: u32,
     ) -> Result<LiveCount> {
         let orphaned = orphaned_tree_pages(
             prev,
             &write.kept,
             &write.shared_chains,
             paging,
-            page_payload(page_size),
+            paging.cap(),
         )?;
         let live = i64::from(self.live) + write.pages.len() as i64
             - i64::from(self.catalog)
@@ -1916,7 +2174,7 @@ pub(crate) fn orphaned_tree_pages(
     kept: &HashSet<u32>,
     shared: &HashSet<u32>,
     paging: &SharedPaging,
-    cap: usize,
+    cap: Cap,
 ) -> Result<u64> {
     let mut count = 0u64;
     for st in prev.stores_iter() {
@@ -1942,10 +2200,10 @@ fn orphaned_node_pages(
     shared: &HashSet<u32>,
     paging: &SharedPaging,
     col_types: Option<&Arc<Vec<ColType>>>,
-    cap: usize,
+    cap: Cap,
 ) -> Result<u64> {
-    let page = node.page.load(Ordering::Acquire);
-    if page == 0 || kept.contains(&page) {
+    let page = node.page_ref();
+    if page.page == 0 || kept.contains(&page.page) {
         return Ok(0);
     }
     if node.children.is_empty() {
@@ -1955,7 +2213,7 @@ fn orphaned_node_pages(
     for child in &node.children {
         count += match child {
             Child::Resident(n) => orphaned_node_pages(n, kept, shared, paging, col_types, cap)?,
-            Child::OnDisk(p) if kept.contains(p) => 0,
+            Child::OnDisk(p) if kept.contains(&p.page) => 0,
             Child::OnDisk(p) => orphaned_leaf_pages(*p, shared, paging, col_types, cap)?,
         };
     }
@@ -1964,16 +2222,16 @@ fn orphaned_node_pages(
 
 /// One orphaned leaf page plus the overflow pages its external values own.
 fn orphaned_leaf_pages(
-    page_idx: u32,
+    page_idx: PageRef,
     kept_chains: &HashSet<u32>,
     paging: &SharedPaging,
     col_types: Option<&Arc<Vec<ColType>>>,
-    cap: usize,
+    cap: Cap,
 ) -> Result<u64> {
     let Some(col_types) = col_types else {
         return Ok(1);
     };
-    let block = paging.pager().read_block(page_idx)?;
+    let block = paging.read_body(page_idx)?;
     let page = parse_page(&block)?;
     if page.page_type != PAGE_LEAF {
         return Err(corrupt("expected a B-tree leaf page"));
@@ -1994,19 +2252,26 @@ fn orphaned_leaf_pages(
             }
             let mut pos = dirs.value_off(payload, c, i);
             // Only the pointer's stored length matters; the resolution handle is deliberately dead.
-            let v = read_value_lazy(&tyref, &shared, payload, &mut pos, &std::sync::Weak::new())?;
+            let v = read_value_lazy(
+                &tyref,
+                &shared,
+                payload,
+                &mut pos,
+                cap,
+                &std::sync::Weak::new(),
+            )?;
             let stored = match v {
-                Value::Unfetched(Unfetched::External {
-                    first_page, len, ..
-                }) if !kept_chains.contains(&first_page) => len as usize,
+                Value::Unfetched(Unfetched::External { first, len, .. })
+                    if !kept_chains.contains(&first.page) =>
+                {
+                    len as usize
+                }
                 Value::Unfetched(Unfetched::ExternalComp {
-                    first_page,
-                    stored_len,
-                    ..
-                }) if !kept_chains.contains(&first_page) => stored_len as usize,
+                    first, stored_len, ..
+                }) if !kept_chains.contains(&first.page) => stored_len as usize,
                 _ => continue,
             };
-            count += stored.div_ceil(cap) as u64;
+            count += stored.div_ceil(cap.chain()) as u64;
         }
     }
     Ok(count)
@@ -2028,7 +2293,7 @@ pub(crate) fn verify_live_count(
     if !VERIFY_LIVE_PAGES.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let reached = reachable_pages(snap, paging, write.root_page)?.len() as u64;
+    let reached = reachable_pages(snap, paging, write.root)?.len() as u64;
     let walked = reached + u64::from(write.gist_pages);
     assert_eq!(
         walked,
@@ -2117,7 +2382,11 @@ impl Snapshot {
         paging: Option<&SharedPaging>,
     ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
-        let cap = ps - PAGE_HEADER;
+        let seal = Sealer::of(ps, paging);
+        let cap = seal.cap;
+        // Every check that can refuse the commit runs before the first page is sealed, so a refusal
+        // draws no nonce (encrypted.md §8).
+        check_catalog_text_lengths(self)?;
 
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
@@ -2139,15 +2408,14 @@ impl Snapshot {
         let mut kept: HashSet<u32> = HashSet::new();
         let mut shared: HashSet<u32> = HashSet::new();
         let mut gist_pages = 0u32;
-        let mut root_data_page = vec![0u32; tables.len()];
-        let mut index_roots: Vec<Vec<u32>> = vec![Vec::new(); tables.len()];
+        let mut root_data_page = vec![PageRef::NONE; tables.len()];
+        let mut index_roots: Vec<Vec<PageRef>> = vec![Vec::new(); tables.len()];
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
                 root_data_page[ti] = serialize_dirty(
                     root,
                     store.col_types(),
-                    cap,
-                    ps,
+                    seal,
                     &mut alloc,
                     &mut pages,
                     &mut kept,
@@ -2164,18 +2432,23 @@ impl Snapshot {
                     // GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from
                     // the allocator (free-list first), the old tree's pages reclaimed on the next open.
                     let mut a = || alloc.take();
-                    serialize_gist_index(self, table, idx, &mut a, &mut |p| {
+                    serialize_gist_index(self, table, idx, cap, &mut a, &mut |p| {
                         // A tree rebuilt from valid leaf keys always fits; an oversized node means
                         // the loaded keys were corrupt.
-                        if p.payload.len() > cap {
+                        if p.payload.len() > cap.c {
                             return Err(corrupt("GiST node overflows its page"));
                         }
                         gist_pages += 1;
-                        pages.push((
+                        let (bytes, tag) = seal.page(
                             p.page_no,
-                            make_page(ps, p.page_type, p.item_count, 0, &p.payload),
-                        ));
-                        Ok(())
+                            p.page_type,
+                            0,
+                            p.item_count,
+                            PageRef::NONE,
+                            &p.payload,
+                        )?;
+                        pages.push((p.page_no, bytes));
+                        Ok(tag)
                     })?
                 } else {
                     let istore = self.index_store(&idx.name.to_string());
@@ -2183,15 +2456,14 @@ impl Snapshot {
                         Some(root) => serialize_dirty(
                             root,
                             &[],
-                            cap,
-                            ps,
+                            seal,
                             &mut alloc,
                             &mut pages,
                             &mut kept,
                             &mut shared,
                             paging,
                         )?,
-                        None => 0,
+                        None => PageRef::NONE,
                     }
                 };
                 index_roots[ti].push(r);
@@ -2202,69 +2474,37 @@ impl Snapshot {
         // its page indices up front — they may be reused free pages, hence not contiguous — so each
         // page can point at the next (`pack` always returns ≥ 1 group, so `cat_pages` is non-empty).
         // Entries are kind-tagged (v9): composite-type entries (kind 1, name order) then table
-        // entries (kind 0) — spec/fileformat/format.md.
-        let mut cat_entries: Vec<Vec<u8>> = Vec::new();
-        for ct in self.composite_types_sorted() {
-            let mut e = vec![1u8];
-            e.extend_from_slice(&composite_type_entry_bytes(ct));
-            cat_entries.push(e);
-        }
-        for s in self.sequences_sorted() {
-            let mut e = vec![2u8];
-            e.extend_from_slice(&sequence_entry_bytes(s));
-            cat_entries.push(e);
-        }
-        // Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated
-        // table entry is read after the entry it references. Reference-only: emit one metadata entry
-        // per collation the SCHEMA references (columns + default), not an imported set
-        // (spec/design/collation.md §2/§5).
-        let default_coll = self.default_collation();
-        for coll in self.referenced_collations()? {
-            let mut e = vec![3u8];
-            e.extend_from_slice(&collation_entry_bytes(
-                &coll,
-                default_coll == Some(coll.name.as_str()),
-            ));
-            cat_entries.push(e);
-        }
-        for (ti, (_, t, store)) in tables.iter().enumerate() {
-            let row_count = store
-                .count()
-                .expect("table stores always carry an exact row count");
-            check_table_row_count(root_data_page[ti], row_count)?;
-            let mut e = vec![0u8];
-            e.extend_from_slice(&table_entry_bytes(
-                t,
-                root_data_page[ti],
-                &index_roots[ti],
-                row_count,
-            ));
-            cat_entries.push(e);
-        }
-        cat_entries.extend(statistics_catalog_entries(self));
-        cat_entries.extend(view_catalog_entries(self));
-        check_catalog_text_lengths(self)?;
-        let cat_layout = catalog_layout(&cat_entries, cap);
+        // entries (kind 0) — spec/fileformat/format.md. The chain is sealed last page first, so
+        // each page binds its successor's tag (encrypted.md §7).
+        let cat_entries = self.catalog_entries(&tables, &root_data_page, &index_roots, cap)?;
+        let cat_layout = catalog_layout(&cat_entries, cap.chain());
         let cat_pages: Vec<u32> = (0..cat_layout.len()).map(|_| alloc.take()).collect();
-        let cat_root = cat_pages[0];
-        for (gi, cp) in cat_layout.iter().enumerate() {
-            let next_page = if gi + 1 < cat_layout.len() {
-                cat_pages[gi + 1]
-            } else {
-                0
-            };
-            pages.push((cat_pages[gi], make_catalog_page(ps, cp, next_page)));
-        }
-
         if alloc.exhausted {
             return Err(EngineError::new(
                 SqlState::ProgramLimitExceeded,
                 "database page limit exceeded",
             ));
         }
+        let mut next = PageRef::NONE;
+        for (gi, cp) in cat_layout.iter().enumerate().rev() {
+            let (bytes, tag) = seal.page(
+                cat_pages[gi],
+                PAGE_CATALOG,
+                u8::from(cp.continued),
+                cp.item_count,
+                next,
+                &cp.payload,
+            )?;
+            pages.push((cat_pages[gi], bytes));
+            next = PageRef {
+                page: cat_pages[gi],
+                tag,
+            };
+        }
+
         Ok(IncrementalWrite {
             pages,
-            root_page: cat_root,
+            root: next,
             page_count: alloc.next,
             // Both ascending, skipped first.
             free_remaining: {
@@ -2291,20 +2531,20 @@ impl Snapshot {
 /// The high-water is extended only if `safe` is exhausted (rare: a large delete on an otherwise-tight
 /// file). A free-list page is consumed here, so it never appears in the list it carries; this
 /// commit's fresh orphans (in `persist`, not in `safe`) are persisted but not reused until the next
-/// commit (the watermark — they are still reachable from the fallback).
+/// commit (the watermark — they are still reachable from the fallback). The chain is sealed last
+/// page first (encrypted.md §7).
 fn serialize_free_list(
     persist: &[u32],
     safe: &[u32],
-    cap: usize,
-    ps: usize,
+    seal: Sealer<'_>,
     next: u32,
-) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32)> {
+) -> Result<(Vec<(u32, Vec<u8>)>, PageRef, Vec<u32>, u32)> {
     // Nothing worth persisting when it would take the whole list to hold itself (empty, or a lone
     // page): leave the residue in RAM, reclaimed at the next compaction (a bounded transient leak).
     if persist.len() < 2 {
-        return Ok((Vec::new(), 0, persist.to_vec(), next));
+        return Ok((Vec::new(), PageRef::NONE, persist.to_vec(), next));
     }
-    let per = (cap / 4).max(1);
+    let per = (seal.cap.chain() / 4).max(1);
     // Draw free-list pages (from `safe`, then the high-water) until they hold every entry that then
     // remains. Each page drawn from `safe` also *removes* itself from what must be held (it is in
     // `persist`), so the loop converges; a high-water page adds a slot without shrinking the content.
@@ -2339,24 +2579,27 @@ fn serialize_free_list(
         .filter(|p| !drawn.contains(p))
         .collect();
     let mut pages = Vec::with_capacity(fl_ids.len());
-    for (ci, &page_no) in fl_ids.iter().enumerate() {
+    let mut next_page = PageRef::NONE;
+    for (ci, &page_no) in fl_ids.iter().enumerate().rev() {
         let lo = (ci * per).min(persisted.len());
         let chunk = &persisted[lo..((ci + 1) * per).min(persisted.len())];
-        let next_page = if ci + 1 < fl_ids.len() {
-            fl_ids[ci + 1]
-        } else {
-            0
-        };
         let mut payload = Vec::with_capacity(chunk.len() * 4);
         for &e in chunk {
             payload.extend_from_slice(&e.to_be_bytes());
         }
-        pages.push((
+        let (bytes, tag) = seal.page(
             page_no,
-            make_page(ps, PAGE_FREELIST, chunk.len() as u32, next_page, &payload),
-        ));
+            PAGE_FREELIST,
+            0,
+            chunk.len() as u32,
+            next_page,
+            &payload,
+        )?;
+        pages.push((page_no, bytes));
+        next_page = PageRef { page: page_no, tag };
     }
-    Ok((pages, fl_ids[0], persisted, hw))
+    pages.reverse();
+    Ok((pages, next_page, persisted, hw))
 }
 
 /// Read a persisted free-list (v25) by following the `page_type 7` chain from `head` (meta offset
@@ -2365,26 +2608,29 @@ fn serialize_free_list(
 /// reconstruct-on-open reachability walk (spec/fileformat/format.md *Reclamation*).
 pub(crate) fn read_free_list(
     paging: &SharedPaging,
-    head: u32,
+    head: PageRef,
     page_count: u32,
     protected: &HashSet<u32>,
 ) -> Result<Vec<u32>> {
+    let cap = paging.cap();
+    let first = cap.first_body();
     let mut chain = HashSet::new();
     let mut free = Vec::new();
     let mut p = head;
-    while p != 0 {
-        if p < ROOT_PAGE || p >= page_count || !chain.insert(p) {
+    while p.page != 0 {
+        if p.page < first || p.page >= page_count || !chain.insert(p.page) {
             return Err(corrupt("invalid free-list chain"));
         }
-        let block = paging.pager().read_block(p)?;
+        let block = paging.read_body(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_FREELIST {
             return Err(corrupt("expected a free-list page"));
         }
+        let (next, content) = chain_content(&page, cap)?;
         let mut pos = 0usize;
         for _ in 0..page.item_count {
-            let id = read_u32(page.payload, &mut pos)?;
-            if id < ROOT_PAGE
+            let id = read_u32(content, &mut pos)?;
+            if id < first
                 || id >= page_count
                 || free.last().is_some_and(|last| id <= *last)
                 || protected.contains(&id)
@@ -2393,7 +2639,7 @@ pub(crate) fn read_free_list(
             }
             free.push(id);
         }
-        p = page.next_page;
+        p = next;
     }
     if free.iter().any(|p| chain.contains(p)) {
         return Err(corrupt("free list contains its own chain"));
@@ -2402,26 +2648,26 @@ pub(crate) fn read_free_list(
 }
 
 /// Assign a page to one **dirty** node (and its dirty descendants) post-order, appending each as a
-/// full `page_size` page to `pages`, and return this node's page index. A **clean** node (already
-/// persisted, `page != 0`) short-circuits: its whole subtree is on disk unchanged (copy-on-write
-/// only rebuilds the modified path), so nothing is written and its existing page is returned. The
-/// node's set-once page id is stored here — safe on the shared tree, since a node is otherwise
-/// immutable (`AtomicU32`, P5.3b). Mirrors `serialize_node` for the byte layout.
+/// full `page_size` page to `pages`, and return the pointer to this node's page. A **clean** node
+/// (already persisted, `page != 0`) short-circuits: its whole subtree is on disk unchanged
+/// (copy-on-write only rebuilds the modified path), so nothing is written and its existing page (and
+/// tag) is returned. The node's set-once page id and tag are stored here — safe on the shared tree,
+/// since a node is otherwise immutable (P5.3b). Mirrors `serialize_node` for the byte layout; a
+/// leaf's fresh overflow chains are sealed before the leaf (encrypted.md §7).
 #[allow(clippy::too_many_arguments)]
 fn serialize_dirty(
     node: &Arc<Node>,
     col_types: &[ColType],
-    cap: usize,
-    ps: usize,
+    seal: Sealer<'_>,
     alloc: &mut PageAlloc,
     pages: &mut Vec<(u32, Vec<u8>)>,
     kept: &mut HashSet<u32>,
     shared: &mut HashSet<u32>,
     paging: Option<&SharedPaging>,
-) -> Result<u32> {
-    let existing = node.page.load(Ordering::Acquire);
-    if existing != 0 {
-        kept.insert(existing);
+) -> Result<PageRef> {
+    let existing = node.page_ref();
+    if existing.page != 0 {
+        kept.insert(existing.page);
         return Ok(existing);
     }
     let mut child_pages = Vec::with_capacity(node.children.len());
@@ -2430,10 +2676,10 @@ fn serialize_dirty(
         // leaf already durable at its page — keep it, write nothing (the incremental-commit win).
         let cp = match child {
             Child::Resident(n) => {
-                serialize_dirty(n, col_types, cap, ps, alloc, pages, kept, shared, paging)?
+                serialize_dirty(n, col_types, seal, alloc, pages, kept, shared, paging)?
             }
             Child::OnDisk(p) => {
-                kept.insert(*p);
+                kept.insert(p.page);
                 *p
             }
         };
@@ -2448,7 +2694,6 @@ fn serialize_dirty(
     // decompression, no chain write. An INTERIOR node is the record-free keys+children skeleton
     // (v24) — no values, no chains. Scoped so the `&mut alloc` borrow ends before this node's own
     // page is allocated.
-    let mut ovf = Vec::new();
     let (page_type, payload) = {
         let mut take = || alloc.take();
         if node.children.is_empty() {
@@ -2459,30 +2704,29 @@ fn serialize_dirty(
                 shared: Vec::new(),
             };
             let payload = encode_leaf_pax(
-                col_types, &node.keys, &rows, cap, &mut take, &mut ovf, &mut src,
+                col_types, &node.keys, &rows, seal, &mut take, pages, &mut src,
             )?;
             shared.extend(src.shared);
             (PAGE_LEAF, payload)
         } else {
-            (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
+            (
+                PAGE_INTERIOR,
+                encode_interior(&node.keys, &child_pages, seal.cap),
+            )
         }
     };
-    if payload.len() > cap {
+    if payload.len() > seal.cap.c {
         return Err(EngineError::new(
             SqlState::FeatureNotSupported,
             "a record larger than the per-row limit is not supported",
         ));
     }
     let index = alloc.take();
-    node.page.store(index, Ordering::Release);
-    pages.push((index, make_page(ps, page_type, n, 0, &payload)));
-    for o in ovf {
-        pages.push((
-            o.index,
-            make_page(ps, PAGE_OVERFLOW, o.item_count, o.next_page, &o.payload),
-        ));
-    }
-    Ok(index)
+    let (bytes, tag) = seal.page(index, page_type, 0, n, PageRef::NONE, &payload)?;
+    let page = PageRef { page: index, tag };
+    node.set_page_ref(page);
+    pages.push((index, bytes));
+    Ok(page)
 }
 
 impl Engine {
@@ -2492,6 +2736,15 @@ impl Engine {
     /// `Snapshot::to_image` at commit; this serves callers/tests holding a `Engine`.)
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
         self.committed().to_image(page_size, txid)
+    }
+
+    /// [`to_image`](Engine::to_image) in the encrypted variant under this database's own keys (the
+    /// tests' and compaction's from-scratch image of an encrypted file); plaintext when the database
+    /// is not encrypted.
+    pub(crate) fn to_image_own(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
+        let codec = self.paging.as_ref().and_then(|p| p.codec().cloned());
+        self.committed()
+            .to_image_sealed(page_size, txid, codec.as_deref())
     }
 
     /// Reconstruct a database from an on-disk image (inverse of `to_image`) over a fresh empty
@@ -2520,7 +2773,7 @@ impl Engine {
         }
         let store = crate::blockstore::MemoryBlockStore::new(image.to_vec());
         let pager = Pager::from_store(Box::new(store))?;
-        Engine::open_paged(pager, usize::MAX, env)
+        Engine::open_paged(pager, usize::MAX, env, None)
     }
 
     /// Open a file-backed database **demand-paged** (spec/design/pager.md, P6.4b): load only the
@@ -2536,15 +2789,17 @@ impl Engine {
     /// The file's collation references resolve against `env`, which becomes the handle's environment
     /// (spec/design/environment.md).
     pub(crate) fn open_paged(
-        pager: Pager,
+        mut pager: Pager,
         capacity: usize,
         env: &crate::environment::Environment,
+        credential: Option<&crate::crypto::Credential>,
     ) -> Result<Engine> {
         let page_size = pager.page_size() as usize;
         if !page_size_valid(page_size) {
             return Err(corrupt("invalid page size"));
         }
-        let paging = SharedPaging::new(pager, capacity);
+        let codec = unlock_pager(&mut pager, credential, env)?;
+        let paging = SharedPaging::with_codec(pager, capacity, codec);
         Self::open_shared_paging(paging, env)
     }
 
@@ -2591,7 +2846,13 @@ impl Engine {
             // txid & 1 (format.md, *Slot alternation*).
             let same_txid = candidates.len() == 2 && candidates[0].0.txid == candidates[1].0.txid;
             let mut selected = None;
+            let encrypted = paging.codec().is_some();
             for (mut m, bytes, slot) in candidates {
+                // A slot of the other variant is not a candidate of this file (encrypted.md §6;
+                // the unlock already refused files whose valid slots disagree).
+                if (m.suite != 0) != encrypted {
+                    continue;
+                }
                 let physical = pg.allocated_pages();
                 let protected = if pg.trusts_meta() {
                     // A page client adopts the owner's meta as served (page-service.md §5.3).
@@ -2603,6 +2864,12 @@ impl Engine {
                         .map(Arc::new)
                 };
                 if let Some(protected) = protected {
+                    // An encrypted meta is authenticated after keyless selection; a CRC-valid meta
+                    // that fails its tag was tampered with — `XX001`, never a fallback.
+                    if let Some(codec) = paging.codec() {
+                        let chain = commit_manifest::chain_pages(bytes, |id| pg.read_block(id))?;
+                        codec.verify_meta(slot, bytes, &chain)?;
+                    }
                     pg.cache_validation(bytes, Arc::clone(&protected));
                     m.protected = protected;
                     let floor_slot = if same_txid { (m.txid & 1) as u32 } else { slot };
@@ -2619,11 +2886,17 @@ impl Engine {
             selected.ok_or_else(|| corrupt("no complete valid meta page"))?
         };
 
+        let cap = paging.cap();
         let mut snap = Snapshot::with_environment(env.clone());
         snap.txid = meta.txid;
+        // Bound before any store is registered, so every store takes this file's capacities.
+        snap.set_store_paging(paging.clone());
         // v25: the free-list is read from the persisted chain (below), not reconstructed by a
         // reachability walk — so the catalog + skeleton load no longer tracks a `reached` set.
-        let mut cat_page = meta.root_page;
+        let mut cat_page = PageRef {
+            page: meta.root_page,
+            tag: meta.root_tag,
+        };
         let mut statistics_expected: std::collections::HashMap<
             (String, usize),
             (usize, usize, usize),
@@ -2641,11 +2914,11 @@ impl Engine {
         // table resolves its column types as it is registered, so the types it reaches must be
         // known-present and acyclic first (composite.md §3).
         let mut types_checked = true;
-        while cat_page != 0 {
-            if !cat_seen.insert(cat_page) {
+        while cat_page.page != 0 {
+            if !cat_seen.insert(cat_page.page) {
                 return Err(corrupt("catalog chain revisits a page"));
             }
-            let block = paging.pager().read_block(cat_page)?;
+            let block = paging.read_body(cat_page)?;
             let page = parse_page(&block)?;
             if page.page_type != PAGE_CATALOG || page.flags & !1 != 0 {
                 return Err(corrupt("expected a catalog page"));
@@ -2653,21 +2926,21 @@ impl Engine {
             live.catalog += 1;
             // A catalog entry longer than a page continues on the following chain pages (v48):
             // header byte 1 bit0 `continued` on every page of the run but the last.
-            let mut next = page.next_page;
+            let (mut next, content) = chain_content(&page, cap)?;
             let joined: Vec<u8>;
             let payload: &[u8] = if page.flags & 1 != 0 {
                 if page.item_count != 1 {
                     return Err(corrupt("a continued catalog page holds other entries"));
                 }
-                let mut buf = page.payload.to_vec();
+                let mut buf = content.to_vec();
                 loop {
-                    if next == 0 {
+                    if next.page == 0 {
                         return Err(corrupt("a continued catalog entry ends the chain"));
                     }
-                    if !cat_seen.insert(next) {
+                    if !cat_seen.insert(next.page) {
                         return Err(corrupt("catalog chain revisits a page"));
                     }
-                    let block = paging.pager().read_block(next)?;
+                    let block = paging.read_body(next)?;
                     let cont = parse_page(&block)?;
                     if cont.page_type != PAGE_CATALOG
                         || cont.item_count != 0
@@ -2676,8 +2949,9 @@ impl Engine {
                         return Err(corrupt("bad catalog continuation page"));
                     }
                     live.catalog += 1;
-                    buf.extend_from_slice(cont.payload);
-                    next = cont.next_page;
+                    let (after, more) = chain_content(&cont, cap)?;
+                    buf.extend_from_slice(more);
+                    next = after;
                     if cont.flags & 1 == 0 {
                         break;
                     }
@@ -2685,7 +2959,7 @@ impl Engine {
                 joined = buf;
                 &joined
             } else {
-                page.payload
+                content
             };
             let mut pos = 0usize;
             for _ in 0..page.item_count {
@@ -2734,7 +3008,7 @@ impl Engine {
                     return Err(corrupt("unknown catalog entry kind"));
                 }
                 let (table, root_data_page, row_count, index_roots) =
-                    decode_table_entry(payload, &mut pos)?;
+                    decode_table_entry(payload, &mut pos, cap)?;
                 // Every record costs at least its 4-byte key-directory entry in some leaf, so no
                 // table holds more rows than the file has room for. Checking keeps a corrupt count
                 // from sizing allocations later.
@@ -2773,7 +3047,7 @@ impl Engine {
                 // The store resolved each column's `ColType` from the (types-first) catalog at
                 // `put_table` (spec/design/composite.md §3).
                 let col_types = Arc::new(snap.store(&name).col_types().to_vec());
-                if root_data_page != 0 {
+                if root_data_page.page != 0 {
                     // Reads only the interior spine — leaves stay `OnDisk`; the exact row count was
                     // restored from the v28 catalog entry (spec/design/storage.md §6).
                     let root = read_skeleton(&paging, root_data_page, &col_types)?;
@@ -2798,9 +3072,8 @@ impl Engine {
                 // keys (spec/design/indexes.md §3); no spillable columns, so no overflow
                 // collection is ever needed.
                 for (idx, &iroot) in indexes.iter().zip(&index_roots) {
-                    let cap = page_size - PAGE_HEADER;
                     let mut istore = TableStore::new(cap, Vec::new());
-                    if iroot != 0 {
+                    if iroot.page != 0 {
                         if idx.kind == IndexKind::Gist {
                             // GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the
                             // whole R-tree, recover its leaf keys into a fully-resident leaf store.
@@ -2808,16 +3081,17 @@ impl Engine {
                             let mut keys = Vec::new();
                             let gist_pages = std::cell::Cell::new(0u32);
                             read_gist_leaf_keys(
-                                &|p| {
+                                &|p: PageRef| {
                                     gist_pages.set(gist_pages.get() + 1);
                                     if let Some(hook) = at.gist {
-                                        hook(p);
+                                        hook(p.page);
                                     }
-                                    let block = paging.pager().read_block(p)?;
+                                    let block = paging.read_body(p)?;
                                     let pg = parse_page(&block)?;
                                     Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
                                 },
                                 iroot,
+                                cap,
                                 &mut keys,
                                 &mut HashSet::new(),
                                 1,
@@ -2871,7 +3145,10 @@ impl Engine {
         if !given {
             db.free_pages = read_free_list(
                 &paging,
-                meta.free_list_head,
+                PageRef {
+                    page: meta.free_list_head,
+                    tag: meta.free_list_tag,
+                },
                 meta.page_count,
                 &meta.protected,
             )?;
@@ -2894,6 +3171,50 @@ impl Engine {
     }
 }
 
+/// Learn from the meta slots whether the file is encrypted and, if it is, unlock it with
+/// `credential` (spec/fileformat/encrypted.md §5, §9): the codec its paging context seals and opens
+/// pages with. A plaintext file opened with a credential is `28P03`, an encrypted one without
+/// `28P02`, a credential that does not unwrap the data key `28P01`.
+pub(crate) fn unlock_pager(
+    pager: &mut Pager,
+    credential: Option<&crate::crypto::Credential>,
+    env: &crate::environment::Environment,
+) -> Result<Option<Arc<crate::crypto::PageCodec>>> {
+    if pager.allocated_pages() < 2 {
+        // Too short for two meta slots: slot selection reports the corruption.
+        return match credential {
+            None => Ok(None),
+            Some(_) => Err(corrupt("no complete valid meta page")),
+        };
+    }
+    let slot0 = pager.read_block(0)?;
+    let slot1 = pager.read_block(1)?;
+    let suite = crate::crypto::file_suite(&slot0, &slot1)?;
+    match (suite, credential) {
+        (0, None) => Ok(None),
+        (0, Some(_)) => Err(EngineError::new(
+            SqlState::CredentialNotApplicable,
+            "a credential was given for a database that is not encrypted",
+        )),
+        (_, None) => Err(EngineError::new(
+            SqlState::CredentialRequired,
+            "the database is encrypted; a credential is required",
+        )),
+        (_, Some(credential)) => {
+            if (pager.page_size() as usize) < crate::crypto::MIN_PAGE_SIZE
+                || pager.allocated_pages() < crate::crypto::FIRST_BODY_PAGE
+            {
+                return Err(corrupt("encrypted file too small for its key block"));
+            }
+            let page2 = pager.read_block(2)?;
+            let page3 = pager.read_block(3)?;
+            let codec = crate::crypto::unlock(&page2, &page3, credential, env.key_stream())?;
+            pager.set_encrypted();
+            Ok(Some(codec))
+        }
+    }
+}
+
 /// How [`Engine::open_shared_paging_at`] differs from an ordinary load: a backup's walk
 /// (spec/design/page-service.md §9) loads the version `meta` names and sees every GiST R-tree page
 /// the load reads through `gist`.
@@ -2911,14 +3232,15 @@ pub(crate) struct LoadAt<'a> {
 /// file never materializes or decompresses a large value.
 fn collect_leaf_overflow(
     paging: &SharedPaging,
-    page_idx: u32,
+    page_idx: PageRef,
     col_types: &Arc<Vec<ColType>>,
     reached: &mut HashSet<u32>,
     seen: &mut HashSet<u32>,
     depth: usize,
 ) -> Result<()> {
     collect_leaf_overflow_with(
-        &|p| paging.pager().read_block(p),
+        &|p| paging.read_body(p),
+        paging.cap(),
         page_idx,
         col_types,
         reached,
@@ -2930,14 +3252,15 @@ fn collect_leaf_overflow(
 /// [`collect_leaf_overflow`] over a page reader: the commit path's reads go to the pager it already
 /// holds, a backup's take the pager lock per page.
 pub(crate) fn collect_leaf_overflow_with(
-    read: &dyn Fn(u32) -> Result<Vec<u8>>,
-    page_idx: u32,
+    read: &dyn Fn(PageRef) -> Result<Vec<u8>>,
+    cap: Cap,
+    page_idx: PageRef,
     col_types: &Arc<Vec<ColType>>,
     reached: &mut HashSet<u32>,
     seen: &mut HashSet<u32>,
     depth: usize,
 ) -> Result<()> {
-    if !seen.insert(page_idx) {
+    if !seen.insert(page_idx.page) {
         return Err(corrupt("B-tree page reached twice"));
     }
     if depth > MAX_TREE_DEPTH {
@@ -2947,7 +3270,7 @@ pub(crate) fn collect_leaf_overflow_with(
     let page = parse_page(&block)?;
     match page.page_type {
         PAGE_LEAF => {
-            let fetch = |p: u32| read(p);
+            let fetch = |p: PageRef| read(p);
             let n = page.item_count as usize;
             // The reachability walk discards each value right after `mark_chains` (only an external
             // chain matters here, never an inline-deferred body), so the form-(a) `Arc` wrap (L3)
@@ -2973,25 +3296,26 @@ pub(crate) fn collect_leaf_overflow_with(
                         &shared,
                         payload,
                         &mut pos,
+                        cap,
                         &std::sync::Weak::new(),
                     )?;
-                    mark_chains(&[v], &fetch, reached)?;
+                    mark_chains(&[v], &fetch, cap, reached)?;
                 }
             }
             Ok(())
         }
         PAGE_INTERIOR => {
             let n = page.item_count as usize;
-            if 8 * n + 4 > page.payload.len() {
+            if (cap.ptr() + 4) * n + cap.ptr() > page.payload.len() {
                 return Err(corrupt("B-tree interior item count overruns page"));
             }
             let mut pos = 0usize;
             let mut cps = Vec::with_capacity(n + 1);
             for _ in 0..=n {
-                cps.push(read_u32(page.payload, &mut pos)?);
+                cps.push(PageRef::read(page.payload, &mut pos, cap)?);
             }
             for cp in cps {
-                collect_leaf_overflow_with(read, cp, col_types, reached, seen, depth + 1)?;
+                collect_leaf_overflow_with(read, cap, cp, col_types, reached, seen, depth + 1)?;
             }
             Ok(())
         }
@@ -3012,29 +3336,30 @@ pub(crate) fn collect_leaf_overflow_with(
 pub(crate) fn reachable_pages(
     snap: &Snapshot,
     paging: &SharedPaging,
-    cat_root: u32,
+    cat_root: PageRef,
 ) -> Result<HashSet<u32>> {
+    let cap = paging.cap();
     let mut reached: HashSet<u32> = HashSet::new();
     // The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
     // what compaction reclaims).
     let mut p = cat_root;
-    while p != 0 {
-        if !reached.insert(p) {
+    while p.page != 0 {
+        if !reached.insert(p.page) {
             return Err(corrupt("catalog chain revisits a page"));
         }
-        let block = paging.pager().read_block(p)?;
+        let block = paging.read_body(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_CATALOG {
             return Err(corrupt("expected a catalog page"));
         }
-        p = page.next_page;
+        p = chain_content(&page, cap)?.0;
     }
     // Table data trees + their live overflow chains.
     for st in snap.stores_iter() {
         if let Some(root) = st.tree_root() {
             collect_tree_pages(root, &mut reached);
-            let root_page = root.page.load(std::sync::atomic::Ordering::Acquire);
-            if root_page != 0 {
+            let root_page = root.page_ref();
+            if root_page.page != 0 {
                 let col_types = Arc::new(st.col_types().to_vec());
                 if any_spillable(&col_types) {
                     collect_leaf_overflow(
@@ -3093,13 +3418,12 @@ pub(crate) fn reclaim_due(page_count: u32, free: usize, live_at_compaction: u32)
 pub(crate) fn plan_free_list(
     snap: &Snapshot,
     paging: &SharedPaging,
-    cat_root: u32,
+    cat_root: PageRef,
     written: &[(u32, Vec<u8>)],
     free_remaining: &[u32],
     page_count: u32,
     live_at_compaction: u32,
     gen_txid: u64,
-    cap: usize,
     ps: usize,
     can_reclaim: bool,
     can_reuse: bool,
@@ -3125,7 +3449,7 @@ pub(crate) fn plan_free_list(
         for (index, _) in pending {
             reached.insert(*index);
         }
-        let free: Vec<u32> = (ROOT_PAGE..page_count)
+        let free: Vec<u32> = (paging.cap().first_body()..page_count)
             .filter(|p| !reached.contains(p))
             .collect();
         // The recomputed list is proven dead at snap.txid — its reuse generation (the §8 gate).
@@ -3194,25 +3518,30 @@ pub(crate) fn plan_free_list(
             .copied()
             .filter(|id| !reserved.contains(id))
             .collect();
+        let seal = Sealer::of(ps, Some(paging));
+        let cap = seal.cap;
         let (pages, head, persisted, new_pc) =
-            serialize_free_list(&persist, &remaining, cap, ps, next)?;
+            serialize_free_list(&persist, &remaining, seal, next)?;
         let needed =
-            commit_manifest::overflow_needed(ps, pending.len() + written.len() + pages.len());
+            commit_manifest::overflow_needed(ps, cap, pending.len() + written.len() + pages.len());
         if needed > n {
             n = needed;
             continue;
         }
-        let base = meta_page(ps as u32, snap.txid, cat_root, new_pc, head, live_pages);
+        let base = meta_page(
+            cap, ps as u32, snap.txid, cat_root, new_pc, head, live_pages,
+        );
         let mut dirty = commit_manifest::entries_of(written);
         dirty.extend(commit_manifest::entries_of(&pages));
         let mut entries = Vec::with_capacity(pending.len() + dirty.len());
         entries.extend_from_slice(pending);
         entries.extend_from_slice(&dirty);
-        let (meta, overflow) = commit_manifest::encode(base, entries, &ids);
+        let (meta, overflow) = commit_manifest::encode(base, cap, entries, &ids);
         let mut auxiliary = pages;
-        auxiliary.extend(overflow);
+        auxiliary.extend(overflow.iter().cloned());
         return Ok(CommitPlan {
             auxiliary,
+            manifest: overflow,
             meta,
             persisted,
             page_count: new_pc,
@@ -3221,6 +3550,21 @@ pub(crate) fn plan_free_list(
             dirty,
         });
     }
+}
+
+/// Complete a commit's meta for `slot` (encrypted.md §6): an encrypted database seals it over its
+/// manifest chain; a plaintext meta is final as planned.
+pub(crate) fn seal_meta(
+    paging: &SharedPaging,
+    slot: u32,
+    meta: &[u8],
+    manifest: &[(u32, Vec<u8>)],
+) -> Result<Vec<u8>> {
+    let mut meta = meta.to_vec();
+    if let Some(codec) = paging.codec() {
+        codec.seal_meta(slot, &mut meta, manifest)?;
+    }
+    Ok(meta)
 }
 
 /// Split the sorted safe free pages at the start `k` of their trailing run below the high-water: every
@@ -3238,6 +3582,10 @@ pub(crate) fn trailing_run(safe: &[u32], high: u32) -> (&[u32], u32) {
 
 pub(crate) struct CommitPlan {
     pub auxiliary: Vec<(u32, Vec<u8>)>,
+    /// The manifest-overflow pages among `auxiliary`, in chain order — what an encrypted meta's tag
+    /// authenticates ([`seal_meta`]).
+    pub manifest: Vec<(u32, Vec<u8>)>,
+    /// The meta page, unsealed: [`seal_meta`] completes it for the slot it is written to.
     pub meta: Vec<u8>,
     pub persisted: Vec<u32>,
     pub page_count: u32,
@@ -3269,7 +3617,7 @@ fn unassign_tree_pages(node: &Node, assigned: &HashSet<u32>) {
     if page == 0 || !assigned.contains(&page) {
         return;
     }
-    node.page.store(0, std::sync::atomic::Ordering::Release);
+    node.set_page_ref(PageRef::NONE);
     for child in &node.children {
         if let Child::Resident(n) = child {
             unassign_tree_pages(n, assigned);
@@ -3299,7 +3647,7 @@ pub(crate) fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
         match child {
             Child::Resident(n) => collect_tree_pages(n, reached),
             Child::OnDisk(p) => {
-                reached.insert(*p);
+                reached.insert(p.page);
             }
         }
     }
@@ -3313,7 +3661,7 @@ pub(crate) fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
 /// (spec/design/pager.md §1/§4).
 fn read_skeleton(
     paging: &Arc<SharedPaging>,
-    root_page: u32,
+    root_page: PageRef,
     col_types: &Arc<Vec<ColType>>,
 ) -> Result<Arc<Node>> {
     match read_skeleton_node(paging, root_page, col_types, &mut HashSet::new(), 1)?.0 {
@@ -3343,7 +3691,7 @@ fn read_skeleton(
 /// at one depth, the invariant the scan and rebalance code relies on.
 fn read_skeleton_node(
     paging: &SharedPaging,
-    page_idx: u32,
+    page_idx: PageRef,
     col_types: &[ColType],
     seen: &mut HashSet<u32>,
     depth: usize,
@@ -3351,26 +3699,27 @@ fn read_skeleton_node(
     if depth > MAX_TREE_DEPTH {
         return Err(corrupt("B-tree deeper than any valid tree"));
     }
-    let block = paging.pager().read_block(page_idx)?;
+    let cap = paging.cap();
+    let block = paging.read_body(page_idx)?;
     let page = parse_page(&block)?;
     match page.page_type {
         PAGE_LEAF => Ok((Child::OnDisk(page_idx), 1)),
         PAGE_INTERIOR => {
-            if !seen.insert(page_idx) {
+            if !seen.insert(page_idx.page) {
                 return Err(corrupt("B-tree interior page reached twice"));
             }
             let n = page.item_count as usize;
             let payload = page.payload;
             // n+1 child pointers plus an n-entry separator directory must fit the payload; checking
             // first keeps a corrupt count from sizing the allocations below.
-            if 8 * n + 4 > payload.len() {
+            if (cap.ptr() + 4) * n + cap.ptr() > payload.len() {
                 return Err(corrupt("B-tree interior item count overruns page"));
             }
             let mut pos = 0usize;
             // Child pointers precede the separator directory (format.md "Interior node").
             let mut child_ptrs = Vec::with_capacity(n + 1);
             for _ in 0..=n {
-                child_ptrs.push(read_u32(payload, &mut pos)?);
+                child_ptrs.push(PageRef::read(payload, &mut pos, cap)?);
             }
             // v24: the record-free routing skeleton — an end-offset separator directory + key
             // blob. Separators carry no values, so no lazy decode and no chains to mark.
@@ -3436,12 +3785,13 @@ fn serialize_gist_index<A, E>(
     snap: &Snapshot,
     table: &Table,
     idx: &IndexDef,
+    cap: Cap,
     alloc: &mut A,
     emit: &mut E,
-) -> Result<u32>
+) -> Result<PageRef>
 where
     A: FnMut() -> u32,
-    E: FnMut(crate::gist::GistPage) -> Result<()>,
+    E: FnMut(crate::gist::GistPage) -> Result<crate::crypto::Tag>,
 {
     // One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per `WITH`
     // column for an EXCLUDE backing index.
@@ -3454,11 +3804,12 @@ where
     let istore = snap.index_store(&idx.name.to_string());
     let keys: Vec<Vec<u8>> = istore.iter_entries()?.into_iter().map(|(k, _)| k).collect();
     if keys.is_empty() {
-        return Ok(0);
+        return Ok(PageRef::NONE);
     }
     let tree = crate::gist::build_from_leaf_keys(&ops, keys.iter().map(|k| k.as_slice()))?;
     drop(keys); // the tree holds every entry now; free the key copies before encoding pages
-    crate::gist::serialize_tree_to(&tree, &ops, alloc, emit)
+    let (page, tag) = crate::gist::serialize_tree_to(&tree, &ops, cap.tag, alloc, emit)?;
+    Ok(PageRef { page, tag })
 }
 
 /// Walk a persisted GiST R-tree (rooted at `root`, page types 5/6 — spec/design/gist.md §4.1),
@@ -3474,15 +3825,16 @@ where
 /// (`data_corrupted`), not a reason to recurse without bound.
 fn read_gist_leaf_keys<F>(
     read: &F,
-    page_no: u32,
+    page_no: PageRef,
+    cap: Cap,
     out: &mut Vec<Vec<u8>>,
     seen: &mut HashSet<u32>,
     depth: usize,
 ) -> Result<()>
 where
-    F: Fn(u32) -> Result<(u8, u32, Vec<u8>)>,
+    F: Fn(PageRef) -> Result<(u8, u32, Vec<u8>)>,
 {
-    if !seen.insert(page_no) {
+    if !seen.insert(page_no.page) {
         return Err(corrupt("GiST page reached twice"));
     }
     if depth > MAX_TREE_DEPTH {
@@ -3506,7 +3858,7 @@ where
         t if t == crate::gist::PAGE_GIST_INTERIOR => {
             // Each entry is at least a u16 bound length and a u32 child pointer; checking first
             // keeps a corrupt count from sizing the allocation.
-            if n as usize * 6 > payload.len() {
+            if n as usize * (2 + cap.ptr()) > payload.len() {
                 return Err(corrupt("GiST interior item count overruns page"));
             }
             // Collect child pages first (the payload borrow ends before recursing).
@@ -3514,10 +3866,10 @@ where
             for _ in 0..n {
                 let blen = read_u16(&payload, &mut pos)? as usize;
                 let _ = take_bytes(&payload, &mut pos, blen)?; // skip the union bound
-                children.push(read_u32(&payload, &mut pos)?);
+                children.push(PageRef::read(&payload, &mut pos, cap)?);
             }
             for cp in children {
-                read_gist_leaf_keys(read, cp, out, seen, depth + 1)?;
+                read_gist_leaf_keys(read, cp, cap, out, seen, depth + 1)?;
             }
             Ok(())
         }
@@ -3536,15 +3888,6 @@ fn take_bytes(buf: &[u8], pos: &mut usize, n: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-/// One record's bytes: `key_len(u16) | key | payload(each column value)`.
-/// One overflow page produced while serializing a record's external value (large-values.md §12).
-struct OverflowPageOut {
-    index: u32,
-    item_count: u32,
-    next_page: u32,
-    payload: Vec<u8>,
-}
-
 /// Encode a record (`key_len | key | each column value`), spilling over-large values out-of-line
 /// per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
 /// page(s) via `take`, append them to `ovf`, and write a fixed `tag | first_page | len` pointer
@@ -3554,10 +3897,10 @@ struct OverflowPageOut {
 /// Build a v24 **interior** node payload (spec/fileformat/format.md "Interior node"): `N+1` child
 /// pointers ‖ an `N`-entry end-offset separator directory ‖ the separator key blob. Record-free —
 /// no value codec, no overflow chains; a separator is raw order-preserving key bytes.
-fn encode_interior(seps: &[Vec<u8>], child_pages: &[u32]) -> Vec<u8> {
+fn encode_interior(seps: &[Vec<u8>], child_pages: &[PageRef], cap: Cap) -> Vec<u8> {
     let mut out = Vec::new();
     for &cp in child_pages {
-        out.extend_from_slice(&cp.to_be_bytes());
+        cp.push(&mut out, cap);
     }
     let mut off = 0u32;
     for s in seps {
@@ -3595,12 +3938,12 @@ impl ChainSource<'_> {
         }
     }
 
-    fn read_chain(&self, first: u32, len: usize) -> Result<Vec<u8>> {
+    fn read_chain(&self, first: PageRef, len: usize) -> Result<Vec<u8>> {
         let paging = self
             .paging
             .ok_or_else(|| corrupt("deferred large value with no pager at encode"))?;
-        let fetch = |p: u32| paging.pager().read_block(p);
-        read_overflow_chain(first, len, &fetch, &mut Vec::new())
+        let fetch = |p: PageRef| paging.read_body(p);
+        read_overflow_chain(first, len, &fetch, paging.cap(), &mut Vec::new())
     }
 
     /// `v` materialized: a deferred value resolved through the database's pager (unmetered, like
@@ -3608,12 +3951,11 @@ impl ChainSource<'_> {
     fn resident_value<'v>(&self, ty: &ColType, v: &'v Value) -> Result<Cow<'v, Value>> {
         match v {
             Value::Unfetched(u) => {
-                let paging = self.paging;
-                let fetch = |p: u32| match paging {
-                    Some(paging) => paging.pager().read_block(p),
-                    None => Err(corrupt("deferred large value with no pager at encode")),
-                };
-                Ok(Cow::Owned(resolve_unfetched(ty, u, &fetch)?))
+                let paging = self
+                    .paging
+                    .ok_or_else(|| corrupt("deferred large value with no pager at encode"))?;
+                let fetch = |p: PageRef| paging.read_body(p);
+                Ok(Cow::Owned(resolve_unfetched(ty, u, &fetch, paging.cap())?))
             }
             v => Ok(Cow::Borrowed(v)),
         }
@@ -3627,11 +3969,9 @@ impl ChainSource<'_> {
             (
                 CompBlock::OnChain(_),
                 Value::Unfetched(Unfetched::ExternalComp {
-                    first_page,
-                    stored_len,
-                    ..
+                    first, stored_len, ..
                 }),
-            ) => self.read_chain(*first_page, *stored_len as usize),
+            ) => self.read_chain(*first, *stored_len as usize),
             (CompBlock::OnChain(_), _) => Err(corrupt("a chained LZ4 block with no chain")),
         }
     }
@@ -3640,18 +3980,18 @@ impl ChainSource<'_> {
     /// written: the existing chain itself (shared), or a fresh copy.
     fn keep_chain(
         &mut self,
-        first: u32,
+        first: PageRef,
         stored: usize,
-        cap: usize,
+        seal: Sealer<'_>,
         take: &mut dyn FnMut() -> u32,
-        ovf: &mut Vec<OverflowPageOut>,
-    ) -> Result<u32> {
+        ovf: &mut Vec<(u32, Vec<u8>)>,
+    ) -> Result<PageRef> {
         if self.share {
-            self.shared.push(first);
+            self.shared.push(first.page);
             return Ok(first);
         }
         let bytes = self.read_chain(first, stored)?;
-        Ok(write_overflow_chain(&bytes, cap, take, ovf))
+        write_overflow_chain(&bytes, seal, take, ovf)
     }
 }
 
@@ -3667,11 +4007,12 @@ fn encode_disposed_value(
     val: &Value,
     disp: &Disp,
     raw_len: usize,
-    cap: usize,
+    seal: Sealer<'_>,
     take: &mut dyn FnMut() -> u32,
-    ovf: &mut Vec<OverflowPageOut>,
+    ovf: &mut Vec<(u32, Vec<u8>)>,
     src: &mut ChainSource<'_>,
 ) -> Result<Vec<u8>> {
+    let cap = seal.cap;
     let mut out = Vec::new();
     match (disp, val) {
         (
@@ -3684,23 +4025,20 @@ fn encode_disposed_value(
             out.extend_from_slice(&block[*off as usize..*off as usize + *len as usize]);
         }
         (Disp::Inline, v) => out.extend_from_slice(&encode_value(ty, &*src.resident_value(ty, v)?)),
-        (
-            Disp::External,
-            Value::Unfetched(Unfetched::External {
-                first_page, len, ..
-            }),
-        ) => {
-            let first = src.keep_chain(*first_page, *len as usize, cap, take, ovf)?;
+        (Disp::External, Value::Unfetched(Unfetched::External { first, len, .. })) => {
+            let first = src.keep_chain(*first, *len as usize, seal, take, ovf)?;
             out.push(TAG_EXTERNAL);
-            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&first.page.to_be_bytes());
             out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(&first.tag[..cap.tag]);
         }
         (Disp::External, v) => {
             let payload = value_payload(ty, &*src.resident_value(ty, v)?);
-            let first = write_overflow_chain(&payload, cap, take, ovf);
+            let first = write_overflow_chain(&payload, seal, take, ovf)?;
             out.push(TAG_EXTERNAL);
-            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&first.page.to_be_bytes());
             out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(&first.tag[..cap.tag]);
         }
         (Disp::InlineComp(c), v) => {
             let comp = src.comp_bytes(c, v)?;
@@ -3712,26 +4050,28 @@ fn encode_disposed_value(
         (
             Disp::ExternalComp(_),
             Value::Unfetched(Unfetched::ExternalComp {
-                first_page,
+                first,
                 stored_len,
                 raw_len,
                 ..
             }),
         ) => {
-            let first = src.keep_chain(*first_page, *stored_len as usize, cap, take, ovf)?;
+            let first = src.keep_chain(*first, *stored_len as usize, seal, take, ovf)?;
             out.push(TAG_EXTERNAL_COMP);
-            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&first.page.to_be_bytes());
             out.extend_from_slice(&stored_len.to_be_bytes());
             out.extend_from_slice(&raw_len.to_be_bytes());
+            out.extend_from_slice(&first.tag[..cap.tag]);
         }
         (Disp::ExternalComp(c), v) => {
             // The chain carries the COMPRESSED block (its page count follows comp size).
             let comp = src.comp_bytes(c, v)?;
-            let first = write_overflow_chain(&comp, cap, take, ovf);
+            let first = write_overflow_chain(&comp, seal, take, ovf)?;
             out.push(TAG_EXTERNAL_COMP);
-            out.extend_from_slice(&first.to_be_bytes());
+            out.extend_from_slice(&first.page.to_be_bytes());
             out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
             out.extend_from_slice(&(raw_len as u32).to_be_bytes());
+            out.extend_from_slice(&first.tag[..cap.tag]);
         }
     }
     Ok(out)
@@ -3750,11 +4090,12 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
     col_types: &[ColType],
     keys: &[K],
     rows: &[&[Value]],
-    cap: usize,
+    seal: Sealer<'_>,
     take: &mut dyn FnMut() -> u32,
-    ovf: &mut Vec<OverflowPageOut>,
+    ovf: &mut Vec<(u32, Vec<u8>)>,
     src: &mut ChainSource<'_>,
 ) -> Result<Vec<u8>> {
+    let cap = seal.cap;
     let n = keys.len();
     let k = col_types.len();
     // Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -3776,7 +4117,7 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
                     val,
                     &plan.disp[c],
                     plan.payload_len[c],
-                    cap,
+                    seal,
                     take,
                     ovf,
                     src,
@@ -3837,32 +4178,37 @@ fn encode_leaf_pax<K: AsRef<[u8]>>(
     Ok(out)
 }
 
-/// Write `payload` across a chain of overflow pages (`cap`-byte slabs, in order), allocating each
-/// page via `take` and linking it with `next_page` (`0` terminates). Returns the first page index
-/// for the record's pointer. `payload` is always non-empty (only values larger than the pointer
-/// spill — `plan_dispositions`).
+/// Write `payload` across a chain of overflow pages (`C − tag`-byte slabs, in order), allocating
+/// each page via `take` and linking it with `next_page` (`0` terminates), then seal the pages last
+/// first so each binds its successor (encrypted.md §7) and append them to `ovf`. Returns the pointer
+/// to the first page for the record. `payload` is always non-empty (only values larger than the
+/// pointer spill — `plan_dispositions`).
 fn write_overflow_chain(
     payload: &[u8],
-    cap: usize,
+    seal: Sealer<'_>,
     take: &mut dyn FnMut() -> u32,
-    ovf: &mut Vec<OverflowPageOut>,
-) -> u32 {
-    let n = payload.len().div_ceil(cap);
+    ovf: &mut Vec<(u32, Vec<u8>)>,
+) -> Result<PageRef> {
+    let slab = seal.cap.chain();
+    let n = payload.len().div_ceil(slab);
     let indices: Vec<u32> = (0..n).map(|_| take()).collect();
-    for (j, slab) in payload.chunks(cap).enumerate() {
-        let next_page = if j + 1 < indices.len() {
-            indices[j + 1]
-        } else {
-            0
+    let mut next = PageRef::NONE;
+    for (j, chunk) in payload.chunks(slab).enumerate().rev() {
+        let (bytes, tag) = seal.page(
+            indices[j],
+            PAGE_OVERFLOW,
+            0,
+            chunk.len() as u32,
+            next,
+            chunk,
+        )?;
+        ovf.push((indices[j], bytes));
+        next = PageRef {
+            page: indices[j],
+            tag,
         };
-        ovf.push(OverflowPageOut {
-            index: indices[j],
-            item_count: slab.len() as u32,
-            next_page,
-            payload: slab.to_vec(),
-        });
     }
-    indices[0]
+    Ok(next)
 }
 
 /// P9 kind-4 catalog entries in canonical `(table, column, subkind, ordinal)` order.
@@ -4204,13 +4550,14 @@ fn check_table_row_count(root_data_page: u32, row_count: i64) -> Result<()> {
 /// One table's catalog entry bytes (spec/fileformat/format.md).
 fn table_entry_bytes(
     table: &Table,
-    root_data_page: u32,
-    index_roots: &[u32],
+    root_data_page: PageRef,
+    index_roots: &[PageRef],
     row_count: i64,
+    cap: Cap,
 ) -> Vec<u8> {
     assert!(row_count >= 0, "table row count is nonnegative");
     assert_eq!(
-        root_data_page == 0,
+        root_data_page.page == 0,
         row_count == 0,
         "table root and row count agree"
     );
@@ -4407,7 +4754,7 @@ fn table_entry_bytes(
         );
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
         out.push(idx.kind as u8);
-        out.extend_from_slice(&root.to_be_bytes());
+        root.push(&mut out, cap);
         // v27: a partial index's predicate canonical text (u16 len + UTF-8), after index_root_page —
         // only when bit1 is set (indexes.md §9, format.md).
         if let Some(p) = &idx.predicate {
@@ -4484,7 +4831,7 @@ fn table_entry_bytes(
             out.push(exclusion_op_code(el.op));
         }
     }
-    out.extend_from_slice(&root_data_page.to_be_bytes());
+    root_data_page.push(&mut out, cap);
     out.extend_from_slice(&row_count.to_be_bytes());
     out
 }
@@ -4558,22 +4905,31 @@ fn pack(sizes: &[usize], cap: usize) -> Result<Vec<Vec<usize>>> {
 /// One bootstrap meta slot's full `page_size` bytes (v33 fixed 64-byte header, zero descriptor). `to_image` copies it into both slots; an incremental commit pwrites it to the alternate
 /// slot (`file.rs`). Single-sources the meta byte layout (spec/fileformat/format.md).
 pub(crate) fn meta_page(
+    cap: Cap,
     page_size: u32,
     txid: u64,
-    root_page: u32,
+    root: PageRef,
     page_count: u32,
-    free_list_head: u32,
+    free_list: PageRef,
     live_pages: u32,
 ) -> Vec<u8> {
     let mut p = vec![0u8; page_size as usize];
     p[0..4].copy_from_slice(&MAGIC);
     p[4..6].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
+    if cap.encrypted_variant() {
+        // The encrypted variant (encrypted.md §6): the suite and its reserve, then the tags of the
+        // catalog root and the free-list head at 64 and 80.
+        p[6] = crate::crypto::SUITE_XAES;
+        p[7] = crate::crypto::RESERVE as u8;
+        p[64..80].copy_from_slice(&root.tag);
+        p[80..96].copy_from_slice(&free_list.tag);
+    }
     p[8..12].copy_from_slice(&page_size.to_be_bytes());
     p[12..20].copy_from_slice(&txid.to_be_bytes());
-    p[20..24].copy_from_slice(&root_page.to_be_bytes());
+    p[20..24].copy_from_slice(&root.page.to_be_bytes());
     p[24..28].copy_from_slice(&page_count.to_be_bytes());
     // v25: offset 28 is the persisted free-list head (0 = empty); through v24 it was reserved 0.
-    p[28..32].copy_from_slice(&free_list_head.to_be_bytes());
+    p[28..32].copy_from_slice(&free_list.page.to_be_bytes());
     // v34: offset 56 is the exact live page count (spec/design/memory.md §8.7).
     p[56..60].copy_from_slice(&live_pages.to_be_bytes());
     let crc = meta_crc(&p);
@@ -4678,16 +5034,6 @@ pub(crate) fn catalog_layout(entries: &[Vec<u8>], cap: usize) -> Vec<CatalogPage
 }
 
 /// A catalog page's full bytes: `make_page` with header byte 1 bit0 `continued` (v48).
-fn make_catalog_page(ps: usize, cp: &CatalogPage, next_page: u32) -> Vec<u8> {
-    let mut p = make_page(ps, PAGE_CATALOG, cp.item_count, next_page, &cp.payload);
-    if cp.continued {
-        p[1] = 1;
-        let crc = page_crc(&p);
-        p[12..16].copy_from_slice(&crc.to_be_bytes());
-    }
-    p
-}
-
 /// A catalog / B-tree page's full `page_size` bytes (header + payload, zero-padded). `to_image`
 /// copies it into the image; an incremental commit pwrites it directly (`file.rs`). Single-sources
 /// the page byte layout.
@@ -4717,11 +5063,12 @@ fn write_meta(
 ) {
     let off = slot * ps;
     image[off..off + ps].copy_from_slice(&meta_page(
+        Cap::plain(page_size),
         page_size,
         txid,
-        root_page,
+        PageRef::plain(root_page),
         page_count,
-        0,
+        PageRef::NONE,
         page_count - ROOT_PAGE,
     ));
 }
@@ -4730,8 +5077,13 @@ fn write_meta(
 #[derive(Clone)]
 pub(crate) struct Meta {
     protected: Arc<HashSet<u32>>,
+    /// The suite byte (meta offset 6): `0` plaintext, [`crate::crypto::SUITE_XAES`] encrypted.
+    pub(crate) suite: u8,
     pub(crate) txid: u64,
     pub(crate) root_page: u32,
+    /// The catalog root's and the free-list head's tags (encrypted.md §6; zero in plaintext).
+    pub(crate) root_tag: crate::crypto::Tag,
+    pub(crate) free_list_tag: crate::crypto::Tag,
     /// On-disk page high-water — the next free page an incremental commit appends at (P6.1 part B).
     pub(crate) page_count: u32,
     /// The persisted free-list head (v25 — meta offset 28): the first `page_type 7` page, or `0`
@@ -4791,7 +5143,13 @@ pub(crate) fn sim_free_list(image: &[u8], ps: u32, v: u64) -> Option<Vec<u32>> {
     )))
     .ok()?;
     let paging = SharedPaging::new(pager, 1);
-    read_free_list(&paging, m.free_list_head, m.page_count, &HashSet::new()).ok()
+    read_free_list(
+        &paging,
+        PageRef::plain(m.free_list_head),
+        m.page_count,
+        &HashSet::new(),
+    )
+    .ok()
 }
 
 /// The page high-water and live page count of the meta slot of `image` holding version `v`
@@ -4849,8 +5207,8 @@ pub(crate) fn commit_crc64(crc: u64, bytes: &[u8]) -> u64 {
 
 /// How many manifest entries a meta page of `ps` bytes holds inline, and how many one manifest
 /// overflow page holds (spec/fileformat/format.md).
-pub(crate) fn manifest_capacities(ps: usize) -> (usize, usize) {
-    commit_manifest::capacities(ps)
+pub(crate) fn manifest_capacities(ps: usize, cap: Cap) -> (usize, usize) {
+    commit_manifest::capacities(ps, cap)
 }
 
 /// `page_type` for a manifest overflow page.
@@ -4880,7 +5238,8 @@ pub(crate) fn encode_manifest(
     written: &[(u32, Vec<u8>)],
     ids: &[u32],
 ) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
-    commit_manifest::encode(meta, commit_manifest::entries_of(written), ids)
+    let cap = Cap::plain(meta.len() as u32);
+    commit_manifest::encode(meta, cap, commit_manifest::entries_of(written), ids)
 }
 
 /// A body page of type `page_type` (tests that build a commit delta by hand).
@@ -4901,32 +5260,58 @@ pub(crate) fn parse_meta(m: &[u8]) -> Option<Meta> {
     if u16::from_be_bytes([m[4], m[5]]) != FORMAT_VERSION {
         return None;
     }
-    if m[6] != 0 || m[7] != 0 {
-        return None;
-    }
+    // Offsets 6/7: the encryption suite and its reserve (encrypted.md §6) — `0, 0` in plaintext.
+    let suite = match (m[6], m[7] as usize) {
+        (0, 0) => 0,
+        (crate::crypto::SUITE_XAES, crate::crypto::RESERVE)
+            if m.len() >= crate::crypto::MIN_PAGE_SIZE =>
+        {
+            crate::crypto::SUITE_XAES
+        }
+        _ => return None,
+    };
     let stored = u32::from_be_bytes([m[32], m[33], m[34], m[35]]);
     if meta_crc(m) != stored {
         return None;
     }
+    let first_body = if suite == 0 {
+        ROOT_PAGE
+    } else {
+        crate::crypto::FIRST_BODY_PAGE
+    };
     let page_count = u32::from_be_bytes(m[24..28].try_into().unwrap());
     // v25: offset 28 is the free-list head — 0 (empty) or a real body page in [2, page_count).
     let free_list_head = u32::from_be_bytes(m[28..32].try_into().unwrap());
-    if free_list_head != 0 && (free_list_head < ROOT_PAGE || free_list_head >= page_count) {
+    if free_list_head != 0 && (free_list_head < first_body || free_list_head >= page_count) {
         return None;
     }
     let root_page = u32::from_be_bytes(m[20..24].try_into().unwrap());
-    if root_page < ROOT_PAGE || root_page >= page_count {
+    if root_page < first_body || root_page >= page_count {
         return None;
     }
     // v34: the live pages are a subset of the body pages.
     let live_pages = u32::from_be_bytes(m[56..60].try_into().unwrap());
-    if live_pages > page_count - ROOT_PAGE {
+    if live_pages > page_count - first_body {
+        return None;
+    }
+    let tag_at = |at: usize| -> crate::crypto::Tag {
+        if suite == 0 {
+            crate::crypto::NO_TAG
+        } else {
+            m[at..at + 16].try_into().unwrap()
+        }
+    };
+    let free_list_tag = tag_at(80);
+    if free_list_head == 0 && free_list_tag != crate::crypto::NO_TAG {
         return None;
     }
     Some(Meta {
         protected: Arc::new(HashSet::new()),
+        suite,
         txid: u64::from_be_bytes(m[12..20].try_into().unwrap()),
-        root_page: u32::from_be_bytes(m[20..24].try_into().unwrap()),
+        root_page,
+        root_tag: tag_at(64),
+        free_list_tag,
         page_count,
         free_list_head,
         live_pages,
@@ -5140,6 +5525,8 @@ pub(crate) struct PackedLeaf {
     /// into each deferred external value so it can self-resolve at the evaluator's column access
     /// (the B4 demand-fault backstop, bplus-reshape.md §5).
     paging: std::sync::Weak<SharedPaging>,
+    /// The database's capacities: an external value's pointer carries a tag in an encrypted file.
+    cap: Cap,
     /// Record count (`= keys.len()`), for the value-directory index arithmetic.
     n: usize,
 }
@@ -5190,6 +5577,7 @@ impl PackedLeaf {
                 &self.block,
                 payload,
                 &mut pos,
+                self.cap,
                 &self.paging,
             ),
         }
@@ -5357,9 +5745,10 @@ pub(crate) fn same_leaf_shape(a: &Arc<Vec<ColType>>, b: &Arc<Vec<ColType>>) -> b
 /// weight is the bytes the record occupies on the page (exactly the writer's `record_size`).
 pub(crate) fn decode_leaf_node(
     block: Vec<u8>,
-    page: u32,
+    page: PageRef,
     col_types: Arc<Vec<ColType>>,
     paging: std::sync::Weak<SharedPaging>,
+    cap: Cap,
 ) -> Result<Node> {
     let parsed = parse_page(&block)?;
     if parsed.page_type != PAGE_LEAF {
@@ -5382,6 +5771,7 @@ pub(crate) fn decode_leaf_node(
         dirs,
         col_types,
         paging,
+        cap,
         n,
     };
     Ok(Node::leaf_loaded_packed(packed, page))
@@ -6062,7 +6452,11 @@ fn validate_loaded_references(snap: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, Vec<u32>)> {
+fn decode_table_entry(
+    buf: &[u8],
+    pos: &mut usize,
+    cap: Cap,
+) -> Result<(Table, PageRef, i64, Vec<PageRef>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
     let mut columns = Vec::with_capacity(col_count);
@@ -6363,7 +6757,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
         if has_predicate && kind == IndexKind::Gin {
             return Err(corrupt("a gin index cannot be partial"));
         }
-        index_roots.push(read_u32(buf, pos)?);
+        index_roots.push(PageRef::read(buf, pos, cap)?);
         // v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
         // it; text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
         let predicate = if has_predicate {
@@ -6528,12 +6922,12 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             elements,
         });
     }
-    let root_data_page = read_u32(buf, pos)?;
+    let root_data_page = PageRef::read(buf, pos, cap)?;
     let row_count = read_i64(buf, pos)?;
     if row_count < 0 {
         return Err(corrupt("negative table row count"));
     }
-    if (root_data_page == 0) != (row_count == 0) {
+    if (root_data_page.page == 0) != (row_count == 0) {
         return Err(corrupt("table root and row count disagree"));
     }
     Ok((
@@ -6587,17 +6981,19 @@ fn read_value(
     ty: &ColType,
     buf: &[u8],
     pos: &mut usize,
-    fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
+    fetch: Option<&dyn Fn(PageRef) -> Result<Vec<u8>>>,
     ovf_out: &mut Vec<u32>,
 ) -> Result<Value> {
+    // A single-value context (a catalog constant, a test) is plaintext: its pointers carry no tag.
+    let plain = Cap { c: 0, tag: 0 };
     match read_u8(buf, pos)? {
         0x00 => read_inline_body(ty, buf, pos, DecodeMode::Construct),
         0x01 => Ok(Value::Null),
         TAG_EXTERNAL => {
-            let first = read_u32(buf, pos)?;
+            let first = PageRef::plain(read_u32(buf, pos)?);
             let len = read_u32(buf, pos)? as usize;
             let fetch = fetch.ok_or_else(|| corrupt("external value with no overflow reader"))?;
-            let payload = read_overflow_chain(first, len, fetch, ovf_out)?;
+            let payload = read_overflow_chain(first, len, fetch, plain, ovf_out)?;
             value_from_payload(ty, &payload)
         }
         TAG_INLINE_COMP => {
@@ -6608,11 +7004,11 @@ fn read_value(
             value_from_payload(ty, &payload)
         }
         TAG_EXTERNAL_COMP => {
-            let first = read_u32(buf, pos)?;
+            let first = PageRef::plain(read_u32(buf, pos)?);
             let stored = read_u32(buf, pos)? as usize;
             let raw_len = read_u32(buf, pos)? as usize;
             let fetch = fetch.ok_or_else(|| corrupt("external value with no overflow reader"))?;
-            let comp = read_overflow_chain(first, stored, fetch, ovf_out)?;
+            let comp = read_overflow_chain(first, stored, fetch, plain, ovf_out)?;
             let payload = crate::lz4::decompress(&comp, raw_len)?;
             value_from_payload(ty, &payload)
         }
@@ -6971,33 +7367,35 @@ fn decode_decimal_body(buf: &[u8], pos: &mut usize, mode: DecodeMode) -> Result<
 /// payload bytes, and chains via `next_page` (`0` terminates). Every visited page is pushed to
 /// `visited` (the free-list reachability walk). `fetch` returns a page's full block by index.
 fn read_overflow_chain(
-    first: u32,
+    first: PageRef,
     len: usize,
-    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+    fetch: &dyn Fn(PageRef) -> Result<Vec<u8>>,
+    cap: Cap,
     visited: &mut Vec<u32>,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(len.min(DECODE_PREALLOC_CAP));
     let mut seen = HashSet::new();
     let mut p = first;
     while out.len() < len {
-        if p == 0 {
+        if p.page == 0 {
             return Err(corrupt("overflow chain ended before the value length"));
         }
-        if !seen.insert(p) {
+        if !seen.insert(p.page) {
             return Err(corrupt("overflow chain revisits a page"));
         }
-        visited.push(p);
+        visited.push(p.page);
         let block = fetch(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_OVERFLOW {
             return Err(corrupt("expected an overflow page"));
         }
+        let (next, slab) = chain_content(&page, cap)?;
         let take = page.item_count as usize;
-        if take == 0 || take > page.payload.len() || out.len() + take > len {
+        if take == 0 || take > slab.len() || out.len() + take > len {
             return Err(corrupt("overflow page slab out of range"));
         }
-        out.extend_from_slice(&page.payload[..take]);
-        p = page.next_page;
+        out.extend_from_slice(&slab[..take]);
+        p = next;
     }
     Ok(out)
 }
@@ -7012,6 +7410,7 @@ fn read_value_lazy(
     block: &Arc<Vec<u8>>,
     buf: &[u8],
     pos: &mut usize,
+    cap: Cap,
     paging: &std::sync::Weak<SharedPaging>,
 ) -> Result<Value> {
     let ty = tyref.ty();
@@ -7044,10 +7443,11 @@ fn read_value_lazy(
         }
         0x01 => Ok(Value::Null),
         TAG_EXTERNAL => {
-            let first_page = read_u32(buf, pos)?;
+            let page = read_u32(buf, pos)?;
             let len = read_u32(buf, pos)?;
+            let first = read_pointer_tag(buf, pos, page, cap)?;
             Ok(Value::Unfetched(Unfetched::External {
-                first_page,
+                first,
                 len,
                 ty: tyref.clone(),
                 paging: crate::value::PagerRef(paging.clone()),
@@ -7064,11 +7464,12 @@ fn read_value_lazy(
             }))
         }
         TAG_EXTERNAL_COMP => {
-            let first_page = read_u32(buf, pos)?;
+            let page = read_u32(buf, pos)?;
             let stored_len = read_u32(buf, pos)?;
             let raw_len = read_u32(buf, pos)?;
+            let first = read_pointer_tag(buf, pos, page, cap)?;
             Ok(Value::Unfetched(Unfetched::ExternalComp {
-                first_page,
+                first,
                 stored_len,
                 raw_len,
                 ty: tyref.clone(),
@@ -7086,7 +7487,8 @@ fn read_value_lazy(
 pub(crate) fn resolve_unfetched(
     ty: &ColType,
     u: &Unfetched,
-    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+    fetch: &dyn Fn(PageRef) -> Result<Vec<u8>>,
+    cap: Cap,
 ) -> Result<Value> {
     let mut sink = Vec::new();
     match u {
@@ -7103,10 +7505,8 @@ pub(crate) fn resolve_unfetched(
             debug_assert_eq!(p, body.len(), "inline deferral span over/under-consumed");
             Ok(v)
         }
-        Unfetched::External {
-            first_page, len, ..
-        } => {
-            let payload = read_overflow_chain(*first_page, *len as usize, fetch, &mut sink)?;
+        Unfetched::External { first, len, .. } => {
+            let payload = read_overflow_chain(*first, *len as usize, fetch, cap, &mut sink)?;
             value_from_payload(ty, &payload)
         }
         Unfetched::InlineComp { comp, raw_len, .. } => {
@@ -7114,12 +7514,12 @@ pub(crate) fn resolve_unfetched(
             value_from_payload(ty, &payload)
         }
         Unfetched::ExternalComp {
-            first_page,
+            first,
             stored_len,
             raw_len,
             ..
         } => {
-            let comp = read_overflow_chain(*first_page, *stored_len as usize, fetch, &mut sink)?;
+            let comp = read_overflow_chain(*first, *stored_len as usize, fetch, cap, &mut sink)?;
             let payload = crate::lz4::decompress(&comp, *raw_len as usize)?;
             value_from_payload(ty, &payload)
         }
@@ -7147,10 +7547,10 @@ pub(crate) fn resolve_unfetched_self(u: &Unfetched) -> Result<Value> {
     match paging {
         // Inline forms own their bytes — no pager involved.
         None => {
-            let fetch = |_p: u32| -> Result<Vec<u8>> {
+            let fetch = |_p: PageRef| -> Result<Vec<u8>> {
                 unreachable!("an inline deferred value reads no overflow pages")
             };
-            resolve_unfetched(ty, u, &fetch)
+            resolve_unfetched(ty, u, &fetch, Cap { c: 0, tag: 0 })
         }
         Some(w) => {
             // A deferred external value is reachable only through a snapshot whose stores hold the
@@ -7158,8 +7558,8 @@ pub(crate) fn resolve_unfetched_self(u: &Unfetched) -> Result<Value> {
             let paging =
                 w.0.upgrade()
                     .expect("a deferred value's database outlives it");
-            let fetch = |p: u32| paging.pager().read_block(p);
-            resolve_unfetched(ty, u, &fetch)
+            let fetch = |p: PageRef| paging.read_body(p);
+            resolve_unfetched(ty, u, &fetch, paging.cap())
         }
     }
 }
@@ -7169,33 +7569,35 @@ pub(crate) fn resolve_unfetched_self(u: &Unfetched) -> Result<Value> {
 /// (spec/design/large-values.md §14). The open-time reachability walk marks live chains with
 /// this, so opening a file never materializes its large values.
 pub(crate) fn chain_pages(
-    first: u32,
+    first: PageRef,
     len: usize,
-    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+    fetch: &dyn Fn(PageRef) -> Result<Vec<u8>>,
+    cap: Cap,
 ) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut gathered = 0usize;
     let mut p = first;
     while gathered < len {
-        if p == 0 {
+        if p.page == 0 {
             return Err(corrupt("overflow chain ended before the value length"));
         }
-        if !seen.insert(p) {
+        if !seen.insert(p.page) {
             return Err(corrupt("overflow chain revisits a page"));
         }
-        out.push(p);
+        out.push(p.page);
         let block = fetch(p)?;
         let page = parse_page(&block)?;
         if page.page_type != PAGE_OVERFLOW {
             return Err(corrupt("expected an overflow page"));
         }
+        let (next, slab) = chain_content(&page, cap)?;
         let take = page.item_count as usize;
-        if take == 0 || take > page.payload.len() || gathered + take > len {
+        if take == 0 || take > slab.len() || gathered + take > len {
             return Err(corrupt("overflow page slab out of range"));
         }
         gathered += take;
-        p = page.next_page;
+        p = next;
     }
     Ok(out)
 }
@@ -7204,23 +7606,20 @@ pub(crate) fn chain_pages(
 /// reachability walk), via the header-only [`chain_pages`] hop.
 fn mark_chains(
     row: &[Value],
-    fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
+    fetch: &dyn Fn(PageRef) -> Result<Vec<u8>>,
+    cap: Cap,
     reached: &mut HashSet<u32>,
 ) -> Result<()> {
     for v in row {
         if let Value::Unfetched(u) = v {
             match u {
-                Unfetched::External {
-                    first_page, len, ..
-                } => {
-                    reached.extend(chain_pages(*first_page, *len as usize, fetch)?);
+                Unfetched::External { first, len, .. } => {
+                    reached.extend(chain_pages(*first, *len as usize, fetch, cap)?);
                 }
                 Unfetched::ExternalComp {
-                    first_page,
-                    stored_len,
-                    ..
+                    first, stored_len, ..
                 } => {
-                    reached.extend(chain_pages(*first_page, *stored_len as usize, fetch)?);
+                    reached.extend(chain_pages(*first, *stored_len as usize, fetch, cap)?);
                 }
                 Unfetched::InlineComp { .. } => {}
                 // Inline-deferred values are resident in the record — no chain to mark.
@@ -7229,6 +7628,14 @@ fn mark_chains(
         }
     }
     Ok(())
+}
+
+/// The tag that ends an external value's pointer in `cap`'s layout (encrypted.md §2), after its
+/// `u32` fields: a bound reference to the chain's first page.
+fn read_pointer_tag(buf: &[u8], pos: &mut usize, page: u32, cap: Cap) -> Result<PageRef> {
+    let mut tag = crate::crypto::NO_TAG;
+    tag[..cap.tag].copy_from_slice(take(buf, pos, cap.tag)?);
+    Ok(PageRef { page, tag })
 }
 
 /// Bounds the recursion of the on-disk tree walks (the root is depth 1). A tree only grows a level
@@ -7771,18 +8178,18 @@ mod tests {
             on_commit: crate::catalog::OnCommit::PreserveRows,
             scalar_func: false,
         };
-        let valid = table_entry_bytes(&table, 2, &[], 3);
+        let valid = table_entry_bytes(&table, PageRef::plain(2), &[], 3, Cap::plain(8192));
 
         let mut root_with_zero_count = valid.clone();
         let n = root_with_zero_count.len();
         root_with_zero_count[n - 8..].copy_from_slice(&0i64.to_be_bytes());
-        let err = decode_table_entry(&root_with_zero_count, &mut 0).unwrap_err();
+        let err = decode_table_entry(&root_with_zero_count, &mut 0, Cap::plain(8192)).unwrap_err();
         assert_eq!(err.state, SqlState::DataCorrupted);
 
         let mut negative_count = valid;
         let n = negative_count.len();
         negative_count[n - 8..].copy_from_slice(&(-1i64).to_be_bytes());
-        let err = decode_table_entry(&negative_count, &mut 0).unwrap_err();
+        let err = decode_table_entry(&negative_count, &mut 0, Cap::plain(8192)).unwrap_err();
         assert_eq!(err.state, SqlState::DataCorrupted);
     }
 
@@ -8130,7 +8537,7 @@ mod tests {
             &col_types,
             &keys,
             &row_refs,
-            cap,
+            Sealer::plain(ps),
             &mut take,
             &mut ovf,
             &mut ChainSource::resident(),
@@ -8148,9 +8555,10 @@ mod tests {
         // eager fault used to, so the form-(a) sharing property still holds.
         let node = decode_leaf_node(
             block,
-            2,
+            PageRef::plain(2),
             Arc::new(col_types.clone()),
             std::sync::Weak::new(),
+            Cap::plain(8192),
         )
         .expect("decode leaf");
         assert!(node.packed.is_some(), "a faulted leaf is Packed");
@@ -8172,7 +8580,7 @@ mod tests {
             assert_eq!(node.key_at(i), keys[i]);
             assert_eq!(
                 node.packed.as_ref().unwrap().record_weight(i) as usize,
-                record_size(&col_types, &keys[i], &rows[i], cap)
+                record_size(&col_types, &keys[i], &rows[i], Cap::plain(ps as u32))
             );
         }
         assert!(
@@ -8213,12 +8621,14 @@ mod tests {
 
         // The reconstructed values still resolve to exactly the originals (reconstruction is
         // decode-neutral — the byte-identical result the eager path produced, moved to touch-time §8).
-        let fetch = |_p: u32| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
+        let fetch =
+            |_p: PageRef| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
         for (row_idx, row) in recon.iter().enumerate() {
             for (col_idx, v) in row.iter().enumerate() {
                 let resolved = match v {
                     Value::Unfetched(u) => {
-                        resolve_unfetched(&col_types[col_idx], u, &fetch).expect("resolve")
+                        resolve_unfetched(&col_types[col_idx], u, &fetch, Cap::plain(8192))
+                            .expect("resolve")
                     }
                     other => other.clone(),
                 };
@@ -8256,7 +8666,7 @@ mod tests {
             &col_types,
             &keys,
             &row_refs,
-            8192 - PAGE_HEADER,
+            Sealer::plain(8192),
             &mut take,
             &mut overflow,
             &mut ChainSource::resident(),
@@ -8268,9 +8678,10 @@ mod tests {
             let block = make_page(8192, PAGE_LEAF, rows.len() as u32, 0, &payload);
             let err = match decode_leaf_node(
                 block,
-                2,
+                PageRef::plain(2),
                 Arc::new(col_types.clone()),
                 std::sync::Weak::new(),
+                Cap::plain(8192),
             ) {
                 Err(err) => err,
                 Ok(_) => panic!("descending PAX directory must fail at leaf fault"),
@@ -8331,7 +8742,7 @@ mod tests {
             &col_types,
             &keys,
             &row_refs,
-            cap,
+            Sealer::plain(ps),
             &mut take,
             &mut ovf,
             &mut ChainSource::resident(),
@@ -8341,17 +8752,19 @@ mod tests {
         let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
         let node = decode_leaf_node(
             block,
-            2,
+            PageRef::plain(2),
             Arc::new(col_types.clone()),
             std::sync::Weak::new(),
+            Cap::plain(8192),
         )
         .expect("decode leaf");
 
-        let fetch = |_p: u32| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
+        let fetch =
+            |_p: PageRef| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
         let resolve = |v: &Value, c: usize| -> Value {
             match v {
                 Value::Unfetched(u) => {
-                    resolve_unfetched(&col_types[c], u, &fetch).expect("resolve")
+                    resolve_unfetched(&col_types[c], u, &fetch, Cap::plain(8192)).expect("resolve")
                 }
                 other => other.clone(),
             }

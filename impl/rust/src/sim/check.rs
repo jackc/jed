@@ -38,6 +38,7 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
         pager,
         cache_leaves(DEFAULT_CACHE_BYTES, page_size),
         &crate::environment::Environment::default(),
+        None,
     )
     .map_err(|e| format!("open: {e}"))?;
     let paging = engine
@@ -53,7 +54,7 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
     }
     let snap = &engine.committed;
 
-    let reached = reachable_pages(snap, &paging, mt.root_page)
+    let reached = reachable_pages(snap, &paging, crate::format::PageRef::plain(mt.root_page))
         .map_err(|e| format!("reachability walk: {e}"))?;
     if reached.len() as u32 != mt.live_pages {
         return Err(format!(
@@ -111,7 +112,7 @@ fn check_table(
     paging: &crate::paging::SharedPaging,
     claimed: &mut HashSet<u32>,
 ) -> Result<(), String> {
-    let fetch = |p: u32| paging.pager().read_block(p);
+    let fetch = |p: crate::format::PageRef| paging.read_body(p);
     let table = snap.table(name).ok_or("no table definition")?;
     let store = snap.sim_store(name).ok_or("no row store")?;
     let mut entries = store.iter_entries().map_err(|e| e.to_string())?;
@@ -129,7 +130,7 @@ fn check_table(
     for i in 0..entries.len() {
         for v in &entries[i].1 {
             if let Some((first, len)) = external_ref(v) {
-                let pages = chain_pages(first, len as usize, &fetch)
+                let pages = chain_pages(first, len as usize, &fetch, paging.cap())
                     .map_err(|e| format!("row {i}: an overflow chain: {e}"))?;
                 for pg in pages {
                     if !claimed.insert(pg) {
@@ -211,7 +212,7 @@ pub(crate) fn check_live(db: &Database) -> Result<(), String> {
     let page_count = state.page_count;
     let free: HashSet<u32> = state.free_pages.iter().copied().collect();
     let paging = state.paging.clone();
-    let fetch = |p: u32| paging.pager().read_block(p);
+    let fetch = |p: crate::format::PageRef| paging.read_body(p);
 
     let check = |what: &str, pg: u32| -> Result<(), String> {
         if pg >= page_count {
@@ -249,7 +250,7 @@ pub(crate) fn check_live(db: &Database) -> Result<(), String> {
                 let Some((first, len)) = external_ref(v) else {
                     continue;
                 };
-                let pages = chain_pages(first, len as usize, &fetch)
+                let pages = chain_pages(first, len as usize, &fetch, paging.cap())
                     .map_err(|e| format!("table {name}: an overflow chain: {e}"))?;
                 for pg in pages {
                     check(&format!("table {name}'s overflow chain"), pg)?;
@@ -279,16 +280,12 @@ pub(crate) fn check_live(db: &Database) -> Result<(), String> {
 
 /// The overflow chain a stored value names — its first page and the bytes the chain carries — or
 /// `None` for an inline or resident value.
-fn external_ref(v: &Value) -> Option<(u32, u32)> {
+fn external_ref(v: &Value) -> Option<(crate::format::PageRef, u32)> {
     match v {
-        Value::Unfetched(Unfetched::External {
-            first_page, len, ..
-        }) => Some((*first_page, *len)),
+        Value::Unfetched(Unfetched::External { first, len, .. }) => Some((*first, *len)),
         Value::Unfetched(Unfetched::ExternalComp {
-            first_page,
-            stored_len,
-            ..
-        }) => Some((*first_page, *stored_len)),
+            first, stored_len, ..
+        }) => Some((*first, *stored_len)),
         _ => None,
     }
 }

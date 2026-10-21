@@ -39,6 +39,14 @@ getrandom = "0.3"
 # Both are standardized, so the output matches Go's stdlib and TS's @noble/hashes byte-for-byte.
 md-5 = "=0.11.0"
 sha2 = "=0.11.0"
+# Encryption at rest (spec/design/encryption.md, spec/fileformat/encrypted.md). Approved under
+# CLAUDE.md §14 clause 3: the raw AES block for the XAES-256-GCM key derivation (the per-core glue
+# over a library AES), AES-256-GCM, HKDF-SHA-256 for subkeys and host-key KEKs, and Argon2id for
+# passphrase KEKs. Standardized, so every core writes identical bytes for identical inputs.
+aes = "=0.9.3"
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"] }
+hkdf = "=0.13.0"
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 # TOML is a TEST-TIME ONLY dependency (CLAUDE.md §5): the cross-check tests read the

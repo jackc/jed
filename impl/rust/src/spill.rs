@@ -637,11 +637,10 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&[21])?;
             write_bytes(w, &block[*off as usize..*off as usize + *len as usize])
         }
-        Value::Unfetched(Unfetched::External {
-            first_page, len, ..
-        }) => {
+        Value::Unfetched(Unfetched::External { first, len, .. }) => {
             w.write_all(&[9])?;
-            write_u32(w, *first_page)?;
+            write_u32(w, first.page)?;
+            w.write_all(&first.tag)?;
             write_u32(w, *len)
         }
         Value::Unfetched(Unfetched::InlineComp { comp, raw_len, .. }) => {
@@ -650,17 +649,26 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             write_bytes(w, comp)
         }
         Value::Unfetched(Unfetched::ExternalComp {
-            first_page,
+            first,
             stored_len,
             raw_len,
             ..
         }) => {
             w.write_all(&[11])?;
-            write_u32(w, *first_page)?;
+            write_u32(w, first.page)?;
+            w.write_all(&first.tag)?;
             write_u32(w, *stored_len)?;
             write_u32(w, *raw_len)
         }
     }
+}
+
+/// A spilled external value's first-page pointer: the page, then its 16-byte tag.
+fn read_page_ref<R: Read>(r: &mut R) -> io::Result<crate::format::PageRef> {
+    let page = read_u32(r)?;
+    let mut tag = [0u8; 16];
+    r.read_exact(&mut tag)?;
+    Ok(crate::format::PageRef { page, tag })
 }
 
 fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
@@ -746,7 +754,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             })
         }
         9 => Value::Unfetched(Unfetched::External {
-            first_page: read_u32(r)?,
+            first: read_page_ref(r)?,
             len: read_u32(r)?,
             ty: crate::value::TypeRef::sentinel(),
             paging: crate::value::PagerRef::default(),
@@ -761,7 +769,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             })
         }
         11 => Value::Unfetched(Unfetched::ExternalComp {
-            first_page: read_u32(r)?,
+            first: read_page_ref(r)?,
             stored_len: read_u32(r)?,
             raw_len: read_u32(r)?,
             ty: crate::value::TypeRef::sentinel(),

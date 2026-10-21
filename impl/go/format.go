@@ -794,9 +794,15 @@ func pageSizeValid(ps int) bool {
 // is recorded in the meta page; txid is written into both meta slots. A collecting sink over
 // writeImage.
 func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
+	return s.toImageSealed(pageSize, txid, nil)
+}
+
+// toImageSealed is ToImage of an encrypted database when codec is set: its key block copy at pages 2
+// and 3, every body page sealed (spec/fileformat/encrypted.md §4–§7).
+func (s *snapshot) toImageSealed(pageSize uint32, txid uint64, codec *pageCodec) ([]byte, error) {
 	ps := int(pageSize)
 	var image []byte
-	_, err := s.writeImage(pageSize, txid, func(index uint32, page []byte) error {
+	_, err := s.writeImage(pageSize, txid, codec, func(index uint32, page []byte) error {
 		off := int(index) * ps
 		if len(image) < off+ps {
 			image = append(image, make([]byte, off+ps-len(image))...)
@@ -815,10 +821,11 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 // particular index order; both meta slots arrive last. The sink sees each page exactly once, so a
 // file sink writes the image in bounded memory — host compaction (Database.Compact,
 // spec/design/api.md §2.6) relies on this to rewrite a larger-than-RAM file without a whole-image
-// buffer.
-func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint32, page []byte) error) (uint32, error) {
+// buffer. With codec the image is the encrypted variant (encrypted.md): the codec's key block at pages
+// 2 and 3, body pages from 4, sealed in seal order (§7).
+func (s *snapshot) writeImage(pageSize uint32, txid uint64, codec *pageCodec, sink func(index uint32, page []byte) error) (uint32, error) {
 	ps := int(pageSize)
-	if ps < minPageSize {
+	if ps < minPageSize || (codec != nil && ps < minEncryptedPageSize) {
 		return 0, newError(FeatureNotSupported, "page size too small for the format")
 	}
 	if ps > maxPageSize {
@@ -827,7 +834,24 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 	if ps&(ps-1) != 0 {
 		return 0, newError(FeatureNotSupported, "page size must be a power of two")
 	}
-	capacity := ps - pageHeader
+	seal := sealer{ps: ps, cap: capOf(pageSize, codec != nil), codec: codec}
+	pcap := seal.cap
+	// Every check that can refuse the image runs before the first page is sealed.
+	if err := checkCatalogTextLengths(s); err != nil {
+		return 0, err
+	}
+
+	// An encrypted image's key block: the same copy at pages 2 and 3 (encrypted.md §5).
+	if codec != nil {
+		block := make([]byte, ps)
+		copy(block, codec.keyBlock)
+		if err := sink(2, block); err != nil {
+			return 0, err
+		}
+		if err := sink(3, block); err != nil {
+			return 0, err
+		}
+	}
 
 	// Tables in ascending name byte order (no map-iteration order leak).
 	keys := make([]string, 0, len(s.tables))
@@ -836,17 +860,16 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 	}
 	sort.Strings(keys)
 
-	// Serialize each table's B-tree post-order, body pages allocated from page 2. Each page is emitted
-	// to the sink as soon as its bytes are final; children precede their parent so parent child-pointers
-	// reference already-allocated pages (format.md). nextPage is 0 for B-tree nodes and the chain link
-	// for overflow pages (large-values.md §12).
-	body := &pageSink{ps: ps, sink: sink}
-	rootDataPage := make([]uint32, len(keys))
-	indexRoots := make([][]uint32, len(keys))
-	nextIndex := rootPage
+	// Serialize each table's B-tree post-order, body pages allocated from the first body page. Each
+	// page is emitted to the sink as soon as its bytes are final; children precede their parent so
+	// parent child-pointers reference already-allocated (and sealed) pages (format.md).
+	body := &pageSink{seal: seal, sink: sink}
+	rootDataPage := make([]pageRef, len(keys))
+	indexRoots := make([][]pageRef, len(keys))
+	nextIndex := pcap.firstBody()
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, np, err := serializeNode(root, s.stores[k], capacity, nextIndex, body)
+			rp, np, err := serializeNode(root, s.stores[k], nextIndex, body)
 			if err != nil {
 				return 0, err
 			}
@@ -856,20 +879,22 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 		// The table's index trees follow its data tree, in catalog (name) order
 		// (spec/fileformat/format.md "From-scratch image").
 		for _, idx := range s.tables[k].Indexes {
-			var r uint32
+			var r pageRef
 			if idx.Kind == indexGist {
 				// GiST: the on-disk form is the R-tree (pages 5/6), not the flat leaf store (gist.md
 				// §4.1). Serialize the canonical tree, allocating from the same counter.
 				// Each node page streams to the sink as it is encoded, so the image never holds an
 				// index's pages at once (host compaction's bounded memory, api.md §2.6).
-				root, err := serializeGistIndex(s, s.tables[k], idx, int(pageSize)-pageHeader, func() uint32 { p := nextIndex; nextIndex++; return p },
-					func(p gistPage) error { return body.page(p.pageNo, p.pageType, p.itemCount, 0, p.payload) })
+				root, err := serializeGistIndex(s, s.tables[k], idx, pcap, func() uint32 { p := nextIndex; nextIndex++; return p },
+					func(p gistPage) (pageTag, error) {
+						return body.page(p.pageNo, p.pageType, p.itemCount, pageRef{}, p.payload)
+					})
 				if err != nil {
 					return 0, err
 				}
 				r = root
 			} else if istore := s.indexStores[idx.Name]; istore.treeRoot() != nil {
-				rp, np, err := serializeNode(istore.treeRoot(), istore, capacity, nextIndex, body)
+				rp, np, err := serializeNode(istore.treeRoot(), istore, nextIndex, body)
 				if err != nil {
 					return 0, err
 				}
@@ -883,7 +908,47 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 	// The catalog chain follows the data; its head is the relocatable root_page. Each entry is
 	// kind-tagged (v9): composite-type entries (kind 1) first in name byte order, then table
 	// entries (kind 0) — spec/fileformat/format.md.
+	catEntries, err := s.catalogEntries(keys, rootDataPage, indexRoots, pcap)
+	if err != nil {
+		return 0, err
+	}
+	catLayout := catalogLayout(catEntries, pcap.chain())
 	catRoot := nextIndex
+	pageCount := catRoot + uint32(len(catLayout))
+
+	// Catalog chain, consecutive pages, sealed last page first (encrypted.md §7).
+	var next pageRef
+	for gi := len(catLayout) - 1; gi >= 0; gi-- {
+		index := catRoot + uint32(gi)
+		tag, err := body.catalogPage(index, &catLayout[gi], next)
+		if err != nil {
+			return 0, err
+		}
+		next = pageRef{page: index, tag: tag}
+	}
+
+	// Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
+	// version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
+	// has an empty free-list, so free_list_head = 0 (v25), and every body page is live (v34).
+	meta := metaPage(pcap, pageSize, txid, next, pageCount, pageRef{}, pageCount-pcap.firstBody())
+	for slot := uint32(0); slot < 2; slot++ {
+		m := append([]byte(nil), meta...)
+		if codec != nil {
+			if err := codec.sealMeta(slot, m, nil); err != nil {
+				return 0, err
+			}
+		}
+		if err := sink(slot, m); err != nil {
+			return 0, err
+		}
+	}
+	return pageCount, nil
+}
+
+// catalogEntries is the catalog chain's entries, kind-tagged in stream order (format.md *Catalog*):
+// composite types, sequences, collation references, tables (with each tree root in pcap's pointer
+// layout), statistics, views. keys is the table names in ascending order.
+func (s *snapshot) catalogEntries(keys []string, rootDataPage []pageRef, indexRoots [][]pageRef, pcap pageCap) ([][]byte, error) {
 	var catEntries [][]byte
 	for _, ct := range s.compositeTypesSorted() {
 		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
@@ -897,7 +962,7 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 	// (spec/design/collation.md §2/§5).
 	refColls, err := s.referencedCollations()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, c := range refColls {
 		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
@@ -907,54 +972,43 @@ func (s *snapshot) writeImage(pageSize uint32, txid uint64, sink func(index uint
 		if !known {
 			panic("table stores always carry an exact row count")
 		}
-		if err := checkTableRowCount(rootDataPage[ti], rowCount); err != nil {
-			return 0, err
+		if err := checkTableRowCount(rootDataPage[ti].page, rowCount); err != nil {
+			return nil, err
 		}
-		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount)...))
+		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount, pcap)...))
 	}
 	catEntries = append(catEntries, statisticsCatalogEntries(s)...)
 	catEntries = append(catEntries, viewCatalogEntries(s)...)
-	if err := checkCatalogTextLengths(s); err != nil {
-		return 0, err
-	}
-	catLayout := catalogLayout(catEntries, capacity)
-	pageCount := catRoot + uint32(len(catLayout))
-
-	// Catalog chain.
-	for gi := range catLayout {
-		index := catRoot + uint32(gi)
-		var next uint32
-		if gi+1 < len(catLayout) {
-			next = index + 1
-		}
-		if err := body.sink(index, makeCatalogPage(body.ps, &catLayout[gi], next)); err != nil {
-			return 0, err
-		}
-	}
-
-	// Meta last: both slots hold the current meta (a fresh from-scratch image has no distinct prior
-	// version; slot alternation is the live incremental-commit path — format.md). A from-scratch image
-	// has an empty free-list, so free_list_head = 0 (v25), and every body page is live (v34).
-	meta := metaPage(pageSize, txid, catRoot, pageCount, 0, pageCount-rootPage)
-	if err := sink(0, meta); err != nil {
-		return 0, err
-	}
-	if err := sink(1, meta); err != nil {
-		return 0, err
-	}
-	return pageCount, nil
+	return catEntries, nil
 }
 
-// pageSink is the from-scratch serializer's page output: it builds each page's full bytes (makePage,
-// the single source of the page layout) and hands them to the caller's sink.
+// pageSink is the from-scratch serializer's page output: it builds each page's stored bytes through
+// the sealer and hands them to the caller's sink.
 type pageSink struct {
-	ps   int
+	seal sealer
 	sink func(index uint32, page []byte) error
 }
 
-// page emits one catalog/B-tree/overflow page.
-func (b *pageSink) page(index uint32, pageType byte, itemCount, nextPage uint32, payload []byte) error {
-	return b.sink(index, makePage(b.ps, pageType, itemCount, nextPage, payload))
+// page emits one B-tree/GiST page and returns the tag a pointer to it binds.
+func (b *pageSink) page(index uint32, pageType byte, itemCount uint32, next pageRef, payload []byte) (pageTag, error) {
+	bytes, tag, err := b.seal.page(index, pageType, 0, itemCount, next, payload)
+	if err != nil {
+		return noTag, err
+	}
+	return tag, b.sink(index, bytes)
+}
+
+// catalogPage emits one catalog chain page (header byte 1 bit0 continued, v48).
+func (b *pageSink) catalogPage(index uint32, cp *catalogPage, next pageRef) (pageTag, error) {
+	var flags byte
+	if cp.continued {
+		flags = 1
+	}
+	bytes, tag, err := b.seal.page(index, pageCatalog, flags, cp.itemCount, next, cp.payload)
+	if err != nil {
+		return noTag, err
+	}
+	return tag, b.sink(index, bytes)
 }
 
 // serializeGistIndex builds a GiST index's canonical R-tree from its leaf-key store and serializes it
@@ -964,8 +1018,9 @@ func (b *pageSink) page(index uint32, pageType byte, itemCount, nextPage uint32,
 // its bytes are a pure function of the set — content-deterministic and cross-core identical (§3).
 // alloc hands out page numbers (a counter for the whole image, the free-list allocator for an
 // incremental commit); emit receives each node page, in post-order, once its bytes are final.
-// Returns the root; an empty index emits no page and returns root 0.
-func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int, alloc func() uint32, emit func(gistPage) error) (uint32, error) {
+// Returns the root (with its tag in an encrypted file); an empty index emits no page and returns root
+// 0. emit returns the tag of the page it stored, which an interior entry binds (encrypted.md §2).
+func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, pcap pageCap, alloc func() uint32, emit func(gistPage) (pageTag, error)) (pageRef, error) {
 	// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per WITH column
 	// for an EXCLUDE backing index. A GiST index is always plain-column (columnOrdinals non-nil).
 	ops := gistOpclassesFor(idx.columnOrdinals(), table.Columns)
@@ -973,7 +1028,7 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int
 	if istore := s.indexStores[idx.Name]; istore != nil {
 		entries, err := istore.EntriesInKeyOrder()
 		if err != nil {
-			return 0, err
+			return pageRef{}, err
 		}
 		keys = make([][]byte, len(entries))
 		for i, e := range entries {
@@ -981,17 +1036,17 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int
 		}
 	}
 	if len(keys) == 0 {
-		return 0, nil
+		return pageRef{}, nil
 	}
 	tree, err := buildGistFromLeafKeys(ops, keys)
 	if err != nil {
-		return 0, err
+		return pageRef{}, err
 	}
 	// Leaf keys are rebuilt from the stored index, so a corrupt key length can grow a node past its
 	// page, which makePage would otherwise truncate: checked before each page is emitted.
-	return serializeGistTree(tree, ops, alloc, func(p gistPage) error {
-		if len(p.payload) > capacity {
-			return newError(DataCorrupted, "GiST node overflows its page")
+	return serializeGistTreeTagged(tree, ops, pcap.tag, alloc, func(p gistPage) (pageTag, error) {
+		if len(p.payload) > pcap.c {
+			return noTag, newError(DataCorrupted, "GiST node overflows its page")
 		}
 		return emit(p)
 	})
@@ -1001,9 +1056,10 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, capacity int
 // this node's assigned page index and the next free index. A leaf's payload is its records; an
 // interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node whose
 // payload would exceed the page is an oversized record (over RECORD_MAX) — feature_not_supported.
-func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, body *pageSink) (uint32, uint32, error) {
+func serializeNode(n *pnode, store *tableStore, nextIndex uint32, body *pageSink) (pageRef, uint32, error) {
 	colTypes := store.colTypes
-	childPages := make([]uint32, len(n.children))
+	pcap := body.seal.cap
+	childPages := make([]pageRef, len(n.children))
 	for i, c := range n.children {
 		// Whole-image serialize renumbers pages from scratch. Under B3 (bplus-reshape.md) every
 		// database — in-memory included — is demand-paged, so a clean leaf may be an OnDisk
@@ -1011,15 +1067,15 @@ func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, 
 		// its own serialization (whole-image serialize is not a hot path).
 		child := c.node
 		if child == nil {
-			faulted, err := store.faultLeaf(c.page)
+			faulted, err := store.faultLeaf(c.ref())
 			if err != nil {
-				return 0, 0, err
+				return pageRef{}, 0, err
 			}
 			child = faulted
 		}
-		cp, np, err := serializeNode(child, store, capacity, nextIndex, body)
+		cp, np, err := serializeNode(child, store, nextIndex, body)
 		if err != nil {
-			return 0, 0, err
+			return pageRef{}, 0, err
 		}
 		childPages[i] = cp
 		nextIndex = np
@@ -1030,14 +1086,15 @@ func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, 
 	// Encode a leaf's records, spilling over-large values to overflow pages allocated after this
 	// node's index (post-order traversal + record-then-column order → deterministic, golden-pinnable
 	// layout; only LEAVES allocate chains in v24). A LEAF is column-major (PAX — encodeLeafPAX); an
-	// INTERIOR node is the record-free keys+children skeleton (encodeInterior), format.md.
-	var ovf []overflowPageOut
+	// INTERIOR node is the record-free keys+children skeleton (encodeInterior), format.md. A leaf's
+	// chains are sealed while its values are encoded, before the leaf (encrypted.md §7).
+	var ovf []dirtyPage
 	take := func() uint32 { p := nextIndex; nextIndex++; return p }
 	var payload []byte
 	pageType := pageLeaf
 	if len(n.children) > 0 {
 		pageType = pageInterior
-		payload = encodeInterior(n.keys, childPages)
+		payload = encodeInterior(n.keys, childPages, pcap)
 	} else {
 		// A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
 		// re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
@@ -1047,25 +1104,26 @@ func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, 
 		// clones are acceptable (packed-leaf.md §7).
 		rows, err := n.decodedRows()
 		if err != nil {
-			return 0, 0, err
+			return pageRef{}, 0, err
 		}
-		payload, err = encodeLeafPAX(colTypes, n.keyViews(), rows, capacity, take, &ovf, &chainSource{paging: store.paging})
+		payload, err = encodeLeafPAX(colTypes, n.keyViews(), rows, body.seal, take, &ovf, &chainSource{paging: store.paging})
 		if err != nil {
-			return 0, 0, err
+			return pageRef{}, 0, err
 		}
 	}
-	if len(payload) > capacity {
-		return 0, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
-	}
-	if err := body.page(index, pageType, uint32(n.keyLen()), 0, payload); err != nil {
-		return 0, 0, err
+	if len(payload) > pcap.c {
+		return pageRef{}, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
 	for _, o := range ovf {
-		if err := body.page(o.index, pageOverflow, o.itemCount, o.nextPage, o.payload); err != nil {
-			return 0, 0, err
+		if err := body.sink(o.index, o.bytes); err != nil {
+			return pageRef{}, 0, err
 		}
 	}
-	return index, nextIndex, nil
+	tag, err := body.page(index, pageType, uint32(n.keyLen()), pageRef{}, payload)
+	if err != nil {
+		return pageRef{}, 0, err
+	}
+	return pageRef{page: index, tag: tag}, nextIndex, nil
 }
 
 // dirtyPage is one full pageSize image awaiting a pwrite at its index (P6.1 part B).
@@ -1078,8 +1136,9 @@ type dirtyPage struct {
 // and high-water for the meta slot (spec/fileformat/format.md, P6.1 part B). file.go pwrites pages,
 // then publishes rootPage/pageCount in the alternate meta slot.
 type incrementalWrite struct {
-	pages     []dirtyPage
-	rootPage  uint32
+	pages []dirtyPage
+	// root is the new catalog chain's head (with its tag in an encrypted file).
+	root      pageRef
 	pageCount uint32
 	// freeRemaining is the free-list entries this commit did not consume by its tree/catalog pages —
 	// all pages dead at the fallback (prior) snapshot, so safe to overwrite this commit. The durable
@@ -1158,7 +1217,13 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, r
 // incrementalImageAllowed is incrementalImage with reuse restricted to allowed (nil: every free page).
 func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []uint32, reuse bool, allowed map[uint32]bool, paging *sharedPaging) (incrementalWrite, error) {
 	ps := int(pageSize)
-	capacity := ps - pageHeader
+	seal := sealerOf(ps, paging)
+	pcap := seal.cap
+	// Every check that can refuse the commit runs before the first page is sealed, so a refusal draws
+	// no nonce (encrypted.md §8).
+	if err := checkCatalogTextLengths(s); err != nil {
+		return incrementalWrite{}, err
+	}
 
 	keys := make([]string, 0, len(s.tables))
 	for k := range s.tables {
@@ -1175,12 +1240,12 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 	kept := make(map[uint32]bool)
 	shared := make(map[uint32]bool)
 	var gistPages uint32
-	rootDataPage := make([]uint32, len(keys))
-	indexRoots := make([][]uint32, len(keys))
+	rootDataPage := make([]pageRef, len(keys))
+	indexRoots := make([][]pageRef, len(keys))
 	var indexColTypes []colType
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, err := serializeDirty(root, s.stores[k].colTypes, capacity, ps, alloc, &pages, kept, shared, paging)
+			rp, err := serializeDirty(root, s.stores[k].colTypes, seal, alloc, &pages, kept, shared, paging)
 			if err != nil {
 				return incrementalWrite{}, err
 			}
@@ -1190,21 +1255,25 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 		// their dirty nodes are written, like any tree (spec/fileformat/format.md
 		// "Allocation & incremental commit").
 		for _, idx := range s.tables[k].Indexes {
-			var r uint32
+			var r pageRef
 			if idx.Kind == indexGist {
 				// GiST rewrites its WHOLE R-tree every commit (gist.md §4.1(b)): fresh pages from the
 				// allocator (free-list first), the old tree's pages reclaimed on the next open.
-				root, err := serializeGistIndex(s, s.tables[k], idx, capacity, alloc.take, func(p gistPage) error {
+				root, err := serializeGistIndex(s, s.tables[k], idx, pcap, alloc.take, func(p gistPage) (pageTag, error) {
 					gistPages++
-					pages = append(pages, dirtyPage{index: p.pageNo, bytes: makePage(ps, p.pageType, p.itemCount, 0, p.payload)})
-					return nil
+					bytes, tag, err := seal.page(p.pageNo, p.pageType, 0, p.itemCount, pageRef{}, p.payload)
+					if err != nil {
+						return noTag, err
+					}
+					pages = append(pages, dirtyPage{index: p.pageNo, bytes: bytes})
+					return tag, nil
 				})
 				if err != nil {
 					return incrementalWrite{}, err
 				}
 				r = root
 			} else if root := s.indexStores[idx.Name].treeRoot(); root != nil {
-				rp, err := serializeDirty(root, indexColTypes, capacity, ps, alloc, &pages, kept, shared, paging)
+				rp, err := serializeDirty(root, indexColTypes, seal, alloc, &pages, kept, shared, paging)
 				if err != nil {
 					return incrementalWrite{}, err
 				}
@@ -1218,60 +1287,37 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 	// page indices up front — they may be reused free pages, hence not contiguous — so each page can
 	// point at the next (pack always returns ≥ 1 group, so catPages is non-empty). Entries are
 	// kind-tagged (v9): composite-type entries (kind 1, name order) then table entries (kind 0) —
-	// spec/fileformat/format.md.
-	var catEntries [][]byte
-	for _, ct := range s.compositeTypesSorted() {
-		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
-	}
-	for _, sq := range s.sequencesSorted() {
-		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
-	}
-	// Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated table
-	// entry is read after the entry it references. Reference-only: emit one metadata entry per
-	// collation the SCHEMA references (columns + default), not an imported set
-	// (spec/design/collation.md §2/§5).
-	refColls, err := s.referencedCollations()
+	// spec/fileformat/format.md. The chain is sealed last page first, so each page binds its
+	// successor's tag (encrypted.md §7).
+	catEntries, err := s.catalogEntries(keys, rootDataPage, indexRoots, pcap)
 	if err != nil {
 		return incrementalWrite{}, err
 	}
-	for _, c := range refColls {
-		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
-	}
-	for ti, k := range keys {
-		rowCount, known := s.stores[k].Count()
-		if !known {
-			panic("table stores always carry an exact row count")
-		}
-		if err := checkTableRowCount(rootDataPage[ti], rowCount); err != nil {
-			return incrementalWrite{}, err
-		}
-		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti], rowCount)...))
-	}
-	catEntries = append(catEntries, statisticsCatalogEntries(s)...)
-	catEntries = append(catEntries, viewCatalogEntries(s)...)
-	if err := checkCatalogTextLengths(s); err != nil {
-		return incrementalWrite{}, err
-	}
-	catLayout := catalogLayout(catEntries, capacity)
+	catLayout := catalogLayout(catEntries, pcap.chain())
 	catPages := make([]uint32, len(catLayout))
 	for i := range catPages {
 		catPages[i] = alloc.take()
 	}
-	catRoot := catPages[0]
-	for gi := range catLayout {
-		var nextPage uint32
-		if gi+1 < len(catLayout) {
-			nextPage = catPages[gi+1]
-		}
-		pages = append(pages, dirtyPage{index: catPages[gi], bytes: makeCatalogPage(ps, &catLayout[gi], nextPage)})
-	}
-
 	if alloc.exhausted {
 		return incrementalWrite{}, newError(ProgramLimitExceeded, "database page limit exceeded")
 	}
+	var next pageRef
+	for gi := len(catLayout) - 1; gi >= 0; gi-- {
+		var flags byte
+		if catLayout[gi].continued {
+			flags = 1
+		}
+		bytes, tag, err := seal.page(catPages[gi], pageCatalog, flags, catLayout[gi].itemCount, next, catLayout[gi].payload)
+		if err != nil {
+			return incrementalWrite{}, err
+		}
+		pages = append(pages, dirtyPage{index: catPages[gi], bytes: bytes})
+		next = pageRef{page: catPages[gi], tag: tag}
+	}
+
 	return incrementalWrite{
 		pages:         pages,
-		rootPage:      catRoot,
+		root:          next,
 		pageCount:     alloc.next,
 		freeRemaining: append(alloc.skipped, alloc.free[alloc.cursor:]...), // both ascending, skipped first
 		kept:          kept,
@@ -1289,23 +1335,23 @@ func (s *snapshot) incrementalImageAllowed(pageSize, startPage uint32, free []ui
 // Page indices come from the allocator (free-list first, then the high-water). Mirrors serializeNode
 // for the byte layout. Every clean node and OnDisk child it reaches is recorded in kept — the shared
 // boundary the live-page delta skips (spec/design/memory.md §8.7).
-func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging) (uint32, error) {
+func serializeDirty(n *pnode, colTypes []colType, seal sealer, alloc *pageAlloc, pages *[]dirtyPage, kept, shared map[uint32]bool, paging *sharedPaging) (pageRef, error) {
 	if n.page != 0 {
 		kept[n.page] = true
-		return n.page, nil
+		return n.ref(), nil
 	}
-	childPages := make([]uint32, len(n.children))
+	childPages := make([]pageRef, len(n.children))
 	for i, c := range n.children {
 		// A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf
 		// already durable at its page — keep it, write nothing (the incremental-commit win).
 		if c.node == nil {
 			kept[c.page] = true
-			childPages[i] = c.page
+			childPages[i] = c.ref()
 			continue
 		}
-		cp, err := serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, kept, shared, paging)
+		cp, err := serializeDirty(c.node, colTypes, seal, alloc, pages, kept, shared, paging)
 		if err != nil {
-			return 0, err
+			return pageRef{}, err
 		}
 		childPages[i] = cp
 	}
@@ -1315,34 +1361,36 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 	// row carries its unassigned large values deferred: each is written from its stored bytes, and a
 	// deferred external value keeps its existing chain (large-values.md §15) — no chain read, no
 	// decompression, no chain write. An INTERIOR node is the record-free keys+children skeleton (v24)
-	// — no values, no chains.
-	var ovf []overflowPageOut
+	// — no values, no chains. A leaf's fresh overflow chains are sealed before the leaf (encrypted.md
+	// §7), appended to pages as they are sealed.
 	var payload []byte
 	pageType := pageLeaf
 	if len(n.children) > 0 {
 		pageType = pageInterior
-		payload = encodeInterior(n.keys, childPages)
+		payload = encodeInterior(n.keys, childPages, seal.cap)
 	} else {
 		src := &chainSource{paging: paging, share: true}
 		var err error
-		payload, err = encodeLeafPAX(colTypes, n.keys, n.vals, capacity, alloc.take, &ovf, src)
+		payload, err = encodeLeafPAX(colTypes, n.keys, n.vals, seal, alloc.take, pages, src)
 		if err != nil {
-			return 0, err
+			return pageRef{}, err
 		}
 		for _, p := range src.shared {
 			shared[p] = true
 		}
 	}
-	if len(payload) > capacity {
-		return 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
+	if len(payload) > seal.cap.c {
+		return pageRef{}, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
 	index := alloc.take()
-	n.page = index
-	*pages = append(*pages, dirtyPage{index: index, bytes: makePage(ps, pageType, uint32(len(n.keys)), 0, payload)})
-	for _, o := range ovf {
-		*pages = append(*pages, dirtyPage{index: o.index, bytes: makePage(ps, pageOverflow, o.itemCount, o.nextPage, o.payload)})
+	bytes, tag, err := seal.page(index, pageType, 0, uint32(len(n.keys)), pageRef{}, payload)
+	if err != nil {
+		return pageRef{}, err
 	}
-	return index, nil
+	ref := pageRef{page: index, tag: tag}
+	n.setRef(ref)
+	*pages = append(*pages, dirtyPage{index: index, bytes: bytes})
+	return ref, nil
 }
 
 // newTempStorage builds a fresh per-domain storage identity for a TEMP snapshot (temp-tables.md §6,
@@ -1416,12 +1464,72 @@ func loadEngine(image []byte, env *Environment) (*engine, error) {
 // O(pages). Making open O(skeleton) needs a per-subtree row count in the format (a deferred follow-on,
 // pager.md §6); the residency win — a bounded resident set — already holds.
 func loadEnginePaged(pgr *pager, capacity int, env *Environment) (*engine, error) {
+	return loadEnginePagedCredential(pgr, capacity, env, nil)
+}
+
+// loadEnginePagedCredential is loadEnginePaged with the credential that unlocks an encrypted file
+// (spec/fileformat/encrypted.md §5, §9): nil for a plaintext file.
+func loadEnginePagedCredential(pgr *pager, capacity int, env *Environment, cred *Credential) (*engine, error) {
 	pageSize := int(pgr.pageSize)
 	if !pageSizeValid(pageSize) {
 		return nil, newError(DataCorrupted, "invalid page size")
 	}
+	if err := unlockPager(pgr, cred, env); err != nil {
+		return nil, err
+	}
 	paging := newSharedPaging(pgr, capacity)
 	return loadEngineSharedPaging(paging, env)
+}
+
+// unlockPager learns from the meta slots whether the file is encrypted and, if it is, unlocks it with
+// cred (spec/fileformat/encrypted.md §5, §9), installing the codec the pager's paging context seals
+// and opens pages with. A plaintext file opened with a credential is 28P03, an encrypted one without
+// 28P02, a credential that does not unwrap the data key 28P01.
+func unlockPager(pgr *pager, cred *Credential, env *Environment) error {
+	if pgr.allocatedPages < 2 {
+		// Too short for two meta slots: slot selection reports the corruption.
+		if cred == nil {
+			return nil
+		}
+		return newError(DataCorrupted, "no complete valid meta page")
+	}
+	slot0, err := pgr.readBlock(0)
+	if err != nil {
+		return err
+	}
+	slot1, err := pgr.readBlock(1)
+	if err != nil {
+		return err
+	}
+	suite, err := fileSuite(slot0, slot1)
+	if err != nil {
+		return err
+	}
+	switch {
+	case suite == 0 && cred == nil:
+		return nil
+	case suite == 0:
+		return newError(CredentialNotApplicable, "a credential was given for a database that is not encrypted")
+	case cred == nil:
+		return newError(CredentialRequired, "the database is encrypted; a credential is required")
+	}
+	if int(pgr.pageSize) < minEncryptedPageSize || pgr.allocatedPages < firstBodyEncrypted {
+		return newError(DataCorrupted, "encrypted file too small for its key block")
+	}
+	page2, err := pgr.readBlock(2)
+	if err != nil {
+		return err
+	}
+	page3, err := pgr.readBlock(3)
+	if err != nil {
+		return err
+	}
+	codec, err := unlockCodec(page2, page3, cred, env.keyStream())
+	if err != nil {
+		return err
+	}
+	pgr.codec = codec
+	return nil
 }
 
 // loadEngineSharedPaging reloads the newest committed root through an existing pager/pool while a
@@ -1459,15 +1567,18 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 		mt = selected
 	}
 
+	pcap := paging.cap()
 	snap := newSnapshot(env)
 	snap.txid = mt.txid
+	// Bound before any store is registered, so every store takes this file's capacities.
+	snap.storePaging = paging
 	statisticsExpected := make(map[string][3]int)
 	var loadedViews []*viewDef
 	// v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
 	// walk — so the catalog + skeleton load no longer tracks a reached set. The live count is the meta's
 	// (v34); the catalog chain and the GiST R-trees it rewrites whole are counted as they are read.
 	live := liveCount{live: mt.livePages}
-	catPage := mt.rootPage
+	catPage := pageRef{page: mt.rootPage, tag: mt.rootTag}
 	catSeen := map[uint32]bool{}
 	// typesChecked records that every composite type registered so far has passed
 	// validateCompositeTypes. A table resolves its column types as it is registered, so the types it
@@ -1476,12 +1587,12 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	// Index stores are keyed by index name alone, so a name repeated across tables would make two
 	// tables share one index tree.
 	indexNames := map[string]bool{}
-	for catPage != 0 {
-		if catSeen[catPage] {
+	for catPage.page != 0 {
+		if catSeen[catPage.page] {
 			return nil, newError(DataCorrupted, "catalog chain revisits a page")
 		}
-		catSeen[catPage] = true
-		block, err := paging.readBlock(catPage)
+		catSeen[catPage.page] = true
+		block, err := paging.readBody(catPage)
 		if err != nil {
 			return nil, err
 		}
@@ -1495,22 +1606,24 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 		live.catalog++
 		// A catalog entry longer than a page continues on the following chain pages (v48): header
 		// byte 1 bit0 continued on every page of the run but the last.
-		next := pg.nextPage
-		payload := pg.payload
+		next, payload, err := chainContent(pg, pcap)
+		if err != nil {
+			return nil, err
+		}
 		if pg.flags&1 != 0 {
 			if pg.itemCount != 1 {
 				return nil, newError(DataCorrupted, "a continued catalog page holds other entries")
 			}
-			buf := append([]byte(nil), pg.payload...)
+			buf := append([]byte(nil), payload...)
 			for {
-				if next == 0 {
+				if next.page == 0 {
 					return nil, newError(DataCorrupted, "a continued catalog entry ends the chain")
 				}
-				if catSeen[next] {
+				if catSeen[next.page] {
 					return nil, newError(DataCorrupted, "catalog chain revisits a page")
 				}
-				catSeen[next] = true
-				block, err := paging.readBlock(next)
+				catSeen[next.page] = true
+				block, err := paging.readBody(next)
 				if err != nil {
 					return nil, err
 				}
@@ -1522,8 +1635,12 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 					return nil, newError(DataCorrupted, "bad catalog continuation page")
 				}
 				live.catalog++
-				buf = append(buf, cont.payload...)
-				next = cont.nextPage
+				after, more, err := chainContent(cont, pcap)
+				if err != nil {
+					return nil, err
+				}
+				buf = append(buf, more...)
+				next = after
 				if cont.flags&1 == 0 {
 					break
 				}
@@ -1589,14 +1706,14 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 				return nil, newError(DataCorrupted, "unknown catalog entry kind")
 			}
 			var rowCount int64
-			table, tableRoot, indexRoots, err := decodeTableEntry(payload, &pos, &rowCount)
+			table, tableRoot, indexRoots, err := decodeTableEntry(payload, &pos, &rowCount, pcap)
 			if err != nil {
 				return nil, err
 			}
 			// Every record costs at least its 4-byte key-directory entry in some leaf, so no table
 			// holds more rows than the file has room for. Checking keeps a corrupt count from sizing
 			// allocations later.
-			if uint64(rowCount) > uint64(mt.pageCount)*uint64((pageSize-pageHeader)/4) {
+			if uint64(rowCount) > uint64(mt.pageCount)*uint64(pcap.c/4) {
 				return nil, newError(DataCorrupted, "table row count exceeds the file")
 			}
 			if !typesChecked {
@@ -1627,7 +1744,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			// The store resolved each column's ColType from the (types-first) catalog at putTable
 			// (spec/design/composite.md §3).
 			colTypes := store.colTypes
-			if tableRoot != 0 {
+			if tableRoot.page != 0 {
 				// Reads only the interior spine — leaves stay OnDisk; the exact row count was restored
 				// from the v28 catalog entry (spec/design/storage.md §6).
 				root, err := readSkeleton(paging, tableRoot, colTypes)
@@ -1656,17 +1773,17 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 			// (spec/design/indexes.md §3); no spillable columns, so no overflow collection
 			// is ever needed.
 			for k, idx := range table.Indexes {
-				istore := newTableStore(pageSize-pageHeader, nil)
-				if indexRoots[k] != 0 && idx.Kind == indexGist {
+				istore := newTableStore(pcap, nil)
+				if indexRoots[k].page != 0 && idx.Kind == indexGist {
 					// GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree,
 					// recover its leaf keys into a fully-resident leaf store.
 					var keys [][]byte
-					read := func(p uint32) (byte, uint32, []byte, error) {
+					read := func(p pageRef) (byte, uint32, []byte, error) {
 						live.gist++
 						if at.gist != nil {
-							at.gist(p)
+							at.gist(p.page)
 						}
-						block, err := paging.readBlock(p)
+						block, err := paging.readBody(p)
 						if err != nil {
 							return 0, 0, nil, err
 						}
@@ -1676,7 +1793,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 						}
 						return pg.pageType, pg.itemCount, pg.payload, nil
 					}
-					if err := readGistLeafKeys(read, indexRoots[k], &keys, map[uint32]bool{}, 1); err != nil {
+					if err := readGistLeafKeys(read, indexRoots[k], pcap, &keys, map[uint32]bool{}, 1); err != nil {
 						return nil, err
 					}
 					for _, key := range keys {
@@ -1686,7 +1803,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 					}
 				} else {
 					istore.attachPaging(paging)
-					if indexRoots[k] != 0 {
+					if indexRoots[k].page != 0 {
 						root, err := readSkeleton(paging, indexRoots[k], nil)
 						if err != nil {
 							return nil, err
@@ -1741,7 +1858,7 @@ func loadEngineSharedPagingAt(paging *sharedPaging, env *Environment, at loadAt)
 	// v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability
 	// walk (spec/fileformat/format.md *Reclamation*).
 	if at.meta == nil {
-		free, err := readFreeList(paging, mt.freeListHead, mt.pageCount)
+		free, err := readFreeList(paging, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.pageCount)
 		if err != nil {
 			return nil, err
 		}
@@ -1794,20 +1911,20 @@ func anySpillable(colTypes []colType) bool {
 // decodes each non-null variable-width span lazily and follows its chains by HEADERS only
 // (chainPages — large-values.md §14), so opening a file never materializes or decompresses a large
 // value.
-func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
-	return collectLeafOverflowWith(paging.pgr.readBlock, pageIdx, colTypes, reached, seen, depth)
+func collectLeafOverflow(paging *sharedPaging, pageIdx pageRef, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
+	return collectLeafOverflowWith(paging.readBodyUnlocked, paging.cap(), pageIdx, colTypes, reached, seen, depth)
 }
 
 // collectLeafOverflowWith is collectLeafOverflow over a page reader: the commit path's reads go
 // straight to the pager it already holds, a backup's take the pager lock per page.
-func collectLeafOverflowWith(read func(uint32) ([]byte, error), pageIdx uint32, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
+func collectLeafOverflowWith(read func(pageRef) ([]byte, error), pcap pageCap, pageIdx pageRef, colTypes []colType, reached, seen map[uint32]bool, depth int) error {
 	if depth > maxTreeDepth {
 		return newError(DataCorrupted, "B-tree deeper than any valid tree")
 	}
-	if seen[pageIdx] {
+	if seen[pageIdx.page] {
 		return newError(DataCorrupted, "B-tree page reached twice")
 	}
-	seen[pageIdx] = true
+	seen[pageIdx.page] = true
 	block, err := read(pageIdx)
 	if err != nil {
 		return err
@@ -1841,11 +1958,11 @@ func collectLeafOverflowWith(read func(uint32) ([]byte, error), pageIdx uint32, 
 				p := 0
 				// The value is discarded right after markChains (only its chain pages matter), so
 				// the paging resolution handle is deliberately dead (nil).
-				v, err := readValueLazy(colTypes, c, vb, &p, nil)
+				v, err := readValueLazy(colTypes, c, vb, &p, pcap, nil)
 				if err != nil {
 					return err
 				}
-				if err := markChains(storedRow{v}, fetch, reached); err != nil {
+				if err := markChains(storedRow{v}, fetch, pcap, reached); err != nil {
 					return err
 				}
 			}
@@ -1853,20 +1970,20 @@ func collectLeafOverflowWith(read func(uint32) ([]byte, error), pageIdx uint32, 
 		return nil
 	case pageInterior:
 		n := int(pg.itemCount)
-		if 8*n+4 > len(pg.payload) {
+		if (pcap.ptr()+4)*n+pcap.ptr() > len(pg.payload) {
 			return newError(DataCorrupted, "B-tree interior item count overruns page")
 		}
 		pos := 0
-		cps := make([]uint32, 0, n+1)
+		cps := make([]pageRef, 0, n+1)
 		for i := 0; i < n+1; i++ {
-			cp, err := readU32(pg.payload, &pos)
+			cp, err := readPageRef(pg.payload, &pos, pcap)
 			if err != nil {
 				return err
 			}
 			cps = append(cps, cp)
 		}
 		for _, cp := range cps {
-			if err := collectLeafOverflowWith(read, cp, colTypes, reached, seen, depth+1); err != nil {
+			if err := collectLeafOverflowWith(read, pcap, cp, colTypes, reached, seen, depth+1); err != nil {
 				return err
 			}
 		}
@@ -1885,16 +2002,17 @@ func collectLeafOverflowWith(read func(uint32) ([]byte, error), pageIdx uint32, 
 // persisted free-list pages — both are handled by the caller unioning the pages this commit just wrote
 // into the reached set (a GiST index rewrites its whole R-tree every commit — gist.md §4.1(b) — so all
 // live GiST pages are in that write set), so a rebuild never frees a live GiST or free-list page.
-func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uint32]bool, error) {
+func (s *snapshot) reachablePages(paging *sharedPaging, catRoot pageRef) (map[uint32]bool, error) {
+	pcap := paging.cap()
 	reached := make(map[uint32]bool)
 	// The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
 	// what compaction reclaims).
-	for p := catRoot; p != 0; {
-		if reached[p] {
+	for p := catRoot; p.page != 0; {
+		if reached[p.page] {
 			return nil, newError(DataCorrupted, "catalog chain revisits a page")
 		}
-		reached[p] = true
-		block, err := paging.pgr.readBlock(p)
+		reached[p.page] = true
+		block, err := paging.readBodyUnlocked(p)
 		if err != nil {
 			return nil, err
 		}
@@ -1905,14 +2023,18 @@ func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uin
 		if pg.pageType != pageCatalog {
 			return nil, newError(DataCorrupted, "expected a catalog page")
 		}
-		p = pg.nextPage
+		next, _, err := chainContent(pg, pcap)
+		if err != nil {
+			return nil, err
+		}
+		p = next
 	}
 	// Table data trees + their live overflow chains.
 	for _, st := range s.stores {
 		root := st.treeRoot()
 		collectTreePages(root, reached)
 		if root != nil && root.page != 0 && anySpillable(st.colTypes) {
-			if err := collectLeafOverflow(paging, root.page, st.colTypes, reached, map[uint32]bool{}, 1); err != nil {
+			if err := collectLeafOverflow(paging, root.ref(), st.colTypes, reached, map[uint32]bool{}, 1); err != nil {
 				return nil, err
 			}
 		}
@@ -1939,8 +2061,8 @@ type liveCount struct {
 // every written page is reachable from the new root, and the orphans are prev's whole catalog chain,
 // its whole GiST forest, and each B-tree node outside the shared subtrees together with its leaf's
 // overflow pages. A count that would go negative means the persisted count was wrong: XX001.
-func (lc liveCount) after(write incrementalWrite, prev *snapshot, paging *sharedPaging, pageSize uint32) (liveCount, error) {
-	orphaned, err := orphanedTreePages(prev, write.kept, write.sharedChains, paging, int(pageSize)-pageHeader)
+func (lc liveCount) after(write incrementalWrite, prev *snapshot, paging *sharedPaging) (liveCount, error) {
+	orphaned, err := orphanedTreePages(prev, write.kept, write.sharedChains, paging, paging.cap())
 	if err != nil {
 		return liveCount{}, err
 	}
@@ -1959,7 +2081,7 @@ func (lc liveCount) after(write incrementalWrite, prev *snapshot, paging *shared
 // exactly one record of a snapshot, so a kept chain's only old referrer is in an orphaned leaf — and
 // each chain's page count follows from its external pointer's stored length. The walk reads only
 // orphaned leaves of tables with spillable columns.
-func orphanedTreePages(prev *snapshot, kept, shared map[uint32]bool, paging *sharedPaging, capacity int) (uint64, error) {
+func orphanedTreePages(prev *snapshot, kept, shared map[uint32]bool, paging *sharedPaging, capacity pageCap) (uint64, error) {
 	var count uint64
 	for _, st := range prev.stores {
 		var colTypes []colType
@@ -1986,12 +2108,12 @@ func orphanedTreePages(prev *snapshot, kept, shared map[uint32]bool, paging *sha
 
 // orphanedNodePages counts one subtree's orphaned pages (orphanedTreePages). colTypes is nil for a tree
 // whose leaves own no overflow chains.
-func orphanedNodePages(n *pnode, kept, shared map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity int) (uint64, error) {
+func orphanedNodePages(n *pnode, kept, shared map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity pageCap) (uint64, error) {
 	if n == nil || n.page == 0 || kept[n.page] {
 		return 0, nil
 	}
 	if len(n.children) == 0 {
-		return orphanedLeafPages(n.page, shared, paging, colTypes, capacity)
+		return orphanedLeafPages(n.ref(), shared, paging, colTypes, capacity)
 	}
 	count := uint64(1)
 	for _, c := range n.children {
@@ -2002,7 +2124,7 @@ func orphanedNodePages(n *pnode, kept, shared map[uint32]bool, paging *sharedPag
 			sub, err = orphanedNodePages(c.node, kept, shared, paging, colTypes, capacity)
 		case kept[c.page]:
 		default:
-			sub, err = orphanedLeafPages(c.page, shared, paging, colTypes, capacity)
+			sub, err = orphanedLeafPages(c.ref(), shared, paging, colTypes, capacity)
 		}
 		if err != nil {
 			return 0, err
@@ -2013,11 +2135,11 @@ func orphanedNodePages(n *pnode, kept, shared map[uint32]bool, paging *sharedPag
 }
 
 // orphanedLeafPages is one orphaned leaf page plus the overflow pages its external values own.
-func orphanedLeafPages(pageIdx uint32, shared map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity int) (uint64, error) {
+func orphanedLeafPages(pageIdx pageRef, shared map[uint32]bool, paging *sharedPaging, colTypes []colType, capacity pageCap) (uint64, error) {
 	if colTypes == nil {
 		return 1, nil
 	}
-	block, err := paging.readBlock(pageIdx)
+	block, err := paging.readBody(pageIdx)
 	if err != nil {
 		return 0, err
 	}
@@ -2048,7 +2170,7 @@ func orphanedLeafPages(pageIdx uint32, shared map[uint32]bool, paging *sharedPag
 			}
 			p := 0
 			// Only the pointer's stored length matters; the resolution handle is deliberately dead (nil).
-			v, err := readValueLazy(colTypes, c, vb, &p, nil)
+			v, err := readValueLazy(colTypes, c, vb, &p, capacity, nil)
 			if err != nil {
 				return 0, err
 			}
@@ -2060,7 +2182,8 @@ func orphanedLeafPages(pageIdx uint32, shared map[uint32]bool, paging *sharedPag
 				if shared[u.FirstPage] {
 					continue // kept by a rewritten record (large-values.md §15)
 				}
-				count += (uint64(u.StoredLen) + uint64(capacity) - 1) / uint64(capacity)
+				slab := uint64(capacity.chain())
+				count += (uint64(u.StoredLen) + slab - 1) / slab
 			}
 		}
 	}
@@ -2083,7 +2206,7 @@ func verifyLiveCount(snap *snapshot, paging *sharedPaging, write incrementalWrit
 	if !verifyLivePages.Load() {
 		return nil
 	}
-	reached, err := snap.reachablePages(paging, write.rootPage)
+	reached, err := snap.reachablePages(paging, write.root)
 	if err != nil {
 		return err
 	}
@@ -2127,7 +2250,7 @@ func unassignTreePages(n *pnode, assigned map[uint32]bool) {
 	if n == nil || n.page == 0 || !assigned[n.page] {
 		return
 	}
-	n.page = 0
+	n.setRef(pageRef{})
 	for _, c := range n.children {
 		if c.node != nil {
 			unassignTreePages(c.node, assigned)
@@ -2159,16 +2282,18 @@ func collectTreePages(n *pnode, reached map[uint32]bool) {
 // offset 28) through the pager, collecting every free page index. head == 0 is an empty free-list.
 // The inverse of the serialization in serializeFreeList; replaces the v24 reconstruct-on-open
 // reachability walk (spec/fileformat/format.md *Reclamation*).
-func readFreeList(paging *sharedPaging, head, pageCount uint32) ([]uint32, error) {
+func readFreeList(paging *sharedPaging, head pageRef, pageCount uint32) ([]uint32, error) {
+	pcap := paging.cap()
+	first := pcap.firstBody()
 	var free []uint32
 	chain := make(map[uint32]bool)
-	last := uint32(1)
-	for p := head; p != 0; {
-		if p < 2 || p >= pageCount || chain[p] {
+	last := first - 1
+	for p := head; p.page != 0; {
+		if p.page < first || p.page >= pageCount || chain[p.page] {
 			return nil, newError(DataCorrupted, "invalid free-list chain")
 		}
-		chain[p] = true
-		block, err := paging.pgr.readBlock(p)
+		chain[p.page] = true
+		block, err := paging.readBodyUnlocked(p)
 		if err != nil {
 			return nil, err
 		}
@@ -2176,12 +2301,19 @@ func readFreeList(paging *sharedPaging, head, pageCount uint32) ([]uint32, error
 		if err != nil {
 			return nil, err
 		}
-		if pg.pageType != pageFreelist || uint64(pg.itemCount)*4 > uint64(len(pg.payload)) {
+		if pg.pageType != pageFreelist {
+			return nil, newError(DataCorrupted, "invalid free-list page")
+		}
+		next, content, err := chainContent(pg, pcap)
+		if err != nil {
+			return nil, err
+		}
+		if uint64(pg.itemCount)*4 > uint64(len(content)) {
 			return nil, newError(DataCorrupted, "invalid free-list page")
 		}
 		pos := 0
 		for i := uint32(0); i < pg.itemCount; i++ {
-			e, err := readU32(pg.payload, &pos)
+			e, err := readU32(content, &pos)
 			if err != nil {
 				return nil, err
 			}
@@ -2191,7 +2323,7 @@ func readFreeList(paging *sharedPaging, head, pageCount uint32) ([]uint32, error
 			last = e
 			free = append(free, e)
 		}
-		p = pg.nextPage
+		p = next
 	}
 	for _, id := range free {
 		if chain[id] {
@@ -2213,13 +2345,13 @@ func readFreeList(paging *sharedPaging, head, pageCount uint32) ([]uint32, error
 // here, so it never appears in the list it carries; this commit's fresh orphans (in persist, not in
 // safe) are persisted but not reused until the next commit (the watermark — still reachable from the
 // fallback).
-func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirtyPage, uint32, []uint32, uint32, error) {
+func serializeFreeList(persist, safe []uint32, seal sealer, next uint32) ([]dirtyPage, pageRef, []uint32, uint32, error) {
 	// Nothing worth persisting when it would take the whole list to hold itself (empty, or a lone
 	// page): leave the residue in RAM, reclaimed at the next compaction (a bounded transient leak).
 	if len(persist) < 2 {
-		return nil, 0, append([]uint32(nil), persist...), next, nil
+		return nil, pageRef{}, append([]uint32(nil), persist...), next, nil
 	}
-	per := cap / 4
+	per := seal.cap.chain() / 4
 	if per < 1 {
 		per = 1
 	}
@@ -2241,7 +2373,7 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 			safeDrawn++
 		} else {
 			if hw == ^uint32(0) {
-				return nil, 0, nil, 0, newError(ProgramLimitExceeded, "database page limit exceeded")
+				return nil, pageRef{}, nil, 0, newError(ProgramLimitExceeded, "database page limit exceeded")
 			}
 			flIDs = append(flIDs, hw)
 			hw++
@@ -2258,8 +2390,11 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 			persisted = append(persisted, p)
 		}
 	}
-	pages := make([]dirtyPage, 0, len(flIDs))
-	for ci, pageNo := range flIDs {
+	// Sealed last page first, so each binds its successor (encrypted.md §7); returned in chain order.
+	pages := make([]dirtyPage, len(flIDs))
+	var nextRef pageRef
+	for ci := len(flIDs) - 1; ci >= 0; ci-- {
+		pageNo := flIDs[ci]
 		lo := ci * per
 		if lo > len(persisted) {
 			lo = len(persisted)
@@ -2269,19 +2404,20 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 			hi = len(persisted)
 		}
 		chunk := persisted[lo:hi]
-		var nextPage uint32
-		if ci+1 < len(flIDs) {
-			nextPage = flIDs[ci+1]
-		}
 		payload := make([]byte, 0, len(chunk)*4)
 		for _, e := range chunk {
 			var b [4]byte
 			binary.BigEndian.PutUint32(b[:], e)
 			payload = append(payload, b[:]...)
 		}
-		pages = append(pages, dirtyPage{index: pageNo, bytes: makePage(ps, pageFreelist, uint32(len(chunk)), nextPage, payload)})
+		bytes, tag, err := seal.page(pageNo, pageFreelist, 0, uint32(len(chunk)), nextRef, payload)
+		if err != nil {
+			return nil, pageRef{}, nil, 0, err
+		}
+		pages[ci] = dirtyPage{index: pageNo, bytes: bytes}
+		nextRef = pageRef{page: pageNo, tag: tag}
 	}
-	return pages, flIDs[0], persisted, hw, nil
+	return pages, nextRef, persisted, hw, nil
 }
 
 // reclaimDue is the periodic reclamation trigger (format.md *Reclamation*; the constants are shared
@@ -2299,7 +2435,7 @@ func reclaimDue(pageCount uint32, free int, liveAtCompaction uint32) bool {
 // orphans and remain protected even when they are unreachable from the new root.
 // pending is a relaxed batch's pending set (validated-cow.md §4): manifest dependencies the rebuilt
 // list must exclude, though they are not live.
-func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry) ([]uint32, uint32, uint64, error) {
+func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot pageRef, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, canReclaim bool, pending []manifestEntry) ([]uint32, uint32, uint64, error) {
 	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
 	// commit even when the file is still below the ordinary amortization threshold.
 	compact := canReclaim && (liveAtCompaction == 0 || reclaimDue(pageCount, len(freeRemaining), liveAtCompaction))
@@ -2319,7 +2455,7 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, wr
 			reached[e.index] = true
 		}
 		var free []uint32
-		for p := rootPage; p < pageCount; p++ {
+		for p := paging.cap().firstBody(); p < pageCount; p++ {
 			if !reached[p] {
 				free = append(free, p)
 			}
@@ -2336,7 +2472,7 @@ func freeListCandidates(snap *snapshot, paging *sharedPaging, catRoot uint32, wr
 // alongside the skeleton (spec/design/storage.md §6). A table whose root is itself a single leaf
 // has no interior parent to hold an OnDisk reference, so the root leaf is faulted resident
 // (spec/design/pager.md §1/§4).
-func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode, error) {
+func readSkeleton(paging *sharedPaging, root pageRef, colTypes []colType) (*pnode, error) {
 	c, _, err := readSkeletonNode(paging, root, colTypes, map[uint32]bool{}, 1)
 	if err != nil {
 		return nil, err
@@ -2344,7 +2480,7 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode
 	if c.node != nil {
 		return c.node, nil
 	}
-	return paging.faultLeaf(c.page, colTypes)
+	return paging.faultLeaf(c.ref(), colTypes)
 }
 
 // readSkeletonNode resolves one B+tree node into a childRef WITHOUT reading the leaf level. A leaf
@@ -2366,11 +2502,12 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode
 // (data_corrupted) rather than a reason to recurse without bound. The returned height (1 for a leaf)
 // lets each interior check that its resolved children sit at one depth, the invariant the scan and
 // rebalance code relies on.
-func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, seen map[uint32]bool, depth int) (childRef, int, error) {
+func readSkeletonNode(paging *sharedPaging, pageIdx pageRef, colTypes []colType, seen map[uint32]bool, depth int) (childRef, int, error) {
 	if depth > maxTreeDepth {
 		return childRef{}, 0, newError(DataCorrupted, "B-tree deeper than any valid tree")
 	}
-	block, err := paging.pgr.readBlock(pageIdx)
+	pcap := paging.cap()
+	block, err := paging.readBodyUnlocked(pageIdx)
 	if err != nil {
 		return childRef{}, 0, err
 	}
@@ -2382,21 +2519,21 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, 
 	case pageLeaf:
 		return onDiskRef(pageIdx), 1, nil
 	case pageInterior:
-		if seen[pageIdx] {
+		if seen[pageIdx.page] {
 			return childRef{}, 0, newError(DataCorrupted, "B-tree interior page reached twice")
 		}
-		seen[pageIdx] = true
+		seen[pageIdx.page] = true
 		n := int(pg.itemCount)
 		// n+1 child pointers plus an n-entry separator directory must fit the payload; checking
 		// first keeps a corrupt count from sizing the allocations below.
-		if 8*n+4 > len(pg.payload) {
+		if (pcap.ptr()+4)*n+pcap.ptr() > len(pg.payload) {
 			return childRef{}, 0, newError(DataCorrupted, "B-tree interior item count overruns page")
 		}
 		pos := 0
 		// Child pointers precede the separator directory (format.md "Interior node").
-		childPtrs := make([]uint32, 0, n+1)
+		childPtrs := make([]pageRef, 0, n+1)
 		for i := 0; i < n+1; i++ {
-			cp, err := readU32(pg.payload, &pos)
+			cp, err := readPageRef(pg.payload, &pos, pcap)
 			if err != nil {
 				return childRef{}, 0, err
 			}
@@ -2431,7 +2568,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, 
 			}
 			children = append(children, child)
 		}
-		return residentRef(&pnode{keys: keys, children: children, page: pageIdx}), height + 1, nil
+		return residentRef(&pnode{keys: keys, children: children, page: pageIdx.page, tag: pageIdx.tag}), height + 1, nil
 	default:
 		return childRef{}, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
@@ -2676,7 +2813,8 @@ func planningPayload(ty colType, v Value) []byte {
 // ran, so pass 1 visited every candidate first), and an inline- or external-compressed one was
 // adopted with the block it stores. Only an inline-deferred value, whose stored form records no
 // outcome, is compressed when an attempt reaches it — from the bytes it holds.
-func planDispositions(colTypes []colType, key []byte, row storedRow, capacity int) recordPlan {
+func planDispositions(colTypes []colType, key []byte, row storedRow, pcap pageCap) recordPlan {
+	capacity := pcap.c
 	// Each column's inline-plain contribution to recordSize (the v24 basis — format.md "Record"):
 	// a fixed-width column always its width (a NULL occupies a zero-filled slot); a variable-width
 	// column 0 when NULL (a zero-length span) else its tagged inline encoding.
@@ -2751,11 +2889,12 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 	}
 	// Pass 2 — externalize: anything whose current encoded size beats its pointer, largest
 	// current size first, ties by ascending index. (A NULL is 1 byte and never qualifies.)
+	// An encrypted file's external pointer also carries its chain's tag (encrypted.md §2).
 	cand = cand[:0]
 	for i, ty := range colTypes {
-		ptr := externalPtrLen
+		ptr := externalPtrLen + pcap.tag
 		if plan.disp[i] == dispInlineComp {
-			ptr = externalCompPtrLen
+			ptr = externalCompPtrLen + pcap.tag
 		}
 		if isSpillable(ty) && cur[i] > ptr {
 			cand = append(cand, i)
@@ -2766,10 +2905,10 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 		if size <= max {
 			break
 		}
-		ptr := externalPtrLen
+		ptr := externalPtrLen + pcap.tag
 		next := dispExternal
 		if plan.disp[i] == dispInlineComp {
-			ptr = externalCompPtrLen
+			ptr = externalCompPtrLen + pcap.tag
 			next = dispExternalComp
 			plan.external += plan.compLen[i]
 		} else {
@@ -2786,7 +2925,7 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 // deferredInStoredForm reports, per column, whether the value is deferred AND the record's plan
 // stores it in exactly its stored form (large-values.md §15) — the deferred values a rewritten
 // record may keep, written from their stored bytes with their chains kept.
-func deferredInStoredForm(colTypes []colType, key []byte, row storedRow, capacity int) []bool {
+func deferredInStoredForm(colTypes []colType, key []byte, row storedRow, capacity pageCap) []bool {
 	plan := planDispositions(colTypes, key, row, capacity)
 	out := make([]bool, len(row))
 	for i, v := range row {
@@ -2813,14 +2952,14 @@ func deferredInStoredForm(colTypes []colType, key []byte, row storedRow, capacit
 // contributes its compressed inline form, an externalized one its fixed pointer size
 // (large-values.md §12/§13). Must equal what the serializer produces, so in-memory node
 // boundaries match serialized pages.
-func recordSize(colTypes []colType, key []byte, row storedRow, capacity int) int {
+func recordSize(colTypes []colType, key []byte, row storedRow, capacity pageCap) int {
 	return planDispositions(colTypes, key, row, capacity).size
 }
 
 // recordFootprint returns a record's on-disk record size (the split weight) and its stored bytes —
 // that size plus the overflow-chain payload of its externalized values (memory.md §7, the
 // pending-write measure).
-func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity int) (size, stored int) {
+func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity pageCap) (size, stored int) {
 	plan := planDispositions(colTypes, key, row, capacity)
 	return plan.size, plan.size + plan.external
 }
@@ -2837,7 +2976,8 @@ func recordFootprint(colTypes []colType, key []byte, row storedRow, capacity int
 // page_read per overflow-chain page and ceil(raw_len / cap) value_decompress slabs per compressed
 // value; nothing for an inline-plain value. A malformed span adds nothing (resolving it reports the
 // corruption). Packed-leaf.md §11 Track A4.
-func spanScanUnits(span []byte, capacity int, pages, decompress *int) {
+func spanScanUnits(span []byte, pcap pageCap, pages, decompress *int) {
+	capacity, slab := pcap.c, pcap.chain()
 	field := func(at int) (int, bool) {
 		if at+4 > len(span) {
 			return 0, false
@@ -2850,7 +2990,7 @@ func spanScanUnits(span []byte, capacity int, pages, decompress *int) {
 	switch span[0] {
 	case tagExternal:
 		if n, ok := field(5); ok {
-			*pages += (n + capacity - 1) / capacity
+			*pages += (n + slab - 1) / slab
 		}
 	case tagInlineComp:
 		if raw, ok := field(1); ok {
@@ -2860,7 +3000,7 @@ func spanScanUnits(span []byte, capacity int, pages, decompress *int) {
 		stored, ok1 := field(5)
 		raw, ok2 := field(9)
 		if ok1 && ok2 {
-			*pages += (stored + capacity - 1) / capacity
+			*pages += (stored + slab - 1) / slab
 			*decompress += (raw + capacity - 1) / capacity
 		}
 	}
@@ -2876,7 +3016,9 @@ func inlinePlainBody(span []byte) ([]byte, bool) {
 	return span[1:], true
 }
 
-func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int, mask []bool) (pages, decompress int) {
+func recordScanUnits(colTypes []colType, key []byte, row storedRow, pcap pageCap, mask []bool) (pages, decompress int) {
+	// A chain page holds C − tag bytes (encrypted.md §2); a decompress slab is C.
+	capacity, slab := pcap.c, pcap.chain()
 	// A lazily-loaded row carries its on-disk forms as unfetched references (large-values.md
 	// §14): read the units straight off them — no disposition re-plan. The numbers equal the plan
 	// below by construction (the references ARE that plan's stored output, and a rewritten row keeps
@@ -2901,28 +3043,28 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int
 				// Inline-deferred values live in the record — no chain page, no decompress slab
 				// (lazy-record.md §8: cost is invariant; matches the resident plan's dispInline).
 			case tagExternal:
-				pages += (int(v.unfetched().StoredLen) + capacity - 1) / capacity
+				pages += (int(v.unfetched().StoredLen) + slab - 1) / slab
 			case tagInlineComp:
 				decompress += (int(v.unfetched().RawLen) + capacity - 1) / capacity
 			case tagExternalComp:
-				pages += (int(v.unfetched().StoredLen) + capacity - 1) / capacity
+				pages += (int(v.unfetched().StoredLen) + slab - 1) / slab
 				decompress += (int(v.unfetched().RawLen) + capacity - 1) / capacity
 			}
 		}
 		return pages, decompress
 	}
-	plan := planDispositions(colTypes, key, row, capacity)
+	plan := planDispositions(colTypes, key, row, pcap)
 	for i, d := range plan.disp {
 		if !mask[i] {
 			continue // an untouched column's chain/slabs are never read (cost.md §3)
 		}
 		switch d {
 		case dispExternal:
-			pages += (plan.payloadLen[i] + capacity - 1) / capacity
+			pages += (plan.payloadLen[i] + slab - 1) / slab
 		case dispInlineComp:
 			decompress += (plan.payloadLen[i] + capacity - 1) / capacity
 		case dispExternalComp:
-			pages += (plan.compLen[i] + capacity - 1) / capacity
+			pages += (plan.compLen[i] + slab - 1) / slab
 			decompress += (plan.payloadLen[i] + capacity - 1) / capacity
 		case dispInline:
 		}
@@ -2934,7 +3076,7 @@ func recordScanUnits(colTypes []colType, key []byte, row storedRow, capacity int
 // ceil(raw/capacity) block per pass-1 compression attempt, adopted or not (cost.md §3;
 // large-values.md §13). Charged once per stored row version at the statement's write site,
 // never for B-tree re-encodes.
-func recordCompressUnits(colTypes []colType, key []byte, row storedRow, capacity int) int {
+func recordCompressUnits(colTypes []colType, key []byte, row storedRow, capacity pageCap) int {
 	return planDispositions(colTypes, key, row, capacity).compressUnits
 }
 
@@ -3022,10 +3164,10 @@ func valueFromPayload(ty colType, payload []byte) (Value, error) {
 // encodeInterior builds a v24 INTERIOR node payload (spec/fileformat/format.md "Interior node"):
 // N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob.
 // Record-free — no value codec, no overflow chains; a separator is raw order-preserving key bytes.
-func encodeInterior(seps [][]byte, childPages []uint32) []byte {
+func encodeInterior(seps [][]byte, childPages []pageRef, pcap pageCap) []byte {
 	var out []byte
 	for _, cp := range childPages {
-		out = appendU32(out, cp)
+		out = cp.appendTo(out, pcap)
 	}
 	off := uint32(0)
 	for _, s := range seps {
@@ -3053,16 +3195,25 @@ type chainSource struct {
 	shared []uint32
 }
 
-func (s *chainSource) fetch(p uint32) ([]byte, error) {
+func (s *chainSource) fetch(p pageRef) ([]byte, error) {
 	if s.paging == nil {
 		return nil, newError(DataCorrupted, "deferred large value with no pager at encode")
 	}
-	return s.paging.readBlock(p)
+	return s.paging.readBody(p)
 }
 
-func (s *chainSource) readChain(first uint32, length int) ([]byte, error) {
+// cap is the capacities of the database the pointers name (plaintext when there is none: an
+// inline value reads no chain).
+func (s *chainSource) cap() pageCap {
+	if s.paging == nil {
+		return pageCap{}
+	}
+	return s.paging.cap()
+}
+
+func (s *chainSource) readChain(first pageRef, length int) ([]byte, error) {
 	var sink []uint32
-	return readOverflowChain(first, length, s.fetch, &sink)
+	return readOverflowChain(first, length, s.fetch, s.cap(), &sink)
 }
 
 // resident returns v materialized: a deferred value resolved through the database's pager
@@ -3071,21 +3222,21 @@ func (s *chainSource) resident(ty colType, v Value) (Value, error) {
 	if v.Kind != ValUnfetched {
 		return v, nil
 	}
-	return resolveUnfetched(ty, v.unfetched(), s.fetch)
+	return resolveUnfetched(ty, v.unfetched(), s.fetch, s.cap())
 }
 
-// keepChain returns the first page of the chain carrying a deferred value's stored bytes in the
-// image being written: the existing chain itself (shared), or a fresh copy.
-func (s *chainSource) keepChain(first uint32, stored, capacity int, take func() uint32, ovf *[]overflowPageOut) (uint32, error) {
+// keepChain returns the pointer to the chain carrying a deferred value's stored bytes in the image
+// being written: the existing chain itself (shared), or a fresh copy.
+func (s *chainSource) keepChain(first pageRef, stored int, seal sealer, take func() uint32, ovf *[]dirtyPage) (pageRef, error) {
 	if s.share {
-		s.shared = append(s.shared, first)
+		s.shared = append(s.shared, first.page)
 		return first, nil
 	}
 	bytes, err := s.readChain(first, stored)
 	if err != nil {
-		return 0, err
+		return pageRef{}, err
 	}
-	return writeOverflowChain(bytes, capacity, take, ovf), nil
+	return writeOverflowChain(bytes, seal, take, ovf)
 }
 
 // encodeDisposedValue encodes one value's on-disk body given its planned disposition (the value
@@ -3095,32 +3246,38 @@ func (s *chainSource) keepChain(first uint32, stored, capacity int, take func() 
 // re-compresses. A deferred value planned in its own stored form is written from its stored bytes —
 // an inline body or block verbatim, an external pointer to its kept chain (§15) — so a rewritten
 // record never re-reads, decompresses, or recompresses an unchanged value.
-func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c, capacity int, take func() uint32, ovf *[]overflowPageOut, src *chainSource) ([]byte, error) {
+func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c int, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
 	var u *Unfetched
 	if v.Kind == ValUnfetched {
 		u = v.unfetched()
 	}
+	pcap := seal.cap
 	rawLen := plan.payloadLen[c]
 	switch plan.disp[c] {
 	case dispExternal:
 		if u != nil && u.Form == tagExternal {
-			first, err := src.keepChain(u.FirstPage, int(u.StoredLen), capacity, take, ovf)
+			first, err := src.keepChain(u.first(), int(u.StoredLen), seal, take, ovf)
 			if err != nil {
 				return nil, err
 			}
 			out := []byte{tagExternal}
-			out = appendU32(out, first)
-			return appendU32(out, u.StoredLen), nil
+			out = appendU32(out, first.page)
+			out = appendU32(out, u.StoredLen)
+			return append(out, first.tag[:pcap.tag]...), nil
 		}
 		r, err := src.resident(ty, v)
 		if err != nil {
 			return nil, err
 		}
 		payload := valuePayload(ty, r)
-		first := writeOverflowChain(payload, capacity, take, ovf)
+		first, err := writeOverflowChain(payload, seal, take, ovf)
+		if err != nil {
+			return nil, err
+		}
 		out := []byte{tagExternal}
-		out = appendU32(out, first)
-		return appendU32(out, uint32(len(payload))), nil
+		out = appendU32(out, first.page)
+		out = appendU32(out, uint32(len(payload)))
+		return append(out, first.tag[:pcap.tag]...), nil
 	case dispInlineComp:
 		comp, err := planBlock(plan, c, u, src)
 		if err != nil {
@@ -3132,25 +3289,30 @@ func encodeDisposedValue(ty colType, v Value, plan *recordPlan, c, capacity int,
 		return append(out, comp...), nil
 	case dispExternalComp:
 		if u != nil && u.Form == tagExternalComp {
-			first, err := src.keepChain(u.FirstPage, int(u.StoredLen), capacity, take, ovf)
+			first, err := src.keepChain(u.first(), int(u.StoredLen), seal, take, ovf)
 			if err != nil {
 				return nil, err
 			}
 			out := []byte{tagExternalComp}
-			out = appendU32(out, first)
+			out = appendU32(out, first.page)
 			out = appendU32(out, u.StoredLen)
-			return appendU32(out, u.RawLen), nil
+			out = appendU32(out, u.RawLen)
+			return append(out, first.tag[:pcap.tag]...), nil
 		}
 		// The chain carries the COMPRESSED block (its page count follows comp size).
 		comp, err := planBlock(plan, c, u, src)
 		if err != nil {
 			return nil, err
 		}
-		first := writeOverflowChain(comp, capacity, take, ovf)
+		first, err := writeOverflowChain(comp, seal, take, ovf)
+		if err != nil {
+			return nil, err
+		}
 		out := []byte{tagExternalComp}
-		out = appendU32(out, first)
+		out = appendU32(out, first.page)
 		out = appendU32(out, uint32(len(comp)))
-		return appendU32(out, uint32(rawLen)), nil
+		out = appendU32(out, uint32(rawLen))
+		return append(out, first.tag[:pcap.tag]...), nil
 	default:
 		if u != nil && u.Form == 0x00 {
 			return append([]byte{0x00}, u.Comp...), nil
@@ -3172,7 +3334,7 @@ func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte,
 	if u == nil || u.Form != tagExternalComp {
 		return nil, newError(DataCorrupted, "a chained LZ4 block with no chain")
 	}
-	return src.readChain(u.FirstPage, int(u.StoredLen))
+	return src.readChain(u.first(), int(u.StoredLen))
 }
 
 // encodeLeafPAX builds a v24 PAX (column-major) leaf payload from records in ascending key order
@@ -3189,7 +3351,7 @@ func planBlock(plan *recordPlan, c int, u *Unfetched, src *chainSource) ([]byte,
 //	          NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled), or — variable-width —
 //	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
 //	          zero-length span)
-func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity int, take func() uint32, ovf *[]overflowPageOut, src *chainSource) ([]byte, error) {
+func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, seal sealer, take func() uint32, ovf *[]dirtyPage, src *chainSource) ([]byte, error) {
 	n := len(keys)
 	k := len(colTypes)
 	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
@@ -3202,7 +3364,7 @@ func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity
 		nulls[c] = make([]bool, n)
 	}
 	for i := 0; i < n; i++ {
-		plan := planDispositions(colTypes, keys[i], rows[i], capacity)
+		plan := planDispositions(colTypes, keys[i], rows[i], seal.cap)
 		for c, ty := range colTypes {
 			isNull := rows[i][c].IsNull()
 			nulls[c][i] = isNull
@@ -3215,7 +3377,7 @@ func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity
 			case isNull:
 				valBytes[c][i] = nil // a zero-length span
 			default:
-				b, err := encodeDisposedValue(ty, rows[i][c], &plan, c, capacity, take, ovf, src)
+				b, err := encodeDisposedValue(ty, rows[i][c], &plan, c, seal, take, ovf, src)
 				if err != nil {
 					return nil, err
 				}
@@ -3279,37 +3441,30 @@ func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity
 	return out, nil
 }
 
-// overflowPageOut is one overflow page produced while serializing a record's external value.
-type overflowPageOut struct {
-	index     uint32
-	itemCount uint32
-	nextPage  uint32
-	payload   []byte
-}
-
-// writeOverflowChain writes payload across a chain of overflow pages (capacity-byte slabs, in order),
-// allocating each page via take and linking it with nextPage (0 terminates). Returns the first page
-// index for the record's pointer. payload is always non-empty (only values larger than the pointer
-// spill — planDispositions).
-func writeOverflowChain(payload []byte, capacity int, take func() uint32, ovf *[]overflowPageOut) uint32 {
-	n := (len(payload) + capacity - 1) / capacity
+// writeOverflowChain writes payload across a chain of overflow pages (C − tag byte slabs, in order),
+// allocating each page via take and linking it with nextPage (0 terminates), then seals the pages last
+// first so each binds its successor (encrypted.md §7), appending them to ovf as they are sealed.
+// Returns the pointer to the first page for the record. payload is always non-empty (only values
+// larger than the pointer spill — planDispositions).
+func writeOverflowChain(payload []byte, seal sealer, take func() uint32, ovf *[]dirtyPage) (pageRef, error) {
+	slab := seal.cap.chain()
+	n := (len(payload) + slab - 1) / slab
 	indices := make([]uint32, n)
 	for i := range indices {
 		indices[i] = take()
 	}
-	for j := 0; j < n; j++ {
-		lo := j * capacity
-		hi := lo + capacity
-		if hi > len(payload) {
-			hi = len(payload)
+	var next pageRef
+	for j := n - 1; j >= 0; j-- {
+		lo := j * slab
+		hi := min(lo+slab, len(payload))
+		bytes, tag, err := seal.page(indices[j], pageOverflow, 0, uint32(hi-lo), next, payload[lo:hi])
+		if err != nil {
+			return pageRef{}, err
 		}
-		var next uint32
-		if j+1 < n {
-			next = indices[j+1]
-		}
-		*ovf = append(*ovf, overflowPageOut{index: indices[j], itemCount: uint32(hi - lo), nextPage: next, payload: payload[lo:hi]})
+		*ovf = append(*ovf, dirtyPage{index: indices[j], bytes: bytes})
+		next = pageRef{page: indices[j], tag: tag}
 	}
-	return indices[0]
+	return next, nil
 }
 
 // compositeTypeEntryBytes serializes a composite-type catalog entry's BODY (after its
@@ -4436,11 +4591,11 @@ func checkTableRowCount(rootDataPage uint32, rowCount int64) error {
 	return nil
 }
 
-func tableEntryBytes(table *catTable, rootDataPage uint32, indexRoots []uint32, rowCount int64) []byte {
+func tableEntryBytes(table *catTable, rootDataPage pageRef, indexRoots []pageRef, rowCount int64, pcap pageCap) []byte {
 	if rowCount < 0 {
 		panic("table row count is nonnegative")
 	}
-	if (rootDataPage == 0) != (rowCount == 0) {
+	if (rootDataPage.page == 0) != (rowCount == 0) {
 		panic("table root and row count agree")
 	}
 	var out []byte
@@ -4648,7 +4803,7 @@ func tableEntryBytes(table *catTable, rootDataPage uint32, indexRoots []uint32, 
 		}
 		out = append(out, iflags)
 		out = append(out, byte(idx.Kind)) // v12: index_kind byte (0 = btree, 1 = GIN)
-		out = appendU32(out, indexRoots[k])
+		out = indexRoots[k].appendTo(out, pcap)
 		// v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
 		if idx.Predicate != nil {
 			out = appendU16(out, uint16(len(idx.Predicate.ExprText)))
@@ -4720,7 +4875,7 @@ func tableEntryBytes(table *catTable, rootDataPage uint32, indexRoots []uint32, 
 			out = append(out, exclusionOpCode(el.Op))
 		}
 	}
-	out = appendU32(out, rootDataPage)
+	out = rootDataPage.appendTo(out, pcap)
 	out = appendI64(out, rowCount)
 	return out
 }
@@ -4861,28 +5016,28 @@ func catalogLayout(entries [][]byte, capacity int) []catalogPage {
 	return out
 }
 
-// makeCatalogPage is a catalog page's full bytes: makePage with header byte 1 bit0 continued (v48).
-func makeCatalogPage(ps int, cp *catalogPage, nextPage uint32) []byte {
-	p := makePage(ps, pageCatalog, cp.itemCount, nextPage, cp.payload)
-	if cp.continued {
-		p[1] = 1
-		binary.BigEndian.PutUint32(p[12:], pageCRC(p))
-	}
-	return p
-}
-
 // metaPage encodes a dependency-free checkpoint meta. Incremental commits add
 // their v33 manifest fields and inline entries, then reseal the full-page CRC.
-func metaPage(pageSize uint32, txid uint64, root, pageCount, freeListHead, livePages uint32) []byte {
+//
+// In pcap's encrypted layout (encrypted.md §6) the meta also carries the suite and its reserve at
+// offsets 6/7 and the tags of the catalog root and the free-list head at 64 and 80; the commit seals
+// it (pageCodec.sealMeta) when it writes the slot.
+func metaPage(pcap pageCap, pageSize uint32, txid uint64, root pageRef, pageCount uint32, freeList pageRef, livePages uint32) []byte {
 	p := make([]byte, pageSize)
 	copy(p[0:4], magic[:])
 	binary.BigEndian.PutUint16(p[4:], formatVersion)
+	if pcap.encrypted() {
+		p[6] = suiteXAES
+		p[7] = cryptoReserve
+		copy(p[64:80], root.tag[:])
+		copy(p[80:96], freeList.tag[:])
+	}
 	binary.BigEndian.PutUint32(p[8:], pageSize)
 	binary.BigEndian.PutUint64(p[12:], txid)
-	binary.BigEndian.PutUint32(p[20:], root)
+	binary.BigEndian.PutUint32(p[20:], root.page)
 	binary.BigEndian.PutUint32(p[24:], pageCount)
-	binary.BigEndian.PutUint32(p[28:], freeListHead) // v25: the persisted free-list head (0 = empty)
-	binary.BigEndian.PutUint32(p[56:], livePages)    // v34: the exact live page count (memory.md §8.7)
+	binary.BigEndian.PutUint32(p[28:], freeList.page) // v25: the persisted free-list head (0 = empty)
+	binary.BigEndian.PutUint32(p[56:], livePages)     // v34: the exact live page count (memory.md §8.7)
 	binary.BigEndian.PutUint32(p[32:], metaCRC(p))
 	return p
 }
@@ -4903,8 +5058,14 @@ func makePage(ps int, pageType byte, itemCount, nextPage uint32, payload []byte)
 
 // meta holds a validated meta slot's salient fields.
 type meta struct {
+	// suite is the meta's suite byte (offset 6): 0 plaintext, suiteXAES encrypted (encrypted.md §6).
+	suite    byte
 	txid     uint64
 	rootPage uint32
+	// rootTag and freeListTag are the catalog root's and the free-list head's tags (encrypted.md §6;
+	// zero in plaintext).
+	rootTag     pageTag
+	freeListTag pageTag
 	// pageCount is the on-disk page high-water — the next free page an incremental commit appends at
 	// (P6.1 part B).
 	pageCount uint32
@@ -4931,41 +5092,62 @@ func parseMeta(m []byte) (meta, bool) {
 	if binary.BigEndian.Uint16(m[4:6]) != formatVersion {
 		return meta{}, false
 	}
-	if m[6] != 0 || m[7] != 0 {
+	// Offsets 6/7: the encryption suite and its reserve (encrypted.md §6) — 0, 0 in plaintext.
+	var suite byte
+	switch {
+	case m[6] == 0 && m[7] == 0:
+	case m[6] == suiteXAES && int(m[7]) == cryptoReserve && len(m) >= minEncryptedPageSize:
+		suite = suiteXAES
+	default:
 		return meta{}, false
 	}
 	if metaCRC(m) != binary.BigEndian.Uint32(m[32:36]) {
 		return meta{}, false
 	}
+	pcap := capOf(uint32(len(m)), suite != 0)
+	first := pcap.firstBody()
 	pageCount := binary.BigEndian.Uint32(m[24:28])
 	root := binary.BigEndian.Uint32(m[20:24])
-	if pageCount < 3 || root < rootPage || root >= pageCount || !zeroBytes(m[60:64]) {
+	if pageCount <= first || root < first || root >= pageCount || !zeroBytes(m[60:64]) {
 		return meta{}, false
 	}
 	head := binary.BigEndian.Uint32(m[36:40])
 	count := binary.BigEndian.Uint32(m[40:44])
 	pages := binary.BigEndian.Uint32(m[44:48])
 	chainCRC := binary.BigEndian.Uint64(m[48:56])
-	if count > pageCount-2 || pages > pageCount-2 || uint64(count)+uint64(pages) > uint64(pageCount-2) ||
-		(head == 0) != (pages == 0) || (head != 0 && (head < rootPage || head >= pageCount)) ||
+	body := pageCount - first
+	if count > body || pages > body || uint64(count)+uint64(pages) > uint64(body) ||
+		(head == 0) != (pages == 0) || (head != 0 && (head < first || head >= pageCount)) ||
 		(pages == 0 && chainCRC != 0) || (count == 0 && pages != 0) {
 		return meta{}, false
 	}
-	inline := min(int(count), manifestInlineCapacity(len(m)))
-	if !zeroBytes(m[64+12*inline:]) || uint64(count) > uint64(inline)+uint64(pages)*uint64(manifestOverflowCapacity(len(m))) {
+	lo, hi := manifestInlineArea(len(m), pcap)
+	inline := min(int(count), manifestInlineCapacity(len(m), pcap))
+	if !zeroBytes(m[lo+12*inline:hi]) || uint64(count) > uint64(inline)+uint64(pages)*uint64(manifestOverflowCapacity(len(m))) {
 		return meta{}, false
 	}
-	// v25: offset 28 is the free-list head — 0 (empty) or a real body page in [2, page_count).
+	// v25: offset 28 is the free-list head — 0 (empty) or a real body page in [first, page_count).
 	freeListHead := binary.BigEndian.Uint32(m[28:32])
-	if freeListHead != 0 && (freeListHead < rootPage || freeListHead >= pageCount) {
+	if freeListHead != 0 && (freeListHead < first || freeListHead >= pageCount) {
 		return meta{}, false
 	}
 	// v34: the live pages are a subset of the body pages.
 	livePages := binary.BigEndian.Uint32(m[56:60])
-	if livePages > pageCount-rootPage {
+	if livePages > body {
+		return meta{}, false
+	}
+	var rootTag, freeListTag pageTag
+	if suite != 0 {
+		copy(rootTag[:], m[64:80])
+		copy(freeListTag[:], m[80:96])
+	}
+	if freeListHead == 0 && freeListTag != noTag {
 		return meta{}, false
 	}
 	return meta{
+		suite:         suite,
+		rootTag:       rootTag,
+		freeListTag:   freeListTag,
 		txid:          binary.BigEndian.Uint64(m[12:20]),
 		rootPage:      binary.BigEndian.Uint32(m[20:24]),
 		pageCount:     pageCount,
@@ -5236,7 +5418,10 @@ type packedLeaf struct {
 	// self-resolve at the evaluator's column access (the B4 demand-fault backstop,
 	// bplus-reshape.md §5). A plain pointer (GC — no Rust-style weak ref needed).
 	paging *sharedPaging
-	n      int
+	// cap is the database's capacities: an external value's pointer carries a tag in an encrypted
+	// file.
+	cap pageCap
+	n   int
 }
 
 func (p *packedLeaf) key(i int) []byte { return p.dirs.key(i) }
@@ -5268,7 +5453,7 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 	if _, fixed := fixedValueWidth(p.colTypes[c]); fixed {
 		return readInlineBody(p.colTypes[c], vb, &pos, decodeConstruct)
 	}
-	return readValueLazy(p.colTypes, c, vb, &pos, p.paging)
+	return readValueLazy(p.colTypes, c, vb, &pos, p.cap, p.paging)
 }
 
 // valueSpan returns the stored bytes of value (record i, column c), borrowed from the page — a
@@ -5316,7 +5501,7 @@ func (p *packedLeaf) rowInto(i int, row storedRow) (storedRow, error) {
 // an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
 // resolved later only for the columns a query touches (or on demand at the evaluator's column
 // access — the B4 backstop; paging is stamped into every deferred value for that).
-func decodeLeafNode(block []byte, pageID uint32, colTypes []colType, paging *sharedPaging) (*pnode, error) {
+func decodeLeafNode(block []byte, pageID pageRef, colTypes []colType, paging *sharedPaging) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
@@ -5336,31 +5521,35 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType, paging *sha
 	// from the directories alone (§3): the weight is len(key) + Σ_c valueLen(c, i) (the v24
 	// record_size), exactly what the writer split on — so the resident leaf is ≈ pageSize (§9),
 	// never an inflated row vector.
-	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, paging: paging, n: n}
-	return &pnode{packed: packed, page: pageID}, nil
+	var pcap pageCap
+	if paging != nil {
+		pcap = paging.cap()
+	}
+	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, paging: paging, cap: pcap, n: n}
+	return &pnode{packed: packed, page: pageID.page, tag: pageID.tag}, nil
 }
 
 // decodeTableEntry decodes one catalog table entry: the *Table (its pk list, checks, and
 // index definitions included), its root_data_page, and each index's root page (parallel
 // to Table.Indexes).
-func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint32, []uint32, error) {
+func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64, pcap pageCap) (*catTable, pageRef, []pageRef, error) {
 	name, err := readString(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	colCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	columns := make([]catColumn, 0, colCount)
 	for i := uint16(0); i < colCount; i++ {
 		cname, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		tc, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if tc == 14 {
 			// A composite column (v9): flags, then the type name (spec/fileformat/format.md), then
@@ -5369,23 +5558,23 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			// identity, or a collation.
 			flags, err := readU8(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if flags&0b01 != 0 {
-				return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
 			if flags&^0b1010 != 0 {
-				return nil, 0, nil, newError(DataCorrupted, "invalid composite column flags")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid composite column flags")
 			}
 			tname, err := readString(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			var defaultExpr *defaultExprDef
 			if flags&0b1000 != 0 {
 				exprText, err := readString(buf, pos)
 				if err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 				// Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
 				expr, perr := parseExpression(exprText)
@@ -5406,24 +5595,24 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			// An array column (v10): flags, then the element type descriptor (array.md §3).
 			flags, err := readU8(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if flags&0b01 != 0 {
-				return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
 			elem, err := readArrayElementType(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			// bit6 has_collation (v36): a text[] column's non-C collation name follows the element
 			// descriptor; the bit on any other element type is corrupt (spec/design/array.md §3).
 			collation := ""
 			if flags&0b100_0000 != 0 {
 				if !elem.IsText() {
-					return nil, 0, nil, newError(DataCorrupted, "has_collation set on a non-text array column")
+					return nil, pageRef{}, nil, newError(DataCorrupted, "has_collation set on a non-text array column")
 				}
 				if collation, err = readString(buf, pos); err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 			}
 			columns = append(columns, catColumn{
@@ -5439,14 +5628,14 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			// (spec/design/ranges.md §3). Ranges carry no default this slice.
 			flags, err := readU8(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if flags&0b01 != 0 {
-				return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 			}
 			elem, err := readRangeElementType(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			columns = append(columns, catColumn{
 				Name:    cname,
@@ -5457,24 +5646,24 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		}
 		ty, ok := scalarForTypeCode(tc)
 		if !ok {
-			return nil, 0, nil, newError(DataCorrupted, "unknown type code")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "unknown type code")
 		}
 		flags, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		// bit0 was the primary_key flag through v4; v5 retired it (the pk list below is
 		// the authority) and reserves it as must-be-zero. bit6 = has_collation (v17); bit7 reserved.
 		if flags&0b01 != 0 {
-			return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit0 set")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit0 set")
 		}
 		if flags&0b1000_0000 != 0 {
-			return nil, 0, nil, newError(DataCorrupted, "reserved column flag bit7 set")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "reserved column flag bit7 set")
 		}
 		// bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
 		// is_identity (spec/design/sequences.md §13).
 		if flags&0b11_0000 == 0b10_0000 {
-			return nil, 0, nil, newError(DataCorrupted, "identity_always set without is_identity")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "identity_always set without is_identity")
 		}
 		var identity *identityKind
 		if flags&0b1_0000 != 0 {
@@ -5489,14 +5678,14 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		if ty.IsDecimal() {
 			precision, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			scale, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if precision != 0 && (precision > maxPrecision || scale > precision) {
-				return nil, 0, nil, newError(DataCorrupted, "invalid decimal typmod")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid decimal typmod")
 			}
 			if precision != 0 {
 				decimal = &decimalTypmod{Precision: precision, Scale: scale}
@@ -5507,7 +5696,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		if ty.IsText() {
 			n, err := readU32(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if n != 0 {
 				varcharLen = &n
@@ -5517,7 +5706,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		// (v43, spec/design/timestamp.md §8, interval.md §6.1).
 		temporal, err := readTemporalTypmod(buf, pos, ty)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		// The default follows the typmod (spec/fileformat/format.md): a CONSTANT default (flags
 		// bit2) is a value via the same value codec rows use — never externalized, so no
@@ -5526,7 +5715,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		// the ordinary expression parser (unparsed if it fails, like a stored check). The two bits
 		// are mutually exclusive — both set is a corrupt catalog.
 		if flags&0b1100 == 0b1100 {
-			return nil, 0, nil, newError(DataCorrupted, "column has both a constant and an expression default")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "column has both a constant and an expression default")
 		}
 		var defaultVal *Value
 		if flags&0b100 != 0 {
@@ -5534,7 +5723,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 			// A constant default is a scalar value (this branch is the scalar type path).
 			dv, err := readValue(scalarColType(ty), buf, pos, nil, &sink)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			defaultVal = &dv
 		}
@@ -5542,7 +5731,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		if flags&0b1000 != 0 {
 			exprText, err := readString(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			// Text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
 			expr, perr := parseExpression(exprText)
@@ -5557,7 +5746,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		if flags&0b100_0000 != 0 {
 			collation, err = readString(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 		}
 		columns = append(columns, catColumn{
@@ -5578,17 +5767,17 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 	// once; membership sets the per-column convenience flag.
 	pkCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	pk := make([]int, 0, pkCount)
 	for i := uint16(0); i < pkCount; i++ {
 		ord, err := readU16(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		o := int(ord)
 		if o >= len(columns) || slices.Contains(pk, o) {
-			return nil, 0, nil, newError(DataCorrupted, "invalid primary key ordinal")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "invalid primary key ordinal")
 		}
 		columns[o].PrimaryKey = true
 		pk = append(pk, o)
@@ -5598,17 +5787,17 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 	// (spec/design/unparsable-definitions.md §3.2).
 	checkCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	checks := make([]checkConstraint, 0, checkCount)
 	for i := uint16(0); i < checkCount; i++ {
 		checkName, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		exprText, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		expr, perr := parseExpression(exprText)
 		if perr != nil {
@@ -5617,15 +5806,15 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		// v35: check_flags (bit0 has_host_deps; reserved bits are XX001), then the dependency list.
 		cflags, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if cflags&^1 != 0 {
-			return nil, 0, nil, newError(DataCorrupted, "a check_flags reserved bit is set")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "a check_flags reserved bit is set")
 		}
 		var checkDeps []hostFuncDep
 		if cflags&1 != 0 {
 			if checkDeps, err = readHostDeps(buf, pos); err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 		}
 		checks = append(checks, checkConstraint{Name: checkName, ExprText: exprText, Expr: expr, Unparsed: perr != nil, HostDeps: checkDeps})
@@ -5636,34 +5825,34 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 	// are legal (indexes.md §1).
 	indexCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	indexes := make([]indexDef, 0, indexCount)
-	indexRoots := make([]uint32, 0, indexCount)
+	indexRoots := make([]pageRef, 0, indexCount)
 	for i := uint16(0); i < indexCount; i++ {
 		iname, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		kc, err := readU16(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if kc == 0 {
-			return nil, 0, nil, newError(DataCorrupted, "index with no key columns")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "index with no key columns")
 		}
 		keys := make([]indexKey, 0, kc)
 		for j := uint16(0); j < kc; j++ {
 			ord, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if ord == 0xFFFF {
 				// An expression key (v26): the sentinel, then the canonical text; re-parse it. Text this
 				// binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md §3.4).
 				text, err := readString(buf, pos)
 				if err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 				expr, perr := parseExpression(text)
 				if perr != nil {
@@ -5673,32 +5862,32 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 				continue
 			}
 			if int(ord) >= len(columns) {
-				return nil, 0, nil, newError(DataCorrupted, "invalid index column ordinal")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid index column ordinal")
 			}
 			keys = append(keys, indexKey{Col: int(ord)})
 		}
 		iflags, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		// bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9), bit2
 		// has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1); rest reserved.
 		if iflags&^uint8(0b1_1111) != 0 {
-			return nil, 0, nil, newError(DataCorrupted, "reserved index flag set")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "reserved index flag set")
 		}
 		ikind, err := readU8(buf, pos) // v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if ikind > 2 {
-			return nil, 0, nil, newError(DataCorrupted, "unsupported index kind")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "unsupported index kind")
 		}
 		// A GIN/GiST index is single-column plain (this slice): an expression key on either is
 		// structurally impossible in a valid file.
 		if indexKind(ikind) != indexBtree {
 			for _, k := range keys {
 				if k.Expr != nil {
-					return nil, 0, nil, newError(DataCorrupted, "a non-btree index cannot have an expression key")
+					return nil, pageRef{}, nil, newError(DataCorrupted, "a non-btree index cannot have an expression key")
 				}
 			}
 		}
@@ -5707,14 +5896,14 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		// constraint (v45, gist.md §7.1 — checked against the exclusion list once the table is
 		// decoded): bit1 with a GIN kind is corrupt.
 		if hasPredicate && indexKind(ikind) == indexGin {
-			return nil, 0, nil, newError(DataCorrupted, "a gin index cannot be partial")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "a gin index cannot be partial")
 		}
 		// Only a btree index or a partial GiST index (a partial exclusion, v45) carries a dependency
 		// list.
 		depsAllowed := indexKind(ikind) == indexBtree || (indexKind(ikind) == indexGist && hasPredicate)
-		iroot, err := readU32(buf, pos)
+		iroot, err := readPageRef(buf, pos, pcap)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		// v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
 		// it; text this binary cannot parse is kept, unparsed (spec/design/unparsable-definitions.md).
@@ -5722,7 +5911,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		if hasPredicate {
 			text, perr := readString(buf, pos)
 			if perr != nil {
-				return nil, 0, nil, perr
+				return nil, pageRef{}, nil, perr
 			}
 			expr, perr := parseExpression(text)
 			if perr != nil {
@@ -5734,46 +5923,46 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		// (extensibility.md §8.1). Only a btree index or a partial GiST index carries one.
 		hasHostDeps := iflags&0b100 != 0
 		if hasHostDeps && !depsAllowed {
-			return nil, 0, nil, newError(DataCorrupted, "a non-btree index cannot have host-function dependencies")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "a non-btree index cannot have host-function dependencies")
 		}
 		var hostDeps []hostFuncDep
 		if hasHostDeps {
 			if hostDeps, err = readHostDeps(buf, pos); err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 		}
 		timezoneDeps := timeZoneDeps{}
 		if iflags&8 != 0 {
 			if !depsAllowed {
-				return nil, 0, nil, newError(DataCorrupted, "a non-btree index cannot have timezone dependencies")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "a non-btree index cannot have timezone dependencies")
 			}
 			dynamic, err := readU8(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			count, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if dynamic > 1 || (dynamic == 0 && count == 0) {
-				return nil, 0, nil, newError(DataCorrupted, "invalid timezone dependency header")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid timezone dependency header")
 			}
 			timezoneDeps.Dynamic = dynamic == 1
 			for d := uint16(0); d < count; d++ {
 				name, err := readString(buf, pos)
 				if err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 				version, err := readString(buf, pos)
 				if err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 				checksum, err := readU32(buf, pos)
 				if err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 				if name == "" || version == "" || (len(timezoneDeps.Zones) > 0 && timezoneDeps.Zones[len(timezoneDeps.Zones)-1].Name >= name) {
-					return nil, 0, nil, newError(DataCorrupted, "invalid timezone dependency order or name/version")
+					return nil, pageRef{}, nil, newError(DataCorrupted, "invalid timezone dependency order or name/version")
 				}
 				timezoneDeps.Zones = append(timezoneDeps.Zones, timeZoneDep{Name: name, Version: version, Checksum: checksum})
 			}
@@ -5783,18 +5972,18 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 		var orders []keyOrder
 		if iflags&0b1_0000 != 0 {
 			if indexKind(ikind) != indexBtree {
-				return nil, 0, nil, newError(DataCorrupted, "a non-btree index cannot have key options")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "a non-btree index cannot have key options")
 			}
 			orders = make([]keyOrder, len(keys))
 			allDefault := true
 			for i := range orders {
 				b, err := readU8(buf, pos)
 				if err != nil {
-					return nil, 0, nil, err
+					return nil, pageRef{}, nil, err
 				}
 				o, ok := keyOrderFromByte(b)
 				if !ok {
-					return nil, 0, nil, newError(DataCorrupted, "reserved index key option bit set")
+					return nil, pageRef{}, nil, newError(DataCorrupted, "reserved index key option bit set")
 				}
 				orders[i] = o
 				if !o.isDefault() {
@@ -5802,7 +5991,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 				}
 			}
 			if allDefault {
-				return nil, 0, nil, newError(DataCorrupted, "index key options are all default")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "index key options are all default")
 			}
 		}
 		indexes = append(indexes, indexDef{Name: iname, Keys: keys, Unique: iflags&0b01 != 0, Kind: indexKind(ikind), Predicate: predicate, HostDeps: hostDeps, TimezoneDeps: timezoneDeps, Orders: orders})
@@ -5816,65 +6005,65 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 	// valid; a structurally impossible FK is rejected below).
 	fkCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	foreignKeys := make([]foreignKey, 0, fkCount)
 	for i := uint16(0); i < fkCount; i++ {
 		fname, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		lc, err := readU16(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if lc == 0 {
-			return nil, 0, nil, newError(DataCorrupted, "foreign key with no columns")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "foreign key with no columns")
 		}
 		cols := make([]int, 0, lc)
 		for j := uint16(0); j < lc; j++ {
 			ord, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if int(ord) >= len(columns) {
-				return nil, 0, nil, newError(DataCorrupted, "invalid foreign-key column ordinal")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid foreign-key column ordinal")
 			}
 			cols = append(cols, int(ord))
 		}
 		refTable, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		rc, err := readU16(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if rc != lc {
-			return nil, 0, nil, newError(DataCorrupted, "foreign-key referencing/referenced column count mismatch")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "foreign-key referencing/referenced column count mismatch")
 		}
 		refCols := make([]int, 0, rc)
 		for j := uint16(0); j < rc; j++ {
 			ord, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			refCols = append(refCols, int(ord))
 		}
 		actions, err := readU8(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if actions&0b1000_0000 != 0 {
-			return nil, 0, nil, newError(DataCorrupted, "reserved foreign-key action bit set")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "reserved foreign-key action bit set")
 		}
 		onDelete, err := fkActionFromCode(actions & 0b111)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		onUpdate, err := fkActionFromCode((actions >> 3) & 0b111)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		foreignKeys = append(foreignKeys, foreignKey{
 			Name:       fname,
@@ -5890,59 +6079,59 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 	// element vector, in name order (spec/design/gist.md §7/§8).
 	excCount, err := readU16(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	exclusions := make([]exclusionConstraint, 0, excCount)
 	for i := uint16(0); i < excCount; i++ {
 		ename, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		iname, err := readString(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		ec, err := readU16(buf, pos)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, pageRef{}, nil, err
 		}
 		if ec == 0 {
-			return nil, 0, nil, newError(DataCorrupted, "exclusion constraint with no elements")
+			return nil, pageRef{}, nil, newError(DataCorrupted, "exclusion constraint with no elements")
 		}
 		elements := make([]exclusionElement, 0, ec)
 		for j := uint16(0); j < ec; j++ {
 			ord, err := readU16(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			if int(ord) >= len(columns) {
-				return nil, 0, nil, newError(DataCorrupted, "invalid exclusion-constraint column ordinal")
+				return nil, pageRef{}, nil, newError(DataCorrupted, "invalid exclusion-constraint column ordinal")
 			}
 			opb, err := readU8(buf, pos)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			op, err := exclusionOpFromCode(opb)
 			if err != nil {
-				return nil, 0, nil, err
+				return nil, pageRef{}, nil, err
 			}
 			elements = append(elements, exclusionElement{Column: int(ord), Op: op})
 		}
 		exclusions = append(exclusions, exclusionConstraint{Name: ename, Index: iname, Elements: elements})
 	}
-	root, err := readU32(buf, pos)
+	root, err := readPageRef(buf, pos, pcap)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	rowCount, err := readI64(buf, pos)
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, pageRef{}, nil, err
 	}
 	if rowCount < 0 {
-		return nil, 0, nil, newError(DataCorrupted, "negative table row count")
+		return nil, pageRef{}, nil, newError(DataCorrupted, "negative table row count")
 	}
-	if (root == 0) != (rowCount == 0) {
-		return nil, 0, nil, newError(DataCorrupted, "table root and row count disagree")
+	if (root.page == 0) != (rowCount == 0) {
+		return nil, pageRef{}, nil, newError(DataCorrupted, "table root and row count disagree")
 	}
 	*rowCountOut = rowCount
 	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions}, root, indexRoots, nil
@@ -5957,7 +6146,7 @@ func decodeTableEntry(buf []byte, pos *int, rowCountOut *int64) (*catTable, uint
 // for the columns a query touches (resolveUnfetched); a commit writes the rest from their stored
 // bytes, keeping their chains (large-values.md §15); a touched-set miss resolves on demand
 // (resolveUnfetchedSelf).
-func readValueLazy(types []colType, c int, buf []byte, pos *int, paging *sharedPaging) (Value, error) {
+func readValueLazy(types []colType, c int, buf []byte, pos *int, pcap pageCap, paging *sharedPaging) (Value, error) {
 	ty := types[c]
 	tag, err := readU8(buf, pos)
 	if err != nil {
@@ -5995,7 +6184,11 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, paging *sharedP
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
+		ref, err := readPointerTag(buf, pos, first, pcap)
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, firstTag: ref.tag, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
 	case tagInlineComp:
 		rawLen, err := readU32(buf, pos)
 		if err != nil {
@@ -6025,7 +6218,11 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, paging *sharedP
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
+		ref, err := readPointerTag(buf, pos, first, pcap)
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, firstTag: ref.tag, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
 	default:
 		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
@@ -6035,7 +6232,7 @@ func readValueLazy(types []colType, c int, buf []byte, pos *int, paging *sharedP
 // (spec/design/large-values.md §14): gather the overflow chain through fetch for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
-func resolveUnfetched(ty colType, u *Unfetched, fetch func(uint32) ([]byte, error)) (Value, error) {
+func resolveUnfetched(ty colType, u *Unfetched, fetch func(pageRef) ([]byte, error), pcap pageCap) (Value, error) {
 	var sink []uint32
 	switch u.Form {
 	case 0x00:
@@ -6044,7 +6241,7 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(uint32) ([]byte, erro
 		p := 0
 		return readInlineBody(ty, u.Comp, &p, decodeConstruct)
 	case tagExternal:
-		payload, err := readOverflowChain(u.FirstPage, int(u.StoredLen), fetch, &sink)
+		payload, err := readOverflowChain(u.first(), int(u.StoredLen), fetch, pcap, &sink)
 		if err != nil {
 			return Value{}, err
 		}
@@ -6056,7 +6253,7 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(uint32) ([]byte, erro
 		}
 		return valueFromPayload(ty, payload)
 	case tagExternalComp:
-		comp, err := readOverflowChain(u.FirstPage, int(u.StoredLen), fetch, &sink)
+		comp, err := readOverflowChain(u.first(), int(u.StoredLen), fetch, pcap, &sink)
 		if err != nil {
 			return Value{}, err
 		}
@@ -6086,15 +6283,14 @@ func resolveUnfetchedSelf(u *Unfetched) (Value, error) {
 	switch u.Form {
 	case 0x00, tagInlineComp:
 		// Inline forms own their bytes — no pager involved (resolveUnfetched never calls fetch).
-		return resolveUnfetched(ty, u, nil)
+		return resolveUnfetched(ty, u, nil, pageCap{})
 	default:
 		// A deferred external value is reachable only through a snapshot whose stores hold the
 		// paging pointer, so a stamped handle is always live while the value is observable.
 		if u.paging == nil {
 			panic("BUG: deferred external value carries no pager handle")
 		}
-		fetch := func(p uint32) ([]byte, error) { return u.paging.readBlock(p) }
-		return resolveUnfetched(ty, u, fetch)
+		return resolveUnfetched(ty, u, u.paging.readBody, u.paging.cap())
 	}
 }
 
@@ -6102,20 +6298,20 @@ func resolveUnfetchedSelf(u *Unfetched) (Value, error) {
 // first, following next_page hops and reading HEADERS only — no payload assembly, no
 // decompression (spec/design/large-values.md §14). The open-time reachability walk marks live
 // chains with this, so opening a file never materializes its large values.
-func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([]uint32, error) {
+func chainPages(first pageRef, length int, fetch func(pageRef) ([]byte, error), pcap pageCap) ([]uint32, error) {
 	var out []uint32
 	seen := map[uint32]bool{}
 	gathered := 0
 	p := first
 	for gathered < length {
-		if p == 0 {
+		if p.page == 0 {
 			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
 		}
-		if seen[p] {
+		if seen[p.page] {
 			return nil, newError(DataCorrupted, "overflow chain revisits a page")
 		}
-		seen[p] = true
-		out = append(out, p)
+		seen[p.page] = true
+		out = append(out, p.page)
 		block, err := fetch(p)
 		if err != nil {
 			return nil, err
@@ -6127,26 +6323,30 @@ func chainPages(first uint32, length int, fetch func(uint32) ([]byte, error)) ([
 		if pg.pageType != pageOverflow {
 			return nil, newError(DataCorrupted, "expected an overflow page")
 		}
+		next, slab, err := chainContent(pg, pcap)
+		if err != nil {
+			return nil, err
+		}
 		n := int(pg.itemCount)
-		if n == 0 || n > len(pg.payload) || gathered+n > length {
+		if n == 0 || n > len(slab) || gathered+n > length {
 			return nil, newError(DataCorrupted, "overflow page slab out of range")
 		}
 		gathered += n
-		p = pg.nextPage
+		p = next
 	}
 	return out, nil
 }
 
 // markChains adds the overflow chain pages a lazily-decoded row references to reached (the
 // free-list reachability walk), via the header-only chainPages hop.
-func markChains(row storedRow, fetch func(uint32) ([]byte, error), reached map[uint32]bool) error {
+func markChains(row storedRow, fetch func(pageRef) ([]byte, error), pcap pageCap, reached map[uint32]bool) error {
 	for _, v := range row {
 		if v.Kind != ValUnfetched {
 			continue
 		}
 		switch v.unfetched().Form {
 		case tagExternal, tagExternalComp:
-			pages, err := chainPages(v.unfetched().FirstPage, int(v.unfetched().StoredLen), fetch)
+			pages, err := chainPages(v.unfetched().first(), int(v.unfetched().StoredLen), fetch, pcap)
 			if err != nil {
 				return err
 			}
@@ -6184,7 +6384,7 @@ func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 		if fetch == nil {
 			return Value{}, newError(DataCorrupted, "external value with no overflow reader")
 		}
-		payload, err := readOverflowChain(first, int(length), fetch, ovfOut)
+		payload, err := readOverflowChain(plainRef(first), int(length), plainFetch(fetch), pageCap{}, ovfOut)
 		if err != nil {
 			return Value{}, err
 		}
@@ -6223,7 +6423,7 @@ func readValue(ty colType, buf []byte, pos *int, fetch func(uint32) ([]byte, err
 		if fetch == nil {
 			return Value{}, newError(DataCorrupted, "external value with no overflow reader")
 		}
-		comp, err := readOverflowChain(first, int(stored), fetch, ovfOut)
+		comp, err := readOverflowChain(plainRef(first), int(stored), plainFetch(fetch), pageCap{}, ovfOut)
 		if err != nil {
 			return Value{}, err
 		}
@@ -6667,19 +6867,19 @@ func decodeDecimalBody(buf []byte, pos *int, mode decodeMode) (Value, error) {
 // chain from first (large-values.md §12): each page is page_type 4, carries itemCount payload bytes,
 // and chains via nextPage (0 terminates). Every visited page is appended to *visited (the free-list
 // reachability walk). fetch returns a page's full block by index.
-func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, error), visited *[]uint32) ([]byte, error) {
+func readOverflowChain(first pageRef, length int, fetch func(pageRef) ([]byte, error), pcap pageCap, visited *[]uint32) ([]byte, error) {
 	out := make([]byte, 0, min(length, decodePreallocCap))
 	seen := map[uint32]bool{}
 	p := first
 	for len(out) < length {
-		if p == 0 {
+		if p.page == 0 {
 			return nil, newError(DataCorrupted, "overflow chain ended before the value length")
 		}
-		if seen[p] {
+		if seen[p.page] {
 			return nil, newError(DataCorrupted, "overflow chain revisits a page")
 		}
-		seen[p] = true
-		*visited = append(*visited, p)
+		seen[p.page] = true
+		*visited = append(*visited, p.page)
 		block, err := fetch(p)
 		if err != nil {
 			return nil, err
@@ -6691,14 +6891,27 @@ func readOverflowChain(first uint32, length int, fetch func(uint32) ([]byte, err
 		if pg.pageType != pageOverflow {
 			return nil, newError(DataCorrupted, "expected an overflow page")
 		}
+		next, slab, err := chainContent(pg, pcap)
+		if err != nil {
+			return nil, err
+		}
 		n := int(pg.itemCount)
-		if n == 0 || n > len(pg.payload) || len(out)+n > length {
+		if n == 0 || n > len(slab) || len(out)+n > length {
 			return nil, newError(DataCorrupted, "overflow page slab out of range")
 		}
-		out = append(out, pg.payload[:n]...)
-		p = pg.nextPage
+		out = append(out, slab[:n]...)
+		p = next
 	}
 	return out, nil
+}
+
+// plainFetch adapts a page-index reader to the bound-pointer reader the chain walks take, for a
+// single-value context (a catalog constant, a test), which is plaintext: its pointers carry no tag.
+func plainFetch(fetch func(uint32) ([]byte, error)) func(pageRef) ([]byte, error) {
+	if fetch == nil {
+		return nil
+	}
+	return func(r pageRef) ([]byte, error) { return fetch(r.page) }
 }
 
 // decodePreallocCap bounds a capacity hint taken from a stored length or count. The stored value is

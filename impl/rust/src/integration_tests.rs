@@ -95,6 +95,10 @@ mod depth_limit;
 mod drop_table;
 #[path = "../tests/encoding.rs"]
 mod encoding;
+#[path = "../tests/encrypted_golden.rs"]
+mod encrypted_golden;
+#[path = "../tests/encryption.rs"]
+mod encryption;
 #[path = "../tests/environment.rs"]
 mod environment;
 #[path = "../tests/ergonomic.rs"]

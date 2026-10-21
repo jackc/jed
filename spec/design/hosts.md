@@ -186,7 +186,7 @@ guard, since `read_at` surfaces a short read as `58030` — same `XX001` outcome
 | **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (`fileBlockStore`, `blockstore.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag (`blockstore_datasync_linux.go`), full `Sync` fallback elsewhere. |
 | **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/fileblockstore.ts`) | the TS core's durable backing; the `node:fs` impl is isolated in `fileblockstore.ts` (the browser-clean `BlockStore` interface is `blockstore.ts`; the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape — and so `node:fs` never reaches a browser bundle. |
 | **Browser / OPFS** | `FileSystemSyncAccessHandle` (`read`/`write`/`truncate`/`getSize`/`flush`) | ✅ built (`OpfsBlockStore`, `impl/ts/src/opfsblockstore.ts`; TS only) | the synchronous access-handle API maps one-to-one onto the §2 `BlockStore` surface (§5). Acquired async at the bootstrap edge (`opfs.ts`); the engine runs in a Web Worker driven by an async client (`src/browser/`). Validated by file-host byte parity (the existing goldens). |
-| **encrypting** | wraps another `BlockStore`/the in-core codec | ⏳ design door ([encryption.md](encryption.md)) | a page codec **above** the seam, not a host (encryption.md §2); the host stays opaque-byte. |
+| **encrypting** | the in-core page codec over any file host | ✅ built (Rust, Go, Node; [../fileformat/encrypted.md](../fileformat/encrypted.md)) — OPFS ⏳ | a page codec **above** the seam, not a host (encryption.md §2); the host stays opaque-byte. A reader that follows a bound pointer hands the stored bytes and the pointer's tag to the codec; commits seal each page as its bytes become final. |
 | **replicating** | a tee wrapping another `BlockStore` | ⏳ design door ([replication.md](replication.md)) | a seam-level tee **below** the codec, so it ships ciphertext (replication.md §4). |
 
 **File-open errors** map to the host-filesystem class-58 SQLSTATEs (api.md §2.1, §7): a
@@ -346,8 +346,10 @@ as it crosses. See the two docs for the full designs.
   one `presence EX` owner, and the page service with handoff run in Rust, Go, and Node (it replaced
   the earlier shared mode). Rust/Go need no dependency; Node uses
   the approved narrow `impl/ts/native-lock` adapter. Prebuilt-package matrix work remains.
-- **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
-  §14 vetted-library decision requiring explicit confirmation before any dependency lands.
+- **Encryption codec** — ✅ built for file hosts in Rust, Go and Node ([encryption.md](encryption.md),
+  [../fileformat/encrypted.md](../fileformat/encrypted.md)); the crypto libraries were confirmed under
+  CLAUDE.md §14. The browser/OPFS host has no synchronous AES and refuses an encrypted database
+  (`0A000`) until an asynchronous provider lands.
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,
   not built.
 - **Direct sub-SQL access over the seam** — kept open, not built (storage.md §5): the key

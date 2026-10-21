@@ -73,6 +73,7 @@ import {
   toImage as toImageBytes,
 } from "./format.ts";
 import type { CompositeType, Table, ViewDef } from "./catalog.ts";
+import type { Credential } from "./crypto.ts";
 import { Environment } from "./environment.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
@@ -1749,17 +1750,24 @@ export function registerFileCompactor(fn: FileCompactor): void {
 // maxStorageBytes limits the attachment's committed storage (spec/design/memory.md §8.1): an in-memory
 // attachment's page high-water (§8.2), a file attachment's live pages (§8.7). Zero, negative, or absent
 // is unlimited.
+// credential unlocks an encrypted file attachment (spec/design/encryption.md §5): 28P02 without one,
+// 28P01 when it does not unwrap the key, 28P03 for a plaintext file, 55000 for an in-memory source
+// (nothing is at rest) or — until scratch encryption lands — on a handle that may spill to disk
+// (spec/fileformat/encrypted.md §10).
 export type AttachSource = {
   file: boolean;
   path?: string;
   locking?: "auto" | "exclusive" | "none";
   fileLockTimeoutMs?: number;
   maxStorageBytes?: bigint;
+  credential?: Credential;
 };
 
 // attachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6),
 // optionally with a committed-storage limit (memory.md §8.1).
-export function attachMemory(options: Pick<AttachSource, "maxStorageBytes"> = {}): AttachSource {
+export function attachMemory(
+  options: Pick<AttachSource, "maxStorageBytes" | "credential"> = {},
+): AttachSource {
   return { file: false, ...options };
 }
 
@@ -1770,7 +1778,10 @@ export function attachMemory(options: Pick<AttachSource, "maxStorageBytes"> = {}
 // options.maxStorageBytes limits the file's live pages (memory.md §8.7).
 export function attachFile(
   path: string,
-  options: Pick<AttachSource, "locking" | "fileLockTimeoutMs" | "maxStorageBytes"> = {},
+  options: Pick<
+    AttachSource,
+    "locking" | "fileLockTimeoutMs" | "maxStorageBytes" | "credential"
+  > = {},
 ): AttachSource {
   return { file: true, path, ...options };
 }
@@ -1909,6 +1920,13 @@ export class Database {
     let root: Snapshot;
     let coordinator: FileCoordinatorHost | null = null;
     let svc: ServiceAttachment | null = null;
+    if (!source.file && source.credential !== undefined) {
+      // Nothing is at rest in an in-memory database (spec/design/encryption.md §5).
+      throw engineError(
+        "object_not_in_prerequisite_state",
+        "an in-memory database cannot be encrypted",
+      );
+    }
     if (source.file) {
       if (fileAttachOpener === null) {
         // A pure in-memory build (no node/OPFS host imported) has no file layer to reach.
@@ -1964,6 +1982,17 @@ export class Database {
         return;
       }
       const engine = opened.engine;
+      // Until scratch encryption lands, an encrypted attachment may not join a handle that can spill
+      // its rows to a plaintext scratch file (spec/fileformat/encrypted.md §10).
+      const encrypted = engine.paging !== null && engine.paging.codec() !== null;
+      if (encrypted && c.storage.spillSink !== null) {
+        engine.paging?.close();
+        opened.coordinator?.close();
+        throw engineError(
+          "object_not_in_prerequisite_state",
+          "an encrypted database cannot be attached to a handle that spills to disk",
+        );
+      }
       // The attachment's storage reaches the same file host as main (compaction, directory barrier).
       engine.fileHost = c.storage.fileHost;
       coordinator = opened.coordinator;

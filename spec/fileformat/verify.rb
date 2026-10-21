@@ -193,6 +193,113 @@ EXTERNAL_COMP_PTR_LEN = 1 + 4 + 4 + 4
 S_COMPRESS = 32 # payloads below this are never fed to the encoder (large-values.md §13)
 
 require_relative "lz4"
+require_relative "xaes"
+
+# --- the encrypted variant (spec/fileformat/encrypted.md) -------------------------------------
+# `$enc` is nil while a plaintext image is built or decoded. For an encrypted one it holds the page
+# and meta keys, the nonce stream (encoder), and `tags` — every page's tag, recorded when the page is
+# sealed (encoder) or when a pointer naming it is read (decoder), so a pointer binds it and a read
+# checks it (§2).
+$enc = nil
+RESERVE = 40 # 24-byte nonce + 16-byte tag at the end of every sealed page (§1)
+TAG_LEN = 16
+ZERO_TAG = ("\x00" * 16).b
+ENC_FIRST_BODY = 4 # pages 2-3 are the key block
+ENC_SEED = 0x4A454442 # the goldens' insecure seeded key-entropy stream (§8)
+ENC_KEY = ("\x4A" * 32).b # the goldens' host key (kdf 2)
+
+def tag_len = $enc ? TAG_LEN : 0
+def first_body = $enc ? ENC_FIRST_BODY : ROOT_PAGE
+
+# The tag a pointer to page `index` carries (§2): nothing in a plaintext file, zeros for no page.
+def tag_of(index)
+  return "".b unless $enc
+  return ZERO_TAG if index.zero?
+
+  $enc[:tags].fetch(index)
+end
+
+# A page pointer in the variant's layout: u32 index ‖ its tag.
+def ptr(index) = u32(index) + tag_of(index)
+
+# Read a pointer, recording the tag it binds for the read of that page (decoder).
+def read_ptr(buf, pos)
+  ib, pos = take(buf, pos, 4)
+  index = ib.unpack1("N")
+  return [index, pos] unless $enc
+
+  tag, pos = take(buf, pos, TAG_LEN)
+  raise "a pointer to no page carries a tag" if index.zero? && tag != ZERO_TAG
+
+  $enc[:tags][index] = tag.b unless index.zero?
+  [index, pos]
+end
+
+def ad_prefix(role, position) = "JEDB".b + [1, role].pack("CC") + u32(position)
+
+# Seal body page `index` (§4): the plaintext page of capacity C (header with a zero CRC; a chain
+# page's successor tag leads the payload), XAES-256-GCM under the page key with a fresh nonce.
+def seal_body(index, type, count, nxt, payload, flags: 0)
+  ps = $enc[:ps]
+  body = "\x00".b * (ps - RESERVE)
+  body.setbyte(0, type)
+  body.setbyte(1, flags)
+  body[4, 4] = u32(count)
+  body[8, 4] = u32(nxt)
+  lead = [PAGE_CATALOG, PAGE_OVERFLOW, 7].include?(type) ? tag_of(nxt) : "".b
+  content = lead + payload
+  raise "page payload overflows its page" if content.bytesize > ps - RESERVE - PAGE_HEADER
+
+  body[PAGE_HEADER, content.bytesize] = content
+  nonce = $enc[:rng].bytes(24)
+  sealed = Xaes.seal($enc[:page_key], nonce, body, ad_prefix(1, index))
+  tag = sealed.byteslice(-16, 16)
+  $enc[:tags][index] = tag
+  sealed.byteslice(0, ps - RESERVE) + nonce + tag
+end
+
+# Record a finished body page: sealed now in an encrypted image (its tag is final before any parent
+# names it), else kept as fields for write_page.
+def put_page(pages, index, type, count, payload, nxt, flags: 0)
+  pages[index] = if $enc
+                   [:sealed, seal_body(index, type, count, nxt, payload, flags: flags)]
+                 else
+                   [type, count, payload, nxt]
+                 end
+end
+
+# The 128-byte key block for the goldens' host key (§5): draws the DEK, KDF salt and wrap nonce.
+def new_key_block(rng)
+  dek = rng.bytes(32)
+  salt = rng.bytes(32)
+  nonce = rng.bytes(12)
+  head = "JEDK".b + u16(1) + [1, 2].pack("CC") + u64(1) + ("\x00" * 16).b + salt + nonce
+  kek = Xaes.host_kek(ENC_KEY, salt)
+  block = head + Xaes.gcm_seal(kek, nonce, dek, head)
+  [block + u32(crc32(block)), dek]
+end
+
+# Unwrap a key block copy with the goldens' host key (decoder): the DEK, or nil.
+def unwrap_key_block(block)
+  return nil unless block.byteslice(0, 4) == "JEDK".b && block.byteslice(124, 4).unpack1("N") == crc32(block.byteslice(0, 124))
+  return nil unless block.byteslice(4, 4) == u16(1) + [1, 2].pack("CC")
+
+  kek = Xaes.host_kek(ENC_KEY, block.byteslice(32, 32))
+  Xaes.gcm_open(kek, block.byteslice(64, 12), block.byteslice(76, 48), block.byteslice(0, 76))
+end
+
+# Seal an encrypted meta page (§6): an empty-plaintext AEAD under the meta key over the slot and the
+# page with its CRC and reserve zeroed (no manifest chain in a from-scratch image); CRC last.
+def seal_meta(meta, slot)
+  ps = meta.bytesize
+  meta[32, 4] = u32(0)
+  meta[ps - RESERVE, RESERVE] = "\x00".b * RESERVE
+  nonce = $enc[:rng].bytes(24)
+  tag = Xaes.seal($enc[:meta_key], nonce, "".b, ad_prefix(2, slot) + meta)
+  meta[ps - RESERVE, RESERVE] = nonce + tag
+  meta[32, 4] = u32(meta_crc(meta))
+  meta
+end
 
 WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "timestamp" => 8, "timestamptz" => 8,
           "date" => 4 }.freeze
@@ -1811,7 +1918,52 @@ MALFORMED_FIXTURES = [
     malformed: :drop_types }
 ].freeze
 
+# --- encrypted-variant fixtures (spec/fileformat/encrypted.md), page size 1024 --------------------
+# Each is the from-scratch image under the goldens' host key ENC_KEY with the key-entropy stream
+# seeded at ENC_SEED: the stream's first draws are the DEK, KDF salt and wrap nonce, then one 24-byte
+# nonce per sealed page in seal order (§7, §8). The cores build each via SQL in an encrypted database
+# (so the tree splits at the encrypted capacity C = 968) and serialize it the same way.
+#
+# `encrypted_pk_table`: 300 rows of (id i32 PRIMARY KEY, v i16), id 3's v NULL — an interior root over
+# several leaves, so interior child pointers carry tags.
+ENC_PK_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("v", "i16")],
+  rows: (1..300).map { |i| [i, i == 3 ? nil : i * 10] }
+}.freeze
+
+# `encrypted_overflow_table`: incompressible values that spill into multi-page chains (slab C − 16 =
+# 952 bytes after the successor's tag), so external pointers and chain links carry tags.
+ENC_OVERFLOW_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("body", "text"), col("blob", "bytea")],
+  rows: [[1, filler_text(2500), filler_bytes(1200)], [2, "small", ["cafe"].pack("H*")], [3, nil, nil]]
+}.freeze
+
+# `encrypted_index_table`: a B-tree index whose tree has an interior root, and a GiST R-tree over
+# 150 ranges (several levels), so both kinds of index pointer carry tags. Built via
+#   CREATE TABLE t (a i32 PRIMARY KEY, v i64, r i32range)
+#   CREATE INDEX t_r ON t USING gist (r);  CREATE INDEX t_v ON t (v)
+#   INSERT INTO t VALUES (a, a * 3, i32range(a, a + 5)) for a in 1..150, ascending.
+ENC_INDEX_TABLE = {
+  name: "t",
+  columns: [col("a", "i32", pk: true), col("v", "i64"), col("r", "i32range")],
+  indexes: [{ name: "t_r", cols: [2], kind: "gist" }, { name: "t_v", cols: [1] }],
+  rows: (1..150).map { |a| [a, a * 3, rng(a, a + 5)] }
+}.freeze
+
+# `encrypted_catalog`: 30 empty tables t00 … t29 of (id i32 PRIMARY KEY, a text, b i64), whose
+# entries span three catalog pages, so the catalog chain is sealed last page first.
+ENC_CATALOG_TABLES = (0...30).map do |i|
+  { name: format("t%02d", i), columns: [col("id", "i32", pk: true), col("a", "text"), col("b", "i64")], rows: [] }
+end.freeze
+
 FIXTURES = ([
+  { file: "encrypted_empty_db.jed", page_size: 1024, encrypted: true, tables: [] },
+  { file: "encrypted_pk_table.jed", page_size: 1024, encrypted: true, tables: [ENC_PK_TABLE] },
+  { file: "encrypted_overflow_table.jed", page_size: 1024, encrypted: true, tables: [ENC_OVERFLOW_TABLE] },
+  { file: "encrypted_index_table.jed", page_size: 1024, encrypted: true, tables: [ENC_INDEX_TABLE] },
+  { file: "encrypted_catalog.jed", page_size: 1024, encrypted: true, tables: ENC_CATALOG_TABLES },
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
   { file: "compressed_table.jed", page_size: 256, tables: [COMPRESSED_TABLE] },
@@ -2578,7 +2730,7 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
 
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
-    out << u32(index_roots[k])
+    out << ptr(index_roots[k])
     # v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
     out << u16(ix[:predicate].bytesize) << ix[:predicate].b if ix[:predicate]
     # v31: the host-function dependency list (extensibility.md §8.1) after the predicate — only when
@@ -2625,7 +2777,7 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
       out << u16(col) << [{ "&&" => 0, "=" => 1 }.fetch(op)].pack("C")
     end
   end
-  out << u32(root_data_page)
+  out << ptr(root_data_page)
   raise "row_count must fit nonnegative i64" unless row_count.between?(0, (1 << 63) - 1)
   raise "root_data_page/row_count invariant violated" unless root_data_page.zero? == row_count.zero?
 
@@ -3352,7 +3504,7 @@ def gist_serialize(ops, node, next_index, pages)
     end
     index = next_index
     next_index += 1
-    pages[index] = [PAGE_GIST_LEAF, node[:entries].size, payload, 0]
+    put_page(pages, index, PAGE_GIST_LEAF, node[:entries].size, payload, 0)
     [index, next_index]
   else
     child_indices = node[:children].map do |_, c|
@@ -3362,11 +3514,11 @@ def gist_serialize(ops, node, next_index, pages)
     payload = +"".b
     node[:children].each_with_index do |(u, _), i|
       b = gist_encode_bound(ops, u)
-      payload << u16(b.bytesize) << b << u32(child_indices[i])
+      payload << u16(b.bytesize) << b << ptr(child_indices[i])
     end
     index = next_index
     next_index += 1
-    pages[index] = [PAGE_GIST_INTERIOR, node[:children].size, payload, 0]
+    put_page(pages, index, PAGE_GIST_INTERIOR, node[:children].size, payload, 0)
     [index, next_index]
   end
 end
@@ -3428,8 +3580,8 @@ def read_gist_keys(image, ps, root_page)
       pg[:item_count].times do
         bl, pos = take(pg[:payload], pos, 2)
         _bound, pos = take(pg[:payload], pos, bl.unpack1("n"))
-        cp, pos = take(pg[:payload], pos, 4)
-        children << cp.unpack1("N")
+        cp, pos = read_ptr(pg[:payload], pos)
+        children << cp
       end
       children.each { |cp| walk.call(cp) }
     else
@@ -3528,13 +3680,13 @@ def plan_record(table, key, row, cap)
   # Pass 2 — externalize: anything whose current encoded size beats its pointer, largest first.
   cand = (0...cols.size).select do |i|
     spillable?(cols[i][:type]) &&
-      cur[i] > (forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN)
+      cur[i] > (forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN) + tag_len
   end
   cand.sort_by! { |i| [-cur[i], i] }
   cand.each do |i|
     break if size <= max
 
-    ptr = forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN
+    ptr = (forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN) + tag_len
     forms[i] = forms[i] == :inline_comp ? :external_comp : :external
     size += ptr - cur[i]
     cur[i] = ptr
@@ -3545,12 +3697,14 @@ end
 # Write a payload across a chain of overflow pages (cap-byte slabs, in order), allocating each via
 # `alloc` and linking with next_page (0 terminates). Returns the first page index for the pointer.
 def write_overflow_chain(payload, cap, alloc, pages)
-  n = (payload.bytesize + cap - 1) / cap
+  slab_cap = cap - tag_len # an encrypted chain page leads with its successor's tag (encrypted.md §2)
+  n = (payload.bytesize + slab_cap - 1) / slab_cap
   indices = Array.new(n) { alloc.call }
-  n.times do |j|
-    slab = payload.byteslice(j * cap, cap)
+  # Sealed last page first, so each page binds its successor (encrypted.md §7).
+  (n - 1).downto(0) do |j|
+    slab = payload.byteslice(j * slab_cap, slab_cap)
     nxt = j + 1 < n ? indices[j + 1] : 0
-    pages[indices[j]] = [PAGE_OVERFLOW, slab.bytesize, slab, nxt]
+    put_page(pages, indices[j], PAGE_OVERFLOW, slab.bytesize, slab, nxt)
   end
   indices[0]
 end
@@ -3566,14 +3720,14 @@ def emit_value(c, v, form, comp, cap, alloc, pages)
   when :external
     payload = value_payload(c[:type], v)
     first = write_overflow_chain(payload, cap, alloc, pages)
-    [TAG_EXTERNAL].pack("C") + u32(first) + u32(payload.bytesize)
+    [TAG_EXTERNAL].pack("C") + u32(first) + u32(payload.bytesize) + tag_of(first)
   when :inline_comp
     payload = value_payload(c[:type], v)
     [TAG_INLINE_COMP].pack("C") + u32(payload.bytesize) + u16(comp.bytesize) + comp
   when :external_comp
     payload = value_payload(c[:type], v)
     first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
-    [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize)
+    [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize) + tag_of(first)
   else
     encode_value(c[:type], v)
   end
@@ -3583,7 +3737,7 @@ end
 # end-offset separator directory, then the separator key blob. Record-free.
 def emit_interior(sep_keys, child_pages)
   out = +"".b
-  child_pages.each { |cp| out << u32(cp) }
+  child_pages.each { |cp| out << ptr(cp) }
   off = 0
   sep_keys.each { |k| off += k.bytesize; out << u32(off) }
   sep_keys.each { |k| out << k }
@@ -3692,7 +3846,7 @@ def pack(sizes, cap)
 end
 
 # `live` defaults to every body page: a from-scratch image has no free list and no manifest.
-def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_count - 2)
+def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_count - first_body)
   off = slot * ps
   image[off, ps] = "\x00".b * ps
   image[off, 4] = MAGIC
@@ -3702,6 +3856,14 @@ def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_c
   image[off + 20, 4] = u32(root)
   image[off + 24, 4] = u32(page_count)
   image[off + 56, 4] = u32(live) # v34: the exact live page count
+  if $enc
+    # The encrypted meta (encrypted.md §6): suite and reserve, the catalog root's tag, then sealed.
+    image.setbyte(off + 6, 1)
+    image.setbyte(off + 7, RESERVE)
+    image[off + 64, 16] = tag_of(root)
+    image[off, ps] = seal_meta(image.byteslice(off, ps), slot)
+    return
+  end
   image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
 end
 
@@ -3735,7 +3897,7 @@ def node_payload(node)
   if node_leaf?(node)
     node[:recs].sum { |r| r[:size] } + leaf_overhead(node[:keys].size, leaf_cols(node))
   else
-    8 * node[:keys].size + 4 + node[:keys].sum(&:bytesize)
+    (4 + tag_len) * (node[:keys].size + 1) + 4 * node[:keys].size + node[:keys].sum(&:bytesize)
   end
 end
 
@@ -3788,8 +3950,9 @@ def split_node(node, cap, right_edge)
         else
           prefix = [0]
           node[:keys].each { |k| prefix << prefix.last + k.bytesize }
-          leftp = ->(mm) { 8 * mm + 4 + prefix[mm] }
-          rightp = ->(mm) { 8 * (n - 1 - mm) + 4 + (prefix[n] - prefix[mm + 1]) }
+          pw = 4 + tag_len # a child pointer's width (encrypted.md §2)
+          leftp = ->(mm) { (pw + 4) * mm + pw + prefix[mm] }
+          rightp = ->(mm) { (pw + 4) * (n - 1 - mm) + pw + (prefix[n] - prefix[mm + 1]) }
           mm = pick_split_m(1..(n - 2), payload, cap, right_edge, leftp, rightp)
           raise "unsplittable interior on the insert path" if mm.nil?
 
@@ -3869,20 +4032,23 @@ def serialize_tree(root, next_index, cap, pages)
     i
   end
   n = root[:keys].size
-  pages[index] = if node_leaf?(root)
-                   [PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages), 0] # column-major (v24)
-                 else
-                   [PAGE_INTERIOR, n, emit_interior(root[:keys], child_pages), 0] # record-free (v24)
-                 end
+  if node_leaf?(root)
+    put_page(pages, index, PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages), 0) # column-major (v24)
+  else
+    put_page(pages, index, PAGE_INTERIOR, n, emit_interior(root[:keys], child_pages), 0) # record-free (v24)
+  end
   [index, next_index]
 end
 
 # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
-def build_image(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE, views: [])
+def build_image(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE, views: [],
+                encrypted: false)
+  return build_encrypted_image(types, sequences, tables, page_size, collations, views) if encrypted
+
   ps = page_size
-  cap = ps - PAGE_HEADER
+  cap = ps - PAGE_HEADER - ($enc ? RESERVE : 0)
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
   $ctypes = types.to_h { |t| [t[:name], t[:fields]] }
   sorted = tables.sort_by { |t| t[:name] }
@@ -3929,22 +4095,60 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
   sorted.each { |t| cat_entries.concat(statistics_entries(t)) }
   # View entries (kind 5, v38) come last, in view-name byte order (format.md *View entry*).
   views.sort_by { |v| v[:name] }.each { |v| cat_entries << ("\x05".b + view_entry_bytes(v)) }
-  cat_layout = catalog_layout(cat_entries, cap)
+  cat_layout = catalog_layout(cat_entries, cap - tag_len)
   page_count = cat_root + cat_layout.size
 
   image = "\x00".b * (page_count * ps)
-  write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
-  write_meta(image, ps, 1, page_size, TXID, cat_root, page_count)
+  unless $enc
+    write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
+    write_meta(image, ps, 1, page_size, TXID, cat_root, page_count)
+  end
 
-  data_pages.each { |index, (type, count, payload, nxt)| write_page(image, ps, index, type, count, nxt || 0, payload) }
+  data_pages.each do |index, page|
+    if page[0] == :sealed
+      image[index * ps, ps] = page[1]
+    else
+      type, count, payload, nxt = page
+      write_page(image, ps, index, type, count, nxt || 0, payload)
+    end
+  end
 
-  cat_layout.each_with_index do |cp, gi|
-    index = cat_root + gi
-    nxt = gi + 1 < cat_layout.size ? index + 1 : 0
-    write_page(image, ps, index, PAGE_CATALOG, cp[:count], nxt, cp[:payload], flags: cp[:continued] ? 1 : 0)
+  if $enc
+    # Sealed last page first, so each binds its successor (encrypted.md §7); then the metas.
+    (cat_layout.size - 1).downto(0) do |gi|
+      cp = cat_layout[gi]
+      index = cat_root + gi
+      nxt = gi + 1 < cat_layout.size ? index + 1 : 0
+      image[index * ps, ps] = seal_body(index, PAGE_CATALOG, cp[:count], nxt, cp[:payload],
+                                        flags: cp[:continued] ? 1 : 0)
+    end
+    write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
+    write_meta(image, ps, 1, page_size, TXID, cat_root, page_count)
+  else
+    cat_layout.each_with_index do |cp, gi|
+      index = cat_root + gi
+      nxt = gi + 1 < cat_layout.size ? index + 1 : 0
+      write_page(image, ps, index, PAGE_CATALOG, cp[:count], nxt, cp[:payload], flags: cp[:continued] ? 1 : 0)
+    end
   end
 
   image
+end
+
+# The encrypted variant's from-scratch image (encrypted.md): the key block (its DEK, KDF salt and
+# wrap nonce the stream's first draws) at pages 2 and 3, then the image sealed from page 4 in seal
+# order — the stream continuing — under the goldens' host key.
+def build_encrypted_image(types, sequences, tables, page_size, collations, views)
+  rng = SeededStream.new(ENC_SEED)
+  block, dek = new_key_block(rng)
+  $enc = { ps: page_size, rng: rng, tags: {}, page_key: Xaes.page_key(dek), meta_key: Xaes.meta_key(dek) }
+  image = build_image(types, sequences, tables, page_size, collations, start_page: ENC_FIRST_BODY, views: views)
+  key_page = block + "\x00".b * (page_size - block.bytesize)
+  image[2 * page_size, page_size] = key_page
+  image[3 * page_size, page_size] = key_page
+  image
+ensure
+  $enc = nil
 end
 
 # The bytes a fixture should contain (applying any torn-slot corruption).
@@ -3953,7 +4157,7 @@ def fixture_image(fx)
   return malformed_fixture_image(fx) if fx[:malformed]
 
   image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
-                      fx[:collations] || [], views: fx[:views] || [])
+                      fx[:collations] || [], views: fx[:views] || [], encrypted: fx[:encrypted])
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
@@ -4205,17 +4409,25 @@ def read_meta(image, ps, slot)
   m = image.byteslice(off, ps)
   return nil unless m.byteslice(0, 4) == MAGIC
   return nil unless m.byteslice(4, 2).unpack1("n") == VERSION
-  return nil unless m.getbyte(6).zero? && m.getbyte(7).zero?
+  # Offsets 6/7: the encryption suite and its reserve (encrypted.md §6).
+  suite = { [0, 0] => 0, [1, RESERVE] => 1 }[[m.getbyte(6), m.getbyte(7)]]
+  return nil if suite.nil? || (suite == 1 && ps < 1024)
   return nil unless m.byteslice(8, 4).unpack1("N") == ps
   return nil unless meta_crc(m) == m.byteslice(32, 4).unpack1("N")
 
+  first = suite.zero? ? ROOT_PAGE : ENC_FIRST_BODY
   meta = { txid: m.byteslice(12, 8).unpack1("Q>"), root_page: m.byteslice(20, 4).unpack1("N"),
            page_count: m.byteslice(24, 4).unpack1("N"), free_head: m.byteslice(28, 4).unpack1("N"),
-           live: m.byteslice(56, 4).unpack1("N") }
-  return nil unless meta[:page_count] >= 3 && meta[:page_count] <= image.bytesize / ps
-  return nil unless (2...meta[:page_count]).cover?(meta[:root_page])
-  return nil unless meta[:live] <= meta[:page_count] - 2
-  return nil unless meta[:free_head].zero? || (2...meta[:page_count]).cover?(meta[:free_head])
+           live: m.byteslice(56, 4).unpack1("N"), suite: suite, slot: slot }
+  if suite == 1
+    meta[:root_tag] = m.byteslice(64, 16)
+    meta[:free_tag] = m.byteslice(80, 16)
+    return nil if meta[:free_head].zero? && meta[:free_tag] != ZERO_TAG
+  end
+  return nil unless meta[:page_count] > first && meta[:page_count] <= image.bytesize / ps
+  return nil unless (first...meta[:page_count]).cover?(meta[:root_page])
+  return nil unless meta[:live] <= meta[:page_count] - first
+  return nil unless meta[:free_head].zero? || (first...meta[:page_count]).cover?(meta[:free_head])
   return nil unless valid_manifest?(image, ps, m, meta)
 
   meta
@@ -4224,21 +4436,25 @@ end
 def valid_manifest?(image, ps, m, meta)
   head, count, chain_count = m.byteslice(36, 12).unpack("N3")
   digest = m.byteslice(48, 8).unpack1("Q>")
+  encrypted = meta[:suite] == 1
+  first = encrypted ? ENC_FIRST_BODY : ROOT_PAGE
+  # An encrypted meta's inline manifest follows its two tags and stops at its reserve (§6).
+  lo, hi = encrypted ? [96, ps - RESERVE] : [64, ps]
   return false unless m.byteslice(60, 4) == "\x00".b * 4
-  return false if count + chain_count > meta[:page_count] - 2
+  return false if count + chain_count > meta[:page_count] - first
   return false unless (chain_count.zero? && head.zero? && digest.zero?) ||
-                      (chain_count.positive? && head >= 2 && head < meta[:page_count])
+                      (chain_count.positive? && head >= first && head < meta[:page_count])
   return false if count.zero? && (!chain_count.zero? || !head.zero? || !digest.zero?)
 
-  inline = [count, (ps - 64) / 12].min
-  refs = m.byteslice(64, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
-  return false unless m.byteslice(64 + inline * 12, ps - 64 - inline * 12).bytes.all?(&:zero?)
+  inline = [count, (hi - lo) / 12].min
+  refs = m.byteslice(lo, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
+  return false unless m.byteslice(lo + inline * 12, hi - lo - inline * 12).bytes.all?(&:zero?)
   chain = []
   chain_digest = 0
   remaining = count - inline
   page = head
   chain_count.times do |ordinal|
-    return false unless page >= 2 && page < meta[:page_count] && !chain.include?(page)
+    return false unless page >= first && page < meta[:page_count] && !chain.include?(page)
     block = image.byteslice(page * ps, ps)
     return false unless block.getbyte(0) == 8 && block.byteslice(1, 3) == "\x00".b * 3
     return false unless page_crc(block) == block.byteslice(12, 4).unpack1("N")
@@ -4260,9 +4476,10 @@ def valid_manifest?(image, ps, m, meta)
   return false if count.positive? && !ids.include?(meta[:root_page])
   return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
   return false unless refs.all? do |index, expected|
-    next false unless index >= 2 && index < meta[:page_count]
+    next false unless index >= first && index < meta[:page_count]
     block = image.byteslice(index * ps, ps)
-    (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
+    # A listed encrypted page is ciphertext: its digest is the whole check (§6).
+    (encrypted || ((1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N"))) &&
       crc64(block) == expected
   end
   meta[:protected] = ids + chain
@@ -4276,7 +4493,18 @@ def validate_free_list!(image, ps, meta)
   free_pages = []
   page = meta[:free_head]
   until page.zero?
-    raise "invalid free-list chain" unless page >= 2 && page < meta[:page_count] && !seen.include?(page)
+    raise "invalid free-list chain" unless page >= first_body && page < meta[:page_count] && !seen.include?(page)
+    if $enc
+      # An encrypted free-list page: tag-checked and decrypted; its successor's tag is recorded.
+      pg = read_page(image, ps, page)
+      raise "invalid free-list page" unless pg[:type] == 7
+      raise "invalid free-list count" if pg[:item_count] > pg[:payload].bytesize / 4
+
+      free_pages.concat(pg[:payload].byteslice(0, pg[:item_count] * 4).unpack("N*"))
+      seen << page
+      page = pg[:next_page]
+      next
+    end
     block = image.byteslice(page * ps, ps)
     raise "invalid free-list page" unless block.getbyte(0) == 7 && page_crc(block) == block.byteslice(12, 4).unpack1("N")
     entries = block.byteslice(4, 4).unpack1("N")
@@ -4285,7 +4513,7 @@ def validate_free_list!(image, ps, meta)
     seen << page
     page = block.byteslice(8, 4).unpack1("N")
   end
-  unless free_pages == free_pages.sort.uniq && free_pages.all? { |id| id >= 2 && id < meta[:page_count] } &&
+  unless free_pages == free_pages.sort.uniq && free_pages.all? { |id| id >= first_body && id < meta[:page_count] } &&
          (free_pages & (meta[:protected] + seen)).empty?
     raise "invalid free-list entry"
   end
@@ -4306,12 +4534,65 @@ def read_page(image, ps, index)
   off = index * ps
   raise "page index out of range" if off + ps > image.bytesize
 
+  return read_sealed_page(image, ps, index) if $enc
+
   p = image.byteslice(off, ps)
   # Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
   raise "page checksum mismatch (corrupted page)" unless page_crc(p) == p.byteslice(12, 4).unpack1("N")
   $reached << index if $reached
   { type: p.getbyte(0), flags: p.getbyte(1), item_count: p.byteslice(4, 4).unpack1("N"),
     next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
+end
+
+# Read an encrypted body page (encrypted.md §4): the stored tag must equal the one the pointer that
+# named the page bound, then it decrypts. A chain page's successor tag is recorded for the next read
+# and stripped from the payload, so callers see the plaintext layout's fields.
+def read_sealed_page(image, ps, index)
+  stored = image.byteslice(index * ps, ps)
+  expected = $enc[:tags][index] or raise "no pointer named page #{index}"
+  nonce = stored.byteslice(ps - RESERVE, 24)
+  tag = stored.byteslice(ps - TAG_LEN, TAG_LEN)
+  raise "page does not match the pointer that names it" unless tag == expected
+
+  body = Xaes.open($enc[:page_key], nonce, stored.byteslice(0, ps - RESERVE) + tag, ad_prefix(1, index))
+  raise "page fails authentication" if body.nil?
+  raise "encrypted page carries a CRC" unless body.byteslice(12, 4) == "\x00".b * 4
+
+  $reached << index if $reached
+  type = body.getbyte(0)
+  nxt = body.byteslice(8, 4).unpack1("N")
+  payload = body.byteslice(PAGE_HEADER, ps - RESERVE - PAGE_HEADER)
+  if [PAGE_CATALOG, PAGE_OVERFLOW, 7].include?(type)
+    succ = payload.byteslice(0, TAG_LEN)
+    raise "the last chain page carries a successor tag" if nxt.zero? && succ != ZERO_TAG
+
+    $enc[:tags][nxt] = succ unless nxt.zero?
+    payload = payload.byteslice(TAG_LEN, payload.bytesize - TAG_LEN)
+  end
+  { type: type, flags: body.getbyte(1), item_count: body.byteslice(4, 4).unpack1("N"),
+    next_page: nxt, payload: payload }
+end
+
+# Unlock an encrypted image for decoding (encrypted.md §5, §6): unwrap the selected key-block copy
+# with the goldens' host key, derive the subkeys, authenticate the selected meta, and record the
+# catalog root's tag.
+def unlock_image(image, ps, meta)
+  copies = [2, 3].map { |i| image.byteslice(i * ps, ps) }
+  raise "key block copies disagree" unless copies[0] == copies[1]
+  raise "key block tail not zero" unless copies[0].byteslice(128, ps - 128).bytes.all?(&:zero?)
+
+  dek = unwrap_key_block(copies[0].byteslice(0, 128)) or raise "the key block does not unwrap"
+  $enc = { ps: ps, tags: {}, page_key: Xaes.page_key(dek), meta_key: Xaes.meta_key(dek) }
+  m = image.byteslice(meta[:slot] * ps, ps).dup
+  nonce = m.byteslice(ps - RESERVE, 24)
+  tag = m.byteslice(ps - TAG_LEN, TAG_LEN)
+  m[32, 4] = u32(0)
+  m[ps - RESERVE, RESERVE] = "\x00".b * RESERVE
+  raise "the meta has a manifest chain this reference does not authenticate" unless m.byteslice(44, 4) == u32(0)
+  raise "meta page fails authentication" if Xaes.open($enc[:meta_key], nonce, tag, ad_prefix(2, meta[:slot]) + m).nil?
+
+  $enc[:tags][meta[:root_page]] = meta[:root_tag]
+  $enc[:tags][meta[:free_head]] = meta[:free_tag] unless meta[:free_head].zero?
 end
 
 # Decode a composite-type catalog entry's body (inverse of composite_type_entry_bytes); the caller
@@ -4543,7 +4824,7 @@ def decode_table_entry(buf, pos)
     raise "a gin index cannot be partial (v27)" if has_predicate && kb.getbyte(0) == 1
     has_host_deps = (fb.getbyte(0) & 0b100) != 0
     raise "a non-btree index cannot have host-function dependencies (v31)" if has_host_deps && kb.getbyte(0) != 0 && !(kb.getbyte(0) == 2 && has_predicate)
-    rb, pos = take(buf, pos, 4)
+    index_root, pos = read_ptr(buf, pos)
     # v27: the partial-index predicate canonical text follows index_root_page when bit1 is set.
     predicate = nil
     if has_predicate
@@ -4586,7 +4867,7 @@ def decode_table_entry(buf, pos)
     end
     indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, orders: orders,
                  kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
-                 root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
+                 root_page: index_root, predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
   end
   # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   # actions byte, in name order. An FK owns no B-tree (no root page).
@@ -4635,14 +4916,14 @@ def decode_table_entry(buf, pos)
     end
     exclusions << { name: ename, index: iname, elements: elements }
   end
-  root, pos = take(buf, pos, 4)
+  root, pos = read_ptr(buf, pos)
   count_raw, pos = take(buf, pos, 8)
   row_count = count_raw.unpack1("q>")
   raise "negative table row_count" if row_count.negative?
-  raise "root_data_page/row_count invariant violated" unless root.unpack1("N").zero? == row_count.zero?
+  raise "root_data_page/row_count invariant violated" unless root.zero? == row_count.zero?
 
   [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes, fks: fks,
-     exclusions: exclusions, root_data_page: root.unpack1("N"), row_count: row_count }, pos]
+     exclusions: exclusions, root_data_page: root, row_count: row_count }, pos]
 end
 
 # Read one value via the value codec (inverse of encode_value): a presence tag, then — when
@@ -4673,6 +4954,15 @@ def value_from_payload(type, payload)
   when "decimal" then decode_decimal_body(payload, 0).first
   else raise "a non-spillable type was stored external"
   end
+end
+
+# The tag ending an encrypted external value's pointer (encrypted.md §2), recorded for its chain.
+def read_pointer_tag(first, buf, pos)
+  return pos unless $enc
+
+  tag, pos = take(buf, pos, TAG_LEN)
+  $enc[:tags][first] = tag.b
+  pos
 end
 
 # Gather `len` bytes of an external value's payload by following its overflow chain from `first`:
@@ -4711,6 +5001,7 @@ def decode_value(type, buf, pos, fetch = nil)
   if t == TAG_EXTERNAL
     fpb, pos = take(buf, pos, 4)
     lnb, pos = take(buf, pos, 4)
+    pos = read_pointer_tag(fpb.unpack1("N"), buf, pos)
     raise "external value with no overflow reader" if fetch.nil?
 
     return [value_from_payload(type, read_overflow_chain(fpb.unpack1("N"), lnb.unpack1("N"), fetch)), pos]
@@ -4725,6 +5016,7 @@ def decode_value(type, buf, pos, fetch = nil)
     fpb, pos = take(buf, pos, 4)
     slb, pos = take(buf, pos, 4)
     rlb, pos = take(buf, pos, 4)
+    pos = read_pointer_tag(fpb.unpack1("N"), buf, pos)
     raise "external value with no overflow reader" if fetch.nil?
 
     comp = read_overflow_chain(fpb.unpack1("N"), slb.unpack1("N"), fetch)
@@ -5034,7 +5326,11 @@ def read_tree_rows(image, ps, root_page, columns)
       end
     when PAGE_INTERIOR
       n = pg[:item_count]
-      children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
+      pos = 0
+      children = (0..n).map do
+        cp, pos = read_ptr(pg[:payload], pos)
+        cp
+      end
       children.each { |cp| walk.call(cp) }
     else
       raise "expected a B-tree node page, got type #{pg[:type]}"
@@ -5062,7 +5358,11 @@ def read_tree_keys(image, ps, root_page)
       leaf_keys.each { |kk| keys << kk }
     when PAGE_INTERIOR
       n = pg[:item_count]
-      children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
+      pos = 0
+      children = (0..n).map do
+        cp, pos = read_ptr(pg[:payload], pos)
+        cp
+      end
       children.each { |cp| walk.call(cp) }
     else
       raise "expected a B-tree node page, got type #{pg[:type]}"
@@ -5171,6 +5471,13 @@ end
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
+  unlock_image(image, ps, meta) if meta[:suite] == 1
+  decode_unlocked(image, ps, meta)
+ensure
+  $enc = nil
+end
+
+def decode_unlocked(image, ps, meta)
   free_pages = validate_free_list!(image, ps, meta)
   # Every page the decode reads from the catalog root is live (v34): the catalog chain, each tree
   # and GiST node, and each overflow page. The meta's count must equal that reachable set.
@@ -5419,6 +5726,50 @@ def lz4_vectors_toml
   out
 end
 
+# The encrypted variant's shared vectors (spec/fileformat/encrypted.md §3, §5, §8): XAES-256-GCM
+# (the two C2SP vectors and one with associated data shaped like a page's), the HKDF subkeys, the
+# host-key KEK, the goldens' key block, and the seeded key-entropy stream. The Argon2id vector is
+# RFC 9106's reference-implementation output, checked by the cores (this reference has no Argon2id).
+def encryption_vectors_path = File.join(__dir__, "encryption_vectors.toml")
+
+def hex(bytes) = bytes.unpack1("H*")
+
+def encryption_vectors_toml
+  out = +"# Encrypted-variant vectors — GENERATED by `ruby spec/fileformat/verify.rb --generate` from\n"
+  out << "# the reference cryptography in xaes.rb (spec/fileformat/encrypted.md). Every core reproduces\n"
+  out << "# each one byte-for-byte. Do not edit by hand.\n\nschema_version = 1\n"
+  nonce = "ABCDEFGHIJKLMNOPQRSTUVWX".b
+  page_nonce = (0...24).map { |i| (0x60 + i).chr }.join.b
+  [["c2sp_1", ("\x01" * 32).b, nonce, "XAES-256-GCM".b, "".b],
+   ["c2sp_2", ("\x03" * 32).b, nonce, "XAES-256-GCM".b, "c2sp.org/XAES-256-GCM".b],
+   ["page_ad", (0...32).map(&:chr).join.b, page_nonce, ("jed page " * 7).b, ad_prefix(1, 9)]].each do |name, key, n, pt, ad|
+    out << "\n[[xaes]]\nname = \"#{name}\"\nkey_hex = \"#{hex(key)}\"\nnonce_hex = \"#{hex(n)}\"\n"
+    out << "plaintext_hex = \"#{hex(pt)}\"\naad_hex = \"#{hex(ad)}\"\n"
+    out << "sealed_hex = \"#{hex(Xaes.seal(key, n, pt, ad))}\"\n"
+  end
+  dek = (0...32).map(&:chr).join.b
+  out << "\n[subkeys]\ndek_hex = \"#{hex(dek)}\"\npage_key_hex = \"#{hex(Xaes.page_key(dek))}\"\n"
+  out << "meta_key_hex = \"#{hex(Xaes.meta_key(dek))}\"\n"
+  salt = (0x40...0x60).map(&:chr).join.b
+  out << "\n[host_kek]\nkey_hex = \"#{hex(ENC_KEY)}\"\nkdf_salt_hex = \"#{hex(salt)}\"\n"
+  out << "kek_hex = \"#{hex(Xaes.host_kek(ENC_KEY, salt))}\"\n"
+  block, golden_dek = new_key_block(SeededStream.new(ENC_SEED))
+  out << "\n# The goldens' key block: the seeded stream's first draws under the host key above.\n"
+  out << "[key_block]\nseed = #{ENC_SEED}\nblock_hex = \"#{hex(block)}\"\ndek_hex = \"#{hex(golden_dek)}\"\n"
+  out << "\n[argon2id]\npassword = \"password\"\nsalt = \"somesalt\"\nmemory_kib = 65536\niterations = 2\n"
+  out << "parallelism = 1\nkey_hex = \"09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7\"\n"
+  out
+end
+
+def verify_encryption_vectors
+  fail!("encryption_vectors.toml: missing (run `ruby spec/fileformat/verify.rb --generate`)") unless File.exist?(encryption_vectors_path)
+  fail!("XAES-256-GCM C2SP vector failed") unless Xaes.seal(("\x01" * 32).b, "ABCDEFGHIJKLMNOPQRSTUVWX".b, "XAES-256-GCM".b, "".b) ==
+                                                ["ce546ef63c9cc60765923609b33a9a1974e96e52daf2fcf7075e2271"].pack("H*")
+  unless File.read(encryption_vectors_path) == encryption_vectors_toml
+    fail!("encryption_vectors.toml: differs from the reference cryptography (regenerate or fix it)")
+  end
+end
+
 def verify_lz4_vectors
   fail!("lz4_vectors.toml: missing (run `ruby spec/fileformat/verify.rb --generate`)") unless File.exist?(lz4_vectors_path)
   unless File.read(lz4_vectors_path) == lz4_vectors_toml
@@ -5471,6 +5822,8 @@ def generate
     puts "wrote #{fx[:file]} (#{fixture_image(fx).bytesize} bytes)"
   end
   File.write(lz4_vectors_path, lz4_vectors_toml)
+  File.write(encryption_vectors_path, encryption_vectors_toml)
+  puts "wrote encryption_vectors.toml"
   puts "wrote lz4_vectors.toml (#{LZ4_VECTORS.size} vectors)"
   puts "Generated #{FIXTURES.size} fixtures in #{dir}"
 end
@@ -5555,8 +5908,9 @@ def verify
   end
 
   verify_lz4_vectors
+  verify_encryption_vectors
   puts "OK: #{FIXTURES.size} file-format fixtures verified (byte-exact + independent decode); " \
-       "#{LZ4_VECTORS.size} LZ4 vectors verified"
+       "#{LZ4_VECTORS.size} LZ4 vectors and the encryption vectors verified"
 end
 
 if ARGV.include?("--generate")

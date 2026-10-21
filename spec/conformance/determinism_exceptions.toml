@@ -50,6 +50,17 @@ test         = "injected-source-exact: the `# seed:` corpus directive injects th
 status       = "ratified"
 reason       = "Randomness is intrinsic to uuidv4. Pushed to a host seam (determinism.md §5): with the provided deterministic source injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the raw per-value OS-CSPRNG read — G1+G2 hold on the injected/test path."
 
+# --- encrypted file bytes: key material and page nonces on the key-entropy source ----------
+[[exception]]
+id           = "encrypted-file-entropy"
+surface      = "the stored bytes of an encrypted database file (../fileformat/encrypted.md §8): its data key, key-block salt and wrap nonce, and every sealed page's nonce and tag"
+class        = "B"
+drops        = []
+blast_radius = "the file's stored bytes only. Rows, values, errors, plans, estimates and cost never depend on them: a page decrypts to the same plaintext whatever its nonce, and the cost meter counts logical pages (encryption.md §7). On the INJECTED path (the environment's insecure seeded key-entropy source) NOTHING is dropped: every core draws the same stream in the same seal order and writes byte-identical files. In PRODUCTION the key material and nonces come from the OS CSPRNG, so two runs of one history write different bytes, by design (nonce uniqueness must survive retried commits, restores and copies — encryption.md §3)."
+test         = "injected-source-exact: the encrypted_* goldens are written byte-for-byte by every core under the seeded source and authored independently by the Ruby reference (spec/fileformat/verify.rb + xaes.rb); encryption_vectors.toml pins the cryptographic building blocks; per-core tests check that a seeded history writes identical bytes twice."
+status       = "ratified"
+reason       = "Fresh randomness per seal is the security property (encryption.md §3), not an artifact. Pushed to a host seam (the environment's key-entropy source, separate from the SQL random source): with the provided deterministic source installed the engine is a deterministic function of it."
+
 # --- uuidv7: clock + entropy seam --------------------------------------------
 [[exception]]
 id           = "uuidv7-clock-entropy"

@@ -53,12 +53,21 @@ impl Database {
 
 /// The paging context a pinned snapshot's pages are read through.
 fn backup_paging(snap: &Snapshot) -> Result<Arc<SharedPaging>> {
-    snap.store_paging().cloned().ok_or_else(|| {
+    let paging = snap.store_paging().cloned().ok_or_else(|| {
         EngineError::new(
             SqlState::FeatureNotSupported,
             "a backup needs a database with storage",
         )
-    })
+    })?;
+    if paging.codec().is_some() {
+        // A backup of an encrypted file needs its key block taken under the key-block mutex
+        // (spec/design/encryption.md §8), not yet built (spec/fileformat/encrypted.md §10).
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "a backup of an encrypted database is not supported yet",
+        ));
+    }
+    Ok(paging)
 }
 
 /// The meta that published version `v`. A commit writes the slot that does not hold the durable floor
@@ -173,7 +182,7 @@ impl Shared {
             })?;
         } else {
             write_backup_file(files, dest, no_sync, &mut |write_at| {
-                snap.write_image(page_size, v + 1, &mut |index, page| {
+                snap.write_image(page_size, v + 1, None, &mut |index, page| {
                     write_at(index as u64 * page_size as u64, page)
                 })
                 .map(|_| ())
@@ -206,7 +215,7 @@ impl Shared {
         };
         let mut reached = gist.into_inner();
         let snap = &loaded.committed;
-        let read = |p: u32| paging.pager().read_block(p);
+        let read = |p: crate::format::PageRef| paging.read_body(p);
         let mut seen: HashSet<u32> = HashSet::new();
         let mut p = mt.root_page;
         while p != 0 {
@@ -214,7 +223,7 @@ impl Shared {
                 return Err(corrupt("invalid catalog chain"));
             }
             reached.insert(p);
-            let block = read(p)?;
+            let block = read(crate::format::PageRef::plain(p))?;
             p = crate::format::page_header(&block)?.next_page;
         }
         for store in snap.stores_by_name() {
@@ -222,11 +231,12 @@ impl Shared {
                 continue;
             };
             crate::format::collect_tree_pages(root, &mut reached);
-            let root_page = root.page.load(Ordering::Acquire);
+            let root_page = root.page_ref();
             let col_types = Arc::new(store.col_types().to_vec());
-            if root_page != 0 && crate::format::any_spillable(&col_types) {
+            if root_page.page != 0 && crate::format::any_spillable(&col_types) {
                 crate::format::collect_leaf_overflow_with(
                     &read,
+                    paging.cap(),
                     root_page,
                     &col_types,
                     &mut reached,
@@ -251,7 +261,7 @@ impl Shared {
                 return Err(corrupt("invalid free-list chain"));
             }
             reached.insert(p);
-            let block = read(p)?;
+            let block = read(crate::format::PageRef::plain(p))?;
             let header = crate::format::page_header(&block)?;
             if header.page_type != PAGE_FREELIST {
                 return Err(corrupt("invalid free-list page"));
@@ -305,11 +315,12 @@ impl Shared {
             write_at(last as u64 * ps, &vec![0u8; page_size as usize])?;
         }
         let bootstrap = crate::format::meta_page(
+            crate::format::Cap::plain(page_size),
             page_size,
             mt.txid,
-            mt.root_page,
+            crate::format::PageRef::plain(mt.root_page),
             mt.page_count,
-            mt.free_list_head,
+            crate::format::PageRef::plain(mt.free_list_head),
             mt.live_pages,
         );
         write_at(0, &bootstrap)?;

@@ -1884,7 +1884,6 @@ impl Engine {
 
         let index_keys: Vec<String> = table.indexes.iter().map(|i| i.name.to_string()).collect();
         // The table is brand new (no rows), so each backing index store starts empty.
-        let cap = crate::format::page_payload(self.page_size);
 
         if let Some(name) = attach_name.clone() {
             // Deferred narrowings on an attached-database table this slice (attached-databases.md §8),
@@ -1930,12 +1929,12 @@ impl Engine {
             // Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may
             // serialize at a different page size than main, and its records must split to match.
             let ps = self.attach_page_size(&name);
-            let acap = crate::format::page_payload(ps);
             // Register into the attachment's working snapshot (attached-databases.md §6) — never the main
             // image; published into `Roots::attached` at commit (N-root commit, §5). `attach_write_snap`
             // clones the attachment's committed root (which already carries its `store_paging`) on first
             // write and marks it dirty, so its NEW stores bind to the attachment's own paging.
             let ws = self.attach_write_snap(&name);
+            let acap = ws.cap_for(ps);
             ws.put_table_resolved(table, col_types, ps);
             for k in index_keys {
                 ws.put_index_store(k, TableStore::new(acap, Vec::new()));
@@ -1986,9 +1985,10 @@ impl Engine {
             let store_paging = Some(self.temp_domain_paging());
             let tw = self.temp_working_mut();
             tw.store_paging = store_paging;
+            let tcap = tw.cap_for(ps);
             tw.put_table_resolved(table, col_types, ps);
             for k in index_keys {
-                tw.put_index_store(k, TableStore::new(cap, Vec::new()));
+                tw.put_index_store(k, TableStore::new(tcap, Vec::new()));
             }
             // Stage each `serial`/IDENTITY column's OWNED sequence into the SAME temp snapshot
             // (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the
@@ -2005,6 +2005,8 @@ impl Engine {
         }
 
         self.put_table(table);
+        let page_size = self.page_size;
+        let cap = self.working_mut().cap_for(page_size);
         for k in index_keys {
             self.working_mut()
                 .put_index_store(k, TableStore::new(cap, Vec::new()));
@@ -3793,6 +3795,7 @@ impl Engine {
         if table_rewrite_needed {
             let old_mask = vec![true; original.columns.len()];
             let store = self.store_scoped(at.db.as_deref(), &original.name);
+            let rewrite_cap = store.cap();
             let (mut rows, pages, slabs) = store.scan_with_units(&old_mask)?;
             rewrite_next_rowid = store.next_rowid();
             if pk_rekeyed && table.pk.is_empty() {
@@ -3886,7 +3889,7 @@ impl Engine {
                     rewrite_col_types.as_ref().expect("rewrite column types"),
                     key,
                     row,
-                    crate::format::page_payload(page_size),
+                    rewrite_cap,
                 ) as i64;
             }
             meter.charge(COSTS.value_compress * compress_units);

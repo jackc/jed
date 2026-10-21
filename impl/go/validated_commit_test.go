@@ -195,7 +195,7 @@ func TestValidatedManifestDependenciesAreNotReusedUntilNextGeneration(t *testing
 				}
 			}
 		}
-		check(raw[64:], min(current.dirtyCount, uint32(manifestInlineCapacity(256))))
+		check(raw[64:], min(current.dirtyCount, uint32(manifestInlineCapacity(256, plainCap(256)))))
 		for id := current.manifestHead; id != 0; {
 			if free[id] {
 				t.Fatalf("manifest page %d is reusable", id)
@@ -217,7 +217,7 @@ func TestValidatedAllocatorRejectsPageHighWaterOverflow(t *testing.T) {
 	if e, ok := err.(*EngineError); !ok || e.Code() != "54000" {
 		t.Fatalf("body high-water overflow: %v", err)
 	}
-	_, _, _, _, err = serializeFreeList([]uint32{2, 3}, nil, 240, 256, ^uint32(0))
+	_, _, _, _, err = serializeFreeList([]uint32{2, 3}, nil, plainSealer(256), ^uint32(0))
 	if e, ok := err.(*EngineError); !ok || e.Code() != "54000" {
 		t.Fatalf("free-list high-water overflow: %v", err)
 	}

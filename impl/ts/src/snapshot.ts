@@ -34,7 +34,7 @@ import type { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
 import type { Entry, Row } from "./storage.ts";
 import { compareTextC } from "./value.ts";
-import { pagePayload } from "./format.ts";
+import { type Cap, plainCap } from "./cap.ts";
 import { compositeRefName } from "./types.ts";
 import type { FkDependent } from "./executor.ts";
 import type { Type } from "./types.ts";
@@ -609,7 +609,7 @@ export class Snapshot {
           for (const ek of indexEntryKeysColumns(table.columns, colTypes, colls, def, e.key, e.row))
             ekeys.push({ key: ek, skeyLen: e.key.length });
         sortIndexEntries(ekeys);
-        const fresh = new TableStore(pagePayload(pageSize), []);
+        const fresh = new TableStore(this.capFor(pageSize), []);
         indexBuildInsert(fresh, def.kind, ekeys);
         this.putIndexStore(def.name, fresh);
       }
@@ -824,7 +824,7 @@ export class Snapshot {
   putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
     this.bumpCatGen();
     const key = t.name;
-    const st = new TableStore(pagePayload(pageSize), colTypes);
+    const st = new TableStore(this.capFor(pageSize), colTypes);
     // Bind the domain's pager (Snapshot.storePaging) so the new store demand-pages like a loaded one:
     // its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
     // instead of staying fully-resident decoded for the handle's lifetime. null only on a bare scratch
@@ -963,7 +963,7 @@ export class Snapshot {
   putIndex(tableKey: string, def: IndexDef, pageSize: number): void {
     this.bumpCatGen();
     const nameKey = def.name;
-    const fresh = new TableStore(pagePayload(pageSize), []);
+    const fresh = new TableStore(this.capFor(pageSize), []);
     // Bind the domain pager, like putTableResolved / putIndexStore.
     if (this.storePaging !== null) fresh.attachPaging(this.storePaging);
     this.indexStores.set(nameKey, fresh);
@@ -1090,7 +1090,7 @@ export class Snapshot {
         this.indexStores.delete(k);
         this.gistTrees.delete(k);
       }
-      const s = new TableStore(pagePayload(pageSize), []);
+      const s = new TableStore(this.capFor(pageSize), []);
       if (this.storePaging !== null) s.attachPaging(this.storePaging);
       indexBuildInsert(s, i.kind, entries.get(k) ?? []);
       this.indexStores.set(k, s);
@@ -1110,7 +1110,7 @@ export class Snapshot {
     }
     for (const index of next.indexes) {
       const key = index.name;
-      const store = new TableStore(pagePayload(pageSize), []);
+      const store = new TableStore(this.capFor(pageSize), []);
       if (this.storePaging !== null) store.attachPaging(this.storePaging);
       indexBuildInsert(store, index.kind, entries.get(key) ?? []);
       this.indexStores.set(key, store);
@@ -1147,6 +1147,13 @@ export class Snapshot {
       if (column < 0) this.sequences.delete(key);
       else this.sequences.set(key, { ...seq, ownedBy: { ...seq.ownedBy, column } });
     }
+  }
+
+  // capFor is the page capacities this snapshot's stores split at: its domain paging context's (an
+  // encrypted file's layout — spec/fileformat/encrypted.md §1), else the plaintext layout at pageSize
+  // (an in-memory or temp domain, or a bare scratch engine).
+  capFor(pageSize: number): Cap {
+    return this.storePaging !== null ? this.storePaging.cap() : plainCap(pageSize);
   }
 
   // putIndexStore registers a loaded index store under its (exact) name — the file

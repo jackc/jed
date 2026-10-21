@@ -1846,12 +1846,12 @@ func TestPersistedRowCountTracksDMLAndRollback(t *testing.T) {
 }
 
 func TestTableRowCountInvariantsAreRejected(t *testing.T) {
-	valid := tableEntryBytes(&catTable{Name: "t"}, 2, nil, 3)
+	valid := tableEntryBytes(&catTable{Name: "t"}, plainRef(2), nil, 3, plainCap(8192))
 
 	rootWithZeroCount := append([]byte(nil), valid...)
 	binary.BigEndian.PutUint64(rootWithZeroCount[len(rootWithZeroCount)-8:], 0)
 	var count int64
-	if _, _, _, err := decodeTableEntry(rootWithZeroCount, new(int), &count); err == nil {
+	if _, _, _, err := decodeTableEntry(rootWithZeroCount, new(int), &count, plainCap(8192)); err == nil {
 		t.Fatal("expected root/nonzero-count mismatch to be rejected")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
 		t.Fatalf("expected XX001, got %v", err)
@@ -1859,7 +1859,7 @@ func TestTableRowCountInvariantsAreRejected(t *testing.T) {
 
 	negativeCount := append([]byte(nil), valid...)
 	binary.BigEndian.PutUint64(negativeCount[len(negativeCount)-8:], ^uint64(0))
-	if _, _, _, err := decodeTableEntry(negativeCount, new(int), &count); err == nil {
+	if _, _, _, err := decodeTableEntry(negativeCount, new(int), &count, plainCap(8192)); err == nil {
 		t.Fatal("expected negative row count to be rejected")
 	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
 		t.Fatalf("expected XX001, got %v", err)

@@ -53,7 +53,7 @@ func TestGinPostingRunVectors(t *testing.T) {
 	}
 	for _, r := range readTomlTables(t, path, "history") {
 		term := ginRunHexes(t, []string{r.str("term")})[0]
-		store := newTableStore(4080, nil)
+		store := newTableStore(pageCap{c: 4080}, nil)
 		for _, op := range r.strs("ops") {
 			key := ginRunHexes(t, []string{op[1:]})[0]
 			var err error

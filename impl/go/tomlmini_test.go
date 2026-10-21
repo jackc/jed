@@ -57,13 +57,28 @@ func (r tomlRow) boolVal(key string) bool {
 // Only keys directly under each entry are captured (sufficient for the spec tables).
 func readTomlTables(t *testing.T, path, section string) []tomlRow {
 	t.Helper()
+	return readTomlHeader(t, path, "[["+section+"]]")
+}
+
+// readTomlTable reads the one plain `[section]` table of a TOML file.
+func readTomlTable(t *testing.T, path, section string) tomlRow {
+	t.Helper()
+	rows := readTomlHeader(t, path, "["+section+"]")
+	if len(rows) != 1 {
+		t.Fatalf("%s: want one [%s] table, got %d", path, section, len(rows))
+	}
+	return rows[0]
+}
+
+// readTomlHeader collects the key = value pairs under every occurrence of header.
+func readTomlHeader(t *testing.T, path, header string) []tomlRow {
+	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	var rows []tomlRow
 	var cur *tomlRow
-	header := "[[" + section + "]]"
 
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)

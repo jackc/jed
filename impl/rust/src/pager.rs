@@ -88,6 +88,9 @@ pub(crate) struct Pager {
     /// makes the newest generation durable. `shrink_pages` is that newest generation's high-water.
     shrink_pending: bool,
     shrink_pages: u32,
+    /// The file is the encrypted variant (spec/fileformat/encrypted.md): its meta's inline manifest
+    /// holds fewer entries, which moves the relaxed batch cap.
+    encrypted: bool,
     /// The armed one-shot commit fault — the **fault-injection seam** (spec/design/storage.md §7),
     /// `#[cfg(test)]` so it is **entirely absent from a production build** (zero footprint). `None`
     /// unless a test armed one with [`arm_fault`](Pager::arm_fault).
@@ -170,6 +173,7 @@ impl Pager {
             pending: BTreeMap::new(),
             shrink_pending: false,
             shrink_pages: 0,
+            encrypted: false,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
@@ -403,7 +407,13 @@ impl Pager {
     /// Whether the pending set fills the inline manifest of one meta page: the batch cap, after
     /// which a flush follows (validated-cow.md §4).
     pub(crate) fn batch_cap_reached(&self) -> bool {
-        self.pending.len() >= crate::format::manifest_capacities(self.page_size as usize).0
+        let cap = crate::format::Cap::of(self.page_size, self.encrypted);
+        self.pending.len() >= crate::format::manifest_capacities(self.page_size as usize, cap).0
+    }
+
+    /// Mark the file as the encrypted variant (set when it is unlocked or created encrypted).
+    pub(crate) fn set_encrypted(&mut self) {
+        self.encrypted = true;
     }
 
     /// Arm a one-shot commit fault (the **fault-injection seam**, spec/design/storage.md §7) and

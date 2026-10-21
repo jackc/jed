@@ -15,10 +15,9 @@ import (
 // pmRow has one fixed-width value column, so the v24 leaf overhead scales with {fixed: 1, var: 0}
 // (format.md "Leaf node"). These maps are in-memory (no paging), so every traversal passes a nil
 // leaf source and never faults.
-const (
-	pmCap = 240
-	pmW   = 16
-)
+const pmW = 16
+
+var pmCap = pageCap{c: 240}
 
 var pmShape = leafShape{fixed: 1}
 
@@ -106,8 +105,8 @@ func pmCheckInvariants(t *testing.T, pm *pMap) {
 				t.Fatal("key at/above its subtree's high separator")
 			}
 		}
-		if n.payload(pmShape) > pmCap {
-			t.Fatalf("node payload %d exceeds cap %d", n.payload(pmShape), pmCap)
+		if n.payload(pmCap, pmShape) > pmCap.c {
+			t.Fatalf("node payload %d exceeds cap %d", n.payload(pmCap, pmShape), pmCap.c)
 		}
 		if n.isLeaf() {
 			return 1
@@ -410,8 +409,8 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 	// Structure: fits + routing correctness (0-key interiors allowed).
 	var walk func(n *pnode)
 	walk = func(n *pnode) {
-		if n.payload(shape) > pmCap {
-			t.Fatalf("node payload %d overflows its page", n.payload(shape))
+		if n.payload(pmCap, shape) > pmCap.c {
+			t.Fatalf("node payload %d overflows its page", n.payload(pmCap, shape))
 		}
 		if !n.isLeaf() {
 			if len(n.children) != len(n.keys)+1 {

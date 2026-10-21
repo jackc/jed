@@ -50,7 +50,20 @@ func zeroBytes(b []byte) bool {
 	return true
 }
 
-func manifestInlineCapacity(ps int) int   { return (ps - 64) / 12 }
+// manifestInlineArea is the byte range of a meta page of ps bytes that holds its inline manifest:
+// after the header, before an encrypted meta's reserve. An encrypted meta's inline manifest starts
+// after the catalog-root and free-list tags (spec/fileformat/encrypted.md §6).
+func manifestInlineArea(ps int, pcap pageCap) (int, int) {
+	if pcap.encrypted() {
+		return 96, ps - cryptoReserve
+	}
+	return 64, ps
+}
+
+func manifestInlineCapacity(ps int, pcap pageCap) int {
+	lo, hi := manifestInlineArea(ps, pcap)
+	return (hi - lo) / 12
+}
 func manifestOverflowCapacity(ps int) int { return (ps - 32) / 12 }
 
 // Check before serialization, which can fault inherited pages. A failed writer
@@ -146,7 +159,7 @@ func (p *pager) flushPending(shrink bool) error {
 // batchCapReached reports whether the pending set fills the inline manifest of one meta page: the
 // batch cap, after which a flush follows (validated-cow.md §4).
 func (p *pager) batchCapReached() bool {
-	return len(p.pending) >= manifestInlineCapacity(int(p.pageSize))
+	return len(p.pending) >= manifestInlineCapacity(int(p.pageSize), capOf(p.pageSize, p.codec != nil))
 }
 
 func (p *pager) selectValidatedMeta() (meta, error) {
@@ -174,6 +187,11 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 		if !ok || m.pageCount > p.allocatedPages {
 			continue
 		}
+		// A slot of the other variant is not a candidate of this file (encrypted.md §6; the unlock
+		// already refused files whose valid slots disagree).
+		if (m.suite != 0) != (p.codec != nil) {
+			continue
+		}
 		if p.trustMeta {
 			p.validatedMeta = append(p.validatedMeta[:0], raw...)
 			p.manifestProtected = map[uint32]bool{}
@@ -186,6 +204,18 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 			}
 			if !valid {
 				continue
+			}
+			// An encrypted meta is authenticated after keyless selection; a CRC-valid meta that
+			// fails its tag was tampered with — XX001, never a fallback.
+			if p.codec != nil {
+				chain, err := p.manifestChain(m)
+				if err != nil {
+					return meta{}, err
+				}
+				if err := p.codec.verifyMeta(slots[k], raw, chain); err != nil {
+					p.manifestProtected = nil
+					return meta{}, err
+				}
 			}
 			adopted := !bytes.Equal(raw, p.validatedMeta)
 			p.validatedMeta = append(p.validatedMeta[:0], raw...)
@@ -210,8 +240,12 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 // bounded by the physical file, ids strictly increase, and chain ordinals prevent
 // cycles without a file-sized visited set.
 func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
+	// An encrypted meta: body pages start past the key block, the inline manifest after the tags, and
+	// a listed page is ciphertext, so only its digest is checked (encrypted.md §6).
+	pcap := capOf(uint32(len(raw)), m.suite != 0)
+	first := pcap.firstBody()
 	protected := make(map[uint32]bool)
-	last := uint32(1)
+	last := first - 1
 	seen := uint32(0)
 	rootSeen, freeHeadSeen := false, m.freeListHead == 0
 	validate := func(entries []byte, count uint32) (bool, error) {
@@ -229,21 +263,25 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			if len(block) != int(p.pageSize) || block[0] < 1 || block[0] > 7 || pageCRC(block) != binary.BigEndian.Uint32(block[12:16]) || commitCRC64(0, block) != binary.BigEndian.Uint64(e[4:]) {
+			if len(block) != int(p.pageSize) || commitCRC64(0, block) != binary.BigEndian.Uint64(e[4:]) {
+				return false, nil
+			}
+			if !pcap.encrypted() && (block[0] < 1 || block[0] > 7 || pageCRC(block) != binary.BigEndian.Uint32(block[12:16])) {
 				return false, nil
 			}
 			seen++
 		}
 		return true, nil
 	}
-	inline := min(m.dirtyCount, uint32(manifestInlineCapacity(len(raw))))
-	if ok, err := validate(raw[64:], inline); !ok || err != nil {
+	lo, _ := manifestInlineArea(len(raw), pcap)
+	inline := min(m.dirtyCount, uint32(manifestInlineCapacity(len(raw), pcap)))
+	if ok, err := validate(raw[lo:], inline); !ok || err != nil {
 		return ok, err
 	}
 	id := m.manifestHead
 	chainCRC := uint64(0)
 	for ordinal := uint32(0); ordinal < m.manifestPages; ordinal++ {
-		if id < 2 || id >= m.pageCount {
+		if id < first || id >= m.pageCount {
 			return false, nil
 		}
 		protected[id] = true
@@ -276,6 +314,23 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 	return valid, nil
 }
 
+// manifestChain is the manifest-overflow chain a valid meta names, in chain order — what an encrypted
+// meta's tag covers (encrypted.md §6). Reads only the pages the meta counts; a malformed chain was
+// already refused by validateCommitManifest.
+func (p *pager) manifestChain(m meta) ([]dirtyPage, error) {
+	var out []dirtyPage
+	id := m.manifestHead
+	for i := uint32(0); i < m.manifestPages; i++ {
+		block, err := p.readBlock(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, dirtyPage{index: id, bytes: block})
+		id = binary.BigEndian.Uint32(block[8:12])
+	}
+	return out, nil
+}
+
 // manifestEntry is one manifest record: a page id and the CRC-64 of its complete encoded bytes.
 type manifestEntry struct {
 	index  uint32
@@ -294,10 +349,10 @@ func manifestEntriesOf(pages []dirtyPage) []manifestEntry {
 // commitManifest encodes the fixed meta inline region and the reserved overflow
 // chain. The entries include free-list pages, but not the manifest itself; under
 // batched durability they also include the pending set (validated-cow.md §4).
-func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uint32, entries []manifestEntry, manifestIDs []uint32) ([]byte, []dirtyPage) {
+func commitManifest(pcap pageCap, ps uint32, txid uint64, root pageRef, pageCount uint32, head pageRef, livePages uint32, entries []manifestEntry, manifestIDs []uint32) ([]byte, []dirtyPage) {
 	ordered := append([]manifestEntry(nil), entries...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
-	meta := metaPage(ps, txid, root, pageCount, head, livePages)
+	meta := metaPage(pcap, ps, txid, root, pageCount, head, livePages)
 	binary.BigEndian.PutUint32(meta[40:], uint32(len(ordered)))
 	binary.BigEndian.PutUint32(meta[44:], uint32(len(manifestIDs)))
 	if len(manifestIDs) > 0 {
@@ -309,8 +364,9 @@ func commitManifest(ps uint32, txid uint64, root, pageCount, head, livePages uin
 			binary.BigEndian.PutUint64(b[i*12+4:], e.digest)
 		}
 	}
-	inline := min(len(ordered), manifestInlineCapacity(int(ps)))
-	encode(meta[64:], ordered[:inline])
+	lo, _ := manifestInlineArea(int(ps), pcap)
+	inline := min(len(ordered), manifestInlineCapacity(int(ps), pcap))
+	encode(meta[lo:], ordered[:inline])
 	remaining := ordered[inline:]
 	pages := make([]dirtyPage, 0, len(manifestIDs))
 	chainCRC := uint64(0)
@@ -351,7 +407,11 @@ func trailingRun(safe []uint32, high uint32) ([]uint32, uint32) {
 }
 
 type validatedCommitPlan struct {
-	pages           []dirtyPage // free-list pages, then manifest overflow
+	pages []dirtyPage // free-list pages, then manifest overflow
+	// manifest is the manifest-overflow pages among pages, in chain order — what an encrypted meta's
+	// tag authenticates (sealMeta).
+	manifest []dirtyPage
+	// meta is the meta page, unsealed: sealMeta completes it for the slot it is written to.
 	meta            []byte
 	free            []uint32
 	pageCount, live uint32
@@ -367,7 +427,7 @@ type validatedCommitPlan struct {
 // free pages (format.md *Trailing truncation*): only an owner's (or an alone process's) own commit that
 // plans against a durable floor — nothing pending — sets it, never a page client's planned delta.
 func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incrementalWrite, pageSize, liveAtCompaction uint32, generation uint64, canReclaim, canReuse, truncate bool, livePages uint32, pending []manifestEntry, allowed map[uint32]bool) (validatedCommitPlan, error) {
-	candidates, live, gen, err := freeListCandidates(snap, paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending)
+	candidates, live, gen, err := freeListCandidates(snap, paging, write.root, write.pages, write.freeRemaining, write.pageCount, liveAtCompaction, generation, canReclaim, pending)
 	if err != nil {
 		return validatedCommitPlan{}, err
 	}
@@ -422,11 +482,12 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 				persist = append(persist, id)
 			}
 		}
-		fl, head, free, pc, err := serializeFreeList(persist, safe[drawn:], ps-pageHeader, ps, next)
+		seal := sealerOf(ps, paging)
+		fl, head, free, pc, err := serializeFreeList(persist, safe[drawn:], seal, next)
 		if err != nil {
 			return validatedCommitPlan{}, err
 		}
-		left := max(0, len(pending)+len(write.pages)+len(fl)-manifestInlineCapacity(ps))
+		left := max(0, len(pending)+len(write.pages)+len(fl)-manifestInlineCapacity(ps, seal.cap))
 		required := (left + manifestOverflowCapacity(ps) - 1) / manifestOverflowCapacity(ps)
 		if required > reserved {
 			reserved = required
@@ -436,7 +497,20 @@ func planValidatedCommit(snap *snapshot, paging *sharedPaging, write incremental
 		dirty = append(dirty, manifestEntriesOf(write.pages)...)
 		dirty = append(dirty, manifestEntriesOf(fl)...)
 		entries := append(append(make([]manifestEntry, 0, len(pending)+len(dirty)), pending...), dirty...)
-		meta, overflow := commitManifest(pageSize, snap.txid, write.rootPage, pc, head, livePages, entries, ids)
-		return validatedCommitPlan{pages: append(fl, overflow...), meta: meta, free: free, pageCount: pc, live: live, generation: gen, dirty: dirty}, nil
+		meta, overflow := commitManifest(seal.cap, pageSize, snap.txid, write.root, pc, head, livePages, entries, ids)
+		return validatedCommitPlan{pages: append(fl, overflow...), manifest: overflow, meta: meta, free: free, pageCount: pc, live: live, generation: gen, dirty: dirty}, nil
 	}
+}
+
+// sealMeta completes a commit's meta for slot (spec/fileformat/encrypted.md §6): an encrypted file
+// seals a copy over its manifest-overflow chain; a plaintext meta is final as planned. Draws one nonce.
+func sealMeta(p *pager, slot uint32, meta []byte, manifest []dirtyPage) ([]byte, error) {
+	if p.codec == nil {
+		return meta, nil
+	}
+	sealed := append([]byte(nil), meta...)
+	if err := p.codec.sealMeta(slot, sealed, manifest); err != nil {
+		return nil, err
+	}
+	return sealed, nil
 }

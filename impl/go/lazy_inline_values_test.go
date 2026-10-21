@@ -332,7 +332,6 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 		{Elem: &i32}, // i32[]
 	}
 	const ps = 8192 // large page → every value stays inline-plain (no spill)
-	capacity := ps - pageHeader
 
 	rows := make([]storedRow, 3)
 	for i := range rows {
@@ -348,14 +347,14 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	// Encode the records into one PAX leaf page payload (everything inline at this page size).
 	takeSeq := uint32(100)
 	take := func() uint32 { takeSeq++; return takeSeq }
-	var ovf []overflowPageOut
+	var ovf []dirtyPage
 	keys := make([][]byte, len(rows))
 	for i := range rows {
 		key := make([]byte, 4)
 		binary.BigEndian.PutUint32(key, uint32(i))
 		keys[i] = key
 	}
-	payload, err := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf, &chainSource{})
+	payload, err := encodeLeafPAX(colTypes, keys, rows, plainSealer(ps), take, &ovf, &chainSource{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +366,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	// Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and
 	// NO value is decoded (the decoded row vector is empty), so rows are reconstructed on demand.
 	// Reconstruction produces the same inline-deferred Unfetched (form (a)) the eager fault used to.
-	node, err := decodeLeafNode(block, 2, colTypes, nil)
+	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}
@@ -393,7 +392,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 		if !bytes.Equal(node.keyAt(i), keys[i]) {
 			t.Fatalf("keyAt(%d) differs from encoded key", i)
 		}
-		if got, want := node.weightAt(i), uint32(recordSize(colTypes, keys[i], rows[i], capacity)); got != want {
+		if got, want := node.weightAt(i), uint32(recordSize(colTypes, keys[i], rows[i], plainCap(uint32(ps)))); got != want {
 			t.Fatalf("weightAt(%d) = %d, want %d", i, got, want)
 		}
 	}
@@ -420,9 +419,9 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 					ri, ci, cap(comp), len(comp))
 			}
 			// It still resolves to exactly the eager value (form (a) is decode-neutral).
-			got, err := resolveUnfetched(colTypes[ci], v.unfetched(), func(uint32) ([]byte, error) {
+			got, err := resolveUnfetched(colTypes[ci], v.unfetched(), func(pageRef) ([]byte, error) {
 				return nil, fmt.Errorf("inline values read no overflow pages")
-			})
+			}, pageCap{})
 			if err != nil {
 				t.Fatalf("row %d col %d: resolve: %v", ri, ci, err)
 			}
@@ -455,8 +454,8 @@ func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
 	}
 	takeSeq := uint32(100)
 	take := func() uint32 { takeSeq++; return takeSeq }
-	var overflow []overflowPageOut
-	payload, err := encodeLeafPAX(colTypes, keys, rows, 8192-pageHeader, take, &overflow, &chainSource{})
+	var overflow []dirtyPage
+	payload, err := encodeLeafPAX(colTypes, keys, rows, plainSealer(8192), take, &overflow, &chainSource{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +465,7 @@ func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
 	assertFaultCorrupt := func(payload []byte) {
 		t.Helper()
 		block := makePage(8192, pageLeaf, uint32(len(rows)), 0, payload)
-		if _, err := decodeLeafNode(block, 2, colTypes, nil); err == nil {
+		if _, err := decodeLeafNode(block, plainRef(2), colTypes, nil); err == nil {
 			t.Fatal("descending PAX directory must fail at leaf fault")
 		} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
 			t.Fatalf("descending PAX directory: want XX001, got %v", err)
@@ -503,21 +502,20 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 		scalarColType(scalarInt64),
 	}
 	const ps = 8192
-	capacity := ps - pageHeader
 	rows := make([]storedRow, 4)
 	for i := range rows {
 		rows[i] = storedRow{IntValue(int64(i)), TextValue(fmt.Sprintf("row-%d", i)), IntValue(int64(i) * 1000)}
 	}
 	takeSeq := uint32(100)
 	take := func() uint32 { takeSeq++; return takeSeq }
-	var ovf []overflowPageOut
+	var ovf []dirtyPage
 	keys := make([][]byte, len(rows))
 	for i := range rows {
 		key := make([]byte, 4)
 		binary.BigEndian.PutUint32(key, uint32(i))
 		keys[i] = key
 	}
-	payload, err := encodeLeafPAX(colTypes, keys, rows, capacity, take, &ovf, &chainSource{})
+	payload, err := encodeLeafPAX(colTypes, keys, rows, plainSealer(ps), take, &ovf, &chainSource{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +523,7 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 		t.Fatalf("values must stay inline, got %d overflow pages", len(ovf))
 	}
 	block := makePage(ps, pageLeaf, uint32(len(rows)), 0, payload)
-	node, err := decodeLeafNode(block, 2, colTypes, nil)
+	node, err := decodeLeafNode(block, plainRef(2), colTypes, nil)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}
@@ -533,9 +531,9 @@ func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 	// resolve a (possibly-deferred) value to its comparable eager bytes.
 	resolve := func(v Value, c int) []byte {
 		if v.Kind == ValUnfetched {
-			got, err := resolveUnfetched(colTypes[c], v.unfetched(), func(uint32) ([]byte, error) {
+			got, err := resolveUnfetched(colTypes[c], v.unfetched(), func(pageRef) ([]byte, error) {
 				return nil, fmt.Errorf("inline values read no overflow pages")
-			})
+			}, pageCap{})
 			if err != nil {
 				t.Fatalf("resolve: %v", err)
 			}

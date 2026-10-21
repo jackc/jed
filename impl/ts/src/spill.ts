@@ -553,6 +553,7 @@ function writeValue(w: ByteWriter, v: Value): void {
         case 0x02:
           w.u8(9);
           w.u32(v.ref.firstPage);
+          w.raw(v.ref.firstTag ?? NO_SPILL_TAG);
           w.u32(v.ref.storedLen);
           break;
         case 0x03:
@@ -563,12 +564,22 @@ function writeValue(w: ByteWriter, v: Value): void {
         case 0x04:
           w.u8(11);
           w.u32(v.ref.firstPage);
+          w.raw(v.ref.firstTag ?? NO_SPILL_TAG);
           w.u32(v.ref.storedLen);
           w.u32(v.ref.rawLen);
           break;
       }
       break;
   }
+}
+
+// A spilled external value's first-page pointer carries its 16-byte tag (an encrypted file's — zero
+// in a plaintext one; spec/fileformat/encrypted.md §2).
+const NO_SPILL_TAG = new Uint8Array(16);
+
+function readTag(r: SpillByteReader): Uint8Array | undefined {
+  const tag = r.bytes(16).slice();
+  return tag.some((b) => b !== 0) ? tag : undefined;
 }
 
 function readU32(r: SpillByteReader): number {
@@ -627,6 +638,7 @@ function readValue(r: SpillByteReader): Value {
         ref: {
           form: 0x02,
           firstPage: readU32(r),
+          firstTag: readTag(r),
           storedLen: readU32(r),
           rawLen: 0,
           comp: undefined,
@@ -656,6 +668,7 @@ function readValue(r: SpillByteReader): Value {
         ref: {
           form: 0x04,
           firstPage: readU32(r),
+          firstTag: readTag(r),
           storedLen: readU32(r),
           rawLen: readU32(r),
           comp: undefined,

@@ -23,6 +23,7 @@ export { splitStatements } from "../split.ts";
 export { PrivilegeSet } from "../privileges.ts";
 export type { JsParam, Row, RunResult } from "../ergonomic.ts";
 export type { SessionOptions } from "../snapshot.ts";
+export type { Argon2Params, Credential } from "../crypto.ts";
 
 type WorkerOptions = {
   backend?: "typescript";

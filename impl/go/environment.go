@@ -32,6 +32,9 @@ type Environment struct {
 	hosts  *hostRegistry
 	random RandomSource
 	clock  ClockSource
+	// keySeed, when set, makes encrypted databases draw their key material and nonces from an
+	// INSECURE seeded stream instead of the OS CSPRNG (spec/fileformat/encrypted.md §8).
+	keySeed *uint64
 }
 
 // EnvironmentBuilder accumulates an Environment's contents (environment.md §3). Every load and
@@ -46,6 +49,7 @@ type EnvironmentBuilder struct {
 	functions  []hostFuncEntry
 	random     RandomSource
 	clock      ClockSource
+	keySeed    *uint64
 }
 
 // NewEnvironmentBuilder returns an empty builder: the built-in C collation and ASCII casing, UTC and
@@ -157,6 +161,15 @@ func (b *EnvironmentBuilder) SetClockSource(c ClockSource) {
 	b.clock = c
 }
 
+// SetInsecureSeededKeyEntropy makes encrypted databases draw their key material and nonces from an
+// INSECURE splitmix64 stream seeded with seed instead of the OS CSPRNG (spec/fileformat/encrypted.md
+// §8): each database opened or created through the environment starts its own stream from seed, so
+// every core writes byte-identical encrypted files for the same history. Separate from the SQL random
+// source, so seeding uuidv4 never seeds a key. For tests and fixtures only — the keys are predictable.
+func (b *EnvironmentBuilder) SetInsecureSeededKeyEntropy(seed uint64) {
+	b.keySeed = &seed
+}
+
 // Build returns an Environment holding the builder's current contents. The maps and the function
 // list are copied (their entries are shared by reference — they are immutable), so continuing to use
 // the builder never changes the returned Environment.
@@ -178,6 +191,7 @@ func (b *EnvironmentBuilder) Build() *Environment {
 		hosts:      &hostRegistry{functions: functions},
 		random:     b.random,
 		clock:      b.clock,
+		keySeed:    b.keySeed,
 	}
 }
 
@@ -192,6 +206,7 @@ func (e *Environment) ToBuilder() *EnvironmentBuilder {
 		functions:  make([]hostFuncEntry, len(e.hosts.functions)),
 		random:     e.random,
 		clock:      e.clock,
+		keySeed:    e.keySeed,
 	}
 	for k, v := range e.collations {
 		b.collations[k] = v
@@ -310,3 +325,12 @@ func (e *Environment) fill(buf []byte) error {
 
 // nowMicros reads the installed clock: micros since the Unix epoch.
 func (e *Environment) nowMicros() int64 { return e.clock.NowMicros() }
+
+// keyStream is a fresh key-entropy stream for one encrypted database (encrypted.md §8): the OS
+// CSPRNG, or the insecure seeded stream SetInsecureSeededKeyEntropy installed.
+func (e *Environment) keyStream() RandomSource {
+	if e.keySeed != nil {
+		return NewSeededRandom(*e.keySeed)
+	}
+	return OSRandomSource()
+}

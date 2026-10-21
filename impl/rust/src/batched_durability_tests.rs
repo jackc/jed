@@ -239,7 +239,7 @@ fn relaxed_batch_reuses_only_the_floors_free_pages() {
         }
     }
     let end = db.0.storage.lock().unwrap().page_count;
-    let cap = crate::format::manifest_capacities(256).0 as u32;
+    let cap = crate::format::manifest_capacities(256, crate::format::Cap::plain(256)).0 as u32;
     assert!(
         end <= midway + cap * 2,
         "the file kept growing under relaxed churn: {midway} pages at update 200, {end} at 400"

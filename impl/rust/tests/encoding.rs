@@ -227,7 +227,8 @@ fn gin_posting_runs_match_vectors() {
     }
     for case in v["history"].as_array().unwrap() {
         let term = unhex(case["term"].as_str().unwrap());
-        let mut store = jed::storage::TableStore::new(4080, Vec::new());
+        let mut store =
+            jed::storage::TableStore::new(jed::format::Cap { c: 4080, tag: 0 }, Vec::new());
         for op in case["ops"].as_array().unwrap() {
             let op = op.as_str().unwrap();
             let key = unhex(&op[1..]);

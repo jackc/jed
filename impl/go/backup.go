@@ -50,6 +50,12 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 		}
 		snap := rt.committed
 		paging := snap.storePaging
+		if paging != nil && paging.codec() != nil {
+			// A backup of an encrypted file needs its key block taken under the key-block mutex
+			// (spec/design/encryption.md §8), not yet built (spec/fileformat/encrypted.md §10).
+			c.deregisterPin(gen, v)
+			return newError(FeatureNotSupported, "a backup of an encrypted database is not supported yet")
+		}
 		noSync := c.handoff != nil && c.handoff.opts.SkipFsync
 		_ = paging.withPager(func(p *pager) error { noSync = noSync || p.skipsSync(); return nil })
 		var fill func(writeAt func(off int64, p []byte) error) error
@@ -77,7 +83,7 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 			}
 		} else {
 			fill = func(writeAt func(off int64, p []byte) error) error {
-				_, err := snap.writeImage(st.pageSize, v+1, func(index uint32, page []byte) error {
+				_, err := snap.writeImage(st.pageSize, v+1, nil, func(index uint32, page []byte) error {
 					return writeAt(int64(index)*int64(st.pageSize), page)
 				})
 				return err
@@ -127,7 +133,10 @@ func (c *sharedCore) backupPages(paging *sharedPaging, mt meta) ([]uint32, error
 		return nil, err
 	}
 	snap := loaded.committed
+	// A backup is of a plaintext file only (backup refuses an encrypted one), so pages are read
+	// unbound.
 	read := paging.readBlock
+	readRef := func(r pageRef) ([]byte, error) { return paging.readBody(r) }
 	seen := map[uint32]bool{}
 	for p := mt.rootPage; p != 0; {
 		if seen[p] || p < rootPage || p >= mt.pageCount {
@@ -155,7 +164,7 @@ func (c *sharedCore) backupPages(paging *sharedPaging, mt meta) ([]uint32, error
 		root := store.treeRoot()
 		collectTreePages(root, reached)
 		if root != nil && root.page != 0 && anySpillable(store.colTypes) {
-			if err := collectLeafOverflowWith(read, root.page, store.colTypes, reached, map[uint32]bool{}, 1); err != nil {
+			if err := collectLeafOverflowWith(readRef, paging.cap(), root.ref(), store.colTypes, reached, map[uint32]bool{}, 1); err != nil {
 				return nil, err
 			}
 		}
@@ -236,7 +245,7 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 			return err
 		}
 	}
-	bootstrap := metaPage(uint32(ps), mt.txid, mt.rootPage, mt.pageCount, mt.freeListHead, mt.livePages)
+	bootstrap := metaPage(plainCap(uint32(ps)), uint32(ps), mt.txid, plainRef(mt.rootPage), mt.pageCount, plainRef(mt.freeListHead), mt.livePages)
 	if err := writeAt(0, bootstrap); err != nil {
 		return err
 	}

@@ -1,11 +1,15 @@
-# Encryption at rest — design (a door, not yet built)
+# Encryption at rest — design (the core variant built)
 
-> A deferred capability (CLAUDE.md §9, storage.md §6, [TODO.md](../../TODO.md)). This records
-> the intended design so nearer work does not foreclose it and so the build is a known shape.
-> Building it needs a CLAUDE.md §14 vetted-crypto decision and explicit confirmation before any
-> dependency lands; we do not roll our own crypto. When a decision here changes, update
-> CLAUDE.md §9 and storage.md §6 in the same edit. Decided points are marked **Decided**;
-> everything else is direction.
+> CLAUDE.md §9, storage.md §6, [TODO.md](../../TODO.md). **Status (2026-10-20):** the encrypted
+> file variant is built in the Rust, Go and TypeScript (Node) cores — its bytes are specified in
+> [../fileformat/encrypted.md](../fileformat/encrypted.md), pinned by the `encrypted_*` goldens and
+> [encryption_vectors.toml](../fileformat/encryption_vectors.toml), and authored independently by the
+> Ruby reference. The crypto dependencies were confirmed under CLAUDE.md §14 that day. Still to
+> build, each failing closed until then (encrypted.md §10): credential change, DEK rotation and
+> conversion, scratch encryption, page-service and replication support, encrypted backups, the
+> browser host, the corpus's encrypted mode and the simulator's growth (§7). The security review
+> (§9) is still owed. When a decision here changes, update CLAUDE.md §9 and storage.md §6 in the
+> same edit. Decided points are marked **Decided**; everything else is direction.
 
 ## 1. Threat model and guarantees
 
@@ -107,10 +111,11 @@ simulator install an explicitly insecure **seeded** source instead — the same 
 `seeded_random_source(u64)` already provides (entropy.md §2), so every core draws identical salts
 from one seed and no salt repeats. Two independent streams: one per database (pages,
 meta, key block) and one per handle (scratch), so per-core scratch framing cannot desynchronize
-page salts under the fixed source. A commit draws its salts in one batch, after every check that
-can refuse the commit and immediately before sealing, in **format.md's commit write order** (per
-table post-order, index trees, catalog chain; every chain tail first), then free-list, manifest
-and meta; images draw in stream order after the DEK, KDF salt and wrap nonce. In simulation each
+page salts under the fixed source. A commit draws one nonce per page as it seals it, after every
+check that can refuse the commit, in the **seal order** of encrypted.md §7 (per table post-order with
+a leaf's fresh chains before the leaf, index trees, the catalog chain, then the free-list chain —
+every chain last page first — then the meta); images draw in stream order after the DEK, KDF salt
+and wrap nonce. In simulation each
 process's streams are seeded from the trace seed and its process id, so an owner and its clients
 never share a stream. The engine keeps no entropy pool across commits. A `fork`ed handle is already invalid
 (locking.md §3). Live VM clones are excluded: a clone resumes with the guest RNG duplicated and
@@ -138,7 +143,8 @@ at 256 bytes the header and reserve take 22% of the page and 20-byte pointers co
 interior fan-out, a corner not worth designing for.
 
 **Pointer binding (Decided).** Every pointer carries the full 16-byte tag of the page it names:
-meta to catalog root, free-list head and manifest chain; catalog to its next page and every
+meta to catalog root and free-list head (and, through its tag's associated data, the whole manifest
+chain — encrypted.md §6); catalog to its next page and every
 root; interior to children; leaf to overflow heads; chain pages to successors. This is the
 ZFS block-pointer construction. It detects **replay** — an older genuine page copied over the
 current one from a backup, a crash remnant or a freed page — which per-page AEAD alone accepts
@@ -337,9 +343,9 @@ promoted replica finishes a torn pair from its log entry.
 
 ## 9. Open
 
-- **XAES lifetime bounds across every DEK use**, and the exact library route per core (the
-  RustCrypto `xaes-256-gcm` crate or the `aes` + `cmac` + `aes-gcm` composition in Rust; the
-  spec-fixed glue elsewhere).
+- **XAES lifetime bounds across every DEK use.** The library route is decided: every core,
+  Rust included, writes the derivation glue over its library's raw AES block (RustCrypto `aes` +
+  `aes-gcm`; Go `crypto/aes` + `crypto/cipher`; Node `node:crypto`), checked against the C2SP vectors.
 - **The security review**: the composition as a mutable page codec (the ePrint 2025/878 analysis
   covers only the CMAC derivation; the GCM composition rests on the C2SP argument), the pointer
   chain, the key-block wrap, the lifetime bounds. With the fixtures of §7 this turns direction into
@@ -348,14 +354,14 @@ promoted replica finishes a torn pair from its log entry.
   standalone page verification and a rejoined copy per library call.
 - **Key-block export/import** (the LUKS header-backup model), accepted only if the imported
   block's DEK authenticates the meta slot.
-- **Format specification**: the reserve and pointer layouts per page type, the key block's
-  encoding, the four `28Pxx` registry entries (jed-defined codes in PostgreSQL's class 28, the
-  `XX003` precedent), the scratch framings, the restated variant
-  arithmetic (inline manifest capacity falls to about 8 entries at 256-byte pages and with it the
-  `synchronous = off` batch cap; interior fan-out with 20-byte pointers; free-list entries per
-  page; `live_pages ≤ page_count − 4`), the host-API surface (credentials on `create`/`open`/
-  `attach`, change-credential, compaction with a new credential or target variant,
-  `scratch_encryption`, `read_key_block`, the `Environment` CSPRNG field), and the goldens.
+- **Format specification** — written for the built variant ([../fileformat/encrypted.md](../fileformat/encrypted.md)):
+  the reserve and pointer layouts per page type, the key block's encoding, the four `28Pxx` registry
+  entries, the restated variant arithmetic (a 1 KiB minimum page size, so the inline manifest holds
+  at least 74 entries; interior fan-out with 20-byte pointers; chain pages hold `C − 16` bytes;
+  `live_pages ≤ page_count − 4`), credentials on `create`/`open`/`attach`, the environment's
+  key-entropy source, and the goldens. Still to specify with the work that needs them: the scratch
+  framings, change-credential, compaction with a new credential or target variant,
+  `scratch_encryption`, `read_key_block`.
 - **Integrated performance** of an encrypted database; nothing above is a database benchmark. In
   particular the **browser per-page path** — two AES-CTR calls for the CMAC step, `importKey`, then
   decrypt, four asynchronous WebCrypto calls per cache miss — is unmeasured, and decides whether

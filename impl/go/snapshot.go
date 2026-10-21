@@ -538,7 +538,7 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 			}
 		}
 		// Rebuild each affected index store from the (re-keyed) rows.
-		c := pagePayload(pageSize)
+		c := s.capFor(pageSize)
 		for _, def := range indexes {
 			// The realign runs on a snapshot with no engine to evaluate an expression key; an
 			// expression index is C-collated so its keys never change on a collation upgrade, but a
@@ -1032,7 +1032,7 @@ func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize uint32) {
 	s.bumpCatGen()
 	key := t.Name
-	st := newTableStore(pagePayload(pageSize), colTypes)
+	st := newTableStore(s.capFor(pageSize), colTypes)
 	// Bind the domain's pager (snapshot.storePaging) so the new store demand-pages like a loaded one:
 	// its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
 	// instead of staying fully-resident decoded for the handle's lifetime. nil only on a bare scratch
@@ -1211,7 +1211,7 @@ func (s *snapshot) storageBytes() uint64 {
 func (s *snapshot) putIndex(tableKey string, def indexDef, pageSize uint32) {
 	s.bumpCatGen()
 	nameKey := def.Name
-	fresh := newTableStore(pagePayload(pageSize), nil)
+	fresh := newTableStore(s.capFor(pageSize), nil)
 	if s.storePaging != nil {
 		fresh.attachPaging(s.storePaging) // bind the domain pager, like putTableResolved/putIndexStore
 	}
@@ -1366,7 +1366,7 @@ func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[s
 			delete(s.indexStores, key)
 			delete(s.gistTrees, key)
 		}
-		fresh := newTableStore(pagePayload(pageSize), nil)
+		fresh := newTableStore(s.capFor(pageSize), nil)
 		if s.storePaging != nil {
 			fresh.attachPaging(s.storePaging)
 		}
@@ -1386,7 +1386,7 @@ func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][
 	}
 	for _, ix := range next.Indexes {
 		key := ix.Name
-		fresh := newTableStore(pagePayload(pageSize), nil)
+		fresh := newTableStore(s.capFor(pageSize), nil)
 		if s.storePaging != nil {
 			fresh.attachPaging(s.storePaging)
 		}
@@ -1555,4 +1555,14 @@ func (s *snapshot) findIndex(name string) (string, indexDef, bool) {
 		}
 	}
 	return "", indexDef{}, false
+}
+
+// capFor is the page capacities this snapshot's stores split at: its domain paging context's (an
+// encrypted file's layout — spec/fileformat/encrypted.md §1), else the plaintext layout at pageSize (an
+// in-memory or temp domain, or a store not yet bound to one).
+func (s *snapshot) capFor(pageSize uint32) pageCap {
+	if s.storePaging != nil {
+		return s.storePaging.cap()
+	}
+	return plainCap(pageSize)
 }

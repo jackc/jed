@@ -9,13 +9,14 @@ import { type Session, intValue } from "../src/tooling.ts";
 import { type Handle, queryOutcome } from "./util.ts";
 import { PMap, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound } from "../src/pmap.ts";
+import type { Cap } from "../src/cap.ts";
 import type { Row } from "../src/storage.ts";
 import type { Value } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
 // --- direct storage-primitive check (the page_read drop) ---
 
-const CAP = 240;
+const CAP: Cap = { c: 240, tag: 0 };
 const W = 15;
 
 function key(n: number): Uint8Array {

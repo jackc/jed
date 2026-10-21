@@ -1122,6 +1122,10 @@ export { Statement } from "./ergonomic.ts";
 export type { JsParam, JsValue, Row, RunResult } from "./ergonomic.ts";
 export { createDatabase, openDatabase } from "./file.ts";
 export type { CreateOptions, Locking, OpenOptions } from "./file.ts";
+// Encryption at rest (spec/design/encryption.md): the credential CreateOptions/OpenOptions/attachFile
+// take, and the Argon2id parameters a passphrase is stretched with at create.
+export { DEFAULT_ARGON2_PARAMS } from "./crypto.ts";
+export type { Argon2Params, Credential } from "./crypto.ts";
 // The Environment (spec/design/environment.md): every outside input except storage — loaded Unicode
 // and time-zone data, host functions (extensibility.md §4.2), and the random + clock sources — built
 // by an EnvironmentBuilder and handed to createDatabase/openDatabase via CreateOptions/OpenOptions.

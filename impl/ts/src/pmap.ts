@@ -19,6 +19,7 @@
 // TableStore). Delete rebalances by merge-then-maybe-split (no borrow — format.md "Delete"; an
 // interior merge whose result cannot 2-way split is ABANDONED).
 
+import { type Cap, capPtr } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
@@ -97,6 +98,10 @@ export type PNode = {
   // serialized.
   packed?: PackedLeaf;
   page: number;
+  // tag is the AEAD tag of the page at `page` in an encrypted file (spec/fileformat/encrypted.md §2):
+  // set with the page id by the commit that seals the node, so a parent written later binds it.
+  // Absent in a plaintext file and while the node is dirty.
+  tag?: Uint8Array;
   [mutationOwner]?: MutationGeneration;
 };
 
@@ -182,13 +187,15 @@ function decodedParts(n: PNode): { keys: Uint8Array[]; vals: Row[]; weights: num
 // resident interior skeleton node, or a materialized leaf); node === null ⇒ OnDisk(page) — always a
 // leaf, since only leaves page, which is what lets nodeCount avoid loading them. An in-memory database
 // constructs only resident refs.
-export type Child = { node: PNode | null; page: number };
+// An OnDisk child also carries the tag its parent binds (spec/fileformat/encrypted.md §2; absent in a
+// plaintext file).
+export type Child = { node: PNode | null; page: number; tag?: Uint8Array };
 
 export function residentRef(n: PNode): Child {
-  return { node: n, page: 0 };
+  return { node: n, page: 0, tag: undefined };
 }
-export function onDiskRef(page: number): Child {
-  return { node: null, page };
+export function onDiskRef(page: number, tag?: Uint8Array): Child {
+  return { node: null, page, tag };
 }
 
 // LeafSource faults a clean leaf page to a resident node on demand (pager.md §4) — the buffer pool,
@@ -196,8 +203,8 @@ export function onDiskRef(page: number): Child {
 // the storage/format layers (they implement it); a fully-resident in-memory database passes null and
 // never faults.
 export interface LeafSource {
-  loadLeaf(page: number): PNode;
-  loadLeafSteps?(page: number): Steps<PNode>;
+  loadLeaf(page: number, tag?: Uint8Array): PNode;
+  loadLeafSteps?(page: number, tag?: Uint8Array): Steps<PNode>;
 }
 
 // resolveChild resolves c to a resident node, faulting an OnDisk leaf through src. A resident ref
@@ -208,8 +215,8 @@ function* resolveChildSteps(c: Child, src: LeafSource | null): Steps<PNode> {
   if (src === null)
     throw new Error(`demand-paged leaf ${c.page} reached with no buffer-pool source`);
   return yield* src.loadLeafSteps === undefined
-    ? ioSteps(() => src.loadLeaf(c.page))
-    : src.loadLeafSteps(c.page);
+    ? ioSteps(() => src.loadLeaf(c.page, c.tag))
+    : src.loadLeafSteps(c.page, c.tag);
 }
 
 function isLeaf(n: PNode): boolean {
@@ -234,15 +241,21 @@ export function leafOverhead(n: number, shape: LeafShape): number {
 }
 
 // payload is this node's serialized size (format.md): a leaf is Σ weights + leafOverhead(N, shape);
-// an interior node is 8·N + 4 + Σ sep_len (child pointers + separator directory + key blob —
-// record-free, v24).
-function payload(n: PNode, shape: LeafShape): number {
+// an interior node is ptr·(N+1) + 4·N + Σ sep_len (child pointers + separator directory + key blob —
+// record-free, v24; ptr is 4, or 20 with an encrypted file's tags — encrypted.md §2).
+function payload(n: PNode, cap: Cap, shape: LeafShape): number {
   if (isLeaf(n)) {
     return totalWeight(n) + leafOverhead(nodeLen(n), shape);
   }
+  return interiorPayload(cap, n.keys);
+}
+
+// interiorPayload is an interior node's payload for these separators (format.md "Interior node";
+// encrypted.md §2).
+function interiorPayload(cap: Cap, keys: Uint8Array[]): number {
   let seps = 0;
-  for (const k of n.keys) seps += k.length;
-  return 8 * n.keys.length + 4 + seps;
+  for (const k of keys) seps += k.length;
+  return capPtr(cap) * (keys.length + 1) + 4 * keys.length + seps;
 }
 
 export function compareBytes(a: Uint8Array, b: Uint8Array): number {
@@ -475,7 +488,7 @@ export class PMap {
     key: Uint8Array,
     val: Row,
     weight: number,
-    cap: number,
+    cap: Cap,
     shape: LeafShape,
     src: LeafSource | null,
   ): Row | undefined {
@@ -486,7 +499,7 @@ export class PMap {
     key: Uint8Array,
     val: Row,
     weight: number,
-    cap: number,
+    cap: Cap,
     shape: LeafShape,
     src: LeafSource | null,
   ): Steps<Row | undefined> {
@@ -520,13 +533,13 @@ export class PMap {
   // cap is the page payload capacity and shape the leaf's column-class shape (the rebalance
   // threshold). src faults OnDisk leaves the delete descends into / rebalances against
   // (spec/design/pager.md §4).
-  remove(key: Uint8Array, cap: number, shape: LeafShape, src: LeafSource | null): Row | undefined {
+  remove(key: Uint8Array, cap: Cap, shape: LeafShape, src: LeafSource | null): Row | undefined {
     return runSync(this.removeSteps(key, cap, shape, src));
   }
 
   *removeSteps(
     key: Uint8Array,
-    cap: number,
+    cap: Cap,
     shape: LeafShape,
     src: LeafSource | null,
   ): Steps<Row | undefined> {
@@ -824,7 +837,7 @@ export class PMap {
         } else if (isLeaf(c.node)) {
           if (c.node.page !== 0) {
             changed = true;
-            children[i] = onDiskRef(c.node.page);
+            children[i] = onDiskRef(c.node.page, c.node.tag);
           } else {
             children[i] = c;
           }
@@ -842,7 +855,7 @@ export class PMap {
       // The rebuilt interior keeps its keys AND its page id — its serialized bytes are unchanged
       // (children reference the same pages), so it must stay clean or the next incremental commit
       // would rewrite the whole spine every time.
-      return { keys: node.keys, vals: [], weights: [], children, page: node.page };
+      return { keys: node.keys, vals: [], weights: [], children, page: node.page, tag: node.tag };
     };
     if (this.root !== null) {
       const rebuilt = demote(this.root);
@@ -990,7 +1003,7 @@ function buildLeaf(
   keys: Uint8Array[],
   vals: Row[],
   weights: number[],
-  cap: number,
+  cap: Cap,
   shape: LeafShape,
   edited: number | null,
   owner?: MutationGeneration,
@@ -999,14 +1012,14 @@ function buildLeaf(
   let total = 0;
   for (const w of weights) total += w;
   const pay = total + leafOverhead(n, shape);
-  if (pay <= cap || n < 2) return { whole: newLeaf(keys, vals, weights, owner) };
+  if (pay <= cap.c || n < 2) return { whole: newLeaf(keys, vals, weights, owner) };
 
   const prefix = new Array<number>(n + 1);
   prefix[0] = 0;
   for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + weights[i]!;
   const leftpayload = (m: number): number => prefix[m]! + leafOverhead(m, shape);
   const rightpayload = (m: number): number => total - prefix[m]! + leafOverhead(n - m, shape);
-  const m = splitPoint(1, n - 1, pay, cap, edited === n - 1, leftpayload, rightpayload);
+  const m = splitPoint(1, n - 1, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
   // Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
   // record cap"); defensively leave the node whole (0A000 at serialize).
   if (m === null) return { whole: newLeaf(keys, vals, weights, owner) };
@@ -1028,15 +1041,13 @@ function buildLeaf(
 function buildInterior(
   keys: Uint8Array[],
   children: Child[],
-  cap: number,
+  cap: Cap,
   edited: number | null,
   owner?: MutationGeneration,
 ): InsOut | null {
   const n = keys.length;
-  let seps = 0;
-  for (const k of keys) seps += k.length;
-  const pay = 8 * n + 4 + seps;
-  if (pay <= cap || n < 2) return { whole: newInterior(keys, children, owner) };
+  const pay = interiorPayload(cap, keys);
+  if (pay <= cap.c || n < 2) return { whole: newInterior(keys, children, owner) };
 
   let m: number;
   if (n === 2) {
@@ -1048,9 +1059,11 @@ function buildInterior(
     prefix[0] = 0;
     for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i]! + keys[i]!.length;
     const total = prefix[n]!;
-    const leftpayload = (mm: number): number => 8 * mm + 4 + prefix[mm]!;
-    const rightpayload = (mm: number): number => 8 * (n - 1 - mm) + 4 + (total - prefix[mm + 1]!);
-    const got = splitPoint(1, n - 2, pay, cap, edited === n - 1, leftpayload, rightpayload);
+    const ptr = capPtr(cap);
+    const leftpayload = (mm: number): number => (ptr + 4) * mm + ptr + prefix[mm]!;
+    const rightpayload = (mm: number): number =>
+      (ptr + 4) * (n - 1 - mm) + ptr + (total - prefix[mm + 1]!);
+    const got = splitPoint(1, n - 2, pay, cap.c, edited === n - 1, leftpayload, rightpayload);
     if (got === null) return null;
     m = got;
   }
@@ -1075,7 +1088,7 @@ function* nodeInsertSteps(
   ctx: InsCtx,
   generation: MutationGeneration,
   src: LeafSource | null,
-  cap: number,
+  cap: Cap,
   shape: LeafShape,
 ): Steps<InsOut> {
   if (isLeaf(n)) {
@@ -1093,7 +1106,7 @@ function* nodeInsertSteps(
         n.vals.splice(index, 0, val);
         n.weights.splice(index, 0, weight);
       }
-      if (payload(n, shape) <= cap || nodeLen(n) < 2) return { whole: n };
+      if (payload(n, cap, shape) <= cap.c || nodeLen(n) < 2) return { whole: n };
       // The unchanged builder selects the exact split point/separator. This edited node is
       // abandoned when its returned halves replace it.
       return buildLeaf(n.keys, n.vals, n.weights, cap, shape, index, generation);
@@ -1138,7 +1151,7 @@ function* nodeInsertSteps(
     n.keys.splice(i, 0, sub.sep);
     n.children[i] = residentRef(sub.left);
     n.children.splice(i + 1, 0, residentRef(sub.right));
-    if (payload(n, shape) <= cap || n.keys.length < 2) return { whole: n };
+    if (payload(n, cap, shape) <= cap.c || n.keys.length < 2) return { whole: n };
     const out = buildInterior(n.keys, n.children, cap, i, generation);
     if (out === null) throw new Error("insert-path interior split always has a valid split point");
     return out;
@@ -1172,7 +1185,7 @@ function* nodeRemoveSteps(
   n: PNode,
   key: Uint8Array,
   src: LeafSource | null,
-  cap: number,
+  cap: Cap,
   shape: LeafShape,
 ): Steps<RemOut> {
   if (isLeaf(n)) {
@@ -1213,11 +1226,11 @@ function* rebalanceChildSteps(
   n: PNode,
   i: number,
   src: LeafSource | null,
-  cap: number,
+  cap: Cap,
   shape: LeafShape,
 ): Steps<PNode> {
   // children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
-  if (payload(yield* resolveChildSteps(n.children[i], src), shape) >= cap / 2) return n;
+  if (payload(yield* resolveChildSteps(n.children[i], src), cap, shape) >= cap.c / 2) return n;
   if (n.children.length < 2) {
     // A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
     // with — its own parent merges IT away; the root case collapses in PMap.remove.
@@ -1239,7 +1252,7 @@ function* mergeAtSteps(
   n: PNode,
   j: number,
   src: LeafSource | null,
-  cap: number,
+  cap: Cap,
   shape: LeafShape,
 ): Steps<PNode> {
   // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may

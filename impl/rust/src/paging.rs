@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::bufferpool::BufferPool;
 use crate::catalog::ColType;
 use crate::error::Result;
+use crate::format::{Cap, PageRef};
 use crate::pager::Pager;
 use crate::pmap::Node;
 
@@ -46,17 +47,64 @@ pub(crate) struct SharedPaging {
     /// The store fetches several pages in one request (a page client): scans read ahead
     /// ([`prefetch_leaves`](Self::prefetch_leaves)).
     batches: bool,
+    /// An encrypted database's page codec (spec/fileformat/encrypted.md): every body page read
+    /// through this context is opened, and every commit page sealed, under its keys. `None` for a
+    /// plaintext file and every in-memory or temp store.
+    codec: Option<Arc<crate::crypto::PageCodec>>,
+    /// The capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
+    cap: Cap,
 }
 
 impl SharedPaging {
     /// Wrap an open `pager` with a CLOCK pool of `capacity` leaves.
     pub(crate) fn new(pager: Pager, capacity: usize) -> Arc<SharedPaging> {
+        SharedPaging::with_codec(pager, capacity, None)
+    }
+
+    /// [`new`](Self::new) for a file `codec` encrypts (`None`: plaintext).
+    pub(crate) fn with_codec(
+        pager: Pager,
+        capacity: usize,
+        codec: Option<Arc<crate::crypto::PageCodec>>,
+    ) -> Arc<SharedPaging> {
         let batches = pager.batches_reads();
+        let cap = Cap::of(pager.page_size(), codec.is_some());
         Arc::new(SharedPaging {
             pager: Mutex::new(pager),
             pool: BufferPool::new(capacity),
             batches,
+            codec,
+            cap,
         })
+    }
+
+    /// The database's page codec, when it is encrypted.
+    pub(crate) fn codec(&self) -> Option<&Arc<crate::crypto::PageCodec>> {
+        self.codec.as_ref()
+    }
+
+    /// The database's page capacities (plaintext or encrypted layout).
+    pub(crate) fn cap(&self) -> Cap {
+        self.cap
+    }
+
+    /// Read the body page `page` names and return its plaintext block: the stored bytes of a
+    /// plaintext file, or an encrypted page checked against the pointer's tag and opened
+    /// (encrypted.md §4) — the decryption runs outside the pager lock.
+    pub(crate) fn read_body(&self, page: PageRef) -> Result<Vec<u8>> {
+        let block = self
+            .pager
+            .lock()
+            .expect("pager mutex poisoned")
+            .read_block(page.page)?;
+        self.open_block(page, block)
+    }
+
+    fn open_block(&self, page: PageRef, block: Vec<u8>) -> Result<Vec<u8>> {
+        match &self.codec {
+            None => Ok(block),
+            Some(codec) => codec.open_body(page.page, &block, &page.tag),
+        }
     }
 
     /// Fault the clean **leaf** at `page` to a resident node, through the buffer pool: a hit returns
@@ -65,15 +113,11 @@ impl SharedPaging {
     /// page id with a caller-supplied decoder is consistent (pager.md §4).
     pub(crate) fn fault_leaf(
         self: &Arc<Self>,
-        page: u32,
+        page: PageRef,
         col_types: &Arc<Vec<ColType>>,
     ) -> Result<Arc<Node>> {
-        let node = self.pool.get_or_load(page, || {
-            let block = self
-                .pager
-                .lock()
-                .expect("pager mutex poisoned")
-                .read_block(page)?;
+        let node = self.pool.get_or_load(page.page, || {
+            let block = self.read_body(page)?;
             // Packed decode (packed-leaf.md §5): retain the page block + PAX directories, decode no
             // values — a spillable value is reconstructed as an unfetched reference only when a
             // column the query touches is read. The shared `col_types` `Arc` is cloned into the leaf
@@ -83,6 +127,7 @@ impl SharedPaging {
                 page,
                 Arc::clone(col_types),
                 Arc::downgrade(self),
+                self.cap,
             )
         })?;
         // The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
@@ -108,35 +153,41 @@ impl SharedPaging {
     /// resident into the pool with one batched store read, decoded as a fault would decode them. At
     /// most a quarter of the pool is read ahead at once, so read-ahead cannot evict the leaf the scan
     /// is on. A failure is ignored: the fault that follows reads the page again and reports it.
-    pub(crate) fn prefetch_leaves(self: &Arc<Self>, pages: &[u32], col_types: &Arc<Vec<ColType>>) {
+    pub(crate) fn prefetch_leaves(
+        self: &Arc<Self>,
+        pages: &[PageRef],
+        col_types: &Arc<Vec<ColType>>,
+    ) {
         if !self.batches {
             return;
         }
         let limit = (self.pool.capacity() / 4).max(1);
-        let missing: Vec<u32> = pages
+        let missing: Vec<PageRef> = pages
             .iter()
             .copied()
-            .filter(|&page| !self.pool.contains(page))
+            .filter(|page| !self.pool.contains(page.page))
             .take(limit)
             .collect();
         if missing.len() < 2 {
             return;
         }
+        let indices: Vec<u32> = missing.iter().map(|p| p.page).collect();
         let Ok(blocks) = self
             .pager
             .lock()
             .expect("pager mutex poisoned")
-            .read_blocks(&missing)
+            .read_blocks(&indices)
         else {
             return;
         };
         for (page, block) in missing.into_iter().zip(blocks) {
-            let _ = self.pool.get_or_load(page, || {
+            let _ = self.pool.get_or_load(page.page, || {
                 crate::format::decode_leaf_node(
-                    block,
+                    self.open_block(page, block)?,
                     page,
                     Arc::clone(col_types),
                     Arc::downgrade(self),
+                    self.cap,
                 )
             });
         }

@@ -15,6 +15,9 @@ import { compileLaneFilter, laneKeepSteps, ScratchRow } from "../src/span_filter
 import type { PNode } from "../src/pmap.ts";
 import { StmtRng } from "../src/seam.ts";
 import { intValue, textValue, type UnfetchedPager, type Value } from "../src/value.ts";
+import { plainCap } from "../src/cap.ts";
+
+const PLAIN_CAP = plainCap(256);
 
 function environment(): EvalEnv {
   const engine = new Engine();
@@ -68,13 +71,12 @@ test("an expression resumes its overflow read without replaying an earlier subqu
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const readBlock = (index: number): Uint8Array => pages.get(index)!;
   const pager: UnfetchedPager = {
-    readBlock(index) {
-      return pages.get(index)!;
-    },
-    *readBlockSteps(index): Steps<Uint8Array> {
+    cap: () => PLAIN_CAP,
+    *readBodySteps(index): Steps<Uint8Array> {
       return yield* ioSteps(
-        () => this.readBlock(index),
+        () => readBlock(index),
         async () => {
           reads.push(index);
           if (index === 7) await gate;
@@ -125,11 +127,9 @@ test("an expression resumes its overflow read without replaying an earlier subqu
 
 test("short-circuit expressions do not issue reads for an untouched deferred value", async () => {
   const pager: UnfetchedPager = {
-    readBlock() {
-      throw new Error("untouched value read synchronously");
-    },
+    cap: () => PLAIN_CAP,
     // biome-ignore lint/correctness/useYield: this step-interface implementation fails if the untouched branch is reached.
-    *readBlockSteps(): Steps<Uint8Array> {
+    *readBodySteps(): Steps<Uint8Array> {
       throw new Error("untouched value read asynchronously");
     },
   };
@@ -152,13 +152,14 @@ test("cancellation after an awaited overflow page prevents later page reads", as
   const pages = textPages(text);
   const reads: number[] = [];
   let canceled = false;
+  const readBlock = (_index: number): Uint8Array => {
+    throw new Error("async read unexpectedly used synchronous adapter");
+  };
   const pager: UnfetchedPager = {
-    readBlock() {
-      throw new Error("async read unexpectedly used synchronous adapter");
-    },
-    *readBlockSteps(index): Steps<Uint8Array> {
+    cap: () => PLAIN_CAP,
+    *readBodySteps(index): Steps<Uint8Array> {
       return yield* ioSteps(
-        () => this.readBlock(index),
+        () => readBlock(index),
         async () => {
           reads.push(index);
           await Promise.resolve();
@@ -186,13 +187,14 @@ test("columnar predicates suspend on deferred columns and reuse the resumed valu
   const text = "columnar ".repeat(50);
   const pages = textPages(text);
   const reads: number[] = [];
+  const readBlock = (_index: number): Uint8Array => {
+    throw new Error("columnar read used synchronous adapter");
+  };
   const pager: UnfetchedPager = {
-    readBlock() {
-      throw new Error("columnar read used synchronous adapter");
-    },
-    *readBlockSteps(index): Steps<Uint8Array> {
+    cap: () => PLAIN_CAP,
+    *readBodySteps(index): Steps<Uint8Array> {
       return yield* ioSteps(
-        () => this.readBlock(index),
+        () => readBlock(index),
         async () => {
           reads.push(index);
           await Promise.resolve();

@@ -479,7 +479,7 @@ impl Snapshot {
                 }
             }
             // 2b. Rebuild each affected index store from the (re-keyed) rows.
-            let cap = crate::format::page_payload(page_size);
+            let cap = self.cap_for(page_size);
             for def in &indexes {
                 // The realign runs on a Snapshot with no Engine to evaluate an expression key; an
                 // expression index is C-collated so its keys never change on a collation upgrade,
@@ -823,7 +823,7 @@ impl Snapshot {
     ) {
         self.bump_cat_gen();
         let key = table.name.to_string();
-        let cap = crate::format::page_payload(page_size);
+        let cap = self.cap_for(page_size);
         let mut st = TableStore::new(cap, col_types);
         // Bind the domain's pager (`Snapshot::store_paging`) so the new store demand-pages like a
         // loaded one: its committed leaves demote at each commit (`demote_clean_leaves`) and fault
@@ -1011,7 +1011,7 @@ impl Snapshot {
     pub(crate) fn put_index(&mut self, table_key: &str, def: IndexDef, page_size: u32) {
         self.bump_cat_gen();
         let name_key = def.name.to_string();
-        let cap = crate::format::page_payload(page_size);
+        let cap = self.cap_for(page_size);
         let mut fresh = TableStore::new(cap, Vec::new());
         if let Some(paging) = &self.store_paging {
             // Bind the domain pager, like put_table_resolved / put_index_store.
@@ -1175,7 +1175,7 @@ impl Snapshot {
                 std::sync::Arc::make_mut(&mut self.index_stores).remove(&k);
                 std::sync::Arc::make_mut(&mut self.gist_trees).remove(&k);
             }
-            let mut s = TableStore::new(crate::format::page_payload(page_size), Vec::new());
+            let mut s = TableStore::new(self.cap_for(page_size), Vec::new());
             if let Some(p) = &self.store_paging {
                 s.attach_paging(p.clone());
             }
@@ -1201,7 +1201,7 @@ impl Snapshot {
             std::sync::Arc::make_mut(&mut self.index_stores).remove(&key);
             std::sync::Arc::make_mut(&mut self.gist_trees).remove(&key);
         }
-        let cap = crate::format::page_payload(page_size);
+        let cap = self.cap_for(page_size);
         for ix in &next.indexes {
             let key = ix.name.to_string();
             let mut store = TableStore::new(cap, Vec::new());
@@ -1363,6 +1363,15 @@ impl Snapshot {
         let mut names: Vec<&String> = self.stores.keys().collect();
         names.sort();
         names.into_iter().map(|name| &self.stores[name]).collect()
+    }
+
+    /// The page capacities this snapshot's stores split at: its domain paging context's (an
+    /// encrypted file's layout — spec/fileformat/encrypted.md §1), else the plaintext layout at
+    /// `page_size` (an in-memory or temp domain, or a store not yet bound to one).
+    pub(crate) fn cap_for(&self, page_size: u32) -> crate::format::Cap {
+        self.store_paging
+            .as_ref()
+            .map_or(crate::format::Cap::plain(page_size), |p| p.cap())
     }
 
     /// This snapshot's domain paging context ([`Snapshot::store_paging`]), the pager its pages are

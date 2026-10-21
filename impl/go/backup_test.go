@@ -139,7 +139,7 @@ func TestPageIdenticalBackupCopiesReachablePagesAtTheirIndices(t *testing.T) {
 	if zeroed == 0 {
 		t.Fatalf("the fixture must leave dead pages")
 	}
-	bootstrap := metaPage(compactPage, mt.txid, mt.rootPage, mt.pageCount, mt.freeListHead, mt.livePages)
+	bootstrap := metaPage(plainCap(compactPage), compactPage, mt.txid, plainRef(mt.rootPage), mt.pageCount, plainRef(mt.freeListHead), mt.livePages)
 	if !bytes.Equal(backup[:compactPage], bootstrap) || !bytes.Equal(backup[compactPage:2*compactPage], bootstrap) {
 		t.Fatalf("both meta slots must carry the bootstrap meta")
 	}

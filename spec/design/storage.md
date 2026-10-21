@@ -370,8 +370,11 @@ sits so the options stay open (CLAUDE.md §9).
   golden, reseal its CRC, and require an engine error or success. Wrong rows from a whole-page
   transposition between same-shaped trees remain undetectable here, as above.
 - **Alternative physical layouts & direct-access API** — kept open (§5), not scheduled.
-- **Encryption at rest (file-level)** — kept open, not built (CLAUDE.md §9); **designed in
-  [encryption.md](encryption.md)**. The insertion point is a **page codec in the core, just
+- **Encryption at rest (file-level)** — **the core variant is built** in the Rust, Go and TS
+  (Node) cores (CLAUDE.md §9); **designed in [encryption.md](encryption.md)**, bytes in
+  [../fileformat/encrypted.md](../fileformat/encrypted.md). Credential change, rotation and
+  conversion, scratch encryption, page-service/replication support and the browser host are still
+  to build and fail closed meanwhile (encrypted.md §10). The insertion point is a **page codec in the core, just
   above the block seam** (a thin layer, not a per-host duty — hosts.md §6), encrypting page
   bodies with standardized AEAD and envelope encryption. Credential changes rewrap the data
   key in a dedicated double-buffered key block, never in the meta slots; data-key rotation (and

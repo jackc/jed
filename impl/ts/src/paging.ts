@@ -13,7 +13,9 @@
 // single-threaded, so unlike the Rust/Go cores this needs no lock between the read and commit paths.
 
 import type { BlockStore } from "./blockstore.ts";
+import { type Cap, capOf, NO_TAG } from "./cap.ts";
 import type { ColType } from "./catalog.ts";
+import type { PageCodec } from "./crypto.ts";
 import type { PNode } from "./pmap.ts";
 import { BufferPool } from "./bufferpool.ts";
 import { runSync, type Steps } from "./execution.ts";
@@ -42,21 +44,62 @@ export function cacheLeaves(cacheBytes: number, pageSize: number): number {
 export class SharedPaging {
   private pager: Pager;
   private pool: BufferPool;
+  // codec is an encrypted database's page codec (spec/fileformat/encrypted.md): every body page read
+  // through readBody* is opened, and every commit page sealed, under its keys. null for a plaintext
+  // file and every in-memory or temp store.
+  private readonly pageCodec: PageCodec | null;
+  // pageCap is the capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
+  private readonly pageCap: Cap;
 
-  constructor(pager: Pager, capacity: number) {
+  constructor(pager: Pager, capacity: number, codec: PageCodec | null = null) {
     this.pager = pager;
     this.pool = new BufferPool(capacity);
+    this.pageCodec = codec;
+    this.pageCap = capOf(pager.pageSize, codec !== null);
+    if (codec !== null) pager.setEncrypted();
+  }
+
+  // codec is the database's page codec, when it is encrypted.
+  codec(): PageCodec | null {
+    return this.pageCodec;
+  }
+
+  // cap is the database's page capacities (plaintext or encrypted layout).
+  cap(): Cap {
+    return this.pageCap;
+  }
+
+  // openBody returns the plaintext block of the body page index whose stored bytes are stored and
+  // whose pointer binds tag: the stored bytes of a plaintext file, or an encrypted page checked
+  // against the tag and opened (encrypted.md §4).
+  openBody(index: number, tag: Uint8Array, stored: Uint8Array): Uint8Array {
+    return this.pageCodec === null ? stored : this.pageCodec.openBody(index, stored, tag);
+  }
+
+  // readBody / readBodySteps read the body page a (page, tag) pointer names on a query's read path;
+  // readBodyPageSteps on the write side (commit, recovery, maintenance — readPageSteps).
+  readBody(index: number, tag: Uint8Array = NO_TAG): Uint8Array {
+    return runSync(this.readBodySteps(index, tag));
+  }
+
+  *readBodySteps(index: number, tag: Uint8Array = NO_TAG): Steps<Uint8Array> {
+    return this.openBody(index, tag, yield* this.pager.readBlockSteps(index));
+  }
+
+  *readBodyPageSteps(index: number, tag: Uint8Array = NO_TAG): Steps<Uint8Array> {
+    return this.openBody(index, tag, yield* this.pager.readPageSteps(index));
   }
 
   // faultLeaf faults the clean leaf at page to a resident node, through the buffer pool: a hit returns
   // the cached node, a miss reads + decodes the page (with this table's colTypes) and caches it,
   // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
-  // with a caller-supplied decoder is consistent (pager.md §4).
-  faultLeaf(page: number, colTypes: ColType[]): PNode {
-    return runSync(this.faultLeafSteps(page, colTypes));
+  // with a caller-supplied decoder is consistent (pager.md §4). tag is the tag the leaf's parent binds
+  // in an encrypted file.
+  faultLeaf(page: number, colTypes: ColType[], tag: Uint8Array = NO_TAG): PNode {
+    return runSync(this.faultLeafSteps(page, colTypes, tag));
   }
 
-  *faultLeafSteps(page: number, colTypes: ColType[]): Steps<PNode> {
+  *faultLeafSteps(page: number, colTypes: ColType[], tag: Uint8Array = NO_TAG): Steps<PNode> {
     // Materialize any external value by following its overflow chain through the pager (the leaf
     // block holds only the pointer — spec/design/large-values.md §12).
     // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
@@ -66,7 +109,13 @@ export class SharedPaging {
     // format.ts resolveUnfetchedSelf).
     const paging = this;
     const node = yield* this.pool.getOrLoadSteps(page, function* () {
-      return decodeLeafNode(yield* paging.pager.readBlockSteps(page), page, colTypes, paging);
+      return decodeLeafNode(
+        yield* paging.readBodySteps(page, tag),
+        page,
+        colTypes,
+        paging,
+        paging.pageCodec === null ? undefined : tag,
+      );
     });
     // The pool is keyed by page alone, so a pointer into another tree's leaf can return a node
     // decoded for that tree's columns. Its directories were validated against those columns, not

@@ -471,7 +471,7 @@ type storageBudget struct {
 	limit int64
 	// lastCatRoot is the catalog root the last commit wrote; 0 before the first commit (nothing to
 	// reclaim yet).
-	lastCatRoot uint32
+	lastCatRoot pageRef
 	// lastWritten is the pages the last commit wrote.
 	lastWritten []uint32
 	// lastCatalogPages is how many catalog pages the last commit wrote (the catalog is rewritten whole
@@ -481,7 +481,7 @@ type storageBudget struct {
 
 // record remembers a successful in-memory commit's catalog root and written pages.
 func (b *storageBudget) record(staged stagedCommit) {
-	b.lastCatRoot = staged.rootPage
+	b.lastCatRoot = staged.root
 	b.lastWritten = append([]uint32(nil), staged.written...)
 	b.lastCatalogPages = staged.catalogPages
 }
@@ -495,7 +495,7 @@ func (b *storageBudget) record(staged stagedCommit) {
 type stagedCommit struct {
 	// name is the attachment the commit belongs to ("" for a temp domain, which adopts in place).
 	name          string
-	rootPage      uint32
+	root          pageRef
 	pageCount     uint32
 	freeRemaining []uint32
 	// written is the pages the commit wrote (unioned into the compaction's live set; the budget record).
@@ -512,7 +512,7 @@ func newStagedCommit(name string, write incrementalWrite) stagedCommit {
 	}
 	return stagedCommit{
 		name:          name,
-		rootPage:      write.rootPage,
+		root:          write.root,
 		pageCount:     write.pageCount,
 		freeRemaining: write.freeRemaining,
 		written:       written,
@@ -698,6 +698,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 		return err
 	}
 	capReached := false
+	var sealed []byte
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(plan.pageCount); err != nil {
 			return err
@@ -709,7 +710,11 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 			st.paging.pool.invalidate(pg.index)
 		}
 		slot := p.commitSlot()
-		if err := p.writeBlock(slot, plan.meta); err != nil {
+		var err error
+		if sealed, err = sealMeta(p, slot, plan.meta, plan.manifest); err != nil {
+			return err
+		}
+		if err := p.writeBlock(slot, sealed); err != nil {
 			return err
 		}
 		if !relaxed {
@@ -717,7 +722,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 				return err
 			}
 		}
-		p.finishValidatedCommit(plan.meta, slot, !relaxed, plan.dirty)
+		p.finishValidatedCommit(sealed, slot, !relaxed, plan.dirty)
 		// Trailing truncation lowered the high-water: shorten the file once the new meta is durable —
 		// now under synchronous = on, at the batch's flush under synchronous = off — keeping one growth
 		// step of slack (pager.md §7).
@@ -728,7 +733,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 		return err
 	}
 	if st.recordCommits {
-		st.lastMeta = plan.meta
+		st.lastMeta = sealed
 		st.lastWritten = st.lastWritten[:0]
 		for _, pg := range write.pages {
 			st.lastWritten = append(st.lastWritten, pg.index)
@@ -752,7 +757,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 // (maybeCompact) — there is no reopen to worry about, so it need not be in-commit. Caller holds st.mu.
 func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canReclaim bool) error {
 	// A memory store is never reopened, so its meta carries no live-page count (memory.md §8.7).
-	meta := metaPage(st.pageSize, snap.txid, write.rootPage, write.pageCount, 0, 0)
+	meta := metaPage(plainCap(st.pageSize), st.pageSize, snap.txid, write.root, write.pageCount, pageRef{}, 0)
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
@@ -828,7 +833,7 @@ func (st *storage) admitRepair(write incrementalWrite, budget *budgetCtx) (incre
 // and rewrites no more catalog pages than the last commit). There is no forced compaction: reclaiming
 // dead pages cannot lower the measure. Caller holds st.mu.
 func (st *storage) admitFile(write incrementalWrite, budget *budgetCtx) (liveCount, error) {
-	live, err := st.live.after(write, budget.prev, st.paging, st.pageSize)
+	live, err := st.live.after(write, budget.prev, st.paging)
 	if err != nil {
 		return liveCount{}, err
 	}
@@ -854,7 +859,7 @@ func (st *storage) fits(write incrementalWrite) bool {
 // snapshot prev (the last commit's catalog root and written pages), ignoring the periodic trigger.
 // Reports whether it freed any page the free list did not already hold. Caller holds st.mu.
 func (st *storage) forceCompact(prev *snapshot) (bool, error) {
-	if st.budget.lastCatRoot == 0 {
+	if st.budget.lastCatRoot.page == 0 {
 		return false, nil // no commit yet: nothing has been orphaned
 	}
 	reached, err := prev.reachablePages(st.paging, st.budget.lastCatRoot)
@@ -865,7 +870,7 @@ func (st *storage) forceCompact(prev *snapshot) (bool, error) {
 		reached[p] = true
 	}
 	var free []uint32
-	for p := rootPage; p < st.pageCount; p++ {
+	for p := st.paging.cap().firstBody(); p < st.pageCount; p++ {
 		if !reached[p] {
 			free = append(free, p)
 		}
@@ -979,7 +984,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 	st.liveAtCompaction = loaded.liveAtCompaction
 	st.freeGenTxid = loaded.freeGenTxid
 	st.live = loaded.live
-	st.budget.lastCatRoot = 0
+	st.budget.lastCatRoot = pageRef{}
 	st.budget.lastWritten = nil
 	st.budget.lastCatalogPages = 0
 	st.dirSynced = true // compaction's own directory barrier made the new entry durable
@@ -1093,7 +1098,7 @@ func (c *sharedCore) deregisterPin(gen, v uint64) {
 // the live set so a live GiST R-tree (rewritten wholesale each commit, invisible to reachablePages) is
 // never freed. canReclaim is the caller's watermark decision — true iff no live reader/cursor pins a
 // version older than this commit.
-func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []uint32, canReclaim bool) error {
+func (st *storage) maybeCompact(snap *snapshot, catRoot pageRef, written []uint32, canReclaim bool) error {
 	if !st.reclaimWithinSession || !canReclaim {
 		return nil
 	}
@@ -1108,7 +1113,7 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []uint32
 		reached[p] = true
 	}
 	free := make([]uint32, 0, int(st.pageCount)-len(reached))
-	for p := rootPage; p < st.pageCount; p++ {
+	for p := st.paging.cap().firstBody(); p < st.pageCount; p++ {
 		if !reached[p] {
 			free = append(free, p)
 		}
@@ -1228,7 +1233,7 @@ func (st *storage) adoptStagedLocked(snap *snapshot, staged stagedCommit, canRec
 	st.pageCount = staged.pageCount
 	st.budget.record(staged)
 	st.freePages = staged.freeRemaining
-	return st.maybeCompact(snap, staged.rootPage, staged.written, canReclaim)
+	return st.maybeCompact(snap, staged.root, staged.written, canReclaim)
 }
 
 // adoptAttachments adopts the in-memory attachment commits commitTx staged, after main persisted and
@@ -1416,6 +1421,8 @@ type AttachSource struct {
 	locking           Locking
 	fileLockTimeoutMs *uint64
 	maxStorageBytes   int64 // the attachment's committed-storage limit (memory.md §8.1); <= 0 is unlimited
+	// credential unlocks an encrypted file attachment (spec/design/encryption.md §5).
+	credential *Credential
 }
 
 // AttachFileOptions controls one file attachment's independent coordination domain.
@@ -1445,6 +1452,30 @@ func AttachFileWithOptions(path string, opts AttachFileOptions) AttachSource {
 func (s AttachSource) WithMaxStorageBytes(bytes int64) AttachSource {
 	s.maxStorageBytes = bytes
 	return s
+}
+
+// WithCredential returns the source unlocking an encrypted file attachment with credential
+// (spec/design/encryption.md §5): 28P02 without one, 28P01 when it does not unwrap the key, 28P03 for
+// a plaintext file, 55000 for an in-memory source (nothing is at rest) or — until scratch encryption
+// lands — on a handle that may spill to disk (spec/fileformat/encrypted.md §10).
+func (s AttachSource) WithCredential(credential *Credential) AttachSource {
+	s.credential = credential
+	return s
+}
+
+// errCredentialWithoutFile is the 55000 for a credential on an in-memory database: nothing is at rest
+// (encryption.md §5).
+func errCredentialWithoutFile() error {
+	return newError(ObjectNotInPrerequisiteState, "an in-memory database cannot be encrypted")
+}
+
+// lockingFor is the coordination an open uses: an encrypted file is never served by the page service
+// (spec/fileformat/encrypted.md §10), so a credential turns auto into an exclusive owner.
+func lockingFor(mode Locking, credential *Credential) Locking {
+	if credential != nil && mode == LockingAuto {
+		return LockingExclusive
+	}
+	return mode
 }
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
@@ -1486,6 +1517,15 @@ type CreateOptions struct {
 	// (pageCount × pageSize, §8.2), a file-backed one its live pages (livePages × pageSize, §8.7). Zero
 	// or negative is unlimited (the default). Not stored anywhere; Database.SetMaxStorageBytes changes it.
 	MaxStorageBytes int64
+	// Credential creates the file ENCRYPTED under it (spec/design/encryption.md,
+	// spec/fileformat/encrypted.md): its pages are sealed under a random data key that only the
+	// credential unwraps. Needs a PageSize of at least 1024 (0A000 otherwise); an in-memory database
+	// with a credential is 55000. nil (the default) creates a plaintext file.
+	Credential *Credential
+	// KDF is the Argon2id parameters a passphrase credential is stretched with (the zero value is the
+	// default, RFC 9106's second recommendation; 22023 outside the format's bounds). Ignored for a host
+	// key or a plaintext file.
+	KDF Argon2Params
 }
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
@@ -1503,15 +1543,18 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		env = NewEnvironment()
 	}
 	if opts.Path == "" {
+		if opts.Credential != nil {
+			return nil, errCredentialWithoutFile()
+		}
 		db := newInMemoryWithPageSize(pageSize, env)
 		db.core.storage.budget.limit = opts.MaxStorageBytes
 		return db, nil
 	}
-	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, opts.FileLockTimeoutMs)
+	coordinator, path, err := prepareCreateCoordinator(opts.Path, lockingFor(opts.Locking, opts.Credential), opts.FileLockTimeoutMs)
 	if err != nil {
 		return nil, err
 	}
-	e, err := create(path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync, env: env})
+	e, err := create(path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync, env: env, credential: opts.Credential, kdf: opts.KDF})
 	if err != nil {
 		if coordinator != nil {
 			coordinator.close()
@@ -1577,6 +1620,7 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
+	mode = lockingFor(mode, opts.Credential)
 	if mode == LockingAuto {
 		return openServiceDatabase(path, opts)
 	}
@@ -1684,12 +1728,16 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	var coordinator *fileCoordinator
 	var svc *Database
 	var svcPath string
+	if !source.file && source.credential != nil {
+		return errCredentialWithoutFile()
+	}
 	locking := LockingNone
 	if source.file {
 		var err error
 		if locking, err = resolvedLocking(source.locking); err != nil {
 			return err
 		}
+		locking = lockingFor(locking, source.credential)
 	}
 	if source.file && locking == LockingAuto {
 		// Under the page service the attachment is owner or page client of its file, elected as an open
@@ -1709,12 +1757,21 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			return err
 		}
 		// Through main's file host (filehost.go), so the simulated filesystem serves attachments too.
-		e, err := openVia(db.core.storage.fileHost(), real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone, Environment: db.core.env})
+		e, err := openVia(db.core.storage.fileHost(), real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone, Environment: db.core.env, Credential: source.credential})
 		if err != nil {
 			if coordinator != nil {
 				coordinator.close()
 			}
 			return err
+		}
+		// Until scratch encryption lands, an encrypted attachment may not join a handle that can spill
+		// its rows to a plaintext scratch file (spec/fileformat/encrypted.md §10).
+		if e.encrypted() && db.core.storage.spill != nil {
+			_ = e.Close()
+			if coordinator != nil {
+				coordinator.close()
+			}
+			return newError(ObjectNotInPrerequisiteState, "an encrypted database cannot be attached to a handle that spills to disk")
 		}
 		st = &storage{
 			pageSize:  e.pageSize,
@@ -2028,7 +2085,13 @@ func (s *Database) Path() string { return s.core.path() }
 // harness's forced temp-spill mode (SetSpillDirForTooling). Production file hosts install os.TempDir at
 // open/create; keeping this a tooling hook keeps the configurable spill-target follow-on out of the
 // embedding API. Sessions minted afterwards inherit it.
-func (s *Database) setSpillDirForTest(dir string) { s.core.storage.spill = osSpillHost{dir: dir} }
+func (s *Database) setSpillDirForTest(dir string) {
+	// An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
+	if s.core.storage.paging != nil && s.core.storage.paging.codec() != nil {
+		return
+	}
+	s.core.storage.spill = osSpillHost{dir: dir}
+}
 
 // SetSpillDirForTooling gives db (and the sessions minted from it afterwards) a spill directory — the
 // conformance harness's forced temp-spill mode runs in-memory databases, which otherwise have none

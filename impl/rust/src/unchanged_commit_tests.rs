@@ -51,6 +51,7 @@ fn unchanged_commits_preserve_bytes_and_skip_barriers() {
         Pager::from_store(Box::new(CountingStore(count.clone()))).unwrap(),
         64,
         &crate::Environment::default(),
+        None,
     )
     .unwrap();
     engine.path = Some("counting-device".into());

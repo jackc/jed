@@ -70,7 +70,21 @@ type pnode struct {
 	// Packed→Decoded first, §7). A Packed leaf is always clean (page != 0), so it is never serialized.
 	packed *packedLeaf
 	page   uint32
-	owner  *mutationGeneration
+	// tag is the tag of the page at page (spec/fileformat/encrypted.md §2); zero in a plaintext file
+	// and while the node is dirty. Set with the page id by the commit that seals the node, so a parent
+	// written later binds it.
+	tag   pageTag
+	owner *mutationGeneration
+}
+
+// ref is this node's page and tag (the zero pageRef while dirty).
+func (n *pnode) ref() pageRef { return pageRef{page: n.page, tag: n.tag} }
+
+// setRef records the page a commit wrote this node to, or clears it (the zero pageRef) for a
+// discarded plan.
+func (n *pnode) setRef(r pageRef) {
+	n.tag = r.tag
+	n.page = r.page
 }
 
 // rowAt reconstructs value row i as a storedRow — the value-read seam (packed-leaf.md §4), on a
@@ -118,7 +132,7 @@ func (n *pnode) colSpan(i, c int) (span []byte, present, ok bool) {
 // for the touched columns mask — on a Packed leaf read off each touched variable column's stored tag
 // (spanScanUnits), on a Decoded leaf the row path's recordScanUnits over the row (Track A4; cost.md
 // §3).
-func (n *pnode) recordScanUnits(i int, colTypes []colType, capacity int, mask []bool) (pages, decompress int) {
+func (n *pnode) recordScanUnits(i int, colTypes []colType, capacity pageCap, mask []bool) (pages, decompress int) {
 	if n.packed == nil {
 		return recordScanUnits(colTypes, n.keyAt(i), n.vals[i], capacity, mask)
 	}
@@ -227,17 +241,23 @@ func (n *pnode) decodedParts() ([][]byte, []storedRow, []uint32, error) {
 type childRef struct {
 	node *pnode
 	page uint32
+	// tag is the tag an OnDisk leaf's parent binds (spec/fileformat/encrypted.md §2; zero in a
+	// plaintext file).
+	tag pageTag
 }
 
-func residentRef(n *pnode) childRef  { return childRef{node: n} }
-func onDiskRef(page uint32) childRef { return childRef{page: page} }
+func residentRef(n *pnode) childRef   { return childRef{node: n} }
+func onDiskRef(page pageRef) childRef { return childRef{page: page.page, tag: page.tag} }
+
+// ref is an OnDisk child's bound pointer.
+func (c childRef) ref() pageRef { return pageRef{page: c.page, tag: c.tag} }
 
 // leafSource faults a clean leaf page to a resident node on demand (pager.md §4) — the buffer pool,
 // behind the table's column types. Defined here so the B+tree traversal can fault without depending on
 // the storage/format layers (they implement it); a fully-resident in-memory database passes a nil
 // source and never faults.
 type leafSource interface {
-	loadLeaf(page uint32) (*pnode, error)
+	loadLeaf(page pageRef) (*pnode, error)
 }
 
 // resolveChild resolves c to a resident node, faulting an OnDisk leaf through src. A resident ref
@@ -250,20 +270,27 @@ func resolveChild(c childRef, src leafSource) (*pnode, error) {
 	if src == nil {
 		panic("demand-paged leaf reached with no buffer-pool source")
 	}
-	return src.loadLeaf(c.page)
+	return src.loadLeaf(c.ref())
 }
 
 func (n *pnode) isLeaf() bool { return len(n.children) == 0 }
 
 // payload is this node's serialized size (format.md): a leaf is Σ weights +
-// leafOverhead(N, shape); an interior node is 8·N + 4 + Σ sep_len (child pointers + separator
-// directory + key blob — record-free, v24).
-func (n *pnode) payload(shape leafShape) int {
+// leafOverhead(N, shape); an interior node is ptr·(N+1) + 4·N + Σ sep_len (child pointers +
+// separator directory + key blob — record-free, v24; ptr is 4, or 20 with an encrypted file's tags —
+// encrypted.md §2).
+func (n *pnode) payload(pcap pageCap, shape leafShape) int {
 	if n.isLeaf() {
 		return n.totalWeight() + leafOverhead(n.keyLen(), shape)
 	}
-	total := 8*len(n.keys) + 4
-	for _, k := range n.keys {
+	return interiorPayload(pcap, n.keys)
+}
+
+// interiorPayload is an interior node's payload for these separators (format.md "Interior node";
+// encrypted.md §2).
+func interiorPayload(pcap pageCap, keys [][]byte) int {
+	total := pcap.ptr()*(len(keys)+1) + 4*len(keys)
+	for _, k := range keys {
 		total += len(k)
 	}
 	return total
@@ -398,7 +425,7 @@ func (m *pMap) GetCounted(key []byte, src leafSource) (storedRow, bool, int, int
 // capacity and shape the leaf's column-class shape. Returns the previous row and true if key was
 // present (an overwrite); otherwise nil and false (a new insert, which grows the length). An
 // overwrite can change the weight, so it too may overflow and split.
-func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape leafShape, src leafSource) (storedRow, bool, error) {
+func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap pageCap, shape leafShape, src leafSource) (storedRow, bool, error) {
 	generation := m.mutationGeneration()
 	if m.root == nil {
 		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}, owner: generation}
@@ -430,7 +457,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape l
 
 // Remove deletes key. Returns the removed row and true, or (nil,false) if absent (then the map is
 // unchanged). cap is the page payload capacity (the rebalance threshold).
-func (m *pMap) Remove(key []byte, cap int, shape leafShape, src leafSource) (storedRow, bool, error) {
+func (m *pMap) Remove(key []byte, cap pageCap, shape leafShape, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		return nil, false, nil
 	}
@@ -489,7 +516,7 @@ func (m *pMap) demoteCleanLeaves() {
 				if c.node.isLeaf() {
 					if c.node.page != 0 {
 						changed = true
-						nc = onDiskRef(c.node.page)
+						nc = onDiskRef(c.node.ref())
 					}
 				} else if rebuilt := demote(c.node); rebuilt != nil {
 					changed = true
@@ -504,7 +531,7 @@ func (m *pMap) demoteCleanLeaves() {
 		// The rebuilt interior keeps its keys AND its page id — its serialized bytes are unchanged
 		// (children reference the same pages), so it must stay clean or the next incremental commit
 		// would rewrite the whole spine every time.
-		return &pnode{keys: n.keys, children: children, page: n.page}
+		return &pnode{keys: n.keys, children: children, page: n.page, tag: n.tag}
 	}
 	if m.root != nil {
 		if rebuilt := demote(m.root); rebuilt != nil {
@@ -1092,14 +1119,14 @@ func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpa
 // just-inserted/replaced record (-1 for the delete path's merge-overflow, which splits balanced). A
 // leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
 // serialized).
-func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape leafShape, edited int, owner *mutationGeneration) insOut {
+func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap pageCap, shape leafShape, edited int, owner *mutationGeneration) insOut {
 	n := len(keys)
 	payload := 0
 	for _, w := range weights {
 		payload += int(w)
 	}
 	payload += leafOverhead(n, shape)
-	if payload <= cap || n < 2 {
+	if payload <= cap.c || n < 2 {
 		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
 	}
 	prefix := make([]int, n+1)
@@ -1109,7 +1136,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape
 	total := prefix[n]
 	leftpayload := func(m int) int { return prefix[m] + leafOverhead(m, shape) }
 	rightpayload := func(m int) int { return total - prefix[m] + leafOverhead(n-m, shape) }
-	m, ok := splitPoint(1, n-1, payload, cap, edited == n-1, leftpayload, rightpayload)
+	m, ok := splitPoint(1, n-1, payload, cap.c, edited == n-1, leftpayload, rightpayload)
 	if !ok {
 		// Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
 		// record cap"); defensively leave the node whole (0A000 at serialize).
@@ -1128,13 +1155,10 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape
 // reachable with near-cap separators) the split is pinned to m = 1, producing a legal N = 0 right
 // interior (the degenerate fan-out contract). Returns ok=false when the node overflows and no valid
 // split point exists — the caller (only the interior MERGE path can hit it) abandons the merge.
-func buildInterior(keys [][]byte, children []childRef, cap int, edited int, owner *mutationGeneration) (insOut, bool) {
+func buildInterior(keys [][]byte, children []childRef, cap pageCap, edited int, owner *mutationGeneration) (insOut, bool) {
 	n := len(keys)
-	payload := 8*n + 4
-	for _, k := range keys {
-		payload += len(k)
-	}
-	if payload <= cap || n < 2 {
+	payload := interiorPayload(cap, keys)
+	if payload <= cap.c || n < 2 {
 		return insOut{whole: &pnode{keys: keys, children: children, owner: owner}}, true
 	}
 	var m int
@@ -1148,10 +1172,11 @@ func buildInterior(keys [][]byte, children []childRef, cap int, edited int, owne
 			prefix[i+1] = prefix[i] + len(k)
 		}
 		total := prefix[n]
-		leftpayload := func(m int) int { return 8*m + 4 + prefix[m] }
-		rightpayload := func(m int) int { return 8*(n-1-m) + 4 + (total - prefix[m+1]) }
+		ptr := cap.ptr()
+		leftpayload := func(m int) int { return (ptr+4)*m + ptr + prefix[m] }
+		rightpayload := func(m int) int { return (ptr+4)*(n-1-m) + ptr + (total - prefix[m+1]) }
 		var ok bool
-		m, ok = splitPoint(1, n-2, payload, cap, edited == n-1, leftpayload, rightpayload)
+		m, ok = splitPoint(1, n-2, payload, cap.c, edited == n-1, leftpayload, rightpayload)
 		if !ok {
 			return insOut{}, false
 		}
@@ -1167,7 +1192,7 @@ func buildInterior(keys [][]byte, children []childRef, cap int, edited int, owne
 // via childSlot); on overwrite it sets *old/*replaced and rebuilds with the value+weight replaced
 // (which may now overflow). Splits propagate back up: a leaf split copies its boundary key up, an
 // interior receiving a separator may push-split in turn.
-func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, generation *mutationGeneration, src leafSource, cap int, shape leafShape) (insOut, error) {
+func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, generation *mutationGeneration, src leafSource, cap pageCap, shape leafShape) (insOut, error) {
 	if n.isLeaf() {
 		i, found := n.search(key)
 		// Only this active generation may own a dirty node. A clone/cursor/publication invalidates the
@@ -1183,7 +1208,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 				n.vals = insertValAtMutable(n.vals, i, val)
 				n.weights = insertWeightAtMutable(n.weights, i, weight)
 			}
-			if n.payload(shape) <= cap || n.keyLen() < 2 {
+			if n.payload(cap, shape) <= cap.c || n.keyLen() < 2 {
 				return insOut{whole: n}, nil
 			}
 			// The unchanged builder selects the exact split point/separator. The edited node is
@@ -1225,7 +1250,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 		n.keys = insertKeyAtMutable(n.keys, i, sub.sep)
 		n.children[i] = residentRef(sub.left)
 		n.children = insertChildAtMutable(n.children, i+1, residentRef(sub.right))
-		if n.payload(shape) <= cap || len(n.keys) < 2 {
+		if n.payload(cap, shape) <= cap.c || len(n.keys) < 2 {
 			return insOut{whole: n}, nil
 		}
 		out, ok := buildInterior(n.keys, n.children, cap, i, generation)
@@ -1253,15 +1278,15 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 
 // underfull: a non-root node is underfull when its payload is below half a page (cap/2), the
 // threshold at which delete rebalances it (format.md "Delete"). The root is exempt.
-func underfull(n *pnode, cap int, shape leafShape) bool {
-	return n.payload(shape) < cap/2
+func underfull(n *pnode, cap pageCap, shape leafShape) bool {
+	return n.payload(cap, shape) < cap.c/2
 }
 
 // nodeRemove is the recursive delete (copy-on-write). It descends to the holding LEAF (a separator
 // equal to the key just routes right — it is never itself deleted or replaced; separators may go
 // stale, format.md "Delete"). Returns the rebuilt subtree (possibly underfull — the caller
 // rebalances it) and the removed row. The touched child is rebalanced via rebalanceChild.
-func nodeRemove(n *pnode, key []byte, src leafSource, cap int, shape leafShape) (*pnode, storedRow, bool, error) {
+func nodeRemove(n *pnode, key []byte, src leafSource, cap pageCap, shape leafShape) (*pnode, storedRow, bool, error) {
 	if n.isLeaf() {
 		i, found := n.search(key)
 		if !found {
@@ -1300,7 +1325,7 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int, shape leafShape) 
 // one), then split the merged node back if it overflows — the unified rebalance (no borrow). The
 // returned parent may itself have lost a key and become underfull; its own parent handles that as
 // the recursion unwinds.
-func rebalanceChild(n *pnode, i int, src leafSource, cap int, shape leafShape) (*pnode, error) {
+func rebalanceChild(n *pnode, i int, src leafSource, cap pageCap, shape leafShape) (*pnode, error) {
 	// children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
@@ -1329,7 +1354,7 @@ func rebalanceChild(n *pnode, i int, src leafSource, cap int, shape leafShape) (
 // separator replace the pair (the parent's key count is unchanged). An INTERIOR M that overflows
 // but admits no valid split (near-cap separators) ABANDONS the merge — the parent is returned
 // unchanged (format.md "Delete", the deterministic abandon rule).
-func mergeAt(n *pnode, j int, src leafSource, cap int, shape leafShape) (*pnode, error) {
+func mergeAt(n *pnode, j int, src leafSource, cap pageCap, shape leafShape) (*pnode, error) {
 	// Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
 	// still be an OnDisk leaf the delete never touched.
 	left, err := resolveChild(n.children[j], src)

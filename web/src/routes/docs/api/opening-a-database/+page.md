@@ -179,6 +179,51 @@ compact; a page client's `compact` also fails with `55006`. A read-only database
 free disk space for a second copy of the live data, and keeps the file's permission bits but not
 its owner.
 
+## Encrypting a database
+
+A file database can be created **encrypted**. Every page except the small header pages is sealed
+with XAES-256-GCM under a random data key, and only your credential can unwrap that key. Pointers
+between pages carry each page's authentication tag, so a tampered or swapped-in page fails with
+`XX001` instead of returning wrong rows. Pass a credential when you create the file, and the same
+credential every time you open or attach it:
+
+```rust
+let key: [u8; 32] = load_key_from_your_secret_store();
+let db = Database::create(CreateOptions {
+    path: Some("secret.jed".into()),
+    credential: Some(Credential::Key(key)), // or Credential::Passphrase(...)
+    ..Default::default()
+})?;
+let db = Database::open_with_options("secret.jed", OpenOptions { credential: Some(Credential::Key(key)), ..Default::default() })?;
+```
+
+In Go, set `CreateOptions.Credential` / `OpenOptions.Credential` to `jed.KeyCredential(key)` or
+`jed.PassphraseCredential(s)`, and attach with `jed.AttachFile(path).WithCredential(c)`. In
+TypeScript (Node), pass `credential: { key }` (a 32-byte `Uint8Array`) or `credential: { passphrase }`
+to `createDatabase` / `openDatabase`, and to `attachFile(path, { credential })`.
+
+A credential is either a **32-byte key** your application keeps elsewhere (a key management service,
+the OS keychain) or a **passphrase**, which jed stretches with Argon2id (64 MiB, 3 passes, 4 lanes by
+default; Rust `kdf`, Go `KDF`, TypeScript `kdf` on create change it). jed never stores the credential,
+and it never appears in a setting, a query, or an error message. An encrypted file needs a page size
+of at least 1024 bytes.
+
+| Error | When |
+|---|---|
+| `28P01` | the credential does not unlock the file |
+| `28P02` | an encrypted file was opened without a credential |
+| `28P03` | a credential was given for a file that is not encrypted |
+| `55000` | a credential was given for an in-memory database |
+| `0A000` | the page size is below 1024, or the host is the browser (OPFS), which cannot open encrypted files yet |
+
+Encryption protects the file's contents at rest: backups, snapshots and copies of the file, and
+anyone who can read the disk. It does not hide the file's size or how many commits it has had, and
+it cannot protect a process that is already running with the key. Some features are not available
+for encrypted databases yet and refuse rather than run unprotected: changing the credential or
+rotating the key, sharing the file between processes (an encrypted file is opened exclusively),
+spilling large sorts and joins to temporary files (they stay in memory), backups, and the `jed`
+command-line tool. Compaction (above) works and keeps the same key.
+
 ## In-memory databases
 
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your

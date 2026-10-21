@@ -9,7 +9,10 @@
 // (the Node-`fs`-free seam, hosts.md §5) rather than through here.
 
 import type { Rows } from "./api.ts";
-import type { Engine, Outcome } from "./executor.ts";
+import { createCodec, type Credential, DEFAULT_ARGON2_PARAMS } from "./crypto.ts";
+import type { Engine, Outcome, Snapshot } from "./executor.ts";
+import { toImage as toImageBytes } from "./format.ts";
+import { seededRandomSource } from "./seam.ts";
 import { FileSpillSink } from "./spillfile.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";
@@ -138,7 +141,24 @@ export function executeScript(db: Engine, sql: string): ScriptSummary {
 // runtime-private core here does not widen lib.ts.
 export function setSpillDirForTest(db: object, dir: string): void {
   const internal = db as { core: { storage: Engine } };
-  internal.core.storage.spillSink = new FileSpillSink(dir);
+  const storage = internal.core.storage;
+  // An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
+  if (storage.paging !== null && storage.paging.codec() !== null) return;
+  storage.spillSink = new FileSpillSink(dir);
+}
+
+// encryptedImageForTesting is the from-scratch image of a Database's committed snapshot in the
+// encrypted variant, under a fresh key block for credential whose key material — and every page nonce
+// after it — comes from the insecure stream seeded with seed (spec/fileformat/encrypted.md §8): the
+// bytes an encrypted_* golden pins. Test-only.
+export function encryptedImageForTesting(
+  db: object,
+  seed: bigint,
+  credential: Credential,
+): Uint8Array {
+  const internal = db as { core: { committed: Snapshot; storage: Engine } };
+  const codec = createCodec(credential, DEFAULT_ARGON2_PARAMS, seededRandomSource(seed));
+  return toImageBytes(internal.core.committed, internal.core.storage.pageSize, 1n, codec);
 }
 
 // hangUpNextPageServiceAckForTesting makes a serving page-service owner drop the connection instead of
