@@ -175,6 +175,8 @@ export class ServiceOwner implements ServiceOwnerHandle {
       }
     }
     owner.state.resetLocked(txid, meta, false);
+    // The worker checks and reseals an encrypted client commit's meta (encrypted.md §14).
+    owner.state.setKeyLocked(paging.codec()?.dataKey() ?? null);
     // The service sees the owner's batched-durability state (validated-cow.md §4): it flushes a pending
     // batch before granting a begin_write and writes a client commit's meta to the non-floor slot.
     paging.setBatchMirror(owner.state);
@@ -246,6 +248,8 @@ export class ServiceOwner implements ServiceOwnerHandle {
   // invalid, and the worker reopens its file handle. The caller holds the lock (and no pin exists).
   compactedLocked(txid: bigint, paging: SharedPaging, facts: ServiceEngineFacts): void {
     this.state.resetLocked(txid, readCommittedMeta(paging, txid), true);
+    // A rekey replaced the data key, or encrypted or decrypted the file (encrypted.md §12).
+    this.state.setKeyLocked(paging.codec()?.dataKey() ?? null);
     paging.setBatchMirror(this.state);
     this.state.setEngineFactsLocked(facts.freeGenTxid, facts.liveAtCompaction, facts.localOldest);
   }

@@ -37,6 +37,7 @@ module SimGen
     "max_query_memory_bytes" => [0],
     "max_storage_bytes" => [0],
     "synchronous" => ["on"],
+    "encrypted" => [0],
     "steps" => 300,
     "max_tables" => 3,
     "max_rows" => 300,
@@ -54,7 +55,8 @@ module SimGen
       "commit" => 9, "rollback" => 2, "check" => 2, "reopen" => 1, "clock" => 1,
       "crash_power" => 1, "crash_process" => 1, "compact" => 0, "backup" => 0,
       "spawn" => 0, "exit" => 0, "kill" => 0, "disconnect" => 0,
-      "attach" => 0, "corrupt" => 0, "temp_table" => 0, "temp_insert" => 0, "temp_read" => 0
+      "attach" => 0, "corrupt" => 0, "temp_table" => 0, "temp_insert" => 0, "temp_read" => 0,
+      "change_key" => 0, "rekey" => 0
     },
     "values" => {
       "short" => 10, "long_compressible" => 3, "long_incompressible" => 3, "null" => 2, "uuid" => 1
@@ -63,6 +65,7 @@ module SimGen
       "commit_fault" => 150, "chain" => 150, "power_loss" => 5, "process_crash" => 3,
       "io_error_write" => 1, "io_error_sync" => 1, "read_error" => 0, "enospc" => 0, "disconnect" => 0,
       "compact_fault" => 300, "backup_fault" => 0, "nth_max" => 1, "attach_fault" => 0, "spill_fault" => 0,
+      "key_fault" => 0,
       "survive" => [100, 900], "tear" => [0, 400], "issue" => [200, 900], "io_p" => [50, 500],
       "flips" => [1, 3], "reseal" => 0, "frames_max" => 8
     }
@@ -182,6 +185,10 @@ module SimGen
       # that leaves it at "on" generates exactly the traces it did before the mode existed.
       synchronous = knob_value(@p["synchronous"])
       header << "# synchronous: #{synchronous}" if synchronous != "on"
+      # Encryption at rest (slice S12): main is encrypted under host key 0, its key entropy seeded by the
+      # trace's seed, so the cores' images stay byte-identical.
+      @encrypted = knob_value(@p["encrypted"]) == 1
+      header << "# encrypted: 1" if @encrypted
       header << "# processes: service" if @service
       header << "# clock: 1700000000000000"
       bootstrap
@@ -232,6 +239,8 @@ module SimGen
       when "crash_power" then crash_power
       when "crash_process" then crash_process
       when "compact" then compact
+      when "change_key" then key_step("change_key") if @encrypted
+      when "rekey" then key_step("rekey") if @encrypted
       when "backup" then backup
       when "spawn" then spawn if @service
       when "exit" then exit_process if @service
@@ -391,6 +400,21 @@ module SimGen
       dbs = @attached.select { |_, v| v == :yes }.keys.sort
       db = dbs.empty? || @rng.chance(500) ? nil : @rng.pick(dbs)
       emit(db ? "compact #{db}" : "compact")
+      fault_kills(line, @procs.min) if faulted
+    end
+
+    # A credential change or a rekey of main (slice S12, encryption.md §5) to host key 1–3. A fault may
+    # land at any of the change's barriers (between its two key-block writes) or the rekey's (as
+    # compaction's); recovery must then open with exactly one of the old and new keys. A rekey fails
+    # 55006 with a session open, which the model records like any outcome.
+    def key_step(kind)
+      faulted = @rng.chance(@p.dig("faults", "key_fault"))
+      if faulted
+        k = @rng.chance(500) ? "power_loss survive=#{draw('survive')} tear=#{draw('tear')}" : "process_crash issue=#{draw('issue')}"
+        line = "fault #{k} nth=#{@rng.range(1, 3)}"
+        emit(line)
+      end
+      emit("#{kind} #{@rng.range(1, 3)}")
       fault_kills(line, @procs.min) if faulted
     end
 

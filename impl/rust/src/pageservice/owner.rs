@@ -181,7 +181,7 @@ impl ServiceWindow {
     pub(crate) fn new(incarnation: Id16, txid: u64, meta: Vec<u8>) -> ServiceWindow {
         let page_count = crate::format::meta_txid_and_page_count(&meta).map_or(0, |(_, n)| n);
         let mut resolution = VecDeque::new();
-        resolution.push_back((txid, crate::format::commit_crc64(0, &meta)));
+        resolution.push_back((txid, crate::format::resolution_digest(&meta)));
         ServiceWindow {
             incarnation,
             meta,
@@ -196,7 +196,7 @@ impl ServiceWindow {
     /// Seed the resolution window with the commit before the recovered one (README.md §4).
     pub(crate) fn seed_previous(&mut self, txid: u64, meta: &[u8]) {
         self.resolution
-            .push_front((txid, crate::format::commit_crc64(0, meta)));
+            .push_front((txid, crate::format::resolution_digest(meta)));
     }
 
     pub(crate) fn incarnation(&self) -> Id16 {
@@ -236,7 +236,7 @@ impl ServiceWindow {
 
     fn record_resolution(&mut self, txid: u64, meta: &[u8]) {
         self.resolution
-            .push_back((txid, crate::format::commit_crc64(0, meta)));
+            .push_back((txid, crate::format::resolution_digest(meta)));
         while self.resolution.len() > RESOLUTION_WINDOW_COMMITS {
             self.resolution.pop_front();
         }
@@ -1466,7 +1466,9 @@ impl PageServiceOwner {
         if w.delta.is_some() || w.failure.is_some() {
             return Err(violation("commit_begin twice in one write transaction"));
         }
-        let delta = match begin_delta(&w.check, m) {
+        let delta = match begin_delta(&w.check, m)
+            .and_then(|delta| shared.page_service_check_meta(&delta).map(|()| delta))
+        {
             Ok(delta) => delta,
             Err(e) => {
                 w.failure = Some(e);
@@ -1560,10 +1562,10 @@ impl PageServiceOwner {
         conn: &ServerConn,
         request_id: u32,
         base: u64,
-        delta: Delta,
+        mut delta: Delta,
     ) -> Result<Option<Message>> {
         let commit = self.commit_lock.lock().expect("commit lock poisoned");
-        if shared.page_service_commit_delta(&delta).is_err() {
+        if shared.page_service_commit_delta(&mut delta).is_err() {
             drop(commit);
             self.stop_serving();
             {

@@ -145,6 +145,14 @@ fn main() -> ExitCode {
         // session state — session-local temp tables, a spanning transaction, a sticky lifetime budget,
         // or a pre-built fixture image (spec/design/conformance.md §3). These are `# skip: disk` and
         // covered by the memory pass only; none exercises the on-disk faulted read path anyway.
+        *CURRENT_FILE.lock().unwrap() = rel.to_string();
+        // The encrypted mode's ledger: a file whose rows or errors legitimately differ in the
+        // encrypted variant (a limit's trip point, a record near the cap) says so with a reason.
+        if encrypted_mode() && parse_skip(&text, "encrypted") {
+            println!("SKIP {rel}  (encrypted-mode)");
+            skipped += 1;
+            continue;
+        }
         if disk && (is_conc || parse_skip(&text, "disk")) {
             println!("SKIP {rel}  (disk-mode)");
             skipped += 1;
@@ -201,6 +209,14 @@ fn main() -> ExitCode {
         }
     }
 
+    if encrypted_mode() {
+        mode = format!("{mode}, encrypted");
+        if let Ok(path) = std::env::var("JED_CONFORMANCE_TRANSCRIPT") {
+            let mut lines = TRANSCRIPT.lock().unwrap().join("\n");
+            lines.push('\n');
+            std::fs::write(&path, lines).expect("write the encrypted-mode transcript");
+        }
+    }
     println!("\n[{mode}] {passed} passed, {failed} failed, {skipped} skipped");
     if service_mode {
         println!(
@@ -894,8 +910,45 @@ fn take_param_value(s: &str) -> std::result::Result<(jed::Value, &str), String> 
     Ok((value, rest))
 }
 
+/// The encrypted mode's transcript (spec/design/encryption.md §7): its cost-bearing outputs — every
+/// `# cost:` record's cost and every EXPLAIN's rows — which follow the variant's page capacity, so
+/// they are compared across cores (`JED_CONFORMANCE_TRANSCRIPT`) instead of against the corpus.
+static TRANSCRIPT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static CURRENT_FILE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn encrypted_mode() -> bool {
+    mode_credential().is_some()
+}
+
+/// Record one cost-bearing output in the encrypted mode's transcript.
+fn transcribe(kind: &str, sql: &str, actual: &str) {
+    let file = CURRENT_FILE.lock().unwrap().clone();
+    let flat = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+    };
+    TRANSCRIPT
+        .lock()
+        .unwrap()
+        .push(format!("{file}\t{kind}\t{}\t{}", flat(sql), flat(actual)));
+}
+
+/// Whether `sql` is an EXPLAIN, whose estimates are cost-bearing output.
+fn is_explain(sql: &str) -> bool {
+    sql.trim_start()
+        .get(..7)
+        .is_some_and(|w| w.eq_ignore_ascii_case("explain"))
+}
+
 /// Assert the accrued execution cost matches a pending `# cost:` directive (if any).
 fn assert_cost(expected: Option<i64>, actual: i64, sql: &str) -> std::result::Result<(), String> {
+    if encrypted_mode() {
+        if expected.is_some() {
+            transcribe("cost", sql, &actual.to_string());
+        }
+        return Ok(());
+    }
     match expected {
         Some(e) if e != actual => Err(format!(
             "cost mismatch: expected {e}, got {actual}\n  SQL: {sql}"
@@ -953,6 +1006,14 @@ fn creates_temp_table(text: &str) -> bool {
     upper.contains("CREATE TEMP ") || upper.contains("CREATE TEMPORARY ")
 }
 
+/// The encrypted mode's credential (`JED_CONFORMANCE_ENCRYPTED=1`, spec/design/encryption.md §7): the
+/// disk mode with every database file encrypted under a fixed host key.
+fn mode_credential() -> Option<jed::Credential> {
+    std::env::var("JED_CONFORMANCE_ENCRYPTED")
+        .is_ok_and(|v| v == "1")
+        .then_some(jed::Credential::Key([0x4A; 32]))
+}
+
 fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // A Drop guard removes the disk-mode temp image on every exit path (memory mode: no temp file),
     // together with the `<path>.lock/` coordination bundle opening it created beside it
@@ -1000,6 +1061,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             skip_fsync: true,
             locking,
             environment: env.clone(),
+            credential: mode_credential(),
             ..Default::default()
         })
         .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
@@ -1217,6 +1279,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     skip_fsync: true, // fsync=off (throwaway image)
                     locking,
                     environment: env.clone(),
+                    credential: mode_credential(),
                     ..Default::default()
                 },
             )
@@ -1379,7 +1442,9 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 let cols = coltypes.len().max(1);
                 let actual = render_drained(&outcome, cols, sortmode);
                 let expected = apply_sort(expected, cols, sortmode);
-                if !results_match(&expected, &actual, coltypes, cols, sortmode) {
+                if encrypted_mode() && is_explain(&sql) {
+                    transcribe("rows", &sql, &actual.join(" "));
+                } else if !results_match(&expected, &actual, coltypes, cols, sortmode) {
                     return Err(format!(
                         "query result mismatch\n  SQL: {sql}\n  expected: {expected:?}\n  actual:   {actual:?}"
                     ));

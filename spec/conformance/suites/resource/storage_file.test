@@ -7,6 +7,8 @@
 # limit after each reopen. A jed-specific resource contract, not a PostgreSQL limit. Pages are 8192
 # bytes; a t row holds a 1000-byte value, so a batch of ten rows fills about one and a half leaves.
 # skip: memory — an in-memory database measures its page high-water instead (storage_memory.test)
+# skip: encrypted — the limit's trip point follows the live page count, which the encrypted
+# variant's smaller page capacity raises (spec/design/encryption.md §7)
 # requires: query.select, query.aggregates, query.set_returning, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.secondary_index, ddl.gist_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, types.text, types.range, resource.storage_file
 
 statement ok

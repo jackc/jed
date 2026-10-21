@@ -202,7 +202,10 @@ the revoked write pin's `txid`. An `abort` clears the revocation silently.
 first waits for any commit past its point of no return to be published, then answers from its
 resolution window (§4): 0 when the window holds `txid` with this digest, 1 when it holds `txid` with
 another digest or `txid` is above the committed `txid`, 2 otherwise. A commit's `digest` is CRC-64/ECMA-182
-(the validated-COW manifest CRC, initial value 0) of the complete meta page the commit published.
+(the validated-COW manifest CRC, initial value 0) of the complete meta page the commit published —
+in the encrypted variant with its CRC field (offset 32) and its 40-byte reserve zeroed, since the owner
+reseals a client's meta for the slot it writes ([../fileformat/encrypted.md](../fileformat/encrypted.md)
+§14) and the client holds the bytes it sent.
 
 ### 3.6 Ownership (phase 4); reserved codes
 

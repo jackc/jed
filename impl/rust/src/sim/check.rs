@@ -17,9 +17,7 @@ use crate::blockstore::MemoryBlockStore;
 use crate::catalog::IndexKind;
 use crate::collation::Collation;
 use crate::executor::{Engine, Snapshot, encode_pk_key, index_entry_keys_columns};
-use crate::format::{
-    ROOT_PAGE, chain_pages, collect_tree_pages, reachable_pages, sim_selected_meta,
-};
+use crate::format::{chain_pages, collect_tree_pages, reachable_pages, sim_selected_meta};
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, cache_leaves};
 use crate::shared::Database;
@@ -30,7 +28,11 @@ use std::sync::Arc;
 
 /// Check `image` holds version `want` and is structurally sound; returns the meta's live page
 /// count, page high-water, and the loaded free list's length.
-pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), String> {
+pub(crate) fn integrity(
+    image: &[u8],
+    want: u64,
+    credential: Option<&crate::crypto::Credential>,
+) -> Result<(u32, u32, u32), String> {
     let pager = Pager::from_store(Box::new(MemoryBlockStore::new(image.to_vec())))
         .map_err(|e| format!("open: {e}"))?;
     let page_size = pager.page_size();
@@ -38,7 +40,7 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
         pager,
         cache_leaves(DEFAULT_CACHE_BYTES, page_size),
         &crate::environment::Environment::default(),
-        None,
+        credential,
     )
     .map_err(|e| format!("open: {e}"))?;
     let paging = engine
@@ -54,8 +56,12 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
     }
     let snap = &engine.committed;
 
-    let reached = reachable_pages(snap, &paging, crate::format::PageRef::plain(mt.root_page))
-        .map_err(|e| format!("reachability walk: {e}"))?;
+    let root = crate::format::PageRef {
+        page: mt.root_page,
+        tag: mt.root_tag,
+    };
+    let reached =
+        reachable_pages(snap, &paging, root).map_err(|e| format!("reachability walk: {e}"))?;
     if reached.len() as u32 != mt.live_pages {
         return Err(format!(
             "live page count {}, but {} pages are reachable",
@@ -65,10 +71,12 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
     }
     let mut sorted: Vec<u32> = reached.iter().copied().collect();
     sorted.sort();
+    // An encrypted file's body pages start after its key block (encrypted.md §1).
+    let first = paging.cap().first_body();
     for pg in sorted {
-        if pg < ROOT_PAGE || pg >= mt.page_count {
+        if pg < first || pg >= mt.page_count {
             return Err(format!(
-                "reachable page {pg} outside [{ROOT_PAGE}, {})",
+                "reachable page {pg} outside [{first}, {})",
                 mt.page_count
             ));
         }
@@ -78,9 +86,9 @@ pub(crate) fn integrity(image: &[u8], want: u64) -> Result<(u32, u32, u32), Stri
         if seen.contains(&pg) {
             return Err(format!("free page {pg} listed twice"));
         }
-        if pg < ROOT_PAGE || pg >= mt.page_count {
+        if pg < first || pg >= mt.page_count {
             return Err(format!(
-                "free page {pg} outside [{ROOT_PAGE}, {})",
+                "free page {pg} outside [{first}, {})",
                 mt.page_count
             ));
         }

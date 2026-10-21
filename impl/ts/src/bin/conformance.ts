@@ -11,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -31,6 +32,8 @@ import {
   textValue,
   type Value,
 } from "../value.ts";
+import { type Credential, preferAsyncCryptoForTesting } from "../crypto.ts";
+import { installWebCrypto } from "../crypto_web.ts";
 import {
   AdvancingClock,
   attachMemory,
@@ -670,8 +673,41 @@ function parseClockAdvanceDirective(line: string): [bigint, bigint] | null {
   }
 }
 
+// The encrypted mode's transcript (spec/design/encryption.md §7): its cost-bearing outputs — every
+// `# cost:` record's cost and every EXPLAIN's rows — which follow the variant's page capacity, so
+// they are compared across cores (JED_CONFORMANCE_TRANSCRIPT) instead of against the corpus.
+const transcript: string[] = [];
+let currentFile = "";
+
+// modeCredential is the encrypted mode's credential (JED_CONFORMANCE_ENCRYPTED=1,
+// spec/design/encryption.md §7): the disk mode with every database file encrypted under a fixed host
+// key. undefined when the mode is off.
+function modeCredential(): Credential | undefined {
+  return encryptedMode() ? { key: new Uint8Array(32).fill(0x4a) } : undefined;
+}
+
+function encryptedMode(): boolean {
+  return process.env.JED_CONFORMANCE_ENCRYPTED === "1";
+}
+
+// transcribe records one cost-bearing output in the encrypted mode's transcript.
+function transcribe(kind: string, sql: string, actual: string): void {
+  const flat = (s: string) =>
+    s.replaceAll("\\", "\\\\").replaceAll("\n", "\\n").replaceAll("\t", "\\t");
+  transcript.push(`${currentFile}\t${kind}\t${flat(sql)}\t${flat(actual)}`);
+}
+
+// isExplain reports whether sql is an EXPLAIN, whose estimates are cost-bearing output.
+function isExplain(sql: string): boolean {
+  return /^explain/i.test(sql.trimStart());
+}
+
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
 function assertCost(expected: bigint | null, actual: bigint, sql: string): void {
+  if (encryptedMode()) {
+    if (expected !== null) transcribe("cost", sql, actual.toString());
+    return;
+  }
   if (expected !== null && expected !== actual) {
     throw new Error(`cost mismatch: expected ${expected}, got ${actual}\n  SQL: ${sql}`);
   }
@@ -878,7 +914,11 @@ function drive<T>(steps: Steps<T>): Promise<T> {
 // created by the synchronous create before the codec existed, also out of scope there.
 async function openAsyncCodec(path: string, env: Environment): Promise<Database> {
   const engine = await drive(
-    openWithTransformSteps(path, { skipFsync: true, environment: env }, new AsyncIdentityCodec()),
+    openWithTransformSteps(
+      path,
+      { skipFsync: true, environment: env, credential: modeCredential() },
+      new AsyncIdentityCodec(),
+    ),
   );
   return Database.fromEngine(engine);
 }
@@ -918,6 +958,7 @@ async function runFile(text: string, disk: boolean): Promise<void> {
         skipFsync: true,
         environment: env,
         locking: serviceLocking(),
+        credential: modeCredential(),
       });
     } catch (e) {
       rmSync(tmpDir, { recursive: true, force: true });
@@ -1150,6 +1191,7 @@ async function runFile(text: string, disk: boolean): Promise<void> {
               skipFsync: true,
               environment: env,
               locking: serviceLocking(),
+              credential: modeCredential(),
             });
         dbHandle.setMaxStorageBytes("main", mainStorageLimit);
         attachDb = dbHandle;
@@ -1310,7 +1352,9 @@ async function runFile(text: string, disk: boolean): Promise<void> {
         const ok = coltypes.includes("R")
           ? rowsEqual(coltypes, cols, actual, exp)
           : arrEq(actual, exp);
-        if (!ok) {
+        if (encryptedMode() && isExplain(sql)) {
+          transcribe("rows", sql, actual.join(" "));
+        } else if (!ok) {
           throw new Error(
             `query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
           );
@@ -1697,6 +1741,13 @@ async function main(): Promise<number> {
   // a synchronous page read left on a query, DDL, or commit path fails with that codec's error. It
   // skips exactly the files the disk mode skips.
   asyncCodec = process.argv.slice(2).includes("async-codec");
+  // With the encrypted mode (JED_CONFORMANCE_ENCRYPTED=1), the async-codec mode's reopens unlock and
+  // seal through the WebCrypto backend (crypto_web.ts), the browser's: every page open and seal is an
+  // awaited stage (encryption.md §9).
+  if (asyncCodec && encryptedMode()) {
+    installWebCrypto();
+    preferAsyncCryptoForTesting(true);
+  }
   const disk = service || asyncCodec || process.argv.slice(2).includes("disk");
   let mode = asyncCodec ? "disk, async codec" : disk ? "disk" : "memory";
   if (service) {
@@ -1739,7 +1790,15 @@ async function main(): Promise<number> {
       continue;
     }
     peakRel = rel;
+    currentFile = rel;
     const isConc = isConcurrencyFormat(text);
+    // The encrypted mode's ledger: a file whose rows or errors legitimately differ in the encrypted
+    // variant (a limit's trip point, a record near the cap) says so with a reason.
+    if (encryptedMode() && parseSkip(text, "encrypted")) {
+      console.log(`SKIP ${rel}  (encrypted-mode)`);
+      skipped++;
+      continue;
+    }
     // Disk mode cannot run a file whose semantics can't survive a per-record REOPEN: the concurrency
     // driver (multi-session schedule on one Database), or a file carrying reopen-fragile session state —
     // session-local temp tables, a spanning transaction, a sticky lifetime budget, or a pre-built
@@ -1771,6 +1830,11 @@ async function main(): Promise<number> {
     }
   }
 
+  if (encryptedMode()) {
+    mode += ", encrypted";
+    const path = process.env.JED_CONFORMANCE_TRANSCRIPT;
+    if (path !== undefined) writeFileSync(path, transcript.join("\n") + "\n");
+  }
   console.log(`\n[${mode}] ${passed} passed, ${failed} failed, ${skipped} skipped`);
   if (asyncCodec) {
     const { encoded, decoded } = AsyncIdentityCodec;

@@ -176,6 +176,13 @@ impl Shared {
             file_lock_timeout_ms: source.file_lock_timeout_ms,
             environment: self.env.clone(),
             max_storage_bytes: source.max_storage_bytes,
+            credential: source.credential.clone(),
+            // The attachment seals its scratch files when the handle does (encryption.md §6).
+            scratch_encryption: if spill.as_ref().is_some_and(|s| s.encrypts()) {
+                crate::file::ScratchEncryption::On
+            } else {
+                crate::file::ScratchEncryption::Auto
+            },
             // The attachment follows the handle's synchronous setting (validated-cow.md §4).
             synchronous: if relaxed {
                 crate::file::Synchronous::Off
@@ -224,7 +231,14 @@ impl Shared {
                 storage.files = Some(Arc::clone(files));
             }
             if let Some(spill) = &hosts.spill {
-                storage.spill = Some(Arc::clone(spill));
+                // Sealed when the handle asks, or for an encrypted database (encryption.md §6).
+                let encrypt = opts.scratch_encryption == crate::file::ScratchEncryption::On
+                    || storage.paging.codec().is_some();
+                storage.spill = Some(crate::file::seal_scratch(
+                    Arc::clone(spill),
+                    encrypt,
+                    &opts.environment,
+                ));
             }
         }
         let handoff = ServiceHandoff {
@@ -433,7 +447,9 @@ impl Shared {
             .get()
             .expect("promotion runs under the page service");
         let files = handoff.file_host();
-        let engine = Engine::open_via(
+        // An encrypted database's client promotes with the data key it holds (encryption.md §8).
+        let held = stale.paging.as_ref().and_then(|p| p.codec().cloned());
+        let engine = Engine::open_via_held(
             files.as_ref(),
             &handoff.path,
             OpenOptions {
@@ -441,6 +457,7 @@ impl Shared {
                 environment: self.env.clone(),
                 ..handoff.opts.clone()
             },
+            held,
         )?;
         let paging = engine
             .paging
@@ -779,9 +796,28 @@ impl Shared {
         if !all && txid <= cache.adopted {
             return Ok(());
         }
+        // The owner may have rekeyed the file since this client unlocked it (encryption.md §8):
+        // the meta must still be of the variant the client opened, and authenticate under its key.
+        let suite = meta.get(6).copied().unwrap_or(0);
+        match (paging.codec().is_some(), suite != 0) {
+            (false, true) => {
+                return Err(EngineError::new(
+                    SqlState::CredentialRequired,
+                    "the database was encrypted since this handle opened it; reopen it with a credential",
+                ));
+            }
+            (true, false) => return Err(stale_key()),
+            _ => {}
+        }
         conn.set_meta(meta);
         paging.pager().refresh_allocated_pages()?;
-        let engine = Engine::open_shared_paging(Arc::clone(paging), &self.env)?;
+        let engine = match Engine::open_shared_paging(Arc::clone(paging), &self.env) {
+            Ok(engine) => engine,
+            Err(e) if e.state == SqlState::DataCorrupted && !held_key_authenticates(paging) => {
+                return Err(stale_key());
+            }
+            Err(e) => return Err(e),
+        };
         {
             let mut storage = self.storage.lock().expect("storage lock not poisoned");
             if !self.role_is(role) {
@@ -1124,4 +1160,18 @@ pub(crate) fn open_service_with(
             Ok(db)
         }
     }
+}
+
+/// `28P04`: the owner rekeyed the database, so this client's data key no longer opens it.
+fn stale_key() -> EngineError {
+    EngineError::new(
+        SqlState::StaleKey,
+        "the database was rekeyed since this handle opened it; reopen it",
+    )
+}
+
+/// Whether the client's held key authenticates the meta it was just served, under either slot
+/// index (a client is served the meta without its slot — encrypted.md §14).
+fn held_key_authenticates(paging: &crate::paging::SharedPaging) -> bool {
+    crate::format::meta_authenticates(paging).unwrap_or(true)
 }

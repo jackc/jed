@@ -165,7 +165,7 @@ readers.
 | `commit_status(txid, manifest_digest)` | Resolve an unacknowledged commit after a lost connection (§8.4). |
 | `snapshot_stream(txid, form)` | Reserved. The ratified design streamed a pinned snapshot for backup from the owner; backup instead reads pages with `read_pages` (§9). |
 | `subscribe(from_txid)` | Stream retained commit deltas, then the live tail (§10). |
-| `read_key_block()` | Encrypted databases, with the encryption format: return a stable image of the key block (the selected copy; a backup writes it to both pages), served under the lock a credential change holds. How a page client unlocks at open and re-checks after a compaction reload or owner change, and what a backup copies instead of reading pages 2–3 ([encryption.md](encryption.md) §8). A credential change itself is owner-only; a client's request is refused (`55000`, encryption.md §5). |
+| (no `read_key_block`) | Decided when the encrypted page service landed: a page client reads the key-block pages 2–3 with `read_pages` and selects a copy itself (encryption.md §5's selection already tolerates a change in progress), and a backup writes the selected copy to both pages of the copy. A credential change is owner-only; a client's request is refused (`55000`). No message was added ([../fileformat/encrypted.md](../fileformat/encrypted.md) §14). |
 | `request_ownership()` | Ask a yielding owner to step aside (§8.2). |
 
 The message catalog, framing, and field encodings are data-shaped and belong in a shared spec table
@@ -493,11 +493,10 @@ byte-identical to the local handle's, whether `jed pages` relays or owns (`tests
   meta** (zero manifest fields, both slots on the same root — validated-cow.md) for that root, with
   the snapshot's `txid`, page count, free-list head, and live count, so the copy opens without the
   original's last manifest. The result has the original's page numbering, so it can seed a replica
-  (§10). In an encrypted database the backup also copies the **key block** (pages 2–3), which no
-  pointer reaches — taken **before** the page walk through the dedicated `read_key_block`
-  operation, which the owner serves under the lock a credential change holds, so the image is a
-  complete pair at one generation rather than two possibly-torn page reads; a backup without it
-  would hold no wrapped key ([encryption.md](encryption.md) §8).
+  (§10). In an encrypted database the backup also writes the **key block** (pages 2–3), which no
+  pointer reaches: the selected copy of the two pages it reads, to both pages, so the image holds a
+  complete pair at one generation; a backup without it would hold no wrapped key
+  ([encryption.md](encryption.md) §8, [../fileformat/encrypted.md](../fileformat/encrypted.md) §13).
 - **Compacted** (the SQLite `VACUUM INTO` analogue). A client pins a snapshot and runs the existing
   streaming `compact` image writer locally against it, writing a fresh, renumbered file at the
   snapshot's `txid + 1`: byte-for-byte the file host compaction ([api.md](api.md) §2.6) would leave

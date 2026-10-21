@@ -59,6 +59,11 @@ export class SharedPaging {
     if (codec !== null) pager.setEncrypted();
   }
 
+  // trustsMeta reports whether the pager trusts the meta it is served (a page client's — pager.ts).
+  trustsMeta(): boolean {
+    return this.pager.trustMeta;
+  }
+
   // codec is the database's page codec, when it is encrypted.
   codec(): PageCodec | null {
     return this.pageCodec;
@@ -83,11 +88,19 @@ export class SharedPaging {
   }
 
   *readBodySteps(index: number, tag: Uint8Array = NO_TAG): Steps<Uint8Array> {
-    return this.openBody(index, tag, yield* this.pager.readBlockSteps(index));
+    return yield* this.openBodySteps(index, tag, yield* this.pager.readBlockSteps(index));
   }
 
   *readBodyPageSteps(index: number, tag: Uint8Array = NO_TAG): Steps<Uint8Array> {
-    return this.openBody(index, tag, yield* this.pager.readPageSteps(index));
+    return yield* this.openBodySteps(index, tag, yield* this.pager.readPageSteps(index));
+  }
+
+  // openBodySteps is openBody as a continuation step: an asynchronous codec's open is awaited
+  // (crypto.ts PageCodec).
+  *openBodySteps(index: number, tag: Uint8Array, stored: Uint8Array): Steps<Uint8Array> {
+    const codec = this.pageCodec;
+    if (codec === null) return stored;
+    return yield* codec.openBodySteps(index, stored, tag);
   }
 
   // faultLeaf faults the clean leaf at page to a resident node, through the buffer pool: a hit returns
@@ -163,8 +176,10 @@ export class SharedPaging {
   settleTruncationSteps(pageCount: number, lowered: boolean, durable: boolean): Steps<void> {
     return this.pager.settleTruncationSteps(pageCount, lowered, durable);
   }
+  // writeSideAsync reports whether the write side awaits: an asynchronous device or page transform, or
+  // an asynchronous page codec (ts-runtime.md §11.4).
   writeSideAsync(): boolean {
-    return this.pager.writeSideAsync();
+    return this.pager.writeSideAsync() || (this.pageCodec?.async ?? false);
   }
   // setPageTransform installs the page codec (the seam of ts-runtime.md §11.5).
   setPageTransform(transform: PageTransform | null): void {

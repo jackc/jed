@@ -371,3 +371,15 @@ export function* validateCommitMetaSteps(
   for (const entry of entries) manifestIds.add(entry.index);
   return manifestIds;
 }
+
+// resolutionDigest is a commit's commit_status digest (spec/pageservice/README.md §3.5): the CRC-64 of
+// its meta page, with — in the encrypted variant (byte 6 nonzero) — the CRC field (32..36) and the
+// 40-byte reserve zeroed, so the meta a client sent and the meta its owner resealed for the slot it
+// wrote resolve alike, a successor owner seeding its window from disk included (encrypted.md §14).
+export function resolutionDigest(meta: Uint8Array): bigint {
+  if (meta.length < 8 || meta[6] === 0) return crc64Update(0n, meta);
+  const m = meta.slice();
+  m.fill(0, 32, 36);
+  m.fill(0, m.length - 40);
+  return crc64Update(0n, m);
+}

@@ -8,6 +8,7 @@ package jed
 // into the open file rather than rewriting it.
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,6 +40,25 @@ const (
 	// (spec/design/validated-cow.md §4).
 	SynchronousOff
 )
+
+// ScratchEncryption is whether a handle seals its scratch files — spill runs, hash partitions, row
+// spools and spilled temp domains (spec/design/encryption.md §6, spec/fileformat/encrypted.md §11).
+// Fixed at open/create for the handle's life.
+type ScratchEncryption uint8
+
+const (
+	// ScratchEncryptionAuto (the default) seals them when the main database is encrypted.
+	ScratchEncryptionAuto ScratchEncryption = iota
+	// ScratchEncryptionOn always seals them, so the handle may attach encrypted databases while
+	// keeping its scratch target.
+	ScratchEncryptionOn
+)
+
+// scratchHost is the handle's scratch target: private files in the OS temp directory, sealed when
+// encrypt with keys from a scratch stream of env's key entropy.
+func scratchHost(encrypt bool, env *Environment) spillHost {
+	return sealScratch(osSpillHost{dir: os.TempDir()}, encrypt, env)
+}
 
 // databaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // PageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -94,11 +114,9 @@ func createVia(files fileHost, path string, opts databaseOptions) (*engine, erro
 	}
 	db := newEngineIn(env)
 	db.path = path
-	// An encrypted database never spills plaintext: it has no scratch target until scratch encryption
-	// lands (spec/fileformat/encrypted.md §10).
-	if codec == nil {
-		db.spill = osSpillHost{dir: os.TempDir()}
-	}
+	// An encrypted database never spills plaintext: its scratch files are sealed
+	// (spec/design/encryption.md §6).
+	db.spill = scratchHost(codec != nil, env)
 	db.pageSize = opts.PageSize
 	db.committed.txid = 1                                                // the initial empty image is committed as txid 1
 	if err := db.writeFullImage(files, opts.noSync, codec); err != nil { // lay down the from-scratch image; later commits are incremental
@@ -186,9 +204,13 @@ type OpenOptions struct {
 	MaxStorageBytes int64
 	// Credential unlocks an encrypted file (spec/design/encryption.md §5): required for one (28P02
 	// without it, 28P01 when it does not unwrap the key), refused for a plaintext file (28P03). A handle
-	// argument only — never stored, never shown. An encrypted file is never served by the page service,
-	// so a credential turns LockingAuto into an exclusive owner.
+	// argument only — never stored, never shown. Under the page service every process holds the data
+	// key: a page client unlocks with its own credential (spec/fileformat/encrypted.md §14).
 	Credential *Credential
+	// ScratchEncryption is whether the handle seals its scratch files (spec/design/encryption.md §6):
+	// ScratchEncryptionAuto, the default, seals them when the database is encrypted. An encrypted file
+	// attachment needs a handle whose scratch files are sealed (55000 otherwise).
+	ScratchEncryption ScratchEncryption
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -212,6 +234,15 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 
 // openVia is openWithOptions through the file host files (filehost.go).
 func openVia(files fileHost, path string, opts OpenOptions) (*engine, error) {
+	return openViaHeld(files, path, opts, nil)
+}
+
+// openViaHeld is openVia for a page client promoting itself to owner with the data key it already
+// holds (held, spec/design/encryption.md §8): the DEK alone opens the file, so a credential changed
+// since the client unlocked does not stop it. The held codec adopts the file's selected key-block copy,
+// and a differing pair is left unrepaired (a process without the credential cannot know which copy it
+// would be writing).
+func openViaHeld(files fileHost, path string, opts OpenOptions, held *pageCodec) (*engine, error) {
 	cacheBytes := opts.CacheBytes
 	if cacheBytes <= 0 {
 		cacheBytes = defaultCacheBytes
@@ -232,16 +263,27 @@ func openVia(files fileHost, path string, opts OpenOptions) (*engine, error) {
 	if env == nil {
 		env = NewEnvironment()
 	}
-	db, err := loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
+	var db *engine
+	if held != nil {
+		if err = adoptHeldCodec(p, held); err == nil {
+			db, err = loadEngineSharedPaging(newSharedPaging(p, cacheLeaves(cacheBytes, p.pageSize)), env)
+		}
+	} else {
+		db, err = loadEnginePagedCredential(p, cacheLeaves(cacheBytes, p.pageSize), env, opts.Credential)
+	}
 	if err != nil {
 		_ = store.close()
 		return nil, err
 	}
 	db.path = path
-	// An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
-	if !db.encrypted() {
-		db.spill = osSpillHost{dir: os.TempDir()}
+	if held == nil && !opts.ReadOnly {
+		if err := db.repairKeyBlock(); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
+	// An encrypted database seals its scratch files (spec/design/encryption.md §6).
+	db.spill = scratchHost(db.encrypted() || opts.ScratchEncryption == ScratchEncryptionOn, env)
 	db.readOnly = opts.ReadOnly
 	if opts.WorkMem != 0 {
 		db.session.workMem = opts.WorkMem
@@ -384,6 +426,15 @@ func writeAtomic(files fileHost, path string, bytes []byte, noSync bool) error {
 // fails, old stays closed and poisoned, so the handle must be reopened. Returns the replacement paging
 // context, a pool of capacity leaves over the new file.
 func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, txid uint64, old *sharedPaging, capacity int) (*sharedPaging, error) {
+	// An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
+	// (spec/design/encryption.md §5).
+	return rewriteFile(files, path, snap, pageSize, txid, old, capacity, old.codec(), "", 0)
+}
+
+// rewriteFile is compactFile under codec (nil: plaintext) instead of old's — DEK rotation and
+// conversion write the rebuilt snap this way (spec/design/encryption.md §5). With a positive limit,
+// an image whose live pages exceed database name's max_storage_bytes fails 54P06 before the rename.
+func rewriteFile(files fileHost, path string, snap *snapshot, pageSize uint32, txid uint64, old *sharedPaging, capacity int, codec *pageCodec, name string, limit int64) (*sharedPaging, error) {
 	var noSync bool
 	_ = old.withPager(func(p *pager) error { noSync = p.skipsSync(); return nil })
 	// Rename over the real file, never over a symlink naming it (the symlink keeps pointing at it).
@@ -392,17 +443,24 @@ func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, t
 		return nil, err
 	}
 	tmp := real + ".jedtmp"
-	// An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
-	// (spec/design/encryption.md §5).
-	codec := old.codec()
+	var pageCount uint32
 	if err := files.writeFile(tmp, real, noSync, func(writeAt func(off int64, p []byte) error) error {
-		_, err := snap.writeImage(pageSize, txid, codec, func(index uint32, page []byte) error {
+		var err error
+		pageCount, err = snap.writeImage(pageSize, txid, codec, func(index uint32, page []byte) error {
 			return writeAt(int64(index)*int64(pageSize), page)
 		})
 		return err
 	}); err != nil {
 		files.remove(tmp)
 		return nil, err
+	}
+	if limit > 0 {
+		// A from-scratch image has no free page: every body page is live (memory.md §8.7).
+		live := pageCount - capOf(pageSize, codec != nil).firstBody()
+		if int64(live)*int64(pageSize) > limit {
+			files.remove(tmp)
+			return nil, errStorageLimit(name, limit)
+		}
 	}
 
 	// Close the old file before the rename: Windows cannot replace a file that is still open.
@@ -436,6 +494,38 @@ func compactFile(files fileHost, path string, snap *snapshot, pageSize uint32, t
 	}
 	p.codec = codec
 	return newSharedPaging(p, capacity), nil
+}
+
+// repairKeyBlock finishes a credential change a crash interrupted (spec/design/encryption.md §5): when
+// the two key-block copies differ, the opener that unwrapped the selected copy writes it over the
+// other, between barriers. A read-only open leaves the pair alone, which is safe because selection
+// already prefers the newer copy.
+func (db *engine) repairKeyBlock() error {
+	if !db.encrypted() {
+		return nil
+	}
+	codec := db.paging.codec()
+	return db.paging.withPager(func(p *pager) error {
+		page2, err := p.readBlock(2)
+		if err != nil {
+			return err
+		}
+		page3, err := p.readBlock(3)
+		if err != nil {
+			return err
+		}
+		if bytes.Equal(page2, page3) {
+			return nil
+		}
+		stale := unselectedKeyPage(page2, page3)
+		if err := p.sync(); err != nil {
+			return err
+		}
+		if err := p.writeBlock(stale, codec.keyBlockPage(int(db.pageSize))); err != nil {
+			return err
+		}
+		return p.sync()
+	})
 }
 
 // encrypted reports whether this database's file is encrypted (spec/fileformat/encrypted.md).

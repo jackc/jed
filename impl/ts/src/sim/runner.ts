@@ -13,9 +13,11 @@ import { EngineError, engineError } from "../errors.ts";
 import type { Engine } from "../executor.ts";
 // The Node file host registers the file compactor, the attach opener, and the directory barrier the
 // engine reaches through Engine.fileHost (here the simulated filesystem).
-import { close as closeEngine, createVia, openServiceWith } from "../file.ts";
+import { type Credential, osKeyEntropy, sealScratch, unlockCodec } from "../crypto.ts";
+import { runSync } from "../execution.ts";
+import { close as closeEngine, createVia, openServiceWith, repairKeyBlockSteps } from "../file.ts";
 import { backupForTesting } from "../backup.ts";
-import { loadEngine, loadEnginePaged, trailingRun } from "../format.ts";
+import { loadEngine, loadEnginePaged, trailingRun, unlockPagerSteps } from "../format.ts";
 import { growthStep, Pager } from "../pager.ts";
 import type { PageClient } from "../pageservice/client.ts";
 import { readFreeListChain } from "../pageservice/delta.ts";
@@ -135,6 +137,14 @@ export function parseTrace(text: string): SimTrace {
       case "compact":
         if (f.length > 2) throw new Error(`line ${n + 1}: compact [<database>]`);
         st.sid = f.length === 2 ? f[1]! : "main";
+        break;
+      case "change_key":
+      case "rekey":
+        // S12: a credential change or rekey of main to simulation key 1–3.
+        if (f.length !== 2 || !["1", "2", "3"].includes(f[1]!)) {
+          throw new Error(`line ${n + 1}: ${st.kind} 1|2|3`);
+        }
+        st.sid = f[1]!;
         break;
       case "corrupt":
         parseParams(st, f.slice(1), n + 1);
@@ -498,6 +508,12 @@ class SimRandom implements RandomSource {
   }
 }
 
+// SIM_KEYS are the simulation's host keys (S12): key n is 32 bytes of 0x4A + n, so key 0 is the
+// goldens' (spec/fileformat/verify.rb tries all four on an encrypted image).
+const SIM_KEYS: Credential[] = [0, 1, 2, 3].map((n) => ({
+  key: new Uint8Array(32).fill(0x4a + n),
+}));
+
 export class SimRunner {
   private tr: SimTrace;
   private seed: bigint;
@@ -551,6 +567,14 @@ export class SimRunner {
   imagePrefix = ""; // when set, each recovery's image is written to <prefix>.step<N>[.<db>].img
   private backups = 0; // backup steps run, naming each destination
 
+  // Encryption at rest (slice S12, spec/fileformat/encrypted.md): main is encrypted under simulation
+  // key `key`, its key entropy seeded by the trace's seed.
+  private encrypted: boolean;
+  private key = 0;
+  // A credential change or rekey of this step: [old key, new key]. Recovery after it probes the key
+  // block, which exactly one of them must unlock.
+  private keyChange: [number, number] | null = null;
+
   constructor(tr: SimTrace) {
     this.tr = tr;
     this.seed = parseUint64(tr.header.get("seed"));
@@ -560,7 +584,11 @@ export class SimRunner {
     this.cacheBytes = atoi(tr.header.get("cache_bytes"));
     this.clock = parseInt64(tr.header.get("clock"));
     const clock: ClockSource = { nowMicros: () => this.clock };
-    this.environment = Environment.builder().randomSource(this.random).clockSource(clock).build();
+    this.encrypted = tr.header.get("encrypted") === "1";
+    let env = Environment.builder().randomSource(this.random).clockSource(clock);
+    // Seeded so the cores' images stay byte-identical (encrypted.md §8).
+    if (this.encrypted) env = env.insecureSeededKeyEntropy(this.seed);
+    this.environment = env.build();
     this.workMem = atoi(tr.header.get("work_mem"));
     this.tempBuffers = atoi(tr.header.get("temp_buffers"));
     this.maxQueryMemory = parseInt64(tr.header.get("max_query_memory_bytes"));
@@ -570,6 +598,86 @@ export class SimRunner {
     if (sector <= 0) sector = SECTOR_DEFAULT;
     this.fs = new SimFS(this.seed, sector, ps);
     this.service = tr.header.get("processes") === "service";
+  }
+
+  // credential is main's credential: simulation key `key`, or none for a plaintext trace.
+  private credential(): Credential | undefined {
+    return this.encrypted ? SIM_KEYS[this.key] : undefined;
+  }
+
+  // unlocks reports whether simulation key k unwraps image's key block.
+  private unlocks(image: Uint8Array, k: number): boolean {
+    const ps = this.pageSize;
+    try {
+      unlockCodec(
+        image.subarray(2 * ps, 3 * ps),
+        image.subarray(3 * ps, 4 * ps),
+        SIM_KEYS[k]!,
+        osKeyEntropy(),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // settleKey: after a crash that interrupted a credential change or rekey (S12), exactly one of the
+  // old and new keys unlocks main's key block, and the new one when the step had succeeded (its last
+  // barrier ran). The runner continues with whichever unlocks.
+  private settleKey(i: number, image: Uint8Array): boolean {
+    const change = this.keyChange;
+    this.keyChange = null;
+    if (change === null) return this.followKey(i, image);
+    const [old, next] = change;
+    if (image.length < 4 * this.pageSize) {
+      this.fail(i, "encryption: the key block is gone");
+      return false;
+    }
+    const acknowledged = this.key === next;
+    if (old === next) {
+      // A change to the key already in use: it must still unlock.
+      if (!this.unlocks(image, next)) {
+        this.fail(i, `encryption: key ${next} no longer unlocks main`);
+        return false;
+      }
+      this.emit(`{"i":${i},"op":"unlocked","key":${next}}`);
+      return true;
+    }
+    const a = this.unlocks(image, old);
+    const b = this.unlocks(image, next);
+    if (a && !b && !acknowledged) this.key = old;
+    else if (!a && b) this.key = next;
+    else if (a && !b) {
+      this.fail(i, `durability: the acknowledged change to key ${next} was lost`);
+      return false;
+    } else {
+      this.fail(
+        i,
+        `encryption: key ${old} unlocks: ${a}, key ${next} unlocks: ${b}; want exactly one`,
+      );
+      return false;
+    }
+    this.emit(`{"i":${i},"op":"unlocked","key":${this.key}}`);
+    return true;
+  }
+
+  // followKey: recovery outside a key step. A rekey whose rename was not yet durable in its directory
+  // may come back as the older file under its older key (validated-cow.md §3), so main opens with
+  // whichever simulation key unlocks the recovered key block, the current one first.
+  private followKey(i: number, image: Uint8Array): boolean {
+    if (!this.encrypted || image.length < 4 * this.pageSize) return true;
+    const order = [this.key, ...[0, 1, 2, 3].filter((k) => k !== this.key)];
+    for (const k of order) {
+      if (this.unlocks(image, k)) {
+        if (k !== this.key) {
+          this.key = k;
+          this.emit(`{"i":${i},"op":"unlocked","key":${k}}`);
+        }
+        return true;
+      }
+    }
+    this.fail(i, "encryption: no simulation key unlocks main");
+    return false;
   }
 
   private fail(step: number, msg: string): void {
@@ -754,17 +862,21 @@ export class SimRunner {
   private openEngine(store: BlockStore): Engine {
     const pager = Pager.fromStore(store);
     const cache = this.cacheBytes > 0 ? this.cacheBytes : DEFAULT_CACHE_BYTES;
+    const codec = runSync(unlockPagerSteps(pager, this.credential(), this.environment));
     const e = loadEnginePaged(
-      new SharedPaging(pager, cacheLeaves(cache, pager.pageSize)),
+      new SharedPaging(pager, cacheLeaves(cache, pager.pageSize), codec),
       this.environment,
     );
     e.path = MAIN_FILE; // marks the engine durable; the simulated filesystem is its only storage
+    // A writable open finishes a credential change a crash interrupted (encrypted.md §5).
+    runSync(repairKeyBlockSteps(e));
     // Create, compaction, and attachments go through the simulated filesystem.
     e.fileHost = this.fs;
     e.persistHook = persistImpl;
     e.relaxed = this.relaxed;
-    // Spill and temp-table spill scratch files, whose operations can fail.
-    e.spillSink = this.fs.spillSink();
+    // Spill and temp-table spill scratch files, whose operations can fail; sealed for an encrypted
+    // database (encrypted.md §11).
+    e.spillSink = sealScratch(this.fs.spillSink(), this.encrypted, this.environment);
     return e;
   }
 
@@ -777,7 +889,15 @@ export class SimRunner {
     // Create the database through the simulated filesystem, as the host's create does: a temp file,
     // its sync, the rename, and the directory barrier (S4).
     try {
-      closeEngine(createVia(this.fs, MAIN_FILE, { pageSize: this.pageSize }));
+      closeEngine(
+        createVia(
+          this.fs,
+          MAIN_FILE,
+          this.encrypted
+            ? { pageSize: this.pageSize, credential: SIM_KEYS[0], environment: this.environment }
+            : { pageSize: this.pageSize },
+        ),
+      );
     } catch (e) {
       this.violation = "create: " + errText(e);
       return;
@@ -953,7 +1073,13 @@ export class SimRunner {
         this.stepCheck(i);
         break;
       case "compact":
-        this.stepCompact(i, st.sid);
+        this.stepCompact(i, st.sid, null);
+        break;
+      case "rekey":
+        this.stepCompact(i, "main", Number(st.sid));
+        break;
+      case "change_key":
+        this.stepChangeKey(i, Number(st.sid));
         break;
       case "backup":
         this.stepBackup(i, st);
@@ -1003,7 +1129,10 @@ export class SimRunner {
     }
     // Checked against the floor this step leaves (a flush in the step moved it).
     for (const d of this.order()) if (!this.checkTruncated(i, d)) return false;
-    if (armed === null) return true;
+    if (armed === null) {
+      this.keyChange = null;
+      return true;
+    }
     if (armed.kind === "disconnect") {
       // A lost connection ends no process: its client re-elects at its next begin.
       const how = this.net.disconnected ? "frame" : "end";
@@ -1686,10 +1815,13 @@ export class SimRunner {
   // as a fresh image at the next version, through the simulated filesystem's temp file, rename, and
   // directory barrier. Its contents are unchanged, so a crash may recover either version with the
   // same digest.
-  private stepCompact(i: number, name: string): void {
+  // rekey (S12) is compaction under simulation key rekey's new data key: the same version and
+  // contents rules.
+  private stepCompact(i: number, name: string, rekey: number | null): void {
+    const op = rekey !== null ? "rekey" : "compact";
     const d = this.dbs.get(name);
     if (d === undefined || this.dbVersion(d) === 0n) {
-      this.emit(`{"i":${i},"op":"compact","db":${goQuote(name)},"skip":true}`);
+      this.emit(`{"i":${i},"op":"${op}","db":${goQuote(name)},"skip":true}`);
       return;
     }
     const base = d.version;
@@ -1697,7 +1829,13 @@ export class SimRunner {
     if (base + 1n > d.maxAttempted) d.maxAttempted = base + 1n;
     let err: unknown = null;
     try {
-      this.database.compact(name);
+      if (rekey !== null) {
+        this.keyChange = [this.key, rekey];
+        this.database.rekey(name, SIM_KEYS[rekey]!);
+        this.key = rekey;
+      } else {
+        this.database.compact(name);
+      }
     } catch (e) {
       err = e;
     }
@@ -1709,26 +1847,26 @@ export class SimRunner {
         this.fail(i, code);
         return;
       }
-      this.emit(`{"i":${i},"op":"compact"${dbField},"error":${goQuote(code)}}`);
-      if (code === "XX001") this.fail(i, "corruption: compaction reported XX001: " + errText(err));
+      this.emit(`{"i":${i},"op":"${op}"${dbField},"error":${goQuote(code)}}`);
+      if (code === "XX001") this.fail(i, `corruption: ${op} reported XX001: ` + errText(err));
       else if (now !== base)
-        this.fail(i, `a failed compaction published version ${now} of ${name} (was ${base})`);
+        this.fail(i, `a failed ${op} published version ${now} of ${name} (was ${base})`);
       return;
     }
-    this.emit(`{"i":${i},"op":"compact"${dbField},"version":${now}}`);
+    this.emit(`{"i":${i},"op":"${op}"${dbField},"version":${now}}`);
     if (now !== base + 1n) {
-      this.fail(i, `compaction moved ${name} from version ${base} to ${now}`);
+      this.fail(i, `${op} moved ${name} from version ${base} to ${now}`);
       return;
     }
     const dg = this.committedDigest(d);
     if (dg === null || dg !== d.lastDigest) {
-      this.fail(i, `compaction changed the contents of ${name}`);
+      this.fail(i, `${op} changed the contents of ${name}`);
       return;
     }
     try {
       this.checkLive();
     } catch (e) {
-      this.fail(i, "after compaction: " + errText(e));
+      this.fail(i, `after ${op}: ` + errText(e));
       return;
     }
     d.version = now;
@@ -1814,7 +1952,7 @@ export class SimRunner {
     }
     let counts: [number, number, number];
     try {
-      counts = checkImage(image, v);
+      counts = checkImage(image, v, this.credential());
     } catch (e) {
       this.fail(i, "backup integrity: " + errText(e));
       return;
@@ -1960,7 +2098,7 @@ export class SimRunner {
       const image = this.image(d);
       let counts: [number, number, number];
       try {
-        counts = checkImage(image ?? new Uint8Array(), d.version);
+        counts = checkImage(image ?? new Uint8Array(), d.version, this.credential());
       } catch (e) {
         this.fail(i, `integrity of ${d.name}: ` + errText(e));
         return;
@@ -2093,6 +2231,32 @@ export class SimRunner {
     return true;
   }
 
+  // stepChangeKey is `change_key <n>` (S12, encrypted.md §5): main's credential changes to simulation
+  // key n. Only the key block is written, so no version or content moves.
+  private stepChangeKey(i: number, n: number): void {
+    if (!this.encrypted) {
+      this.emit(`{"i":${i},"op":"change_key","skip":true}`);
+      return;
+    }
+    const d = this.dbs.get("main")!;
+    const base = this.dbVersion(d);
+    this.keyChange = [this.key, n];
+    try {
+      this.database.changeCredential("main", SIM_KEYS[n]!);
+      this.key = n;
+      this.emit(`{"i":${i},"op":"change_key","key":${n}}`);
+    } catch (e) {
+      const code = errCode(e);
+      if (code.startsWith("non-engine")) {
+        this.fail(i, code);
+        return;
+      }
+      this.emit(`{"i":${i},"op":"change_key","error":${goQuote(code)}}`);
+      if (code === "XX001") this.fail(i, "corruption: change_key reported XX001: " + errText(e));
+    }
+    if (this.dbVersion(d) !== base) this.fail(i, "a credential change published a version");
+  }
+
   // recover abandons the crashed process — its sessions and Database — and opens the disk as a new
   // process would, then checks every database's recovered generation against its history and
   // durability floor (§8.1–8.2) and its image against the integrity checker (§8.3).
@@ -2120,6 +2284,10 @@ export class SimRunner {
         writeFileSync(`${this.imagePrefix}.step${i}${suffix}.img`, image ?? new Uint8Array());
       }
     }
+    if (!this.settleKey(i, images.get("main") ?? new Uint8Array())) {
+      this.crashImage = images.get("main") ?? null;
+      return false;
+    }
     try {
       this.open();
     } catch (e) {
@@ -2139,7 +2307,7 @@ export class SimRunner {
       }
       let counts: [number, number, number];
       try {
-        counts = checkImage(image ?? new Uint8Array(), v);
+        counts = checkImage(image ?? new Uint8Array(), v, this.credential());
       } catch (e) {
         this.crashImage = image;
         this.fail(i, `recovery integrity of ${d.name}: ` + errText(e));

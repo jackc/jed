@@ -21,7 +21,10 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"sync"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -228,15 +231,53 @@ type pageCodec struct {
 	page, meta xaesKey
 	// rng is the database's key-entropy stream (encrypted.md §8): one per database.
 	rng RandomSource
+	// dek is the data key, kept so a credential change can rewrap it (encrypted.md §5).
+	dek []byte
 	// keyBlock is the selected key block copy, kept for compaction, which writes it to both pages of
-	// the new file (encrypted.md §5).
-	keyBlock []byte
+	// the new file, and replaced by a credential change (encrypted.md §5). Guarded by keyBlockMu.
+	keyBlockMu sync.Mutex
+	keyBlock   []byte
 }
 
 func newPageCodec(dek []byte, rng RandomSource, keyBlock []byte) *pageCodec {
 	pk := hkdf32(dek, nil, "jed/v1/page")
 	mk := hkdf32(dek, nil, "jed/v1/meta")
-	return &pageCodec{page: newXaesKey(pk[:]), meta: newXaesKey(mk[:]), rng: rng, keyBlock: keyBlock}
+	return &pageCodec{page: newXaesKey(pk[:]), meta: newXaesKey(mk[:]), rng: rng, dek: dek, keyBlock: keyBlock}
+}
+
+// selectedKeyBlock is the selected key-block copy (128 bytes; the rest of its page is zero).
+func (c *pageCodec) selectedKeyBlock() []byte {
+	c.keyBlockMu.Lock()
+	defer c.keyBlockMu.Unlock()
+	return c.keyBlock
+}
+
+// keyBlockPage is the selected copy as a whole key-block page of pageSize bytes.
+func (c *pageCodec) keyBlockPage(pageSize int) []byte {
+	page := make([]byte, pageSize)
+	copy(page, c.selectedKeyBlock())
+	return page
+}
+
+// rewrap is the key block for a credential change (encrypted.md §5): the same DEK wrapped for cred
+// under a fresh KDF salt and wrap nonce, drawn in that order from the key-entropy stream, at the next
+// generation. Runs the KDF, so a caller derives it before taking the writer gate.
+func (c *pageCodec) rewrap(cred *Credential, params Argon2Params) ([]byte, error) {
+	generation := keyBlockGeneration(c.selectedKeyBlock())
+	if generation == ^uint64(0) {
+		return nil, cryptoCorrupt("key block generation exhausted")
+	}
+	return wrapKeyBlock(c.dek, generation+1, cred, params, c.rng)
+}
+
+// keyBlockGeneration is a key block's generation (offset 8).
+func keyBlockGeneration(block []byte) uint64 { return binary.BigEndian.Uint64(block[8:]) }
+
+// setKeyBlock adopts block as the selected copy once a credential change has written both pages.
+func (c *pageCodec) setKeyBlock(block []byte) {
+	c.keyBlockMu.Lock()
+	defer c.keyBlockMu.Unlock()
+	c.keyBlock = block
 }
 
 func (c *pageCodec) nonce() ([]byte, error) {
@@ -377,16 +418,26 @@ func newKeyBlock(cred *Credential, params Argon2Params, rng RandomSource) ([]byt
 	if err := rng.Fill(dek); err != nil {
 		return nil, nil, err
 	}
+	block, err := wrapKeyBlock(dek, 1, cred, params, rng)
+	if err != nil {
+		return nil, nil, err
+	}
+	return block, dek, nil
+}
+
+// wrapKeyBlock is the 128-byte key block wrapping dek for cred at generation: it draws the KDF salt,
+// then the wrap nonce, from rng (encrypted.md §5, §8).
+func wrapKeyBlock(dek []byte, generation uint64, cred *Credential, params Argon2Params, rng RandomSource) ([]byte, error) {
 	block := make([]byte, keyBlockLen)
 	copy(block, keyBlockMagic)
 	binary.BigEndian.PutUint16(block[4:], keyBlockVersion)
 	block[6] = suiteXAES
-	binary.BigEndian.PutUint64(block[8:], 1)
+	binary.BigEndian.PutUint64(block[8:], generation)
 	switch cred.kind {
 	case credentialPassphrase:
 		params = params.orDefault()
 		if !params.valid() {
-			return nil, nil, newError(InvalidParameterValue, "Argon2id parameters are out of range")
+			return nil, newError(InvalidParameterValue, "Argon2id parameters are out of range")
 		}
 		block[7] = kdfArgon2id
 		binary.BigEndian.PutUint32(block[16:], params.MemoryKiB)
@@ -395,16 +446,16 @@ func newKeyBlock(cred *Credential, params Argon2Params, rng RandomSource) ([]byt
 	case credentialKey:
 		block[7] = kdfHostKey
 	default:
-		return nil, nil, newError(InvalidParameterValue, "an empty credential")
+		return nil, newError(InvalidParameterValue, "an empty credential")
 	}
 	if err := rng.Fill(block[32:76]); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	key, _ := kek(block, cred)
 	sealed := newGCM(key[:]).Seal(nil, block[64:76], dek, block[:76])
 	copy(block[76:124], sealed)
 	binary.BigEndian.PutUint32(block[124:], crc32IEEE(block[:124]))
-	return block, dek, nil
+	return block, nil
 }
 
 // parseKeyBlock validates one key-block copy (encrypted.md §5): ok=false when it is not a valid copy.
@@ -458,6 +509,22 @@ func selectKeyBlock(page2, page3 []byte) ([]byte, error) {
 	}
 }
 
+// unselectedKeyPage is the key-block page a credential change writes first (encrypted.md §5): the copy
+// that is not the selected one — the older or invalid copy, page 3 when both are equal — so the only
+// valid copy is never the first overwritten.
+func unselectedKeyPage(page2, page3 []byte) uint32 {
+	_, ga, okA := parseKeyBlock(page2)
+	_, gb, okB := parseKeyBlock(page3)
+	switch {
+	case okA && okB && gb > ga:
+		return 2
+	case !okA && okB:
+		return 2
+	default:
+		return 3
+	}
+}
+
 // unwrapDEK unwraps the selected copy's DEK with cred: 28P01 when it does not unwrap.
 func unwrapDEK(block []byte, cred *Credential) ([]byte, error) {
 	key, ok := kek(block, cred)
@@ -478,6 +545,20 @@ func createCodec(cred *Credential, params Argon2Params, rng RandomSource) (*page
 		return nil, err
 	}
 	return newPageCodec(dek, rng, block), nil
+}
+
+// scratchCodec is the codec of a rebuild's scratch domain when the target is encrypted
+// (spec/design/encryption.md §5): a throwaway random key from the OS CSPRNG, never the database's
+// key-entropy stream, so it perturbs no persisted draw.
+func scratchCodec() (*pageCodec, error) {
+	rng := OSRandomSource()
+	key := make([]byte, 32)
+	if err := rng.Fill(key); err != nil {
+		return nil, err
+	}
+	var k [32]byte
+	copy(k[:], key)
+	return createCodec(KeyCredential(k), Argon2Params{}, rng)
 }
 
 // unlockCodec unlocks an encrypted file from its key-block pages: select the copy, unwrap its DEK with
@@ -520,4 +601,237 @@ func fileSuite(slot0, slot1 []byte) (byte, error) {
 	}
 	// Neither slot is valid: slot selection reports the corruption.
 	return suite, nil
+}
+
+// --- scratch encryption (spec/design/encryption.md §6, spec/fileformat/encrypted.md §11) ---------
+
+const (
+	// scratchBlock is the plaintext bytes of one sealed scratch block; each is stored as the block's
+	// ciphertext, its 24-byte nonce and its 16-byte tag.
+	scratchBlock  = 4096
+	scratchStored = scratchBlock + cryptoReserve
+	roleScratch   = 0x03
+)
+
+// encryptingSpillHost is a spill host whose every scratch file is sealed (encryption.md §6): each file
+// gets a random key and id from the handle's scratch stream, never persisted, and stores its bytes in
+// sealed 4 KiB blocks whose associated data binds the file id, the block ordinal and the block's write
+// counter, so a replayed older version of a rewritten block fails. Results and cost do not change.
+type encryptingSpillHost struct {
+	inner spillHost
+	rng   RandomSource
+}
+
+func (h *encryptingSpillHost) encrypts() bool { return true }
+
+func (h *encryptingSpillHost) create(kind string) (spillFile, error) {
+	key := make([]byte, 32)
+	if err := h.rng.Fill(key); err != nil {
+		return nil, err
+	}
+	var id [16]byte
+	if err := h.rng.Fill(id[:]); err != nil {
+		return nil, err
+	}
+	inner, err := h.inner.create(kind)
+	if err != nil {
+		return nil, err
+	}
+	return &sealedSpillFile{inner: inner, key: newXaesKey(key), id: id, rng: h.rng, cachedAt: -1}, nil
+}
+
+// spillEncrypts reports whether every file host makes is sealed (scratch encryption).
+func spillEncrypts(host spillHost) bool {
+	e, ok := host.(interface{ encrypts() bool })
+	return ok && e.encrypts()
+}
+
+// sealScratch is host, sealed with keys from a scratch stream of env's key entropy when encrypt (and
+// not already sealed).
+func sealScratch(host spillHost, encrypt bool, env *Environment) spillHost {
+	if host == nil || !encrypt || spillEncrypts(host) {
+		return host
+	}
+	return &encryptingSpillHost{inner: host, rng: env.keyStream()}
+}
+
+var errScratchAuth = errors.New("a scratch block fails authentication")
+
+type sealedSpillFile struct {
+	inner spillFile
+	key   xaesKey
+	id    [16]byte
+	rng   RandomSource
+	mu    sync.Mutex
+	// size is the logical (plaintext) size.
+	logical int64
+	// counters is each block's write counter, never reset (truncation included), so no sealed version
+	// of a block can authenticate again once a newer one was sealed.
+	counters []uint64
+	// live is whether each block holds written bytes; a block never written, or cut by a truncation,
+	// reads as zeros.
+	live []bool
+	// cached is the block last written (cachedAt its ordinal, −1 for none), kept in plaintext until
+	// another block is written, so a run of small writes into one block seals it once.
+	cachedAt int
+	cached   []byte
+}
+
+// ad is the associated data of block ordinal at write counter counter.
+func (f *sealedSpillFile) ad(ordinal int, counter uint64) []byte {
+	ad := make([]byte, 0, 42)
+	ad = append(ad, adPrefix(roleScratch, 0)[:6]...)
+	ad = append(ad, f.id[:]...)
+	ad = binary.BigEndian.AppendUint64(ad, uint64(ordinal))
+	return binary.BigEndian.AppendUint64(ad, counter)
+}
+
+// load is block ordinal's plaintext: the cached block, zeros for a block never written, else the
+// stored block opened against its counter. Caller holds mu.
+func (f *sealedSpillFile) load(ordinal int) ([]byte, error) {
+	if f.cachedAt == ordinal {
+		return append([]byte(nil), f.cached...), nil
+	}
+	if ordinal >= len(f.live) || !f.live[ordinal] {
+		return make([]byte, scratchBlock), nil
+	}
+	counter := f.counters[ordinal]
+	stored := make([]byte, scratchStored)
+	if _, err := f.inner.ReadAt(stored, int64(ordinal)*scratchStored); err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	var tag pageTag
+	copy(tag[:], stored[scratchBlock+cryptoNonceLen:])
+	block := stored[:scratchBlock]
+	if !f.key.open(stored[scratchBlock:scratchBlock+cryptoNonceLen], block, f.ad(ordinal, counter), tag) {
+		return nil, errScratchAuth
+	}
+	return block, nil
+}
+
+// flushCached seals and stores the cached block, if any, at its next write counter. Caller holds mu.
+func (f *sealedSpillFile) flushCached() error {
+	if f.cachedAt < 0 {
+		return nil
+	}
+	ordinal, block := f.cachedAt, f.cached
+	f.cachedAt, f.cached = -1, nil
+	for len(f.counters) <= ordinal {
+		f.counters = append(f.counters, 0)
+		f.live = append(f.live, false)
+	}
+	counter := f.counters[ordinal] + 1
+	nonce := make([]byte, cryptoNonceLen)
+	if err := f.rng.Fill(nonce); err != nil {
+		return err
+	}
+	tag := f.key.seal(nonce, block, f.ad(ordinal, counter))
+	stored := make([]byte, 0, scratchStored)
+	stored = append(append(append(stored, block...), nonce...), tag[:]...)
+	if _, err := f.inner.WriteAt(stored, int64(ordinal)*scratchStored); err != nil {
+		return err
+	}
+	f.counters[ordinal] = counter
+	f.live[ordinal] = true
+	return nil
+}
+
+func (f *sealedSpillFile) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if off >= f.logical {
+		return 0, io.EOF
+	}
+	n := int(min(int64(len(p)), f.logical-off))
+	for done := 0; done < n; {
+		at := off + int64(done)
+		ordinal, within := int(at/scratchBlock), int(at%scratchBlock)
+		take := min(scratchBlock-within, n-done)
+		block, err := f.load(ordinal)
+		if err != nil {
+			return done, err
+		}
+		copy(p[done:done+take], block[within:within+take])
+		done += take
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (f *sealedSpillFile) WriteAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for done := 0; done < len(p); {
+		at := off + int64(done)
+		ordinal, within := int(at/scratchBlock), int(at%scratchBlock)
+		take := min(scratchBlock-within, len(p)-done)
+		if f.cachedAt != ordinal {
+			var block []byte
+			if take == scratchBlock {
+				block = make([]byte, scratchBlock)
+			} else {
+				var err error
+				if block, err = f.load(ordinal); err != nil {
+					return done, err
+				}
+			}
+			if err := f.flushCached(); err != nil {
+				return done, err
+			}
+			f.cachedAt, f.cached = ordinal, block
+		}
+		copy(f.cached[within:within+take], p[done:done+take])
+		done += take
+	}
+	f.logical = max(f.logical, off+int64(len(p)))
+	return len(p), nil
+}
+
+func (f *sealedSpillFile) size() (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logical, nil
+}
+
+func (f *sealedSpillFile) truncate(n int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	blocks := int((n + scratchBlock - 1) / scratchBlock)
+	if n < f.logical {
+		// Zero the kept part of a cut block, so growing again reads zeros past n.
+		if within := int(n % scratchBlock); within != 0 {
+			ordinal := int(n / scratchBlock)
+			block, err := f.load(ordinal)
+			if err != nil {
+				return err
+			}
+			clear(block[within:])
+			if f.cachedAt != ordinal {
+				if err := f.flushCached(); err != nil {
+					return err
+				}
+			}
+			f.cachedAt, f.cached = ordinal, block
+		}
+		if f.cachedAt >= blocks {
+			f.cachedAt, f.cached = -1, nil
+		}
+		for i := blocks; i < len(f.live); i++ {
+			f.live[i] = false
+		}
+		if err := f.inner.truncate(int64(blocks) * scratchStored); err != nil {
+			return err
+		}
+	}
+	f.logical = n
+	return nil
+}
+
+func (f *sealedSpillFile) close() error {
+	f.mu.Lock()
+	f.cachedAt, f.cached = -1, nil
+	f.mu.Unlock()
+	return f.inner.close()
 }

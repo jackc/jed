@@ -110,7 +110,13 @@ pub fn ssh_command(url: &SshUrl) -> Vec<String> {
 }
 
 /// Open the remote database `url` names as a page client over `ssh` (`name` is the URL as given).
-pub fn open(url: &SshUrl, name: &str, read_only: bool) -> jed::Result<jed::Database> {
+/// An encrypted database unlocks with `credential` on this side; the remote end relays ciphertext.
+pub fn open(
+    url: &SshUrl,
+    name: &str,
+    read_only: bool,
+    credential: Option<jed::Credential>,
+) -> jed::Result<jed::Database> {
     #[cfg(unix)]
     {
         jed::Database::open_remote(
@@ -118,13 +124,14 @@ pub fn open(url: &SshUrl, name: &str, read_only: bool) -> jed::Result<jed::Datab
             name,
             jed::OpenOptions {
                 read_only,
+                credential,
                 ..jed::OpenOptions::default()
             },
         )
     }
     #[cfg(not(unix))]
     {
-        let _ = (url, name, read_only);
+        let _ = (url, name, read_only, credential);
         Err(jed::EngineError::new(
             jed::SqlState::FeatureNotSupported,
             "ssh:// databases are not supported on this platform",
@@ -133,19 +140,44 @@ pub fn open(url: &SshUrl, name: &str, read_only: bool) -> jed::Result<jed::Datab
 }
 
 pub const PAGES_USAGE: &str = "\
-usage: jed pages [--read-only] DBFILE
+usage: jed pages [--read-only] [--key-file FILE | --passphrase-file FILE] DBFILE
 
 Serve one page-service connection for DBFILE on stdin/stdout: the remote end of
 `jed ssh://host/DBFILE`, which runs it over ssh. It relays to the process that owns
 DBFILE, or owns DBFILE itself (handing ownership to an application that asks).
-  --read-only   refuse writes on the connection, whatever the client asks";
+  --read-only             refuse writes on the connection, whatever the client asks
+  --key-file FILE         the key of an encrypted DBFILE, needed only to own it (a relay
+  --passphrase-file FILE  passes ciphertext through); without one, owning it fails 28P02";
 
 /// `jed pages …` (cli.md §3). Exit status 0 when the connection ended, 1 on a usage error or when
 /// the database could not be served (the client was told why on the stream).
 pub fn pages(argv: &[String]) -> u8 {
     let mut read_only = false;
     let mut path = None;
-    for arg in argv {
+    let mut credential = None;
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match crate::credential::parse_flag(arg, &credential, &mut value) {
+            // stdin carries the connection, so there is no terminal to prompt on.
+            Ok(Some(crate::credential::CredentialSource::Prompt)) => {
+                eprintln!("jed pages: --passphrase cannot prompt here; use --passphrase-file");
+                return 1;
+            }
+            Ok(Some(source)) => {
+                credential = Some(source);
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("jed pages: {e}\n\n{PAGES_USAGE}");
+                return 1;
+            }
+        }
         match arg.as_str() {
             "--read-only" => read_only = true,
             "-h" | "--help" => {
@@ -167,18 +199,31 @@ pub fn pages(argv: &[String]) -> u8 {
         eprintln!("jed pages: missing DBFILE\n\n{PAGES_USAGE}");
         return 1;
     };
+    let credential = match &credential {
+        Some(source) => match crate::credential::load(source, false) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("jed pages: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
     // stdout carries the connection: nothing else may be written to it.
     #[cfg(unix)]
     let served = jed::Database::serve_page_stream(
         &path,
-        jed::OpenOptions::default(),
+        jed::OpenOptions {
+            credential,
+            ..jed::OpenOptions::default()
+        },
         read_only,
         Box::new(std::io::stdin()),
         Box::new(std::io::stdout()),
     );
     #[cfg(not(unix))]
     let served: jed::Result<()> = {
-        let _ = (&path, read_only);
+        let _ = (&path, read_only, credential);
         Err(jed::EngineError::new(
             jed::SqlState::FeatureNotSupported,
             "jed pages is not supported on this platform",

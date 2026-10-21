@@ -1,4 +1,4 @@
-# Encryption at rest — design (the core variant built)
+# Encryption at rest — design (built)
 
 > CLAUDE.md §9, storage.md §6, [TODO.md](../../TODO.md). **Status (2026-10-20):** the encrypted
 > file variant is built in the Rust, Go and TypeScript (Node) cores — its bytes are specified in
@@ -301,8 +301,10 @@ across every attempted seal.
 
 **Every process of an encrypted database holds the DEK**: owner, every page client, the SSH page
 server. There is no keyless owner (a keyless *read-only* owner is conceivable, since recovery is
-keyless and it writes nothing; not pursued). A page client unlocks by fetching the key block
-through `read_key_block` and unwrapping it with its credential. The credential is needed only to
+keyless and it writes nothing; not pursued). A page client unlocks by reading the key-block pages
+through `read_pages` and unwrapping the selected copy with its credential: a credential change in
+progress never leaves both copies invalid, so no dedicated message or lock is needed (built so;
+encrypted.md §14). The credential is needed only to
 unwrap a key block; **the DEK alone opens the file**. So a client **promotes to owner with the DEK
 it holds** (page-service.md §8.1), verifying it against the meta slot's tag, and ownership
 handoff, yield and the read-only owner's deferral to a writer all work as for a plaintext file; a
@@ -324,10 +326,9 @@ variant and reserve they opened and still authenticates under their held subkey;
 client cannot tell a rotation from tampering and need not, since the reopen with the credential
 surfaces tampering as `28P01` or `XX001`. Read-ahead's held ciphertext counts against `cache_bytes`.
 
-**Backups** (page-service.md §9) take the key block through `read_key_block`, which the owner
-serves under a key-block mutex that a credential change holds only across its two writes (not the
-writer gate, so a backup never waits behind a long transaction), and write the returned copy to
-both pages; plain page reads could capture a torn pair mid-change. Taking a page-identical backup
+**Backups** (page-service.md §9) read the two key-block pages and write the **selected** copy to
+both pages of the copy, so the copy holds a complete pair at one generation even while a change runs
+(a torn page read mid-change is simply not selected; encrypted.md §13). Taking a page-identical backup
 needs the DEK, since the walk follows pointers; only applying deltas is keyless.
 
 **Replication.** A credential change is an item in the stream, ordered after the commit it
@@ -359,14 +360,25 @@ promoted replica finishes a torn pair from its log entry.
   entries, the restated variant arithmetic (a 1 KiB minimum page size, so the inline manifest holds
   at least 74 entries; interior fan-out with 20-byte pointers; chain pages hold `C − 16` bytes;
   `live_pages ≤ page_count − 4`), credentials on `create`/`open`/`attach`, the environment's
-  key-entropy source, and the goldens. Still to specify with the work that needs them: the scratch
-  framings, change-credential, compaction with a new credential or target variant,
-  `scratch_encryption`, `read_key_block`.
-- **Integrated performance** of an encrypted database; nothing above is a database benchmark. In
-  particular the **browser per-page path** — two AES-CTR calls for the CMAC step, `importKey`, then
-  decrypt, four asynchronous WebCrypto calls per cache miss — is unmeasured, and decides whether
-  the browser path is usable, not which suite is chosen; a pure-JS table-based AES is not an escape
-  hatch, since it is not constant-time. Argon2id's cost in pure JS is unmeasured too.
+  key-entropy source, and the goldens; since then the credential change (§5), the scratch framing
+  and `scratch_encryption` (§11), rekey (§12), backups (§13) and the page service (§14, which needed
+  no `read_key_block`).
+- **Integrated performance** of an encrypted database. *First measurement (2026-10-20,
+  `mise run bench:encryption`, Rust, 200,000 rows of 100-byte text at 4 KiB pages, three alternating
+  rounds, fsync off, Linux on an Intel Core Ultra 9 285K):* 1000-row commits 1.09× plaintext, a full scan through a 1 MiB page cache 1.27×,
+  random point lookups that mostly miss that cache 1.97×, the same lookups with the table resident
+  1.03×, file size 1.03×. Every cache miss derives the page's key and decrypts it (two AES blocks, the
+  GCM key setup, then the page), so the cost sits on misses; a resident working set pays almost
+  nothing. Go's and TS's workers (same checksums) show the same shape, 100,000 rows: Go 1.10× /
+  1.11× / 1.68× / ~1.0×, TS 1.03× / 1.07× / 1.33× / ~1.0× — TS's plaintext baseline is slower, so
+  the crypto is a smaller share. The **browser per-page path** — two AES-CTR calls for the CMAC step, `importKey`, then
+  decrypt, four asynchronous WebCrypto calls per cache miss — decides whether the browser path is
+  usable, not which suite is chosen; a pure-JS table-based AES is not an escape hatch, since it is
+  not constant-time. *First measurement (2026-10-20, the real-Chromium e2e, headless, 20,000 rows at
+  4 KiB pages, 576 pages, two runs):* a cold full scan after a reopen cost 0.11–0.14 ms more per page
+  than plaintext (231 ms vs 148 ms in one run), a bulk commit 0.57–0.95 ms more per page sealed
+  (1.06 s vs 0.51 s, including the seal sessions' repeated serialization passes) — usable for the
+  browser's expected small databases. Argon2id's cost in pure JS is unmeasured.
 - **SQL crypto functions** are a separate, unscheduled proposal: authenticated seal/open over
   byte values with explicit application keys, never the file's DEK, through the sanctioned
   entropy seam and the cost schedule. Not a prerequisite for encryption at rest.

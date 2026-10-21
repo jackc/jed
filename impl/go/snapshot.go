@@ -1472,6 +1472,75 @@ func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
 // bound.
 func (s *snapshot) gistTreeFor(nameKey string) *gistTree { return s.gistTrees[nameKey] }
 
+// emptied is this snapshot's catalog over empty stores of capacity cap in paging: the start of a
+// rebuild under another page layout (DEK rotation and conversion, spec/design/encryption.md §5). Each
+// store keeps its column types and synthetic-rowid counter.
+func (s *snapshot) emptied(cap pageCap, paging *sharedPaging) *snapshot {
+	empty := func(store *tableStore) *tableStore {
+		fresh := newTableStore(cap, store.colTypes)
+		fresh.BumpRowidTo(store.nextRowid)
+		fresh.attachPaging(paging)
+		return fresh
+	}
+	out := s.clone()
+	out.stores = make(map[string]*tableStore, len(s.stores))
+	for k, v := range s.stores {
+		out.stores[k] = empty(v)
+	}
+	out.indexStores = make(map[string]*tableStore, len(s.indexStores))
+	for k, v := range s.indexStores {
+		out.indexStores[k] = empty(v)
+	}
+	out.gistTrees = make(map[string]*gistTree)
+	out.storePaging = paging
+	return out
+}
+
+// rebuildRows copies every record of every table and index store into target (from emptied), each
+// store in ascending key order with its values fully materialized, so each rebuilt tree is the one
+// ascending insertion builds under target's layout (encrypted.md §12). Stores go in name byte order,
+// tables before indexes. stage runs whenever the copied versions pass stageBytes, and once at the end,
+// so the caller can write the dirty pages out and keep memory bounded. A record the target layout
+// cannot store fails here, before anything is written.
+func (s *snapshot) rebuildRows(target *snapshot, stageBytes int64, stage func(*snapshot) error) error {
+	for _, index := range []bool{false, true} {
+		from, to := s.stores, target.stores
+		if index {
+			from, to = s.indexStores, target.indexStores
+		}
+		names := make([]string, 0, len(from))
+		for name := range from {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			source, dest := from[name], to[name]
+			err := source.ScanRange(unboundedBound(), func(key []byte, row storedRow) (bool, error) {
+				row, err := source.resolveAll(row)
+				if err != nil {
+					return false, err
+				}
+				if _, err := dest.Insert(key, row); err != nil {
+					return false, err
+				}
+				if target.stagedBytes() >= stageBytes {
+					if err := stage(target); err != nil {
+						return false, err
+					}
+				}
+				return true, nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if err := target.rebuildGistTrees(); err != nil {
+		return err
+	}
+	return stage(target)
+}
+
 // rebuildGistTrees rebuilds EVERY GiST index's resident R-tree from its leaf-key store
 // (spec/design/gist.md §3/§4.1). Called after any statement that may have changed a GiST index's
 // leaf set (the mutating-statement hook) and on load, so the working snapshot always carries a fresh

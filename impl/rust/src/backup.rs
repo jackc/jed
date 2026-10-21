@@ -59,14 +59,6 @@ fn backup_paging(snap: &Snapshot) -> Result<Arc<SharedPaging>> {
             "a backup needs a database with storage",
         )
     })?;
-    if paging.codec().is_some() {
-        // A backup of an encrypted file needs its key block taken under the key-block mutex
-        // (spec/design/encryption.md §8), not yet built (spec/fileformat/encrypted.md §10).
-        return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            "a backup of an encrypted database is not supported yet",
-        ));
-    }
     Ok(paging)
 }
 
@@ -182,7 +174,10 @@ impl Shared {
             })?;
         } else {
             write_backup_file(files, dest, no_sync, &mut |write_at| {
-                snap.write_image(page_size, v + 1, None, &mut |index, page| {
+                // An encrypted database's copy keeps its data key and key block, every page
+                // resealed under fresh nonces, as compaction does (spec/design/encryption.md §5).
+                let codec = paging.codec().map(|c| &**c);
+                snap.write_image(page_size, v + 1, codec, &mut |index, page| {
                     write_at(index as u64 * page_size as u64, page)
                 })
                 .map(|_| ())
@@ -217,14 +212,23 @@ impl Shared {
         let snap = &loaded.committed;
         let read = |p: crate::format::PageRef| paging.read_body(p);
         let mut seen: HashSet<u32> = HashSet::new();
-        let mut p = mt.root_page;
-        while p != 0 {
-            if !seen.insert(p) || p < ROOT_PAGE || p >= mt.page_count {
+        // Chains are followed through their bound pointers (encrypted.md §2), so every chain page of
+        // an encrypted file is authenticated on the way.
+        let cap = paging.cap();
+        let first = paging
+            .codec()
+            .map_or(ROOT_PAGE, |_| crate::crypto::FIRST_BODY_PAGE);
+        let mut p = crate::format::PageRef {
+            page: mt.root_page,
+            tag: mt.root_tag,
+        };
+        while p.page != 0 {
+            if !seen.insert(p.page) || p.page < first || p.page >= mt.page_count {
                 return Err(corrupt("invalid catalog chain"));
             }
-            reached.insert(p);
-            let block = read(crate::format::PageRef::plain(p))?;
-            p = crate::format::page_header(&block)?.next_page;
+            reached.insert(p.page);
+            let block = read(p)?;
+            p = crate::format::chain_step(&block, cap)?.1;
         }
         for store in snap.stores_by_name() {
             let Some(root) = store.tree_root() else {
@@ -255,22 +259,25 @@ impl Shared {
                 "the pages reachable from the snapshot do not match its live page count",
             ));
         }
-        let mut p = mt.free_list_head;
-        while p != 0 {
-            if reached.contains(&p) || p < ROOT_PAGE || p >= mt.page_count {
+        let mut p = crate::format::PageRef {
+            page: mt.free_list_head,
+            tag: mt.free_list_tag,
+        };
+        while p.page != 0 {
+            if reached.contains(&p.page) || p.page < first || p.page >= mt.page_count {
                 return Err(corrupt("invalid free-list chain"));
             }
-            reached.insert(p);
-            let block = read(crate::format::PageRef::plain(p))?;
-            let header = crate::format::page_header(&block)?;
-            if header.page_type != PAGE_FREELIST {
+            reached.insert(p.page);
+            let block = read(p)?;
+            let (page_type, next) = crate::format::chain_step(&block, cap)?;
+            if page_type != PAGE_FREELIST {
                 return Err(corrupt("invalid free-list page"));
             }
-            p = header.next_page;
+            p = next;
         }
         let mut pages: Vec<u32> = Vec::with_capacity(reached.len());
         for p in reached {
-            if p < ROOT_PAGE || p >= mt.page_count {
+            if p < first || p >= mt.page_count {
                 return Err(corrupt("a reachable page lies outside the snapshot"));
             }
             pages.push(p);
@@ -305,9 +312,30 @@ impl Shared {
             #[cfg(not(unix))]
             let blocks = read_local(paging, batch)?;
             for (index, block) in batch.iter().zip(&blocks) {
-                crate::format::page_header(block)?;
+                // An encrypted page is ciphertext: the walk authenticated the chain pages and every
+                // interior node, and a leaf or overflow page is authenticated when the copy reads it.
+                if paging.codec().is_none() {
+                    crate::format::page_header(block)?;
+                }
                 write_at(*index as u64 * ps, block)?;
             }
+        }
+        // An encrypted copy holds the key block at pages 2 and 3, which no pointer reaches: the
+        // file's selected copy, written to both, so the pair is complete at one generation even while
+        // a credential change runs (encrypted.md §13). A page client reads the pages through the
+        // service; selection already tolerates a change in progress, which never leaves both
+        // copies invalid.
+        if paging.codec().is_some() {
+            #[cfg(unix)]
+            let pair = match &client {
+                Some(cl) => cl.read_pages(&[2, 3])?,
+                None => read_local(paging, &[2, 3])?,
+            };
+            #[cfg(not(unix))]
+            let pair = read_local(paging, &[2, 3])?;
+            let block = crate::crypto::selected_key_page(&pair[0], &pair[1])?;
+            write_at(2 * ps, &block)?;
+            write_at(3 * ps, &block)?;
         }
         let last = mt.page_count - 1;
         if pages.last() != Some(&last) {
@@ -315,16 +343,23 @@ impl Shared {
             write_at(last as u64 * ps, &vec![0u8; page_size as usize])?;
         }
         let bootstrap = crate::format::meta_page(
-            crate::format::Cap::plain(page_size),
+            paging.cap(),
             page_size,
             mt.txid,
-            crate::format::PageRef::plain(mt.root_page),
+            crate::format::PageRef {
+                page: mt.root_page,
+                tag: mt.root_tag,
+            },
             mt.page_count,
-            crate::format::PageRef::plain(mt.free_list_head),
+            crate::format::PageRef {
+                page: mt.free_list_head,
+                tag: mt.free_list_tag,
+            },
             mt.live_pages,
         );
-        write_at(0, &bootstrap)?;
-        write_at(ps, &bootstrap)
+        // Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
+        write_at(0, &crate::format::seal_meta(paging, 0, &bootstrap, &[])?)?;
+        write_at(ps, &crate::format::seal_meta(paging, 1, &bootstrap, &[])?)
     }
 }
 

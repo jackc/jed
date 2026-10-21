@@ -1,0 +1,153 @@
+schema_version = 1
+name = "encrypted-database-through-the-page-service"
+description = "An encrypted database under the page service (spec/fileformat/encrypted.md §14): a page client unlocks with its own credential from the key-block pages it reads through the owner (none is 28P02, a wrong one 28P01), commits through the owner, which checks and reseals the meta; only the owner changes the credential (a client is 55000); when the owner dies the client promotes itself with the data key it holds although its credential was changed meanwhile; and after the owner rekeys, an idle client fails 28P04 and reopens with the new key."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, s text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, 'secret-' || g FROM generate_series(1, 500) g"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+expect_error = "28P02"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open key=5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b"
+expect_error = "28P01"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "500"
+
+# A client commit: the owner authenticates its meta under the database key and reseals it for the
+# slot it writes.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, 'client-' || g FROM generate_series(501, 900) g"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "900"
+
+[[step]]
+actor = "b"
+command = "change_key"
+argument = "6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c"
+expect_error = "55000"
+
+[[step]]
+actor = "a"
+command = "change_key"
+argument = "6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+expect_error = "28P01"
+
+# The client keeps working with the data key it holds.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1000, 'after the change')"
+
+[[step]]
+actor = "a"
+command = "kill"
+
+# b promotes itself with its held data key; its own credential no longer unwraps the key block.
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "901"
+retry_ms = 2000
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "owner"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open key=6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c"
+
+[[step]]
+actor = "c"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT max(id) FROM t"
+expect = "1000"
+
+# The owner rotates the data key; the idle client's key is stale.
+[[step]]
+actor = "b"
+command = "rekey"
+argument = "7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d"
+# A client's end_read gets no reply, so its last pin may still be releasing (compact.process.toml).
+retry_ms = 2000
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect_error = "28P04"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open key=7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT count(*) FROM t WHERE s LIKE 'client-%'"
+expect = "400"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"

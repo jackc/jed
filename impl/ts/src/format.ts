@@ -53,7 +53,8 @@ import {
   ENCRYPTED_MIN_PAGE_SIZE,
   fileSuite,
   type PageCodec,
-  unlockCodec,
+  sealPassesSteps,
+  unlockCodecSteps,
 } from "./crypto.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "./costs.ts";
 import {
@@ -1020,6 +1021,38 @@ export class Sealer {
 
 // chainContent is the content of a parsed chain page (catalog, overflow, free-list) in tagLen's
 // layout: its successor pointer and tag, and the bytes after the successor's tag (encrypted.md §2).
+// metaAuthenticates reports whether paging's key authenticates the meta in slot 0 under either slot
+// index — a page client's test that a rekey has not left its held key stale (encrypted.md §14). True in
+// plaintext, and for a meta that does not parse (the load reports that).
+export function metaAuthenticates(paging: SharedPaging): boolean {
+  const codec = paging.codec();
+  if (codec === null) return true;
+  const block = paging.readBlock(0);
+  const meta = parseCommitMeta(block, paging.pageSize(), 0xffff_ffff);
+  if (meta === null) return true;
+  const chain = runSync(manifestChainSteps(meta, (p) => paging.readPageSteps(p)));
+  for (const slot of [0, 1]) {
+    try {
+      codec.verifyMeta(slot, block, chain);
+      return true;
+    } catch {
+      // Try the other slot index.
+    }
+  }
+  return false;
+}
+
+// chainStep is one step along a chain (catalog, overflow, free list) of a page read through its pointer:
+// the page's type and its bound successor pointer (encrypted.md §2; the tag is NO_TAG in plaintext).
+export function chainStep(
+  block: Uint8Array,
+  cap: Cap,
+): { pageType: number; next: number; nextTag: Uint8Array } {
+  const pg = parsePage(block);
+  const { next, nextTag } = chainContent(pg, cap.tag);
+  return { pageType: pg.pageType, next, nextTag };
+}
+
 function chainContent(
   pg: Page,
   tagLen: number,
@@ -2927,6 +2960,59 @@ export function toImage(
   return image;
 }
 
+// writeImageSteps is writeImage as a continuation: under an asynchronous codec every pass of the image
+// is sealed through a seal session (crypto.ts SealSession) and the pages reach sink after the last;
+// otherwise it is writeImage.
+export function* writeImageSteps(
+  snap: Snapshot,
+  pageSize: number,
+  txid: bigint,
+  sink: PageSinkFn,
+  codec: PageCodec | null = null,
+): Steps<number> {
+  if (codec === null || !codec.async) return writeImage(snap, pageSize, txid, sink, codec);
+  let out: { index: number; page: Uint8Array }[] = [];
+  const count = yield* sealPassesSteps(codec, () => {
+    out = [];
+    return writeImage(
+      snap,
+      pageSize,
+      txid,
+      (index, page) => {
+        out.push({ index, page: page.slice() });
+      },
+      codec,
+    );
+  });
+  for (const pg of out) sink(pg.index, pg.page);
+  return count;
+}
+
+// toImageSteps is toImage as a continuation (writeImageSteps).
+export function* toImageSteps(
+  snap: Snapshot,
+  pageSize: number,
+  txid: bigint,
+  codec: PageCodec | null,
+): Steps<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  const pageCount = yield* writeImageSteps(
+    snap,
+    pageSize,
+    txid,
+    (index, page) => {
+      chunks[index] = page;
+    },
+    codec,
+  );
+  const image = new Uint8Array(pageCount * pageSize);
+  for (let index = 0; index < pageCount; index++) {
+    const page = chunks[index];
+    if (page !== undefined) image.set(page, index * pageSize);
+  }
+  return image;
+}
+
 // PageSinkFn receives one full page of a from-scratch image: its page index and its pageSize bytes.
 export type PageSinkFn = (index: number, page: Uint8Array) => void;
 
@@ -2960,11 +3046,7 @@ export function writeImage(
 
   // An encrypted image's key block: the same copy at pages 2 and 3 (encrypted.md §5).
   if (codec !== null) {
-    for (const index of [2, 3]) {
-      const block = new Uint8Array(ps);
-      block.set(codec.keyBlock, 0);
-      sink(index, block);
-    }
+    for (const index of [2, 3]) sink(index, codec.keyBlockPage(ps));
   }
 
   // Tables in ascending name byte order (no map-iteration order leak).
@@ -3526,28 +3608,42 @@ export function* incrementalImageSteps(
     return incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed);
   const chains = new Map<number, Uint8Array>();
   const awaited = new Set<number>();
-  for (;;) {
-    try {
-      return incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed, chains);
-    } catch (e) {
-      if (!(e instanceof ChainMiss)) throw e;
-      // Every page of an awaited chain is cached, so the same chain cannot miss twice.
-      if (awaited.has(e.first)) throw new Error("serialization missed a cached overflow chain");
-      awaited.add(e.first);
-      serializationRetries.count++;
-      yield* readOverflowChainSteps(
-        e.first,
-        e.firstTag,
-        e.length,
-        function* (p, tag) {
-          const bytes = yield* paging.readBodyPageSteps(p, tag);
-          chains.set(p, bytes);
-          return bytes;
-        },
-        paging.cap().tag,
-        [],
-      );
+  // An asynchronous codec seals through a session: a pass that left seals to await is undone and
+  // repeated once they resolve (crypto.ts SealSession).
+  const codec = paging.codec();
+  const session = codec?.beginSession() ?? null;
+  try {
+    for (;;) {
+      session?.beginPass();
+      let write: IncrementalWrite;
+      try {
+        write = incrementalImage(snap, pageSize, startPage, free, paging, reuse, allowed, chains);
+      } catch (e) {
+        if (!(e instanceof ChainMiss)) throw e;
+        // Every page of an awaited chain is cached, so the same chain cannot miss twice.
+        if (awaited.has(e.first)) throw new Error("serialization missed a cached overflow chain");
+        awaited.add(e.first);
+        serializationRetries.count++;
+        yield* readOverflowChainSteps(
+          e.first,
+          e.firstTag,
+          e.length,
+          function* (p, tag) {
+            const bytes = yield* paging.readBodyPageSteps(p, tag);
+            chains.set(p, bytes);
+            return bytes;
+          },
+          paging.cap().tag,
+          [],
+        );
+        continue;
+      }
+      if (session === null || !session.pending()) return write;
+      unassignPages(snap, write.pages);
+      yield* session.resolveSteps();
     }
+  } finally {
+    if (session !== null) codec!.endSession();
   }
 }
 
@@ -3821,7 +3917,7 @@ export function* unlockPagerSteps(
   }
   const page2 = yield* pager.readPageSteps(2);
   const page3 = yield* pager.readPageSteps(3);
-  return unlockCodec(page2, page3, credential, environment.keyStream());
+  return yield* unlockCodecSteps(page2, page3, credential, environment.keyStream());
 }
 
 // newTempStorage builds a fresh per-domain storage Engine for a TEMP snapshot (temp-tables.md §6,
@@ -3836,6 +3932,21 @@ export function* unlockPagerSteps(
 // owning handle's (a temp domain uses its handle's environment — environment.md §3).
 export function newTempStorage(pageSize: number, environment: Environment): Engine {
   const st = loadEngine(toImage(new Snapshot(environment, 0n), pageSize, 0n), environment);
+  st.reclaimWithinSession = true;
+  return st;
+}
+
+// newScratchStorage builds a rebuild's scratch domain (DEK rotation and conversion, spec/fileformat/
+// encrypted.md §12): a temp domain (newTempStorage) in the target layout, sealed under the throwaway
+// codec when the target is encrypted.
+export function newScratchStorage(
+  pageSize: number,
+  codec: PageCodec | null,
+  environment: Environment,
+): Engine {
+  const image = toImage(new Snapshot(environment, 0n), pageSize, 0n, codec);
+  const pager = Pager.fromStore(new MemoryBlockStore(image));
+  const st = loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER, codec), environment);
   st.reclaimWithinSession = true;
   return st;
 }
@@ -3878,13 +3989,15 @@ export function collectLeafOverflowWith(
   reached: Set<number>,
   seen: Set<number>,
   depth: number,
+  rootTag: Uint8Array = NO_TAG,
+  tagLen = 0,
 ): void {
   runSync(
     collectLeafOverflowSteps(
       (p, t) => ioSteps(() => read(p, t)),
       pageIdx,
-      NO_TAG,
-      0,
+      rootTag,
+      tagLen,
       colTypes,
       reached,
       seen,
@@ -4311,11 +4424,14 @@ export function* planFreeListSteps(
       manifestIds.push(next++);
     }
     const reserved = new Set(manifestIds);
-    const s = serializeFreeList(
-      persistList.filter((p) => !reserved.has(p)),
-      safe.slice(reused),
-      seal,
-      next,
+    // An asynchronous codec seals the chain through a session (crypto.ts SealSession).
+    const s = yield* sealPassesSteps(seal.codec, () =>
+      serializeFreeList(
+        persistList.filter((p) => !reserved.has(p)),
+        safe.slice(reused),
+        seal,
+        next,
+      ),
     );
     const required = Math.ceil(
       Math.max(
@@ -4434,7 +4550,14 @@ export function* loadEnginePagedAtSteps(
       // tag was tampered with — XX001, never a fallback (encrypted.md §6).
       if (codec !== null) {
         const chain = yield* manifestChainSteps(candidate.meta, (p) => paging.readPageSteps(p));
-        codec.verifyMeta(candidate.slot, candidate.bytes, chain);
+        try {
+          yield* codec.verifyMetaSteps(candidate.slot, candidate.bytes, chain);
+        } catch (error) {
+          // A page client is served the meta without its slot; it authenticates under either slot
+          // index (encrypted.md §14).
+          if (!paging.trustsMeta()) throw error;
+          yield* codec.verifyMetaSteps(candidate.slot ^ 1, candidate.bytes, chain);
+        }
       }
       paging.cacheValidation(candidate.bytes, validated);
       selected = candidate;

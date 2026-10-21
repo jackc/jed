@@ -8,6 +8,7 @@
 import { closeSync, openSync } from "node:fs";
 
 import { FileCoordinator, osLocks } from "../coordinator.ts";
+import { type PageCodec, sealScratch } from "../crypto.ts";
 import type { Environment } from "../environment.ts";
 import type { Engine } from "../executor.ts";
 import type { FileHost } from "../filehost.ts";
@@ -34,6 +35,7 @@ export type HandoffOptions = {
   maxConnections?: number;
   synchronous?: "on" | "off";
   skipFsync?: boolean;
+  scratchEncryption?: "auto" | "on";
 };
 
 // HandoffHosts are a handle's hosts under the page service: its lock host (the OS by default), its
@@ -64,7 +66,8 @@ export class ServiceHandoff implements ServiceHandoffHost {
   private readonly environment: Environment;
   // openOwner opens the file as an owner opening it does (recovery and the stabilization a writable
   // handle performs), with the handle's open options.
-  private readonly openOwner: () => Engine;
+  // held is the data key a promoting page client holds (encrypted.md §14), null otherwise.
+  private readonly openOwner: (held: PageCodec | null) => Engine;
   readonly host: LockHost;
   private readonly files: FileHost | null;
   private readonly adoptClient: ((engine: Engine) => void) | null;
@@ -77,13 +80,26 @@ export class ServiceHandoff implements ServiceHandoffHost {
     timeoutMs: number | undefined,
     clientOpen: ClientOpenOptions,
     environment: Environment,
-    openOwner: () => Engine,
+    openOwner: (held: PageCodec | null) => Engine,
     hosts: HandoffHosts = {},
   ) {
     this.path = path;
     this.host = hosts.lock ?? osLocks;
     this.files = hosts.files ?? null;
-    this.adoptClient = hosts.adoptClient ?? null;
+    // A client engine adopted from the handle's hosts (the simulator's spill host in a simulation) keeps
+    // the handle's scratch encryption: "on" seals its scratch files (encrypted.md §11).
+    // An encrypted database's scratch files are always sealed (encrypted.md §11).
+    const adopt = hosts.adoptClient ?? null;
+    this.adoptClient =
+      adopt === null
+        ? null
+        : (engine) => {
+            adopt(engine);
+            const encrypt =
+              options.scratchEncryption === "on" ||
+              (engine.paging !== null && engine.paging.codec() !== null);
+            engine.spillSink = sealScratch(engine.spillSink, encrypt, environment);
+          };
     this.background = hosts.background ?? true;
     this.ownership = options.ownership ?? "prefer";
     this.relaxed = options.synchronous === "off";
@@ -118,7 +134,8 @@ export class ServiceHandoff implements ServiceHandoffHost {
     return won;
   }
 
-  elect(pauseUntilMs: number): ServiceRole {
+  // held is the data key the stale role holds: a promotion opens the file with it (encrypted.md §14).
+  elect(pauseUntilMs: number, held: PageCodec | null = null): ServiceRole {
     const won = electService(this.host, this.path, this.timeoutMs, this.readOnly, {
       never: this.ownership === "never",
       pauseUntilMs,
@@ -138,15 +155,19 @@ export class ServiceHandoff implements ServiceHandoffHost {
     }
     // Promotion: presence EX is held; open the file as an owner and serve it.
     const coordinator = FileCoordinator.fromElection(this.host, this.path, won.owner);
-    return this.startOwner(coordinator);
+    return this.startOwner(coordinator, undefined, held);
   }
 
   // startOwner makes the file the coordinator holds presence EX on a serving owner's role. A failure
   // releases presence (the path claim stays the handle's).
-  startOwner(coordinator: FileCoordinator, opened?: Engine): ServiceRole {
+  startOwner(
+    coordinator: FileCoordinator,
+    opened?: Engine,
+    held: PageCodec | null = null,
+  ): ServiceRole {
     let engine: Engine;
     try {
-      engine = opened ?? this.openOwner();
+      engine = opened ?? this.openOwner(held);
     } catch (error) {
       coordinator.close();
       throw error;

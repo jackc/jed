@@ -271,21 +271,52 @@ end
 # The 128-byte key block for the goldens' host key (§5): draws the DEK, KDF salt and wrap nonce.
 def new_key_block(rng)
   dek = rng.bytes(32)
-  salt = rng.bytes(32)
-  nonce = rng.bytes(12)
-  head = "JEDK".b + u16(1) + [1, 2].pack("CC") + u64(1) + ("\x00" * 16).b + salt + nonce
-  kek = Xaes.host_kek(ENC_KEY, salt)
-  block = head + Xaes.gcm_seal(kek, nonce, dek, head)
-  [block + u32(crc32(block)), dek]
+  [wrap_key_block(dek, 1, ENC_KEY, rng), dek]
 end
 
-# Unwrap a key block copy with the goldens' host key (decoder): the DEK, or nil.
-def unwrap_key_block(block)
+# The key block wrapping `dek` for `host_key` at `generation` (§5): draws the KDF salt, then the wrap
+# nonce. A credential change is this at the next generation over the same DEK.
+def wrap_key_block(dek, generation, host_key, rng)
+  salt = rng.bytes(32)
+  nonce = rng.bytes(12)
+  head = "JEDK".b + u16(1) + [1, 2].pack("CC") + u64(generation) + ("\x00" * 16).b + salt + nonce
+  kek = Xaes.host_kek(host_key, salt)
+  block = head + Xaes.gcm_seal(kek, nonce, dek, head)
+  block + u32(crc32(block))
+end
+
+# The host keys an encrypted image may be under: the goldens' (ENC_KEY, 32 bytes of 0x4A) first, then
+# the simulation's keys 1–3 (32 bytes of 0x4A + n; simulation-testing.md §14 S12).
+DECODE_KEYS = (0..3).map { |n| ([0x4A + n].pack("C") * 32).b }.freeze
+
+# Unwrap a host-key key-block copy with `key` (decoder): the DEK, or nil.
+def unwrap_key_block(block, key = ENC_KEY)
   return nil unless block.byteslice(0, 4) == "JEDK".b && block.byteslice(124, 4).unpack1("N") == crc32(block.byteslice(0, 124))
   return nil unless block.byteslice(4, 4) == u16(1) + [1, 2].pack("CC")
 
-  kek = Xaes.host_kek(ENC_KEY, block.byteslice(32, 32))
+  kek = Xaes.host_kek(key, block.byteslice(32, 32))
   Xaes.gcm_open(kek, block.byteslice(64, 12), block.byteslice(76, 48), block.byteslice(0, 76))
+end
+
+# One key-block copy (§5) as [block, generation], or nil when it is not a valid host-key copy.
+def key_block_copy(page)
+  b = page.byteslice(0, 128)
+  return nil unless b.byteslice(0, 4) == "JEDK".b && b.byteslice(124, 4).unpack1("N") == crc32(b.byteslice(0, 124))
+  return nil unless b.byteslice(4, 4) == u16(1) + [1, 2].pack("CC") && b.byteslice(16, 16) == ("\x00" * 16).b
+  return nil unless page.byteslice(128, page.bytesize - 128).bytes.all?(&:zero?)
+
+  generation = b.byteslice(8, 8).unpack1("Q>")
+  generation >= 1 ? [b, generation] : nil
+end
+
+# Select the key-block copy to unwrap (§5): the valid copy with the greater generation; two valid
+# copies of one generation must be identical.
+def select_key_block(page2, page3)
+  copies = [key_block_copy(page2), key_block_copy(page3)].compact
+  raise "no valid key block" if copies.empty?
+  raise "key block copies disagree" if copies.size == 2 && copies[0][1] == copies[1][1] && copies[0][0] != copies[1][0]
+
+  copies.max_by { |_, generation| generation }[0]
 end
 
 # Seal an encrypted meta page (§6): an empty-plaintext AEAD under the meta key over the slot and the
@@ -1964,6 +1995,11 @@ FIXTURES = ([
   { file: "encrypted_overflow_table.jed", page_size: 1024, encrypted: true, tables: [ENC_OVERFLOW_TABLE] },
   { file: "encrypted_index_table.jed", page_size: 1024, encrypted: true, tables: [ENC_INDEX_TABLE] },
   { file: "encrypted_catalog.jed", page_size: 1024, encrypted: true, tables: ENC_CATALOG_TABLES },
+  # A plaintext file holding ENC_INDEX_TABLE's rows (create, CREATE TABLE, two CREATE INDEX, 150
+  # inserts: txid 154), encrypted by a rekey (txid 155): every tree rebuilt by ascending insertion at
+  # the encrypted capacity, and the database's first key-entropy draws the key block (encrypted.md §12).
+  { file: "encrypted_rekey_index_table.jed", page_size: 1024, encrypted: true, tables: [ENC_INDEX_TABLE],
+    txid: 155 },
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
   { file: "compressed_table.jed", page_size: 256, tables: [COMPRESSED_TABLE] },
@@ -4044,8 +4080,8 @@ end
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
 def build_image(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE, views: [],
-                encrypted: false)
-  return build_encrypted_image(types, sequences, tables, page_size, collations, views) if encrypted
+                encrypted: false, txid: TXID)
+  return build_encrypted_image(types, sequences, tables, page_size, collations, views, txid) if encrypted
 
   ps = page_size
   cap = ps - PAGE_HEADER - ($enc ? RESERVE : 0)
@@ -4122,8 +4158,8 @@ def build_image(types, sequences, tables, page_size, collations = [], start_page
       image[index * ps, ps] = seal_body(index, PAGE_CATALOG, cp[:count], nxt, cp[:payload],
                                         flags: cp[:continued] ? 1 : 0)
     end
-    write_meta(image, ps, 0, page_size, TXID, cat_root, page_count)
-    write_meta(image, ps, 1, page_size, TXID, cat_root, page_count)
+    write_meta(image, ps, 0, page_size, $enc[:txid], cat_root, page_count)
+    write_meta(image, ps, 1, page_size, $enc[:txid], cat_root, page_count)
   else
     cat_layout.each_with_index do |cp, gi|
       index = cat_root + gi
@@ -4138,10 +4174,11 @@ end
 # The encrypted variant's from-scratch image (encrypted.md): the key block (its DEK, KDF salt and
 # wrap nonce the stream's first draws) at pages 2 and 3, then the image sealed from page 4 in seal
 # order — the stream continuing — under the goldens' host key.
-def build_encrypted_image(types, sequences, tables, page_size, collations, views)
+def build_encrypted_image(types, sequences, tables, page_size, collations, views, txid = TXID)
   rng = SeededStream.new(ENC_SEED)
   block, dek = new_key_block(rng)
-  $enc = { ps: page_size, rng: rng, tags: {}, page_key: Xaes.page_key(dek), meta_key: Xaes.meta_key(dek) }
+  $enc = { ps: page_size, rng: rng, tags: {}, page_key: Xaes.page_key(dek), meta_key: Xaes.meta_key(dek),
+           txid: txid }
   image = build_image(types, sequences, tables, page_size, collations, start_page: ENC_FIRST_BODY, views: views)
   key_page = block + "\x00".b * (page_size - block.bytesize)
   image[2 * page_size, page_size] = key_page
@@ -4157,7 +4194,8 @@ def fixture_image(fx)
   return malformed_fixture_image(fx) if fx[:malformed]
 
   image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
-                      fx[:collations] || [], views: fx[:views] || [], encrypted: fx[:encrypted])
+                      fx[:collations] || [], views: fx[:views] || [], encrypted: fx[:encrypted],
+                      txid: fx[:txid] || TXID)
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
@@ -4573,23 +4611,29 @@ def read_sealed_page(image, ps, index)
     next_page: nxt, payload: payload }
 end
 
-# Unlock an encrypted image for decoding (encrypted.md §5, §6): unwrap the selected key-block copy
-# with the goldens' host key, derive the subkeys, authenticate the selected meta, and record the
-# catalog root's tag.
+# Unlock an encrypted image for decoding (encrypted.md §5, §6): select the key-block copy, unwrap it
+# with whichever known host key opens it, derive the subkeys, authenticate the selected meta over its
+# manifest chain, and record the catalog root's tag.
 def unlock_image(image, ps, meta)
-  copies = [2, 3].map { |i| image.byteslice(i * ps, ps) }
-  raise "key block copies disagree" unless copies[0] == copies[1]
-  raise "key block tail not zero" unless copies[0].byteslice(128, ps - 128).bytes.all?(&:zero?)
-
-  dek = unwrap_key_block(copies[0].byteslice(0, 128)) or raise "the key block does not unwrap"
+  block = select_key_block(image.byteslice(2 * ps, ps), image.byteslice(3 * ps, ps))
+  dek = DECODE_KEYS.lazy.map { |key| unwrap_key_block(block, key) }.find(&:itself) or raise "the key block does not unwrap"
   $enc = { ps: ps, tags: {}, page_key: Xaes.page_key(dek), meta_key: Xaes.meta_key(dek) }
   m = image.byteslice(meta[:slot] * ps, ps).dup
   nonce = m.byteslice(ps - RESERVE, 24)
   tag = m.byteslice(ps - TAG_LEN, TAG_LEN)
   m[32, 4] = u32(0)
   m[ps - RESERVE, RESERVE] = "\x00".b * RESERVE
-  raise "the meta has a manifest chain this reference does not authenticate" unless m.byteslice(44, 4) == u32(0)
-  raise "meta page fails authentication" if Xaes.open($enc[:meta_key], nonce, tag, ad_prefix(2, meta[:slot]) + m).nil?
+  # The manifest-overflow chain the tag also covers: each page's index, then its bytes.
+  chain = "".b
+  id = m.byteslice(36, 4).unpack1("N")
+  m.byteslice(44, 4).unpack1("N").times do
+    raise "manifest chain leaves the image" if id.zero? || (id + 1) * ps > image.bytesize
+
+    page = image.byteslice(id * ps, ps)
+    chain << u32(id) << page
+    id = page.byteslice(8, 4).unpack1("N")
+  end
+  raise "meta page fails authentication" if Xaes.open($enc[:meta_key], nonce, tag, ad_prefix(2, meta[:slot]) + m + chain).nil?
 
   $enc[:tags][meta[:root_page]] = meta[:root_tag]
   $enc[:tags][meta[:free_head]] = meta[:free_tag] unless meta[:free_head].zero?
@@ -5756,6 +5800,11 @@ def encryption_vectors_toml
   block, golden_dek = new_key_block(SeededStream.new(ENC_SEED))
   out << "\n# The goldens' key block: the seeded stream's first draws under the host key above.\n"
   out << "[key_block]\nseed = #{ENC_SEED}\nblock_hex = \"#{hex(block)}\"\ndek_hex = \"#{hex(golden_dek)}\"\n"
+  rewrap_key = ("\x5a" * 32).b
+  rewrap = wrap_key_block(golden_dek, 2, rewrap_key, SeededStream.new(ENC_SEED + 1))
+  out << "\n# A credential change of that block to a second host key: the same DEK at generation 2, the\n"
+  out << "# salt and nonce drawn from a stream seeded with seed + 1 (encrypted.md §5).\n"
+  out << "[rewrap]\nseed = #{ENC_SEED + 1}\nkey_hex = \"#{hex(rewrap_key)}\"\nblock_hex = \"#{hex(rewrap)}\"\n"
   out << "\n[argon2id]\npassword = \"password\"\nsalt = \"somesalt\"\nmemory_kib = 65536\niterations = 2\n"
   out << "parallelism = 1\nkey_hex = \"09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7\"\n"
   out

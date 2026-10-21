@@ -9,7 +9,7 @@
 // (the Node-`fs`-free seam, hosts.md §5) rather than through here.
 
 import type { Rows } from "./api.ts";
-import { createCodec, type Credential, DEFAULT_ARGON2_PARAMS } from "./crypto.ts";
+import { createCodec, type Credential, DEFAULT_ARGON2_PARAMS, sealScratch } from "./crypto.ts";
 import type { Engine, Outcome, Snapshot } from "./executor.ts";
 import { toImage as toImageBytes } from "./format.ts";
 import { seededRandomSource } from "./seam.ts";
@@ -142,9 +142,11 @@ export function executeScript(db: Engine, sql: string): ScriptSummary {
 export function setSpillDirForTest(db: object, dir: string): void {
   const internal = db as { core: { storage: Engine } };
   const storage = internal.core.storage;
-  // An encrypted database has no scratch target (spec/fileformat/encrypted.md §10).
-  if (storage.paging !== null && storage.paging.codec() !== null) return;
-  storage.spillSink = new FileSpillSink(dir);
+  // A sealed scratch target stays sealed (spec/fileformat/encrypted.md §11).
+  const encrypt =
+    (storage.paging !== null && storage.paging.codec() !== null) ||
+    (storage.spillSink?.encrypts?.() ?? false);
+  storage.spillSink = sealScratch(new FileSpillSink(dir), encrypt, storage.environment);
 }
 
 // encryptedImageForTesting is the from-scratch image of a Database's committed snapshot in the

@@ -8,6 +8,9 @@
 // Each test gets a fresh browser context, so OPFS starts empty; a unique db name per test avoids the
 // exclusive-handle clash even if state lingered.
 
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 import { expect, test } from "@playwright/test";
 
 const EXPECTED = [
@@ -61,4 +64,43 @@ test("commit, recovery and maintenance await an asynchronous page codec over rea
     encoded: true,
     decoded: true,
   });
+});
+
+test("an encrypted database seals and opens its pages through WebCrypto in the worker", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.locator("#out")).toContainText("read back");
+  const result = await page.evaluate((n) => window.jed.encryptedScenario(n), "enc1.jed");
+  expect(result).toEqual({ written: EXPECTED, read: EXPECTED, missing: "28P02", wrong: "28P01" });
+});
+
+test("WebCrypto writes the Node host's bytes, and its per-page cost", async ({ page }) => {
+  test.setTimeout(120_000);
+  // The Node side: the seeded workload's file under node:crypto, and the goldens' rows.
+  const script = fileURLToPath(new URL("./encryption_expected.ts", import.meta.url));
+  const request = JSON.parse(
+    execFileSync(process.execPath, [script], { maxBuffer: 64 << 20 }).toString(),
+  );
+  await page.goto("/");
+  await expect(page.locator("#out")).toContainText("read back");
+  const result = (await page.evaluate((r) => window.jed.encryptionScenario(r), request)) as {
+    error?: string;
+    goldens: Record<string, boolean>;
+    sameBytes: boolean;
+    timing: Record<"plain" | "sealed", { write: number; scan: number; pages: number }>;
+  };
+  expect(result.error).toBeUndefined();
+  expect(Object.values(result.goldens)).toEqual([true, true, true, true]);
+  expect(result.sameBytes).toBe(true);
+  // The per-page cost (encryption.md §9): the encrypted run's extra time over the plaintext one,
+  // per page of the encrypted file — reported, not asserted (wall-clock).
+  const { plain, sealed } = result.timing;
+  const perPage = (a: number, b: number) => (((a - b) * 1000) / sealed.pages).toFixed(1);
+  console.log(
+    `browser encryption cost: ${sealed.pages} pages; cold scan ${sealed.scan.toFixed(1)} ms vs ` +
+      `${plain.scan.toFixed(1)} ms plaintext (${perPage(sealed.scan, plain.scan)} µs/page); bulk ` +
+      `write ${sealed.write.toFixed(1)} ms vs ${plain.write.toFixed(1)} ms ` +
+      `(${perPage(sealed.write, plain.write)} µs/page)`,
+  );
 });

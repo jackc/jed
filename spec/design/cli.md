@@ -67,6 +67,10 @@ jed pages [--read-only] DBFILE
   -o FILE                 script mode: write results to FILE instead of stdout
                           ('-' = stdout); errors still go to stderr
   --max-cost N            cost ceiling: statements abort with 54P01 at cost N (api.md §8)
+  --key-file FILE         the 32-byte key of an encrypted DBFILE (or, with --create, encrypt it):
+                          32 raw bytes or 64 hex digits
+  --passphrase-file FILE  the passphrase of an encrypted DBFILE, from FILE
+  --passphrase            prompt for the passphrase on the terminal (echo off)
   --continue-on-error     script mode: keep going after a SQL error (default: stop)
   -q, --quiet             script mode: suppress OK lines (results and errors still print)
   --version, -h, --help
@@ -85,6 +89,15 @@ DuckDB convention; ideal for trying SQL), stated by the TUI status bar / script-
 defaults to READ ONLY, writes are `25006`, the file is opened without write access); it
 requires a DBFILE and excludes `--create`. The TUI status bar appends `(read-only)` to the
 path.
+
+**Encrypted databases (encryption.md §5).** A credential comes from a key file, a passphrase file,
+or a terminal prompt, at most one of them — never a flag's value or an environment variable, which
+other processes and shell histories can read. With `--create` it encrypts the new database (a
+prompted passphrase is asked twice); otherwise it unlocks an encrypted DBFILE. Opening an encrypted
+file without one is `28P02` with a `hint:` naming the flags; the wrong one is `28P01`; one for a
+plaintext file `28P03`. `jed migrate` takes the same three flags (a new DBFILE it creates is
+encrypted). An encrypted database is not reachable over `ssh://` yet (the page service does not
+serve one, encrypted.md §10).
 
 **Exit codes.** `0` success · `1` startup/usage error (bad flags; `58P01`/`58P02`/
 `XX001`/`58030` on open/create) · `2` a SQL statement failed in script mode.
@@ -272,7 +285,8 @@ When the error's table is in a database other than `main` (`DatabaseName`, [erro
 not printed (psql likewise prints `SCHEMA NAME` only in verbose mode). The TUI's one-line message log
 appends Detail, Hint, and a non-`main` database inline (`…  DETAIL: Key (id)=(1) already exists.`,
 `…  HINT: …`, `…  DATABASE: reports`). CLI-generated hints (a second `hint: ...` line):
-missing file → `pass --create`; `54P01` → `raise the ceiling with --max-cost`.
+missing file → `pass --create`; `54P01` → `raise the ceiling with --max-cost`; `28P02` → `pass
+--key-file, --passphrase-file or --passphrase`.
 
 ## 6. TUI mode
 

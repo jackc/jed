@@ -64,6 +64,62 @@ async function asyncCodecScenario(): Promise<Record<string, unknown>> {
   }
 }
 
+// encryptedScenario runs an encrypted database through the public async API (encryption.md §9): create
+// with a host key, write, close; reopen with the key and read; reopen without one (28P02) and with a
+// wrong one (28P01). The worker seals and opens every page through WebCrypto.
+async function encryptedScenario(name: string): Promise<Record<string, unknown>> {
+  const credential = { key: new Uint8Array(32).fill(0x4a) };
+  const db = await OpfsDatabase.create(name, { credential });
+  let written: string[][];
+  try {
+    await db.execute("CREATE TABLE t (k i32 PRIMARY KEY, v text)");
+    await db.execute("INSERT INTO t VALUES (1, 'one')");
+    await db.execute("INSERT INTO t VALUES (2, 'two')");
+    await db.execute("INSERT INTO t VALUES (3, 'three')");
+    written = (await db.query(SELECT)).rows;
+  } finally {
+    await db.close();
+  }
+  const reopened = await OpfsDatabase.open(name, { credential });
+  let read: string[][];
+  try {
+    read = (await reopened.query(SELECT)).rows;
+  } finally {
+    await reopened.close();
+  }
+  const code = async (key?: Uint8Array): Promise<string> => {
+    try {
+      const db = await OpfsDatabase.open(name, key === undefined ? {} : { credential: { key } });
+      await db.close();
+      return "<no error>";
+    } catch (e) {
+      return e instanceof OpfsError ? e.code : `<${String(e)}>`;
+    }
+  };
+  return {
+    written,
+    read,
+    missing: await code(),
+    wrong: await code(new Uint8Array(32).fill(1)),
+  };
+}
+
+// encryptionScenario hands the e2e's request (e2e/encryption_expected.ts) to a dedicated worker that
+// checks WebCrypto's bytes against the Node host's and times the per-page cost.
+async function encryptionScenario(request: unknown): Promise<Record<string, unknown>> {
+  const worker = new Worker(new URL("./workers/encryption_worker.ts", import.meta.url), {
+    type: "module",
+  });
+  try {
+    return await new Promise((resolve) => {
+      worker.onmessage = (event) => resolve(event.data as Record<string, unknown>);
+      worker.postMessage(request);
+    });
+  } finally {
+    worker.terminate();
+  }
+}
+
 declare global {
   interface Window {
     jed: {
@@ -71,13 +127,22 @@ declare global {
       readScenario: (name: string) => Promise<string[][]>;
       errorScenario: (name: string) => Promise<string>;
       asyncCodecScenario: () => Promise<Record<string, unknown>>;
+      encryptedScenario: (name: string) => Promise<Record<string, unknown>>;
+      encryptionScenario: (request: unknown) => Promise<Record<string, unknown>>;
     };
     jedRuntime: typeof runtime;
     jedHostFunctions: typeof hostFunctions;
   }
 }
 
-window.jed = { writeScenario, readScenario, errorScenario, asyncCodecScenario };
+window.jed = {
+  writeScenario,
+  readScenario,
+  errorScenario,
+  asyncCodecScenario,
+  encryptedScenario,
+  encryptionScenario,
+};
 window.jedRuntime = runtime;
 window.jedHostFunctions = hostFunctions;
 

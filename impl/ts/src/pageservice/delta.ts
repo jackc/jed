@@ -14,6 +14,7 @@ import {
   parseCommitMeta,
   type CommitMeta,
 } from "../commit_manifest.ts";
+import type { PageCodec } from "../crypto.ts";
 import type { PsCommitBegin, PsIndexedPage } from "./codec.ts";
 
 const PAGE_FREELIST = 7;
@@ -34,13 +35,17 @@ export type DeltaBase = {
   pageCount: number;
   // granted is the reusable free pages when the reuse grant passed; null otherwise.
   granted: Set<number> | null;
+  // codec is an encrypted database's page codec (spec/fileformat/encrypted.md §14), null in plaintext:
+  // the meta must authenticate under it, the inline manifest starts at 96, body pages are ciphertext
+  // checked by their manifest identity alone, and the key block (pages 2–3) is never written.
+  codec?: PageCodec | null;
 };
 
 // legal reports whether a delta may write index: a body page beyond the committed high-water or a
 // granted free page, below the new page count.
 export function legal(base: DeltaBase, index: number, newPageCount: number): boolean {
   return (
-    index >= 2 &&
+    index >= ((base.codec ?? null) === null ? 2 : 4) &&
     index < newPageCount &&
     (index >= base.pageCount || base.granted?.has(index) === true)
   );
@@ -65,6 +70,8 @@ export class Delta {
   readonly txid: bigint;
   readonly meta: Uint8Array;
   readonly parsed: CommitMeta;
+  // encrypted: body pages are ciphertext, checked by their manifest identity alone.
+  private readonly encrypted: boolean;
   // manifest is the overflow chain, in chain order; it arrives whole in commit_begin.
   readonly manifest: PsIndexedPage[] = [];
   // written is every index the delta writes (listed and manifest pages), ascending: the invalidation
@@ -74,10 +81,11 @@ export class Delta {
   private readonly expected = new Map<number, bigint>();
   private readonly received = new Set<number>();
 
-  private constructor(txid: bigint, meta: Uint8Array, parsed: CommitMeta) {
+  private constructor(txid: bigint, meta: Uint8Array, parsed: CommitMeta, encrypted: boolean) {
     this.txid = txid;
     this.meta = meta;
     this.parsed = parsed;
+    this.encrypted = encrypted;
   }
 
   // begin runs the checks before any page is written (README §3.5 check A): the meta, then the
@@ -92,8 +100,12 @@ export class Delta {
     if (m.txid !== cb.txid) throw failure("the meta page names another txid");
     if (m.pageCount < base.pageCount) throw failure("the page count shrinks");
     if (m.dirtyCount === 0) throw failure("the manifest lists no page");
+    const codec = base.codec ?? null;
+    if ((m.suite !== 0) !== (codec !== null)) {
+      throw failure("the meta is not of the database's variant");
+    }
     const ps = base.pageSize;
-    const d = new Delta(cb.txid, cb.meta.slice(), m);
+    const d = new Delta(cb.txid, cb.meta.slice(), m, codec !== null);
     if (cb.manifestPages.length !== m.overflowCount) {
       throw failure("commit_begin carries the wrong number of manifest pages");
     }
@@ -118,7 +130,11 @@ export class Delta {
         listed++;
       }
     };
-    list(cb.meta, 64, Math.min(m.dirtyCount, manifestInlineCapacity(ps)));
+    list(
+      cb.meta,
+      codec === null ? 64 : 96,
+      Math.min(m.dirtyCount, manifestInlineCapacity(ps, codec !== null)),
+    );
     let id = m.overflowHead;
     let chain = 0n;
     for (let ordinal = 0; ordinal < cb.manifestPages.length; ordinal++) {
@@ -155,6 +171,14 @@ export class Delta {
     if (listed !== m.dirtyCount || !rootSeen || !freeHeadSeen) {
       throw failure("the manifest does not cover the catalog root and free-list head");
     }
+    // An encrypted meta must authenticate under the database key, under either slot index (a client
+    // cannot know the slot), or the delta is a client bug (encrypted.md §14).
+    if (codec !== null) {
+      const chain = d.manifest.map((pg) => ({ index: pg.index, bytes: pg.page }));
+      if (!metaAuthenticates(codec, d.meta, chain)) {
+        throw failure("the meta does not authenticate under the database key");
+      }
+    }
     d.written.push(...[...protectedPages].sort((a, b) => a - b));
     return d;
   }
@@ -166,7 +190,8 @@ export class Delta {
     if (crc === undefined) throw failure(`page ${pg.index} is not listed in the manifest`);
     if (this.received.has(pg.index)) throw failure(`page ${pg.index} arrived twice`);
     const b = pg.page;
-    if (b[0]! < 1 || b[0]! > 7 || pageChecksum(b) !== u32(b, 12) || crc64Update(0n, b) !== crc) {
+    const plainOk = this.encrypted || (b[0]! >= 1 && b[0]! <= 7 && pageChecksum(b) === u32(b, 12));
+    if (b.length !== this.meta.length || !plainOk || crc64Update(0n, b) !== crc) {
       throw failure(`page ${pg.index} does not match its manifest identity`);
     }
     this.received.add(pg.index);
@@ -180,24 +205,56 @@ export class Delta {
   }
 }
 
+// metaAuthenticates reports whether codec authenticates meta under either slot index
+// (spec/fileformat/encrypted.md §14); chain is its manifest-overflow chain.
+export function metaAuthenticates(
+  codec: PageCodec,
+  meta: Uint8Array,
+  chain: { index: number; bytes: Uint8Array }[],
+): boolean {
+  for (const slot of [0, 1]) {
+    try {
+      codec.verifyMeta(slot, meta, chain);
+      return true;
+    } catch {
+      // Try the other slot index.
+    }
+  }
+  return false;
+}
+
 // readFreeListChain reads the committed free list (the page_type 7 chain at head) through read, for the
-// reuse grant's granted pages. A malformed chain yields null: the owner then grants no reuse.
+// reuse grant's granted pages. A malformed chain yields null: the owner then grants no reuse. In an
+// encrypted database (codec set) each page is opened against the tag its predecessor binds, starting
+// with headTag, the meta's (spec/fileformat/encrypted.md §2).
 export function readFreeListChain(
   read: (index: number) => Uint8Array,
   head: number,
   pageCount: number,
+  codec: PageCodec | null = null,
+  headTag: Uint8Array = new Uint8Array(16),
 ): number[] | null {
   const free: number[] = [];
   const chain = new Set<number>();
+  const first = codec === null ? 2 : 4;
+  const tagLen = codec === null ? 0 : 16;
+  let tag = headTag;
   for (let p = head; p !== 0; ) {
-    if (p < 2 || p >= pageCount || chain.has(p)) return null;
+    if (p < first || p >= pageCount || chain.has(p)) return null;
     chain.add(p);
-    const b = read(p);
+    let b: Uint8Array;
+    try {
+      b = codec === null ? read(p) : codec.openBody(p, read(p), tag);
+    } catch {
+      return null;
+    }
     if (b[0] !== PAGE_FREELIST || pageChecksum(b) !== u32(b, 12)) return null;
     const count = u32(b, 4);
-    if (count > Math.floor((b.length - 16) / 4)) return null;
-    for (let i = 0; i < count; i++) free.push(u32(b, 16 + i * 4));
+    const at = 16 + tagLen;
+    if (count > Math.floor((b.length - at) / 4)) return null;
+    for (let i = 0; i < count; i++) free.push(u32(b, at + i * 4));
     p = u32(b, 8);
+    tag = b.slice(16, 16 + tagLen);
   }
   return free;
 }

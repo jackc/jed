@@ -155,8 +155,28 @@ The reader takes the valid copy with the greater `generation`; two valid copies 
 must be byte-identical (else `XX001`); no valid copy is `XX001`. It unwraps with that copy alone and
 never falls back to the other.
 
-A key block is written only by `create` (and compaction, which copies the selected copy to both
-pages). The credential-change protocol of encryption.md §5 is not yet built.
+A key block is written only by `create`, by compaction (which copies the selected copy to both pages
+of the new file), and by a credential change.
+
+**Changing the credential** rewraps the same DEK; no other page is written. The new copy has
+`generation` one greater than the selected copy, the new credential's `kdf` and parameters, and a fresh
+`kdf_salt` and `wrap_nonce`. The writer, holding the writer gate and the file:
+
+1. derives the new KEK before taking the gate;
+2. issues a **stabilization barrier**: flushes any pending `synchronous = off` batch, syncs the file, and
+   syncs its directory once per handle (encryption.md §5);
+3. writes the new copy over the copy that is **not selected** — the invalid or older copy, or page 3
+   when both are valid and equal — then a barrier;
+4. writes it over the other page, then a barrier, and only then acknowledges.
+
+A crash before step 3's barrier leaves the old credential working; after it, the new one; never neither.
+A failure poisons the handle, which must be reopened. Under the gate the writer first checks that its new
+copy's `generation` is still one past the selected copy's; a change that lost a race with another is
+refused (`55006`) before it writes, so two different copies of one generation are never written.
+
+**Repair at open.** When the two pages differ (one invalid, or an older generation), a writable open that
+unwrapped the selected copy writes it over the other page between two barriers. A read-only open leaves
+the pair alone; selection already prefers the newer copy.
 
 ## 6. Meta slots
 
@@ -210,7 +230,9 @@ order differ, and a from-scratch writer may emit pages in any index order.
 Every seal draws a fresh 24-byte nonce from the database's key-entropy stream; nothing about nonces
 is allocated, counted or persisted. `create` draws, in order, the 32-byte `DEK`, the 32-byte
 `kdf_salt`, and the 12-byte `wrap_nonce`, then the from-scratch image's nonces in seal order.
-Compaction draws only the image's nonces (it keeps the DEK and key block).
+Compaction draws only the image's nonces (it keeps the DEK and key block). A credential change draws
+the new copy's 32-byte `kdf_salt`, then its 12-byte `wrap_nonce`, when it is called, before taking the
+gate; `encryption_vectors.toml`'s `[rewrap]` pins one.
 
 The key-entropy stream is the environment's key-entropy source (environment.md), separate from the
 SQL random source: the OS CSPRNG in production. Tests and the goldens install an explicitly insecure
@@ -237,12 +259,113 @@ setting, so it reaches no SQL surface or error message.
 
 ## 10. Not yet built (fail closed)
 
-- **Page service.** An encrypted file is never served: an open or create that carries a credential
-  under `locking = auto` takes the exclusive, non-serving mode, as on a host that cannot serve. An
-  open without a credential — a page client, `jed pages` — fails closed with `28P02`.
-- **Scratch.** A handle whose main database is encrypted has no scratch target: blocking operators
-  and temp domains stay resident instead of spilling plaintext. Attaching an encrypted database to a
-  handle that has a scratch target is `55000`.
-- **Credential change, DEK rotation, encrypting or decrypting an existing file, backups** of an
-  encrypted file: not exposed (`0A000` where an entry point exists).
-- **Browser/OPFS**: an encrypted database is `0A000` there (no synchronous AES).
+- **Replication** (not built for any file): a credential change's key-block item in the stream.
+- **A credential carried in `hello`** for a `jed pages` server that must own an encrypted database;
+  today such a server is given a key or passphrase file, or fails `28P02` (a relay needs none).
+
+## 11. Scratch files
+
+Scratch encryption (encryption.md §6) is a **handle** setting fixed at `open`/`create`,
+`scratch_encryption = auto | on`; `auto` is on when the main database is encrypted. With it on, every
+scratch file the handle's spill host makes — sort runs, row spools, hash partitions, a spilled temp
+domain's page store — is sealed; with it off, attaching an encrypted database is `55000` on a host that
+has a scratch target. Hosts with none (in-memory, OPFS, WASI) have nothing to seal. Scratch bytes are
+never durable, never reopened and never read by another process or core, so this framing is not a
+cross-core byte contract and has no goldens; it is stated so the cores agree on what they protect.
+
+- Each file draws a random 32-byte key and a random 16-byte file id from the handle's **scratch
+  stream** — a key-entropy stream of its own, so it never perturbs a database's stream.
+- The file's logical bytes are cut into 4096-byte blocks. Block `i` is stored at `i·4136` as its
+  XAES-256-GCM ciphertext (always the whole block, zero-padded), its 24-byte nonce and its 16-byte tag.
+- The associated data is `"JEDB" ‖ suite ‖ 0x03 ‖ file_id ‖ u64 i ‖ u64 counter`, where `counter` is
+  the block's write count, kept in memory (one `u64` per block, outside the logical memory accounts)
+  and incremented at every seal. A counter is **never reset**, truncation included, so no version
+  sealed before a newer one can authenticate again; a block never written, or cut by a truncation and
+  not rewritten since, reads as zeros. A replayed older version of a
+  rewritten block, a block moved to another ordinal or file, and any altered byte fail to open, an I/O
+  error (`58030`) to the operator reading it.
+- The logical size is kept in memory; truncation zeroes the cut part of a kept block.
+- A core may buffer the block most recently written in memory and seal it when another block is
+  written, so a run of small writes into one block seals it once.
+
+Results, cost and every limit's trip point are unchanged: scratch encryption is unmetered physical work.
+
+## 12. Rekey: DEK rotation and conversion
+
+A **rekey** rewrites a file database under a new data key: encrypted for a new credential — rotating an
+encrypted file's DEK, or encrypting a plaintext file — or plaintext, decrypting an encrypted one. It is
+compaction (api.md §2.6) with three differences:
+
+1. **Every tree is rebuilt** under the target layout, since node-preserving compaction cannot carry a
+   packed page across a capacity change. Each table's data tree and each B-tree or GIN index tree of
+   the result is the tree that **inserting its records in ascending key order into an empty tree**
+   produces at the target's `C` and pointer width, every value fully materialized (so its storage —
+   inline, compressed or in an overflow chain — is re-planned at the target capacity); a GiST tree is
+   rebuilt from its leaf keys as always. Catalog entries, row counts, rowid counters, statistics and
+   every other catalog object are kept. The image is then the ordinary from-scratch image of that
+   snapshot at `txid + 1`, sealed as §7 says.
+2. **Draws.** An encrypted target draws, from the database's key-entropy stream (a new stream for a
+   plaintext source, the open database's own for an encrypted one), the new 32-byte DEK, `kdf_salt`
+   and `wrap_nonce` (a new key block at `generation = 1`), then the image's nonces in seal order. The
+   golden `encrypted_rekey_index_table.jed` pins it: a plaintext file holding `encrypted_index_table`'s
+   rows (built in any order), rekeyed at `txid 155`.
+3. **Failure before the rename.** A record or index key the target cannot store (an encrypted page holds
+   40 bytes less and its pointers are wider, so `RECORD_MAX` and the key cap fall), or a result whose
+   live pages exceed `max_storage_bytes` (`54P06`), fails before the file is replaced.
+
+The rebuild runs in a **scratch domain** in the target layout — a temp domain sealed under a throwaway
+random key when the target is encrypted — whose pages move to a scratch file of the handle's spill host
+once they pass the handle's page-cache budget, so memory stays bounded. Encrypting is refused (`55000`)
+through a handle whose scratch files are plaintext (§11), and an encrypted target needs a page size of
+at least 1024 (`0A000`). A rekey keeps compaction's rules: it never waits (`55006` with a reader, a
+write transaction or another process), and it starts a new key lineage, so earlier copies of the file
+still open with their old credential.
+
+## 13. Backups
+
+Both backup forms of page-service.md §9 work on an encrypted database, from its owner or a page client
+(§14):
+
+- **Page-identical**: the walk follows every chain through its bound pointers, so chain pages and
+  interior nodes are authenticated as they are read; every copied page keeps its stored (ciphertext)
+  bytes at its index. Pages 2 and 3 both receive the database's **selected key-block copy** — the one a
+  credential change replaces only after writing both pages — so the copy holds a complete pair at one
+  generation even while a change runs. Both meta slots carry the bootstrap meta of the pinned version
+  (its root and free-list tags at 64 and 80), each sealed for its own slot index.
+- **Compacted**: the from-scratch image at `txid + 1` under the same DEK and key block, every page
+  resealed with fresh nonces from the database's key-entropy stream, as compaction does.
+
+Either copy opens with the database's credential at the time of the backup.
+
+## 14. The page service
+
+An encrypted database is served like a plaintext one (page-service.md); every process that reads or
+writes its pages holds the DEK. No message is added to the wire protocol (spec/pageservice/):
+
+- **Unlocking a client.** A page client learns the variant from the meta in `read_begun` (offset 6) and
+  unlocks with its own credential, reading pages 2 and 3 through `read_pages` like any page and
+  selecting a copy by §5. A credential change in progress never leaves both copies invalid, so this
+  needs no lock; no credential is `28P02`, a wrong one `28P01`, a credential for a plaintext database
+  `28P03`. Pages cross the connection as stored bytes and the client opens them with its own codec.
+- **The served meta has no slot.** `read_begun` carries the meta's bytes, not the slot that holds them,
+  so a client authenticates a served meta under either slot index. It seals its commit's meta for
+  either index; the owner checks the tag (under either index — a meta that authenticates under neither
+  is `08P01`, a client bug, before any page is written), then **reseals** the meta for the slot it
+  writes, with a nonce of its own, and publishes those bytes. A commit's `commit_status` digest is
+  therefore taken with the meta's CRC field and reserve zeroed (spec/pageservice/README.md §3.5), so
+  the resealed meta and the one the client sent resolve alike. A delta's inline manifest starts at 96,
+  it may not write pages below 4, and its body pages are checked by their manifest identity alone.
+- **Credential change** is the owner's: a page client's request is `55000`.
+- **Promotion.** A client that promotes itself opens the file with the **data key it holds**, not its
+  credential, so a credential changed since it unlocked does not stop it. It adopts the file's selected
+  key-block copy and leaves a differing pair unrepaired (§5 makes that safe). The meta is
+  authenticated under the held key (`XX001` otherwise).
+- **Rekey under the service** is the owner's, under compaction's rules (no client may pin a snapshot).
+  A client that stays connected finds, at its next transaction, a meta its held key no longer
+  authenticates (or a plaintext one): `28P04 stale_key`, and it reopens with the new credential. A
+  plaintext client whose database was encrypted meanwhile gets `28P02`.
+- **Backups** through a client read pages 2 and 3 through the service and write the selected copy to
+  both (§13).
+- **`jed pages`** relays ciphertext without a key. A `jed pages` that must own an encrypted database
+  needs one (`--key-file` / `--passphrase-file`), else `28P02`.
+

@@ -1389,6 +1389,83 @@ impl Snapshot {
         self.gist_trees.get(name_key)
     }
 
+    /// This snapshot's catalog over empty stores of capacity `cap` in `paging`: the start of a
+    /// rebuild under another page layout (DEK rotation and conversion, spec/design/encryption.md §5).
+    /// Each store keeps its column types and synthetic-rowid counter.
+    pub(crate) fn emptied(
+        &self,
+        cap: crate::format::Cap,
+        paging: &std::sync::Arc<crate::paging::SharedPaging>,
+    ) -> Snapshot {
+        let empty = |store: &TableStore| {
+            let mut fresh = TableStore::new(cap, store.col_types().to_vec());
+            fresh.bump_rowid_to(store.next_rowid());
+            fresh.attach_paging(std::sync::Arc::clone(paging));
+            fresh
+        };
+        let mut out = self.clone();
+        out.stores = std::sync::Arc::new(
+            self.stores
+                .iter()
+                .map(|(k, v)| (k.clone(), empty(v)))
+                .collect(),
+        );
+        out.index_stores = std::sync::Arc::new(
+            self.index_stores
+                .iter()
+                .map(|(k, v)| (k.clone(), empty(v)))
+                .collect(),
+        );
+        out.gist_trees = std::sync::Arc::new(HashMap::new());
+        out.store_paging = Some(std::sync::Arc::clone(paging));
+        out
+    }
+
+    /// Copy every record of every table and index store into `target` (from [`emptied`]), each store
+    /// in ascending key order with its values fully materialized, so each rebuilt tree is the one
+    /// ascending insertion builds under `target`'s layout (encrypted.md §12). Stores go in name byte
+    /// order, tables before indexes. `stage` runs whenever the copied versions pass `stage_bytes`, and
+    /// once at the end, so the caller can write the dirty pages out and keep memory bounded. A record
+    /// the target layout cannot store fails here, before anything is written.
+    pub(crate) fn rebuild_rows(
+        &self,
+        target: &mut Snapshot,
+        stage_bytes: i64,
+        stage: &mut dyn FnMut(&mut Snapshot) -> Result<()>,
+    ) -> Result<()> {
+        for index in [false, true] {
+            let map = if index {
+                &self.index_stores
+            } else {
+                &self.stores
+            };
+            let mut names: Vec<&String> = map.keys().collect();
+            names.sort();
+            for name in names {
+                let source = &map[name];
+                source.scan_range(&crate::pmap::KeyBound::unbounded(), &mut |key, row| {
+                    let mut row = row.clone();
+                    source.resolve_all(&mut row)?;
+                    let stores = if index {
+                        &mut target.index_stores
+                    } else {
+                        &mut target.stores
+                    };
+                    std::sync::Arc::make_mut(stores)
+                        .get_mut(name)
+                        .expect("an emptied snapshot has every store")
+                        .insert(key.to_vec(), row)?;
+                    if target.staged_bytes() >= stage_bytes {
+                        stage(target)?;
+                    }
+                    Ok(true)
+                })?;
+            }
+        }
+        target.rebuild_gist_trees()?;
+        stage(target)
+    }
+
     /// Rebuild **every** GiST index's resident R-tree from its leaf-key store (spec/design/gist.md
     /// §3/§4.1). Called after any statement that may have changed a GiST index's leaf set (the
     /// mutating-statement hook), so the working snapshot always carries a fresh tree a subsequent

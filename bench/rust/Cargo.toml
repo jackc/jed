@@ -32,3 +32,9 @@ path = "src/bin/bench_sqlite.rs"
 [[bin]]
 name = "stress"
 path = "src/bin/stress.rs"
+
+# Encryption-at-rest benchmark worker (spec/design/encryption.md §9); driven by mise run
+# bench:encryption.
+[[bin]]
+name = "encryption"
+path = "src/bin/encryption.rs"

@@ -358,6 +358,43 @@ fn chain_content<'p>(page: &Page<'p>, cap: Cap) -> Result<(PageRef, &'p [u8])> {
         &page.payload[cap.tag..],
     ))
 }
+/// Whether `paging`'s key authenticates the meta in slot 0 under either slot index — a page client's
+/// test that a rekey has not left its held key stale (encrypted.md §14). `Ok(true)` in plaintext.
+pub(crate) fn meta_authenticates(paging: &SharedPaging) -> Result<bool> {
+    let Some(codec) = paging.codec() else {
+        return Ok(true);
+    };
+    let mut pager = paging.pager();
+    let meta = pager.read_block(0)?;
+    let chain = commit_manifest::chain_pages(&meta, |id| pager.read_block(id))?;
+    Ok(codec.verify_meta(0, &meta, &chain).is_ok() || codec.verify_meta(1, &meta, &chain).is_ok())
+}
+
+/// A commit's resolution digest (spec/pageservice/README.md §3.5 `commit_status`): the CRC-64 of
+/// its meta page, with the CRC field and the reserve zeroed in the encrypted variant, so the digest
+/// of the meta a client sent equals that of the meta the owner resealed for its slot
+/// (spec/fileformat/encrypted.md §14).
+pub(crate) fn resolution_digest(meta: &[u8]) -> u64 {
+    if meta.get(6).copied() != Some(crate::crypto::SUITE_XAES)
+        || meta.len() < crate::crypto::MIN_PAGE_SIZE
+    {
+        return commit_crc64(0, meta);
+    }
+    let mut m = meta.to_vec();
+    let ps = m.len();
+    m[32..36].fill(0);
+    m[ps - crate::crypto::RESERVE..].fill(0);
+    commit_crc64(0, &m)
+}
+
+/// One step along a chain (catalog, overflow, free-list) of a page read through its pointer: the
+/// page's type and its bound successor pointer (encrypted.md §2; the tag is zero in plaintext).
+pub(crate) fn chain_step(block: &[u8], cap: Cap) -> Result<(u8, PageRef)> {
+    let page = parse_page(block)?;
+    let (next, _) = chain_content(&page, cap)?;
+    Ok((page.page_type, next))
+}
+
 /// Bytes reserved inside `RECORD_MAX` beyond the per-column term — **independent of
 /// `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Historically the two-key
 /// interior node's three child pointers (`4·3`); since v24 the value is kept as the `K = 0` floor
@@ -1811,8 +1848,7 @@ impl Snapshot {
 
         // An encrypted image's key block: the same copy at pages 2 and 3 (encrypted.md §5).
         if let Some(codec) = codec {
-            let mut block = vec![0u8; ps];
-            block[..codec.key_block().len()].copy_from_slice(codec.key_block());
+            let block = codec.key_block_page(ps);
             sink(2, &block)?;
             sink(3, &block)?;
         }
@@ -2868,7 +2904,14 @@ impl Engine {
                     // that fails its tag was tampered with — `XX001`, never a fallback.
                     if let Some(codec) = paging.codec() {
                         let chain = commit_manifest::chain_pages(bytes, |id| pg.read_block(id))?;
-                        codec.verify_meta(slot, bytes, &chain)?;
+                        let verified = codec.verify_meta(slot, bytes, &chain);
+                        if verified.is_err() && pg.trusts_meta() {
+                            // A page client is served the meta without its slot; it authenticates
+                            // under either slot index (encrypted.md §14).
+                            codec.verify_meta(slot ^ 1, bytes, &chain)?;
+                        } else {
+                            verified?;
+                        }
                     }
                     pg.cache_validation(bytes, Arc::clone(&protected));
                     m.protected = protected;
@@ -3213,6 +3256,30 @@ pub(crate) fn unlock_pager(
             Ok(Some(codec))
         }
     }
+}
+
+/// Prepare `pager` to open with a page client's held codec (spec/design/encryption.md §8): the file
+/// must be encrypted, and the codec adopts its selected key-block copy, so a later credential
+/// change or backup starts from the file's current generation. The load then authenticates the meta
+/// under the held key (`XX001` when it does not).
+pub(crate) fn adopt_held_codec(pager: &mut Pager, codec: &crate::crypto::PageCodec) -> Result<()> {
+    if pager.allocated_pages() < crate::crypto::FIRST_BODY_PAGE {
+        return Err(corrupt("encrypted file too small for its key block"));
+    }
+    let slot0 = pager.read_block(0)?;
+    let slot1 = pager.read_block(1)?;
+    if crate::crypto::file_suite(&slot0, &slot1)? == 0 {
+        return Err(EngineError::new(
+            SqlState::StaleKey,
+            "the database is no longer encrypted; reopen it",
+        ));
+    }
+    let page2 = pager.read_block(2)?;
+    let page3 = pager.read_block(3)?;
+    let selected = crate::crypto::selected_key_page(&page2, &page3)?;
+    codec.set_key_block(selected[..crate::crypto::KEY_BLOCK_LEN].to_vec());
+    pager.set_encrypted();
+    Ok(())
 }
 
 /// How [`Engine::open_shared_paging_at`] differs from an ordinary load: a backup's walk
@@ -5100,6 +5167,7 @@ pub(crate) struct Meta {
 pub(crate) struct SimMeta {
     pub(crate) txid: u64,
     pub(crate) root_page: u32,
+    pub(crate) root_tag: crate::crypto::Tag,
     pub(crate) page_count: u32,
     pub(crate) live_pages: u32,
     pub(crate) protected: Arc<HashSet<u32>>,
@@ -5121,6 +5189,7 @@ pub(crate) fn sim_selected_meta(paging: &SharedPaging) -> Result<SimMeta> {
             return Ok(SimMeta {
                 txid: m.txid,
                 root_page: m.root_page,
+                root_tag: m.root_tag,
                 page_count: m.page_count,
                 live_pages: m.live_pages,
                 protected,
@@ -5145,7 +5214,10 @@ pub(crate) fn sim_free_list(image: &[u8], ps: u32, v: u64) -> Option<Vec<u32>> {
     let paging = SharedPaging::new(pager, 1);
     read_free_list(
         &paging,
-        PageRef::plain(m.free_list_head),
+        PageRef {
+            page: m.free_list_head,
+            tag: m.free_list_tag,
+        },
         m.page_count,
         &HashSet::new(),
     )

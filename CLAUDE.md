@@ -112,7 +112,8 @@ language, because hardening the spec was never the reason to add it.
    can await I/O. Commit, open/recovery and storage maintenance are the same kind of continuation
    (`spec/design/ts-runtime.md` §11): they await any page-codec or byte-device stage that has an
    asynchronous form, keep validated-COW ordering, and run inline over today's synchronous hosts.
-   Async crypto providers remain separate work. No encryption suite or Rust delivery default is
+   The page codec has an asynchronous WebCrypto provider (the browser's; byte-identical to Node's
+   `node:crypto` one), so encrypted databases open on OPFS. No Rust delivery default is
    selected by this migration. Host functions register inside the execution worker: Node uses
    `extensionModule`; browsers supply a fresh worker through `workerFactory` and call the public
    `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
@@ -632,16 +633,19 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   jed's *own* storage; a **host extension** may relax them (an external or virtual-table-style
   row source, a format that needs the host's code to reopen) as it judges appropriate, owning
   the consequence (the host-extension boundary, §13).
-- **Encryption at rest (file-level) — the core variant is built.** The single-file format and
+- **Encryption at rest (file-level) — built.** The single-file format and
   the storage seam (storage.md §2) took **encryption at rest** without a reshape: the encrypted
   file variant (bytes in `spec/fileformat/encrypted.md`, the `encrypted_*` goldens and
   `encryption_vectors.toml`, authored by the Ruby reference) runs in the Rust, Go and TS (Node)
   cores — a credential on `create`/`open`/`attach`, sealed body pages from page 4 behind a key block
-  at pages 2–3, tag-bound pointers, `28P01`–`28P03` for credential failures. Still to build, each
-  failing closed meanwhile (encrypted.md §10): credential change, DEK rotation and conversion,
-  scratch encryption (an encrypted handle has no spill target), page service and replication,
-  encrypted backups, the browser/OPFS host, the corpus's encrypted mode and simulator growth; and
-  the security review. **Designed in `spec/design/encryption.md`:**
+  at pages 2–3, tag-bound pointers, `28P01`–`28P04` for credential failures — together with credential
+  change, rekey (DEK rotation and conversion, trees rebuilt in a sealed scratch domain), sealed scratch
+  files (`scratch_encryption`), encrypted backups, the page service (clients unlock from the key block
+  they read; the owner checks and reseals client metas), the CLI's key/passphrase-file inputs, the
+  corpus's encrypted mode and simulator slice S12. Still to build, each failing closed meanwhile
+  (encrypted.md §10): replication's key-block item, a credential in `hello`, credential change and
+  rekey on the TS async API; and the security review. The browser/OPFS host opens encrypted files
+  through an asynchronous WebCrypto codec. **Designed in `spec/design/encryption.md`:**
   a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
   a random data key is stored only wrapped by a per-file key-encryption key, itself derived from
   a host-supplied key or a passphrase.

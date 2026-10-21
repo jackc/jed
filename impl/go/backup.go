@@ -50,12 +50,6 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 		}
 		snap := rt.committed
 		paging := snap.storePaging
-		if paging != nil && paging.codec() != nil {
-			// A backup of an encrypted file needs its key block taken under the key-block mutex
-			// (spec/design/encryption.md §8), not yet built (spec/fileformat/encrypted.md §10).
-			c.deregisterPin(gen, v)
-			return newError(FeatureNotSupported, "a backup of an encrypted database is not supported yet")
-		}
 		noSync := c.handoff != nil && c.handoff.opts.SkipFsync
 		_ = paging.withPager(func(p *pager) error { noSync = noSync || p.skipsSync(); return nil })
 		var fill func(writeAt func(off int64, p []byte) error) error
@@ -82,8 +76,14 @@ func (c *sharedCore) backup(dest string, pageIdentical bool) error {
 				return c.writePageIdentical(paging, mt, pages, writeAt)
 			}
 		} else {
+			// An encrypted database's copy keeps its data key and key block, every page resealed under
+			// fresh nonces, as compaction does (spec/fileformat/encrypted.md §13).
+			var codec *pageCodec
+			if paging != nil {
+				codec = paging.codec()
+			}
 			fill = func(writeAt func(off int64, p []byte) error) error {
-				_, err := snap.writeImage(st.pageSize, v+1, nil, func(index uint32, page []byte) error {
+				_, err := snap.writeImage(st.pageSize, v+1, codec, func(index uint32, page []byte) error {
 					return writeAt(int64(index)*int64(st.pageSize), page)
 				})
 				return err
@@ -133,26 +133,25 @@ func (c *sharedCore) backupPages(paging *sharedPaging, mt meta) ([]uint32, error
 		return nil, err
 	}
 	snap := loaded.committed
-	// A backup is of a plaintext file only (backup refuses an encrypted one), so pages are read
-	// unbound.
-	read := paging.readBlock
+	// Chains are followed through their bound pointers (encrypted.md §2), so every chain page of an
+	// encrypted file is authenticated on the way.
 	readRef := func(r pageRef) ([]byte, error) { return paging.readBody(r) }
+	pcap := paging.cap()
+	first := pcap.firstBody()
 	seen := map[uint32]bool{}
-	for p := mt.rootPage; p != 0; {
-		if seen[p] || p < rootPage || p >= mt.pageCount {
+	for p := (pageRef{page: mt.rootPage, tag: mt.rootTag}); p.page != 0; {
+		if seen[p.page] || p.page < first || p.page >= mt.pageCount {
 			return nil, newError(DataCorrupted, "invalid catalog chain")
 		}
-		seen[p] = true
-		reached[p] = true
-		block, err := read(p)
+		seen[p.page] = true
+		reached[p.page] = true
+		block, err := readRef(p)
 		if err != nil {
 			return nil, err
 		}
-		pg, err := parsePage(block)
-		if err != nil {
+		if _, p, err = chainStep(block, pcap); err != nil {
 			return nil, err
 		}
-		p = pg.nextPage
 	}
 	names := make([]string, 0, len(snap.stores))
 	for name := range snap.stores {
@@ -175,27 +174,26 @@ func (c *sharedCore) backupPages(paging *sharedPaging, mt meta) ([]uint32, error
 	if uint32(len(reached)) != mt.livePages {
 		return nil, newError(DataCorrupted, "the pages reachable from the snapshot do not match its live page count")
 	}
-	for p := mt.freeListHead; p != 0; {
-		if reached[p] || p < rootPage || p >= mt.pageCount {
+	for p := (pageRef{page: mt.freeListHead, tag: mt.freeListTag}); p.page != 0; {
+		if reached[p.page] || p.page < first || p.page >= mt.pageCount {
 			return nil, newError(DataCorrupted, "invalid free-list chain")
 		}
-		reached[p] = true
-		block, err := read(p)
+		reached[p.page] = true
+		block, err := readRef(p)
 		if err != nil {
 			return nil, err
 		}
-		pg, err := parsePage(block)
-		if err != nil {
+		var pageType byte
+		if pageType, p, err = chainStep(block, pcap); err != nil {
 			return nil, err
 		}
-		if pg.pageType != pageFreelist {
+		if pageType != pageFreelist {
 			return nil, newError(DataCorrupted, "invalid free-list page")
 		}
-		p = pg.nextPage
 	}
 	pages := make([]uint32, 0, len(reached))
 	for p := range reached {
-		if p < rootPage || p >= mt.pageCount {
+		if p < first || p >= mt.pageCount {
 			return nil, newError(DataCorrupted, "a reachable page lies outside the snapshot")
 		}
 		pages = append(pages, p)
@@ -219,6 +217,7 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 		}
 		return out, nil
 	}
+	encrypted := paging.codec() != nil
 	batchSize := 1
 	if cl := c.pageClient(); cl != nil {
 		read = cl.readPages
@@ -231,12 +230,38 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 			return err
 		}
 		for i, block := range blocks {
-			if _, err := parsePage(block); err != nil {
-				return err
+			// An encrypted page is ciphertext: the walk authenticated the chain pages and every
+			// interior node, and a leaf or overflow page is authenticated when the copy reads it.
+			if !encrypted {
+				if _, err := parsePage(block); err != nil {
+					return err
+				}
 			}
 			if err := writeAt(int64(batch[i])*ps, block); err != nil {
 				return err
 			}
+		}
+	}
+	// An encrypted copy holds the key block at pages 2 and 3, which no pointer reaches: the file's
+	// selected copy, written to both, so the pair is complete at one generation even while a credential
+	// change runs (encrypted.md §13). A page client reads the pages through the service; selection
+	// already tolerates a change in progress, which never leaves both copies invalid.
+	if encrypted {
+		pair, err := read([]uint32{2, 3})
+		if err != nil {
+			return err
+		}
+		block, err := selectKeyBlock(pair[0], pair[1])
+		if err != nil {
+			return err
+		}
+		page := make([]byte, ps)
+		copy(page, block)
+		if err := writeAt(2*ps, page); err != nil {
+			return err
+		}
+		if err := writeAt(3*ps, page); err != nil {
+			return err
 		}
 	}
 	if last := mt.pageCount - 1; len(pages) == 0 || pages[len(pages)-1] != last {
@@ -245,11 +270,20 @@ func (c *sharedCore) writePageIdentical(paging *sharedPaging, mt meta, pages []u
 			return err
 		}
 	}
-	bootstrap := metaPage(plainCap(uint32(ps)), uint32(ps), mt.txid, plainRef(mt.rootPage), mt.pageCount, plainRef(mt.freeListHead), mt.livePages)
-	if err := writeAt(0, bootstrap); err != nil {
-		return err
+	bootstrap := metaPage(paging.cap(), uint32(ps), mt.txid, pageRef{page: mt.rootPage, tag: mt.rootTag}, mt.pageCount, pageRef{page: mt.freeListHead, tag: mt.freeListTag}, mt.livePages)
+	// Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
+	for slot := uint32(0); slot < 2; slot++ {
+		m := append([]byte(nil), bootstrap...)
+		if encrypted {
+			if err := paging.codec().sealMeta(slot, m, nil); err != nil {
+				return err
+			}
+		}
+		if err := writeAt(int64(slot)*ps, m); err != nil {
+			return err
+		}
 	}
-	return writeAt(ps, bootstrap)
+	return nil
 }
 
 // writeBackupFile writes dest the way create writes a new database (api.md §2.1): a sibling temp file,

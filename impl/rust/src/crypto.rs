@@ -10,7 +10,7 @@
 //! (https://c2sp.org/XAES-256-GCM — two AES blocks and a GF(2^128) doubling) is written here, over the
 //! library AES, and checked against the C2SP vectors in spec/fileformat/encryption_vectors.toml.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aes::Aes256;
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
@@ -177,9 +177,11 @@ pub(crate) struct PageCodec {
     meta: XaesKey,
     /// The database's key-entropy stream (encrypted.md §8): one per database.
     rng: Arc<dyn RandomSource>,
+    /// The data key, kept so a credential change can rewrap it (encrypted.md §5).
+    dek: [u8; 32],
     /// The selected key block copy, kept for compaction, which writes it to both pages of the new
-    /// file (encrypted.md §5).
-    key_block: Vec<u8>,
+    /// file, and replaced by a credential change (encrypted.md §5).
+    key_block: Mutex<Vec<u8>>,
 }
 
 impl PageCodec {
@@ -188,7 +190,8 @@ impl PageCodec {
             page: XaesKey::new(&hkdf(dek, &[], "jed/v1/page")),
             meta: XaesKey::new(&hkdf(dek, &[], "jed/v1/meta")),
             rng,
-            key_block,
+            dek: *dek,
+            key_block: Mutex::new(key_block),
         }
     }
 
@@ -198,9 +201,45 @@ impl PageCodec {
         Ok(n)
     }
 
+    /// The database's key-entropy stream: a rotation draws the new data key from it.
+    pub(crate) fn rng(&self) -> Arc<dyn RandomSource> {
+        Arc::clone(&self.rng)
+    }
+
     /// The selected key-block copy (128 bytes; the rest of its page is zero).
-    pub(crate) fn key_block(&self) -> &[u8] {
-        &self.key_block
+    pub(crate) fn key_block(&self) -> Vec<u8> {
+        self.key_block.lock().expect("key block lock").clone()
+    }
+
+    /// The selected copy as a whole key-block page of `page_size` bytes.
+    pub(crate) fn key_block_page(&self, page_size: usize) -> Vec<u8> {
+        let mut page = vec![0u8; page_size];
+        page[..KEY_BLOCK_LEN].copy_from_slice(&self.key_block());
+        page
+    }
+
+    /// The key block for a credential change (encrypted.md §5): the same DEK wrapped for `cred`
+    /// under a fresh KDF salt and wrap nonce, drawn in that order from the key-entropy stream, at
+    /// the next generation. Runs the KDF, so a caller derives it before taking the writer gate.
+    pub(crate) fn rewrap(&self, cred: &Credential, params: Argon2Params) -> Result<Vec<u8>> {
+        let current = self.key_block();
+        let generation = u64::from_be_bytes(current[8..16].try_into().unwrap());
+        let generation = generation
+            .checked_add(1)
+            .ok_or_else(|| corrupt("key block generation exhausted"))?;
+        wrap_key_block(&self.dek, generation, cred, params, self.rng.as_ref())
+    }
+
+    /// Whether `block` is the next generation of the selected copy: a credential change derived
+    /// before the writer gate fails `55006` when another change won the race (encrypted.md §5).
+    pub(crate) fn follows(&self, block: &[u8]) -> bool {
+        let generation = |b: &[u8]| u64::from_be_bytes(b[8..16].try_into().unwrap());
+        generation(block) == generation(&self.key_block()).wrapping_add(1)
+    }
+
+    /// Adopt `block` as the selected copy once a credential change has written both pages.
+    pub(crate) fn set_key_block(&self, block: Vec<u8>) {
+        *self.key_block.lock().expect("key block lock") = block;
     }
 
     /// Seal body page `index` in place (encrypted.md §4): `page` is the full page, its first
@@ -348,11 +387,24 @@ fn new_key_block(
 ) -> Result<(Vec<u8>, [u8; 32])> {
     let mut dek = [0u8; 32];
     rng.fill(&mut dek)?;
+    let block = wrap_key_block(&dek, 1, cred, params, rng)?;
+    Ok((block, dek))
+}
+
+/// The 128-byte key block wrapping `dek` for `cred` at `generation`: draws the KDF salt, then the
+/// wrap nonce, from `rng` (encrypted.md §5, §8).
+fn wrap_key_block(
+    dek: &[u8; 32],
+    generation: u64,
+    cred: &Credential,
+    params: Argon2Params,
+    rng: &dyn RandomSource,
+) -> Result<Vec<u8>> {
     let mut block = vec![0u8; KEY_BLOCK_LEN];
     block[..4].copy_from_slice(KEY_MAGIC);
     block[4..6].copy_from_slice(&KEY_BLOCK_VERSION.to_be_bytes());
     block[6] = SUITE_XAES;
-    block[8..16].copy_from_slice(&1u64.to_be_bytes());
+    block[8..16].copy_from_slice(&generation.to_be_bytes());
     match cred {
         Credential::Passphrase(_) => {
             if !params.valid() {
@@ -371,7 +423,7 @@ fn new_key_block(
     rng.fill(&mut block[32..76])?;
     let kek = kek(&block, cred)?.expect("the block's KDF matches its credential");
     let nonce: [u8; 12] = block[64..76].try_into().unwrap();
-    let mut wrapped = dek;
+    let mut wrapped = *dek;
     let tag = Aes256Gcm::new(&kek.into())
         .encrypt_inout_detached(&nonce.into(), &block[..76], (&mut wrapped[..]).into())
         .expect("AES-GCM wraps 32 bytes");
@@ -379,7 +431,7 @@ fn new_key_block(
     block[108..124].copy_from_slice(&tag);
     let crc = crate::format::crc32_ieee(&block[..124]);
     block[124..128].copy_from_slice(&crc.to_be_bytes());
-    Ok((block, dek))
+    Ok(block)
 }
 
 /// One key-block copy, validated (encrypted.md §5): `None` when it is not a valid copy.
@@ -429,6 +481,26 @@ fn select_key_block<'a>(page2: &'a [u8], page3: &'a [u8]) -> Result<&'a [u8]> {
     }
 }
 
+/// The selected key-block copy of `page2` and `page3` as a whole page — what a backup writes to
+/// both pages (encrypted.md §13).
+pub(crate) fn selected_key_page(page2: &[u8], page3: &[u8]) -> Result<Vec<u8>> {
+    let block = select_key_block(page2, page3)?;
+    let mut page = vec![0u8; page2.len()];
+    page[..KEY_BLOCK_LEN].copy_from_slice(block);
+    Ok(page)
+}
+
+/// The key-block page a credential change writes first (encrypted.md §5): the copy that is not the
+/// selected one — the older or invalid copy, page 3 when both are equal — so the only valid copy is
+/// never the first overwritten.
+pub(crate) fn unselected_key_page(page2: &[u8], page3: &[u8]) -> u32 {
+    match (parse_key_block(page2), parse_key_block(page3)) {
+        (Some((_, ga)), Some((_, gb))) if gb > ga => 2,
+        (None, Some(_)) => 2,
+        _ => 3,
+    }
+}
+
 /// Unwrap the selected copy's DEK with `cred`: `28P01` when it does not unwrap.
 fn unwrap_dek(block: &[u8], cred: &Credential) -> Result<[u8; 32]> {
     let kek = kek(block, cred)?.ok_or_else(wrong_credential)?;
@@ -454,6 +526,16 @@ pub(crate) fn create(
 ) -> Result<Arc<PageCodec>> {
     let (block, dek) = new_key_block(cred, params, rng.as_ref())?;
     Ok(Arc::new(PageCodec::new(&dek, rng, block)))
+}
+
+/// A throwaway codec for a rebuild's scratch domain (spec/design/encryption.md §5): a random key
+/// from the OS CSPRNG, never persisted. The scratch pages it seals are discarded, so they never
+/// touch a database's key-entropy stream.
+pub(crate) fn scratch_codec() -> Result<Arc<PageCodec>> {
+    let rng = crate::seam::os_random_source();
+    let mut key = [0u8; 32];
+    rng.fill(&mut key)?;
+    create(&Credential::Key(key), Argon2Params::default(), rng)
 }
 
 /// Unlock an encrypted file from its key-block pages: select the copy, unwrap its DEK with `cred`.
@@ -491,6 +573,231 @@ pub(crate) fn file_suite(slot0: &[u8], slot1: &[u8]) -> Result<u8> {
     }
     // Neither slot is valid: slot selection reports the corruption.
     Ok(suite.unwrap_or(0))
+}
+
+// --- scratch encryption (spec/design/encryption.md §6) ------------------------------------------
+
+/// The plaintext bytes of one sealed scratch block; each is stored as the block's ciphertext, its
+/// 24-byte nonce and its 16-byte tag (spec/fileformat/encrypted.md §11).
+pub(crate) const SCRATCH_BLOCK: usize = 4096;
+const SCRATCH_STORED: usize = SCRATCH_BLOCK + RESERVE;
+const ROLE_SCRATCH: u8 = 0x03;
+
+/// A spill host whose every scratch file is sealed (encryption.md §6): each file gets a random key
+/// and id from the handle's scratch stream, never persisted, and stores its bytes in sealed 4 KiB
+/// blocks whose associated data binds the file id, the block ordinal and the block's write counter,
+/// so a replayed older version of a rewritten block fails. Results and cost do not change.
+pub(crate) fn encrypting_spill_host(
+    inner: Arc<dyn crate::spillhost::SpillHost>,
+    rng: Arc<dyn RandomSource>,
+) -> Arc<dyn crate::spillhost::SpillHost> {
+    Arc::new(EncryptingSpillHost { inner, rng })
+}
+
+struct EncryptingSpillHost {
+    inner: Arc<dyn crate::spillhost::SpillHost>,
+    rng: Arc<dyn RandomSource>,
+}
+
+impl crate::spillhost::SpillHost for EncryptingSpillHost {
+    fn create(&self, kind: &str) -> Result<Box<dyn crate::spillhost::SpillFile>> {
+        let mut key = [0u8; 32];
+        self.rng.fill(&mut key)?;
+        let mut id = [0u8; 16];
+        self.rng.fill(&mut id)?;
+        Ok(Box::new(SealedSpillFile {
+            inner: self.inner.create(kind)?,
+            key: XaesKey::new(&key),
+            id,
+            rng: Arc::clone(&self.rng),
+            state: Mutex::new(SealedState {
+                size: 0,
+                counters: Vec::new(),
+                live: Vec::new(),
+                cached: None,
+            }),
+        }))
+    }
+
+    fn encrypts(&self) -> bool {
+        true
+    }
+}
+
+struct SealedSpillFile {
+    inner: Box<dyn crate::spillhost::SpillFile>,
+    key: XaesKey,
+    id: [u8; 16],
+    rng: Arc<dyn RandomSource>,
+    state: Mutex<SealedState>,
+}
+
+struct SealedState {
+    /// The logical (plaintext) size.
+    size: u64,
+    /// Each block's write counter, never reset (truncation included), so no sealed version of a
+    /// block can authenticate again once a newer one was sealed.
+    counters: Vec<u64>,
+    /// Whether each block holds written bytes; a block never written, or cut by a truncation,
+    /// reads as zeros.
+    live: Vec<bool>,
+    /// The block last written, kept in plaintext until another block is written, so a run of small
+    /// writes into one block seals it once.
+    cached: Option<(usize, Vec<u8>)>,
+}
+
+fn io_err(e: EngineError) -> std::io::Error {
+    std::io::Error::other(e.message.clone())
+}
+
+impl SealedSpillFile {
+    /// The associated data of block `ordinal` at write counter `counter`.
+    fn ad(&self, ordinal: usize, counter: u64) -> Vec<u8> {
+        let mut ad = Vec::with_capacity(42);
+        ad.extend_from_slice(&ad_prefix(ROLE_SCRATCH, 0)[..6]);
+        ad.extend_from_slice(&self.id);
+        ad.extend_from_slice(&(ordinal as u64).to_be_bytes());
+        ad.extend_from_slice(&counter.to_be_bytes());
+        ad
+    }
+
+    /// Block `ordinal`'s plaintext: the cached block, zeros for a block never written, else the
+    /// stored block opened against its counter.
+    fn load(&self, state: &SealedState, ordinal: usize) -> std::io::Result<Vec<u8>> {
+        if let Some((at, block)) = &state.cached
+            && *at == ordinal
+        {
+            return Ok(block.clone());
+        }
+        if !state.live.get(ordinal).copied().unwrap_or(false) {
+            return Ok(vec![0u8; SCRATCH_BLOCK]);
+        }
+        let counter = state.counters[ordinal];
+        let mut stored = vec![0u8; SCRATCH_STORED];
+        crate::spillhost::read_exact_at(
+            self.inner.as_ref(),
+            (ordinal * SCRATCH_STORED) as u64,
+            &mut stored,
+        )?;
+        let nonce: [u8; NONCE_LEN] = stored[SCRATCH_BLOCK..SCRATCH_BLOCK + NONCE_LEN]
+            .try_into()
+            .unwrap();
+        let tag: Tag = stored[SCRATCH_BLOCK + NONCE_LEN..].try_into().unwrap();
+        stored.truncate(SCRATCH_BLOCK);
+        if !self
+            .key
+            .open(&nonce, &mut stored, &self.ad(ordinal, counter), &tag)
+        {
+            return Err(std::io::Error::other(
+                "a scratch block fails authentication",
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Seal and store the cached block, if any, at its next write counter.
+    fn flush_cached(&self, state: &mut SealedState) -> std::io::Result<()> {
+        let Some((ordinal, mut block)) = state.cached.take() else {
+            return Ok(());
+        };
+        if state.counters.len() <= ordinal {
+            state.counters.resize(ordinal + 1, 0);
+            state.live.resize(ordinal + 1, false);
+        }
+        let counter = state.counters[ordinal] + 1;
+        let mut nonce = [0u8; NONCE_LEN];
+        self.rng.fill(&mut nonce).map_err(io_err)?;
+        let tag = self
+            .key
+            .seal(&nonce, &mut block, &self.ad(ordinal, counter));
+        block.extend_from_slice(&nonce);
+        block.extend_from_slice(&tag);
+        self.inner
+            .write_at((ordinal * SCRATCH_STORED) as u64, &block)?;
+        state.counters[ordinal] = counter;
+        state.live[ordinal] = true;
+        Ok(())
+    }
+}
+
+impl crate::spillhost::SpillFile for SealedSpillFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if offset >= state.size {
+            return Ok(0);
+        }
+        let n = buf.len().min((state.size - offset) as usize);
+        let mut done = 0;
+        while done < n {
+            let at = offset as usize + done;
+            let (ordinal, within) = (at / SCRATCH_BLOCK, at % SCRATCH_BLOCK);
+            let take = (SCRATCH_BLOCK - within).min(n - done);
+            let block = self.load(&state, ordinal)?;
+            buf[done..done + take].copy_from_slice(&block[within..within + take]);
+            done += take;
+        }
+        Ok(n)
+    }
+
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut done = 0;
+        while done < bytes.len() {
+            let at = offset as usize + done;
+            let (ordinal, within) = (at / SCRATCH_BLOCK, at % SCRATCH_BLOCK);
+            let take = (SCRATCH_BLOCK - within).min(bytes.len() - done);
+            if state.cached.as_ref().is_none_or(|(c, _)| *c != ordinal) {
+                let block = if take == SCRATCH_BLOCK {
+                    vec![0u8; SCRATCH_BLOCK]
+                } else {
+                    self.load(&state, ordinal)?
+                };
+                self.flush_cached(&mut state)?;
+                state.cached = Some((ordinal, block));
+            }
+            let (_, block) = state.cached.as_mut().expect("cached above");
+            block[within..within + take].copy_from_slice(&bytes[done..done + take]);
+            done += take;
+        }
+        state.size = state.size.max(offset + bytes.len() as u64);
+        Ok(())
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        Ok(self.state.lock().unwrap_or_else(|e| e.into_inner()).size)
+    }
+
+    fn truncate(&self, n: u64) -> std::io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let blocks = (n as usize).div_ceil(SCRATCH_BLOCK);
+        if n < state.size {
+            // Zero the kept part of a cut block, so growing again reads zeros past `n`.
+            let within = n as usize % SCRATCH_BLOCK;
+            if within != 0 {
+                let ordinal = n as usize / SCRATCH_BLOCK;
+                let mut block = self.load(&state, ordinal)?;
+                block[within..].fill(0);
+                if state.cached.as_ref().is_none_or(|(c, _)| *c != ordinal) {
+                    self.flush_cached(&mut state)?;
+                }
+                state.cached = Some((ordinal, block));
+            }
+            if state.cached.as_ref().is_some_and(|(c, _)| *c >= blocks) {
+                state.cached = None;
+            }
+            for live in state.live.iter_mut().skip(blocks) {
+                *live = false;
+            }
+            self.inner.truncate((blocks * SCRATCH_STORED) as u64)?;
+        }
+        state.size = n;
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).cached = None;
+        self.inner.close();
+    }
 }
 
 #[cfg(test)]
@@ -580,6 +887,16 @@ mod tests {
             new_key_block(&Credential::Key(key), Argon2Params::default(), rng.as_ref()).unwrap();
         assert_eq!(block, field(kb, "block_hex"));
         assert_eq!(dek.to_vec(), field(kb, "dek_hex"));
+        let rw = doc["rewrap"].as_table().unwrap();
+        let mut page = vec![0u8; 1024];
+        page[..KEY_BLOCK_LEN].copy_from_slice(&block);
+        let rng = crate::seam::seeded_random_source(rw["seed"].as_integer().unwrap() as u64);
+        let codec = unlock(&page, &page, &Credential::Key(key), rng).unwrap();
+        let new_key: [u8; 32] = field(rw, "key_hex").try_into().unwrap();
+        let rewrapped = codec
+            .rewrap(&Credential::Key(new_key), Argon2Params::default())
+            .unwrap();
+        assert_eq!(rewrapped, field(rw, "block_hex"));
         let a = doc["argon2id"].as_table().unwrap();
         let params = argon2::Params::new(
             a["memory_kib"].as_integer().unwrap() as u32,
@@ -617,8 +934,7 @@ mod tests {
         let rng = crate::seam::seeded_random_source(7);
         let cred = Credential::Key([9; 32]);
         let codec = create(&cred, Argon2Params::default(), rng.clone()).unwrap();
-        let mut page = vec![0u8; 1024];
-        page[..KEY_BLOCK_LEN].copy_from_slice(codec.key_block());
+        let page = codec.key_block_page(1024);
         assert!(unlock(&page, &page, &cred, rng.clone()).is_ok());
         let err = unlock(&page, &page, &Credential::Key([8; 32]), rng.clone())
             .err()
@@ -638,6 +954,152 @@ mod tests {
         assert!(unlock(&page, &torn, &cred, rng.clone()).is_ok());
         let err = unlock(&torn, &torn, &cred, rng).err().unwrap();
         assert_eq!(err.state, SqlState::DataCorrupted);
+    }
+
+    #[test]
+    fn credential_change_writes_the_unselected_copy_first() {
+        let rng = crate::seam::seeded_random_source(3);
+        let cred = Credential::Key([9; 32]);
+        let codec = create(&cred, Argon2Params::default(), rng.clone()).unwrap();
+        let old = codec.key_block_page(1024);
+        let mut new = vec![0u8; 1024];
+        let next = codec
+            .rewrap(&Credential::Key([5; 32]), Argon2Params::default())
+            .unwrap();
+        new[..KEY_BLOCK_LEN].copy_from_slice(&next);
+        assert!(codec.follows(&next));
+        codec.set_key_block(next.clone());
+        assert!(
+            !codec.follows(&next),
+            "a second change from the same generation lost the race"
+        );
+        assert_eq!(unselected_key_page(&old, &old), 3);
+        assert_eq!(unselected_key_page(&old, &new), 2);
+        assert_eq!(unselected_key_page(&new, &old), 3);
+        let mut torn = old.clone();
+        torn[50] ^= 1;
+        assert_eq!(unselected_key_page(&torn, &old), 2);
+        assert_eq!(unselected_key_page(&old, &torn), 3);
+        // The newer copy is selected: the new credential unlocks, the old one no longer does.
+        assert!(unlock(&old, &new, &Credential::Key([5; 32]), rng.clone()).is_ok());
+        let err = unlock(&old, &new, &cred, rng).err().unwrap();
+        assert_eq!(err.state, SqlState::InvalidPassword);
+    }
+
+    /// An in-memory spill host whose files the test can read and overwrite underneath the seal.
+    #[derive(Default)]
+    struct MemSpill(Mutex<Vec<Arc<Mutex<Vec<u8>>>>>);
+    struct MemFile(Arc<Mutex<Vec<u8>>>);
+
+    impl crate::spillhost::SpillHost for Arc<MemSpill> {
+        fn create(&self, _kind: &str) -> Result<Box<dyn crate::spillhost::SpillFile>> {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            self.0.lock().unwrap().push(Arc::clone(&bytes));
+            Ok(Box::new(MemFile(bytes)))
+        }
+    }
+
+    impl crate::spillhost::SpillFile for MemFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let b = self.0.lock().unwrap();
+            let start = (offset as usize).min(b.len());
+            let n = buf.len().min(b.len() - start);
+            buf[..n].copy_from_slice(&b[start..start + n]);
+            Ok(n)
+        }
+        fn write_at(&self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+            let mut b = self.0.lock().unwrap();
+            let end = offset as usize + bytes.len();
+            if b.len() < end {
+                b.resize(end, 0);
+            }
+            b[offset as usize..end].copy_from_slice(bytes);
+            Ok(())
+        }
+        fn size(&self) -> std::io::Result<u64> {
+            Ok(self.0.lock().unwrap().len() as u64)
+        }
+        fn truncate(&self, n: u64) -> std::io::Result<()> {
+            self.0.lock().unwrap().resize(n as usize, 0);
+            Ok(())
+        }
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn sealed_scratch_round_trips_and_detects_replay() {
+        let mem = Arc::new(MemSpill::default());
+        let host = encrypting_spill_host(
+            Arc::new(Arc::clone(&mem)),
+            crate::seam::seeded_random_source(5),
+        );
+        assert!(host.encrypts());
+        let file = host.create("hash").unwrap();
+        let mut model = vec![0u8; 0];
+        let mut write = |file: &Box<dyn crate::spillhost::SpillFile>, at: usize, bytes: &[u8]| {
+            file.write_at(at as u64, bytes).unwrap();
+            if model.len() < at + bytes.len() {
+                model.resize(at + bytes.len(), 0);
+            }
+            model[at..at + bytes.len()].copy_from_slice(bytes);
+            model.clone()
+        };
+        let secret = b"secret-scratch-".repeat(700);
+        write(&file, 0, &secret);
+        write(&file, 5000, b"patched");
+        write(&file, 20000, b"far away");
+        let expect = write(&file, 4090, b"straddles a block boundary");
+        let read = |file: &Box<dyn crate::spillhost::SpillFile>| {
+            let mut out = vec![0u8; file.size().unwrap() as usize];
+            crate::spillhost::read_exact_at(file.as_ref(), 0, &mut out).unwrap();
+            out
+        };
+        assert_eq!(read(&file), expect);
+        let mut tail = [0u8; 4];
+        assert_eq!(file.read_at(expect.len() as u64, &mut tail).unwrap(), 0);
+        // Writing another block seals the cached one; nothing is stored in plaintext.
+        write(&file, 30000, b"x");
+        let stored = mem.0.lock().unwrap()[0].lock().unwrap().clone();
+        assert!(!stored.windows(15).any(|w| w == b"secret-scratch-"));
+
+        // Replay: put back an older sealed version of block 1, which was rewritten since.
+        let block1 = stored[SCRATCH_STORED..2 * SCRATCH_STORED].to_vec();
+        write(&file, 4100, b"newer");
+        write(&file, 30001, b"y");
+        assert_eq!(&read(&file)[4100..4105], b"newer");
+        mem.0.lock().unwrap()[0].lock().unwrap()[SCRATCH_STORED..2 * SCRATCH_STORED]
+            .copy_from_slice(&block1);
+        let mut buf = [0u8; 5];
+        assert!(
+            file.read_at(4100, &mut buf).is_err(),
+            "a replayed block must fail"
+        );
+
+        // A block sealed before a truncation does not authenticate after the block is rewritten.
+        let file = host.create("rows").unwrap();
+        let mem_file = mem.0.lock().unwrap().last().unwrap().clone();
+        file.write_at(0, &[1u8; 4096]).unwrap();
+        file.write_at(4096, &[2u8; 4096]).unwrap();
+        file.write_at(8192, &[0u8; 1]).unwrap(); // seals block 1
+        let sealed = mem_file.lock().unwrap()[SCRATCH_STORED..2 * SCRATCH_STORED].to_vec();
+        file.truncate(4096).unwrap();
+        file.write_at(4096, &[3u8; 4096]).unwrap();
+        file.write_at(8192, &[0u8; 1]).unwrap();
+        mem_file.lock().unwrap()[SCRATCH_STORED..2 * SCRATCH_STORED].copy_from_slice(&sealed);
+        assert!(
+            file.read_at(4096, &mut buf).is_err(),
+            "a pre-truncation block must fail"
+        );
+
+        // Truncation zeroes the cut tail.
+        let file = host.create("rows").unwrap();
+        file.write_at(0, &[7u8; 9000]).unwrap();
+        file.truncate(4500).unwrap();
+        file.write_at(8999, &[1]).unwrap();
+        let got = read(&file);
+        assert_eq!(got.len(), 9000);
+        assert!(got[..4500].iter().all(|&b| b == 7));
+        assert!(got[4500..8999].iter().all(|&b| b == 0));
     }
 
     #[test]

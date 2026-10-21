@@ -19,15 +19,23 @@ import { indexColumnOrdinals } from "../catalog.ts";
 import type { Collation } from "../collation.ts";
 import { type CommitMeta, parseCommitMeta, validateCommitMeta } from "../commit_manifest.ts";
 import { type Engine, encodePkKey, indexEntryKeysColumns, type Snapshot } from "../executor.ts";
-import { chainPages, collectTreePages, loadEnginePaged, reachablePages } from "../format.ts";
+import { capFirstBody, NO_TAG } from "../cap.ts";
+import type { Credential } from "../crypto.ts";
+import { Environment } from "../environment.ts";
+import { runSync } from "../execution.ts";
+import {
+  chainPages,
+  collectTreePages,
+  loadEnginePaged,
+  reachablePages,
+  unlockPagerSteps,
+} from "../format.ts";
 import { MemoryBlockStore } from "../memoryblockstore.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import type { Database } from "../shared.ts";
 import type { Value } from "../value.ts";
 import { bytesEqual, compareBytes, compareUtf8 } from "./util.ts";
-
-const ROOT_PAGE = 2;
 
 export class CheckError extends Error {}
 
@@ -55,14 +63,21 @@ function selectMeta(paging: SharedPaging): { meta: CommitMeta; protectedPages: S
 }
 
 // checkImage is simIntegrity: it returns [live, pages, free] from the selected meta and the loaded
-// free list, or throws a CheckError naming the first violated invariant.
-export function checkImage(image: Uint8Array, want: bigint): [number, number, number] {
+// free list, or throws a CheckError naming the first violated invariant. credential opens an encrypted
+// image (S12).
+export function checkImage(
+  image: Uint8Array,
+  want: bigint,
+  credential?: Credential,
+): [number, number, number] {
   let e: Engine;
   let paging: SharedPaging;
   try {
     const pager = Pager.fromStore(new MemoryBlockStore(image));
-    paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize));
-    e = loadEnginePaged(paging);
+    const environment = new Environment();
+    const codec = runSync(unlockPagerSteps(pager, credential, environment));
+    paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec);
+    e = loadEnginePaged(paging, environment);
   } catch (err) {
     throw new CheckError("open: " + message(err));
   }
@@ -73,7 +88,7 @@ export function checkImage(image: Uint8Array, want: bigint): [number, number, nu
   const snap = e.committed;
   let reached: Set<number>;
   try {
-    reached = reachablePages(snap, paging, mt.rootPage);
+    reached = reachablePages(snap, paging, mt.rootPage, mt.rootTag);
   } catch (err) {
     throw new CheckError("reachability walk: " + message(err));
   }
@@ -82,16 +97,18 @@ export function checkImage(image: Uint8Array, want: bigint): [number, number, nu
       `live page count ${mt.livePages}, but ${reached.size} pages are reachable`,
     );
   }
+  // An encrypted file's body pages start after its key block (encrypted.md §1).
+  const first = capFirstBody(paging.cap());
   for (const pg of reached) {
-    if (pg < ROOT_PAGE || pg >= mt.pageCount) {
-      throw new CheckError(`reachable page ${pg} outside [${ROOT_PAGE}, ${mt.pageCount})`);
+    if (pg < first || pg >= mt.pageCount) {
+      throw new CheckError(`reachable page ${pg} outside [${first}, ${mt.pageCount})`);
     }
   }
   const seen = new Set<number>();
   for (const pg of e.freePages) {
     if (seen.has(pg)) throw new CheckError(`free page ${pg} listed twice`);
-    if (pg < ROOT_PAGE || pg >= mt.pageCount) {
-      throw new CheckError(`free page ${pg} outside [${ROOT_PAGE}, ${mt.pageCount})`);
+    if (pg < first || pg >= mt.pageCount) {
+      throw new CheckError(`free page ${pg} outside [${first}, ${mt.pageCount})`);
     }
     if (reached.has(pg)) throw new CheckError(`free page ${pg} is reachable`);
     if (protectedPages.has(pg)) {
@@ -119,7 +136,8 @@ function checkTable(
   paging: SharedPaging,
   claimed: Set<number>,
 ): void {
-  const fetch = (p: number): Uint8Array => paging.readBlock(p);
+  const fetch = (p: number, tag: Uint8Array): Uint8Array => paging.readBody(p, tag);
+  const tagLen = paging.cap().tag;
   const table = snap.tables.get(name)!;
   const store = snap.stores.get(name);
   if (store === undefined) throw new CheckError("no row store");
@@ -134,7 +152,7 @@ function checkTable(
       if (ext === null) continue;
       let pages: number[];
       try {
-        pages = chainPages(ext[0], ext[1], fetch);
+        pages = chainPages(ext[0], ext[1], fetch, ext[2], tagLen);
       } catch (err) {
         throw new CheckError(`row ${i}: an overflow chain: ${message(err)}`);
       }
@@ -205,7 +223,8 @@ export function checkLive(db: Database): void {
   const pageCount = st.pageCount;
   const free = new Set(st.freePages);
   const paging = st.paging!;
-  const fetch = (p: number): Uint8Array => paging.readBlock(p);
+  const fetch = (p: number, tag: Uint8Array): Uint8Array => paging.readBody(p, tag);
+  const tagLen = paging.cap().tag;
   const check = (what: string, pg: number): void => {
     if (pg >= pageCount) {
       throw new CheckError(`${what} references page ${pg} past the high-water ${pageCount}`);
@@ -231,7 +250,7 @@ export function checkLive(db: Database): void {
         if (ext === null) continue;
         let pages: number[];
         try {
-          pages = chainPages(ext[0], ext[1], fetch);
+          pages = chainPages(ext[0], ext[1], fetch, ext[2], tagLen);
         } catch (err) {
           throw new CheckError(`table ${name}: an overflow chain: ${message(err)}`);
         }
@@ -254,10 +273,10 @@ export function checkLive(db: Database): void {
   }
 }
 
-// externalRef returns the overflow chain a stored value names — its first page and the bytes the
-// chain carries — or null for an inline or resident value.
-function externalRef(v: Value): [number, number] | null {
+// externalRef returns the overflow chain a stored value names — its first page, the bytes the chain
+// carries, and the tag its pointer binds (encrypted files) — or null for an inline or resident value.
+function externalRef(v: Value): [number, number, Uint8Array] | null {
   if (v.kind !== "unfetched") return null;
   if (v.ref.form !== TAG_EXTERNAL && v.ref.form !== TAG_EXTERNAL_COMP) return null;
-  return [v.ref.firstPage, v.ref.storedLen];
+  return [v.ref.firstPage, v.ref.storedLen, v.ref.firstTag ?? NO_TAG];
 }

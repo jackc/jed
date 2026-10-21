@@ -9,6 +9,7 @@
 
 import type { Engine, Snapshot } from "./executor.ts";
 import { buildCommitManifest, manifestEntriesOf, metaChecksum } from "./commit_manifest.ts";
+import { unselectedKeyPage } from "./crypto.ts";
 import { engineError } from "./errors.ts";
 import { runSync, type Steps } from "./execution.ts";
 import type { FileHost } from "./filehost.ts";
@@ -115,6 +116,9 @@ export interface StagedCommit {
   // name is the attachment the commit belongs to ("" for a temp domain, which adopts in place).
   name: string;
   rootPage: number;
+  // rootTag is the catalog head's tag in an encrypted domain (NO_TAG in plaintext) — a rekey's sealed
+  // scratch domain (spec/fileformat/encrypted.md §12) follows it when it reclaims.
+  rootTag: Uint8Array;
   pageCount: number;
   freeRemaining: number[];
   // written is the pages the commit wrote (unioned into the compaction's live set; the budget record).
@@ -128,6 +132,7 @@ function stagedFromWrite(name: string, write: IncrementalWrite): StagedCommit {
   return {
     name,
     rootPage: write.rootPage,
+    rootTag: write.rootTag,
     pageCount: write.pageCount,
     freeRemaining: write.freeRemaining,
     written: write.pages.map((pg) => pg.index),
@@ -381,6 +386,39 @@ function syncDirectoryOnce(db: Engine): void {
   }
 }
 
+// writeKeyBlockSteps writes a credential change's key block (spec/design/encryption.md §5;
+// spec/fileformat/encrypted.md §5): a stabilization barrier (any pending relaxed batch flushed, the file
+// synced, and its directory once), then the copy that is not the selected one, a barrier, the other copy,
+// a barrier; only then does the codec adopt block. The caller holds the writer gate. A failure poisons the
+// storage, so the handle must be reopened; recovery then unlocks with exactly one of the old and new
+// credentials. A block derived before another change won the gate is not the selected copy's next
+// generation: 55006 before anything is written.
+export function* writeKeyBlockSteps(db: Engine, block: Uint8Array): Steps<void> {
+  const paging = db.paging;
+  if (paging === null) throw engineError("io_error", "database storage is closed");
+  const codec = paging.codec()!;
+  yield* paging.flushPendingSteps();
+  paging.checkDurableCommit();
+  if (!codec.follows(block)) {
+    throw engineError("object_in_use", "the credential was changed concurrently");
+  }
+  syncDirectoryOnce(db);
+  try {
+    yield* paging.syncSteps();
+    const first = unselectedKeyPage(yield* paging.readPageSteps(2), yield* paging.readPageSteps(3));
+    const page = new Uint8Array(db.pageSize);
+    page.set(block, 0);
+    yield* paging.writePagesSteps([{ index: first, bytes: page }]);
+    yield* paging.syncSteps();
+    yield* paging.writePagesSteps([{ index: 5 - first, bytes: page }]);
+    yield* paging.syncSteps();
+  } catch (e) {
+    paging.poison();
+    throw e;
+  }
+  codec.setKeyBlock(block);
+}
+
 // Write tree/catalog first so reclamation can read the new catalog. Joint allocation then reserves
 // descriptor and free-list pages from the prior safe free set, protecting every new write from reuse.
 // The inline/overflow descriptor hashes those body pages and the single final sync publishes them.
@@ -452,7 +490,7 @@ function* commitFileSteps(
   // The slot not holding the floor (format.md, *Slot alternation*): txid & 1 under synchronous = on.
   const slot = paging.commitSlot();
   // An encrypted meta is sealed for its slot over its manifest chain (encrypted.md §6).
-  if (codec !== null) codec.sealMeta(slot, meta, manifest.pages);
+  if (codec !== null) yield* codec.sealMetaSteps(slot, meta, manifest.pages);
   yield* paging.writePagesSteps([{ index: slot, bytes: meta }]);
   // One durability barrier covers body + descriptor + meta; a relaxed commit defers it to a flush.
   if (!relaxed) yield* paging.syncSteps();
@@ -536,10 +574,11 @@ export function maybeCompact(
   catRoot: number,
   written: number[],
   canReclaim: boolean,
+  catTag?: Uint8Array,
 ): void {
   if (!db.reclaimWithinSession || !canReclaim || db.paging === null) return;
   if (!reclaimDue(db.pageCount, db.freePages.length, db.liveAtCompaction)) return;
-  const reached = reachablePages(snap, db.paging, catRoot);
+  const reached = reachablePages(snap, db.paging, catRoot, catTag);
   for (const p of written) reached.add(p);
   const free: number[] = [];
   for (let p = ROOT_PAGE; p < db.pageCount; p++) {
@@ -633,5 +672,28 @@ export function adoptStaged(
   db.pageCount = staged.pageCount;
   recordBudget(db, staged);
   db.freePages = staged.freeRemaining;
-  maybeCompact(db, snap, staged.rootPage, staged.written, canReclaim);
+  maybeCompact(db, snap, staged.rootPage, staged.written, canReclaim, staged.rootTag);
+}
+
+// repairKeyBlockSteps finishes a credential change a crash interrupted (spec/design/encryption.md §5;
+// spec/fileformat/encrypted.md §5): when the two key-block copies differ, the opener that unwrapped the
+// selected copy writes it over the other, between barriers. A read-only open leaves the pair alone, which
+// is safe because selection already prefers the newer copy.
+export function* repairKeyBlockSteps(db: Engine): Steps<void> {
+  const paging = db.paging;
+  const codec = paging?.codec() ?? null;
+  if (paging === null || codec === null) return;
+  const page2 = yield* paging.readPageSteps(2);
+  const page3 = yield* paging.readPageSteps(3);
+  if (bytesEqual(page2, page3)) return;
+  const stale = unselectedKeyPage(page2, page3);
+  yield* paging.syncSteps();
+  yield* paging.writePagesSteps([{ index: stale, bytes: codec.keyBlockPage(db.pageSize) }]);
+  yield* paging.syncSteps();
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

@@ -25,10 +25,18 @@ import { Engine, DEFAULT_PAGE_SIZE } from "./executor.ts";
 import { Environment } from "./environment.ts";
 import { engineError } from "./errors.ts";
 import { runAsync, runSync, type Steps } from "./execution.ts";
-import { loadEnginePagedSteps, ROOT_PAGE, toImage, unlockPagerSteps } from "./format.ts";
+import { loadEnginePagedSteps, toImageSteps, unlockPagerSteps } from "./format.ts";
+import { capFirstBody, capOf } from "./cap.ts";
+import {
+  type Argon2Params,
+  createCodecSteps,
+  type Credential,
+  DEFAULT_ARGON2_PARAMS,
+  ENCRYPTED_MIN_PAGE_SIZE,
+} from "./crypto.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
-import { persistImpl } from "./persist.ts";
+import { persistImpl, repairKeyBlockSteps } from "./persist.ts";
 import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
 
 // DatabaseOptions / OpenOptions mirror file.ts (spec/design/api.md §2/§2.1): create-time pageSize is
@@ -36,10 +44,16 @@ import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
 // environment is the handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one.
 // synchronous is the durability mode (file.ts Synchronous, spec/design/transactions.md §9): "off"
 // batches the barrier (spec/design/validated-cow.md §4). Default "on"; a handle setting.
+// credential creates or opens the file encrypted (spec/fileformat/encrypted.md; file.ts CreateOptions):
+// through the WebCrypto backend in a browser, every seal and open an awaited stage of the continuation
+// (encryption.md §9). kdf stretches a passphrase at create. OPFS has no scratch target, so there is
+// nothing more to seal.
 export type DatabaseOptions = {
   pageSize?: number;
   environment?: Environment;
   synchronous?: "on" | "off";
+  credential?: Credential;
+  kdf?: Argon2Params;
 };
 export type OpenOptions = {
   cacheBytes?: number;
@@ -47,6 +61,7 @@ export type OpenOptions = {
   workMem?: number;
   environment?: Environment;
   synchronous?: "on" | "off";
+  credential?: Credential;
 };
 
 // createOpfsWithHandle creates a new file-backed database over an already-acquired, EMPTY OPFS sync
@@ -55,20 +70,46 @@ export type OpenOptions = {
 // through the seam incrementally (api.md §3, hosts.md §5). toImage validates the page size (0A000 if out
 // of range / not a power of two) BEFORE any write, so an invalid page size leaves the handle untouched.
 export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOptions = {}): Engine {
-  const db = new Engine(opts.environment ?? new Environment());
+  return runSync(createOpfsWithHandleSteps(handle, opts));
+}
+
+// createOpfsWithHandleSteps is the create as one continuation: an encrypted database's key block and
+// every page of its image are sealed through awaited stages under an asynchronous codec.
+export function* createOpfsWithHandleSteps(
+  handle: SyncAccessHandle,
+  opts: DatabaseOptions = {},
+): Steps<Engine> {
+  const environment = opts.environment ?? new Environment();
+  const db = new Engine(environment);
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
+  if (opts.credential !== undefined && db.pageSize < ENCRYPTED_MIN_PAGE_SIZE) {
+    throw engineError(
+      "feature_not_supported",
+      "an encrypted database needs a page size of at least 1024",
+    );
+  }
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
+  // A new encrypted file's key block and codec (spec/fileformat/encrypted.md §5, §8): the data key,
+  // KDF salt and wrap nonce are the first draws of the database's key-entropy stream.
+  const codec =
+    opts.credential === undefined
+      ? null
+      : yield* createCodecSteps(
+          opts.credential,
+          opts.kdf ?? DEFAULT_ARGON2_PARAMS,
+          environment.keyStream(),
+        );
   // Lay down the whole from-scratch image in place (write-in-place create — hosts.md §5). toImage seeds
   // both meta slots and validates the page size; every later commit is incremental (persistImpl).
-  const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
+  const bytes = yield* toImageSteps(db.committed, db.pageSize, db.committed.txid, codec);
   const store = new OpfsBlockStore(handle);
   store.writeAt(0, bytes);
   store.sync();
   db.pageCount = Math.floor(bytes.length / db.pageSize);
   // The image is of an empty database: every body page is live, and every one is a catalog page
   // (spec/design/memory.md §8.7).
-  const body = db.pageCount - ROOT_PAGE;
+  const body = db.pageCount - capFirstBody(capOf(db.pageSize, codec !== null));
   db.live = { live: body, catalog: body, gist: 0 };
   // Adopt the just-written handle as the open pager + buffer pool, so later commits write through the
   // seam without re-acquiring (spec/design/pager.md). Pager.fromStore reads the page size from the meta
@@ -76,6 +117,7 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
   db.paging = new SharedPaging(
     Pager.fromStore(store),
     cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
+    codec,
   );
   // Tables built in this session bind this pager at creation (Snapshot.storePaging), so their
   // committed leaves demote at each commit — same residency shape as after a reopen (file.ts create).
@@ -109,13 +151,15 @@ export function* openOpfsWithHandleSteps(
   const pager = yield* Pager.fromStoreSteps(new OpfsBlockStore(handle));
   pager.setPageTransform(transform);
   const environment = opts.environment ?? new Environment();
-  // An encrypted file is 0A000 on a host with no cryptography backend (spec/fileformat/encrypted.md
-  // §10); this host takes no credential.
-  const codec = yield* unlockPagerSteps(pager, undefined, environment);
+  // An encrypted file unlocks with the credential (encrypted.md §5): through the WebCrypto backend in
+  // a browser, so the unlock and every later seal and open are awaited.
+  const codec = yield* unlockPagerSteps(pager, opts.credential, environment);
   const db = yield* loadEnginePagedSteps(
     new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
     environment,
   );
+  // A writable open finishes a credential change a crash interrupted (encrypted.md §5).
+  if (!readOnly) yield* repairKeyBlockSteps(db);
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;
   db.relaxed = opts.synchronous === "off";
@@ -199,7 +243,7 @@ export async function createOpfs(name: string, opts: DatabaseOptions = {}): Prom
   const fileHandle = await dir.getFileHandle(name, { create: true });
   const handle = await fileHandle.createSyncAccessHandle();
   try {
-    return createOpfsWithHandle(handle, opts);
+    return await runAsync(createOpfsWithHandleSteps(handle, opts));
   } catch (e) {
     try {
       handle.close();

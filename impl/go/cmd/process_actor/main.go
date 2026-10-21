@@ -65,6 +65,11 @@ func run() error {
 		ownership = jed.OwnershipNever
 	}
 	maxConnections, _ := strconv.Atoi(options["max_connections"])
+	// key=<64 hex digits>: the host key of an encrypted database (spec/design/encryption.md §8).
+	var credential *jed.Credential
+	if key, ok := options["key"]; ok {
+		credential = hostKey(key)
+	}
 	var db *jed.Database
 	var err error
 	if os.Args[1] == "owner-idle" {
@@ -82,11 +87,13 @@ func run() error {
 		db, err = jed.CreateDatabase(jed.CreateOptions{
 			Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle,
 			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
+			Credential: credential,
 		})
 	} else {
 		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{
 			Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle, ReadOnly: readOnly,
 			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
+			Credential: credential,
 		})
 	}
 	if err != nil {
@@ -143,6 +150,16 @@ func run() error {
 			// The backup test entry point (spec/design/page-service.md §9): BACKUP <form>\t<dest>.
 			form, dest, _ := strings.Cut(argument, "\t")
 			err = jed.BackupForTesting(db, dest, form == "page_identical")
+		case "CHANGE_KEY":
+			// An encrypted database's credential change and rekey (spec/design/encryption.md §5):
+			// CHANGE_KEY <hex>, REKEY <hex> (empty: decrypt).
+			err = db.ChangeCredential("main", hostKey(argument), jed.Argon2Params{})
+		case "REKEY":
+			var target *jed.Credential
+			if argument != "" {
+				target = hostKey(argument)
+			}
+			err = db.Rekey("main", target, jed.Argon2Params{})
 		case "MAX_STORAGE_BYTES":
 			bytes, parseErr := strconv.ParseInt(argument, 10, 64)
 			if parseErr != nil {
@@ -351,4 +368,15 @@ func timed(db *jed.Database, command, argument string) (string, error) {
 		}
 	}
 	return fmt.Sprintf("%d:%d", time.Since(start).Nanoseconds(), checksum), nil
+}
+
+// hostKey is a 32-byte host-key credential from 64 hex digits.
+func hostKey(text string) *jed.Credential {
+	b, err := hex.DecodeString(text)
+	if err != nil || len(b) != 32 {
+		panic("a 64-hex-digit key")
+	}
+	var key [32]byte
+	copy(key[:], b)
+	return jed.KeyCredential(key)
 }

@@ -29,20 +29,24 @@ import { DEFAULT_PAGE_SIZE, Engine, type Snapshot } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import { Environment } from "./environment.ts";
 import type { FileHost, WriteAt } from "./filehost.ts";
-import { capFirstBody, capOf } from "./cap.ts";
+import { capFirstBody, capOf, FIRST_BODY_ENCRYPTED as ENCRYPTED_FIRST_BODY } from "./cap.ts";
 import {
   type Argon2Params,
   createCodec,
   type Credential,
   DEFAULT_ARGON2_PARAMS,
   ENCRYPTED_MIN_PAGE_SIZE,
+  fileSuite,
+  KEY_BLOCK_LEN,
   type PageCodec,
+  sealScratch,
+  selectedKeyPage,
 } from "./crypto.ts";
 import { loadEnginePagedSteps, toImage, unlockPagerSteps, writeImage } from "./format.ts";
 import { runSync, type Steps } from "./execution.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
-import { persistImpl, registerDirectorySync } from "./persist.ts";
+import { persistImpl, registerDirectorySync, repairKeyBlockSteps } from "./persist.ts";
 import {
   type AttachSource,
   buildInMemory,
@@ -50,9 +54,11 @@ import {
   type OpenedAttachment,
   registerFileAttachOpener,
   registerFileCompactor,
+  type RekeyTarget,
   type ServiceHandoffHost,
 } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
+import type { SpillSink } from "./spill.ts";
 import { canonicalOpenPath, FileCoordinator, resolvedLocking } from "./coordinator.ts";
 import { type HandoffHosts, type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
 
@@ -70,7 +76,20 @@ export type DatabaseOptions = {
   environment?: Environment;
   credential?: Credential;
   kdf?: Argon2Params;
+  scratchEncryption?: ScratchEncryption;
 };
+
+// ScratchEncryption is whether a handle seals its scratch files — sort runs, hash partitions, row
+// spools, spilled temp domains (spec/fileformat/encrypted.md §11, api.md): "auto" (the default) seals
+// them when the main database is encrypted; "on" always does, so the handle may attach encrypted
+// databases while keeping its scratch target. Fixed at open/create for the handle's life.
+export type ScratchEncryption = "auto" | "on";
+
+// scratchSink is a file handle's scratch target: the OS temp directory, sealed when encrypt
+// (encrypted.md §11) with keys from a scratch stream of environment's key entropy.
+function scratchSink(encrypt: boolean, environment: Environment): SpillSink {
+  return sealScratch(new FileSpillSink(tmpdir()), encrypt, environment)!;
+}
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1).
 // path selects the backing: absent → an in-memory database (never touches the filesystem); present
@@ -127,20 +146,17 @@ export type CreateOptions = {
   // credential creates the file ENCRYPTED (spec/design/encryption.md, spec/fileformat/encrypted.md):
   // its pages are sealed under a random data key that only the credential — a passphrase or a 32-byte
   // host key — unwraps. Needs a pageSize of at least 1024 (0A000 otherwise); an in-memory database
-  // with a credential is 55000. An encrypted file is never served by the page service (locking "auto"
-  // becomes an exclusive owner) and has no spill target. Absent (the default) creates a plaintext file.
+  // with a credential is 55000. An encrypted file is served by the page service like a plaintext one
+  // (every process holds the key, encrypted.md §14) and seals its scratch files (§11). Absent (the
+  // default) creates a plaintext file.
   credential?: Credential;
   // kdf is the Argon2id parameters a passphrase credential is stretched with (default RFC 9106's second
   // recommendation; 22023 outside the format's bounds). Ignored for a host key or a plaintext file.
   kdf?: Argon2Params;
+  // scratchEncryption is whether the handle seals its scratch files (ScratchEncryption above): "auto"
+  // (the default) seals them when the database is encrypted.
+  scratchEncryption?: ScratchEncryption;
 };
-
-// lockingFor is the coordination an open uses: an encrypted file is never served by the page service
-// (spec/fileformat/encrypted.md §10), so a credential turns "auto" into an exclusive owner.
-function lockingFor(locking: Locking | undefined, credential: Credential | undefined): Locking {
-  const resolved = resolvedLocking(locking);
-  return credential !== undefined && resolved === "auto" ? "exclusive" : resolved;
-}
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
@@ -194,8 +210,8 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
   db.committed.storePaging = db.paging;
   // Scratch is independent of the persistence path: a read-only database directory must still be
   // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1). An encrypted database never spills
-  // plaintext: it has no scratch target until scratch encryption lands (encrypted.md §10).
-  db.spillSink = codec === null ? new FileSpillSink(tmpdir()) : null;
+  // plaintext: its scratch files are sealed (encrypted.md §11).
+  db.spillSink = scratchSink(codec !== null || opts.scratchEncryption === "on", environment);
   return db;
 }
 
@@ -283,6 +299,9 @@ export type OpenOptions = {
   // without it, 28P01 when it does not unwrap the key), refused for a plaintext file (28P03). A handle
   // argument only — never stored, never shown.
   credential?: Credential;
+  // scratchEncryption is whether the handle seals its scratch files (ScratchEncryption above): "auto"
+  // (the default) seals them when the database is encrypted.
+  scratchEncryption?: ScratchEncryption;
 };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
@@ -308,9 +327,35 @@ export function* openWithTransformSteps(
   return yield* openViaSteps(osFiles, path, opts, transform);
 }
 
-// openVia is open through the file host files (filehost.ts).
-export function openVia(files: FileHost, path: string, opts: OpenOptions = {}): Engine {
-  return runSync(openViaSteps(files, path, opts, null));
+// openVia is open through the file host files (filehost.ts). held is the data key a page client
+// promoting itself to owner already holds (spec/fileformat/encrypted.md §14): the codec then opens the
+// file in place of the credential, adopting the file's selected key-block copy, and a differing pair is
+// left unrepaired (a process without the credential cannot know which copy it would be writing).
+export function openVia(
+  files: FileHost,
+  path: string,
+  opts: OpenOptions = {},
+  held: PageCodec | null = null,
+): Engine {
+  return runSync(openViaSteps(files, path, opts, null, held));
+}
+
+// adoptHeldCodecSteps prepares pager to open with a promoting client's held codec (encrypted.md §14):
+// the file must be encrypted (28P04 when it no longer is), and the codec adopts its selected key-block
+// copy, so a later credential change or backup starts from the file's current generation. The load
+// then authenticates the meta under the held key (XX001 when it does not).
+function* adoptHeldCodecSteps(pager: Pager, codec: PageCodec): Steps<void> {
+  if (pager.physicalPages() < ENCRYPTED_FIRST_BODY) {
+    throw engineError("data_corrupted", "encrypted file too small for its key block");
+  }
+  const slot0 = yield* pager.readPageSteps(0);
+  const slot1 = yield* pager.readPageSteps(1);
+  if (fileSuite(slot0, slot1) === 0) {
+    throw engineError("stale_key", "the database is no longer encrypted; reopen it");
+  }
+  const page2 = yield* pager.readPageSteps(2);
+  const page3 = yield* pager.readPageSteps(3);
+  codec.setKeyBlock(selectedKeyPage(page2, page3).slice(0, KEY_BLOCK_LEN));
 }
 
 // openViaSteps is openVia as one continuation (ts-runtime.md §11.1), with the page codec transform
@@ -321,6 +366,7 @@ export function* openViaSteps(
   path: string,
   opts: OpenOptions,
   transform: PageTransform | null,
+  held: PageCodec | null = null,
 ): Steps<Engine> {
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
   const readOnly = opts.readOnly ?? false;
@@ -332,7 +378,13 @@ export function* openViaSteps(
     const pager = yield* Pager.fromStoreSteps(store);
     pager.setPageTransform(transform);
     const environment = opts.environment ?? new Environment();
-    const codec = yield* unlockPagerSteps(pager, opts.credential, environment);
+    let codec: PageCodec | null;
+    if (held !== null) {
+      yield* adoptHeldCodecSteps(pager, held);
+      codec = held;
+    } else {
+      codec = yield* unlockPagerSteps(pager, opts.credential, environment);
+    }
     const db = yield* loadEnginePagedSteps(
       new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize), codec),
       environment,
@@ -340,12 +392,13 @@ export function* openViaSteps(
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
+    if (!readOnly && held === null) yield* repairKeyBlockSteps(db);
     db.storageBudget.limit = opts.maxStorageBytes ?? 0n;
     db.relaxed = opts.synchronous === "off";
     // Scratch is independent of the persistence path, so read-only database filesystems remain
-    // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1). An encrypted database has
-    // no scratch target (spec/fileformat/encrypted.md §10).
-    db.spillSink = codec === null ? new FileSpillSink(tmpdir()) : null;
+    // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1). An encrypted database seals
+    // its scratch files (spec/fileformat/encrypted.md §11).
+    db.spillSink = scratchSink(codec !== null || opts.scratchEncryption === "on", environment);
     // 0 (or unset) means "the default budget", not "unlimited" — the zero value stays a safe finite
     // budget (matching Go/Rust). Unbounded/never-spill is a runtime-only mode via setWorkMem(0).
     if (opts.workMem) db.session.workMem = opts.workMem;
@@ -356,6 +409,8 @@ export function* openViaSteps(
     throw ioError(e);
   }
 }
+
+export { repairKeyBlockSteps };
 
 // Register the Node file host as the file-attach opener (attached-databases.md §4, Slice 2): importing
 // file.ts (the node host) enables `db.attach(name, attachFile(path))` without shared.ts importing a host
@@ -368,11 +423,20 @@ export function* openViaSteps(
 // its own (openServiceAttachment). Under "exclusive" it is a non-serving owner of its file: another
 // process holding the file makes the attach wait, then fail 55006. Either way it follows the handle's
 // synchronous setting (validated-cow.md §4).
-registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHandoff) => {
+registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHandoff, seals) => {
   const path = source.path!;
-  const locking = lockingFor(source.locking, source.credential);
+  const locking = resolvedLocking(source.locking);
   if (locking === "auto") {
-    return openServiceAttachment(path, source, readOnly, files, environment, relaxed, mainHandoff);
+    return openServiceAttachment(
+      path,
+      source,
+      readOnly,
+      files,
+      environment,
+      relaxed,
+      mainHandoff,
+      seals,
+    );
   }
   const coordinator = FileCoordinator.open(path, locking, source.fileLockTimeoutMs);
   try {
@@ -405,6 +469,7 @@ function openServiceAttachment(
   environment: Environment,
   relaxed: boolean,
   mainHandoff: ServiceHandoffHost | null,
+  seals: boolean,
 ): OpenedAttachment {
   const main = mainHandoff instanceof ServiceHandoff ? mainHandoff : null;
   const hosts: HandoffHosts = main !== null ? main.hosts() : { files };
@@ -418,6 +483,9 @@ function openServiceAttachment(
     maxStorageBytes: source.maxStorageBytes,
     // The attachment follows the handle's synchronous setting (validated-cow.md §4).
     synchronous: relaxed ? "off" : "on",
+    credential: source.credential,
+    // The attachment seals its scratch files when the handle does (encrypted.md §11).
+    scratchEncryption: seals ? "on" : "auto",
   };
   if (main !== null) {
     // A handle under the page service lends its ownership preference and owner limits to its
@@ -435,10 +503,13 @@ function openServiceAttachment(
     options,
     readOnly,
     source.fileLockTimeoutMs,
-    {},
+    {
+      credential: source.credential,
+      scratchEncryption: seals ? "on" : "auto",
+    },
     environment,
-    () => {
-      const engine = openVia(hostFiles ?? osFiles, real, { ...options, locking: "none" });
+    (held) => {
+      const engine = openVia(hostFiles ?? osFiles, real, { ...options, locking: "none" }, held);
       // An owner's storage reaches the same file and spill hosts a client's does.
       engine.fileHost = hostFiles;
       adoptClient?.(engine);
@@ -461,6 +532,10 @@ function openServiceAttachment(
 // the rename fails, the old file is reopened into old. If reopening the new file fails, old stays closed
 // and poisoned, so the handle must be reopened. Returns the replacement paging context, a pool of
 // capacity leaves over the new file.
+//
+// rekey, when given, is a rekey's target (spec/fileformat/encrypted.md §12): the image is written under
+// its codec (null: plaintext) instead of old's, and an image whose live pages exceed limit bytes (when
+// positive) fails 54P06 before the rename, naming the database name.
 export function compactFile(
   host: FileHost | null,
   path: string,
@@ -469,6 +544,7 @@ export function compactFile(
   txid: bigint,
   old: SharedPaging,
   capacity: number,
+  rekey?: RekeyTarget,
 ): SharedPaging {
   const files = host ?? osFiles;
   const noSync = old.skipsSync();
@@ -476,15 +552,33 @@ export function compactFile(
   const real = files.realPath(path);
   const tmp = real + ".jedtmp";
   // An encrypted file keeps its data key and key block; every page is resealed under fresh nonces
-  // (spec/design/encryption.md §5).
-  const codec = old.codec();
+  // (spec/design/encryption.md §5). A rekey writes under its target codec instead.
+  const codec = rekey === undefined ? old.codec() : rekey.codec;
+  let pageCount = 0;
   try {
     files.writeFile(tmp, real, noSync, (writeAt) => {
-      writeImage(snap, pageSize, txid, (index, page) => writeAt(index * pageSize, page), codec);
+      pageCount = writeImage(
+        snap,
+        pageSize,
+        txid,
+        (index, page) => writeAt(index * pageSize, page),
+        codec,
+      );
     });
   } catch (e) {
     files.remove(tmp);
     throw e;
+  }
+  if (rekey !== undefined && rekey.limit > 0n) {
+    // A from-scratch image holds no free page: every body page is live (memory.md §8.7).
+    const live = pageCount - capFirstBody(capOf(pageSize, codec !== null));
+    if (BigInt(live) * BigInt(pageSize) > rekey.limit) {
+      files.remove(tmp);
+      throw engineError(
+        "storage_limit_exceeded",
+        `storage of database "${rekey.name}" exceeded the limit of ${rekey.limit} bytes`,
+      );
+    }
   }
 
   // Close the old file before the rename: Windows cannot replace a file that is still open.
@@ -640,7 +734,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
   if (opts.path !== undefined) {
     const coordinator = FileCoordinator.create(
       opts.path,
-      lockingFor(opts.locking, opts.credential),
+      resolvedLocking(opts.locking),
       opts.fileLockTimeoutMs,
     );
     try {
@@ -650,6 +744,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         environment: opts.environment,
         credential: opts.credential,
         kdf: opts.kdf,
+        scratchEncryption: opts.scratchEncryption,
       });
       engine.storageBudget.limit = maxStorageBytes;
       engine.relaxed = opts.synchronous === "off";
@@ -662,15 +757,22 @@ export function createDatabase(opts: CreateOptions = {}): Database {
           opts,
           false,
           opts.fileLockTimeoutMs,
-          {},
+          { scratchEncryption: opts.scratchEncryption, credential: opts.credential },
           environment,
-          () =>
-            open(path, {
-              skipFsync: opts.skipFsync,
-              synchronous: opts.synchronous,
-              environment,
-              locking: "none",
-            }),
+          (held) =>
+            openVia(
+              osFiles,
+              path,
+              {
+                skipFsync: opts.skipFsync,
+                synchronous: opts.synchronous,
+                environment,
+                locking: "none",
+                scratchEncryption: opts.scratchEncryption,
+                credential: opts.credential,
+              },
+              held,
+            ),
         );
         return startServiceOwner(engine, coordinator, handoff);
       }
@@ -687,7 +789,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
 // the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
 export function openDatabase(path: string, opts: OpenOptions = {}): Database {
-  const locking = lockingFor(opts.locking, opts.credential);
+  const locking = resolvedLocking(opts.locking);
   if (locking === "auto") return openServiceDatabase(path, opts);
   const coordinator = FileCoordinator.open(path, locking, opts.fileLockTimeoutMs);
   try {
@@ -712,7 +814,7 @@ function openServiceDatabase(path: string, opts: OpenOptions): Database {
     opts.fileLockTimeoutMs,
     opts,
     environment,
-    () => open(real, { ...opts, locking: "none", environment }),
+    (held) => openVia(osFiles, real, { ...opts, locking: "none", environment }, held),
   );
   return openServiceWith(handoff);
 }

@@ -28,6 +28,8 @@ type psDelta struct {
 	protected map[uint32]bool
 	// written is every index the delta writes, in ascending order: the invalidation window's entry.
 	written []uint32
+	// encrypted: body pages are ciphertext, checked by their manifest identity alone (encrypted.md §6).
+	encrypted bool
 }
 
 func errDelta(reason string) error {
@@ -40,12 +42,21 @@ type psDeltaBase struct {
 	pageSize      uint32
 	pageCount     uint32          // the committed high-water
 	granted       map[uint32]bool // the reusable free pages when the reuse grant passed; nil otherwise
+	// encrypted: the file is the encrypted variant — the inline manifest starts at 96, body pages are
+	// ciphertext checked by their manifest identity alone, and the key block (pages 2–3) is never
+	// written by a delta (spec/fileformat/encrypted.md §6, §14). codec is its page codec then.
+	encrypted bool
+	codec     *pageCodec
 }
 
 // legal reports whether a delta may write index: a body page beyond the committed high-water or a
 // granted free page, below the new page count.
 func (b psDeltaBase) legal(index, newPageCount uint32) bool {
-	return index >= 2 && index < newPageCount && (index >= b.pageCount || b.granted[index])
+	first := uint32(2)
+	if b.encrypted {
+		first = firstBodyEncrypted
+	}
+	return index >= first && index < newPageCount && (index >= b.pageCount || b.granted[index])
 }
 
 // beginDelta runs the checks before any page is written (README.md §3.5 check A): the meta, then the
@@ -78,6 +89,7 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		expected:  make(map[uint32]uint64, m.dirtyCount),
 		received:  make(map[uint32]bool, m.dirtyCount),
 		protected: make(map[uint32]bool, int(m.dirtyCount)+len(cb.manifestPages)),
+		encrypted: base.encrypted,
 	}
 	if len(cb.manifestPages) != int(m.manifestPages) {
 		return nil, errDelta("commit_begin carries the wrong number of manifest pages")
@@ -104,8 +116,9 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 		}
 		return nil
 	}
-	// The page service serves plaintext files only (spec/fileformat/encrypted.md §10).
-	if err := list(cb.meta[64:], min(m.dirtyCount, uint32(manifestInlineCapacity(ps, plainCap(uint32(ps)))))); err != nil {
+	pcap := capOf(uint32(ps), base.encrypted)
+	inlineAt, _ := manifestInlineArea(ps, pcap)
+	if err := list(cb.meta[inlineAt:], min(m.dirtyCount, uint32(manifestInlineCapacity(ps, pcap)))); err != nil {
 		return nil, err
 	}
 	id := m.manifestHead
@@ -146,6 +159,30 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 	return d, nil
 }
 
+// manifestChain is the delta's manifest-overflow chain as the meta tag covers it (encrypted.md §6).
+func (d *psDelta) manifestChain() []dirtyPage {
+	chain := make([]dirtyPage, len(d.manifest))
+	for i, pg := range d.manifest {
+		chain[i] = dirtyPage{index: pg.index, bytes: pg.page}
+	}
+	return chain
+}
+
+// checkMeta checks an encrypted delta's meta against the database key before any page is written
+// (spec/fileformat/encrypted.md §14): a client cannot know the slot the owner writes, so the meta must
+// authenticate under one of the two slot indices; otherwise the delta is a client bug (08P01) rather
+// than XX001 at the next open.
+func (d *psDelta) checkMeta(codec *pageCodec) error {
+	if codec == nil {
+		return nil
+	}
+	chain := d.manifestChain()
+	if codec.verifyMeta(0, d.meta, chain) == nil || codec.verifyMeta(1, d.meta, chain) == nil {
+		return nil
+	}
+	return errDelta("the meta does not authenticate under the database key")
+}
+
 // checkPage runs check B before one body page is written: it is listed, not yet received, and
 // matches its manifest identity.
 func (d *psDelta) checkPage(pg psIndexedPage) error {
@@ -157,7 +194,8 @@ func (d *psDelta) checkPage(pg psIndexedPage) error {
 		return errDelta("page " + strconv.FormatUint(uint64(pg.index), 10) + " arrived twice")
 	}
 	b := pg.page
-	if b[0] < 1 || b[0] > 7 || pageCRC(b) != binary.BigEndian.Uint32(b[12:16]) || commitCRC64(0, b) != crc {
+	plainOK := d.encrypted || (b[0] >= 1 && b[0] <= 7 && pageCRC(b) == binary.BigEndian.Uint32(b[12:16]))
+	if len(b) != len(d.meta) || !plainOK || commitCRC64(0, b) != crc {
 		return errDelta("page " + strconv.FormatUint(uint64(pg.index), 10) + " does not match its manifest identity")
 	}
 	d.received[pg.index] = true

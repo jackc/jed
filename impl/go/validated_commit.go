@@ -193,6 +193,13 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 			continue
 		}
 		if p.trustMeta {
+			// A page client is served the meta without its slot; it authenticates under either slot
+			// index (spec/fileformat/encrypted.md §14). XX001 when it does not.
+			if p.codec != nil {
+				if err := p.verifyServedMeta(m, raw); err != nil {
+					return meta{}, err
+				}
+			}
 			p.validatedMeta = append(p.validatedMeta[:0], raw...)
 			p.manifestProtected = map[uint32]bool{}
 			return m, nil
@@ -317,6 +324,19 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 // manifestChain is the manifest-overflow chain a valid meta names, in chain order — what an encrypted
 // meta's tag covers (encrypted.md §6). Reads only the pages the meta counts; a malformed chain was
 // already refused by validateCommitManifest.
+// verifyServedMeta authenticates a served meta under the pager's codec for either slot index
+// (spec/fileformat/encrypted.md §14): XX001 when neither tag checks.
+func (p *pager) verifyServedMeta(m meta, raw []byte) error {
+	chain, err := p.manifestChain(m)
+	if err != nil {
+		return err
+	}
+	if err := p.codec.verifyMeta(0, raw, chain); err != nil {
+		return p.codec.verifyMeta(1, raw, chain)
+	}
+	return nil
+}
+
 func (p *pager) manifestChain(m meta) ([]dirtyPage, error) {
 	var out []dirtyPage
 	id := m.manifestHead

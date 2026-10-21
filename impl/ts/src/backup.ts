@@ -25,18 +25,20 @@ import type { FileHost, WriteAt } from "./filehost.ts";
 import { osFiles } from "./file.ts";
 import {
   anySpillable,
+  chainStep,
   collectLeafOverflowWith,
   collectTreePages,
   loadEnginePagedAt,
   metaPage,
   PAGE_FREELIST,
   parsePage,
-  ROOT_PAGE,
   writeImage,
 } from "./format.ts";
 import type { SharedPaging } from "./paging.ts";
 import type { PageClientHandle, ServiceHandoffHost } from "./shared.ts";
 import { compareTextC } from "./value.ts";
+import { capFirstBody, NO_TAG } from "./cap.ts";
+import { selectedKeyPage } from "./crypto.ts";
 
 // BackupCore is the part of a Database's shared core a backup uses.
 type BackupCore = {
@@ -70,14 +72,6 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
       "a page-identical backup needs a file database; an in-memory database has only the compacted form",
     );
   }
-  if (st.paging !== null && st.paging.codec() !== null) {
-    // A backup of an encrypted file needs its key block taken under the key-block mutex
-    // (spec/design/encryption.md §8), not yet built (spec/fileformat/encrypted.md §10).
-    throw engineError(
-      "feature_not_supported",
-      "a backup of an encrypted database is not supported yet",
-    );
-  }
   if (files.exists(dest)) {
     throw engineError("duplicate_file", "database file already exists: " + dest);
   }
@@ -104,8 +98,17 @@ function backup(c: BackupCore, dest: string, pageIdentical: boolean): void {
         const pages = backupPages(c, paging, mt);
         fill = (writeAt) => writePageIdentical(c, paging, pageSize, mt, pages, writeAt);
       } else {
+        // An encrypted database's copy keeps its data key and key block, every page resealed under
+        // fresh nonces, as compaction does (spec/fileformat/encrypted.md §13).
+        const codec = paging?.codec() ?? null;
         fill = (writeAt) => {
-          writeImage(snap, pageSize, v + 1n, (index, page) => writeAt(index * pageSize, page));
+          writeImage(
+            snap,
+            pageSize,
+            v + 1n,
+            (index, page) => writeAt(index * pageSize, page),
+            codec,
+          );
         };
       }
       writeBackupFile(files, dest, noSync, fill);
@@ -141,15 +144,22 @@ export function backupPages(c: BackupCore, paging: SharedPaging, mt: CommitMeta)
     gist: (p) => reached.add(p),
   });
   const snap = loaded.committed;
-  const read = (p: number): Uint8Array => paging.readBlock(p);
+  const read = (p: number, tag: Uint8Array): Uint8Array => paging.readBody(p, tag);
+  // Chains are followed through their bound pointers (encrypted.md §2), so every chain page of an
+  // encrypted file is authenticated on the way.
+  const cap = paging.cap();
+  const first = capFirstBody(cap);
   const seen = new Set<number>();
+  let tag = mt.rootTag;
   for (let p = mt.rootPage; p !== 0; ) {
-    if (seen.has(p) || p < ROOT_PAGE || p >= mt.pageCount) {
+    if (seen.has(p) || p < first || p >= mt.pageCount) {
       throw engineError("data_corrupted", "invalid catalog chain");
     }
     seen.add(p);
     reached.add(p);
-    p = parsePage(read(p)).nextPage;
+    const step = chainStep(read(p, tag), cap);
+    p = step.next;
+    tag = step.nextTag;
   }
   const names = [...snap.stores.keys()].sort(compareTextC);
   for (const name of names) {
@@ -157,7 +167,16 @@ export function backupPages(c: BackupCore, paging: SharedPaging, mt: CommitMeta)
     const root = store.treeRoot();
     collectTreePages(root, reached);
     if (root !== null && root.page !== 0 && anySpillable(store.columnTypes())) {
-      collectLeafOverflowWith(read, root.page, store.columnTypes(), reached, new Set(), 1);
+      collectLeafOverflowWith(
+        read,
+        root.page,
+        store.columnTypes(),
+        reached,
+        new Set(),
+        1,
+        root.tag ?? NO_TAG,
+        cap.tag,
+      );
     }
   }
   for (const istore of snap.indexStores.values()) collectTreePages(istore.treeRoot(), reached);
@@ -167,20 +186,22 @@ export function backupPages(c: BackupCore, paging: SharedPaging, mt: CommitMeta)
       "the pages reachable from the snapshot do not match its live page count",
     );
   }
+  tag = mt.freeListTag;
   for (let p = mt.freeListHead; p !== 0; ) {
-    if (reached.has(p) || p < ROOT_PAGE || p >= mt.pageCount) {
+    if (reached.has(p) || p < first || p >= mt.pageCount) {
       throw engineError("data_corrupted", "invalid free-list chain");
     }
     reached.add(p);
-    const pg = parsePage(read(p));
-    if (pg.pageType !== PAGE_FREELIST) {
+    const step = chainStep(read(p, tag), cap);
+    if (step.pageType !== PAGE_FREELIST) {
       throw engineError("data_corrupted", "invalid free-list page");
     }
-    p = pg.nextPage;
+    p = step.next;
+    tag = step.nextTag;
   }
   const pages: number[] = [];
   for (const p of reached) {
-    if (p < ROOT_PAGE || p >= mt.pageCount) {
+    if (p < first || p >= mt.pageCount) {
       throw engineError("data_corrupted", "a reachable page lies outside the snapshot");
     }
     pages.push(p);
@@ -199,6 +220,7 @@ function writePageIdentical(
   pages: number[],
   writeAt: WriteAt,
 ): void {
+  const codec = paging.codec();
   let read = (batch: number[]): Uint8Array[] => batch.map((p) => paging.readBlock(p));
   let batchSize = 1;
   const client = c.client;
@@ -211,18 +233,43 @@ function writePageIdentical(
     const blocks = read(batch);
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]!;
-      parsePage(block); // the page's CRC-32 (XX001)
+      // An encrypted page is ciphertext: the walk authenticated the chain pages and every interior
+      // node, and a leaf or overflow page is authenticated when the copy reads it.
+      if (codec === null) parsePage(block); // the page's CRC-32 (XX001)
       writeAt(batch[i]! * ps, block);
     }
+  }
+  // An encrypted copy holds the key block at pages 2 and 3, which no pointer reaches: the file's
+  // selected copy, written to both, so the pair is complete at one generation even while a credential
+  // change runs (encrypted.md §13). A page client reads the pages through the service.
+  if (codec !== null) {
+    const pair = read([2, 3]);
+    const block = selectedKeyPage(pair[0]!, pair[1]!);
+    writeAt(2 * ps, block);
+    writeAt(3 * ps, block);
   }
   const last = mt.pageCount - 1;
   if (pages.length === 0 || pages[pages.length - 1] !== last) {
     // The file must span the snapshot's page count: its trailing dead pages are zero.
     writeAt(last * ps, new Uint8Array(ps));
   }
-  const bootstrap = metaPage(ps, mt.txid, mt.rootPage, mt.pageCount, mt.freeListHead, mt.livePages);
-  writeAt(0, bootstrap);
-  writeAt(ps, bootstrap);
+  const bootstrap = (slot: number): Uint8Array => {
+    const meta = metaPage(
+      ps,
+      mt.txid,
+      mt.rootPage,
+      mt.pageCount,
+      mt.freeListHead,
+      mt.livePages,
+      undefined,
+      codec === null ? undefined : { root: mt.rootTag, freeList: mt.freeListTag },
+    );
+    // Each slot is sealed for its own index in an encrypted copy (encrypted.md §6).
+    if (codec !== null) codec.sealMeta(slot, meta, []);
+    return meta;
+  };
+  writeAt(0, bootstrap(0));
+  writeAt(ps, bootstrap(1));
 }
 
 // writeBackupFile writes dest the way create writes a new database (api.md §2.1): a sibling temp file,

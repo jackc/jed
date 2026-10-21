@@ -22,7 +22,7 @@
 // answer "invalidate all", which README §3.2 permits for anything older than the retained window); a
 // single commit larger than the arena empties the window.
 
-import { crc64Update } from "../commit_manifest.ts";
+import { resolutionDigest } from "../commit_manifest.ts";
 import {
   PS_COMMIT_STATUS_COMMITTED,
   PS_COMMIT_STATUS_NOT_COMMITTED,
@@ -80,6 +80,10 @@ const OWNER_STATE = 11;
 // moves the floor at each client commit, always holding the writer gate.
 const FLOOR_SLOT = 12;
 const BATCH_PENDING = 13;
+// KEY_STATE is whether the database is encrypted (spec/fileformat/encrypted.md §14): 1 when KEY holds
+// its data key, which the worker checks and reseals a client commit's meta with, and opens free-list
+// pages with. The engine thread sets it at start and after a rekey.
+const KEY_STATE = 14;
 const HEADER_I32 = 16;
 
 // BigInt64 slots.
@@ -105,7 +109,9 @@ const PIN_COUNT_OFFSET = PIN_TXID_OFFSET + PIN_SLOTS * 8;
 const ARENA_OFFSET = PIN_COUNT_OFFSET + PIN_SLOTS * 4;
 const META_OFFSET = ARENA_OFFSET + WINDOW_ARENA * 4;
 const RESOLUTION_OFFSET = META_OFFSET + META_MAX;
-const TOTAL_BYTES = RESOLUTION_OFFSET + PS_RESOLUTION_WINDOW_COMMITS * 16;
+const KEY_OFFSET = RESOLUTION_OFFSET + PS_RESOLUTION_WINDOW_COMMITS * 16;
+const KEY_LEN = 32;
+const TOTAL_BYTES = KEY_OFFSET + KEY_LEN;
 
 // Invalidation is begin_read's cache answer: everything, or the exact ascending index list.
 export type Invalidation = { all: boolean; indices: number[] };
@@ -306,6 +312,25 @@ export class ServiceState {
     this.big[ENGINE_OLDEST] = -1n;
   }
 
+  // setKeyLocked records the database's data key (null: plaintext) for the worker
+  // (spec/fileformat/encrypted.md §14).
+  setKeyLocked(dek: Uint8Array | null): void {
+    const key = new Uint8Array(this.buffer, KEY_OFFSET, KEY_LEN);
+    if (dek === null) {
+      key.fill(0);
+      this.header[KEY_STATE] = 0;
+    } else {
+      key.set(dek);
+      this.header[KEY_STATE] = 1;
+    }
+  }
+
+  // keyLocked copies the database's data key, or null for a plaintext database.
+  keyLocked(): Uint8Array | null {
+    if (this.header[KEY_STATE] === 0) return null;
+    return new Uint8Array(this.buffer, KEY_OFFSET, KEY_LEN).slice();
+  }
+
   // metaLocked copies the committed meta page.
   metaLocked(): Uint8Array {
     return this.metaBytes.slice(0, this.header[META_LENGTH]);
@@ -431,12 +456,12 @@ export class ServiceState {
     return oldest;
   }
 
-  // recordResolutionLocked adds a published commit's (txid, digest) pair: the digest is the CRC-64 of
-  // the meta page that published it (README §3.5).
+  // recordResolutionLocked adds a published commit's (txid, digest) pair: the digest is the resolution
+  // digest of the meta page that published it (README §3.5, resolutionDigest).
   recordResolutionLocked(txid: bigint, meta: Uint8Array): void {
     const next = this.header[RESOLUTION_NEXT]!;
     this.resolution[next * 2] = txid;
-    this.resolution[next * 2 + 1] = BigInt.asIntN(64, crc64Update(0n, meta));
+    this.resolution[next * 2 + 1] = BigInt.asIntN(64, resolutionDigest(meta));
     this.header[RESOLUTION_NEXT] = (next + 1) % PS_RESOLUTION_WINDOW_COMMITS;
     this.header[RESOLUTION_COUNT] = Math.min(
       this.header[RESOLUTION_COUNT]! + 1,

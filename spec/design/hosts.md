@@ -186,7 +186,7 @@ guard, since `read_at` surfaces a short read as `58030` — same `XX001` outcome
 | **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (`fileBlockStore`, `blockstore.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag (`blockstore_datasync_linux.go`), full `Sync` fallback elsewhere. |
 | **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/fileblockstore.ts`) | the TS core's durable backing; the `node:fs` impl is isolated in `fileblockstore.ts` (the browser-clean `BlockStore` interface is `blockstore.ts`; the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape — and so `node:fs` never reaches a browser bundle. |
 | **Browser / OPFS** | `FileSystemSyncAccessHandle` (`read`/`write`/`truncate`/`getSize`/`flush`) | ✅ built (`OpfsBlockStore`, `impl/ts/src/opfsblockstore.ts`; TS only) | the synchronous access-handle API maps one-to-one onto the §2 `BlockStore` surface (§5). Acquired async at the bootstrap edge (`opfs.ts`); the engine runs in a Web Worker driven by an async client (`src/browser/`). Validated by file-host byte parity (the existing goldens). |
-| **encrypting** | the in-core page codec over any file host | ✅ built (Rust, Go, Node; [../fileformat/encrypted.md](../fileformat/encrypted.md)) — OPFS ⏳ | a page codec **above** the seam, not a host (encryption.md §2); the host stays opaque-byte. A reader that follows a bound pointer hands the stored bytes and the pointer's tag to the codec; commits seal each page as its bytes become final. |
+| **encrypting** | the in-core page codec over any file host | ✅ built (Rust, Go, Node, and the browser/OPFS host through WebCrypto; [../fileformat/encrypted.md](../fileformat/encrypted.md)) | a page codec **above** the seam, not a host (encryption.md §2); the host stays opaque-byte. A reader that follows a bound pointer hands the stored bytes and the pointer's tag to the codec; commits seal each page as its bytes become final. |
 | **replicating** | a tee wrapping another `BlockStore` | ⏳ design door ([replication.md](replication.md)) | a seam-level tee **below** the codec, so it ships ciphertext (replication.md §4). |
 
 **File-open errors** map to the host-filesystem class-58 SQLSTATEs (api.md §2.1, §7): a
@@ -213,8 +213,14 @@ worker scheduling and bounded typed delivery while retaining the OPFS byte devic
 page continuations yield before synchronous OPFS data reads and periodically during resident
 work; Node can await the same page seam's asynchronous byte read. Commit, open/recovery and
 maintenance await any asynchronous page-codec stage while the handle stays the synchronous device
-([ts-runtime.md](ts-runtime.md) §11.4); async crypto integration remains a follow-on. The
-following describes the byte host.
+([ts-runtime.md](ts-runtime.md) §11.4). An **encrypted** OPFS database seals and opens its pages
+through the worker's WebCrypto (`impl/ts/src/crypto_web.ts`, encryption.md §9): every page open, meta
+seal and key unwrap is an awaited stage of the continuation, and a commit's body pages are sealed
+through a *seal session* — serialization stays synchronous and pure, each pass seals what the
+session has resolved, the continuation awaits the rest, and the pass repeats, the nonce of each seal
+fixed by its position so the bytes equal the Node codec's (checked by the Node WebCrypto test, the
+whole corpus in the async-codec mode under `JED_CONFORMANCE_ENCRYPTED=1`, and the real-browser e2e).
+OPFS has no scratch target, so nothing more is sealed. The following describes the byte host.
 
 The browser host backs the database on the Origin Private File System via a
 `FileSystemSyncAccessHandle` — the one browser API that offers **synchronous** file I/O
