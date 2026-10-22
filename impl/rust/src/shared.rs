@@ -3127,6 +3127,8 @@ impl Database {
     /// The handle is an ordinary page client: it runs its own engine over pages fetched through the
     /// command, commits through it, and when the connection ends it runs the command again
     /// (re-election, README.md §6.5) — it never becomes the owner, whatever `opts.ownership` says.
+    /// `opts.credential` unlocks an encrypted database here and is also sent in every connection's
+    /// `hello`, for a serving end that must own the database (README.md §3.1).
     /// An open that cannot reach the database in `opts.file_lock_timeout_ms` fails `08006` with the
     /// command's standard error; an error the remote side reports (`58P01`, `0A000`, …) is returned
     /// as is. Unix only.
@@ -3162,8 +3164,9 @@ impl Database {
     /// ends: the serving side of [`open_remote`](Self::open_remote), run by `jed pages`
     /// (spec/pageservice/README.md §5.3). The stream is relayed to the database's live owner when it
     /// has one; otherwise this process opens the database as a `yield` owner (read-only when
-    /// `read_only`), which keeps serving its local endpoint too. `read_only` also makes the
-    /// connection read-only whatever the client asks. Unix only.
+    /// `read_only`), which keeps serving its local endpoint too. It opens with the credential from
+    /// the client's `hello`, never `opts.credential`, and no owner receives that credential.
+    /// `read_only` also makes the connection read-only whatever the client asks. Unix only.
     #[cfg(unix)]
     pub fn serve_page_stream(
         path: &Path,

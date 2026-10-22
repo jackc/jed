@@ -16,6 +16,7 @@
 #   u32_list         comma-separated decimals; "" is the empty list
 #   page_list        pages separated by ";"; "" is the empty list
 #   indexed_page_list  "<index>=<page>" items separated by ";"; "" is the empty list
+#   credential       "" (none), "passphrase:<text>", or "key:<64 lowercase hex digits>"
 # page_size is "0" when the message has no page field. Bytes are lowercase hex, no separators.
 # Regenerate the hex with `ruby spec/pageservice/verify.rb --generate` only when the contract changes.
 
@@ -33,7 +34,8 @@ f_protocol_max = "1"
 f_format_version = "42"
 f_flags = "1"
 f_client_name = "jed-go"
-hex = "00000016010000000100010001002a01000000066a65642d676f"
+f_credential = ""
+hex = "00000017010000000100010001002a01000000066a65642d676f00"
 
 [[frame]]
 name = "hello_unicode_name"
@@ -45,7 +47,34 @@ f_protocol_max = "3"
 f_format_version = "42"
 f_flags = "0"
 f_client_name = "jéd"
-hex = "00000014010000000100010003002a00000000046ac3a964"
+f_credential = ""
+hex = "00000015010000000100010003002a00000000046ac3a96400"
+
+[[frame]]
+name = "hello_passphrase"
+message = "hello"
+request_id = "1"
+page_size = "0"
+f_protocol_min = "1"
+f_protocol_max = "1"
+f_format_version = "49"
+f_flags = "0"
+f_client_name = "jed-rust"
+f_credential = "passphrase:correct horse"
+hex = "0000002a010000000100010001003100000000086a65642d72757374010000000d636f727265637420686f727365"
+
+[[frame]]
+name = "hello_key"
+message = "hello"
+request_id = "1"
+page_size = "0"
+f_protocol_min = "1"
+f_protocol_max = "1"
+f_format_version = "49"
+f_flags = "1"
+f_client_name = "jed-rust"
+f_credential = "key:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+hex = "00000039010000000100010001003101000000086a65642d7275737402000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 
 [[frame]]
 name = "hello_ok"
@@ -361,3 +390,17 @@ page_size = "0"
 kind = "sqlstate"
 reason = "sqlstate characters must be ASCII digits or upper-case letters"
 hex = "000000137f000000093038703031000000000000000001"
+
+[[malformed]]
+name = "bad_credential_kind"
+page_size = "0"
+kind = "credential"
+reason = "hello's credential kind 3 names no credential"
+hex = "00000015010000000100010001003100000000046a65642d03"
+
+[[malformed]]
+name = "short_credential_key"
+page_size = "0"
+kind = "truncated"
+reason = "hello's key credential has 31 of its 32 bytes"
+hex = "00000034010000000100010001003100000000046a65642d0200000000000000000000000000000000000000000000000000000000000000"

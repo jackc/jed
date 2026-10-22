@@ -356,6 +356,11 @@ export class Connection {
 
   // hello negotiates the protocol and the format (README §3.1).
   private hello(m: PsHello): PsMessage {
+    // Only a stream transport's serving end takes a credential, and it removes it before the hello
+    // reaches an owner (README §3.1).
+    if (m.credential !== null) {
+      throw violation("an owner's endpoint does not take a credential in hello");
+    }
     if (m.protocolMin > PS_PROTOCOL_VERSION || m.protocolMax < PS_PROTOCOL_VERSION) {
       throw new Failure(
         "0A000",

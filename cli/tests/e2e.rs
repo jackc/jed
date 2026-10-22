@@ -942,6 +942,45 @@ fn ssh_url_opens_a_remote_database_through_jed_pages() {
     let r = run_with_path(&bin, &["ssh://dbhost", "-c", "SELECT 1"]);
     assert_eq!(r.code, 1);
     assert!(r.stderr.contains("bad ssh:// URL"), "stderr: {}", r.stderr);
+
+    // An encrypted database needs no key on the server: the client's --key-file credential travels
+    // in its hello, and the jed pages that owns the file opens it with that (README.md §5.3).
+    let enc = bin.join("enc.jed");
+    let enc_str = enc.to_str().unwrap();
+    let key = bin.join("enc.key");
+    std::fs::write(&key, format!("{}\n", "4a".repeat(32))).unwrap();
+    let key_str = key.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            "--key-file",
+            key_str,
+            enc_str,
+            "-c",
+            "CREATE TABLE t (a i32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    let enc_url = format!("ssh://dbhost{enc_str}");
+    let r = run_with_path(
+        &bin,
+        &[
+            "--key-file",
+            key_str,
+            &enc_url,
+            "-q",
+            "-c",
+            "INSERT INTO t VALUES (2)",
+            "-c",
+            "SELECT count(*) AS n FROM t",
+        ],
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "{}", r.stderr);
+    assert!(r.stdout.contains(" 2\n"), "stdout: {}", r.stdout);
+    let r = run_with_path(&bin, &[&enc_url, "-c", "SELECT 1"]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("ERROR 28P02"), "stderr: {}", r.stderr);
     let _ = std::fs::remove_dir_all(&bin);
 }
 
@@ -952,6 +991,10 @@ fn pages_subcommand_rejects_bad_usage() {
     assert!(r.stderr.contains("missing DBFILE"), "stderr: {}", r.stderr);
     let r = run(&["pages", "--nope", "x.jed"], "");
     assert_eq!(r.code, 1);
+    // The credential arrives in the client's hello, so jed pages takes no key flags.
+    let r = run(&["pages", "--key-file", "k", "x.jed"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("unknown flag"), "stderr: {}", r.stderr);
     // The first frame must be hello: anything else gets a fatal error frame, not SQL output.
     let db = tmp("pages_garbage.jed");
     let r = run(&["--create", db.to_str().unwrap()], "");

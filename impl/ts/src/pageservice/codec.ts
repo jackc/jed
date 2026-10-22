@@ -10,6 +10,7 @@
 // (id16, pages) are copies, never views of the input buffer.
 
 import { crc32Ieee } from "../crc32.ts";
+import type { Credential } from "../crypto.ts";
 import { type EngineError, engineError } from "../errors.ts";
 
 // --- constants (messages.toml top-level keys) ----------------------------------------------------
@@ -58,6 +59,9 @@ export const PS_CODE_ERROR = 0x7f;
 
 // hello.flags
 export const PS_HELLO_FLAG_READ_ONLY = 0x01;
+// hello.credential kinds (README §1)
+export const PS_CREDENTIAL_PASSPHRASE = 1;
+export const PS_CREDENTIAL_KEY = 2;
 // hello_ok.flags
 export const PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY = 0x01;
 export const PS_HELLO_OK_FLAG_OWNER_READ_ONLY = 0x02;
@@ -101,6 +105,9 @@ export type PsHello = {
   formatVersion: number;
   flags: number;
   clientName: string;
+  // Sent only over the stream transport, for a serving end that must own the database
+  // (spec/pageservice/README.md §3.1, §5.3); null otherwise.
+  credential: Credential | null;
 };
 export type PsBeginRead = { kind: "begin_read"; incarnation: Uint8Array; lastTxid: bigint };
 export type PsReadPages = { kind: "read_pages"; txid: bigint; indices: number[] };
@@ -308,6 +315,20 @@ class Writer {
     this.raw(b);
   }
 
+  // credential writes the credential type: kind 0 for none, else the kind and its secret.
+  credential(c: Credential | null): void {
+    if (c === null) {
+      this.u8(0);
+    } else if ("passphrase" in c) {
+      this.u8(PS_CREDENTIAL_PASSPHRASE);
+      this.string(c.passphrase);
+    } else {
+      if (c.key.length !== 32) throw violation(`credential key of ${c.key.length} bytes`);
+      this.u8(PS_CREDENTIAL_KEY);
+      this.raw(c.key);
+    }
+  }
+
   page(p: Uint8Array): void {
     if (p.length === 0) throw violation("empty page");
     if (this.pageSize === 0) this.pageSize = p.length;
@@ -348,6 +369,7 @@ function writeBody(w: Writer, m: PsMessage): void {
       w.u16(m.formatVersion);
       w.u8(m.flags);
       w.string(m.clientName);
+      w.credential(m.credential);
       return;
     case "begin_read":
       w.id16(m.incarnation);
@@ -530,6 +552,14 @@ class Reader {
     }
   }
 
+  credential(): Credential | null {
+    const kind = this.u8();
+    if (kind === 0) return null;
+    if (kind === PS_CREDENTIAL_PASSPHRASE) return { passphrase: this.string() };
+    if (kind === PS_CREDENTIAL_KEY) return { key: this.copy(32) };
+    throw violation(`credential kind ${kind} names no credential`);
+  }
+
   page(): Uint8Array {
     if (this.pageSize <= 0) throw violation("page field without a connection page size");
     return this.copy(this.pageSize);
@@ -579,6 +609,7 @@ function readBody(r: Reader, code: number): PsMessage {
         formatVersion: r.u16(),
         flags: r.u8(),
         clientName: r.string(),
+        credential: r.credential(),
       };
     case PS_CODE_BEGIN_READ:
       return { kind: "begin_read", incarnation: r.id16(), lastTxid: r.u64() };

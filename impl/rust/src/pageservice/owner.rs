@@ -1111,6 +1111,15 @@ impl PageServiceOwner {
 
     /// Negotiate the protocol and the format (README.md §3.1). False closes the connection.
     fn hello(&self, conn: &ServerConn, request_id: u32, m: &Hello) -> bool {
+        // Only a stream transport's serving end takes a credential, and it removes it before the
+        // hello reaches an owner (README.md §3.1).
+        if m.credential.is_some() {
+            conn.fail(
+                request_id,
+                &violation("an owner's endpoint does not take a credential in hello"),
+            );
+            return false;
+        }
         if m.protocol_min > PROTOCOL_VERSION || m.protocol_max < PROTOCOL_VERSION {
             conn.fail(
                 request_id,

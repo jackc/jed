@@ -106,6 +106,11 @@ function parseValue(type: string, text: string, pageSize: number): unknown {
     case "sqlstate":
     case "string":
       return text;
+    case "credential": {
+      if (text === "") return null;
+      const [kind, rest] = [text.slice(0, text.indexOf(":")), text.slice(text.indexOf(":") + 1)];
+      return kind === "passphrase" ? { passphrase: rest } : { key: hexToBytes(rest) };
+    }
     case "page":
       return parsePage(text, pageSize);
     case "u32_list":
@@ -320,6 +325,8 @@ function zeroValue(type: string, pageSize: number): unknown {
       return "XX000";
     case "string":
       return "s";
+    case "credential":
+      return { passphrase: "p" };
     case "page":
       return new Uint8Array(pageSize).fill(9);
     case "u32_list":

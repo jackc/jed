@@ -44,7 +44,7 @@ pub(crate) const NO_TAG: Tag = [0; TAG_LEN];
 /// 32-byte key the host keeps elsewhere (the KEK is HKDF of it). It is an argument of
 /// `create`/`open`/`attach`, never a setting, and its `Debug` form never shows it
 /// (spec/design/encryption.md §5).
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
     Passphrase(String),
     Key([u8; 32]),

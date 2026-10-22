@@ -21,7 +21,7 @@ FIXTURES_PATH = File.join(DIR, "fixtures.toml")
 FIXTURES = TomlRB.load_file(FIXTURES_PATH)
 
 MAX_FRAME = CATALOG.fetch("max_frame_length")
-TYPES = %w[u8 u16 u32 u64 bool id16 sqlstate string page u32_list page_list indexed_page_list].freeze
+TYPES = %w[u8 u16 u32 u64 bool id16 sqlstate string page u32_list page_list indexed_page_list credential].freeze
 
 class Malformed < StandardError
   attr_reader :kind
@@ -85,6 +85,20 @@ def parse_page(text, page_size)
   bytes + ([fill.to_i(16)].pack("C") * (page_size - bytes.bytesize))
 end
 
+# A credential value is nil (none), [:passphrase, text], or [:key, 32 bytes].
+def parse_credential(text)
+  return nil if text.empty?
+
+  kind, rest = text.split(":", 2)
+  case kind
+  when "passphrase" then [:passphrase, rest]
+  when "key"
+    fail!("credential key #{text.inspect}") unless rest&.match?(/\A\h{64}\z/)
+    [:key, [rest].pack("H*")]
+  else fail!("credential #{text.inspect}")
+  end
+end
+
 def parse_value(type, text, page_size)
   case type
   when "u8", "u16", "u32", "u64" then Integer(text, 10)
@@ -93,6 +107,7 @@ def parse_value(type, text, page_size)
     fail!("id16 #{text.inspect}") unless text.match?(/\A\h{32}\z/)
     [text].pack("H*")
   when "sqlstate", "string" then text
+  when "credential" then parse_credential(text)
   when "page" then parse_page(text, page_size)
   when "u32_list" then text.empty? ? [] : text.split(",").map { |v| Integer(v, 10) }
   when "page_list" then text.empty? ? [] : text.split(";").map { |p| parse_page(p, page_size) }
@@ -120,6 +135,12 @@ def encode_value(type, value, page_size)
     fail!("sqlstate #{value.inspect}") unless value.match?(/\A[0-9A-Z]{5}\z/)
     value.b
   when "string" then [value.bytesize].pack("N") + value.b
+  when "credential"
+    case value&.first
+    when nil then [0].pack("C")
+    when :passphrase then [1].pack("C") + encode_value("string", value[1], 0)
+    when :key then [2].pack("C") + value[1].b
+    end
   when "page"
     fail!("page is not page_size bytes") unless value.bytesize == page_size && page_size.positive?
     value.b
@@ -178,6 +199,14 @@ def decode_value(type, reader, page_size)
     raise Malformed.new("utf8", text.b.inspect) unless text.valid_encoding?
 
     text
+  when "credential"
+    kind = reader.take(1).unpack1("C")
+    case kind
+    when 0 then nil
+    when 1 then [:passphrase, decode_value("string", reader, page_size)]
+    when 2 then [:key, reader.take(32)]
+    else raise Malformed.new("credential", "credential kind #{kind}")
+    end
   when "page"
     raise Malformed.new("page", "no connection page size") unless page_size.positive?
 

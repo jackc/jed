@@ -261,7 +261,9 @@ must reopen with the new credential.
 
 The `jed` command line takes `--key-file FILE` (32 raw bytes or 64 hex digits),
 `--passphrase-file FILE` or `--passphrase` (a terminal prompt), never a credential on the command
-line itself.
+line itself. Over `ssh://` the credential is needed only on your side: `jed` sends it to `jed pages`
+inside the SSH connection, which uses it only if it has to open the file itself, so the server keeps
+no key.
 
 ## In-memory databases
 

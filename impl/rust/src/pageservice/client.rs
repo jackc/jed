@@ -219,6 +219,7 @@ pub(crate) fn connect(
         format_version: crate::format::FORMAT_VERSION,
         flags: if read_only { HELLO_FLAG_READ_ONLY } else { 0 },
         client_name: "jed-rust".into(),
+        credential: host.hello_credential(),
     });
     match conn.round_trip(|| Ok(hello)) {
         Ok(Message::HelloOk(ok)) if crate::format::page_size_valid(ok.page_size as usize) => {

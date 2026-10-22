@@ -126,8 +126,11 @@ ownership to an application that opens with `prefer`, which ends the stream; the
 re-election then reaches the application through a fresh `jed pages`. `--read-only` makes the
 connection read-only whatever the client asks (and opens the file read-only when it owns), so an
 `authorized_keys` entry `command="jed pages --read-only /srv/app.jed"` restricts a key to reads of
-one database. A failure to open (`58P01`, …) is reported to the client on the stream and to stderr;
-exit status `0` when the connection ended, `1` otherwise.
+one database. An encrypted database needs no key on the server: the client sends the credential it
+was given (`--key-file`, `--passphrase-file`, `--passphrase`) in its handshake on the ssh stream, and
+`jed pages` uses it only when it opens the database itself. A failure to open (`58P01`, `28P01`, …)
+is reported to the client on the stream and to stderr; exit status `0` when the connection ended,
+`1` otherwise.
 
 ### 3.1 The `migrate` subcommand (a reserved first-token verb)
 

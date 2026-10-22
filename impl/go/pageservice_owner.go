@@ -734,6 +734,12 @@ func (sc *psServerConn) serve() {
 // hello negotiates the protocol and the format (README.md §3.1). False closes the connection.
 func (sc *psServerConn) hello(requestID uint32, m psHello) bool {
 	o := sc.owner
+	// Only a stream transport's serving end takes a credential, and it removes it before the hello
+	// reaches an owner (spec/pageservice/README.md §3.1).
+	if m.credential != nil {
+		sc.fail(requestID, newError(ProtocolViolation, "an owner's endpoint does not take a credential in hello"))
+		return false
+	}
 	if m.protocolMin > psProtocolVersion || m.protocolMax < psProtocolVersion {
 		sc.fail(requestID, newError(FeatureNotSupported, "unsupported page-service protocol; the owner speaks version 1"))
 		return false
