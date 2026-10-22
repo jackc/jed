@@ -155,7 +155,7 @@ readers.
 
 | Operation | Effect |
 |---|---|
-| `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). With the encryption format, over SSH it also carries the database credential to a server that may become owner — in the stream, never `argv` or the environment. There is no cached-DEK resume: a reconnect that must open the file afresh and has no credential fails `28P02` and the host reopens ([encryption.md](encryption.md) §8). |
+| `hello(versions, format_version, page_size, caps)` | Handshake: pick a protocol version; confirm the client supports the file's `format_version` and page size; report connection limits (read-only, §11.2). Over SSH it also carries the client's database credential, on every connection: the serving end needs it only when it must own the file, and takes it out of the `hello` in either case, so no owner endpoint receives one. It travels in the stream, never `argv` or the environment ([encryption.md](encryption.md) §8). |
 | `begin_read(incarnation, last_txid)` | Pin the owner's current committed snapshot. Returns the meta (root, `txid`, `page_count`, free-list head, live count), the owner's **incarnation id**, and the **invalidation set**: page indices written by commits after `last_txid`, or "invalidate all" (§5.4). |
 | `read_pages(txid, [index…])` | Return page bytes. `txid` must be pinned by this connection. Batched. |
 | `end_read(txid)` | Release one pin. Asynchronous: no reply. |
@@ -675,7 +675,9 @@ mixed-fleet rollout is designed or tested.
   process's session envelope, exactly as today.
 - **Ciphertext on the wire, key at the owner.** Encrypted pages cross the service as ciphertext
   (§5.1), but an owner, including an SSH helper or backup host that becomes owner, must hold the key.
-  Only replication subscribers and replica apply loops (§10) can run keyless.
+  An SSH helper gets it from the client's `hello` (§5.2), sent on every connection whether the helper
+  relays or owns: a relaying helper discards a credential it never needed, on the host that runs the
+  key-holding owner anyway. Only replication subscribers and replica apply loops (§10) can run keyless.
 
 ## 14. Platforms and cores
 

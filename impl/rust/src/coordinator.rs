@@ -103,6 +103,13 @@ pub(crate) trait LockHost: Send + Sync {
     fn reads_ahead(&self) -> bool {
         false
     }
+    /// The credential page clients dialed through this host send in `hello`
+    /// (spec/pageservice/README.md §3.1): the stream transport's, whose serving end may have to own
+    /// the database. A local owner already holds the data key, so a local socket's clients send none.
+    #[cfg(unix)]
+    fn hello_credential(&self) -> Option<crate::Credential> {
+        None
+    }
 }
 
 /// The production coordination host: `flock` / `LockFileEx` on the bundle files.

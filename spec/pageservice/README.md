@@ -29,6 +29,7 @@ All integers are **big-endian** and unsigned, as in the file format. The field t
 | `u32_list` | `u32` count, then `count` × `u32` |
 | `page_list` | `u32` count, then `count` × `page` |
 | `indexed_page_list` | `u32` count, then `count` × (`u32` page index, `page`) |
+| `credential` | `u8` kind, then: `0` none (nothing follows); `1` a passphrase (a `string`); `2` a key (32 raw bytes). Any other kind is malformed |
 
 A decoder rejects a body that ends before its last field or that has bytes after it. A `flags`
 field's reserved bits are written as 0 and ignored on receipt, so a later protocol version can give
@@ -75,7 +76,8 @@ The first frame on a connection, and only the first, is `hello`; any other first
 - `hello`: `protocol_min u16`, `protocol_max u16` (the versions the client speaks),
   `format_version u16` (the one on-disk format the client reads and writes), `flags u8` (bit 0:
   the client asks for a read-only connection; bits 1–7 are 0), `client_name string` (diagnostic,
-  e.g. `jed-go`; never parsed).
+  e.g. `jed-go`; never parsed), `credential credential` (the database credential, for the stream
+  transport's serving end, §5.3; none otherwise).
 - The owner picks the highest version both sides speak. With none, or when `format_version` differs
   from the file's, it replies `error` `0A000` (fatal) with the supported versions in the detail.
 - `hello_ok`: `protocol u16`, `format_version u16`, `page_size u32`, `connection_id u64` (unique
@@ -83,6 +85,12 @@ The first frame on a connection, and only the first, is `hello`; any other first
   the owner's own handle is read-only; bit 2: the owner's ownership preference is `yield`, §6.5; bits 3–7
   are 0), `max_read_pages u32`, the most indices one
   `read_pages` may name: `min(1024, floor((max_frame_length − 9) / page_size))`.
+
+**The credential.** Only a stream-transport client (§5.3) sends one: the credential its open was
+given, on every connection, whether or not the serving end turns out to need it. The serving end
+takes it out of the `hello` before the frame reaches any owner, so an owner's endpoint never receives
+one: a `hello` with a credential there is answered with a fatal `08P01`. A local-socket client sends
+none, since the owner already holds the data key and the client unlocks from the key block it reads.
 
 `page` fields in either direction are decoded with this connection's `page_size`. A client whose
 engine does not support the page size (page sizes are a file-format fact every core supports)
@@ -311,15 +319,19 @@ the transport only replaces how a connection is made.
   preference is `never` whatever was asked. An open that cannot complete a `hello` before
   `file_lock_timeout_ms` fails `08006` with the transport's standard error; a fatal `error` answering
   the `hello` (`58P01` for a missing file, `0A000`, `53300`) is the open's error.
+- **The client** sends the credential its open was given in every `hello` (§3.1), and keeps it for
+  the handle's lifetime so that the `hello` of a reconnect carries it too.
 - **The serving end** (`jed pages [--read-only] DBFILE`) reads the first frame, which must be
-  `hello` (anything else is answered with a fatal `08P01`), and sets its read-only flag when started
-  with `--read-only`. Then:
+  `hello` (anything else is answered with a fatal `08P01`), takes the credential out of it, and sets
+  its read-only flag when started with `--read-only`. Then:
   1. if the owner record (§5.1) names a serving owner of this user whose endpoint accepts a
-     connection, it writes the (possibly rewritten) `hello` to that endpoint and relays bytes in both
-     directions until either side ends;
+     connection, it writes the rewritten `hello` (no credential; the read-only bit set with
+     `--read-only`) to that endpoint and relays bytes in both directions until either side ends. The
+     credential is discarded;
   2. otherwise it opens the database under `locking = auto` as an `ownership = yield` owner (read-only
-     with `--read-only`) and serves the stream as one more connection of that owner, alongside its
-     own endpoint. It exits when the stream ends. A `prefer` opener that asks for ownership gets it
+     with `--read-only`), with the credential from the `hello` (an encrypted database opened without
+     one fails `28P02`, with a wrong one `28P01`; a plaintext database offered one fails `28P03`), and
+     serves the stream as one more connection of that owner, alongside its own endpoint. It exits when the stream ends. A `prefer` opener that asks for ownership gets it
      (§6.5), which ends the stream; the client's re-election reaches the new owner through a fresh
      `jed pages` (step 1). If the open makes it a client instead (another process won the election),
      it closes that handle and retries step 1;

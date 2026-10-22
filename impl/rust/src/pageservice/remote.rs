@@ -5,10 +5,12 @@
 //! - **The remote client** ([`RemoteLockHost`]) runs a command (for the CLI, `ssh host jed pages
 //!   /path`) whose stdin and stdout carry the connection. It never owns: there is no bundle to lock
 //!   here, so the election always finds a serving owner and dials it by running the command again.
-//!   Re-election and `commit_status` therefore work exactly as for a local client.
+//!   Re-election and `commit_status` therefore work exactly as for a local client. Every `hello`
+//!   carries the handle's credential, if it has one.
 //! - **The serving side** ([`serve_pages`], the `jed pages` command) relays the stream to the
-//!   database's live owner when there is one, and otherwise becomes a yielding owner itself and
-//!   serves the stream as one more connection, alongside its own endpoint.
+//!   database's live owner when there is one, and otherwise becomes a yielding owner itself, opening
+//!   the database with the credential from the client's `hello`, and serves the stream as one more
+//!   connection, alongside its own endpoint.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -18,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::coordinator::{LockFiles, LockHandle, LockHost};
+use crate::crypto::Credential;
 use crate::error::{EngineError, Result, SqlState};
 use crate::file::{Locking, OpenOptions, Ownership};
 use crate::pageservice::codec::{
@@ -40,6 +43,9 @@ pub(crate) struct RemoteLockHost {
     /// The tail of the last transport's standard error, and how it ended, for a failed open's
     /// message.
     last_failure: Arc<Mutex<String>>,
+    /// Sent in every connection's `hello`, for a serving end that must own the database
+    /// (spec/pageservice/README.md §5.3).
+    credential: Option<Credential>,
 }
 
 /// An in-process transport: a fresh connection per dial.
@@ -54,6 +60,7 @@ impl RemoteLockHost {
             command,
             dialer: None,
             last_failure: Arc::new(Mutex::new(String::new())),
+            credential: None,
         }
     }
 
@@ -63,7 +70,14 @@ impl RemoteLockHost {
             command: vec!["<in-process>".to_string()],
             dialer: Some(dialer),
             last_failure: Arc::new(Mutex::new(String::new())),
+            credential: None,
         }
+    }
+
+    /// The same host, sending `credential` in every `hello`.
+    pub(crate) fn with_credential(mut self, credential: Option<Credential>) -> RemoteLockHost {
+        self.credential = credential;
+        self
     }
 
     pub(crate) fn command(&self) -> &[String] {
@@ -244,6 +258,10 @@ impl LockHost for RemoteLockHost {
     fn reads_ahead(&self) -> bool {
         true
     }
+
+    fn hello_credential(&self) -> Option<Credential> {
+        self.credential.clone()
+    }
 }
 
 /// The options a remote open runs with: a remote client never owns, so it never asks for
@@ -290,9 +308,11 @@ fn send_fatal(output: &mut dyn Write, request_id: u32, error: &EngineError) {
 /// `jed pages` command (spec/pageservice/README.md §5.3). `read_only` makes the connection
 /// read-only whatever the client asks. Returns when the connection ends.
 ///
-/// The first frame must be `hello`. When the database has a live serving owner the stream is relayed
-/// to its endpoint unchanged (with the read-only bit forced). Otherwise this process opens the
-/// database as a `yield` owner, read-only when `read_only`, and serves the stream on it; a preferred
+/// The first frame must be `hello`. Its credential is taken out, so no owner receives one. When the
+/// database has a live serving owner the stream is relayed to its endpoint (with the read-only bit
+/// forced) and the credential is discarded. Otherwise this process opens the database with that
+/// credential (`opts.credential` is not used) as a `yield` owner, read-only when `read_only`, and
+/// serves the stream on it; a preferred
 /// opener that later asks for ownership gets it, which ends this connection, and the client's
 /// re-election reaches the new owner through a fresh `jed pages`. A failure to open is answered with
 /// a fatal error frame.
@@ -316,6 +336,7 @@ pub(crate) fn serve_pages(
     if read_only {
         hello.flags |= HELLO_FLAG_READ_ONLY;
     }
+    let credential = hello.credential.take();
     let prefix = encode_frame(request_id, &Message::Hello(hello))?;
     let fail = |output: &mut dyn Write, e: EngineError| {
         send_fatal(output, request_id, &e);
@@ -329,6 +350,7 @@ pub(crate) fn serve_pages(
         locking: Locking::Auto,
         ownership: Ownership::Yield,
         read_only,
+        credential,
         ..opts
     };
     let deadline = Instant::now() + Duration::from_millis(opts.file_lock_timeout_ms);

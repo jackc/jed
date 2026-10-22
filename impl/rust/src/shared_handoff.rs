@@ -1074,7 +1074,7 @@ pub(super) fn open_remote(
     opts: OpenOptions,
 ) -> Result<Database> {
     use crate::pageservice::remote::{remote_open_error, remote_options};
-    let host = Arc::new(host);
+    let host = Arc::new(host.with_credential(opts.credential.clone()));
     let hosts = ServiceHosts {
         host: Arc::clone(&host) as Arc<dyn LockHost>,
         files: None,

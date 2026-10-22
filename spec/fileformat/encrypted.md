@@ -260,8 +260,6 @@ setting, so it reaches no SQL surface or error message.
 ## 10. Not yet built (fail closed)
 
 - **Replication** (not built for any file): a credential change's key-block item in the stream.
-- **A credential carried in `hello`** for a `jed pages` server that must own an encrypted database;
-  today such a server is given a key or passphrase file, or fails `28P02` (a relay needs none).
 
 ## 11. Scratch files
 
@@ -375,6 +373,8 @@ writes its pages holds the DEK. No message is added to the wire protocol (spec/p
   plaintext client whose database was encrypted meanwhile gets `28P02`.
 - **Backups** through a client read pages 2 and 3 through the service and write the selected copy to
   both (§13).
-- **`jed pages`** relays ciphertext without a key. A `jed pages` that must own an encrypted database
-  needs one (`--key-file` / `--passphrase-file`), else `28P02`.
+- **`jed pages`** gets the credential in the client's `hello` (spec/pageservice/README.md §3.1, §5.3),
+  sent on every connection. A relaying `jed pages` discards it and passes ciphertext through; one that
+  must own the database opens with it. Without one, owning an encrypted database is `28P02`, and with
+  one for a plaintext database `28P03` (the `encrypted_stream` process scenario).
 

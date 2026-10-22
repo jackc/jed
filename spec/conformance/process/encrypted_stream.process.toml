@@ -1,0 +1,116 @@
+schema_version = 1
+name = "encrypted-database-through-the-stream-transport"
+description = "An encrypted database over the stream transport (spec/pageservice/README.md §3.1, §5.3): the stream client sends its credential in every hello. While an owner lives, the transport relays and takes the credential out of the hello (every core's owner refuses a hello that carries one, 08P01), and the client unlocks on its own side (none is 28P02). When the owner leaves, the re-election's fresh transport owns the file with the credential the client sent again; an application that opens with prefer then takes ownership from it. A transport that must own the file with no credential fails the open 28P02. The stream client and its transport are the Rust core (the only core with a stream transport); the owners are every core."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, s text)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t SELECT g, 'secret-' || g FROM generate_series(1, 500) g"
+
+# Relayed to a: the client has no credential to unlock with on its own side.
+[[step]]
+actor = "b"
+core = "rust"
+command = "start"
+argument = "open-remote"
+expect_error = "28P02"
+
+# Relayed to a with a credential: the transport removes it from the hello, so a accepts the
+# connection, and the client unlocks from the key-block pages it reads.
+[[step]]
+actor = "b"
+core = "rust"
+command = "start"
+argument = "open-remote key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1000, 'through the relay')"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "501"
+
+# The owner leaves. The re-election runs the transport again, which finds no owner and opens the file
+# with the credential in the client's new hello.
+[[step]]
+actor = "a"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "501"
+retry_ms = 5000
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1001, 'transport owns')"
+
+# An application opens with prefer and takes ownership from the yielding transport; the client's
+# next transport relays to it, again without the credential.
+[[step]]
+actor = "c"
+command = "start"
+argument = "open key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
+
+[[step]]
+actor = "c"
+command = "role"
+expect = "owner"
+retry_ms = 8000
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*) FROM t"
+expect = "502"
+retry_ms = 8000
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1002, 'after the yield')"
+
+[[step]]
+actor = "c"
+command = "query_i64"
+sql = "SELECT id FROM t WHERE id >= 1000 ORDER BY id"
+expect = "1000,1001,1002"
+
+[[step]]
+actor = "b"
+command = "close"
+
+[[step]]
+actor = "c"
+command = "close"
+
+# No owner and no credential: the transport must open the file itself and cannot.
+[[step]]
+actor = "d"
+core = "rust"
+command = "start"
+argument = "open-remote"
+expect_error = "28P02"

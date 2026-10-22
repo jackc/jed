@@ -311,6 +311,7 @@ export class PageClient implements PageClientHandle {
         formatVersion: FORMAT_VERSION,
         flags: readOnly ? PS_HELLO_FLAG_READ_ONLY : 0,
         clientName: "jed-ts",
+        credential: null,
       });
     } catch (error) {
       this.link.disconnect();

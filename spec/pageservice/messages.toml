@@ -31,7 +31,7 @@ code = 0x01
 direction = "request"
 reply = "hello_ok"
 phase = 2
-fields = ["protocol_min:u16", "protocol_max:u16", "format_version:u16", "flags:u8", "client_name:string"]
+fields = ["protocol_min:u16", "protocol_max:u16", "format_version:u16", "flags:u8", "client_name:string", "credential:credential"]
 
 [[message]]
 name = "begin_read"

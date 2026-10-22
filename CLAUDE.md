@@ -644,11 +644,11 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   at pages 2–3, tag-bound pointers, `28P01`–`28P04` for credential failures — together with credential
   change, rekey (DEK rotation and conversion, trees rebuilt in a sealed scratch domain), sealed scratch
   files (`scratch_encryption`), encrypted backups, the page service (clients unlock from the key block
-  they read; the owner checks and reseals client metas), the CLI's key/passphrase-file inputs, the
+  they read; the owner checks and reseals client metas; an SSH client sends its credential in every
+  `hello`, which a `jed pages` that must own opens with), the CLI's key/passphrase-file inputs, the
   corpus's encrypted mode and simulator slices S12–S13 (credential changes, rekeys and conversions under
   crashes, page replay at every pointer kind, restores, encrypted attachments and service traces). Still to build, each failing closed meanwhile
-  (encrypted.md §10): replication's key-block item and a credential in `hello`; and the security
-  review. The TS async API exposes compaction, credential change and rekey (`ts-runtime.md` §10). The browser/OPFS host opens encrypted files
+  (encrypted.md §10): replication's key-block item; and the security review. The TS async API exposes compaction, credential change and rekey (`ts-runtime.md` §10). The browser/OPFS host opens encrypted files
   through an asynchronous WebCrypto codec. **Designed in `spec/design/encryption.md`:**
   a page codec **in the core above the block seam**, standardized AEAD, and envelope encryption:
   a random data key is stored only wrapped by a per-file key-encryption key, itself derived from

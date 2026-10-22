@@ -3,8 +3,8 @@
 //! constants and the codec's message table are checked against messages.toml. TOML is a test-time
 //! only dependency.
 
-use jed::SqlState;
 use jed::pageservice::codec::*;
+use jed::{Credential, SqlState};
 use std::path::Path;
 
 fn spec(rel: &str) -> toml::Value {
@@ -80,6 +80,20 @@ impl Fields<'_> {
         self.text(name).to_string()
     }
 
+    /// `""`, `passphrase:<text>`, or `key:<64 hex digits>`.
+    fn credential(&mut self, name: &str) -> Option<Credential> {
+        let text = self.text(name);
+        if text.is_empty() {
+            return None;
+        }
+        let (kind, rest) = text.split_once(':').unwrap();
+        Some(match kind {
+            "passphrase" => Credential::Passphrase(rest.to_string()),
+            "key" => Credential::Key(unhex(rest).try_into().unwrap()),
+            other => panic!("credential kind {other:?}"),
+        })
+    }
+
     fn page(&mut self, name: &str) -> Vec<u8> {
         let size = self.page_size;
         parse_page(self.text(name), size)
@@ -137,6 +151,7 @@ fn build_message(name: &str, f: &mut Fields<'_>) -> Message {
             format_version: f.u16("format_version"),
             flags: f.u8("flags"),
             client_name: f.string("client_name"),
+            credential: f.credential("credential"),
         }),
         "hello_ok" => Message::HelloOk(HelloOk {
             protocol: f.u16("protocol"),
@@ -230,6 +245,7 @@ const CODEC_MESSAGES: &[(&str, u8, &[&str])] = &[
             "format_version",
             "flags",
             "client_name",
+            "credential",
         ],
     ),
     ("begin_read", CODE_BEGIN_READ, &["incarnation", "last_txid"]),

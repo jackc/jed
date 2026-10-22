@@ -186,10 +186,12 @@ client whose connection is the stdin/stdout of `command` (`["ssh", "--", "host",
 the path: it is the handle's process-local identity and what `path()` reports. The handle is an
 ordinary page client — its own engine, environment, and session envelope — that never owns
 (`opts.ownership` is ignored) and re-runs the command when the connection ends; `opts.read_only`
-asks for a read-only connection, `opts.file_lock_timeout_ms` bounds each election, and an open that
+asks for a read-only connection, `opts.file_lock_timeout_ms` bounds each election, `opts.credential`
+unlocks an encrypted database here and is also sent in every connection's `hello`, and an open that
 reaches nothing fails `08006` with the command's stderr. `Database::serve_page_stream(path, opts,
 read_only, input, output)` is the far side (`jed pages`): it relays the stream to the database's live
 owner, or owns the database as a `yield` owner and serves the stream, returning when the stream ends.
+When it owns, it opens with the credential from the client's `hello`; `opts.credential` is not used.
 Go and TS have no stream transport yet (page-service.md §14).
 
 **Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`

@@ -312,10 +312,13 @@ it holds** (page-service.md §8.1), verifying it against the meta slot's tag, an
 owner with it too (encrypted.md §14), and ownership
 handoff, yield and the read-only owner's deferral to a writer all work as for a plaintext file; a
 promoted process without the credential leaves a differing key-block pair unrepaired, which §5
-makes safe. Over SSH the credential travels in `hello` on the encrypted stream, never `argv` or
-the environment, or the server is configured with it; either way it reaches the remote host (§1).
-A reconnect that must start a fresh process with neither DEK nor credential — an SSH helper whose
-owner is gone — fails `28P02` and the host reopens; there is no cached-DEK resume. Sealing follows
+makes safe. Over SSH the client sends its credential in every `hello` on the encrypted stream,
+never in `argv` or the environment, and keeps it for the handle's lifetime: the SSH helper uses it
+only when it must own the file and discards it when it relays, so the credential reaches the remote
+host (§1) even when it is not needed there. Sending it unconditionally keeps the handshake a single
+message with no conditional exchange, and a reconnect that starts a fresh helper whose owner is
+gone carries the credential like the first connection. There is no cached-DEK resume: the DEK never
+crosses the wire. Sealing follows
 page-service.md §5.6's split: a client seals the body pages, manifest and meta of its own commit
 and the owner seals its maintenance commits, each from its own entropy stream; before writing a
 client's commit the owner, which holds the DEK, checks the meta tag as well as its CRC, the last

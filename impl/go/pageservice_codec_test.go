@@ -35,9 +35,9 @@ type psCatalogEntry struct {
 var psCatalog = map[string]psCatalogEntry{
 	"hello": {
 		psCodeHello,
-		[]string{"protocol_min:u16", "protocol_max:u16", "format_version:u16", "flags:u8", "client_name:string"},
+		[]string{"protocol_min:u16", "protocol_max:u16", "format_version:u16", "flags:u8", "client_name:string", "credential:credential"},
 		func(f psFixtureFields) psMessage {
-			return psHello{protocolMin: f.u16("protocol_min"), protocolMax: f.u16("protocol_max"), formatVersion: f.u16("format_version"), flags: f.u8("flags"), clientName: f.str("client_name")}
+			return psHello{protocolMin: f.u16("protocol_min"), protocolMax: f.u16("protocol_max"), formatVersion: f.u16("format_version"), flags: f.u8("flags"), clientName: f.str("client_name"), credential: f.credential("credential")}
 		},
 	},
 	"begin_read": {
@@ -161,6 +161,29 @@ func (f psFixtureFields) uint(name string, bits int) uint64 {
 		f.t.Fatalf("f_%s: %v", name, err)
 	}
 	return n
+}
+
+// credential parses "", "passphrase:<text>", or "key:<64 hex digits>".
+func (f psFixtureFields) credential(name string) *Credential {
+	text := f.str(name)
+	if text == "" {
+		return nil
+	}
+	kind, rest, _ := strings.Cut(text, ":")
+	switch kind {
+	case "passphrase":
+		return PassphraseCredential(rest)
+	case "key":
+		b, err := hex.DecodeString(rest)
+		if err != nil || len(b) != 32 {
+			f.t.Fatalf("f_%s: not 64 hex digits", name)
+		}
+		var key [32]byte
+		copy(key[:], b)
+		return KeyCredential(key)
+	}
+	f.t.Fatalf("f_%s: credential kind %q", name, kind)
+	return nil
 }
 
 func (f psFixtureFields) u8(name string) uint8   { return uint8(f.uint(name, 8)) }

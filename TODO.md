@@ -728,8 +728,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     entry points (Node and browser). On OPFS `changeCredential` awaits the WebCrypto rewrap and the
     key-block writes (byte-identical to the Node host); `compact` and `rekey` stay `0A000` there.
   - [ ] **Replication** — the key-block item in the stream (replication itself is not built).
-  - [ ] **A credential in `hello`** for a `jed pages` server that must own an encrypted database
-    (today: a key or passphrase file on the server, or `28P02`).
   - [x] **Simulator growth** — S13 (simulation-testing.md §14): `replay <kind>` puts an older durable
     page back at a page each of the eleven bound-pointer kinds names (`encryption-replay`); `restore`
     copies a backup over main so later commits diverge; `rekey plain` converts to and from plaintext;

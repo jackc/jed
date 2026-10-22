@@ -116,6 +116,9 @@ type psHello struct {
 	formatVersion uint16
 	flags         uint8
 	clientName    string
+	// credential is sent only over the stream transport, for a serving end that must own the
+	// database (spec/pageservice/README.md §3.1, §5.3); nil otherwise.
+	credential *Credential
 }
 
 type psBeginRead struct {
@@ -286,6 +289,20 @@ func (w *psWriter) str(v string) {
 	w.buf = append(w.buf, v...)
 }
 
+// credential encodes the credential type: kind 0 for none, else the kind and its secret.
+func (w *psWriter) credential(c *Credential) {
+	switch {
+	case c == nil:
+		w.u8(0)
+	case c.kind == credentialPassphrase:
+		w.u8(credentialPassphrase)
+		w.str(c.passphrase)
+	default:
+		w.u8(credentialKey)
+		w.buf = append(w.buf, c.key[:]...)
+	}
+}
+
 // page writes one page. Every page in a frame must be the same nonzero length: the connection's
 // page_size, which the caller guarantees.
 func (w *psWriter) page(p []byte) {
@@ -339,6 +356,7 @@ func (m psHello) psEncodeBody(w *psWriter) {
 	w.u16(m.formatVersion)
 	w.u8(m.flags)
 	w.str(m.clientName)
+	w.credential(m.credential)
 }
 
 func (m psBeginRead) psEncodeBody(w *psWriter) {
@@ -551,6 +569,33 @@ func (r *psReader) str() string {
 	return string(b)
 }
 
+// credential decodes the credential type: a kind byte, then a passphrase string or a 32-byte key.
+func (r *psReader) credential() *Credential {
+	switch kind := r.u8(); {
+	case r.err != nil:
+		return nil
+	case kind == 0:
+		return nil
+	case kind == credentialPassphrase:
+		text := r.str()
+		if r.err != nil {
+			return nil
+		}
+		return PassphraseCredential(text)
+	case kind == credentialKey:
+		b := r.take(32)
+		if r.err != nil {
+			return nil
+		}
+		var key [32]byte
+		copy(key[:], b)
+		return KeyCredential(key)
+	default:
+		r.fail("credential kind %d names no credential", kind)
+		return nil
+	}
+}
+
 func (r *psReader) page() []byte {
 	if r.err != nil {
 		return nil
@@ -647,7 +692,7 @@ func decodePSFrame(frame []byte, pageSize uint32) (uint32, psMessage, error) {
 	var m psMessage
 	switch code {
 	case psCodeHello:
-		m = psHello{protocolMin: r.u16(), protocolMax: r.u16(), formatVersion: r.u16(), flags: r.u8(), clientName: r.str()}
+		m = psHello{protocolMin: r.u16(), protocolMax: r.u16(), formatVersion: r.u16(), flags: r.u8(), clientName: r.str(), credential: r.credential()}
 	case psCodeBeginRead:
 		m = psBeginRead{incarnation: r.id(), lastTxid: r.u64()}
 	case psCodeReadPages:

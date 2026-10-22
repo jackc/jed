@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, OpenOptions};
+use jed::{CreateOptions, Credential, Database, OpenOptions};
 
 fn tmp(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("remote_stream");
@@ -135,6 +135,123 @@ fn read_only_transport_refuses_writes() {
         .execute("INSERT INTO t VALUES (7000, 'nope')", &[])
         .unwrap_err();
     assert_eq!(error.code(), "25006");
+    remote.close().unwrap();
+}
+
+const KEY: [u8; 32] = [0x5a; 32];
+
+fn create_encrypted(path: &Path) {
+    let mut db = Database::create(CreateOptions {
+        path: Some(path.to_path_buf()),
+        credential: Some(Credential::Key(KEY)),
+        ..CreateOptions::default()
+    })
+    .unwrap();
+    db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v text)", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO t SELECT g, repeat('x', 200) FROM generate_series(1, 2000) g",
+        &[],
+    )
+    .unwrap();
+    db.close().unwrap();
+}
+
+fn open_remote_with(path: &Path, credential: Option<Credential>) -> jed::Result<Database> {
+    Database::open_remote_in_process(
+        path,
+        false,
+        &format!("remote:{}", path.display()),
+        OpenOptions {
+            credential,
+            ..OpenOptions::default()
+        },
+    )
+}
+
+fn open_with(path: &Path, credential: Option<Credential>) -> jed::Result<Database> {
+    Database::open_with_options(
+        path,
+        OpenOptions {
+            credential,
+            ..OpenOptions::default()
+        },
+    )
+}
+
+/// The client's credential travels in `hello` (README.md §3.1): a `jed pages` with no owner to relay
+/// to opens the encrypted database with it, and the client's commits land in the file.
+#[test]
+fn transport_owns_an_encrypted_database_with_the_hello_credential() {
+    let path = tmp("encrypted_owns.jed");
+    create_encrypted(&path);
+    let mut remote = open_remote_with(&path, Some(Credential::Key(KEY))).unwrap();
+    assert_eq!(remote.page_service_role_for_testing(), "client");
+    assert_eq!(scalar(&mut remote, "SELECT count(*) FROM t"), 2000);
+    remote
+        .execute("INSERT INTO t VALUES (5000, 'remote')", &[])
+        .unwrap();
+    remote.close().unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut local = loop {
+        match open_with(&path, Some(Credential::Key(KEY))) {
+            Ok(db) => break db,
+            Err(e) if e.code() == "55006" && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("open after the remote handle closed: {e:?}"),
+        }
+    };
+    assert_eq!(scalar(&mut local, "SELECT count(*) FROM t"), 2001);
+    local.close().unwrap();
+}
+
+/// A `jed pages` that must own fails the open with the credential error the client's `hello`
+/// earns: none for an encrypted database is `28P02`, a wrong one `28P01`, and one for a plaintext
+/// database `28P03`.
+#[test]
+fn transport_reports_the_hello_credential_errors() {
+    let path = tmp("encrypted_errors.jed");
+    create_encrypted(&path);
+    let code = |r: jed::Result<Database>| match r {
+        Ok(_) => panic!("the remote open succeeded"),
+        Err(e) => e.code().to_string(),
+    };
+    assert_eq!(code(open_remote_with(&path, None)), "28P02");
+    assert_eq!(
+        code(open_remote_with(&path, Some(Credential::Key([1; 32])))),
+        "28P01"
+    );
+    let plain = tmp("plain_with_credential.jed");
+    create(&plain);
+    assert_eq!(
+        code(open_remote_with(&plain, Some(Credential::Key(KEY)))),
+        "28P03"
+    );
+}
+
+/// A relaying `jed pages` takes the credential out of the `hello` (an owner's endpoint refuses one
+/// with `08P01`), and the client sends it again on every connection: when the owner leaves, the
+/// fresh transport the re-election runs owns the database with it.
+#[test]
+fn relayed_hello_drops_the_credential_and_a_reconnect_resends_it() {
+    let path = tmp("encrypted_relay.jed");
+    create_encrypted(&path);
+    let mut owner = open_with(&path, Some(Credential::Key(KEY))).unwrap();
+    assert_eq!(owner.page_service_role_for_testing(), "owner");
+    let mut remote = open_remote_with(&path, Some(Credential::Key(KEY))).unwrap();
+    remote
+        .execute("INSERT INTO t VALUES (6000, 'from remote')", &[])
+        .unwrap();
+    assert_eq!(scalar(&mut owner, "SELECT count(*) FROM t"), 2001);
+
+    owner.close().unwrap();
+    assert_eq!(scalar(&mut remote, "SELECT count(*) FROM t"), 2001);
+    remote
+        .execute("INSERT INTO t VALUES (6001, 'after handoff')", &[])
+        .unwrap();
+    assert_eq!(scalar(&mut remote, "SELECT count(*) FROM t"), 2002);
     remote.close().unwrap();
 }
 

@@ -13,6 +13,7 @@
 // the client and owner land (page-service.md §16 phase 2).
 #![allow(dead_code)]
 
+use crate::crypto::Credential;
 use crate::error::{EngineError, Result, SqlState};
 use crate::format::crc32_ieee;
 use std::io::{ErrorKind, Read};
@@ -75,6 +76,10 @@ pub const HELLO_OK_FLAG_CONNECTION_READ_ONLY: u8 = 0x01;
 pub const HELLO_OK_FLAG_OWNER_READ_ONLY: u8 = 0x02;
 /// `hello_ok.flags` bit 2: the owner's ownership preference is `yield` (README.md §6.5).
 pub const HELLO_OK_FLAG_OWNER_YIELDS: u8 = 0x04;
+/// `hello.credential` kinds (README.md §1).
+pub const CREDENTIAL_NONE: u8 = 0;
+pub const CREDENTIAL_PASSPHRASE: u8 = 1;
+pub const CREDENTIAL_KEY: u8 = 2;
 /// `error.flags` bit 0: fatal — the owner closes the connection after this frame.
 pub const ERROR_FLAG_FATAL: u8 = 0x01;
 /// The owner record's `flags` bit 0: the owner serves.
@@ -125,6 +130,9 @@ pub struct Hello {
     pub format_version: u16,
     pub flags: u8,
     pub client_name: String,
+    /// The client's database credential: sent only over the stream transport, for a serving end
+    /// that must own the database (README.md §3.1, §5.3). `Debug` redacts it.
+    pub credential: Option<Credential>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +393,21 @@ impl Writer {
         Ok(())
     }
 
+    fn credential(&mut self, v: &Option<Credential>) -> Result<()> {
+        match v {
+            None => self.u8(CREDENTIAL_NONE),
+            Some(Credential::Passphrase(text)) => {
+                self.u8(CREDENTIAL_PASSPHRASE);
+                self.string(text)?;
+            }
+            Some(Credential::Key(key)) => {
+                self.u8(CREDENTIAL_KEY);
+                self.out.extend_from_slice(key);
+            }
+        }
+        Ok(())
+    }
+
     fn page(&mut self, page: &[u8]) -> Result<()> {
         if page.is_empty() {
             return Err(violation("page-service page is empty"));
@@ -448,6 +471,7 @@ pub fn encode_frame(request_id: u32, m: &Message) -> Result<Vec<u8>> {
             w.u16(b.format_version);
             w.u8(b.flags);
             w.string(&b.client_name)?;
+            w.credential(&b.credential)?;
         }
         Message::HelloOk(b) => {
             w.u16(b.protocol);
@@ -629,6 +653,20 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn credential(&mut self) -> Result<Option<Credential>> {
+        match self.u8()? {
+            CREDENTIAL_NONE => Ok(None),
+            CREDENTIAL_PASSPHRASE => Ok(Some(Credential::Passphrase(self.string()?))),
+            CREDENTIAL_KEY => {
+                let key: [u8; 32] = self.take(32)?.try_into().expect("took 32 bytes");
+                Ok(Some(Credential::Key(key)))
+            }
+            kind => Err(violation(format!(
+                "page-service credential kind {kind} names no credential"
+            ))),
+        }
+    }
+
     fn page(&mut self, page_size: u32) -> Result<Vec<u8>> {
         if page_size == 0 {
             return Err(violation(
@@ -727,6 +765,7 @@ fn decode_body(code: u8, r: &mut Reader<'_>, page_size: u32) -> Result<Message> 
             format_version: r.u16()?,
             flags: r.u8()?,
             client_name: r.string()?,
+            credential: r.credential()?,
         }),
         CODE_HELLO_OK => Message::HelloOk(HelloOk {
             protocol: r.u16()?,
