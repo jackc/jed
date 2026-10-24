@@ -175,9 +175,11 @@ Compaction is an explicit maintenance step and never waits. It fails with `55006
 else is using the database — an open write transaction, a read session or open cursor on the
 handle, or a read in progress on a page client — so close those and retry. Only the owner can
 compact; a page client's `compact` also fails with `55006`. A read-only database is
-`25006`, and the browser (OPFS) host does not support compaction yet (`0A000`). The rewrite needs
-free disk space for a second copy of the live data, and keeps the file's permission bits but not
-its owner.
+`25006`. The rewrite needs free disk space for a second copy of the live data, and keeps the
+file's permission bits but not its owner. In the browser (OPFS), which cannot rename a file over
+another, the compacted copy is written to a `<name>.jedcompact` file beside the database and then
+copied over it; if the page closes part way, the next open finishes the copy, so the database is
+never left half-compacted.
 
 ## Encrypting a database
 
@@ -238,7 +240,8 @@ Pass an attachment's name to change that file's credential instead.
 file under a **new data key**: it rotates an encrypted file's key, or encrypts a plaintext file. Pass
 no credential (`None` / `nil` / `null`) to decrypt. Every page is rebuilt, so it takes about as long as
 compaction (above) and has the same rules: it never waits, and fails with
-`55006` while a reader or another transaction is open, and with `0A000` in the browser (OPFS). A row that fits a plaintext page but not an
+`55006` while a reader or another transaction is open. In the browser it goes through the same
+`.jedcompact` copy as compaction. A row that fits a plaintext page but not an
 encrypted one (which holds 40 bytes less) fails before the file is touched. Copies of the file made
 before still open with their old credential: rotation protects the file from now on, not old copies.
 

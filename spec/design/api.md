@@ -547,8 +547,10 @@ from RAM and lowering `storage_bytes` (memory.md §8). A file's `storage_bytes` 
    is not a compaction target).
 2. The database must be writable — a read-only handle (`main`) or a read-only attachment is
    `25006`.
-3. The host must support replacing the database atomically. The browser OPFS host does not yet,
-   so compaction there is `0A000` (a follow-on — [hosts.md](hosts.md) §7).
+3. The host must support replacing the database: the file hosts rename a temp file into place, the
+   browser OPFS host copies the image over the database through a journal file it recovers from
+   ([hosts.md](hosts.md) §5.1). An OPFS database compacts only through the async runtime, and one
+   opened without a journal (the synchronous test entry points) is `0A000`.
 4. Nothing else may be using the database (`55006 object_in_use`). Compaction **never waits**:
    - the handle's writer gate must be free (no session holds an open write transaction);
    - no reader may be pinned (the reader watermark is drained — no open read session, read-only

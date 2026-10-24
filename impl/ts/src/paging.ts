@@ -50,6 +50,10 @@ export class SharedPaging {
   private readonly pageCodec: PageCodec | null;
   // pageCap is the capacities the file's variant implies (format.md *Page model*, encrypted.md §1).
   private readonly pageCap: Cap;
+  // prefetched holds opened body pages a storage rewrite read ahead through the awaitable read
+  // (prefetchSteps), so the synchronous from-scratch serializer finds them without a read under an
+  // asynchronous codec or device (spec/design/ts-runtime.md §11.1). null outside a rewrite.
+  private prefetched: Map<number, Uint8Array> | null = null;
 
   constructor(pager: Pager, capacity: number, codec: PageCodec | null = null) {
     this.pager = pager;
@@ -88,11 +92,32 @@ export class SharedPaging {
   }
 
   *readBodySteps(index: number, tag: Uint8Array = NO_TAG): Steps<Uint8Array> {
+    const hit = this.prefetched?.get(index);
+    if (hit !== undefined) return hit;
     return yield* this.openBodySteps(index, tag, yield* this.pager.readBlockSteps(index));
   }
 
   *readBodyPageSteps(index: number, tag: Uint8Array = NO_TAG): Steps<Uint8Array> {
+    const hit = this.prefetched?.get(index);
+    if (hit !== undefined) return hit;
     return yield* this.openBodySteps(index, tag, yield* this.pager.readPageSteps(index));
+  }
+
+  // prefetchSteps reads the body page a (page, tag) pointer names through the awaitable read and keeps
+  // it opened until endPrefetch (a storage rewrite under an asynchronous codec, shared.ts).
+  *prefetchSteps(index: number, tag: Uint8Array): Steps<Uint8Array> {
+    if (this.prefetched === null) this.prefetched = new Map();
+    const map = this.prefetched;
+    const hit = map.get(index);
+    if (hit !== undefined) return hit;
+    const bytes = yield* this.readBodyPageSteps(index, tag);
+    map.set(index, bytes);
+    return bytes;
+  }
+
+  // endPrefetch drops every page prefetchSteps kept.
+  endPrefetch(): void {
+    this.prefetched = null;
   }
 
   // openBodySteps is openBody as a continuation step: an asynchronous codec's open is awaited

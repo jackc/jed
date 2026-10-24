@@ -4,7 +4,7 @@
 // main thread and talks to the engine-in-Worker via the async client (src/browser/client.ts).
 
 import { OpfsDatabase, OpfsError } from "../src/browser/client.ts";
-import { EngineError, openDatabase } from "../src/browser/async.ts";
+import { createDatabase, EngineError, openDatabase } from "../src/browser/async.ts";
 import * as runtime from "./runtime_scenarios.ts";
 import * as hostFunctions from "./host_function_scenarios.ts";
 
@@ -67,7 +67,7 @@ async function asyncCodecScenario(): Promise<Record<string, unknown>> {
 
 // encryptedScenario runs an encrypted database through the public async API (encryption.md §9): create
 // with a host key, write, close; reopen with the key and read; reopen without one (28P02) and with a
-// wrong one (28P01); change the credential to a passphrase (compaction and rekey are 0A000 on OPFS),
+// wrong one (28P01); compact it, rekey it under a new key, then change the credential to a passphrase,
 // after which only the passphrase opens it. The worker seals and opens every page through WebCrypto.
 async function encryptedScenario(name: string): Promise<Record<string, unknown>> {
   const credential = { key: new Uint8Array(32).fill(0x4a) };
@@ -110,11 +110,12 @@ async function encryptedScenario(name: string): Promise<Record<string, unknown>>
   };
   const passphrase = { passphrase: "changed in the browser" };
   const db2 = await openDatabase(name, { credential });
+  const rotated = { key: new Uint8Array(32).fill(0x5b) };
   let compact: string;
   let rekey: string;
   try {
     compact = await sqlstate(() => db2.compact("main"));
-    rekey = await sqlstate(() => db2.rekey("main", null));
+    rekey = await sqlstate(() => db2.rekey("main", rotated));
     await db2.changeCredential("main", passphrase, {
       memoryKib: 64,
       iterations: 1,
@@ -138,7 +139,46 @@ async function encryptedScenario(name: string): Promise<Record<string, unknown>>
     compact,
     rekey,
     oldKey: await code(credential.key),
+    rotatedKey: await code(rotated.key),
     afterChange,
+    journal: await opfsSize(name + ".jedcompact"),
+  };
+}
+
+// opfsSize is the byte length of the OPFS file name, or null when it is absent.
+async function opfsSize(name: string): Promise<number | null> {
+  const dir = await navigator.storage.getDirectory();
+  try {
+    return (await (await dir.getFileHandle(name)).getFile()).size;
+  } catch {
+    return null;
+  }
+}
+
+// compactScenario grows a plaintext database, deletes most of it, and compacts it through the public
+// async API (hosts.md §5.1): the file shrinks, the journal is gone, and a fresh handle reads the rows.
+// Sizes are read with no handle open (an open sync access handle locks the file).
+async function compactScenario(name: string): Promise<Record<string, unknown>> {
+  const db = await createDatabase({ path: name });
+  try {
+    await db.execute("CREATE TABLE t (k i32 PRIMARY KEY, v text)");
+    await db.execute("INSERT INTO t SELECT g, repeat('x', 300) FROM generate_series(1, 3000) g");
+    await db.execute("DELETE FROM t WHERE k > 3");
+  } finally {
+    await db.close();
+  }
+  const before = await opfsSize(name);
+  const reopened = await openDatabase(name);
+  try {
+    await reopened.compact("main");
+  } finally {
+    await reopened.close();
+  }
+  const after = await opfsSize(name);
+  return {
+    shrank: before !== null && after !== null && after * 4 < before,
+    journal: await opfsSize(name + ".jedcompact"),
+    rows: (await readScenario(name)).length,
   };
 }
 
@@ -166,6 +206,7 @@ declare global {
       errorScenario: (name: string) => Promise<string>;
       asyncCodecScenario: () => Promise<Record<string, unknown>>;
       encryptedScenario: (name: string) => Promise<Record<string, unknown>>;
+      compactScenario: (name: string) => Promise<Record<string, unknown>>;
       encryptionScenario: (request: unknown) => Promise<Record<string, unknown>>;
     };
     jedRuntime: typeof runtime;
@@ -179,6 +220,7 @@ window.jed = {
   errorScenario,
   asyncCodecScenario,
   encryptedScenario,
+  compactScenario,
   encryptionScenario,
 };
 window.jedRuntime = runtime;

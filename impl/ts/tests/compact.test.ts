@@ -325,7 +325,9 @@ class MemoryHandle implements SyncAccessHandle {
   close(): void {}
 }
 
-test("the OPFS host cannot compact yet (0A000)", () => {
+// An OPFS database opened without a journal (opfsrewrite.ts) has no way to replace its storage; the
+// journal path is tests/opfs_compaction.test.ts.
+test("an OPFS database without a journal cannot compact (0A000)", () => {
   const db = Database.fromEngine(createOpfsWithHandle(new MemoryHandle(), { pageSize: PAGE }));
   growAndShrink(db);
   const pages = db.pageCount;
