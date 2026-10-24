@@ -54,6 +54,8 @@ type Collation struct {
 	Description  string
 	Singles      []singleEntry      // ascending by code point
 	Contractions []contractionEntry // lexicographic by code-point sequence
+	// maxContraction is the longest Contractions sequence, computed once where the table is built.
+	maxContraction int
 }
 
 // the dev tailoring weight allocator (spec/collation/README.md §1.2) — fixed constants so every
@@ -148,6 +150,7 @@ func compileCollation(name, definition string) (*Collation, error) {
 		UnicodeVersion: unicodeVersion,
 		Singles:        singles,
 		Contractions:   contractions,
+		maxContraction: longestContraction(contractions),
 	}, nil
 }
 
@@ -473,12 +476,7 @@ func sortKey(coll *Collation, s string) ([]byte, error) {
 }
 
 func collationElements(coll *Collation, cps []uint32) ([]ce, error) {
-	maxContraction := 0
-	for _, c := range coll.Contractions {
-		if len(c.seq) > maxContraction {
-			maxContraction = len(c.seq)
-		}
-	}
+	maxContraction := coll.maxContraction
 	var out []ce
 	i := 0
 	for i < len(cps) {
@@ -509,20 +507,32 @@ func collationElements(coll *Collation, cps []uint32) ([]ce, error) {
 	return out, nil
 }
 
-func lookupSingle(coll *Collation, cp uint32) ([]ce, bool) {
-	for _, s := range coll.Singles {
-		if s.cp == cp {
-			return s.ces, true
+// longestContraction is the length of the longest contraction sequence (0 when there are none).
+func longestContraction(contractions []contractionEntry) int {
+	n := 0
+	for _, c := range contractions {
+		if len(c.seq) > n {
+			n = len(c.seq)
 		}
+	}
+	return n
+}
+
+// lookupSingle binary-searches Singles, which the table contract keeps ascending by code point.
+func lookupSingle(coll *Collation, cp uint32) ([]ce, bool) {
+	i := sort.Search(len(coll.Singles), func(i int) bool { return coll.Singles[i].cp >= cp })
+	if i < len(coll.Singles) && coll.Singles[i].cp == cp {
+		return coll.Singles[i].ces, true
 	}
 	return nil, false
 }
 
+// lookupContraction binary-searches Contractions, which the table contract keeps lexicographic by
+// sequence.
 func lookupContraction(coll *Collation, seq []uint32) ([]ce, bool) {
-	for _, c := range coll.Contractions {
-		if equalSeq(c.seq, seq) {
-			return c.ces, true
-		}
+	i := sort.Search(len(coll.Contractions), func(i int) bool { return !seqLess(coll.Contractions[i].seq, seq) })
+	if i < len(coll.Contractions) && equalSeq(coll.Contractions[i].seq, seq) {
+		return coll.Contractions[i].ces, true
 	}
 	return nil, false
 }
@@ -683,6 +693,7 @@ func openCollation(bytes []byte) (*Collation, error) {
 		Description:    description,
 		Singles:        singles,
 		Contractions:   contractions,
+		maxContraction: longestContraction(contractions),
 	}, nil
 }
 
@@ -1226,6 +1237,7 @@ func loadBundle(b *bundle) ([]*Collation, *propertyTable, error) {
 		return &Collation{
 			Name: name, UnicodeVersion: b.UnicodeVersion, CldrVersion: b.CldrVersion,
 			Description: b.Description, Singles: singles, Contractions: contractions,
+			maxContraction: longestContraction(contractions),
 		}
 	}
 	var colls []*Collation
