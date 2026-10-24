@@ -1789,7 +1789,7 @@ fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
 /// Parses a stored expression's canonical text. Text this binary's parser rejects is not corruption
 /// (spec/design/unparsable-definitions.md §2): it yields a placeholder and `true`, and the object is
 /// kept, unparsed.
-fn parse_stored_expression(text: &str) -> (crate::ast::Expr, bool) {
+pub(crate) fn parse_stored_expression(text: &str) -> (crate::ast::Expr, bool) {
     match crate::parser::parse_expression(text) {
         Ok(expr) => (expr, false),
         Err(_) => (

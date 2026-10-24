@@ -4,13 +4,14 @@
 # last_value/is_called are preserved unless RESTART is given; the post-edit cross-checks are START then
 # the preserved last_value in [MIN, MAX] (22023); MINVALUE < MAXVALUE is strict; the INCREMENT sign does
 # not recompute the bounds. RENAME TO moves the catalog key (42P07 collision) and, for an OWNED (serial)
-# sequence, rewrites the owning column's nextval default so a later INSERT still advances it.
+# sequence, rewrites the owning column's nextval default so a later INSERT still advances it; every
+# other table or view column default that names the sequence is rewritten too.
 #
 # Default-typed (bigint) sequences only: the typed-sequence ALTER-bound divergence (the value type is
 # not persisted — §14.4), the 0A000 actions (AS type / OWNED BY / OWNER TO / SET …, all PG-valid), and
 # the transactional rollback of an ALTER live in the per-core unit tests (a PG-clean single-handle
 # corpus cannot express them).
-# requires: ddl.alter_sequence, ddl.sequence, func.sequence, ddl.serial, ddl.create_table, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, types.i32, types.i64
+# requires: ddl.alter_sequence, ddl.sequence, func.sequence, ddl.serial, ddl.column_default_expr, ddl.view, ddl.view_default, dml.view_write, ddl.create_table, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, types.i32, types.i64
 
 # --- the option edit preserves the counter (PG init_params, isInit=false) ---------------------------
 
@@ -198,6 +199,55 @@ SELECT id, v FROM jt ORDER BY id
 # the owned link survives the rename: a direct DROP of the renamed owned sequence is still 2BP01
 statement error 2BP01
 DROP SEQUENCE jt_seq_renamed
+
+# --- RENAME rewrites every column DEFAULT that names the sequence (a table's and a view's): inserts
+# keep drawing from it, and the drop dependency follows the new name ----------------------------------
+
+statement ok
+CREATE SEQUENCE pd_seq
+
+statement ok
+CREATE TABLE pd (id i64 PRIMARY KEY DEFAULT nextval('pd_seq'), v i32)
+
+statement ok
+CREATE VIEW pdv AS SELECT id, v FROM pd
+
+statement ok
+ALTER VIEW pdv ALTER id SET DEFAULT nextval('pd_seq') + 100
+
+statement ok
+INSERT INTO pd (v) VALUES (1)
+
+statement ok
+ALTER SEQUENCE pd_seq RENAME TO pd_seq2
+
+statement ok
+INSERT INTO pd (v) VALUES (2)
+
+statement ok
+INSERT INTO pdv (v) VALUES (3)
+
+query II nosort
+SELECT id, v FROM pd ORDER BY id
+----
+1
+1
+2
+2
+103
+3
+
+statement error 2BP01
+DROP SEQUENCE pd_seq2
+
+statement ok
+DROP VIEW pdv
+
+statement ok
+DROP TABLE pd
+
+statement ok
+DROP SEQUENCE pd_seq2
 
 # --- cleanup ----------------------------------------------------------------------------------------
 

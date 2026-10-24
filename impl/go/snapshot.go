@@ -829,6 +829,13 @@ func exprTextNamesSequence(text, seq string) bool {
 	if err != nil {
 		return false
 	}
+	return len(sequenceArgTokens(tokens, seq)) > 0
+}
+
+// sequenceArgTokens returns the positions of the string tokens that are a constant nextval / currval
+// / setval first argument naming seq (exprTextNamesSequence's rule).
+func sequenceArgTokens(tokens []token, seq string) []int {
+	var out []int
 	for i := 0; i+3 < len(tokens); i++ {
 		t := tokens[i]
 		call := t.Kind == tokWord && (t.Word == "nextval" || t.Word == "currval" || t.Word == "setval") &&
@@ -838,10 +845,45 @@ func exprTextNamesSequence(text, seq string) bool {
 			continue
 		}
 		if n, err := parseNameText(tokens[i+2].Word); err == nil && n == seq {
-			return true
+			out = append(out, i+2)
 		}
 	}
-	return false
+	return out
+}
+
+// renameSequenceInDefault rewrites an expression DEFAULT for ALTER SEQUENCE old RENAME TO new
+// (sequences.md §15.3): each constant nextval / currval / setval argument naming old becomes new (as
+// an identifier, quoted when it must be), so the default follows the sequence as PostgreSQL's regclass
+// constant does. It returns nil when the default does not name old. Text that no longer parses stays
+// Unparsed (unparsable-definitions.md).
+func renameSequenceInDefault(de *defaultExprDef, old, new string) *defaultExprDef {
+	if de == nil {
+		return nil
+	}
+	tokens, err := lex(de.ExprText)
+	if err != nil {
+		return nil
+	}
+	positions := sequenceArgTokens(tokens, old)
+	if len(positions) == 0 {
+		return nil
+	}
+	for _, i := range positions {
+		tokens[i] = token{Kind: tokStr, Word: quoteIdentifier(new)}
+	}
+	end := len(tokens)
+	for i, t := range tokens {
+		if t.Kind == tokEof {
+			end = i
+			break
+		}
+	}
+	text := renderTokens(tokens[:end])
+	expr, err := parseExpression(text)
+	if err != nil {
+		return &defaultExprDef{ExprText: text, Unparsed: true}
+	}
+	return &defaultExprDef{ExprText: text, Expr: expr}
 }
 
 // compositeDependent reports whether any table column or composite-type field still references the

@@ -1642,18 +1642,60 @@ impl Snapshot {
 /// reads as a `regclass` (an expression such as `'a' || 'b'` is a text value resolved at run time,
 /// and records nothing). Token-level, so it reads unparsable stored text too.
 fn expr_text_names_sequence(text: &str, seq: &str) -> bool {
-    use crate::token::Token;
     let Ok(tokens) = crate::lexer::lex(text) else {
         return false;
     };
-    tokens.windows(4).any(|w| {
+    !sequence_arg_tokens(&tokens, seq).is_empty()
+}
+
+/// The positions of the string tokens that are a constant `nextval` / `currval` / `setval` first
+/// argument naming `seq` (`expr_text_names_sequence`'s rule).
+fn sequence_arg_tokens(tokens: &[crate::token::Token], seq: &str) -> Vec<usize> {
+    use crate::token::Token;
+    let mut out = Vec::new();
+    for (i, w) in tokens.windows(4).enumerate() {
         let call = matches!(&w[0], Token::Word(n)
             if matches!(n.as_str(), "nextval" | "currval" | "setval"))
             && matches!(w[1], Token::LParen)
             && matches!(w[3], Token::RParen | Token::Comma);
-        match (&w[2], call) {
-            (Token::Str(s), true) => crate::parser::parse_name_text(s).is_ok_and(|n| n == seq),
-            _ => false,
+        if let (Token::Str(s), true) = (&w[2], call)
+            && crate::parser::parse_name_text(s).is_ok_and(|n| n == seq)
+        {
+            out.push(i + 2);
         }
+    }
+    out
+}
+
+/// Rewrites an expression `DEFAULT` for `ALTER SEQUENCE old RENAME TO new` (sequences.md §15.3):
+/// each constant `nextval` / `currval` / `setval` argument naming `old` becomes `new` (as an
+/// identifier, quoted when it must be), so the default follows the sequence as PostgreSQL's
+/// `regclass` constant does. Returns `None` when the default does not name `old`. Text that no
+/// longer parses stays unparsed (unparsable-definitions.md).
+pub(crate) fn rename_sequence_in_default(
+    de: Option<&crate::catalog::DefaultExpr>,
+    old: &str,
+    new: &str,
+) -> Option<crate::catalog::DefaultExpr> {
+    use crate::token::Token;
+    let de = de?;
+    let mut tokens = crate::lexer::lex(&de.expr_text).ok()?;
+    let positions = sequence_arg_tokens(&tokens, old);
+    if positions.is_empty() {
+        return None;
+    }
+    for i in positions {
+        tokens[i] = Token::Str(crate::parser::quote_identifier(new));
+    }
+    let end = tokens
+        .iter()
+        .position(|t| matches!(t, Token::Eof))
+        .unwrap_or(tokens.len());
+    let expr_text = crate::parser::render_tokens(&tokens[..end]);
+    let (expr, unparsed) = crate::format::parse_stored_expression(&expr_text);
+    Some(crate::catalog::DefaultExpr {
+        expr_text,
+        expr,
+        unparsed,
     })
 }
