@@ -411,8 +411,9 @@ worker calls the engine's own method, so the preconditions, error order and SQLS
 synchronous API's. They never wait for the writer: a session of the same handle holding a write
 transaction, or an open read session, transaction or cursor pinning a snapshot, makes them `55006`,
 exactly as an in-process session would. A credential change runs as a continuation (§11.1): a
-cancellation can stop it before the writer gate is taken, never during the key-block write. On OPFS
-`compact` and `rekey` are `0A000` (the rekey before its KDF runs).
+cancellation can stop it before the writer gate is taken, never during the key-block write.
+Compaction and rekey are continuations too: a rekey's KDF can be canceled, the rewrite cannot. On
+OPFS they write the image to a journal file and copy it over the database (hosts.md §5.1).
 
 `query(sql, Value[], {signal})` and prepared `query(Value[], {signal})` return async,
 single-pass rows. Column names/types and command count are returned at open; cost is final
@@ -629,12 +630,14 @@ These remain synchronous and are not required by the browser storage stack:
   temporary-domain migration to a Node scratch file. Browser hosts have no spill target.
 - Page-service paths (Node only): a page client's commit through the blocking channel, owner
   adoption of client commits and the owner's maintenance commit, election and promotion.
-- Host compaction and rekey (`compactFile`; on the async surface they run inline in the Node
-  worker): the from-scratch serializer faults leaves through the synchronous store path. OPFS
-  compaction and rekey are already `0A000` pending a crash-safe replace (hosts.md §7); an async
-  compaction needs a generator from-scratch serializer and belongs with that design. A credential
-  change is not in this list: it writes only the key block (encrypted.md §5), so it is a
-  continuation whose rewrap and two-barrier write the WebCrypto codec awaits.
+- The from-scratch serializer and rekey's tree rebuild inside host compaction and rekey: they read
+  pages through the synchronous store path. The Node file host (`compactFile`) runs them inline. On
+  OPFS compaction and rekey are continuations (`compactSteps` / `rekeySteps`): journal acquisition
+  and removal are awaited, and under an asynchronous codec or device every page of the snapshot's
+  trees and live overflow chains is first read ahead through the awaited read, so the synchronous
+  passes find them; the image is then sealed through seal sessions (hosts.md §5.1). A credential
+  change writes only the key block (encrypted.md §5), so it is a continuation whose rewrap and
+  two-barrier write the WebCrypto codec awaits.
 - `create`'s whole bootstrap image written in place (OPFS) or through a temp file (Node): an
   encrypted create must first define how bootstrap pages are encoded (encryption.md §4).
 - Host backup (`backupForTesting`, Node only and not on the async surface): it walks the snapshot

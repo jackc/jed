@@ -66,7 +66,7 @@ test("commit, recovery and maintenance await an asynchronous page codec over rea
   });
 });
 
-test("an encrypted database seals its pages through WebCrypto and changes its credential", async ({
+test("an encrypted database seals its pages through WebCrypto, compacts, rekeys and changes its credential", async ({
   page,
 }) => {
   await page.goto("/");
@@ -77,11 +77,22 @@ test("an encrypted database seals its pages through WebCrypto and changes its cr
     read: EXPECTED,
     missing: "28P02",
     wrong: "28P01",
-    compact: "0A000",
-    rekey: "0A000",
+    compact: "<no error>",
+    rekey: "<no error>",
     oldKey: "28P01",
+    rotatedKey: "28P01",
     afterChange: EXPECTED,
+    journal: null,
   });
+});
+
+test("compaction shrinks an OPFS database through its journal (hosts.md §5.1)", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.locator("#out")).toContainText("read back");
+  const result = await page.evaluate((n) => window.jed.compactScenario(n), "compact1.jed");
+  expect(result).toEqual({ shrank: true, journal: null, rows: 3 });
 });
 
 test("WebCrypto writes the Node host's bytes, and its per-page cost", async ({ page }) => {

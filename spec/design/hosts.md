@@ -290,6 +290,52 @@ incl. durability across a page reload). Both run in `mise run ci` — the parity
 suite, the browser e2e as the `e2e:ts` gate step (it needs the Chromium build `mise run dev:browsers`
 installs). The OPFS host adds no SQL semantics, so conformance is unchanged.
 
+### 5.1 Replacing the database: compaction and rekey
+
+Compaction and rekey ([api.md](api.md) §2.6, [../fileformat/encrypted.md](../fileformat/encrypted.md)
+§12) replace the whole database with a from-scratch image. The file hosts write it to `<path>.jedtmp`
+and rename it into place. OPFS has no rename that atomically replaces an existing file, and moving a
+file needs its sync access handle closed, which would release the exclusive lock (§5). The OPFS host
+(`impl/ts/src/opfsrewrite.ts`) instead **copies the image over the database in place, made
+crash-safe by roll-forward**, with the database's handle held throughout:
+
+1. Acquire a sync access handle on the **journal** file `<name>.jedcompact` beside the database
+   (created empty), truncate it to 0, and write the image there, page `i` at `i × page_size`.
+2. `flush()` the journal. Then write the **trailer** at the image length `L` and `flush()` again:
+   20 bytes, the magic `JEDCMPT1`, `L` as a big-endian u64, and the CRC-32/IEEE of those 16 bytes.
+   A journal is **complete** exactly when its length is `L + 20` and its trailer is valid. The
+   durable trailer is the commit point.
+3. Copy the journal's first `L` bytes over the database, truncate it to `L`, and `flush()` it.
+4. Truncate the journal to 0, `flush()`, close and remove it.
+
+**Open runs recovery first** (before the page-size header is read, even on a read-only open, because
+the database may hold a partial copy): a complete journal is copied over the database (step 3,
+repeated until it succeeds, giving the same bytes every time) and then removed; an incomplete one
+is removed without touching the database. `create` removes any journal a deleted database of the
+same name left, so a stale image is never copied over a new database.
+
+Failures follow the file host's contract (`compactFile`). A failure before the trailer is durable
+leaves the database and the handle unchanged, and the partial journal is removed (or removed at
+the next open). After it, the old pager is closed and poisoned: a failed copy leaves the handle
+refusing commits until it is reopened, and the reopen finishes the copy. A failure while removing
+the journal is ignored; the next open removes it. The image is written twice, which the
+browser's dataset sizes (§9 of CLAUDE.md: RAM-sized) make acceptable.
+
+**Asynchronous stages.** Acquiring and removing the journal are asynchronous in a browser
+(`getFileHandle`, `createSyncAccessHandle`, `removeEntry`), so compaction and rekey are continuations
+(`Database.compactSteps` / `rekeySteps`, ts-runtime.md §11.1) and on OPFS run only through the async
+runtime; the synchronous API reports `0A000` for them there. An encrypted OPFS database's pages open
+through WebCrypto, but the from-scratch serializer and rekey's rebuild read pages synchronously, so
+under an asynchronous codec or device the rewrite first **reads ahead** every page of the snapshot's
+trees and live overflow chains through the awaited read (`prefetchSnapshotSteps`) and serves the
+serializer from them; the image is then sealed through seal sessions (`writeImageSteps`). The
+read-ahead holds the database's tree pages in memory for the rewrite, as the async image path
+already holds the sealed image. A rekey on OPFS keeps its rebuilt trees resident instead of staging
+them through a scratch domain: OPFS has no scratch target (§5), so nothing would leave memory, and
+the browser has no synchronous cipher for the scratch domain's throwaway key. The bytes equal the
+Node file host's compaction and rekey under the same key stream (`tests/opfs_compaction.test.ts`,
+`tests/encryption_webcrypto.test.ts`, and the real-browser e2e).
+
 ## 6. The decoration layering (where encryption and replication sit)
 
 Encryption and replication are **not** new hosts and **not** new methods on the seam — they
@@ -344,9 +390,8 @@ as it crosses. See the two docs for the full designs.
   - **Deferred OPFS follow-ons** (none foreclosed): disk-spill for OPFS (the `ORDER BY` external merge
     sort currently stays resident for OPFS — `db.path` is null so the `SpillSink` is unset; an
     OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
-    (not portable yet); and **compaction** ([api.md](api.md) §2.6), which is `0A000` on OPFS until a
-    crash-safe whole-file replace is designed for it (a sibling OPFS file plus a swap the engine can
-    recover from — OPFS offers no atomic rename-over-existing contract the file host's recipe relies on).
+    (not portable yet). **Compaction and rekey** have landed through a journal file and roll-forward
+    recovery (§5.1).
 - **Multi-process file access** — ✅ **landed
   ([locking.md](locking.md), [page-service.md](page-service.md))**: the `protocol-v2` lock bundle,
   one `presence EX` owner, and the page service with handoff run in Rust, Go, and Node (it replaced
@@ -354,8 +399,7 @@ as it crosses. See the two docs for the full designs.
   the approved narrow `impl/ts/native-lock` adapter. Prebuilt-package matrix work remains.
 - **Encryption codec** — ✅ built for file hosts in Rust, Go and Node ([encryption.md](encryption.md),
   [../fileformat/encrypted.md](../fileformat/encrypted.md)); the crypto libraries were confirmed under
-  CLAUDE.md §14. The browser/OPFS host has no synchronous AES and refuses an encrypted database
-  (`0A000`) until an asynchronous provider lands.
+  CLAUDE.md §14. The browser/OPFS host uses the asynchronous WebCrypto provider (§5).
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,
   not built.
 - **Direct sub-SQL access over the seam** — kept open, not built (storage.md §5): the key

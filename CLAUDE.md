@@ -719,7 +719,9 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   holding the file is `55006` (locking.md §6) — and is results- and cost-neutral (pages are renumbered,
   tree nodes kept). Ordinary owner commits also cut off free pages at the top of a file and shorten it
   after their barrier (in-place trailing truncation, format.md *Trailing truncation*; never on a page
-  client). OPFS compaction remains a follow-on.
+  client). On OPFS, which has no atomic rename, the image goes to a `<name>.jedcompact` journal committed
+  by a durable trailer and is copied over the database in place; open finishes a committed copy
+  (roll-forward, [hosts.md](spec/design/hosts.md) §5.1). OPFS rekey takes the same path.
 - **Validated COW durable commits (format v33).** Dirty body pages are written once, with
   CRC-64/ECMA-182 identities recorded inline in the alternate meta page and, for large
   transactions, in reusable manifest overflow pages. A single final durable barrier replaces

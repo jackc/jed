@@ -989,7 +989,8 @@ export class AsyncDatabase extends AsyncHandle {
    * Rewrite database `name` (`"main"`, matched exactly) as the garbage-free image of its committed
    * snapshot, returning its dead pages (spec/design/api.md §2.6). Never waits: `55006` while a
    * session holds a write transaction or a read session, transaction or cursor is open; `25006`
-   * read-only; `0A000` on OPFS, which cannot replace a file atomically yet.
+   * read-only. On OPFS the image is written to a `<name>.jedcompact` journal and copied over the
+   * database; an open after a crash finishes the copy (spec/design/hosts.md §5.1).
    */
   async compact(name: string): Promise<void> {
     await this.call("compact", { name });
@@ -1007,8 +1008,8 @@ export class AsyncDatabase extends AsyncHandle {
   /**
    * Rewrite the file database `name` under a new data key: encrypted for `credential` (rotating the
    * key, or encrypting a plaintext file — which needs `scratchEncryption: "on"`), or plaintext when
-   * it is null. It replaces the file as compaction does, with compaction's limits (`55006`, and
-   * `0A000` on OPFS).
+   * it is null. It replaces the file as compaction does, with compaction's limits (`55006`), on
+   * OPFS through the same journal.
    */
   async rekey(name: string, credential: Credential | null, kdf?: Argon2Params): Promise<void> {
     await this.call("rekey", { name, credential, kdf });

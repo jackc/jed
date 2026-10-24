@@ -27,11 +27,12 @@ import {
 } from "../src/crypto.ts";
 import { installWebCrypto } from "../src/crypto_web.ts";
 import { Environment } from "../src/environment.ts";
-import { runAsync, type Steps } from "../src/execution.ts";
+import { ioSteps, runAsync, type Steps } from "../src/execution.ts";
 import { toImageSteps } from "../src/format.ts";
 import { createDatabase, type Database } from "../src/lib.ts";
 import { closeOpfs, createOpfsWithHandleSteps, openOpfsWithHandleSteps } from "../src/opfs.ts";
 import type { SyncAccessHandle } from "../src/opfsblockstore.ts";
+import type { OpfsJournal } from "../src/opfsrewrite.ts";
 import { seededRandomSource } from "../src/seam.ts";
 import { Database as SharedDatabase, type Session } from "../src/shared.ts";
 import type { Snapshot } from "../src/snapshot.ts";
@@ -366,8 +367,7 @@ test("an encrypted OPFS database fails closed without its credential", async () 
 
 // A credential change on OPFS runs as a continuation (ts-runtime.md §11): the WebCrypto rewrap and the
 // two-barrier key-block write are awaited, and the file equals the Node file host's after the same
-// change under the same seeded key stream. Compaction and rekey need an atomic file replace OPFS lacks:
-// 0A000, the rekey before its KDF runs.
+// change under the same seeded key stream.
 test("an OPFS credential change through WebCrypto writes the Node file host's bytes", async () => {
   const pass: Credential = { passphrase: "changed" };
   const kdf = { memoryKib: 64, iterations: 1, parallelism: 1 };
@@ -402,6 +402,7 @@ test("an OPFS credential change through WebCrypto writes the Node file host's by
     for (const sql of WORKLOAD) await runAsync(session.executeSteps(sql));
     session.close();
     await runAsync(db.changeCredentialSteps("main", pass, kdf));
+    // Without a journal the OPFS host cannot replace the database: 0A000, the rekey before its KDF.
     assert.throws(() => db.compact("main"), /0A000/);
     assert.throws(() => db.rekey("main", ENC_KEY), /0A000/);
     await runAsync(db.closeSteps());
@@ -416,5 +417,109 @@ test("an OPFS credential change through WebCrypto writes the Node file host's by
     assert.equal((await runAsync(querySteps(r, "SELECT count(*) FROM t")))[0], "202");
     r.close();
     await runAsync(reopened.closeSteps());
+  });
+});
+
+// memoryJournal is an OPFS journal over a fake handle whose acquisition and removal are awaited, as the
+// browser's are (opfs.ts opfsJournal).
+function memoryJournal(): { journal: OpfsJournal; files: Map<string, FakeSyncAccessHandle> } {
+  const files = new Map<string, FakeSyncAccessHandle>();
+  const journal: OpfsJournal = {
+    acquire: (create) =>
+      ioSteps(
+        () => {
+          throw new Error("synchronous journal acquisition");
+        },
+        async () => {
+          let h = files.get("j");
+          if (h === undefined && create) {
+            h = new FakeSyncAccessHandle();
+            files.set("j", h);
+          }
+          return h ?? null;
+        },
+      ),
+    discard: () =>
+      ioSteps(
+        () => {
+          throw new Error("synchronous journal removal");
+        },
+        async () => {
+          files.delete("j");
+        },
+      ),
+  };
+  return { journal, files };
+}
+
+// Compaction and rekey on OPFS through WebCrypto (hosts.md §5.1, ts-runtime.md §11.1): the database's
+// pages are read ahead through the awaited open, the image is sealed through seal sessions into the
+// journal, and the result equals the Node file host's compaction and rekey under the same seeded key
+// stream, byte for byte. Then the rekeyed file decrypts in place.
+test("OPFS compaction and rekey through WebCrypto write the Node file host's bytes", async () => {
+  const pass: Credential = { passphrase: "rotated" };
+  const kdf = { memoryKib: 64, iterations: 1, parallelism: 1 };
+  const path = join(scratch, "webcrypto_compact.jed");
+  const control = createDatabase({
+    path,
+    pageSize: PAGE,
+    skipFsync: true,
+    environment: seeded(),
+    credential: ENC_KEY,
+    locking: "none",
+  });
+  const s = control.session();
+  for (const sql of WORKLOAD) s.execute(sql);
+  s.close();
+  control.compact("main");
+  const compacted = new Uint8Array(readFileSync(path));
+  control.rekey("main", pass, kdf);
+  control.close();
+  const rekeyed = new Uint8Array(readFileSync(path));
+
+  await withAsync(async () => {
+    const handle = new FakeSyncAccessHandle();
+    const { journal, files } = memoryJournal();
+    const db = SharedDatabase.fromEngine(
+      await runAsync(
+        createOpfsWithHandleSteps(
+          handle,
+          { pageSize: PAGE, credential: ENC_KEY, environment: seeded() },
+          journal,
+        ),
+      ),
+    );
+    const session = db.session();
+    for (const sql of WORKLOAD) await runAsync(session.executeSteps(sql));
+    session.close();
+    // The synchronous API cannot drive WebCrypto.
+    assert.throws(() => db.compact("main"));
+    await runAsync(db.compactSteps("main"));
+    assert.ok(bytesEqual(handle.bytes(), compacted), "the OPFS compaction wrote different bytes");
+    await runAsync(db.rekeySteps("main", pass, kdf));
+    assert.ok(bytesEqual(handle.bytes(), rekeyed), "the OPFS rekey wrote different bytes");
+    assert.equal(files.size, 0);
+    const r = db.session();
+    assert.equal((await runAsync(querySteps(r, "SELECT count(*) FROM t")))[0], "202");
+    r.close();
+    await runAsync(db.closeSteps());
+
+    const reopened = SharedDatabase.fromEngine(
+      await runAsync(openOpfsWithHandleSteps(handle, { credential: pass }, null, journal)),
+    );
+    await runAsync(reopened.rekeySteps("main", null));
+    const summary = reopened.session();
+    const want = await runAsync(querySteps(summary, SUMMARY));
+    summary.close();
+    await runAsync(reopened.closeSteps());
+    assert.ok(!Buffer.from(rekeyed).includes(Buffer.from("secret-")));
+    assert.ok(Buffer.from(handle.bytes()).includes(Buffer.from("secret-")), "decrypted in place");
+    const plain = SharedDatabase.fromEngine(
+      await runAsync(openOpfsWithHandleSteps(handle, {}, null, journal)),
+    );
+    const p = plain.session();
+    assert.deepEqual(await runAsync(querySteps(p, SUMMARY)), want);
+    p.close();
+    await runAsync(plain.closeSteps());
   });
 });

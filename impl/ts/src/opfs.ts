@@ -17,6 +17,9 @@
 //     is detected as XX001 on open, never silent bad data.
 //   • a single long-lived, exclusive sync access handle is held for the database's life (the exclusive
 //     lock is the single-writer guarantee, CLAUDE.md §3) and released by closeOpfs.
+//   • compaction and rekey replace the database through a sibling journal file (opfsrewrite.ts,
+//     hosts.md §5.1): the image is written there, committed by a durable trailer, and copied over the
+//     database in place; an open that finds a complete journal finishes the copy first.
 //   • db.path is left null: OPFS is file-backed via db.paging, but spill-to-disk (executor newSorterFor)
 //     uses node:fs and has no OPFS backing yet, so it is disabled (sorts stay resident, like an
 //     in-memory database — spill.md §2); spilling via OPFS is a later enhancement.
@@ -38,6 +41,14 @@ import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
 import { persistImpl, repairKeyBlockSteps } from "./persist.ts";
 import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
+import { ioSteps } from "./execution.ts";
+import {
+  discardJournalSteps,
+  JOURNAL_SUFFIX,
+  type OpfsJournal,
+  opfsRewriter,
+  recoverJournalSteps,
+} from "./opfsrewrite.ts";
 
 // DatabaseOptions / OpenOptions mirror file.ts (spec/design/api.md §2/§2.1): create-time pageSize is
 // fixed into the file's meta; open-time cacheBytes / readOnly / workMem are handle settings.
@@ -69,8 +80,15 @@ export type OpenOptions = {
 // from-scratch image in place + flush, then adopts the handle as the open pager so later commits write
 // through the seam incrementally (api.md §3, hosts.md §5). toImage validates the page size (0A000 if out
 // of range / not a power of two) BEFORE any write, so an invalid page size leaves the handle untouched.
-export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOptions = {}): Engine {
-  return runSync(createOpfsWithHandleSteps(handle, opts));
+// journal reaches the database's journal file, through which compaction and rekey replace it
+// (opfsrewrite.ts); without one they are 0A000. create discards a journal a removed database of the
+// same name left behind.
+export function createOpfsWithHandle(
+  handle: SyncAccessHandle,
+  opts: DatabaseOptions = {},
+  journal: OpfsJournal | null = null,
+): Engine {
+  return runSync(createOpfsWithHandleSteps(handle, opts, journal));
 }
 
 // createOpfsWithHandleSteps is the create as one continuation: an encrypted database's key block and
@@ -78,6 +96,7 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
 export function* createOpfsWithHandleSteps(
   handle: SyncAccessHandle,
   opts: DatabaseOptions = {},
+  journal: OpfsJournal | null = null,
 ): Steps<Engine> {
   const environment = opts.environment ?? new Environment();
   const db = new Engine(environment);
@@ -103,6 +122,7 @@ export function* createOpfsWithHandleSteps(
   // Lay down the whole from-scratch image in place (write-in-place create — hosts.md §5). toImage seeds
   // both meta slots and validates the page size; every later commit is incremental (persistImpl).
   const bytes = yield* toImageSteps(db.committed, db.pageSize, db.committed.txid, codec);
+  if (journal !== null) yield* discardJournalSteps(journal);
   const store = new OpfsBlockStore(handle);
   store.writeAt(0, bytes);
   store.sync();
@@ -125,6 +145,7 @@ export function* createOpfsWithHandleSteps(
   db.paging.setFloorSlot(Number(db.committed.txid & 1n));
   db.relaxed = opts.synchronous === "off";
   db.committed.storePaging = db.paging;
+  db.rewriter = journal === null ? null : opfsRewriter(handle, journal);
   return db;
 }
 
@@ -132,9 +153,15 @@ export function* createOpfsWithHandleSteps(
 // file.ts open: Pager.fromStore reads the page size from the meta header, the demand-paged loader builds
 // the interior skeleton resident and faults leaves through the bounded pool, bounded by cacheBytes
 // (pager.md §1, P6.4b). A malformed file is XX001, a read failure 58030 (api.md §2.1). db.path stays
-// null (spill disabled for OPFS, see header).
-export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions = {}): Engine {
-  return runSync(openOpfsWithHandleSteps(handle, opts));
+// null (spill disabled for OPFS, see header). With journal, a replace an earlier handle left
+// committed is finished before anything is read, and compaction and rekey replace the database
+// through it (opfsrewrite.ts); without one they are 0A000.
+export function openOpfsWithHandle(
+  handle: SyncAccessHandle,
+  opts: OpenOptions = {},
+  journal: OpfsJournal | null = null,
+): Engine {
+  return runSync(openOpfsWithHandleSteps(handle, opts, null, journal));
 }
 
 // openOpfsWithHandleSteps is the open as one continuation (ts-runtime.md §11.1): the worker drives it
@@ -145,8 +172,11 @@ export function* openOpfsWithHandleSteps(
   handle: SyncAccessHandle,
   opts: OpenOptions = {},
   transform: PageTransform | null = null,
+  journal: OpfsJournal | null = null,
 ): Steps<Engine> {
   const cacheBytes = opts.cacheBytes ?? DEFAULT_CACHE_BYTES;
+  // Even a read-only open finishes a committed replace: the database's bytes may be a partial copy.
+  if (journal !== null) yield* recoverJournalSteps(handle, journal);
   const readOnly = opts.readOnly ?? false;
   const pager = yield* Pager.fromStoreSteps(new OpfsBlockStore(handle));
   pager.setPageTransform(transform);
@@ -161,6 +191,7 @@ export function* openOpfsWithHandleSteps(
   // A writable open finishes a credential change a crash interrupted (encrypted.md §5).
   if (!readOnly) yield* repairKeyBlockSteps(db);
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
+  db.rewriter = journal === null ? null : opfsRewriter(handle, journal);
   db.readOnly = readOnly;
   db.relaxed = opts.synchronous === "off";
   // 0 (or unset) ⇒ the default budget, not unlimited (matching Go/Rust); unbounded is setWorkMem(0).
@@ -243,7 +274,7 @@ export async function createOpfs(name: string, opts: DatabaseOptions = {}): Prom
   const fileHandle = await dir.getFileHandle(name, { create: true });
   const handle = await fileHandle.createSyncAccessHandle();
   try {
-    return await runAsync(createOpfsWithHandleSteps(handle, opts));
+    return await runAsync(createOpfsWithHandleSteps(handle, opts, opfsJournal(dir, name)));
   } catch (e) {
     try {
       handle.close();
@@ -272,7 +303,7 @@ export async function openOpfs(name: string, opts: OpenOptions = {}): Promise<En
   }
   const handle = await fileHandle.createSyncAccessHandle();
   try {
-    return await runAsync(openOpfsWithHandleSteps(handle, opts));
+    return await runAsync(openOpfsWithHandleSteps(handle, opts, null, opfsJournal(dir, name)));
   } catch (e) {
     try {
       handle.close(); // a malformed file / read failure must not leak the handle
@@ -281,4 +312,37 @@ export async function openOpfs(name: string, opts: OpenOptions = {}): Promise<En
     }
     throw e;
   }
+}
+
+// opfsJournal reaches the journal file beside database name in dir (opfsrewrite.ts): acquiring and
+// removing it are asynchronous, so a compaction or rekey on OPFS runs only through the async driver.
+function opfsJournal(dir: OpfsDirHandle, name: string): OpfsJournal {
+  const journalName = name + JOURNAL_SUFFIX;
+  const asyncOnly = (): never => {
+    throw engineError(
+      "feature_not_supported",
+      "an OPFS database replaces its storage only through the asynchronous API",
+    );
+  };
+  return {
+    acquire: (create) =>
+      ioSteps(asyncOnly, async () => {
+        let fileHandle: OpfsFileHandle;
+        try {
+          fileHandle = await dir.getFileHandle(journalName, create ? { create: true } : undefined);
+        } catch (e) {
+          if (!create) return null;
+          throw engineError(
+            "io_error",
+            `cannot create the OPFS journal ${journalName}: ${String(e)}`,
+          );
+        }
+        return await fileHandle.createSyncAccessHandle();
+      }),
+    discard: (handle) =>
+      ioSteps(asyncOnly, async () => {
+        handle.close();
+        await dir.removeEntry(journalName);
+      }),
+  };
 }

@@ -360,6 +360,7 @@ import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import type { HostFunctions, HostFuncEntry } from "./extension.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { FileHost } from "./filehost.ts";
+import type { StorageRewriter } from "./shared.ts";
 import type { TrapClass } from "./trap_class.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
@@ -2083,6 +2084,10 @@ export class Engine {
   // fileHost is the file host a file database's compaction goes through (filehost.ts); null is the
   // OS. Only the deterministic simulator sets another.
   fileHost: FileHost | null;
+  // rewriter replaces a durable database's storage that has no file path (the OPFS host, opfs.ts):
+  // compaction and rekey write through it (spec/design/hosts.md §5.1). null for a file database
+  // (which goes through fileHost) and for an in-memory one.
+  rewriter: StorageRewriter | null;
   // dirSynced is whether this handle has made the file's directory entry durable (persist.ts
   // syncDirectoryOnce): false on open, set by the first durable file commit or a compaction.
   dirSynced: boolean;
@@ -2202,6 +2207,7 @@ export class Engine {
     this.readOnly = false;
     this.spillSink = null;
     this.fileHost = null;
+    this.rewriter = null;
     this.dirSynced = false;
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;

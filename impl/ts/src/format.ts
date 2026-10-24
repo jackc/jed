@@ -4192,6 +4192,62 @@ export function* reachablePagesSteps(
   return reached;
 }
 
+// prefetchSnapshotSteps reads every on-disk page of snap's table and index B+trees, and the live
+// overflow chains of its table leaves, through paging's awaitable read and keeps them opened in paging
+// (SharedPaging.prefetchSteps), so the synchronous from-scratch serializer and a rekey's rebuild run
+// without a read under an asynchronous codec or device (a storage rewrite on the OPFS host,
+// spec/design/hosts.md §5.1). It holds the database's tree pages in memory until endPrefetch.
+export function* prefetchSnapshotSteps(snap: Snapshot, paging: SharedPaging): Steps<void> {
+  const tagLen = paging.cap().tag;
+  const read: PageFetch = (p, t) => paging.prefetchSteps(p, t);
+  const stores = [...snap.stores.values(), ...snap.indexStores.values()];
+  for (const st of stores) {
+    const root = st.treeRoot();
+    if (root === null || root.page === 0) continue;
+    yield* prefetchTreeSteps(read, root.page, root.tag ?? NO_TAG, tagLen, new Set<number>(), 1);
+  }
+  for (const st of snap.stores.values()) {
+    const root = st.treeRoot();
+    if (root === null || root.page === 0 || !anySpillable(st.columnTypes())) continue;
+    yield* collectLeafOverflowSteps(
+      read,
+      root.page,
+      root.tag ?? NO_TAG,
+      tagLen,
+      st.columnTypes(),
+      new Set<number>(),
+      new Set<number>(),
+      1,
+    );
+  }
+}
+
+// prefetchTreeSteps reads the B+tree node page pageIdx and, below an interior page, every child.
+function* prefetchTreeSteps(
+  read: PageFetch,
+  pageIdx: number,
+  pageTag: Uint8Array,
+  tagLen: number,
+  seen: Set<number>,
+  depth: number,
+): Steps<void> {
+  if (seen.has(pageIdx)) throw engineError("data_corrupted", "B-tree page reached twice");
+  seen.add(pageIdx);
+  if (depth > MAX_TREE_DEPTH)
+    throw engineError("data_corrupted", "B-tree deeper than any valid tree");
+  const pg = parsePage(yield* read(pageIdx, pageTag));
+  if (pg.pageType === PAGE_LEAF) return;
+  if (pg.pageType !== PAGE_INTERIOR)
+    throw engineError("data_corrupted", "expected a B-tree node page");
+  const ptr = 4 + tagLen;
+  if ((ptr + 4) * pg.itemCount + ptr > pg.payload.length)
+    throw engineError("data_corrupted", "B-tree interior item count overruns page");
+  const cur = { pos: 0 };
+  const cps: { page: number; tag: Uint8Array }[] = [];
+  for (let i = 0; i < pg.itemCount + 1; i++) cps.push(readPointer(pg.payload, cur, tagLen));
+  for (const cp of cps) yield* prefetchTreeSteps(read, cp.page, cp.tag, tagLen, seen, depth + 1);
+}
+
 // catalogPageCount is how many of pages are catalog pages (memory.md §8.3's repair exemption compares
 // a commit's rewritten catalog with the last one's).
 export function catalogPageCount(pages: { index: number; bytes: Uint8Array }[]): number {

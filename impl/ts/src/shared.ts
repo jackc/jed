@@ -68,9 +68,11 @@ import { drainRunSteps, PreparedStatement, Rows, rowsFromOutcome, Transaction } 
 import {
   loadEngine,
   loadEnginePaged,
+  loadEnginePagedSteps,
   metaAuthenticates,
   newAttachedStorage,
   newScratchStorage,
+  prefetchSnapshotSteps,
   reclaimDue,
   toImage as toImageBytes,
 } from "./format.ts";
@@ -78,7 +80,7 @@ import type { CompositeType, Table, ViewDef } from "./catalog.ts";
 import {
   type Argon2Params,
   type Credential,
-  createCodec,
+  createCodecSteps,
   DEFAULT_ARGON2_PARAMS,
   ENCRYPTED_MIN_PAGE_SIZE,
   type PageCodec,
@@ -1356,11 +1358,12 @@ class SharedCore {
     }
   }
 
-  // compactLocked compacts database lname (`main` or an attachment) under the local writer flag the
+  // compactLockedSteps compacts database lname (`main` or an attachment) under the local writer flag the
   // caller holds (spec/design/api.md §2.6): require presence-exclusive coordination and a drained reader
   // watermark, then rewrite the storage at the next version and publish the reloaded root. JS is
-  // single-threaded, so no reader can pin between the check and the publish.
-  compactLocked(lname: string, name: string, rekey: Rekey | null = null): void {
+  // single-threaded, and the async runtime starts no other engine operation while a continuation is
+  // suspended (ts-runtime.md §11.2), so no reader can pin between the check and the publish.
+  *compactLockedSteps(lname: string, name: string, rekey: Rekey | null = null): Steps<void> {
     const main = lname === "main";
     const coordinator = main
       ? this.coordinator
@@ -1387,8 +1390,8 @@ class SharedCore {
       // A rebuild's scratch domain spills through the handle's scratch target (encrypted.md §12).
       const compacted =
         rekey === null
-          ? compactStorage(this.storageFor(lname), prev, prev.txid + 1n)
-          : rekeyStorage(
+          ? yield* compactStorageSteps(this.storageFor(lname), prev, prev.txid + 1n)
+          : yield* rekeyStorageSteps(
               this.storageFor(lname),
               prev,
               prev.txid + 1n,
@@ -1735,10 +1738,11 @@ function attachPinsStale(pins: AttachPin[]): void {
 
 // compactStorage replaces storage st with the from-scratch image of snap at txid (host compaction,
 // spec/design/api.md §2.6) and returns the committed snapshot reloaded from it. A file is rewritten
-// through the host's registered file compactor (file.ts compactFile); an in-memory domain swaps in a new
-// MemoryBlockStore. The image has no free list and no garbage, so the page accounting restarts from it,
-// and the storage budget forgets the last commit's pages (none of them is dead now).
-function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
+// through the host's registered file compactor (file.ts compactFile), a durable store without a path
+// through its rewriter (the OPFS host, opfs.ts); an in-memory domain swaps in a new MemoryBlockStore.
+// The image has no free list and no garbage, so the page accounting restarts from it, and the storage
+// budget forgets the last commit's pages (none of them is dead now).
+function* compactStorageSteps(st: Engine, snap: Snapshot, txid: bigint): Steps<Snapshot> {
   const old = st.paging;
   if (old === null) throw engineError("io_error", "database storage is closed");
   old.checkDurableCommit();
@@ -1746,11 +1750,33 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
   let paging: SharedPaging;
   if (st.path !== null) {
     paging = fileCompactor!(st.fileHost, st.path, snap, st.pageSize, txid, old, capacity);
+  } else if (st.rewriter !== null) {
+    const rewriter = st.rewriter;
+    paging = yield* withPrefetchSteps(old, snap, () =>
+      rewriter(snap, st.pageSize, txid, old, capacity),
+    );
   } else {
     const image = toImageBytes(snap, st.pageSize, txid);
     paging = new SharedPaging(Pager.fromStore(new MemoryBlockStore(image)), capacity);
   }
-  return adoptRewritten(st, paging);
+  return yield* adoptRewrittenSteps(st, paging);
+}
+
+// withPrefetchSteps runs a storage rewrite of snap over old: under an asynchronous codec or device it
+// first reads snap's pages ahead through the awaitable read (format.ts prefetchSnapshotSteps), so the
+// synchronous serializer and rebuild never read, and drops them when the rewrite ends.
+function* withPrefetchSteps<T>(
+  old: SharedPaging,
+  snap: Snapshot,
+  rewrite: () => Steps<T>,
+): Steps<T> {
+  if (!old.writeSideAsync()) return yield* rewrite();
+  try {
+    yield* prefetchSnapshotSteps(snap, old);
+    return yield* rewrite();
+  } finally {
+    old.endPrefetch();
+  }
 }
 
 // rekeyStorage rotates the data key of file storage st, or converts it between the plaintext and
@@ -1760,60 +1786,71 @@ function compactStorage(st: Engine, snap: Snapshot, txid: bigint): Snapshot {
 // under target (null: plaintext) and rename it over the file as compaction does. A record or key the
 // target cannot store, or an image over max_storage_bytes, fails before the rename with the file
 // untouched. The caller holds the writer gate with the reader watermark drained.
-function rekeyStorage(
+//
+// A store without a path (the OPFS host) has no scratch target: its rebuilt trees stay resident and
+// are never staged, so the scratch domain holds no page and needs no throwaway key (the browser has
+// no synchronous cipher to seal one with). Its pages are read ahead under an asynchronous codec
+// (withPrefetchSteps), and the rewriter writes the image.
+function* rekeyStorageSteps(
   st: Engine,
   snap: Snapshot,
   txid: bigint,
   target: PageCodec | null,
   sink: SpillSink | null,
   name: string,
-): Snapshot {
+): Steps<Snapshot> {
   const old = st.paging;
   if (old === null) throw engineError("io_error", "database storage is closed");
   old.checkDurableCommit();
-  if (st.path === null || fileCompactor === null) {
+  const path = st.path;
+  const rewriter = st.rewriter;
+  if ((path === null || fileCompactor === null) && rewriter === null) {
     throw engineError(
       "feature_not_supported",
       `cannot rekey database "${name}": its storage host cannot replace the file atomically`,
     );
   }
   const capacity = old.capacity();
+  const resident = path === null;
   const build = newScratchStorage(
     st.pageSize,
-    target === null ? null : scratchCodec(),
+    target === null || resident ? null : scratchCodec(),
     st.environment,
   );
+  const rekey = { codec: target, limit: st.storageBudget.limit, name };
   let paging: SharedPaging;
   try {
-    // The scratch domain spills past the handle's page-cache budget, like a temp domain.
-    const budget = Math.max(Math.min(capacity * st.pageSize, Number.MAX_SAFE_INTEGER), 1 << 20);
-    const built = snap.emptied(capOf(st.pageSize, target !== null), build.paging!);
-    snap.rebuildRows(built, Math.floor(budget / 4), (s) => {
-      const staged = stageTemp(build, s, budget, sink);
-      adoptStaged(build, s, staged, true);
-      s.clearStaged();
-    });
-    paging = fileCompactor(st.fileHost, st.path, built, st.pageSize, txid, old, capacity, {
-      codec: target,
-      limit: st.storageBudget.limit,
-      name,
+    paging = yield* withPrefetchSteps(old, snap, function* () {
+      // The scratch domain spills past the handle's page-cache budget, like a temp domain.
+      const budget = Math.max(Math.min(capacity * st.pageSize, Number.MAX_SAFE_INTEGER), 1 << 20);
+      const built = snap.emptied(capOf(st.pageSize, target !== null), build.paging!);
+      snap.rebuildRows(built, resident ? Infinity : Math.floor(budget / 4), (s) => {
+        if (resident) return;
+        const staged = stageTemp(build, s, budget, sink);
+        adoptStaged(build, s, staged, true);
+        s.clearStaged();
+      });
+      if (path !== null) {
+        return fileCompactor!(st.fileHost, path, built, st.pageSize, txid, old, capacity, rekey);
+      }
+      return yield* rewriter!(built, st.pageSize, txid, old, capacity, rekey);
     });
   } finally {
     // The scratch domain (and any scratch file it moved to) is released whatever happened.
     build.paging?.close();
   }
-  return adoptRewritten(st, paging);
+  return yield* adoptRewrittenSteps(st, paging);
 }
 
 // adoptRewritten makes paging, over st's rewritten storage, its storage and returns the committed
 // snapshot reloaded from it (compaction and rekey). The image has no free list and no garbage, so the
 // page accounting restarts from it, and the storage budget forgets the last commit's pages.
-function adoptRewritten(st: Engine, paging: SharedPaging): Snapshot {
+function* adoptRewrittenSteps(st: Engine, paging: SharedPaging): Steps<Snapshot> {
   // A file's old pager is already closed and poisoned here, so a failed reload leaves the handle
   // needing a reopen; an in-memory domain keeps its old store untouched.
   let loaded: Engine;
   try {
-    loaded = loadEnginePaged(paging, st.environment);
+    loaded = yield* loadEnginePagedSteps(paging, st.environment);
   } catch (error) {
     paging.close();
     throw error;
@@ -1877,6 +1914,20 @@ type FileCompactor = (
   rekey?: RekeyTarget,
 ) => SharedPaging;
 
+// StorageRewriter replaces a durable store that has no file path (the OPFS host, opfs.ts — hosts.md
+// §5.1) with the from-scratch image of snap at txid, the counterpart of FileCompactor: written under
+// rekey's codec when given (else old's), and returning the replacement paging context, a pool of
+// capacity leaves. It reads snap's pages only through the synchronous read (the caller prefetches
+// them under an asynchronous codec) and awaits its own device and codec stages.
+export type StorageRewriter = (
+  snap: Snapshot,
+  pageSize: number,
+  txid: bigint,
+  old: SharedPaging,
+  capacity: number,
+  rekey?: RekeyTarget,
+) => Steps<SharedPaging>;
+
 // RekeyTarget is what a rekey writes its image under (spec/fileformat/encrypted.md §12): the target
 // codec (null: plaintext) and the database's max_storage_bytes (0 or less: unlimited), checked against
 // the image's live pages before the rename, with name the database the 54P06 names.
@@ -1886,6 +1937,12 @@ export type RekeyTarget = { codec: PageCodec | null; limit: bigint; name: string
 type Rekey = { target: PageCodec | null };
 
 let fileCompactor: FileCompactor | null = null;
+
+// canRewrite reports whether durable storage st can be replaced by compaction or rekey: a file through
+// the registered file compactor, a store without a path through its rewriter (the OPFS host).
+function canRewrite(st: Engine): boolean {
+  return st.path !== null ? fileCompactor !== null : st.rewriter !== null;
+}
 
 // registerFileCompactor installs the host file rewrite that Database.compact uses for a file-backed
 // database (called once, at file.ts module load).
@@ -2251,10 +2308,17 @@ export class Database {
   // snapshot at the next version and swap the storage atomically (a file through temp file + rename, an
   // in-memory database by replacing its byte store). Rows, catalog, and later results and costs are
   // unchanged. Never waits: 42704 for a name that is not attached, 25006 for a read-only database, 0A000
-  // on a host that cannot replace a file atomically (OPFS), and 55006 while a write transaction or reader
-  // is open on this handle or another process has the file open. Not metered and not reachable from SQL.
+  // on a host that cannot replace its storage, and 55006 while a write transaction or reader is open on
+  // this handle or another process has the file open. Not metered and not reachable from SQL. On OPFS
+  // the image is written to a journal file and copied over the database (hosts.md §5.1).
   compact(name: string): void {
-    this.compactAs(name, name, null);
+    runSync(this.compactSteps(name));
+  }
+
+  // compactSteps is compact as a continuation (ts-runtime.md §11.1): an asynchronous codec or device
+  // (the browser's WebCrypto, OPFS journal acquisition) is awaited. It cannot be canceled.
+  *compactSteps(name: string): Steps<void> {
+    yield* uncancelableSteps(this.compactAsSteps(name, name, null));
   }
 
   // rekey rewrites the file database name (`main` or a file attachment) under a NEW data key
@@ -2277,6 +2341,16 @@ export class Database {
     credential: Credential | null,
     kdf: Argon2Params = DEFAULT_ARGON2_PARAMS,
   ): void {
+    runSync(this.rekeySteps(name, credential, kdf));
+  }
+
+  // rekeySteps is rekey as a continuation (ts-runtime.md §11.1): the KDF, and an asynchronous codec or
+  // device, are awaited. A cancellation can stop it only before the rewrite begins.
+  *rekeySteps(
+    name: string,
+    credential: Credential | null,
+    kdf: Argon2Params = DEFAULT_ARGON2_PARAMS,
+  ): Steps<void> {
     const c = this.core;
     let storage: Engine;
     if (name === "main") {
@@ -2295,9 +2369,8 @@ export class Database {
         "an in-memory database has no credential",
       );
     }
-    // A durable store without a path is the OPFS host, which cannot replace a file atomically yet
-    // (hosts.md §5): refuse before the KDF runs rather than after.
-    if (storage.path === null || fileCompactor === null) {
+    // A durable store that cannot replace its storage is refused before the KDF runs rather than after.
+    if (!canRewrite(storage)) {
       throw engineError(
         "feature_not_supported",
         `cannot rekey database "${name}": its storage host cannot replace the file atomically`,
@@ -2322,9 +2395,9 @@ export class Database {
       // taken (encrypted.md §12).
       const source = storage.paging?.codec() ?? null;
       const rng = source !== null ? source.keyEntropy() : c.environment.keyStream();
-      target = createCodec(credential, kdf, rng);
+      target = yield* createCodecSteps(credential, kdf, rng);
     }
-    this.compactAs(name, name, { target });
+    yield* uncancelableSteps(this.compactAsSteps(name, name, { target }));
   }
 
   // changeCredential changes the credential of the encrypted file database name (`main` or a file
@@ -2409,7 +2482,7 @@ export class Database {
 
   // compactAs compacts database lname of this handle, naming it name in errors (an inner handle of a
   // service attachment compacts its main under the attachment's name).
-  private compactAs(lname: string, name: string, rekey: Rekey | null): void {
+  private *compactAsSteps(lname: string, name: string, rekey: Rekey | null): Steps<void> {
     const c = this.core;
     let storage: Engine;
     let readOnly: boolean;
@@ -2439,16 +2512,15 @@ export class Database {
         );
       }
       try {
-        service.db.compactAs("main", name, rekey);
+        yield* service.db.compactAsSteps("main", name, rekey);
       } finally {
         c.releaseWriter();
       }
       return;
     }
-    // A durable store without a path is the OPFS host (opfs.ts leaves path null), which has no atomic
-    // file replace yet (hosts.md §5).
+    // A durable store is replaced through its file host or rewriter (hosts.md §5.1).
     const durable = storage.path !== null || storage.persistHook !== null;
-    if (durable && (storage.path === null || fileCompactor === null)) {
+    if (durable && !canRewrite(storage)) {
       throw engineError(
         "feature_not_supported",
         `cannot compact database "${name}": its storage host cannot replace the file atomically`,
@@ -2480,7 +2552,7 @@ export class Database {
         }
         c.serviceRefresh();
       }
-      c.compactLocked(lname, name, rekey);
+      yield* c.compactLockedSteps(lname, name, rekey);
     } finally {
       c.releaseWriter();
     }

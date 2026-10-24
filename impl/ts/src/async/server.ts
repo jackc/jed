@@ -600,7 +600,7 @@ export class RuntimeServer {
     const name = args.name;
     if (typeof name !== "string") throw new TransportError("PROTOCOL", "a database name is text");
     if (op === "compact") {
-      db.compact(name);
+      yield* db.compactSteps(name);
       return;
     }
     const kdf = (args.kdf ?? DEFAULT_ARGON2_PARAMS) as Argon2Params;
@@ -610,7 +610,7 @@ export class RuntimeServer {
       throw engineError("invalid_parameter_value", "a credential is a passphrase or a 32-byte key");
     }
     if (op === "rekey") {
-      db.rekey(name, credential as Credential | null, kdf);
+      yield* db.rekeySteps(name, credential as Credential | null, kdf);
     } else {
       if (credential === null) {
         throw engineError(
