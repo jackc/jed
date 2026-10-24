@@ -253,19 +253,6 @@ test("CREATE UNIQUE INDEX build verification", () => {
   run(db, "INSERT INTO d VALUES (4, 9, NULL)");
 });
 
-// DROP INDEX of a constraint-backed unique index is allowed and drops the constraint
-// (the documented PG divergence — indexes.md §7: jed has no ALTER TABLE, so the index
-// name is the constraint's only handle).
-test("DROP INDEX drops the constraint", () => {
-  const db = memDb().session();
-  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)");
-  run(db, "INSERT INTO t VALUES (1, 10)");
-  assert.equal(errInfo(() => run(db, "INSERT INTO t VALUES (2, 10)")).code, "23505");
-  run(db, "DROP INDEX t_v_key");
-  run(db, "INSERT INTO t VALUES (2, 10)"); // no longer enforced
-  assert.deepEqual(names(db, "t"), []);
-});
-
 // Uniqueness validation is unmetered (cost.md §3): an INSERT into a uniquely-indexed
 // table still costs 0, and a CREATE UNIQUE INDEX build charges exactly the plain build's
 // scan. The planner treats a unique index like any other (the bounded-scan cost).

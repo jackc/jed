@@ -312,24 +312,6 @@ func TestCreateUniqueIndexBuild(t *testing.T) {
 	uqRun(t, db, "INSERT INTO d VALUES (4, 9, NULL)")
 }
 
-// DROP INDEX of a constraint-backed unique index is allowed and drops the constraint
-// (the documented PG divergence — indexes.md §7: jed has no ALTER TABLE, so the index
-// name is the constraint's only handle).
-func TestDropIndexDropsTheConstraint(t *testing.T) {
-	t.Parallel()
-	db := memDB().Session(SessionOptions{})
-	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)")
-	uqRun(t, db, "INSERT INTO t VALUES (1, 10)")
-	if code, _ := uqErr(t, db, "INSERT INTO t VALUES (2, 10)"); code != "23505" {
-		t.Fatalf("enforced = %s", code)
-	}
-	uqRun(t, db, "DROP INDEX t_v_key")
-	uqRun(t, db, "INSERT INTO t VALUES (2, 10)") // no longer enforced
-	if got := uqNames(t, db, "t"); len(got) != 0 {
-		t.Fatalf("t indexes = %v", got)
-	}
-}
-
 // Uniqueness validation is unmetered (cost.md §3): an INSERT into a uniquely-indexed
 // table still costs 0, and a CREATE UNIQUE INDEX build charges exactly the plain build's
 // scan. The planner treats a unique index like any other (the bounded-scan cost).

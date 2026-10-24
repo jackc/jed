@@ -214,16 +214,6 @@ sql = "UPDATE m SET vv = 5 - vv WHERE id < 3"
 reason = "jed: the end-state value swap succeeds (indexes.md §8); PG fails it per-row in heap order (23505) — and here runs against the state its earlier failed UPDATE preserved."
 
 [[override]]
-file = "ddl/unique.test"
-sql = "DROP INDEX m_vv_key"
-reason = "jed: DROP INDEX of a constraint-backed unique index is allowed and drops the UNIQUE constraint with it — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the constraint's only handle (indexes.md §7). PG refuses (2BP01, dependent_objects_still_exist)."
-
-[[override]]
-file = "ddl/unique.test"
-sql = "INSERT INTO m VALUES (4, 30)"
-reason = "Follows the constraint-drop divergence: jed dropped m's UNIQUE so the duplicate 30 inserts; in PG the constraint survived its refused DROP INDEX (and vv still holds 30 from the earlier failed UPDATEs), so the oracle traps 23505."
-
-[[override]]
 file = "dml/returning.test"
 sql = "UPDATE old SET x = x RETURNING with(old.x)"
 reason = "jed keeps every word non-reserved (grammar.md §3): because this does not have the structural `WITH (OLD|NEW AS` alias-prefix shape, `with` parses as an ordinary function name and resolution reports 42883. PostgreSQL treats WITH as the RETURNING alias introducer and rejects the function-call shape with 42601."

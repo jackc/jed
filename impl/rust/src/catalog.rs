@@ -287,6 +287,12 @@ pub struct IndexDef {
     pub name: String,
     pub keys: Vec<IndexKey>,
     pub unique: bool,
+    /// Marks the unique index that backs a `UNIQUE` constraint (`CREATE TABLE … UNIQUE`, `ALTER
+    /// TABLE … ADD UNIQUE` — spec/design/constraints.md §5) rather than a bare `CREATE UNIQUE
+    /// INDEX` (`format_version` 50, `index_flags` bit5). Only a constraint index is a constraint:
+    /// `DROP INDEX` refuses it (2BP01) and `ALTER TABLE … DROP CONSTRAINT`, `ON CONFLICT ON
+    /// CONSTRAINT` and `jed_constraints` see only it. Always `unique` and B-tree.
+    pub constraint: bool,
     pub kind: IndexKind,
     /// A **partial** index's `WHERE predicate` (spec/design/indexes.md §9): only rows whose
     /// predicate is TRUE are indexed / constrained. `None` for an ordinary (full) index. Carries
@@ -312,6 +318,11 @@ pub struct IndexDef {
 }
 
 impl IndexDef {
+    /// Whether this index backs a `UNIQUE` constraint (and so is one).
+    pub fn is_unique_constraint(&self) -> bool {
+        self.unique && self.constraint
+    }
+
     /// Key element `i`'s sort order (`ASC NULLS LAST` when the index carries no options).
     pub fn key_order(&self, i: usize) -> crate::encoding::KeyOrder {
         self.orders.get(i).copied().unwrap_or_default()

@@ -154,7 +154,10 @@ const MAGIC: [u8; 4] = *b"JEDB";
 // not hold the newest durable meta (`txid & 1` under synchronous = on, one slot for a whole relaxed
 // batch), and a pending commit's manifest also lists every body page written since that floor; no
 // byte layout change.
-pub(crate) const FORMAT_VERSION: u16 = 49;
+// v50: the per-index `index_flags` byte gains bit5 `is_constraint`: set on the unique index that
+// backs a UNIQUE constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique;
+// spec/design/constraints.md §5.5).
+pub(crate) const FORMAT_VERSION: u16 = 50;
 #[path = "commit_manifest.rs"]
 mod commit_manifest;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
@@ -4849,7 +4852,8 @@ fn table_entry_bytes(
                 | (if idx.predicate.is_some() { 2 } else { 0 })
                 | (if idx.host_deps.is_empty() { 0 } else { 4 })
                 | (if idx.timezone_deps.is_empty() { 0 } else { 8 })
-                | (if idx.orders.is_empty() { 0 } else { 16 }),
+                | (if idx.orders.is_empty() { 0 } else { 16 })
+                | (if idx.constraint { 32 } else { 0 }),
         );
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
         out.push(idx.kind as u8);
@@ -7037,8 +7041,12 @@ fn decode_table_entry(
         let iflags = read_u8(buf, pos)?;
         // bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9), bit2
         // has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1); the rest reserved.
-        if iflags & !0b1_1111 != 0 {
+        if iflags & !0b11_1111 != 0 {
             return Err(corrupt("reserved index flag set"));
+        }
+        // bit5 is_constraint (v50): only a unique index backs a UNIQUE constraint.
+        if iflags & 0b10_0000 != 0 && iflags & 0b01 == 0 {
+            return Err(corrupt("a constraint index must be unique"));
         }
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7);
         // v20: 2 = GiST (spec/design/gist.md §8).
@@ -7145,6 +7153,7 @@ fn decode_table_entry(
             name: iname,
             keys,
             unique: iflags & 0b01 != 0,
+            constraint: iflags & 0b10_0000 != 0,
             kind,
             predicate,
             host_deps,

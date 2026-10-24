@@ -212,7 +212,9 @@ fn schema_constraint_name_taken(snap: &Snapshot, skip: &str, name: &str) -> bool
 
 fn constraint_name_taken(t: &Table, name: &str) -> bool {
     t.checks.iter().any(|c| c.name == name)
-        || t.indexes.iter().any(|i| i.unique && i.name == name)
+        || t.indexes
+            .iter()
+            .any(|i| i.is_unique_constraint() && i.name == name)
         || t.foreign_keys.iter().any(|f| f.name == name)
         || t.exclusions.iter().any(|e| e.name == name)
 }
@@ -1601,6 +1603,7 @@ impl Engine {
                     name,
                     keys: cols.into_iter().map(IndexKey::Column).collect(),
                     unique: true,
+                    constraint: true,
                     kind: IndexKind::Btree,
                     predicate: None,
                     // A PK / UNIQUE constraint index is always plain-column — no host dependency.
@@ -1711,7 +1714,10 @@ impl Engine {
             // (§6.2/§6.7). A derived name also walks past the domain's other tables' names.
             let local_taken = |n: &str| {
                 table.checks.iter().any(|c| c.name == n)
-                    || table.indexes.iter().any(|i| i.unique && i.name == n)
+                    || table
+                        .indexes
+                        .iter()
+                        .any(|i| i.is_unique_constraint() && i.name == n)
                     || resolved_fks.iter().any(|f| f.name == n)
             };
             let name = match &fk.name {
@@ -1865,6 +1871,7 @@ impl Engine {
                     // the constraint, not the index, enforces it (23P01, gist.md §7.2), so it is no
                     // FOREIGN KEY target and no ON CONFLICT column-list arbiter.
                     unique: false,
+                    constraint: false,
                     kind: method,
                     predicate,
                     // Plain-column keys; only a partial predicate can carry a dependency.
@@ -2266,7 +2273,9 @@ impl Engine {
             AlterTableAction::RenameConstraint { old, new } => {
                 let exists = |name: &str, t: &Table| {
                     t.checks.iter().any(|c| c.name == name)
-                        || t.indexes.iter().any(|i| i.unique && i.name == name)
+                        || t.indexes
+                            .iter()
+                            .any(|i| i.is_unique_constraint() && i.name == name)
                         || t.foreign_keys.iter().any(|f| f.name == name)
                         || t.exclusions.iter().any(|e| e.name == name)
                 };
@@ -2300,7 +2309,7 @@ impl Engine {
                     }
                 }
                 for i in &mut table.indexes {
-                    if (i.unique || index_rename.is_some()) && i.name == old {
+                    if (i.is_unique_constraint() || index_rename.is_some()) && i.name == old {
                         i.name = new.clone();
                         index_rename = Some((old.clone(), new.clone()));
                     }
@@ -2894,6 +2903,7 @@ impl Engine {
                                     name: name.clone(),
                                     keys: cols.into_iter().map(IndexKey::Column).collect(),
                                     unique: true,
+                                    constraint: true,
                                     kind: IndexKind::Btree,
                                     predicate: None,
                                     host_deps: Vec::new(),
@@ -3103,6 +3113,7 @@ impl Engine {
                                     name: name.clone(),
                                     keys: cols.into_iter().map(IndexKey::Column).collect(),
                                     unique: false,
+                                    constraint: false,
                                     kind: method,
                                     predicate,
                                     host_deps,
@@ -3144,7 +3155,7 @@ impl Engine {
                         if let Some(ix) = table
                             .indexes
                             .iter()
-                            .find(|x| x.unique && x.name == name)
+                            .find(|x| x.is_unique_constraint() && x.name == name)
                             .cloned()
                         {
                             let cols = sorted_unique(&ix.column_ordinals().unwrap());
@@ -5368,6 +5379,7 @@ impl Engine {
             name,
             keys: ci_keys,
             unique: ci.unique,
+            constraint: false,
             kind,
             predicate,
             host_deps,
@@ -5794,34 +5806,14 @@ impl Engine {
             ));
         }
         let name_key = di.name.to_string();
-        // An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
-        // it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet, so the
-        // index lives until DROP TABLE). 2BP01, matching PG's "cannot drop index … because
-        // constraint … requires it" (spec/design/gist.md §7).
-        if let Some(table_key) = self.find_index(&di.name).map(|(tk, _)| tk.to_string()) {
-            if let Some(t) = self.table(&table_key) {
-                if t.exclusions.iter().any(|e| e.index == di.name) {
-                    return Err(EngineError::new(
-                        SqlState::DependentObjectsStillExist,
-                        format!(
-                            "cannot drop index {} because constraint {} on table {} requires it",
-                            di.name, di.name, t.name
-                        ),
-                    )
-                    .hinted(&error_hint::drop_owner_instead(&di.name, &t.name)));
-                }
-            }
-        }
         if self.is_temp_index(&di.name) {
-            let table_key = self
-                .temp_read_snap()
-                .find_index(&di.name)
-                .unwrap()
-                .0
-                .to_string();
+            let (table_key, def) = self.temp_read_snap().find_index(&di.name).unwrap();
+            let (table_key, def) = (table_key.to_string(), def.clone());
+            self.check_index_owner(&table_key, &def)?;
             self.temp_working_mut().remove_index(&table_key, &name_key);
-        } else if let Some((table_key, _)) = self.find_index(&di.name) {
-            let table_key = table_key.to_string();
+        } else if let Some((table_key, def)) = self.find_index(&di.name) {
+            let (table_key, def) = (table_key.to_string(), def.clone());
+            self.check_index_owner(&table_key, &def)?;
             self.working_mut().remove_index(&table_key, &name_key);
         } else {
             return Err(EngineError::new(
@@ -5833,6 +5825,33 @@ impl Engine {
             cost: 0,
             rows_affected: None,
         })
+    }
+
+    /// Refuse a `DROP INDEX` of an index a constraint owns — a UNIQUE constraint's backing index or
+    /// an EXCLUDE constraint's (spec/design/constraints.md §5.5, gist.md §7). 2BP01, matching
+    /// PostgreSQL's "cannot drop index … because constraint … requires it"; `ALTER TABLE … DROP
+    /// CONSTRAINT` drops both.
+    fn check_index_owner(&self, table_key: &str, def: &IndexDef) -> Result<()> {
+        let Some(t) = self.table(table_key) else {
+            return Ok(());
+        };
+        let mut owner: Option<&str> = def.is_unique_constraint().then_some(&*def.name);
+        for e in &t.exclusions {
+            if e.index == def.name {
+                owner = Some(&e.name);
+            }
+        }
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        Err(EngineError::new(
+            SqlState::DependentObjectsStillExist,
+            format!(
+                "cannot drop index {} because constraint {owner} on table {} requires it",
+                def.name, t.name
+            ),
+        )
+        .hinted(&error_hint::drop_owner_instead(owner, &t.name)))
     }
 
     /// Analyze and run a CREATE TYPE (spec/design/composite.md): reject a duplicate type name
@@ -6046,9 +6065,9 @@ impl Engine {
         })
     }
 
-    /// Analyze and run a DROP SEQUENCE (spec/design/sequences.md §1). RESTRICT-only: a missing
-    /// sequence is 42P01 unless `IF EXISTS`. No dependency tracking this slice (a plain `DEFAULT
-    /// nextval('s')` creates none — PG). Multiple names are dropped left to right.
+    /// Analyze and run a DROP SEQUENCE (spec/design/sequences.md §1). A missing sequence is 42P01
+    /// unless `IF EXISTS`; an owning serial column, a column DEFAULT that names the sequence, or
+    /// (under RESTRICT) a view blocks the drop with 2BP01. Multiple names are dropped left to right.
     pub(crate) fn execute_drop_sequence(&mut self, ds: DropSequence) -> Result<Outcome> {
         for name in &ds.names {
             // Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
@@ -6097,6 +6116,29 @@ impl Engine {
                     SqlState::DependentObjectsStillExist,
                     format!(
                         "cannot drop sequence {seq_name} because other objects depend on it: default value for column {col_name} of table {table_name} depends on sequence {seq_name}"
+                    ),
+                ));
+            }
+            // A column DEFAULT that names the sequence depends on it (sequences.md §1): 2BP01, as in
+            // PostgreSQL. Its CASCADE would drop the default too: not supported.
+            let seq_name = self.sequence(name).map(|s| s.name.clone()).unwrap();
+            let dep = self
+                .read_snap()
+                .sequence_default_dependent(&seq_name)
+                .or_else(|| self.temp_read_snap().sequence_default_dependent(&seq_name));
+            if let Some(dep) = dep {
+                if ds.cascade {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "DROP SEQUENCE ... CASCADE of a sequence a column default uses is not supported: {dep}"
+                        ),
+                    ));
+                }
+                return Err(EngineError::new(
+                    SqlState::DependentObjectsStillExist,
+                    format!(
+                        "cannot drop sequence {seq_name} because other objects depend on it: {dep} depends on sequence {seq_name}"
                     ),
                 ));
             }

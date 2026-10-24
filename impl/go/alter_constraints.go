@@ -267,7 +267,7 @@ func constraintNameTaken(t *catTable, name string) bool {
 		}
 	}
 	for _, i := range t.Indexes {
-		if i.Unique && i.Name == name {
+		if i.isUniqueConstraint() && i.Name == name {
 			return true
 		}
 	}
@@ -355,7 +355,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 				return relationTaken(n) || constraintNameTaken(t, n) || schemaConstraintNameTaken(snap, t.Name, n)
 			})
 		}
-		t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Unique: true, Kind: indexBtree})
+		t.Indexes = append(t.Indexes, indexDef{Name: name, Keys: columnKeys(cols), Unique: true, Constraint: true, Kind: indexBtree})
 		sort.SliceStable(t.Indexes, func(i, j int) bool { return t.Indexes[i].Name < t.Indexes[j].Name })
 		st.added[name] = true
 		return nil
@@ -522,7 +522,7 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 		}
 	}
 	for i, ix := range t.Indexes {
-		if ix.Unique && ix.Name == d.Name {
+		if ix.isUniqueConstraint() && ix.Name == d.Name {
 			cols := sortedUnique(ix.columnOrdinals())
 			var originalCols []int
 			for _, col := range cols {

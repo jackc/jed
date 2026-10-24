@@ -498,13 +498,23 @@ key first**, then the unique indexes in the catalog's **ascending name byte orde
 PostgreSQL reports in index *creation* order, which jed does not persist — a documented
 divergence (the code is identical; only the choice of reported name differs).
 
-### 5.5 Persistence
+### 5.5 Persistence and ownership
 
-Nothing constraint-specific is persisted: the backing index is stored like any other, with
-its **`unique` flag** in the per-index catalog flags byte (`format_version` **6** —
-[../fileformat/format.md](../fileformat/format.md), [indexes.md §6](indexes.md)). A
-reloaded database enforces exactly as the creating session did. The byte fixture is the
-`unique_table.jed` golden.
+The backing index is stored like any other, with its **`unique` flag** in the per-index
+catalog flags byte (`format_version` **6** — [../fileformat/format.md](../fileformat/format.md),
+[indexes.md §6](indexes.md)), plus an **`is_constraint` flag** (`format_version` **50**, bit5)
+that tells a UNIQUE constraint's index from a bare `CREATE UNIQUE INDEX`. Both enforce alike;
+the flag decides only which is a *constraint*, as PostgreSQL's `pg_constraint` row does:
+
+- `DROP INDEX` of a constraint's index is **`2BP01`** (*cannot drop index … because constraint …
+  requires it*, hint *You can drop constraint … on table … instead.*); `ALTER TABLE … DROP
+  CONSTRAINT` drops the constraint and its index together.
+- `ALTER TABLE … DROP CONSTRAINT`, `RENAME CONSTRAINT` and `ON CONFLICT ON CONSTRAINT` naming a
+  bare unique index are **`42704`**, and `jed_constraints` does not list one. A bare unique index is
+  still a FOREIGN KEY target and an `ON CONFLICT` column-list arbiter, as in PostgreSQL.
+
+A reloaded database enforces exactly as the creating session did. The byte fixture is the
+`unique_table.jed` golden (`t_v_key` and `wv` are constraints, `uq` is not).
 
 ## 6. `FOREIGN KEY`
 

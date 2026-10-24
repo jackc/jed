@@ -745,7 +745,6 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | `security_barrier` changes no plan | jed never evaluates an outer condition on a row the view's own `WHERE` rejects (§16.2) |
 | `DROP SEQUENCE` / `DROP TYPE … CASCADE` of an owned sequence or of a type a column uses is `0A000`; PG drops the default or column | `CASCADE` drops only views (§6.2) |
 | A view records no dependency on a collation or host function | neither can be dropped through SQL; a view stores no derived value (§6.2) |
-| A view column default's own `nextval('s')` records no dependency; PG records one | view defaults follow jed's table-default rule (sequences.md §1) |
 | PG also accepts `ALTER TABLE v SET / RESET (options)` on a view; jed accepts only the `ALTER VIEW` spelling | the `ALTER TABLE` grammar has no option lists |
 | A zero-column view is `0A000` | the canonical text cannot express an empty select list after `*` expansion |
 | `ANALYZE v` succeeds silently; PG also emits a warning | jed has no notice channel |

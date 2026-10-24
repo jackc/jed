@@ -17,12 +17,18 @@ reader/fallback outcomes and production histories' cross-core byte equality are 
 A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 49)
+## Version scope (`format_version` 50)
 
 > **The encrypted variant** ([encrypted.md](encrypted.md)) is the same `format_version` with a
 > nonzero `suite` byte at meta offset 6; it amends this layout only where encrypted.md says (page
 > capacity, bound pointers, the key block at pages 2–3, the authenticated meta). A reader that
 > predates it rejects that byte as a nonzero reserved field.
+
+`format_version` **50** — **UNIQUE constraint ownership** ([../design/constraints.md §5.5](../design/constraints.md)).
+The per-index `index_flags` byte gains **bit5 `is_constraint`**: set on the unique index that backs a
+`UNIQUE` constraint (`CREATE TABLE … UNIQUE`, `ALTER TABLE … ADD UNIQUE`), clear on a bare `CREATE
+UNIQUE INDEX`. It is legal only with bit0 `unique` (else `XX001`). A file with no UNIQUE constraint
+changes only by its version byte + meta CRC. Readers accept only the exact current version.
 
 `format_version` **49** — **batched durability** ([../design/validated-cow.md §4](../design/validated-cow.md)).
 No byte layout changes. A commit's meta goes to the slot that does not hold the newest durable meta
@@ -899,7 +905,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`index_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key **element** (a column or, **v26**, an expression): |
 | &nbsp;&nbsp;`key_element` ×`key_col_count` | per element a `u16` in **index-key order**: a **column ordinal** (`< col_count`; duplicates allowed — indexes.md §1; an out-of-range non-sentinel ordinal is `XX001`), **or** the sentinel **`0xFFFF`** (**new in v26**) marking an **expression key**, immediately followed by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (*Check-expression text* below). An expression element re-parses at load (kept unparsed on failure — [unparsable-definitions.md](../design/unparsable-definitions.md)) and re-resolves against this table's columns to recover its result type; a plain column index writes no `0xFFFF` and is byte-identical to v6 |
-| &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); **bit1 `has_predicate`** (**new in v27** — a partial index, indexes.md §9; the predicate text follows `index_root_page`); bit2 `has_host_deps` (v31), bit3 `has_timezone_deps` (v32), **bit4 `has_key_options`** (**new in v46** — indexes.md §11; B-tree only); bits 5–7 reserved, written 0 (a set reserved bit is `XX001`) |
+| &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); **bit1 `has_predicate`** (**new in v27** — a partial index, indexes.md §9; the predicate text follows `index_root_page`); bit2 `has_host_deps` (v31), bit3 `has_timezone_deps` (v32), **bit4 `has_key_options`** (**new in v46** — indexes.md §11; B-tree only); **bit5 `is_constraint`** (**new in v50** — the index backs a `UNIQUE` constraint, constraints.md §5.5; only with bit0); bits 6–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear. A partial index (`index_flags` bit1) is B-tree, or (**v45**) the GiST index backing a partial exclusion constraint — `has_predicate` set on a GIN index, or on a GiST index no exclusion names, is `XX001` |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
 | &nbsp;&nbsp;`index_pred_len` | u16 — **only present when `index_flags` bit1 (`has_predicate`)** (**new in v27**); written *after* `index_root_page` |

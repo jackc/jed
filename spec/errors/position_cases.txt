@@ -2297,6 +2297,13 @@ code: 2BP01
 no-position
 hint: You can drop constraint x_r_excl on table x instead.
 
+case: DROP INDEX a UNIQUE constraint owns
+setup: CREATE TABLE u (id int PRIMARY KEY, a int UNIQUE)
+run: DROP INDEX u_a_key
+code: 2BP01
+no-position
+hint: You can drop constraint u_a_key on table u instead.
+
 # jed: jed's DROP TYPE takes no CASCADE, so PostgreSQL's CASCADE hint would mislead.
 case: DROP TYPE a column depends on
 setup: CREATE TYPE addr AS (z int)
@@ -2309,5 +2316,14 @@ no-position
 case: DROP SEQUENCE a serial column owns
 setup: CREATE TABLE ts (id serial)
 run: DROP SEQUENCE ts_id_seq
+code: 2BP01
+no-position
+
+# jed: DROP SEQUENCE ... CASCADE of a sequence a column default uses is 0A000, so PostgreSQL's
+# CASCADE hint would mislead.
+case: DROP SEQUENCE a column default uses
+setup: CREATE SEQUENCE ds
+setup: CREATE TABLE td (id bigint PRIMARY KEY DEFAULT nextval('ds'))
+run: DROP SEQUENCE ds
 code: 2BP01
 no-position

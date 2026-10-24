@@ -1,12 +1,13 @@
 # CREATE SEQUENCE / ALTER SEQUENCE RESTART / DROP SEQUENCE — a named, persisted, monotonic i64
 # generator as the third catalog-object kind (after tables + composite types), format_version 12.
 # Order-free CREATE options (INCREMENT/MINVALUE/MAXVALUE/START/CACHE/CYCLE), bigint-only, the shared
-# relation namespace (42P07 duplicate / 42P01 missing), option validation 22023, RESTRICT-only DROP.
+# relation namespace (42P07 duplicate / 42P01 missing), option validation 22023, RESTRICT DROP (a column
+# DEFAULT naming the sequence blocks it, 2BP01).
 # ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n] resets the counter (the only ALTER action this
 # slice; a non-RESTART action is 0A000). The value functions nextval/currval/setval/lastval are
 # exercised in ../expr/sequence_value.test. The transactional-rollback divergence (nextval/setval/
 # RESTART roll back — sequences.md §5) and read-only 25006 live in the per-core unit tests.
-# requires: ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, dml.insert, query.select, types.i64
+# requires: ddl.sequence, func.sequence, ddl.column_default_expr, ddl.create_table, ddl.drop_table, dml.insert, query.select, types.i64
 
 # a bare CREATE SEQUENCE defaults to INCREMENT 1, MINVALUE 1, START 1
 statement ok
@@ -148,6 +149,47 @@ query I nosort
 SELECT nextval('s')
 ----
 1
+
+# a column DEFAULT that names the sequence in a constant nextval / currval / setval argument depends
+# on it: DROP SEQUENCE is 2BP01 (PostgreSQL reads the constant as a regclass), and a multi-name drop
+# fails whole
+statement ok
+CREATE SEQUENCE dep
+
+statement ok
+CREATE SEQUENCE free
+
+statement ok
+CREATE TABLE dep_t (id i64 PRIMARY KEY DEFAULT nextval('dep'), v i32)
+
+statement error 2BP01
+DROP SEQUENCE dep
+
+statement error 2BP01
+DROP SEQUENCE free, dep
+
+query I nosort
+SELECT nextval('free')
+----
+1
+
+statement ok
+CREATE TABLE dep_u (id i32 PRIMARY KEY, c i64 DEFAULT currval('free') + 1)
+
+statement error 2BP01
+DROP SEQUENCE free
+
+statement ok
+DROP TABLE dep_t
+
+statement ok
+DROP SEQUENCE dep
+
+statement ok
+DROP TABLE dep_u
+
+statement ok
+DROP SEQUENCE free
 
 # clean up the live oracle (autocommit DDL persists across corpus:check files)
 statement ok

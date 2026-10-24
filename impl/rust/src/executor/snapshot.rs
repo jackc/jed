@@ -564,6 +564,46 @@ impl Snapshot {
         keys
     }
 
+    /// A column (of a table, then of a view) whose expression `DEFAULT` names sequence `seq` in a
+    /// constant `nextval` / `currval` / `setval` argument — the dependency PostgreSQL records by
+    /// reading the constant as a `regclass`, which makes `DROP SEQUENCE` 2BP01 (sequences.md §1).
+    /// Returns the first such column's description for the error message, scanning tables then
+    /// views in name byte order and columns in ordinal order (CLAUDE.md §8).
+    pub(crate) fn sequence_default_dependent(&self, seq: &str) -> Option<String> {
+        let mut table_keys: Vec<&String> = self.tables.keys().collect();
+        table_keys.sort();
+        for tk in table_keys {
+            let t = &self.tables[tk];
+            for c in &t.columns {
+                if c.default_expr
+                    .as_ref()
+                    .is_some_and(|d| expr_text_names_sequence(&d.expr_text, seq))
+                {
+                    return Some(format!(
+                        "default value for column {} of table {}",
+                        c.name, t.name
+                    ));
+                }
+            }
+        }
+        let mut view_keys: Vec<&String> = self.views.keys().collect();
+        view_keys.sort();
+        for vk in view_keys {
+            let v = &self.views[vk];
+            for (i, d) in v.defaults.iter().enumerate() {
+                if d.as_ref()
+                    .is_some_and(|d| expr_text_names_sequence(&d.expr_text, seq))
+                {
+                    return Some(format!(
+                        "default value for column {} of view {}",
+                        v.columns[i], v.name
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Whether any table column or composite-type field still references the composite type
     /// `name` (exact name) — the `DROP TYPE ... RESTRICT` dependency check (2BP01). Returns
     /// the first dependent's description for the error detail, or `None` if there are no dependents.
@@ -1595,4 +1635,25 @@ impl Snapshot {
             .map(|(k, t)| (k.as_str(), t, self.stores.get(k).expect("store exists")))
             .collect()
     }
+}
+
+/// Whether persisted expression text calls `nextval` / `currval` / `setval` with a lone
+/// string-literal first argument that names `seq` — a constant argument, which is what PostgreSQL
+/// reads as a `regclass` (an expression such as `'a' || 'b'` is a text value resolved at run time,
+/// and records nothing). Token-level, so it reads unparsable stored text too.
+fn expr_text_names_sequence(text: &str, seq: &str) -> bool {
+    use crate::token::Token;
+    let Ok(tokens) = crate::lexer::lex(text) else {
+        return false;
+    };
+    tokens.windows(4).any(|w| {
+        let call = matches!(&w[0], Token::Word(n)
+            if matches!(n.as_str(), "nextval" | "currval" | "setval"))
+            && matches!(w[1], Token::LParen)
+            && matches!(w[3], Token::RParen | Token::Comma);
+        match (&w[2], call) {
+            (Token::Str(s), true) => crate::parser::parse_name_text(s).is_ok_and(|n| n == seq),
+            _ => false,
+        }
+    })
 }

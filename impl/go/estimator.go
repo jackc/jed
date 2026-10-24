@@ -2035,7 +2035,7 @@ func (db *engine) estimateCatalogRows(srf *srfPlan) int64 {
 		case srfJedConstraints:
 			rows = satEstimateAdd(rows, int64(len(table.Checks)+len(table.ForeignKeys)+len(table.Exclusions)))
 			for _, index := range table.Indexes {
-				if index.Unique {
+				if index.isUniqueConstraint() {
 					rows = satEstimateAdd(rows, 1)
 				}
 			}

@@ -1275,7 +1275,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 			})
 		}
 		// Insert in catalog (ascending name byte) order — indexes.md §6.
-		def := indexDef{Name: name, Keys: columnKeys(ru.cols), Unique: true, Kind: indexBtree}
+		def := indexDef{Name: name, Keys: columnKeys(ru.cols), Unique: true, Constraint: true, Kind: indexBtree}
 		nameKey := name
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -1383,7 +1383,7 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 				}
 			}
 			for _, ix := range table.Indexes {
-				if ix.Unique && ix.Name == candidate {
+				if ix.isUniqueConstraint() && ix.Name == candidate {
 					return true
 				}
 			}
@@ -2272,7 +2272,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				}
 			}
 			for _, i := range table.Indexes {
-				if i.Unique && i.Name == name {
+				if i.isUniqueConstraint() && i.Name == name {
 					return true
 				}
 			}
@@ -2311,7 +2311,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 		}
 		for i := range table.Indexes {
-			if (table.Indexes[i].Unique || indexOld != "") && table.Indexes[i].Name == old {
+			if (table.Indexes[i].isUniqueConstraint() || indexOld != "") && table.Indexes[i].Name == old {
 				table.Indexes[i].Name = next
 				indexOld, indexNew = old, next
 			}
@@ -4457,31 +4457,49 @@ func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 		return outcome{}, newError(WrongObjectType, di.Name+" is not an index")
 	}
 	nameKey := di.Name
-	switch {
-	case db.isTempIndex(di.Name):
-		tableKey, _, _ := db.tempSnap().findIndex(di.Name)
+	if db.isTempIndex(di.Name) {
+		tableKey, def, _ := db.tempSnap().findIndex(di.Name)
+		if err := db.checkIndexOwner(tableKey, &def); err != nil {
+			return outcome{}, err
+		}
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.removeIndex(tableKey, nameKey)
-	default:
-		tableKey, _, ok := db.findIndex(di.Name)
-		if !ok {
-			return outcome{}, newError(UndefinedObject, "index does not exist: "+di.Name)
-		}
-		// An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
-		// it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01,
-		// matching PG's "cannot drop index … because constraint … requires it" (gist.md §7).
-		if t, tok := db.lkpTable(tableKey); tok {
-			for _, e := range t.Exclusions {
-				if e.Index == di.Name {
-					return outcome{}, newError(DependentObjectsStillExist,
-						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it").
-						hinted(dropOwnerInsteadHint(di.Name, t.Name))
-				}
-			}
-		}
-		db.working().removeIndex(tableKey, nameKey)
+		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
+	tableKey, def, ok := db.findIndex(di.Name)
+	if !ok {
+		return outcome{}, newError(UndefinedObject, "index does not exist: "+di.Name)
+	}
+	if err := db.checkIndexOwner(tableKey, &def); err != nil {
+		return outcome{}, err
+	}
+	db.working().removeIndex(tableKey, nameKey)
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
+}
+
+// checkIndexOwner refuses a DROP INDEX of an index a constraint owns — a UNIQUE constraint's backing
+// index or an EXCLUDE constraint's (constraints.md §5.5, gist.md §7). 2BP01, matching PostgreSQL's
+// "cannot drop index … because constraint … requires it"; ALTER TABLE … DROP CONSTRAINT drops both.
+func (db *engine) checkIndexOwner(tableKey string, def *indexDef) error {
+	t, ok := db.lkpTable(tableKey)
+	if !ok {
+		return nil
+	}
+	owner := ""
+	if def.isUniqueConstraint() {
+		owner = def.Name
+	}
+	for _, e := range t.Exclusions {
+		if e.Index == def.Name {
+			owner = e.Name
+		}
+	}
+	if owner == "" {
+		return nil
+	}
+	return newError(DependentObjectsStillExist,
+		"cannot drop index "+def.Name+" because constraint "+owner+" on table "+t.Name+" requires it").
+		hinted(dropOwnerInsteadHint(owner, t.Name))
 }
 
 // executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a duplicate
@@ -4630,8 +4648,9 @@ func (db *engine) executeCreateSequence(cs *createSequence) (outcome, error) {
 }
 
 // executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
-// RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
-// (a plain DEFAULT nextval('s') creates none — PG). Multiple names are dropped left to right.
+// A missing sequence is 42P01 unless IF EXISTS; an owning serial column, a column DEFAULT that names
+// the sequence, or (under RESTRICT) a view blocks the drop with 2BP01. Multiple names are dropped
+// left to right.
 func (db *engine) executeDropSequence(ds *dropSequence) (outcome, error) {
 	for _, name := range ds.Names {
 		// Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
@@ -4663,6 +4682,21 @@ func (db *engine) executeDropSequence(ds *dropSequence) (outcome, error) {
 				"cannot drop sequence %s because other objects depend on it: default value for column %s of table %s depends on sequence %s",
 				seq.Name, colName, tableName, seq.Name,
 			))
+		}
+		// A column DEFAULT that names the sequence depends on it (sequences.md §1): 2BP01, as in
+		// PostgreSQL. Its CASCADE would drop the default too: not supported.
+		dep, ok := db.readSnap().sequenceDefaultDependent(seq.Name)
+		if !ok {
+			dep, ok = db.tempSnap().sequenceDefaultDependent(seq.Name)
+		}
+		if ok {
+			if ds.Cascade {
+				return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+					"DROP SEQUENCE ... CASCADE of a sequence a column default uses is not supported: %s", dep))
+			}
+			return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
+				"cannot drop sequence %s because other objects depend on it: %s depends on sequence %s",
+				seq.Name, dep, seq.Name))
 		}
 		// A view that depends on the sequence blocks the drop under RESTRICT (2BP01); CASCADE drops
 		// it, with every view that depends on it (views.md §6.1).

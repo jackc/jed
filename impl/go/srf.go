@@ -1238,9 +1238,10 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				NullValue(),
 			})
 		}
-		// UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
+		// UNIQUE: every unique b-tree index that backs a UNIQUE constraint (a bare CREATE UNIQUE
+		// INDEX is an index, not a constraint).
 		for _, idx := range t.Indexes {
-			if !idx.Unique {
+			if !idx.isUniqueConstraint() {
 				continue
 			}
 			if err := m.Step(); err != nil {
