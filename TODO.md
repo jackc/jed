@@ -46,7 +46,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Named + optional (DEFAULT) function arguments.** → [functions.md §11](spec/design/functions.md)
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
 - [x] **Named windows.** → [window.md](spec/design/window.md)
-  - [ ] _follow-on:_ PostgreSQL's prefix-compatible sort sharing between window definitions (window.md §11).
 - [x] **`DISTINCT ON`** — the kept row is the first under the fully determined `ORDER BY`. → [grammar.md §11.1](spec/design/grammar.md)
   - [ ] _follow-on:_ streaming dedup over a scan that already satisfies the order, so `LIMIT` stops the scan early (planner.md §4).
   - [ ] _follow-on:_ push WHERE conjuncts that read only `ON` keys into a `DISTINCT ON` body (planner.md §3).
