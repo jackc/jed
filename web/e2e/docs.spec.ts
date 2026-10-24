@@ -437,6 +437,23 @@ test('the select page orders an aggregate input live', async ({ page }) => {
   );
 });
 
+test('the select page keeps one row per group with DISTINCT ON live', async ({ page }) => {
+  await page.goto('/docs/sql/select/');
+  // DISTINCT ON (spec/design/grammar.md §11.1): each category's cheapest product.
+  const panel = livePanel(page, 'distinctOn');
+  await expect(panel.getByTestId('result-rows')).toContainText('Coffee');
+  await expect(panel.getByTestId('result-rows')).toContainText('Pen');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('Mug');
+  await panel
+    .getByTestId('sql-input')
+    .fill(
+      'SELECT DISTINCT ON (category) category, name FROM product ORDER BY category, price DESC'
+    );
+  await panel.getByTestId('run-button').click();
+  await expect(panel.getByTestId('result-rows')).toContainText('Mug');
+  await expect(panel.getByTestId('result-rows')).toContainText('Notebook');
+});
+
 test('the select page inserts the rows of a set operation live', async ({ page }) => {
   await page.goto('/docs/sql/select/');
   // A set operation as an INSERT source (spec/design/grammar.md §24): the two office products are

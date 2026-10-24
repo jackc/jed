@@ -771,6 +771,11 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 		r.emit(d, "Limit", limitDetail(sp.limit, sp.offset))
 		d++
 	}
+	// A DISTINCT ON dedups after its sort, so its Distinct renders above the Sort (explain.md §4).
+	if sp.distinctOn > 0 {
+		r.emit(d, "Distinct", fmt.Sprintf("on=%d", sp.distinctOn))
+		d++
+	}
 	orderNote := ""
 	if len(sp.order) > 0 {
 		switch {
@@ -839,6 +844,9 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 func selectActualRootNode(sp *selectPlan) string {
 	if sp.limit != nil || sp.offset != nil {
 		return "Limit"
+	}
+	if sp.distinctOn > 0 {
+		return "Distinct"
 	}
 	if len(sp.order) > 0 && !sp.phys.pkOrdered && sp.phys.indexOrder == nil && !sp.phys.joinPkOrdered {
 		return "Sort"

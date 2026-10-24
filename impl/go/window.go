@@ -1101,6 +1101,23 @@ func groupWindowSpecs(specs []windowSpec) [][]int {
 	return groups
 }
 
+// dedupSortedRuns is DISTINCT ON (spec/design/grammar.md §11.1): keep the first row of each run of
+// sorted rows whose leading dedup keys compare equal — NULL-safe sort equality; every jed collation
+// is deterministic, so collation-equal text is identical text and the value comparator decides.
+// Unmetered, like the sort it follows. dropped sees each discarded row, so its query-memory charge
+// can be released.
+func dedupSortedRuns[R ~[]Value](rows []R, keys []orderSlot, dropped func(R)) []R {
+	out := rows[:0]
+	for _, row := range rows {
+		if len(out) > 0 && cmpRowsByOrder(out[len(out)-1], row, keys) == 0 {
+			dropped(row)
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
 // cmpRowsByOrder compares two rows by the (all-C) ORDER BY keys — the first non-equal key decides; a
 // full tie is 0 (the stable sort then keeps input order). Only used when no key is collated.
 func cmpRowsByOrder[R ~[]Value](a, b R, order []orderSlot) int {

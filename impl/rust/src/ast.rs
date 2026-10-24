@@ -1252,6 +1252,11 @@ pub struct Select {
     /// `SELECT DISTINCT` — deduplicate the projected output rows (NULL-safe), applied
     /// after ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
     pub distinct: bool,
+    /// `SELECT DISTINCT ON (k, …)` — the ON keys, each classified like an ORDER BY key (ordinal,
+    /// column, or expression; ascending, default NULL placement). Non-empty only with `distinct`
+    /// set. The planner matches them against the ORDER BY and dedups the sorted rows by them
+    /// (spec/design/grammar.md §11.1).
+    pub distinct_on: Vec<OrderKey>,
     /// Projected expressions, or `*` for all (`SelectItems::All`).
     pub items: SelectItems,
     /// The first table reference of the FROM clause, or `None` for a FROM-less SELECT —

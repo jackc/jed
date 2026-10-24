@@ -34,6 +34,19 @@ func relationColumnRange(plan *selectPlan, ordinal int) columnRanges {
 // scope's relation list — the rules need the *catTable pointers the owned plan deliberately drops
 // (planRel carries only names, so the plan outlives the scope).
 func (db *engine) optimizeSelect(plan *selectPlan, rels []scopeRel) {
+	// A DISTINCT ON plan always sorts and then dedups, so no rule may elide its sort or stop its
+	// input early: it is optimized as the unordered, unlimited query (planner.md §4).
+	if plan.distinctOn > 0 {
+		order, limit, offset, distinctOn := plan.order, plan.limit, plan.offset, plan.distinctOn
+		plan.order, plan.limit, plan.offset, plan.distinctOn = nil, nil, nil, 0
+		db.optimizeSelectRules(plan, rels)
+		plan.order, plan.limit, plan.offset, plan.distinctOn = order, limit, offset, distinctOn
+		return
+	}
+	db.optimizeSelectRules(plan, rels)
+}
+
+func (db *engine) optimizeSelectRules(plan *selectPlan, rels []scopeRel) {
 	db.ruleScanBounds(plan, rels)
 	db.ruleIndexNestedLoop(plan, rels)
 	db.ruleHashJoin(plan, rels)

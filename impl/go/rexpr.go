@@ -1888,8 +1888,12 @@ type selectPlan struct {
 	// columnTypmods is each output column's typmod (create-table-as.md §2), carried the same way.
 	columnTypmods []typmod
 	distinct      bool
-	limit         *int64
-	offset        *int64
+	// distinctOn is the number of leading order keys that form a DISTINCT ON dedup key (0 = none).
+	// The sorted rows keep the first of each run of equal keys, before LIMIT/OFFSET and projection
+	// (spec/design/grammar.md §11.1). distinct is false when this is set.
+	distinctOn int
+	limit      *int64
+	offset     *int64
 	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
 	// §14): which of its columns this query statically references. Drives the chain-page_read /
 	// value_decompress portion of the scan's up-front cost block — an untouched spilled or

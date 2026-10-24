@@ -665,6 +665,10 @@ id = "query.distinct"
 description = "SELECT DISTINCT: deduplicate projected output rows (NULL-safe), with the PostgreSQL ORDER-BY-in-select-list restriction"
 
 [[capability]]
+id = "query.distinct_on"
+description = "SELECT DISTINCT ON (keys): keep the first row of each key group in the fully determined ORDER BY order (spec/design/grammar.md §11.1). Keys resolve like ORDER BY keys (ordinal, output name, input column, expression); they must match the leading ORDER BY keys (42P10), and unmatched keys are appended to the sort when every ORDER BY key matches. Grouping is NULL-safe sort equality. The dedup runs after the sort and before LIMIT/OFFSET; window functions see every row. Only emitted rows are projected; the dedup compare is unmetered"
+
+[[capability]]
 id = "query.select_no_from"
 description = "FROM-less SELECT — the select list evaluates over ONE virtual zero-column row with no table access (PostgreSQL semantics, spec/design/grammar.md §34): WHERE/LIMIT/OFFSET/DISTINCT/HAVING/aggregates compose (SELECT 1 WHERE false → zero rows; SELECT count(*) → 1 via the single-group rule), and it is a full citizen of set operations, subqueries (a correlated zero-relation scope resolves purely outward), and INSERT ... SELECT. SELECT * with no FROM is 42601 (PG's exact message), a bare column the ordinary 42703. Cost charges no scan units — just the items' metered evaluation plus row_produced (spec/design/cost.md §3)"
 

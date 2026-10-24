@@ -975,6 +975,7 @@ impl Engine {
         };
         if let Some(limit) = sp.limit {
             if !sp.distinct
+                && sp.distinct_on == 0
                 && (streaming_scan_eligible(sp)
                     || sp.phys.index_order.is_some()
                     || self.window_top_n_eligible(sp))
@@ -1162,6 +1163,23 @@ impl Engine {
             plan = EstimatedPlan::wrap(plan, rows, logical_rows, local);
             self.add_expression_list_subqueries(&mut plan.root, &sp.order_exprs, rows, ctx);
             plan.nodes[0] = plan.root.clone();
+        }
+
+        // DISTINCT ON dedups the sorted rows by its leading sort keys (estimator.md §7): the group
+        // count over those keys, with column statistics when every key is a bare input column of an
+        // ungrouped query.
+        if sp.distinct_on > 0 {
+            let keys = &sp.order[..sp.distinct_on];
+            let input_width: usize = sp.rels.iter().map(|r| r.col_count).sum();
+            let input = plan.root.rows;
+            let default = || input.min(estimate_pow(DEFAULT_DISTINCT_VALUES, keys.len()));
+            let rows = if !sp.is_agg && keys.iter().all(|(slot, ..)| *slot < input_width) {
+                self.estimate_simple_distinct_rows(sp, keys.iter().map(|(slot, ..)| slot), input)
+                    .unwrap_or_else(default)
+            } else {
+                default()
+            };
+            plan = EstimatedPlan::wrap(plan, rows, rows, [0; ESTIMATOR_UNIT_COUNT]);
         }
 
         if sp.limit.is_some() || sp.offset.is_some() {

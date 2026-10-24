@@ -203,6 +203,7 @@ function joinGroupBody(from: TableRef, joins: JoinClause[]): Select {
   return {
     kind: "select",
     distinct: false,
+    distinctOn: [],
     items: { kind: "all" },
     from,
     joins,
@@ -3654,6 +3655,23 @@ class Parser {
         distinct = true;
       }
     }
+    // DISTINCT ON (k, …): the word `on` directly followed by `(` (grammar.md §11.1); any other `on`
+    // is the first select item.
+    const distinctOn: OrderKey[] = [];
+    if (distinct && this.peekKeyword() === "on" && this.tokens[this.pos + 1]!.kind === "lparen") {
+      this.advance();
+      this.advance();
+      for (;;) {
+        const expr = this.parseExpr();
+        distinctOn.push(classifyOrderKey(expr, null, false, false, true));
+        if (this.peek().kind === "comma") {
+          this.advance();
+          continue;
+        }
+        break;
+      }
+      this.expect("rparen");
+    }
 
     // Only the statement's leftmost SELECT may take an INTO (create-table-as.md §6), so this one owns
     // it and every SELECT nested in its clauses does not.
@@ -3682,6 +3700,7 @@ class Parser {
     return {
       kind: "select",
       distinct,
+      distinctOn,
       items,
       from,
       joins,
@@ -4662,6 +4681,7 @@ class Parser {
       source = {
         kind: "select",
         distinct: false,
+        distinctOn: [],
         items: { kind: "all" },
         from,
         joins: [],
@@ -7124,6 +7144,7 @@ function valuesQuery(
   return {
     kind: "select",
     distinct: false,
+    distinctOn: [],
     items: { kind: "all" },
     from: inner,
     joins: [],

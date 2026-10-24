@@ -65,6 +65,7 @@ impl Engine {
             && self.spill.is_some()
             && (plan.is_agg
                 || plan.distinct
+                || plan.distinct_on > 0
                 || plan.phys.hash_join.is_some()
                 || !plan.phys.join_steps.is_empty())
     }
@@ -329,6 +330,33 @@ impl Engine {
             if root != "Sort" {
                 if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
                     profile.record_parent("Sort".to_string(), meter.accrued);
+                }
+            }
+        }
+        if plan.distinct_on > 0 {
+            // DISTINCT ON (grammar.md §11.1): the sorted spool keeps the first row of each run of
+            // equal dedup keys. Only the previous survivor's key values are held.
+            let keys = &plan.order[..plan.distinct_on];
+            let mut kept = self.blocking_spool();
+            let mut prev: Option<Row> = None;
+            let mut scan = rows.into_reader()?;
+            while let Some(row) = scan.next()? {
+                meter.poll()?;
+                let same = prev.as_ref().is_some_and(|p| {
+                    keys.iter().zip(p).all(|((idx, d, n, _), v)| {
+                        key_cmp(v, &row[*idx], *d, *n) == std::cmp::Ordering::Equal
+                    })
+                });
+                if same {
+                    continue;
+                }
+                prev = Some(keys.iter().map(|(idx, ..)| row[*idx].clone()).collect());
+                kept.push(row)?;
+            }
+            rows = kept;
+            if root != "Distinct" {
+                if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                    profile.record_parent("Distinct".to_string(), meter.accrued);
                 }
             }
         }

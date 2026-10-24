@@ -190,7 +190,7 @@ function valueNoOpWidening(leaf: ResolvedType, want: ResolvedType): boolean {
 export function nonMatchingBody(q: QueryPlan): boolean {
   switch (q.kind) {
     case "select":
-      return !q.isAgg && !q.distinct && !q.hasWindow;
+      return !q.isAgg && !q.distinct && q.distinctOn === 0 && !q.hasWindow;
     case "setOp":
       return q.op === "union" && q.all && nonMatchingBody(q.lhs) && nonMatchingBody(q.rhs);
     default:

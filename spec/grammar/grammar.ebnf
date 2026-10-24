@@ -861,11 +861,22 @@ set_operand    ::= select_core | values_body | "(" subquery_expr ")"
  * 0A000. TEMP, TEMPORARY, UNLOGGED, and TABLE are words of the clause unless "." follows (a database
  * qualifier); UNLOGGED is 0A000. "INTO" is a bare-label stop word (../design/grammar.md §8), so
  * after a select item it begins this clause rather than an output label. */
-select_core    ::= "SELECT" "DISTINCT"? select_items into_clause? ("FROM" from_clause)?
+select_core    ::= "SELECT" distinct_clause? select_items into_clause? ("FROM" from_clause)?
                    where_clause?
                    group_by?
                    having_clause?
                    window_clause?
+
+/* SELECT DISTINCT / DISTINCT ON (../design/grammar.md §11). DISTINCT is non-reserved: it is the
+ * modifier iff the next token is neither "FROM" nor end of input (a two-token lookahead), else it
+ * is a column named "distinct". After the modifier, the word "ON" followed by "(" begins the
+ * DISTINCT ON list; any other "ON" (SELECT DISTINCT on FROM t) is the first select item. Each
+ * distinct_on_key is classified exactly like an order_term's expression — an output-column ordinal,
+ * an output name (alias) or input column, or a general expression — but takes no COLLATE suffix of
+ * its own (an inner COLLATE stays part of the expression), no direction and no NULLS placement. The
+ * keys must match the query's leading ORDER BY keys (42P10, §11); with no ORDER BY they become it. */
+distinct_clause ::= "DISTINCT" ("ON" "(" distinct_on_key ("," distinct_on_key)* ")")?
+distinct_on_key ::= expr
 
 into_clause    ::= "INTO" ("TEMPORARY" | "TEMP" | "UNLOGGED")? "TABLE"? qualified_table
 

@@ -6969,6 +6969,10 @@ pub(crate) struct SelectPlan {
     /// Each output column's typmod (create-table-as.md §2), carried the same way.
     column_typmods: Vec<Typmod>,
     distinct: bool,
+    /// `DISTINCT ON`: the number of leading `order` keys that form the dedup key (0 = none). The
+    /// sorted rows keep the first of each run of equal keys, before LIMIT/OFFSET and projection
+    /// (spec/design/grammar.md §11.1). `distinct` is false when this is set.
+    distinct_on: usize,
     limit: Option<i64>,
     offset: Option<i64>,
     /// The **touched set** per relation (cost.md §3 "The touched set"; large-values.md §14): which

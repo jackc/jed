@@ -249,14 +249,15 @@ func bodyPushable(rel planRel) *queryPlan {
 }
 
 // queryBodyPushable is the structural half of body-pushability (planner.md §3.2): a SELECT with no
-// LIMIT or OFFSET that is either ungrouped or grouped by exactly one grouping set with at least one
+// LIMIT, OFFSET, or DISTINCT ON (whose kept row a filter could change — grammar.md §11.1) that is
+// either ungrouped or grouped by exactly one grouping set with at least one
 // key (window functions admitted — bodyInputColumn then requires every window to partition by the
 // column); or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
 func queryBodyPushable(q *queryPlan) bool {
 	switch {
 	case q.sel != nil:
 		b := q.sel
-		if b.limit != nil || b.offset != nil {
+		if b.limit != nil || b.offset != nil || b.distinctOn > 0 {
 			return false
 		}
 		return !b.isAgg || len(b.groupSets) == 1 && len(b.groupKeys) > 0

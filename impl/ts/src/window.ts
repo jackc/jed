@@ -920,6 +920,27 @@ export function sortRows(rows: Row[], order: OrderSlot[], acct: QueryAccount): v
   rows.sort((a, b) => cmpRowsByOrder(a, b, order));
 }
 
+// dedupSortedRuns is DISTINCT ON (spec/design/grammar.md §11.1): keep the first row of each run of
+// sorted rows whose leading dedup keys compare equal — NULL-safe sort equality; every jed collation
+// is deterministic, so collation-equal text is identical text and the value comparator decides.
+// Unmetered, like the sort it follows. dropped sees each discarded row, so its query-memory charge
+// can be released.
+export function dedupSortedRuns<R extends Row>(
+  rows: R[],
+  keys: OrderSlot[],
+  dropped: (row: R) => void,
+): R[] {
+  const out: R[] = [];
+  for (const row of rows) {
+    if (out.length > 0 && cmpRowsByOrder(out[out.length - 1]!, row, keys) === 0) {
+      dropped(row);
+      continue;
+    }
+    out.push(row);
+  }
+  return out;
+}
+
 // cmpRowsByOrder compares two rows by the (all-C) ORDER BY keys — the first non-equal key decides; a
 // full tie is 0 (the stable sort then keeps input order). Only used when no key is collated.
 export function cmpRowsByOrder(a: Row, b: Row, order: OrderSlot[]): number {

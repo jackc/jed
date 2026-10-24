@@ -4125,6 +4125,26 @@ impl Parser {
         let owner = std::mem::replace(&mut self.into_ok, false);
         self.into_nest += 1;
         let mut sel = empty_select(distinct);
+        // `DISTINCT ON (k, …)`: the word `on` directly followed by `(` (grammar.md §11.1); any other
+        // `on` is the first select item.
+        if distinct
+            && self.peek_keyword().as_deref() == Some("on")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance();
+            self.advance();
+            loop {
+                let expr = self.parse_expr()?;
+                sel.distinct_on
+                    .push(Self::classify_order_key(expr, None, false, false, true));
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+        }
         outline(|| -> Result<()> {
             sel.items = self.parse_select_items()?;
             Ok(())
@@ -5422,6 +5442,7 @@ impl Parser {
             };
             let source = QueryExpr::Select(Box::new(Select {
                 distinct: false,
+                distinct_on: Vec::new(),
                 items: SelectItems::All(StarPos(None)),
                 from: Some(from),
                 joins: Vec::new(),
@@ -7980,6 +8001,7 @@ fn splice_leading_group(item: TableRef, joins: Vec<JoinClause>) -> (TableRef, Ve
 fn join_group_body(from: TableRef, joins: Vec<JoinClause>) -> QueryExpr {
     QueryExpr::Select(Box::new(Select {
         distinct: false,
+        distinct_on: Vec::new(),
         items: SelectItems::All(StarPos(None)),
         from: Some(from),
         joins,
@@ -8042,6 +8064,7 @@ const VALUES_LABEL: &str = "*VALUES*";
 fn empty_select(distinct: bool) -> Box<Select> {
     Box::new(Select {
         distinct,
+        distinct_on: Vec::new(),
         items: SelectItems::Items(Vec::new()),
         from: None,
         joins: Vec::new(),
@@ -8086,6 +8109,7 @@ fn values_query(
     };
     QueryExpr::Select(Box::new(Select {
         distinct: false,
+        distinct_on: Vec::new(),
         items: SelectItems::All(StarPos(None)),
         from: Some(inner),
         joins: Vec::new(),

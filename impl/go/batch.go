@@ -156,7 +156,7 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 	}
 	// No blocking / re-shaping operator beyond the fold (each would add cost the fast path would have
 	// to mirror; deferred). LIMIT/OFFSET is honored below via windowBounds, so it need not bail.
-	if plan.distinct || plan.having != nil || plan.hasWindow || len(plan.order) != 0 {
+	if plan.distinct || plan.distinctOn > 0 || plan.having != nil || plan.hasWindow || len(plan.order) != 0 {
 		return false
 	}
 	if len(plan.aggSpecs) == 0 {
