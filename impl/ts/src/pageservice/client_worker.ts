@@ -11,7 +11,8 @@
 // records there too (waking an engine thread waiting for it) and announces on the connection's event
 // port, so the engine thread re-elects at its next idle event-loop turn. Node-only.
 
-import { createConnection, type Socket } from "node:net";
+import { spawn } from "node:child_process";
+import { createConnection } from "node:net";
 import { type MessagePort, workerData } from "node:worker_threads";
 
 import { signalAnswer } from "./blocking.ts";
@@ -34,6 +35,9 @@ export type ClientRequest =
       op: "connect";
       conn: number;
       endpoint: string;
+      // command, when present, is the stream transport's command (spec/pageservice/README.md §5.3):
+      // the connection is its stdin and stdout instead of a socket to endpoint.
+      command?: string[];
       // status and events are sent with a connection's first connect (events in the transfer list).
       status?: SharedArrayBuffer;
       events?: MessagePort;
@@ -44,17 +48,29 @@ export type ClientRequest =
   | { op: "forget"; conn: number };
 
 // The worker's answers: connected (or a reply-less frame written), a reply frame, or the connection
-// is gone (unsent: it was already gone before the frame could be written).
+// is gone (unsent: it was already gone before the frame could be written; failure: a stream
+// transport's standard error tail, or why it could not run, for a failed open's message).
 export type ClientAnswer =
   | { ok: true }
   | { frame: Uint8Array }
-  | { lost: string; unsent?: boolean };
+  | { lost: string; unsent?: boolean; failure?: string };
+
+// STDERR_TAIL is how much of a stream transport's standard error a failed open reports.
+const STDERR_TAIL = 2048;
+
+// Transport is one connection's byte pipe: a socket, or a stream transport's stdin and stdout.
+type Transport = {
+  write(frame: Uint8Array, written?: () => void): void;
+  destroy(): void;
+};
 
 const { flag, port } = workerData as { flag: Int32Array; port: MessagePort };
 
 // Connection is one page-service connection's socket state.
 class Connection {
-  socket: Socket | null = null;
+  socket: Transport | null = null;
+  // failure is the stream transport's standard error tail (or why it could not run).
+  failure = "";
   // lost is why the connection ended (null while it is up).
   lost: string | null = "not connected";
   // waiting is true while the engine thread waits for this connection's frame (or its connect);
@@ -112,7 +128,7 @@ class Connection {
     this.socket = null;
     this.markLost();
     if ((this.waiting && this.frames.length === 0) || this.acking) {
-      this.answer({ lost: this.lost });
+      this.answer(this.lostAnswer());
     }
   }
 
@@ -145,9 +161,18 @@ class Connection {
     if (this.waiting && this.frames.length > 0) this.answer({ frame: this.frames.shift()! });
   }
 
-  connect(endpoint: string): void {
+  // lostAnswer is the answer for a lost connection, carrying a stream transport's failure.
+  lostAnswer(unsent = false): ClientAnswer {
+    const answer: ClientAnswer = { lost: this.lost ?? "not connected" };
+    if (unsent) answer.unsent = true;
+    if (this.failure.trim() !== "") answer.failure = this.failure.trim();
+    return answer;
+  }
+
+  connect(endpoint: string, command?: string[]): void {
     this.socket?.destroy();
     this.lost = null;
+    this.failure = "";
     this.buffered = new Uint8Array(0);
     this.frames.length = 0;
     this.waiting = true;
@@ -155,26 +180,83 @@ class Connection {
       Atomics.store(this.status, STATUS_LOST, 0);
       Atomics.store(this.status, STATUS_PAUSED, 0);
     }
+    if (command !== undefined) {
+      this.spawnTransport(command);
+      return;
+    }
     const s = createConnection(endpoint);
-    this.socket = s;
+    const transport: Transport = {
+      write: (frame, written) => {
+        s.write(frame, written);
+      },
+      destroy: () => s.destroy(),
+    };
+    this.socket = transport;
     s.on("connect", () => {
-      if (this.socket === s && this.waiting) this.answer({ ok: true });
+      if (this.socket === transport && this.waiting) this.answer({ ok: true });
     });
     s.on("data", (chunk: Buffer) => {
-      if (this.socket === s) this.receive(chunk);
+      if (this.socket === transport) this.receive(chunk);
     });
     s.on("error", (error) => {
-      if (this.socket === s) this.connectionLost(error.message);
+      if (this.socket === transport) this.connectionLost(error.message);
     });
     s.on("close", () => {
-      if (this.socket === s) this.connectionLost("the owner closed the connection");
+      if (this.socket === transport) this.connectionLost("the owner closed the connection");
+    });
+  }
+
+  // spawnTransport runs a stream transport's command (spec/pageservice/README.md §5.3): its stdin and
+  // stdout carry the connection, and the tail of its standard error is kept for a failed open's
+  // message. Dropping the connection closes its stdin, so a well-behaved transport exits on its own;
+  // one that does not is killed.
+  private spawnTransport(command: string[]): void {
+    const child = spawn(command[0]!, command.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+    const transport: Transport = {
+      write: (frame, written) => {
+        child.stdin.write(frame, written === undefined ? undefined : () => written());
+      },
+      destroy: () => {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        if (killTimer === null && child.exitCode === null && child.signalCode === null) {
+          killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+          killTimer.unref();
+        }
+      },
+    };
+    this.socket = transport;
+    child.on("spawn", () => {
+      if (this.socket === transport && this.waiting) this.answer({ ok: true });
+    });
+    child.on("error", (error) => {
+      if (this.socket !== transport) return;
+      if (child.pid === undefined) this.failure = `could not run ${command[0]}: ${error.message}`;
+      this.connectionLost(error.message);
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (this.socket === transport) this.receive(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (this.socket !== transport) return;
+      this.failure += chunk.toString("utf8");
+      if (this.failure.length > STDERR_TAIL) this.failure = this.failure.slice(-STDERR_TAIL);
+    });
+    // Write errors (EPIPE once the transport exits) end the connection like its close does.
+    child.stdin.on("error", (error) => {
+      if (this.socket === transport) this.connectionLost(error.message);
+    });
+    child.on("close", () => {
+      if (killTimer !== null) clearTimeout(killTimer);
+      if (this.socket === transport) this.connectionLost("the transport exited");
     });
   }
 
   send(frame: Uint8Array, reply: boolean): void {
     const socket = this.socket;
     if (this.lost !== null || socket === null) {
-      this.answer({ lost: this.lost ?? "not connected", unsent: true });
+      this.answer(this.lostAnswer(true));
       return;
     }
     if (reply) {
@@ -196,7 +278,7 @@ class Connection {
       return;
     }
     if (this.lost !== null || this.socket === null) {
-      this.answer({ lost: this.lost ?? "not connected" });
+      this.answer(this.lostAnswer());
       return;
     }
     this.waiting = true;
@@ -221,7 +303,7 @@ port.on("message", (request: ClientRequest) => {
         connections.set(request.conn, c);
       }
       if (request.status !== undefined) c.attach(request.status, request.events);
-      c.connect(request.endpoint);
+      c.connect(request.endpoint, request.command);
       return;
     case "send":
       if (c === undefined) signalAnswer(port, flag, { lost: "not connected", unsent: true });

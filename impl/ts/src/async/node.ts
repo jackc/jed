@@ -54,8 +54,11 @@ function nodeTransport(worker: Worker): RuntimeTransport {
 }
 
 async function connect(
-  mode: "create" | "open",
-  options: AsyncCreateOptions | (AsyncOpenOptions & { path: string }),
+  mode: "create" | "open" | "remote",
+  options:
+    | AsyncCreateOptions
+    | (AsyncOpenOptions & { path: string })
+    | (AsyncOpenOptions & { command: string[]; name: string }),
 ): Promise<AsyncDatabase> {
   if (options.backend !== undefined && options.backend !== "typescript") {
     throw new TransportError("UNSUPPORTED", "this package provides the typescript backend");
@@ -92,4 +95,22 @@ export function createDatabase(options: AsyncCreateOptions = {}): Promise<AsyncD
 }
 export function openDatabase(path: string, options: AsyncOpenOptions = {}): Promise<AsyncDatabase> {
   return connect("open", { ...options, path });
+}
+
+/**
+ * Open a database another machine (or process) serves over a stream (spec/pageservice/README.md
+ * §5.3): a page client whose connection is the stdin and stdout of `command`, run once per
+ * connection — `["ssh", "--", "db1", "jed pages '/srv/app.jed'"]` reaches `/srv/app.jed` on `db1`.
+ * `name` identifies the database in this process (one handle per name, like a path). The handle runs
+ * its own engine over pages fetched through the command, commits through it, reconnects by running
+ * the command again, and never owns the database. `credential` unlocks an encrypted database and is
+ * sent to the serving end, which needs it only when it must open the file itself. An open that
+ * reaches nothing fails `08006` with the command's standard error. Unix only.
+ */
+export function openRemoteDatabase(
+  command: string[],
+  name: string,
+  options: AsyncOpenOptions = {},
+): Promise<AsyncDatabase> {
+  return connect("remote", { ...options, command: [...command], name });
 }

@@ -12,6 +12,9 @@ ROOT = File.expand_path("..", __dir__)
 CORPUS = File.join(ROOT, "spec/conformance/process")
 # JED_PROCESS_CORES=rust,go narrows the pairings while a core is being brought up; CI runs all three.
 CORES = (ENV["JED_PROCESS_CORES"]&.split(",") || %w[rust go node]).freeze
+# The serving end of the stream transport (`jed pages`) is the Rust core's: every core's stream client
+# runs the Rust actor's `pages` as its transport command.
+ENV["JED_PAGES_ACTOR"] = File.join(ROOT, "impl/rust/target/release/process_actor")
 START_TIMEOUT = 15
 COMMAND_TIMEOUT = 10
 
@@ -166,10 +169,11 @@ def run_scenario(path, first_core, second_core)
           actor_name = step.fetch("actor")
           command = step.fetch("command")
           if command == "start"
-            # `core` pins an actor to one core, for a role only that core implements (the stream
-            # transport's client is Rust's); otherwise "a" runs the pairing's first core, every other
-            # actor its second.
+            # `core` pins an actor to one core, for a role only that core implements; `cores` limits it
+            # to the cores that implement the role (the stream transport's client), falling back to the
+            # first listed. Otherwise "a" runs the pairing's first core, every other actor its second.
             core = step["core"] || (actor_name == "a" ? first_core : second_core)
+            core = step["cores"].first if step["cores"] && !step["cores"].include?(core)
             actor_path = File.join(dir, "#{step.fetch('path', 'shared')}.jed")
             begin
               actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)

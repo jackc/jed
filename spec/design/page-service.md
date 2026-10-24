@@ -217,8 +217,8 @@ follows reads the page and reports any error). A request names at most the `hell
 `max_read_pages`. Read-ahead is on for clients over the stream transport (the SSH case,
 [spec/pageservice/README.md](../pageservice/README.md) §5.3), whose round trips cross a network; a
 local-socket client still fetches one leaf per fault, which keeps the deterministic simulator's frame
-counts and the cross-core local behavior unchanged. Rust implements it; Go and TS have no stream
-transport yet. Point lookups fetch only their path (one leaf), as before.
+counts and the cross-core local behavior unchanged. Every core implements it for its stream client.
+Point lookups fetch only their path (one leaf), as before.
 
 ### 5.4 Client cache coherence
 
@@ -718,13 +718,14 @@ native code (the OS locks still use `impl/ts/native-lock`):
 
 Not every core needs to serve: the browser has one process, and WASI has no OS file locks.
 
-**The stream transport (SSH, phase 5)** is Rust-only for now: `Database::open_remote` (the client)
-and `Database::serve_page_stream` (`jed pages`, the serving end) — so the CLI, and Rust programs,
-reach remote databases. The owner a `jed pages` relays to may be any core, and a `jed pages` that
-owns serves local clients of every core (the `service_stream` process scenario). Go and TS clients
-over a stream are not required by any use case yet (§1 use cases 1–4 are the CLI's); their local
-clients already speak the identical protocol, so adding one is a transport, not a protocol, change.
-Unix only, like serving.
+**The stream transport (SSH, phase 5).** Every core has the client: Rust `Database::open_remote`,
+Go `OpenRemote`, TS `openRemoteDatabase` — so the CLI and programs in any core reach remote
+databases. The serving end is Rust's alone: `Database::serve_page_stream` (`jed pages`). The owner a
+`jed pages` relays to may be any core, and a `jed pages` that owns serves local clients of every core
+(the `service_stream` process scenario runs every core's stream client against owners of every
+core). Go and TS add only a transport: their local clients already speak the identical protocol. Go
+runs the command with its stdio on `os.Pipe`s; TS runs it on the client's socket worker thread, which
+carries socket and stream connections alike. Unix only, like serving.
 
 **Endpoint mechanics (decided at ratification; exact layout in
 [spec/pageservice/README.md](../pageservice/README.md) §5):**
@@ -782,15 +783,15 @@ Unix only, like serving.
    ([spec/pageservice/README.md](../pageservice/README.md) §6.5); the process-corpus rewrite;
    simulation testing of an owner and its clients ([simulation-testing.md](simulation-testing.md) §14
    S8); retiring shared mode and the `shared` option; the new bundle marker.
-5. ✅ **SSH** (landed, Rust and the CLI): the stream transport and `jed pages`
+5. ✅ **SSH** (landed: Rust and the CLI, then the Go and TS clients): the stream transport and `jed pages`
    ([spec/pageservice/README.md](../pageservice/README.md) §5.3, [cli.md](cli.md) §3), the CLI
    opening `ssh://[user@]host[:port]/path` through the system `ssh`, client-side read-ahead and
    subtree fetch over the existing `read_pages` (§5.3; no wire change). Proven by the
-   `service_stream` process scenario (a Rust stream client against owners of every core), Rust
-   host-API tests, and the CLI's e2e tests with a fake `ssh`; `bench:page_service` adds the
-   `stream_cold_scan` lanes. **Open question:** how a deployment configures the remote binary
-   (anything but `jed` on the remote `PATH`) and the ssh command — not decided, so nothing is
-   configurable yet. Go and TS gain a stream transport when a program needs remote access from them.
+   `service_stream` and `encrypted_stream` process scenarios (every core's stream client against
+   owners of every core, through the Rust `jed pages`), host-API tests in every core, and the CLI's
+   e2e tests with a fake `ssh`; `bench:page_service` adds the `stream_cold_scan` lanes. **Open
+   question:** how a deployment configures the remote binary (anything but `jed` on the remote
+   `PATH`) and the ssh command — not decided, so nothing is configurable yet.
 6. ✅ **Backup** (landed): page-identical and compacted forms, the client walking its own pinned
    snapshot (§9, [spec/pageservice/README.md](../pageservice/README.md) §6.6); the host API's public
    name is open.

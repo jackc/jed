@@ -1,6 +1,6 @@
 schema_version = 1
 name = "encrypted-database-through-the-stream-transport"
-description = "An encrypted database over the stream transport (spec/pageservice/README.md §3.1, §5.3): the stream client sends its credential in every hello. While an owner lives, the transport relays and takes the credential out of the hello (every core's owner refuses a hello that carries one, 08P01), and the client unlocks on its own side (none is 28P02). When the owner leaves, the re-election's fresh transport owns the file with the credential the client sent again; an application that opens with prefer then takes ownership from it. A transport that must own the file with no credential fails the open 28P02. The stream client and its transport are the Rust core (the only core with a stream transport); the owners are every core."
+description = "An encrypted database over the stream transport (spec/pageservice/README.md §3.1, §5.3): the stream client sends its credential in every hello. While an owner lives, the transport relays and takes the credential out of the hello (every core's owner refuses a hello that carries one, 08P01), and the client unlocks on its own side (none is 28P02). When the owner leaves, the re-election's fresh transport owns the file with the credential the client sent again; an application that opens with prefer then takes ownership from it. A transport that must own the file with no credential fails the open 28P02. The stream client is every core (each with a stream transport); its transport is the Rust core (the only serving end), and the owners are every core."
 requires = ["file.page_service"]
 
 [[step]]
@@ -21,7 +21,7 @@ sql = "INSERT INTO t SELECT g, 'secret-' || g FROM generate_series(1, 500) g"
 # Relayed to a: the client has no credential to unlock with on its own side.
 [[step]]
 actor = "b"
-core = "rust"
+cores = ["rust", "go", "node"]
 command = "start"
 argument = "open-remote"
 expect_error = "28P02"
@@ -30,7 +30,7 @@ expect_error = "28P02"
 # connection, and the client unlocks from the key-block pages it reads.
 [[step]]
 actor = "b"
-core = "rust"
+cores = ["rust", "go", "node"]
 command = "start"
 argument = "open-remote key=4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a"
 
@@ -110,7 +110,7 @@ command = "close"
 # No owner and no credential: the transport must open the file itself and cannot.
 [[step]]
 actor = "d"
-core = "rust"
+cores = ["rust", "go", "node"]
 command = "start"
 argument = "open-remote"
 expect_error = "28P02"

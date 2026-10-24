@@ -205,7 +205,18 @@ export function onDiskRef(page: number, tag?: Uint8Array): Child {
 export interface LeafSource {
   loadLeaf(page: number, tag?: Uint8Array): PNode;
   loadLeafSteps?(page: number, tag?: Uint8Array): Steps<PNode>;
+  // prefetches reports whether prefetch does anything: only a store that fetches several pages in one
+  // request (a page client over the stream transport, spec/design/page-service.md §5.3) benefits
+  // from read-ahead.
+  prefetches?(): boolean;
+  // prefetch is a hint that the scan will fault these leaf pages next, in this order: a source that
+  // batches reads brings the ones not already resident in with one request. Errors are left for the
+  // fault that follows. Invisible to cost, which counts logical page reads (cost.md).
+  prefetch?(pages: { page: number; tag?: Uint8Array }[]): void;
 }
+
+// READ_AHEAD_MAX is the most leaves one read-ahead hint names.
+const READ_AHEAD_MAX = 64;
 
 // resolveChild resolves c to a resident node, faulting an OnDisk leaf through src. A resident ref
 // returns its node directly; an OnDisk leaf with no source is an internal wiring bug (an in-memory
@@ -865,8 +876,9 @@ export class PMap {
 }
 
 // Both public synchronous generators and runtime pulls drive this one retained traversal. A
-// page read suspends before entering its child; no row or earlier traversal is replayed.
-type ScanFrame = { node: PNode; next: number; last: number };
+// page read suspends before entering its child; no row or earlier traversal is replayed. hinted
+// counts the descents into an interior's children still covered by its last read-ahead hint.
+type ScanFrame = { node: PNode; next: number; last: number; hinted: number };
 
 class TreeStepIterator<T> implements StepIterator<T> {
   private readonly frames: ScanFrame[] = [];
@@ -876,6 +888,13 @@ class TreeStepIterator<T> implements StepIterator<T> {
   private readonly project: (node: PNode, index: number) => T;
   private closed = false;
   private traversed = 0;
+  // window is the read-ahead window (spec/design/page-service.md §5.3): when the traversal descends
+  // into a leaf of an interior node it already holds, it hints that leaf together with the next
+  // leaves of that node it will visit, within the scan's bounds. The window starts at one leaf (no
+  // read-ahead, so a scan stopped by LIMIT after one leaf fetches nothing extra) and doubles with each
+  // hint up to READ_AHEAD_MAX, so a long scan fetches its leaves in batches of 64 — every leaf of a
+  // subtree in one request when it has at most that many.
+  private window = 1;
   nodesVisited = 0;
 
   constructor(
@@ -901,7 +920,32 @@ class TreeStepIterator<T> implements StepIterator<T> {
       node,
       next: this.reverse ? last : first,
       last: this.reverse ? first : last,
+      hinted: 0,
     });
+  }
+
+  // hint hints the descent into child index of frame's interior and the descents after it, in visit
+  // order. It returns how many of those descents the hint covers, the current one included: the
+  // caller hints again after that many.
+  private hint(frame: ScanFrame, index: number): number {
+    const src = this.source;
+    if (src === null || src.prefetches?.() !== true) return Number.POSITIVE_INFINITY;
+    const step = this.reverse ? -1 : 1;
+    const pages: { page: number; tag?: Uint8Array }[] = [];
+    let taken = 0;
+    for (
+      let i = index;
+      taken < this.window && (this.reverse ? i >= frame.last : i <= frame.last);
+      i += step, taken++
+    ) {
+      const c = frame.node.children[i]!;
+      if (c.node === null) pages.push({ page: c.page, tag: c.tag });
+    }
+    taken = Math.max(taken, 1);
+    if (pages.length === 0) return taken;
+    this.window = Math.min(this.window * 2, READ_AHEAD_MAX);
+    if (pages.length > 1) src.prefetch!(pages);
+    return taken;
   }
 
   *nextSteps(): Steps<IteratorResult<T>> {
@@ -919,6 +963,8 @@ class TreeStepIterator<T> implements StepIterator<T> {
           if ((++this.traversed & 63) === 0 && shouldCooperate(64)) yield COOPERATE;
           return { done: false, value: this.project(frame.node, index) };
         }
+        if (frame.hinted === 0) frame.hinted = this.hint(frame, index);
+        frame.hinted--;
         this.enter(yield* resolveChildSteps(frame.node.children[index]!, this.source));
       }
       this.closed = true;

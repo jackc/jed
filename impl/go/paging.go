@@ -45,11 +45,14 @@ type sharedPaging struct {
 	pagerMu sync.Mutex
 	pgr     *pager
 	pool    *bufferPool
+	// batches is set when the store fetches several pages in one request (a page client over the
+	// stream transport): scans read ahead (prefetchLeaves).
+	batches bool
 }
 
 // newSharedPaging wraps an open pager with a CLOCK pool of capacity leaves.
 func newSharedPaging(p *pager, capacity int) *sharedPaging {
-	return &sharedPaging{pgr: p, pool: newBufferPool(capacity)}
+	return &sharedPaging{pgr: p, pool: newBufferPool(capacity), batches: p.batchesReads()}
 }
 
 // codec is the database's page codec when its file is encrypted (spec/fileformat/encrypted.md): every
@@ -116,6 +119,49 @@ func (s *sharedPaging) faultLeaf(page pageRef, colTypes []colType) (*pnode, erro
 		return nil, newError(DataCorrupted, "leaf page belongs to a different tree")
 	}
 	return node, nil
+}
+
+// prefetchLeaves reads ahead (spec/design/page-service.md §5.3): it brings the leaves at pages that
+// are not resident into the pool with one batched store read, decoded as a fault would decode them.
+// At most a quarter of the pool is read ahead at once, so read-ahead cannot evict the leaf the scan is
+// on. A failure is ignored: the fault that follows reads the page again and reports it.
+func (s *sharedPaging) prefetchLeaves(pages []pageRef, colTypes []colType) {
+	if !s.batches {
+		return
+	}
+	limit := max(s.pool.capacityPages()/4, 1)
+	var missing []pageRef
+	for _, page := range pages {
+		if len(missing) == limit {
+			break
+		}
+		if !s.pool.contains(page.page) {
+			missing = append(missing, page)
+		}
+	}
+	if len(missing) < 2 {
+		return
+	}
+	indices := make([]uint32, len(missing))
+	for i, page := range missing {
+		indices[i] = page.page
+	}
+	s.pagerMu.Lock()
+	blocks, err := s.pgr.readBlocks(indices)
+	s.pagerMu.Unlock()
+	if err != nil {
+		return
+	}
+	for i, page := range missing {
+		block := blocks[i]
+		_, _ = s.pool.getOrLoad(page.page, func() (*pnode, error) {
+			plain, err := s.openBlock(page, block)
+			if err != nil {
+				return nil, err
+			}
+			return decodeLeafNode(plain, page, colTypes, s)
+		})
+	}
 }
 
 // sameLeafShape reports whether a leaf decoded for columns a can be read as columns b: the same

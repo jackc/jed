@@ -17,9 +17,11 @@ import {
   hangUpNextPageServiceAckForTesting,
   intValue,
   openDatabase,
+  openRemoteDatabase,
   pageServiceAttachmentRoleForTesting,
   pageServiceRoleForTesting,
   render,
+  setPageClientReadAheadForTesting,
   type Session,
 } from "../tooling.ts";
 
@@ -71,24 +73,41 @@ const idleInTransactionTimeoutMs = idleText === undefined ? undefined : Number(i
 const locking = action === "open-exclusive" ? "exclusive" : "auto";
 const readOnly = action === "open-read-only";
 
+// remoteDatabase opens PATH as a page client over the stream transport. TS has no serving end, so the
+// transport command is the Rust actor serving PATH (`pages`, named by JED_PAGES_ACTOR): what
+// `jed ssh://host/path` runs, without SSH.
+function remoteDatabase(): Database {
+  const server = process.env.JED_PAGES_ACTOR;
+  if (server === undefined || server === "") {
+    throw new Error("open-remote needs JED_PAGES_ACTOR, the Rust process actor");
+  }
+  if (options.get("read_ahead") === "off") setPageClientReadAheadForTesting(false);
+  const transport = [server, action === "open-remote" ? "pages" : "pages-read-only", path!];
+  const latency = options.get("latency_us");
+  if (latency !== undefined) transport.push(latency);
+  return openRemoteDatabase(transport, `remote:${path}`, { fileLockTimeoutMs, credential });
+}
+
 let database: Database;
 try {
   database =
-    action === "create"
-      ? createDatabase({
-          path,
-          locking,
-          fileLockTimeoutMs,
-          idleInTransactionTimeoutMs,
-          ...handoffOptions,
-        })
-      : openDatabase(path, {
-          locking,
-          fileLockTimeoutMs,
-          idleInTransactionTimeoutMs,
-          readOnly,
-          ...handoffOptions,
-        });
+    action === "open-remote" || action === "open-remote-read-only"
+      ? remoteDatabase()
+      : action === "create"
+        ? createDatabase({
+            path,
+            locking,
+            fileLockTimeoutMs,
+            idleInTransactionTimeoutMs,
+            ...handoffOptions,
+          })
+        : openDatabase(path, {
+            locking,
+            fileLockTimeoutMs,
+            idleInTransactionTimeoutMs,
+            readOnly,
+            ...handoffOptions,
+          });
 } catch (error) {
   replyError(error);
   process.exit(1);

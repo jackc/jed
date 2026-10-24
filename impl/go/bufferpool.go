@@ -102,6 +102,15 @@ func (p *bufferPool) getOrLoad(page uint32, load func() (*pnode, error)) (*pnode
 	return flight.node, flight.err
 }
 
+// contains reports whether page is resident or being loaded.
+func (p *bufferPool) contains(page uint32) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, resident := p.index[page]
+	_, loading := p.loading[page]
+	return resident || loading
+}
+
 // insert adds a freshly-loaded page, evicting one under CLOCK if at capacity.
 func (p *bufferPool) insert(page uint32, node *pnode) {
 	p.mu.Lock()

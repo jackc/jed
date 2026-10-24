@@ -168,6 +168,29 @@ func (p *pager) readBlock(index uint32) ([]byte, error) {
 	return p.store.readAt(int64(index)*int64(p.pageSize), int(p.pageSize))
 }
 
+// readBlocks reads several pages in one store request when the store batches reads (a page client,
+// spec/design/page-service.md §5.3), page by page otherwise.
+func (p *pager) readBlocks(indices []uint32) ([][]byte, error) {
+	if batch, ok := p.store.(batchReader); ok && batch.batchesReads() {
+		return batch.readPages(indices)
+	}
+	out := make([][]byte, len(indices))
+	for i, index := range indices {
+		block, err := p.readBlock(index)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = block
+	}
+	return out, nil
+}
+
+// batchesReads reports whether the store fetches several pages in one request.
+func (p *pager) batchesReads() bool {
+	batch, ok := p.store.(batchReader)
+	return ok && batch.batchesReads()
+}
+
 // refreshAllocatedPages reconciles the physical high-water after a foreign process appended.
 func (p *pager) refreshAllocatedPages() error {
 	size, err := p.store.size()

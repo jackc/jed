@@ -43,6 +43,14 @@ type blockStore interface {
 	close() error
 }
 
+// batchReader is a block store whose readPages fetches several pages in one request, so scans read
+// ahead through it (a page client over the stream transport, spec/design/page-service.md §5.3). Every
+// other host reads page by page and scans fault one leaf at a time.
+type batchReader interface {
+	batchesReads() bool
+	readPages(indices []uint32) ([][]byte, error)
+}
+
 // fileBlockStore is the file storage host (spec/design/hosts.md §4): an *os.File with positioned
 // ReadAt/WriteAt (pread/pwrite — no shared cursor), a data-only fdatasync barrier (datasync, pure Go,
 // no cgo — CLAUDE.md §2), and a durable-grow zero-write + full Sync.

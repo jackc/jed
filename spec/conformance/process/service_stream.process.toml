@@ -1,6 +1,6 @@
 schema_version = 1
 name = "service-stream-transport"
-description = "Page service phase 5: a page client over the stream transport (what `jed ssh://host/path` runs, with the actor serving `pages` in place of `ssh host jed pages`). The transport relays to the live owner; when the owner leaves, the client's re-election runs the transport again, which owns the file itself as a yield owner; an application that then opens with prefer takes ownership from it, and the stream client reconnects to the application. The stream client and its transport are the Rust core (the only core with a stream transport); the owners are every core."
+description = "Page service phase 5: a page client over the stream transport (what `jed ssh://host/path` runs, with the actor serving `pages` in place of `ssh host jed pages`). The transport relays to the live owner; when the owner leaves, the client's re-election runs the transport again, which owns the file itself as a yield owner; an application that then opens with prefer takes ownership from it, and the stream client reconnects to the application. The stream client is every core (each with a stream transport); its transport is the Rust core (the only serving end), and the owners are every core."
 requires = ["file.page_service"]
 
 [[step]]
@@ -21,7 +21,7 @@ sql = "INSERT INTO t SELECT g, repeat('x', 100) FROM generate_series(1, 500) g"
 # The stream client: its transport finds a's owner record and relays to a's endpoint.
 [[step]]
 actor = "b"
-core = "rust"
+cores = ["rust", "go", "node"]
 command = "start"
 argument = "open-remote"
 

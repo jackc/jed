@@ -151,9 +151,14 @@ connection. On the server, `command="jed pages --read-only /srv/app.jed"` in `au
 limits a key to reading that one database. SSH handles authentication and encryption, using your ssh
 configuration.
 
-In Rust, `Database::open_remote(command, name, options)` opens a database through any command whose
-stdin and stdout carry the connection (`["ssh", "--", "db1", "jed pages '/srv/app.jed'"]`).
-`Database::serve_page_stream` implements the serving side. Go and Node have no remote client yet.
+A program opens a remote database the same way, through any command whose stdin and stdout carry
+the connection (`["ssh", "--", "db1", "jed pages '/srv/app.jed'"]`): `Database::open_remote(command,
+name, options)` in Rust, `jed.OpenRemote(command, name, opts)` in Go, and
+`await openRemoteDatabase(command, name, options)` in Node. `name` identifies the database in your
+process. The handle runs its own engine and never owns the file, and a `credential` in the options
+unlocks an encrypted database. The serving side is `jed pages` (Rust's
+`Database::serve_page_stream`), so the remote host needs the `jed` binary whichever language your
+program is written in.
 
 ## Reclaiming space (compaction)
 

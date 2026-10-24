@@ -179,7 +179,7 @@ unmetered. File attachments carry these fields in `AttachSource::file(path, opti
 their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, `FileLockTimeoutMs` /
 `locking`, `fileLockTimeoutMs`). In-memory databases have no bundle and ignore file-lock options.
 
-**Remote databases — the stream transport (Rust, Unix; [spec/pageservice/README.md](../pageservice/README.md)
+**Remote databases — the stream transport (Unix; [spec/pageservice/README.md](../pageservice/README.md)
 §5.3).** `Database::open_remote(command, name, opts)` opens a database another machine serves: a page
 client whose connection is the stdin/stdout of `command` (`["ssh", "--", "host", "jed pages
 '/srv/app.jed'"]` for the CLI's `ssh://host/srv/app.jed`), run once per connection. `name` stands for
@@ -192,7 +192,9 @@ reaches nothing fails `08006` with the command's stderr. `Database::serve_page_s
 read_only, input, output)` is the far side (`jed pages`): it relays the stream to the database's live
 owner, or owns the database as a `yield` owner and serves the stream, returning when the stream ends.
 When it owns, it opens with the credential from the client's `hello`; `opts.credential` is not used.
-Go and TS have no stream transport yet (page-service.md §14).
+Go and TS have the client with the same contract: `OpenRemote(command, name, opts)` and
+`openRemoteDatabase(command, name, opts)` (the TS async entry point of the same name returns a
+`Promise<Database>`). The serving end is Rust's alone (page-service.md §14).
 
 **Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`
 (Rust `OpenOptions { work_mem }` / Go `OpenOptions { WorkMem }` / TS `{ workMem }`; default

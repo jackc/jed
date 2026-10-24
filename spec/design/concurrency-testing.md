@@ -466,7 +466,11 @@ step `repeat` count, `expect_max` for an upper bound, and extra actor arguments 
 observing a client's asynchronous `end_read` or a handoff completing. An `async` step sends its
 command without waiting; a later `await` step on the same actor checks its reply (or, after an async
 `close`, waits for the actor to exit). A `start` step may `expect_error` a failed open, and every actor
-must exit with status 0 after `close`. A step's `sql` may write `{{repeat <char> <count>}}` for a run of
+must exit with status 0 after `close`. A `start` step's `core` pins its actor to one core; its
+`cores` limits the actor to the cores that implement its role, falling back to the first listed when
+the pairing's core is not among them (a stream client, whose `open-remote` every differential core
+implements and whose transport is always the Rust actor serving `pages`, named to every actor by
+`JED_PAGES_ACTOR`). A step's `sql` may write `{{repeat <char> <count>}}` for a run of
 one character, which the driver expands, so a statement too long to spell out fits in the file.
 
 The corpus, not per-core copies, covers:
