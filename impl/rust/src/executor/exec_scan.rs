@@ -2660,8 +2660,24 @@ impl Engine {
                         // row (extensibility.md §4.2.1).
                         let batch =
                             HostBatch::for_exprs(&plan.projections, self.session.env.functions());
+                        // The projecting drive consumes its source buffer: pre-projection rows under the
+                        // touched mask, or an aggregate's group rows (memory.md §5.3). Each source row is
+                        // freed once projected (a host prefetch reads only rows at or after the current
+                        // one); the buffer's charge is still returned only after the drive.
+                        let mask = if plan.is_agg {
+                            Vec::new()
+                        } else {
+                            plan.memory_mask(&meter)
+                        };
+                        let source_charge: i64 = if meter.query_memory_active() {
+                            rows.iter()
+                                .map(|r| crate::memsize::row_bytes_masked(r, &mask))
+                                .sum()
+                        } else {
+                            0
+                        };
                         let mut out = Vec::with_capacity(end - start);
-                        for (i, row) in rows.iter().enumerate().take(end).skip(start) {
+                        for i in start..end {
                             meter.checkpoint()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
                             meter.charge(COSTS.row_produced);
                             if let Some(b) = &batch {
@@ -2673,19 +2689,14 @@ impl Engine {
                             };
                             let mut o = Vec::with_capacity(plan.projections.len());
                             for p in &plan.projections {
-                                o.push(p.eval(row, &env, &mut meter)?);
+                                o.push(p.eval(&rows[i], &env, &mut meter)?);
                             }
+                            rows[i] = Vec::new();
                             meter.admit_row(&o)?; // the buffered result collector (memory.md §5.1)
                             out.push(o);
                         }
-                        // The projecting drive consumed its source buffer: pre-projection rows under the
-                        // touched mask, or an aggregate's group rows (memory.md §5.3).
-                        let mask = if plan.is_agg {
-                            Vec::new()
-                        } else {
-                            plan.memory_mask(&meter)
-                        };
-                        meter.release_rows_masked(&rows, &mask);
+                        drop(rows);
+                        meter.release_query(source_charge);
                         out
                     }
                 },

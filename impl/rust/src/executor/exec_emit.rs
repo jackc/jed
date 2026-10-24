@@ -924,8 +924,19 @@ impl Engine {
                     }
                 }
                 let mut group_rows: Vec<Vec<Value>> = Vec::new();
-                for gset in &plan.group_sets {
-                    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+                // The last grouping set frees each post-WHERE row once folded; their charge is still
+                // returned only after aggregation (memory.md §5.3).
+                let input_charge: i64 = if meter.query_memory_active() {
+                    rows.iter()
+                        .map(|r| crate::memsize::row_bytes_masked(r, &mem_mask))
+                        .sum()
+                } else {
+                    0
+                };
+                for (set_index, gset) in plan.group_sets.iter().enumerate() {
+                    let last_set = set_index + 1 == plan.group_sets.len();
+                    // The bucket index holds group positions; a probe reads the row's key slots in place.
+                    let mut index = RowIndex::default();
                     // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge —
                     // its entry plus everything its accumulators retain (memory.md §6.2/§6.3).
                     #[allow(clippy::type_complexity)]
@@ -946,16 +957,30 @@ impl Engine {
                         };
                         meter.reserve_query(entry)?;
                         groups.push((Vec::new(), new_accs(), new_seen(), entry));
-                        index.insert(Vec::new(), 0);
+                        index.insert(index.hash(std::iter::empty()), 0);
                     }
-                    for row in &rows {
+                    for ri in 0..rows.len() {
+                        let owned;
+                        let row: &Row = if last_set {
+                            owned = std::mem::take(&mut rows[ri]);
+                            &owned
+                        } else {
+                            &rows[ri]
+                        };
                         meter.checkpoint()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
-                        let key: Vec<Value> =
-                            gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
-                        charge_hash_keys(meter, &key)?;
-                        let gi = match index.get(&key) {
-                            Some(&i) => i,
+                        charge_hash_keys(meter, gset.key_cols.iter().map(|&gk| &row[gk]))?;
+                        let hash = index.hash(gset.key_cols.iter().map(|&gk| &row[gk]));
+                        let found = index.find(hash, |at| {
+                            gset.key_cols
+                                .iter()
+                                .zip(&groups[at].0)
+                                .all(|(&gk, v)| row[gk] == *v)
+                        });
+                        let gi = match found {
+                            Some(i) => i,
                             None => {
+                                let key: Vec<Value> =
+                                    gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
                                 let entry = if meter.query_memory_active() {
                                     crate::memsize::entry_bytes(&key)
                                 } else {
@@ -963,7 +988,7 @@ impl Engine {
                                 };
                                 meter.reserve_query(entry)?;
                                 let i = groups.len();
-                                index.insert(key.clone(), i);
+                                index.insert(hash, i);
                                 groups.push((key, new_accs(), new_seen(), entry));
                                 i
                             }
@@ -1127,7 +1152,8 @@ impl Engine {
                     }
                 }
                 // Aggregation consumed the post-WHERE rows (memory.md §5.3).
-                meter.release_rows_masked(&rows, &mem_mask);
+                drop(rows);
+                meter.release_query(input_charge);
                 // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The
                 // predicate is evaluated against each group's synthetic row (charging its
                 // operator_evals per group); only a TRUE result keeps the group. A dropped group
@@ -1199,28 +1225,34 @@ impl Engine {
                     // keeping the first occurrence in the (already ORDER-BY-sorted) order, then apply
                     // LIMIT/OFFSET. `seen` is membership-only; output order comes from the deterministic
                     // group iteration / sort, never set iteration (no hashmap-order leak — CLAUDE.md §8/§10).
-                    let mut seen: std::collections::HashSet<Vec<Value>> =
-                        std::collections::HashSet::new();
+                    let mut seen = RowIndex::default();
                     let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
                     let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
-                    for srow in &group_rows {
+                    let mut group_charge = 0i64;
+                    for srow in group_rows {
+                        if meter.query_memory_active() {
+                            group_charge += crate::memsize::row_bytes(&srow);
+                        }
                         let mut out = Vec::with_capacity(plan.projections.len());
                         for p in &plan.projections {
-                            out.push(p.eval(srow, &env, meter)?);
+                            out.push(p.eval(&srow, &env, meter)?);
                         }
+                        drop(srow);
                         charge_hash_keys(meter, &out)?;
-                        if seen.insert(out.clone()) {
+                        let hash = seen.hash(out.iter());
+                        if seen.find(hash, |at| distinct_rows[at] == out).is_none() {
                             if meter.query_memory_active() {
                                 let bytes = crate::memsize::entry_bytes(&out);
                                 meter.reserve_query(bytes)?;
                                 seen_charge += bytes;
                             }
                             meter.admit_row(&out)?;
+                            seen.insert(hash, distinct_rows.len());
                             distinct_rows.push(out);
                         }
                     }
                     meter.release_query(seen_charge);
-                    meter.release_rows(&group_rows);
+                    meter.release_query(group_charge);
                     if select_actual_root_node(plan) != "Distinct"
                         && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                     {
@@ -1250,29 +1282,37 @@ impl Engine {
                 // Project every filtered row (charging projection cost per row, the §3
                 // asymmetry), keeping first occurrences. `seen` is membership-only: the
                 // output order comes from the deterministic source iteration, never from set
-                // iteration (no hashmap-order leak — CLAUDE.md §8/§10).
-                let mut seen: std::collections::HashSet<Vec<Value>> =
-                    std::collections::HashSet::new();
+                // iteration (no hashmap-order leak — CLAUDE.md §8/§10). The set indexes the kept
+                // rows in place, and each input row is freed once projected; the input's charge is
+                // still returned only after the pass (memory.md §5.3).
+                let mut seen = RowIndex::default();
                 let mut distinct_rows: Vec<Vec<Value>> = Vec::new();
                 let mut seen_charge = 0i64; // the dedup set's entries (memory.md §6.2)
-                for row in &rows {
+                let mut input_charge = 0i64;
+                for row in rows {
+                    if meter.query_memory_active() {
+                        input_charge += crate::memsize::row_bytes_masked(&row, &mem_mask);
+                    }
                     let mut out = Vec::with_capacity(plan.projections.len());
                     for p in &plan.projections {
-                        out.push(p.eval(row, &env, meter)?);
+                        out.push(p.eval(&row, &env, meter)?);
                     }
+                    drop(row);
                     charge_hash_keys(meter, &out)?;
-                    if seen.insert(out.clone()) {
+                    let hash = seen.hash(out.iter());
+                    if seen.find(hash, |at| distinct_rows[at] == out).is_none() {
                         if meter.query_memory_active() {
                             let bytes = crate::memsize::entry_bytes(&out);
                             meter.reserve_query(bytes)?;
                             seen_charge += bytes;
                         }
                         meter.admit_row(&out)?;
+                        seen.insert(hash, distinct_rows.len());
                         distinct_rows.push(out);
                     }
                 }
                 meter.release_query(seen_charge);
-                meter.release_rows_masked(&rows, &mem_mask);
+                meter.release_query(input_charge);
                 if select_actual_root_node(plan) != "Distinct"
                     && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                 {
