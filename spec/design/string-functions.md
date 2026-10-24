@@ -434,9 +434,10 @@ are STRICT and ride the scalar-function mold (§1), except `||`, which has its o
   has no group, and NULL on no match. Overload choice follows [functions.md](functions.md) §9.1: an
   untyped second argument (a bare string literal, `NULL`, or `$N`) prefers `text`, so
   `SUBSTRING('hello' FROM '2')` is a regex search (NULL, as in PostgreSQL), while `FROM 2` is the
-  position form. The three-text-argument SQL-standard `SIMILAR … ESCAPE` form
-  (`SUBSTRING(s FROM p FOR esc)`) is excluded with `SIMILAR TO`: it reaches `substring(text, text,
-  text)`, which has no overload (`42883`, ledgered).
+  position form. Three text operands (`SUBSTRING(s FROM p FOR esc)`, or the standard spelling
+  `SUBSTRING(s SIMILAR p ESCAPE esc)`) reach the SQL-standard `SIMILAR` overload `substring(text,
+  text, text)` ([regex.md](regex.md) §8f): `p` must match all of `s`, and the result is the text
+  between its two `esc"` separators.
 - **`get_byte(bytea, n)` → int** — the `n`-th byte, **0-based**, as an unsigned 0–255. An index
   outside `[0, length − 1]` (negative, or any index into an empty value) traps **`2202E`** with
   PostgreSQL's message, `index n out of valid range, 0..length−1` (`0..-1` for an empty value).

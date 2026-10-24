@@ -1668,8 +1668,8 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
   literal `%`, `_`, and `\`; a `\` before any other character matches that character literally
   (`'a' LIKE '\a'` is TRUE). String literals have no backslash escapes
   (`standard_conforming_strings`, §3 / [types.md](types.md) §11), so a `\` written in a
-  pattern literal is a literal backslash byte the matcher then interprets. `SIMILAR TO` is
-  excluded (regex.md).
+  pattern literal is a literal backslash byte the matcher then interprets. `SIMILAR TO` is the
+  regex-backed pattern form (§22c).
 - **`ESCAPE e` — choosing the escape character.** `s [NOT] LIKE p ESCAPE e` (and `ILIKE`) matches
   with `e` as the escape character instead of `\`. The parser **desugars** it exactly as
   PostgreSQL does: `s LIKE like_escape(p, e)`, where the built-in `like_escape(text, text) → text`
@@ -1732,7 +1732,7 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
 `regex_op` is one of `~` `~*` `!~` `!~*`. The flavor is jed's own **RE2-able subset**
 ([regex.md](regex.md)), deliberately **not** PostgreSQL-compatible — the *overriding reason* is
 determinism + untrusted-query safety (the engine is a linear-time **Pike VM**, immune to ReDoS,
-[regex.md](regex.md) §4/§6). `SIMILAR TO`, backreferences, and lookaround are excluded.
+[regex.md](regex.md) §4/§6). Backreferences and lookaround are excluded; `SIMILAR TO` is §22c.
 
 - **Punctuation operators, two base + two negations.** `~` is case-sensitive match, `~*`
   case-insensitive (two `[[operator]]` rows, `regex_match`/`regex_imatch`, symbols `~`/`~*`).
@@ -1768,6 +1768,24 @@ determinism + untrusted-query safety (the engine is a linear-time **Pike VM**, i
   (`|program|`, once for a constant pattern — §5) and `regex_step` (per Pike-VM thread-step) — the
   per-step work LIKE's matcher leaves unmetered (regex is program × input, LIKE input alone). Output
   name for a bare `SELECT s ~ …` is `?column?` (§8).
+
+## 22c. `SIMILAR TO` / `NOT SIMILAR TO`
+
+`s [NOT] SIMILAR TO p [ESCAPE e]` is the SQL-standard pattern match: TRUE iff `p` matches the
+**whole** of `s`, where `%` and `_` are `LIKE`'s wildcards and `| * + ? {…} ( ) […]` are regular
+expression syntax. It extends `comparison` with `"NOT"? "SIMILAR" "TO" concat ("ESCAPE" concat)?`
+(precedence 35, the LIKE slot); a `NOT` before it is the predicate negation, taken like `NOT LIKE`.
+The parser desugars it as PostgreSQL does, to `s ~ similar_to_escape(p [, e])` (`!~` for `NOT`), on
+the `Regex` node with its *similar* flag, which compiles the pattern in the dot-all mode. The
+translation, the escape rules, errors, and cost are [regex.md](regex.md) §8f. The operands are text
+(`42804` otherwise); a NULL operand is NULL, but the pattern is translated first, so a NULL subject
+does not hide an invalid escape (`22025`) or a third separator (`2200C`).
+
+```sql
+SELECT 'abc' SIMILAR TO 'a(b|x)%'           -- true
+SELECT 'abc' SIMILAR TO 'b%'                -- false: the whole string must match
+SELECT '50%' SIMILAR TO '50#%' ESCAPE '#'   -- true
+```
 
 ## 23. `CASE`
 
@@ -3795,9 +3813,11 @@ SELECT substring('hello' FOR 2 FROM 3)               -- ll     (either order)
   form uses `start = 1`. This is PostgreSQL's own rewrite, so resolution, NULL handling, errors, cost,
   and the output label (`substring`) are those of the call. No `WITHIN GROUP`, `FILTER`, or `OVER`
   may follow, since the form is not a function application.
-- **Not supported.** PostgreSQL also uses this syntax for regular-expression extraction
-  (`substring(text FROM pattern)`, `substring(text SIMILAR pattern ESCAPE e)`). jed parses the first
-  as this form, where `substring(text, text)` has no overload (`42883`); `SIMILAR` is a syntax error.
+- **Pattern forms.** PostgreSQL also uses this syntax for pattern extraction. A text `FROM`
+  operand reaches the regex overload `substring(text, text)` ([regex.md](regex.md) §8e), and a text
+  `FROM … FOR …` the `SIMILAR` overload `substring(text, text, text)` (§8f). The SQL-standard
+  spelling `SUBSTRING(s SIMILAR p ESCAPE e)` desugars to `substring(s, p, e)`; its `ESCAPE` is
+  required, as in PostgreSQL.
 
 ## 56. `POSITION` and `OVERLAY` ([string-functions.md §3/§4](string-functions.md))
 

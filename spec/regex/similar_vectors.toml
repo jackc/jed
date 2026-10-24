@@ -1,0 +1,220 @@
+# SIMILAR TO vectors — (pattern[, escape], input) -> the translation, the SIMILAR TO result, the
+# SIMILAR substring, and the regex_compile / regex_step cost of each (../design/regex.md §8f, README.md).
+# Each core translates the pattern (similar_to_escape), compiles it dot-all and matches the input
+# (`similar`, `similar_compile` instructions, `similar_steps`), then builds the substring matcher and
+# runs it (`substring`, or `substring_null = true` for no match; `substring_compile` instructions
+# summed over its programs, `substring_steps` summed over its runs).
+#
+# `escape` absent is the default backslash; `escape = ""` is no escape character. `error` is the
+# translation's SQLSTATE (nothing else is checked); `substring_error` the substring matcher's compile
+# error (a part that is not a pattern by itself). Generated from the first conformant core and
+# audited against the VM spec; like the on-disk goldens it is then the pinned contract.
+
+schema_version = 1
+
+[[case]]
+pattern = "abc"
+input = "abc"
+translation = "^(?:abc)$"
+similar = true
+similar_compile = 11
+similar_steps = 25
+substring = "abc"
+substring_compile = 11
+substring_steps = 25
+
+[[case]]
+pattern = "a%"
+input = "abc"
+translation = "^(?:a.*)$"
+similar = true
+similar_compile = 12
+similar_steps = 33
+substring = "abc"
+substring_compile = 12
+substring_steps = 33
+
+[[case]]
+pattern = "a%"
+input = "xbc"
+translation = "^(?:a.*)$"
+similar = false
+similar_compile = 12
+similar_steps = 20
+substring_null = true
+substring_compile = 12
+substring_steps = 20
+
+[[case]]
+pattern = "a_c"
+input = "a\nc"
+translation = "^(?:a.c)$"
+similar = true
+similar_compile = 11
+similar_steps = 25
+substring = "a\nc"
+substring_compile = 11
+substring_steps = 25
+
+[[case]]
+pattern = "50\\%"
+input = "50%"
+translation = "^(?:50\\%)$"
+similar = true
+similar_compile = 11
+similar_steps = 25
+substring = "50%"
+substring_compile = 11
+substring_steps = 25
+
+[[case]]
+pattern = "50#%"
+escape = "#"
+input = "50%"
+translation = "^(?:50\\%)$"
+similar = true
+similar_compile = 11
+similar_steps = 25
+substring = "50%"
+substring_compile = 11
+substring_steps = 25
+
+[[case]]
+pattern = "(a|b)*c"
+input = "abac"
+translation = "^(?:(?:a|b)*c)$"
+similar = true
+similar_compile = 15
+similar_steps = 52
+substring = "abac"
+substring_compile = 15
+substring_steps = 52
+
+[[case]]
+pattern = "[]a]"
+input = "]"
+translation = "^(?:[]a])$"
+similar = true
+similar_compile = 9
+similar_steps = 13
+substring = "]"
+substring_compile = 9
+substring_steps = 13
+
+[[case]]
+pattern = "a.^$"
+escape = ""
+input = "a.^$"
+translation = "^(?:a\\.\\^\\$)$"
+similar = true
+similar_compile = 12
+similar_steps = 31
+substring = "a.^$"
+substring_compile = 12
+substring_steps = 31
+
+[[case]]
+pattern = "%#\"o_b#\"%"
+escape = "#"
+input = "foobar"
+translation = "^(?:.*){1,1}?(o.b){1,1}(?:.*)$"
+similar = true
+similar_compile = 19
+similar_steps = 86
+substring = "oob"
+substring_compile = 45
+substring_steps = 194
+
+[[case]]
+pattern = "%#\"o%#\"%"
+escape = "#"
+input = "foobar"
+translation = "^(?:.*){1,1}?(o.*){1,1}(?:.*)$"
+similar = true
+similar_compile = 20
+similar_steps = 108
+substring = "oobar"
+substring_compile = 47
+substring_steps = 244
+
+[[case]]
+pattern = "a%#\"b%#\""
+escape = "#"
+input = "abcabc"
+translation = "^(?:a.*){1,1}?(b.*){1,1}(?:)$"
+similar = true
+similar_compile = 18
+similar_steps = 90
+substring = "bcabc"
+substring_compile = 42
+substring_steps = 210
+
+[[case]]
+pattern = "f#\"o%"
+escape = "#"
+input = "foobar"
+translation = "^(?:f){1,1}?(o.*)$"
+similar = true
+similar_compile = 15
+similar_steps = 63
+substring = "oobar"
+substring_compile = 20
+substring_steps = 81
+
+[[case]]
+pattern = "#\"a|aa#\"%"
+escape = "#"
+input = "aab"
+translation = "^(?:){1,1}?(a|aa){1,1}(?:.*)$"
+similar = true
+similar_compile = 18
+similar_steps = 40
+substring = "aa"
+substring_compile = 46
+substring_steps = 107
+
+[[case]]
+pattern = "%#\"[0-9]+#\"%"
+escape = "#"
+input = "ab123cd"
+translation = "^(?:.*){1,1}?([0-9]+){1,1}(?:.*)$"
+similar = true
+similar_compile = 18
+similar_steps = 105
+substring = "123"
+substring_compile = 43
+substring_steps = 242
+
+[[case]]
+pattern = "%#\"x#\"%"
+escape = "#"
+input = "abc"
+translation = "^(?:.*){1,1}?(x){1,1}(?:.*)$"
+similar = false
+similar_compile = 17
+similar_steps = 38
+substring_null = true
+substring_compile = 41
+substring_steps = 58
+
+[[case]]
+pattern = "(a#\"b)#\""
+escape = "#"
+input = "ab"
+translation = "^(?:(?:a){1,1}?(b)){1,1}(?:)$"
+similar = true
+similar_compile = 12
+similar_steps = 21
+substring_error = "2201B"
+
+[[case]]
+pattern = "a"
+escape = "ab"
+input = "a"
+error = "22025"
+
+[[case]]
+pattern = "a#\"b#\"c#\"d"
+escape = "#"
+input = "abcd"
+error = "2200C"

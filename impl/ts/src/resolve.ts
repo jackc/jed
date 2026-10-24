@@ -168,7 +168,7 @@ import { extractField } from "./datetime_fn.ts";
 import type { ColType, Column, CompositeType, Table } from "./catalog.ts";
 import type { RegexProgram } from "./regex.ts";
 import { type PropertyTable, sortKey as collationSortKey } from "./collation.ts";
-import { compileRegex, foldRegexPattern } from "./regex.ts";
+import { compileRegex, compileSimilar, foldRegexPattern, similarToEscape } from "./regex.ts";
 import type { Collation } from "./collation.ts";
 import { AGGREGATES, OPERATORS, WINDOWS } from "./operators.ts";
 import type { ArrayShape, Value } from "./value.ts";
@@ -2528,15 +2528,27 @@ function resolveRegexExpr(
   const p = resolveTextOperandPair(scope, e.lhs, e.rhs, ag, params);
   requireTextOrNull(p.lt);
   requireTextOrNull(p.rt);
+  // SIMILAR TO (regex.md §8f.2): a similar_to_escape call over constant text is translated now, so
+  // the pattern precompiles below (and a translation error surfaces at resolve).
+  let rr = p.rr;
+  if (
+    e.similar &&
+    rr.kind === "scalarFunc" &&
+    rr.func === "similar_to_escape" &&
+    rr.args.every((a) => a.kind === "constText")
+  ) {
+    const [pat, esc] = rr.args as { kind: "constText"; value: string }[];
+    rr = { kind: "constText", value: similarToEscape(pat.value, esc?.value) };
+  }
   // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at
   // eval. For ~* the constant is case-folded before compiling (the ILIKE mechanism). A malformed
   // pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
   let program: RegexProgram | null = null;
-  if (p.rr.kind === "constText") {
+  if (rr.kind === "constText") {
     const pat = e.insensitive
-      ? foldRegexPattern(p.rr.value, scope.catalog.environment.property())
-      : p.rr.value;
-    program = compileRegex(pat);
+      ? foldRegexPattern(rr.value, scope.catalog.environment.property())
+      : rr.value;
+    program = e.similar ? compileSimilar(pat) : compileRegex(pat);
   }
   // A precompiled program carries the one-shot compileCharged cost flag mutated on first eval, so
   // a reused plan would under-charge the 2nd+ execute — never cache such a plan.
@@ -2545,9 +2557,10 @@ function resolveRegexExpr(
     node: {
       kind: "regex",
       lhs: p.rl,
-      rhs: p.rr,
+      rhs: rr,
       negated: e.negated,
       insensitive: e.insensitive,
+      similar: e.similar,
       program,
       compileCharged: false,
     },

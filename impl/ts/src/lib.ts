@@ -323,6 +323,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.regexp_split_to_array",
   // The regex substring(text, text) / SUBSTRING(x FROM pattern) (regex.md §8e).
   "func.substring_regex",
+  "func.substring_similar",
   // The array <-> text conversions (array-functions.md §15).
   "func.array_to_string",
   "func.string_to_array",
@@ -924,6 +925,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.like",
   "expr.ilike",
   "expr.like_escape",
+  "expr.similar_to",
   "expr.text_concat",
   "expr.text_build",
   "expr.regex_match",

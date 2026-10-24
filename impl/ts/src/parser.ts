@@ -5070,7 +5070,8 @@ class Parser {
       (this.peekKeywordAt(1) === "in" ||
         this.peekKeywordAt(1) === "between" ||
         this.peekKeywordAt(1) === "like" ||
-        this.peekKeywordAt(1) === "ilike");
+        this.peekKeywordAt(1) === "ilike" ||
+        (this.peekKeywordAt(1) === "similar" && this.peekKeywordAt(2) === "to"));
     // The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
     const opLoc = this.here();
     if (predNegated) {
@@ -5093,6 +5094,8 @@ class Parser {
     // or `$N` pattern/escape is typed text by the function's signature (grammar.md §22).
     if (this.peekKeyword() === "like" || this.peekKeyword() === "ilike")
       return this.parseLikePredicate(lhs, predNegated, opLoc);
+    if (this.peekKeyword() === "similar" && this.peekKeywordAt(1) === "to")
+      return this.parseSimilarPredicate(lhs, predNegated, opLoc);
     // `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
     // `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
     // is the prefix-NOT over the whole match, taken a level up). The pattern is one CONCAT expression.
@@ -5113,6 +5116,7 @@ class Parser {
         rhs,
         negated: rxNegated,
         insensitive: rxInsensitive,
+        similar: false,
         loc: opLoc,
       };
     }
@@ -5245,6 +5249,39 @@ class Parser {
       };
     }
     return { kind: "like", lhs, rhs, negated: predNegated, insensitive, loc: opLoc };
+  }
+
+  // parseSimilarPredicate parses `[NOT] SIMILAR TO pattern [ESCAPE e]` on lhs (grammar.md §22c). It
+  // desugars, as in PostgreSQL, to `lhs ~ similar_to_escape(pattern [, e])` (`!~` for NOT) on a regex
+  // node flagged similar, which compiles the pattern dot-all (regex.md §8f).
+  private parseSimilarPredicate(lhs: Expr, predNegated: boolean, opLoc: SrcLoc | undefined): Expr {
+    const similarLoc = this.here();
+    this.advance(); // SIMILAR
+    this.advance(); // TO
+    const args = [this.parseConcat()];
+    if (this.peekKeyword() === "escape") {
+      this.advance();
+      args.push(this.parseConcat());
+    }
+    const rhs: Expr = {
+      kind: "funcCall",
+      name: "similar_to_escape",
+      args,
+      argNames: [],
+      star: false,
+      distinct: false,
+      variadic: false,
+      loc: similarLoc,
+    };
+    return {
+      kind: "regex",
+      lhs,
+      rhs,
+      negated: predNegated,
+      insensitive: false,
+      similar: true,
+      loc: opLoc,
+    };
   }
 
   // parseQuantifiedComparison parses `op ANY|SOME|ALL (…)` on lhs (a parseComparison arm).
@@ -6157,7 +6194,9 @@ class Parser {
           argName === null &&
           !distinct &&
           args.length === 1 &&
-          (this.peekKeyword() === "from" || this.peekKeyword() === "for")
+          (this.peekKeyword() === "from" ||
+            this.peekKeyword() === "for" ||
+            this.peekKeyword() === "similar")
         ) {
           return this.parseSubstringTail(name, args[0]!, loc);
         }
@@ -6359,7 +6398,14 @@ class Parser {
   private parseSubstringTail(name: string, source: Expr, loc: SrcLoc | undefined): Expr {
     let start: Expr | null = null;
     let count: Expr | null = null;
-    if (this.peekKeyword() === "from") {
+    // `SUBSTRING(x SIMILAR p ESCAPE e)` is `substring(x, p, e)` (regex.md §8f); ESCAPE is required,
+    // as in PostgreSQL.
+    if (this.peekKeyword() === "similar") {
+      this.advance();
+      start = this.parseExpr();
+      this.expectKeyword("escape");
+      count = this.parseExpr();
+    } else if (this.peekKeyword() === "from") {
       this.advance();
       start = this.parseExpr();
       if (this.peekKeyword() === "for") {

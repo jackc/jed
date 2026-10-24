@@ -253,3 +253,119 @@ fn match_vectors_match() {
         );
     }
 }
+
+#[derive(Default)]
+struct SimilarCase {
+    pattern: String,
+    escape: Option<String>,
+    input: String,
+    error: Option<String>,
+    translation: String,
+    similar: bool,
+    similar_compile: usize,
+    similar_steps: i64,
+    substring: Option<String>,
+    substring_error: Option<String>,
+    substring_compile: usize,
+    substring_steps: i64,
+}
+
+fn parse_similar_cases(text: &str) -> Vec<SimilarCase> {
+    let mut cases: Vec<SimilarCase> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[[case]]" {
+            cases.push(SimilarCase::default());
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') || !line.contains('=') {
+            continue;
+        }
+        let Some(c) = cases.last_mut() else { continue };
+        let (key, val) = line.split_once('=').unwrap();
+        let (key, val) = (key.trim(), val.trim());
+        match key {
+            "pattern" => c.pattern = unquote(val),
+            "escape" => c.escape = Some(unquote(val)),
+            "input" => c.input = unquote(val),
+            "error" => c.error = Some(unquote(val)),
+            "translation" => c.translation = unquote(val),
+            "similar" => c.similar = val == "true",
+            "similar_compile" => c.similar_compile = val.parse().unwrap(),
+            "similar_steps" => c.similar_steps = val.parse().unwrap(),
+            "substring" => c.substring = Some(unquote(val)),
+            "substring_error" => c.substring_error = Some(unquote(val)),
+            "substring_compile" => c.substring_compile = val.parse().unwrap(),
+            "substring_steps" => c.substring_steps = val.parse().unwrap(),
+            _ => {}
+        }
+    }
+    cases
+}
+
+/// The SIMILAR TO contract (regex.md §8f): the translation, the dot-all match, and the four-search
+/// substring, with their compile and step costs.
+#[test]
+fn similar_vectors_match() {
+    use jed::cost::Meter;
+    use jed::regex::{SimilarMatcher, compile_similar, similar_to_escape};
+    let text = std::fs::read_to_string("../../spec/regex/similar_vectors.toml")
+        .expect("read similar_vectors.toml");
+    let cases = parse_similar_cases(&text);
+    assert!(
+        cases.len() >= 15,
+        "expected the full vector set, got {}",
+        cases.len()
+    );
+    for c in &cases {
+        let what = format!("{:?} escape {:?} on {:?}", c.pattern, c.escape, c.input);
+        let escape = c.escape.as_deref();
+        let translated = similar_to_escape(&c.pattern, escape);
+        if let Some(code) = &c.error {
+            assert_eq!(
+                translated.unwrap_err().state.code(),
+                code,
+                "error for {what}"
+            );
+            continue;
+        }
+        let translated = translated.unwrap_or_else(|e| panic!("translate {what}: {}", e.message));
+        assert_eq!(translated, c.translation, "translation for {what}");
+        let chars: Vec<char> = c.input.chars().collect();
+        let prog = compile_similar(&translated).unwrap();
+        let mut m = Meter::new();
+        assert_eq!(
+            prog.is_match(&chars, &mut m).unwrap(),
+            c.similar,
+            "similar for {what}"
+        );
+        assert_eq!(
+            prog.ninst(),
+            c.similar_compile,
+            "similar_compile for {what}"
+        );
+        assert_eq!(m.accrued, c.similar_steps, "similar_steps for {what}");
+        let matcher = SimilarMatcher::compile(&c.pattern, escape.unwrap_or("\\"));
+        if let Some(code) = &c.substring_error {
+            assert_eq!(
+                matcher.unwrap_err().state.code(),
+                code,
+                "substring_error for {what}"
+            );
+            continue;
+        }
+        let matcher = matcher.unwrap();
+        let mut m = Meter::new();
+        let got = matcher
+            .substring(&chars, &mut m)
+            .unwrap()
+            .map(|(i, j)| chars[i..j].iter().collect::<String>());
+        assert_eq!(got, c.substring, "substring for {what}");
+        assert_eq!(
+            matcher.ninst(),
+            c.substring_compile,
+            "substring_compile for {what}"
+        );
+        assert_eq!(m.accrued, c.substring_steps, "substring_steps for {what}");
+    }
+}

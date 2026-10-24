@@ -62,6 +62,8 @@ pub enum SqlState {
     InvalidParameterValue,
     /// 22025 — {detail}
     InvalidEscapeSequence,
+    /// 2200C — {detail}
+    InvalidUseOfEscapeCharacter,
     /// 2201B — invalid regular expression: {detail}
     InvalidRegularExpression,
     /// 2202E — {detail}
@@ -267,6 +269,7 @@ impl SqlState {
             SqlState::CharacterNotInRepertoire => "22021",
             SqlState::InvalidParameterValue => "22023",
             SqlState::InvalidEscapeSequence => "22025",
+            SqlState::InvalidUseOfEscapeCharacter => "2200C",
             SqlState::InvalidRegularExpression => "2201B",
             SqlState::ArraySubscriptError => "2202E",
             SqlState::DuplicateJsonObjectKeyValue => "22030",
@@ -387,6 +390,7 @@ impl SqlState {
             "22021" => Some(SqlState::CharacterNotInRepertoire),
             "22023" => Some(SqlState::InvalidParameterValue),
             "22025" => Some(SqlState::InvalidEscapeSequence),
+            "2200C" => Some(SqlState::InvalidUseOfEscapeCharacter),
             "2201B" => Some(SqlState::InvalidRegularExpression),
             "2202E" => Some(SqlState::ArraySubscriptError),
             "22030" => Some(SqlState::DuplicateJsonObjectKeyValue),
@@ -516,6 +520,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22021", name: "character_not_in_repertoire", class: "data exception" },
     ErrorDesc { code: "22023", name: "invalid_parameter_value", class: "data exception" },
     ErrorDesc { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
+    ErrorDesc { code: "2200C", name: "invalid_use_of_escape_character", class: "data exception" },
     ErrorDesc { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
     ErrorDesc { code: "2202E", name: "array_subscript_error", class: "data exception" },
     ErrorDesc { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },

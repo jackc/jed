@@ -204,6 +204,19 @@ pattern = "\\."
 prog = ["split 3 1", "anychar", "jmp 0", "save 0", "char 46", "save 1", "match"]
 count = 7
 
+# \c for any c that is not an ASCII letter or digit is the literal c (regex.md §2): \% is 37, and in a
+# class \- is a literal hyphen (45).
+[[case]]
+pattern = "\\%"
+prog = ["split 3 1", "anychar", "jmp 0", "save 0", "char 37", "save 1", "match"]
+count = 7
+
+[[case]]
+pattern = "[\\-]"
+prog = ["split 3 1", "anychar", "jmp 0", "save 0", "class 0", "save 1", "match"]
+count = 7
+classes = ["45-45"]
+
 # --- a small ReDoS-shaped pattern still compiles to a tiny program -----------
 # (a+)+ — the classic catastrophic-backtracking pattern; here it is just a few instructions and
 # the Pike VM runs it in linear time (regex.md §6). group 1 -> slots 2,3.

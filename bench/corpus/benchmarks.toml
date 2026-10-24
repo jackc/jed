@@ -2990,6 +2990,36 @@ iterations = 20
 seed = 4220
 expect_rows_per_iter = 1
 
+# SIMILAR TO filter over the same 1M notes (spec/design/regex.md §8f): the pattern is translated to a
+# whole-string regex (`^(?:.*[aeiou]{2}.*)$`) and run on the Pike VM in the dot-all mode, so its
+# matching rows are exactly regex_filter_scan's. jed + PostgreSQL only (SQLite has no SIMILAR TO).
+[[bench]]
+name = "similar_to_filter_scan"
+description = "Full-scan SIMILAR TO filter over the 1M-row note text column (translated to a regex)"
+dataset = "large"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM orders WHERE note SIMILAR TO '%[aeiou]{2}%'"
+warmup = 3
+iterations = 20
+seed = 4220
+expect_rows_per_iter = 1
+
+# The SIMILAR substring over the 1M notes (regex.md §8f.3): four gated linear searches per row choose
+# the shortest first part and the longest middle part, PostgreSQL's rule. The middle part is a
+# fixed-length vowel pair, so the summed length checks the matching rows against PostgreSQL.
+[[bench]]
+name = "similar_substring"
+description = "SUBSTRING(note SIMILAR … ESCAPE …) extracting the first vowel pair over 1M rows"
+dataset = "large"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT sum(length(substring(note SIMILAR '%#\"[aeiou]{2}#\"%' ESCAPE '#'))) FROM orders"
+warmup = 3
+iterations = 20
+seed = 4220
+expect_rows_per_iter = 1
+
 # Running (EXPANDING) window aggregate — the WINDOWED TOP-N optimization (spec/design/window.md §5.2a,
 # cost.md §3). The frame (UNBOUNDED PRECEDING TO CURRENT ROW) is BACKWARD over the id order, the window
 # ORDER BY id = the PK = the outer ORDER BY, and there is a LIMIT 100 — so the first 100 output rows

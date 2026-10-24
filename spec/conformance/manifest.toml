@@ -1398,7 +1398,11 @@ description = "string_to_array(text, sep [, null_string]) → text[] (spec/desig
 
 [[capability]]
 id = "func.substring_regex"
-description = "The POSIX-regex substring (spec/design/regex.md §8e): substring(string, pattern) and the special form SUBSTRING(string FROM pattern) → text — the first match of pattern over jed's RE2-subset Pike VM; when the pattern has a capture group, the text the FIRST group captured, else the whole match. No match, or a first group that did not participate, → NULL. STRICT. A text (or bare string literal, untyped NULL, or $N) second argument selects this overload over substring(text, integer) — text wins among the candidates (functions.md §9.1), as in PostgreSQL, so SUBSTRING('hello' FROM '2') is a regex search (NULL). Match choice is jed's leftmost-first (PostgreSQL's ARE engine prefers the longest match in some patterns — the ledgered flavor divergence). The SIMILAR … ESCAPE form is excluded. Builds on func.regexp_substr"
+description = "The POSIX-regex substring (spec/design/regex.md §8e): substring(string, pattern) and the special form SUBSTRING(string FROM pattern) → text — the first match of pattern over jed's RE2-subset Pike VM; when the pattern has a capture group, the text the FIRST group captured, else the whole match. No match, or a first group that did not participate, → NULL. STRICT. A text (or bare string literal, untyped NULL, or $N) second argument selects this overload over substring(text, integer) — text wins among the candidates (functions.md §9.1), as in PostgreSQL, so SUBSTRING('hello' FROM '2') is a regex search (NULL). Match choice is jed's leftmost-first (PostgreSQL's ARE engine prefers the longest match in some patterns — the ledgered flavor divergence). Builds on func.regexp_substr"
+
+[[capability]]
+id = "func.substring_similar"
+description = "The SQL-standard SIMILAR substring (spec/design/regex.md §8f): substring(s, p, e), SUBSTRING(s SIMILAR p ESCAPE e), and SUBSTRING(s FROM p FOR e) with text operands → text. p (a SIMILAR TO pattern) must match all of s; the result is the text between the two e\" separators, the first part matching as little and the middle part as much as possible (PostgreSQL's rule, computed by four gated linear searches). No separators: s itself when p matches. No match → NULL. STRICT as PostgreSQL's inlined definition: a NULL constant argument is NULL; otherwise every argument is evaluated before the NULL check, so a NULL subject value does not hide a bad escape. Builds on expr.similar_to + func.substring_regex"
 
 [[capability]]
 id = "func.unnest"
@@ -1569,6 +1573,10 @@ description = "text LIKE pattern / NOT LIKE — % matches any run, _ one code po
 [[capability]]
 id = "expr.ilike"
 description = "text ILIKE / NOT ILIKE — case-insensitive LIKE (spec/design/collation.md §16, grammar.md §22). Same contract as LIKE; the matcher simple-lowercases (1:1) both operands first — ASCII-only when no Unicode property bundle is loaded, full simple Unicode mappings when one is. % matches any run, _ one code point, default \\ escape; NULL propagates; non-text 42804; trailing-escape 22025. Builds on expr.like"
+
+[[capability]]
+id = "expr.similar_to"
+description = "s [NOT] SIMILAR TO p [ESCAPE e] and similar_to_escape(p [, e]) (spec/design/regex.md §8f, grammar.md §22c). Desugared, as in PostgreSQL, to s ~ similar_to_escape(p [, e]) compiled in the dot-all mode; similar_to_escape is PostgreSQL's translation byte for byte (% → .*, _ → ., ( → (?:, the escape character quoting, wrapped ^(?:…)$). An escape of two or more code points is 22025; more than two escape-double-quote separators is 2200C. The regex engine reads \\c for a c that is not an ASCII letter or digit as the literal c. Builds on expr.regex_match"
 
 [[capability]]
 id = "expr.like_escape"

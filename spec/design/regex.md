@@ -5,14 +5,16 @@
 > Oracle-compat scalar functions `regexp_count` / `regexp_instr` / `regexp_substr` /
 > `regexp_like` (§8b). **Slice 4** — the set-returning `regexp_matches` /
 > `regexp_split_to_table` and the scalar `regexp_split_to_array` (§8c). That completes PG's
-> `regexp_*` family; §10 lists what stays deferred. Stores nothing on disk → **no
+> `regexp_*` family. **`SIMILAR TO`** and the `SIMILAR` substring followed (§8f); §10 lists what
+> stays deferred. Stores nothing on disk → **no
 > `format_version` bump**.
 
 jed adds POSIX-style regular-expression matching with PostgreSQL's core operators (`~ ~* !~ !~*`)
 and a small function set. **The flavor deliberately does NOT track PostgreSQL** (CLAUDE.md §1):
 we own a clean, **RE2-able** subset chosen so the engine is **linear-time and immune to
-catastrophic backtracking** — the SQL-standard `SIMILAR TO` is excluded, and so are
-backreferences, lookaround, and named groups (the features that force backtracking). This is the
+catastrophic backtracking** — backreferences, lookaround, and named groups (the features that
+force backtracking) are excluded. The SQL-standard `SIMILAR TO` is PostgreSQL's translation onto
+this engine (§8f). This is the
 *overriding reason* for the divergence: **determinism (§8/§10) + untrusted-query safety (§13)**.
 
 The engine is **hand-written in each core** (Rust/Go/TS) like the parser and executor — never
@@ -82,6 +84,7 @@ to tightest: **alternation** `|` → **concatenation** → **quantifier** (`* + 
 | `\D \W \S` | their negations |
 | `\n \t \r \f \v` | the control characters |
 | `\<metachar>` | a literal metacharacter — `\. \* \+ \? \( \) \[ \] \{ \} \| \^ \$ \\` |
+| `\c` | for any other `c` that is not an ASCII letter or digit, the literal `c` (`\%`, `\-`, `\é`), at the top level and in a class — PostgreSQL's and PCRE's rule; `SIMILAR`'s translation relies on it (§8f) |
 | `(...)` | capturing group (group index = its `(` order, 1-based) |
 | `(?:...)` | non-capturing group |
 | `^` `$` | zero-width anchors: start / end of the whole subject (no multiline for the SQL operators; jsonpath `like_regex`'s `m` flag makes them line anchors, §8d) |
@@ -121,7 +124,8 @@ when it matches `{\d+}`, `{\d+,}`, or `{\d+,\d+}`; otherwise it is a **literal `
 matches the literal text `a{b}`. A well-formed interval with `m < n` is **`2201B`**.
 
 **Error cases (all `2201B`):** a quantifier with no preceding atom (`*ab`, `a**`), an unbalanced
-`(`/`[`, a trailing `\`, an unknown alphabetic escape (`\q`), a `{n,m}` with `m < n`.
+`(`/`[`, a trailing `\`, an unknown escape of an ASCII letter or digit (`\q`, `\1`), a `{n,m}`
+with `m < n`.
 
 ---
 
@@ -147,6 +151,7 @@ indices.
 | `AssertEnd`   | — | if `sp == len`: thread → `pc+1`; else die |
 | `AssertLineStart` | — | if `sp == 0` or `input[sp-1] == '\n'`: thread → `pc+1`; else die (line-anchor mode, §8d) |
 | `AssertLineEnd`   | — | if `sp == len` or `input[sp] == '\n'`: thread → `pc+1`; else die (line-anchor mode, §8d) |
+| `Gate` | — | if `sp` is in the run's gate set: thread → `pc+1`; else die (only the gated wrappers of §8f emit it) |
 | `Match`| — | accept; record capture slots |
 
 `Char`/`Any`/`AnyChar`/`Class` are **consuming** (advance `sp`); the rest are zero-width (epsilon). A class
@@ -412,7 +417,9 @@ compile (resolve for a constant pattern, eval for a per-row pattern).
 
 | code | when |
 |---|---|
-| `2201B` `invalid_regular_expression` | malformed pattern: unbalanced `(`/`[`, trailing `\`, unknown alphabetic escape, quantifier with no atom, `{n,m}` with `m<n` (§2) |
+| `2201B` `invalid_regular_expression` | malformed pattern: unbalanced `(`/`[`, trailing `\`, unknown escape of an ASCII letter or digit, quantifier with no atom, `{n,m}` with `m<n` (§2) |
+| `22025` `invalid_escape_sequence` | a `SIMILAR` escape string of two or more code points (§8f) |
+| `2200C` `invalid_use_of_escape_character` | a `SIMILAR` pattern with more than two `e"` separators (§8f) |
 | `54001` `statement_too_complex` | a well-formed pattern whose compiled program exceeds `MAX_REGEX_PROGRAM` (§6) |
 | `54P01` `cost_limit_exceeded` | accrued `regex_compile`/`regex_step` (plus the statement's other cost) reaches the handle's `max_cost` (§6) |
 | `42804` | a non-text operand to `~ ~* !~ !~*` |
@@ -633,13 +640,129 @@ among the candidates ([functions.md](functions.md) §9.1), as in PostgreSQL. So
 would prefer a longer match the results differ: `SUBSTRING('xabcd' FROM 'ab|abc')` is `ab` in jed and
 `abc` in PostgreSQL. This is the flavor divergence of §1, ledgered in `oracle_overrides.toml` for the
 corpus rows that show it. The three-argument SQL-standard form `SUBSTRING(s FROM pattern FOR escape)`
-is PostgreSQL's `SIMILAR` substring and is excluded with `SIMILAR TO` (§10): it is `42883`.
+is PostgreSQL's `SIMILAR` substring (§8f).
+
+---
+
+## 8f. `SIMILAR TO`, `similar_to_escape`, and the `SIMILAR` substring
+
+The SQL-standard pattern surface, over the same engine. PostgreSQL implements it by translating the
+SQL pattern into a regular expression; jed takes the same translation, so the patterns, their
+results, and the translated text agree with PostgreSQL 18. `SIMILAR TO`'s operators are all regular,
+so nothing here compromises the linear-time guarantee (§6).
+
+```sql
+s [NOT] SIMILAR TO p [ESCAPE e]              -- boolean; NOT SIMILAR TO is the negation
+similar_to_escape(p [, e])                   -- the translation, → text
+SUBSTRING(s SIMILAR p ESCAPE e)              -- ≡ substring(s, p, e), → text
+SUBSTRING(s FROM p FOR e)                    -- the same call (an untyped FROM/FOR prefers text)
+```
+
+### 8f.1 The translation `similar_to_escape(p [, e])`
+
+`similar_to_escape` returns PostgreSQL's translation (`similar_escape_internal`) byte for byte. The
+escape character is `e`, or `\` when `e` is omitted; an empty `e` means no escape character; an `e`
+of two or more code points is **`22025`** (`invalid escape string`). STRICT (a NULL argument is
+NULL). The pattern is read one code point at a time, with three pieces of state: *after escape*,
+*in class*, and the class start counter `k`:
+
+| read (in order of precedence) | emitted |
+|---|---|
+| after escape, `"`, not in class | a part separator (below); a third separator is **`2200C`** |
+| after escape, any other `c` | `\c` (in a class this also sets `k = 3`) |
+| the escape character | nothing; *after escape* is set |
+| in class, `c` | `c`, with a `\` doubled to `\\`; `]` closes the class when `k > 2`; else `^` adds 1 to `k`; else `k = 3` |
+| `[` | `[`, enters a class with `k = 1` |
+| `%` | `.*` |
+| `_` | `.` |
+| `(` | `(?:` |
+| `\ . ^ $` | `\` then the character |
+| any other `c` | `c` |
+
+So `]` is literal right after `[` or `[^`, and closes the class anywhere later, as in PostgreSQL.
+`| * + ? { } )` pass through as regex syntax, and a class's contents are regex class syntax. A
+trailing lone escape character emits nothing. The whole is wrapped as `^(?:` … `)$`. The first
+separator emits `){1,1}?(` and the second `){1,1}(?:`, so a pattern of three parts `p1 #" p2 #" p3`
+becomes `^(?:p1){1,1}?(p2){1,1}(?:p3)$`, and one of two parts becomes `^(?:p1){1,1}?(p2)$`. The
+**part texts** `t1`, `t2`, `t3` are what the parts emit between these separators.
+
+Two engine rules make the translation compile as PostgreSQL's does. Every escape `\c` for a `c` that
+is not an ASCII letter or digit is the literal `c` (§2), so `\%` is a percent sign. And `SIMILAR`
+compiles in the dot-all mode (§8d), where `.` matches a newline: PostgreSQL's `.` does, and `%` and
+`_` must match any character. An unknown escaped letter is still `2201B` (`\b` is a backspace in
+PostgreSQL), and a class item the engine lacks (`[[:alpha:]]`, §2) reads as the engine reads it.
+
+**Cost.** A growth kernel ([cost.md](cost.md) §8.1), like `like_escape`: one `operator_eval`, plus
+`scalar_byte` per output byte when an argument is not constant.
+
+### 8f.2 `SIMILAR TO`
+
+`s [NOT] SIMILAR TO p [ESCAPE e]` binds at the comparison level (precedence 35), like `LIKE`. The
+parser desugars it as PostgreSQL does: to `s ~ similar_to_escape(p [, e])` (`!~` for `NOT`), on the
+`Regex` node with its *similar* flag set, so the pattern compiles in the dot-all mode. (A `~` written
+over an explicit `similar_to_escape(…)` call is an ordinary `~`, where `.` does not match a newline.)
+The operands are text, as for `~`: a non-text operand is `42804`. The pattern operand is evaluated
+before the NULL check, so a NULL subject does not hide a bad escape (`22025`), as in PostgreSQL.
+
+When `p` and `e` are constant text, the resolver translates them and precompiles the result (§5);
+a translation error then surfaces at resolve, even over no rows. The cost per row is then one
+`operator_eval` and the `regex_step`s of the match, plus `regex_compile` once per execution. A
+non-constant pattern adds `similar_to_escape`'s cost and a compile per row.
+
+### 8f.3 The `SIMILAR` substring `substring(s, p, e)`
+
+The SQL standard's `SUBSTRING(s SIMILAR p ESCAPE e)`: `p` must match the whole of `s`, and the
+result is the text matched by the part between the two `e"` separators. PostgreSQL's rule, which jed
+follows: **the first part matches as little as possible, then the middle part as much as possible**,
+and the third part the rest. With one separator there is no third part. With none, the result is
+all of `s` when `p` matches it. No match is NULL. STRICT, as PostgreSQL's inlined definition is: a
+NULL constant argument makes the call NULL; otherwise every argument is evaluated, then any NULL is
+NULL, so a NULL subject value does not hide a bad escape. It is the `substring(text, text, text)`
+catalog row; `ESCAPE` is required in the `SIMILAR` form, as in PostgreSQL.
+
+jed's leftmost-first search (§4) cannot choose that split by itself, so a pattern with separators
+runs four searches over the part texts, each linear. Each part compiles alone (dot-all), so a part
+must be a well-formed pattern: a `(` closed in a later part is `2201B` (PostgreSQL accepts it, a
+ledgered divergence). Two wrappers replace §3.2's, both gated:
+
+```
+leftmost:  0: Split 3, 1        rightmost:  0: Split 1, 3      # rightmost: the prefix is greedy
+           1: AnyChar                       1: AnyChar
+           2: Jmp 0                         2: Jmp 0
+           3: Gate                          3: Gate
+           4: Save 0  <body>  Save 1  Match
+```
+
+`Gate` (listing `gate`) is zero-width: a thread passes it only at a position in the run's *gate set*.
+Under the lazy prefix the match starts at the leftmost gated position that leads to one; under the
+greedy prefix, at the rightmost (a later start has the higher priority, and dedup keeps it). An
+*ends run* is the VM of §4 except that a thread reaching `Match` records its position in an *end
+set* and does not stop the run. With `n` the subject length:
+
+| program | body | run | gate set | result |
+|---|---|---|---|---|
+| A | `(?:t1)` | ends run | `{0}` | `E1` = where the first part can end |
+| B | `(?:t2)(?:t3)$` (`(?:t2)$` for two parts) | leftmost search | `E1` | no match → NULL; else its start `i` |
+| C | `(?:t2)` | ends run | `{i}` | `E2` = where the middle part can end |
+| D | `(?:t3)$` | rightmost search | `E2` | its start `j` |
+
+The result is `s[i..j]` (two parts: `s[i..n]`, with no C or D). Without separators the program is
+the §3.2 program of `^(?:t1)$`, and a match returns `s`.
+
+**Cost.** One `operator_eval`, then `regex_compile` for every instruction of every program (once per
+execution when `p` and `e` are constant, else per row, plus the translation's `scalar_byte`s), and
+the `regex_step`s of each run. The result is a slice of `s`, so it charges no `scalar_byte` itself.
+
+**Divergences** (ledgered where the corpus shows them): the cross-part parenthesis above; a `~`
+over an explicit `similar_to_escape(…)` keeps jed's `.` (no newline); and the two-argument
+`substring(s, similar_to_escape(p, e))`, PostgreSQL's definition of the three-argument form, is the
+leftmost-first §8e search in jed, so it can split the parts differently.
 
 ---
 
 ## 9. Cross-core fixtures
 
-Two TOML fixture families in [`spec/regex/`](../regex/) (the `spec/encoding/` precedent), the
+Three TOML fixture families in [`spec/regex/`](../regex/) (the `spec/encoding/` precedent), the
 binding determinism contract:
 
 - **`program_vectors.toml`** — `(pattern, flags) → (instruction listing, instruction count)`. Each
@@ -647,6 +770,8 @@ binding determinism contract:
   match the listing exactly. This is THE compile-determinism check.
 - **`match_vectors.toml`** — `(pattern, flags, input) → (matched?, capture spans, regex_step cost)`.
   Each core runs the VM and asserts identical result, capture offsets (code-point), and step count.
+- **`similar_vectors.toml`** — `(pattern, escape, input) → (translation, SIMILAR TO result,
+  SIMILAR substring, regex_compile and regex_step cost of each)` (§8f).
 
 Per CLAUDE.md §10 these are verified by **per-core unit tests** (cross-core compile/cost identity is
 structurally outside the SQL corpus's reach); the SQL-observable behavior lives in the conformance
@@ -660,15 +785,16 @@ corpus (§11).
 - The SELECT-list position of `regexp_matches` / `regexp_split_to_table` (deferred for every SRF,
   [functions.md](functions.md) §10). The functions themselves **landed in Slice 4** (§8c), and the
   Oracle-compat functions in Slice 3 (§8b).
-- `\b` word boundary, POSIX `[[:class:]]`, numeric escapes `\xHH`/`\x{…}`, Unicode-property classes
-  `\p{…}` (ties into the collation Unicode-property work), the `m`/`x` flags and inline `(?i)` on
-  the SQL operators. (The `s` and `m` flags exist only for jsonpath `like_regex`, §8d.)
+- `\b` word boundary, POSIX `[[:class:]]`, numeric escapes `\xHH`/`\x{…}`, the `m`/`x` flags and
+  inline `(?i)` on the SQL operators. (The `s` and `m` flags exist only for jsonpath `like_regex`, §8d.)
 - A lazy-DFA fast path (perf only — same semantics); regex-driven index acceleration (anchored
   `~ '^literal'` → a PK/index bound, the point-lookup precedent).
 
+**Not planned:** Unicode-property classes `\p{…}` (they would need the collation bundle's
+property tables); `\p` stays an invalid escape.
+
 **Permanently excluded** (would force backtracking, defeating the linear-time guarantee):
-backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And the SQL-standard
-`SIMILAR TO` (a separate, deliberately-omitted surface).
+backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups.
 
 ---
 
@@ -679,13 +805,13 @@ backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`, named groups. And
   Slice 2 adds `func.regexp_replace`, `func.regexp_match`; Slice 3 adds `func.regexp_count`,
   `func.regexp_instr`, `func.regexp_substr`, `func.regexp_like`; Slice 4 adds
   `func.regexp_matches`, `func.regexp_split_to_table`, `func.regexp_split_to_array`; §8e adds
-  `func.substring_regex`.
+  `func.substring_regex`; §8f adds `expr.similar_to` and `func.substring_similar`.
 - Corpus: `suites/expr/regex.test` (operators, NULL/42804/2201B, code-point/astral, `# cost:` pins),
   `suites/resource/regex_program_limit.test` (`54001` boundary, jed-specific — not oracle-checked),
   `suites/expr/regexp_functions.test` (Slice 2), `suites/expr/regexp_oracle_functions.test` (Slice 3),
   `suites/query/regexp_srf.test` (Slice 4), `suites/expr/regex_case_insensitive_escapes.test` (the
   §1 pattern fold keeps escape letters: `\D \W \S \A` under `~*` and `'i'`), `suites/expr/substring_regex.test`
-  (§8e).
+  (§8e), `suites/expr/similar_to.test` and `suites/expr/substring_similar.test` (§8f).
 - **Oracle divergence** (§7 conformance): jed's flavor is the RE2 subset, so only the **PG-agreeing
   subset** is oracle-checkable (`mise run corpus:check`); flavor-divergent cases (a pattern PG accepts
   via a backref, greedy-edge differences) get **hand-authored expected output + an

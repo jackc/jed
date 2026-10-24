@@ -597,6 +597,8 @@ import {
   replaceMatches,
   replaceSize,
   type RegexProgram,
+  compileSimilarMatcher,
+  type SimilarMatcher,
   utf8Offsets,
 } from "./regex.ts";
 
@@ -38414,6 +38416,8 @@ export type RExpr =
       rhs: RExpr;
       negated: boolean;
       insensitive: boolean;
+      // SIMILAR TO (regex.md §8f.2): the pattern compiles in the dot-all mode.
+      similar: boolean;
       program: RegexProgram | null;
       compileCharged: boolean;
     }
@@ -38514,6 +38518,8 @@ export type RExpr =
       func: RegexFuncName;
       args: RExpr[];
       program: RegexProgram | null;
+      // The precompiled matcher of a similar_substring with a constant pattern and escape.
+      similar?: SimilarMatcher | null;
       compileCharged: boolean;
     }
   // A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and
@@ -38957,7 +38963,10 @@ export type ScalarFuncName =
   | "quote_nullable"
   // like_escape(pattern, escape) → text — rewrite a LIKE pattern to the default \ escape; what
   // LIKE … ESCAPE desugars to (§3, grammar.md §22).
-  | "like_escape";
+  | "like_escape"
+  // similar_to_escape(pattern [, escape]) → text — PostgreSQL's SIMILAR-to-regex translation; what
+  // SIMILAR TO … [ESCAPE …] desugars to (regex.md §8f).
+  | "similar_to_escape";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -39002,7 +39011,11 @@ export type RegexFuncName =
   | "split_to_table"
   // substring(string, pattern) / SUBSTRING(string FROM pattern) (regex.md §8e): the first match's
   // first capture group when the pattern has one, else the whole match. EXPLAIN renders `substring`.
-  | "substring";
+  | "substring"
+  // substring(string, pattern, escape) / SUBSTRING(string SIMILAR pattern ESCAPE escape) (regex.md
+  // §8f.3): the text between the pattern's two separators, the pattern matching the whole string.
+  // Its programs live in the node's `similar` matcher, not `program`. EXPLAIN renders `substring`.
+  | "similar_substring";
 
 export type RangeFuncName =
   | "lower"
@@ -45262,6 +45275,24 @@ function regexFuncNode(
     const f = rargs[flagsIdx];
     insensitive = f.kind === "constText" ? f.value.includes("i") : null;
   }
+  // The SIMILAR substring precompiles its matcher from a constant pattern and escape (§8f.3); a NULL
+  // constant subject makes the call NULL without translating, as PostgreSQL's strict SQL function
+  // folds before it inlines.
+  if (func === "similar_substring") {
+    let similar: SimilarMatcher | null = null;
+    if (
+      rargs[0].kind !== "constNull" &&
+      rargs[1].kind === "constText" &&
+      rargs[2].kind === "constText"
+    ) {
+      similar = compileSimilarMatcher(rargs[1].value, rargs[2].value);
+      params.uncacheable = true;
+    }
+    return {
+      node: { kind: "regexFunc", func, args: rargs, program: null, similar, compileCharged: false },
+      type: { kind: "text" },
+    };
+  }
   let program: RegexProgram | null = null;
   if (rargs[1].kind === "constText" && insensitive !== null) {
     const pat = insensitive
@@ -45586,6 +45617,14 @@ export function resolveScalarFunc(
     desc.argFamilies[1] === "text"
   ) {
     return regexFuncNode(scope, "substring", -1, rargs, params);
+  }
+  // The SIMILAR overload substring(text, text, text) (regex.md §8f.3), on the same node.
+  if (
+    (name as string) === "substring" &&
+    desc.argFamilies.length === 3 &&
+    desc.argFamilies[1] === "text"
+  ) {
+    return regexFuncNode(scope, "similar_substring", -1, rargs, params);
   }
   // Eval-kernel aliases that share a backing kernel id: `power(x, y)` is PG's name for jed's pow (the
   // name gap, float.md §8); `ceiling` is PG's alias of `ceil` (functions.md §9). The catalog lookup

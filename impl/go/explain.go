@@ -1878,6 +1878,8 @@ func explainScalarFunc(f scalarFunc) string {
 		return "quote_nullable"
 	case sfLikeEscape:
 		return "like_escape"
+	case sfSimilarToEscape:
+		return "similar_to_escape"
 	}
 	panic("unhandled scalar function in EXPLAIN")
 }
@@ -1891,7 +1893,7 @@ func explainRangeFunc(f rangeFunc) string {
 }
 
 func explainRegexFunc(f regexFunc) string {
-	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr", "regexp_split_to_array", "regexp_matches", "regexp_split_to_table", "substring"}[f]
+	return [...]string{"regexp_replace", "regexp_match", "regexp_like", "regexp_count", "regexp_substr", "regexp_instr", "regexp_split_to_array", "regexp_matches", "regexp_split_to_table", "substring", "substring"}[f]
 }
 
 func explainRangeOp(op rangeOp) string {

@@ -46,6 +46,8 @@ pub enum Inst {
     AssertLineStart,
     /// `$` in the line-anchor mode: the subject end or just before a `\n`.
     AssertLineEnd,
+    /// Passes only at a position in the run's gate set (the gated wrappers of regex.md §8f).
+    Gate,
     Match,
 }
 
@@ -101,6 +103,7 @@ impl Program {
                 Inst::AssertEnd => "assertend".to_string(),
                 Inst::AssertLineStart => "assertlinestart".to_string(),
                 Inst::AssertLineEnd => "assertlineend".to_string(),
+                Inst::Gate => "gate".to_string(),
                 Inst::Match => "match".to_string(),
             })
             .collect()
@@ -451,7 +454,8 @@ impl Parser {
         if let Some(ctrl) = control_escape(c) {
             return Ok(Node::Char(ctrl));
         }
-        if is_meta(c) {
+        // Any other escaped code point that is not an ASCII letter or digit is itself (regex.md §2).
+        if is_meta(c) || !c.is_ascii_alphanumeric() {
             return Ok(Node::Char(c));
         }
         Err(invalid(&format!("invalid escape \\{c}")))
@@ -544,7 +548,7 @@ impl Parser {
         if let Some(ctrl) = control_escape(e) {
             return Ok(ClassItem::Char(ctrl));
         }
-        if is_meta(e) || e == '-' || e == ']' {
+        if is_meta(e) || !e.is_ascii_alphanumeric() {
             return Ok(ClassItem::Char(e));
         }
         Err(invalid(&format!("invalid escape \\{e}")))
@@ -846,6 +850,19 @@ pub fn compile(pattern: &str) -> Result<Program> {
 
 /// [`compile`] under a jsonpath `like_regex` compile mode (regex.md §8d).
 pub fn compile_mode(pattern: &str, mode: Mode) -> Result<Program> {
+    compile_wrapped(pattern, mode, Wrapper::Search)
+}
+
+/// The program wrapper around a pattern body: §3.2's unanchored search, or one of the gated wrappers
+/// of regex.md §8f, whose prefix is lazy (the leftmost gated start) or greedy (the rightmost).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wrapper {
+    Search,
+    GatedLeftmost,
+    GatedRightmost,
+}
+
+fn compile_wrapped(pattern: &str, mode: Mode, wrapper: Wrapper) -> Result<Program> {
     let mut parser = Parser {
         chars: pattern.chars().collect(),
         pos: 0,
@@ -863,10 +880,18 @@ pub fn compile_mode(pattern: &str, mode: Mode) -> Result<Program> {
         insts: Vec::new(),
         classes: Vec::new(),
     };
-    // Wrapper (regex.md §3.2): lazy `.*?` prefix (unanchored, leftmost) + group-0 save + Match.
-    c.push(Inst::Split(3, 1))?;
+    // Wrapper (regex.md §3.2): lazy `.*?` prefix (unanchored, leftmost) + group-0 save + Match. The
+    // gated wrappers (§8f) add a Gate after the prefix, whose arms the rightmost form swaps.
+    c.push(if wrapper == Wrapper::GatedRightmost {
+        Inst::Split(1, 3)
+    } else {
+        Inst::Split(3, 1)
+    })?;
     c.push(Inst::AnyChar)?;
     c.push(Inst::Jmp(0))?;
+    if wrapper != Wrapper::Search {
+        c.push(Inst::Gate)?;
+    }
     c.push(Inst::Save(0))?;
     c.emit(&root)?;
     c.push(Inst::Save(1))?;
@@ -1044,6 +1069,14 @@ struct Thread<C> {
     caps: Option<C>,
 }
 
+/// A search's gate set (one flag per position; `None` outside the gated wrappers) and, for an ends
+/// run, its end set (regex.md §8f).
+#[derive(Default)]
+struct Gating<'a> {
+    gate: Option<&'a [bool]>,
+    ends: Option<&'a mut [bool]>,
+}
+
 /// The per-position dedup set (regex.md §4): `marks[pc] == generation` means `pc` was visited at the
 /// current position, so moving to the next position is an increment, not a clear. A program pools
 /// its sets and reuses them across searches and rows, so a search does no setup work in proportion to
@@ -1124,11 +1157,52 @@ impl Program {
         start: usize,
         m: &mut Meter,
     ) -> Result<Option<Captures>> {
+        self.gated_search(seen, input, start, &mut Gating::default(), m)
+    }
+
+    /// [`Program::search`] under a gate set and, for an ends run, an end set (regex.md §8f).
+    fn gated_search(
+        &self,
+        seen: &mut Seen,
+        input: &[char],
+        start: usize,
+        gating: &mut Gating,
+        m: &mut Meter,
+    ) -> Result<Option<Captures>> {
         if self.cap_depth == 1 {
-            self.pike_search::<FlatCaps>(seen, input, start, m)
+            self.pike_search::<FlatCaps>(seen, input, start, gating, m)
         } else {
-            self.pike_search::<TreeCaps>(seen, input, start, m)
+            self.pike_search::<TreeCaps>(seen, input, start, gating, m)
         }
+    }
+
+    /// The start of the match of a gated program (regex.md §8f) whose start is in `gate` (one flag per
+    /// position, `input.len() + 1` of them): the leftmost such start under the lazy prefix, the
+    /// rightmost under the greedy one.
+    pub fn gated_start(
+        &self,
+        input: &[char],
+        gate: &[bool],
+        m: &mut Meter,
+    ) -> Result<Option<usize>> {
+        let mut gating = Gating {
+            gate: Some(gate),
+            ends: None,
+        };
+        let caps = self.with_seen(|seen| self.gated_search(seen, input, 0, &mut gating, m))?;
+        Ok(caps.map(|caps| self.slot(&caps, 0) as usize))
+    }
+
+    /// An ends run of a gated program (regex.md §8f): every position at which a match starting in
+    /// `gate` can end, as one flag per position.
+    pub fn match_ends(&self, input: &[char], gate: &[bool], m: &mut Meter) -> Result<Vec<bool>> {
+        let mut ends = vec![false; input.len() + 1];
+        let mut gating = Gating {
+            gate: Some(gate),
+            ends: Some(&mut ends),
+        };
+        self.with_seen(|seen| self.gated_search(seen, input, 0, &mut gating, m))?;
+        Ok(ends)
     }
 
     /// [`Program::search`] over the capture representation `R`.
@@ -1138,15 +1212,17 @@ impl Program {
         seen: &mut Seen,
         input: &[char],
         start: usize,
+        gating: &mut Gating,
         m: &mut Meter,
     ) -> Result<Option<Captures>> {
+        let gate = gating.gate;
         let len = input.len();
         let mut clist: Vec<Thread<R::Caps>> = Vec::new();
         let mut nlist: Vec<Thread<R::Caps>> = Vec::new();
         let mut matched: Option<R::Caps> = None;
 
         let generation = seen.next();
-        self.add_thread::<R>(&mut clist, seen, generation, 0, None, start, input, m)?;
+        self.add_thread::<R>(&mut clist, seen, generation, 0, None, start, input, gate, m)?;
 
         for sp in start..=len {
             let generation = seen.next();
@@ -1160,6 +1236,12 @@ impl Program {
                     Inst::AnyChar => sp < len,
                     Inst::Class(k) => sp < len && self.classes[*k].admits(input[sp]),
                     Inst::Match => {
+                        // An ends run records the position and keeps every thread (regex.md §8f).
+                        if let Some(ends) = gating.ends.as_deref_mut() {
+                            ends[sp] = true;
+                            i += 1;
+                            continue;
+                        }
                         matched = clist[i].caps.clone();
                         break; // cut lower-priority threads (leftmost-first, regex.md §4)
                     }
@@ -1175,6 +1257,7 @@ impl Program {
                         caps,
                         sp + 1,
                         input,
+                        gate,
                         m,
                     )?;
                 }
@@ -1203,6 +1286,7 @@ impl Program {
         caps0: Option<R::Caps>,
         sp: usize,
         input: &[char],
+        gate: Option<&[bool]>,
         m: &mut Meter,
     ) -> Result<()> {
         let len = input.len();
@@ -1250,6 +1334,11 @@ impl Program {
                 }
                 Inst::AssertLineEnd => {
                     if sp == len || input[sp] == '\n' {
+                        stack.push(Thread { pc: pc + 1, caps });
+                    }
+                }
+                Inst::Gate => {
+                    if gate.is_some_and(|g| g[sp]) {
                         stack.push(Thread { pc: pc + 1, caps });
                     }
                 }
@@ -1514,6 +1603,215 @@ impl Program {
             Piece::Span(a, b) => out.extend(orig[a..b].iter()),
         });
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIMILAR TO (regex.md §8f)
+// ---------------------------------------------------------------------------
+
+/// The compile mode of every SIMILAR program: dot-all, so `%` and `_` match a newline (regex.md §8f).
+const SIMILAR_MODE: Mode = Mode {
+    nl_stop: false,
+    dot_all: true,
+    nl_anchor: false,
+};
+
+/// The part texts of a SIMILAR pattern: PostgreSQL's `similar_escape_internal` translation of each
+/// part between the escape-double-quote separators, one to three of them (regex.md §8f.1). `escape`
+/// `None` is the default `\`; `Some("")` is no escape character. An escape of two or more code points
+/// is 22025; a third separator is 2200C.
+fn similar_parts(pattern: &str, escape: Option<&str>) -> Result<Vec<String>> {
+    let esc = match escape {
+        None => Some('\\'),
+        Some(e) => {
+            let mut it = e.chars();
+            match (it.next(), it.next()) {
+                (None, _) => None,
+                (Some(c), None) => Some(c),
+                (Some(_), Some(_)) => {
+                    return Err(EngineError::new(
+                        SqlState::InvalidEscapeSequence,
+                        "invalid escape string",
+                    ));
+                }
+            }
+        }
+    };
+    // PostgreSQL's multibyte path: with a non-ASCII escape, a non-ASCII pattern character is copied
+    // without touching the class state.
+    let wide_escape = esc.is_some_and(|e| !e.is_ascii());
+    let mut parts = vec![String::with_capacity(pattern.len() + 8)];
+    let mut after_escape = false;
+    let mut in_class = false;
+    let mut class_start = 0u32;
+    for c in pattern.chars() {
+        let out = parts.last_mut().expect("parts is never empty");
+        if wide_escape && !c.is_ascii() {
+            if after_escape {
+                out.push('\\');
+                out.push(c);
+                after_escape = false;
+            } else if Some(c) == esc {
+                after_escape = true;
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        if after_escape {
+            if c == '"' && !in_class {
+                if parts.len() == 3 {
+                    return Err(EngineError::new(
+                        SqlState::InvalidUseOfEscapeCharacter,
+                        "SQL regular expression may not contain more than two escape-double-quote separators",
+                    ));
+                }
+                parts.push(String::new());
+            } else {
+                out.push('\\');
+                out.push(c);
+                class_start = 3;
+            }
+            after_escape = false;
+        } else if Some(c) == esc {
+            after_escape = true;
+        } else if in_class {
+            if c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+            // `]` is literal right after `[` or `[^` (class_start 1 or 2), else it closes the class.
+            if c == ']' && class_start > 2 {
+                in_class = false;
+            } else if c == '^' {
+                class_start += 1;
+            } else {
+                class_start = 3;
+            }
+        } else {
+            match c {
+                '[' => {
+                    out.push('[');
+                    in_class = true;
+                    class_start = 1;
+                }
+                '%' => out.push_str(".*"),
+                '_' => out.push('.'),
+                '(' => out.push_str("(?:"),
+                '\\' | '.' | '^' | '$' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+    Ok(parts)
+}
+
+/// The whole-pattern translation from its part texts: `^(?:t1)$`, `^(?:t1){1,1}?(t2)$`, or
+/// `^(?:t1){1,1}?(t2){1,1}(?:t3)$` (regex.md §8f.1).
+fn similar_join(parts: &[String]) -> String {
+    let mut out = String::from("^(?:");
+    out.push_str(&parts[0]);
+    if let Some(t2) = parts.get(1) {
+        out.push_str("){1,1}?(");
+        out.push_str(t2);
+    }
+    if let Some(t3) = parts.get(2) {
+        out.push_str("){1,1}(?:");
+        out.push_str(t3);
+    }
+    out.push_str(")$");
+    out
+}
+
+/// `similar_to_escape(pattern [, escape])` (regex.md §8f.1): PostgreSQL's translation of a SIMILAR
+/// pattern into a regular expression, byte for byte.
+pub fn similar_to_escape(pattern: &str, escape: Option<&str>) -> Result<String> {
+    Ok(similar_join(&similar_parts(pattern, escape)?))
+}
+
+/// Compile a translated SIMILAR pattern for `SIMILAR TO` (regex.md §8f.2): the §3.2 program, dot-all.
+pub fn compile_similar(translated: &str) -> Result<Program> {
+    compile_mode(translated, SIMILAR_MODE)
+}
+
+/// The programs of `substring(s, p, e)` (regex.md §8f.3).
+#[derive(Clone, Debug)]
+pub enum SimilarMatcher {
+    /// No separators: the §3.2 program of `^(?:t1)$`.
+    Whole(Program),
+    /// Two or three parts: A and B, and for three parts C and D.
+    Parts {
+        a: Program,
+        b: Program,
+        cd: Option<(Program, Program)>,
+    },
+}
+
+impl SimilarMatcher {
+    /// Translate and compile `p` with escape `e`. Does not meter; the caller charges `regex_compile ×
+    /// ninst()`.
+    pub fn compile(pattern: &str, escape: &str) -> Result<SimilarMatcher> {
+        let parts = similar_parts(pattern, Some(escape))?;
+        if parts.len() == 1 {
+            return Ok(SimilarMatcher::Whole(compile_similar(&similar_join(
+                &parts,
+            ))?));
+        }
+        let gated = |body: String, wrapper| compile_wrapped(&body, SIMILAR_MODE, wrapper);
+        let t2 = &parts[1];
+        let a = gated(format!("(?:{})", parts[0]), Wrapper::GatedLeftmost)?;
+        let Some(t3) = parts.get(2) else {
+            let b = gated(format!("(?:{t2})$"), Wrapper::GatedLeftmost)?;
+            return Ok(SimilarMatcher::Parts { a, b, cd: None });
+        };
+        let b = gated(format!("(?:{t2})(?:{t3})$"), Wrapper::GatedLeftmost)?;
+        let c = gated(format!("(?:{t2})"), Wrapper::GatedLeftmost)?;
+        let d = gated(format!("(?:{t3})$"), Wrapper::GatedRightmost)?;
+        Ok(SimilarMatcher::Parts {
+            a,
+            b,
+            cd: Some((c, d)),
+        })
+    }
+
+    /// The instruction count of every program = the `regex_compile` cost.
+    pub fn ninst(&self) -> usize {
+        match self {
+            SimilarMatcher::Whole(p) => p.ninst(),
+            SimilarMatcher::Parts { a, b, cd } => {
+                a.ninst() + b.ninst() + cd.as_ref().map_or(0, |(c, d)| c.ninst() + d.ninst())
+            }
+        }
+    }
+
+    /// The code-point span `[i, j)` the SIMILAR substring returns, or `None` when the pattern does not
+    /// match the whole input (regex.md §8f.3). Charges every run's `regex_step`s.
+    pub fn substring(&self, input: &[char], m: &mut Meter) -> Result<Option<(usize, usize)>> {
+        let n = input.len();
+        let at = |pos: usize| {
+            let mut gate = vec![false; n + 1];
+            gate[pos] = true;
+            gate
+        };
+        match self {
+            SimilarMatcher::Whole(p) => Ok(p.run(input, m)?.map(|_| (0, n))),
+            SimilarMatcher::Parts { a, b, cd } => {
+                let e1 = a.match_ends(input, &at(0), m)?;
+                let Some(i) = b.gated_start(input, &e1, m)? else {
+                    return Ok(None);
+                };
+                let Some((c, d)) = cd else {
+                    return Ok(Some((i, n)));
+                };
+                let e2 = c.match_ends(input, &at(i), m)?;
+                // B's match proves a split exists, so D always finds one.
+                Ok(d.gated_start(input, &e2, m)?.map(|j| (i, j)))
+            }
+        }
     }
 }
 

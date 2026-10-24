@@ -405,7 +405,8 @@ errors         = []
 # (../design/grammar.md §22; verified against PostgreSQL 18). text vs a non-text operand is a
 # 42804 (compare.toml lists only text×text). ILIKE is the case-insensitive form (below). The
 # `ESCAPE e` clause is not an operand: the parser desugars `x LIKE p ESCAPE e` to
-# `x LIKE like_escape(p, e)` (the like_escape function below); SIMILAR TO is excluded.
+# `x LIKE like_escape(p, e)` (the like_escape function below). SIMILAR TO is not a row: the parser
+# desugars it to `x ~ similar_to_escape(p [, e])` (../design/regex.md §8f).
 
 [[operator]]
 volatility     = "immutable"
@@ -439,8 +440,8 @@ errors         = ["22025"]
 # negations (carried by the AST `negated` flag, the NOT-LIKE precedent — not separate rows). Unlike
 # LIKE these are PUNCTUATION operators (a `symbol`), and unlike LIKE the match is UNANCHORED — `~`
 # is TRUE iff the pattern matches some SUBSTRING (anchor with ^/$). The flavor is jed's own RE2-able
-# subset (../design/regex.md), NOT PostgreSQL-compatible; SIMILAR TO and backreferences/lookaround
-# are excluded. text×text → boolean, null = "propagates" (a NULL operand → NULL, never the pattern
+# subset (../design/regex.md), NOT PostgreSQL-compatible; backreferences/lookaround are excluded.
+# SIMILAR TO desugars onto this node (../design/regex.md §8f). text×text → boolean, null = "propagates" (a NULL operand → NULL, never the pattern
 # error), a non-text operand is 42804 (compare.toml lists only text×text). A malformed pattern is
 # 2201B; a well-formed-but-too-large compiled program is 54001 (../design/regex.md §6/§7). `~*`
 # simple-lowercases both operands first (the ILIKE mechanism, collation.md §16). Binds at the
@@ -4363,7 +4364,7 @@ errors         = ["22011"]
 # substring(string, start[, count]) — the SQL-standard name of substr, for text and bytea (the same
 # kernel). The parser also desugars the special form SUBSTRING(x FROM s [FOR l]) / SUBSTRING(x FOR l
 # [FROM s]) to these calls (grammar.ebnf `substring_expr`; FOR-only starts at 1). A text `from`
-# selects the regex form substring(text, text) below; the SIMILAR … ESCAPE form is not catalogued.
+# selects the regex form substring(text, text) below, and three text arguments the SIMILAR form.
 [[operator]]
 volatility     = "immutable"
 name           = "substring"
@@ -4426,6 +4427,25 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = ["2201B"]
+
+# substring(string, pattern, escape) / SUBSTRING(string SIMILAR pattern ESCAPE escape) /
+# SUBSTRING(string FROM pattern FOR escape) → text — the SQL-standard SIMILAR substring
+# (../design/regex.md §8f): `pattern` (a SIMILAR TO pattern, escape character `escape`) must match the
+# whole string; the result is the text the part between the two escape-double-quote separators
+# matched, the first part matching as little as possible and the middle as much as possible
+# (PostgreSQL's rule). No separators: the whole string when it matches. No match → NULL. STRICT: a NULL
+# constant argument is NULL; otherwise every argument is evaluated first. Resolver-routed to RegexFunc. An untyped FROM/FOR operand
+# prefers this row over substring(text, integer, integer), as in PostgreSQL (functions.md §9.1).
+[[operator]]
+volatility     = "immutable"
+name           = "substring"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["2201B", "22025", "2200C"]
 
 # overlay(string PLACING new FROM start [FOR count]) — the SQL standard's splice: the string with
 # `count` units starting at the 1-based `start` replaced by `new` (count defaults to length(new)).
@@ -5108,6 +5128,34 @@ arg_resolution = "none"
 result         = "text"
 null           = "propagates"
 errors         = ["22025"]
+
+# similar_to_escape(pattern [, escape]) → text — PostgreSQL's translation of a SIMILAR TO pattern into
+# a regular expression (similar_escape_internal), byte for byte (../design/regex.md §8f): `%` → `.*`,
+# `_` → `.`, `(` → `(?:`, `\ . ^ $` escaped, the escape character (default `\`, '' = none) quoting the
+# next character, its `"` separating up to three parts, the whole wrapped as `^(?:…)$`. An escape of
+# two or more code points is 22025; a third separator is 2200C. What `x SIMILAR TO p [ESCAPE e]`
+# desugars to. STRICT. A growth kernel (cost.md §8.1).
+[[operator]]
+volatility     = "immutable"
+name           = "similar_to_escape"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+volatility     = "immutable"
+name           = "similar_to_escape"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["22025", "2200C"]
 
 # --- text-building VARIADIC "any" functions (string-functions.md §6) ---------------------------------
 # PostgreSQL's concat / concat_ws / format. Each takes a spread of heterogeneous arguments (or a single

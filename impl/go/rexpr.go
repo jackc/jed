@@ -969,6 +969,9 @@ const (
 	// like_escape(pattern, escape) → text — rewrite a LIKE pattern to the default \ escape; what
 	// LIKE … ESCAPE desugars to (§3, grammar.md §22).
 	sfLikeEscape
+	// similar_to_escape(pattern [, escape]) → text — PostgreSQL's SIMILAR-to-regex translation; what
+	// SIMILAR TO … [ESCAPE …] desugars to (regex.md §8f).
+	sfSimilarToEscape
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -1035,6 +1038,10 @@ const (
 	// rxSubstring is substring(string, pattern) / SUBSTRING(string FROM pattern) (regex.md §8e): the
 	// first match's first capture group when the pattern has one, else the whole match.
 	rxSubstring
+	// rxSimilarSubstring is substring(string, pattern, escape) / SUBSTRING(string SIMILAR pattern
+	// ESCAPE escape) (regex.md §8f.3): the text between the pattern's two separators, the pattern
+	// matching the whole string. Its programs live in rxSimilarMatcher, not rxProgram.
+	rxSimilarSubstring
 )
 
 // rangeOp selects a range BOOLEAN operator (spec/design/range-functions.md §3, RF3). Each is a binary
@@ -1177,6 +1184,11 @@ type rExpr struct {
 	rxProgram        *regexProgram
 	rxCompileCharged bool
 	rxFunc           regexFunc
+	// rxSimilar marks a reRegex from SIMILAR TO, compiled in the dot-all mode (regex.md §8f.2);
+	// rxSimilarMatcher is the precompiled matcher of an rxSimilarSubstring with a constant pattern
+	// and escape (§8f.3).
+	rxSimilar        bool
+	rxSimilarMatcher *similarMatcher
 	// collation is the derived collation of a reCompare (spec/design/collation.md §7). nil is the
 	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
 	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless

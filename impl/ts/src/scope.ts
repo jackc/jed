@@ -3280,7 +3280,10 @@ export function renderRExpr(e: RExpr): string {
     case "rangeFunc":
       return explainCall(e.func, e.args);
     case "regexFunc":
-      return explainCall(e.func === "substring" ? "substring" : `regexp_${e.func}`, e.args);
+      return explainCall(
+        e.func === "substring" || e.func === "similar_substring" ? "substring" : `regexp_${e.func}`,
+        e.args,
+      );
     case "rangeCtor":
       return explainCall(rangeNameForElement(e.elem) ?? "range", e.args);
     case "rangeOp":

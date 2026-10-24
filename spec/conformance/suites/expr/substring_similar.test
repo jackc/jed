@@ -1,0 +1,135 @@
+# The SQL-standard SIMILAR substring (spec/design/regex.md §8f.3): SUBSTRING(s SIMILAR p ESCAPE e),
+# SUBSTRING(s FROM p FOR e), and substring(s, p, e) with text operands. The pattern must match the
+# whole subject; the result is the text matched by the part between the two e" separators, the first
+# part matching as little as possible and the middle part as much as possible (PostgreSQL's rule).
+# One separator: the middle part runs to the end. None: the whole subject when it matches. No match
+# is NULL. Verified against PostgreSQL 18; cost is jed's own.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, func.substring_similar, types.i32, types.text, null.three_valued, resource.cost_metering
+
+# --- PostgreSQL's documented examples --------------------------------------------------------------
+query TT nosort
+SELECT substring('foobar' SIMILAR '%#"o_b#"%' ESCAPE '#'), substring('foobar' SIMILAR '#"o_b#"%' ESCAPE '#')
+----
+oob
+NULL
+
+# --- the split: the first part as short as possible, then the middle part as long as possible -----
+query TTTT nosort
+SELECT substring('ab123cd' SIMILAR '%#"[0-9]+#"%' ESCAPE '#'), substring('foobar' SIMILAR '%#"o%#"%' ESCAPE '#'), substring('abcabc' SIMILAR 'a%#"b%#"' ESCAPE '#'), substring('abab' SIMILAR '(ab|a)#"%#"' ESCAPE '#')
+----
+123
+oobar
+bcabc
+bab
+
+# The middle part's alternation takes its longest choice; the third part gets the rest.
+query TTT nosort
+SELECT substring('aab' SIMILAR '#"a|aa#"%' ESCAPE '#'), substring('aab' SIMILAR '#"aa|a#"%' ESCAPE '#'), substring('xaaay' SIMILAR 'x#"a*#"a*y' ESCAPE '#')
+----
+aa
+aa
+aaa
+
+# An empty middle part.
+query T nosort
+SELECT '[' || substring('abc' SIMILAR 'abc#"#"' ESCAPE '#') || ']'
+----
+[]
+
+# --- one separator, and none ----------------------------------------------------------------
+query TTTT nosort
+SELECT substring('foobar' SIMILAR 'f#"o%' ESCAPE '#'), substring('foobar' SIMILAR '%o#"%' ESCAPE '#'), substring('foobar' SIMILAR 'foobar' ESCAPE '#'), substring('foobar' SIMILAR 'fo' ESCAPE '#')
+----
+oobar
+obar
+foobar
+NULL
+
+# --- the FROM … FOR and comma spellings ----------------------------------------------------------
+query TTT nosort
+SELECT substring('Thomas' FROM '%#"o_a#"_' FOR '#'), substring('Thomas', '%#"o_a#"_', '#'), substring('Thomas' FROM 2 FOR 3)
+----
+oma
+oma
+hom
+
+# `%` matches a newline.
+query T nosort
+SELECT substring('a' || chr(10) || 'bc' SIMILAR '%#"c#"' ESCAPE '#')
+----
+c
+
+# --- NULL ------------------------------------------------------------------------------------
+query TTT nosort
+SELECT substring(NULL SIMILAR 'a' ESCAPE '#'), substring('a' SIMILAR NULL ESCAPE '#'), substring('a' SIMILAR 'a' ESCAPE NULL)
+----
+NULL
+NULL
+NULL
+
+# --- errors ----------------------------------------------------------------------------------
+statement error 2200C
+SELECT substring('abcd' SIMILAR 'a#"b#"c#"d' ESCAPE '#')
+
+statement error 22025
+SELECT substring('abc' SIMILAR 'a' ESCAPE '##')
+
+# A NULL constant argument is NULL before the escape is read, as in PostgreSQL.
+query T nosort
+SELECT substring(NULL SIMILAR 'a' ESCAPE '##')
+----
+NULL
+
+# The SIMILAR spelling requires ESCAPE.
+statement error 42601
+SELECT substring('abc' SIMILAR 'abc')
+
+# --- untyped parameters bind text -----------------------------------------------------------------
+# params: '%#"b#"%', '#'
+query T nosort
+SELECT substring('abc' FROM $1 FOR $2)
+----
+b
+
+# --- over a table: constant and per-row patterns -------------------------------------------------
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, p text)
+
+statement ok
+INSERT INTO t VALUES (1, 'key=value', '%=#"%#"'), (2, 'k=v=w', '%=#"%#"'), (3, 'novalue', '%=#"%#"'), (4, NULL, '%=#"%#"')
+
+# A constant pattern compiles its four programs once per execution; each non-NULL subject runs the
+# four searches (regex.md §8f.3).
+# cost: 584
+query IT nosort
+SELECT id, substring(s SIMILAR '%=#"%#"' ESCAPE '#') FROM t ORDER BY id
+----
+1
+value
+2
+v=w
+3
+NULL
+4
+NULL
+
+# A bad escape is an error even where the subject value is NULL.
+statement error 22025
+SELECT id, substring(s SIMILAR 'a' ESCAPE '##') FROM t WHERE id = 4
+
+statement error 22025
+SELECT id, substring(s SIMILAR p ESCAPE p) FROM t WHERE id = 4
+
+# A per-row pattern is translated and compiled per row.
+query IT nosort
+SELECT id, substring(s SIMILAR p ESCAPE '#') FROM t ORDER BY id
+----
+1
+value
+2
+v=w
+3
+NULL
+4
+NULL

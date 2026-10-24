@@ -2095,6 +2095,9 @@ type regexExpr struct {
 	Rhs         exprNode
 	Negated     bool
 	Insensitive bool
+	// Similar marks SIMILAR TO (grammar.md §22c): Rhs is the desugared similar_to_escape(p [, e])
+	// call, and the pattern compiles in the dot-all mode (regex.md §8f).
+	Similar bool
 }
 
 // CaseExpr is a CASE expression (spec/design/grammar.md §23). Searched form: Operand is nil and

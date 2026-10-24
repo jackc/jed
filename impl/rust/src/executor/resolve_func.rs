@@ -538,7 +538,18 @@ pub(crate) fn regex_func_node(
         None => Some(false),
         Some(_) => None, // non-constant flags: defer compilation (and the `i` decision) to eval.
     };
+    // The SIMILAR substring precompiles its matcher from a constant pattern and escape (§8f.3).
+    // A NULL constant subject makes the call NULL without translating, as PostgreSQL's strict SQL
+    // function folds before it inlines.
+    let similar = match (func, &rargs[0], &rargs[1], rargs.get(2)) {
+        (RegexFunc::SimilarSubstring, RExpr::ConstNull, _, _) => None,
+        (RegexFunc::SimilarSubstring, _, RExpr::ConstText(pat), Some(RExpr::ConstText(esc))) => {
+            Some(crate::regex::SimilarMatcher::compile(pat, esc)?)
+        }
+        _ => None,
+    };
     let program = match (&rargs[1], insensitive) {
+        _ if func == RegexFunc::SimilarSubstring => None,
         (RExpr::ConstText(pat), Some(insensitive)) => {
             let pat = if insensitive {
                 let prop = scope.catalog.session.env.property();
@@ -552,11 +563,14 @@ pub(crate) fn regex_func_node(
     };
     // A precompiled program carries the one-shot `compile_charged` cost flag mutated on first eval, so
     // a reused plan would under-charge the 2nd+ execute — never cache such a plan.
-    if program.is_some() {
+    if program.is_some() || similar.is_some() {
         params.uncacheable = true;
     }
     let result = match func {
-        RegexFunc::Replace | RegexFunc::Substr | RegexFunc::Substring => ResolvedType::Text,
+        RegexFunc::Replace
+        | RegexFunc::Substr
+        | RegexFunc::Substring
+        | RegexFunc::SimilarSubstring => ResolvedType::Text,
         RegexFunc::Match | RegexFunc::SplitToArray | RegexFunc::SplitToTable => {
             ResolvedType::Array(Box::new(ResolvedType::Text))
         }
@@ -572,6 +586,7 @@ pub(crate) fn regex_func_node(
             func,
             args: rargs,
             program: program.map(Box::new),
+            similar: similar.map(Box::new),
             compile_charged: std::cell::Cell::new(false),
         },
         result,
@@ -1132,6 +1147,10 @@ fn adopt_scalar_overload(
     // pattern precompilation and the regex cost units.
     if name == "substring" && desc.arg_families == ["text", "text"] {
         return regex_func_node(scope, RegexFunc::Substring, None, rargs, params);
+    }
+    // The SIMILAR overload substring(text, text, text) (regex.md §8f.3), on the same node.
+    if name == "substring" && desc.arg_families == ["text", "text", "text"] {
+        return regex_func_node(scope, RegexFunc::SimilarSubstring, None, rargs, params);
     }
     // Catalog volatility is executable admission data. date_part's epoch overload
     // is refined by its constant field, without erasing dependencies of either child.
@@ -2418,7 +2437,7 @@ pub(crate) fn explain_regex_func(func: RegexFunc) -> &'static str {
         RegexFunc::Like => "regexp_like",
         RegexFunc::Count => "regexp_count",
         RegexFunc::Substr => "regexp_substr",
-        RegexFunc::Substring => "substring",
+        RegexFunc::Substring | RegexFunc::SimilarSubstring => "substring",
         RegexFunc::Instr => "regexp_instr",
         RegexFunc::SplitToArray => "regexp_split_to_array",
         RegexFunc::Matches => "regexp_matches",
@@ -6344,13 +6363,38 @@ fn resolve_node(
             rhs,
             negated,
             insensitive,
+            similar,
             ..
         } => outline(|| {
             // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand
             // typing as LIKE: resolve the pair, require both text (or a bare NULL); non-text 42804.
-            let (rl, lt, rr, rt) = resolve_text_operand_pair(scope, lhs, rhs, agg, params)?;
+            let (rl, lt, mut rr, rt) = resolve_text_operand_pair(scope, lhs, rhs, agg, params)?;
             require_text_or_null(&lt)?;
             require_text_or_null(&rt)?;
+            // SIMILAR TO (regex.md §8f.2): a similar_to_escape call over constant text is translated
+            // now, so the pattern precompiles below (and a translation error surfaces at resolve).
+            if *similar {
+                if let RExpr::ScalarFunc {
+                    func: ScalarFunc::SimilarToEscape,
+                    args,
+                    ..
+                } = &rr
+                {
+                    let consts: Option<Vec<&str>> = args
+                        .iter()
+                        .map(|a| match a {
+                            RExpr::ConstText(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(c) = consts {
+                        rr = RExpr::ConstText(crate::regex::similar_to_escape(
+                            c[0],
+                            c.get(1).copied(),
+                        )?);
+                    }
+                }
+            }
             // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per
             // row at eval. For ~* the constant is case-folded before compiling (the ILIKE
             // mechanism); the subject is folded per row at eval. A malformed pattern surfaces 2201B
@@ -6364,7 +6408,11 @@ fn resolve_node(
                 } else {
                     pat.as_str()
                 };
-                Some(crate::regex::compile(pat_ref)?)
+                Some(if *similar {
+                    crate::regex::compile_similar(pat_ref)?
+                } else {
+                    crate::regex::compile(pat_ref)?
+                })
             } else {
                 None
             };
@@ -6379,6 +6427,7 @@ fn resolve_node(
                     rhs: Box::new(rr),
                     negated: *negated,
                     insensitive: *insensitive,
+                    similar: *similar,
                     program: program.map(Box::new),
                     compile_charged: std::cell::Cell::new(false),
                 },

@@ -1269,6 +1269,7 @@ impl RExpr {
                 rhs,
                 negated,
                 insensitive,
+                similar,
                 program,
                 compile_charged,
             } => outline(|| {
@@ -1319,7 +1320,11 @@ impl RExpr {
                         } else {
                             p
                         };
-                        let prog = crate::regex::compile(pat_ref)?;
+                        let prog = if *similar {
+                            crate::regex::compile_similar(pat_ref)?
+                        } else {
+                            crate::regex::compile(pat_ref)?
+                        };
                         m.charge(COSTS.regex_compile * prog.ninst() as i64);
                         m.guard()?;
                         prog.is_match(&subj_chars, m)?
@@ -1332,17 +1337,25 @@ impl RExpr {
                 func,
                 args,
                 program,
+                similar,
                 compile_charged,
             } => outline(|| {
                 m.charge(COSTS.operator_eval);
-                // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+                // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8). The
+                // SIMILAR substring short-circuits only on a NULL constant and otherwise evaluates every
+                // argument first, so a NULL subject does not hide a bad escape (regex.md §8f.3).
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     let v = a.eval(row, env, m)?;
-                    if matches!(v, Value::Null) {
+                    if matches!(v, Value::Null)
+                        && (*func != RegexFunc::SimilarSubstring || matches!(a, RExpr::ConstNull))
+                    {
                         return Ok(Value::Null);
                     }
                     vals.push(v);
+                }
+                if *func == RegexFunc::SimilarSubstring {
+                    return similar_substring(&vals, similar.as_deref(), compile_charged, m);
                 }
                 let text = |v: &Value| -> String {
                     match v {
@@ -1372,7 +1385,7 @@ impl RExpr {
                             flags = text(v);
                         }
                     }
-                    RegexFunc::Substring => {}
+                    RegexFunc::Substring | RegexFunc::SimilarSubstring => {}
                     RegexFunc::Match
                     | RegexFunc::Like
                     | RegexFunc::SplitToArray
@@ -1467,7 +1480,8 @@ impl RExpr {
                     | RegexFunc::SplitToArray
                     | RegexFunc::Matches
                     | RegexFunc::SplitToTable
-                    | RegexFunc::Substring => {}
+                    | RegexFunc::Substring
+                    | RegexFunc::SimilarSubstring => {}
                 }
                 // Validate flags: `i` and `g` are known, anything else is 2201B. Then (PG order) `g`
                 // on a function that does not take it — all but regexp_replace / regexp_matches — is
@@ -1591,6 +1605,9 @@ impl RExpr {
                                 ))
                             }
                         }
+                    }
+                    RegexFunc::SimilarSubstring => {
+                        unreachable!("the SIMILAR substring returns before the regexp_* dispatch")
                     }
                     RegexFunc::Instr => match prog.nth_match(&match_chars, start0, nth, m)? {
                         None => Ok(Value::Int(0)),
@@ -3110,6 +3127,23 @@ impl RExpr {
                             _ => unreachable!("resolver restricts like_escape to text"),
                         };
                         let out = Value::Text(like_escape_text(p, e)?);
+                        if !args.iter().all(rexpr_is_constant) {
+                            charge_output(m, &out)?;
+                        }
+                        Ok(out)
+                    }
+                    // similar_to_escape(pattern [, escape]) → text — the `SIMILAR TO` translation
+                    // (regex.md §8f.1), a growth kernel like like_escape.
+                    ScalarFunc::SimilarToEscape => {
+                        let text = |v: &Value| match v {
+                            Value::Text(s) => s.clone(),
+                            _ => unreachable!("resolver restricts similar_to_escape to text"),
+                        };
+                        let escape = vals.get(1).map(text);
+                        let out = Value::Text(crate::regex::similar_to_escape(
+                            &text(&vals[0]),
+                            escape.as_deref(),
+                        )?);
                         if !args.iter().all(rexpr_is_constant) {
                             charge_output(m, &out)?;
                         }

@@ -16,12 +16,18 @@ import { Meter } from "../src/cost.ts";
 import {
   compileRegex,
   compileRegexMode,
+  compileSimilar,
+  compileSimilarMatcher,
   foldRegexPattern,
   regexClassListing,
+  regexIsMatch,
   regexListing,
   regexNinst,
   regexRun,
   regexSlots,
+  similarNinst,
+  similarSubstringSpan,
+  similarToEscape,
 } from "../src/regex.ts";
 import { specPath } from "./tomlmini.ts";
 
@@ -143,5 +149,66 @@ test("regex match vectors match spec/regex/match_vectors.toml", () => {
       `caps for ${pattern}/${input}`,
     );
     assert.equal(m.accrued, BigInt(Number(c.get("steps"))), `steps for ${pattern}/${input}`);
+  }
+});
+
+// The SIMILAR TO contract (regex.md §8f): the translation, the dot-all match, and the four-search
+// substring, with their compile and step costs.
+test("regex SIMILAR vectors match spec/regex/similar_vectors.toml", () => {
+  const blocks = parseCaseBlocks(specPath("regex/similar_vectors.toml"));
+  assert.ok(blocks.length >= 15, `expected the full vector set, got ${blocks.length}`);
+  const code = (f: () => unknown): string => {
+    try {
+      f();
+    } catch (e) {
+      return (e as { code(): string }).code();
+    }
+    return "";
+  };
+  for (const c of blocks) {
+    const pattern = tomlUnquote(c.get("pattern"));
+    const input = tomlUnquote(c.get("input"));
+    const escapeChar = c.has("escape") ? tomlUnquote(c.get("escape")) : undefined;
+    const what = `${pattern} escape ${escapeChar} on ${input}`;
+    if (c.has("error")) {
+      assert.equal(
+        code(() => similarToEscape(pattern, escapeChar)),
+        tomlUnquote(c.get("error")),
+        `error for ${what}`,
+      );
+      continue;
+    }
+    const translated = similarToEscape(pattern, escapeChar);
+    assert.equal(translated, tomlUnquote(c.get("translation")), `translation for ${what}`);
+    const cps = Array.from(input, (ch) => ch.codePointAt(0) as number);
+    const prog = compileSimilar(translated);
+    let m = new Meter();
+    assert.equal(regexIsMatch(prog, cps, m), c.get("similar") === "true", `similar for ${what}`);
+    assert.equal(regexNinst(prog), Number(c.get("similar_compile")), `similar_compile for ${what}`);
+    assert.equal(m.accrued, BigInt(Number(c.get("similar_steps"))), `similar_steps for ${what}`);
+    if (c.has("substring_error")) {
+      assert.equal(
+        code(() => compileSimilarMatcher(pattern, escapeChar ?? "\\")),
+        tomlUnquote(c.get("substring_error")),
+        `substring_error for ${what}`,
+      );
+      continue;
+    }
+    const sm = compileSimilarMatcher(pattern, escapeChar ?? "\\");
+    m = new Meter();
+    const span = similarSubstringSpan(sm, cps, m);
+    const got = span === null ? null : String.fromCodePoint(...cps.slice(span[0], span[1]));
+    const want = c.get("substring_null") === "true" ? null : tomlUnquote(c.get("substring"));
+    assert.equal(got, want, `substring for ${what}`);
+    assert.equal(
+      similarNinst(sm),
+      Number(c.get("substring_compile")),
+      `substring_compile for ${what}`,
+    );
+    assert.equal(
+      m.accrued,
+      BigInt(Number(c.get("substring_steps"))),
+      `substring_steps for ${what}`,
+    );
   }
 });

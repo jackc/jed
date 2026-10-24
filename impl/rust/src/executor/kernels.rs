@@ -204,6 +204,49 @@ pub(crate) fn regexp_replace_text(
     Ok(prog.replace_build(orig_chars, repl, &found, size))
 }
 
+/// The SIMILAR substring `substring(s, p, e)` (regex.md §8f.3) over its evaluated arguments. The
+/// matcher is the precompiled one (its `regex_compile` charged once per execution, on first eval) or
+/// translated and compiled now, charging the translation's bytes (a growth kernel, cost.md §8.1) and
+/// the compile. A NULL pattern or escape is NULL before any translation; a NULL subject is NULL after
+/// it, so it does not hide a bad escape. The result is a slice of the subject.
+pub(crate) fn similar_substring(
+    vals: &[Value],
+    precompiled: Option<&crate::regex::SimilarMatcher>,
+    compile_charged: &std::cell::Cell<bool>,
+    meter: &mut Meter,
+) -> Result<Value> {
+    let (Value::Text(pattern), Value::Text(escape)) = (&vals[1], &vals[2]) else {
+        return Ok(Value::Null);
+    };
+    let owned;
+    let matcher = match precompiled {
+        Some(matcher) => {
+            if !compile_charged.get() {
+                compile_charged.set(true);
+                meter.charge(COSTS.regex_compile * matcher.ninst() as i64);
+                meter.guard()?;
+            }
+            matcher
+        }
+        None => {
+            let translated = crate::regex::similar_to_escape(pattern, Some(escape))?;
+            charge_output(meter, &Value::Text(translated))?;
+            owned = crate::regex::SimilarMatcher::compile(pattern, escape)?;
+            meter.charge(COSTS.regex_compile * owned.ninst() as i64);
+            meter.guard()?;
+            &owned
+        }
+    };
+    let Value::Text(subject) = &vals[0] else {
+        return Ok(Value::Null);
+    };
+    let chars: Vec<char> = subject.chars().collect();
+    Ok(match matcher.substring(&chars, meter)? {
+        Some((i, j)) => Value::Text(chars[i..j].iter().collect()),
+        None => Value::Null,
+    })
+}
+
 /// `regexp_match` / `regexp_matches` (regex.md §8/§8c): one `text[]` capture array for the first
 /// match, or for every non-overlapping match when `global`; no match gives none. An amplifier
 /// (cost.md §8.1): nested groups capture the same text once each, so the pattern multiplies the

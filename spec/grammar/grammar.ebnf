@@ -1228,7 +1228,9 @@ not_expr       ::= "NOT" not_expr
  * expression, optionally followed by "ESCAPE" and one more (the escape string, §22). The parser
  * desugars "x LIKE p ESCAPE e" to "x LIKE like_escape(p, e)" — PostgreSQL's own rewrite into the
  * default backslash form — so the clause adds no operator node. "ESCAPE" is read as the clause
- * only directly after a LIKE/ILIKE pattern (elsewhere it is an ordinary bare label). PostgreSQL binds IN/BETWEEN/LIKE slightly tighter than the comparison operators;
+ * only directly after a LIKE/ILIKE/SIMILAR TO pattern (elsewhere it is an ordinary bare label).
+ * "x SIMILAR TO p [ESCAPE e]" desugars to "x ~ similar_to_escape(p [, e])" (§22c), "NOT SIMILAR TO"
+ * to the "!~" form, compiled in the dot-all mode (../design/regex.md §8f). PostgreSQL binds IN/BETWEEN/LIKE slightly tighter than the comparison operators;
  * collapsing them into this one non-associative level is a documented narrowing (unobservable,
  * since chaining comparisons is already a syntax error here). Every comparison operand is a
  * `concat` expression, so the `||` operator (one rung tighter) is available inside them.
@@ -1247,6 +1249,7 @@ comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( subquery
                             | "NOT"? "IN" "(" ( subquery_expr | concat ("," concat)* ) ")"
                             | "NOT"? "BETWEEN" concat "AND" concat
                             | "NOT"? ("LIKE" | "ILIKE") concat ("ESCAPE" concat)?
+                            | "NOT"? "SIMILAR" "TO" concat ("ESCAPE" concat)?
                             | regex_op concat )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">=" | "<>" | "!="   /* "<>" and "!=" are one not-equal operator; the lexer folds "!=" to "<>" */
@@ -1472,12 +1475,14 @@ extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
  * functions.md §4, ../design/grammar.md §55) — the SQL special form, desugared by the parser to the
  * ordinary call substring(x, start[, count]) (start = 1 when only FOR is given — PostgreSQL's
  * rewrite), so it resolves like any function_call and is labelled `substring`. Recognized only for
- * an UNQUOTED `substring` call whose FIRST argument (positional, no DISTINCT) is followed by FROM or
- * FOR; otherwise the call is an ordinary function_call (the comma form substring(x, s, l)). The form
+ * an UNQUOTED `substring` call whose FIRST argument (positional, no DISTINCT) is followed by FROM,
+ * FOR, or SIMILAR; otherwise the call is an ordinary function_call (the comma form substring(x, s, l)). The form
  * is not a function application, so no WITHIN GROUP / FILTER / OVER may follow. "SUBSTRING" is not
- * reserved. PG's regular-expression forms (substring(text FROM pattern), SIMILAR … ESCAPE) parse as
- * this form and fail resolution (42883). */
-substring_expr ::= "SUBSTRING" "(" expr ( "FROM" expr ( "FOR" expr )? | "FOR" expr ( "FROM" expr )? ) ")"
+ * reserved. A text FROM selects the regex overload substring(text, text), and a text FROM … FOR the
+ * SIMILAR overload substring(text, text, text) (../design/regex.md §8e/§8f). "SIMILAR" p "ESCAPE" e
+ * desugars to substring(x, p, e); ESCAPE is required, as in PostgreSQL. */
+substring_expr ::= "SUBSTRING" "(" expr ( "FROM" expr ( "FOR" expr )? | "FOR" expr ( "FROM" expr )?
+                                        | "SIMILAR" expr "ESCAPE" expr ) ")"
 
 /* POSITION(substring IN string) (../design/string-functions.md §3/§4, ../design/grammar.md §56) —
  * the SQL special form, desugared by the parser to the ordinary call position(string, substring)

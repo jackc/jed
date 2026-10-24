@@ -49,14 +49,24 @@ FROM account
 ORDER BY id;`;
 
 	const redos = `SELECT 'aaaaaaaaaaaaaaaaaaaa!' ~ '(a+)+\$' AS matched;`;
+
+	const similar = `SELECT id, email FROM account
+WHERE email SIMILAR TO '[a-z]+@(example|work.example).(com|org)'
+ORDER BY id;`;
+
+	const similarEscape = `SELECT '50%' SIMILAR TO '50#%' ESCAPE '#' AS literal_percent,
+       similar_to_escape('a%b_c')              AS as_regex;`;
+
+	const substringSimilar = `SELECT substring('ab123cd' SIMILAR '%#"[0-9]+#"%' ESCAPE '#') AS digits,
+       substring('key=value' FROM '%=#"%#"' FOR '#')         AS after_eq;`;
 </script>
 
 # Pattern matching
 
-jed offers three ways to match text against a pattern: SQL `LIKE` / `ILIKE`, the
-regular-expression operators `~` `~*` `!~` `!~*`, and the `regexp_*` functions
-(`regexp_replace`, `regexp_match`, `regexp_matches`, the split functions, and the regex form of
-`substring`).
+jed offers four ways to match text against a pattern: SQL `LIKE` / `ILIKE`, the SQL-standard
+`SIMILAR TO`, the regular-expression operators `~` `~*` `!~` `!~*`, and the `regexp_*` functions
+(`regexp_replace`, `regexp_match`, `regexp_matches`, the split functions, and the regex and
+`SIMILAR` forms of `substring`).
 
 ## `LIKE` / `ILIKE`
 
@@ -72,6 +82,21 @@ otherwise).
 
 <LiveSql query={likeEscape} rows={1} />
 
+## `SIMILAR TO`
+
+`s SIMILAR TO pattern` is TRUE when the pattern matches the **whole** string. `%` and `_` are
+`LIKE`'s wildcards, and `|`, `*`, `+`, `?`, `{n,m}`, `( )`, and `[...]` work as in a regular
+expression. `.`, `^`, and `$` are ordinary characters. `NOT SIMILAR TO` is the negation.
+
+<LiveSql {seed} query={similar} rows={2} />
+
+As in PostgreSQL, the pattern is translated into a regular expression, which
+`similar_to_escape(pattern [, escape])` shows. The default escape character is backslash, `ESCAPE`
+picks another (it must be a single character, `22025` otherwise), and `ESCAPE ''` turns escaping
+off. `%` and `_` also match a newline.
+
+<LiveSql query={similarEscape} rows={1} />
+
 ## Regular expressions
 
 The `~` operator is TRUE when the pattern matches **somewhere** in the subject (it is
@@ -81,7 +106,7 @@ unanchored — anchor with `^` / `$` for a whole-string match). `~*` is case-ins
 jed's regex flavor is its **own**, deliberately **not** PostgreSQL-compatible: it is a clean
 [RE2](https://github.com/google/re2)-style subset run by a linear-time engine, so it is immune
 to catastrophic-backtracking ("ReDoS") attacks — a pattern that would hang a backtracking engine
-runs in linear time here. `SIMILAR TO`, backreferences, and lookaround are intentionally absent.
+runs in linear time here. Backreferences and lookaround are intentionally absent.
 
 <LiveSql {seed} query={regexOp} rows={3} />
 
@@ -131,9 +156,18 @@ Reordering with capture groups:
 text of the first match: the first capture group when the pattern has one, otherwise the whole
 match, and `NULL` when nothing matches. A quoted second argument is a pattern, as in PostgreSQL, so
 `substring('hello' FROM '2')` searches for `2`; pass an integer (`FROM 2`) for the position form.
-The SQL-standard `SIMILAR` form (`FROM pattern FOR escape`) is not supported.
 
 <LiveSql query={substringRegex} rows={1} />
+
+## `substring(… SIMILAR pattern ESCAPE e)`
+
+The SQL-standard form `SUBSTRING(source SIMILAR pattern ESCAPE e)`, also written
+`SUBSTRING(source FROM pattern FOR e)`, takes a `SIMILAR TO` pattern that must match the whole
+string, with two `e"` markers around the part to return. The part before the first marker matches
+as little as possible and the marked part as much as possible, as in PostgreSQL. It returns `NULL`
+when the pattern does not match.
+
+<LiveSql query={substringSimilar} rows={1} />
 
 ## `regexp_matches`
 

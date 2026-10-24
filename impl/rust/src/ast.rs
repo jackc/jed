@@ -1773,6 +1773,9 @@ pub enum Expr {
         rhs: Box<Expr>,
         negated: bool,
         insensitive: bool,
+        /// `SIMILAR TO` (grammar.md §22c): `rhs` is the desugared `similar_to_escape(p [, e])` call,
+        /// and the pattern compiles in the dot-all mode (regex.md §8f).
+        similar: bool,
         /// The operator's character position (spec/design/error-fields.md §10.2): the `~` / `~*` / `!~` / `!~*` token.
         pos: SrcPos,
     },

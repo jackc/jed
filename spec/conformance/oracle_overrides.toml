@@ -1476,11 +1476,6 @@ reason = "jed: an operator word the expression grammar continues with is always 
 
 [[override]]
 file = "expr/substring_regex.test"
-sql = "SELECT substring('abc' FROM 'b' FOR '#')"
-reason = "jed: the three-text-argument SUBSTRING(s FROM pattern FOR escape) is PostgreSQL's SQL-standard SIMILAR substring, which jed deliberately excludes with SIMILAR TO (regex.md §10): the form desugars to substring(text, text, text), which has no overload (42883). PostgreSQL evaluates it."
-
-[[override]]
-file = "expr/substring_regex.test"
 sql = "SELECT substring('xabcd' FROM 'ab|abc')"
 reason = "jed: the regex flavor is leftmost-first (regex.md §1/§4), so the first alternative that matches wins and substring returns 'ab'. PostgreSQL's ARE engine gives an unquantified alternation longest-match preference and returns 'abc'. The ratified flavor divergence, as for regexp_substr."
 

@@ -231,6 +231,8 @@ import {
 import { type Collation, foldCase, foldLowerSimple } from "./collation.ts";
 import {
   compileRegex,
+  compileSimilar,
+  compileSimilarMatcher,
   foldRegexPattern,
   regexIsMatch,
   regexNinst,
@@ -238,8 +240,11 @@ import {
   regexpNthMatch,
   regexSlot,
   regexpSplitPieces,
+  similarNinst,
+  similarSubstringSpan,
+  similarToEscape,
 } from "./regex.ts";
-import type { RegexProgram } from "./regex.ts";
+import type { RegexProgram, SimilarMatcher } from "./regex.ts";
 import { NEG_INFINITY, POS_INFINITY, makeTimestamp } from "./timestamp.ts";
 import {
   instantToLocalMicros,
@@ -1500,13 +1505,43 @@ function* evalRegexNodeSteps(e: Of<"regex">, row: Row, env: EvalEnv, m: Meter): 
   } else {
     // Non-constant pattern: compile now (charging regex_compile) and run.
     const pat = e.insensitive ? foldRegexPattern(pattern.text, prop) : pattern.text;
-    const prog = compileRegex(pat);
+    const prog = e.similar ? compileSimilar(pat) : compileRegex(pat);
     m.charge(COSTS.regexCompile * BigInt(regexNinst(prog)));
     m.guard();
     matched = regexIsMatch(prog, subjCps, m);
   }
   // negated carries !~ / !~*: matched !== negated flips for the negated form.
   return { kind: "bool", value: matched !== e.negated };
+}
+
+// similarSubstring is the SIMILAR substring substring(s, p, e) (regex.md §8f.3) over its evaluated
+// arguments. The matcher is the precompiled one (its regex_compile charged once per execution, on
+// first eval) or translated and compiled now, charging the translation's bytes (a growth kernel,
+// cost.md §8.1) and the compile. A NULL pattern or escape is NULL before any translation; a NULL
+// subject is NULL after it, so it does not hide a bad escape. The result is a slice of the subject.
+function similarSubstring(e: Of<"regexFunc">, vals: Value[], m: Meter): Value {
+  const [subject, pattern, escapeChar] = vals;
+  if (pattern.kind !== "text" || escapeChar.kind !== "text") return nullValue();
+  let sm: SimilarMatcher;
+  if (e.similar) {
+    sm = e.similar;
+    if (!e.compileCharged) {
+      e.compileCharged = true;
+      m.charge(COSTS.regexCompile * BigInt(similarNinst(sm)));
+      m.guard();
+    }
+  } else {
+    chargeOutput(m, textValue(similarToEscape(pattern.text, escapeChar.text)));
+    sm = compileSimilarMatcher(pattern.text, escapeChar.text);
+    m.charge(COSTS.regexCompile * BigInt(similarNinst(sm)));
+    m.guard();
+  }
+  if (subject.kind !== "text") return nullValue();
+  const cps = Array.from(subject.text, (c) => c.codePointAt(0) as number);
+  const span = similarSubstringSpan(sm, cps, m);
+  return span === null
+    ? nullValue()
+    : textValue(String.fromCodePoint(...cps.slice(span[0], span[1])));
 }
 
 function* evalRegexFuncNodeSteps(
@@ -1516,13 +1551,17 @@ function* evalRegexFuncNodeSteps(
   m: Meter,
 ): Steps<Value> {
   m.charge(COSTS.operatorEval);
-  // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+  // STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8). The SIMILAR substring
+  // short-circuits only on a NULL constant and otherwise evaluates every argument first, so a NULL
+  // subject does not hide a bad escape (regex.md §8f.3).
   const vals: Value[] = [];
   for (const a of e.args) {
     const v = yield* evalExprSteps(a, row, env, m);
-    if (v.kind === "null") return nullValue();
+    if (v.kind === "null" && (e.func !== "similar_substring" || a.kind === "constNull"))
+      return nullValue();
     vals.push(v);
   }
+  if (e.func === "similar_substring") return similarSubstring(e, vals, m);
   const text = (v: Value): string => {
     if (v.kind !== "text") throw new Error("unreachable: resolver requires text regexp_* operands");
     return v.text;
@@ -2505,6 +2544,15 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     // quote_literal(text) → text — wrap as a SQL string literal. A growth kernel: quoting
     // doubles every quote (cost.md §8.1).
     return growthResult(m, e.args, textValue(quoteLiteralText((vals[0] as { text: string }).text)));
+  }
+  if (e.func === "similar_to_escape") {
+    // similar_to_escape(pattern [, escape]) → text — the SIMILAR TO translation (regex.md §8f.1), a
+    // growth kernel like like_escape.
+    const out = similarToEscape(
+      (vals[0] as { text: string }).text,
+      vals.length > 1 ? (vals[1] as { text: string }).text : undefined,
+    );
+    return growthResult(m, e.args, textValue(out));
   }
   if (e.func === "like_escape") {
     // like_escape(pattern, escape) → text — the LIKE … ESCAPE rewrite (grammar.md §22). A growth
