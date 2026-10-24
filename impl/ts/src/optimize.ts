@@ -154,6 +154,47 @@ function buildHashJoinPlanForOns(
   return keys.length > 0 ? { keys } : null;
 }
 
+// mergeHashJoinPlan is the hash keys of a MERGE matching loop (spec/design/merge.md §3, estimator.md
+// §9.4) over the join condition `on` in the [target | source] slots (the target's n columns first):
+// null when a conjunct fails the hash join's structural gate (cost.md §3 "JOIN"), else the bare
+// target-column = source-column equalities of the same keyable type — the source as the probe
+// (left) side, the target as the build (right) side — or null when there is none.
+export function mergeHashJoinPlan(on: RExpr, n: number, rels: ScopeRel[]): HashJoinPlan | null {
+  const conjuncts: RExpr[] = [];
+  flattenHashJoinConjuncts(on, conjuncts);
+  const keys: { left: number; right: number; type: Type }[] = [];
+  for (const expr of conjuncts) {
+    if (!hashJoinSafeConjunct(expr)) return null;
+    if (
+      expr.kind !== "compare" ||
+      expr.op !== "eq" ||
+      expr.lhs.kind !== "column" ||
+      expr.rhs.kind !== "column"
+    ) {
+      continue;
+    }
+    const a = expr.lhs.index;
+    const b = expr.rhs.index;
+    let target: number;
+    let source: number;
+    if (a < n && b >= n) [target, source] = [a, b];
+    else if (a >= n && b < n) [target, source] = [b, a];
+    else continue;
+    const targetType = hashJoinColumnType(rels, target);
+    const sourceType = hashJoinColumnType(rels, source);
+    if (
+      targetType === null ||
+      sourceType === null ||
+      !fkTypesEqual(targetType, sourceType) ||
+      !hashJoinKeyableType(targetType)
+    ) {
+      continue;
+    }
+    keys.push({ left: source, right: target, type: targetType });
+  }
+  return keys.length > 0 ? { keys } : null;
+}
+
 function flattenHashJoinConjuncts(expr: RExpr, out: RExpr[]): void {
   if (expr.kind === "and") {
     flattenHashJoinConjuncts(expr.lhs, out);

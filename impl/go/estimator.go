@@ -2725,6 +2725,84 @@ func (db *engine) estimateMutationScan(table *catTable, dbScope *string, filter 
 	return plan
 }
 
+// estimateMerge estimates a MERGE (spec/design/estimator.md §9.4): the source plan; the target probe —
+// the UPDATE/DELETE scan estimate of the join condition, its join-condition filter included — repeated
+// once per estimated source row, as an index-nested-loop inner; and the full target scan of NOT
+// MATCHED BY SOURCE. The matching loop delivers the repeated probe's matched rows; the Merge root sums
+// its children and estimates one action per source row plus one per scanned not-matched-by-source
+// row.
+func (db *engine) estimateMerge(m *mergeStmt, visible []*cteBinding, ctx *estimateCTECtx) (estimatedPlan, error) {
+	m, mv, err := db.mergeTarget(m)
+	if err != nil {
+		return estimatedPlan{}, err
+	}
+	table := db.mergeTable(m)
+	plan, err := db.planMergeDetached(m, table, mv, visible, db.newParamTypes())
+	if err != nil {
+		return estimatedPlan{}, err
+	}
+	source := db.estimateQueryPlan(plan.source, ctx)
+	sourceRows := source.root.rows
+	nested, hashed := db.estimateMergeLoop(table, m.DB, source, plan.on, plan.probe, plan.hash, ctx)
+	matching := nested
+	if plan.hash != nil && hashed != nil {
+		matching = *hashed
+	}
+	root := matching.root
+	root.rows, root.logicalRows = sourceRows, sourceRows
+	if plan.hasBySource() {
+		full := db.estimateMutationScan(table, m.DB, plan.targetFilter, ctx)
+		root = addPlanEstimates(root, full.root)
+		root.rows = satEstimateAdd(sourceRows, full.root.rows)
+		root.logicalRows = root.rows
+		return parentEstimatedPlan(root, matching, full), nil
+	}
+	return parentEstimatedPlan(root, matching), nil
+}
+
+// estimateMergeLoop returns the MERGE matching loop's two estimates (estimator.md §9.4) over the
+// source estimate: the nested loop — the probe P (the selected scan with the complete join condition
+// as its WHERE) repeated per source row — and, given hash keys, the hash join — one full scan plus the
+// hash build over its rows, the probe per source row and per matched pair, and the join condition per
+// matched pair (nil without keys). Each is the loop node over [source, scan].
+func (db *engine) estimateMergeLoop(table *catTable, dbScope *string, source estimatedPlan, on, probe *rExpr, hash *hashJoinPlan, ctx *estimateCTECtx) (estimatedPlan, *estimatedPlan) {
+	sourceRows := source.root.rows
+	per := db.estimateMutationScan(table, dbScope, probe, ctx)
+	probes := repeatPlanEstimate(per.root, sourceRows)
+	probeScan := leafEstimatedPlan(repeatPlanEstimate(per.nodes[1], sourceRows))
+	loopRoot := addPlanEstimates(source.root, probes)
+	loopRoot.rows, loopRoot.logicalRows = probes.rows, probes.logicalRows
+	nested := parentEstimatedPlan(loopRoot, source, probeScan)
+	if hash == nil {
+		return nested, nil
+	}
+	rel := scopeRel{label: table.Name, table: table, offset: 0, db: dbScope}
+	// Each key's width is its target column's: the type's fixed width, else the column's analyzed
+	// average width, else the default variable-width key (§8.4).
+	var width int64
+	for _, key := range hash.keys {
+		var w int64
+		if scalar, ok := key.ty.AsScalar(); ok && scalar.IsFixedWidth() {
+			w = int64(scalar.WidthBytes())
+		} else if statistics := db.currentColumnStatistics(rel, key.right); statistics != nil && statistics.averageWidth != nil {
+			w = max64(1, *statistics.averageWidth)
+		} else {
+			w = max64(1, defaultVariableKeyBytes)
+		}
+		width = satEstimateAdd(width, w)
+	}
+	framed := satEstimateAdd(satEstimateMul(4, int64(len(hash.keys))), width)
+	scan := per.nodes[1]
+	matched := probes.rows
+	root := addPlanEstimates(source.root, scan)
+	addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(scan.rows, width))
+	addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(sourceRows, width), satEstimateMul(matched, framed)))
+	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(on), matched))
+	root.rows, root.logicalRows = matched, probes.logicalRows
+	hashed := parentEstimatedPlan(root, source, leafEstimatedPlan(scan))
+	return nested, &hashed
+}
+
 // estimateExplain builds the pre-order estimate stream consumed by the hand-written EXPLAIN
 // renderer. Planning is deliberately unmetered; the renderer independently walks the same selected
 // plan, and a shape mismatch is an internal bug caught by the shared corpus.
@@ -2775,6 +2853,12 @@ func (db *engine) estimateExplainScoped(inner *statement, bindings []*cteBinding
 		scan := db.estimateMutationScan(table, upd.DB, filter, ctx)
 		root := scan.root
 		return parentEstimatedPlan(root, scan).nodes, nil
+	case inner.Merge != nil:
+		plan, err := db.estimateMerge(inner.Merge, bindings, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return plan.nodes, nil
 	case inner.Delete != nil:
 		del, vw, err := db.rewriteDeleteTarget(inner.Delete)
 		if err != nil {
@@ -2811,7 +2895,7 @@ func (db *engine) estimateExplainWithDml(wq *withQuery) ([]planEstimate, error) 
 	for i, binding := range wp.bindings {
 		var body estimatedPlan
 		if binding.isDml() {
-			stmt := statement{Insert: binding.dm.insert, Update: binding.dm.update, Delete: binding.dm.delete}
+			stmt := statement{Insert: binding.dm.insert, Update: binding.dm.update, Delete: binding.dm.delete, Merge: binding.dm.merge}
 			nodes, err := db.estimateExplainScoped(&stmt, wp.bindings[:i], ctx)
 			if err != nil {
 				return nil, err
@@ -2835,7 +2919,7 @@ func (db *engine) estimateExplainWithDml(wq *withQuery) ([]planEstimate, error) 
 	if wp.primary != nil {
 		primary = db.estimateQueryPlan(*wp.primary, ctx)
 	} else {
-		stmt := statement{Insert: wp.body.Insert, Update: wp.body.Update, Delete: wp.body.Delete}
+		stmt := statement{Insert: wp.body.Insert, Update: wp.body.Update, Delete: wp.body.Delete, Merge: wp.body.Merge}
 		nodes, err := db.estimateExplainScoped(&stmt, wp.bindings, ctx)
 		if err != nil {
 			return nil, err

@@ -776,6 +776,39 @@ batch. Results that do not depend on visitation — the affected rows and the en
 successful statement — never depend on the choice, because every path rechecks the complete WHERE.
 `dml/cost_plan_mutation.test` pins a plan flip, both error orders, and `nextval` assignment order.
 
+### 9.4 MERGE
+
+A `MERGE` ([merge.md](merge.md) §3) plans one target probe with the §9.3 selector, over its join
+condition with each source column a correlated outer reference (a constant per source row, read as a
+key source exactly like an index-nested-loop inner's outer column, §9.2). Only a bare source column
+is a key source; an expression over the source row is residual. The selector runs once per
+statement; every source row reuses the selected path.
+
+The estimate (EXPLAIN, explain.md §4) composes, with `S` the source plan's estimate and `Rs = S.rows`:
+
+1. the probe: the §9.3 estimate of the selected scan with the complete join condition as its WHERE
+   (access work plus the condition evaluated once per scan row), `P`, repeated `Rs` times — every
+   unit, `rows`, and `logical_rows` multiplied by `Rs`, saturating; the probe `Scan` node shows the
+   repeated scan alone;
+2. the matching loop (`Nested Loop`): `S` plus the repeated `P`, delivering the repeated `P`'s rows
+   (`logical_rows` alike);
+3. with a NOT MATCHED BY SOURCE clause, the full target scan `F` (§9.3 with no WHERE); and
+4. the `Merge` root: the loop's units plus `F`'s, with `rows` and `logical_rows` equal to
+   `Rs + F.rows` (`Rs` without `F`) — one action per source row and per scanned target row.
+
+When the probe's selected path is a full scan and the join condition yields hash keys (merge.md
+§3), the **hash** loop is estimated too: `S` plus the full scan `F` (`P`'s scan leaf, once), with
+`hash_build = F.rows × W`, `hash_probe = Rs × W + M × (4K + W)`, and `operator_eval = O × M`, where
+`K` is the key count, `W` the sum of the keys' widths — each its target column's fixed encoded width,
+else that column's analyzed average width, else `DEFAULT_VARIABLE_KEY_BYTES` — `M` the repeated
+`P`'s rows (the estimated matched pairs), and `O` the join condition's operator nodes; it delivers
+`M` rows. The hash form is chosen iff its cost is strictly below the nested loop's, both computed
+with no CTE context (a CTE reference estimates as it would outside the statement), so EXPLAIN and
+execution choose identically; EXPLAIN then shows the chosen loop's estimate, computed with the
+statement's CTE context.
+
+WHEN conditions, actions, `RETURNING`, and phase two are not estimated, as for §9.3's per-row work.
+
 ## 10. Join search and its deterministic bound
 
 Only left-deep orders are in Path B. INNER/CROSS relations form reorderable islands; outer joins,

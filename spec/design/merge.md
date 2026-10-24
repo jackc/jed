@@ -28,6 +28,7 @@ when_clause [ ... ]
 source_ref  ::= a single FROM item: [db.]table or view [ [AS] alias [(cols)] ]
               | ( query ) [AS] alias [(cols)]  | ( VALUES … ) [AS] alias [(cols)]
               | table_function(…) [alias]      | a CTE name
+              | a join of FROM items: a JOIN b ON …  (optionally parenthesized, optionally aliased)
 
 when_clause ::= WHEN MATCHED [ AND condition ] THEN { merge_update | DELETE | DO NOTHING }
               | WHEN NOT MATCHED BY SOURCE [ AND condition ] THEN { merge_update | DELETE | DO NOTHING }
@@ -60,7 +61,16 @@ merge_insert ::= INSERT [ ( column [, ...] ) ] [ OVERRIDING { SYSTEM | USER } VA
 
 The statement resolves against two relations: the **target** (labeled by its alias, else its name)
 and the **source** (labeled by its alias, else its table/view/CTE/function name; an unaliased
-derived table has no label and is reachable only by bare column names). Which relation each part
+derived table has no label and is reachable only by bare column names).
+
+A **joined source** — `USING a JOIN b ON p ON cond`, or the join in parentheses without an alias —
+is one source relation whose inner labels stay visible, exactly an unaliased parenthesized join in
+a `FROM` clause ([grammar.md §15](grammar.md)): `a.x` and `b.y` qualify its columns everywhere the
+source is visible, a `USING`/`NATURAL` column is one merged column (bare `k`; `*` shows it once), and
+its source query is `SELECT *` over the join. The first `ON` after the join belongs to the join, the
+next to `MERGE` (PostgreSQL's grammar). An **aliased** parenthesized join is an ordinary derived
+table: only its alias qualifies (`a.x` is `42P01`). The target's label is checked only against the
+source's own label (`42712`), never against a join's inner labels — PostgreSQL's rule. Which relation each part
 of the statement sees is PostgreSQL's:
 
 | Part | Target | Source |
@@ -113,6 +123,25 @@ never decides a match. For each source row, in source order:
 4. if no entry matched, the source row is a **not-matched** source row (§4).
 
 A `NULL`-bearing or absent join never matches: such a source row is not matched.
+
+**The hash form.** When the probe's selected path is a full scan, the matching loop may instead
+take a **hash** form, the deterministic in-memory hash join of [cost.md](cost.md) §3 "JOIN" with the
+target as its build side. It applies when the join condition passes that join's structural
+non-trapping gate (bare-column comparisons; a trapping or function conjunct keeps the nested loop),
+at least one top-level conjunct equates a target column with a source column of the same keyable
+type, and its estimate is strictly cheaper than the nested loop's ([estimator.md](estimator.md)
+§9.4). The choice is made once, at plan time, so EXPLAIN shows the form execution runs. In the hash
+form:
+
+1. before the first source row, one full scan of the target in storage-key order charges the
+   access path's page and decompression units and `storage_row_read` per row, materializes each
+   row's touched columns, and builds the table over the key columns (`hash_build`); then
+2. for each source row, in source order, the probe charges `hash_probe` (per key component, and
+   per bucket entry compared), and each exact-key candidate, in scan order, has the complete join
+   condition evaluated and, when `TRUE`, is a matched pair processed as in step 3.
+
+A key with a `NULL` component is neither inserted nor probed. The matched pairs and their order are
+the nested loop's; only the cost differs.
 
 **Not matched by source.** Only when the statement has a `WHEN NOT MATCHED BY SOURCE` clause,
 after every source row: one full scan of the target in storage-key order (the access path of an
@@ -221,14 +250,19 @@ charges `row_produced` plus its items' evaluation (cost.md §3).
 ## 8. Targets
 
 The target is a **base table** — in `main`, `temp`, or an attached database (`MERGE INTO
-reports.t …`). A catalog relation is `42809`, a read-only attachment `25006`, and a missing table
+reports.t …`) — or an **automatically updatable view**, which makes the statement the equivalent
+`MERGE` into its base table ([views.md](views.md) §15.8): the view's `WHERE` limits which rows are
+target rows, its check option checks every inserted and updated row, and each clause's columns are
+the view's. A catalog relation is `42809`, a read-only attachment `25006`, and a missing table
 `42P01`, as for `UPDATE`. A collated key column whose collation is version-skewed is `XX002`
 (collation.md §12).
 
 ## 9. Cost
 
 `MERGE` adds no cost unit. Its total is, in order: the source query (§3); per source row, the
-probe's access-path units, `storage_row_read` per entry, and the join condition; the
+probe's access-path units, `storage_row_read` per entry, and the join condition — or, in the hash
+form, the one full scan and `hash_build` before the first source row, then per source row
+`hash_probe` and the join condition per candidate; the
 not-matched-by-source scan when present; every tried `WHEN` condition; each action's `SET`,
 `VALUES`, default, and `CHECK` evaluation (`operator_eval`, `decimal_work`, …); the touched large
 values' `value_chain`/`value_decompress` units; `value_compress`; and `RETURNING`. Validation probes
@@ -263,13 +297,8 @@ expression's sublinks and functions need.
 
 ## 12. Narrowings and deferred follow-ons
 
-Each is refused with **`0A000`** until its own slice:
+Multi-column assignment `SET (a, b) = (…)` is not in `UPDATE` either, and is a `42601` syntax
+error until its own slice.
 
-- a target that is a **view** (PostgreSQL rewrites `MERGE` onto an automatically updatable view);
-- a source that is a **parenthesized join** (`USING (a JOIN b ON …) j`) — write the join as a
-  subquery;
-- multi-column assignment `SET (a, b) = (…)` (not in `UPDATE` either);
-- `EXPLAIN MERGE`.
-
-A hash join for a join condition the probe cannot narrow (today each source row reads the whole
-target) is a performance follow-on, not a semantic one.
+`EXPLAIN [ANALYZE] MERGE` renders the matching loop ([explain.md](explain.md) §5, estimates in
+[estimator.md](estimator.md) §9.4).

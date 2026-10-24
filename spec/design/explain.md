@@ -26,7 +26,7 @@ is `42601`. The legacy positional `EXPLAIN ANALYZE` remains equivalent to
 
 The option words are recognized positionally and remain non-reserved. The inner statement is a
 query (`SELECT`, `VALUES`, a set operation, or `WITH`, including a data-modifying `WITH`) or DML
-(`INSERT`, `UPDATE`, `DELETE`), or a `CREATE TABLE … AS` / `SELECT … INTO`, which renders the plan of
+(`INSERT`, `UPDATE`, `DELETE`, `MERGE`), or a `CREATE TABLE … AS` / `SELECT … INTO`, which renders the plan of
 the query it runs ([create-table-as.md](create-table-as.md) §7). Other DDL (the column-definition
 `CREATE TABLE` included), transaction control, and nested `EXPLAIN` are rejected `42601`.
 
@@ -102,7 +102,7 @@ The fixed node vocabulary is:
 | joins | `Nested Loop` / `Hash Join` |
 | SELECT pipeline | `Filter`, `Aggregate`, `Window`, `Distinct`, `Sort`, `Limit`, `Result` |
 | relation/set wrappers | `Values`, `Union`, `Intersect`, `Except`, `WITH`, `CTE <name>` |
-| DML | `Insert <table>`, `Update <table>`, `Delete <table>` |
+| DML | `Insert <table>`, `Update <table>`, `Delete <table>`, `Merge <table>` |
 | ANALYZE wrapper | `Analyze` |
 
 A SELECT renders outermost first in this order: Limit → non-elided Sort → Distinct → Window →
@@ -179,11 +179,23 @@ parser spelling irrelevant while keeping structure byte-assertable. SQL/JSON que
 their resolved `RETURNING` type, wrapper and quotes mode where applicable, and `ON EMPTY`/`ON ERROR`
 behaviors, including semantic defaults.
 
+- **MERGE** ([merge.md](merge.md) §3). `Merge <table>` has detail `when=N` (its WHEN clause count).
+  Its first child is the matching loop, a `Nested Loop` with detail `left; on:conjuncts=N`
+  (VERBOSE: `left; on=<expr>`, the join condition in the `[target | source]` slots of merge.md §3),
+  or in its hash form a `Hash Join` with detail `left; keys=K; on:conjuncts=N`, whose children are
+  the source query's plan and then the target — for the nested loop the per-row probe, `Scan
+  <table>` with the selected access path, whose bound reads the source row as `outer`; for the hash
+  form the one full scan — with the statement's `touched=K`. With a NOT MATCHED BY SOURCE clause the root's second child is a `Scan <table>`
+  (`Full scan; touched=K`). Estimates follow [estimator.md](estimator.md) §9.4. Under ANALYZE the
+  probe `Scan` is the probes' (or the one full scan's) access work and row reads, the loop node adds
+  the source's cost, every join-condition evaluation, and the hash form's build and probe work, and the second `Scan` is the full scan's access work and row
+  reads; WHEN conditions, actions, and `RETURNING` are attributed only to the root.
+
 ## 6. Data-modifying WITH
 
 Plain EXPLAIN plans a top-level data-modifying WITH without running any sub-statement. The `WITH`
 root contains each `CTE <name>` in authored order. A data-modifying CTE is always `materialized` and
-its complete Insert/Update/Delete subtree appears below its definition; the primary query or DML
+its complete Insert/Update/Delete/Merge subtree appears below its definition; the primary query or DML
 subtree follows the definitions. Reference counts still determine read-only CTE modes. ANALYZE uses
 the ordinary writable-CTE orchestrator, including its pre-statement read pin and last-write-wins
 rules.

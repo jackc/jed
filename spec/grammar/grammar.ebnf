@@ -87,7 +87,7 @@ explain        ::= "EXPLAIN" ( "ANALYZE" | explain_options )? explainable
 explain_options ::= "(" explain_option ( "," explain_option )* ")"
 explain_option ::= ( "ANALYZE" | "VERBOSE" | "COSTS" | "LANE" ) explain_boolean?
 explain_boolean ::= "TRUE" | "FALSE" | "ON" | "OFF"
-explainable    ::= query_statement | insert | update | delete
+explainable    ::= query_statement | insert | update | delete | merge
                  | "CREATE" table_scope? "TABLE" ("IF" "NOT" "EXISTS")? qualified_table create_table_as
 
 /* Deterministic column-statistics collection (../design/statistics.md). One target per statement;
@@ -641,15 +641,16 @@ delete         ::= "DELETE" "FROM" qualified_table where_clause? returning_claus
 /* MERGE (../design/merge.md): join a data source to the target and run, per joined pair, the first
  * WHEN clause whose kind fits and whose AND condition is TRUE. The target is a base table (a view is
  * 0A000); its optional alias (AS optional) replaces the table's name as the qualifier. The source is
- * one table_ref that is not a parenthesized join (0A000), evaluated as "SELECT * FROM source"; the
- * target and source labels must differ (42712). The join condition sees both relations; a MATCHED
+ * one from_item, evaluated as "SELECT * FROM source": a table_ref, or a join chain (the first ON after
+ * a JOIN is the join's, the next MERGE's), which — like an unaliased joined_group — keeps its inner
+ * labels visible; the target and the source's own label must differ (42712). The join condition sees both relations; a MATCHED
  * clause sees both, a NOT MATCHED [BY TARGET] clause only the source, a NOT MATCHED BY SOURCE clause
  * only the target (42P01 otherwise). A clause after an unconditional clause of the same kind is 42601.
  * A target row updated or deleted twice is 21000. merge_action() is legal only in RETURNING (42601
  * elsewhere). MATCHED, SOURCE, TARGET, BY, THEN, DO, and NOTHING are NOT reserved (§3); WHEN ends a
  * SET right-hand side's DEFAULT form. RETURNING's "*" is the source's columns, then the target's. */
 merge          ::= "MERGE" "INTO" qualified_table ("AS"? identifier)?
-                   "USING" table_ref "ON" expr
+                   "USING" from_item "ON" expr
                    merge_when+
                    returning_clause?
 

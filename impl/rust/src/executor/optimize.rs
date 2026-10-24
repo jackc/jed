@@ -1384,7 +1384,7 @@ impl Engine {
     }
 }
 
-fn flatten_hash_join_conjuncts<'a>(expr: &'a RExpr, out: &mut Vec<&'a RExpr>) {
+pub(crate) fn flatten_hash_join_conjuncts<'a>(expr: &'a RExpr, out: &mut Vec<&'a RExpr>) {
     if let RExpr::And(lhs, rhs) = expr {
         flatten_hash_join_conjuncts(lhs, out);
         flatten_hash_join_conjuncts(rhs, out);
@@ -1393,7 +1393,7 @@ fn flatten_hash_join_conjuncts<'a>(expr: &'a RExpr, out: &mut Vec<&'a RExpr>) {
     }
 }
 
-fn hash_join_safe_conjunct(expr: &RExpr) -> bool {
+pub(crate) fn hash_join_safe_conjunct(expr: &RExpr) -> bool {
     matches!(
         expr,
         RExpr::Compare {
@@ -1430,7 +1430,10 @@ fn hash_join_leaf(expr: &RExpr) -> bool {
     )
 }
 
-fn hash_join_column_type<'a>(rels: &'a [ScopeRel<'_>], index: usize) -> Option<&'a Type> {
+pub(crate) fn hash_join_column_type<'a>(
+    rels: &'a [ScopeRel<'_>],
+    index: usize,
+) -> Option<&'a Type> {
     rels.iter().find_map(|rel| {
         index
             .checked_sub(rel.offset)
@@ -1439,7 +1442,7 @@ fn hash_join_column_type<'a>(rels: &'a [ScopeRel<'_>], index: usize) -> Option<&
     })
 }
 
-fn hash_join_keyable_type(ty: &Type) -> bool {
+pub(crate) fn hash_join_keyable_type(ty: &Type) -> bool {
     match ty {
         Type::Scalar(s) => hash_join_keyable_scalar(*s),
         Type::Array(elem) | Type::Range(elem) => {

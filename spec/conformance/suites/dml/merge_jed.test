@@ -1,43 +1,15 @@
 # MERGE — the jed-specific behavior of spec/design/merge.md that PostgreSQL cannot oracle-check:
-# the narrowings (§12: a view target, a joined source, EXPLAIN MERGE), the divergences (§11: end-state
+# the divergences (§11: end-state
 # uniqueness, a non-boolean join condition), the deterministic cost of the matching pass (§3, §9), and
 # the session privilege envelope (§10).
 # CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
-# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.view, dml.insert, dml.insert_multi_row, dml.merge, dml.returning, query.select, query.order_by, query.values, query.explain, dml.explain, resource.cost_metering, session.privileges, types.i32, types.text, expr.arithmetic
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.view, dml.insert, dml.insert_multi_row, dml.merge, dml.returning, query.select, query.order_by, query.values, query.explain, dml.explain, resource.cost_metering, session.privileges, ddl.view_default, ddl.view_alter, func.abs, types.i32, types.text, expr.arithmetic
 
 statement ok
 CREATE TABLE j (id i32 PRIMARY KEY, v i32, code text UNIQUE)
 
 statement ok
 INSERT INTO j VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
-
-statement ok
-CREATE VIEW jv AS SELECT id, v FROM j
-
-# --- narrowings (§12) ---------------------------------------------------------------------------
-
-# A view target.
-statement error 0A000
-MERGE INTO jv USING (VALUES (1)) AS s(k) ON jv.id = s.k
-WHEN MATCHED THEN DELETE
-
-# A joined source, parenthesized or not.
-statement error 0A000
-MERGE INTO j USING (VALUES (1)) AS a(k) JOIN (VALUES (1)) AS b(k) ON a.k = b.k ON j.id = a.k
-WHEN MATCHED THEN DELETE
-
-statement error 0A000
-MERGE INTO j USING ((VALUES (1)) AS a(k) JOIN (VALUES (1)) AS b(k) ON a.k = b.k) AS g ON j.id = g.k
-WHEN MATCHED THEN DELETE
-
-# EXPLAIN MERGE, directly and inside a WITH.
-statement error 0A000
-EXPLAIN MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
-WHEN MATCHED THEN DELETE
-
-statement error 0A000
-EXPLAIN WITH m AS (MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k WHEN MATCHED THEN DELETE)
-SELECT 1
 
 # --- divergences (§11) --------------------------------------------------------------------------
 
@@ -187,3 +159,45 @@ WHEN NOT MATCHED THEN INSERT VALUES (s.k, 0, 'q')
 statement ok
 MERGE INTO j USING jsrc AS s ON j.id = s.k
 WHEN NOT MATCHED THEN INSERT VALUES (s.k, 0, 'q')
+
+# Through a view, privileges are the view's, as for any write through it (views.md §15.4).
+statement ok
+CREATE VIEW jv AS SELECT id, v FROM j WHERE v >= 0
+
+# default_privileges: NONE
+# grant: SELECT, UPDATE ON jv
+statement ok
+MERGE INTO jv USING (VALUES (1)) AS s(k) ON jv.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 1
+
+# default_privileges: NONE
+# grant: SELECT, UPDATE ON j
+statement error 42501
+MERGE INTO jv USING (VALUES (1)) AS s(k) ON jv.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 1
+
+# The view column default an INSERT through the view applies, and a SET c = DEFAULT that assigns it,
+# need EXECUTE on what they call (session.md §5.3, views.md §16.1).
+statement ok
+ALTER VIEW jv ALTER COLUMN v SET DEFAULT abs(-5)
+
+# revoke: EXECUTE ON abs
+statement error 42501
+MERGE INTO jv USING (VALUES (40)) AS s(k) ON jv.id = s.k
+WHEN NOT MATCHED THEN INSERT (id) VALUES (s.k)
+
+# revoke: EXECUTE ON abs
+statement error 42501
+MERGE INTO jv USING (VALUES (1)) AS s(k) ON jv.id = s.k
+WHEN MATCHED THEN UPDATE SET v = DEFAULT
+
+statement ok
+MERGE INTO jv USING (VALUES (40)) AS s(k) ON jv.id = s.k
+WHEN NOT MATCHED THEN INSERT (id) VALUES (s.k)
+
+query IIT nosort
+SELECT id, v, code FROM j WHERE id = 40
+----
+40
+5
+NULL

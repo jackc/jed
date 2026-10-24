@@ -1449,6 +1449,27 @@ gen = "int_uniform"
 min = 1
 max = 100
 
+# MERGE on an unindexed join column (dml.merge; spec/design/merge.md §3): a 200-row generated source
+# matches `orders.amount`, which no index covers, so the matching loop takes its hash form — one scan
+# of the 10k-row target builds the table every source row probes — instead of reading the whole
+# target once per source row. Rolled back each iteration. SQLite has no MERGE.
+[[bench]]
+name = "merge_hash"
+description = "MERGE of a 200-row source into 10k orders on an unindexed column (hash form), rolled back each iteration"
+dataset = "small"
+kind = "write_rollback"
+engines = ["jed", "postgres"]
+sql = "MERGE INTO orders o USING (SELECT g AS amt FROM generate_series($1::integer, $1::integer + 199) AS s(g)) AS s ON o.amount = s.amt WHEN MATCHED THEN UPDATE SET customer_id = o.customer_id + 1"
+warmup = 20
+iterations = 200
+seed = 4303
+batch = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 0
+max = 99800
+
 # UPDATE/DELETE WHERE contradiction (dml.where_contradiction): the empty literal range on the
 # unindexed amount column is proven at plan time, so jed reads none of the 1M rows; before the rule
 # the mutation full-scanned them and evaluated the WHERE per row. Rolled back each iteration.

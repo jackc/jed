@@ -4899,12 +4899,6 @@ fn with_has_dml(wq: &WithQuery) -> bool {
     wq.body.is_data_modifying() || wq.ctes.iter().any(|c| c.body.is_data_modifying())
 }
 
-/// Whether a `WITH` statement's primary or any CTE body is a `MERGE` (spec/design/merge.md §1).
-fn with_has_merge(wq: &WithQuery) -> bool {
-    matches!(wq.body, CteBody::Merge(_))
-        || wq.ctes.iter().any(|c| matches!(c.body, CteBody::Merge(_)))
-}
-
 /// Each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a RECURSIVE or
 /// data-modifying CTE is ALWAYS materialized; otherwise a `MATERIALIZED` hint or ≥2 references →
 /// Materialize, else Inline.

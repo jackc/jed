@@ -1161,12 +1161,6 @@ export function withHasDml(wq: WithQuery): boolean {
   return cteBodyIsDataModifying(wq.body) || wq.ctes.some((c) => cteBodyIsDataModifying(c.body));
 }
 
-// withHasMerge reports whether a WITH statement's primary or any CTE body is a MERGE
-// (spec/design/merge.md §1).
-export function withHasMerge(wq: WithQuery): boolean {
-  return wq.body.kind === "merge" || wq.ctes.some((c) => c.body.kind === "merge");
-}
-
 // cteModes computes each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
 // RECURSIVE or data-modifying CTE is ALWAYS materialized; otherwise a MATERIALIZED hint or >=2
 // references → materialize, else inline.

@@ -1207,7 +1207,7 @@ func (p *parser) parseExplain() (statement, error) {
 }
 
 // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / VALUES /
-// WITH / a parenthesized query) or a DML statement (INSERT / UPDATE / DELETE). DDL, transaction
+// WITH / a parenthesized query) or a DML statement (INSERT / UPDATE / DELETE / MERGE). DDL, transaction
 // control, and a nested EXPLAIN have no query plan to render and are rejected 42601.
 func (p *parser) parseExplainInner() (statement, error) {
 	switch p.peekKeyword() {
@@ -1233,9 +1233,12 @@ func (p *parser) parseExplainInner() (statement, error) {
 			return statement{}, err
 		}
 		return statement{Delete: del}, nil
-	// EXPLAIN MERGE is a deferred follow-on (spec/design/merge.md §12).
 	case "merge":
-		return statement{}, newError(FeatureNotSupported, "EXPLAIN MERGE is not supported")
+		m, err := p.parseMerge()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Merge: m}, nil
 	// `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no plan
 	// to render.
 	case "create":
@@ -6100,27 +6103,40 @@ func (p *parser) parseMerge() (*mergeStmt, error) {
 	if err := p.expectKeyword("using"); err != nil {
 		return nil, err
 	}
-	sourceRef, err := p.parseTableRef()
+	// The source is one FROM item: a table_ref, possibly followed by joins (`USING a JOIN b ON p ON
+	// cond`). A joined source — written so, or as an unaliased parenthesized join — is the unaliased
+	// join group `SELECT * FROM a JOIN b …`, whose inner labels stay visible (merge.md §2); an aliased
+	// parenthesized join is an ordinary derived table.
+	first, err := p.parseTableRef()
 	if err != nil {
 		return nil, err
 	}
-	joined := sourceRef.Subquery != nil && sourceRef.Subquery.Select != nil && sourceRef.Subquery.Select.ParenJoin
-	switch p.peekKeyword() {
-	case "join", "inner", "left", "right", "full", "cross", "natural":
-		joined = true
+	from, joins := spliceLeadingGroup(first, nil)
+	for {
+		j, ok, err := p.parseJoinClause()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		joins = append(joins, j)
 	}
-	if joined {
-		return nil, newError(FeatureNotSupported, "a joined MERGE source is not supported; write the join as a subquery")
-	}
+	var source queryExpr
 	var sourceLabel *string
-	if sourceRef.Alias != nil {
-		l := *sourceRef.Alias
-		sourceLabel = &l
-	} else if sourceRef.Subquery == nil && sourceRef.Values == nil && sourceRef.Name != "" {
-		l := sourceRef.Name
-		sourceLabel = &l
+	if len(joins) == 0 {
+		if from.Alias != nil {
+			l := *from.Alias
+			sourceLabel = &l
+		} else if from.Subquery == nil && from.Values == nil && from.Name != "" {
+			l := from.Name
+			sourceLabel = &l
+		}
+		source = queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &from}}
+	} else {
+		source = joinGroupBody(from, joins)
+		source.Select.JoinGroup = true
 	}
-	source := queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &sourceRef}}
 	if err := p.expectKeyword("on"); err != nil {
 		return nil, err
 	}

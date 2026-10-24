@@ -406,6 +406,8 @@ func (db *engine) renderExplainWithBindings(r *explainRender, inner *statement, 
 		return db.explainUpdate(r, inner.Update, depth, bindings)
 	case inner.Delete != nil:
 		return db.explainDelete(r, inner.Delete, depth, bindings)
+	case inner.Merge != nil:
+		return db.explainMerge(r, inner.Merge, depth, bindings)
 	case inner.With != nil && withHasDml(inner.With):
 		return db.renderExplainWithDml(r, inner.With, depth)
 	default:
@@ -467,7 +469,7 @@ func (db *engine) renderExplainWithDml(r *explainRender, wq *withQuery, depth in
 	for i, binding := range plan.bindings {
 		r.emit(depth+1, "CTE "+binding.name, cteDetail(binding, plan.modes[i]))
 		if binding.isDml() {
-			stmt := statement{Insert: binding.dm.insert, Update: binding.dm.update, Delete: binding.dm.delete}
+			stmt := statement{Insert: binding.dm.insert, Update: binding.dm.update, Delete: binding.dm.delete, Merge: binding.dm.merge}
 			if err := db.renderExplainWithBindings(r, &stmt, depth+2, plan.bindings[:i]); err != nil {
 				return err
 			}
@@ -481,7 +483,7 @@ func (db *engine) renderExplainWithDml(r *explainRender, wq *withQuery, depth in
 	if plan.primary != nil {
 		return db.renderQueryPlan(r, *plan.primary, depth+1)
 	}
-	stmt := statement{Insert: plan.body.Insert, Update: plan.body.Update, Delete: plan.body.Delete}
+	stmt := statement{Insert: plan.body.Insert, Update: plan.body.Update, Delete: plan.body.Delete, Merge: plan.body.Merge}
 	return db.renderExplainWithBindings(r, &stmt, depth+1, plan.bindings)
 }
 
@@ -569,6 +571,43 @@ func (db *engine) explainDelete(r *explainRender, del *deleteStmt, depth int, bi
 		return err
 	}
 	db.renderDmlScan(r, table, del.Table, filter, mask, depth+1)
+	return nil
+}
+
+// explainMerge renders a MERGE plan (spec/design/merge.md §12, explain.md §4): the Merge root, the
+// matching loop — a left Nested Loop (or Hash Join) over the source subtree and the per-source-row
+// target probe Scan — and, with a NOT MATCHED BY SOURCE clause, the full target Scan. It resolves the
+// statement but never writes.
+func (db *engine) explainMerge(r *explainRender, m *mergeStmt, depth int, bindings []*cteBinding) error {
+	// A MERGE into a view renders its base-table statement (views.md §15.5).
+	m, mv, err := db.mergeTarget(m)
+	if err != nil {
+		return err
+	}
+	table := db.mergeTable(m)
+	plan, err := db.planMergeDetached(m, table, mv, bindings, db.newParamTypes())
+	if err != nil {
+		return err
+	}
+	r.emit(depth, "Merge "+m.Table, fmt.Sprintf("when=%d", len(m.Clauses)))
+	on := fmt.Sprintf("on:conjuncts=%d", conjunctCount(plan.on))
+	if r.verbose {
+		on = "on=" + renderRExpr(plan.on)
+	}
+	if plan.hash != nil {
+		r.emit(depth+1, "Hash Join", fmt.Sprintf("left; keys=%d; %s", len(plan.hash.keys), on))
+	} else {
+		r.emit(depth+1, "Nested Loop", "left; "+on)
+	}
+	if err := db.renderQueryPlan(r, plan.source, depth+2); err != nil {
+		return err
+	}
+	mask := mergeTouched(plan, len(table.Columns))
+	bound := db.planMutationScan(m.DB, table, plan.probe, whereContradicts(plan.probe)).bound
+	r.emit(depth+2, "Scan "+table.Name, db.scanDetail(table.Name, bound, false, mask))
+	if plan.hasBySource() {
+		db.renderDmlScan(r, table, table.Name, plan.targetFilter, mask, depth+1)
+	}
 	return nil
 }
 

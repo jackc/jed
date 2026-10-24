@@ -1057,7 +1057,7 @@ impl Parser {
     }
 
     /// The statement EXPLAIN wraps — restricted to a query (`SELECT` / `VALUES` / `WITH` / a
-    /// parenthesized query) or a DML statement (`INSERT` / `UPDATE` / `DELETE`). DDL, transaction
+    /// parenthesized query) or a DML statement (`INSERT` / `UPDATE` / `DELETE` / `MERGE`). DDL, transaction
     /// control, and a nested `EXPLAIN` have no query plan to render and are rejected `42601`.
     fn parse_explain_inner(&mut self) -> Result<Statement> {
         match self.peek_keyword().as_deref() {
@@ -1066,11 +1066,7 @@ impl Parser {
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
-            // EXPLAIN MERGE is a deferred follow-on (spec/design/merge.md §12).
-            Some("merge") => Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "EXPLAIN MERGE is not supported",
-            )),
+            Some("merge") => Ok(Statement::Merge(self.parse_merge()?)),
             // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no
             // plan to render.
             Some("create") if !self.at_create_view() => {
@@ -5404,45 +5400,50 @@ impl Parser {
             }
         };
         self.expect_keyword("using")?;
-        let source_ref = self.parse_table_ref()?;
-        let joined = matches!(&source_ref.subquery, Some(q) if matches!(&**q, QueryExpr::Select(sel) if sel.paren_join));
-        if joined
-            || matches!(
-                self.peek_keyword().as_deref(),
-                Some("join" | "inner" | "left" | "right" | "full" | "cross" | "natural")
-            )
-        {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "a joined MERGE source is not supported; write the join as a subquery",
-            ));
+        // The source is one FROM item: a table_ref, possibly followed by joins (`USING a JOIN b ON
+        // p ON cond`). A joined source — written so, or as an unaliased parenthesized join — is the
+        // unaliased join group `SELECT * FROM a JOIN b …`, whose inner labels stay visible (merge.md
+        // §2); an aliased parenthesized join is an ordinary derived table.
+        let first = self.parse_table_ref()?;
+        let (from, mut joins) = splice_leading_group(first, Vec::new());
+        while let Some(j) = self.parse_join_clause()? {
+            joins.push(j);
         }
-        let source_label = match &source_ref.alias {
-            Some(a) => Some(a.clone()),
-            None if source_ref.subquery.is_none()
-                && source_ref.values.is_none()
-                && !source_ref.name.is_empty() =>
-            {
-                Some(source_ref.name.clone())
+        let (source, source_label) = if joins.is_empty() {
+            let label = match &from.alias {
+                Some(a) => Some(a.clone()),
+                None if from.subquery.is_none()
+                    && from.values.is_none()
+                    && !from.name.is_empty() =>
+                {
+                    Some(from.name.clone())
+                }
+                None => None,
+            };
+            let source = QueryExpr::Select(Box::new(Select {
+                distinct: false,
+                items: SelectItems::All(StarPos(None)),
+                from: Some(from),
+                joins: Vec::new(),
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                windows: Vec::new(),
+                join_group: false,
+                paren_join: false,
+                tail: Vec::new(),
+            }));
+            (source, label)
+        } else {
+            let mut body = join_group_body(from, joins);
+            if let QueryExpr::Select(sel) = &mut body {
+                sel.join_group = true;
             }
-            None => None,
+            (body, None)
         };
-        let source = QueryExpr::Select(Box::new(Select {
-            distinct: false,
-            items: SelectItems::All(StarPos(None)),
-            from: Some(source_ref),
-            joins: Vec::new(),
-            filter: None,
-            group_by: Vec::new(),
-            having: None,
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-            windows: Vec::new(),
-            join_group: false,
-            paren_join: false,
-            tail: Vec::new(),
-        }));
         self.expect_keyword("on")?;
         let on = self.parse_expr()?;
         let mut clauses: Vec<MergeClause> = Vec::new();

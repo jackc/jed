@@ -27,6 +27,8 @@ func (t *hashJoinTable) release() {
 type hashJoinEntry struct {
 	key []byte
 	row storedRow
+	// pos is the row's position in the build rows.
+	pos int
 }
 
 func newHashJoinTable(plan *hashJoinPlan, buildOffset, probeOffset int, rows []storedRow, meter *costMeter) (*hashJoinTable, error) {
@@ -35,7 +37,7 @@ func newHashJoinTable(plan *hashJoinPlan, buildOffset, probeOffset int, rows []s
 
 func newHashJoinTableWithHash(plan *hashJoinPlan, buildOffset, probeOffset int, rows []storedRow, meter *costMeter, hasher func([]byte) uint64) (*hashJoinTable, error) {
 	t := &hashJoinTable{entries: make(map[uint64][]hashJoinEntry), hash: hasher, probeOffset: probeOffset, charge: meter.stateCharge()}
-	for _, row := range rows {
+	for pos, row := range rows {
 		indices := make([]int, len(plan.keys))
 		types := make([]dataType, len(plan.keys))
 		for i, key := range plan.keys {
@@ -55,12 +57,51 @@ func newHashJoinTableWithHash(plan *hashJoinPlan, buildOffset, probeOffset int, 
 			}
 		}
 		h := t.hash(encoded)
-		t.entries[h] = append(t.entries[h], hashJoinEntry{key: encoded, row: row})
+		t.entries[h] = append(t.entries[h], hashJoinEntry{key: encoded, row: row, pos: pos})
 	}
 	return t, nil
 }
 
 func (t *hashJoinTable) probe(plan *hashJoinPlan, row storedRow, meter *costMeter) ([]storedRow, error) {
+	encoded, entries, err := t.bucket(plan, row, meter)
+	if err != nil || entries == nil {
+		return nil, err
+	}
+	out := make([]storedRow, 0, len(entries))
+	for i := range entries {
+		hit, err := probeEntry(&entries[i], encoded, meter)
+		if err != nil {
+			return nil, err
+		}
+		if hit {
+			out = append(out, entries[i].row)
+		}
+	}
+	return out, nil
+}
+
+// probePositions is probe returning the matched build rows' positions, in build order.
+func (t *hashJoinTable) probePositions(plan *hashJoinPlan, row storedRow, meter *costMeter) ([]int, error) {
+	encoded, entries, err := t.bucket(plan, row, meter)
+	if err != nil || entries == nil {
+		return nil, err
+	}
+	out := make([]int, 0, len(entries))
+	for i := range entries {
+		hit, err := probeEntry(&entries[i], encoded, meter)
+		if err != nil {
+			return nil, err
+		}
+		if hit {
+			out = append(out, entries[i].pos)
+		}
+	}
+	return out, nil
+}
+
+// bucket encodes a probe row's key (charging hash_probe) and returns its hash bucket; nil entries for
+// a NULL key, which matches nothing.
+func (t *hashJoinTable) bucket(plan *hashJoinPlan, row storedRow, meter *costMeter) ([]byte, []hashJoinEntry, error) {
 	indices := make([]int, len(plan.keys))
 	types := make([]dataType, len(plan.keys))
 	for i, key := range plan.keys {
@@ -69,27 +110,30 @@ func (t *hashJoinTable) probe(plan *hashJoinPlan, row storedRow, meter *costMete
 	}
 	encoded, present, err := hashJoinRowKey(row, indices, types, costs.HashProbe, meter)
 	if err != nil || !present {
-		return nil, err
+		return nil, nil, err
 	}
 	entries := t.entries[t.hash(encoded)]
-	out := make([]storedRow, 0, len(entries))
-	for _, entry := range entries {
-		if err := meter.Step(); err != nil {
-			return nil, err
-		}
-		work := len(entry.key)
-		if len(encoded) < work {
-			work = len(encoded)
-		}
-		if work == 0 {
-			work = 1
-		}
-		meter.Charge(costs.HashProbe * int64(work))
-		if bytes.Equal(entry.key, encoded) {
-			out = append(out, entry.row)
-		}
+	if entries == nil {
+		entries = []hashJoinEntry{}
 	}
-	return out, nil
+	return encoded, entries, nil
+}
+
+// probeEntry compares one bucket entry's full key bytes with the probe key, charging the compared
+// bytes.
+func probeEntry(entry *hashJoinEntry, encoded []byte, meter *costMeter) (bool, error) {
+	if err := meter.Step(); err != nil {
+		return false, err
+	}
+	work := len(entry.key)
+	if len(encoded) < work {
+		work = len(encoded)
+	}
+	if work == 0 {
+		work = 1
+	}
+	meter.Charge(costs.HashProbe * int64(work))
+	return bytes.Equal(entry.key, encoded), nil
 }
 
 func hashJoinRowKey(row storedRow, indices []int, types []dataType, unit int64, meter *costMeter) ([]byte, bool, error) {

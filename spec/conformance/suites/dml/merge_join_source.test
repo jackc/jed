@@ -1,0 +1,139 @@
+# MERGE with a joined source (spec/design/merge.md §2): `USING a JOIN b ON p ON cond`, or the same
+# join parenthesized, is one source relation whose inner labels stay visible — in the join
+# condition, the WHEN clauses, and RETURNING — while an aliased parenthesized join is an ordinary
+# derived table that hides them. Oracle-probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.merge, dml.returning, query.select, query.order_by, query.join_inner, query.join_left, query.join_using, query.join_parenthesized, types.i32
+
+statement ok
+CREATE TABLE mt (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE ma (k i32, x i32)
+
+statement ok
+CREATE TABLE mb (k i32, y i32)
+
+statement ok
+INSERT INTO mt VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO ma VALUES (1, 100), (3, 300)
+
+statement ok
+INSERT INTO mb VALUES (1, 1), (3, 3)
+
+statement ok
+CREATE TABLE mr1 (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE mr2 (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO mr1 VALUES (1, 10)
+
+statement ok
+INSERT INTO mr2 VALUES (1, 10)
+
+# Inner labels are visible in the join condition, the clauses, and RETURNING; `*` is the join's
+# columns, then the target's.
+query TIIIIII rowsort
+MERGE INTO mr1 USING ma JOIN mb ON ma.k = mb.k ON mr1.id = ma.k
+WHEN MATCHED THEN UPDATE SET v = ma.x + mb.y
+WHEN NOT MATCHED THEN INSERT VALUES (mb.k, ma.x)
+RETURNING merge_action(), ma.k, ma.x, mb.k, mb.y, mr1.id, mr1.v
+----
+INSERT
+3
+300
+3
+3
+3
+300
+UPDATE
+1
+100
+1
+1
+1
+101
+
+# A USING join merges its column: bare `k` is the merged column, and `*` shows it once.
+query IIIII rowsort
+MERGE INTO mr2 USING ma JOIN mb USING (k) ON mr2.id = k
+WHEN MATCHED THEN UPDATE SET v = x + y
+WHEN NOT MATCHED THEN INSERT VALUES (k, x)
+RETURNING *
+----
+1
+100
+1
+1
+101
+3
+300
+3
+3
+300
+
+# Parenthesized and unaliased: still one relation with visible inner labels.
+statement ok
+MERGE INTO mt USING (ma JOIN mb USING (k)) ON mt.id = ma.k
+WHEN MATCHED THEN DELETE
+
+query II nosort
+SELECT id, v FROM mt ORDER BY id
+----
+2
+20
+
+# Aliased: a derived table; only the alias qualifies.
+statement ok
+MERGE INTO mt USING (ma JOIN mb USING (k)) AS g ON mt.id = g.k
+WHEN NOT MATCHED THEN INSERT VALUES (g.k, g.x + g.y)
+
+query II nosort
+SELECT id, v FROM mt ORDER BY id
+----
+1
+101
+2
+20
+3
+303
+
+statement error 42P01
+MERGE INTO mt USING (ma JOIN mb USING (k)) AS g ON mt.id = ma.k
+WHEN MATCHED THEN DELETE
+
+# An outer join: an unmatched inner side is all NULL.
+statement ok
+MERGE INTO mt USING ma LEFT JOIN mb ON ma.k = mb.k + 2 ON mt.id = ma.k + 10
+WHEN NOT MATCHED THEN INSERT VALUES (ma.k + 10, mb.y)
+
+query II nosort
+SELECT id, v FROM mt ORDER BY id
+----
+1
+101
+2
+20
+3
+303
+11
+NULL
+13
+1
+
+# The join may read the target table under another label.
+statement ok
+MERGE INTO mt USING ma JOIN mt AS other ON ma.k = other.id ON mt.id = other.id + 100
+WHEN NOT MATCHED THEN INSERT VALUES (other.id + 100, ma.x)
+
+query II nosort
+SELECT id, v FROM mt WHERE id > 100 ORDER BY id
+----
+101
+100
+103
+300

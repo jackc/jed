@@ -822,7 +822,7 @@ impl Engine {
     /// The view default `SET c = DEFAULT` assigns through a view (views.md §16.1): the target view's
     /// own default for column `c`, else NULL — never a default further down the chain or the base
     /// column's (PostgreSQL's rewrite). An unparsable default is XX003.
-    fn view_set_default(&self, view: &str, column: &str) -> Result<Expr> {
+    pub(crate) fn view_set_default(&self, view: &str, column: &str) -> Result<Expr> {
         let def = self.visible_view(view).and_then(|v| {
             let i = v.columns.iter().position(|c| c == column)?;
             v.defaults.get(i).cloned().flatten()

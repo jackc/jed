@@ -745,14 +745,6 @@ impl Engine {
             Statement::Merge(m) => self.execute_merge(m, params, CteCtx::empty()),
             // EXPLAIN renders the inner statement's plan (spec/design/explain.md): plain EXPLAIN is
             // plan-only, EXPLAIN ANALYZE runs the inner and reports its actual cost + row count.
-            // EXPLAIN of a MERGE — directly (refused by the parser) or in a WITH — is a deferred
-            // follow-on (spec/design/merge.md §12).
-            Statement::Explain { inner, .. } if matches!(&*inner, Statement::With(wq) if with_has_merge(wq)) => {
-                Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "EXPLAIN MERGE is not supported",
-                ))
-            }
             Statement::Explain {
                 analyze,
                 verbose,
