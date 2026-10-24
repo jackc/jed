@@ -379,22 +379,22 @@ WHEN MATCHED THEN UPDATE SET n = hs.d
 ----
 0
 Analyze
-cost=48581 rows=0
+cost=36181 rows=0
 60
 60181
-48581
+36181
 1
 Merge hb
 when=1
 60
 60181
-48581
+36181
 2
 Nested Loop
 left; on:conjuncts=2
 60
 60181
-48581
+36181
 3
 Scan hs
 Full scan; touched=2

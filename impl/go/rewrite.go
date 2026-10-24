@@ -198,6 +198,10 @@ func rewriteWhere(plan *selectPlan) {
 	}
 	for ri, f := range pd.relFilters {
 		if f != nil {
+			// A relation's pushed ON and WHERE conjuncts form one filter, cost-ordered together
+			// (planner.md §3.0).
+			f = orderFilterConjuncts(f)
+			pd.relFilters[ri] = f
 			pd.relLocal[ri] = rebaseColumns(f, plan.rels[ri].offset)
 		}
 	}

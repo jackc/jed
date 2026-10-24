@@ -742,7 +742,7 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 | `ALTER VIEW … OWNER TO` / `SET SCHEMA` are `0A000` | jed has no owners or schemas |
 | A temporary view does not block another session's DDL on the persistent relations it reads | temporary views are private to the session (§10, temp-tables.md §3) |
 | `CREATE OR REPLACE VIEW v` of a temporary view replaces it (it stays temporary); a replacement that would make a persistent view temporary is `42P07`; PG creates a second view in another schema | jed has one relation namespace (§10) |
-| `security_barrier` changes no plan | jed never evaluates an outer condition on a row the view's own `WHERE` rejects (§16.2) |
+| `security_barrier` changes no plan | jed pushes only non-trapping, pure outer conditions into a view body, which reveal nothing about a row the view's own `WHERE` rejects (§16.2) |
 | `DROP SEQUENCE` / `DROP TYPE … CASCADE` of an owned sequence or of a type a column uses is `0A000`; PG drops the default or column | `CASCADE` drops only views (§6.2) |
 | A view records no dependency on a collation or host function | neither can be dropped through SQL; a view stores no derived value (§6.2) |
 | PG also accepts `ALTER TABLE v SET / RESET (options)` on a view; jed accepts only the `ALTER VIEW` spelling | the `ALTER TABLE` grammar has no option lists |
@@ -1159,11 +1159,11 @@ PostgreSQL's view reloptions:
   with a trailing `WITH … CHECK OPTION` is `22023` (*parameter "check_option" specified more than
   once*). Setting it on a view that is not automatically updatable is `0A000`. `RESET` removes it.
 - **`security_barrier`** — a boolean. PostgreSQL uses it to keep outer conditions that may leak
-  from being evaluated on rows the view's `WHERE` rejects. jed already never does that for any view:
-  a condition pushed into a view body is appended after the body's own `WHERE`, whose `AND` chain
-  stops at the first conjunct that is not TRUE ([planner.md](planner.md) §3.2, cost.md §3), and only
-  structurally non-trapping conjuncts are pushed. So the option is stored and reported and changes no
-  plan.
+  from being evaluated on rows the view's `WHERE` rejects. A condition jed pushes into a view body is
+  structurally non-trapping and pure ([planner.md](planner.md) §3.2, §3.5), so evaluating it on such a
+  row raises nothing and reveals nothing; it is cost-ordered together with the body's own `WHERE`
+  (planner.md §3.0), as PostgreSQL also lets a cheap leakproof qual run first. So the option is
+  stored and reported and changes no plan.
 - **`security_invoker`** — a boolean: the privilege checks of §9 against the session using the view.
 
 Values follow PostgreSQL's `parse_bool`: a case-insensitive prefix of `true`, `false`, `yes`, or

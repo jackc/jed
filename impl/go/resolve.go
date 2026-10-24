@@ -1405,6 +1405,78 @@ func resolveBooleanFilter(s *scope, e *exprNode, params *paramTypes) (*rExpr, er
 	return node, nil
 }
 
+// resolveOrderedFilter resolves a WHERE or join ON clause and cost-orders its top-level conjuncts
+// (orderFilterConjuncts).
+func resolveOrderedFilter(s *scope, e *exprNode, params *paramTypes) (*rExpr, error) {
+	node, err := resolveBooleanFilter(s, e, params)
+	if err != nil {
+		return nil, err
+	}
+	return orderFilterConjuncts(node), nil
+}
+
+// orderFilterConjuncts stable-sorts a WHERE / ON / HAVING clause's top-level AND chain by estimated
+// per-row evaluation cost, PostgreSQL's order_qual_clauses (planner.md §3.0): a conjunct without a
+// correlated subquery before one with, then fewer estimated operator_eval (estimator.md §8.2) first,
+// ties in source order. An already-ordered chain is returned unchanged; a reordered one is rebuilt
+// left-deep.
+func orderFilterConjuncts(e *rExpr) *rExpr {
+	type conjunctKey struct {
+		correlated bool
+		nodes      int64
+	}
+	less := func(a, b conjunctKey) bool {
+		if a.correlated != b.correlated {
+			return !a.correlated
+		}
+		return a.nodes < b.nodes
+	}
+	conjuncts := flattenConjuncts(e)
+	keys := make([]conjunctKey, len(conjuncts))
+	sorted := true
+	for i, c := range conjuncts {
+		keys[i] = conjunctKey{hasCorrelatedSubquery(c), estimatorOperatorNodes(c)}
+		if i > 0 && less(keys[i], keys[i-1]) {
+			sorted = false
+		}
+	}
+	if sorted {
+		return e
+	}
+	order := make([]int, len(conjuncts))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		switch {
+		case less(keys[a], keys[b]):
+			return -1
+		case less(keys[b], keys[a]):
+			return 1
+		}
+		return 0
+	})
+	out := conjuncts[order[0]]
+	for _, i := range order[1:] {
+		out = &rExpr{kind: reAnd, lhs: out, rhs: conjuncts[i]}
+	}
+	return out
+}
+
+// hasCorrelatedSubquery reports whether e contains a subquery that is re-run per row (one that
+// references this query level or an enclosing one, so the uncorrelated fold leaves it in place).
+func hasCorrelatedSubquery(e *rExpr) bool {
+	if e.kind == reSubquery && e.subPlan != nil && queryPlanReferencesOuter(e.subPlan, 0) {
+		return true
+	}
+	for _, child := range rexprChildren(e) {
+		if hasCorrelatedSubquery(child) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveColumnRef turns a chain resolution into a resolved node + type (§26). A Local column
 // obeys the grouping rule (collectColumn); an Outer (correlated) reference is a per-outer-row
 // CONSTANT, so it bypasses that rule and resolves to an reOuterColumn reading the enclosing row at

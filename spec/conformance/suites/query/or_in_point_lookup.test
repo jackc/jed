@@ -73,9 +73,10 @@ SELECT a FROM t WHERE id IN (99, 100)
 
 # The OR conjunct can sit inside an AND: `(id = 1 OR id = 4) AND a > 15` bounds by the disjunction
 # {1,4} (2 probes = 2 page, 2 rows scanned), and the WHOLE filter is the residual re-applied per
-# scanned row: `And(Or(Eq,Eq), Gt)` = 4 nodes for id 1 (its first Eq decides the OR) + 5 for id 4 = 9.
-# Only id=4 (a=40>15) survives → 1 produced. 2 + 2 + 9 + 1 = 14.
-# cost: 14
+# scanned row, its cheaper `a > 15` first (planner.md §3.0): `And(Gt, Or(Eq,Eq))` = 2 nodes for id 1
+# (a=10, its FALSE Gt stops the filter) + 5 for id 4 = 7. Only id=4 (a=40>15) survives → 1 produced.
+# 2 + 2 + 7 + 1 = 12.
+# cost: 12
 query I rowsort
 SELECT id FROM t WHERE (id = 1 OR id = 4) AND a > 15
 ----

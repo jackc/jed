@@ -991,7 +991,7 @@ impl Engine {
                             merge_action: None,
                             hints: Default::default(),
                         };
-                        Some(resolve_boolean_filter(
+                        Some(resolve_ordered_filter(
                             &pair,
                             pred_ast.as_ref().expect("USING has >= 1 column"),
                             ptypes,
@@ -1024,7 +1024,7 @@ impl Engine {
                             hints: on_hints,
                         };
                         seg_star.extend(rel_star(k + 1));
-                        Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
+                        Some(resolve_ordered_filter(&partial, on_expr, ptypes)?)
                     } else {
                         seg_star.extend(rel_star(k + 1));
                         None
@@ -1386,7 +1386,9 @@ impl Engine {
                             grouping_specs = gs;
                         }
                         match ty {
-                            ResolvedType::Bool | ResolvedType::Null => Some(node),
+                            ResolvedType::Bool | ResolvedType::Null => {
+                                Some(order_filter_conjuncts(node))
+                            }
                             _ => {
                                 return Err(type_error("argument of HAVING must be boolean")
                                     .with_position(h.location().0));
@@ -1448,7 +1450,7 @@ impl Engine {
             // pipeline as the non-aggregate DISTINCT path (§11 below). The ORDER BY restriction (each
             // key must be a select-list item) is enforced once for both paths at the §11 block.
             let filter = match &sel.filter {
-                Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
+                Some(p) => Some(resolve_ordered_filter(&scope, p, ptypes)?),
                 None => None,
             };
             // ORDER BY resolution (spec/design/grammar.md §10). Each key is one of three modes (set at
@@ -1910,6 +1912,9 @@ impl Engine {
                     Some(acc) => RExpr::And(Box::new(acc), Box::new(c)),
                 });
             }
+            // The body's own conjuncts and the pushed ones form one filter, cost-ordered together
+            // (planner.md §3.0).
+            let filter = filter.map(order_filter_conjuncts);
             let rels: Vec<PlanRel> = scope
                 .rels
                 .iter()

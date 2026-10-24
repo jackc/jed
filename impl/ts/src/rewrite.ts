@@ -31,6 +31,7 @@ import {
   estimatorLiteral,
   estimatorLiteralCmp,
   estimatorValue,
+  orderFilterConjuncts,
 } from "./executor.ts";
 import {
   armWidening,
@@ -244,7 +245,12 @@ export function rewriteWhere(plan: SelectPlan): void {
     }
   }
   pd.relFilters.forEach((f, ri) => {
-    if (f !== null) pd.relLocal[ri] = rebaseColumns(f, plan.rels[ri]!.offset);
+    if (f === null) return;
+    // A relation's pushed ON and WHERE conjuncts form one filter, cost-ordered together (planner.md
+    // §3.0).
+    const ordered = orderFilterConjuncts(f);
+    pd.relFilters[ri] = ordered;
+    pd.relLocal[ri] = rebaseColumns(ordered, plan.rels[ri]!.offset);
   });
   plan.pushdown = pd;
 }

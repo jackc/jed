@@ -314,7 +314,7 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, mv *mergeView, bindin
 		}
 		return &rExpr{kind: reAnd, lhs: view, rhs: cond}, nil
 	}
-	on, err := resolveBooleanFilter(both, &m.On, ptypes)
+	on, err := resolveOrderedFilter(both, &m.On, ptypes)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +325,7 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, mv *mergeView, bindin
 	// resolution above already raised every name error.
 	probeScope := mergeScope(db, []scopeRel{mergeTargetRel(table, vw, m.Alias, 0)}, bindings)
 	probeScope.parent = srcOnly
-	probe, err := resolveBooleanFilter(probeScope, &m.On, &paramTypes{})
+	probe, err := resolveOrderedFilter(probeScope, &m.On, &paramTypes{})
 	if err != nil {
 		return nil, err
 	}

@@ -630,7 +630,7 @@ impl Engine {
                     .as_deref()
                     .expect("a view layer reads a level below");
                 let lscope = Scope::layer_body(self, table, 0, &layer.below_label, below);
-                let node = resolve_boolean_filter(&lscope, filter, &mut ParamTypes::default())?;
+                let node = resolve_ordered_filter(&lscope, filter, &mut ParamTypes::default())?;
                 out = Some(match out {
                     None => node,
                     Some(prev) => RExpr::And(Box::new(prev), Box::new(node)),
@@ -638,7 +638,7 @@ impl Engine {
             }
         }
         if let Some(p) = user {
-            let node = resolve_boolean_filter(scope, p, ptypes)?;
+            let node = resolve_ordered_filter(scope, p, ptypes)?;
             out = Some(match out {
                 None => node,
                 Some(prev) => RExpr::And(Box::new(prev), Box::new(node)),

@@ -241,7 +241,7 @@ SELECT id FROM o WHERE a = NULL
 
 # --- key-set probes over a DESC column ------------------------------------------------------------
 
-# cost: 181
+# cost: 141
 query I rowsort
 SELECT id FROM o WHERE a IN (3, 47) AND id < 200
 ----

@@ -17,7 +17,7 @@ statement ok
 INSERT INTO k SELECT n, n % 3, CASE WHEN n % 11 = 0 THEN NULL ELSE 'n' || n END, CASE WHEN n % 7 = 0 THEN NULL ELSE n % 40 END FROM generate_series(1, 90) AS n
 
 # the full scan, for comparison
-# cost: 561
+# cost: 627
 query I nosort
 SELECT count(*) FROM k WHERE g + 0 = 1 AND name > 'n4' AND name < 'n55'
 ----

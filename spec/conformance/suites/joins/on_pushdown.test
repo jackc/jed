@@ -209,7 +209,7 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND b.w > 0 WHERE b.w < 7 AND a.v >
 11
 
 # OR, NOT, and IS [NOT] DISTINCT FROM over one relation are pushdown-safe.
-# cost: 49
+# cost: 48
 query II nosort
 SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND (b.w IS NULL OR NOT (b.w < 6)) AND b.id IS DISTINCT FROM 11 ORDER BY a.id, b.id
 ----

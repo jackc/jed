@@ -388,6 +388,12 @@ pub(crate) fn rewrite_where(plan: &mut SelectPlan) {
         let acc = rel_filters[p.ri].take();
         rel_filters[p.ri] = Some(and_conjunct(acc, p.expr));
     }
+    // A relation's pushed ON and WHERE conjuncts form one filter, cost-ordered together (planner.md
+    // §3.0).
+    let rel_filters: Vec<Option<RExpr>> = rel_filters
+        .into_iter()
+        .map(|f| f.map(order_filter_conjuncts))
+        .collect();
     let rel_local = rel_filters
         .iter()
         .enumerate()

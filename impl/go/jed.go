@@ -752,6 +752,7 @@ var SupportedCapabilities = []string{
 	"expr.comparison_value",
 	"expr.not_equal",
 	"query.logical_connectives",
+	"query.filter_conjunct_order",
 	"query.is_distinct_from",
 	"error.division_by_zero",
 	// Predicate forms (Phase 2, spec/design/grammar.md §20-§23).

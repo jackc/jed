@@ -447,13 +447,13 @@ impl Engine {
                 },
             )
         };
-        let on = resolve_boolean_filter(&both, &m.on, ptypes)?;
+        let on = resolve_ordered_filter(&both, &m.on, ptypes)?;
         let on = lead(on)?;
         // The probe form: the target is the relation, the source an enclosing level (§3). The
         // combined resolution above already raised every name error.
         let mut probe_scope = merge_scope(self, vec![target_rel_at(table, vw, alias, 0)], bindings);
         probe_scope.parent = Some(&src_only);
-        let probe = resolve_boolean_filter(&probe_scope, &m.on, &mut ParamTypes::default())?;
+        let probe = resolve_ordered_filter(&probe_scope, &m.on, &mut ParamTypes::default())?;
         let probe = lead(probe)?;
         let target_filter =
             self.resolve_write_filter(&tgt_only, table, vw, None, &mut ParamTypes::default())?;
