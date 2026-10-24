@@ -142,7 +142,7 @@ export function* createOpfsWithHandleSteps(
   // Tables built in this session bind this pager at creation (Snapshot.storePaging), so their
   // committed leaves demote at each commit — same residency shape as after a reopen (file.ts create).
   // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
-  db.paging.setFloorSlot(Number(db.committed.txid & 1n));
+  db.paging.setFloorSlot(Number(db.committed.txid & 1n), db.committed.txid);
   db.relaxed = opts.synchronous === "off";
   db.committed.storePaging = db.paging;
   db.rewriter = journal === null ? null : opfsRewriter(handle, journal);

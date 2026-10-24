@@ -2521,19 +2521,14 @@ impl<'a> Runner<'a> {
                     );
                     return;
                 }
+                let relaxed = self.relaxed;
                 let d = self.sdb(name);
                 d.add_history(now, inflight.clone());
                 d.version = now;
                 d.last_digest = inflight.clone();
                 d.max_attempted = d.max_attempted.max(now);
-                let client = self
-                    .db()
-                    .sim_service_db(name)
-                    .is_some_and(|db| db.sim_page_client().is_some());
-                let relaxed = self.relaxed;
-                let d = self.sdb(name);
-                if !relaxed || client {
-                    d.floor = now; // acknowledged under synchronous = on, or a page client's commit (§8.2)
+                if !relaxed {
+                    d.floor = now; // acknowledged under synchronous = on; a relaxed client's joins the owner's batch (§8.2)
                 }
                 self.check_growth(i, name, quiet);
                 if !self.violation.is_empty() {

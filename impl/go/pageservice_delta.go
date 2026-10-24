@@ -27,6 +27,7 @@ type psDelta struct {
 	// manifestProtected once the commit is published, so the owner's reload need not re-read them.
 	protected map[uint32]bool
 	// written is every index the delta writes, in ascending order: the invalidation window's entry.
+	// A relaxed delta's carried pending pages are listed but not written, so they are not in it.
 	written []uint32
 	// encrypted: body pages are ciphertext, checked by their manifest identity alone (encrypted.md §6).
 	encrypted bool
@@ -42,6 +43,9 @@ type psDeltaBase struct {
 	pageSize      uint32
 	pageCount     uint32          // the committed high-water
 	granted       map[uint32]bool // the reusable free pages when the reuse grant passed; nil otherwise
+	// pending is the owner's pending set named in a relaxed write_begun (README.md §3.5): the delta's
+	// cumulative manifest must list each with this digest, and none of them arrives in commit_pages.
+	pending map[uint32]uint64
 	// encrypted: the file is the encrypted variant — the inline manifest starts at 96, body pages are
 	// ciphertext checked by their manifest identity alone, and the key block (pages 2–3) is never
 	// written by a delta (spec/fileformat/encrypted.md §6, §14). codec is its page codec then.
@@ -96,13 +100,26 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 	}
 	last := uint32(1)
 	rootSeen, freeHeadSeen := false, m.freeListHead == 0
-	listed := uint32(0)
+	listed, carried := uint32(0), 0
 	list := func(entries []byte, count uint32) error {
 		for i := uint32(0); i < count; i++ {
 			e := entries[int(i)*12:]
 			index := binary.BigEndian.Uint32(e)
 			if index <= last {
 				return errDelta("manifest indices are not strictly ascending")
+			}
+			if digest, ok := base.pending[index]; ok {
+				// A page an earlier commit of the batch wrote: listed, never sent again.
+				if binary.BigEndian.Uint64(e[4:]) != digest {
+					return errDelta("pending page " + strconv.FormatUint(uint64(index), 10) + " is listed with another digest")
+				}
+				last = index
+				d.protected[index] = true
+				rootSeen = rootSeen || index == m.rootPage
+				freeHeadSeen = freeHeadSeen || index == m.freeListHead
+				listed++
+				carried++
+				continue
 			}
 			if !base.legal(index, m.pageCount) {
 				return errDelta("page " + strconv.FormatUint(uint64(index), 10) + " is neither beyond the high-water nor a granted free page")
@@ -152,8 +169,13 @@ func beginDelta(base psDeltaBase, cb psCommitBegin) (*psDelta, error) {
 	if listed != m.dirtyCount || !rootSeen || !freeHeadSeen {
 		return nil, errDelta("the manifest does not cover the catalog root and free-list head")
 	}
+	if carried != len(base.pending) {
+		return nil, errDelta("the manifest does not list the owner's pending pages")
+	}
 	for index := range d.protected {
-		d.written = append(d.written, index)
+		if _, ok := base.pending[index]; !ok {
+			d.written = append(d.written, index)
+		}
 	}
 	sortUint32s(d.written)
 	return d, nil
@@ -200,6 +222,16 @@ func (d *psDelta) checkPage(pg psIndexedPage) error {
 	}
 	d.received[pg.index] = true
 	return nil
+}
+
+// own is the delta's own listed body pages with their digests: what a relaxed commit adds to the
+// owner's pending set (validated-cow.md §4).
+func (d *psDelta) own() []manifestEntry {
+	entries := make([]manifestEntry, 0, len(d.expected))
+	for index, digest := range d.expected {
+		entries = append(entries, manifestEntry{index: index, digest: digest})
+	}
+	return entries
 }
 
 // complete runs check C at commit_end: every listed page arrived.

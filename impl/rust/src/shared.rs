@@ -405,6 +405,12 @@ pub(crate) struct Storage {
     /// The free list as of the floor — recorded by the first commit of a relaxed batch — the only
     /// pages a pending commit may reuse (validated-cow.md §4 rule 3).
     floor_free: Option<Arc<HashSet<u32>>>,
+    /// A page client's view of its owner's batch for the write transaction in progress, from a
+    /// relaxed `write_begun` (spec/pageservice/README.md §3.5): the pending set its cumulative
+    /// manifest lists, and the only free pages it may reuse while that set is non-empty. Empty
+    /// outside a relaxed client's write transaction.
+    service_pending: Vec<(u32, u64)>,
+    service_reuse: Option<Arc<HashSet<u32>>>,
 }
 
 /// One cap flush (validated-cow.md §4). A failed barrier may have dropped pending pages from the OS
@@ -535,6 +541,8 @@ impl Storage {
             flushing: None,
             inline_flush: false,
             floor_free: None,
+            service_pending: Vec::new(),
+            service_reuse: None,
         })
     }
 
@@ -776,8 +784,7 @@ impl Storage {
             self.await_flush()?;
             // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its
             // floor.
-            let pending = self.paging.pager().has_pending();
-            let allowed = self.floor_free_for(pending);
+            let allowed = self.floor_free_for(self.batch_open());
             let write = snap.incremental_image_allowed(
                 self.page_size,
                 self.page_count,
@@ -870,28 +877,60 @@ impl Storage {
     /// pending the floor is the committed generation, so a relaxed domain records the pages free now
     /// — the floor's free list — and allows them all; while a batch is pending only those not yet
     /// consumed may be reused, since a page freed during the batch may still be needed by the floor.
-    /// A synchronous = on domain is never restricted.
+    /// The restriction binds every commit that begins inside a batch, a synchronous = on owner's
+    /// included, since its relaxed page clients may have opened one (page-service.md §6).
     fn reuse_allowed(&mut self, pending: bool) -> Option<Arc<HashSet<u32>>> {
-        if !self.relaxed_file() {
-            return None;
+        if pending {
+            return self.floor_free_for(true);
         }
-        if !pending {
-            self.floor_free = Some(Arc::new(self.free_pages.iter().copied().collect()));
-            return None;
+        if self.relaxed_file() {
+            self.record_floor_free();
         }
-        self.floor_free_for(true)
+        None
     }
 
-    /// The restriction a pending batch plans under, without recording a new floor.
-    fn floor_free_for(&self, pending: bool) -> Option<Arc<HashSet<u32>>> {
-        if !pending || !self.relaxed_file() {
+    /// Record the committed free list as the floor's, for a batch about to start: by the domain's
+    /// own first relaxed commit, or by a relaxed page client's (README.md §3.5).
+    pub(crate) fn record_floor_free(&mut self) {
+        self.floor_free = Some(Arc::new(self.free_pages.iter().copied().collect()));
+    }
+
+    /// The restriction a pending batch plans under, without recording a new floor. A page client's
+    /// is the reuse list its owner sent.
+    pub(crate) fn floor_free_for(&self, pending: bool) -> Option<Arc<HashSet<u32>>> {
+        if !pending {
             return None;
         }
-        Some(
-            self.floor_free
-                .clone()
-                .unwrap_or_else(|| Arc::new(HashSet::new())),
-        )
+        let allowed = if self.service_client {
+            &self.service_reuse
+        } else {
+            &self.floor_free
+        };
+        Some(allowed.clone().unwrap_or_else(|| Arc::new(HashSet::new())))
+    }
+
+    /// The pending set the commit about to plan carries in its manifest: the domain's own, or, on a
+    /// page client, its owner's from a relaxed `write_begun`.
+    fn batch_entries(&self) -> Vec<(u32, u64)> {
+        if self.service_client {
+            return self.service_pending.clone();
+        }
+        self.paging.pager().pending_entries()
+    }
+
+    /// Whether the commit about to plan begins inside a batch.
+    fn batch_open(&self) -> bool {
+        if self.service_client {
+            return !self.service_pending.is_empty();
+        }
+        self.paging.pager().has_pending()
+    }
+
+    /// Record the owner's batch a relaxed `write_begun` named (README.md §3.5), or clear it (empty
+    /// lists) when the write transaction ends.
+    pub(crate) fn set_service_batch(&mut self, pending: Vec<(u32, u64)>, reuse: Vec<u32>) {
+        self.service_reuse = (!pending.is_empty()).then(|| Arc::new(reuse.into_iter().collect()));
+        self.service_pending = pending;
     }
 
     /// Whether this domain's commits batch their barrier.
@@ -964,11 +1003,8 @@ impl Storage {
         if self.path.is_some() {
             let ctx = budget.expect("a file commit names its previous snapshot");
             self.await_flush()?;
-            let pending = {
-                let pager = self.paging.pager();
-                pager.check_commit()?;
-                pager.has_pending()
-            };
+            self.paging.pager().check_commit()?;
+            let pending = self.batch_open();
             let allowed = self.reuse_allowed(pending);
             let write = snap.incremental_image_allowed(
                 self.page_size,
@@ -1018,7 +1054,7 @@ impl Storage {
             }
         }
         let relaxed = self.relaxed_file();
-        let pending = self.paging.pager().pending_entries();
+        let pending = self.batch_entries();
         let plan = crate::format::plan_free_list(
             snap,
             &self.paging,
@@ -1532,26 +1568,42 @@ impl Shared {
     /// Pin the published snapshot for a client write transaction that holds the writer gate
     /// (README.md §3.5): the write pin, the cache answer, and the reuse grant — every pin on the
     /// database, the write pin included, is at or after the free list's generation
-    /// (page-service.md §6) — with the owner state its delta is checked against.
+    /// (page-service.md §6) — with the owner state its delta is checked against. A `relaxed`
+    /// client is also told the owner's pending set and, inside a batch, the floor-free pages the
+    /// grant narrows to.
     #[cfg(unix)]
     pub(crate) fn page_service_begin_write(
         &self,
         pins: &mut crate::pageservice::owner::ConnPins,
         incarnation: &crate::pageservice::codec::Id16,
         last_txid: u64,
+        relaxed: bool,
     ) -> Option<(
         crate::pageservice::codec::WriteBegun,
         crate::pageservice::delta::DeltaBase,
     )> {
         // The gate is held, so the page accounting matches the published version.
-        let (page_size, page_count, free_pages, free_gen_txid, encrypted) = {
-            let st = self.storage.lock().expect("storage lock not poisoned");
+        let (page_size, page_count, free_pages, free_gen_txid, encrypted, pending, floor) = {
+            let mut st = self.storage.lock().expect("storage lock not poisoned");
+            let pending = if relaxed {
+                st.paging.pager().pending_entries()
+            } else {
+                Vec::new()
+            };
+            let floor = st.floor_free_for(!pending.is_empty());
+            if relaxed && pending.is_empty() {
+                // The client's commit may start a batch: the committed free list is the floor's
+                // (validated-cow.md §4 rule 3).
+                st.record_floor_free();
+            }
             (
                 st.page_size,
                 st.page_count,
                 st.free_pages.clone(),
                 st.free_gen_txid,
                 st.paging.codec().is_some(),
+                pending,
+                floor,
             )
         };
         let mut live = self.live.lock().expect("live lock not poisoned");
@@ -1565,11 +1617,29 @@ impl Shared {
         // Later pins are on this snapshot or newer, so they cannot void the grant.
         let grant = live.oldest().map_or(txid, |oldest| oldest.min(txid)) >= free_gen_txid;
         drop(live);
+        let mut reuse = Vec::new();
+        let granted = match floor {
+            // Inside a batch the grant narrows to the committed free pages that were free at the
+            // floor (validated-cow.md §4 rule 3), the lowest MAX_REUSE_PAGES of them.
+            Some(floor) => {
+                if grant {
+                    reuse = free_pages
+                        .into_iter()
+                        .filter(|page| floor.contains(page))
+                        .collect();
+                    reuse.sort_unstable();
+                    reuse.truncate(crate::pageservice::codec::MAX_REUSE_PAGES);
+                }
+                Some(reuse.iter().copied().collect())
+            }
+            None => grant.then(|| free_pages.into_iter().collect()),
+        };
         let check = crate::pageservice::delta::DeltaBase {
             committed_txid: txid,
             page_size,
             page_count,
-            granted: grant.then(|| free_pages.into_iter().collect()),
+            granted,
+            pending: pending.iter().copied().collect(),
             encrypted,
         };
         Some((
@@ -1580,6 +1650,8 @@ impl Shared {
                 indices,
                 reuse_grant: grant,
                 meta,
+                pending,
+                reuse,
             },
             check,
         ))
@@ -1613,14 +1685,37 @@ impl Shared {
         Ok(())
     }
 
-    /// Flush the owner's own relaxed commits before a client plans against the committed meta: a
-    /// client cannot name the owner's pending set in its manifest (README.md §3.5).
+    /// The owner's batch at a client's `begin_write` (README.md §3.5): a synchronous client plans
+    /// against a durable floor, so the pending set is flushed first; a `relaxed` one is told the
+    /// pending set instead, once any cap flush in progress has finished.
     #[cfg(unix)]
-    pub(crate) fn page_service_flush(&self) -> Result<()> {
-        self.storage
-            .lock()
-            .expect("storage lock not poisoned")
-            .flush_for_client()
+    pub(crate) fn page_service_flush(&self, relaxed: bool) -> Result<()> {
+        let mut st = self.storage.lock().expect("storage lock not poisoned");
+        if relaxed {
+            st.await_flush()
+        } else {
+            st.flush_for_client()
+        }
+    }
+
+    /// End a batch a relaxed client commit brought to the cap (README.md §3.5): the flush runs at
+    /// once, before any maintenance commit, and shrinks nothing — a shrink an owner commit deferred
+    /// waits for the owner's own next barrier. A failed barrier revokes the storage, as a local cap
+    /// flush does (validated-cow.md §4); the caller stops serving. Called holding the gate.
+    #[cfg(unix)]
+    pub(crate) fn page_service_cap_flush(&self) -> Result<()> {
+        let st = self.storage.lock().expect("storage lock not poisoned");
+        let result = st.paging.pager().flush_pending(false);
+        if let Err(e) = &result {
+            st.paging.revoke(EngineError::new(
+                SqlState::IoError,
+                format!(
+                    "a deferred durability flush failed; reopen the database: {}",
+                    e.message
+                ),
+            ));
+        }
+        result
     }
 
     /// End an owner-pager commit a client delta began but will never finish (an abort, a rejected
@@ -1637,19 +1732,22 @@ impl Shared {
     }
 
     /// A client commit's point of no return (README.md §3.5, §6.4): write the meta slot, run the
-    /// single durable barrier, then record the new page count and free list (read from the
-    /// committed free-list chain). The caller holds the owner's commit lock; a failure poisons the
-    /// owner, which stops serving.
+    /// single durable barrier (a `relaxed` commit joins the owner's batch instead), then record the
+    /// new page count and free list (read from the committed free-list chain). Returns whether a
+    /// relaxed commit brought the batch to its cap. The caller holds the owner's commit lock; a
+    /// failure poisons the owner, which stops serving.
     #[cfg(unix)]
     pub(crate) fn page_service_commit_delta(
         &self,
         delta: &mut crate::pageservice::delta::Delta,
-    ) -> Result<()> {
+        relaxed: bool,
+    ) -> Result<bool> {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
-        {
+        let cap_reached = {
             let mut pager = st.paging.pager();
-            // The slot not holding the committed meta, which the begin_write flush made the floor
-            // (README.md §3.5); a client commit always keeps its own barrier.
+            // The slot not holding the floor (README.md §3.5). A synchronous client's commit keeps
+            // its own barrier (the begin_write flush left nothing pending); a relaxed one joins the
+            // batch.
             let slot = pager.commit_slot();
             // A client cannot know that slot, so an encrypted meta, already checked against the
             // database key, is resealed for it (spec/fileformat/encrypted.md §14).
@@ -1658,12 +1756,15 @@ impl Shared {
                 codec.seal_meta(slot, &mut delta.meta, &chain)?;
             }
             pager.write_block(slot, &delta.meta)?;
-            pager.sync()?;
-            pager.finish_commit(&delta.meta, slot, true, &[]);
+            if !relaxed {
+                pager.sync()?;
+            }
+            pager.finish_commit(&delta.meta, slot, !relaxed, &delta.own());
             // The owner validated this commit's dependencies itself, so its reload need not
             // re-read them.
             pager.cache_validation(&delta.meta, Arc::new(delta.protected.clone()));
-        }
+            relaxed && pager.batch_cap_reached()
+        };
         let free_tag = crate::format::parse_meta(&delta.meta)
             .map_or(crate::crypto::NO_TAG, |m| m.free_list_tag);
         let free = crate::format::read_free_list(
@@ -1677,7 +1778,7 @@ impl Shared {
         )?;
         st.page_count = delta.page_count;
         st.free_pages = free;
-        Ok(())
+        Ok(cap_reached)
     }
 
     /// Check a client commit's meta against the database key before any page is written
@@ -2726,6 +2827,8 @@ impl Database {
             flushing: None,
             inline_flush: false,
             floor_free: None,
+            service_pending: Vec::new(),
+            service_reuse: None,
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -3581,6 +3684,8 @@ impl Database {
                 flushing: None,
                 inline_flush,
                 floor_free: None,
+                service_pending: Vec::new(),
+                service_reuse: None,
             };
             Some((storage, engine.committed, coordinator))
         } else {

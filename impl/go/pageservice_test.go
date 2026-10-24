@@ -7,6 +7,7 @@ package jed
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -293,5 +294,50 @@ func TestPageServiceResolutionWindow(t *testing.T) {
 	}
 	if len(o.resolution) != psResolutionWindowCommits || o.resolution[0].txid != 13 {
 		t.Errorf("the resolution window must keep the newest %d commits", psResolutionWindowCommits)
+	}
+}
+
+// TestPageServiceRelaxedDeltaValidation checks a relaxed client's delta against the owner's named
+// pending set (README.md §3.5): the cumulative manifest lists each pending page with its digest, those
+// pages never arrive again, and the invalidation entry names only the pages the delta wrote.
+func TestPageServiceRelaxedDeltaValidation(t *testing.T) {
+	const ps = 512
+	cb, all := testDelta(t, ps, 10, []uint32{12, 4, 13})
+	var body []psIndexedPage
+	pending := map[uint32]uint64{}
+	for _, pg := range all {
+		if pg.index == 4 {
+			pending[4] = commitCRC64(0, pg.page)
+		} else {
+			body = append(body, pg)
+		}
+	}
+	base := psDeltaBase{committedTxid: 5, pageSize: ps, pageCount: 10, pending: pending, granted: map[uint32]bool{}}
+	if err := applyDelta(base, cb, body); err != nil {
+		t.Fatalf("a valid relaxed delta was refused: %v", err)
+	}
+	d, err := beginDelta(base, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(d.written) != "[12 13]" {
+		t.Errorf("written = %v, want the delta's own pages [12 13]", d.written)
+	}
+	cases := []struct {
+		name   string
+		mutate func(*psDeltaBase, *[]psIndexedPage)
+	}{
+		{"pending digest differs", func(b *psDeltaBase, _ *[]psIndexedPage) { b.pending = map[uint32]uint64{4: pending[4] ^ 1} }},
+		{"pending page not listed", func(b *psDeltaBase, _ *[]psIndexedPage) { b.pending = map[uint32]uint64{4: pending[4], 5: 9} }},
+		{"pending page sent again", func(_ *psDeltaBase, body *[]psIndexedPage) { *body = all }},
+		{"no pending set", func(b *psDeltaBase, _ *[]psIndexedPage) { b.pending = nil }},
+	}
+	for _, c := range cases {
+		b := base
+		mc, mb := cloneDelta(cb, body)
+		c.mutate(&b, &mb)
+		if err := applyDelta(b, mc, mb); err == nil || psErrCode(err) != "08P01" {
+			t.Errorf("%s: got %v, want 08P01", c.name, err)
+		}
 	}
 }

@@ -763,6 +763,10 @@ func (c *sharedCore) clientBeginWrite(r *serviceRole, timeoutMs uint64) error {
 	}
 	cl.refreshMu.Lock()
 	request := psBeginWrite{incarnation: cl.incarnation, lastTxid: cl.adopted, lockTimeoutMs: timeoutMs}
+	if c.storage.relaxed {
+		// A relaxed client commits into the owner's batch rather than having it flushed (README.md §3.5).
+		request.flags |= psBeginWriteRelaxed
+	}
 	cl.refreshMu.Unlock()
 	reply, err := cl.roundTrip(request)
 	if err != nil {
@@ -777,6 +781,7 @@ func (c *sharedCore) clientBeginWrite(r *serviceRole, timeoutMs uint64) error {
 		return newError(DataCorrupted, "the owner sent an invalid meta page")
 	}
 	cl.gateHeld, cl.reuseGrant = true, wb.reuseGrant
+	c.storage.setServiceBatch(wb.pending, wb.reuse)
 	cl.sendMu.Lock()
 	cl.writeTxid.Store(wb.txid)
 	cl.updateReadTxidLocked()
@@ -810,8 +815,23 @@ func (c *sharedCore) clientEndWrite(cl *psClient) {
 	if !cl.gateHeld {
 		return
 	}
+	c.storage.setServiceBatch(nil, nil)
 	cl.gateHeld = false
 	cl.abortWrite()
+}
+
+// setServiceBatch records the owner's batch a relaxed write_begun named (README.md §3.5), or clears it
+// when the write transaction ends.
+func (st *storage) setServiceBatch(pending []manifestEntry, reuse []uint32) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.servicePending, st.serviceReuse = pending, nil
+	if len(pending) > 0 {
+		st.serviceReuse = make(map[uint32]bool, len(reuse))
+		for _, p := range reuse {
+			st.serviceReuse[p] = true
+		}
+	}
 }
 
 // abortWrite clears the write pin's readTxid contribution and sends abort, both under sendMu so no

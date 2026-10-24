@@ -725,6 +725,10 @@ impl Shared {
         if let Some(owner) = &role.owner {
             owner.gate.release();
         } else if let Some(conn) = &role.client {
+            self.storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .set_service_batch(Vec::new(), Vec::new());
             conn.end_write();
         }
     }
@@ -859,8 +863,20 @@ impl Shared {
             let cache = conn.cache.lock().expect("client cache lock poisoned");
             (cache.incarnation, cache.adopted)
         };
-        let begun = conn.begin_write(incarnation, last_txid, timeout_ms)?;
+        let relaxed = self
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .relaxed;
+        let mut begun = conn.begin_write(incarnation, last_txid, timeout_ms, relaxed)?;
         conn.start_write(begun.txid, begun.reuse_grant);
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .set_service_batch(
+                std::mem::take(&mut begun.pending),
+                std::mem::take(&mut begun.reuse),
+            );
         let adopted = {
             let mut cache = conn.cache.lock().expect("client cache lock poisoned");
             self.client_adopt(
@@ -874,6 +890,10 @@ impl Shared {
             )
         };
         if adopted.is_err() {
+            self.storage
+                .lock()
+                .expect("storage lock not poisoned")
+                .set_service_batch(Vec::new(), Vec::new());
             conn.end_write();
         }
         adopted
@@ -921,7 +941,11 @@ impl Shared {
             can_compact: false,
             stages_rows,
         };
-        let Err(error) = st.commit_durable(snap, false, conn.reuse_grant(), Some(&budget)) else {
+        let result = st.commit_durable(snap, false, conn.reuse_grant(), Some(&budget));
+        // The commit ends the write transaction, whatever its outcome: the owner's batch it named is
+        // gone.
+        st.set_service_batch(Vec::new(), Vec::new());
+        let Err(error) = result else {
             return Ok(());
         };
         if let Some((txid, digest)) = conn.take_lost_commit() {

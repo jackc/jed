@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use jed::{
     Argon2Params, AttachSource, CreateOptions, Credential, Database, EngineError, Environment,
-    Locking, OpenOptions, Ownership, Session, SessionOptions, Value,
+    Locking, OpenOptions, Ownership, Session, SessionOptions, Synchronous, Value,
 };
 
 fn main() {
@@ -58,7 +58,8 @@ fn run() -> Result<(), EngineError> {
     // Positional arguments after the path: the open timeout, then the page-service owner's
     // idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
     // handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
-    // shutdown_grace, idle_session (milliseconds), max_connections.
+    // shutdown_grace, idle_session (milliseconds), max_connections; synchronous=off batches the
+    // handle's barriers (spec/design/validated-cow.md §4).
     let mut positional = Vec::new();
     let mut options = std::collections::HashMap::new();
     for arg in args {
@@ -87,6 +88,10 @@ fn run() -> Result<(), EngineError> {
         .get("max_connections")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let synchronous = match options.get("synchronous").map(String::as_str) {
+        Some("off") => Synchronous::Off,
+        _ => Synchronous::On,
+    };
     // key=<64 hex digits>: the host key of an encrypted database (spec/design/encryption.md §8).
     let credential = options.get("key").map(|hex| host_key(hex));
     // create/open use the default locking (the page service); open-exclusive is a non-serving owner.
@@ -140,6 +145,7 @@ fn run() -> Result<(), EngineError> {
             max_connections,
             ownership,
             credential,
+            synchronous,
             ..CreateOptions::default()
         })?
     } else {
@@ -156,6 +162,7 @@ fn run() -> Result<(), EngineError> {
                 max_connections,
                 ownership,
                 credential,
+                synchronous,
                 ..OpenOptions::default()
             },
         )?

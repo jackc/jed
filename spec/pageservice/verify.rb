@@ -21,7 +21,7 @@ FIXTURES_PATH = File.join(DIR, "fixtures.toml")
 FIXTURES = TomlRB.load_file(FIXTURES_PATH)
 
 MAX_FRAME = CATALOG.fetch("max_frame_length")
-TYPES = %w[u8 u16 u32 u64 bool id16 sqlstate string page u32_list page_list indexed_page_list credential].freeze
+TYPES = %w[u8 u16 u32 u64 bool id16 sqlstate string page u32_list digest_list page_list indexed_page_list credential].freeze
 
 class Malformed < StandardError
   attr_reader :kind
@@ -110,6 +110,8 @@ def parse_value(type, text, page_size)
   when "credential" then parse_credential(text)
   when "page" then parse_page(text, page_size)
   when "u32_list" then text.empty? ? [] : text.split(",").map { |v| Integer(v, 10) }
+  when "digest_list"
+    text.empty? ? [] : text.split(",").map { |item| item.split("=", 2).map { |v| Integer(v, 10) } }
   when "page_list" then text.empty? ? [] : text.split(";").map { |p| parse_page(p, page_size) }
   when "indexed_page_list"
     text.empty? ? [] : text.split(";").map do |item|
@@ -145,6 +147,8 @@ def encode_value(type, value, page_size)
     fail!("page is not page_size bytes") unless value.bytesize == page_size && page_size.positive?
     value.b
   when "u32_list" then [value.size].pack("N") + value.map { |v| encode_value("u32", v, 0) }.join
+  when "digest_list"
+    [value.size].pack("N") + value.map { |i, d| encode_value("u32", i, 0) + encode_value("u64", d, 0) }.join
   when "page_list" then [value.size].pack("N") + value.map { |p| encode_value("page", p, page_size) }.join
   when "indexed_page_list"
     [value.size].pack("N") + value.map { |i, p| encode_value("u32", i, 0) + encode_value("page", p, page_size) }.join
@@ -211,15 +215,16 @@ def decode_value(type, reader, page_size)
     raise Malformed.new("page", "no connection page size") unless page_size.positive?
 
     reader.take(page_size)
-  when "u32_list", "page_list", "indexed_page_list"
+  when "u32_list", "digest_list", "page_list", "indexed_page_list"
     count = decode_value("u32", reader, page_size)
-    item = { "u32_list" => 4, "page_list" => page_size, "indexed_page_list" => 4 + page_size }.fetch(type)
+    item = { "u32_list" => 4, "digest_list" => 12, "page_list" => page_size, "indexed_page_list" => 4 + page_size }.fetch(type)
     raise Malformed.new("count", "#{count} items of #{item} bytes") if count * item > reader.remaining
 
     Array.new(count) do
       case type
       when "u32_list" then decode_value("u32", reader, page_size)
       when "page_list" then decode_value("page", reader, page_size)
+      when "digest_list" then [decode_value("u32", reader, page_size), decode_value("u64", reader, page_size)]
       else [decode_value("u32", reader, page_size), decode_value("page", reader, page_size)]
       end
     end

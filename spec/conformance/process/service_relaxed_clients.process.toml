@@ -1,0 +1,167 @@
+schema_version = 1
+name = "service-relaxed-clients"
+description = "Batched durability under the page service: page clients whose own handles run synchronous = off commit into the owner's batch (the owner names its pending set in write_begun, spec/pageservice/README.md §3.5), beside a synchronous client and a synchronous owner that commit inside the batch they opened; a commit large enough to reach the batch cap is flushed by the owner; and when the owner dies, the promoted client still sees every acknowledged commit, since a process crash loses none."
+requires = ["file.page_service"]
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY, v text)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open synchronous=off"
+
+[[step]]
+actor = "b"
+command = "role"
+expect = "client"
+
+[[step]]
+actor = "c"
+command = "start"
+argument = "open synchronous=off"
+
+# Relaxed client commits from both clients: each plans against the batch the previous one left pending.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (1, 'b')"
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "INSERT INTO t VALUES (2, 'c')"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "UPDATE t SET v = 'bb' WHERE id = 1"
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "DELETE FROM t WHERE id = 2"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64, count(*) FILTER (WHERE v = 'bb') FROM t"
+expect = "1:1:1"
+
+# The synchronous owner commits inside the batch its relaxed clients opened, and its barrier ends it.
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (3, 'a')"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (4, 'b')"
+
+# A relaxed explicit transaction commits into the batch too.
+[[step]]
+actor = "c"
+command = "write_open"
+
+[[step]]
+actor = "c"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (5, 'c'), (6, 'c')"
+
+[[step]]
+actor = "c"
+command = "write_commit"
+
+# One commit large enough to reach the batch cap: the owner flushes it before the gate moves on.
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t SELECT g, repeat('x', 40) FROM generate_series(100, 3099) g"
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "UPDATE t SET v = 'y' WHERE id BETWEEN 100 AND 199"
+
+# A synchronous client gets the owner's batch flushed before its begin_write and keeps its barrier.
+[[step]]
+actor = "d"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "d"
+command = "exec"
+sql = "DELETE FROM t WHERE id BETWEEN 3000 AND 3099"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (7, 'b')"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64, count(*) FILTER (WHERE v = 'y') FROM t"
+expect = "2906:4493576:100"
+
+[[step]]
+actor = "d"
+command = "close"
+
+# The owner dies with the relaxed client commits acknowledged but not flushed. A process crash loses
+# none of them: their writes reached the file before the owner acknowledged.
+[[step]]
+actor = "a"
+command = "kill"
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64, count(*) FILTER (WHERE v = 'y') FROM t"
+expect = "2906:4493576:100"
+retry_ms = 2000
+
+[[step]]
+actor = "c"
+command = "exec"
+sql = "INSERT INTO t VALUES (8, 'c')"
+retry_ms = 2000
+
+[[step]]
+actor = "b"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "2907:4493584"
+
+[[step]]
+actor = "c"
+command = "close"
+
+[[step]]
+actor = "b"
+command = "close"
+
+# The promoted owner's close flushed its batch: a fresh open sees every commit.
+[[step]]
+actor = "a"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT count(*), sum(id)::i64 FROM t"
+expect = "2907:4493584"
+
+[[step]]
+actor = "a"
+command = "close"

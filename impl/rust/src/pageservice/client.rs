@@ -541,19 +541,27 @@ impl PsConnection {
         Ok(begun)
     }
 
-    /// `begin_write` with the session's lock timeout (README.md §3.5). The wait for the owner's
-    /// gate does not hold the send lock, so this process's readers keep reading.
+    /// `begin_write` with the session's lock timeout (README.md §3.5); a `relaxed` client commits
+    /// into the owner's batch rather than having it flushed. The wait for the owner's gate does not
+    /// hold the send lock, so this process's readers keep reading.
     pub(crate) fn begin_write(
         &self,
         incarnation: Id16,
         last_txid: u64,
         lock_timeout_ms: u64,
+        relaxed: bool,
     ) -> Result<WriteBegun> {
+        let flags = if relaxed {
+            crate::pageservice::codec::BEGIN_WRITE_RELAXED
+        } else {
+            0
+        };
         let reply = self.round_trip(|| {
             Ok(Message::BeginWrite(BeginWrite {
                 incarnation,
                 last_txid,
                 lock_timeout_ms,
+                flags,
             }))
         })?;
         let Message::WriteBegun(begun) = reply else {

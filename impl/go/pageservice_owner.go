@@ -131,7 +131,9 @@ type pageServiceOwner struct {
 type psWriteTxn struct {
 	base  uint64
 	grant bool
-	check psDeltaBase
+	// relaxed is a begin_write with the relaxed bit: the commit joins the owner's batch (README.md §3.5).
+	relaxed bool
+	check   psDeltaBase
 	// delta is the CommitDelta being received (between commit_begin and commit_end); failure is a
 	// rejected delta, whose remaining frames are discarded and which commit_end reports.
 	delta   *psDelta
@@ -921,14 +923,20 @@ func (sc *psServerConn) beginWrite(requestID uint32, m psBeginWrite) (psMessage,
 func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 	o := sc.owner
 	c := o.core
+	relaxed := m.flags&psBeginWriteRelaxed != 0
 	err := o.acquireGate(m.lockTimeoutMs, sc.done)
 	if err == nil {
-		// The owner's own relaxed commits are flushed before a client plans against the committed meta:
-		// a client cannot name the owner's pending set in its manifest (README.md §3.5). A failed flush
-		// poisons the owner, which stops serving.
+		// The owner's batch (README.md §3.5): a synchronous client plans against a durable floor, so the
+		// pending set is flushed first; a relaxed one is told the pending set instead, once any cap flush
+		// in progress has finished. A failed flush poisons the owner, which stops serving.
 		st := c.storage
 		st.mu.Lock()
-		ferr := st.flush(false)
+		var ferr error
+		if relaxed {
+			ferr = st.awaitFlush()
+		} else {
+			ferr = st.flush(false)
+		}
 		st.mu.Unlock()
 		if ferr != nil {
 			o.releaseGate()
@@ -971,15 +979,48 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 	c.liveMu.Unlock()
 	codec := st.paging.codec()
 	check := psDeltaBase{committedTxid: txid, pageSize: o.pageSize, pageCount: st.pageCount, encrypted: codec != nil, codec: codec}
-	if grant {
+	var pending []manifestEntry
+	var reuse []uint32
+	st.mu.Lock()
+	if relaxed {
+		_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
+	}
+	switch {
+	case len(pending) > 0:
+		// Inside a batch the grant narrows to the committed free pages that were free at the floor
+		// (validated-cow.md §4 rule 3), the lowest psMaxReuse of them.
+		check.pending = make(map[uint32]uint64, len(pending))
+		for _, e := range pending {
+			check.pending[e.index] = e.digest
+		}
+		check.granted = map[uint32]bool{}
+		if grant {
+			floor := st.floorFreeFor(true)
+			for _, p := range st.freePages {
+				if floor[p] {
+					reuse = append(reuse, p)
+				}
+			}
+			sortUint32s(reuse)
+			reuse = reuse[:min(len(reuse), psMaxReuse)]
+			for _, p := range reuse {
+				check.granted[p] = true
+			}
+		}
+	case grant:
 		check.granted = make(map[uint32]bool, len(st.freePages))
 		for _, p := range st.freePages {
 			check.granted[p] = true
 		}
 	}
-	sc.write = &psWriteTxn{base: txid, grant: grant, check: check}
+	if relaxed && len(pending) == 0 {
+		// The client's commit may start a batch: the committed free list is the floor's (rule 3).
+		st.recordFloorFree()
+	}
+	st.mu.Unlock()
+	sc.write = &psWriteTxn{base: txid, grant: grant, relaxed: relaxed, check: check}
 	sc.armIdleLocked()
-	sc.send(requestID, psWriteBegun{incarnation: o.incarnation, txid: txid, invalidate: invalidate, indices: indices, reuseGrant: grant, meta: meta})
+	sc.send(requestID, psWriteBegun{incarnation: o.incarnation, txid: txid, invalidate: invalidate, indices: indices, reuseGrant: grant, meta: meta, pending: pending, reuse: reuse})
 }
 
 // touch restarts the idle-in-transaction and idle-session timers on every received frame.
@@ -1215,9 +1256,10 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	d := w.delta
 	o.commitMu.Lock()
 	st.mu.Lock()
+	capReached := false
 	err := st.paging.withPager(func(p *pager) error {
-		// The slot not holding the committed meta, which the begin_write flush made the floor
-		// (README.md §3.5); a client commit always keeps its own barrier.
+		// The slot not holding the floor (README.md §3.5). A synchronous client's commit keeps its own
+		// barrier (the begin_write flush left nothing pending); a relaxed one joins the batch.
 		slot := p.commitSlot()
 		// A client cannot know that slot, so an encrypted meta, already checked against the database
 		// key, is resealed for it (spec/fileformat/encrypted.md §14).
@@ -1229,11 +1271,14 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 		if err := p.writeBlock(slot, d.meta); err != nil {
 			return err
 		}
-		if err := p.sync(); err != nil {
-			return err
+		if !w.relaxed {
+			if err := p.sync(); err != nil {
+				return err
+			}
 		}
-		p.finishValidatedCommit(d.meta, slot, true, nil)
+		p.finishValidatedCommit(d.meta, slot, !w.relaxed, d.own())
 		p.manifestProtected = d.protected
+		capReached = w.relaxed && p.batchCapReached()
 		return nil
 	})
 	var free []uint32
@@ -1275,11 +1320,34 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	default:
 		sc.send(requestID, psCommitted{txid: d.txid})
 	}
+	if capReached && !o.capFlushClientCommit() {
+		o.releaseGate()
+		return nil
+	}
 	if c.adoptForeign(o) == nil {
 		c.maintenanceCommit(o)
 	}
 	o.releaseGate()
 	return nil
+}
+
+// capFlushClientCommit ends a batch a relaxed client commit brought to the cap (README.md §3.5): the
+// flush runs at once, before any maintenance commit, and shrinks nothing — a shrink an owner commit
+// deferred waits for the owner's own next barrier. A failed barrier revokes the storage, as a local cap
+// flush does (validated-cow.md §4), and the owner stops serving. Called holding the gate.
+func (o *pageServiceOwner) capFlushClientCommit() bool {
+	st := o.core.storage
+	st.mu.Lock()
+	err := st.paging.withPager(func(p *pager) error { return p.flushPending(false) })
+	if err != nil {
+		st.paging.revoke(newError(IoError, "a deferred durability flush failed; reopen the database: "+err.Error()))
+	}
+	st.mu.Unlock()
+	if err != nil {
+		o.stopServing()
+		return false
+	}
+	return true
 }
 
 // commitStatus resolves an unacknowledged commit (page-service.md §8.4), after any commit past its

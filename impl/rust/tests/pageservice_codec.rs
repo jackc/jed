@@ -107,6 +107,19 @@ impl Fields<'_> {
         text.split(',').map(|v| v.parse().unwrap()).collect()
     }
 
+    fn digest_list(&mut self, name: &str) -> Vec<(u32, u64)> {
+        let text = self.text(name);
+        if text.is_empty() {
+            return Vec::new();
+        }
+        text.split(',')
+            .map(|item| {
+                let (index, digest) = item.split_once('=').unwrap();
+                (index.parse().unwrap(), digest.parse().unwrap())
+            })
+            .collect()
+    }
+
     fn page_list(&mut self, name: &str) -> Vec<Vec<u8>> {
         let size = self.page_size;
         let text = self.text(name);
@@ -186,6 +199,7 @@ fn build_message(name: &str, f: &mut Fields<'_>) -> Message {
             incarnation: f.id16("incarnation"),
             last_txid: f.u64("last_txid"),
             lock_timeout_ms: f.u64("lock_timeout_ms"),
+            flags: f.u8("flags"),
         }),
         "write_begun" => Message::WriteBegun(WriteBegun {
             incarnation: f.id16("incarnation"),
@@ -194,6 +208,8 @@ fn build_message(name: &str, f: &mut Fields<'_>) -> Message {
             indices: f.u32_list("indices"),
             reuse_grant: f.bool("reuse_grant"),
             meta: f.page("meta"),
+            pending: f.digest_list("pending"),
+            reuse: f.u32_list("reuse"),
         }),
         "commit_begin" => Message::CommitBegin(CommitBegin {
             txid: f.u64("txid"),
@@ -254,7 +270,7 @@ const CODEC_MESSAGES: &[(&str, u8, &[&str])] = &[
     (
         "begin_write",
         CODE_BEGIN_WRITE,
-        &["incarnation", "last_txid", "lock_timeout_ms"],
+        &["incarnation", "last_txid", "lock_timeout_ms", "flags"],
     ),
     (
         "commit_begin",
@@ -294,6 +310,8 @@ const CODEC_MESSAGES: &[(&str, u8, &[&str])] = &[
             "indices",
             "reuse_grant",
             "meta",
+            "pending",
+            "reuse",
         ],
     ),
     ("committed", CODE_COMMITTED, &["txid"]),
@@ -332,6 +350,7 @@ fn constants_match_catalog() {
         int("max_invalidation_entries"),
         i64::from(MAX_INVALIDATION_ENTRIES)
     );
+    assert_eq!(int("max_reuse_pages"), MAX_REUSE_PAGES as i64);
     assert_eq!(
         int("invalidation_window_commits"),
         i64::from(INVALIDATION_WINDOW_COMMITS)

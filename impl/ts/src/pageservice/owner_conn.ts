@@ -8,7 +8,8 @@
 // The writer gate. A begin_write waits for the gate asynchronously (Atomics.waitAsync), so the worker
 // keeps serving the connection's other requests and every other connection meanwhile; write_begun is
 // sent when the wait ends, possibly out of request order (README §2). A client commit past its point of
-// no return is written, synced, and published synchronously, so a commit_status (from any connection)
+// no return is written, synced (a relaxed client's joins the owner's batch instead, README §3.5), and
+// published synchronously, so a commit_status (from any connection)
 // never observes it half published. When a client commit is published the service hands the gate to the
 // engine thread if a maintenance commit is due, which runs it and releases the gate (README §6.4; the
 // service has no engine).
@@ -23,6 +24,7 @@
 
 import process from "node:process";
 
+import { type ManifestEntry, manifestInlineCapacity, parseCommitMeta } from "../commit_manifest.ts";
 import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
 import { KEY_BLOCK_LEN, PageCodec } from "../crypto.ts";
 import type { RandomSource } from "../seam.ts";
@@ -31,12 +33,14 @@ import {
   encodeFrame,
   FrameAccumulator,
   PS_ERROR_FLAG_FATAL,
+  PS_BEGIN_WRITE_RELAXED,
   PS_HELLO_FLAG_READ_ONLY,
   PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY,
   PS_HELLO_OK_FLAG_OWNER_READ_ONLY,
   PS_HELLO_OK_FLAG_OWNER_YIELDS,
   PS_INVALIDATE_ALL,
   PS_INVALIDATE_EXACT,
+  PS_MAX_REUSE_PAGES,
   PS_NOTICE_YIELD_BEGUN,
   PS_OWNERSHIP_REFUSED,
   PS_OWNERSHIP_YIELDING,
@@ -102,9 +106,11 @@ export interface ServedDb {
   // meta was never written.
   writeDelta(w: WriteTxn, pages: PsIndexedPage[], pageCount: number): void;
   abandonDelta(w: WriteTxn): void;
-  // commitDelta writes a completed delta's meta and runs the single durable barrier; false when it
-  // failed (the meta may be durable).
-  commitDelta(d: Delta): boolean;
+  // commitDelta writes a completed delta's meta to the slot not holding the floor and runs the single
+  // durable barrier, after which the meta is the floor (ServiceState.floorAt); a relaxed one runs no
+  // barrier, and its own pages join the pending set (ServiceState.addPending). false when it failed
+  // (the meta may be durable).
+  commitDelta(d: Delta, relaxed: boolean): boolean;
   // flushBatch makes the owner's pending relaxed commits durable (spec/design/validated-cow.md §4): the
   // file's durable barrier, after which the newest meta is the floor (ServiceState.batchFlushed).
   // false when the barrier failed. Called holding the writer gate.
@@ -190,8 +196,10 @@ function codecFor(dek: Uint8Array | null, rng: RandomSource): PageCodec | null {
 }
 
 // WriteTxn is a client write transaction: the connection holds the gate and a write pin on base.
+// relaxed is a begin_write with the relaxed bit: the commit joins the owner's batch (README §3.5).
 export type WriteTxn = {
   base: bigint;
+  relaxed: boolean;
   check: DeltaBase;
   // delta is the CommitDelta being received (between commit_begin and commit_end); failure is a
   // rejected delta, whose remaining frames are discarded and which commit_end reports.
@@ -591,12 +599,19 @@ export class Connection {
   // free list's generation (page-service.md §6). Later pins are on this snapshot or newer.
   private startWrite(m: PsBeginWrite): PsMessage {
     const state = this.db.state;
-    // The owner's own relaxed commits are flushed before a client plans against the committed meta: a
-    // client cannot name the owner's pending set in its manifest (README §3.5).
-    if (state.batchPending() && !this.db.flushBatch()) {
-      state.releaseGate();
-      throw new FlushFailure();
+    const relaxed = (m.flags & PS_BEGIN_WRITE_RELAXED) !== 0;
+    // The owner's batch (README §3.5): a synchronous client plans against a durable floor, so the
+    // pending set is flushed first; a relaxed one is told the pending set instead. A set the shared
+    // state could not hold is flushed for a relaxed client too (it never outlives the commit that grew
+    // it, which is flushed before the gate moves on).
+    let pending: ManifestEntry[] | null = relaxed ? state.pendingEntries() : null;
+    if (pending === null && state.batchPending()) {
+      if (!this.db.flushBatch()) {
+        state.releaseGate();
+        throw new FlushFailure();
+      }
     }
+    pending ??= [];
     let txid: bigint;
     let grant: boolean;
     let meta: Uint8Array;
@@ -637,10 +652,9 @@ export class Connection {
       throw error;
     }
     const pageCount = metaPageCount(meta);
-    let granted: Set<number> | null = null;
+    let free: number[] | null = null;
     if (grant) {
       // The committed free list, read under the gate (no commit is writing it).
-      let free: number[] | null = null;
       try {
         free = readFreeListChain(
           (p) => this.db.readPage(p),
@@ -653,11 +667,36 @@ export class Connection {
         free = null;
       }
       if (free === null) grant = false;
-      else granted = new Set(free);
+    }
+    let granted: Set<number> | null = null;
+    const reuse: number[] = [];
+    if (pending.length > 0) {
+      // Inside a batch the grant narrows to the committed free pages that were free at the floor
+      // (validated-cow.md §4 rule 3), the lowest PS_MAX_REUSE_PAGES of them. A floor list that cannot
+      // be read grants no reuse.
+      granted = new Set();
+      const floor = grant ? this.floorFree(codec) : null;
+      if (floor === null) grant = false;
+      else {
+        for (const p of free!) if (floor.has(p)) reuse.push(p);
+        reuse.sort((a, b) => a - b);
+        reuse.length = Math.min(reuse.length, PS_MAX_REUSE_PAGES);
+        for (const p of reuse) granted.add(p);
+      }
+    } else if (grant) {
+      granted = new Set(free!);
     }
     this.write = {
       base: txid,
-      check: { committedTxid: txid, pageSize: this.db.pageSize, pageCount, granted, codec },
+      relaxed,
+      check: {
+        committedTxid: txid,
+        pageSize: this.db.pageSize,
+        pageCount,
+        granted,
+        codec,
+        pending: pending.length > 0 ? new Map(pending.map((e) => [e.index, e.checksum])) : null,
+      },
       delta: null,
       failure: null,
       started: false,
@@ -672,7 +711,31 @@ export class Connection {
       indices,
       reuseGrant: grant,
       meta,
+      pending: pending.map((e) => ({ index: e.index, digest: e.checksum })),
+      reuse,
     };
+  }
+
+  // floorFree is the floor's free list (validated-cow.md §4), read from the floor's meta slot under the
+  // gate: no commit of the batch rewrites the floor's free-list pages (rule 3). Null when it cannot be
+  // read.
+  private floorFree(codec: PageCodec | null): Set<number> | null {
+    const state = this.db.state;
+    try {
+      const block = this.db.readPage(state.floorSlot());
+      const floor = parseCommitMeta(block, this.db.pageSize, 0xffff_ffff);
+      if (floor === null || floor.txid !== state.floorTxid()) return null;
+      const free = readFreeListChain(
+        (p) => this.db.readPage(p),
+        floor.freeListHead,
+        floor.pageCount,
+        codec,
+        floor.freeListTag,
+      );
+      return free === null ? null : new Set(free);
+    } catch {
+      return null;
+    }
   }
 
   // touch restarts the idle-in-transaction and idle-session timers on every received frame.
@@ -819,9 +882,11 @@ export class Connection {
   }
 
   // finishClientCommit publishes a validated delta (page-service.md §5.6): the meta, the single durable
-  // barrier, the structural publication (meta, invalidation and resolution windows; the engine thread
-  // adopts the catalog at its next transaction begin), the acknowledgement, then either a gate handoff
-  // for a maintenance commit or the gate's release. A write or sync failure poisons the owner.
+  // barrier (none for a relaxed client, whose pages join the owner's batch), the structural publication
+  // (meta, invalidation and resolution windows; the engine thread adopts the catalog at its next
+  // transaction begin), the acknowledgement, a cap flush when a relaxed commit filled the batch, then
+  // either a gate handoff for a maintenance commit or the gate's release. A write or sync failure
+  // poisons the owner.
   private finishClientCommit(requestId: number, w: WriteTxn, d: Delta): void {
     const state = this.db.state;
     const codec = w.check.codec ?? null;
@@ -832,7 +897,7 @@ export class Connection {
       const chain = d.manifest.map((pg) => ({ index: pg.index, bytes: pg.page }));
       codec.sealMeta(state.floorSlot() ^ 1, d.meta, chain);
     }
-    if (!this.db.commitDelta(d)) {
+    if (!this.db.commitDelta(d, w.relaxed)) {
       // The meta may be durable: no error frame, only a closed connection, so the client resolves the
       // outcome with commit_status (README §3.5).
       this.write = null;
@@ -889,6 +954,18 @@ export class Connection {
     if (hook === ACK_CRASH) process.kill(process.pid, "SIGKILL");
     if (hook === ACK_HANG_UP) this.socket.destroy();
     else this.send(requestId, { kind: "committed", txid: d.txid });
+    // A relaxed client commit that brought the pending set to the batch cap is flushed now, before any
+    // maintenance commit, and that flush shrinks nothing (README §3.5). A failed flush poisons the
+    // owner, which stops serving.
+    if (
+      w.relaxed &&
+      state.pendingCount() >= manifestInlineCapacity(this.db.pageSize, codec !== null) &&
+      !this.db.flushBatch()
+    ) {
+      state.releaseGate();
+      this.db.stopServing();
+      return;
+    }
     if (maintenance) {
       state.handGate();
       this.db.maintain();

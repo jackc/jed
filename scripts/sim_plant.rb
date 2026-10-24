@@ -127,7 +127,13 @@ module SimPlant
       name: "relaxed-reuse",
       protection: "a commit inside a relaxed batch reuses only pages free at its floor (validated-cow.md §4 rule 3)",
       profile: "relaxed",
-      edits: [["impl/go/shared.go", "\t\treturn nil\n\t}\n\treturn st.floorFreeFor(true)\n", "\t\treturn nil\n\t}\n\treturn nil\n"]]
+      edits: [["impl/go/shared.go", "\tif pending {\n\t\treturn st.floorFreeFor(true)\n\t}\n", "\tif pending {\n\t\treturn nil\n\t}\n"]]
+    ),
+    Plant.new(
+      name: "relaxed-client-reuse",
+      protection: "a relaxed page client's commit inside the owner's batch reuses only pages free at its floor (pageservice/README.md §3.5)",
+      profile: "service-relaxed",
+      edits: [["impl/go/pageservice_owner.go", "\t\t\t\tif floor[p] {\n", "\t\t\t\tif floor[p] || true {\n"]]
     ),
     # Trailing truncation (format.md *Trailing truncation*): a commit cuts off the free list's top run,
     # and only the pages the reader watermark lets it reuse.

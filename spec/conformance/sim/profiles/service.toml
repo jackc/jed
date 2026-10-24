@@ -7,8 +7,8 @@
 description = "An owner and page clients: promotion, lost connections, client commits"
 
 processes = "service"
-# Half the traces run the owner under synchronous = off (validated-cow.md §4): it flushes its batch
-# before a client's begin_write, and every client commit keeps its own barrier.
+# Half the traces run every process under synchronous = off (validated-cow.md §4): a client's commits
+# then join the owner's batch (the service-relaxed profile leans on that).
 synchronous = ["on", "off"]
 max_procs = 3
 page_sizes = [256, 512]

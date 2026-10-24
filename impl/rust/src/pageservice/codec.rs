@@ -30,6 +30,8 @@ pub const HEADER_LENGTH: usize = 9;
 pub const MAX_READ_PAGES_CAP: u32 = 1024;
 /// Above this many invalidated indices `read_begun` says "invalidate everything" (README.md §3.2).
 pub const MAX_INVALIDATION_ENTRIES: u32 = 65_536;
+/// The most floor-free pages a relaxed `write_begun` offers in `reuse` (README.md §3.5).
+pub const MAX_REUSE_PAGES: usize = 65_536;
 /// The owner retains the written-index sets of this many recent commits (README.md §4).
 pub const INVALIDATION_WINDOW_COMMITS: u32 = 256;
 /// The longest endpoint socket path an owner binds (README.md §5.2).
@@ -181,7 +183,12 @@ pub struct BeginWrite {
     pub incarnation: Id16,
     pub last_txid: u64,
     pub lock_timeout_ms: u64,
+    pub flags: u8,
 }
+
+/// `begin_write`'s flags bit 0: the client's handle runs synchronous = off, so the owner names its
+/// pending batch instead of flushing it (README.md §3.5).
+pub const BEGIN_WRITE_RELAXED: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteBegun {
@@ -191,6 +198,10 @@ pub struct WriteBegun {
     pub indices: Vec<u32>,
     pub reuse_grant: bool,
     pub meta: Vec<u8>,
+    /// The owner's pending set for a relaxed `begin_write`, ascending, as (page index, digest);
+    /// `reuse` narrows the grant while it is non-empty (README.md §3.5).
+    pub pending: Vec<(u32, u64)>,
+    pub reuse: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,6 +445,15 @@ impl Writer {
         Ok(())
     }
 
+    fn digest_list(&mut self, v: &[(u32, u64)]) -> Result<()> {
+        self.count(v.len(), "digest_list")?;
+        for &(index, digest) in v {
+            self.u32(index);
+            self.u64(digest);
+        }
+        Ok(())
+    }
+
     fn page_list(&mut self, v: &[Vec<u8>]) -> Result<()> {
         self.count(v.len(), "page_list")?;
         for page in v {
@@ -506,6 +526,7 @@ pub fn encode_frame(request_id: u32, m: &Message) -> Result<Vec<u8>> {
             w.id16(&b.incarnation);
             w.u64(b.last_txid);
             w.u64(b.lock_timeout_ms);
+            w.u8(b.flags);
         }
         Message::WriteBegun(b) => {
             w.id16(&b.incarnation);
@@ -514,6 +535,8 @@ pub fn encode_frame(request_id: u32, m: &Message) -> Result<Vec<u8>> {
             w.u32_list(&b.indices)?;
             w.bool(b.reuse_grant);
             w.page(&b.meta)?;
+            w.digest_list(&b.pending)?;
+            w.u32_list(&b.reuse)?;
         }
         Message::CommitBegin(b) => {
             w.u64(b.txid);
@@ -685,6 +708,15 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn digest_list(&mut self) -> Result<Vec<(u32, u64)>> {
+        let count = self.count(12, "digest_list")?;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push((self.u32()?, self.u64()?));
+        }
+        Ok(out)
+    }
+
     fn page_list(&mut self, page_size: u32) -> Result<Vec<Vec<u8>>> {
         let count = self.count(page_size as usize, "page_list")?;
         let mut out = Vec::with_capacity(count);
@@ -798,6 +830,7 @@ fn decode_body(code: u8, r: &mut Reader<'_>, page_size: u32) -> Result<Message> 
             incarnation: r.id16()?,
             last_txid: r.u64()?,
             lock_timeout_ms: r.u64()?,
+            flags: r.u8()?,
         }),
         CODE_WRITE_BEGUN => Message::WriteBegun(WriteBegun {
             incarnation: r.id16()?,
@@ -806,6 +839,8 @@ fn decode_body(code: u8, r: &mut Reader<'_>, page_size: u32) -> Result<Message> 
             indices: r.u32_list()?,
             reuse_grant: r.bool()?,
             meta: r.page(page_size)?,
+            pending: r.digest_list()?,
+            reuse: r.u32_list()?,
         }),
         CODE_COMMIT_BEGIN => Message::CommitBegin(CommitBegin {
             txid: r.u64()?,

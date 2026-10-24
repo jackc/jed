@@ -98,7 +98,7 @@ import {
   type RunResult,
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
-import { metaChecksum } from "./commit_manifest.ts";
+import { type ManifestEntry, metaChecksum, parseCommitMeta } from "./commit_manifest.ts";
 import type { BlockStore } from "./blockstore.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
@@ -309,6 +309,11 @@ export type ClientReadBegun = {
   meta: Uint8Array;
 };
 
+// ClientWriteBegun is a page client's write_begun reply as the core uses it: the cache answer, and the
+// owner's batch a relaxed begin_write was named (README §3.5) — its pending set, ascending, and the
+// floor-free pages the client may reuse while that set is non-empty.
+export type ClientWriteBegun = ClientReadBegun & { pending: ManifestEntry[]; reuse: number[] };
+
 // PageClientHandle is a page client as the core sees it (spec/design/page-service.md §4.2; the Node
 // implementation is pageservice/client.ts). held is the set of versions it pins at the owner.
 export interface PageClientHandle {
@@ -320,9 +325,10 @@ export interface PageClientHandle {
   readonly reuseGrant: boolean;
   // beginRead runs begin_read and records the pin it carries (a duplicate is released at once).
   beginRead(): ClientReadBegun;
-  // beginWrite runs begin_write (waiting at most timeoutMs for the owner's gate) and holds the write
+  // beginWrite runs begin_write (waiting at most timeoutMs for the owner's gate; relaxed: the handle
+  // runs synchronous = off, so the owner names its batch rather than flushing it) and holds the write
   // pin it carries until endWrite or the commit.
-  beginWrite(timeoutMs: number): ClientReadBegun;
+  beginWrite(timeoutMs: number, relaxed: boolean): ClientWriteBegun;
   // endWrite ends a write transaction whose commit never reached the owner (abort).
   endWrite(): void;
   // setMeta makes meta serve page indices 0 and 1 (before a reload reads it); markAdopted records the
@@ -566,6 +572,7 @@ class SharedCore {
   // releaseMainGate ends main's page-service write: a client's open write transaction, and the owner's
   // gate this thread holds. A no-op when neither is held.
   private releaseMainGate(): void {
+    this.storage.serviceBatch = null;
     this.writerClient?.endWrite();
     this.writerClient = null;
     this.releaseServiceGate();
@@ -1144,10 +1151,19 @@ class SharedCore {
     if (paging === null) throw engineError("io_error", "database storage is closed");
     if (pending.all) paging.invalidateAll();
     else for (const index of pending.indices) paging.invalidate(index);
-    // The client commit is durable (the service synced it): no recovery barrier is owed for it, and a
-    // single commit's written pages are exactly the indices its manifest protects.
+    // No recovery barrier is owed for the client commit: a synchronous client's is durable (the service
+    // synced it), and a relaxed one's joined the batch the service recorded in the batch mirror, which
+    // the next flush makes durable. A single commit's written pages are the indices its manifest
+    // protects unless its manifest carried pending pages from earlier commits of a batch, which the
+    // load then validates.
     paging.finishDurableCommit(pending.txid, metaChecksum(pending.meta));
-    if (!pending.all && pending.txid === own + 1n) {
+    const meta = parseCommitMeta(pending.meta, paging.pageSize(), 0xffff_ffff);
+    if (
+      !pending.all &&
+      pending.txid === own + 1n &&
+      meta !== null &&
+      pending.indices.length === meta.dirtyCount + meta.overflowCount
+    ) {
       paging.cacheValidation(pending.meta, new Set(pending.indices));
     }
     paging.refreshAllocatedPages();
@@ -1285,13 +1301,16 @@ class SharedCore {
         "cannot write through a read-only page-service connection",
       );
     }
-    const reply = client.beginWrite(timeoutMs);
+    // A relaxed client commits into the owner's batch rather than having it flushed (README §3.5).
+    const reply = client.beginWrite(timeoutMs, this.handoff?.relaxed ?? false);
     try {
       this.clientAdopt(reply);
     } catch (error) {
       client.endWrite();
       throw error;
     }
+    this.storage.serviceBatch =
+      reply.pending.length > 0 ? { pending: reply.pending, reuse: new Set(reply.reuse) } : null;
   }
 
   // persistClient is a page client's commit (page-service.md §5.6, §6): the ordinary validated-COW
@@ -1310,6 +1329,8 @@ class SharedCore {
     try {
       persistImpl(this.storage, snap, false, client.reuseGrant, budget, false);
     } catch (error) {
+      // The commit ends the write transaction, whatever its outcome: the owner's batch it named is gone.
+      this.storage.serviceBatch = null;
       // A lost acknowledgement: the outcome is resolved by re-election (README §6.5).
       const lost = client.lostCommit(error);
       if (lost !== null) {
@@ -1322,6 +1343,7 @@ class SharedCore {
       this.storage.paging?.invalidateAll();
       throw settled.error;
     }
+    this.storage.serviceBatch = null;
   }
 
   // refreshAndPin is a read begin that pins a local reader: refresh to the latest committed version and

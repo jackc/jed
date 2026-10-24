@@ -8,7 +8,12 @@
 // Browser-clean: imports only host-agnostic core, no `node:*`, so it lands in a browser bundle.
 
 import type { Engine, Snapshot } from "./executor.ts";
-import { buildCommitManifest, manifestEntriesOf, metaChecksum } from "./commit_manifest.ts";
+import {
+  buildCommitManifest,
+  type ManifestEntry,
+  manifestEntriesOf,
+  metaChecksum,
+} from "./commit_manifest.ts";
 import { unselectedKeyPage } from "./crypto.ts";
 import { engineError } from "./errors.ts";
 import { runSync, type Steps } from "./execution.ts";
@@ -25,6 +30,7 @@ import {
   metaPage,
   planFreeListSteps,
   reachablePages,
+  readFloorFreeSteps,
   reclaimDue,
   ROOT_PAGE,
   unassignPages,
@@ -235,6 +241,7 @@ export function* precheckBudgetSteps(
   if (db.paging === null || db.storageBudget.limit <= 0n) return;
   if (db.persistHook !== null) {
     // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
+    const allowed = batchOpen(db) ? yield* floorFreeSteps(db) : null;
     const write = yield* incrementalImageSteps(
       snap,
       db.pageSize,
@@ -242,7 +249,7 @@ export function* precheckBudgetSteps(
       db.freePages,
       db.paging,
       reuse,
-      floorFreeFor(db, db.paging.hasPending()),
+      allowed,
     );
     try {
       yield* admitFileSteps(db, write, budget.prev, budget);
@@ -287,9 +294,9 @@ export function* persistSteps(
 ): Steps<IncrementalWrite> {
   let allowed: Set<number> | null = null;
   if (db.paging !== null && db.persistHook !== null) {
-    const pending = db.paging.hasPending();
+    const pending = batchOpen(db);
     db.paging.checkDurableCommit();
-    allowed = reuseAllowed(db, pending);
+    allowed = yield* reuseAllowedSteps(db, pending);
   }
   const write =
     db.paging !== null && db.persistHook === null
@@ -324,24 +331,50 @@ function relaxedFile(db: Engine): boolean {
   return db.relaxed && db.persistHook !== null && db.paging !== null;
 }
 
-// reuseAllowed is the reuse restriction of the commit about to plan (validated-cow.md §4 rule 3). With
-// nothing pending the floor is the committed generation, so a relaxed domain records the pages free
-// now — the floor's free list — and allows them all; while a batch is pending only those not yet
-// consumed may be reused, since a page freed during the batch may still be needed by the floor. A
-// synchronous = on domain is never restricted.
-function reuseAllowed(db: Engine, pending: boolean): Set<number> | null {
-  if (!relaxedFile(db)) return null;
-  if (!pending) {
+// reuseAllowedSteps is the reuse restriction of the commit about to plan (validated-cow.md §4 rule 3).
+// With nothing pending the floor is the committed generation, so a relaxed domain records the pages
+// free now — the floor's free list — and allows them all; while a batch is pending only those not yet
+// consumed may be reused, since a page freed during the batch may still be needed by the floor. The
+// restriction binds every commit that begins inside a batch, a synchronous = on owner's included,
+// since its relaxed page clients may have opened one (page-service.md §6).
+function* reuseAllowedSteps(db: Engine, pending: boolean): Steps<Set<number> | null> {
+  if (pending) return yield* floorFreeSteps(db);
+  if (relaxedFile(db)) {
     db.floorFree = new Set(db.freePages);
-    return null;
+    db.floorFreeTxid = db.paging!.floorMetaTxid();
   }
-  return floorFreeFor(db, true);
+  return null;
 }
 
-// floorFreeFor is the restriction a pending batch plans under, without recording a new floor.
-function floorFreeFor(db: Engine, pending: boolean): Set<number> | null {
-  if (!pending || !relaxedFile(db)) return null;
-  return db.floorFree ?? new Set();
+// floorFreeSteps is the restriction a pending batch plans under, without recording a new floor. A page
+// client's is the reuse list its owner sent. A batch this domain did not start — a page-service
+// owner's batch a relaxed client's commit opened — has no recorded floor list, so the floor's is read
+// from its meta; a list that cannot be read allows no reuse.
+function* floorFreeSteps(db: Engine): Steps<Set<number>> {
+  if (db.serviceBatch !== null) return db.serviceBatch.reuse;
+  const paging = db.paging!;
+  const floor = paging.floorMetaTxid();
+  if (db.floorFree !== null && db.floorFreeTxid === floor) return db.floorFree;
+  let free: number[] = [];
+  try {
+    free = yield* readFloorFreeSteps(paging);
+  } catch {
+    // No reuse: always safe inside the batch.
+  }
+  db.floorFree = new Set(free);
+  db.floorFreeTxid = floor;
+  return db.floorFree;
+}
+
+// batchOpen reports whether the commit about to plan begins inside a batch: the domain's own pending
+// set, or on a page client its owner's from a relaxed write_begun (spec/pageservice/README.md §3.5).
+function batchOpen(db: Engine): boolean {
+  return db.serviceBatch !== null || db.paging!.hasPending();
+}
+
+// batchEntries is the pending set the commit about to plan carries in its manifest.
+function batchEntries(db: Engine): ManifestEntry[] {
+  return db.serviceBatch?.pending ?? db.paging!.pendingEntries();
 }
 
 // capFlush ends a batch that reached the cap (validated-cow.md §4). TypeScript has no second engine
@@ -443,7 +476,7 @@ function* commitFileSteps(
   yield* paging.writePagesSteps(write.pages);
   // A relaxed batch's pending set joins the manifest and stays off the free list (validated-cow.md §4).
   const relaxed = relaxedFile(db);
-  const pending = paging.pendingEntries();
+  const pending = batchEntries(db);
   const plan = yield* planFreeListSteps(
     snap,
     paging,

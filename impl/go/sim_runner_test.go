@@ -1734,8 +1734,8 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			d.addHistory(now, in.digest)
 			d.version, d.lastDigest = now, in.digest
 			d.maxAttempted = max(d.maxAttempted, now)
-			if c := simServiceCore(r.db, d); !r.relaxed || (c != nil && c.pageClient() != nil) {
-				d.floor = now // acknowledged under synchronous = on, or a page client's commit (§8.2)
+			if !r.relaxed {
+				d.floor = now // acknowledged under synchronous = on; a relaxed client's joins the owner's batch (§8.2)
 			}
 			r.checkGrowth(i, d, quiet)
 			if r.violation != "" {

@@ -1,0 +1,55 @@
+# Relaxed page clients under the page service (page-service.md §6; pageservice/README.md §3.5):
+# every process runs synchronous = off, so a client's commits join its owner's batch — the owner names
+# its pending set and floor-free pages in write_begun, the client writes a cumulative manifest and
+# reuses only pages free at the floor, and the owner skips the barrier, flushing at the cap. Churn
+# (updates and deletes) frees pages during a batch, and power losses land mid-batch, so recovery must
+# find the floor intact under client commits as under the owner's own.
+
+description = "Relaxed page clients commit into their owner's batch: churn, power loss mid-batch"
+
+processes = "service"
+synchronous = ["off"]
+max_procs = 3
+page_sizes = [512, 1024]
+cache_bytes = [0, 2048]
+steps = 400
+max_tables = 2
+max_rows = 300
+max_readers = 2
+batch = [1, 40]
+
+[weights]
+backup = 1
+spawn = 8
+exit = 1
+kill = 1
+disconnect = 1
+open_write = 14
+open_read = 3
+close_read = 4
+read_query = 2
+insert = 8
+update = 10
+delete = 8
+upsert = 2
+commit = 16
+rollback = 1
+create_table = 1
+drop_table = 2
+create_index = 1
+drop_index = 1
+check = 2
+crash_power = 5
+crash_process = 2
+
+[faults]
+backup_fault = 300
+commit_fault = 250
+nth_max = 2
+power_loss = 6
+process_crash = 4
+disconnect = 6
+frames_max = 8
+survive = [100, 1000]
+tear = [0, 300]
+issue = [500, 1000]

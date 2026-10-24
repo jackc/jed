@@ -17,12 +17,25 @@
 //
 // Browser-safe: no node: imports, so it is unit-testable on its own; only the Node owner uses it.
 //
+// Batched durability (spec/design/validated-cow.md §4) is mirrored here too: the floor (its slot and
+// txid) and the pending set's entries (page index and CRC-64 digest), which the worker names to a
+// relaxed client's begin_write and adds that client's commit to (spec/pageservice/README.md §3.5). The
+// entries live in a fixed region the size of the largest inline manifest; a pending set is below the
+// batch cap at every begin_write (a commit reaching it is flushed before the gate moves on), so only a
+// commit in progress can overflow it, which marks the set unnamed until the flush that follows. A
+// generation counter changes with every update, so the engine thread re-reads the set only then.
+//
 // The window is a bounded ring of at most PS_INVALIDATION_WINDOW_COMMITS commits whose indices share a
 // fixed arena. When a commit's indices do not fit, the oldest commits are dropped (their txids then
 // answer "invalidate all", which README §3.2 permits for anything older than the retained window); a
 // single commit larger than the arena empties the window.
 
-import { resolutionDigest } from "../commit_manifest.ts";
+import {
+  type ManifestEntry,
+  manifestInlineCapacity,
+  resolutionDigest,
+} from "../commit_manifest.ts";
+import type { BatchState } from "../pager.ts";
 import {
   PS_COMMIT_STATUS_COMMITTED,
   PS_COMMIT_STATUS_NOT_COMMITTED,
@@ -39,6 +52,8 @@ export const WINDOW_ARENA = 1 << 18;
 const META_MAX = 65536;
 // The resolution window holds the (txid, digest) pairs of this many published commits (README §4).
 export const PS_RESOLUTION_WINDOW_COMMITS = PS_INVALIDATION_WINDOW_COMMITS;
+// The pending-entries region holds the largest inline manifest of any supported page size.
+export const PENDING_SLOTS = manifestInlineCapacity(65536);
 
 // The owner's handoff states (spec/pageservice/README.md §6.5): serving; yielding to a requester
 // (draining); closing (a graceful close's drain); releasing (the drain ended, ownership is being
@@ -75,16 +90,21 @@ const RESOLUTION_NEXT = 9;
 const ACK_HOOK = 10;
 const OWNER_STATE = 11;
 // Batched durability (spec/design/validated-cow.md §4): the meta slot holding the newest durable meta,
-// and whether the engine thread holds relaxed commits pending a flush. The engine thread publishes both
-// after each own commit and flush; the worker flushes a pending batch before granting a begin_write and
-// moves the floor at each client commit, always holding the writer gate.
+// and the pending set's entry count (PENDING_OVERFLOW when it outgrew the region). The engine thread
+// publishes the batch after each own commit and flush; the worker flushes it before granting a
+// synchronous client's begin_write, names it to a relaxed one, and records each client commit, always
+// holding the writer gate. BATCH_LOCK guards the batch slots and region; BATCH_GENERATION changes with
+// every update.
 const FLOOR_SLOT = 12;
-const BATCH_PENDING = 13;
+const PENDING_COUNT = 13;
 // KEY_STATE is whether the database is encrypted (spec/fileformat/encrypted.md §14): 1 when KEY holds
 // its data key, which the worker checks and reseals a client commit's meta with, and opens free-list
 // pages with. The engine thread sets it at start and after a rekey.
 const KEY_STATE = 14;
-const HEADER_I32 = 16;
+const BATCH_LOCK = 15;
+const BATCH_GENERATION = 16;
+const HEADER_I32 = 20;
+const PENDING_OVERFLOW = -1;
 
 // BigInt64 slots.
 const COMMITTED_TXID = 0;
@@ -97,6 +117,8 @@ const LIVE_AT_COMPACTION = 3;
 const ENGINE_OLDEST = 4;
 // REQUESTER is the connection id a yielding owner yields to (0: none).
 const REQUESTER = 5;
+// FLOOR_TXID is the txid of the newest durable meta, in FLOOR_SLOT.
+const FLOOR_TXID = 6;
 const BIG_SLOTS = 8;
 
 // Byte offsets of the other regions (each 8-byte aligned).
@@ -111,7 +133,9 @@ const META_OFFSET = ARENA_OFFSET + WINDOW_ARENA * 4;
 const RESOLUTION_OFFSET = META_OFFSET + META_MAX;
 const KEY_OFFSET = RESOLUTION_OFFSET + PS_RESOLUTION_WINDOW_COMMITS * 16;
 const KEY_LEN = 32;
-const TOTAL_BYTES = KEY_OFFSET + KEY_LEN;
+const PENDING_DIGEST_OFFSET = KEY_OFFSET + KEY_LEN;
+const PENDING_INDEX_OFFSET = PENDING_DIGEST_OFFSET + PENDING_SLOTS * 8;
+const TOTAL_BYTES = PENDING_INDEX_OFFSET + PENDING_SLOTS * 4;
 
 // Invalidation is begin_read's cache answer: everything, or the exact ascending index list.
 export type Invalidation = { all: boolean; indices: number[] };
@@ -129,6 +153,9 @@ export class ServiceState {
   private readonly metaBytes: Uint8Array;
   // resolution is the ring of (txid, digest) pairs: slot i at [2i, 2i + 1].
   private readonly resolution: BigInt64Array;
+  // The pending set's entries, in the batch's order of addition: digests (as signed 64-bit) and indices.
+  private readonly pendingDigest: BigInt64Array;
+  private readonly pendingIndex: Uint32Array;
 
   // constructor makes fresh state, or (given buffer) another view of existing state.
   constructor(shared?: SharedArrayBuffer) {
@@ -148,6 +175,8 @@ export class ServiceState {
       RESOLUTION_OFFSET,
       PS_RESOLUTION_WINDOW_COMMITS * 2,
     );
+    this.pendingDigest = new BigInt64Array(buffer, PENDING_DIGEST_OFFSET, PENDING_SLOTS);
+    this.pendingIndex = new Uint32Array(buffer, PENDING_INDEX_OFFSET, PENDING_SLOTS);
     if (shared === undefined) this.big[ENGINE_OLDEST] = -1n;
   }
 
@@ -239,23 +268,154 @@ export class ServiceState {
 
   // --- batched durability (validated-cow.md §4): the pager's BatchMirror, plus the worker's side ---
 
+  // The batch lock is separate from the state lock, so a mirror update never nests inside it (the
+  // engine thread publishes its batch while holding the state lock at a compaction).
+  private lockBatch(): void {
+    while (Atomics.compareExchange(this.header, BATCH_LOCK, 0, 1) !== 0) {
+      Atomics.wait(this.header, BATCH_LOCK, 1);
+    }
+  }
+
+  private unlockBatch(): void {
+    Atomics.store(this.header, BATCH_LOCK, 0);
+    Atomics.notify(this.header, BATCH_LOCK, 1);
+  }
+
+  // bumpBatch records an update of the batch; the caller holds the batch lock.
+  private bumpBatch(): number {
+    return Atomics.add(this.header, BATCH_GENERATION, 1) + 1;
+  }
+
+  // setEntries replaces the pending set; the caller holds the batch lock.
+  private setEntries(entries: ManifestEntry[]): void {
+    if (entries.length > PENDING_SLOTS) {
+      Atomics.store(this.header, PENDING_COUNT, PENDING_OVERFLOW);
+      return;
+    }
+    for (let i = 0; i < entries.length; i++) {
+      this.pendingIndex[i] = entries[i]!.index;
+      this.pendingDigest[i] = BigInt.asIntN(64, entries[i]!.checksum);
+    }
+    Atomics.store(this.header, PENDING_COUNT, entries.length);
+  }
+
+  // entries is the pending set in page order, or null when it outgrew the region; the caller holds the
+  // batch lock.
+  private entries(): ManifestEntry[] | null {
+    const count = Atomics.load(this.header, PENDING_COUNT);
+    if (count === PENDING_OVERFLOW) return null;
+    const out: ManifestEntry[] = [];
+    for (let i = 0; i < count; i++) {
+      out.push({
+        index: this.pendingIndex[i]!,
+        checksum: BigInt.asUintN(64, this.pendingDigest[i]!),
+      });
+    }
+    return out.sort((a, b) => a.index - b.index);
+  }
+
   floorSlot(): number {
     return Atomics.load(this.header, FLOOR_SLOT);
   }
 
+  floorTxid(): bigint {
+    return Atomics.load(this.big, FLOOR_TXID);
+  }
+
+  // batchPending reports whether anything is pending a flush.
   batchPending(): boolean {
-    return Atomics.load(this.header, BATCH_PENDING) !== 0;
+    return Atomics.load(this.header, PENDING_COUNT) !== 0;
   }
 
-  publishBatch(floorSlot: number, pending: boolean): void {
-    Atomics.store(this.header, FLOOR_SLOT, floorSlot);
-    Atomics.store(this.header, BATCH_PENDING, pending ? 1 : 0);
+  // pendingCount is the pending set's size; an overflowed set counts as unbounded.
+  pendingCount(): number {
+    const count = Atomics.load(this.header, PENDING_COUNT);
+    return count === PENDING_OVERFLOW ? Number.MAX_SAFE_INTEGER : count;
   }
 
-  // batchFlushed records the worker's flush of a pending batch: the newest meta, in the non-floor
-  // slot, is the floor now.
-  batchFlushed(): void {
-    this.publishBatch(this.floorSlot() ^ 1, false);
+  // pendingEntries is the pending set in page order, or null when it outgrew the region (the worker
+  // then flushes rather than name it).
+  pendingEntries(): ManifestEntry[] | null {
+    this.lockBatch();
+    try {
+      return this.entries();
+    } finally {
+      this.unlockBatch();
+    }
+  }
+
+  batchGeneration(): number {
+    return Atomics.load(this.header, BATCH_GENERATION);
+  }
+
+  // batchState reads the whole batch at once (the pager's reconciliation).
+  batchState(): BatchState {
+    this.lockBatch();
+    try {
+      return {
+        generation: Atomics.load(this.header, BATCH_GENERATION),
+        floorSlot: Atomics.load(this.header, FLOOR_SLOT),
+        floorTxid: Atomics.load(this.big, FLOOR_TXID),
+        entries: this.entries(),
+      };
+    } finally {
+      this.unlockBatch();
+    }
+  }
+
+  // publishBatch replaces the batch with the engine thread's, returning the new generation.
+  publishBatch(floorSlot: number, floorTxid: bigint, entries: ManifestEntry[]): number {
+    this.lockBatch();
+    try {
+      Atomics.store(this.header, FLOOR_SLOT, floorSlot);
+      Atomics.store(this.big, FLOOR_TXID, floorTxid);
+      this.setEntries(entries);
+      return this.bumpBatch();
+    } finally {
+      this.unlockBatch();
+    }
+  }
+
+  // floorAt records a durable client commit: its meta, in slot, is the floor, and nothing is pending.
+  floorAt(slot: number, txid: bigint): void {
+    this.publishBatch(slot, txid, []);
+  }
+
+  // addPending records a relaxed client commit (README §3.5): its own body pages join the pending set.
+  addPending(own: ManifestEntry[]): void {
+    this.lockBatch();
+    try {
+      const count = Atomics.load(this.header, PENDING_COUNT);
+      if (count === PENDING_OVERFLOW || count + own.length > PENDING_SLOTS) {
+        Atomics.store(this.header, PENDING_COUNT, PENDING_OVERFLOW);
+      } else {
+        for (let i = 0; i < own.length; i++) {
+          this.pendingIndex[count + i] = own[i]!.index;
+          this.pendingDigest[count + i] = BigInt.asIntN(64, own[i]!.checksum);
+        }
+        Atomics.store(this.header, PENDING_COUNT, count + own.length);
+      }
+      this.bumpBatch();
+    } finally {
+      this.unlockBatch();
+    }
+  }
+
+  // batchFlushed records a flush of a pending batch: the newest meta, in the non-floor slot, is the
+  // floor now. newest is the flusher's newest commit (the engine thread's own may not be published
+  // yet); the published one counts too (a client commit the engine thread has not adopted). Called
+  // holding the writer gate, so no commit moves it meanwhile.
+  batchFlushed(newest = 0n): void {
+    this.lockBatch();
+    try {
+      const committed = Atomics.load(this.big, COMMITTED_TXID);
+      Atomics.store(this.header, FLOOR_SLOT, Atomics.load(this.header, FLOOR_SLOT) ^ 1);
+      Atomics.store(this.big, FLOOR_TXID, newest > committed ? newest : committed);
+      Atomics.store(this.header, PENDING_COUNT, 0);
+      this.bumpBatch();
+    } finally {
+      this.unlockBatch();
+    }
   }
 
   // --- handoff (README §6.5) ---
