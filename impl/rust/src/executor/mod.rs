@@ -134,6 +134,8 @@ pub(crate) use implication::{
 };
 mod span_filter;
 pub(crate) use span_filter::{LaneFilter, ScratchRow};
+mod row_index;
+pub(crate) use row_index::RowIndex;
 // __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
