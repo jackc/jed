@@ -53,7 +53,7 @@ export const ESTIMATOR_ACCESS_PATH_ORDER = [
   "full",
 ] as const;
 
-export const ESTIMATOR_UNIT_COUNT = 28;
+export const ESTIMATOR_UNIT_COUNT = 30;
 export const UNIT_STORAGE_ROW_READ = 0;
 export const UNIT_STATISTICS_VALUE = 1;
 export const UNIT_PAGE_READ = 2;
@@ -82,6 +82,8 @@ export const UNIT_SCALAR_BYTE = 24;
 export const UNIT_DECIMAL_TRANSCEND = 25;
 export const UNIT_JSONPATH_COMPILE = 26;
 export const UNIT_JSONPATH_STEP = 27;
+export const UNIT_SORT_KEY = 28;
+export const UNIT_HASH_KEY = 29;
 export const ESTIMATOR_UNIT_IDS = [
   "storage_row_read",
   "statistics_value",
@@ -111,8 +113,12 @@ export const ESTIMATOR_UNIT_IDS = [
   "decimal_transcend",
   "jsonpath_compile",
   "jsonpath_step",
+  "sort_key",
+  "hash_key",
 ] as const;
 export const ESTIMATOR_UNIT_WEIGHTS = [
+  1n,
+  1n,
   1n,
   1n,
   1n,

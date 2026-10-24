@@ -329,16 +329,17 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
    the buffer (value-canonical keys, an insertion-ordered partition list — §3), and **sort** each
    partition by `order_keys` with the PK tie-break. **Specs that share an identical `partition_keys`
    + `order_keys` are partitioned and sorted ONCE** (`group_window_specs` — the shared partition/sort
-   pass), and each then computes its own results over the shared sorted partitions; the partition +
-   sort are the expensive, **unmetered** step (§8), so sharing them lowers wall-clock without changing
-   the cost or the rows (`group_window_specs` groups only identical definitions — PostgreSQL's
+   pass), and each then computes its own results over the shared sorted partitions; the partition
+   probes and sort comparisons are the expensive, **unmetered** step (§8), and each row's keys are
+   charged once per group, so sharing them lowers wall-clock and the key charge without changing the
+   rows (`group_window_specs` groups only identical definitions — PostgreSQL's
    prefix-compatible sharing is declined, §11).
    When an `order_key` is **collated** (S10), the spec's collated UCA sort-key bytes are decorated
    **once per row up front** (the query `ORDER BY`'s decorate-sort pattern; an unmapped code point is
    `0A000` at that deterministic per-row point), and one collation-aware comparator drives the sort
    **and** every peer determination below — ranking peer groups, the running aggregate default frame,
    and `RANGE`/`GROUPS` frame peer groups — so the collation never diverges between ordering and
-   peering. The sort and partition stay **unmetered** (§8); collation adds no cost unit here.
+   peering. Building a row's collated key charges `collate` per code point, once per group (§8).
 3. For each spec, walk each partition in resolved order and write the per-row result into the
    spec's synthetic slot:
    - **`RowNumber`** → 1-based sequence position.
@@ -545,9 +546,9 @@ covers every site with site-specific message detail. (The aggregate analog is `4
 
 ## 8. Cost accrual (the cross-core contract — [cost.md](cost.md) §3)
 
-Two new units; the partition + per-partition sort are **unmetered** (the `ORDER BY`/`GROUP BY`
-precedent — their input cardinality is already bounded by upstream `storage_row_read`/
-`row_produced`):
+Two new units, plus the per-row key charge every sort and hash table takes ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"). The
+partition probes and the per-partition sort's comparisons are **unmetered** (the `ORDER BY`/`GROUP BY`
+precedent):
 
 - **`window_result`** (weight 1) — once per `(input row × window function)` result materialized
   into the synthetic row; the window-stage analog of `aggregate_accumulate`.
@@ -570,8 +571,13 @@ precedent — their input cardinality is already bounded by upstream `storage_ro
   expression — so an expression key adds metered work that a bare-column key does not. Deterministic
   and cross-core identical (the same `RExpr` evaluated the same way in every core); a bare-column key
   materializes nothing and is byte-identical to before.
-- **Unmetered**: the partition bucketing, the per-partition sort, and each spec's finalize (the
-  ratio/`avg` division) — like the `ORDER BY` sort and the `DISTINCT` dedup.
+- **Per-row keys** (specified, not yet implemented: `resource.key_metering`): once per shared
+  partition/sort group, every input row charges `hash_key` × the payload of its partition keys, then
+  `sort_key` × the payload of its order keys (`collate` per code point for a collated one), in input
+  order. Fixed-width keys measure 0, so the counts below are unchanged for them.
+- **Unmetered**: the partition table's probes, the per-partition sort's comparisons, and each spec's
+  finalize (the ratio/`avg` division) — like the `ORDER BY` sort's comparisons and the `DISTINCT`
+  probes.
 
 So a `row_number()`-only query over `N` rows accrues `N` (`storage_row_read`) `+ N`
 (`window_result`) `+ N` (`row_produced`) `+ page_read` — pinned in the corpus with the `# cost:`
@@ -666,8 +672,9 @@ Deliberate divergences from PostgreSQL, each registered in
   **declined**: jed pins the order of rows that tie on a window's `ORDER BY` to primary-key order (D1),
   and a longer sort orders those ties by its extra keys instead, so reuse is sound only for functions
   that ignore the order within peer groups (`rank`, `dense_rank`, `percent_rank`, `cume_dist`, and a
-  fold whose result does not depend on input order) and needs a per-function check. Since the sort is
-  unmetered (§8), the gain would be wall-clock only, too small for that check in every core.
+  fold whose result does not depend on input order) and needs a per-function check. Since the sort's
+  comparisons are unmetered (§8), the gain would be wall-clock plus one definition's per-row key
+  charge, too small for that check in every core.
   Partitioning once for specs with the same `PARTITION BY` but different `ORDER BY` is sound but
   would change the deterministic query-memory charge for the partition tables.
   The frame slide carries the accumulator for an expanding frame (every aggregate) and a moving

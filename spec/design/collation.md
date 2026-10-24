@@ -251,7 +251,7 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
     that collation, so `max(name)` over an `unicode` column is its `unicode` maximum: the comparison
     collation is the argument's own derivation, so a conflicted or indeterminate argument is `42P22`
     (PostgreSQL raises it once two values are compared; jed when the query is planned). The fold
-    stays unmetered, like the sort (§11). A `WITHIN GROUP` key, like a query `ORDER BY` key, takes
+    stays unmetered, an open amplifier recorded in [cost.md](cost.md) §3 "`sort_key` / `hash_key`". A `WITHIN GROUP` key, like a query `ORDER BY` key, takes
     its expression's derivation (not only a bare column's).
   - **Scalar subqueries** carry their single output column's collation as an **implicit** one (an
     explicit body `COLLATE` is implicit outside, as for a derived table); a body output with an
@@ -770,12 +770,11 @@ Collation is a §8 divergence hotspot handled by the established machinery:
   **comparison-operator evaluation** site — the deterministic, cross-core-identical metering point:
   each ORDERING comparison (`< <= > >=`) under a collation charges `collate × (codepoints(lhs) +
   codepoints(rhs))`. `=`/`<>` charge nothing here (deterministic-collation equality is byte-equality,
-  §7). The **`ORDER BY` sort itself stays unmetered**, like every sort ([cost.md §3](cost.md),
-  [spill.md §6](spill.md)); its input cardinality is bounded by the upstream `storage_row_read` /
-  `row_produced`, and its decorate sorter builds each row's sort key exactly once. (The original plan
-  named ORDER BY as a metering site; the comparison evaluator is the one deterministic, meterable
-  point — the set-operation sort path carries no `Meter` at all — so the spec is refined to charge
-  there, which is consistent with sorts being unmetered.) A collated ordering comparison of two
+  §7). A **sort on a collated key** builds each row's sort key exactly once and charges `collate` per
+  code point there; its comparisons over the built keys stay unmetered ([cost.md](cost.md) §3 "`sort_key` / `hash_key`";
+  specified, not yet implemented). (The comparison evaluator was at first the only metered point,
+  because the set-operation sort path carries no `Meter`; the per-row key charge needs one there
+  too.) A collated ordering comparison of two
   `text[]` values charges the same unit per element pair it walks: `collate × (codepoints(x) +
   codepoints(y))` for each pair of present text elements compared, up to and including the pair
   that decides (a NULL element or the array shape decides without a charge), in place of the

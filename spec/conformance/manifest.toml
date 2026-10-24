@@ -1709,6 +1709,10 @@ id = "resource.cost_limit"
 description = "Caller-set execution-cost ceiling (`max_cost`) with a deterministic, cross-core-identical abort (54P01) the instant accrued cost reaches it (CLAUDE.md §13; spec/design/cost.md §6). The safety gate for untrusted, user-supplied queries; the `# max_cost: N` corpus directive runs the next record under a ceiling of N. Builds on resource.cost_metering."
 
 [[capability]]
+id = "resource.key_metering"
+description = "Per-row key metering (CLAUDE.md §13; spec/design/cost.md §3 \"sort_key / hash_key\"). Every row a sort receives charges sort_key × payload for each non-collated key value and collate × code points for a collated text key; every row GROUP BY, SELECT DISTINCT, a DISTINCT aggregate, a set operation's dedup or count table, a recursive CTE's UNION, or a window PARTITION BY receives charges hash_key × payload per key value. payload is the shared logical size measure of the query-memory account (memory.md §3), 0 for NULL and fixed-width values. Closes the amplification where one large value repeated across many rows made a sort or dedup do rows × length work for a rows + length cost. Specified, not yet implemented: no core declares it. jed-specific, so cross-core-checked, not oracle-checked. Builds on resource.cost_metering, resource.cost_limit."
+
+[[capability]]
 id = "resource.depth_limit"
 description = "Fixed maximum expression / subquery / set-operation nesting depth (MAX_EXPR_DEPTH = 256), checked in the parser and aborting with 54001 (statement_too_complex) (CLAUDE.md §13; spec/design/cost.md §7). The SECOND untrusted-query safety gate: it guards the native call stack, which the cost ceiling cannot — deeply-nested input overflows the recursive parser/resolve/eval walks BEFORE any cost is metered. The limit is a deterministic, cross-core-identical constant (a documented divergence from PG's runtime stack probe), so the same statement is accepted or rejected identically in every core; not oracle-checked."
 

@@ -733,8 +733,8 @@ Rules 4 and 5 consume each candidate's explicit scan-order property. A PK ORDER 
 elided only for a table-storage-order candidate; a B-tree bound can always elide only the exact same
 index order, while a boundless order-only candidate additionally requires LIMIT. The chosen bound
 always retains the complete WHERE as its residual. A plain or ordered LIMIT may change the winner
-only through scheduled work it avoids; blocking sort work remains unmetered and contributes no
-private planner weight.
+only through scheduled work it avoids; a blocking sort's comparisons remain unmetered and its
+per-row key charge is estimated as zero, so it contributes no private planner weight.
 
 Access-path execution has a common key-preserving result: deterministic `(storage key, row)`
 candidates plus the exact up-front `page_read` / `value_decompress` / access-method work block.

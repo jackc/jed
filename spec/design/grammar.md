@@ -741,7 +741,8 @@ constant state, adds nothing to the query-memory account, and releases each drop
 **Output order** is the effective sort order. With no `ORDER BY` the order is still unspecified by
 contract (CLAUDE.md §8, compared `rowsort`), although jed happens to emit the `ON`-key order.
 
-**Cost** ([cost.md](cost.md) §3). The dedup compare is **unmetered**, like the sort it follows. An
+**Cost** ([cost.md](cost.md) §3). The sort charges each row's keys by size, the `ON` expressions
+first (`sort_key`); the dedup compare is **unmetered**, like the sort's comparisons. An
 expression `ON` key is materialized like an expression `ORDER BY` key (its `operator_eval`s per
 sorted row; a key that matches an `ORDER BY` expression is evaluated once). Unlike plain `DISTINCT`,
 there is no project-every-row asymmetry: the dedup key is already a sort key, so only **emitted**
@@ -1539,8 +1540,9 @@ group** (NULL groups with NULL — the NULL-safe equality `DISTINCT` uses, not t
 `=`), and `decimal` keys bucket by **value-canonical** form (`1.5` and `1.50` share one
 group — [decimal.md](decimal.md) §5); the group's displayed key is the first occurrence's
 value. `GROUP BY` over an **empty** table produces **zero** rows (contrast §17's
-whole-table single row). The grouping itself is unmetered, like the sort and `DISTINCT`
-dedup ([cost.md](cost.md) §3); `row_produced` is charged per emitted group.
+whole-table single row). Each input row charges its grouping keys by size (`hash_key`,
+[cost.md](cost.md) §3); the group table's probes are unmetered; `row_produced` is charged per emitted
+group.
 
 **`ORDER BY` over the grouped output.** In an aggregate query, an `ORDER BY` key resolves
 against the **grouping keys** (not the raw FROM columns): a key that is a grouping column
@@ -2137,7 +2139,8 @@ operand (`SELECT a FROM t UNION VALUES (2), (4)`, `VALUES (1) EXCEPT SELECT …`
   named `values` stays an expression. In FROM, a parenthesized `VALUES` list with no set operator
   stays the §42 `VALUES` relation itself (its alias and rename list apply directly).
 
-**Cost** is `lhs + rhs`, the combine itself unmetered — see [cost.md](cost.md) §3. A `VALUES` query
+**Cost** is `lhs + rhs`, plus each row's keys by size for every form but `UNION ALL` — see
+[cost.md](cost.md) §3. A `VALUES` query
 costs its rows twice — once produced by the `VALUES` relation, once by the wrapping query's scan —
 the §42 derived-table charges, no new unit.
 

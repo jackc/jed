@@ -228,6 +228,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Blocking sort and hash-operator spill.** → [spill.md](spec/design/spill.md)
   - [ ] **Remaining query-memory owners** — Q1–Q3 and the storage limits (Q4a/Q4c) have landed, as has every constructing scalar kernel (cost.md §8.1); host scratch support for OPFS/WASI remains. `work_mem` is an operator threshold, not a whole-query memory ceiling. → [memory.md](spec/design/memory.md), [hosts.md](spec/design/hosts.md)
   - [ ] _follow-on:_ bounding the interior skeleton and resident GiST R-tree once they page ([memory.md §8](spec/design/memory.md)).
+- [ ] **Per-row key metering** — charge `sort_key`, `hash_key`, and sort-site `collate` in Rust, Go, and TS; give the set-operation combine and its sort a meter; declare `resource.key_metering`; re-pin the `# cost:` entries that sort, group, dedup, or partition on variable-width keys. → [cost.md §3 "`sort_key` / `hash_key`"](spec/design/cost.md), `resource/key_metering.test` _(size: M)_
+  - [ ] _follow-on:_ meter aggregate `MIN`/`MAX` folds over `text`/`bytea`, which make one unmetered comparison per row (`GREATEST`/`LEAST` are already metered).
+  - [ ] _follow-on:_ price the new units in the estimator from analyzed average widths ([estimator.md §2](spec/design/estimator.md)).
 - [x] **Point-lookup, cold-read, and INSERT performance work.** → [benchmarks.md](spec/design/benchmarks.md), [pager.md](spec/design/pager.md)
   - [ ] _follow-on:_ Rust's unique-dirty DELETE/rebalance transient ([transactions.md §3](spec/design/transactions.md)) for Go and TypeScript, over their INSERT
     mutation-generation tokens. Measure first: their delete path's allocation and GC profile differs
