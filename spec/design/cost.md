@@ -1333,6 +1333,9 @@ its authored build/probe roles). Hash collisions compare the full canonical byte
 a candidate, and the executor never iterates the map to emit rows. WHERE, ORDER BY, LIMIT/OFFSET,
 projection, and `row_produced` remain downstream and unchanged. The table is deliberately in-memory;
 grace-hash spill is the remaining storage slice ([spill.md](spill.md) §7).
+A `MERGE` whose target probe would be a full scan uses the same table, with the target as the build
+side and the buffered source as the probe side, when its estimate is cheaper ([merge.md](merge.md)
+§3, [estimator.md](estimator.md) §9.4).
 
 **ORDER BY satisfied by the DRIVER relation's PK scan order — the join top-N.** The selected
 fence-free INNER/CROSS tree preserves its physical **driver** relation's primary-key order through

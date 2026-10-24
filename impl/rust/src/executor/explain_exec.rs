@@ -323,6 +323,7 @@ impl Engine {
             Statement::Insert(ins) => self.explain_insert(r, ins, depth, bindings),
             Statement::Update(upd) => self.explain_update(r, upd, depth, bindings),
             Statement::Delete(del) => self.explain_delete(r, del, depth, bindings),
+            Statement::Merge(m) => self.explain_merge(r, m, depth, bindings),
             Statement::With(wq) if with_has_dml(wq) => self.render_explain_with_dml(r, wq, depth),
             _ => {
                 let qp = self.plan_explain_inner(inner)?;
@@ -409,7 +410,10 @@ impl Engine {
                         let visible: Vec<&CteBinding> = bindings[..i].iter().collect();
                         self.explain_delete(r, delete, depth + 2, &visible)?
                     }
-                    DmStmt::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
+                    DmStmt::Merge(merge) => {
+                        let visible: Vec<&CteBinding> = bindings[..i].iter().collect();
+                        self.explain_merge(r, merge, depth + 2, &visible)?
+                    }
                 },
             }
         }
@@ -421,7 +425,7 @@ impl Engine {
             CteBody::Insert(insert) => self.explain_insert(r, insert, depth + 1, &visible),
             CteBody::Update(update) => self.explain_update(r, update, depth + 1, &visible),
             CteBody::Delete(delete) => self.explain_delete(r, delete, depth + 1, &visible),
-            CteBody::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
+            CteBody::Merge(merge) => self.explain_merge(r, merge, depth + 1, &visible),
             CteBody::Query(_) => unreachable!("a query primary was planned above"),
         }
     }
@@ -491,6 +495,71 @@ impl Engine {
         let mask =
             self.explain_update_touched(table, upd, filter.as_ref(), bindings, vw.as_ref())?;
         self.render_dml_scan(r, table, &upd.table, filter.as_ref(), &mask, depth + 1);
+        Ok(())
+    }
+
+    /// Render a MERGE plan (spec/design/merge.md §12, explain.md §4): the Merge root, the matching
+    /// loop — a left `Nested Loop` over the source subtree and the per-source-row target probe `Scan`
+    /// — and, with a NOT MATCHED BY SOURCE clause, the full target `Scan`. Resolves the statement but
+    /// never writes.
+    pub(crate) fn explain_merge(
+        &self,
+        r: &mut ExplainRender,
+        m: &Merge,
+        depth: i64,
+        bindings: &[&CteBinding],
+    ) -> Result<()> {
+        // A MERGE into a view renders its base-table statement (views.md §15.5).
+        let mut m = m.clone();
+        let mv = self.merge_target(&mut m)?;
+        let m = &m;
+        let table = self.merge_table(m);
+        let plan =
+            self.plan_merge_detached(m, table, mv.as_ref(), bindings, &mut ParamTypes::default())?;
+        r.emit(
+            depth,
+            format!("Merge {}", m.table),
+            format!("when={}", m.clauses.len()),
+        );
+        let on = if r.verbose {
+            format!("on={}", render_rexpr(plan.on()))
+        } else {
+            format!("on:conjuncts={}", conjunct_count(plan.on()))
+        };
+        match plan.hash() {
+            Some(hash) => r.emit(
+                depth + 1,
+                "Hash Join",
+                format!("left; keys={}; {on}", hash.keys.len()),
+            ),
+            None => r.emit(depth + 1, "Nested Loop", format!("left; {on}")),
+        }
+        self.render_query_plan(r, plan.source(), depth + 2)?;
+        let mask = super::merge::merge_touched(&plan, table.columns.len());
+        let probe = plan.probe();
+        let bound = self
+            .plan_mutation_scan(
+                m.db.as_deref(),
+                table,
+                Some(probe),
+                where_contradicts(Some(probe)),
+            )
+            .bound;
+        r.emit(
+            depth + 2,
+            format!("Scan {}", table.name),
+            self.scan_detail(&table.name, bound.as_ref(), false, &mask),
+        );
+        if plan.has_by_source() {
+            self.render_dml_scan(
+                r,
+                table,
+                &table.name,
+                plan.target_filter(),
+                &mask,
+                depth + 1,
+            );
+        }
         Ok(())
     }
 

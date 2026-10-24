@@ -330,8 +330,11 @@ impl Engine {
         // here only for that schema, so the CTE references the planning counts are restored — the
         // orchestrator static-counts a data-modifying part's references (§3).
         if let CteBody::Merge(m) = body {
-            let tdef = self.merge_target(m)?;
             let stmt = DmStmt::Merge(m.clone());
+            let mut m = (**m).clone();
+            let mv = self.merge_target(&mut m)?;
+            let m = &m;
+            let tdef = self.merge_table(m);
             let Some(_) = &m.returning else {
                 let table = cte_synthetic_table_cols(lname, &[], &[], None, None, rename)?;
                 return Ok((
@@ -342,16 +345,8 @@ impl Engine {
                     },
                 ));
             };
-            let saved: Vec<(usize, bool)> = bindings
-                .iter()
-                .map(|b| (b.refs.get(), b.expanded.get()))
-                .collect();
-            let plan = self.plan_merge(m, tdef, bindings, ptypes);
-            for (b, (refs, expanded)) in bindings.iter().zip(saved) {
-                b.refs.set(refs);
-                b.expanded.set(expanded);
-            }
-            let (_, names, types, derivs, typmods) = plan?
+            let (_, names, types, derivs, typmods) = self
+                .plan_merge_detached(m, tdef, mv.as_ref(), bindings, ptypes)?
                 .returning
                 .expect("a MERGE with RETURNING resolves its projection");
             let table = cte_synthetic_table_cols(
@@ -881,7 +876,7 @@ impl Engine {
             CteBody::Insert(ins) => Some(format!("Insert {}", ins.table)),
             CteBody::Update(upd) => Some(format!("Update {}", upd.table)),
             CteBody::Delete(del) => Some(format!("Delete {}", del.table)),
-            CteBody::Merge(m) => Some(format!("Merge {}", m.table)),
+            CteBody::Merge(m) => Some(self.merge_node(m)),
             CteBody::Query(_) => None,
         };
         let outcome = match body {
@@ -964,7 +959,7 @@ impl Engine {
             DmStmt::Insert(ins) => format!("Insert {}", ins.table),
             DmStmt::Update(upd) => format!("Update {}", upd.table),
             DmStmt::Delete(del) => format!("Delete {}", del.table),
-            DmStmt::Merge(m) => format!("Merge {}", m.table),
+            DmStmt::Merge(m) => self.merge_node(m),
         };
         let outcome = match stmt {
             DmStmt::Insert(ins) => self.execute_insert(*ins, params, ctx)?,

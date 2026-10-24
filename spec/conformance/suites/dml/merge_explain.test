@@ -1,0 +1,508 @@
+# EXPLAIN MERGE (spec/design/merge.md §12, explain.md §4, estimator.md §9.4): a `Merge <table>` root
+# (when=N), the matching loop as a left `Nested Loop` over the source subtree and the per-source-row
+# target probe `Scan` — its bound reads the source row as `outer` — and, with a NOT MATCHED BY
+# SOURCE clause, the full target `Scan`. Plain EXPLAIN writes nothing; ANALYZE runs the statement and
+# attributes its cost. CROSS-CORE-checked, NOT PostgreSQL-oracle-checked (jed's EXPLAIN).
+# requires: ddl.create_table, ddl.view, dml.view_write, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.merge, dml.with_clause, query.cte_data_modifying, query.select, query.values, query.join_inner, query.explain, query.explain_analyze, dml.explain, dml.explain_analyze, types.i32, expr.arithmetic, query.set_returning, dml.insert_select
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE INDEX t_v ON t (v)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE TABLE a (k i32, x i32)
+
+statement ok
+INSERT INTO a VALUES (1, 100), (4, 400)
+
+# A primary-key probe per source row; the estimate repeats it for each estimated source row.
+query ITTII nosort
+EXPLAIN MERGE INTO t USING (VALUES (1, 5), (9, 9)) AS s(k, w) ON t.id = s.k
+WHEN MATCHED THEN UPDATE SET v = t.v + s.w
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.w)
+----
+0
+Merge t
+when=2
+2
+10
+1
+Nested Loop
+left; on:conjuncts=1
+2
+10
+2
+Subquery s
+-
+2
+4
+3
+Values
+rows=2
+2
+2
+2
+Scan t
+PK bound: id = outer; touched=2
+2
+4
+
+# Plain EXPLAIN wrote nothing.
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+10
+2
+20
+3
+30
+
+# A secondary-index probe, and a probe no access path narrows (an expression over the source row is
+# not a probe key).
+query ITTII nosort
+EXPLAIN MERGE INTO t USING (VALUES (10), (40)) AS s(w) ON t.v = s.w
+WHEN MATCHED THEN DELETE
+----
+0
+Merge t
+when=1
+2
+12
+1
+Nested Loop
+left; on:conjuncts=1
+2
+12
+2
+Subquery s
+-
+2
+4
+3
+Values
+rows=2
+2
+2
+2
+Scan t
+Index bound: using t_v; touched=1
+2
+6
+
+query ITTII nosort
+EXPLAIN MERGE INTO t USING a ON t.v + 0 = a.x
+WHEN MATCHED THEN DELETE
+----
+0
+Merge t
+when=1
+2
+25
+1
+Nested Loop
+left; on:conjuncts=1
+2
+25
+2
+Scan a
+Full scan; touched=2
+2
+5
+2
+Scan t
+Full scan; touched=1
+6
+8
+
+# NOT MATCHED BY SOURCE adds the full target scan; ANALYZE attributes the actual cost.
+query ITTIII nosort
+EXPLAIN ANALYZE MERGE INTO t USING (VALUES (1, 5), (9, 9)) AS s(k, w) ON t.id = s.k
+WHEN MATCHED THEN UPDATE SET v = t.v + s.w
+WHEN NOT MATCHED BY SOURCE AND t.id = 3 THEN DELETE
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.w)
+----
+0
+Analyze
+cost=15 rows=3
+5
+14
+15
+1
+Merge t
+when=3
+5
+14
+15
+2
+Nested Loop
+left; on:conjuncts=1
+2
+10
+8
+3
+Subquery s
+-
+2
+4
+4
+4
+Values
+rows=2
+2
+2
+2
+3
+Scan t
+PK bound: id = outer; touched=2
+2
+4
+3
+2
+Scan t
+Full scan; touched=2
+3
+4
+4
+
+# ANALYZE ran it.
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+15
+2
+20
+9
+9
+
+# VERBOSE spells the join condition in the [target | source] slots.
+query ITT nosort
+EXPLAIN (VERBOSE, COSTS FALSE) MERGE INTO t USING (VALUES (1, 5)) AS s(k, w) ON t.v = s.w
+WHEN MATCHED THEN DELETE
+----
+0
+Merge t
+when=1
+1
+Nested Loop
+left; on=(#1 = #3)
+2
+Subquery s
+output=[#0, #1]
+3
+Values
+rows=1
+2
+Scan t
+Index bound: using t_v; touched=1
+
+# A joined source renders its join under the matching loop.
+query ITTII nosort
+EXPLAIN MERGE INTO t USING a JOIN t AS o ON a.k = o.id ON t.id = a.k + 1
+WHEN NOT MATCHED THEN INSERT VALUES (a.k + 1, o.v)
+----
+0
+Merge t
+when=1
+2
+31
+1
+Nested Loop
+left; on:conjuncts=1
+2
+31
+2
+Nested Loop
+inner; on:conjuncts=1
+2
+11
+3
+Scan a
+Full scan; touched=2
+2
+3
+3
+Scan t
+Index-nested-loop PK bound: id = join; touched=2
+2
+4
+2
+Scan t
+Full scan; touched=1
+6
+8
+
+# A MERGE in a writable CTE renders below its definition.
+query ITTII nosort
+EXPLAIN WITH m AS (
+  MERGE INTO t USING (VALUES (2)) AS s(k) ON t.id = s.k
+  WHEN MATCHED THEN DELETE
+  RETURNING t.id
+)
+SELECT id FROM m
+----
+0
+WITH
+ctes=1
+1
+7
+1
+CTE m
+materialized
+1
+5
+2
+Merge t
+when=1
+1
+5
+3
+Nested Loop
+left; on:conjuncts=1
+1
+5
+4
+Subquery s
+-
+1
+2
+5
+Values
+rows=1
+1
+1
+4
+Scan t
+PK bound: id = outer; touched=1
+1
+2
+1
+CTE Scan m
+-
+1
+2
+
+# Into a view: the base-table statement, whose join condition leads with the view's WHERE, and
+# whose not-matched-by-source scan filters by it.
+statement ok
+CREATE VIEW tv AS SELECT id, v FROM t WHERE v > 0
+
+query ITTII nosort
+EXPLAIN MERGE INTO tv USING (VALUES (1)) AS s(k) ON tv.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 0
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+----
+0
+Merge t
+when=2
+2
+11
+1
+Nested Loop
+left; on:conjuncts=2
+1
+7
+2
+Subquery s
+-
+1
+2
+3
+Values
+rows=1
+1
+1
+2
+Scan t
+PK bound: id = outer; touched=2
+1
+2
+1
+Filter
+conjuncts=1
+1
+4
+2
+Scan t
+Index bound: using t_v; touched=2
+1
+3
+
+# A join condition no access path narrows, over inputs large enough that the hash form is cheaper:
+# one full scan of the target builds the table each source row probes.
+statement ok
+CREATE TABLE hb (id i32 PRIMARY KEY, grp i32, n i32)
+
+statement ok
+INSERT INTO hb SELECT g, g % 20, 0 FROM generate_series(1, 200) AS s(g)
+
+statement ok
+CREATE TABLE hs (grp i32, d i32)
+
+statement ok
+INSERT INTO hs SELECT g % 30, g FROM generate_series(1, 60) AS s(g)
+
+query ITTII nosort
+EXPLAIN MERGE INTO hb USING hs ON hb.grp = hs.grp AND hb.id = hs.d
+WHEN MATCHED THEN UPDATE SET n = hs.d
+----
+0
+Merge hb
+when=1
+60
+421
+1
+Nested Loop
+left; on:conjuncts=2
+60
+421
+2
+Scan hs
+Full scan; touched=2
+60
+121
+2
+Scan hb
+PK bound: id = outer; touched=2
+60
+120
+
+query ITTIII nosort
+EXPLAIN ANALYZE MERGE INTO hb USING hs ON hb.grp + 0 = hs.grp AND hb.n = hs.d
+WHEN MATCHED THEN UPDATE SET n = hs.d
+----
+0
+Analyze
+cost=48581 rows=0
+60
+60181
+48581
+1
+Merge hb
+when=1
+60
+60181
+48581
+2
+Nested Loop
+left; on:conjuncts=2
+60
+60181
+48581
+3
+Scan hs
+Full scan; touched=2
+60
+121
+121
+3
+Scan hb
+Full scan; touched=2
+12000
+12060
+12060
+
+query ITTIII nosort
+EXPLAIN ANALYZE MERGE INTO hb USING hs ON hb.grp = hs.grp AND hb.n = 0
+WHEN MATCHED AND hb.id > 1000 THEN UPDATE SET n = hs.d
+----
+0
+Analyze
+cost=6162 rows=0
+60
+2022
+6162
+1
+Merge hb
+when=1
+60
+2022
+6162
+2
+Hash Join
+left; keys=1; on:conjuncts=2
+60
+2022
+5762
+3
+Scan hs
+Full scan; touched=2
+60
+121
+121
+3
+Scan hb
+Full scan; touched=3
+200
+201
+201
+
+# A MERGE into a view in a writable CTE: its actual cost is attributed to the rendered base-table node.
+query ITTIII nosort
+EXPLAIN ANALYZE WITH m AS (
+  MERGE INTO tv USING (VALUES (1)) AS s(k) ON tv.id = s.k
+  WHEN MATCHED THEN UPDATE SET v = 7
+  RETURNING tv.id
+)
+SELECT id FROM m
+----
+0
+Analyze
+cost=10 rows=1
+1
+9
+10
+1
+WITH
+ctes=1
+1
+9
+10
+2
+CTE m
+materialized
+1
+7
+8
+3
+Merge t
+when=1
+1
+7
+8
+4
+Nested Loop
+left; on:conjuncts=2
+1
+7
+7
+5
+Subquery s
+-
+1
+2
+2
+6
+Values
+rows=1
+1
+1
+1
+5
+Scan t
+PK bound: id = outer; touched=2
+1
+2
+2
+2
+CTE Scan m
+-
+1
+2
+2

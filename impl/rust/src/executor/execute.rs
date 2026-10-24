@@ -1335,23 +1335,56 @@ impl Engine {
     /// and the target's CHECK constraints when any action writes.
     fn collect_merge_catalog_privs(&self, m: &crate::ast::Merge, req: &mut PrivReq) {
         use crate::ast::{MergeAction, MergeValue};
-        let Some(table) = self.table_scoped(m.db.as_deref(), &m.table) else {
+        // A MERGE into a view is retargeted first, as execution does (views.md §15.8): `SET c =
+        // DEFAULT` then assigns the view column default, and an INSERT applies the view column
+        // defaults in place of the table's.
+        let original = m;
+        let mut m = m.clone();
+        let Ok(mv) = self.rewrite_merge_target(&mut m) else {
+            return;
+        };
+        let Some(base) = self.table_scoped(m.db.as_deref(), &m.table) else {
             return;
         };
         let locals = HashSet::new();
         let mut writes = false;
-        for c in &m.clauses {
-            match &c.action {
-                MergeAction::Update(assigns) => {
+        for (ci, (c, was)) in m.clauses.iter().zip(&original.clauses).enumerate() {
+            let defaulted_table;
+            let table = match mv.as_ref().and_then(|mv| mv.clause(ci)) {
+                Some(cvw) if !cvw.default_overrides.is_empty() => {
+                    let overriding = match &c.action {
+                        MergeAction::Insert { overriding, .. } => *overriding,
+                        _ => None,
+                    };
+                    match self.table_with_view_defaults(base, cvw, overriding) {
+                        Ok(t) => {
+                            defaulted_table = t;
+                            &defaulted_table
+                        }
+                        Err(_) => return,
+                    }
+                }
+                _ => base,
+            };
+            match (&c.action, &was.action) {
+                (MergeAction::Update(assigns), MergeAction::Update(written)) => {
                     writes = true;
+                    for (a, w) in assigns.iter().zip(written) {
+                        if w.is_default && !a.is_default {
+                            collect_expr_privs(&a.value, req, &locals);
+                        }
+                    }
                     collect_assignment_default_privs(table, assigns, req);
                 }
-                MergeAction::Insert {
-                    columns,
-                    overriding,
-                    values,
-                    ..
-                } => {
+                (
+                    MergeAction::Insert {
+                        columns,
+                        overriding,
+                        values,
+                        ..
+                    },
+                    _,
+                ) => {
                     writes = true;
                     let targets: Vec<Option<usize>> = match columns {
                         None => (0..table.columns.len()).map(Some).collect(),
@@ -1375,11 +1408,11 @@ impl Engine {
                         }
                     }
                 }
-                MergeAction::Delete | MergeAction::DoNothing => {}
+                _ => {}
             }
         }
         if writes {
-            collect_check_privs(table, req);
+            collect_check_privs(base, req);
         }
     }
 

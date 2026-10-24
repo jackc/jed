@@ -1215,8 +1215,8 @@ class Parser {
   }
 
   // parseExplainInner parses the statement EXPLAIN wraps — restricted to a query (SELECT / VALUES /
-  // WITH / a parenthesized query), a DML statement (INSERT / UPDATE / DELETE), or a CREATE TABLE … AS
-  // (create-table-as.md §7). Other DDL, transaction
+  // WITH / a parenthesized query), a DML statement (INSERT / UPDATE / DELETE / MERGE), or a
+  // CREATE TABLE … AS (create-table-as.md §7). Other DDL, transaction
   // control, and a nested EXPLAIN have no query plan to render and are rejected 42601.
   private parseExplainInner(): Statement {
     switch (this.peekKeyword()) {
@@ -1231,9 +1231,8 @@ class Parser {
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
-      // EXPLAIN MERGE is a deferred follow-on (spec/design/merge.md §12).
       case "merge":
-        throw engineError("feature_not_supported", "EXPLAIN MERGE is not supported");
+        return this.parseMerge();
       // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no plan to
       // render.
       case "create": {
@@ -4625,8 +4624,8 @@ class Parser {
   }
 
   // parseMerge parses `MERGE INTO target [[AS] alias] USING source_ref ON cond when_clause+
-  // [RETURNING …]` (spec/design/merge.md §1). The source is one table_ref, carried as
-  // `SELECT * FROM source_ref`; a parenthesized join, or a join after the source, is 0A000 (§12). A
+  // [RETURNING …]` (spec/design/merge.md §1). The source is one FROM item, carried as
+  // `SELECT * FROM source_ref` (a joined source as the unaliased join group over its chain). A
   // clause after an unconditional clause of the same kind is 42601 here, before any name resolves
   // (PostgreSQL's order).
   private parseMerge(): Merge {
@@ -4643,47 +4642,41 @@ class Parser {
       alias = this.expectIdentifier();
     }
     this.expectKeyword("using");
-    const sourceRef = this.parseTableRef();
-    const joined = sourceRef.subquery?.kind === "select" && sourceRef.subquery.parenJoin === true;
-    const next = this.peekKeyword();
-    if (
-      joined ||
-      next === "join" ||
-      next === "inner" ||
-      next === "left" ||
-      next === "right" ||
-      next === "full" ||
-      next === "cross" ||
-      next === "natural"
-    ) {
-      throw engineError(
-        "feature_not_supported",
-        "a joined MERGE source is not supported; write the join as a subquery",
-      );
+    // The source is one FROM item: a table_ref, possibly followed by joins (`USING a JOIN b ON p ON
+    // cond`). A joined source — written so, or as an unaliased parenthesized join — is the unaliased
+    // join group `SELECT * FROM a JOIN b …`, whose inner labels stay visible (merge.md §2); an
+    // aliased parenthesized join is an ordinary derived table.
+    const { from, joins } = spliceLeadingGroup(this.parseTableRef(), []);
+    for (;;) {
+      const j = this.parseJoinClause();
+      if (j === null) break;
+      joins.push(j);
     }
+    let source: Select;
     let sourceLabel: string | null = null;
-    if (sourceRef.alias !== null) sourceLabel = sourceRef.alias;
-    else if (
-      sourceRef.subquery === undefined &&
-      sourceRef.values === undefined &&
-      sourceRef.name !== ""
-    ) {
-      sourceLabel = sourceRef.name;
+    if (joins.length === 0) {
+      if (from.alias !== null) sourceLabel = from.alias;
+      else if (from.subquery === undefined && from.values === undefined && from.name !== "") {
+        sourceLabel = from.name;
+      }
+      source = {
+        kind: "select",
+        distinct: false,
+        items: { kind: "all" },
+        from,
+        joins: [],
+        filter: null,
+        groupBy: [],
+        having: null,
+        orderBy: [],
+        limit: null,
+        offset: null,
+        windows: [],
+      };
+    } else {
+      source = joinGroupBody(from, joins);
+      source.joinGroup = true;
     }
-    const source: Select = {
-      kind: "select",
-      distinct: false,
-      items: { kind: "all" },
-      from: sourceRef,
-      joins: [],
-      filter: null,
-      groupBy: [],
-      having: null,
-      orderBy: [],
-      limit: null,
-      offset: null,
-      windows: [],
-    };
     this.expectKeyword("on");
     const on = this.parseExpr();
     const clauses: MergeClause[] = [];

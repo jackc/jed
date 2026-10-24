@@ -24,6 +24,19 @@ type mergeClausePlan struct {
 	// values[p] is an INSERT action's resolved slot p, nil for a DEFAULT slot (whose column is then
 	// defaulted) or a value an OVERRIDING USER VALUE identity column discards.
 	values []*rExpr
+	// rowTable is the table an INSERT action's row is built over: the target, with the view column
+	// defaults an INSERT through a view applies in place of the table's (views.md §16.1).
+	rowTable *catTable
+	// defaults are those columns' expression defaults, resolved for this action (constraints.md §2).
+	defaults []*rExpr
+}
+
+// mergeView is a MERGE into an automatically updatable view, retargeted at its base table (merge.md
+// §8, views.md §15): the write layering of each action clause (nil for DO NOTHING), each validated for
+// its own action kind and target columns, and the layering the statement's scopes expose.
+type mergeView struct {
+	clauses []*viewWrite
+	top     *viewWrite
 }
 
 // mergeReturning is a resolved RETURNING projection: the nodes and the output schema.
@@ -46,10 +59,21 @@ type mergePlan struct {
 	// probe's access path is planned from it (§3). It never decides a match.
 	probe   *rExpr
 	clauses []mergeClausePlan
-	// defaultExprs are the expression defaults the INSERT actions may apply, per column
-	// (constraints.md §2).
-	defaultExprs []*rExpr
-	returning    *mergeReturning
+	// hash is the hash form of the matching loop (§3), chosen at plan time when its estimate is
+	// cheaper than the per-source-row probe (estimator.md §9.4); nil — the nested loop.
+	hash *hashJoinPlan
+	// targetFilter is the target view's WHERE chain over the target row (views.md §15.2), for the
+	// not-matched-by-source scan; the join condition already leads with it.
+	targetFilter *rExpr
+	// viewChecks are the check-option checks of a MERGE into a view (views.md §15.6), over a placed
+	// row.
+	viewChecks []viewCheck
+	returning  *mergeReturning
+}
+
+// hasBySource reports whether a WHEN NOT MATCHED BY SOURCE clause runs the full target scan (§3).
+func (p *mergePlan) hasBySource() bool {
+	return slices.ContainsFunc(p.clauses, func(c mergeClausePlan) bool { return c.kind == mergeNotMatchedBySource })
 }
 
 // mergeAction is one action of the action list (merge.md §4), in matching-pass order. src is the
@@ -79,16 +103,42 @@ func mergeSourceRel(table *catTable, label string, offset int) scopeRel {
 	return scopeRel{label: label, table: table, offset: offset}
 }
 
-// mergeVersionRel is a qualifier-only row-version relation (old / new) over the target's columns.
-func mergeVersionRel(table *catTable, label string, offset int) scopeRel {
-	return scopeRel{label: label, table: table, offset: offset, qualifierOnly: true}
+// mergeVersionRel is a qualifier-only row-version relation (old / new) over the target's columns — a
+// view's columns for a MERGE into a view.
+func mergeVersionRel(table *catTable, vw *viewWrite, label string, offset int) scopeRel {
+	rel := scopeRel{label: label, table: table, offset: offset, qualifierOnly: true}
+	if vw != nil {
+		rel.layer = vw.top
+	}
+	return rel
 }
 
 // mergeTargetRel is the target relation at flat offset: targetRel moved.
-func mergeTargetRel(table *catTable, alias *string, offset int) scopeRel {
-	rel := targetRel(table, nil, alias)
+func mergeTargetRel(table *catTable, vw *viewWrite, alias *string, offset int) scopeRel {
+	rel := targetRel(table, vw, alias)
 	rel.offset = offset
 	return rel
+}
+
+// withSourceGroup exposes a joined source's inner labels and hides its USING/NATURAL copies
+// (grammar.md §15) when the source sits at flat offset of s, FROM ordinal rel (merge.md §2). A no-op
+// for any other source.
+func withSourceGroup(s *scope, group *joinGroupLayout, offset, rel int) {
+	if group == nil {
+		return
+	}
+	s.subRels = make([]subRel, len(group.subRels))
+	for i, sr := range group.subRels {
+		slots := make([]int, len(sr.slots))
+		for k, slot := range sr.slots {
+			slots[k] = offset + slot
+		}
+		s.subRels[i] = subRel{label: sr.label, table: sr.table, slots: slots, rel: rel}
+	}
+	s.hidden = make([]int, len(group.hidden))
+	for i, h := range group.hidden {
+		s.hidden[i] = offset + h
+	}
 }
 
 // executeMerge runs a MERGE (spec/design/merge.md). An error names the target's database
@@ -102,35 +152,126 @@ func (db *engine) executeMerge(m *mergeStmt, params []Value, ctx cteCtx) (outcom
 }
 
 // mergeTarget makes the target checks every MERGE makes before resolving anything (merge.md §8): a
-// catalog relation is 42809, a read-only attachment 25006, a view 0A000, a missing table 42P01.
-func (db *engine) mergeTarget(m *mergeStmt) (*catTable, error) {
+// catalog relation is 42809, a read-only attachment 25006, a missing table 42P01. A view target is
+// retargeted at its base table first (rewriteMergeTarget): the returned statement then names the
+// table (the written one is left intact), and the returned mergeView carries the view layering.
+func (db *engine) mergeTarget(m *mergeStmt) (*mergeStmt, *mergeView, error) {
 	if err := checkCatalogRelWrite(m.Table); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := db.checkAttachmentWritable(m.DB); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	vw, err := db.dmlTargetView(m.DB, m.Table)
+	m, mv, err := db.rewriteMergeTarget(m)
 	if err != nil {
-		return nil, err
-	}
-	if vw != nil {
-		return nil, newError(FeatureNotSupported, "MERGE into a view is not supported")
+		return nil, nil, err
 	}
 	if err := db.checkTableQualifier(m.DB, m.Table); err != nil {
-		return nil, atTarget(err, m.TablePos)
+		return nil, nil, atTarget(err, m.TablePos)
 	}
+	if _, ok := db.lkpTableScoped(m.DB, m.Table); !ok {
+		return nil, nil, newError(UndefinedTable, "table does not exist: "+m.Table).withPosition(int32(m.TablePos))
+	}
+	return m, mv, nil
+}
+
+// mergeNode is the plan-node label of a MERGE (explain.md §5): `Merge <table>`, naming the base table
+// of a view target as EXPLAIN renders it (views.md §15.5). A target the rewrite refuses names itself;
+// its error surfaces when the MERGE runs.
+func (db *engine) mergeNode(m *mergeStmt) string {
+	if rewritten, _, err := db.rewriteMergeTarget(m); err == nil {
+		m = rewritten
+	}
+	return "Merge " + m.Table
+}
+
+// mergeTable is the target table of a MERGE mergeTarget validated.
+func (db *engine) mergeTable(m *mergeStmt) *catTable {
 	table, ok := db.lkpTableScoped(m.DB, m.Table)
 	if !ok {
-		return nil, newError(UndefinedTable, "table does not exist: "+m.Table).withPosition(int32(m.TablePos))
+		panic("mergeTarget validated the target")
 	}
-	return table, nil
+	return table
+}
+
+// rewriteMergeTarget retargets a MERGE into an automatically updatable view at its base table
+// (merge.md §8, views.md §15.2), clause by clause in written order: an UPDATE's SET columns and an
+// INSERT's column list name view columns and are validated like the standalone statement's (42703,
+// 42701, a read-only column 0A000, a view not updatable for the action 55000), then become the base
+// columns; `SET c = DEFAULT` assigns the view column's default. An INSERT without a column list
+// targets the view's first columns, one per value. It returns a copy of the statement and the write,
+// or the statement unchanged and nil when the target is a table.
+func (db *engine) rewriteMergeTarget(m *mergeStmt) (*mergeStmt, *mergeView, error) {
+	view, err := db.dmlTargetView(m.DB, m.Table)
+	if err != nil {
+		return nil, nil, err
+	}
+	if view == nil {
+		return m, nil, nil
+	}
+	c := *m
+	c.Clauses = slices.Clone(m.Clauses)
+	clauses := make([]*viewWrite, len(c.Clauses))
+	for ci := range c.Clauses {
+		cl := &c.Clauses[ci]
+		var vw *viewWrite
+		switch cl.Action {
+		case mergeDoNothing:
+		case mergeDelete:
+			if vw, err = db.prepareViewWrite(m.DB, m.Table, writeDelete, nil, nil, nil, nil); err != nil {
+				return nil, nil, err
+			}
+		case mergeUpdate:
+			targets := make([]string, len(cl.Assignments))
+			pos := make([]srcPos, len(cl.Assignments))
+			for i, a := range cl.Assignments {
+				targets[i], pos[i] = a.Column, a.Pos
+			}
+			if vw, err = db.prepareViewWrite(m.DB, m.Table, writeUpdate, targets, pos, nil, nil); err != nil {
+				return nil, nil, err
+			}
+			assigns := make([]assignment, len(cl.Assignments))
+			for i, a := range cl.Assignments {
+				if a.IsDefault {
+					a.IsDefault = false
+					if a.Value, err = db.viewSetDefault(vw.view, a.Column); err != nil {
+						return nil, nil, err
+					}
+				}
+				a.Column = vw.targets[i]
+				assigns[i] = a
+			}
+			cl.Assignments = assigns
+		case mergeInsert:
+			targets := cl.Columns
+			if targets == nil {
+				targets = slices.Clone(view.Columns[:min(len(cl.Values), len(view.Columns))])
+			}
+			if vw, err = db.prepareViewWrite(m.DB, m.Table, writeInsert, targets, cl.ColumnPos, nil, nil); err != nil {
+				return nil, nil, err
+			}
+			cl.Columns = append(make([]string, 0, len(vw.targets)), vw.targets...)
+		}
+		clauses[ci] = vw
+	}
+	// The layering the scopes expose: the chain validated for the weakest action, so a MERGE of only
+	// DO NOTHING clauses still names an updatable view.
+	top, err := db.prepareViewWrite(m.DB, m.Table, writeDelete, nil, nil, nil, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.Table, c.DB = top.table, nil
+	return &c, &mergeView{clauses: clauses, top: top}, nil
 }
 
 // planMerge resolves a MERGE against its target (merge.md §2): the source query, the join condition,
 // every WHEN clause in written order, then RETURNING — PostgreSQL's analysis order.
-func (db *engine) planMerge(m *mergeStmt, table *catTable, bindings []*cteBinding, ptypes *paramTypes) (*mergePlan, error) {
+func (db *engine) planMerge(m *mergeStmt, table *catTable, mv *mergeView, bindings []*cteBinding, ptypes *paramTypes) (*mergePlan, error) {
 	n := len(table.Columns)
+	var vw *viewWrite
+	if mv != nil {
+		vw = mv.top
+	}
 	source, err := db.planQuery(m.Source, nil, bindings, ptypes)
 	if err != nil {
 		return nil, err
@@ -139,59 +280,66 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, bindings []*cteBindin
 	if m.SourceLabel != nil {
 		label = *m.SourceLabel
 	}
-	srcTable, err := cteSyntheticTable(label, &source, nil)
-	if err != nil {
+	// A joined source is an unaliased join group (merge.md §2): one relation with no label whose inner
+	// labels stay visible, its columns the group's (hidden USING copies included).
+	group := derivedJoinGroup(&source)
+	var srcTable *catTable
+	if group != nil {
+		srcTable = &catTable{Columns: group.columns}
+	} else if srcTable, err = cteSyntheticTable(label, &source, nil); err != nil {
 		return nil, err
 	}
 	mw := len(srcTable.Columns)
 	targetLabel := table.Name
+	if vw != nil {
+		targetLabel = vw.view
+	}
 	if m.Alias != nil {
 		targetLabel = *m.Alias
 	}
 	if label != "" && label == targetLabel {
 		return nil, newError(DuplicateAlias, fmt.Sprintf("name \"%s\" specified more than once", label))
 	}
-	both := mergeScope(db, []scopeRel{mergeTargetRel(table, m.Alias, 0), mergeSourceRel(srcTable, label, n)}, bindings)
+	both := mergeScope(db, []scopeRel{mergeTargetRel(table, vw, m.Alias, 0), mergeSourceRel(srcTable, label, n)}, bindings)
+	withSourceGroup(both, group, n, 1)
 	srcOnly := mergeScope(db, []scopeRel{mergeSourceRel(srcTable, label, 0)}, bindings)
-	tgtOnly := mergeScope(db, []scopeRel{mergeTargetRel(table, m.Alias, 0)}, bindings)
+	withSourceGroup(srcOnly, group, 0, 0)
+	tgtOnly := mergeScope(db, []scopeRel{mergeTargetRel(table, vw, m.Alias, 0)}, bindings)
+	// A view target's rows are those its WHERE chain shows (views.md §15.2): the chain leads the join
+	// condition (and filters the not-matched-by-source scan), AND-ed left-deep.
+	lead := func(cond *rExpr) (*rExpr, error) {
+		view, err := db.resolveWriteFilter(tgtOnly, table, vw, nil, &paramTypes{})
+		if err != nil || view == nil {
+			return cond, err
+		}
+		return &rExpr{kind: reAnd, lhs: view, rhs: cond}, nil
+	}
 	on, err := resolveBooleanFilter(both, &m.On, ptypes)
 	if err != nil {
 		return nil, err
 	}
+	if on, err = lead(on); err != nil {
+		return nil, err
+	}
 	// The probe form: the target is the relation, the source an enclosing level (§3). The combined
 	// resolution above already raised every name error.
-	probeScope := mergeScope(db, []scopeRel{mergeTargetRel(table, m.Alias, 0)}, bindings)
+	probeScope := mergeScope(db, []scopeRel{mergeTargetRel(table, vw, m.Alias, 0)}, bindings)
 	probeScope.parent = srcOnly
 	probe, err := resolveBooleanFilter(probeScope, &m.On, &paramTypes{})
 	if err != nil {
 		return nil, err
 	}
-
-	// An INSERT's omitted columns resolve their expression defaults once per statement
-	// (constraints.md §2); only the columns some action can default resolve.
-	need := make([]bool, n)
-	anyNeed := false
-	for ci := range m.Clauses {
-		c := &m.Clauses[ci]
-		if c.Action != mergeInsert {
-			continue
-		}
-		provided, _, err := mergeInsertColumns(table, c.Columns, nil, c.Overriding, c.Values)
-		if err != nil {
-			continue
-		}
-		for i, p := range provided {
-			if p < 0 {
-				need[i] = true
-				anyNeed = true
-			}
-		}
+	if probe, err = lead(probe); err != nil {
+		return nil, err
 	}
-	defaultExprs := make([]*rExpr, n)
-	if anyNeed {
-		if defaultExprs, err = db.resolveDefaultExprsFor(table, need, &paramTypes{}); err != nil {
-			return nil, err
-		}
+	targetFilter, err := db.resolveWriteFilter(tgtOnly, table, vw, nil, &paramTypes{})
+	if err != nil {
+		return nil, err
+	}
+	hash := db.mergeHashChoice(m.DB, table, source, on, probe, both)
+	viewChecks, err := db.resolveViewChecks(table, vw)
+	if err != nil {
+		return nil, err
 	}
 
 	clauses := make([]mergeClausePlan, 0, len(m.Clauses))
@@ -216,9 +364,32 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, bindings []*cteBindin
 				return nil, err
 			}
 		case mergeInsert:
-			provided, slotCol, err := mergeInsertColumns(table, c.Columns, c.ColumnPos, c.Overriding, c.Values)
+			// Through a view, the view column defaults replace the table's (views.md §16.1).
+			rowTable := table
+			if mv != nil {
+				if cvw := mv.clauses[ci]; cvw != nil && len(cvw.defaultOverrides) > 0 {
+					if rowTable, err = db.tableWithViewDefaults(table, cvw, c.Overriding); err != nil {
+						return nil, err
+					}
+				}
+			}
+			provided, slotCol, err := mergeInsertColumns(rowTable, c.Columns, c.ColumnPos, c.Overriding, c.Values)
 			if err != nil {
 				return nil, err
+			}
+			// The omitted columns' expression defaults, resolved once for this action.
+			need := make([]bool, n)
+			anyNeed := false
+			for i, p := range provided {
+				if p < 0 {
+					need[i], anyNeed = true, true
+				}
+			}
+			defaults := make([]*rExpr, n)
+			if anyNeed {
+				if defaults, err = db.resolveDefaultExprsFor(rowTable, need, &paramTypes{}); err != nil {
+					return nil, err
+				}
 			}
 			nodes := make([]*rExpr, len(c.Values))
 			for p, v := range c.Values {
@@ -249,17 +420,18 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, bindings []*cteBindin
 					nodes[p] = node
 				}
 			}
-			cp.provided, cp.values = provided, nodes
+			cp.provided, cp.values, cp.rowTable, cp.defaults = provided, nodes, rowTable, defaults
 		}
 		clauses = append(clauses, cp)
 	}
 
 	var returning *mergeReturning
 	if m.Returning != nil {
-		s, err := db.mergeReturningScope(table, m.Alias, srcTable, label, m.Returning)
+		s, err := db.mergeReturningScope(table, vw, m.Alias, srcTable, label, m.Returning)
 		if err != nil {
 			return nil, err
 		}
+		withSourceGroup(s, group, 0, 0)
 		s.ctes = bindings
 		nodes, names, types, derivs, typmods, err := resolveProjections(s, m.Returning.Items, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
@@ -268,9 +440,78 @@ func (db *engine) planMerge(m *mergeStmt, table *catTable, bindings []*cteBindin
 		returning = &mergeReturning{nodes: nodes, names: names, types: types, derivs: derivs, typmods: typmods}
 	}
 	return &mergePlan{
-		source: source, m: mw, on: on, probe: probe, clauses: clauses,
-		defaultExprs: defaultExprs, returning: returning,
+		source: source, m: mw, on: on, probe: probe, clauses: clauses, hash: hash,
+		targetFilter: targetFilter, viewChecks: viewChecks, returning: returning,
 	}, nil
+}
+
+// planMergeDetached is planMerge for a MERGE that is not about to run — a writable CTE's RETURNING
+// schema, EXPLAIN's render and estimate. The CTE references the planning counts are restored: the
+// orchestrator static-counts a data-modifying part's references (writable-cte.md §3).
+func (db *engine) planMergeDetached(m *mergeStmt, table *catTable, mv *mergeView, bindings []*cteBinding, ptypes *paramTypes) (*mergePlan, error) {
+	type savedRefs struct {
+		refs     int
+		expanded bool
+	}
+	saved := make([]savedRefs, len(bindings))
+	for i, b := range bindings {
+		saved[i] = savedRefs{b.refs, b.expanded}
+	}
+	plan, err := db.planMerge(m, table, mv, bindings, ptypes)
+	for i, b := range bindings {
+		b.refs, b.expanded = saved[i].refs, saved[i].expanded
+	}
+	return plan, err
+}
+
+// mergeHashChoice chooses the matching loop's form (merge.md §3, estimator.md §9.4): the hash join
+// when the probe's selected path is a full scan, the join condition passes the hash join's structural
+// gate (cost.md §3 "JOIN"), at least one conjunct equates a target column with a source column of the
+// same keyable type, and the hash estimate is strictly cheaper than the nested loop's. The estimates
+// read no CTE context, so EXPLAIN and execution choose identically.
+func (db *engine) mergeHashChoice(dbScope *string, table *catTable, source queryPlan, on, probe *rExpr, s *scope) *hashJoinPlan {
+	probePlan := db.planMutationScan(dbScope, table, probe, whereContradicts(probe))
+	if probePlan.bound != nil || probePlan.contradiction {
+		return nil
+	}
+	n := len(table.Columns)
+	var conjuncts []*rExpr
+	flattenHashJoinConjuncts(on, &conjuncts)
+	var keys []hashJoinKey
+	for _, e := range conjuncts {
+		if !hashJoinSafeConjunct(e) {
+			return nil
+		}
+		if e.op != opEq || e.lhs.kind != reColumn || e.rhs.kind != reColumn {
+			continue
+		}
+		a, b := e.lhs.index, e.rhs.index
+		var target, sourceCol int
+		switch {
+		case a < n && b >= n:
+			target, sourceCol = a, b
+		case a >= n && b < n:
+			target, sourceCol = b, a
+		default:
+			continue
+		}
+		tTy, tok := hashJoinColumnType(s.rels, target)
+		sTy, sok := hashJoinColumnType(s.rels, sourceCol)
+		if !tok || !sok || !hashJoinTypesEqual(tTy, sTy) || !hashJoinKeyableType(tTy) {
+			continue
+		}
+		keys = append(keys, hashJoinKey{left: sourceCol, right: target, ty: tTy})
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	hash := &hashJoinPlan{keys: keys}
+	sourceEstimate := db.estimateQueryPlan(source, nil)
+	nested, hashed := db.estimateMergeLoop(table, dbScope, sourceEstimate, on, probe, hash, nil)
+	if hashed == nil || hashed.root.cost() >= nested.root.cost() {
+		return nil
+	}
+	return hash
 }
 
 // mergeAssignments resolves one UPDATE action's assignments against its clause scope — the
@@ -343,10 +584,10 @@ func (db *engine) mergeAssignments(s *scope, table *catTable, assigns []assignme
 // and the old / new qualifier-only versions at m + n / m + 2n, over the row
 // [source | target | old | new | action]; merge_action() reads the last slot. Aliases follow
 // grammar.md §32.
-func (db *engine) mergeReturningScope(table *catTable, alias *string, srcTable *catTable, label string, ret *returningClause) (*scope, error) {
+func (db *engine) mergeReturningScope(table *catTable, vw *viewWrite, alias *string, srcTable *catTable, label string, ret *returningClause) (*scope, error) {
 	n := len(table.Columns)
 	mw := len(srcTable.Columns)
-	rels := []scopeRel{mergeSourceRel(srcTable, label, 0), mergeTargetRel(table, alias, mw)}
+	rels := []scopeRel{mergeSourceRel(srcTable, label, 0), mergeTargetRel(table, vw, alias, mw)}
 	for _, explicit := range []struct {
 		alias  *string
 		offset int
@@ -360,7 +601,7 @@ func (db *engine) mergeReturningScope(table *catTable, alias *string, srcTable *
 				return nil, newError(DuplicateAlias, "table name "+a+" specified more than once")
 			}
 		}
-		rels = append(rels, mergeVersionRel(table, a, explicit.offset))
+		rels = append(rels, mergeVersionRel(table, vw, a, explicit.offset))
 	}
 	for _, pseudo := range []struct {
 		label   string
@@ -372,7 +613,7 @@ func (db *engine) mergeReturningScope(table *catTable, alias *string, srcTable *
 			occupied = occupied || r.label == pseudo.label
 		}
 		if !pseudo.aliased && !occupied {
-			rels = append(rels, mergeVersionRel(table, pseudo.label, pseudo.offset))
+			rels = append(rels, mergeVersionRel(table, vw, pseudo.label, pseudo.offset))
 		}
 	}
 	s := mergeScope(db, rels, nil)
@@ -381,15 +622,16 @@ func (db *engine) mergeReturningScope(table *catTable, alias *string, srcTable *
 	return s, nil
 }
 
-func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (outcome, error) {
+func (db *engine) executeMergeTarget(written *mergeStmt, params []Value, ctx cteCtx) (outcome, error) {
 	// The statement resolves before its values are bound; a plan that read one restarts it with the
 	// values visible (estimator.md §6.1).
 	planning := db.beginPlanning()
 	defer planning.end()
-	table, err := db.mergeTarget(m)
+	m, mv, err := db.mergeTarget(written)
 	if err != nil {
 		return outcome{}, err
 	}
+	table := db.mergeTable(m)
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
 		return outcome{}, err
 	}
@@ -407,7 +649,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 	colTypes := store.colTypes
 	colls := db.columnCollations(table.Columns)
 	ptypes := &paramTypes{}
-	plan, err := db.planMerge(m, table, ctx.bindings, ptypes)
+	plan, err := db.planMerge(m, table, mv, ctx.bindings, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -422,7 +664,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 	if planning.bind(bound) {
 		var out outcome
 		err := db.restartPlanning(bound, func() (err error) {
-			out, err = db.executeMerge(m, params, ctx)
+			out, err = db.executeMerge(written, params, ctx)
 			return err
 		})
 		return out, err
@@ -437,6 +679,11 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 	}
 	if err := db.foldUncorrelatedInRExpr(plan.on, bound, ctx, &meter.Accrued); err != nil {
 		return outcome{}, err
+	}
+	if plan.targetFilter != nil {
+		if err := db.foldUncorrelatedInRExpr(plan.targetFilter, bound, ctx, &meter.Accrued); err != nil {
+			return outcome{}, err
+		}
 	}
 	for ci := range plan.clauses {
 		c := &plan.clauses[ci]
@@ -466,6 +713,9 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 			}
 		}
 	}
+	if err := db.foldViewChecks(plan.viewChecks, bound, ctx, meter); err != nil {
+		return outcome{}, err
+	}
 
 	// The source (§3): SELECT * FROM source_ref, its rows buffered and its cost charged.
 	q, err := db.execQueryPlan(&plan.source, nil, bound, ctx)
@@ -476,28 +726,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 	srcRows := rowsFromValues(q.rows)
 	mw := plan.m
 
-	// The touched set (§9): every target column any part of the statement reads.
-	mask := make([]bool, n)
-	collectTouched(plan.on, 0, mask)
-	for ci := range plan.clauses {
-		c := &plan.clauses[ci]
-		if c.kind == mergeNotMatchedByTarget {
-			continue
-		}
-		collectTouched(c.condition, 0, mask)
-		for i := range c.assigns {
-			collectTouched(c.assigns[i].source, 0, mask)
-		}
-	}
-	if plan.returning != nil {
-		retMask := make([]bool, mw+3*n+1)
-		for _, node := range plan.returning.nodes {
-			collectTouched(node, 0, retMask)
-		}
-		for i := range mask {
-			mask[i] = mask[i] || retMask[mw+i] || retMask[mw+n+i] || retMask[mw+2*n+i]
-		}
-	}
+	mask := mergeTouched(plan, n)
 
 	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
 	pkChanged := make([]bool, len(plan.clauses))
@@ -611,18 +840,23 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 	// The matching pass (§3): per source row, the probe, the join condition, the matched pairs, or the
 	// not-matched action.
 	scanPlan := db.planMutationScan(m.DB, table, plan.probe, contradiction)
-	hasBySource := slices.ContainsFunc(plan.clauses, func(c mergeClausePlan) bool { return c.kind == mergeNotMatchedBySource })
-	for si, src := range srcRows {
-		if err := meter.Step(); err != nil {
-			return outcome{}, err
-		}
-		probeEnv := &evalEnv{exec: db, params: bound, outer: []storedRow{src}, rng: env.rng, ctes: ctx}
-		batch, err := db.executeMutationScan(scanPlan, m.Table, bound, probeEnv, meter, mask)
+	hasBySource := plan.hasBySource()
+	// EXPLAIN ANALYZE attribution (explain.md §3): the probe scans, the matching loop (the source, the
+	// probes, and the join condition), and the not-matched-by-source scan.
+	var probeActual int64
+	loopActual := q.cost
+	// The hash form of the matching loop (§3): one full scan of the target, its rows' key columns
+	// hashed into a table each source row probes; the candidates keep scan order.
+	var hashed *hashJoinTable
+	var targets []mergeCandidate
+	if plan.hash != nil {
+		before := meter.Accrued
+		batch, err := db.executeMutationScan(scanPlan, m.Table, bound, env, meter, mask)
 		if err != nil {
 			return outcome{}, err
 		}
 		meter.Charge(costs.PageRead*int64(batch.pages) + costs.ValueDecompress*int64(batch.slabs))
-		anyMatch := false
+		targets = make([]mergeCandidate, 0, len(batch.entries))
 		for _, e := range batch.entries {
 			if err := meter.Step(); err != nil {
 				return outcome{}, err
@@ -632,9 +866,72 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 			if err != nil {
 				return outcome{}, err
 			}
+			targets = append(targets, mergeCandidate{key: e.Key, row: row, stored: e.Row})
+		}
+		probeActual += meter.Accrued - before
+		rows := make([]storedRow, len(targets))
+		for i := range targets {
+			rows[i] = targets[i].row
+		}
+		if hashed, err = newHashJoinTable(plan.hash, 0, n, rows, meter); err != nil {
+			return outcome{}, err
+		}
+		defer hashed.release()
+		loopActual += meter.Accrued - before
+	}
+	for si, src := range srcRows {
+		if err := meter.Step(); err != nil {
+			return outcome{}, err
+		}
+		// This source row's candidate target rows: the hash table's exact-key matches, already read;
+		// or the probe scan's entries, read one by one below.
+		var entries []mergeCandidate
+		prefetched := hashed != nil
+		if prefetched {
+			before := meter.Accrued
+			hits, err := hashed.probePositions(plan.hash, src, meter)
+			if err != nil {
+				return outcome{}, err
+			}
+			loopActual += meter.Accrued - before
+			entries = make([]mergeCandidate, len(hits))
+			for i, h := range hits {
+				entries[i] = targets[h]
+			}
+		} else {
+			probeBefore := meter.Accrued
+			probeEnv := &evalEnv{exec: db, params: bound, outer: []storedRow{src}, rng: env.rng, ctes: ctx}
+			batch, err := db.executeMutationScan(scanPlan, m.Table, bound, probeEnv, meter, mask)
+			if err != nil {
+				return outcome{}, err
+			}
+			meter.Charge(costs.PageRead*int64(batch.pages) + costs.ValueDecompress*int64(batch.slabs))
+			probeActual += meter.Accrued - probeBefore
+			loopActual += meter.Accrued - probeBefore
+			entries = make([]mergeCandidate, len(batch.entries))
+			for i, e := range batch.entries {
+				entries[i] = mergeCandidate{key: e.Key, row: e.Row, stored: e.Row}
+			}
+		}
+		anyMatch := false
+		for _, e := range entries {
+			row := e.row
+			if !prefetched {
+				if err := meter.Step(); err != nil {
+					return outcome{}, err
+				}
+				meter.Charge(costs.StorageRowRead)
+				probeActual += costs.StorageRowRead
+				loopActual += costs.StorageRowRead
+				if row, err = store.resolveColumns(e.stored, mask); err != nil {
+					return outcome{}, err
+				}
+			}
 			combined := make(storedRow, 0, len(row)+len(src))
 			combined = append(append(combined, row...), src...)
+			onBefore := meter.Accrued
 			ok, err := plan.on.evalFilter(combined, env, meter)
+			loopActual += meter.Accrued - onBefore
 			if err != nil {
 				return outcome{}, err
 			}
@@ -643,7 +940,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 			}
 			anyMatch = true
 			if hasBySource {
-				matched[string(e.Key)] = struct{}{}
+				matched[string(e.key)] = struct{}{}
 			}
 			ci, chosen, err := choose(mergeMatched, combined)
 			if err != nil {
@@ -655,7 +952,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 			if row, err = store.resolveInlineColumns(row); err != nil {
 				return outcome{}, err
 			}
-			if err := actOnTarget(ci, e.Key, row, e.Row, si, combined); err != nil {
+			if err := actOnTarget(ci, e.key, row, e.stored, si, combined); err != nil {
 				return outcome{}, err
 			}
 		}
@@ -683,7 +980,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 				return outcome{}, err
 			}
 		}
-		row, err := db.buildInsertRow(table, colTypes, c.provided, vals, plan.defaultExprs, env.rng, meter)
+		row, err := db.buildInsertRow(c.rowTable, colTypes, c.provided, vals, c.defaults, env.rng, meter)
 		if err != nil {
 			return outcome{}, err
 		}
@@ -692,25 +989,46 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 		}
 		actions = append(actions, mergeAction{kind: mergeInsert, newRow: row, src: si, clause: ci})
 	}
+	loopNode := "Nested Loop"
+	if plan.hash != nil {
+		loopNode = "Hash Join"
+	}
+	db.explainActual.record(loopNode, loopActual)
+	db.explainActual.record("Scan "+m.Table, probeActual)
 	// Not matched by source (§3): one full scan in storage-key order.
 	if hasBySource {
-		full := db.planMutationScan(m.DB, table, nil, false)
+		scanBefore := meter.Accrued
+		full := db.planMutationScan(m.DB, table, plan.targetFilter, whereContradicts(plan.targetFilter))
 		batch, err := db.executeMutationScan(full, m.Table, bound, env, meter, mask)
 		if err != nil {
 			return outcome{}, err
 		}
 		meter.Charge(costs.PageRead*int64(batch.pages) + costs.ValueDecompress*int64(batch.slabs))
+		scanActual := meter.Accrued - scanBefore
 		for _, e := range batch.entries {
 			if err := meter.Step(); err != nil {
 				return outcome{}, err
 			}
 			meter.Charge(costs.StorageRowRead)
+			scanActual += costs.StorageRowRead
 			if _, ok := matched[string(e.Key)]; ok {
 				continue
 			}
 			row, err := store.resolveColumns(e.Row, mask)
 			if err != nil {
 				return outcome{}, err
+			}
+			// A view target's row outside its WHERE chain is not a target row (views.md §15.2).
+			if plan.targetFilter != nil {
+				before := meter.Accrued
+				shown, err := plan.targetFilter.evalFilter(row, env, meter)
+				scanActual += meter.Accrued - before
+				if err != nil {
+					return outcome{}, err
+				}
+				if !shown {
+					continue
+				}
 			}
 			ci, chosen, err := choose(mergeNotMatchedBySource, row)
 			if err != nil {
@@ -726,6 +1044,7 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 				return outcome{}, err
 			}
 		}
+		db.explainActual.record("Scan "+m.Table, scanActual)
 	}
 
 	// End-state validation (§5). The vacated keys: every updated row's old key and every deleted
@@ -813,6 +1132,13 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 				return outcome{}, newUniqueViolation(table.Name, rindex.Name).
 					withDetail(db.indexDetailByName(table, rindex, row, detailExists))
 			}
+		}
+	}
+	// The check option of a MERGE into a view (views.md §15.6): each placed row, after the end-state
+	// keys and before EXCLUDE and FOREIGN KEY.
+	for _, row := range placed {
+		if err := evalViewChecks(plan.viewChecks, row, env, meter); err != nil {
+			return outcome{}, err
 		}
 	}
 	if err := db.validateExclusions(m.DB, table, colTypes, placed, vacated); err != nil {
@@ -1085,6 +1411,44 @@ func (db *engine) executeMergeTarget(m *mergeStmt, params []Value, ctx cteCtx) (
 		return outcome{Kind: outcomeQuery, ColumnNames: plan.returning.names, ColumnTypes: typeNames(plan.returning.types), Rows: returned, Cost: meter.Accrued}, nil
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued, RowsAffected: int64(len(actions)), HasRowsAffected: true}, nil
+}
+
+// mergeCandidate is one target row the matching loop considers for a source row: its storage key, the
+// row with the touched set resolved (the probe form resolves it as the row is read), and the row as
+// the scan returned it.
+type mergeCandidate struct {
+	key    []byte
+	row    storedRow
+	stored storedRow
+}
+
+// mergeTouched is the touched set of a target row (merge.md §9): every target column the join
+// condition, a MATCHED or NOT MATCHED BY SOURCE condition or SET right-hand side, or RETURNING
+// (target, old., or new.) reads.
+func mergeTouched(plan *mergePlan, n int) []bool {
+	mask := make([]bool, n)
+	collectTouched(plan.on, 0, mask)
+	for ci := range plan.clauses {
+		c := &plan.clauses[ci]
+		if c.kind == mergeNotMatchedByTarget {
+			continue
+		}
+		collectTouched(c.condition, 0, mask)
+		for i := range c.assigns {
+			collectTouched(c.assigns[i].source, 0, mask)
+		}
+	}
+	if plan.returning != nil {
+		mw := plan.m
+		retMask := make([]bool, mw+3*n+1)
+		for _, node := range plan.returning.nodes {
+			collectTouched(node, 0, retMask)
+		}
+		for i := range mask {
+			mask[i] = mask[i] || retMask[mw+i] || retMask[mw+n+i] || retMask[mw+2*n+i]
+		}
+	}
+	return mask
 }
 
 // mergeInsertColumns maps an INSERT action's value slots to target columns (merge.md §2):

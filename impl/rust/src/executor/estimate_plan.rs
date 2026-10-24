@@ -5,7 +5,7 @@ use super::*;
 use crate::estimator::{EstimatedPlan, PlanEstimate, estimate_rows, sat_add, sat_mul, scale_ceil};
 use crate::estimator_constants::*;
 
-struct EstimateCteCtx {
+pub(crate) struct EstimateCteCtx {
     modes: Vec<CteMode>,
     bodies: Vec<EstimatedPlan>,
 }
@@ -1289,7 +1289,11 @@ impl Engine {
         EstimatedPlan { root, nodes }
     }
 
-    fn estimate_query_plan(&self, plan: &QueryPlan, ctx: Option<&EstimateCteCtx>) -> EstimatedPlan {
+    pub(crate) fn estimate_query_plan(
+        &self,
+        plan: &QueryPlan,
+        ctx: Option<&EstimateCteCtx>,
+    ) -> EstimatedPlan {
         match plan {
             QueryPlan::Select(select) => self.estimate_select_plan(select, ctx),
             QueryPlan::SetOp(set_op) => self.estimate_set_op_plan(set_op, ctx),
@@ -1345,6 +1349,122 @@ impl Engine {
         self.add_expression_subqueries(&mut plan.root, Some(filter), invocation_rows, ctx);
         plan.nodes[0] = plan.root.clone();
         plan
+    }
+
+    /// Estimate a MERGE (spec/design/estimator.md §9.4): the source plan; the target probe — the
+    /// UPDATE/DELETE scan estimate of the join condition, its join-condition filter included —
+    /// repeated once per estimated source row, as an index-nested-loop inner; and the full target
+    /// scan of NOT MATCHED BY SOURCE. The matching loop delivers the repeated probe's matched rows;
+    /// the Merge root sums its children and estimates one action per source row plus one per scanned
+    /// not-matched-by-source row.
+    fn estimate_merge(
+        &self,
+        m: &Merge,
+        visible: &[&CteBinding],
+        ctx: Option<&EstimateCteCtx>,
+    ) -> Result<EstimatedPlan> {
+        let mut m = m.clone();
+        let mv = self.merge_target(&mut m)?;
+        let m = &m;
+        let table = self.merge_table(m);
+        let plan =
+            self.plan_merge_detached(m, table, mv.as_ref(), visible, &mut ParamTypes::default())?;
+        let source = self.estimate_query_plan(plan.source(), ctx);
+        let source_rows = source.root.rows;
+        let (nested, hashed) = self.estimate_merge_loop(
+            table,
+            m.db.as_deref(),
+            &source,
+            plan.on(),
+            plan.probe(),
+            plan.hash(),
+            ctx,
+        );
+        let matching = match (plan.hash(), hashed) {
+            (Some(_), Some(hashed)) => hashed,
+            _ => nested,
+        };
+        let mut root = matching.root.clone();
+        root.rows = source_rows;
+        root.logical_rows = source_rows;
+        if plan.has_by_source() {
+            let full =
+                self.estimate_mutation_scan(table, m.db.as_deref(), plan.target_filter(), ctx);
+            root = root.add(&full.root);
+            root.rows = sat_add(source_rows, full.root.rows);
+            root.logical_rows = root.rows;
+            return Ok(EstimatedPlan::parent(root, &[&matching, &full]));
+        }
+        Ok(EstimatedPlan::parent(root, &[&matching]))
+    }
+
+    /// The MERGE matching loop's two estimates (estimator.md §9.4) over the source estimate `source`:
+    /// the nested loop — the probe `P` (the selected scan with the complete join condition as its
+    /// WHERE) repeated per source row — and, given `hash` keys, the hash join — one full scan plus
+    /// the hash build over its rows, the probe per source row and per matched pair, and the join
+    /// condition per matched pair. Each is the loop node over `[source, scan]`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn estimate_merge_loop(
+        &self,
+        table: &Table,
+        db: Option<&str>,
+        source: &EstimatedPlan,
+        on: &RExpr,
+        probe: &RExpr,
+        hash: Option<&HashJoinPlan>,
+        ctx: Option<&EstimateCteCtx>,
+    ) -> (EstimatedPlan, Option<EstimatedPlan>) {
+        let source_rows = source.root.rows;
+        let per = self.estimate_mutation_scan(table, db, Some(probe), ctx);
+        let probes = per.root.repeated(source_rows);
+        let probe_scan = EstimatedPlan::leaf(per.nodes[1].repeated(source_rows));
+        let mut loop_root = source.root.add(&probes);
+        loop_root.rows = probes.rows;
+        loop_root.logical_rows = probes.logical_rows;
+        let nested = EstimatedPlan::parent(loop_root, &[source, &probe_scan]);
+        let hashed = hash.map(|hash| {
+            let rel = ScopeRel {
+                label: table.name.to_string(),
+                table,
+                offset: 0,
+                qualifier_only: false,
+                view: None,
+                base: false,
+                cte: None,
+                db: db.map(str::to_owned),
+                layer: None,
+            };
+            // Each key's width is its target column's: the type's fixed width, else the column's
+            // analyzed average width, else the default variable-width key (§8.4).
+            let width: i64 = hash
+                .keys
+                .iter()
+                .map(|key| match &key.ty {
+                    Type::Scalar(scalar) if scalar.is_fixed_width() => scalar.width_bytes() as i64,
+                    _ => current_column_statistics(&rel, key.right, self)
+                        .and_then(|statistics| statistics.average_width)
+                        .unwrap_or(DEFAULT_VARIABLE_KEY_BYTES)
+                        .max(1),
+                })
+                .fold(0, sat_add);
+            let framed = sat_add(sat_mul(4, hash.keys.len() as i64), width);
+            let scan = per.nodes[1].clone();
+            let matched = probes.rows;
+            let mut root = source.root.add(&scan);
+            root.add_unit(UNIT_HASH_BUILD, sat_mul(scan.rows, width));
+            root.add_unit(
+                UNIT_HASH_PROBE,
+                sat_add(sat_mul(source_rows, width), sat_mul(matched, framed)),
+            );
+            root.add_unit(
+                UNIT_OPERATOR_EVAL,
+                sat_mul(estimator_operator_nodes(Some(on)), matched),
+            );
+            root.rows = matched;
+            root.logical_rows = probes.logical_rows;
+            EstimatedPlan::parent(root, &[source, &EstimatedPlan::leaf(scan)])
+        });
+        (nested, hashed)
     }
 
     /// Build the pre-order estimate stream consumed by the EXPLAIN renderer.
@@ -1430,6 +1550,7 @@ impl Engine {
                     self.estimate_mutation_scan(table, delete.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])
             }
+            Statement::Merge(merge) => self.estimate_merge(merge, &visible, ctx)?,
             _ => self.estimate_query_plan(&self.plan_explain_inner(inner)?, None),
         };
         Ok(plan.nodes)
@@ -1451,7 +1572,7 @@ impl Engine {
                         DmStmt::Insert(v) => Statement::Insert((**v).clone()),
                         DmStmt::Update(v) => Statement::Update((**v).clone()),
                         DmStmt::Delete(v) => Statement::Delete((**v).clone()),
-                        DmStmt::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
+                        DmStmt::Merge(v) => Statement::Merge((**v).clone()),
                     };
                     let nodes = self.estimate_explain_scoped(&stmt, &bindings[..i], Some(&ctx))?;
                     EstimatedPlan {
@@ -1480,7 +1601,7 @@ impl Engine {
                 CteBody::Insert(v) => Statement::Insert((**v).clone()),
                 CteBody::Update(v) => Statement::Update((**v).clone()),
                 CteBody::Delete(v) => Statement::Delete((**v).clone()),
-                CteBody::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
+                CteBody::Merge(v) => Statement::Merge((**v).clone()),
                 CteBody::Query(_) => unreachable!("a query primary was planned above"),
             };
             let nodes = self.estimate_explain_scoped(&stmt, &bindings, Some(&ctx))?;

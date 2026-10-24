@@ -1,0 +1,173 @@
+# MERGE into an automatically updatable view (spec/design/merge.md §8, views.md §15): the statement
+# is the equivalent MERGE into the base table. The view's WHERE limits which base rows are target
+# rows — for matching and for NOT MATCHED BY SOURCE — its check option checks every inserted and
+# updated row, SET and INSERT name view columns (a read-only column is 0A000), and an INSERT fills
+# the other base columns from their defaults. Oracle-probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.view, dml.insert, dml.insert_multi_row, dml.merge, dml.returning, dml.view_write, dml.view_check_option, query.select, query.order_by, query.values, query.group_by, query.aggregates, types.i32, types.text, expr.arithmetic
+
+statement ok
+CREATE TABLE vb (id i32 PRIMARY KEY, v i32, w text DEFAULT 'd', hidden i32 DEFAULT 7)
+
+statement ok
+INSERT INTO vb VALUES (1, 10, 'a', 1), (2, 20, 'b', 2), (3, -5, 'c', 3)
+
+statement ok
+CREATE VIEW vpos AS SELECT id, v, w FROM vb WHERE v > 0
+
+# Row 3 is outside the view, so source row 3 is not matched and inserts (as 13).
+statement ok
+MERGE INTO vpos USING (VALUES (3, 99), (1, 11)) AS s(k, x) ON vpos.id = s.k
+WHEN MATCHED THEN UPDATE SET v = s.x
+WHEN NOT MATCHED THEN INSERT VALUES (s.k + 10, s.x)
+
+query IITI nosort
+SELECT id, v, w, hidden FROM vb ORDER BY id
+----
+1
+11
+a
+1
+2
+20
+b
+2
+3
+-5
+c
+3
+13
+99
+d
+7
+
+# NOT MATCHED BY SOURCE reaches only the rows the view shows.
+statement ok
+MERGE INTO vpos USING (VALUES (1)) AS s(k) ON vpos.id = s.k
+WHEN NOT MATCHED BY SOURCE AND vpos.v < 50 THEN DELETE
+
+query II nosort
+SELECT id, v FROM vb ORDER BY id
+----
+1
+11
+3
+-5
+13
+99
+
+# A target alias, and RETURNING through the view's columns (old / new too).
+statement ok
+CREATE TABLE vr (id i32 PRIMARY KEY, v i32, w text DEFAULT 'd')
+
+statement ok
+INSERT INTO vr VALUES (1, 10, 'a')
+
+statement ok
+CREATE VIEW vrv AS SELECT id, v FROM vr WHERE v > 0
+
+query TIIII rowsort
+MERGE INTO vrv AS p USING (VALUES (1, 5), (2, 6)) AS s(k, x) ON p.id = s.k
+WHEN MATCHED THEN UPDATE SET v = p.v + s.x
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.k, s.x)
+RETURNING merge_action(), p.id, p.v, old.v, new.v
+----
+INSERT
+2
+6
+NULL
+6
+UPDATE
+1
+15
+10
+15
+
+# The check option checks updated and inserted rows (44000).
+statement ok
+CREATE VIEW vchk AS SELECT id, v FROM vb WHERE v > 0 WITH CHECK OPTION
+
+statement error 44000
+MERGE INTO vchk USING (VALUES (1, -1)) AS s(k, x) ON vchk.id = s.k
+WHEN MATCHED THEN UPDATE SET v = s.x
+
+statement error 44000
+MERGE INTO vchk USING (VALUES (9, -1)) AS s(k, x) ON vchk.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.x)
+
+statement ok
+MERGE INTO vchk USING (VALUES (1, 12), (9, 90)) AS s(k, x) ON vchk.id = s.k
+WHEN MATCHED THEN UPDATE SET v = s.x
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.x)
+
+query II nosort
+SELECT id, v FROM vb ORDER BY id
+----
+1
+12
+3
+-5
+9
+90
+13
+99
+
+# A read-only (expression) column cannot be assigned or inserted into; the others can.
+statement ok
+CREATE VIEW vexpr AS SELECT id, v * 2 AS v2, w FROM vb
+
+statement error 0A000
+MERGE INTO vexpr USING (VALUES (1)) AS s(k) ON vexpr.id = s.k
+WHEN MATCHED THEN UPDATE SET v2 = 1
+
+statement error 0A000
+MERGE INTO vexpr USING (VALUES (20)) AS s(k) ON vexpr.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, 1, 'n')
+
+statement ok
+MERGE INTO vexpr USING (VALUES (1), (20)) AS s(k) ON vexpr.id = s.k
+WHEN MATCHED THEN UPDATE SET w = 'z'
+WHEN NOT MATCHED THEN INSERT (id, w) VALUES (s.k, 'n')
+
+query IITI nosort
+SELECT id, v, w, hidden FROM vb WHERE id IN (1, 20) ORDER BY id
+----
+1
+12
+z
+1
+20
+NULL
+n
+7
+
+# A view that is not automatically updatable (55000).
+statement ok
+CREATE VIEW vgrp AS SELECT id, count(*) AS n FROM vb GROUP BY id
+
+statement error 55000
+MERGE INTO vgrp USING (VALUES (1)) AS s(k) ON vgrp.id = s.k
+WHEN MATCHED THEN DELETE
+
+# A view over a view: both WHERE clauses limit the target rows.
+statement ok
+CREATE VIEW vlow AS SELECT id, v FROM vpos WHERE id < 10
+
+statement ok
+MERGE INTO vlow USING (VALUES (1, 0), (3, 0), (9, 0), (13, 0)) AS s(k, x) ON vlow.id = s.k
+WHEN MATCHED THEN UPDATE SET v = s.x
+WHEN NOT MATCHED THEN DO NOTHING
+
+query II nosort
+SELECT id, v FROM vb ORDER BY id
+----
+1
+0
+3
+-5
+9
+0
+13
+99
+20
+NULL

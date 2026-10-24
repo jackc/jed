@@ -1086,6 +1086,25 @@ second-affect rule (`21000`), a primary-key assignment re-keying the row, the `D
 check option costs its equivalent base statement, and a check option adds its `WHERE` evaluations
 (§15.6). `EXPLAIN` renders the base statement (`Insert t`). A writable CTE may hold the statement.
 
+### 15.8 `MERGE`
+
+`MERGE INTO v …` through an updatable view is the equivalent `MERGE` into its base table
+([merge.md](merge.md) §8), as PostgreSQL rewrites it. Each action clause is a write of its own kind
+through `v` and is validated as that statement is, clause by clause in written order (§15.3): a
+view not updatable for the clause's action is `55000`; an `UPDATE` action's `SET` columns and an
+`INSERT` action's column list name `v`'s columns (`42703`, a read-only column `0A000`, two over one
+base column `42701`); an `INSERT` without a column list targets `v`'s first columns, one per value.
+`SET c = DEFAULT` assigns the view column's default (§16.1), and an `INSERT` fills the base columns
+it omits from the view column defaults, then the table's.
+
+**Target rows are the rows `v` shows.** The view's `WHERE` chain (§15.2) leads the join condition,
+AND-ed left-deep, so a base row `v` hides never matches — its source row is not matched — and the
+not-matched-by-source scan reads the chain as its `WHERE`. Inserted rows are not filtered (as for
+`INSERT`). **Check option**: every inserted and updated row is checked (§15.6) after the end-state key
+checks and before `EXCLUDE` and `FOREIGN KEY`. Names in the join condition, the clauses, and
+`RETURNING` see `v`'s columns under `v`'s name or the alias; privileges are `v`'s (§15.4); EXPLAIN
+renders the base-table statement (§15.5).
+
 ## 16. Column defaults and view options
 
 ### 16.1 Column defaults (`format_version` 48)

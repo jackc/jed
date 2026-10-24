@@ -61,6 +61,7 @@ import type {
   JsonWrapper,
   JtColumn,
   Merge,
+  MergeClause,
   MergeMatch,
   OnConflict,
   OrderKey,
@@ -110,6 +111,8 @@ import {
   type MergePlan,
   type MergePlanned,
   type MergeReturning,
+  type MergeView,
+  mergeHasBySource,
   mergeInsertColumns,
   mergeSourceRel,
   mergeTargetRel,
@@ -168,7 +171,7 @@ import {
 } from "./unparsed.ts";
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
-import { optimizeSelect } from "./optimize.ts";
+import { mergeHashJoinPlan, optimizeSelect } from "./optimize.ts";
 import {
   ctasColumns,
   ctasQueryStatement,
@@ -764,7 +767,6 @@ import {
   typeFromResolved,
   typeNames,
   withHasDml,
-  withHasMerge,
   withNote,
 } from "./scope.ts";
 import type { ExplainRow, PrivReq, UnseenFrame, UnseenRel } from "./scope.ts";
@@ -4300,13 +4302,41 @@ export class Engine {
   // collectMergeCatalogPrivs adds the catalog expressions a MERGE evaluates (spec/design/merge.md
   // §10): the defaults of each INSERT action's omitted columns and DEFAULT slots, each UPDATE action's
   // SET c = DEFAULT, and the target's CHECK constraints when any action writes.
-  private collectMergeCatalogPrivs(m: Merge, req: PrivReq): void {
-    const table = this.lkpTableScoped(m.db, m.table);
-    if (table === undefined) return;
+  private collectMergeCatalogPrivs(written: Merge, req: PrivReq): void {
+    // A MERGE into a view is retargeted first, as execution does (views.md §15.8): `SET c = DEFAULT`
+    // then assigns the view column default, and an INSERT applies the view column defaults in place
+    // of the table's.
+    let m: Merge;
+    let mv: MergeView | null;
+    try {
+      ({ m, mv } = this.rewriteMergeTarget(written));
+    } catch {
+      return;
+    }
+    const base = this.lkpTableScoped(m.db, m.table);
+    if (base === undefined) return;
     let writes = false;
-    for (const c of m.clauses) {
+    for (let ci = 0; ci < m.clauses.length; ci++) {
+      const c = m.clauses[ci]!;
+      const was = written.clauses[ci]!;
+      let table = base;
+      const cvw = mv?.clauses[ci] ?? null;
+      if (cvw !== null && cvw.defaultOverrides.length > 0) {
+        const overriding = c.action.kind === "insert" ? c.action.overriding : null;
+        try {
+          table = this.tableWithViewDefaults(base, cvw, overriding);
+        } catch {
+          return;
+        }
+      }
       if (c.action.kind === "update") {
         writes = true;
+        if (was.action.kind === "update") {
+          const original = was.action.assignments;
+          c.action.assignments.forEach((a, i) => {
+            if (original[i]!.isDefault && !a.isDefault) collectExprPrivs(a.value, req, new Set());
+          });
+        }
         collectAssignmentDefaultPrivs(table, c.action.assignments, req);
       } else if (c.action.kind === "insert") {
         writes = true;
@@ -4329,7 +4359,7 @@ export class Engine {
         });
       }
     }
-    if (writes) collectCheckPrivs(table, req);
+    if (writes) collectCheckPrivs(base, req);
   }
 
   private collectUpdateCatalogPrivs(written: Update, req: PrivReq): void {
@@ -4604,11 +4634,6 @@ export class Engine {
       case "merge":
         return yield* this.executeMergeSteps(stmt, params, EMPTY_CTE_CTX);
       case "explain":
-        // EXPLAIN of a MERGE — directly (refused by the parser) or in a WITH — is a deferred
-        // follow-on (spec/design/merge.md §12).
-        if (stmt.inner.kind === "with" && withHasMerge(stmt.inner)) {
-          throw engineError("feature_not_supported", "EXPLAIN MERGE is not supported");
-        }
         return yield* this.executeExplainSteps(stmt, params);
       default:
         // Transaction control (begin/commit/rollback) is handled by executeStmtParams before
@@ -5977,7 +6002,116 @@ export class Engine {
       const scan = this.estimateMutationScan(table, stmt.db, filter, ctx);
       return parentEstimatedPlan(scan.root, scan).nodes;
     }
+    if (inner.kind === "merge") return this.estimateMerge(inner, bindings, ctx).nodes;
     return this.estimateQueryPlan(this.planExplainInner(inner), null).nodes;
+  }
+
+  // estimateMerge estimates a MERGE (spec/design/estimator.md §9.4): the source plan; the target
+  // probe — the UPDATE/DELETE scan estimate of the join condition, its join-condition filter
+  // included — repeated once per estimated source row, as an index-nested-loop inner; and the full
+  // target scan of NOT MATCHED BY SOURCE. The matching loop delivers the repeated probe's matched
+  // rows; the Merge root sums its children and estimates one action per source row plus one per
+  // scanned not-matched-by-source row.
+  private estimateMerge(
+    written: Merge,
+    visible: CteBinding[],
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
+    const { m, mv } = this.mergeTarget(written);
+    const table = this.mergeTable(m);
+    const plan = this.planMergeDetached(m, table, mv, visible, new ParamTypes());
+    const source = this.estimateQueryPlan(plan.source, ctx);
+    const sourceRows = source.root.rows;
+    const { nested, hashed } = this.estimateMergeLoop(
+      table,
+      m.db,
+      source,
+      plan.on,
+      plan.probe,
+      plan.hash,
+      ctx,
+    );
+    const matching = plan.hash !== null && hashed !== null ? hashed : nested;
+    const root = clonePlanEstimate(matching.root);
+    root.rows = sourceRows;
+    root.logicalRows = sourceRows;
+    if (mergeHasBySource(plan)) {
+      const full = this.estimateMutationScan(table, m.db, plan.targetFilter, ctx);
+      const total = addPlanEstimates(root, full.root);
+      total.rows = saturatingEstimateAdd(sourceRows, full.root.rows);
+      total.logicalRows = total.rows;
+      return parentEstimatedPlan(total, matching, full);
+    }
+    return parentEstimatedPlan(root, matching);
+  }
+
+  // estimateMergeLoop is the MERGE matching loop's two estimates (estimator.md §9.4) over the source
+  // estimate: the nested loop — the probe P (the selected scan with the complete join condition as
+  // its WHERE) repeated per source row — and, given hash keys, the hash join — one full scan plus the
+  // hash build over its rows, the probe per source row and per matched pair, and the join condition
+  // per matched pair. Each is the loop node over [source, scan].
+  private estimateMergeLoop(
+    table: Table,
+    db: string | undefined,
+    source: EstimatedPlan,
+    on: RExpr,
+    probe: RExpr,
+    hash: HashJoinPlan | null,
+    ctx: EstimateCteContext | null,
+  ): { nested: EstimatedPlan; hashed: EstimatedPlan | null } {
+    const sourceRows = source.root.rows;
+    const per = this.estimateMutationScan(table, db, probe, ctx);
+    const probes = repeatPlanEstimate(per.root, sourceRows);
+    const probeScan = leafEstimatedPlan(repeatPlanEstimate(per.nodes[1]!, sourceRows));
+    const loopRoot = addPlanEstimates(source.root, probes);
+    loopRoot.rows = probes.rows;
+    loopRoot.logicalRows = probes.logicalRows;
+    const nested = parentEstimatedPlan(loopRoot, source, probeScan);
+    if (hash === null) return { nested, hashed: null };
+    const rel: ScopeRel = {
+      label: table.name,
+      table,
+      offset: 0,
+      ...(db === undefined ? {} : { db }),
+    };
+    // Each key's width is its target column's: the type's fixed width, else the column's analyzed
+    // average width, else the default variable-width key (§8.4).
+    let width = 0n;
+    for (const key of hash.keys) {
+      const scalar = typeAsScalar(key.type);
+      let w: bigint;
+      if (scalar !== undefined && isFixedWidth(scalar)) w = BigInt(widthBytes(scalar));
+      else {
+        w =
+          currentColumnStatistics(this, rel, key.right)?.averageWidth ?? DEFAULT_VARIABLE_KEY_BYTES;
+        if (w < 1n) w = 1n;
+      }
+      width = saturatingEstimateAdd(width, w);
+    }
+    const framed = saturatingEstimateAdd(
+      saturatingEstimateMultiply(4n, BigInt(hash.keys.length)),
+      width,
+    );
+    const scan = clonePlanEstimate(per.nodes[1]!);
+    const matched = probes.rows;
+    const root = addPlanEstimates(source.root, scan);
+    addPlanUnit(root, UNIT_HASH_BUILD, saturatingEstimateMultiply(scan.rows, width));
+    addPlanUnit(
+      root,
+      UNIT_HASH_PROBE,
+      saturatingEstimateAdd(
+        saturatingEstimateMultiply(sourceRows, width),
+        saturatingEstimateMultiply(matched, framed),
+      ),
+    );
+    addPlanUnit(
+      root,
+      UNIT_OPERATOR_EVAL,
+      saturatingEstimateMultiply(estimatorOperatorNodes(on), matched),
+    );
+    root.rows = matched;
+    root.logicalRows = probes.logicalRows;
+    return { nested, hashed: parentEstimatedPlan(root, source, leafEstimatedPlan(scan)) };
   }
 
   private estimateExplainWithDml(wq: WithQuery): PlanEstimate[] {
@@ -6012,7 +6146,7 @@ export class Engine {
         ? this.estimateQueryPlan(wp.primary, ctx)
         : (() => {
             const nodes = this.estimateExplainScoped(
-              wp.body as Insert | Update | Delete,
+              wp.body as Insert | Update | Delete | Merge,
               wp.bindings,
               ctx,
             );
@@ -6309,6 +6443,9 @@ export class Engine {
       case "delete":
         this.explainDelete(r, inner, depth, bindings);
         return;
+      case "merge":
+        this.explainMerge(r, inner, depth, bindings);
+        return;
       case "with":
         if (withHasDml(inner)) {
           this.renderExplainWithDml(r, inner, depth);
@@ -6356,7 +6493,13 @@ export class Engine {
       } else this.renderExplain(r, binding.source.dm.stmt, depth + 2, plan.bindings.slice(0, i));
     }
     if (plan.primary !== null) this.renderQueryPlan(r, plan.primary, depth + 1);
-    else this.renderExplain(r, plan.body as Insert | Update | Delete, depth + 1, plan.bindings);
+    else
+      this.renderExplain(
+        r,
+        plan.body as Insert | Update | Delete | Merge,
+        depth + 1,
+        plan.bindings,
+      );
   }
 
   // explainInsert renders an INSERT plan: the Insert root (with an ON CONFLICT note), then the row
@@ -6439,6 +6582,41 @@ export class Engine {
       this.explainDeleteTouched(table, del, filter, bindings, vw),
       depth + 1,
     );
+  }
+
+  // explainMerge renders a MERGE plan (spec/design/merge.md §12, explain.md §4): the Merge root, the
+  // matching loop — a left Nested Loop (or its Hash Join form) over the source subtree and the
+  // per-source-row target probe Scan — and, with a NOT MATCHED BY SOURCE clause, the full target
+  // Scan. It resolves the statement but never writes.
+  private explainMerge(
+    r: ExplainRender,
+    written: Merge,
+    depth: number,
+    bindings: CteBinding[],
+  ): void {
+    // A MERGE into a view renders its base-table statement (views.md §15.5).
+    const { m, mv } = this.mergeTarget(written);
+    const table = this.mergeTable(m);
+    const plan = this.planMergeDetached(m, table, mv, bindings, new ParamTypes());
+    r.emit(depth, "Merge " + m.table, `when=${m.clauses.length}`);
+    const on = r.verbose ? `on=${renderRExpr(plan.on)}` : `on:conjuncts=${conjunctCount(plan.on)}`;
+    if (plan.hash !== null) {
+      r.emit(depth + 1, "Hash Join", `left; keys=${plan.hash.keys.length}; ${on}`);
+    } else {
+      r.emit(depth + 1, "Nested Loop", `left; ${on}`);
+    }
+    this.renderQueryPlan(r, plan.source, depth + 2);
+    const mask = mergeTouched(plan, table.columns.length);
+    const bound = this.planMutationScan(
+      m.db,
+      table,
+      plan.probe,
+      whereContradicts(plan.probe),
+    ).bound;
+    r.emit(depth + 2, "Scan " + table.name, this.scanDetail(table.name, bound, false, mask));
+    if (mergeHasBySource(plan)) {
+      this.renderDmlScan(r, table, table.name, plan.targetFilter, mask, depth + 1);
+    }
   }
 
   // explainDmlFilter resolves an UPDATE/DELETE WHERE predicate against a single-table scope (the same
@@ -16456,80 +16634,169 @@ export class Engine {
   }
 
   // mergeTarget makes the target checks every MERGE makes before resolving anything (merge.md §8): a
-  // catalog relation is 42809, a read-only attachment 25006, a view 0A000, a missing table 42P01.
-  private mergeTarget(m: Merge): Table {
-    checkCatalogRelWrite(m.table);
-    this.checkAttachmentWritable(m.db);
-    if (this.dmlTargetView(m.db, m.table) !== undefined) {
-      throw engineError("feature_not_supported", "MERGE into a view is not supported");
-    }
+  // catalog relation is 42809, a read-only attachment 25006, a missing table 42P01. A view target is
+  // retargeted at its base table first (rewriteMergeTarget), so the returned statement then names
+  // the table; mv carries the view layering. The written statement is left intact.
+  private mergeTarget(written: Merge): { m: Merge; mv: MergeView | null } {
+    checkCatalogRelWrite(written.table);
+    this.checkAttachmentWritable(written.db);
+    const { m, mv } = this.rewriteMergeTarget(written);
     this.checkTargetQualifier(m.db, m.table, m.tableLoc);
-    const table = this.lkpTableScoped(m.db, m.table);
-    if (table === undefined) {
+    if (this.lkpTableScoped(m.db, m.table) === undefined) {
       throw engineError("undefined_table", "table does not exist: " + m.table).atTarget(m.tableLoc);
     }
+    return { m, mv };
+  }
+
+  // mergeNode is the plan-node label of a MERGE (explain.md §5): `Merge <table>`, naming the base
+  // table of a view target as EXPLAIN renders it (views.md §15.5). A target the rewrite refuses names
+  // itself; its error surfaces when the MERGE runs.
+  private mergeNode(m: Merge): string {
+    try {
+      return "Merge " + this.rewriteMergeTarget(m).m.table;
+    } catch {
+      return "Merge " + m.table;
+    }
+  }
+
+  // mergeTable is the target table of a MERGE mergeTarget validated.
+  private mergeTable(m: Merge): Table {
+    const table = this.lkpTableScoped(m.db, m.table);
+    if (table === undefined) throw new Error("mergeTarget validated the target");
     return table;
+  }
+
+  // rewriteMergeTarget retargets a MERGE into an automatically updatable view at its base table
+  // (merge.md §8, views.md §15.2), clause by clause in written order: an UPDATE's SET columns and an
+  // INSERT's column list name view columns and are validated like the standalone statement's (42703,
+  // 42701, a read-only column 0A000, a view not updatable for the action 55000), then become the
+  // base columns; `SET c = DEFAULT` assigns the view column's default. An INSERT without a column
+  // list targets the view's first columns, one per value. It returns a copy of the statement (the
+  // written one is left intact) and the layering, or the statement unchanged and null when the
+  // target is a table.
+  private rewriteMergeTarget(m: Merge): { m: Merge; mv: MergeView | null } {
+    if (this.dmlTargetView(m.db, m.table) === undefined) return { m, mv: null };
+    const layers: (ViewWrite | null)[] = [];
+    const clauses: MergeClause[] = [];
+    for (const c of m.clauses) {
+      const action = c.action;
+      switch (action.kind) {
+        case "doNothing":
+          layers.push(null);
+          clauses.push(c);
+          break;
+        case "delete":
+          layers.push(this.prepareViewWrite(m.db, m.table, "delete", null));
+          clauses.push(c);
+          break;
+        case "update": {
+          const vw = this.prepareViewWrite(
+            m.db,
+            m.table,
+            "update",
+            action.assignments.map((a) => a.column),
+            action.assignments.map((a) => a.loc),
+          )!;
+          const assignments = action.assignments.map((a, i) =>
+            a.isDefault
+              ? {
+                  ...a,
+                  column: vw.targets[i]!,
+                  isDefault: false,
+                  value: this.viewSetDefault(vw.view, a.column),
+                }
+              : { ...a, column: vw.targets[i]! },
+          );
+          layers.push(vw);
+          clauses.push({ ...c, action: { ...action, assignments } });
+          break;
+        }
+        case "insert": {
+          const viewCols = this.dmlTargetView(m.db, m.table)!.columns;
+          const targets = action.columns ?? viewCols.slice(0, action.values.length);
+          const vw = this.prepareViewWrite(m.db, m.table, "insert", targets, action.columnLocs)!;
+          layers.push(vw);
+          clauses.push({ ...c, action: { ...action, columns: vw.targets.slice() } });
+          break;
+        }
+      }
+    }
+    // The layering the scopes expose: the chain validated for the weakest action, so a MERGE of only
+    // DO NOTHING clauses still names an updatable view.
+    const top = this.prepareViewWrite(m.db, m.table, "delete", null)!;
+    const { db: _db, ...rest } = m;
+    return { m: { ...rest, table: top.table, clauses }, mv: { clauses: layers, top } };
   }
 
   // planMerge resolves a MERGE against its target (merge.md §2): the source query, the join
   // condition, every WHEN clause in written order, then RETURNING — PostgreSQL's analysis order.
-  private planMerge(m: Merge, table: Table, bindings: CteBinding[], ptypes: ParamTypes): MergePlan {
+  private planMerge(
+    m: Merge,
+    table: Table,
+    mv: MergeView | null,
+    bindings: CteBinding[],
+    ptypes: ParamTypes,
+  ): MergePlan {
     const n = table.columns.length;
+    const vw = mv?.top ?? null;
     const source = this.planQuery(m.source, null, bindings, ptypes);
     const label = m.sourceLabel ?? "";
-    const srcTable = cteSyntheticTable(label, source, null);
+    // A joined source is an unaliased join group (merge.md §2): one relation with no label whose
+    // inner labels stay visible, its columns the group's (hidden USING copies included).
+    const group = source.kind === "select" ? source.group : null;
+    const srcTable: Table =
+      group !== null
+        ? {
+            name: "",
+            columns: group.columns,
+            pk: [],
+            checks: [],
+            indexes: [],
+            fks: [],
+            exclusions: [],
+          }
+        : cteSyntheticTable(label, source, null);
     const width = srcTable.columns.length;
-    const targetLabel = m.alias ?? table.name;
+    const targetLabel = m.alias ?? (vw !== null ? vw.view : table.name);
     if (label !== "" && label === targetLabel) {
       throw engineError("duplicate_alias", `name "${label}" specified more than once`);
     }
     const both = new Scope(
-      [mergeTargetRel(table, m.alias, 0), mergeSourceRel(srcTable, label, n)],
+      [mergeTargetRel(table, vw, m.alias, 0), mergeSourceRel(srcTable, label, n)],
       this,
       null,
       true,
       bindings,
     );
+    withSourceGroup(both, group, n);
     const srcOnly = new Scope([mergeSourceRel(srcTable, label, 0)], this, null, true, bindings);
-    const tgtOnly = new Scope([mergeTargetRel(table, m.alias, 0)], this, null, true, bindings);
-    const on = resolveBooleanFilter(both, m.on, ptypes);
+    withSourceGroup(srcOnly, group, 0);
+    const tgtOnly = new Scope([mergeTargetRel(table, vw, m.alias, 0)], this, null, true, bindings);
+    // A view target's rows are those its WHERE chain shows (views.md §15.2): the chain leads the join
+    // condition (and filters the not-matched-by-source scan), AND-ed left-deep.
+    const lead = (cond: RExpr): RExpr => {
+      const view = this.resolveWriteFilter(tgtOnly, table, vw, null, new ParamTypes());
+      return view === null ? cond : { kind: "and", lhs: view, rhs: cond };
+    };
+    const on = lead(resolveBooleanFilter(both, m.on, ptypes));
     // The probe form: the target is the relation, the source an enclosing level (§3). The combined
     // resolution above already raised every name error.
     const probeScope = new Scope(
-      [mergeTargetRel(table, m.alias, 0)],
+      [mergeTargetRel(table, vw, m.alias, 0)],
       this,
       srcOnly,
       true,
       bindings,
     );
-    const probe = resolveBooleanFilter(probeScope, m.on, new ParamTypes());
-
-    // An INSERT's omitted columns resolve their expression defaults once per statement
-    // (constraints.md §2); only the columns some action can default resolve.
-    const need: boolean[] = new Array(n).fill(false);
-    for (const c of m.clauses) {
-      if (c.action.kind !== "insert") continue;
-      let provided: number[];
-      try {
-        ({ provided } = mergeInsertColumns(
-          table,
-          c.action.columns,
-          [],
-          c.action.overriding,
-          c.action.values,
-        ));
-      } catch {
-        continue; // the clause's own resolution below raises the error
-      }
-      for (let i = 0; i < n; i++) if (provided[i]! < 0) need[i] = true;
-    }
-    const defaultExprs = need.some((b) => b)
-      ? this.resolveDefaultExprsFor(table, need)
-      : table.columns.map(() => null);
+    const probe = lead(resolveBooleanFilter(probeScope, m.on, new ParamTypes()));
+    const targetFilter = this.resolveWriteFilter(tgtOnly, table, vw, null, new ParamTypes());
+    const hash = this.mergeHashChoice(m.db, table, source, on, probe, both);
+    const viewChecks = this.resolveViewChecks(table, vw);
 
     const forbidden = (): AggCtx => ({ collecting: false, groupKeys: [], specs: [] });
     const clauses: MergeClausePlan[] = [];
-    for (const c of m.clauses) {
+    for (let ci = 0; ci < m.clauses.length; ci++) {
+      const c = m.clauses[ci]!;
       const scope =
         c.match === "matched" ? both : c.match === "notMatchedByTarget" ? srcOnly : tgtOnly;
       const condition =
@@ -16549,13 +16816,25 @@ export class Engine {
           };
           break;
         case "insert": {
+          // Through a view, the view column defaults replace the table's (views.md §16.1).
+          const cvw = mv?.clauses[ci] ?? null;
+          const rowTable =
+            cvw !== null && cvw.defaultOverrides.length > 0
+              ? this.tableWithViewDefaults(table, cvw, c.action.overriding)
+              : table;
           const { provided, slotCol } = mergeInsertColumns(
-            table,
+            rowTable,
             c.action.columns,
             c.action.columnLocs,
             c.action.overriding,
             c.action.values,
           );
+          // The omitted columns' expression defaults, resolved once for this action
+          // (constraints.md §2).
+          const need = provided.map((p) => p < 0);
+          const defaults = need.some((b) => b)
+            ? this.resolveDefaultExprsFor(rowTable, need)
+            : table.columns.map(() => null);
           const nodes: (RExpr | null)[] = [];
           for (let p = 0; p < c.action.values.length; p++) {
             const e = c.action.values[p]!;
@@ -16581,7 +16860,7 @@ export class Engine {
               nodes.push(resolveContainerAssign(scope, col, e, forbidden(), ptypes));
             }
           }
-          action = { kind: "insert", provided, values: nodes };
+          action = { kind: "insert", provided, values: nodes, table: rowTable, defaults };
           break;
         }
       }
@@ -16590,11 +16869,74 @@ export class Engine {
 
     let returning: MergeReturning | null = null;
     if (m.returning !== null) {
-      const scope = this.mergeReturningScope(table, m.alias, srcTable, label, m.returning);
+      const scope = this.mergeReturningScope(table, vw, m.alias, srcTable, label, m.returning);
+      withSourceGroup(scope, group, 0);
       scope.ctes = bindings;
       returning = resolveProjections(scope, m.returning.items, forbidden(), ptypes);
     }
-    return { source, width, on, probe, clauses, defaultExprs, returning };
+    return {
+      source,
+      width,
+      on,
+      probe,
+      clauses,
+      hash,
+      targetFilter,
+      viewChecks,
+      returning,
+    };
+  }
+
+  // planMergeDetached is planMerge for a MERGE that is not about to run — a writable CTE's RETURNING
+  // schema, EXPLAIN's render and estimate. The CTE references the planning counts are restored: the
+  // orchestrator static-counts a data-modifying part's references (writable-cte.md §3).
+  private planMergeDetached(
+    m: Merge,
+    table: Table,
+    mv: MergeView | null,
+    bindings: CteBinding[],
+    ptypes: ParamTypes,
+  ): MergePlan {
+    const saved = bindings.map((b) => ({ refs: b.refs, expanded: b.expanded }));
+    try {
+      return this.planMerge(m, table, mv, bindings, ptypes);
+    } finally {
+      bindings.forEach((b, i) => {
+        b.refs = saved[i]!.refs;
+        b.expanded = saved[i]!.expanded;
+      });
+    }
+  }
+
+  // mergeHashChoice chooses the matching loop's form (merge.md §3, estimator.md §9.4): the hash join
+  // when the probe's selected path is a full scan, the join condition passes the hash join's
+  // structural gate (cost.md §3 "JOIN"), at least one conjunct equates a target column with a source
+  // column of the same keyable type, and the hash estimate is strictly cheaper than the nested
+  // loop's. The estimates read no CTE context, so EXPLAIN and execution choose identically.
+  private mergeHashChoice(
+    db: string | undefined,
+    table: Table,
+    source: QueryPlan,
+    on: RExpr,
+    probe: RExpr,
+    scope: Scope,
+  ): HashJoinPlan | null {
+    const probePlan = this.planMutationScan(db, table, probe, whereContradicts(probe));
+    if (probePlan.bound !== null || probePlan.contradiction) return null;
+    const hash = mergeHashJoinPlan(on, table.columns.length, scope.rels);
+    if (hash === null) return null;
+    const sourceEstimate = this.estimateQueryPlan(source, null);
+    const { nested, hashed } = this.estimateMergeLoop(
+      table,
+      db,
+      sourceEstimate,
+      on,
+      probe,
+      hash,
+      null,
+    );
+    if (hashed === null) return null;
+    return planEstimateCost(hashed.root) < planEstimateCost(nested.root) ? hash : null;
   }
 
   // mergeAssignments resolves one UPDATE action's assignments against its clause scope — the
@@ -16672,6 +17014,7 @@ export class Engine {
   // grammar.md §32.
   private mergeReturningScope(
     table: Table,
+    vw: ViewWrite | null,
     alias: string | undefined,
     srcTable: Table,
     label: string,
@@ -16679,7 +17022,10 @@ export class Engine {
   ): Scope {
     const n = table.columns.length;
     const w = srcTable.columns.length;
-    const rels: ScopeRel[] = [mergeSourceRel(srcTable, label, 0), mergeTargetRel(table, alias, w)];
+    const rels: ScopeRel[] = [
+      mergeSourceRel(srcTable, label, 0),
+      mergeTargetRel(table, vw, alias, w),
+    ];
     for (const explicit of [
       { alias: ret.oldAlias, offset: w + n },
       { alias: ret.newAlias, offset: w + 2 * n },
@@ -16689,14 +17035,14 @@ export class Engine {
       if (rels.some((r) => r.label === a)) {
         throw engineError("duplicate_alias", `table name ${a} specified more than once`);
       }
-      rels.push(mergeVersionRel(table, a, explicit.offset));
+      rels.push(mergeVersionRel(table, vw, a, explicit.offset));
     }
     for (const pseudo of [
       { label: "old", offset: w + n, aliased: ret.oldAlias !== null },
       { label: "new", offset: w + 2 * n, aliased: ret.newAlias !== null },
     ]) {
       if (!pseudo.aliased && !rels.some((r) => r.label === pseudo.label)) {
-        rels.push(mergeVersionRel(table, pseudo.label, pseudo.offset));
+        rels.push(mergeVersionRel(table, vw, pseudo.label, pseudo.offset));
       }
     }
     const scope = new Scope(rels, this, null, true);
@@ -16710,8 +17056,9 @@ export class Engine {
     ctx: CteCtx,
     planning: Planning,
   ): Steps<Outcome> {
-    const table = this.mergeTarget(m);
-    const db = m.db;
+    const { m: target, mv } = this.mergeTarget(m);
+    const table = this.mergeTable(target);
+    const db = target.db;
     const relation = table.name;
     this.ensureCollationsWritable(table.columns);
     const n = table.columns.length;
@@ -16722,7 +17069,7 @@ export class Engine {
     const colTypes = store.columnTypes();
     const colls = this.columnCollations(table.columns);
     const ptypes = new ParamTypes();
-    const plan = this.planMerge(m, table, ctx.bindings, ptypes);
+    const plan = this.planMerge(target, table, mv, ctx.bindings, ptypes);
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () => this.executeMergeSteps(m, params, ctx));
@@ -16734,6 +17081,13 @@ export class Engine {
     const foldCost = { value: 0n };
     yield* this.foldUncorrelatedInPlanSteps(plan.source, bound, ctx, foldCost);
     plan.on = yield* this.foldUncorrelatedInRExprSteps(plan.on, bound, ctx, foldCost);
+    if (plan.targetFilter !== null)
+      plan.targetFilter = yield* this.foldUncorrelatedInRExprSteps(
+        plan.targetFilter,
+        bound,
+        ctx,
+        foldCost,
+      );
     for (const c of plan.clauses) {
       if (shouldCooperate()) yield COOPERATE;
       if (c.condition !== null)
@@ -16758,6 +17112,10 @@ export class Engine {
         nodes[i] = yield* this.foldUncorrelatedInRExprSteps(nodes[i]!, bound, ctx, foldCost);
       }
     }
+    for (const c of plan.viewChecks) {
+      if (shouldCooperate()) yield COOPERATE;
+      c.check = yield* this.foldUncorrelatedInRExprSteps(c.check, bound, ctx, foldCost);
+    }
     meter.charge(foldCost.value);
 
     // The source (§3): `SELECT * FROM source_ref`, its rows buffered and its cost charged.
@@ -16767,22 +17125,7 @@ export class Engine {
     const w = plan.width;
 
     // The touched set (§9): every target column any part of the statement reads.
-    const mask: boolean[] = new Array(n).fill(false);
-    collectTouched(plan.on, 0, mask);
-    for (const c of plan.clauses) {
-      if (c.match === "notMatchedByTarget") continue;
-      if (c.condition !== null) collectTouched(c.condition, 0, mask);
-      if (c.action.kind === "update") {
-        for (const a of c.action.assigns) collectTouched(a.source, 0, mask);
-      }
-    }
-    if (plan.returning !== null) {
-      const retMask: boolean[] = new Array(w + 3 * n + 1).fill(false);
-      for (const node of plan.returning.nodes) collectTouched(node, 0, retMask);
-      for (let i = 0; i < n; i++) {
-        if (retMask[w + i] || retMask[w + n + i] || retMask[w + 2 * n + i]) mask[i] = true;
-      }
-    }
+    const mask = mergeTouched(plan, n);
 
     const stmtRng = new StmtRng();
     const env: EvalEnv = {
@@ -16886,375 +17229,467 @@ export class Engine {
     // The matching pass (§3): per source row, the probe, the join condition, the matched pairs, or
     // the not-matched action.
     const scanPlan = this.planMutationScan(db, table, plan.probe, contradiction);
-    const hasBySource = plan.clauses.some((c) => c.match === "notMatchedBySource");
-    for (let si = 0; si < srcRows.length; si++) {
-      if (shouldCooperate()) yield COOPERATE;
-      meter.guard();
-      const src = srcRows[si]!;
-      const probeEnv: EvalEnv = { ...env, outer: [src] };
-      const batch = yield* this.executeMutationScanSteps(
-        scanPlan,
-        table.name,
-        plan.probe,
-        bound,
-        probeEnv,
-        meter,
-        mask,
-      );
-      meter.charge(
-        COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
-      );
-      let any = false;
-      for (const e of batch.entries) {
-        if (shouldCooperate()) yield COOPERATE;
-        meter.guard();
-        meter.charge(COSTS.storageRowRead);
-        const row = yield* store.resolveColumnsSteps(e.row, mask);
-        const combined = row.concat(src);
-        if (!(yield* evalFilterSteps(plan.on, combined, env, meter))) continue;
-        any = true;
-        if (hasBySource) matched.add(e.key.join(","));
-        const ci = yield* choose("matched", combined);
-        if (ci < 0) continue;
-        yield* actOnTarget(ci, e.key, store.resolveInlineColumns(row), e.row, si, combined);
-      }
-      if (any) continue;
-      const ci = yield* choose("notMatchedByTarget", src);
-      if (ci < 0) continue;
-      const action = plan.clauses[ci]!.action;
-      if (action.kind !== "insert") continue; // DO NOTHING
-      const vals: Value[] = [];
-      for (const node of action.values) {
-        if (node === null) {
-          vals.push(nullValue());
-          continue;
+    const hasBySource = mergeHasBySource(plan);
+    // EXPLAIN ANALYZE attribution (explain.md §3): the probe scans, the matching loop (the source, the
+    // probes, and the join condition), and the not-matched-by-source scan.
+    let probeActual = 0n;
+    let loopActual = q.cost;
+    // The hash form of the matching loop (§3): one full scan of the target, its rows' key columns
+    // hashed into a table each source row probes; the candidates keep scan order.
+    type Candidate = { key: Uint8Array; row: Row; stored: Row };
+    let hashed: { table: HashJoinTable; hp: HashJoinPlan; targets: Candidate[] } | null = null;
+    try {
+      if (plan.hash !== null) {
+        const before = meter.accrued;
+        const batch = yield* this.executeMutationScanSteps(
+          scanPlan,
+          table.name,
+          plan.probe,
+          bound,
+          env,
+          meter,
+          mask,
+        );
+        meter.charge(
+          COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
+        );
+        const targets: Candidate[] = [];
+        for (const e of batch.entries) {
+          if (shouldCooperate()) yield COOPERATE;
+          meter.guard();
+          meter.charge(COSTS.storageRowRead);
+          const row = yield* store.resolveColumnsSteps(e.row, mask);
+          targets.push({ key: e.key, row, stored: e.row });
         }
-        meter.guard();
-        vals.push(yield* evalExprSteps(node, src, env, meter));
+        probeActual += meter.accrued - before;
+        const hashTable = yield* HashJoinTable.buildSteps(
+          plan.hash,
+          0,
+          n,
+          targets.map((t) => t.row),
+          meter,
+        );
+        loopActual += meter.accrued - before;
+        hashed = { table: hashTable, hp: plan.hash, targets };
       }
-      const row = yield* this.buildInsertRowSteps(
-        table,
-        colTypes,
-        action.provided,
-        vals,
-        plan.defaultExprs,
-        stmtRng,
-        meter,
-      );
-      yield* evalChecksSteps(checks, relation, row, env, meter);
-      actions.push({ kind: "insert", row, src: si });
-    }
-    // Not matched by source (§3): one full scan in storage-key order.
-    if (hasBySource) {
-      const full = this.planMutationScan(db, table, null, false);
-      const batch = yield* this.executeMutationScanSteps(
-        full,
-        table.name,
-        null,
-        bound,
-        env,
-        meter,
-        mask,
-      );
-      meter.charge(
-        COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
-      );
-      for (const e of batch.entries) {
+      for (let si = 0; si < srcRows.length; si++) {
         if (shouldCooperate()) yield COOPERATE;
         meter.guard();
-        meter.charge(COSTS.storageRowRead);
-        if (matched.has(e.key.join(","))) continue;
-        const resolved = yield* store.resolveColumnsSteps(e.row, mask);
-        const ci = yield* choose("notMatchedBySource", resolved);
+        const src = srcRows[si]!;
+        // This source row's candidate target rows: the hash table's exact-key matches, already
+        // read; or the probe scan's entries, read one by one below.
+        let entries: Candidate[];
+        if (hashed !== null) {
+          const before = meter.accrued;
+          const hits = yield* hashed.table.probeSteps(hashed.hp, src, meter);
+          loopActual += meter.accrued - before;
+          entries = hits.map((i) => hashed!.targets[i]!);
+        } else {
+          const probeBefore = meter.accrued;
+          const probeEnv: EvalEnv = { ...env, outer: [src] };
+          const batch = yield* this.executeMutationScanSteps(
+            scanPlan,
+            table.name,
+            plan.probe,
+            bound,
+            probeEnv,
+            meter,
+            mask,
+          );
+          meter.charge(
+            COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
+          );
+          probeActual += meter.accrued - probeBefore;
+          loopActual += meter.accrued - probeBefore;
+          entries = batch.entries.map((e) => ({ key: e.key, row: e.row, stored: e.row }));
+        }
+        let any = false;
+        for (const e of entries) {
+          if (shouldCooperate()) yield COOPERATE;
+          let row = e.row;
+          if (hashed === null) {
+            meter.guard();
+            meter.charge(COSTS.storageRowRead);
+            probeActual += COSTS.storageRowRead;
+            loopActual += COSTS.storageRowRead;
+            row = yield* store.resolveColumnsSteps(e.row, mask);
+          }
+          const combined = row.concat(src);
+          const onBefore = meter.accrued;
+          const hit = yield* evalFilterSteps(plan.on, combined, env, meter);
+          loopActual += meter.accrued - onBefore;
+          if (!hit) continue;
+          any = true;
+          if (hasBySource) matched.add(e.key.join(","));
+          const ci = yield* choose("matched", combined);
+          if (ci < 0) continue;
+          yield* actOnTarget(ci, e.key, store.resolveInlineColumns(row), e.stored, si, combined);
+        }
+        if (any) continue;
+        const ci = yield* choose("notMatchedByTarget", src);
         if (ci < 0) continue;
-        const row = store.resolveInlineColumns(resolved);
-        yield* actOnTarget(ci, e.key, row, e.row, -1, row);
+        const action = plan.clauses[ci]!.action;
+        if (action.kind !== "insert") continue; // DO NOTHING
+        const vals: Value[] = [];
+        for (const node of action.values) {
+          if (node === null) {
+            vals.push(nullValue());
+            continue;
+          }
+          meter.guard();
+          vals.push(yield* evalExprSteps(node, src, env, meter));
+        }
+        const row = yield* this.buildInsertRowSteps(
+          action.table,
+          colTypes,
+          action.provided,
+          vals,
+          action.defaults,
+          stmtRng,
+          meter,
+        );
+        yield* evalChecksSteps(checks, relation, row, env, meter);
+        actions.push({ kind: "insert", row, src: si });
       }
-    }
+      this.recordExplainActual(plan.hash !== null ? "Hash Join" : "Nested Loop", loopActual);
+      this.recordExplainActual("Scan " + table.name, probeActual);
+      // Not matched by source (§3): one full scan in storage-key order.
+      if (hasBySource) {
+        const scanBefore = meter.accrued;
+        const full = this.planMutationScan(
+          db,
+          table,
+          plan.targetFilter,
+          whereContradicts(plan.targetFilter),
+        );
+        const batch = yield* this.executeMutationScanSteps(
+          full,
+          table.name,
+          plan.targetFilter,
+          bound,
+          env,
+          meter,
+          mask,
+        );
+        meter.charge(
+          COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
+        );
+        let scanActual = meter.accrued - scanBefore;
+        for (const e of batch.entries) {
+          if (shouldCooperate()) yield COOPERATE;
+          meter.guard();
+          meter.charge(COSTS.storageRowRead);
+          scanActual += COSTS.storageRowRead;
+          if (matched.has(e.key.join(","))) continue;
+          const resolved = yield* store.resolveColumnsSteps(e.row, mask);
+          // A view target's row outside its WHERE chain is not a target row (views.md §15.2).
+          if (plan.targetFilter !== null) {
+            const before = meter.accrued;
+            const shown = yield* evalFilterSteps(plan.targetFilter, resolved, env, meter);
+            scanActual += meter.accrued - before;
+            if (!shown) continue;
+          }
+          const ci = yield* choose("notMatchedBySource", resolved);
+          if (ci < 0) continue;
+          const row = store.resolveInlineColumns(resolved);
+          yield* actOnTarget(ci, e.key, row, e.row, -1, row);
+        }
+        this.recordExplainActual("Scan " + table.name, scanActual);
+      }
 
-    // End-state validation (§5). The vacated keys: every updated row's old key and every deleted
-    // row's key. The placed rows: every inserted row and every updated row's new version, in
-    // action-list order.
-    const vacated = new Set<string>();
-    for (const a of actions) {
-      if (a.kind === "update") vacated.add(a.oldKey.join(","));
-      else if (a.kind === "delete") vacated.add(a.key.join(","));
-    }
-    // Each insert's primary key, computed once (a table without one allocates a rowid in phase 2).
-    const insertKeys: (Uint8Array | null)[] = actions.map((a) =>
-      a.kind === "insert" && pkMembers.length > 0
-        ? encodePkKey(colTypes, pkMembers, colls, a.row)
-        : null,
-    );
-    if (pkMembers.length > 0) {
-      const seen = new Set<string>();
+      // End-state validation (§5). The vacated keys: every updated row's old key and every deleted
+      // row's key. The placed rows: every inserted row and every updated row's new version, in
+      // action-list order.
+      const vacated = new Set<string>();
+      for (const a of actions) {
+        if (a.kind === "update") vacated.add(a.oldKey.join(","));
+        else if (a.kind === "delete") vacated.add(a.key.join(","));
+      }
+      // Each insert's primary key, computed once (a table without one allocates a rowid in phase 2).
+      const insertKeys: (Uint8Array | null)[] = actions.map((a) =>
+        a.kind === "insert" && pkMembers.length > 0
+          ? encodePkKey(colTypes, pkMembers, colls, a.row)
+          : null,
+      );
+      if (pkMembers.length > 0) {
+        const seen = new Set<string>();
+        for (let ai = 0; ai < actions.length; ai++) {
+          if (shouldCooperate()) yield COOPERATE;
+          const a = actions[ai]!;
+          if (a.kind === "delete") continue;
+          const key = a.kind === "insert" ? insertKeys[ai]! : a.newKey;
+          const row = a.kind === "insert" ? a.row : a.newRow;
+          const k = key.join(",");
+          const taken = (yield* store.getSteps(key)) !== undefined && !vacated.has(k);
+          if (taken || seen.has(k)) {
+            throw uniqueViolation(relation, pkeyName(relation)).withDetail(
+              yield* pkDetailSteps(
+                this.session,
+                relation,
+                table.columns,
+                pkMembers,
+                row,
+                DETAIL_EXISTS,
+              ),
+            );
+          }
+          seen.add(k);
+        }
+      }
+      const placed: Row[] = [];
+      for (const a of actions) {
+        if (a.kind === "insert") placed.push(a.row);
+        else if (a.kind === "update") placed.push(a.newRow);
+      }
+      if (placed.length > 0) {
+        for (const rindex of rindexes) {
+          if (shouldCooperate()) yield COOPERATE;
+          if (!rindex.unique) continue;
+          const istore = this.lkpIndexStoreScoped(db, rindex.name);
+          const batch = new Set<string>();
+          for (const row of placed) {
+            if (shouldCooperate()) yield COOPERATE;
+            const prefix = yield* this.indexPrefixSteps(colTypes, colls, rindex, row);
+            if (prefix === null) continue;
+            const k = prefix.join(",");
+            const conflict =
+              batch.has(k) ||
+              (yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix))).some(
+                (e) => !vacated.has(e.key.slice(prefix.length).join(",")),
+              );
+            if (conflict) {
+              throw uniqueViolation(relation, rindex.name).withDetail(
+                yield* indexDetailByNameSteps(this.session, table, rindex, row, env, DETAIL_EXISTS),
+              );
+            }
+            batch.add(k);
+          }
+        }
+      }
+      // The check option of a MERGE into a view (views.md §15.6): each placed row, after the end-state
+      // keys and before EXCLUDE and FOREIGN KEY.
+      for (const row of placed) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* evalViewChecksSteps(plan.viewChecks, row, env, meter);
+      }
+      yield* this.validateExclusionsSteps(db, table, placed, vacated);
+      // FOREIGN KEY child side: every inserted row, and every updated row whose clause assigned one of
+      // the key's columns; a self-reference may be satisfied by a placed row.
+      const { fks, temp: fkTemp } = this.targetForeignKeys(db, table.name);
+      for (const fk of fks) {
+        if (shouldCooperate()) yield COOPERATE;
+        const parent = this.fkSnap(fkTemp).table(fk.refTable);
+        if (parent === undefined) continue;
+        const parentColls = this.columnCollations(parent.columns);
+        const batch = new Set<string>();
+        if (fk.refTable === relation) {
+          for (const r of placed) {
+            if (shouldCooperate()) yield COOPERATE;
+            const p = yield* fkProbeSteps(fk, parent, parentColls, r, fk.refColumns);
+            if (p !== null) batch.add(fkProbeBytes(p).join(","));
+          }
+        }
+        for (const a of actions) {
+          if (shouldCooperate()) yield COOPERATE;
+          let row: Row;
+          if (a.kind === "insert") row = a.row;
+          else if (a.kind === "update") {
+            const action = plan.clauses[a.clause]!.action;
+            if (action.kind !== "update" || !action.assigns.some((x) => fk.columns.includes(x.idx)))
+              continue;
+            row = a.newRow;
+          } else continue;
+          const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
+          if (probe === null) {
+            if (fkMatchFullViolated(fk, row))
+              yield* this.fkChildCheckSteps(relation, table.columns, fk, null, row, fkTemp);
+            continue;
+          }
+          if (batch.has(fkProbeBytes(probe).join(","))) continue;
+          yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, row, fkTemp);
+        }
+      }
+
+      // The compression attempts of every placed row's disposition plan, then the ceiling — the last
+      // abort point before a write (§5). A rowid table's 8-byte placeholder stands in for the key a
+      // phase-2 insert allocates (only the key length feeds the plan).
+      const placeholder = new Uint8Array(8);
+      let cunits = 0n;
       for (let ai = 0; ai < actions.length; ai++) {
         if (shouldCooperate()) yield COOPERATE;
         const a = actions[ai]!;
-        if (a.kind === "delete") continue;
-        const key = a.kind === "insert" ? insertKeys[ai]! : a.newKey;
-        const row = a.kind === "insert" ? a.row : a.newRow;
-        const k = key.join(",");
-        const taken = (yield* store.getSteps(key)) !== undefined && !vacated.has(k);
-        if (taken || seen.has(k)) {
-          throw uniqueViolation(relation, pkeyName(relation)).withDetail(
-            yield* pkDetailSteps(
-              this.session,
-              relation,
+        if (a.kind === "insert")
+          cunits += BigInt(store.writeCompressUnits(insertKeys[ai] ?? placeholder, a.row));
+        else if (a.kind === "update")
+          cunits += BigInt(store.writeCompressUnits(a.newKey, a.newRow));
+      }
+      meter.charge(COSTS.valueCompress * cunits);
+      meter.guard();
+
+      // RETURNING (§7): one row per action over [source | target | old | new | action].
+      let returned: Value[][] | null = null;
+      if (plan.returning !== null) {
+        const renv: EvalEnv = { ...env, rng: new StmtRng() };
+        const nullTarget: Row = table.columns.map(() => nullValue());
+        const nullSrc: Row = new Array(w).fill(null).map(() => nullValue());
+        returned = [];
+        for (const a of actions) {
+          if (shouldCooperate()) yield COOPERATE;
+          meter.guard();
+          meter.charge(COSTS.rowProduced);
+          let row: Row;
+          if (a.kind === "insert") {
+            row = [...srcRows[a.src]!, ...a.row, ...nullTarget, ...a.row];
+            row.push({ kind: "text", text: "INSERT" });
+          } else if (a.kind === "update") {
+            const src = a.src >= 0 ? srcRows[a.src]! : nullSrc;
+            row = [...src, ...a.newRow, ...a.oldRow, ...a.newRow];
+            row.push({ kind: "text", text: "UPDATE" });
+          } else {
+            const src = a.src >= 0 ? srcRows[a.src]! : nullSrc;
+            row = [...src, ...a.oldRow, ...a.oldRow, ...nullTarget];
+            row.push({ kind: "text", text: "DELETE" });
+          }
+          const vals: Value[] = [];
+          for (const node of plan.returning.nodes)
+            vals.push(yield* evalExprSteps(node, row, renv, meter));
+          meter.admitRow(vals); // a RETURNING result row (memory.md §5.1)
+          returned.push(vals);
+        }
+      }
+
+      // Every index entry change, per action, before the writes (§6): a deleted row's entries and an
+      // update's moved-away entries (removals), and an update's moved-to entries. An insert's entries
+      // are computed in phase 2, under the key it is placed at (a rowid table allocates it there).
+      const removes: IndexEntry[][] = table.indexes.map(() => []);
+      const updateAdds: Uint8Array[][][] = [];
+      for (const a of actions) {
+        if (shouldCooperate()) yield COOPERATE;
+        const perIndex: Uint8Array[][] = [];
+        for (let k = 0; k < rindexes.length; k++) {
+          const rindex = rindexes[k]!;
+          if (a.kind === "delete") {
+            for (const ek of yield* this.indexEntriesSteps(
               table.columns,
-              pkMembers,
-              row,
-              DETAIL_EXISTS,
-            ),
-          );
-        }
-        seen.add(k);
-      }
-    }
-    const placed: Row[] = [];
-    for (const a of actions) {
-      if (a.kind === "insert") placed.push(a.row);
-      else if (a.kind === "update") placed.push(a.newRow);
-    }
-    if (placed.length > 0) {
-      for (const rindex of rindexes) {
-        if (shouldCooperate()) yield COOPERATE;
-        if (!rindex.unique) continue;
-        const istore = this.lkpIndexStoreScoped(db, rindex.name);
-        const batch = new Set<string>();
-        for (const row of placed) {
-          if (shouldCooperate()) yield COOPERATE;
-          const prefix = yield* this.indexPrefixSteps(colTypes, colls, rindex, row);
-          if (prefix === null) continue;
-          const k = prefix.join(",");
-          const conflict =
-            batch.has(k) ||
-            (yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix))).some(
-              (e) => !vacated.has(e.key.slice(prefix.length).join(",")),
+              colTypes,
+              colls,
+              rindex,
+              a.key,
+              a.oldRow,
+            )) {
+              removes[k]!.push({ key: ek, skeyLen: a.key.length });
+            }
+            perIndex.push([]);
+          } else if (a.kind === "update") {
+            const oldEks = yield* this.indexEntriesSteps(
+              table.columns,
+              colTypes,
+              colls,
+              rindex,
+              a.oldKey,
+              a.oldRow,
             );
-          if (conflict) {
-            throw uniqueViolation(relation, rindex.name).withDetail(
-              yield* indexDetailByNameSteps(this.session, table, rindex, row, env, DETAIL_EXISTS),
+            const newEks = yield* this.indexEntriesSteps(
+              table.columns,
+              colTypes,
+              colls,
+              rindex,
+              a.newKey,
+              a.newRow,
             );
+            for (const ek of bytesDiff(oldEks, newEks)) {
+              removes[k]!.push({ key: ek, skeyLen: a.oldKey.length });
+            }
+            perIndex.push(bytesDiff(newEks, oldEks));
+          } else {
+            perIndex.push([]);
           }
-          batch.add(k);
         }
+        updateAdds.push(perIndex);
       }
-    }
-    yield* this.validateExclusionsSteps(db, table, placed, vacated);
-    // FOREIGN KEY child side: every inserted row, and every updated row whose clause assigned one of
-    // the key's columns; a self-reference may be satisfied by a placed row.
-    const { fks, temp: fkTemp } = this.targetForeignKeys(db, table.name);
-    for (const fk of fks) {
-      if (shouldCooperate()) yield COOPERATE;
-      const parent = this.fkSnap(fkTemp).table(fk.refTable);
-      if (parent === undefined) continue;
-      const parentColls = this.columnCollations(parent.columns);
-      const batch = new Set<string>();
-      if (fk.refTable === relation) {
-        for (const r of placed) {
-          if (shouldCooperate()) yield COOPERATE;
-          const p = yield* fkProbeSteps(fk, parent, parentColls, r, fk.refColumns);
-          if (p !== null) batch.add(fkProbeBytes(p).join(","));
-        }
-      }
+
+      // Phase 2 (§6). 1: vacate — each deleted row and each re-keyed row's old key. 2: place — each
+      // insert (its key, or an allocated rowid) and each updated row, in action-list order. 3: per
+      // index, every removal, then every addition.
+      const writeStore = this.writeStoreScoped(db, table.name);
       for (const a of actions) {
         if (shouldCooperate()) yield COOPERATE;
-        let row: Row;
-        if (a.kind === "insert") row = a.row;
-        else if (a.kind === "update") {
-          const action = plan.clauses[a.clause]!.action;
-          if (action.kind !== "update" || !action.assigns.some((x) => fk.columns.includes(x.idx)))
-            continue;
-          row = a.newRow;
-        } else continue;
-        const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
-        if (probe === null) {
-          if (fkMatchFullViolated(fk, row))
-            yield* this.fkChildCheckSteps(relation, table.columns, fk, null, row, fkTemp);
-          continue;
-        }
-        if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, row, fkTemp);
+        if (a.kind === "delete") yield* writeStore.removeSteps(a.key);
+        else if (a.kind === "update" && !bytesEq(a.oldKey, a.newKey))
+          yield* writeStore.removeSteps(a.oldKey);
       }
-    }
-
-    // The compression attempts of every placed row's disposition plan, then the ceiling — the last
-    // abort point before a write (§5). A rowid table's 8-byte placeholder stands in for the key a
-    // phase-2 insert allocates (only the key length feeds the plan).
-    const placeholder = new Uint8Array(8);
-    let cunits = 0n;
-    for (let ai = 0; ai < actions.length; ai++) {
-      if (shouldCooperate()) yield COOPERATE;
-      const a = actions[ai]!;
-      if (a.kind === "insert")
-        cunits += BigInt(store.writeCompressUnits(insertKeys[ai] ?? placeholder, a.row));
-      else if (a.kind === "update") cunits += BigInt(store.writeCompressUnits(a.newKey, a.newRow));
-    }
-    meter.charge(COSTS.valueCompress * cunits);
-    meter.guard();
-
-    // RETURNING (§7): one row per action over [source | target | old | new | action].
-    let returned: Value[][] | null = null;
-    if (plan.returning !== null) {
-      const renv: EvalEnv = { ...env, rng: new StmtRng() };
-      const nullTarget: Row = table.columns.map(() => nullValue());
-      const nullSrc: Row = new Array(w).fill(null).map(() => nullValue());
-      returned = [];
-      for (const a of actions) {
+      const adds: IndexEntry[][] = table.indexes.map(() => []);
+      const fkDeletes: Row[] = [];
+      const fkUpdates: { row: Row; oldRow: Row }[] = [];
+      for (let ai = 0; ai < actions.length; ai++) {
         if (shouldCooperate()) yield COOPERATE;
-        meter.guard();
-        meter.charge(COSTS.rowProduced);
-        let row: Row;
+        const a = actions[ai]!;
         if (a.kind === "insert") {
-          row = [...srcRows[a.src]!, ...a.row, ...nullTarget, ...a.row];
-          row.push({ kind: "text", text: "INSERT" });
-        } else if (a.kind === "update") {
-          const src = a.src >= 0 ? srcRows[a.src]! : nullSrc;
-          row = [...src, ...a.newRow, ...a.oldRow, ...a.newRow];
-          row.push({ kind: "text", text: "UPDATE" });
-        } else {
-          const src = a.src >= 0 ? srcRows[a.src]! : nullSrc;
-          row = [...src, ...a.oldRow, ...a.oldRow, ...nullTarget];
-          row.push({ kind: "text", text: "DELETE" });
-        }
-        const vals: Value[] = [];
-        for (const node of plan.returning.nodes)
-          vals.push(yield* evalExprSteps(node, row, renv, meter));
-        meter.admitRow(vals); // a RETURNING result row (memory.md §5.1)
-        returned.push(vals);
-      }
-    }
-
-    // Every index entry change, per action, before the writes (§6): a deleted row's entries and an
-    // update's moved-away entries (removals), and an update's moved-to entries. An insert's entries
-    // are computed in phase 2, under the key it is placed at (a rowid table allocates it there).
-    const removes: IndexEntry[][] = table.indexes.map(() => []);
-    const updateAdds: Uint8Array[][][] = [];
-    for (const a of actions) {
-      if (shouldCooperate()) yield COOPERATE;
-      const perIndex: Uint8Array[][] = [];
-      for (let k = 0; k < rindexes.length; k++) {
-        const rindex = rindexes[k]!;
-        if (a.kind === "delete") {
-          for (const ek of yield* this.indexEntriesSteps(
-            table.columns,
-            colTypes,
-            colls,
-            rindex,
-            a.key,
-            a.oldRow,
-          )) {
-            removes[k]!.push({ key: ek, skeyLen: a.key.length });
+          const key = insertKeys[ai] ?? encodeInt("i64", writeStore.allocRowid());
+          for (let k = 0; k < rindexes.length; k++) {
+            for (const ek of yield* this.indexEntriesSteps(
+              table.columns,
+              colTypes,
+              colls,
+              rindexes[k]!,
+              key,
+              a.row,
+            )) {
+              adds[k]!.push({ key: ek, skeyLen: key.length });
+            }
           }
-          perIndex.push([]);
-        } else if (a.kind === "update") {
-          const oldEks = yield* this.indexEntriesSteps(
-            table.columns,
-            colTypes,
-            colls,
-            rindex,
-            a.oldKey,
-            a.oldRow,
-          );
-          const newEks = yield* this.indexEntriesSteps(
-            table.columns,
-            colTypes,
-            colls,
-            rindex,
-            a.newKey,
-            a.newRow,
-          );
-          for (const ek of bytesDiff(oldEks, newEks)) {
-            removes[k]!.push({ key: ek, skeyLen: a.oldKey.length });
-          }
-          perIndex.push(bytesDiff(newEks, oldEks));
-        } else {
-          perIndex.push([]);
-        }
-      }
-      updateAdds.push(perIndex);
-    }
-
-    // Phase 2 (§6). 1: vacate — each deleted row and each re-keyed row's old key. 2: place — each
-    // insert (its key, or an allocated rowid) and each updated row, in action-list order. 3: per
-    // index, every removal, then every addition.
-    const writeStore = this.writeStoreScoped(db, table.name);
-    for (const a of actions) {
-      if (shouldCooperate()) yield COOPERATE;
-      if (a.kind === "delete") yield* writeStore.removeSteps(a.key);
-      else if (a.kind === "update" && !bytesEq(a.oldKey, a.newKey))
-        yield* writeStore.removeSteps(a.oldKey);
-    }
-    const adds: IndexEntry[][] = table.indexes.map(() => []);
-    const fkDeletes: Row[] = [];
-    const fkUpdates: { row: Row; oldRow: Row }[] = [];
-    for (let ai = 0; ai < actions.length; ai++) {
-      if (shouldCooperate()) yield COOPERATE;
-      const a = actions[ai]!;
-      if (a.kind === "insert") {
-        const key = insertKeys[ai] ?? encodeInt("i64", writeStore.allocRowid());
-        for (let k = 0; k < rindexes.length; k++) {
-          for (const ek of yield* this.indexEntriesSteps(
-            table.columns,
-            colTypes,
-            colls,
-            rindexes[k]!,
-            key,
-            a.row,
-          )) {
-            adds[k]!.push({ key: ek, skeyLen: key.length });
-          }
-        }
-        if (!(yield* writeStore.insertSteps(key, a.row))) {
-          // Reachable only under the writable-CTE read pin (writable-cte.md §7).
-          throw uniqueViolation(relation, pkeyName(relation));
-        }
-      } else if (a.kind === "update") {
-        for (let k = 0; k < rindexes.length; k++) {
-          for (const ek of updateAdds[ai]![k]!)
-            adds[k]!.push({ key: ek, skeyLen: a.newKey.length });
-        }
-        if (!bytesEq(a.oldKey, a.newKey)) {
-          if (!(yield* writeStore.insertSteps(a.newKey, a.newRow))) {
+          if (!(yield* writeStore.insertSteps(key, a.row))) {
+            // Reachable only under the writable-CTE read pin (writable-cte.md §7).
             throw uniqueViolation(relation, pkeyName(relation));
           }
+        } else if (a.kind === "update") {
+          for (let k = 0; k < rindexes.length; k++) {
+            for (const ek of updateAdds[ai]![k]!)
+              adds[k]!.push({ key: ek, skeyLen: a.newKey.length });
+          }
+          if (!bytesEq(a.oldKey, a.newKey)) {
+            if (!(yield* writeStore.insertSteps(a.newKey, a.newRow))) {
+              throw uniqueViolation(relation, pkeyName(relation));
+            }
+          } else {
+            yield* writeStore.replaceSteps(a.oldKey, a.newRow);
+          }
+          fkUpdates.push({ row: a.newRow, oldRow: a.oldRow });
         } else {
-          yield* writeStore.replaceSteps(a.oldKey, a.newRow);
-        }
-        fkUpdates.push({ row: a.newRow, oldRow: a.oldRow });
-      } else {
-        fkDeletes.push(a.oldRow);
-      }
-    }
-    for (let k = 0; k < table.indexes.length; k++) {
-      if (shouldCooperate()) yield COOPERATE;
-      const def = table.indexes[k]!;
-      const istore = this.writeIndexStoreScoped(db, def.name);
-      for (const ek of removes[k]!) {
-        if (shouldCooperate()) yield COOPERATE;
-        yield* indexEntryRemoveSteps(istore, def.kind, ek.key, ek.skeyLen);
-      }
-      for (const ek of adds[k]!) {
-        if (shouldCooperate()) yield COOPERATE;
-        if (!(yield* indexEntryInsertSteps(istore, def.kind, ek.key, ek.skeyLen))) {
-          if (def.unique) throw uniqueViolation(relation, def.name);
-          throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+          fkDeletes.push(a.oldRow);
         }
       }
+      for (let k = 0; k < table.indexes.length; k++) {
+        if (shouldCooperate()) yield COOPERATE;
+        const def = table.indexes[k]!;
+        const istore = this.writeIndexStoreScoped(db, def.name);
+        for (const ek of removes[k]!) {
+          if (shouldCooperate()) yield COOPERATE;
+          yield* indexEntryRemoveSteps(istore, def.kind, ek.key, ek.skeyLen);
+        }
+        for (const ek of adds[k]!) {
+          if (shouldCooperate()) yield COOPERATE;
+          if (!(yield* indexEntryInsertSteps(istore, def.kind, ek.key, ek.skeyLen))) {
+            if (def.unique) throw uniqueViolation(relation, def.name);
+            throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+          }
+        }
+      }
+      this.syncPendingWrites(meter);
+      if (actions.length > 0) this.markEstimatorMutation(db, table.name);
+      const domain = this.fkDomain(db, table.name);
+      yield* this.applyFkDeleteActionsSteps(table, fkDeletes, meter, domain);
+      yield* this.applyFkUpdateActionsSteps(table, fkUpdates, meter, domain);
+      return dmlOutcome(
+        plan.returning?.names ?? null,
+        plan.returning !== null ? typeNames(plan.returning.types) : null,
+        returned,
+        actions.length,
+        meter.accrued,
+      );
+    } finally {
+      hashed?.table.release();
     }
-    this.syncPendingWrites(meter);
-    if (actions.length > 0) this.markEstimatorMutation(db, table.name);
-    const domain = this.fkDomain(db, table.name);
-    yield* this.applyFkDeleteActionsSteps(table, fkDeletes, meter, domain);
-    yield* this.applyFkUpdateActionsSteps(table, fkUpdates, meter, domain);
-    return dmlOutcome(
-      plan.returning?.names ?? null,
-      plan.returning !== null ? typeNames(plan.returning.types) : null,
-      returned,
-      actions.length,
-      meter.accrued,
-    );
   }
 
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
@@ -17523,22 +17958,13 @@ export class Engine {
     // only for that schema, so the CTE references the planning counts are restored — the
     // orchestrator static-counts a data-modifying part's references (§3).
     if (body.kind === "merge") {
-      const tdef = this.mergeTarget(body);
+      const { m, mv } = this.mergeTarget(body);
+      const tdef = this.mergeTable(m);
       if (body.returning === null) {
         const table = cteSyntheticTableCols(lname, [], [], null, null, rename);
         return { table, dm: { stmt: body, noReturning: true } };
       }
-      const saved = bindings.map((b) => ({ refs: b.refs, expanded: b.expanded }));
-      let plan: MergePlan;
-      try {
-        plan = this.planMerge(body, tdef, bindings, ptypes);
-      } finally {
-        bindings.forEach((b, i) => {
-          b.refs = saved[i]!.refs;
-          b.expanded = saved[i]!.expanded;
-        });
-      }
-      const ret = plan.returning!;
+      const ret = this.planMergeDetached(m, tdef, mv, bindings, ptypes).returning!;
       const table = cteSyntheticTableCols(
         lname,
         ret.names,
@@ -18099,14 +18525,15 @@ export class Engine {
     } else if (body.kind === "update") {
       outcome = yield* this.executeUpdateSteps(body, params, ctx);
     } else if (body.kind === "merge") {
+      const node = this.mergeNode(body);
       outcome = yield* this.executeMergeSteps(body, params, ctx);
+      this.recordExplainActual(node, outcome.cost);
     } else {
       outcome = yield* this.executeDeleteSteps(body, params, ctx);
     }
     if (body.kind === "insert") this.recordExplainActual("Insert " + body.table, outcome.cost);
     else if (body.kind === "update") this.recordExplainActual("Update " + body.table, outcome.cost);
     else if (body.kind === "delete") this.recordExplainActual("Delete " + body.table, outcome.cost);
-    else if (body.kind === "merge") this.recordExplainActual("Merge " + body.table, outcome.cost);
     // (5) Settle every foreign-key check the parts queued, against the end state of the whole
     //     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
     const fkMeter = this.session.newMeter();
@@ -18141,6 +18568,14 @@ export class Engine {
       throw new Error("execDmCte requires a data-modifying binding");
     }
     const stmt = src.dm.stmt;
+    const node =
+      stmt.kind === "insert"
+        ? "Insert " + stmt.table
+        : stmt.kind === "update"
+          ? "Update " + stmt.table
+          : stmt.kind === "merge"
+            ? this.mergeNode(stmt)
+            : "Delete " + stmt.table;
     let outcome: Outcome;
     if (stmt.kind === "insert") {
       outcome = yield* this.executeInsertSteps(stmt, params, ctx);
@@ -18151,15 +18586,7 @@ export class Engine {
     } else {
       outcome = yield* this.executeDeleteSteps(stmt, params, ctx);
     }
-    const verb =
-      stmt.kind === "insert"
-        ? "Insert"
-        : stmt.kind === "update"
-          ? "Update"
-          : stmt.kind === "merge"
-            ? "Merge"
-            : "Delete";
-    this.recordExplainActual(`${verb} ${stmt.table}`, outcome.cost);
+    this.recordExplainActual(node, outcome.cost);
     if (outcome.kind === "query") {
       return { rows: outcome.rows, cost: outcome.cost };
     }
@@ -36285,6 +36712,44 @@ function joinGroupOutputs(
 function starColumnIndex(pr: RExpr): number {
   if (pr.kind !== "column") throw new Error("a join group's outputs are bare columns");
   return pr.index;
+}
+
+// withSourceGroup exposes a joined MERGE source's inner labels and hides its USING/NATURAL copies
+// (grammar.md §15) when the source sits at flat offset of scope (merge.md §2). A no-op for any other
+// source.
+function withSourceGroup(scope: Scope, group: JoinGroupLayout | null, offset: number): void {
+  if (group === null) return;
+  scope.subRels = group.subRels.map((sr) => ({
+    label: sr.label,
+    table: sr.table,
+    slots: sr.slots.map((slot) => offset + slot),
+    rel: 0,
+  }));
+  scope.hidden = group.hidden.map((h) => offset + h);
+}
+
+// mergeTouched is the touched set of a target row (merge.md §9): every target column the join
+// condition, a MATCHED or NOT MATCHED BY SOURCE condition or SET right-hand side, or RETURNING
+// (target, old., or new.) reads.
+function mergeTouched(plan: MergePlan, n: number): boolean[] {
+  const mask: boolean[] = new Array(n).fill(false);
+  collectTouched(plan.on, 0, mask);
+  for (const c of plan.clauses) {
+    if (c.match === "notMatchedByTarget") continue;
+    if (c.condition !== null) collectTouched(c.condition, 0, mask);
+    if (c.action.kind === "update") {
+      for (const a of c.action.assigns) collectTouched(a.source, 0, mask);
+    }
+  }
+  if (plan.returning !== null) {
+    const w = plan.width;
+    const retMask: boolean[] = new Array(w + 3 * n + 1).fill(false);
+    for (const node of plan.returning.nodes) collectTouched(node, 0, retMask);
+    for (let i = 0; i < n; i++) {
+      if (retMask[w + i] || retMask[w + n + i] || retMask[w + 2 * n + i]) mask[i] = true;
+    }
+  }
+  return mask;
 }
 
 // derivedJoinGroup is the layout of a FROM item's derived body when it is an unaliased

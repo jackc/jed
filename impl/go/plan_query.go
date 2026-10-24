@@ -313,12 +313,13 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 	// A MERGE body (spec/design/merge.md §1): its relation is its RETURNING schema. It is planned here
 	// only for that schema, so the CTE references the planning counts are restored — the orchestrator
 	// static-counts a data-modifying part's references (§3).
-	if m := body.Merge; m != nil {
-		tdef, err := db.mergeTarget(m)
+	if written := body.Merge; written != nil {
+		m, mv, err := db.mergeTarget(written)
 		if err != nil {
 			return nil, nil, err
 		}
-		dm := &dmCte{merge: m}
+		tdef := db.mergeTable(m)
+		dm := &dmCte{merge: written}
 		if m.Returning == nil {
 			dm.noReturning = true
 			table, err := cteSyntheticTableCols(lname, nil, nil, nil, nil, rename)
@@ -327,18 +328,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 			}
 			return table, dm, nil
 		}
-		type savedRefs struct {
-			refs     int
-			expanded bool
-		}
-		saved := make([]savedRefs, len(bindings))
-		for i, b := range bindings {
-			saved[i] = savedRefs{b.refs, b.expanded}
-		}
-		plan, err := db.planMerge(m, tdef, bindings, ptypes)
-		for i, b := range bindings {
-			b.refs, b.expanded = saved[i].refs, saved[i].expanded
-		}
+		plan, err := db.planMergeDetached(m, tdef, mv, bindings, ptypes)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -837,6 +827,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	// (4) Execute the primary against the full CTE context, adding the materialization cost.
 	ctx := topLevelCteCtx(modes, bindings, buffers)
 	var out outcome
+	var mergeNode string
 	switch {
 	case wq.Body.AsQuery() != nil:
 		var subqueryCost int64
@@ -859,6 +850,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	case wq.Body.Update != nil:
 		out, err = db.executeUpdate(wq.Body.Update, params, ctx)
 	case wq.Body.Merge != nil:
+		mergeNode = db.mergeNode(wq.Body.Merge)
 		out, err = db.executeMerge(wq.Body.Merge, params, ctx)
 	default:
 		out, err = db.executeDelete(wq.Body.Delete, params, ctx)
@@ -874,7 +866,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	case wq.Body.Delete != nil:
 		db.explainActual.record("Delete "+wq.Body.Delete.Table, out.Cost)
 	case wq.Body.Merge != nil:
-		db.explainActual.record("Merge "+wq.Body.Merge.Table, out.Cost)
+		db.explainActual.record(mergeNode, out.Cost)
 	}
 	// (5) Settle every foreign-key check the parts queued, against the end state of the whole
 	//     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
@@ -896,12 +888,14 @@ func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 	dm := bindings[i].dm
 	var out outcome
 	var err error
+	var mergeNode string
 	switch {
 	case dm.insert != nil:
 		out, err = db.executeInsert(dm.insert, params, ctx)
 	case dm.update != nil:
 		out, err = db.executeUpdate(dm.update, params, ctx)
 	case dm.merge != nil:
+		mergeNode = db.mergeNode(dm.merge)
 		out, err = db.executeMerge(dm.merge, params, ctx)
 	default:
 		out, err = db.executeDelete(dm.delete, params, ctx)
@@ -915,7 +909,7 @@ func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 	case dm.update != nil:
 		db.explainActual.record("Update "+dm.update.Table, out.Cost)
 	case dm.merge != nil:
-		db.explainActual.record("Merge "+dm.merge.Table, out.Cost)
+		db.explainActual.record(mergeNode, out.Cost)
 	default:
 		db.explainActual.record("Delete "+dm.delete.Table, out.Cost)
 	}
@@ -1214,20 +1208,6 @@ func withHasDml(wq *withQuery) bool {
 	}
 	for i := range wq.Ctes {
 		if wq.Ctes[i].Body.IsDataModifying() {
-			return true
-		}
-	}
-	return false
-}
-
-// withHasMerge reports whether a WITH statement's primary or any CTE body is a MERGE
-// (spec/design/merge.md §1).
-func withHasMerge(wq *withQuery) bool {
-	if wq.Body.Merge != nil {
-		return true
-	}
-	for i := range wq.Ctes {
-		if wq.Ctes[i].Body.Merge != nil {
 			return true
 		}
 	}

@@ -500,8 +500,8 @@ The whole statement is all-or-nothing.
 
 ## Synchronizing a table with `MERGE`
 
-`MERGE` joins a **source** — a table, a view, a subquery, a `VALUES` list, or a CTE — to the target
-table and, for each joined row, runs the first `WHEN` clause that applies: update or delete a
+`MERGE` joins a **source** — a table, a view, a subquery, a `VALUES` list, a CTE, or a join of
+these — to the target table (or an updatable view) and, for each joined row, runs the first `WHEN` clause that applies: update or delete a
 matched row, insert a row for an unmatched source row, or update or delete a target row that no
 source row matched. Run this in the panel above:
 
@@ -532,5 +532,15 @@ updated or deleted at most once — two source rows that both act on it raise `2
 always read the row as it was before the statement. Like every write, `MERGE` is all-or-nothing, and
 its constraints are checked against the statement's end state, so a `MERGE` may delete one row and
 insert another with the same key. A `MERGE` can be prefixed by `WITH`, or itself be a `WITH` query
-whose `RETURNING` rows feed the rest of the statement. `MERGE` into a view and `EXPLAIN MERGE` are
-not supported yet (`0A000`).
+whose `RETURNING` rows feed the rest of the statement.
+
+More shapes:
+
+- **A joined source** — `MERGE INTO account a USING txn t JOIN account x ON t.account_id = x.id ON
+  a.id = x.id …`: the join's own labels (`t`, `x`) stay usable in the clauses and `RETURNING`.
+- **Into a view** — the view's `WHERE` decides which rows are targets (a row the view hides is never
+  matched), its `WITH CHECK OPTION` checks every inserted and updated row, and `SET` / `INSERT` name
+  the view's columns.
+- **`EXPLAIN MERGE`** — shows the source plan and how each source row finds its target rows: a key
+  or index lookup per row, or, when no index covers the join columns and the inputs are large, a
+  `Hash Join` that reads the target once.

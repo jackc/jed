@@ -612,7 +612,15 @@ func (db *engine) collectCteCatalogPrivs(body *cteBody, req *privReq) {
 // the defaults of each INSERT action's omitted columns and DEFAULT slots, each UPDATE action's
 // SET c = DEFAULT, and the target's CHECK constraints when any action writes.
 func (db *engine) collectMergeCatalogPrivs(m *mergeStmt, req *privReq) {
-	table, ok := db.lkpTableScoped(m.DB, m.Table)
+	// A MERGE into a view is retargeted first, as execution does (views.md §15.8): SET c = DEFAULT
+	// then assigns the view column default, and an INSERT applies the view column defaults in place
+	// of the table's.
+	original := m
+	m, mv, err := db.rewriteMergeTarget(m)
+	if err != nil {
+		return
+	}
+	base, ok := db.lkpTableScoped(m.DB, m.Table)
 	if !ok {
 		return
 	}
@@ -620,9 +628,26 @@ func (db *engine) collectMergeCatalogPrivs(m *mergeStmt, req *privReq) {
 	writes := false
 	for ci := range m.Clauses {
 		c := &m.Clauses[ci]
+		table := base
+		if mv != nil {
+			if cvw := mv.clauses[ci]; cvw != nil && len(cvw.defaultOverrides) > 0 {
+				var overriding *overridingKind
+				if c.Action == mergeInsert {
+					overriding = c.Overriding
+				}
+				if table, err = db.tableWithViewDefaults(base, cvw, overriding); err != nil {
+					return
+				}
+			}
+		}
 		switch c.Action {
 		case mergeUpdate:
 			writes = true
+			for i := range c.Assignments {
+				if original.Clauses[ci].Assignments[i].IsDefault && !c.Assignments[i].IsDefault {
+					collectExprPrivs(&c.Assignments[i].Value, req, locals)
+				}
+			}
 			db.collectAssignmentDefaultPrivs(table, c.Assignments, req)
 		case mergeInsert:
 			writes = true
@@ -659,7 +684,7 @@ func (db *engine) collectMergeCatalogPrivs(m *mergeStmt, req *privReq) {
 		}
 	}
 	if writes {
-		collectCheckPrivs(table, req)
+		collectCheckPrivs(base, req)
 	}
 }
 

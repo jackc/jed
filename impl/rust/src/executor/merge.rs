@@ -24,8 +24,21 @@ pub(crate) enum MergeActionPlan {
     Insert {
         provided: Vec<Option<usize>>,
         values: Vec<Option<RExpr>>,
+        /// The columns the row is built over: the table's, with the view column defaults an INSERT
+        /// through a view applies in place of the table's (views.md §16.1).
+        columns: Vec<Column>,
+        /// Those columns' expression defaults, resolved for this action (constraints.md §2).
+        defaults: Vec<Option<RExpr>>,
     },
     DoNothing,
+}
+
+/// A MERGE into an automatically updatable view, retargeted at its base table (merge.md §8,
+/// views.md §15): the write layering of each action clause (`None` for DO NOTHING), each validated
+/// for its own action kind and target columns, and the layering the statement's scopes expose.
+pub(crate) struct MergeView {
+    clauses: Vec<Option<ViewWrite>>,
+    top: ViewWrite,
 }
 
 /// A resolved `RETURNING` projection: the nodes and the output schema.
@@ -48,9 +61,56 @@ pub(crate) struct MergePlan {
     /// access path is planned from it (§3). It never decides a match.
     probe: RExpr,
     clauses: Vec<MergeClausePlan>,
-    /// The expression defaults the actions may apply, per column (constraints.md §2).
-    default_exprs: Vec<Option<RExpr>>,
+    /// The hash form of the matching loop (§3), chosen at plan time when its estimate is cheaper
+    /// than the per-source-row probe (estimator.md §9.4); `None` — the nested loop.
+    hash: Option<HashJoinPlan>,
+    /// The target view's WHERE chain over the target row (views.md §15.2), for the
+    /// not-matched-by-source scan; the join condition already leads with it.
+    target_filter: Option<RExpr>,
+    /// The check-option checks of a MERGE into a view (views.md §15.6), over a placed row.
+    view_checks: Vec<(String, RExpr)>,
     pub(crate) returning: Option<MergeReturning>,
+}
+
+impl MergeView {
+    /// Clause `ci`'s write layering (`None` for DO NOTHING).
+    pub(crate) fn clause(&self, ci: usize) -> Option<&ViewWrite> {
+        self.clauses.get(ci).and_then(Option::as_ref)
+    }
+}
+
+impl MergePlan {
+    /// The source query plan.
+    pub(crate) fn source(&self) -> &QueryPlan {
+        &self.source
+    }
+
+    /// The join condition over `[target | source]`.
+    pub(crate) fn on(&self) -> &RExpr {
+        &self.on
+    }
+
+    /// The join condition in its probe form (source columns as outer references).
+    pub(crate) fn probe(&self) -> &RExpr {
+        &self.probe
+    }
+
+    /// The hash form of the matching loop, when chosen.
+    pub(crate) fn hash(&self) -> Option<&HashJoinPlan> {
+        self.hash.as_ref()
+    }
+
+    /// A view target's WHERE chain over the target row, filtering the not-matched-by-source scan.
+    pub(crate) fn target_filter(&self) -> Option<&RExpr> {
+        self.target_filter.as_ref()
+    }
+
+    /// Whether a WHEN NOT MATCHED BY SOURCE clause runs the full target scan (§3).
+    pub(crate) fn has_by_source(&self) -> bool {
+        self.clauses
+            .iter()
+            .any(|c| c.kind == MergeMatch::NotMatchedBySource)
+    }
 }
 
 /// One action of the action list (merge.md §4), in matching-pass order. `src` is the source row
@@ -118,8 +178,14 @@ fn source_rel<'a>(table: &'a Table, label: &str, offset: usize) -> ScopeRel<'a> 
     }
 }
 
-/// A qualifier-only row-version relation (`old` / `new`) over the target's columns.
-fn version_rel<'a>(table: &'a Table, label: &str, offset: usize) -> ScopeRel<'a> {
+/// A qualifier-only row-version relation (`old` / `new`) over the target's columns — a view's
+/// columns for a MERGE into a view.
+fn version_rel<'a>(
+    table: &'a Table,
+    vw: Option<&'a ViewWrite>,
+    label: &str,
+    offset: usize,
+) -> ScopeRel<'a> {
     ScopeRel {
         label: label.to_string(),
         table,
@@ -129,13 +195,36 @@ fn version_rel<'a>(table: &'a Table, label: &str, offset: usize) -> ScopeRel<'a>
         base: false,
         cte: None,
         db: None,
-        layer: None,
+        layer: vw.map(|vw| &vw.top),
     }
 }
 
+/// Expose a joined source's inner labels and hide its USING/NATURAL copies (grammar.md §15) when the
+/// source sits at flat `offset` of `scope` (merge.md §2). A no-op for any other source.
+fn with_source_group<'a>(scope: &mut Scope<'a>, group: Option<&'a JoinGroupLayout>, offset: usize) {
+    let Some(g) = group else {
+        return;
+    };
+    scope.sub_rels = g
+        .sub_rels
+        .iter()
+        .map(|sr| SubRel {
+            label: sr.label.clone(),
+            table: &sr.table,
+            slots: sr.slots.iter().map(|&s| offset + s).collect(),
+        })
+        .collect();
+    scope.hidden = g.hidden.iter().map(|&h| offset + h).collect();
+}
+
 /// The target relation at flat `offset`: [`Scope::target_rel`] moved.
-fn target_rel_at<'a>(table: &'a Table, alias: Option<&str>, offset: usize) -> ScopeRel<'a> {
-    let mut rel = Scope::target_rel(table, None, alias);
+fn target_rel_at<'a>(
+    table: &'a Table,
+    vw: Option<&'a ViewWrite>,
+    alias: Option<&str>,
+    offset: usize,
+) -> ScopeRel<'a> {
+    let mut rel = Scope::target_rel(table, vw, alias);
     rel.offset = offset;
     rel
 }
@@ -155,25 +244,133 @@ impl Engine {
     }
 
     /// The target checks every MERGE makes before resolving anything (merge.md §8): a catalog
-    /// relation is 42809, a read-only attachment 25006, a view 0A000, a missing table 42P01.
-    pub(crate) fn merge_target(&self, m: &Merge) -> Result<&Table> {
+    /// relation is 42809, a read-only attachment 25006, a missing table 42P01. A view target is
+    /// retargeted at its base table first ([`Self::rewrite_merge_target`]), so `m` then names the
+    /// table; the returned [`MergeView`] carries the view layering.
+    pub(crate) fn merge_target(&self, m: &mut Merge) -> Result<Option<MergeView>> {
         check_catalog_rel_write(&m.table)?;
         self.check_attachment_writable(m.db.as_deref())?;
-        if self.dml_target_view(m.db.as_deref(), &m.table)?.is_some() {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "MERGE into a view is not supported",
-            ));
-        }
+        let mv = self.rewrite_merge_target(m)?;
         self.check_table_qualifier(m.db.as_deref(), &m.table)
             .map_err(|e| e.at_target(m.table_pos.0))?;
-        self.table_scoped(m.db.as_deref(), &m.table).ok_or_else(|| {
-            EngineError::new(
+        if self.table_scoped(m.db.as_deref(), &m.table).is_none() {
+            return Err(EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", m.table),
             )
-            .at_target(m.table_pos.0)
-        })
+            .at_target(m.table_pos.0));
+        }
+        Ok(mv)
+    }
+
+    /// The plan-node label of a MERGE (explain.md §5): `Merge <table>`, naming the base table of a
+    /// view target as EXPLAIN renders it (views.md §15.5).
+    pub(crate) fn merge_node(&self, m: &Merge) -> String {
+        let mut m = m.clone();
+        // A target the rewrite refuses names itself; its error surfaces when the MERGE runs.
+        let _ = self.rewrite_merge_target(&mut m);
+        format!("Merge {}", m.table)
+    }
+
+    /// The target table of a MERGE [`Self::merge_target`] validated.
+    pub(crate) fn merge_table(&self, m: &Merge) -> &Table {
+        self.table_scoped(m.db.as_deref(), &m.table)
+            .expect("merge_target validated the target")
+    }
+
+    /// Retarget a MERGE into an automatically updatable view at its base table (merge.md §8,
+    /// views.md §15.2), clause by clause in written order: an UPDATE's SET columns and an INSERT's
+    /// column list name view columns and are validated like the standalone statement's (42703,
+    /// 42701, a read-only column 0A000, a view not updatable for the action 55000), then become the
+    /// base columns; `SET c = DEFAULT` assigns the view column's default. An INSERT without a column
+    /// list targets the view's first columns, one per value. `Ok(None)` when the target is a table.
+    pub(crate) fn rewrite_merge_target(&self, m: &mut Merge) -> Result<Option<MergeView>> {
+        if self.dml_target_view(m.db.as_deref(), &m.table)?.is_none() {
+            return Ok(None);
+        }
+        let mut clauses: Vec<Option<ViewWrite>> = Vec::with_capacity(m.clauses.len());
+        for c in &mut m.clauses {
+            let vw = match &mut c.action {
+                MergeAction::DoNothing => None,
+                MergeAction::Delete => self.prepare_view_write(
+                    m.db.as_deref(),
+                    &m.table,
+                    WriteKind::Delete,
+                    None,
+                    &[],
+                    &[],
+                    &[],
+                )?,
+                MergeAction::Update(assigns) => {
+                    let targets: Vec<String> = assigns.iter().map(|a| a.column.clone()).collect();
+                    let pos: Vec<SrcPos> = assigns.iter().map(|a| a.pos).collect();
+                    let vw = self
+                        .prepare_view_write(
+                            m.db.as_deref(),
+                            &m.table,
+                            WriteKind::Update,
+                            Some(&targets),
+                            &pos,
+                            &[],
+                            &[],
+                        )?
+                        .expect("the target is a view");
+                    for (a, base) in assigns.iter_mut().zip(&vw.targets) {
+                        if a.is_default {
+                            a.is_default = false;
+                            a.value = self.view_set_default(&vw.view, &a.column)?;
+                        }
+                        a.column = base.clone();
+                    }
+                    Some(vw)
+                }
+                MergeAction::Insert {
+                    columns,
+                    column_pos,
+                    values,
+                    ..
+                } => {
+                    let view_cols = self
+                        .dml_target_view(m.db.as_deref(), &m.table)?
+                        .expect("the target is a view")
+                        .columns;
+                    let targets: Vec<String> = match columns {
+                        Some(list) => list.clone(),
+                        None => view_cols.into_iter().take(values.len()).collect(),
+                    };
+                    let vw = self
+                        .prepare_view_write(
+                            m.db.as_deref(),
+                            &m.table,
+                            WriteKind::Insert,
+                            Some(&targets),
+                            column_pos,
+                            &[],
+                            &[],
+                        )?
+                        .expect("the target is a view");
+                    *columns = Some(vw.targets.clone());
+                    Some(vw)
+                }
+            };
+            clauses.push(vw);
+        }
+        // The layering the scopes expose: the chain validated for the weakest action, so a MERGE of
+        // only DO NOTHING clauses still names an updatable view.
+        let top = self
+            .prepare_view_write(
+                m.db.as_deref(),
+                &m.table,
+                WriteKind::Delete,
+                None,
+                &[],
+                &[],
+                &[],
+            )?
+            .expect("the target is a view");
+        m.table = top.table.clone();
+        m.db = None;
+        Ok(Some(MergeView { clauses, top }))
     }
 
     /// Resolve a MERGE against its target (merge.md §2): the source query, the join condition, every
@@ -182,15 +379,39 @@ impl Engine {
         &self,
         m: &Merge,
         table: &Table,
+        mv: Option<&MergeView>,
         bindings: &[&CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<MergePlan> {
         let n = table.columns.len();
+        let vw = mv.map(|mv| &mv.top);
         let source = self.plan_query(&m.source, None, bindings, ptypes)?;
         let label = m.source_label.clone().unwrap_or_default();
-        let src_table = cte_synthetic_table(&label, &source, None)?;
+        // A joined source is an unaliased join group (merge.md §2): one relation with no label whose
+        // inner labels stay visible, its columns the group's (hidden USING copies included).
+        let group = match &source {
+            QueryPlan::Select(sel) => sel.group.as_ref(),
+            _ => None,
+        };
+        let src_table = match group {
+            Some(g) => Box::new(Table {
+                name: String::new(),
+                columns: g.columns.clone(),
+                pk: Vec::new(),
+                checks: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                exclusions: Vec::new(),
+                on_commit: crate::catalog::OnCommit::PreserveRows,
+                scalar_func: false,
+            }),
+            None => cte_synthetic_table(&label, &source, None)?,
+        };
         let mw = src_table.columns.len();
-        let target_label = m.alias.as_deref().unwrap_or(&table.name);
+        let target_label = m
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| vw.map_or(table.name.as_str(), |vw| vw.view.as_str()));
         if !label.is_empty() && label == target_label {
             return Err(EngineError::new(
                 SqlState::DuplicateAlias,
@@ -198,55 +419,49 @@ impl Engine {
             ));
         }
         let alias = m.alias.as_deref();
-        let both = merge_scope(
+        let mut both = merge_scope(
             self,
             vec![
-                target_rel_at(table, alias, 0),
+                target_rel_at(table, vw, alias, 0),
                 source_rel(&src_table, &label, n),
             ],
             bindings,
         );
-        let src_only = merge_scope(self, vec![source_rel(&src_table, &label, 0)], bindings);
-        let tgt_only = merge_scope(self, vec![target_rel_at(table, alias, 0)], bindings);
+        with_source_group(&mut both, group, n);
+        let mut src_only = merge_scope(self, vec![source_rel(&src_table, &label, 0)], bindings);
+        with_source_group(&mut src_only, group, 0);
+        let tgt_only = merge_scope(self, vec![target_rel_at(table, vw, alias, 0)], bindings);
+        // A view target's rows are those its WHERE chain shows (views.md §15.2): the chain leads the
+        // join condition (and filters the not-matched-by-source scan), AND-ed left-deep.
+        let lead = |cond: RExpr| -> Result<RExpr> {
+            Ok(
+                match self.resolve_write_filter(
+                    &tgt_only,
+                    table,
+                    vw,
+                    None,
+                    &mut ParamTypes::default(),
+                )? {
+                    Some(view) => RExpr::And(Box::new(view), Box::new(cond)),
+                    None => cond,
+                },
+            )
+        };
         let on = resolve_boolean_filter(&both, &m.on, ptypes)?;
+        let on = lead(on)?;
         // The probe form: the target is the relation, the source an enclosing level (§3). The
         // combined resolution above already raised every name error.
-        let mut probe_scope = merge_scope(self, vec![target_rel_at(table, alias, 0)], bindings);
+        let mut probe_scope = merge_scope(self, vec![target_rel_at(table, vw, alias, 0)], bindings);
         probe_scope.parent = Some(&src_only);
         let probe = resolve_boolean_filter(&probe_scope, &m.on, &mut ParamTypes::default())?;
-
-        // SET col = DEFAULT and an INSERT's omitted columns resolve their expression defaults once
-        // per statement (constraints.md §2); only the columns some action can default resolve.
-        let mut need = vec![false; n];
-        for c in &m.clauses {
-            match &c.action {
-                MergeAction::Insert {
-                    columns,
-                    overriding,
-                    values,
-                    ..
-                } => {
-                    if let Ok((provided, _)) =
-                        merge_insert_columns(table, columns.as_deref(), &[], *overriding, values)
-                    {
-                        for (i, p) in provided.iter().enumerate() {
-                            if p.is_none() {
-                                need[i] = true;
-                            }
-                        }
-                    }
-                }
-                MergeAction::Update(_) | MergeAction::Delete | MergeAction::DoNothing => {}
-            }
-        }
-        let default_exprs = if need.iter().any(|&b| b) {
-            self.resolve_default_exprs_for(table, Some(&need), &mut ParamTypes::default())?
-        } else {
-            (0..n).map(|_| None).collect()
-        };
+        let probe = lead(probe)?;
+        let target_filter =
+            self.resolve_write_filter(&tgt_only, table, vw, None, &mut ParamTypes::default())?;
+        let hash = self.merge_hash_choice(m.db.as_deref(), table, &source, &on, &probe, &both);
+        let view_checks = self.resolve_view_checks(table, vw)?;
 
         let mut clauses = Vec::with_capacity(m.clauses.len());
-        for c in &m.clauses {
+        for (ci, c) in m.clauses.iter().enumerate() {
             let scope = match c.kind {
                 MergeMatch::Matched => &both,
                 MergeMatch::NotMatchedByTarget => &src_only,
@@ -268,13 +483,32 @@ impl Engine {
                     overriding,
                     values,
                 } => {
+                    // Through a view, the view column defaults replace the table's (views.md §16.1).
+                    let defaulted = match mv.and_then(|mv| mv.clauses[ci].as_ref()) {
+                        Some(cvw) if !cvw.default_overrides.is_empty() => {
+                            Some(self.table_with_view_defaults(table, cvw, *overriding)?)
+                        }
+                        _ => None,
+                    };
+                    let row_table = defaulted.as_ref().unwrap_or(table);
                     let (provided, slot_col) = merge_insert_columns(
-                        table,
+                        row_table,
                         columns.as_deref(),
                         column_pos,
                         *overriding,
                         values,
                     )?;
+                    // The omitted columns' expression defaults, resolved once for this action.
+                    let need: Vec<bool> = provided.iter().map(Option::is_none).collect();
+                    let defaults = if need.iter().any(|&b| b) {
+                        self.resolve_default_exprs_for(
+                            row_table,
+                            Some(&need),
+                            &mut ParamTypes::default(),
+                        )?
+                    } else {
+                        (0..n).map(|_| None).collect()
+                    };
                     let mut nodes: Vec<Option<RExpr>> = Vec::with_capacity(values.len());
                     for (p, v) in values.iter().enumerate() {
                         let (MergeValue::Expr(e), Some(i)) = (v, slot_col[p]) else {
@@ -324,6 +558,8 @@ impl Engine {
                     MergeActionPlan::Insert {
                         provided,
                         values: nodes,
+                        columns: row_table.columns.clone(),
+                        defaults,
                     }
                 }
             };
@@ -338,7 +574,8 @@ impl Engine {
             None => None,
             Some(ret) => {
                 let mut scope =
-                    self.merge_returning_scope(table, alias, &src_table, &label, ret)?;
+                    self.merge_returning_scope(table, vw, alias, &src_table, &label, ret)?;
+                with_source_group(&mut scope, group, 0);
                 scope.ctes = bindings;
                 let (nodes, names, types, derivs, typmods) =
                     resolve_projections(&scope, &ret.items, &mut AggCtx::Forbidden, ptypes)?;
@@ -351,9 +588,104 @@ impl Engine {
             on,
             probe,
             clauses,
-            default_exprs,
+            hash,
+            target_filter,
+            view_checks,
             returning,
         })
+    }
+
+    /// [`Self::plan_merge`] for a MERGE that is not about to run — a writable CTE's RETURNING schema,
+    /// EXPLAIN's render and estimate. The CTE references the planning counts are restored: the
+    /// orchestrator static-counts a data-modifying part's references (writable-cte.md §3).
+    pub(crate) fn plan_merge_detached(
+        &self,
+        m: &Merge,
+        table: &Table,
+        mv: Option<&MergeView>,
+        bindings: &[&CteBinding],
+        ptypes: &mut ParamTypes,
+    ) -> Result<MergePlan> {
+        let saved: Vec<(usize, bool)> = bindings
+            .iter()
+            .map(|b| (b.refs.get(), b.expanded.get()))
+            .collect();
+        let plan = self.plan_merge(m, table, mv, bindings, ptypes);
+        for (b, (refs, expanded)) in bindings.iter().zip(saved) {
+            b.refs.set(refs);
+            b.expanded.set(expanded);
+        }
+        plan
+    }
+
+    /// Choose the matching loop's form (merge.md §3, estimator.md §9.4): the hash join when the
+    /// probe's selected path is a full scan, the join condition passes the hash join's structural
+    /// gate (cost.md §3 "JOIN"), at least one conjunct equates a target column with a source column
+    /// of the same keyable type, and the hash estimate is strictly cheaper than the nested loop's.
+    /// The estimates read no CTE context, so EXPLAIN and execution choose identically.
+    fn merge_hash_choice(
+        &self,
+        db: Option<&str>,
+        table: &Table,
+        source: &QueryPlan,
+        on: &RExpr,
+        probe: &RExpr,
+        scope: &Scope,
+    ) -> Option<HashJoinPlan> {
+        let probe_plan =
+            self.plan_mutation_scan(db, table, Some(probe), where_contradicts(Some(probe)));
+        if probe_plan.bound.is_some() || probe_plan.contradiction {
+            return None;
+        }
+        let n = table.columns.len();
+        let mut conjuncts = Vec::new();
+        super::optimize::flatten_hash_join_conjuncts(on, &mut conjuncts);
+        let mut keys = Vec::new();
+        for e in conjuncts {
+            if !super::optimize::hash_join_safe_conjunct(e) {
+                return None;
+            }
+            let RExpr::Compare {
+                op: CmpOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = e
+            else {
+                continue;
+            };
+            let (RExpr::Column(a), RExpr::Column(b)) = (&**lhs, &**rhs) else {
+                continue;
+            };
+            let (target, source_col) = match (*a < n, *b < n) {
+                (true, false) => (*a, *b),
+                (false, true) => (*b, *a),
+                _ => continue,
+            };
+            let Some(t_ty) = super::optimize::hash_join_column_type(&scope.rels, target) else {
+                continue;
+            };
+            let Some(s_ty) = super::optimize::hash_join_column_type(&scope.rels, source_col) else {
+                continue;
+            };
+            if t_ty != s_ty || !super::optimize::hash_join_keyable_type(t_ty) {
+                continue;
+            }
+            keys.push(HashJoinKey {
+                left: source_col,
+                right: target,
+                ty: t_ty.clone(),
+            });
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let hash = HashJoinPlan { keys };
+        let source_estimate = self.estimate_query_plan(source, None);
+        let (nested, hashed) =
+            self.estimate_merge_loop(table, db, &source_estimate, on, probe, Some(&hash), None);
+        let hashed = hashed?;
+        (hashed.root.cost() < nested.root.cost()).then_some(hash)
     }
 
     /// Resolve one UPDATE action's assignments against its clause scope — the standalone UPDATE
@@ -428,6 +760,7 @@ impl Engine {
     fn merge_returning_scope<'a>(
         &'a self,
         table: &'a Table,
+        vw: Option<&'a ViewWrite>,
         alias: Option<&str>,
         src_table: &'a Table,
         label: &str,
@@ -437,7 +770,7 @@ impl Engine {
         let mw = src_table.columns.len();
         let mut rels = vec![
             source_rel(src_table, label, 0),
-            target_rel_at(table, alias, mw),
+            target_rel_at(table, vw, alias, mw),
         ];
         for (a, offset) in [
             (ret.old_alias.as_deref(), mw + n),
@@ -450,7 +783,7 @@ impl Engine {
                         format!("table name {a} specified more than once"),
                     ));
                 }
-                rels.push(version_rel(table, a, offset));
+                rels.push(version_rel(table, vw, a, offset));
             }
         }
         for (pseudo, offset, aliased) in [
@@ -458,7 +791,7 @@ impl Engine {
             ("new", mw + 2 * n, ret.new_alias.is_some()),
         ] {
             if !aliased && !rels.iter().any(|r| r.label == pseudo) {
-                rels.push(version_rel(table, pseudo, offset));
+                rels.push(version_rel(table, vw, pseudo, offset));
             }
         }
         let mut scope = merge_scope(self, rels, &[]);
@@ -471,7 +804,9 @@ impl Engine {
         // the values visible (estimator.md §6.1).
         let mut planning = plan_params::begin();
         let retry = planning.probing().then(|| m.clone());
-        let table = self.merge_target(&m)?;
+        let mut m = m;
+        let mv = self.merge_target(&mut m)?;
+        let table = self.merge_table(&m);
         let db = m.db.clone();
         let table_name = table.name.to_string();
         let relation = table.name.clone();
@@ -493,7 +828,7 @@ impl Engine {
             .to_vec();
         let colls = self.column_collations(&table.columns);
         let mut ptypes = ParamTypes::default();
-        let mut plan = self.plan_merge(&m, table, ctx.bindings, &mut ptypes)?;
+        let mut plan = self.plan_merge(&m, table, mv.as_ref(), ctx.bindings, &mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
         if planning.bind(&bound) {
             let retry = retry.expect("a probing boundary keeps its statement");
@@ -506,6 +841,9 @@ impl Engine {
         let contradiction = where_contradicts(Some(&plan.probe));
         self.fold_uncorrelated_in_plan(&mut plan.source, &bound, ctx, &mut meter.accrued)?;
         self.fold_uncorrelated_in_rexpr(&mut plan.on, &bound, ctx, &mut meter.accrued)?;
+        if let Some(f) = &mut plan.target_filter {
+            self.fold_uncorrelated_in_rexpr(f, &bound, ctx, &mut meter.accrued)?;
+        }
         for c in &mut plan.clauses {
             if let Some(cond) = &mut c.condition {
                 self.fold_uncorrelated_in_rexpr(cond, &bound, ctx, &mut meter.accrued)?;
@@ -534,6 +872,9 @@ impl Engine {
                 self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
             }
         }
+        for (_, check) in &mut plan.view_checks {
+            self.fold_uncorrelated_in_rexpr(check, &bound, ctx, &mut meter.accrued)?;
+        }
 
         // The source (§3): `SELECT * FROM source_ref`, its rows buffered and its cost charged.
         let q = self.exec_query_plan(&plan.source, &[], &bound, ctx)?;
@@ -541,31 +882,7 @@ impl Engine {
         let src_rows: Vec<Row> = q.rows;
         let mw = plan.m;
 
-        // The touched set (§9): every target column any part of the statement reads.
-        let mut mask = vec![false; n];
-        collect_touched(&plan.on, 0, &mut mask);
-        for c in &plan.clauses {
-            if c.kind == MergeMatch::NotMatchedByTarget {
-                continue;
-            }
-            if let Some(cond) = &c.condition {
-                collect_touched(cond, 0, &mut mask);
-            }
-            if let MergeActionPlan::Update(assigns) = &c.action {
-                for a in assigns {
-                    collect_touched(&a.source, 0, &mut mask);
-                }
-            }
-        }
-        if let Some((nodes, ..)) = &plan.returning {
-            let mut ret_mask = vec![false; mw + 3 * n + 1];
-            for node in nodes {
-                collect_touched(node, 0, &mut ret_mask);
-            }
-            for (i, t) in mask.iter_mut().enumerate() {
-                *t |= ret_mask[mw + i] || ret_mask[mw + n + i] || ret_mask[mw + 2 * n + i];
-            }
-        }
+        let mask = merge_touched(&plan, n);
 
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
@@ -710,41 +1027,117 @@ impl Engine {
             .clauses
             .iter()
             .any(|c| c.kind == MergeMatch::NotMatchedBySource);
+        // EXPLAIN ANALYZE attribution (explain.md §3): the probe scans, the matching loop (the source,
+        // the probes, and the join condition), and the not-matched-by-source scan.
+        let mut probe_actual: i64 = 0;
+        let mut loop_actual: i64 = q.cost;
+        // The hash form of the matching loop (§3): one full scan of the target, its rows' key
+        // columns hashed into a table each source row probes; the candidates keep scan order.
+        type Candidate = (Vec<u8>, Row, Option<Row>);
+        let hashed: Option<(HashJoinTable, &HashJoinPlan, Vec<Candidate>)> = match &plan.hash {
+            None => None,
+            Some(hp) => {
+                let before = meter.accrued;
+                let batch = self.execute_mutation_scan(
+                    &scan_plan,
+                    &table_name,
+                    Some(&plan.probe),
+                    &bound,
+                    &env,
+                    &mut meter,
+                    &mask,
+                )?;
+                meter.charge(
+                    COSTS.page_read * batch.pages as i64
+                        + COSTS.value_decompress * batch.slabs as i64,
+                );
+                let mut targets: Vec<Candidate> = Vec::with_capacity(batch.entries.len());
+                for (key, mut row) in batch.entries {
+                    meter.checkpoint()?;
+                    meter.charge(COSTS.storage_row_read);
+                    let stored = row
+                        .iter()
+                        .any(|v| matches!(v, Value::Unfetched(u) if u.is_large_form()))
+                        .then(|| row.clone());
+                    store.resolve_columns(&mut row, &mask)?;
+                    targets.push((key, row, stored));
+                }
+                probe_actual += meter.accrued - before;
+                let rows: Vec<Row> = targets.iter().map(|(_, row, _)| row.clone()).collect();
+                let table = HashJoinTable::build(hp, 0, n, &rows, &mut meter)?;
+                loop_actual += meter.accrued - before;
+                Some((table, hp, targets))
+            }
+        };
         for (si, src) in src_rows.iter().enumerate() {
             meter.checkpoint()?;
-            let outer: [&[Value]; 1] = [src.as_slice()];
-            let probe_env = EvalEnv {
-                exec: self,
-                params: &bound,
-                outer: &outer,
-                rng: &stmt_rng,
-                ctes: ctx,
-                host_batch: None,
+            // This source row's candidate target rows: the hash table's exact-key matches, already
+            // read; or the probe scan's entries, read one by one below.
+            let (entries, prefetched): (Vec<Candidate>, bool) = match &hashed {
+                Some((table, hp, targets)) => {
+                    let before = meter.accrued;
+                    let hits = table.probe(hp, src, &mut meter)?;
+                    loop_actual += meter.accrued - before;
+                    (hits.iter().map(|&i| targets[i].clone()).collect(), true)
+                }
+                None => {
+                    let outer: [&[Value]; 1] = [src.as_slice()];
+                    let probe_before = meter.accrued;
+                    let probe_env = EvalEnv {
+                        exec: self,
+                        params: &bound,
+                        outer: &outer,
+                        rng: &stmt_rng,
+                        ctes: ctx,
+                        host_batch: None,
+                    };
+                    let batch = self.execute_mutation_scan(
+                        &scan_plan,
+                        &table_name,
+                        Some(&plan.probe),
+                        &bound,
+                        &probe_env,
+                        &mut meter,
+                        &mask,
+                    )?;
+                    meter.charge(
+                        COSTS.page_read * batch.pages as i64
+                            + COSTS.value_decompress * batch.slabs as i64,
+                    );
+                    probe_actual += meter.accrued - probe_before;
+                    loop_actual += meter.accrued - probe_before;
+                    (
+                        batch
+                            .entries
+                            .into_iter()
+                            .map(|(key, row)| (key, row, None))
+                            .collect(),
+                        false,
+                    )
+                }
             };
-            let batch = self.execute_mutation_scan(
-                &scan_plan,
-                &table_name,
-                Some(&plan.probe),
-                &bound,
-                &probe_env,
-                &mut meter,
-                &mask,
-            )?;
-            meter.charge(
-                COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
-            );
             let mut any = false;
-            for (key, mut row) in batch.entries {
-                meter.checkpoint()?;
-                meter.charge(COSTS.storage_row_read);
-                let stored = row
-                    .iter()
-                    .any(|v| matches!(v, Value::Unfetched(u) if u.is_large_form()))
-                    .then(|| row.clone());
-                store.resolve_columns(&mut row, &mask)?;
+            for (key, mut row, read) in entries {
+                let stored = if prefetched {
+                    read
+                } else {
+                    meter.checkpoint()?;
+                    meter.charge(COSTS.storage_row_read);
+                    probe_actual += COSTS.storage_row_read;
+                    loop_actual += COSTS.storage_row_read;
+                    let stored = row
+                        .iter()
+                        .any(|v| matches!(v, Value::Unfetched(u) if u.is_large_form()))
+                        .then(|| row.clone());
+                    store.resolve_columns(&mut row, &mask)?;
+                    stored
+                };
                 let mut combined = row.clone();
                 combined.extend_from_slice(src);
-                if !plan.on.eval_filter(&combined, &env, &mut meter)? {
+                let on_before = meter.accrued;
+                let hit = plan.on.eval_filter(&combined, &env, &mut meter)?;
+                loop_actual += meter.accrued - on_before;
+                if !hit {
                     continue;
                 }
                 any = true;
@@ -773,7 +1166,13 @@ impl Engine {
             let Some(ci) = choose(MergeMatch::NotMatchedByTarget, src, &mut meter)? else {
                 continue;
             };
-            let MergeActionPlan::Insert { provided, values } = &plan.clauses[ci].action else {
+            let MergeActionPlan::Insert {
+                provided,
+                values,
+                columns: row_columns,
+                defaults,
+            } = &plan.clauses[ci].action
+            else {
                 continue; // DO NOTHING
             };
             let mut vals: Vec<Value> = Vec::with_capacity(values.len());
@@ -787,11 +1186,11 @@ impl Engine {
                 });
             }
             let row = self.build_insert_row(
-                &columns,
+                row_columns,
                 &col_types,
                 provided,
                 &vals,
-                &plan.default_exprs,
+                defaults,
                 &stmt_rng,
                 &mut meter,
                 &relation,
@@ -799,13 +1198,28 @@ impl Engine {
             self.eval_checks(&checks, &row, &stmt_rng, &relation, &mut meter)?;
             actions.push(Planned::Insert { row, src: si });
         }
+        if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+            let node = if plan.hash.is_some() {
+                "Hash Join"
+            } else {
+                "Nested Loop"
+            };
+            profile.record(node.to_string(), loop_actual);
+            profile.record(format!("Scan {table_name}"), probe_actual);
+        }
         // Not matched by source (§3): one full scan in storage-key order.
         if has_by_source {
-            let full = self.plan_mutation_scan(db.as_deref(), table, None, false);
+            let scan_before = meter.accrued;
+            let full = self.plan_mutation_scan(
+                db.as_deref(),
+                table,
+                plan.target_filter.as_ref(),
+                where_contradicts(plan.target_filter.as_ref()),
+            );
             let batch = self.execute_mutation_scan(
                 &full,
                 &table_name,
-                None,
+                plan.target_filter.as_ref(),
                 &bound,
                 &env,
                 &mut meter,
@@ -814,9 +1228,11 @@ impl Engine {
             meter.charge(
                 COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
             );
+            let mut scan_actual = meter.accrued - scan_before;
             for (key, mut row) in batch.entries {
                 meter.checkpoint()?;
                 meter.charge(COSTS.storage_row_read);
+                scan_actual += COSTS.storage_row_read;
                 if matched.contains(&key) {
                     continue;
                 }
@@ -825,6 +1241,15 @@ impl Engine {
                     .any(|v| matches!(v, Value::Unfetched(u) if u.is_large_form()))
                     .then(|| row.clone());
                 store.resolve_columns(&mut row, &mask)?;
+                // A view target's row outside its WHERE chain is not a target row (views.md §15.2).
+                if let Some(f) = &plan.target_filter {
+                    let before = meter.accrued;
+                    let shown = f.eval_filter(&row, &env, &mut meter)?;
+                    scan_actual += meter.accrued - before;
+                    if !shown {
+                        continue;
+                    }
+                }
                 let Some(ci) = choose(MergeMatch::NotMatchedBySource, &row, &mut meter)? else {
                     continue;
                 };
@@ -841,6 +1266,9 @@ impl Engine {
                     &mut affected,
                     &mut actions,
                 )?;
+            }
+            if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
+                profile.record(format!("Scan {table_name}"), scan_actual);
             }
         }
 
@@ -926,6 +1354,11 @@ impl Engine {
                         )));
                 }
             }
+        }
+        // The check option of a MERGE into a view (views.md §15.6): each placed row, after the
+        // end-state keys and before EXCLUDE and FOREIGN KEY.
+        for row in &placed {
+            eval_view_checks(&plan.view_checks, row, &env, &mut meter)?;
         }
         self.validate_exclusions(&table_name, &relation, &placed, &vacated)?;
         // FOREIGN KEY child side: every inserted row, and every updated row whose clause assigned one
@@ -1211,6 +1644,38 @@ impl Engine {
             },
         })
     }
+}
+
+/// The touched set of a target row (merge.md §9): every target column the join condition, a MATCHED
+/// or NOT MATCHED BY SOURCE condition or `SET` right-hand side, or `RETURNING` (target, `old.`, or
+/// `new.`) reads.
+pub(crate) fn merge_touched(plan: &MergePlan, n: usize) -> Vec<bool> {
+    let mut mask = vec![false; n];
+    collect_touched(&plan.on, 0, &mut mask);
+    for c in &plan.clauses {
+        if c.kind == MergeMatch::NotMatchedByTarget {
+            continue;
+        }
+        if let Some(cond) = &c.condition {
+            collect_touched(cond, 0, &mut mask);
+        }
+        if let MergeActionPlan::Update(assigns) = &c.action {
+            for a in assigns {
+                collect_touched(&a.source, 0, &mut mask);
+            }
+        }
+    }
+    if let Some((nodes, ..)) = &plan.returning {
+        let mw = plan.m;
+        let mut ret_mask = vec![false; mw + 3 * n + 1];
+        for node in nodes {
+            collect_touched(node, 0, &mut ret_mask);
+        }
+        for (i, t) in mask.iter_mut().enumerate() {
+            *t |= ret_mask[mw + i] || ret_mask[mw + n + i] || ret_mask[mw + 2 * n + i];
+        }
+    }
+    mask
 }
 
 /// Map an INSERT action's value slots to target columns (merge.md §2): `provided[i]` is the slot
