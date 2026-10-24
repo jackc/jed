@@ -2796,8 +2796,7 @@ type recordPlan struct {
 // "Value codec"): the present tag plus, for the length-prefixed text / bytea / json bodies, the u16
 // length; just the tag for every other spillable body (whose payload is the body itself).
 func inlineHeaderLen(ty colType) int {
-	if !ty.Composite && ty.Elem == nil && ty.RangeElem == nil &&
-		(ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsJson()) {
+	if stringPayload(ty) {
 		return 3
 	}
 	return 1
@@ -2822,11 +2821,24 @@ func valueFacts(ty colType, v Value) (inline, payload int) {
 		}
 		return payload + inlineHeaderLen(ty), payload
 	}
-	inline = len(encodeValue(ty, v))
-	if isSpillable(ty) {
+	if !isSpillable(ty) {
+		return len(encodeValue(ty, v)), 0
+	}
+	// A spillable value's inline-plain encoding is its header then its payload P(v), so neither is
+	// built just to be measured: a text / bytea / json body's length is its string's.
+	if stringPayload(ty) {
+		payload = len(v.str())
+	} else {
 		payload = len(valuePayload(ty, v))
 	}
-	return inline, payload
+	return inlineHeaderLen(ty) + payload, payload
+}
+
+// stringPayload reports whether a column's content payload P(v) is a resident value's string body
+// verbatim — text, bytea and json (valuePayload).
+func stringPayload(ty colType) bool {
+	return !ty.Composite && ty.Elem == nil && ty.RangeElem == nil &&
+		(ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsJson())
 }
 
 // planningPayload is the content payload P(v) of a value the planner compresses: a resident value's,
@@ -2843,6 +2855,17 @@ func planningPayload(ty colType, v Value) []byte {
 		return u.Comp[skip:]
 	}
 	return valuePayload(ty, v)
+}
+
+// planningCompress is the LZ4 block of planningPayload, written into scratch. A resident string body
+// is compressed in place rather than from a copy of it.
+func planningCompress(scratch *lz4Scratch, ty colType, v Value) []byte {
+	if v.Kind != ValUnfetched && stringPayload(ty) {
+		scratch.out = lz4CompressInto(scratch.out, &scratch.table, v.str())
+	} else {
+		scratch.out = lz4CompressInto(scratch.out, &scratch.table, planningPayload(ty, v))
+	}
+	return scratch.out
 }
 
 // planDispositions decides each column's on-disk disposition (large-values.md §3/§12/§13;
@@ -2920,8 +2943,14 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, pcap pageCa
 				compLen = int(u.StoredLen) // the block stays on the value's chain
 			}
 		} else {
-			comp = lz4Compress(planningPayload(colTypes[i], v))
+			// The attempt's block is built in a recycled buffer and copied out only if adopted.
+			scratch := lz4ScratchPool.Get().(*lz4Scratch)
+			comp = planningCompress(scratch, colTypes[i], v)
 			compLen = len(comp)
+			if inlineCompOverhead+compLen < inline[i] {
+				comp = bytes.Clone(comp)
+			}
+			lz4ScratchPool.Put(scratch)
 		}
 		if compLen >= 0 && inlineCompOverhead+compLen < inline[i] {
 			size = size - cur[i] + inlineCompOverhead + compLen
