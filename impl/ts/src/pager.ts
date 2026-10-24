@@ -311,6 +311,21 @@ export class Pager {
     return yield* this.decodeSteps(index, stored);
   }
 
+  // readBlocks reads several pages in one store request when the store batches reads (a page client,
+  // spec/design/page-service.md §5.3), page by page otherwise.
+  readBlocks(indices: number[]): Uint8Array[] {
+    const store = this.store;
+    if (store.batchesReads?.() !== true || store.readPages === undefined) {
+      return indices.map((index) => this.readBlock(index));
+    }
+    return store.readPages(indices).map((stored, i) => this.decodeSync(indices[i]!, stored));
+  }
+
+  // batchesReads reports whether the store fetches several pages in one request.
+  batchesReads(): boolean {
+    return this.store.batchesReads?.() === true;
+  }
+
   // readPageSteps is the write side's page read (commit, recovery, maintenance — ts-runtime.md §11):
   // inline in the synchronous mode, otherwise each stage awaits its asynchronous form when offered.
   // Unlike a query's data read it never adds a task yield before a synchronous device read.

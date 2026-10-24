@@ -9,7 +9,7 @@
 // §5): the owner record and the owner's endpoint. Type-only, so it imports nothing at run time.
 
 import type { PsOwnerRecord } from "./pageservice/codec.ts";
-import type { PageNet } from "./pageservice/net.ts";
+import type { PageNet, StreamTransport } from "./pageservice/net.ts";
 
 // A LockHandle is one bundle file's lock: a native lock file for the OS host.
 export type LockHandle = unknown;
@@ -45,4 +45,8 @@ export interface LockHost {
   // pageNet is the simulator's in-memory page-service network. Absent (the OS host), an owner serves
   // and a client connects on the process's worker threads over OS sockets.
   readonly pageNet?: PageNet;
+  // stream is a remote database's transport (pageservice/remote.ts): a client connects by running its
+  // command, sends its credential in every hello, and reads ahead. Absent, a client dials the owner's
+  // endpoint socket.
+  readonly stream?: StreamTransport;
 }

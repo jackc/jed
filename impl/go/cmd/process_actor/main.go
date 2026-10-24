@@ -83,7 +83,27 @@ func run() error {
 		locking = jed.LockingExclusive
 	}
 	readOnly := os.Args[1] == "open-read-only"
-	if os.Args[1] == "create" {
+	if os.Args[1] == "open-remote" || os.Args[1] == "open-remote-read-only" {
+		// A page client over the stream transport. Go has no serving end, so the transport command is
+		// the Rust actor serving PATH (`pages`, named by JED_PAGES_ACTOR): what `jed ssh://host/path`
+		// runs, without SSH.
+		server := os.Getenv("JED_PAGES_ACTOR")
+		if server == "" {
+			return fmt.Errorf("open-remote needs JED_PAGES_ACTOR, the Rust process actor")
+		}
+		serve := "pages"
+		if os.Args[1] == "open-remote-read-only" {
+			serve = "pages-read-only"
+		}
+		if options["read_ahead"] == "off" {
+			jed.SetPageClientReadAheadForTesting(false)
+		}
+		transport := []string{server, serve, os.Args[2]}
+		if latency, ok := options["latency_us"]; ok {
+			transport = append(transport, latency)
+		}
+		db, err = jed.OpenRemote(transport, "remote:"+os.Args[2], jed.OpenOptions{FileLockTimeoutMs: &timeout, Credential: credential})
+	} else if os.Args[1] == "create" {
 		db, err = jed.CreateDatabase(jed.CreateOptions{
 			Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle,
 			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,

@@ -336,9 +336,9 @@ the transport only replaces how a connection is made.
      `jed pages` (step 1). If the open makes it a client instead (another process won the election),
      it closes that handle and retries step 1;
   3. a failure to open is answered with a fatal `error` frame for the `hello`.
-- Only the Rust core (and so the CLI) has a stream transport so far; the owners it relays to may be
-  any core. Go and TypeScript clients reach a remote database the same way once they gain one; the
-  wire contract needs nothing more.
+- Every core has the client (Rust `Database::open_remote`, Go `OpenRemote`, TS
+  `openRemoteDatabase`); only Rust has the serving end (`jed pages`). The owners it relays to may be
+  any core.
 
 ## 6. Roles under `locking = auto` (phases 2–4)
 

@@ -386,7 +386,9 @@ Both expose `createDatabase(options)` and `openDatabase(path, options)` returnin
 with `UNSUPPORTED`. A path selects a Node file or an OPFS name; create without a path
 selects the same page-backed in-memory host. `jed-ts/internal` and repository-relative
 core modules retain synchronous entry points for conformance and existing host tooling;
-they are not the application entry point. Rust and Go APIs are unchanged.
+they are not the application entry point. Rust and Go APIs are unchanged. `jed-ts` also exports
+`openRemoteDatabase(command, name, options)`, a page client over the stream transport run inside the
+execution worker ([api.md](api.md) §2.1, [spec/pageservice/README.md](../pageservice/README.md) §5.3).
 
 The database offers async `session`, `readSession`, `query`, `execute`, `prepare`,
 `batch`, `executeScript`, `view`, `update`, and `close`. Database conveniences use a fresh

@@ -810,15 +810,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `jed pages [--read-only] DBFILE`, relaying to the live owner or owning as a `yield` owner), the CLI
     opening `ssh://[user@]host[:port]/path` through the system `ssh`, and client-side read-ahead /
     subtree fetch over the unchanged `read_pages` for stream clients (spec/pageservice/README.md §5.3,
-    page-service.md §5.3, cli.md §3). No wire change. Proven by `service_stream.process.toml` (a Rust
-    stream client against owners of every core), Rust host-API tests (including a backup through the
+    page-service.md §5.3, cli.md §3). No wire change. Proven by `service_stream.process.toml` (each
+    core's stream client against owners of every core), Rust host-API tests (including a backup through the
     stream, byte-identical to a local one), and CLI e2e tests with a fake `ssh`; `bench:page_service`
     adds `stream_cold_scan` with and without read-ahead.
     - [ ] **Decide: configuring the remote binary and the ssh command** (maintainer). Today the CLI runs
       `ssh` from `PATH` and `jed` from the remote `PATH`, with no option for either (an environment
       variable, a flag, or a URL query are the candidates).
-    - [ ] **Go / TS stream clients**, when a program needs remote access from them (page-service.md §14);
-      a transport, not a protocol, change. Read-ahead would then be ported with them.
+    - [x] **Go / TS stream clients** ✅ **landed**: Go `OpenRemote` and TS `openRemoteDatabase` (sync
+      and async entry points) over the unchanged protocol, with read-ahead ported. The
+      `service_stream` / `encrypted_stream` process scenarios now run every core's stream client
+      against owners of every core through the Rust `jed pages`; Go and TS host-API tests cover
+      read-ahead round trips and a failed open's `08006` wording. The serving end stays Rust's.
   - [x] **Phase 6 — backup.** ✅ **landed** (Rust, Go, TS). Page-identical and compacted forms — jed's
     answer to SQLite's `sqlite3_backup` / `VACUUM INTO`, locally as well as over SSH. A backup pins one
     committed snapshot like a reader (never the writer gate) and walks it with its own engine in every

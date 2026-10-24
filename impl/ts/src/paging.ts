@@ -54,10 +54,14 @@ export class SharedPaging {
   // (prefetchSteps), so the synchronous from-scratch serializer finds them without a read under an
   // asynchronous codec or device (spec/design/ts-runtime.md §11.1). null outside a rewrite.
   private prefetched: Map<number, Uint8Array> | null = null;
+  // batches is set when the store fetches several pages in one request (a page client over the stream
+  // transport): scans read ahead (prefetchLeaves).
+  readonly batches: boolean;
 
   constructor(pager: Pager, capacity: number, codec: PageCodec | null = null) {
     this.pager = pager;
     this.pool = new BufferPool(capacity);
+    this.batches = pager.batchesReads();
     this.pageCodec = codec;
     this.pageCap = capOf(pager.pageSize, codec !== null);
     if (codec !== null) pager.setEncrypted();
@@ -161,6 +165,42 @@ export class SharedPaging {
     if (!sameLeafShape(node.packed!.colTypes, colTypes))
       throw engineError("data_corrupted", "leaf page belongs to a different tree");
     return node;
+  }
+
+  // prefetchLeaves reads ahead (spec/design/page-service.md §5.3): it brings the leaves at pages that
+  // are not resident into the pool with one batched store read, decoded as a fault would decode them.
+  // At most a quarter of the pool is read ahead at once, so read-ahead cannot evict the leaf the scan
+  // is on. A failure is ignored: the fault that follows reads the page again and reports it.
+  prefetchLeaves(pages: { page: number; tag: Uint8Array }[], colTypes: ColType[]): void {
+    if (!this.batches) return;
+    const limit = Math.max(Math.floor(this.pool.capacity / 4), 1);
+    const missing: { page: number; tag: Uint8Array }[] = [];
+    for (const p of pages) {
+      if (missing.length === limit) break;
+      if (!this.pool.contains(p.page)) missing.push(p);
+    }
+    if (missing.length < 2) return;
+    let blocks: Uint8Array[];
+    try {
+      blocks = this.pager.readBlocks(missing.map((p) => p.page));
+    } catch {
+      return;
+    }
+    missing.forEach(({ page, tag }, i) => {
+      try {
+        this.pool.getOrLoad(page, () =>
+          decodeLeafNode(
+            this.openBody(page, tag, blocks[i]!),
+            page,
+            colTypes,
+            this,
+            this.pageCodec === null ? undefined : tag,
+          ),
+        );
+      } catch {
+        // The fault reports it.
+      }
+    });
   }
 
   // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and

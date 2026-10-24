@@ -52,7 +52,7 @@ import {
   STATUS_PAUSED,
 } from "./client_status.ts";
 import type { ClientAnswer, ClientRequest } from "./client_worker.ts";
-import type { ClientLink } from "./net.ts";
+import type { ClientLink, StreamTransport } from "./net.ts";
 import {
   decodeFrame,
   encodeFrame,
@@ -129,6 +129,25 @@ export class CommitLost extends Error {
   }
 }
 
+// readAheadDisabled turns read-ahead off for connections made afterwards
+// (setPageClientReadAheadForTesting).
+let readAheadDisabled = false;
+
+// setPageClientReadAheadForTesting turns page-client read-ahead (spec/design/page-service.md §5.3) on
+// or off for connections this process makes afterwards. On by default for the stream transport. Test-
+// and benchmark-only: the page-service benchmark's no-read-ahead baseline.
+export function setPageClientReadAheadForTesting(enabled: boolean): void {
+  readAheadDisabled = !enabled;
+}
+
+// readPagesSent counts the read_pages requests this process sent (the read-ahead tests count round
+// trips).
+let readPagesSent = 0;
+
+export function readPagesSentForTesting(): number {
+  return readPagesSent;
+}
+
 // The process's one socket worker, shared by every page-service connection it opens; conn numbers
 // tag each connection there.
 const socketWorker = new ProcessWorker(new URL("./client_worker.ts", import.meta.url));
@@ -147,8 +166,11 @@ export class WorkerLink implements ClientLink {
   private readonly remoteEvents: MessagePort;
   // attached is set once the status buffer and the event port went to the worker.
   private attached = false;
+  // stream is the stream transport this link's connections run (null: the owner's endpoint socket).
+  private readonly stream: StreamTransport | null;
 
-  constructor() {
+  constructor(stream: StreamTransport | null = null) {
+    this.stream = stream;
     this.channel = socketWorker.acquire();
     const { port1, port2 } = new MessageChannel();
     this.events = port1;
@@ -158,11 +180,20 @@ export class WorkerLink implements ClientLink {
 
   connect(endpoint: string): ClientAnswer {
     const request: ClientRequest = { op: "connect", conn: this.conn, endpoint };
-    if (this.attached) return this.channel.request(request) as ClientAnswer;
+    if (this.stream !== null) request.command = this.stream.command;
+    if (this.attached) return this.noted(this.channel.request(request) as ClientAnswer);
     this.attached = true;
     request.status = this.status;
     request.events = this.remoteEvents;
-    return this.channel.request(request, [this.remoteEvents]) as ClientAnswer;
+    return this.noted(this.channel.request(request, [this.remoteEvents]) as ClientAnswer);
+  }
+
+  // noted records a stream transport's failure from a lost answer, for a failed open's message.
+  private noted(answer: ClientAnswer): ClientAnswer {
+    if (this.stream !== null && "lost" in answer && answer.failure !== undefined) {
+      this.stream.lastFailure = answer.failure;
+    }
+    return answer;
   }
 
   send(frame: Uint8Array, reply: boolean): void {
@@ -170,11 +201,13 @@ export class WorkerLink implements ClientLink {
   }
 
   wait(): ClientAnswer {
-    return this.channel.wait() as ClientAnswer;
+    return this.noted(this.channel.wait() as ClientAnswer);
   }
 
   next(): ClientAnswer {
-    return this.channel.request({ op: "next", conn: this.conn } as ClientRequest) as ClientAnswer;
+    return this.noted(
+      this.channel.request({ op: "next", conn: this.conn } as ClientRequest) as ClientAnswer,
+    );
   }
 
   disconnect(): void {
@@ -250,6 +283,11 @@ export class PageClient implements PageClientHandle {
   private writeTxid = 0n;
   // link is the connection's transport: the socket worker, or the simulator's in-memory network.
   private readonly link: ClientLink;
+  // stream is the stream transport the link runs, whose hellos carry its credential and whose scans
+  // read ahead (page-service.md §5.3); null for a local connection.
+  private readonly stream: StreamTransport | null;
+  // readAhead is set for a connection over the stream transport: scans read ahead through it.
+  readonly readAhead: boolean;
   private nextId = 0;
   // broken is the sticky failure after the connection is lost (08006) or a fatal error.
   private broken: EngineError | null = null;
@@ -260,9 +298,11 @@ export class PageClient implements PageClientHandle {
   // request_ownership); they are dropped when they arrive.
   private readonly discard = new Set<number>();
 
-  constructor(dbPath: string, link: ClientLink = new WorkerLink()) {
+  constructor(dbPath: string, link?: ClientLink, stream: StreamTransport | null = null) {
     this.dbPath = dbPath;
-    this.link = link;
+    this.link = link ?? new WorkerLink(stream);
+    this.stream = stream;
+    this.readAhead = stream !== null && !readAheadDisabled;
   }
 
   // onLost installs the handler run (on the event loop) when the connection ends.
@@ -311,7 +351,7 @@ export class PageClient implements PageClientHandle {
         formatVersion: FORMAT_VERSION,
         flags: readOnly ? PS_HELLO_FLAG_READ_ONLY : 0,
         clientName: "jed-ts",
-        credential: null,
+        credential: this.stream?.credential ?? null,
       });
     } catch (error) {
       this.link.disconnect();
@@ -535,33 +575,31 @@ export class PageClient implements PageClientHandle {
 
   // readPage fetches one page under the newest pinned version, the write pin included.
   readPage(index: number): Uint8Array {
-    let newest = this.writeTxid;
-    for (const v of this.held) if (v > newest) newest = v;
-    if (newest === 0n) {
-      throw engineError("io_error", "a page client read a page with no pinned snapshot");
-    }
-    const reply = this.roundTrip({ kind: "read_pages", txid: newest, indices: [index] });
-    if (reply.kind !== "pages" || reply.pages.length !== 1) {
-      this.breakWith(engineError("protocol_violation", "unexpected reply to read_pages"));
-      throw this.broken!;
-    }
-    return reply.pages[0]!;
+    return this.readPages([index])[0]!;
   }
 
-  // readPages fetches a batch of pages under the newest pinned version (a backup's copy, README.md
-  // §6.6). The batch holds at most maxReadPages() indices.
+  // readPages fetches pages under the newest pinned version, the write pin included, in as few
+  // read_pages requests as maxReadPages() allows (read-ahead batches them, page-service.md §5.3; a
+  // backup's copy, README.md §6.6).
   readPages(indices: number[]): Uint8Array[] {
     let newest = this.writeTxid;
     for (const v of this.held) if (v > newest) newest = v;
     if (newest === 0n) {
       throw engineError("io_error", "a page client read a page with no pinned snapshot");
     }
-    const reply = this.roundTrip({ kind: "read_pages", txid: newest, indices: [...indices] });
-    if (reply.kind !== "pages" || reply.pages.length !== indices.length) {
-      this.breakWith(engineError("protocol_violation", "unexpected reply to read_pages"));
-      throw this.broken!;
+    const limit = Math.max(this.maxReadPages(), 1);
+    const pages: Uint8Array[] = [];
+    for (let start = 0; start < indices.length; start += limit) {
+      const chunk = indices.slice(start, start + limit);
+      readPagesSent++;
+      const reply = this.roundTrip({ kind: "read_pages", txid: newest, indices: chunk });
+      if (reply.kind !== "pages" || reply.pages.length !== chunk.length) {
+        this.breakWith(engineError("protocol_violation", "unexpected reply to read_pages"));
+        throw this.broken!;
+      }
+      pages.push(...reply.pages);
     }
-    return reply.pages;
+    return pages;
   }
 
   // maxReadPages is the most indices one read_pages may name on this connection (README.md §3.1).
@@ -679,6 +717,29 @@ class ServiceBlockStore implements BlockStore {
 
   constructor(client: PageClient) {
     this.client = client;
+  }
+
+  // batchesReads makes scans read ahead through a connection over the stream transport.
+  batchesReads(): boolean {
+    return this.client.readAhead;
+  }
+
+  // readPages reads whole pages: the meta slots and a commit's pending pages are local; every other
+  // page comes from the owner in one batched fetch.
+  readPages(indices: number[]): Uint8Array[] {
+    const remote = indices.filter((index) => index >= 2 && !this.pending.has(index));
+    const fetched = remote.length === 0 ? [] : this.client.readPages(remote);
+    let next = 0;
+    return indices.map((index) => {
+      const page =
+        index < 2
+          ? this.client.currentMeta().slice()
+          : (this.pending.get(index)?.slice() ?? fetched[next++]!);
+      if (page.length !== this.client.pageSize) {
+        throw engineError("protocol_violation", "the owner sent a page of the wrong size");
+      }
+      return page;
+    });
   }
 
   readAt(offset: number, len: number): Uint8Array {

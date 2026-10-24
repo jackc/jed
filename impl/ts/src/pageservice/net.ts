@@ -5,6 +5,7 @@
 // network (src/sim/net.ts) on which the owner's connection code (owner_conn.ts) runs on the engine
 // thread, so every request is answered before the client's wait returns. Type-only.
 
+import type { Credential } from "../crypto.ts";
 import type { Engine } from "../executor.ts";
 import type { ClientAnswer } from "./client_worker.ts";
 import type { ServiceState } from "./shared_state.ts";
@@ -35,6 +36,16 @@ export interface ClientLink {
   // onLost installs the handler run on the event loop when the connection ends.
   onLost(handler: () => void): void;
 }
+
+// StreamTransport is how a remote database is reached (the stream transport, spec/pageservice/README.md
+// §5.3): every connection runs command, whose stdin and stdout carry it, and its hello carries
+// credential. lastFailure is the tail of the last transport's standard error, or why it could not run,
+// for a failed open's message.
+export type StreamTransport = {
+  readonly command: string[];
+  readonly credential: Credential | null;
+  lastFailure: string;
+};
 
 // OwnerServeArgs is what an owner's service needs to serve one database (owner.ts).
 export type OwnerServeArgs = {

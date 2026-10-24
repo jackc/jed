@@ -47,6 +47,9 @@ type psClient struct {
 	// ownerReadOnly and ownerYields are the owner's hello_ok flags (README.md §3.1, §6.5).
 	ownerReadOnly bool
 	ownerYields   bool
+	// readAhead is set for a connection over the stream transport: scans read ahead through it
+	// (page-service.md §5.3).
+	readAhead bool
 
 	// pendMu guards pending and broken. broken is the sticky failure after the connection is lost
 	// (08006) or poisoned by a fatal error.
@@ -95,8 +98,25 @@ type psClient struct {
 	closeOnce sync.Once
 }
 
+// readAheadDisabled turns read-ahead off for connections made afterwards
+// (SetPageClientReadAheadForTesting).
+var readAheadDisabled atomic.Bool
+
+// SetPageClientReadAheadForTesting turns page-client read-ahead (spec/design/page-service.md §5.3) on
+// or off for connections this process makes afterwards. On by default for the stream transport. Test-
+// and benchmark-only: the page-service benchmark's no-read-ahead baseline.
+func SetPageClientReadAheadForTesting(enabled bool) { readAheadDisabled.Store(!enabled) }
+
 func connectionLost(err error) error {
 	return newError(ConnectionFailure, "lost the connection to the database owner: "+err.Error())
+}
+
+// streamLockHost is a lock host whose connections are a transport command's stdio (the stream
+// transport, pageservice_remote_unix.go; spec/pageservice/README.md §5.3): its hellos carry the
+// handle's credential, and its clients read ahead because their round trips cross a network.
+type streamLockHost interface {
+	helloCredential() *Credential
+	readsAhead() bool
 }
 
 // connectPageClient dials the endpoint and runs hello. A dial or handshake failure the opener may
@@ -112,7 +132,12 @@ func connectPageClient(host lockHost, dbPath, endpoint string, readOnly bool) (c
 	if readOnly {
 		flags = psHelloFlagReadOnly
 	}
-	reply, err := cl.roundTrip(psHello{protocolMin: psProtocolVersion, protocolMax: psProtocolVersion, formatVersion: formatVersion, flags: flags, clientName: "jed-go"})
+	var credential *Credential
+	if stream, ok := host.(streamLockHost); ok {
+		credential = stream.helloCredential()
+		cl.readAhead = stream.readsAhead() && !readAheadDisabled.Load()
+	}
+	reply, err := cl.roundTrip(psHello{protocolMin: psProtocolVersion, protocolMax: psProtocolVersion, formatVersion: formatVersion, flags: flags, clientName: "jed-go", credential: credential})
 	if err != nil {
 		cl.close()
 		var engine *EngineError
@@ -340,43 +365,42 @@ func (cl *psClient) currentMeta() []byte {
 
 // readPage fetches one page under the newest pinned version.
 func (cl *psClient) readPage(index uint32) ([]byte, error) {
-	reply, err := cl.roundTripWith(func() (psMessage, error) {
-		txid := cl.readTxid.Load()
-		if txid == 0 {
-			return nil, newError(ObjectNotInPrerequisiteState, "a page client read a page outside any transaction")
-		}
-		return psReadPages{txid: txid, indices: []uint32{index}}, nil
-	})
+	pages, err := cl.readPages([]uint32{index})
 	if err != nil {
 		return nil, err
 	}
-	pages, ok := reply.(psPages)
-	if !ok || len(pages.pages) != 1 {
-		return nil, newError(ProtocolViolation, "unexpected reply to read_pages")
-	}
-	return append([]byte(nil), pages.pages[0]...), nil
+	return pages[0], nil
 }
 
-// readPages fetches a batch of pages under the newest pinned version (a backup's copy, README.md
-// §6.6). The batch holds at most maxReadPages indices.
+// psReadPagesSent counts the read_pages requests this process sent (the read-ahead tests count round
+// trips).
+var psReadPagesSent atomic.Uint64
+
+// readPages fetches pages under the newest pinned version, in as few read_pages requests as
+// maxReadPages allows (read-ahead batches them, page-service.md §5.3; a backup's copy, README.md §6.6).
 func (cl *psClient) readPages(indices []uint32) ([][]byte, error) {
-	reply, err := cl.roundTripWith(func() (psMessage, error) {
-		txid := cl.readTxid.Load()
-		if txid == 0 {
-			return nil, newError(ObjectNotInPrerequisiteState, "a page client read a page outside any transaction")
+	out := make([][]byte, 0, len(indices))
+	limit := max(cl.maxReadPages(), 1)
+	for start := 0; start < len(indices); start += limit {
+		chunk := indices[start:min(start+limit, len(indices))]
+		psReadPagesSent.Add(1)
+		reply, err := cl.roundTripWith(func() (psMessage, error) {
+			txid := cl.readTxid.Load()
+			if txid == 0 {
+				return nil, newError(ObjectNotInPrerequisiteState, "a page client read a page outside any transaction")
+			}
+			return psReadPages{txid: txid, indices: chunk}, nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		return psReadPages{txid: txid, indices: indices}, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	pages, ok := reply.(psPages)
-	if !ok || len(pages.pages) != len(indices) {
-		return nil, newError(ProtocolViolation, "unexpected reply to read_pages")
-	}
-	out := make([][]byte, len(pages.pages))
-	for i, page := range pages.pages {
-		out[i] = append([]byte(nil), page...)
+		pages, ok := reply.(psPages)
+		if !ok || len(pages.pages) != len(chunk) {
+			return nil, newError(ProtocolViolation, "unexpected reply to read_pages")
+		}
+		for _, page := range pages.pages {
+			out = append(out, append([]byte(nil), page...))
+		}
 	}
 	return out, nil
 }
@@ -424,6 +448,45 @@ func (s *serviceBlockStore) readAt(off int64, length int) ([]byte, error) {
 		}
 	}
 	return append([]byte(nil), page[within:within+int64(length)]...), nil
+}
+
+// batchesReads makes the store a batchReader for a connection that reads ahead (the stream
+// transport).
+func (s *serviceBlockStore) batchesReads() bool { return s.client.readAhead }
+
+// readPages reads whole pages: the meta slots and a commit's pending pages are local; every other page
+// comes from the owner in one batched fetch.
+func (s *serviceBlockStore) readPages(indices []uint32) ([][]byte, error) {
+	var remote []uint32
+	for _, index := range indices {
+		if _, pending := s.pending[index]; index >= 2 && !pending {
+			remote = append(remote, index)
+		}
+	}
+	var fetched [][]byte
+	if len(remote) > 0 {
+		var err error
+		if fetched, err = s.client.readPages(remote); err != nil {
+			return nil, err
+		}
+	}
+	ps := int(s.client.pageSize.Load())
+	out := make([][]byte, len(indices))
+	for i, index := range indices {
+		var page []byte
+		if index < 2 {
+			page = append([]byte(nil), s.client.currentMeta()...)
+		} else if p, ok := s.pending[index]; ok {
+			page = append([]byte(nil), p...)
+		} else {
+			page, fetched = fetched[0], fetched[1:]
+		}
+		if len(page) != ps {
+			return nil, newError(ProtocolViolation, "the owner sent a page of the wrong size")
+		}
+		out[i] = page
+	}
+	return out, nil
 }
 
 func errClientReadOnly() error {

@@ -52,6 +52,11 @@ export class BufferPool {
     return node;
   }
 
+  // contains reports whether page is resident.
+  contains(page: number): boolean {
+    return this.index.has(page);
+  }
+
   // insertSlot adds a freshly-loaded page, evicting one under CLOCK if at capacity.
   private insertSlot(page: number, node: PNode): void {
     if (this.slots.length < this.capacity) {

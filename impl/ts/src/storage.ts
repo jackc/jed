@@ -74,6 +74,17 @@ class PagedSource implements LeafSource {
   loadLeafSteps(page: number, tag?: Uint8Array): Steps<PNode> {
     return this.paging.faultLeafSteps(page, this.colTypes, tag ?? NO_TAG);
   }
+
+  prefetches(): boolean {
+    return this.paging.batches;
+  }
+
+  prefetch(pages: { page: number; tag?: Uint8Array }[]): void {
+    this.paging.prefetchLeaves(
+      pages.map((p) => ({ page: p.page, tag: p.tag ?? NO_TAG })),
+      this.colTypes,
+    );
+  }
 }
 
 // TableStore holds one table's rows, keyed by encoded primary key.

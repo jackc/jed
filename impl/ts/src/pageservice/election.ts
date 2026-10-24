@@ -80,7 +80,7 @@ export function electService(
       else if (!record.serving) reason = "owned by a non-serving process";
       else {
         reason = "";
-        const client = new PageClient(path, host.pageNet?.link(host.pid()));
+        const client = new PageClient(path, host.pageNet?.link(host.pid()), host.stream ?? null);
         const result = client.connect(record.endpoint, readOnly);
         if (result.ok) {
           let engine: Engine | null = null;

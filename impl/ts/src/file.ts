@@ -65,6 +65,7 @@ import { FileSpillSink } from "./spillfile.ts";
 import type { SpillSink } from "./spill.ts";
 import { canonicalOpenPath, FileCoordinator, resolvedLocking } from "./coordinator.ts";
 import { type HandoffHosts, type Ownership, ServiceHandoff } from "./pageservice/handoff.ts";
+import { RemoteLockHost } from "./pageservice/remote.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -804,6 +805,50 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
   } catch (error) {
     coordinator?.close();
     throw error;
+  }
+}
+
+// openRemoteDatabase opens a database that another machine (or process) serves over a stream: a page
+// client whose connection is the standard input and output of command, run once per connection
+// (spec/pageservice/README.md §5.3). The CLI opens `ssh://host/path` as
+// ["ssh", "--", "host", "jed pages '/path'"]. name identifies the database in this process (one handle
+// per name, like a path) and is what the handle reports as its path.
+//
+// The handle is an ordinary page client: it runs its own engine over pages fetched through the
+// command, commits through it, and when the connection ends it runs the command again (re-election,
+// README §6.5) — it never becomes the owner, whatever opts.ownership says. opts.credential unlocks an
+// encrypted database here and is also sent in every connection's hello, for a serving end that must
+// own the database (README §3.1). An open that cannot reach the database in opts.fileLockTimeoutMs
+// fails 08006 with the command's standard error; an error the remote side reports (58P01, 0A000, …)
+// is thrown as is. Unix only.
+export function openRemoteDatabase(
+  command: string[],
+  name: string,
+  opts: OpenOptions = {},
+): Database {
+  if (command.length === 0) throw engineError("connection_failure", "empty transport command");
+  if (process.platform === "win32") {
+    throw engineError("feature_not_supported", "remote databases are unavailable on this platform");
+  }
+  const host = new RemoteLockHost(command, opts.credential ?? null);
+  const environment = opts.environment ?? new Environment();
+  const options: OpenOptions = { ...opts, ownership: "never", locking: "auto", environment };
+  const handoff = new ServiceHandoff(
+    name,
+    options,
+    options.readOnly ?? false,
+    options.fileLockTimeoutMs,
+    options,
+    environment,
+    () => {
+      throw engineError("object_in_use", "a remote database is owned on the remote side");
+    },
+    { lock: host },
+  );
+  try {
+    return openServiceWith(handoff);
+  } catch (error) {
+    throw host.openError(error);
   }
 }
 

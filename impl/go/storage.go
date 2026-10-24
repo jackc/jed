@@ -100,6 +100,10 @@ func (ps *pagedSource) loadLeaf(page pageRef) (*pnode, error) {
 	return ps.paging.faultLeaf(page, ps.colTypes)
 }
 
+func (ps *pagedSource) prefetches() bool { return ps.paging.batches }
+
+func (ps *pagedSource) prefetch(pages []pageRef) { ps.paging.prefetchLeaves(pages, ps.colTypes) }
+
 // leafSrc builds this store's leaf source, or nil (a true nil interface) for an in-memory store that
 // never faults.
 func (s *tableStore) leafSrc() leafSource {

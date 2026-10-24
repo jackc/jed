@@ -260,6 +260,63 @@ type leafSource interface {
 	loadLeaf(page pageRef) (*pnode, error)
 }
 
+// leafPrefetcher is a leafSource that benefits from read-ahead: one that fetches several pages in one
+// request (a page client over the stream transport, spec/design/page-service.md §5.3). prefetch is a
+// hint that the scan will fault these leaf pages next, in this order; it brings the ones not already
+// resident in with one request and leaves errors for the fault that follows. Invisible to cost, which
+// counts logical page reads (cost.md).
+type leafPrefetcher interface {
+	prefetches() bool
+	prefetch(pages []pageRef)
+}
+
+// readAheadMax is the most leaves one read-ahead hint names.
+const readAheadMax = 64
+
+// noReadAhead is what leafReadAhead.hint returns when the source does not prefetch: a count of descents
+// the caller never exhausts, so it never hints again.
+const noReadAhead = int(^uint(0) >> 1)
+
+// leafReadAhead is a scan's read-ahead (spec/design/page-service.md §5.3): when the traversal descends
+// into a leaf of an interior node it already holds, it hints that leaf together with the next leaves
+// of that node it will visit, within the scan's bounds. The window starts at one leaf (no read-ahead,
+// so a scan stopped by LIMIT after one leaf fetches nothing extra) and doubles with each hint up to
+// readAheadMax, so a long scan fetches its leaves in batches of 64 — every leaf of a subtree in one
+// request when it has at most that many.
+type leafReadAhead struct {
+	window int
+}
+
+// hint hints the descent into position at(0) of n and the descents after it (positions in visit
+// order: at(k) is the k-th, ok false past the last). It returns how many of those descents the hint
+// covers, the current one included: the caller hints again after that many.
+func (ra *leafReadAhead) hint(n *pnode, at func(k int) (int, bool), src leafSource) int {
+	pf, ok := src.(leafPrefetcher)
+	if !ok || !pf.prefetches() {
+		return noReadAhead
+	}
+	taken := 0
+	var pages []pageRef
+	for ; taken < ra.window; taken++ {
+		i, ok := at(taken)
+		if !ok {
+			break
+		}
+		if c := n.children[i]; c.node == nil {
+			pages = append(pages, c.ref())
+		}
+	}
+	taken = max(taken, 1)
+	if len(pages) == 0 {
+		return taken
+	}
+	ra.window = min(ra.window*2, readAheadMax)
+	if len(pages) > 1 {
+		pf.prefetch(pages)
+	}
+	return taken
+}
+
 // resolveChild resolves c to a resident node, faulting an OnDisk leaf through src. A resident ref
 // returns its node directly; an OnDisk leaf with no source is an internal wiring bug (an in-memory tree
 // builds no OnDisk ref, and every file-backed traversal supplies a source), so it panics.
@@ -866,6 +923,7 @@ func (m *pMap) overlapNodeCount(b keyBound) int {
 // "LIMIT short-circuit"). Like rangeEntries it prunes non-overlapping subtrees; unlike it, it streams
 // (one row at a time, no Vec) so a bounded result holds ~one leaf resident.
 func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
+	ahead := &leafReadAhead{window: 1}
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		if n.isLeaf() {
@@ -883,7 +941,13 @@ func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 			return true, nil
 		}
 		cf, cl := b.childWindow(n)
+		hinted := 0
 		for i := cf; i <= cl; i++ {
+			if hinted == 0 {
+				from := i
+				hinted = ahead.hint(n, func(k int) (int, bool) { return from + k, from+k <= cl }, src)
+			}
+			hinted--
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
 				return false, err
@@ -908,6 +972,7 @@ func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 // returns a false `continue` without faulting leaves past the stop point (a reverse top-N faults
 // from the high end). An interior node walks its windowed children from cl down to cf.
 func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
+	ahead := &leafReadAhead{window: 1}
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		if n.isLeaf() {
@@ -925,7 +990,13 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, r
 			return true, nil
 		}
 		cf, cl := b.childWindow(n)
+		hinted := 0
 		for i := cl; i >= cf; i-- {
+			if hinted == 0 {
+				from := i
+				hinted = ahead.hint(n, func(k int) (int, bool) { return from - k, from-k >= cf }, src)
+			}
+			hinted--
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
 				return false, err
@@ -952,6 +1023,9 @@ type scanFrame struct {
 	node   *pnode
 	isLeaf bool
 	lo, hi int
+	// hinted counts the descents into this interior's children still covered by its last read-ahead
+	// hint.
+	hinted int
 }
 
 func newScanFrame(n *pnode, b keyBound) scanFrame {
@@ -982,6 +1056,7 @@ type rangeCursor struct {
 	bound   keyBound
 	src     leafSource
 	reverse bool
+	ahead   leafReadAhead
 }
 
 // rangeCursor returns a pull cursor over the (key, row) pairs within b. The first node on the stack is
@@ -990,7 +1065,7 @@ func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool) *rangeCurso
 	// The cursor retains the current root after this call. Invalidate its generation before capturing
 	// the first frame so a later write through the same working map path-copies the pinned path.
 	m.freezeMutationGeneration()
-	c := &rangeCursor{bound: b, src: src, reverse: reverse}
+	c := &rangeCursor{bound: b, src: src, reverse: reverse, ahead: leafReadAhead{window: 1}}
 	if m.root != nil {
 		c.stack = append(c.stack, newScanFrame(m.root, b))
 	}
@@ -1044,6 +1119,16 @@ func (c *rangeCursor) nextInto(dst *storedRow) (key []byte, row storedRow, ok bo
 			}
 			return fr.node.keyAt(p), row, true, nil
 		}
+		if fr.hinted == 0 {
+			if c.reverse {
+				lo := fr.lo
+				fr.hinted = c.ahead.hint(fr.node, func(k int) (int, bool) { return p - k, p-k >= lo }, c.src)
+			} else {
+				hi := fr.hi
+				fr.hinted = c.ahead.hint(fr.node, func(k int) (int, bool) { return p + k, p+k < hi }, c.src)
+			}
+		}
+		fr.hinted--
 		child, e := resolveChild(fr.node.children[p], c.src)
 		if e != nil {
 			return nil, nil, false, e

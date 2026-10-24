@@ -37,6 +37,10 @@ export { queryMemoryPeak, queryMemoryUnderflows } from "./cost.ts";
 export { verifyLivePages } from "./format.ts";
 // Session-local temp domains spilled to a scratch file (spec/design/temp-tables.md §6).
 export { tempSpills } from "./persist.ts";
+export {
+  readPagesSentForTesting,
+  setPageClientReadAheadForTesting,
+} from "./pageservice/client.ts";
 import { query } from "./api.ts";
 export {
   begin,

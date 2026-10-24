@@ -1,7 +1,13 @@
 // Node-only execution adapter. All engine and synchronous storage work runs in this worker;
 // the application thread owns only typed transport proxies.
 import { parentPort } from "node:worker_threads";
-import { createDatabase, type CreateOptions, openDatabase, type OpenOptions } from "../file.ts";
+import {
+  createDatabase,
+  type CreateOptions,
+  openDatabase,
+  type OpenOptions,
+  openRemoteDatabase,
+} from "../file.ts";
 import { TransportError } from "./errors.ts";
 import { Environment } from "../environment.ts";
 import type { RuntimeRequest } from "./protocol.ts";
@@ -41,6 +47,20 @@ const server = new RuntimeServer({
     }
     const configured = { ...options, environment: builder.build() };
     if (args.mode === "create") return createDatabase(configured as CreateOptions);
+    if (args.mode === "remote") {
+      const { command, name, ...rest } = configured as Record<string, unknown>;
+      if (
+        !Array.isArray(command) ||
+        !command.every((part) => typeof part === "string") ||
+        typeof name !== "string"
+      ) {
+        throw new TransportError(
+          "PROTOCOL",
+          "opening a remote database requires a command and a name",
+        );
+      }
+      return openRemoteDatabase(command as string[], name, rest as OpenOptions);
+    }
     if (args.mode !== "open" || typeof options.path !== "string") {
       throw new TransportError("PROTOCOL", "opening a database requires a file path");
     }

@@ -41,6 +41,12 @@ export interface BlockStore {
   writeAtAsync?(offset: number, bytes: Uint8Array): Promise<void>;
   syncAsync?(): Promise<void>;
   setSizeAsync?(bytes: number): Promise<void>;
+  // batchesReads reports whether readPages fetches several pages in one request, so scans read ahead
+  // through it (a page client over the stream transport, spec/design/page-service.md §5.3). Absent
+  // means false: every other host reads page by page and scans fault one leaf at a time.
+  batchesReads?(): boolean;
+  // readPages reads the whole pages at indices in one request (offered with batchesReads).
+  readPages?(indices: number[]): Uint8Array[];
   // close releases the backing (the OS file descriptor). Lifecycle, not part of the §2 data surface.
   close(): void;
   // skipsSync reports whether sync skips its durability barrier (fsync=off, api.md §2.1), so a
