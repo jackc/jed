@@ -175,8 +175,10 @@ SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v) FILTER (WHERE v > 15) FROM
 
 # --- cost pin: one ordered-set aggregate over all 11 whole-table rows ---
 # 11 storage_row_read + 11 aggregate_accumulate + 1 row_produced (+ the aggregate-query constant).
-# Same cost shape as an ordinary aggregate — the per-group sort + finalize are unmetered.
-# cost: 24
+# Same cost shape as an ordinary aggregate, plus each retained input's sort_key — the per-group
+# sort's comparisons and the finalize are unmetered.
+# Per-row keys add 36 (cost.md §3 "sort_key / hash_key"): 24 before them.
+# cost: 60
 query D nosort
 SELECT mode() WITHIN GROUP (ORDER BY v) FROM osa
 ----

@@ -571,7 +571,7 @@ precedent):
   expression — so an expression key adds metered work that a bare-column key does not. Deterministic
   and cross-core identical (the same `RExpr` evaluated the same way in every core); a bare-column key
   materializes nothing and is byte-identical to before.
-- **Per-row keys** (specified, not yet implemented: `resource.key_metering`): once per shared
+- **Per-row keys** (`resource.key_metering`): once per shared
   partition/sort group, every input row charges `hash_key` × the payload of its partition keys, then
   `sort_key` × the payload of its order keys (`collate` per code point for a collated one), in input
   order. Fixed-width keys measure 0, so the counts below are unchanged for them.

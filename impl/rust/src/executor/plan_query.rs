@@ -654,7 +654,28 @@ impl Engine {
         let mut seen_charge = crate::cost::StateCharge::new(acct.clone());
         let mut result: Vec<Row> = Vec::new();
         let mut working: Vec<Row> = Vec::new();
+        // A UNION row's columns charge hash_key before its duplicate check (cost.md §3 "sort_key /
+        // hash_key"); UNION ALL builds no table. The charge lands on its own meter, which feeds the
+        // session's lifetime total, and in `total_cost`, which the statement ceiling guards.
+        let mut key_meter = self.session.new_meter();
+        let mut charge_keys = |row: &Row, total_cost: &mut i64| -> Result<()> {
+            if rt.union_all {
+                return Ok(());
+            }
+            let units: i64 = row
+                .iter()
+                .map(|v| COSTS.hash_key * crate::memsize::payload_bytes(v))
+                .sum();
+            if units == 0 {
+                return Ok(());
+            }
+            key_meter.charge(units);
+            *total_cost += units;
+            guard(*total_cost)?;
+            key_meter.guard()
+        };
         for row in anchor_rows {
+            charge_keys(&row, total_cost)?;
             if rt.union_all || seen.insert(row.clone()) {
                 if !rt.union_all && seen_charge.active() {
                     seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
@@ -715,6 +736,7 @@ impl Engine {
                 new_rows = rows;
             }
             for row in new_rows {
+                charge_keys(&row, total_cost)?;
                 if rt.union_all || seen.insert(row.clone()) {
                     if !rt.union_all && seen_charge.active() {
                         seen_charge.reserve_direct(crate::memsize::entry_bytes(&row))?;
@@ -1405,7 +1427,9 @@ impl Engine {
 
     /// Execute a resolved set operation: run both operands against the outer environment,
     /// coerce to the unified types, combine per the operator + ALL flag, then sort + window.
-    /// Cost is `lhs.cost + rhs.cost` — the combine, sort, and window are unmetered (cost.md §3).
+    /// Cost is `lhs.cost + rhs.cost` plus the combine's and the sort's per-row keys (cost.md §3
+    /// "sort_key / hash_key"); the combine's probes, the sort's comparisons, and the window are
+    /// unmetered.
     pub(crate) fn exec_set_op_plan(
         &self,
         plan: &SetOpPlan,
@@ -1430,9 +1454,19 @@ impl Engine {
         let coerced = acct.measure_rows(&left_rows) + acct.measure_rows(&right_rows);
         acct.reserve(coerced - before)?;
 
+        // The combine and the sort charge their per-row keys on a meter that starts from both arms'
+        // cost, so its guard sees the whole statement: every left row, then every right row, unless
+        // UNION ALL.
+        let mut meter = self.session.new_meter();
+        meter.accrued = left.cost + right.cost;
+        if !(matches!(plan.op, SetOpKind::Union) && plan.all) {
+            for row in left_rows.iter().chain(right_rows.iter()) {
+                charge_hash_keys(&mut meter, row)?;
+            }
+        }
         let mut rows = combine_setop(plan.op, plan.all, left_rows, right_rows, &acct)?;
         acct.release(coerced - acct.measure_rows(&rows));
-        let cost = left.cost + right.cost;
+        let mut cost = meter.accrued;
         let root_node = if plan.limit.is_some() || plan.offset.is_some() {
             "Limit"
         } else if !plan.order.is_empty() {
@@ -1447,7 +1481,8 @@ impl Engine {
         }
 
         if !plan.order.is_empty() {
-            sort_rows(&mut rows, &plan.order, &acct)?;
+            sort_rows(&mut rows, &plan.order, &acct, &mut meter)?;
+            cost = meter.accrued;
             if root_node != "Sort"
                 && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
             {

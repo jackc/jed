@@ -205,6 +205,7 @@ import { type Collation, serializeTable, sortKey as collationSortKey } from "./c
 import { Environment } from "./environment.ts";
 import { BatchDeadline } from "./idle_flush.ts";
 import { COSTS, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
+import { chargeHashKey, chargeHashKeys, chargeSortKey, chargeSortKeys, hashKeyUnits } from "./key_meter.ts";
 import {
   entryBytes,
   entryBytesAt,
@@ -18515,6 +18516,19 @@ export class Engine {
     // its result copy, returned when the recursive CTE completes.
     const seen = new Set<string>();
     const seenCharge = new StateCharge(acct);
+    // chargeKeys charges a UNION row's columns as hash_key before its duplicate check (cost.md §3
+    // "sort_key / hash_key"); UNION ALL builds no table. The charge lands on its own meter, which
+    // feeds the session's lifetime total, and in totalCost, which the statement ceiling guards.
+    const keyMeter = this.session.newMeter();
+    const chargeKeys = (row: Row): void => {
+      if (rt.unionAll) return;
+      const units = hashKeyUnits(row);
+      if (units === 0n) return;
+      keyMeter.charge(units);
+      totalCost.value += units;
+      guard(totalCost.value);
+      keyMeter.guard();
+    };
     const keep = (row: Row): boolean => {
       if (rt.unionAll) return true;
       const k = distinctRowKey(row);
@@ -18527,6 +18541,7 @@ export class Engine {
     let working: Row[] = [];
     for (const row of anchorRows) {
       if (shouldCooperate()) yield COOPERATE;
+      chargeKeys(row);
       if (keep(row)) {
         acct.admitRow(row);
         result.push(row);
@@ -18579,6 +18594,7 @@ export class Engine {
       }
       for (const row of newRows) {
         if (shouldCooperate()) yield COOPERATE;
+        chargeKeys(row);
         if (keep(row)) {
           acct.admitRow(row);
           result.push(row);
@@ -20715,7 +20731,8 @@ export class Engine {
 
   // execSetOpPlan executes a resolved set operation: run both operands against the outer
   // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
-  // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+  // rhs.cost plus the combine's and the sort's per-row keys (cost.md §3 "sort_key / hash_key"); the
+  // combine's probes, the sort's comparisons, and the window are unmetered.
   private execSetOpPlan(
     plan: SetOpPlan,
     outer: Row[],
@@ -20743,9 +20760,18 @@ export class Engine {
     const coerced = acct.measureRows(left.rows) + acct.measureRows(right.rows);
     acct.reserve(coerced - beforeCoerce);
 
+    // The combine and the sort charge their per-row keys on a meter that starts from both arms' cost,
+    // so its guard sees the whole statement: every left row, then every right row, unless UNION ALL.
+    const meter = this.session.newMeter();
+    meter.accrued = left.cost + right.cost;
+    if (!(plan.op === "union" && plan.all)) {
+      for (const arm of [left.rows, right.rows]) {
+        for (const row of arm) chargeHashKeys(meter, row);
+      }
+    }
     let rows = combineSetop(plan.op, plan.all, left.rows, right.rows, acct);
     acct.release(coerced - acct.measureRows(rows));
-    const cost = left.cost + right.cost;
+    let cost = meter.accrued;
     const rootNode =
       plan.limit !== null || plan.offset !== null
         ? "Limit"
@@ -20756,7 +20782,8 @@ export class Engine {
       this.recordExplainActualParent(setOpNodeName(plan.op), cost);
 
     if (plan.order.length > 0) {
-      sortRows(rows, plan.order, acct);
+      sortRows(rows, plan.order, acct, meter);
+      cost = meter.accrued;
       if (rootNode !== "Sort") this.recordExplainActualParent("Sort", cost);
     }
 
@@ -24505,7 +24532,13 @@ export class Engine {
           const before = meter.accrued;
           if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
           const tuple = yield* evalExpressionsSteps(plan.projections, row, projectEnv, meter);
-          distinctWork += meter.accrued - before;
+          // The dedup set receives the row: its values are charged (cost.md §3 "sort_key /
+          // hash_key"), attributed to the Distinct node with the projection.
+          try {
+            chargeHashKeys(meter, tuple);
+          } finally {
+            distinctWork += meter.accrued - before;
+          }
           const key = distinctRowKey(tuple);
           // A duplicate of an already-emitted/seen value; a new one reserves its entry (memory.md §6.2).
           if (!meter.costFirst(() => seen.insert(key, tuple))) return true;
@@ -25043,13 +25076,13 @@ export class Engine {
         // The selection discards rows: release the buffer, re-reserve the kept rows.
         charge.releaseAll();
         const topK = plan.phys.topK;
-        retained = meter.costFirst(() => topKRows(rows, plan.order, topK, meter.query));
+        retained = meter.costFirst(() => topKRows(rows, plan.order, topK, meter.query, meter));
         if (charge.active())
           for (const row of retained) {
             if (shouldCooperate()) yield COOPERATE;
             charge.reserve(meter, rowBytes(row));
           }
-      } else meter.costFirst(() => sortRows(retained, plan.order, meter.query));
+      } else meter.costFirst(() => sortRows(retained, plan.order, meter.query, meter));
       sorted = new SortedRows(retained, null, charge);
     } else {
       // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
@@ -25058,7 +25091,7 @@ export class Engine {
       // spills when it exceeds the budget.
       const useTopK = plan.phys.topK !== null && this.streamingTopKFits(plan, plan.phys.topK);
       const keeper = useTopK
-        ? new TopKKeeper(plan.phys.topK!, plan.order, false).withCharge(meter.stateCharge())
+        ? new TopKKeeper(plan.phys.topK!, plan.order, false, meter).withCharge(meter.stateCharge())
         : null;
       const sorter = useTopK ? null : this.newSorterFor(plan.order);
       let survivorCount = 0n;
@@ -25081,7 +25114,15 @@ export class Engine {
               // Sort state holds only the touched columns (memory.md §6.1); a structure reserving
               // without the meter reports a reached cost ceiling first (§6.7).
               const owned = nullUntouched(row, mask);
-              meter.costFirst(() => (keeper !== null ? keeper.push(owned) : sorter!.push(owned)));
+              // A survivor's sort keys are charged as the sorter receives it (cost.md §3
+              // "sort_key / hash_key"); the keeper charges its own.
+              meter.costFirst(() => {
+                if (keeper !== null) keeper.push(owned);
+                else {
+                  chargeSortKeys(meter, owned, plan.order);
+                  sorter!.push(owned);
+                }
+              });
               return true; // never stop early — the sort must see every row
             }.bind(this),
           );
@@ -27255,6 +27296,7 @@ export class Engine {
             if (shouldCooperate()) yield COOPERATE;
             meter.guard();
             const keys = gset.keyCols.map((index) => row[index]!);
+            chargeHashKeys(meter, keys); // the group table receives the row (cost.md §3)
             const key = distinctRowKey(keys);
             const previous = states.get(key);
             const accs =
@@ -27275,7 +27317,7 @@ export class Engine {
               if (spec.hypo != null) {
                 collections.append(
                   collectionKey,
-                  yield* evalExpressionsSteps(spec.hypo.keys, row, env, meter),
+                  yield* hypoKeyTupleSteps(spec.hypo, row, env, meter),
                 );
                 continue;
               }
@@ -27290,6 +27332,7 @@ export class Engine {
                   : null;
               if (spec.distinct) {
                 if (value.kind === "null" && !aggDistinctKeepsNull(spec.plan)) continue;
+                chargeHashKey(meter, value); // the value set receives it (cost.md §3)
                 // The entry is (group ordinal, aggregate ordinal, value).
                 const dk = `${key.length}:${key}${si}:${distinctRowKey([value])}`;
                 if (!seen.insert(dk, 2 * MEMORY_VALUE + valueBytes(value))) continue;
@@ -27411,6 +27454,9 @@ export class Engine {
           for (const order of plan.order) {
             if (shouldCooperate()) yield COOPERATE;
             const value = row[order.idx]!;
+            // Each key is charged as the sort receives the row, before its decoration (cost.md §3
+            // "sort_key / hash_key").
+            chargeSortKey(meter, value, order.collation);
             decorated.push(
               order.collation !== null && (value.kind === "text" || value.kind === "array")
                 ? byteaValue(collatedSortKey(order.collation, value)!)
@@ -27460,6 +27506,7 @@ export class Engine {
         for (const row of rows) {
           if (shouldCooperate()) yield COOPERATE;
           const projected = yield* evalExpressionsSteps(plan.projections, row, env, meter);
+          chargeHashKeys(meter, projected); // the dedup table receives the row (cost.md §3)
           if (seen.insert(distinctRowKey(projected), keyBytes(projected))) unique.push(projected);
         }
         rows.close();
@@ -28032,14 +28079,14 @@ export class Engine {
         meter.releaseRowsMasked(rows, memMask);
         const topK = plan.phys.topK;
         const input = rows;
-        rows = meter.costFirst(() => topKRows(input, plan.order, topK, meter.query));
+        rows = meter.costFirst(() => topKRows(input, plan.order, topK, meter.query, meter));
         for (const row of rows) {
           if (shouldCooperate()) yield COOPERATE;
           meter.admitRowMasked(row, memMask);
         }
       } else {
         const input = rows;
-        meter.costFirst(() => sortRows(input, plan.order, meter.query));
+        meter.costFirst(() => sortRows(input, plan.order, meter.query, meter));
       }
       if (selectActualRootNode(plan) !== "Sort")
         this.recordExplainActualParent("Sort", meter.accrued);
@@ -28139,6 +28186,7 @@ export class Engine {
           if (shouldCooperate()) yield COOPERATE;
           meter.guard(); // enforce the cost ceiling per folded row (CLAUDE.md §13)
           const keys = gset.keyCols.map((gk) => row[gk]!);
+          chargeHashKeys(meter, keys); // the group table receives the row (cost.md §3)
           const k = distinctRowKey(keys);
           let gi = index.get(k);
           if (gi === undefined) {
@@ -28168,7 +28216,7 @@ export class Engine {
             // hypothetical row itself is evaluated per group at finalize. No DISTINCT (rejected at resolve).
             if (spec.hypo !== undefined && spec.hypo !== null) {
               const hp = spec.hypo;
-              const tuple = yield* evalExpressionsSteps(hp.keys, row, env, meter);
+              const tuple = yield* hypoKeyTupleSteps(hp, row, env, meter);
               if (meter.queryMemoryActive()) {
                 const bytes = rowBytes(tuple);
                 meter.reserveQuery(bytes);
@@ -28194,6 +28242,7 @@ export class Engine {
             const dedup = seen[i];
             if (dedup) {
               if (v.kind === "null" && !aggDistinctKeepsNull(spec.plan)) continue;
+              chargeHashKey(meter, v); // the value set receives it (cost.md §3)
               const dk = distinctRowKey([v]);
               if (dedup.has(dk)) continue;
               dedup.add(dk);
@@ -28314,7 +28363,7 @@ export class Engine {
       // expression key is materialized against the grouped row and appended — grammar.md §10).
       if (plan.order.length > 0) {
         yield* materializeOrderExprsSteps(groupRows, plan.orderExprs, env, meter);
-        meter.costFirst(() => sortRows(groupRows, plan.order, meter.query));
+        meter.costFirst(() => sortRows(groupRows, plan.order, meter.query, meter));
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
         if (plan.distinctOn > 0) {
@@ -28338,6 +28387,7 @@ export class Engine {
         for (const srow of groupRows) {
           if (shouldCooperate()) yield COOPERATE;
           const tuple = yield* evalExpressionsSteps(plan.projections, srow, env, meter);
+          chargeHashKeys(meter, tuple); // the dedup table receives the row (cost.md §3)
           const key = distinctRowKey(tuple);
           if (!seen.has(key)) {
             seen.add(key);
@@ -28374,6 +28424,7 @@ export class Engine {
       for (const row of rows) {
         if (shouldCooperate()) yield COOPERATE;
         const tuple = yield* evalExpressionsSteps(plan.projections, row, env, meter);
+        chargeHashKeys(meter, tuple); // the dedup table receives the row (cost.md §3)
         const key = distinctRowKey(tuple);
         if (!seen.has(key)) {
           seen.add(key);
@@ -41745,7 +41796,12 @@ export function foldAcc(a: Acc, v: Value, m: Meter): void {
       // Value (the interval plan interpolates in the interval domain at finalize).
       if (v.kind !== "null") {
         if (a.plan === "percentileCont") a.osaFloats!.push(percentileInputF64(v));
-        else a.osaVals!.push(v);
+        else {
+          // The retained value is the finalize sort's key (cost.md §3 "sort_key / hash_key");
+          // percentile_cont's widened f64 measures 0.
+          chargeSortKey(m, v, a.osaCollation ?? null);
+          a.osaVals!.push(v);
+        }
       }
       break;
     case "hypoRank":
@@ -42229,12 +42285,28 @@ export function* aggOrderTupleSteps(
     if (shouldCooperate()) yield COOPERATE;
     let kv = yield* evalExprSteps(order.keys[i]!, row, env, meter);
     const coll = order.sorts[i]!.collation;
+    // The key is charged as the finalize sort's (cost.md §3 "sort_key / hash_key"), before its
+    // decoration.
+    chargeSortKey(meter, kv, coll);
     if (coll !== null && (kv.kind === "text" || kv.kind === "array")) {
       kv = byteaValue(collatedSortKey(coll, kv)!);
     }
     tuple.push(kv);
   }
   tuple.push(value);
+  return tuple;
+}
+
+// hypoKeyTupleSteps evaluates one passing input row's hypothetical-set WITHIN GROUP key tuple
+// (aggregates.md §19), charging each key as the sort receives it right after it is evaluated, under
+// that key's collation (cost.md §3 "sort_key / hash_key").
+function* hypoKeyTupleSteps(hp: HypoParams, row: Row, env: EvalEnv, meter: Meter): Steps<Value[]> {
+  const tuple: Value[] = [];
+  for (let i = 0; i < hp.keys.length; i++) {
+    const kv = yield* evalExprSteps(hp.keys[i]!, row, env, meter);
+    chargeSortKey(meter, kv, hp.sorts[i]!.collation);
+    tuple.push(kv);
+  }
   return tuple;
 }
 
@@ -46922,10 +46994,13 @@ function foldBlockingCollection(
     a.plan === "percentileCont" ||
     a.plan === "orderedSetContInterval"
   ) {
-    if (value.kind !== "null")
+    if (value.kind !== "null") {
+      // The retained value is the finalize sort's key, charged as in foldAcc (cost.md §3).
+      if (a.plan !== "percentileCont") chargeSortKey(meter, value, a.osaCollation ?? null);
       collections.append(key, [
         a.plan === "percentileCont" ? float64Value(percentileInputF64(value)) : value,
       ]);
+    }
     return true;
   }
   if (a.plan === "arrayAgg" || a.plan === "arrayAggArray") {

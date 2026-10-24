@@ -77,6 +77,13 @@ by the work the path does: each byte of the path compiled, each step applied, ea
 each object member searched, and each comparison a filter makes. A filter that compares every
 array element against every other element therefore costs in proportion to the pairs it tests.
 
+Sorts, `GROUP BY`, `DISTINCT`, set operations other than `UNION ALL`, and window partitions charge
+each row's key values by size, once per row: one cost unit per byte of a `text`, `bytea`, `decimal`,
+array, or JSON key, and for a key sorted under a linguistic collation one unit per character. Integer,
+date, timestamp, uuid, and other fixed-width keys charge nothing. So a query that repeats one large
+value across many rows and sorts or deduplicates them pays for the value in every row, and
+`max_cost` stops it. A sort that an index or the primary key makes unnecessary charges nothing.
+
 ## Query memory budget
 
 `max_query_memory_bytes` bounds the **rows and operator state a statement holds at once**:

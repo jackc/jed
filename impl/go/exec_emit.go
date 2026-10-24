@@ -988,7 +988,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			// re-reserve the kept rows (never more than was released).
 			releaseRowsMasked(meter, rows, memMask)
 			var err error
-			rows, err = topKRows(rows, plan.order, *plan.phys.topK, meter.query)
+			rows, err = topKRows(rows, plan.order, *plan.phys.topK, meter.query, meter)
 			if err = meter.costFirst(err); err != nil {
 				return emitter{}, err
 			}
@@ -998,7 +998,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				}
 			}
 		} else {
-			if err := meter.costFirst(sortRows(rows, plan.order, meter.query)); err != nil {
+			if err := meter.costFirst(sortRows(rows, plan.order, meter.query, meter)); err != nil {
 				return emitter{}, err
 			}
 		}
@@ -1132,6 +1132,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 				for i, gk := range gset.keyCols {
 					keys[i] = row[gk]
 				}
+				if err := chargeHashKeys(meter, keys); err != nil {
+					return emitter{}, err
+				}
 				k := distinctRowKey(keys)
 				gi, ok := index[k]
 				if !ok {
@@ -1174,6 +1177,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 							if kerr != nil {
 								return emitter{}, kerr
 							}
+							if err := chargeSortKey(meter, kv, spec.hypo.sorts[ki].collation); err != nil {
+								return emitter{}, err
+							}
 							tuple[ki] = kv
 						}
 						if meter.queryMemoryActive() {
@@ -1210,6 +1216,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					if seen := groups[gi].seen[i]; seen != nil {
 						if v.IsNull() && !spec.plan.distinctKeepsNull() {
 							continue
+						}
+						if err := chargeHashKey(meter, v); err != nil {
+							return emitter{}, err
 						}
 						dk := distinctRowKey([]Value{v})
 						if seen[dk] {
@@ -1369,7 +1378,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			if err := materializeOrderExprs(groupRows, plan.orderExprs, env, meter); err != nil {
 				return emitter{}, err
 			}
-			if err := meter.costFirst(sortRows(groupRows, plan.order, meter.query)); err != nil {
+			if err := meter.costFirst(sortRows(groupRows, plan.order, meter.query, meter)); err != nil {
 				return emitter{}, err
 			}
 			if selectActualRootNode(plan) != "Sort" {
@@ -1402,6 +1411,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 						return emitter{}, perr
 					}
 					projected[i] = v
+				}
+				if err := chargeHashKeys(meter, projected); err != nil {
+					return emitter{}, err
 				}
 				if key := distinctRowKey(projected); !seen[key] {
 					seen[key] = true
@@ -1449,6 +1461,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					return emitter{}, err
 				}
 				projected[i] = v
+			}
+			if err := chargeHashKeys(meter, projected); err != nil {
+				return emitter{}, err
 			}
 			if key := distinctRowKey(projected); !seen[key] {
 				seen[key] = true

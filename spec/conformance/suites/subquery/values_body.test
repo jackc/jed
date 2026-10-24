@@ -90,7 +90,8 @@ SELECT x FROM (VALUES (CASE WHEN 1 < 2 THEN 10 ELSE 20 END), (5)) AS v (x) ORDER
 # Per-column type unification across rows: int + decimal -> decimal (the int value coerces; the
 # rendered decimals keep their own scales).
 # names: column1
-# cost: 6
+# Per-row keys add 12 (cost.md §3 "sort_key / hash_key"): 6 before them.
+# cost: 18
 query D nosort
 SELECT column1 FROM (VALUES (1), (2.5), (3) ) AS v ORDER BY column1
 ----

@@ -306,6 +306,7 @@ impl Engine {
                     .map(|(i, (_, d, n, _))| (base + i, *d, *n, None))
                     .collect();
                 for (column, _, _, coll) in &plan.order {
+                    charge_sort_key(meter, &row[*column], coll.as_deref())?;
                     let key = match (coll, &row[*column]) {
                         (Some(coll), v @ (Value::Text(_) | Value::Array(_))) => {
                             Value::Bytea(collation_sort_key(coll, v)?.expect("a non-NULL key"))
@@ -371,6 +372,7 @@ impl Engine {
                     .iter()
                     .map(|p| p.eval(&row, env, meter))
                     .collect::<Result<Row>>()?;
+                charge_hash_keys(meter, &out)?;
                 if seen.insert(out.clone())? {
                     distinct.push(out)?;
                 }
@@ -790,6 +792,7 @@ impl Engine {
             while let Some(row) = scan.next()? {
                 meter.checkpoint()?;
                 let key: Row = gset.key_cols.iter().map(|&k| row[k].clone()).collect();
+                charge_hash_keys(meter, &key)?;
                 let mut state = match groups.get(&key)? {
                     Some(state) => state,
                     None => {
@@ -810,11 +813,12 @@ impl Engine {
                     };
                     let owner = group as u64 * plan.agg_specs.len() as u64 + si as u64;
                     if let Some(hp) = &spec.hypo {
-                        let tuple = hp
-                            .keys
-                            .iter()
-                            .map(|k| k.eval(&row, env, meter))
-                            .collect::<Result<Row>>()?;
+                        let mut tuple = Vec::with_capacity(hp.keys.len());
+                        for (k, sort) in hp.keys.iter().zip(&hp.sorts) {
+                            let v = k.eval(&row, env, meter)?;
+                            charge_sort_key(meter, &v, sort.collation.as_deref())?;
+                            tuple.push(v);
+                        }
                         collections.push(owner, tuple)?;
                         continue;
                     }
@@ -827,15 +831,14 @@ impl Engine {
                         Some(order) => Some(agg_order_tuple(order, v.clone(), &row, env, meter)?),
                         None => None,
                     };
-                    if spec.distinct
-                        && ((matches!(v, Value::Null) && !spec.plan.distinct_keeps_null())
-                            || !seen.insert(vec![
-                                state[0].clone(),
-                                Value::Int(si as i64),
-                                v.clone(),
-                            ])?)
-                    {
-                        continue;
+                    if spec.distinct {
+                        if matches!(v, Value::Null) && !spec.plan.distinct_keeps_null() {
+                            continue;
+                        }
+                        charge_hash_key(meter, &v)?;
+                        if !seen.insert(vec![state[0].clone(), Value::Int(si as i64), v.clone()])? {
+                            continue;
+                        }
                     }
                     // An ordered aggregate spools its `[keys…, argument]` tuple; finalize sorts and
                     // folds them.

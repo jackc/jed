@@ -15,7 +15,8 @@ INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,10),(4,2,10),(5,3,NULL),(6,NULL,5)
 
 # COUNT(DISTINCT) over duplicates + NULLs: a = {1,1,2,2,3,NULL} -> 3 distinct non-NULL.
 # Only storage_row_read (6) + aggregate_accumulate (6) + row_produced (1); a bare-column
-# DISTINCT argument is a leaf (no operator_eval), and dedup/finalize are unmetered (§8).
+# DISTINCT argument is a leaf (no operator_eval), its integer values charge no hash_key, and the
+# dedup probes and finalize are unmetered (§8).
 # names: count
 # cost: 14
 query I nosort

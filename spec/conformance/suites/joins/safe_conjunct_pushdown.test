@@ -194,7 +194,8 @@ SELECT s.id FROM (SELECT id FROM a UNION ALL SELECT id FROM n) s WHERE s.id = 50
 5000000000
 
 # An i32 arm under a decimal output reads its column through CAST(… AS decimal).
-# cost: 49
+# Per-row keys add 32 (cost.md §3 "sort_key / hash_key"): 49 before them.
+# cost: 81
 query D nosort
 SELECT s.x FROM (SELECT k AS x FROM a UNION SELECT d FROM a WHERE d <> 1.5) s WHERE s.x >= 2 ORDER BY s.x
 ----
@@ -203,7 +204,8 @@ SELECT s.x FROM (SELECT k AS x FROM a UNION SELECT d FROM a WHERE d <> 1.5) s WH
 3
 
 # Nested: the inner set operation is i32, the outer decimal; the conversion composes.
-# cost: 61
+# Per-row keys add 8 (cost.md §3 "sort_key / hash_key"): 61 before them.
+# cost: 69
 query D nosort
 SELECT s.x FROM ((SELECT k AS x FROM a UNION ALL SELECT w FROM b) UNION ALL SELECT d FROM a) s WHERE s.x = 2 ORDER BY s.x
 ----

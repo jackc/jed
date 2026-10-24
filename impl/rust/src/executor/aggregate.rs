@@ -426,7 +426,11 @@ impl Acc {
                 pairs.push((key, image));
             }
             Acc::OrderedSet {
-                kind, vals, floats, ..
+                kind,
+                vals,
+                floats,
+                collation,
+                ..
             } => {
                 // Collect the non-NULL aggregated argument (the WITHIN GROUP order key, evaluated per
                 // row). percentile_cont widens each numeric value to f64 up front (the correctly-
@@ -435,6 +439,9 @@ impl Acc {
                     if matches!(kind, AggPlan::OrderedSetCont) {
                         floats.push(percentile_input_f64(&value)?);
                     } else {
+                        // The retained value is the finalize sort's key (cost.md §3 "sort_key /
+                        // hash_key"); percentile_cont's widened f64 measures 0.
+                        charge_sort_key(m, &value, collation.as_deref())?;
                         vals.push(value);
                     }
                 }
@@ -725,6 +732,8 @@ pub(crate) fn agg_order_tuple(
     let mut tuple = Vec::with_capacity(order.keys.len() + 1);
     for (k, sort) in order.keys.iter().zip(&order.sorts) {
         let kv = k.eval(row, env, m)?;
+        // The key is charged as the sort receives it (cost.md §3 "sort_key / hash_key").
+        charge_sort_key(m, &kv, sort.collation.as_deref())?;
         let kv = match &sort.collation {
             Some(c) => match collation_sort_key(c, &kv)? {
                 Some(bytes) => Value::Bytea(bytes),

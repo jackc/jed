@@ -59,7 +59,8 @@ SELECT a FROM cp WHERE b = 1 AND a = NULL
 ----
 
 # No leading member means no skip-scan: full scan (1 page + 5 rows + 5 filters + 2 outputs).
-# cost: 13
+# Per-row keys add 7 (cost.md §3 "sort_key / hash_key"): 13 before them.
+# cost: 20
 query T nosort
 SELECT v FROM cp WHERE a = 2 ORDER BY v
 ----
@@ -132,7 +133,8 @@ statement ok
 INSERT INTO ct VALUES (1, 'a', 1), (1, 'aa', 2), (1, 'b', 3), (2, 'a', 4)
 
 # 1 page + 2 rows + 6 filter nodes + 2 outputs = 11.
-# cost: 11
+# Per-row keys add 3 (cost.md §3 "sort_key / hash_key"): 11 before them.
+# cost: 14
 query T nosort
 SELECT name FROM ct WHERE g = 1 AND name < 'b' ORDER BY name
 ----
@@ -155,7 +157,8 @@ INSERT INTO cc VALUES (1, 'a'), (1, 'A'), (1, 'b'), (2, 'a')
 
 # Unicode order a < A < b. Two admitted rows; each residual ordering comparison also charges
 # collate by two code points: 1 page + 2 rows + 6 filter + 4 collate + 2 outputs = 15.
-# cost: 15
+# Per-row keys add 2 (cost.md §3 "sort_key / hash_key"): 15 before them.
+# cost: 17
 query T nosort
 SELECT name FROM cc WHERE g = 1 AND name < 'b' ORDER BY name
 ----
@@ -165,7 +168,8 @@ A
 # Explicit C collation disagrees with the stored unicode member and therefore cannot seed the
 # second-member range. The leading g=1 prefix remains usable and the residual C comparison filters.
 # The leading g prefix admits all three g=1 rows: 1 page + 3 rows + 9 filter nodes + 2 outputs = 15.
-# cost: 15
+# Per-row keys add 2 (cost.md §3 "sort_key / hash_key"): 15 before them.
+# cost: 17
 query T nosort
 SELECT name FROM cc WHERE g = 1 AND name < 'b' COLLATE "C" ORDER BY name COLLATE "C"
 ----

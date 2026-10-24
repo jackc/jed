@@ -106,8 +106,9 @@ SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS
 
 # ============================================================================================
 # THE SHARED PARTITION/SORT PASS. Three window functions share one PARTITION BY g ORDER BY id, so the
-# partition + sort run ONCE and serve all three (the partition/sort are unmetered, so the cost is the
-# same as three independent passes — cost-neutral — while the rows are unchanged). row_number and
+# partition + sort run ONCE and serve all three (the partition probes and sort comparisons are
+# unmetered and the integer keys charge nothing, so the cost is the same as three independent
+# passes — cost-neutral — while the rows are unchanged). row_number and
 # rank restart per partition; the running sum is per partition.
 # names: id, rn, rk, rs
 # cost: 37

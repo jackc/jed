@@ -4,9 +4,9 @@
 # sort over the PK scan today). NULL placement is a CROSS-CORE determinism contract (CLAUDE.md §8): the physical key
 # order ratifies NULL as the LARGEST value (types.md §4), so a key with no NULLS clause
 # defaults to ASC => NULLS LAST, DESC => NULLS FIRST — the PostgreSQL model. An explicit NULLS
-# FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
-# §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
-# operator_eval); multi-key/NULLS placement adds nothing.
+# FIRST|LAST overrides that default regardless of direction. The sort's comparisons are unmetered
+# and its integer keys charge no sort_key (cost.md §3): cost = storage_row_read per scanned row +
+# row_produced per produced row (+ filter operator_eval); multi-key/NULLS placement adds nothing.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.order_by_alias, query.select_star, query.column_alias, query.comparison_order, query.limit, expr.arithmetic, func.abs, types.i32, resource.cost_metering
 
 statement ok

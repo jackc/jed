@@ -4,8 +4,9 @@
 # needs no sort: the table tree, walked forward in storage-key order, already delivers rows in that
 # order. The engine elides the sort and STREAMS the scan; with a LIMIT it stops once the window is
 # filled (a top-N early-out). The cost-visible win is the LIMIT case: storage_row_read drops to the
-# rows actually read. A query with no LIMIT reads every row either way (the sort is unmetered —
-# cost.md §3 — so eliding it does not move the cost; the contract there is the ROW ORDER).
+# rows actually read. A query with no LIMIT reads every row either way; eliding the sort removes
+# only its per-row key charge, which is 0 for the integer keys here (cost.md §3 "sort_key / hash_key"), so the
+# contract there is the ROW ORDER.
 #
 # This file pins the COMPOSITE-PK behavior + the contrasts the single-column query/limit_offset.test
 # does not: a STRICT PREFIX of a composite key satisfies an ASC order, an ORDER BY that runs PAST the

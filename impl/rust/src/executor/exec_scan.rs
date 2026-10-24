@@ -108,7 +108,9 @@ fn process_streaming_row(
         for p in &plan.projections {
             projected.push(p.eval(row, penv, meter)?);
         }
+        let charged = charge_hash_keys(meter, &projected);
         actual.distinct += meter.accrued - before;
+        charged?;
         let inserted = seen.insert(projected.clone());
         if !meter.cost_first(inserted)? {
             return Ok(true);
@@ -1549,7 +1551,8 @@ impl Engine {
                 // The selection discards rows: release the buffer, re-reserve the kept rows.
                 charge.release_all();
                 let acct = meter.query.clone();
-                rows = meter.cost_first(top_k_rows(rows, &plan.order, k, &acct))?;
+                let r = top_k_rows(rows, &plan.order, k, &acct, meter);
+                rows = meter.cost_first(r)?;
                 if charge.active() {
                     for row in &rows {
                         charge.reserve(meter, crate::memsize::row_bytes(row))?;
@@ -1557,7 +1560,8 @@ impl Engine {
                 }
             } else {
                 let acct = meter.query.clone();
-                meter.cost_first(sort_rows(&mut rows, &plan.order, &acct))?;
+                let r = sort_rows(&mut rows, &plan.order, &acct, meter);
+                meter.cost_first(r)?;
             }
             (
                 total,
@@ -1607,9 +1611,12 @@ impl Engine {
                         // Sort state holds only the touched columns (memory.md §6.1).
                         null_untouched(&mut owned, &plan.rel_masks[0]);
                         let pushed = if let Some(k) = &mut keeper {
-                            k.push(owned)
+                            k.push(owned, meter)
                         } else {
-                            sorter.as_mut().unwrap().push(owned)
+                            // Each survivor charges its sort keys as the sorter receives it
+                            // (cost.md §3 "sort_key / hash_key").
+                            charge_sort_keys(meter, &owned, &plan.order)
+                                .and_then(|()| sorter.as_mut().unwrap().push(owned))
                         };
                         meter.cost_first(pushed)?;
                     }

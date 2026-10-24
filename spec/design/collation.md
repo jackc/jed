@@ -771,8 +771,8 @@ Collation is a §8 divergence hotspot handled by the established machinery:
   each ORDERING comparison (`< <= > >=`) under a collation charges `collate × (codepoints(lhs) +
   codepoints(rhs))`. `=`/`<>` charge nothing here (deterministic-collation equality is byte-equality,
   §7). A **sort on a collated key** builds each row's sort key exactly once and charges `collate` per
-  code point there; its comparisons over the built keys stay unmetered ([cost.md](cost.md) §3 "`sort_key` / `hash_key`";
-  specified, not yet implemented). (The comparison evaluator was at first the only metered point,
+  code point there; its comparisons over the built keys stay unmetered ([cost.md](cost.md) §3 "`sort_key` / `hash_key`").
+  (The comparison evaluator was at first the only metered point,
   because the set-operation sort path carries no `Meter`; the per-row key charge needs one there
   too.) A collated ordering comparison of two
   `text[]` values charges the same unit per element pair it walks: `collate × (codepoints(x) +

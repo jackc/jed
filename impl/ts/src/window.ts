@@ -37,6 +37,7 @@ import {
   unfoldAcc,
 } from "./executor.ts";
 import { COSTS } from "./costs.ts";
+import { chargeHashKeys, chargeSortKey, chargeSortKeys } from "./key_meter.ts";
 import { entryBytes, rowBytes, sortKeyBytes, valueBytes } from "./memsize.ts";
 import { engineError } from "./errors.ts";
 import { intervalCmp } from "./interval.ts";
@@ -484,8 +485,9 @@ export function* applyWindowStageSteps(
   }
   // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
   // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
-  // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
-  // purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
+  // results over the shared sorted partitions. Each group charges every row's partition keys, then
+  // every row's order keys (cost.md §3 "sort_key / hash_key"); the probes and comparisons are
+  // unmetered, so sharing saves those charges and wall-clock without changing the rows.
   const groups = groupWindowSpecs(specs);
   const specGroup = new Array<number>(specs.length).fill(0);
   const cache: Array<{ partitions: number[][]; collKeys: (Uint8Array | null)[][] | null }> = [];
@@ -502,6 +504,7 @@ export function* applyWindowStageSteps(
     const partitions: number[][] = [];
     for (let i = 0; i < n; i++) {
       const keyVals = rep.partition.map((p) => rows[i]![p]!);
+      chargeHashKeys(meter, keyVals);
       const k = distinctRowKey(keyVals);
       let pi = index.get(k);
       if (pi === undefined) {
@@ -912,11 +915,13 @@ export function* applyWindowStageSteps(
 // (Array.prototype.sort is stable in modern engines — the runtime jed targets, spill.md §6.)
 // A collated sort's decorations are transient operator state charged to acct (memory.md §6.8); a
 // rejected reservation throws 54P05 for the caller's cost-first check.
-export function sortRows(rows: Row[], order: OrderSlot[], acct: QueryAccount): void {
+export function sortRows(rows: Row[], order: OrderSlot[], acct: QueryAccount, meter: Meter): void {
   if (order.some((k) => k.collation !== null)) {
-    sortRowsCollated(rows, order, acct);
+    sortRowsCollated(rows, order, acct, meter);
     return;
   }
+  // Every row's keys are charged as the sort receives it (cost.md §3 "sort_key / hash_key").
+  for (const row of rows) chargeSortKeys(meter, row, order);
   rows.sort((a, b) => cmpRowsByOrder(a, b, order));
 }
 
@@ -964,13 +969,19 @@ export function windowCollKeys(
   order: OrderSlot[],
   meter: Meter,
 ): { keys: (Uint8Array | null)[][]; charged: number } | null {
-  if (!order.some((k) => k.collation !== null)) return null;
+  if (!order.some((k) => k.collation !== null)) {
+    // The sort still receives every row: its keys are charged (cost.md §3 "sort_key / hash_key").
+    for (const row of rows) chargeSortKeys(meter, row, order);
+    return null;
+  }
   const active = meter.queryMemoryActive();
   let charged = 0;
   const all: (Uint8Array | null)[][] = [];
   for (const row of rows) {
     const keys: (Uint8Array | null)[] = [];
     for (const k of order) {
+      // Each key is charged as the sort receives the row, just before its decoration.
+      chargeSortKey(meter, row[k.idx]!, k.collation);
       if (k.collation === null) continue;
       const v = row[k.idx]!;
       keys.push(collatedSortKey(k.collation, v)); // NULL → null, handled by NULL placement
@@ -1031,12 +1042,17 @@ export function cmpWindowRows(
 // collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
 // Each row's decoration reserves its sortKeyBytes as it is built; all are released once the rows are
 // undecorated (memory.md §6.8).
-export function sortRowsCollated(rows: Row[], order: OrderSlot[], acct: QueryAccount): void {
+export function sortRowsCollated(
+  rows: Row[],
+  order: OrderSlot[],
+  acct: QueryAccount,
+  meter: Meter,
+): void {
   const charge = new StateCharge(acct);
   // (keys[i], row) per row; a keys entry is null for a NULL value, the sort-key bytes otherwise.
   const deco: { keys: (Uint8Array | null)[]; row: Row }[] = [];
   for (const row of rows) {
-    const keys = collationKeysForRow(row, order);
+    const keys = collationKeysForRow(row, order, meter);
     if (charge.active()) charge.reserveDirect(sortKeyBytes(keys));
     deco.push({ keys, row });
   }
@@ -1045,9 +1061,12 @@ export function sortRowsCollated(rows: Row[], order: OrderSlot[], acct: QueryAcc
   charge.releaseAll();
 }
 
-function collationKeysForRow(row: Row, order: OrderSlot[]): (Uint8Array | null)[] {
+function collationKeysForRow(row: Row, order: OrderSlot[], meter: Meter): (Uint8Array | null)[] {
   const keys: (Uint8Array | null)[] = [];
   for (const k of order) {
+    // Every key of the row is charged as the sort receives it, each just before its decoration
+    // (cost.md §3 "sort_key / hash_key").
+    chargeSortKey(meter, row[k.idx]!, k.collation);
     if (k.collation === null) continue;
     const v = row[k.idx]!;
     keys.push(collatedSortKey(k.collation, v)); // NULL → null, handled by NULL placement
@@ -1072,11 +1091,15 @@ export class TopKKeeper {
   // retained item reserves its sort keys with its row, released when it is evicted or the heap is
   // finished.
   private decorations: StateCharge = new StateCharge();
+  // meter charges every pushed row's sort keys (cost.md §3 "sort_key / hash_key"), including the rows
+  // the heap discards.
+  private readonly meter: Meter;
 
-  constructor(k: bigint, order: OrderSlot[], collated: boolean) {
+  constructor(k: bigint, order: OrderSlot[], collated: boolean, meter: Meter) {
     this.k = k;
     this.order = order;
     this.collated = collated;
+    this.meter = meter;
   }
 
   // withCharge charges the retained rows to `charge` (memory.md §6.4): a retained row reserves its
@@ -1103,11 +1126,11 @@ export class TopKKeeper {
   }
 
   push(row: Row): void {
-    const item: TopKItem = {
-      keys: this.collated ? collationKeysForRow(row, this.order) : [],
-      row,
-      pos: this.nextPos++,
-    };
+    const pos = this.nextPos++;
+    let keys: (Uint8Array | null)[] = [];
+    if (this.collated) keys = collationKeysForRow(row, this.order, this.meter);
+    else chargeSortKeys(this.meter, row, this.order);
+    const item: TopKItem = { keys, row, pos };
     // A collated LIMIT 0 still decorates every input row, preserving the full sort's trap point.
     if (this.k === 0n) return;
     if (BigInt(this.items.length) < this.k) {
@@ -1166,11 +1189,18 @@ export class TopKKeeper {
   }
 }
 
-export function topKRows(rows: Row[], order: OrderSlot[], k: bigint, acct: QueryAccount): Row[] {
+export function topKRows(
+  rows: Row[],
+  order: OrderSlot[],
+  k: bigint,
+  acct: QueryAccount,
+  meter: Meter,
+): Row[] {
   const keeper = new TopKKeeper(
     k,
     order,
     order.some((key) => key.collation !== null),
+    meter,
   ).withDecorations(acct);
   for (const row of rows) keeper.push(row);
   return keeper.finish();

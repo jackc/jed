@@ -111,7 +111,8 @@ NULL
 12
 NULL
 
-# cost: 68
+# Per-row keys add 40 (cost.md §3 "sort_key / hash_key"): 68 before them.
+# cost: 108
 query IIIII nosort
 SELECT k, count(*), count(DISTINCT n), sum(id), sum(DISTINCT id) FROM spill_left GROUP BY k ORDER BY k NULLS FIRST
 ----
@@ -193,7 +194,8 @@ SELECT l.k, count(*), sum(r.v) FROM spill_left l JOIN spill_right r ON l.k = r.k
 1
 110
 
-# cost: 18
+# Per-row keys add 26 (cost.md §3 "sort_key / hash_key"): 18 before them.
+# cost: 44
 query T nosort
 SELECT DISTINCT s FROM spill_left ORDER BY s NULLS FIRST LIMIT 5 OFFSET 1
 ----
@@ -203,7 +205,8 @@ p
 q
 z
 
-# cost: 20
+# Per-row keys add 80 (cost.md §3 "sort_key / hash_key"): 20 before them.
+# cost: 100
 query D nosort
 SELECT DISTINCT n FROM spill_left ORDER BY n NULLS FIRST
 ----
@@ -244,7 +247,8 @@ NULL
 12
 1
 
-# cost: 56
+# Per-row keys add 28 (cost.md §3 "sort_key / hash_key"): 56 before them.
+# cost: 84
 query II nosort
 SELECT k, count(DISTINCT n) FILTER (WHERE id > 3) FROM spill_left GROUP BY k HAVING count(*) > 1 ORDER BY k NULLS FIRST
 ----

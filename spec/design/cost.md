@@ -883,11 +883,8 @@ metering point, like `collate`):
 
 ### `sort_key` / `hash_key` — per-row key work in sorts, grouping, and dedup
 
-> **Status: specified, not yet implemented.** Gated by the `resource.key_metering` capability and
-> pinned by `spec/conformance/suites/resource/key_metering.test`, which no core declares yet. Until
-> a core does, it charges none of this subsection's units; the statements elsewhere in this document
-> and in the other design docs that sorts, dedup, grouping, and partitioning charge per-row key work
-> describe a core that declares the capability.
+> **Status: implemented** in all three cores (the `resource.key_metering` capability), pinned by
+> `spec/conformance/suites/resource/key_metering.test`.
 
 A sort, a grouping or dedup table, and a window's partitioning do work on every row's **key values**
 in proportion to their size. The comparisons inside a sort and the probes inside a hash table stay
@@ -922,8 +919,11 @@ measured fetched. Every core already computes this measure, pinned by
   partition comparisons;
 - every other key: **`sort_key` × `payload(v)`**.
 
-The charge is taken where the row's sort key is built, before the row enters the sort, and guarded
-after each key, so a ceiling aborts (`54P01`) before the sort does the work. A blocking `ORDER BY`
+The charge is taken where the row's sort key is built, before the row enters the sort, and each
+nonzero charge is guarded at once, so a ceiling aborts (`54P01`) before the sort does the work; a
+key that charges nothing adds no guard, so no existing abort point moves. Within a row the keys are
+charged in key order, each just before a collated key is decorated, so a decoration error (`0A000`)
+and a ceiling abort are ordered the same way in every lane. A blocking `ORDER BY`
 builds its keys after every pre-sort row's `ORDER BY` expressions are evaluated (expression keys
 charge their `operator_eval`s first, as above), in input order, the order its collated keys are
 decorated in. A sort receives every row presented to it, including the rows a top-k heap discards and,
@@ -934,20 +934,20 @@ primary-key order", and its index and join variants) and a `DISTINCT` streamed i
 
 | Sort | Rows it receives | Keys |
 |---|---|---|
-| Query `ORDER BY`: the eager sort, the external sorter, the collated survivor buffer, the top-k heap, and the bounded-spill lane | each pre-sort row (post-`WHERE`; in a grouped query each group row; in a `SELECT DISTINCT` query each kept row) | the `ORDER BY` keys |
+| Query `ORDER BY`: the eager sort, the external sorter, the collated survivor buffer, the top-k heap, and the bounded-spill lane | each pre-sort row (post-`WHERE`; in a grouped query each group row; a `SELECT DISTINCT` query sorts before it dedups, so every row) | the `ORDER BY` keys |
 | A set operation's trailing `ORDER BY` | each combined output row | its `ORDER BY` keys |
 | `DISTINCT ON` | each pre-sort row | the `ON` expressions, then the remaining `ORDER BY` keys |
 | A window, once per shared partition/sort group with an `ORDER BY` ([window.md](window.md) §5.2) | each input row | the group's `ORDER BY` keys |
-| An in-aggregate `ORDER BY` ([aggregates.md](aggregates.md) §22) | each input that passes the aggregate's `FILTER` | its `ORDER BY` keys |
-| An ordered-set aggregate's `WITHIN GROUP` sort (`mode`, `percentile_disc`, `percentile_cont`) | each retained (non-NULL) input | the `WITHIN GROUP` key |
+| An in-aggregate `ORDER BY` ([aggregates.md](aggregates.md) §22) | each input that passes the aggregate's `FILTER`, as its keys are evaluated (before a `DISTINCT` check) | its `ORDER BY` keys |
+| An ordered-set aggregate's `WITHIN GROUP` sort (`mode`, `percentile_disc`, `percentile_cont`) | each retained (non-NULL) input, as it is retained | the `WITHIN GROUP` key, as it is sorted: numeric `percentile_cont` sorts its inputs widened to `f64`, which measure 0 |
 | A hypothetical-set aggregate (`rank`, `dense_rank`, `percent_rank`, `cume_dist` with `WITHIN GROUP`) | each passing input, as it is compared with the hypothetical row | the `WITHIN GROUP` key tuple |
 
 Window definitions that share a partition/sort group are charged once for the group, not once per
 definition, because they share one sort.
 
 **Grouping and dedup tables.** Every row a table **receives** charges **`hash_key` × `payload(v)`**
-for each of its key values, in key order, before the row is inserted or checked, guarded after each
-key:
+for each of its key values, in key order, before the row is inserted or checked, each nonzero charge
+guarded at once:
 
 | Table | Rows it receives | Keys |
 |---|---|---|
@@ -958,7 +958,11 @@ key:
 | A recursive CTE's `UNION` | each row of the non-recursive term and of every iteration, before its duplicate check | every column |
 | A window's `PARTITION BY`, once per shared partition/sort group with one | each input row | the partition keys |
 
-`UNION ALL` and a recursive CTE's `UNION ALL` build no table and charge nothing. A hash join keeps its
+`UNION ALL` and a recursive CTE's `UNION ALL` build no table and charge nothing. A set operation
+charges every row of its left operand, then every row of its right, before it combines them, on a
+meter that starts from the two operands' cost so its guard sees the statement's total; its trailing
+`ORDER BY` then charges on the same meter. A recursive CTE charges each row's keys before that row's
+duplicate check and guards the CTE's running total. A hash join keeps its
 own `hash_build` / `hash_probe` units (§ "JOIN"), which measure the canonical key encoding, and a
 `MERGE` that uses the hash join does too; neither is also charged `hash_key`. The window stage charges
 a group's partition keys for every row in input order, then its sort keys for every row in input
@@ -972,9 +976,11 @@ back charge nothing more, so cost stays independent of `work_mem` and of whether
 
 **The estimator** counts `sort_key`, `hash_key`, and sort-site `collate` as zero, as it does
 `varlen_compare` and `collate` without admitted value-size facts ([estimator.md](estimator.md) §8), so
-these units change no plan and no `est_cost`. Pricing them from analyzed average widths is a
-follow-on under [estimator.md](estimator.md) §2's rule that a newly metered event is re-pinned before
-the estimator counts it.
+these units change no plan and no `est_cost`. A plan the estimator prefers can therefore cost more
+in actual units than one it rejected: a full scan and sort of a text column now charges its keys,
+while an index walk that elides the sort does not (`query/order_by_index_scan.test`). Pricing them
+from analyzed average widths is a follow-on under [estimator.md](estimator.md) §2's rule that a newly
+metered event is re-pinned before the estimator counts it.
 
 **Still unmetered, and still open.** The comparisons inside a sort, a hash table's probes and
 collision checks, and sort merge passes remain unmetered; the per-row charge bounds them. Two

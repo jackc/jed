@@ -173,6 +173,9 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 				for i, c := range gs.keyCols {
 					key[i] = row[c]
 				}
+				if err := chargeHashKeys(m, key); err != nil {
+					return err
+				}
 				state, ok, err := groups.get(key)
 				if err != nil {
 					return err
@@ -205,6 +208,9 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 							if err != nil {
 								return err
 							}
+							if err := chargeSortKey(m, v, spec.hypo.sorts[j].collation); err != nil {
+								return err
+							}
 							tuple[j] = v
 						}
 						if err := collections.push(owner, tuple); err != nil {
@@ -228,6 +234,9 @@ func (db *engine) blockingAggregate(p *selectPlan, rows *rowSpool, env *evalEnv,
 					if spec.distinct {
 						if v.IsNull() && !spec.plan.distinctKeepsNull() {
 							continue
+						}
+						if err := chargeHashKey(m, v); err != nil {
+							return err
 						}
 						inserted, err := seen.insert([]Value{state[0], IntValue(int64(si)), v})
 						if err != nil {
