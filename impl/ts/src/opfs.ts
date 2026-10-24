@@ -39,7 +39,8 @@ import {
 } from "./crypto.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
-import { persistImpl, repairKeyBlockSteps } from "./persist.ts";
+import { DEFAULT_FLUSH_INTERVAL_MS, type Durability } from "./idle_flush.ts";
+import { persistImpl, repairKeyBlockSteps, setDurability, stopIdleFlush } from "./persist.ts";
 import { OpfsBlockStore, type SyncAccessHandle } from "./opfsblockstore.ts";
 import { ioSteps } from "./execution.ts";
 import {
@@ -54,7 +55,9 @@ import {
 // fixed into the file's meta; open-time cacheBytes / readOnly / workMem are handle settings.
 // environment is the handle's Environment (spec/design/environment.md); absent ⇒ a fresh empty one.
 // synchronous is the durability mode (file.ts Synchronous, spec/design/transactions.md §9): "off"
-// batches the barrier (spec/design/validated-cow.md §4). Default "on"; a handle setting.
+// batches the barrier (spec/design/validated-cow.md §4). Default "on"; a handle setting. flushIntervalMs
+// is how long an "off" batch may stay pending before it is flushed (validated-cow.md §4.1; default
+// DEFAULT_FLUSH_INTERVAL_MS, 0 off), measured on the environment's clock source.
 // credential creates or opens the file encrypted (spec/fileformat/encrypted.md; file.ts CreateOptions):
 // through the WebCrypto backend in a browser, every seal and open an awaited stage of the continuation
 // (encryption.md §9). kdf stretches a passphrase at create. OPFS has no scratch target, so there is
@@ -63,6 +66,7 @@ export type DatabaseOptions = {
   pageSize?: number;
   environment?: Environment;
   synchronous?: "on" | "off";
+  flushIntervalMs?: number;
   credential?: Credential;
   kdf?: Argon2Params;
 };
@@ -72,8 +76,21 @@ export type OpenOptions = {
   workMem?: number;
   environment?: Environment;
   synchronous?: "on" | "off";
+  flushIntervalMs?: number;
   credential?: Credential;
 };
+
+// opfsDurability is the durability an OPFS create or open's options set (validated-cow.md §4, §4.1).
+function opfsDurability(opts: {
+  synchronous?: "on" | "off";
+  flushIntervalMs?: number;
+}): Durability {
+  return {
+    relaxed: opts.synchronous === "off",
+    flushIntervalMs: opts.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
+    idleFlush: true,
+  };
+}
 
 // createOpfsWithHandle creates a new file-backed database over an already-acquired, EMPTY OPFS sync
 // access handle (the async createOpfs acquires it; the parity test passes a fake one). Writes the
@@ -143,7 +160,7 @@ export function* createOpfsWithHandleSteps(
   // committed leaves demote at each commit — same residency shape as after a reopen (file.ts create).
   // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
   db.paging.setFloorSlot(Number(db.committed.txid & 1n), db.committed.txid);
-  db.relaxed = opts.synchronous === "off";
+  setDurability(db, opfsDurability(opts));
   db.committed.storePaging = db.paging;
   db.rewriter = journal === null ? null : opfsRewriter(handle, journal);
   return db;
@@ -193,7 +210,7 @@ export function* openOpfsWithHandleSteps(
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.rewriter = journal === null ? null : opfsRewriter(handle, journal);
   db.readOnly = readOnly;
-  db.relaxed = opts.synchronous === "off";
+  setDurability(db, opfsDurability(opts));
   // 0 (or unset) ⇒ the default budget, not unlimited (matching Go/Rust); unbounded is setWorkMem(0).
   if (opts.workMem) db.session.workMem = opts.workMem;
   return db;
@@ -204,6 +221,7 @@ export function* openOpfsWithHandleSteps(
 // every prior statement is already durable, so close does NOT drop committed work. Idempotent.
 export function closeOpfs(db: Engine): void {
   db.rollbackTx();
+  stopIdleFlush(db);
   if (db.paging !== null) {
     const paging = db.paging;
     db.paging = null;

@@ -505,12 +505,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   reuse only pages the floor had free, and keep the batch off the free list, so recovery lands between
   the last flush and the newest attempted commit and never corrupts. The batch ends at the
   inline-manifest cap (a background flush in Go/Rust, inline in TS), at close, before a synchronous page client's
-  `begin_write` (a relaxed client commits into the owner's batch), and at compaction. Simulator S9 (`relaxed` profile, engine-aligned floor oracle).
+  `begin_write` (a relaxed client commits into the owner's batch), at compaction, and at the batch deadline (below). Simulator S9 (`relaxed` profile, engine-aligned floor oracle).
   → [validated-cow.md §4](spec/design/validated-cow.md), [transactions.md §9](spec/design/transactions.md)
-  - [ ] _follow-on — needs a decision:_ a **time-based flush** — a background flusher that makes an
-    idle relaxed batch durable after an interval. Its default interval and the knob's name are a
-    product decision (no spec names one); until then an idle relaxed handle stays undurable until its
-    next cap flush or `close`. _(size: S + decision)_
+  - [x] **Time-based flush** — `flush_interval_ms` (default 1000, `0` off): a batch pending that long
+    on the environment's clock is flushed by the next commit before it plans, or by an idle flusher
+    (thread / goroutine / event-loop timer) that does early only what that commit would do, so file
+    bytes stay a function of the commit sequence and its clock readings. Simulator S14.
+    → [validated-cow.md §4.1](spec/design/validated-cow.md)
   - [x] _follow-on:_ honor a page client's own `synchronous = off`: a relaxed client's `begin_write`
     carries a relaxed bit, `write_begun` names the owner's pending set and the floor-free pages it may
     reuse, and the client commits into the owner's batch (cumulative manifest, owner checks the carried

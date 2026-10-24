@@ -18,6 +18,7 @@ import type { Engine } from "../executor.ts";
 import { FORMAT_VERSION } from "../format.ts";
 import type { LockHost } from "../lockhost.ts";
 import type { SharedPaging } from "../paging.ts";
+import { armClientBatch, bindBatchDeadline } from "../persist.ts";
 import type { ServiceEngineFacts, ServiceOwnerHandle, ServicePending } from "../shared.ts";
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
 import { currentUid, newIncarnation } from "./endpoint.ts";
@@ -107,6 +108,7 @@ class WorkerOwnerLink implements OwnerLink {
     port1.on("message", (message: string) => {
       if (message === "maintain") args.onMaintain();
       else if (message === "yield") args.onYield();
+      else if (message === "batch") args.onBatch();
     });
     port1.unref();
     this.channel = channel;
@@ -180,6 +182,9 @@ export class ServiceOwner implements ServiceOwnerHandle {
     // The service sees the owner's batched-durability state (validated-cow.md §4): it flushes a pending
     // batch before granting a begin_write and writes a client commit's meta to the non-floor slot.
     paging.setBatchMirror(owner.state);
+    // The service applies the time-based flush's rule 4 to the batch its relaxed clients plan against and
+    // commit into, so the batch deadline lives in the shared state (validated-cow.md §4.1).
+    bindBatchDeadline(storage, owner.state);
     owner.state.setEngineFactsLocked(storage.freeGenTxid, storage.liveAtCompaction, null);
     host.writeOwnerRecord(dbPath, {
       serving: owner.endpoint !== "",
@@ -207,6 +212,7 @@ export class ServiceOwner implements ServiceOwnerHandle {
       maxConnections: limits.maxConnections,
       onMaintain: () => owner.handoff?.(),
       onYield: () => owner.yieldRequested?.(),
+      onBatch: () => armClientBatch(storage),
       localOldest: () => owner.localOldest?.() ?? null,
     };
     try {

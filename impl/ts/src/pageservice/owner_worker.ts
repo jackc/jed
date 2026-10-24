@@ -228,6 +228,16 @@ class Served implements ServedDb {
     }
   }
 
+  // batchClock reads the owner's clock when it is the wall clock (validated-cow.md §4.1 rule 4); a host
+  // clock source lives on the engine thread, which then takes the reading at batchStarted.
+  batchClock(): bigint | null {
+    return this.state.wallClock() ? BigInt(Date.now()) * 1000n : null;
+  }
+
+  batchStarted(): void {
+    this.notify.postMessage("batch");
+  }
+
   maintenanceDue(computed: boolean): boolean {
     return computed;
   }

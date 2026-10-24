@@ -58,6 +58,10 @@ pub enum ScratchEncryption {
 
 pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
 
+/// The default `flush_interval_ms`: how long a `synchronous = off` batch may stay pending before it
+/// is flushed (spec/design/validated-cow.md §4.1).
+pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
+
 /// A page-service owner's default idle-in-transaction timeout (spec/design/page-service.md §11.1).
 pub const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 60_000;
 
@@ -123,6 +127,10 @@ pub struct CreateOptions {
     /// transactions.md §9). Ignored for an in-memory database. A handle setting, not stored in the
     /// file.
     pub synchronous: Synchronous,
+    /// How long a [`Synchronous::Off`] batch may stay pending, in milliseconds, before it is flushed
+    /// (spec/design/validated-cow.md §4.1), measured on the environment's clock. `0` turns the
+    /// time-based flush off. Ignored under [`Synchronous::On`]. Default [`DEFAULT_FLUSH_INTERVAL_MS`].
+    pub flush_interval_ms: u64,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
     /// The environment this database runs in (spec/design/environment.md): the loaded Unicode and
@@ -176,6 +184,7 @@ impl Default for CreateOptions {
             page_size: 0,
             skip_fsync: false,
             synchronous: Synchronous::On,
+            flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             environment: Environment::default(),
@@ -230,6 +239,10 @@ pub struct OpenOptions {
     /// transactions.md §9). A handle setting, not stored in the file; the handle's file attachments
     /// follow it.
     pub synchronous: Synchronous,
+    /// How long a [`Synchronous::Off`] batch may stay pending, in milliseconds, before it is flushed
+    /// (spec/design/validated-cow.md §4.1), measured on the environment's clock. `0` turns the
+    /// time-based flush off. Ignored under [`Synchronous::On`]. Default [`DEFAULT_FLUSH_INTERVAL_MS`].
+    pub flush_interval_ms: u64,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
     /// The environment this handle runs in (spec/design/environment.md): the loaded Unicode and
@@ -278,6 +291,7 @@ impl Default for OpenOptions {
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             skip_fsync: false,
             synchronous: Synchronous::On,
+            flush_interval_ms: DEFAULT_FLUSH_INTERVAL_MS,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
             environment: Environment::default(),

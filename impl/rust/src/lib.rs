@@ -51,6 +51,7 @@ mod formatting_num;
 mod gin_jsonpath;
 mod gin_runs;
 mod gist;
+mod idle_flush;
 mod interval;
 mod json;
 mod jsonpath;
@@ -133,8 +134,9 @@ pub(crate) use executor::Engine;
 // white-box test drain helper (`query_outcome`), never nameable outside the crate.
 pub(crate) use executor::Outcome;
 pub use file::{
-    CreateOptions, DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS, DEFAULT_SHUTDOWN_GRACE_MS,
-    DEFAULT_YIELD_GRACE_MS, Locking, OpenOptions, Ownership, ScratchEncryption, Synchronous,
+    CreateOptions, DEFAULT_FLUSH_INTERVAL_MS, DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_YIELD_GRACE_MS, Locking, OpenOptions, Ownership,
+    ScratchEncryption, Synchronous,
 };
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{

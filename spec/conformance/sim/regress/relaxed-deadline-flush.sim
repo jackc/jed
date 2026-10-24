@@ -1,0 +1,61 @@
+# The time-based flush (validated-cow.md §4.1; simulation-testing.md §14 S14). Main and a file
+# attachment each keep their own batch deadline on the simulated clock. A commit that finds its
+# database's deadline passed flushes the batch before it plans; the clock moving alone flushes
+# nothing (the simulator runs no idle flusher). The tables stay small enough to fit the file's
+# preallocated pages, so no file-growth barrier stands in for a deadline flush: deleting the engine's
+# flush before a commit past the deadline fails this trace at step 23. Power losses after each kind of
+# commit check that the deadline flush moved the floor. Hand-written.
+# format: simulation
+# profile: relaxed
+# seed: 4242
+# page_size: 512
+# synchronous: off
+# flush_interval_ms: 1000
+# clock: 1700000000000000
+attach a1
+open w1 write
+on w1 CREATE TABLE t (id i64 PRIMARY KEY, v text)
+commit w1
+open w1b write
+on w1b CREATE TABLE a1.u (id i64 PRIMARY KEY, v text)
+commit w1b
+open w2 write
+on w2 INSERT INTO t SELECT g, repeat('x', 40) FROM generate_series(1, 60) g
+commit w2
+open w3 write
+on w3 INSERT INTO a1.u SELECT g, repeat('y', 40) FROM generate_series(1, 60) g
+commit w3
+open w4 write
+on w4 UPDATE t SET v = 'starts a batch' WHERE id = 7
+commit w4
+clock +600000
+open w5 write
+on w5 UPDATE a1.u SET v = 'starts a batch' WHERE id = 9
+commit w5
+clock +500000
+open w6 write
+on w6 UPDATE t SET v = 'flushed first' WHERE id = 8
+commit w6
+crash power survive=0 tear=0
+check
+open w7 write
+on w7 UPDATE t SET v = 'starts a batch' WHERE id = 10
+commit w7
+clock +700000
+open w8 write
+on w8 UPDATE a1.u SET v = 'past its deadline' WHERE id = 11
+commit w8
+open w8b write
+on w8b UPDATE t SET v = 'inside the batch' WHERE id = 12
+commit w8b
+crash power survive=1000 tear=0
+check
+open w9 write
+on w9 UPDATE t SET v = 'idle' WHERE id = 13
+commit w9
+clock +5000000
+crash power survive=0 tear=0
+check
+open r1 read
+on r1 SELECT count(*) FROM t
+close r1

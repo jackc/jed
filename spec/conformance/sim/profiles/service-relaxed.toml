@@ -3,12 +3,15 @@
 # its pending set and floor-free pages in write_begun, the client writes a cumulative manifest and
 # reuses only pages free at the floor, and the owner skips the barrier, flushing at the cap. Churn
 # (updates and deletes) frees pages during a batch, and power losses land mid-batch, so recovery must
-# find the floor intact under client commits as under the owner's own.
+# find the floor intact under client commits as under the owner's own. Most traces also time the
+# batches (validated-cow.md §4.1): the owner flushes one past its deadline at a relaxed client's
+# begin_write or before its own commit plans.
 
 description = "Relaxed page clients commit into their owner's batch: churn, power loss mid-batch"
 
 processes = "service"
 synchronous = ["off"]
+flush_interval_ms = [0, 1000, 4000]
 max_procs = 3
 page_sizes = [512, 1024]
 cache_bytes = [0, 2048]
@@ -19,6 +22,7 @@ max_readers = 2
 batch = [1, 40]
 
 [weights]
+clock = 4
 backup = 1
 spawn = 8
 exit = 1

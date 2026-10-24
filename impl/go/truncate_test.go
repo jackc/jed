@@ -145,7 +145,8 @@ func TestTrailingTruncationWaitsForTheFlushUnderSynchronousOff(t *testing.T) {
 	}
 	s.Close()
 	db.Close()
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff})
+	zero := uint64(0) // no time-based flush: wall time never moves a flush
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{Synchronous: SynchronousOff, FlushIntervalMs: &zero})
 	if err != nil {
 		t.Fatal(err)
 	}

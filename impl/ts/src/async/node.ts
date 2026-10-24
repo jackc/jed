@@ -20,6 +20,7 @@ export { EngineError } from "../errors.ts";
 export { Decimal } from "../decimal.ts";
 export * from "../value.ts";
 export { splitStatements } from "../split.ts";
+export { DEFAULT_FLUSH_INTERVAL_MS } from "../idle_flush.ts";
 export { PrivilegeSet } from "../privileges.ts";
 export type { JsParam, Row, RunResult } from "../ergonomic.ts";
 export type { SessionOptions } from "../snapshot.ts";

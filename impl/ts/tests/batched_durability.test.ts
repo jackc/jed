@@ -13,12 +13,16 @@ import { after, test } from "node:test";
 
 import { type BlockStore, ClosedBlockStore } from "../src/blockstore.ts";
 import { manifestInlineCapacity } from "../src/commit_manifest.ts";
-import { engineError } from "../src/errors.ts";
+import { Environment } from "../src/environment.ts";
+import { EngineError, engineError } from "../src/errors.ts";
 import type { Engine } from "../src/executor.ts";
 import { createDatabase, openDatabase } from "../src/file.ts";
+import { BatchDeadline } from "../src/idle_flush.ts";
+import { setDurability } from "../src/persist.ts";
+import { type ManualClock, manualClock } from "../src/seam.ts";
 import type { SharedPaging } from "../src/paging.ts";
 import { ServiceState } from "../src/pageservice/shared_state.ts";
-import { Database } from "../src/shared.ts";
+import { attachMemory, Database } from "../src/shared.ts";
 import { errCode } from "./util.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "jed-relaxed-"));
@@ -79,9 +83,27 @@ function record(db: Database): RecordingStore {
   return rec;
 }
 
+// relaxedDb is a relaxed database with no time-based flush, so wall time never moves a flush.
 function relaxedDb(name: string, pageSize?: number): { db: Database; path: string } {
+  return relaxedDbTimed(name, pageSize, 0, new Environment());
+}
+
+// relaxedDbTimed is a relaxed database whose batches end intervalMs after they start on env's clock.
+function relaxedDbTimed(
+  name: string,
+  pageSize: number | undefined,
+  intervalMs: number,
+  environment: Environment,
+): { db: Database; path: string } {
   const path = join(dir, name);
-  const db = createDatabase({ path, pageSize, synchronous: "off", locking: "none" });
+  const db = createDatabase({
+    path,
+    pageSize,
+    synchronous: "off",
+    flushIntervalMs: intervalMs,
+    environment,
+    locking: "none",
+  });
   return { db, path };
 }
 
@@ -187,7 +209,7 @@ test("the newest meta vouches for the whole batch", () => {
   db.execute("INSERT INTO t SELECT g, repeat('a', 20) FROM generate_series(1, 60) g");
   db.close(); // the floor: every row 'a'
   const prior = readFileSync(path);
-  const reopened = openDatabase(path, { synchronous: "off", locking: "none" });
+  const reopened = openDatabase(path, { synchronous: "off", flushIntervalMs: 0, locking: "none" });
   try {
     // The first commit after an open stabilizes the adopted generation with a barrier
     // (validated-cow.md §3); it then starts the batch.
@@ -298,7 +320,12 @@ test("relaxed trailing truncation waits for the flush", () => {
   seed.execute("CREATE TABLE big (id i64 PRIMARY KEY, pad text)");
   seed.execute("INSERT INTO big SELECT g, repeat('z', 300) FROM generate_series(1, 20000) g");
   seed.close();
-  const db = openDatabase(path, { synchronous: "off", skipFsync: true, locking: "none" });
+  const db = openDatabase(path, {
+    synchronous: "off",
+    flushIntervalMs: 0,
+    skipFsync: true,
+    locking: "none",
+  });
   const length = () => statSync(path).size;
   const state = () => {
     const st = storage(db);
@@ -342,4 +369,226 @@ test("relaxed trailing truncation waits for the flush", () => {
   } finally {
     re.close();
   }
+});
+
+// manualEnv is a manual clock and an environment that reads it.
+function manualEnv(): { clock: ManualClock; env: Environment } {
+  const clock = manualClock(0n);
+  return { clock, env: Environment.builder().clockSource(clock).build() };
+}
+
+function pending(db: Database): boolean {
+  return storage(db).paging!.hasPending();
+}
+
+// eventually waits up to five seconds for cond, on the event loop.
+async function eventually(cond: () => boolean): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    if (cond()) return true;
+    await sleep(5);
+  }
+  return cond();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A commit that reads the clock at or past its batch's deadline flushes the batch before it plans
+// (validated-cow.md §4.1 rule 3), and starts the next batch itself.
+test("a relaxed deadline flushes before the next commit", () => {
+  const { clock, env } = manualEnv();
+  const { db, path } = relaxedDbTimed("deadline.jed", undefined, 1000, env);
+  try {
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+    const rec = record(db);
+    db.execute("INSERT INTO t VALUES (1)");
+    clock.advance(999_999n);
+    db.execute("INSERT INTO t VALUES (2)");
+    assert.equal(rec.syncs, 0, "a commit before the deadline flushed");
+    clock.advance(1n);
+    const before = db.version;
+    db.execute("INSERT INTO t VALUES (3)");
+    assert.equal(rec.syncs, 1, "the commit at the deadline did not flush first");
+    // The flush made `before` the floor, so the new commit wrote the other slot and is pending.
+    assert.equal(metaTxidAt(path, Number(before & 1n)), before);
+    assert.equal(metaTxidAt(path, Number((before & 1n) ^ 1n)), db.version);
+    assert.ok(pending(db), "the commit after the flush is not pending");
+    // Its batch started at the reading of the flushing commit: the next deadline is a whole interval on.
+    clock.advance(999_999n);
+    db.execute("INSERT INTO t VALUES (4)");
+    assert.equal(rec.syncs, 1, "the new batch ended early");
+  } finally {
+    db.close();
+  }
+});
+
+// The idle flusher flushes a batch no commit follows once the clock passes its deadline, and never
+// before (validated-cow.md §4.1 rule 5).
+test("the idle flusher waits for the clock", async () => {
+  const { clock, env } = manualEnv();
+  const { db } = relaxedDbTimed("idle.jed", undefined, 20, env);
+  try {
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+    const rec = record(db);
+    db.execute("INSERT INTO t VALUES (1)");
+    await sleep(150);
+    assert.equal(rec.syncs, 0, "the flusher flushed before the clock passed the deadline");
+    assert.ok(pending(db));
+    clock.advance(20_000n);
+    assert.ok(await eventually(() => !pending(db)), "the idle flusher never flushed the batch");
+    assert.equal(rec.syncs, 1);
+  } finally {
+    db.close();
+  }
+});
+
+// The same commits and clock readings write the same file whether the idle flusher ran each flush or
+// the next commit did (validated-cow.md §4.1).
+test("the idle flusher writes the same bytes", async () => {
+  const images: Uint8Array[] = [];
+  for (const background of [true, false]) {
+    const { clock, env } = manualEnv();
+    const { db, path } = relaxedDbTimed(`idle${background}.jed`, 256, 10, env);
+    if (!background) {
+      setDurability(storage(db), { relaxed: true, flushIntervalMs: 10, idleFlush: false });
+    }
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v text)");
+    for (let i = 1; i <= 40; i++) {
+      db.execute(`INSERT INTO t VALUES (${i}, repeat('v', ${i % 30}))`);
+      if (i % 6 === 0) db.execute(`DELETE FROM t WHERE id = ${i - 2}`);
+      if (i % 5 === 0) {
+        clock.advance(10_000n);
+        if (background) {
+          assert.ok(
+            await eventually(() => !pending(db)),
+            `the idle flusher never flushed after commit ${i}`,
+          );
+        }
+      }
+    }
+    db.close();
+    images.push(readFileSync(path));
+  }
+  assert.deepEqual(images[0], images[1], "the idle flusher changed the file's bytes");
+});
+
+// A batch's deadline is per database: an attachment follows its handle's interval and clock but keeps
+// its own batch.
+test("a relaxed deadline is per database", () => {
+  const { clock, env } = manualEnv();
+  const { db } = relaxedDbTimed("deadline-main.jed", undefined, 1000, env);
+  try {
+    const other = join(dir, "deadline-other.jed");
+    createDatabase({ path: other, environment: env, locking: "none" }).close();
+    db.attach("o", { file: true, path: other, locking: "none" });
+    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
+    clock.advance(500_000n);
+    db.execute("CREATE TABLE o.u (id i32 PRIMARY KEY)");
+    clock.advance(500_000n);
+    // Main's deadline has passed; the attachment's has not.
+    db.execute("INSERT INTO o.u VALUES (1)");
+    const attachedPending = () =>
+      (
+        db as unknown as { core: { attachments: Map<string, { storage: Engine }> } }
+      ).core.attachments
+        .get("o")!
+        .storage.paging!.hasPending();
+    assert.ok(attachedPending(), "the attachment's batch ended at main's deadline");
+    assert.ok(pending(db), "main flushed without a commit of its own");
+    db.execute("INSERT INTO t VALUES (1)");
+    assert.ok(attachedPending());
+  } finally {
+    db.close();
+  }
+});
+
+// The idle flusher never flushes while one of the domain's commits runs, even when the commit awaits
+// across the deadline (validated-cow.md §4.1 rule 4, ts-runtime.md §11): it waits for the commit to end.
+test("the idle flusher waits for an awaiting commit", async () => {
+  const clock = manualClock(0n);
+  const deadline = new BatchDeadline(5);
+  let batch = true;
+  let flushes = 0;
+  const target = {
+    pending: () => batch,
+    flush: () => {
+      flushes++;
+      batch = false;
+      return true;
+    },
+  };
+  deadline.enter();
+  deadline.afterCommit(true, true, clock.nowMicros(), target, clock);
+  clock.advance(5_000n);
+  await sleep(50);
+  assert.equal(flushes, 0, "the idle flusher flushed inside a commit");
+  deadline.leave();
+  assert.ok(
+    await eventually(() => flushes === 1),
+    "the idle flusher never flushed after the commit",
+  );
+  deadline.stop();
+});
+
+// The maxStorageBytes precheck of a commit that also writes an in-memory attachment plans a pending
+// batch's reuse restriction, while the commit itself may first flush the batch at its deadline
+// (validated-cow.md §4.1) and plan without it. The answer cannot differ: the file form limits live
+// pages (memory.md §8.7), which do not depend on which page ids a commit takes. Run the same
+// transactions with no batching, with batches, and with a deadline flush before every commit: every
+// 54P06 lands on the same transaction. Mirrors the Rust test.
+test("the storage precheck ignores the deadline", () => {
+  const runs: string[][] = [];
+  for (const [k, mode] of ["on", "batched", "deadline"].entries()) {
+    const { clock, env } = manualEnv();
+    const db =
+      mode === "on"
+        ? createDatabase({
+            path: join(dir, `precheck${k}.jed`),
+            pageSize: 512,
+            environment: env,
+            locking: "none",
+          })
+        : relaxedDbTimed(`precheck${k}.jed`, 512, mode === "deadline" ? 1 : 0, env).db;
+    try {
+      db.attach("m", attachMemory(), false);
+      db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v text)");
+      db.execute("CREATE TABLE m.log (id i64 PRIMARY KEY)");
+      db.setMaxStorageBytes("main", 40n * 512n);
+      const outcomes: string[] = [];
+      for (let i = 0; i < 120; i++) {
+        let sql: string;
+        if (i % 4 < 2) {
+          sql = `INSERT INTO t SELECT g, md5(g::text) || md5((g + 1)::text) FROM generate_series(${i * 10}, ${i * 10 + 9}) g`;
+        } else if (i % 4 === 2) {
+          sql = `DELETE FROM t WHERE id % 50 = ${i % 50}`;
+        } else {
+          sql = `UPDATE t SET v = left(md5(v), ${1 + (i % 20)}) || v WHERE id % 5 = 0`;
+        }
+        const s = db.session();
+        let code = "";
+        try {
+          s.begin(true);
+          s.execute(sql);
+          s.execute(`INSERT INTO m.log VALUES (${i})`);
+          s.commit();
+        } catch (e) {
+          if (!(e instanceof EngineError)) throw e;
+          code = e.code();
+        } finally {
+          s.close();
+        }
+        outcomes.push(code);
+        clock.advance(1_000n);
+      }
+      assert.ok(outcomes.includes("54P06"), `${mode}: the limit never tripped`);
+      assert.ok(outcomes.includes(""), `${mode}: every commit failed`);
+      runs.push(outcomes);
+    } finally {
+      db.close();
+    }
+  }
+  assert.deepEqual(runs[1], runs[0], "batching moved a 54P06");
+  assert.deepEqual(runs[2], runs[0], "the deadline flush moved a 54P06");
 });

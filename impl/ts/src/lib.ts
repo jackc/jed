@@ -1127,6 +1127,7 @@ export type { CreateOptions, Locking, OpenOptions, ScratchEncryption } from "./f
 // Encryption at rest (spec/design/encryption.md): the credential CreateOptions/OpenOptions/attachFile
 // take, and the Argon2id parameters a passphrase is stretched with at create.
 export { DEFAULT_ARGON2_PARAMS } from "./crypto.ts";
+export { DEFAULT_FLUSH_INTERVAL_MS } from "./idle_flush.ts";
 export type { Argon2Params, Credential } from "./crypto.ts";
 // The Environment (spec/design/environment.md): every outside input except storage — loaded Unicode
 // and time-zone data, host functions (extensibility.md §4.2), and the random + clock sources — built

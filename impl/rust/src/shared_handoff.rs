@@ -149,13 +149,14 @@ impl Shared {
         source: &AttachSource,
         read_only: bool,
     ) -> Result<(Arc<Shared>, PathBuf)> {
-        let (main_files, spill, relaxed, inline_flush) = {
+        let (main_files, spill, relaxed, inline_flush, flush_interval_ms) = {
             let storage = self.storage.lock().expect("storage lock not poisoned");
             (
                 storage.files.clone(),
                 storage.spill.clone(),
                 storage.relaxed,
                 storage.inline_flush,
+                storage.deadline.interval_ms(),
             )
         };
         let (host, files, background) = match self.handoff.get() {
@@ -189,6 +190,7 @@ impl Shared {
             } else {
                 crate::file::Synchronous::On
             },
+            flush_interval_ms,
             ..OpenOptions::default()
         };
         if let Some(handoff) = self.handoff.get() {
@@ -301,7 +303,19 @@ impl Shared {
     ) {
         let mut live = self.live.lock().expect("live lock not poisoned");
         let mut st = self.storage.lock().expect("storage lock not poisoned");
+        // An owner's idle flusher takes its writer gate first (validated-cow.md §4.1 rule 5).
+        st.set_flush_gate(next.owner.as_ref().map(|owner| {
+            let owner = Arc::downgrade(owner);
+            Arc::new(move || {
+                let owner = owner.upgrade()?;
+                owner
+                    .gate
+                    .try_acquire()
+                    .then(|| Box::new(move || owner.gate.release()) as Box<dyn FnOnce() + Send>)
+            }) as crate::idle_flush::FlushGate
+        }));
         if let Some(engine) = engine {
+            st.end_timed_batch();
             st.paging = engine
                 .paging
                 .clone()
@@ -1049,7 +1063,11 @@ pub(super) fn start_service_owner(
     let (paging, page_size) = {
         let mut storage = shared.storage.lock().expect("storage lock not poisoned");
         storage.record_commits = true;
-        storage.relaxed = handoff.opts.synchronous == crate::file::Synchronous::Off;
+        storage.set_synchronous(
+            handoff.opts.synchronous == crate::file::Synchronous::Off,
+            handoff.opts.flush_interval_ms,
+            &shared.env,
+        );
         (storage.paging.clone(), storage.page_size)
     };
     let txid = shared.committed_version();
@@ -1173,7 +1191,11 @@ pub(crate) fn open_service_with(
                 // The owner publishes this process's commits; the client adopts its own from the meta.
                 storage.record_commits = true;
                 storage.budget.limit = opts.max_storage_bytes;
-                storage.relaxed = opts.synchronous == crate::file::Synchronous::Off;
+                storage.set_synchronous(
+                    opts.synchronous == crate::file::Synchronous::Off,
+                    opts.flush_interval_ms,
+                    &db.0.env,
+                );
             }
             db.0.attach_handoff(hosts, &real, opts);
             let role = Arc::new(ServiceRole {

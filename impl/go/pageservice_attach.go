@@ -96,9 +96,12 @@ func (c *sharedCore) openServiceAttachment(name, path string, source AttachSourc
 		opts.ScratchEncryption = ScratchEncryptionOn
 	}
 	if c.storage.relaxed {
-		// The attachment follows the handle's synchronous setting (validated-cow.md §4).
+		// The attachment follows the handle's synchronous setting and its time-based flush
+		// (validated-cow.md §4, §4.1).
 		opts.Synchronous = SynchronousOff
 	}
+	interval := c.storage.deadline.intervalMs()
+	opts.FlushIntervalMs = &interval
 	if h := c.handoff; h != nil {
 		// A handle under the page service lends its ownership preference and owner limits to its
 		// attachments (README.md §6.6).

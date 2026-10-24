@@ -24,12 +24,18 @@ import type { Argon2Params, Credential } from "../crypto.ts";
 export type { SessionOptions } from "../snapshot.ts";
 export { PrivilegeSet } from "../privileges.ts";
 export { splitStatements } from "../split.ts";
+export { DEFAULT_FLUSH_INTERVAL_MS } from "../idle_flush.ts";
 
 export type BrowserDatabaseOptions = {
   backend?: "typescript";
   path?: string;
   pageSize?: number;
   synchronous?: "on" | "off";
+  /**
+   * How long a synchronous "off" batch may stay pending, in milliseconds, before it is flushed
+   * (spec/design/validated-cow.md §4.1). 0 turns the time-based flush off; default 1000.
+   */
+  flushIntervalMs?: number;
   maxStorageBytes?: bigint;
   unicodeData?: Uint8Array;
   timeZoneData?: Uint8Array;

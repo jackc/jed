@@ -29,6 +29,7 @@ import { COMPACT_GROWTH, COMPACT_MIN_PAGES } from "../costs.ts";
 import { KEY_BLOCK_LEN, PageCodec } from "../crypto.ts";
 import type { RandomSource } from "../seam.ts";
 import { EngineError } from "../errors.ts";
+import { saturatingDeadline } from "../idle_flush.ts";
 import {
   encodeFrame,
   FrameAccumulator,
@@ -115,6 +116,12 @@ export interface ServedDb {
   // file's durable barrier, after which the newest meta is the floor (ServiceState.batchFlushed).
   // false when the barrier failed. Called holding the writer gate.
   flushBatch(): boolean;
+  // batchClock reads the owner's clock for the time-based flush (validated-cow.md §4.1 rule 4), or null
+  // when this side cannot (a worker thread over a host clock source only the engine thread reads).
+  batchClock(): bigint | null;
+  // batchStarted tells the engine thread that a relaxed client commit started a batch, so its idle
+  // flusher arms (and sets the deadline, when batchClock could not).
+  batchStarted(): void;
   // maintenanceDue reports, holding the state lock after a client commit was published, whether to
   // hand the gate to the engine thread (computed is the service's own estimate); maintain tells the
   // engine thread, which runs the maintenance commit and releases the gate.
@@ -604,6 +611,7 @@ export class Connection {
     // pending set is flushed first; a relaxed one is told the pending set instead. A set the shared
     // state could not hold is flushed for a relaxed client too (it never outlives the commit that grew
     // it, which is flushed before the gate moves on).
+    if (relaxed) this.beginClientBatch();
     let pending: ManifestEntry[] | null = relaxed ? state.pendingEntries() : null;
     if (pending === null && state.batchPending()) {
       if (!this.db.flushBatch()) {
@@ -714,6 +722,23 @@ export class Connection {
       pending: pending.map((e) => ({ index: e.index, digest: e.checksum })),
       reuse,
     };
+  }
+
+  // beginClientBatch is a relaxed begin_write's rule 4 (validated-cow.md §4.1): the client is about to
+  // plan against the owner's pending batch, so a batch past its deadline on the owner's clock is flushed
+  // first, as the owner's own commit would, shrinking nothing (like the flush before a synchronous
+  // client); write_begun then names the empty set. Called holding the gate.
+  private beginClientBatch(): void {
+    const state = this.db.state;
+    if (state.flushInterval() <= 0n || !state.batchPending()) return;
+    const now = this.db.batchClock();
+    const deadline = state.deadline();
+    if (now === null || deadline === null || now < deadline) return;
+    if (!this.db.flushBatch()) {
+      state.releaseGate();
+      throw new FlushFailure();
+    }
+    state.setDeadline(null);
   }
 
   // floorFree is the floor's free list (validated-cow.md §4), read from the floor's meta slot under the
@@ -897,6 +922,8 @@ export class Connection {
       const chain = d.manifest.map((pg) => ({ index: pg.index, bytes: pg.page }));
       codec.sealMeta(state.floorSlot() ^ 1, d.meta, chain);
     }
+    // Whether a relaxed commit starts the owner's batch (validated-cow.md §4.1 rule 4).
+    const beganEmpty = w.relaxed && !state.batchPending();
     if (!this.db.commitDelta(d, w.relaxed)) {
       // The meta may be durable: no error frame, only a closed connection, so the client resolves the
       // outcome with commit_status (README §3.5).
@@ -905,6 +932,15 @@ export class Connection {
       state.releaseGate();
       this.db.stopServing();
       return;
+    }
+    const capReached =
+      w.relaxed && state.pendingCount() >= manifestInlineCapacity(this.db.pageSize, codec !== null);
+    // A relaxed client commit that starts a batch sets its deadline from a reading of the owner's clock
+    // taken now, and arms the owner's idle flusher; one that reaches the cap ends the batch (rule 4).
+    if (beganEmpty && !capReached && state.flushInterval() > 0n) {
+      const now = this.db.batchClock();
+      state.setDeadline(now === null ? null : saturatingDeadline(now, state.flushInterval()));
+      this.db.batchStarted();
     }
     let due: boolean;
     let quiet = false;
@@ -957,11 +993,7 @@ export class Connection {
     // A relaxed client commit that brought the pending set to the batch cap is flushed now, before any
     // maintenance commit, and that flush shrinks nothing (README §3.5). A failed flush poisons the
     // owner, which stops serving.
-    if (
-      w.relaxed &&
-      state.pendingCount() >= manifestInlineCapacity(this.db.pageSize, codec !== null) &&
-      !this.db.flushBatch()
-    ) {
+    if (capReached && !this.db.flushBatch()) {
       state.releaseGate();
       this.db.stopServing();
       return;

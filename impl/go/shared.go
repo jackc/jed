@@ -338,6 +338,9 @@ type storage struct {
 	// non-empty. Empty outside a relaxed client's write transaction.
 	servicePending []manifestEntry
 	serviceReuse   map[uint32]bool
+	// deadline is the time-based flush of a relaxed batch (validated-cow.md §4.1): the handle's
+	// FlushIntervalMs, its clock, and the batch deadline its commits and idle flusher share.
+	deadline deadlineFlush
 }
 
 // backgroundFlush is one background cap flush (validated-cow.md §4).
@@ -370,7 +373,11 @@ func (st *storage) flush(shrink bool) error {
 	if st.paging == nil {
 		return nil
 	}
-	return st.paging.withPager(func(p *pager) error { return p.flushPending(shrink) })
+	if err := st.paging.withPager(func(p *pager) error { return p.flushPending(shrink) }); err != nil {
+		return err
+	}
+	st.deadline.clear()
+	return nil
 }
 
 // startCapFlush ends a batch that reached the cap: the flush runs on its own goroutine (or inline for
@@ -682,6 +689,23 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		}); err != nil {
 			return err
 		}
+		// The batch deadline (validated-cow.md §4.1): one clock reading, and st.mu held from it to the
+		// publish, so the idle flusher never runs inside a commit. The file's owner times every batch, a
+		// synchronous one's included, since its relaxed page clients may open one: a relaxed commit reads
+		// the clock, and so does any commit that begins inside a batch (rule 1).
+		timed := st.timedFlush() && (pending || st.relaxedFile())
+		var now int64
+		if timed {
+			now = st.deadline.clock.nowMicros()
+			if pending && st.deadline.passed(now) {
+				// Past the deadline: flush the batch before planning (rule 3).
+				if err := st.paging.withPager(func(p *pager) error { return p.flushPending(true) }); err != nil {
+					return err
+				}
+				st.deadline.clear()
+				pending = false
+			}
+		}
 		allowed := st.reuseAllowed(pending)
 		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, canReuse, allowed, st.paging)
 		if err != nil {
@@ -691,7 +715,15 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		if err != nil {
 			return err
 		}
-		return st.commitFile(snap, write, live, canReclaim, canReuse, allowed)
+		capReached, err := st.commitFile(snap, write, live, canReclaim, canReuse, allowed)
+		if err != nil {
+			return err
+		}
+		if timed {
+			// A synchronous commit's own barrier ends the batch it began in (rule 3).
+			st.afterTimedCommit(!pending, st.relaxedFile() && !capReached, now)
+		}
+		return nil
 	}
 	write, err := st.planInMemory(snap, canReuse, budget)
 	if err != nil {
@@ -703,9 +735,10 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 // commitFile writes body pages before planning reclamation so the reachability
 // walk sees the new catalog. It allocates the free-list and manifest together,
 // then publishes the alternate meta (carrying live, the live-page count this
-// commit publishes — memory.md §8.7) and syncs once. Caller holds st.mu and has
+// commit publishes — memory.md §8.7) and syncs once. It reports whether the commit
+// reached the relaxed batch cap (a flush follows). Caller holds st.mu and has
 // checked writer admission before assigning dirty-node page ids.
-func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveCount, canReclaim, canReuse bool, allowed map[uint32]bool) error {
+func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveCount, canReclaim, canReuse bool, allowed map[uint32]bool) (bool, error) {
 	st.syncDirectoryOnce()
 	if err := st.paging.withPager(func(p *pager) error {
 		if err := p.beginValidatedCommit(); err != nil {
@@ -722,7 +755,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 		}
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
 	relaxed := st.relaxedFile()
 	pending := st.batchEntries()
@@ -732,10 +765,10 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	truncate := !st.serviceClient && len(pending) == 0
 	plan, err := planValidatedCommit(snap, st.paging, write, st.pageSize, st.liveAtCompaction, st.freeGenTxid, canReclaim, canReuse, truncate, live.live, pending, allowed)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := verifyLiveCount(snap, st.paging, write, live); err != nil {
-		return err
+		return false, err
 	}
 	capReached := false
 	var sealed []byte
@@ -770,7 +803,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 		capReached = relaxed && p.batchCapReached()
 		return nil
 	}); err != nil {
-		return err
+		return false, err
 	}
 	if st.recordCommits {
 		st.lastMeta = sealed
@@ -788,7 +821,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 	if capReached {
 		st.startCapFlush()
 	}
-	return nil
+	return capReached, nil
 }
 
 // commitInMemory is the IN-MEMORY branch of commitDurable: a memoryBlockStore is never reopened, so it
@@ -938,7 +971,10 @@ func (st *storage) precheckBudget(snap *snapshot, reuse bool, budget *budgetCtx)
 		if err := st.awaitFlush(); err != nil {
 			return err
 		}
-		// Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
+		// Plan as the commit will: a pending relaxed batch reuses only pages free at its floor. A commit
+		// past its batch's deadline flushes first and plans without that restriction (validated-cow.md
+		// §4.1); the answer is the same, since live pages (memory.md §8.7) do not depend on which page
+		// ids a commit takes.
 		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, reuse, st.floorFreeFor(st.batchOpen()), st.paging)
 		if err != nil {
 			return err
@@ -1017,6 +1053,7 @@ func (st *storage) compact(snap *snapshot, txid uint64) (*snapshot, error) {
 		return nil, err
 	}
 	st.paging = paging
+	st.deadline.clear() // the new image is durable: no batch is pending (validated-cow.md §4.1)
 	st.pageCount = loaded.pageCount
 	st.freePages = loaded.freePages
 	st.liveAtCompaction = loaded.liveAtCompaction
@@ -1090,6 +1127,7 @@ func (st *storage) rekey(snap *snapshot, txid uint64, target *pageCodec, spill s
 		return nil, err
 	}
 	st.paging = paging
+	st.deadline.clear() // the new image is durable: no batch is pending (validated-cow.md §4.1)
 	st.pageCount = loaded.pageCount
 	st.freePages = loaded.freePages
 	st.liveAtCompaction = loaded.liveAtCompaction
@@ -1167,6 +1205,7 @@ func (st *storage) close() error {
 	// §4); a failed flush is what close reports.
 	st.mu.Lock()
 	ferr := st.flush(true)
+	st.stopIdleFlush()
 	st.mu.Unlock()
 	if err := st.paging.close(); err != nil && ferr == nil {
 		ferr = err
@@ -1662,7 +1701,10 @@ type CreateOptions struct {
 	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
 	// §9). Ignored for an in-memory database. A handle setting, not stored in the file.
 	Synchronous Synchronous
-	Locking     Locking
+	// FlushIntervalMs is the OpenOptions field of the same name (validated-cow.md §4.1): nil is
+	// DefaultFlushIntervalMs, &0 turns the time-based flush off.
+	FlushIntervalMs *uint64
+	Locking         Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
 	FileLockTimeoutMs *uint64
 	// IdleInTransactionTimeoutMs, IdleSessionTimeoutMs, YieldGraceMs, ShutdownGraceMs, MaxConnections,
@@ -1738,6 +1780,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		openOpts := OpenOptions{
 			SkipFsync:                  opts.SkipFsync,
 			Synchronous:                opts.Synchronous,
+			FlushIntervalMs:            opts.FlushIntervalMs,
 			Locking:                    LockingAuto,
 			FileLockTimeoutMs:          opts.FileLockTimeoutMs,
 			IdleInTransactionTimeoutMs: opts.IdleInTransactionTimeoutMs,
@@ -1756,7 +1799,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
-	c.storage.relaxed = opts.Synchronous == SynchronousOff
+	c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushIntervalMs), c.env)
 	return databaseOver(c), nil
 }
 
@@ -1813,7 +1856,7 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	}
 	c := sharedCoreFromEngineCoordinated(e, coordinator)
 	c.storage.budget.limit = opts.MaxStorageBytes
-	c.storage.relaxed = opts.Synchronous == SynchronousOff
+	c.storage.setSynchronous(opts.Synchronous == SynchronousOff, flushIntervalMs(opts.FlushIntervalMs), c.env)
 	return databaseOver(c), nil
 }
 
@@ -1971,6 +2014,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			// A file attachment follows the handle's synchronous setting (validated-cow.md §4).
 			relaxed:     db.core.storage.relaxed,
 			inlineFlush: db.core.storage.inlineFlush,
+			deadline:    db.core.storage.deadline.settings(),
 		}
 		root = e.committed // its stores fault through st.paging; loadEnginePaged bound storePaging too
 	}
@@ -2575,6 +2619,10 @@ func (db *Database) Close() error {
 		closeErr = st.close()
 		st.paging = nil
 	}
+	// A service role may have left no file to close; the idle flusher stops either way.
+	c.storage.mu.Lock()
+	c.storage.stopIdleFlush()
+	c.storage.mu.Unlock()
 	// Release any still-attached file databases (an in-memory attachment's close is a no-op), so the
 	// host need not detach before Close (attached-databases.md §4). In name order: a relaxed
 	// attachment's close flushes its batch (validated-cow.md §4), so the order is the order of I/O.

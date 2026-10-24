@@ -441,6 +441,17 @@ class SimServed implements ServedDb, OwnerLink {
     }
   }
 
+  // batchClock reads the owner's clock (validated-cow.md §4.1 rule 4): the service runs on the engine
+  // thread, so the simulated clock times client batches exactly as the Go and Rust owners do.
+  batchClock(): bigint | null {
+    return this.storage.environment.clockSource().nowMicros();
+  }
+
+  // batchStarted tells the engine thread, whose idle flusher the simulator never runs.
+  batchStarted(): void {
+    this.args.onBatch();
+  }
+
   // maintenanceDue hands every client commit to the engine thread, which adopts it and decides the
   // maintenance commit on its own exact facts (the Go owner's order).
   maintenanceDue(_computed: boolean): boolean {

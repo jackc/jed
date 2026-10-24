@@ -474,10 +474,11 @@ database-level **`synchronous`** setting governs *when* the fsync fires relative
 
   Results, plans, and cost are identical in both modes; only when the barrier runs differs. The
   setting is a **handle** setting (`create`/`open`, [api.md](api.md) §2.1), not stored in the file,
-  and applies to the handle's file attachments too; an in-memory database ignores it. There is
-  deliberately **no time-based flush yet**: the interval and its knob are an open decision
-  ([../../TODO.md](../../TODO.md)), so an idle relaxed handle stays undurable until its next cap
-  flush or `close`.
+  and applies to the handle's file attachments too; an in-memory database ignores it. A batch
+  pending for the handle's `flush_interval_ms` (default 1000 ms, on the environment's clock; `0`
+  is off) is flushed by the next commit before it plans, or by an idle flusher if no commit
+  follows ([validated-cow.md](validated-cow.md) §4.1), so an idle relaxed handle becomes durable
+  about one interval after its last commit.
 
 **The seam, default `on`.** The fsync is the single chokepoint at the commit boundary; `off`
 (batching/group-commit) is an additive change behind it and can land later. **Phase 5** kept
@@ -686,9 +687,10 @@ a")` drives the same mechanism ([api.md](api.md) §2.2).
 - **Group-commit / async durability** — the `synchronous=off` batching machinery is built (§9,
   [validated-cow.md](validated-cow.md) §4): the batch cap, the background cap flush, and fsync
   coalescing across every committer of the handle (its sessions on any thread, and its owner-side
-  maintenance commits) — successive commits share one barrier. Still open: a **time-based** flush
-  (its interval and knob are undecided), while page clients' commits coalesce too: a relaxed client's
-  `begin_write` carries its setting, and its commits join the owner's batch (page-service.md §6). Under
+  maintenance commits) — successive commits share one barrier — and the **time-based** flush
+  (`flush_interval_ms`, default 1000, [validated-cow.md](validated-cow.md) §4.1), while page clients'
+  commits coalesce too: a relaxed client's `begin_write` carries its setting, and its commits join the
+  owner's batch (page-service.md §6). Under
   `synchronous=on` a commit holds the writer gate through its barrier, as PostgreSQL makes a commit
   visible only once durable; overlapping the next writer with that barrier would need it to build on
   an unpublished snapshot (early lock release), which is not foreclosed and not planned.

@@ -3,11 +3,14 @@
 # the high-water, and ends in one flush at the batch cap (37 manifest entries at 512-byte pages) or at
 # close. Crashes and faulted commits land mid-batch and at the cap flush itself; recovery must land
 # between the last flush and the newest attempted commit. Readers stay pinned across batches so reuse
-# after a flush is still gated by the watermark.
+# after a flush is still gated by the watermark. Most traces also time their batches (validated-cow.md
+# §4.1): clock steps move the simulated clock past a batch's deadline, so the next commit flushes
+# before it plans.
 
 description = "synchronous = off: batched commits, cap flushes, crashes mid-batch and at the flush"
 
 synchronous = ["off"]
+flush_interval_ms = [0, 1000, 4000]
 page_sizes = [512, 1024]
 cache_bytes = [0, 2048]
 steps = 400
@@ -37,6 +40,7 @@ check = 2
 reopen = 2
 crash_power = 5
 crash_process = 3
+clock = 4
 
 [faults]
 backup_fault = 200

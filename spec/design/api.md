@@ -239,12 +239,16 @@ cores. (The positively-oriented name `skip_fsync` reads as the action it perform
 with `SynchronousOn` (the zero value) and `SynchronousOff` / TS `{ synchronous: 'on' | 'off' }`; default
 **`on`**) chooses when a commit's durable barrier runs (transactions.md §9). Under `off` a commit is
 visible and acknowledged once its pages and meta are written, and one later **flush** makes a run of
-commits durable together: when the batch reaches its cap, at `close` (whose return value then reports a
-failed flush), and at the other flush points of [validated-cow.md](validated-cow.md) §4. A power loss
+commits durable together: when the batch reaches its cap, once it has been pending for the handle's
+**`flush_interval_ms`** (Rust `flush_interval_ms` on both options structs / Go `FlushIntervalMs` /
+TS `flushIntervalMs`; default **1000**, `0` turns the time-based flush off; measured on the
+environment's clock source, [validated-cow.md](validated-cow.md) §4.1), at `close` (whose return
+value then reports a failed flush), and at the other flush points of [validated-cow.md](validated-cow.md) §4. A power loss
 or OS crash can lose the commits acknowledged since the last flush, never the file's integrity; a
 process crash loses none. The browser OPFS entry points take the same option. It is a **handle**
 setting, not stored in the file; the handle's file attachments follow it; an in-memory database ignores
-it. Results, plans, cost, and file bytes are the same as without the background thread, in every core.
+it. Results, plans, cost, and file bytes are the same as without the background cap flush or the idle
+flusher, in every core: file bytes are a function of the commit sequence and its clock readings.
 Combined with `skip_fsync`, the deferred barrier is itself a no-op.
 
 #### 2.1.1 One create, no in-memory constructor
