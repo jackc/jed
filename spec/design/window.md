@@ -331,8 +331,8 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
    + `order_keys` are partitioned and sorted ONCE** (`group_window_specs` — the shared partition/sort
    pass), and each then computes its own results over the shared sorted partitions; the partition +
    sort are the expensive, **unmetered** step (§8), so sharing them lowers wall-clock without changing
-   the cost or the rows (`group_window_specs` is conservative — identical, not yet PostgreSQL's
-   prefix-compatible, definitions; §11).
+   the cost or the rows (`group_window_specs` groups only identical definitions — PostgreSQL's
+   prefix-compatible sharing is declined, §11).
    When an `order_key` is **collated** (S10), the spec's collated UCA sort-key bytes are decorated
    **once per row up front** (the query `ORDER BY`'s decorate-sort pattern; an unmapped code point is
    `0A000` at that deterministic per-row point), and one collation-aware comparator drives the sort
@@ -662,13 +662,14 @@ Deliberate divergences from PostgreSQL, each registered in
   narrowing).
 - **Wider sharing / sliding** — *cost-lowering only, never correctness; the landed core is §5.2/§8.*
   The shared partition/sort pass groups specs with an **identical** partition+order. PostgreSQL's
-  prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) is not done, and is
-  not a straight port: jed pins the order of rows that tie on a window's `ORDER BY` to primary-key
-  order (D1), and a longer sort orders those ties by its extra keys instead. Reusing it is sound only
-  for functions that ignore the order within peer groups (`rank`, `dense_rank`, `percent_rank`,
-  `cume_dist`, and a fold whose result does not depend on input order), so it needs a per-function
-  check. Partitioning once for specs with the same `PARTITION BY` but different `ORDER BY` is sound
-  but would change the deterministic query-memory charge for the partition tables.
+  prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) was considered and
+  **declined**: jed pins the order of rows that tie on a window's `ORDER BY` to primary-key order (D1),
+  and a longer sort orders those ties by its extra keys instead, so reuse is sound only for functions
+  that ignore the order within peer groups (`rank`, `dense_rank`, `percent_rank`, `cume_dist`, and a
+  fold whose result does not depend on input order) and needs a per-function check. Since the sort is
+  unmetered (§8), the gain would be wall-clock only, too small for that check in every core.
+  Partitioning once for specs with the same `PARTITION BY` but different `ORDER BY` is sound but
+  would change the deterministic query-memory charge for the partition tables.
   The frame slide carries the accumulator for an expanding frame (every aggregate) and a moving
   `count`/`count(*)` (the invertible un-fold); a **moving `sum`/`avg`/`min`/`max`/float still re-folds
   from scratch** — a safely-invertible decimal/float sum (guarding the result scale, the
