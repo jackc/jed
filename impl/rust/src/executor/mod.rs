@@ -3480,6 +3480,9 @@ pub(crate) enum ScalarFunc {
     /// like_escape(pattern, escape) → text — rewrite a LIKE pattern to the default `\` escape; what
     /// `LIKE … ESCAPE` desugars to (§3, grammar.md §22).
     LikeEscape,
+    /// similar_to_escape(pattern [, escape]) → text — PostgreSQL's SIMILAR-to-regex translation; what
+    /// `SIMILAR TO … [ESCAPE …]` desugars to (regex.md §8f).
+    SimilarToEscape,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -3582,6 +3585,10 @@ pub(crate) enum RegexFunc {
     /// substring(string, pattern) / `SUBSTRING(string FROM pattern)` → text (regex.md §8d): the
     /// first match's first capture group when the pattern has one, else the whole match.
     Substring,
+    /// substring(string, pattern, escape) / `SUBSTRING(string SIMILAR pattern ESCAPE escape)` → text
+    /// (regex.md §8f.3): the text between the pattern's two separators, the pattern matching the
+    /// whole string. Its programs live in the node's `similar` matcher, not `program`.
+    SimilarSubstring,
     /// regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]]) → integer
     /// (regex.md §8b).
     Instr,
@@ -4047,6 +4054,8 @@ pub(crate) enum RExpr {
         rhs: Box<RExpr>,
         negated: bool,
         insensitive: bool,
+        /// `SIMILAR TO` (regex.md §8f.2): the pattern compiles in the dot-all mode.
+        similar: bool,
         program: Option<Box<crate::regex::Program>>,
         compile_charged: std::cell::Cell<bool>,
     },
@@ -4201,6 +4210,8 @@ pub(crate) enum RExpr {
         func: RegexFunc,
         args: Vec<RExpr>,
         program: Option<Box<crate::regex::Program>>,
+        /// The precompiled matcher of a `SimilarSubstring` with a constant pattern and escape.
+        similar: Option<Box<crate::regex::SimilarMatcher>>,
         compile_charged: std::cell::Cell<bool>,
     },
     /// A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and

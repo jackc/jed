@@ -270,6 +270,52 @@ func replaceText(s, from, to string, m *costMeter) (string, error) {
 	return strings.ReplaceAll(s, from, to), nil
 }
 
+// similarSubstring is the SIMILAR substring substring(s, p, e) (regex.md §8f.3) over its evaluated
+// arguments. The matcher is the precompiled one (its regex_compile charged once per execution, on
+// first eval) or translated and compiled now, charging the translation's bytes (a growth kernel,
+// cost.md §8.1) and the compile. A NULL pattern or escape is NULL before any translation; a NULL
+// subject is NULL after it, so it does not hide a bad escape. The result is a slice of the subject.
+func similarSubstring(e *rExpr, vals []Value, m *costMeter) (Value, error) {
+	if vals[1].Kind == ValNull || vals[2].Kind == ValNull {
+		return NullValue(), nil
+	}
+	sm := e.rxSimilarMatcher
+	if sm != nil {
+		if !e.rxCompileCharged {
+			e.rxCompileCharged = true
+			m.Charge(costs.RegexCompile * int64(sm.ninst()))
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+		}
+	} else {
+		pattern, escape := vals[1].str(), vals[2].str()
+		translated, err := similarToEscape(pattern, &escape)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := chargeOutput(m, TextValue(translated)); err != nil {
+			return Value{}, err
+		}
+		if sm, err = compileSimilarMatcher(pattern, escape); err != nil {
+			return Value{}, err
+		}
+		m.Charge(costs.RegexCompile * int64(sm.ninst()))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+	}
+	if vals[0].Kind == ValNull {
+		return NullValue(), nil
+	}
+	chars := []rune(vals[0].str())
+	i, j, ok, err := sm.substring(chars, m)
+	if err != nil || !ok {
+		return NullValue(), err
+	}
+	return TextValue(string(chars[i:j])), nil
+}
+
 // regexpReplaceText is regexp_replace (regex.md §8): run the whole search, then size the result
 // exactly, cap it at maxResultChars (54000), charge and reserve it, and splice it from the recorded
 // matches. An amplifier (cost.md §8.1): its input charge is the search's regex_steps plus the

@@ -39,6 +39,8 @@ type RegexOp =
   // `^` / `$` in the line-anchor mode (regex.md §8d): also just after / before a newline.
   | "assertLineStart"
   | "assertLineEnd"
+  // Passes only at a position in the run's gate set (the gated wrappers of regex.md §8f).
+  | "gate"
   | "match";
 
 // One NFA instruction. x/y hold jump targets (absolute instruction indices) for split/jmp, the slot
@@ -102,6 +104,8 @@ export function regexListing(p: RegexProgram): string[] {
         return "assertlinestart";
       case "assertLineEnd":
         return "assertlineend";
+      case "gate":
+        return "gate";
       case "match":
         return "match";
       default: {
@@ -404,7 +408,8 @@ class RegexParser {
     if (pc !== null) return { kind: "class", class: { negated: pc.negated, ranges: pc.ranges } };
     const ctrl = controlEscape(c);
     if (ctrl !== null) return { kind: "char", ch: ctrl };
-    if (isRegexMeta(c)) return { kind: "char", ch: c.codePointAt(0) as number };
+    // Any other escaped code point that is not an ASCII letter or digit is itself (regex.md §2).
+    if (isRegexMeta(c) || !isAsciiAlnum(c)) return { kind: "char", ch: c.codePointAt(0) as number };
     throw regexInvalid(`invalid escape \\${c}`);
   }
 
@@ -470,10 +475,14 @@ class RegexParser {
     }
     const ctrl = controlEscape(e);
     if (ctrl !== null) return { ch: ctrl, set: null };
-    if (isRegexMeta(e) || e === "-" || e === "]")
-      return { ch: e.codePointAt(0) as number, set: null };
+    if (isRegexMeta(e) || !isAsciiAlnum(e)) return { ch: e.codePointAt(0) as number, set: null };
     throw regexInvalid(`invalid escape \\${e}`);
   }
+}
+
+// isAsciiAlnum reports whether c is an ASCII letter or digit, the escapes regex.md §2 reserves.
+function isAsciiAlnum(c: string): boolean {
+  return /^[0-9A-Za-z]$/.test(c);
 }
 
 function isRegexMeta(c: string): boolean {
@@ -721,15 +730,30 @@ export function compileRegex(pattern: string): RegexProgram {
 
 // compileRegexMode is compileRegex under a jsonpath like_regex compile mode (regex.md §8d).
 export function compileRegexMode(pattern: string, mode: RegexMode): RegexProgram {
+  return compileRegexWrapped(pattern, mode, "search");
+}
+
+// The program wrapper around a pattern body: §3.2's unanchored search, or one of the gated wrappers
+// of regex.md §8f, whose prefix is lazy (the leftmost gated start) or greedy (the rightmost).
+type RegexWrapper = "search" | "gatedLeftmost" | "gatedRightmost";
+
+function compileRegexWrapped(
+  pattern: string,
+  mode: RegexMode,
+  wrapper: RegexWrapper,
+): RegexProgram {
   const parser = new RegexParser(pattern, mode);
   const root = parser.parseAlt();
   if (!parser.atEnd()) throw regexInvalid("unbalanced parenthesis");
   const ngroups = parser.ngroups;
   const c = new RegexCompiler();
-  // Wrapper (regex.md §3.2): lazy `.*?` prefix + group-0 save + match.
-  c.pushInst({ op: "split", x: 3, y: 1, ch: 0 });
+  // Wrapper (regex.md §3.2): lazy `.*?` prefix + group-0 save + match. The gated wrappers (§8f) add
+  // a gate after the prefix, whose arms the rightmost form swaps.
+  if (wrapper === "gatedRightmost") c.pushInst({ op: "split", x: 1, y: 3, ch: 0 });
+  else c.pushInst({ op: "split", x: 3, y: 1, ch: 0 });
   c.pushInst({ op: "anyChar", x: 0, y: 0, ch: 0 });
   c.pushInst({ op: "jmp", x: 0, y: 0, ch: 0 });
+  if (wrapper !== "search") c.pushInst({ op: "gate", x: 0, y: 0, ch: 0 });
   c.pushInst({ op: "save", x: 0, y: 0, ch: 0 });
   c.emit(root);
   c.pushInst({ op: "save", x: 1, y: 0, ch: 0 });
@@ -874,16 +898,45 @@ export function regexRun(p: RegexProgram, input: number[], m: Meter): CapNode | 
   }
 }
 
+// regexGatedStart returns the start of the match of a gated program (regex.md §8f) whose start is in
+// gate (one flag per position, input.length + 1 of them): the leftmost such start under the lazy
+// prefix, the rightmost under the greedy one; null for no match.
+export function regexGatedStart(
+  p: RegexProgram,
+  input: number[],
+  gate: boolean[],
+  m: Meter,
+): number | null {
+  const caps = withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, gate, null));
+  return caps === null ? null : regexSlot(p, caps, 0);
+}
+
+// regexMatchEnds is an ends run of a gated program (regex.md §8f): every position at which a match
+// starting in gate can end, as one flag per position.
+export function regexMatchEnds(
+  p: RegexProgram,
+  input: number[],
+  gate: boolean[],
+  m: Meter,
+): boolean[] {
+  const ends: boolean[] = new Array(input.length + 1).fill(false);
+  withSeen(p, (seen) => regexSearch(p, seen, input, 0, m, gate, ends));
+  return ends;
+}
+
 // regexSearch runs the Pike VM, considering only matches that START at code-point position `start` or
 // later (the unanchored search seeds its lazy `.*?` prefix at `start`); ^/$ still anchor at the true
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
-// guards once per input position.
+// guards once per input position. `gate` is the gate set of a gated program (null outside the gated
+// wrappers) and `ends` the end set an ends run fills (regex.md §8f).
 function regexSearch(
   p: RegexProgram,
   seen: RegexSeen,
   input: number[],
   start: number,
   m: Meter,
+  gate: boolean[] | null = null,
+  ends: boolean[] | null = null,
 ): CapNode | null {
   const len = input.length;
   let clist: Thread[] = [];
@@ -891,7 +944,7 @@ function regexSearch(
   let matched: CapNode | null = null;
 
   const marks = seen.marks;
-  addThread(p, clist, marks, nextGeneration(seen), 0, null, start, input, m);
+  addThread(p, clist, marks, nextGeneration(seen), 0, null, start, input, m, gate);
 
   for (let sp = start; sp <= len; sp++) {
     const generation = nextGeneration(seen);
@@ -902,25 +955,30 @@ function regexSearch(
       switch (inst.op) {
         case "char":
           if (sp < len && input[sp] === inst.ch) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
           }
           break;
         case "any":
           if (sp < len && input[sp] !== 0x0a) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
           }
           break;
         case "anyChar":
           if (sp < len) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
           }
           break;
         case "class":
           if (sp < len && classAdmits(p.classes[inst.x], input[sp])) {
-            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m);
+            addThread(p, nlist, marks, generation, th.pc + 1, th.caps, sp + 1, input, m, gate);
           }
           break;
         case "match":
+          // An ends run records the position and keeps every thread (regex.md §8f).
+          if (ends !== null) {
+            ends[sp] = true;
+            break;
+          }
           matched = th.caps;
           break inner; // cut lower-priority threads (leftmost-first, regex.md §4)
       }
@@ -948,6 +1006,7 @@ function addThread(
   sp: number,
   input: number[],
   m: Meter,
+  gate: boolean[] | null,
 ): void {
   const len = input.length;
   const stack: Thread[] = [{ pc: pc0, caps: caps0 }];
@@ -980,6 +1039,9 @@ function addThread(
         break;
       case "assertLineEnd":
         if (sp === len || input[sp] === 0x0a) stack.push({ pc: top.pc + 1, caps: top.caps });
+        break;
+      case "gate":
+        if (gate?.[sp]) stack.push({ pc: top.pc + 1, caps: top.caps });
         break;
       default:
         // char / any / class / match — parked for the consume loop.
@@ -1273,4 +1335,170 @@ export function replaceBuild(
   });
   parts.push(String.fromCodePoint(...chunk));
   return parts.join("");
+}
+
+// ---------------------------------------------------------------------------
+// SIMILAR TO (regex.md §8f)
+// ---------------------------------------------------------------------------
+
+// The compile mode of every SIMILAR program: dot-all, so `%` and `_` match a newline (regex.md §8f).
+const SIMILAR_MODE: RegexMode = { nlStop: false, dotAll: true, nlAnchor: false };
+
+// similarParts returns the part texts of a SIMILAR pattern: PostgreSQL's similar_escape_internal
+// translation of each part between the escape-double-quote separators, one to three of them
+// (regex.md §8f.1). An undefined escapeChar is the default `\`; an empty one is no escape character.
+// An escape of two or more code points is 22025; a third separator is 2200C.
+function similarParts(pattern: string, escapeChar: string | undefined): string[] {
+  let esc: string | null = "\\";
+  if (escapeChar !== undefined) {
+    const e = Array.from(escapeChar);
+    if (e.length > 1) throw engineError("invalid_escape_sequence", "invalid escape string");
+    esc = e.length === 0 ? null : e[0];
+  }
+  // PostgreSQL's multibyte path: with a non-ASCII escape, a non-ASCII pattern character is copied
+  // without touching the class state.
+  const wideEscape = esc !== null && (esc.codePointAt(0) as number) >= 0x80;
+  const parts: string[] = [""];
+  let afterEscape = false;
+  let inClass = false;
+  let classStart = 0;
+  for (const c of pattern) {
+    const k = parts.length - 1;
+    if (wideEscape && (c.codePointAt(0) as number) >= 0x80) {
+      if (afterEscape) {
+        parts[k] += "\\" + c;
+        afterEscape = false;
+      } else if (c === esc) {
+        afterEscape = true;
+      } else {
+        parts[k] += c;
+      }
+      continue;
+    }
+    if (afterEscape) {
+      if (c === '"' && !inClass) {
+        if (parts.length === 3) {
+          throw engineError(
+            "invalid_use_of_escape_character",
+            "SQL regular expression may not contain more than two escape-double-quote separators",
+          );
+        }
+        parts.push("");
+      } else {
+        parts[k] += "\\" + c;
+        classStart = 3;
+      }
+      afterEscape = false;
+    } else if (c === esc) {
+      afterEscape = true;
+    } else if (inClass) {
+      parts[k] += c === "\\" ? "\\\\" : c;
+      // `]` is literal right after `[` or `[^` (classStart 1 or 2), else it closes the class.
+      if (c === "]" && classStart > 2) inClass = false;
+      else if (c === "^") classStart++;
+      else classStart = 3;
+    } else {
+      switch (c) {
+        case "[":
+          parts[k] += "[";
+          inClass = true;
+          classStart = 1;
+          break;
+        case "%":
+          parts[k] += ".*";
+          break;
+        case "_":
+          parts[k] += ".";
+          break;
+        case "(":
+          parts[k] += "(?:";
+          break;
+        case "\\":
+        case ".":
+        case "^":
+        case "$":
+          parts[k] += "\\" + c;
+          break;
+        default:
+          parts[k] += c;
+      }
+    }
+  }
+  return parts;
+}
+
+// similarJoin builds the whole-pattern translation from its part texts: `^(?:t1)$`,
+// `^(?:t1){1,1}?(t2)$`, or `^(?:t1){1,1}?(t2){1,1}(?:t3)$` (regex.md §8f.1).
+function similarJoin(parts: string[]): string {
+  let out = "^(?:" + parts[0];
+  if (parts.length > 1) out += "){1,1}?(" + parts[1];
+  if (parts.length > 2) out += "){1,1}(?:" + parts[2];
+  return out + ")$";
+}
+
+// similarToEscape is similar_to_escape(pattern [, escape]) (regex.md §8f.1): PostgreSQL's
+// translation of a SIMILAR pattern into a regular expression, byte for byte.
+export function similarToEscape(pattern: string, escapeChar: string | undefined): string {
+  return similarJoin(similarParts(pattern, escapeChar));
+}
+
+// compileSimilar compiles a translated SIMILAR pattern for SIMILAR TO (regex.md §8f.2): the §3.2
+// program, dot-all.
+export function compileSimilar(translated: string): RegexProgram {
+  return compileRegexMode(translated, SIMILAR_MODE);
+}
+
+// The programs of substring(s, p, e) (regex.md §8f.3): `whole` alone with no separators (the §3.2
+// program of `^(?:t1)$`), else A and B, and for three parts C and D.
+export type SimilarMatcher =
+  | { whole: RegexProgram }
+  | { whole: null; a: RegexProgram; b: RegexProgram; cd: [RegexProgram, RegexProgram] | null };
+
+// compileSimilarMatcher translates and compiles p with escape e. Does not meter; the caller charges
+// regex_compile × similarNinst().
+export function compileSimilarMatcher(pattern: string, escapeChar: string): SimilarMatcher {
+  const parts = similarParts(pattern, escapeChar);
+  if (parts.length === 1) return { whole: compileSimilar(similarJoin(parts)) };
+  const gated = (body: string, wrapper: RegexWrapper) =>
+    compileRegexWrapped(body, SIMILAR_MODE, wrapper);
+  const a = gated(`(?:${parts[0]})`, "gatedLeftmost");
+  if (parts.length === 2) {
+    return { whole: null, a, b: gated(`(?:${parts[1]})$`, "gatedLeftmost"), cd: null };
+  }
+  const b = gated(`(?:${parts[1]})(?:${parts[2]})$`, "gatedLeftmost");
+  const c = gated(`(?:${parts[1]})`, "gatedLeftmost");
+  const d = gated(`(?:${parts[2]})$`, "gatedRightmost");
+  return { whole: null, a, b, cd: [c, d] };
+}
+
+// similarNinst is the instruction count of every program = the regex_compile cost.
+export function similarNinst(sm: SimilarMatcher): number {
+  if (sm.whole !== null) return regexNinst(sm.whole);
+  let n = regexNinst(sm.a) + regexNinst(sm.b);
+  if (sm.cd !== null) n += regexNinst(sm.cd[0]) + regexNinst(sm.cd[1]);
+  return n;
+}
+
+// similarSubstringSpan returns the code-point span [i, j) the SIMILAR substring returns, or null when
+// the pattern does not match the whole input (regex.md §8f.3). Charges every run's regex_steps.
+export function similarSubstringSpan(
+  sm: SimilarMatcher,
+  input: number[],
+  m: Meter,
+): [number, number] | null {
+  const n = input.length;
+  const at = (pos: number): boolean[] => {
+    const gate: boolean[] = new Array(n + 1).fill(false);
+    gate[pos] = true;
+    return gate;
+  };
+  if (sm.whole !== null) return regexRun(sm.whole, input, m) === null ? null : [0, n];
+  const e1 = regexMatchEnds(sm.a, input, at(0), m);
+  const i = regexGatedStart(sm.b, input, e1, m);
+  if (i === null) return null;
+  if (sm.cd === null) return [i, n];
+  const e2 = regexMatchEnds(sm.cd[0], input, at(i), m);
+  // B's match proves a split exists, so D always finds one.
+  const j = regexGatedStart(sm.cd[1], input, e2, m);
+  return j === null ? null : [i, j];
 }

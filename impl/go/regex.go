@@ -46,6 +46,8 @@ const (
 	// after a newline. opAssertLineEnd is `$` there: the subject end or just before a newline.
 	opAssertLineStart
 	opAssertLineEnd
+	// opGate passes only at a position in the run's gate set (the gated wrappers of regex.md §8f).
+	opGate
 	opMatch
 )
 
@@ -117,6 +119,8 @@ func (p *regexProgram) listing() []string {
 			out[i] = "assertlinestart"
 		case opAssertLineEnd:
 			out[i] = "assertlineend"
+		case opGate:
+			out[i] = "gate"
 		case opMatch:
 			out[i] = "match"
 		}
@@ -488,10 +492,16 @@ func (p *regexParser) parseEscape() (*regexNode, error) {
 	if ctrl, ok := controlEscape(c); ok {
 		return &regexNode{kind: nChar, ch: ctrl}, nil
 	}
-	if isRegexMeta(c) {
+	// Any other escaped code point that is not an ASCII letter or digit is itself (regex.md §2).
+	if isRegexMeta(c) || !isASCIIAlnum(c) {
 		return &regexNode{kind: nChar, ch: c}, nil
 	}
 	return nil, regexInvalid(fmt.Sprintf("invalid escape \\%c", c))
+}
+
+// isASCIIAlnum reports whether c is an ASCII letter or digit, the escapes regex.md §2 reserves.
+func isASCIIAlnum(c rune) bool {
+	return c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
 }
 
 func (p *regexParser) parseClass() (*regexNode, error) {
@@ -573,7 +583,7 @@ func (p *regexParser) classItem() (lo rune, set [][2]rune, isSet bool, err error
 	if ctrl, ok := controlEscape(e); ok {
 		return ctrl, nil, false, nil
 	}
-	if isRegexMeta(e) || e == '-' || e == ']' {
+	if isRegexMeta(e) || !isASCIIAlnum(e) {
 		return e, nil, false, nil
 	}
 	return 0, nil, false, regexInvalid(fmt.Sprintf("invalid escape \\%c", e))
@@ -872,6 +882,21 @@ func compileRegex(pattern string) (*regexProgram, error) {
 
 // compileRegexMode is compileRegex under a jsonpath like_regex compile mode (regex.md §8d).
 func compileRegexMode(pattern string, mode regexMode) (*regexProgram, error) {
+	return compileRegexWrapped(pattern, mode, wrapSearch)
+}
+
+// regexWrapper is the program wrapper around a pattern body: §3.2's unanchored search, or one of
+// the gated wrappers of regex.md §8f, whose prefix is lazy (the leftmost gated start) or greedy (the
+// rightmost).
+type regexWrapper uint8
+
+const (
+	wrapSearch regexWrapper = iota
+	wrapGatedLeftmost
+	wrapGatedRightmost
+)
+
+func compileRegexWrapped(pattern string, mode regexMode, wrapper regexWrapper) (*regexProgram, error) {
 	p := &regexParser{chars: []rune(pattern), mode: mode}
 	root, err := p.parseAlt()
 	if err != nil {
@@ -881,8 +906,13 @@ func compileRegexMode(pattern string, mode regexMode) (*regexProgram, error) {
 		return nil, regexInvalid("unbalanced parenthesis")
 	}
 	c := &regexCompiler{}
-	// Wrapper (regex.md §3.2): lazy `.*?` prefix + group-0 save + Match.
-	if _, err := c.push(regexInst{op: opSplit, x: 3, y: 1}); err != nil {
+	// Wrapper (regex.md §3.2): lazy `.*?` prefix + group-0 save + Match. The gated wrappers (§8f)
+	// add a Gate after the prefix, whose arms the rightmost form swaps.
+	prefix := regexInst{op: opSplit, x: 3, y: 1}
+	if wrapper == wrapGatedRightmost {
+		prefix = regexInst{op: opSplit, x: 1, y: 3}
+	}
+	if _, err := c.push(prefix); err != nil {
 		return nil, err
 	}
 	if _, err := c.push(regexInst{op: opAnyChar}); err != nil {
@@ -890,6 +920,11 @@ func compileRegexMode(pattern string, mode regexMode) (*regexProgram, error) {
 	}
 	if _, err := c.push(regexInst{op: opJmp, x: 0}); err != nil {
 		return nil, err
+	}
+	if wrapper != wrapSearch {
+		if _, err := c.push(regexInst{op: opGate}); err != nil {
+			return nil, err
+		}
 	}
 	if _, err := c.push(regexInst{op: opSave, x: 0}); err != nil {
 		return nil, err
@@ -1110,14 +1145,45 @@ func (p *regexProgram) run(input []rune, m *costMeter) (regexCaps, bool, error) 
 // input bounds. Used by regexp_replace's global loop. Charges regex_step per explored state and
 // guards once per input position.
 func (p *regexProgram) search(seen *regexSeen, input []rune, start int, m *costMeter) (regexCaps, bool, error) {
+	return p.gatedSearch(seen, input, start, nil, nil, m)
+}
+
+// gatedSearch is search under a gate set (one flag per position; nil outside the gated wrappers)
+// and, for an ends run, an end set it fills (regex.md §8f).
+func (p *regexProgram) gatedSearch(seen *regexSeen, input []rune, start int, gate, ends []bool, m *costMeter) (regexCaps, bool, error) {
 	if p.capDepth == 1 {
-		return pikeSearch[[]int64, flatCaps](p, seen, input, start, m)
+		return pikeSearch[[]int64, flatCaps](p, seen, input, start, gate, ends, m)
 	}
-	return pikeSearch[*capNode, treeCaps](p, seen, input, start, m)
+	return pikeSearch[*capNode, treeCaps](p, seen, input, start, gate, ends, m)
+}
+
+// gatedStart returns the start of the match of a gated program (regex.md §8f) whose start is in
+// gate (one flag per position, len(input)+1 of them): the leftmost such start under the lazy prefix,
+// the rightmost under the greedy one.
+func (p *regexProgram) gatedStart(input []rune, gate []bool, m *costMeter) (int, bool, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
+	caps, ok, err := p.gatedSearch(seen, input, 0, gate, nil, m)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	return int(p.slot(caps, 0)), true, nil
+}
+
+// matchEnds is an ends run of a gated program (regex.md §8f): every position at which a match
+// starting in gate can end, as one flag per position.
+func (p *regexProgram) matchEnds(input []rune, gate []bool, m *costMeter) ([]bool, error) {
+	seen := p.takeSeen()
+	defer p.seenPool.Put(seen)
+	ends := make([]bool, len(input)+1)
+	if _, _, err := p.gatedSearch(seen, input, 0, gate, ends, m); err != nil {
+		return nil, err
+	}
+	return ends, nil
 }
 
 // pikeSearch is search over the capture representation R.
-func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []rune, start int, m *costMeter) (regexCaps, bool, error) {
+func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []rune, start int, gate, ends []bool, m *costMeter) (regexCaps, bool, error) {
 	var rep R
 	var unset C
 	length := len(input)
@@ -1126,7 +1192,7 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 	var matched C
 	found := false
 
-	if err := pikeAddThread[C, R](p, &clist, seen, seen.next(), 0, unset, start, input, m); err != nil {
+	if err := pikeAddThread[C, R](p, &clist, seen, seen.next(), 0, unset, start, input, gate, m); err != nil {
 		return regexCaps{}, false, err
 	}
 
@@ -1140,29 +1206,34 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 			switch in.op {
 			case opChar:
 				if sp < length && input[sp] == in.ch {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, gate, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
 			case opAny:
 				if sp < length && input[sp] != '\n' {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, gate, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
 			case opAnyChar:
 				if sp < length {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, gate, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
 			case opClass:
 				if sp < length && p.classes[in.x].admits(input[sp]) {
-					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, m); err != nil {
+					if err := pikeAddThread[C, R](p, &nlist, seen, generation, th.pc+1, th.caps, sp+1, input, gate, m); err != nil {
 						return regexCaps{}, false, err
 					}
 				}
 			case opMatch:
+				// An ends run records the position and keeps every thread (regex.md §8f).
+				if ends != nil {
+					ends[sp] = true
+					continue
+				}
 				matched, found = th.caps, true
 				break inner // cut lower-priority threads (leftmost-first, regex.md §4)
 			}
@@ -1182,7 +1253,7 @@ func pikeSearch[C any, R capRep[C]](p *regexProgram, seen *regexSeen, input []ru
 // consuming/Match threads to *list, deduping by pc within this generation. Iterative (explicit
 // stack) so a long Jmp/Split chain cannot overflow the native stack; the y arm of a Split is pushed
 // before x so x is processed first (higher priority). Charges regex_step per explored state.
-func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], seen *regexSeen, generation uint32, pc0 int, caps0 C, sp int, input []rune, m *costMeter) error {
+func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], seen *regexSeen, generation uint32, pc0 int, caps0 C, sp int, input []rune, gate []bool, m *costMeter) error {
 	var rep R
 	length := len(input)
 	stack := []regexThread[C]{{pc0, caps0}}
@@ -1218,6 +1289,10 @@ func pikeAddThread[C any, R capRep[C]](p *regexProgram, list *[]regexThread[C], 
 			}
 		case opAssertLineEnd:
 			if sp == length || input[sp] == '\n' {
+				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
+			}
+		case opGate:
+			if gate != nil && gate[sp] {
 				stack = append(stack, regexThread[C]{top.pc + 1, top.caps})
 			}
 		default:
@@ -1520,4 +1595,231 @@ func (p *regexProgram) replaceBuild(orig, repl []rune, found []regexCaps, size i
 		}
 	})
 	return b.String()
+}
+
+// ---------------------------------------------------------------------------
+// SIMILAR TO (regex.md §8f)
+// ---------------------------------------------------------------------------
+
+// similarMode is the compile mode of every SIMILAR program: dot-all, so `%` and `_` match a newline
+// (regex.md §8f).
+var similarMode = regexMode{dotAll: true}
+
+// similarParts returns the part texts of a SIMILAR pattern: PostgreSQL's similar_escape_internal
+// translation of each part between the escape-double-quote separators, one to three of them
+// (regex.md §8f.1). A nil escape is the default `\`; an empty one is no escape character. An escape
+// of two or more code points is 22025; a third separator is 2200C.
+func similarParts(pattern string, escape *string) ([]string, error) {
+	esc, hasEsc := '\\', true
+	if escape != nil {
+		e := []rune(*escape)
+		switch len(e) {
+		case 0:
+			hasEsc = false
+		case 1:
+			esc = e[0]
+		default:
+			return nil, newError(InvalidEscapeSequence, "invalid escape string")
+		}
+	}
+	// PostgreSQL's multibyte path: with a non-ASCII escape, a non-ASCII pattern character is copied
+	// without touching the class state.
+	wideEscape := hasEsc && esc >= 0x80
+	parts := []*strings.Builder{{}}
+	afterEscape, inClass := false, false
+	classStart := 0
+	for _, c := range pattern {
+		out := parts[len(parts)-1]
+		isEsc := hasEsc && c == esc
+		if wideEscape && c >= 0x80 {
+			switch {
+			case afterEscape:
+				out.WriteByte('\\')
+				out.WriteRune(c)
+				afterEscape = false
+			case isEsc:
+				afterEscape = true
+			default:
+				out.WriteRune(c)
+			}
+			continue
+		}
+		switch {
+		case afterEscape:
+			if c == '"' && !inClass {
+				if len(parts) == 3 {
+					return nil, newError(InvalidUseOfEscapeCharacter, "SQL regular expression may not contain more than two escape-double-quote separators")
+				}
+				parts = append(parts, &strings.Builder{})
+			} else {
+				out.WriteByte('\\')
+				out.WriteRune(c)
+				classStart = 3
+			}
+			afterEscape = false
+		case isEsc:
+			afterEscape = true
+		case inClass:
+			if c == '\\' {
+				out.WriteByte('\\')
+			}
+			out.WriteRune(c)
+			// `]` is literal right after `[` or `[^` (classStart 1 or 2), else it closes the class.
+			switch {
+			case c == ']' && classStart > 2:
+				inClass = false
+			case c == '^':
+				classStart++
+			default:
+				classStart = 3
+			}
+		default:
+			switch c {
+			case '[':
+				out.WriteByte('[')
+				inClass, classStart = true, 1
+			case '%':
+				out.WriteString(".*")
+			case '_':
+				out.WriteByte('.')
+			case '(':
+				out.WriteString("(?:")
+			case '\\', '.', '^', '$':
+				out.WriteByte('\\')
+				out.WriteRune(c)
+			default:
+				out.WriteRune(c)
+			}
+		}
+	}
+	texts := make([]string, len(parts))
+	for i, b := range parts {
+		texts[i] = b.String()
+	}
+	return texts, nil
+}
+
+// similarJoin builds the whole-pattern translation from its part texts: `^(?:t1)$`,
+// `^(?:t1){1,1}?(t2)$`, or `^(?:t1){1,1}?(t2){1,1}(?:t3)$` (regex.md §8f.1).
+func similarJoin(parts []string) string {
+	var b strings.Builder
+	b.WriteString("^(?:")
+	b.WriteString(parts[0])
+	if len(parts) > 1 {
+		b.WriteString("){1,1}?(")
+		b.WriteString(parts[1])
+	}
+	if len(parts) > 2 {
+		b.WriteString("){1,1}(?:")
+		b.WriteString(parts[2])
+	}
+	b.WriteString(")$")
+	return b.String()
+}
+
+// similarToEscape is similar_to_escape(pattern [, escape]) (regex.md §8f.1): PostgreSQL's
+// translation of a SIMILAR pattern into a regular expression, byte for byte.
+func similarToEscape(pattern string, escape *string) (string, error) {
+	parts, err := similarParts(pattern, escape)
+	if err != nil {
+		return "", err
+	}
+	return similarJoin(parts), nil
+}
+
+// compileSimilar compiles a translated SIMILAR pattern for SIMILAR TO (regex.md §8f.2): the §3.2
+// program, dot-all.
+func compileSimilar(translated string) (*regexProgram, error) {
+	return compileRegexMode(translated, similarMode)
+}
+
+// similarMatcher holds the programs of substring(s, p, e) (regex.md §8f.3): whole alone with no
+// separators (the §3.2 program of `^(?:t1)$`), else A and B, and for three parts C and D.
+type similarMatcher struct {
+	whole      *regexProgram
+	a, b, c, d *regexProgram
+}
+
+// compileSimilarMatcher translates and compiles p with escape e. Does not meter; the caller charges
+// regex_compile × ninst().
+func compileSimilarMatcher(pattern, escape string) (*similarMatcher, error) {
+	parts, err := similarParts(pattern, &escape)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 1 {
+		whole, err := compileSimilar(similarJoin(parts))
+		if err != nil {
+			return nil, err
+		}
+		return &similarMatcher{whole: whole}, nil
+	}
+	gated := func(body string, wrapper regexWrapper) (*regexProgram, error) {
+		return compileRegexWrapped(body, similarMode, wrapper)
+	}
+	sm := &similarMatcher{}
+	if sm.a, err = gated("(?:"+parts[0]+")", wrapGatedLeftmost); err != nil {
+		return nil, err
+	}
+	if len(parts) == 2 {
+		if sm.b, err = gated("(?:"+parts[1]+")$", wrapGatedLeftmost); err != nil {
+			return nil, err
+		}
+		return sm, nil
+	}
+	if sm.b, err = gated("(?:"+parts[1]+")(?:"+parts[2]+")$", wrapGatedLeftmost); err != nil {
+		return nil, err
+	}
+	if sm.c, err = gated("(?:"+parts[1]+")", wrapGatedLeftmost); err != nil {
+		return nil, err
+	}
+	if sm.d, err = gated("(?:"+parts[2]+")$", wrapGatedRightmost); err != nil {
+		return nil, err
+	}
+	return sm, nil
+}
+
+// ninst is the instruction count of every program = the regex_compile cost.
+func (sm *similarMatcher) ninst() int {
+	if sm.whole != nil {
+		return sm.whole.ninst()
+	}
+	n := sm.a.ninst() + sm.b.ninst()
+	if sm.c != nil {
+		n += sm.c.ninst() + sm.d.ninst()
+	}
+	return n
+}
+
+// substring returns the code-point span [i, j) the SIMILAR substring returns, ok false when the
+// pattern does not match the whole input (regex.md §8f.3). Charges every run's regex_steps.
+func (sm *similarMatcher) substring(input []rune, m *costMeter) (i, j int, ok bool, err error) {
+	n := len(input)
+	at := func(pos int) []bool {
+		gate := make([]bool, n+1)
+		gate[pos] = true
+		return gate
+	}
+	if sm.whole != nil {
+		_, ok, err := sm.whole.run(input, m)
+		return 0, n, ok, err
+	}
+	e1, err := sm.a.matchEnds(input, at(0), m)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	i, ok, err = sm.b.gatedStart(input, e1, m)
+	if err != nil || !ok {
+		return 0, 0, false, err
+	}
+	if sm.c == nil {
+		return i, n, true, nil
+	}
+	e2, err := sm.c.matchEnds(input, at(i), m)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	// B's match proves a split exists, so D always finds one.
+	j, ok, err = sm.d.gatedStart(input, e2, m)
+	return i, j, ok, err
 }

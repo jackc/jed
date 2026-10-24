@@ -119,7 +119,3 @@ SELECT substring('abc' FROM '(')
 # a bytea subject has no regex overload
 statement error 42883
 SELECT substring('\x01'::bytea FROM 'a'::text)
-
-# the three-argument text form is PostgreSQL's SIMILAR substring, which jed does not implement
-statement error 42883
-SELECT substring('abc' FROM 'b' FOR '#')

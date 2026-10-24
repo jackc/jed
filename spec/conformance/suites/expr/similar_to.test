@@ -1,0 +1,228 @@
+# s [NOT] SIMILAR TO p [ESCAPE e] and similar_to_escape(p [, e]) (spec/design/regex.md §8f,
+# grammar.md §22c). The parser desugars SIMILAR TO, as PostgreSQL does, to s ~ similar_to_escape(p [, e])
+# (!~ for NOT), compiled in the dot-all mode so `%` and `_` match a newline. similar_to_escape is
+# PostgreSQL's translation byte for byte. The pattern must match the WHOLE subject. Verified against
+# PostgreSQL 18; cost is jed's own.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, ddl.check, ddl.view, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, expr.similar_to, expr.regex_match, types.i32, types.text, null.three_valued, resource.cost_metering
+
+# --- whole-string match: % and _ are LIKE's wildcards, the rest is regex syntax ----------------
+query BBBB nosort
+SELECT 'abc' SIMILAR TO 'abc', 'abc' SIMILAR TO 'a', 'abc' SIMILAR TO '%b%', 'abc' SIMILAR TO 'b%'
+----
+true
+false
+true
+false
+
+query BBBBB nosort
+SELECT 'abc' SIMILAR TO 'a_c', 'ac' SIMILAR TO 'a_c', 'abc' SIMILAR TO '%(b|d)%', 'abd' SIMILAR TO 'a(b|c)(c|d)', 'xyz' SIMILAR TO 'abc|xyz'
+----
+true
+false
+true
+true
+true
+
+# Quantifiers, intervals, and bracket classes pass through as regex syntax.
+query BBBBBB nosort
+SELECT 'aaa' SIMILAR TO 'a*', '' SIMILAR TO 'a*', 'b' SIMILAR TO 'a+', 'ab' SIMILAR TO 'ab?', 'aaa' SIMILAR TO 'a{3}', 'a7z' SIMILAR TO '[a-c][0-9][^0-9]'
+----
+true
+true
+false
+true
+true
+true
+
+# `.`, `^`, and `$` are literal characters, not regex metacharacters.
+query BBBB nosort
+SELECT 'a.c' SIMILAR TO 'a.c', 'abc' SIMILAR TO 'a.c', '^a$' SIMILAR TO '^a$', 'a' SIMILAR TO '^a$'
+----
+true
+false
+true
+false
+
+# `%` and `_` match a newline (PostgreSQL's `.` does); the match is case-sensitive.
+query BBB nosort
+SELECT ('a' || chr(10) || 'b') SIMILAR TO 'a%b', ('a' || chr(10) || 'b') SIMILAR TO 'a_b', 'ABC' SIMILAR TO 'abc'
+----
+true
+true
+false
+
+# --- NOT SIMILAR TO, and NULL ----------------------------------------------------------------
+query BBBBB nosort
+SELECT 'abc' NOT SIMILAR TO 'a%', 'abc' NOT SIMILAR TO 'x%', NULL SIMILAR TO 'a', 'a' SIMILAR TO NULL, 'a' SIMILAR TO 'a' ESCAPE NULL
+----
+false
+true
+NULL
+NULL
+NULL
+
+# --- escapes ---------------------------------------------------------------------------------
+# The default escape is backslash: `\%` and `\_` are literal, as are `\.` and `\\`.
+query BBBB nosort
+SELECT '50%' SIMILAR TO '50\%', '50x' SIMILAR TO '50\%', 'a_b' SIMILAR TO 'a\_b', 'a\b' SIMILAR TO 'a\\b'
+----
+true
+false
+true
+true
+
+# ESCAPE chooses the escape character; an empty escape turns escaping off.
+query BBBB nosort
+SELECT '50%' SIMILAR TO '50#%' ESCAPE '#', '50x' SIMILAR TO '50#%' ESCAPE '#', 'a\x' SIMILAR TO 'a\_' ESCAPE '', 'a#' SIMILAR TO 'a##' ESCAPE '#'
+----
+true
+false
+true
+true
+
+# An escaped character in a class is literal; `]` right after `[` or `[^` is literal.
+query BBBB nosort
+SELECT ']' SIMILAR TO '[]a]', 'b' SIMILAR TO '[^]a]', ']' SIMILAR TO '[#]]' ESCAPE '#', '%' SIMILAR TO '[%_]'
+----
+true
+true
+true
+true
+
+# The escape-double-quote separators are only grouping in a match: the parts concatenate.
+query BB nosort
+SELECT 'abc' SIMILAR TO 'a#"b#"c' ESCAPE '#', 'xbc' SIMILAR TO 'a|x#"b#"c' ESCAPE '#'
+----
+true
+true
+
+# A non-ASCII escape character.
+query BB nosort
+SELECT 'a%' SIMILAR TO 'aé%' ESCAPE 'é', 'aé' SIMILAR TO 'aéé' ESCAPE 'é'
+----
+true
+true
+
+# --- the translation, similar_to_escape --------------------------------------------------------
+# names: similar_to_escape, similar_to_escape, similar_to_escape
+query TTT nosort
+SELECT similar_to_escape('a%b_c'), similar_to_escape('(a|b)*.^$'), similar_to_escape('50#%', '#')
+----
+^(?:a.*b.c)$
+^(?:(?:a|b)*\.\^\$)$
+^(?:50\%)$
+
+query TTT nosort
+SELECT similar_to_escape('a#"b#"c', '#'), similar_to_escape('a#"b', '#'), similar_to_escape('[a\b]', '#')
+----
+^(?:a){1,1}?(b){1,1}(?:c)$
+^(?:a){1,1}?(b)$
+^(?:[a\\b])$
+
+query TTTT nosort
+SELECT similar_to_escape('[]a]'), similar_to_escape('a\', ''), similar_to_escape('ab#', '#'), similar_to_escape(NULL)
+----
+^(?:[]a])$
+^(?:a\\)$
+^(?:ab)$
+NULL
+
+# --- errors ----------------------------------------------------------------------------------
+# An escape of two or more characters.
+statement error 22025
+SELECT 'a' SIMILAR TO 'a' ESCAPE 'ab'
+
+statement error 22025
+SELECT similar_to_escape('a', 'ab')
+
+# More than two escape-double-quote separators.
+statement error 2200C
+SELECT 'abcd' SIMILAR TO 'a#"b#"c#"d' ESCAPE '#'
+
+# A malformed translated pattern is a regex error.
+statement error 2201B
+SELECT 'a' SIMILAR TO '(a'
+
+statement error 2201B
+SELECT 'a' SIMILAR TO '[a'
+
+# A non-text operand.
+statement error 42804
+SELECT 5 SIMILAR TO '5'
+
+# --- over a table: constant and per-row patterns -------------------------------------------------
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, p text, e text)
+
+statement ok
+INSERT INTO t VALUES (1, 'abc', 'a%', '#'), (2, 'xbc', '_bc', '#'), (3, 'a%c', 'a#%c', '#'), (4, NULL, 'a', '#'), (5, 'abc', 'a#%c', NULL)
+
+# A constant pattern is translated at resolve and compiled once: ^(?:a.*)$ is 12 instructions. Cost:
+# 1 page + 5 rows read + 3 produced + 5 operator_evals (the NULL row's too) + 12 compile + the match
+# steps (33 for each 'a…' subject, 20 for 'xbc', none for NULL) = 145.
+# cost: 145
+query I nosort
+SELECT id FROM t WHERE s SIMILAR TO 'a%' ORDER BY id
+----
+1
+3
+5
+
+query I nosort
+SELECT id FROM t WHERE s NOT SIMILAR TO 'a%' ORDER BY id
+----
+2
+
+# A per-row pattern and escape: similar_to_escape runs per row, and the result compiles per row.
+query IB nosort
+SELECT id, s SIMILAR TO p ESCAPE e FROM t ORDER BY id
+----
+1
+true
+2
+true
+3
+true
+4
+NULL
+5
+NULL
+
+# A bad per-row escape is an error even where the subject is NULL.
+statement ok
+INSERT INTO t VALUES (6, NULL, 'a', '##')
+
+statement error 22025
+SELECT id, s SIMILAR TO p ESCAPE e FROM t ORDER BY id
+
+statement ok
+DELETE FROM t WHERE id = 6
+
+# --- parameters bind text ------------------------------------------------------------------------
+# params: 'abc', 'a%'
+query B nosort
+SELECT $1 SIMILAR TO $2
+----
+true
+
+# --- a view and a CHECK constraint keep SIMILAR TO in their stored text -------------------------
+statement ok
+CREATE VIEW v AS SELECT id FROM t WHERE s SIMILAR TO '%c' ESCAPE '#'
+
+query I nosort
+SELECT id FROM v ORDER BY id
+----
+1
+2
+3
+5
+
+statement ok
+CREATE TABLE codes (code text PRIMARY KEY CHECK (code SIMILAR TO '[A-Z]{2}[0-9]+'))
+
+statement ok
+INSERT INTO codes VALUES ('AB12')
+
+statement error 23514
+INSERT INTO codes VALUES ('ab12')

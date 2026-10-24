@@ -35,6 +35,7 @@ export type SqlState =
   | "character_not_in_repertoire" // 22021 — invalid byte sequence for encoding "UTF8": {detail}
   | "invalid_parameter_value" // 22023 — invalid parameter value: {detail}
   | "invalid_escape_sequence" // 22025 — {detail}
+  | "invalid_use_of_escape_character" // 2200C — {detail}
   | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
   | "array_subscript_error" // 2202E — {detail}
   | "duplicate_json_object_key_value" // 22030 — duplicate JSON object key value
@@ -149,6 +150,7 @@ const CODES: Record<SqlState, string> = {
   character_not_in_repertoire: "22021",
   invalid_parameter_value: "22023",
   invalid_escape_sequence: "22025",
+  invalid_use_of_escape_character: "2200C",
   invalid_regular_expression: "2201B",
   array_subscript_error: "2202E",
   duplicate_json_object_key_value: "22030",
@@ -279,6 +281,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "22021", name: "character_not_in_repertoire", class: "data exception" },
   { code: "22023", name: "invalid_parameter_value", class: "data exception" },
   { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
+  { code: "2200C", name: "invalid_use_of_escape_character", class: "data exception" },
   { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
   { code: "2202E", name: "array_subscript_error", class: "data exception" },
   { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },

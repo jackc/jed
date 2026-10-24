@@ -2238,7 +2238,13 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if e.insensitive {
 				pat = foldRegexPattern(pat, prop)
 			}
-			prog, err := compileRegex(pat)
+			var prog *regexProgram
+			var err error
+			if e.rxSimilar {
+				prog, err = compileSimilar(pat)
+			} else {
+				prog, err = compileRegex(pat)
+			}
 			if err != nil {
 				return Value{}, err
 			}
@@ -2255,17 +2261,22 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		return BoolValue(matched != e.negated), nil
 	case reRegexFunc:
 		m.Charge(costs.OperatorEval)
-		// STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8).
+		// STRICT: evaluate the args; any NULL short-circuits to NULL (regex.md §8). The SIMILAR
+		// substring short-circuits only on a NULL constant and otherwise evaluates every argument
+		// first, so a NULL subject does not hide a bad escape (regex.md §8f.3).
 		vals := make([]Value, len(e.sargs))
 		for i, a := range e.sargs {
 			v, err := a.eval(row, env, m)
 			if err != nil {
 				return Value{}, err
 			}
-			if v.Kind == ValNull {
+			if v.Kind == ValNull && (e.rxFunc != rxSimilarSubstring || a.kind == reConstNull) {
 				return NullValue(), nil
 			}
 			vals[i] = v
+		}
+		if e.rxFunc == rxSimilarSubstring {
+			return similarSubstring(e, vals, m)
 		}
 		source, pattern := vals[0].str(), vals[1].str()
 		// Per-function argument layout (regex.md §8 / §8b); the numeric defaults match PG.
@@ -3600,6 +3611,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// like_escape(pattern, escape) → text — the LIKE … ESCAPE rewrite (grammar.md §22). A growth
 			// kernel like quote_literal: it can double backslashes, and nests.
 			out, err := likeEscapeText(vals[0].str(), vals[1].str())
+			if err != nil {
+				return Value{}, err
+			}
+			return growthResult(m, e.sargs, TextValue(out))
+		case sfSimilarToEscape:
+			// similar_to_escape(pattern [, escape]) → text — the SIMILAR TO translation (regex.md
+			// §8f.1), a growth kernel like like_escape.
+			var escape *string
+			if len(vals) > 1 {
+				esc := vals[1].str()
+				escape = &esc
+			}
+			out, err := similarToEscape(vals[0].str(), escape)
 			if err != nil {
 				return Value{}, err
 			}

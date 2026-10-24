@@ -65,6 +65,8 @@ const (
 	InvalidParameterValue
 	// InvalidEscapeSequence is 22025 — {detail}.
 	InvalidEscapeSequence
+	// InvalidUseOfEscapeCharacter is 2200C — {detail}.
+	InvalidUseOfEscapeCharacter
 	// InvalidRegularExpression is 2201B — invalid regular expression: {detail}.
 	InvalidRegularExpression
 	// ArraySubscriptError is 2202E — {detail}.
@@ -294,6 +296,8 @@ func (s SqlState) Code() string {
 		return "22023"
 	case InvalidEscapeSequence:
 		return "22025"
+	case InvalidUseOfEscapeCharacter:
+		return "2200C"
 	case InvalidRegularExpression:
 		return "2201B"
 	case ArraySubscriptError:
@@ -509,6 +513,7 @@ var errorDescs = []errorDesc{
 	{Code: "22021", Name: "character_not_in_repertoire", Class: "data exception"},
 	{Code: "22023", Name: "invalid_parameter_value", Class: "data exception"},
 	{Code: "22025", Name: "invalid_escape_sequence", Class: "data exception"},
+	{Code: "2200C", Name: "invalid_use_of_escape_character", Class: "data exception"},
 	{Code: "2201B", Name: "invalid_regular_expression", Class: "data exception"},
 	{Code: "2202E", Name: "array_subscript_error", Class: "data exception"},
 	{Code: "22030", Name: "duplicate_json_object_key_value", Class: "data exception"},

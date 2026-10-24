@@ -213,6 +213,15 @@ name = "invalid_escape_sequence"
 class = "data exception"
 template = "{detail}"
 
+# A SIMILAR TO pattern with more than two escape-double-quote separators (../design/regex.md §8f):
+# PostgreSQL's code and message, "SQL regular expression may not contain more than two
+# escape-double-quote separators".
+[[error]]
+code = "2200C"
+name = "invalid_use_of_escape_character"
+class = "data exception"
+template = "{detail}"
+
 # A malformed regular-expression pattern given to `~`/`~*`/`!~`/`!~*` or a regexp_* function
 # (../design/regex.md §7): unbalanced parenthesis/bracket, a trailing backslash, an unknown
 # alphabetic escape, a quantifier with no operand, or a `{n,m}` with m<n. Borrows PostgreSQL's

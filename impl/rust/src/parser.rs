@@ -5949,10 +5949,12 @@ impl Parser {
             | Token::BangTildeStar => true,
             Token::Word(_) => match self.peek_keyword().as_deref() {
                 Some("is" | "in" | "between" | "like" | "ilike") => true,
-                Some("not") => matches!(
-                    self.peek_keyword_at(1).as_deref(),
-                    Some("in" | "between" | "like" | "ilike")
-                ),
+                Some("similar") => self.peek_keyword_at(1).as_deref() == Some("to"),
+                Some("not") => match self.peek_keyword_at(1).as_deref() {
+                    Some("in" | "between" | "like" | "ilike") => true,
+                    Some("similar") => self.peek_keyword_at(2).as_deref() == Some("to"),
+                    _ => false,
+                },
                 _ => false,
             },
             _ => false,
@@ -6042,10 +6044,11 @@ impl Parser {
         // `NOT` was already taken by parse_not). They bind at the comparison level (35),
         // non-associative (grammar.md §20-§21).
         let negated = self.peek_keyword().as_deref() == Some("not")
-            && matches!(
-                self.peek_keyword_at(1).as_deref(),
-                Some("in") | Some("between") | Some("like") | Some("ilike")
-            );
+            && match self.peek_keyword_at(1).as_deref() {
+                Some("in") | Some("between") | Some("like") | Some("ilike") => true,
+                Some("similar") => self.peek_keyword_at(2).as_deref() == Some("to"),
+                _ => false,
+            };
         // The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
         let op_pos = self.here();
         if negated {
@@ -6138,6 +6141,45 @@ impl Parser {
                 });
             });
         }
+        // `[NOT] SIMILAR TO p [ESCAPE e]` (grammar.md §22c) desugars, as in PostgreSQL, to
+        // `s ~ similar_to_escape(p [, e])` (`!~` for NOT) on a Regex node flagged `similar`, which
+        // compiles the pattern dot-all (regex.md §8f).
+        if self.peek_keyword().as_deref() == Some("similar")
+            && self.peek_keyword_at(1).as_deref() == Some("to")
+        {
+            return outline(|| {
+                let similar_pos = self.here();
+                self.advance(); // SIMILAR
+                self.advance(); // TO
+                let mut args = vec![self.parse_concat()?];
+                if self.peek_keyword().as_deref() == Some("escape") {
+                    self.advance();
+                    args.push(self.parse_concat()?);
+                }
+                let rhs = Expr::FuncCall {
+                    name: "similar_to_escape".to_string(),
+                    args,
+                    arg_names: None,
+                    star: false,
+                    distinct: false,
+                    filter: None,
+                    variadic: false,
+                    over: None,
+                    over_name: None,
+                    within_group: None,
+                    agg_order: None,
+                    pos: similar_pos,
+                };
+                return Ok(Expr::Regex {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    negated,
+                    insensitive: false,
+                    similar: true,
+                    pos: op_pos,
+                });
+            });
+        }
         // `~` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md). These are
         // PUNCTUATION operators (not keywords), so `negated`/`insensitive` come from the token itself;
         // there is no `NOT ~` keyword form (`NOT x ~ p` is the prefix-NOT over the whole match, taken
@@ -6158,6 +6200,7 @@ impl Parser {
                     rhs: Box::new(rhs),
                     negated: rx_negated,
                     insensitive: rx_insensitive,
+                    similar: false,
                     pos: op_pos,
                 });
             });
@@ -7235,7 +7278,10 @@ impl Parser {
                     && positional
                     && !distinct
                     && args.len() == 1
-                    && matches!(self.peek_keyword().as_deref(), Some("from" | "for"))
+                    && matches!(
+                        self.peek_keyword().as_deref(),
+                        Some("from" | "for" | "similar")
+                    )
                 {
                     let source = args.pop().expect("one argument parsed");
                     return self.parse_substring_tail(name, source, pos);
@@ -7375,7 +7421,14 @@ impl Parser {
     fn parse_substring_tail(&mut self, name: String, source: Expr, pos: SrcPos) -> Result<Expr> {
         let mut start = None;
         let mut count = None;
-        if self.peek_keyword().as_deref() == Some("from") {
+        // `SUBSTRING(x SIMILAR p ESCAPE e)` is `substring(x, p, e)` (regex.md §8f); ESCAPE is
+        // required, as in PostgreSQL.
+        if self.peek_keyword().as_deref() == Some("similar") {
+            self.advance();
+            start = Some(self.parse_expr()?);
+            self.expect_keyword("escape")?;
+            count = Some(self.parse_expr()?);
+        } else if self.peek_keyword().as_deref() == Some("from") {
             self.advance();
             start = Some(self.parse_expr()?);
             if self.peek_keyword().as_deref() == Some("for") {

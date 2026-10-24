@@ -37,8 +37,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Core query / DML completeness
 
-- [x] **Predicate forms** (`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`CASE`, regex operators). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
-  - [ ] _follow-on:_ `SIMILAR TO` (deliberately excluded — the SQL-standard surface); Unicode-property char classes (`\p{…}`).
+- [x] **Predicate forms** (`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`CASE`, regex operators, `SIMILAR TO`). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
 - [x] **Left-to-right short-circuit `AND` / `OR`** (PostgreSQL's qual-list NULL rule in filters, whose conjuncts are cost-ordered like PostgreSQL's). → [cost.md §3](spec/design/cost.md), [planner.md §3.0](spec/design/planner.md), `expr/short_circuit.test`, `expr/filter_conjunct_order.test`
 - [x] **Scalar functions.** → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ a general implicit argument-coercion pass.

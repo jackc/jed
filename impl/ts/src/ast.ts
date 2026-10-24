@@ -279,7 +279,17 @@ export type Expr =
   // own RE2-able flavor (not PostgreSQL-compatible), matched by a hand-written linear-time Pike VM.
   // UNANCHORED (matches a substring). Both operands must be text; NULL propagates. `negated` carries
   // `!~`/`!~*`; `insensitive` carries `~*`/`!~*` (both sides simple-lowercased like ILIKE).
-  | { kind: "regex"; lhs: Expr; rhs: Expr; negated: boolean; insensitive: boolean; loc?: SrcLoc }
+  // `similar` marks SIMILAR TO (grammar.md §22c): rhs is the desugared similar_to_escape(p [, e])
+  // call, and the pattern compiles in the dot-all mode (regex.md §8f).
+  | {
+      kind: "regex";
+      lhs: Expr;
+      rhs: Expr;
+      negated: boolean;
+      insensitive: boolean;
+      similar: boolean;
+      loc?: SrcLoc;
+    }
   // A CASE expression (spec/design/grammar.md §23). Searched form: `operand` is null and each
   // `whens` condition must be boolean. Simple form: `operand` is non-null and each branch matches
   // when `operand = cond`. `whens` has ≥1 entry; `els` is the ELSE result, or null for an implicit

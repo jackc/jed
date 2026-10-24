@@ -202,3 +202,88 @@ func TestRegexMatchVectors(t *testing.T) {
 		}
 	}
 }
+
+// TestRegexSimilarVectors checks the SIMILAR TO contract (regex.md §8f): the translation, the
+// dot-all match, and the four-search substring, with their compile and step costs.
+func TestRegexSimilarVectors(t *testing.T) {
+	t.Parallel()
+	blocks := parseCaseBlocks(t, specPath(t, "regex/similar_vectors.toml"))
+	if len(blocks) < 15 {
+		t.Fatalf("expected the full vector set, got %d", len(blocks))
+	}
+	code := func(err error) string {
+		if e, ok := err.(*EngineError); ok {
+			return e.Code()
+		}
+		return ""
+	}
+	for _, c := range blocks {
+		pattern, input := tomlUnquote(c["pattern"]), tomlUnquote(c["input"])
+		var escape *string
+		if raw, ok := c["escape"]; ok {
+			e := tomlUnquote(raw)
+			escape = &e
+		}
+		what := pattern + " on " + input
+		translated, err := similarToEscape(pattern, escape)
+		if want, ok := c["error"]; ok {
+			if code(err) != tomlUnquote(want) {
+				t.Errorf("error for %q: got %v want %s", what, err, want)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("translate %q: %v", what, err)
+		}
+		if want := tomlUnquote(c["translation"]); translated != want {
+			t.Errorf("translation for %q: got %q want %q", what, translated, want)
+		}
+		chars := []rune(input)
+		prog, err := compileSimilar(translated)
+		if err != nil {
+			t.Fatalf("compile %q: %v", what, err)
+		}
+		m := newMeter()
+		ok, err := prog.isMatch(chars, m)
+		if err != nil {
+			t.Fatalf("match %q: %v", what, err)
+		}
+		if want := c["similar"] == "true"; ok != want {
+			t.Errorf("similar for %q: got %v want %v", what, ok, want)
+		}
+		if want, _ := strconv.Atoi(c["similar_compile"]); prog.ninst() != want {
+			t.Errorf("similar_compile for %q: got %d want %d", what, prog.ninst(), want)
+		}
+		if want, _ := strconv.ParseInt(c["similar_steps"], 10, 64); m.Accrued != want {
+			t.Errorf("similar_steps for %q: got %d want %d", what, m.Accrued, want)
+		}
+		esc := "\\"
+		if escape != nil {
+			esc = *escape
+		}
+		sm, err := compileSimilarMatcher(pattern, esc)
+		if want, ok := c["substring_error"]; ok {
+			if code(err) != tomlUnquote(want) {
+				t.Errorf("substring_error for %q: got %v want %s", what, err, want)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("compile substring %q: %v", what, err)
+		}
+		m = newMeter()
+		i, j, found, err := sm.substring(chars, m)
+		if err != nil {
+			t.Fatalf("substring %q: %v", what, err)
+		}
+		if want, isNull := c["substring"], c["substring_null"] == "true"; found == isNull || found && string(chars[i:j]) != tomlUnquote(want) {
+			t.Errorf("substring for %q: got %v %q want %s (null %v)", what, found, string(chars[i:j]), want, isNull)
+		}
+		if want, _ := strconv.Atoi(c["substring_compile"]); sm.ninst() != want {
+			t.Errorf("substring_compile for %q: got %d want %d", what, sm.ninst(), want)
+		}
+		if want, _ := strconv.ParseInt(c["substring_steps"], 10, 64); m.Accrued != want {
+			t.Errorf("substring_steps for %q: got %d want %d", what, m.Accrued, want)
+		}
+	}
+}

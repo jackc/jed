@@ -545,6 +545,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfQuoteNullable
 	case "like_escape":
 		return sfLikeEscape
+	case "similar_to_escape":
+		return sfSimilarToEscape
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -1182,6 +1184,20 @@ func regexFuncNode(s *scope, rfn regexFunc, flagsIdx int, rargs []*rExpr, params
 		} else {
 			insensitiveKnown = false
 		}
+	}
+	// The SIMILAR substring precompiles its matcher from a constant pattern and escape (§8f.3); a NULL
+	// constant subject makes the call NULL without translating, as PostgreSQL's strict SQL function
+	// folds before it inlines.
+	if rfn == rxSimilarSubstring {
+		var sm *similarMatcher
+		if rargs[0].kind != reConstNull && rargs[1].kind == reConstText && rargs[2].kind == reConstText {
+			var err error
+			if sm, err = compileSimilarMatcher(rargs[1].cText, rargs[2].cText); err != nil {
+				return nil, resolvedType{}, err
+			}
+			params.uncacheable = true
+		}
+		return &rExpr{kind: reRegexFunc, rxFunc: rfn, sargs: rargs, rxSimilarMatcher: sm}, resolvedType{kind: rtText}, nil
 	}
 	var prog *regexProgram
 	if rargs[1].kind == reConstText && insensitiveKnown {
@@ -4173,6 +4189,10 @@ func adoptScalarOverload(s *scope, fc *funcCallExpr, desc *operatorDesc, rargs [
 	// pattern precompilation and the regex cost units.
 	if name == "substring" && len(desc.ArgFamilies) == 2 && desc.ArgFamilies[1] == "text" {
 		return regexFuncNode(s, rxSubstring, -1, rargs, params)
+	}
+	// The SIMILAR overload substring(text, text, text) (regex.md §8f.3), on the same node.
+	if name == "substring" && len(desc.ArgFamilies) == 3 && desc.ArgFamilies[1] == "text" {
+		return regexFuncNode(s, rxSimilarSubstring, -1, rargs, params)
 	}
 	epoch := name == "date_part" && len(rargs) > 0 && rargs[0].kind == reConstText && strings.EqualFold(rargs[0].cText, "epoch")
 	params.nonimmutable = params.nonimmutable || (desc.Volatility != "immutable" && !epoch)

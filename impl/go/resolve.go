@@ -3154,6 +3154,25 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if err := requireTextOrNull(rt); err != nil {
 			return nil, resolvedType{}, err
 		}
+		// SIMILAR TO (regex.md §8f.2): a similar_to_escape call over constant text is translated now,
+		// so the pattern precompiles below (and a translation error surfaces at resolve).
+		if e.Regex.Similar && rr.kind == reScalarFunc && rr.sfunc == sfSimilarToEscape {
+			constant := true
+			for _, a := range rr.sargs {
+				constant = constant && a.kind == reConstText
+			}
+			if constant {
+				var escape *string
+				if len(rr.sargs) > 1 {
+					escape = &rr.sargs[1].cText
+				}
+				translated, err := similarToEscape(rr.sargs[0].cText, escape)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				rr = &rExpr{kind: reConstText, cText: translated}
+			}
+		}
 		// Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per row at
 		// eval. For ~* the constant is case-folded before compiling (the ILIKE mechanism). A malformed
 		// pattern surfaces 2201B (and an oversized one 54001) here, at resolve, for the constant case.
@@ -3163,7 +3182,11 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 			if e.Regex.Insensitive {
 				pat = foldRegexPattern(pat, s.catalog.session.env.propertyTable())
 			}
-			prog, err = compileRegex(pat)
+			if e.Regex.Similar {
+				prog, err = compileSimilar(pat)
+			} else {
+				prog, err = compileRegex(pat)
+			}
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -3173,7 +3196,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if prog != nil {
 			params.uncacheable = true
 		}
-		return &rExpr{kind: reRegex, lhs: rl, rhs: rr, negated: e.Regex.Negated, insensitive: e.Regex.Insensitive, rxProgram: prog},
+		return &rExpr{kind: reRegex, lhs: rl, rhs: rr, negated: e.Regex.Negated, insensitive: e.Regex.Insensitive, rxSimilar: e.Regex.Similar, rxProgram: prog},
 			resolvedType{kind: rtBool}, nil
 	case exprCase:
 		// Resolve each branch's condition: searched form requires a boolean WHEN (42804

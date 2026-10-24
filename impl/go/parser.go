@@ -6689,7 +6689,8 @@ func (p *parser) parseComparison() (exprNode, error) {
 	// already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
 	predNegated := p.peekKeyword() == "not" &&
 		(p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between" ||
-			p.peekKeywordAt(1) == "like" || p.peekKeywordAt(1) == "ilike")
+			p.peekKeywordAt(1) == "like" || p.peekKeywordAt(1) == "ilike" ||
+			p.peekKeywordAt(1) == "similar" && p.peekKeywordAt(2) == "to")
 	// The operator's position: the `NOT` of a negated form, else the keyword (PostgreSQL's).
 	opPos := p.here()
 	if predNegated {
@@ -6775,6 +6776,29 @@ func (p *parser) parseComparison() (exprNode, error) {
 			}, Pos: likePos}
 		}
 		return exprNode{Kind: exprLike, Like: &likeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}, Pos: opPos}, nil
+	}
+	// `[NOT] SIMILAR TO p [ESCAPE e]` (grammar.md §22c) desugars, as in PostgreSQL, to
+	// `s ~ similar_to_escape(p [, e])` (`!~` for NOT) on a regex node flagged Similar, which compiles
+	// the pattern dot-all (regex.md §8f).
+	if p.peekKeyword() == "similar" && p.peekKeywordAt(1) == "to" {
+		similarPos := p.here()
+		p.advance() // SIMILAR
+		p.advance() // TO
+		pattern, err := p.parseConcat()
+		if err != nil {
+			return exprNode{}, err
+		}
+		args := []*exprNode{&pattern}
+		if p.peekKeyword() == "escape" {
+			p.advance()
+			escape, err := p.parseConcat()
+			if err != nil {
+				return exprNode{}, err
+			}
+			args = append(args, &escape)
+		}
+		rhs := exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "similar_to_escape", Args: args}, Pos: similarPos}
+		return exprNode{Kind: exprRegex, Regex: &regexExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Similar: true}, Pos: opPos}, nil
 	}
 	// `~` / `~*` / `!~` / `!~*` — regex match (grammar.md §22b, regex.md). Punctuation operators, so
 	// `negated`/`insensitive` come from the token itself; there is no `NOT ~` keyword form (`NOT x ~ p`
@@ -7843,7 +7867,7 @@ func (p *parser) parseFunctionCall() (exprNode, error) {
 			// `substring_expr`, string-functions.md §4): a FROM/FOR keyword after the first
 			// positional argument selects the special form.
 			if substringForm && argName == nil && !fc.Distinct && len(fc.Args) == 1 {
-				if kw := p.peekKeyword(); kw == "from" || kw == "for" {
+				if kw := p.peekKeyword(); kw == "from" || kw == "for" || kw == "similar" {
 					return p.parseSubstringTail(name, arg, pos)
 				}
 			}
@@ -8185,7 +8209,24 @@ func (p *parser) parseQualifiedTableName() (*string, string, error) {
 // starting at 1. No FILTER / OVER may follow (the form is not a function application).
 func (p *parser) parseSubstringTail(name string, source exprNode, pos srcPos) (exprNode, error) {
 	var start, count *exprNode
-	if p.peekKeyword() == "from" {
+	// `SUBSTRING(x SIMILAR p ESCAPE e)` is `substring(x, p, e)` (regex.md §8f); ESCAPE is required,
+	// as in PostgreSQL.
+	if p.peekKeyword() == "similar" {
+		p.advance()
+		e, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		start = &e
+		if err := p.expectKeyword("escape"); err != nil {
+			return exprNode{}, err
+		}
+		c, err := p.parseExpr()
+		if err != nil {
+			return exprNode{}, err
+		}
+		count = &c
+	} else if p.peekKeyword() == "from" {
 		p.advance()
 		e, err := p.parseExpr()
 		if err != nil {
