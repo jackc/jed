@@ -765,6 +765,24 @@ statement (`COPY … TO/FROM`, `CREATE FUNCTION`, `DO`, `LOAD`, `CREATE EXTENSIO
 is a tripwire: introducing any of them flips exactly one line from error to ok. It is jed-specific
 (PG provides these), so it is not oracle-checked.
 
+**SQL-bodied routines — deferred (decided 2026-10-24).** Two features whose bodies would be plain
+SQL are deliberately not planned: `CREATE FUNCTION … LANGUAGE sql` (PostgreSQL's SQL-language
+functions) and triggers (`CREATE TRIGGER`, whether SQLite-style with a SQL statement body or
+PostgreSQL-style calling a trigger function). Neither is excluded on purity grounds — a SQL body
+can only use this pure surface, so neither would break the guarantee above — but neither has a
+user asking for it, and each is a large surface: a new persisted catalog object (the
+[views.md](views.md) machinery of stored text, dependencies, rename rewriting, and `XX003`),
+definer/invoker authorization in the session envelope ([session.md](session.md)), a bounded
+recursion depth, and cost identity across cores. Triggers additionally need a specified firing
+order and interact with foreign-key actions, `ON CONFLICT`, writable `WITH`, and `RETURNING`, and
+SQLite-style triggers have no PostgreSQL counterpart for the oracle to check. So `CREATE FUNCTION`
+and `CREATE TRIGGER` stay syntax errors (`42601`), and what depends on triggers stays out too:
+`ALTER TABLE … {ENABLE|DISABLE} TRIGGER` ([alter.md](alter.md) §6), `INSTEAD OF` writes through a
+view that is not automatically updatable ([views.md](views.md) §12), and the `TRIGGER` privilege.
+Reopening either feature is a new decision, which would narrow the tripwire above to reject only
+non-SQL languages. Host-registered functions are separate and unaffected
+([extensibility.md](extensibility.md) §7).
+
 ## 14. Sequence value functions (`nextval` / `currval` / `setval` / `lastval`) — the stateful built-ins
 
 `nextval('s')` / `currval('s')` / `setval('s', n[, b])` / `lastval()` ([sequences.md](sequences.md))

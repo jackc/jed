@@ -405,7 +405,7 @@ it would bind differently, the whole statement fails with `0A000` and nothing ch
 ## 6. Deliberately excluded (Tier C — we own our surface, CLAUDE.md §1)
 
 Most of PG's `ALTER TABLE` menu is moot here and is **not** planned: `OWNER TO` / RLS /
-`{ENABLE|DISABLE} TRIGGER` (no roles/triggers, §3); `ATTACH`/`DETACH PARTITION`, `INHERIT`
+`{ENABLE|DISABLE} TRIGGER` (no roles, CLAUDE.md §3; no triggers, [functions.md](functions.md) §13); `ATTACH`/`DETACH PARTITION`, `INHERIT`
 (no partitioning/inheritance); `SET TABLESPACE`, `SET (fillfactor=…)`, `SET STATISTICS`,
 `CLUSTER ON`, `SET {LOGGED|UNLOGGED}` (no storage/planner knobs of that kind); `SET SCHEMA`
 (no schemas). Each is a `0A000` if it ever reaches the parser. Identity management, once listed

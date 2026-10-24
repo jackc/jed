@@ -50,9 +50,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **`DISTINCT ON`** — the kept row is the first under the fully determined `ORDER BY`. → [grammar.md §11.1](spec/design/grammar.md)
   - [ ] _follow-on:_ streaming dedup over a scan that already satisfies the order, so `LIMIT` stops the scan early (planner.md §4).
   - [ ] _follow-on:_ push WHERE conjuncts that read only `ON` keys into a `DISTINCT ON` body (planner.md §3).
-- [ ] **Decide: SQL-language triggers and functions** — SQLite-style triggers whose bodies are plain
-  SQL statements, and `CREATE FUNCTION … LANGUAGE sql`. Both stay pure, so neither conflicts with
-  CLAUDE.md §13. Record each as a scheduled item or an explicit non-goal. _(size: decision; L each if built)_
 
 ---
 

@@ -754,8 +754,8 @@ Recorded divergences from PostgreSQL (CLAUDE.md §1):
 
 Deferred follow-ons, none foreclosed:
 
-- `INSTEAD OF` behavior for views that are not automatically updatable (jed has no triggers or
-  rules);
+- `INSTEAD OF` behavior for views that are not automatically updatable (jed has no rules, and
+  triggers are deferred — [functions.md](functions.md) §13);
 - an updatability column in `jed_views` (PostgreSQL's `information_schema.views.is_updatable`);
 - `CREATE MATERIALIZED VIEW` (`0A000`);
 - views in or over attached databases (`0A000`), including `ALTER TABLE` of an attached table that
