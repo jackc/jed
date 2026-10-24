@@ -4654,6 +4654,28 @@ func (p *parser) parseSelectCore() (*selectStmt, error) {
 			distinct = true
 		}
 	}
+	// DISTINCT ON (k, …): the word `on` directly followed by `(` (grammar.md §11.1); any other `on`
+	// is the first select item.
+	var distinctOn []orderKey
+	if distinct && p.peekKeyword() == "on" && p.tokens[p.pos+1].Kind == tokLParen {
+		p.advance()
+		p.advance()
+		for {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			distinctOn = append(distinctOn, classifyOrderKey(expr, "", false, false, true))
+			if p.peek().Kind == tokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+	}
 
 	// Only the statement's leftmost SELECT may take an INTO (create-table-as.md §6), so this one owns
 	// it and every SELECT nested in its clauses does not.
@@ -4680,7 +4702,7 @@ func (p *parser) parseSelectCore() (*selectStmt, error) {
 		from, joins = &f, j
 	}
 
-	sel := &selectStmt{Distinct: distinct, Items: items, From: from, Joins: joins}
+	sel := &selectStmt{Distinct: distinct, DistinctOn: distinctOn, Items: items, From: from, Joins: joins}
 
 	filter, err := p.parseOptionalWhere()
 	if err != nil {

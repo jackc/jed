@@ -2947,7 +2947,12 @@ impl Engine {
         }
         // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window
         // bounds below, so it need not bail.
-        if plan.distinct || plan.having.is_some() || plan.has_window || !plan.order.is_empty() {
+        if plan.distinct
+            || plan.distinct_on > 0
+            || plan.having.is_some()
+            || plan.has_window
+            || !plan.order.is_empty()
+        {
             return false;
         }
         if plan.agg_specs.is_empty() {

@@ -330,13 +330,14 @@ function bodyPushable(rel: PlanRel): QueryPlan | null {
 }
 
 // queryBodyPushable is the structural half of body-pushability (planner.md §3.2): a SELECT with no
-// LIMIT or OFFSET that is either ungrouped or grouped by exactly one grouping set with at least one
+// LIMIT, OFFSET, or DISTINCT ON (whose kept row a filter could change — grammar.md §11.1) that is
+// either ungrouped or grouped by exactly one grouping set with at least one
 // key (window functions admitted — bodyInputColumn then requires every window to partition by the
 // column); or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
 function queryBodyPushable(q: QueryPlan): boolean {
   switch (q.kind) {
     case "select":
-      if (q.limit !== null || q.offset !== null) return false;
+      if (q.limit !== null || q.offset !== null || q.distinctOn > 0) return false;
       return !q.isAgg || (q.groupSets.length === 1 && q.groupKeys.length > 0);
     case "setOp":
       return (

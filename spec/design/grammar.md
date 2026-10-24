@@ -631,8 +631,8 @@ each a relaxable follow-on.
 `SELECT DISTINCT` removes duplicate rows from the result by **deduplicating the projected
 output** — the select-list values, *not* the source rows. So `SELECT DISTINCT a FROM t`
 collapses rows that share an `a` even when their other columns differ, and
-`SELECT DISTINCT a, b` keys on the `(a, b)` pair. `DISTINCT` with no qualifier is the only
-form; `DISTINCT ON (...)` (the PostgreSQL extension) is out of scope.
+`SELECT DISTINCT a, b` keys on the `(a, b)` pair. The PostgreSQL extension `DISTINCT ON (...)`,
+which keeps one *source* row per key, is specified at the end of this section.
 
 **Where it applies — before the window, after the sort.** Dedup is the SQL "is this output
 row new?" step, so it must run on projected values and **before** `LIMIT`/`OFFSET`:
@@ -676,6 +676,87 @@ ASC → NULLS LAST, §10).
 `SELECT DISTINCT FROM t` (the only valid parse being the column) selects `distinct`. This
 lookahead is a CLAUDE.md §8 determinism surface: it must be byte-identical across the three
 hand-written parsers.
+
+### 11.1 `DISTINCT ON`
+
+`SELECT DISTINCT ON (k1, k2, …) items … [ORDER BY …]` keeps **one row per distinct value of the
+`ON` keys**: the **first** row of each group in the query's sort order, with every select item
+evaluated over that row. It is PostgreSQL's spelling of greatest-n-per-group:
+
+```sql
+SELECT DISTINCT ON (customer_id) customer_id, id, placed_at
+FROM orders ORDER BY customer_id, placed_at DESC;   -- each customer's latest order
+```
+
+**Syntax.** After the `DISTINCT` modifier (whose lookahead is unchanged), the word `ON` followed by
+`(` begins the key list; any other `ON` (`SELECT DISTINCT on FROM t`) is the first select item, as
+before. The list holds one or more expressions and does not accept `ASC`/`DESC`/`NULLS` (42601).
+`DISTINCT ON ()` is 42601.
+
+**Key resolution.** Each `ON` key resolves **exactly like an `ORDER BY` key** (§10). It is an
+output-column ordinal (`DISTINCT ON (1)`), an output name (an alias or derived name) that binds
+before an input column, an input column, or a general expression evaluated over the source row.
+In a grouped query it resolves in the group context, and it may contain an aggregate, a window
+function, or an outer column. The `ORDER BY` errors carry over with PostgreSQL's
+`DISTINCT ON` wording: a bad ordinal is `42P10` *"DISTINCT ON position N is not in select list"*,
+and an ambiguous bare name is `42702` *"DISTINCT ON \"s\" is ambiguous"*. A `json` key is `42883`:
+*"could not identify an ordering operator for type json"* when an `ORDER BY` key spells it (the
+`ORDER BY` resolves first), else *"could not identify an equality operator for type json"*. Both
+`42P10` errors below are reported at the offending `ON` key. The keys need **not** appear in the select list, and neither
+do the `ORDER BY` keys: plain `DISTINCT`'s select-list restriction (above) does not apply.
+
+**Matching the `ORDER BY` — PostgreSQL's rule.** Two keys *match* when they resolve to the same
+input/group slot (`a`, `t.a`, and an ordinal or alias naming a bare `a` are one key), or when both
+are expressions that are structurally identical. The order keys are then checked left to right:
+
+- each `ORDER BY` key that matches some `ON` key extends the leading run of keys. An `ORDER BY` key
+  that matches an `ON` key **after** a key that did not is `42P10` *"SELECT DISTINCT ON
+  expressions must match initial ORDER BY expressions"*, as in PostgreSQL;
+- an `ON` key matched by no `ORDER BY` key is the same `42P10` if any `ORDER BY` key failed to
+  match. Otherwise it is **appended** to the sort as an `ASC` key with the default NULL placement,
+  in `ON`-list order, once per distinct key. So with no `ORDER BY` the sort is the `ON` keys,
+  and `DISTINCT ON (a, b) … ORDER BY a` sorts by `a, b`. This is PostgreSQL's behavior too.
+
+The **dedup key** is the leading run of effective sort keys that match `ON` keys. The direction,
+NULL placement, and collation of a matched key come from its `ORDER BY` spelling. Those affect only
+where a group sorts, not which rows group together.
+
+**Which row survives — deterministic, unlike PostgreSQL.** Rows are grouped by **sort equality**
+on the dedup key: the key's collation and the type's ordering equality (`1.5` and `1.50` group,
+`-0` and `+0` group). Equality is NULL-safe, so all NULL keys form one group, as in PostgreSQL. The
+surviving row is the first of its group in the **fully determined** `ORDER BY` order of §10. A tie
+across every sort key is broken by the primary key, which is the stable first-occurrence order.
+The kept row, and so the result multiset, is therefore identical across cores. PostgreSQL leaves the
+choice unspecified whenever the `ORDER BY` does not order the rows within a group. jed answers with
+a well-defined row there, which is a refinement, not a divergence: every PostgreSQL answer to a query
+whose `ORDER BY` determines the row is also jed's. The cost is that the choice in a tie is pinned
+to the sort's tie-break, so (as with `ORDER BY … LIMIT 1` over ties) it follows the selected plan's
+row order. A query that cares should order the rows within each group.
+
+**Pipeline.** FROM/WHERE → GROUP BY/HAVING → window functions → sort (the effective order) →
+**dedup** → `LIMIT`/`OFFSET` → projection. Window functions see every row, including rows the
+dedup drops. `LIMIT`/`OFFSET` slice the deduplicated rows. The sort places each group's rows
+together, so the dedup only compares a row's key with the previous kept row's key. That holds
+constant state, adds nothing to the query-memory account, and releases each dropped row's charge.
+**Output order** is the effective sort order. With no `ORDER BY` the order is still unspecified by
+contract (CLAUDE.md §8, compared `rowsort`), although jed happens to emit the `ON`-key order.
+
+**Cost** ([cost.md](cost.md) §3). The dedup compare is **unmetered**, like the sort it follows. An
+expression `ON` key is materialized like an expression `ORDER BY` key (its `operator_eval`s per
+sorted row; a key that matches an `ORDER BY` expression is evaluated once). Unlike plain `DISTINCT`,
+there is no project-every-row asymmetry: the dedup key is already a sort key, so only **emitted**
+rows are projected and charge `row_produced`. `SELECT DISTINCT ON (a) 1/b FROM t ORDER BY a LIMIT 1`
+traps only on the emitted row's `b`. This diverges from PostgreSQL, which computes a cheap select
+item below its sort, over every row, and so can trap on a row the dedup drops (the override ledger
+records the case).
+
+**Planning.** A `DISTINCT ON` query always takes the blocking sort path. The streaming scan, the
+`ORDER BY` top-k, and the `LIMIT` early-out over an ordered scan are not used, since a row the sort
+keeps may still be dropped. A WHERE conjunct is never pushed into a `DISTINCT ON` derived-table or
+CTE body (planner.md §3): filtering before the dedup changes which row survives. A `DISTINCT ON`
+view is not automatically updatable (views.md §15). EXPLAIN renders `Distinct` with detail `on=N`
+(the dedup key count) *above* the `Sort`, its execution order (explain.md §4). Streaming dedup over
+an order-satisfying scan, and pushdown of conjuncts that read only `ON` keys, are follow-ons.
 
 ## 12. Multi-row `INSERT`
 

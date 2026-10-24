@@ -1967,3 +1967,20 @@ reason = "jed pairs foreign-key columns only when its comparison matrix defines 
 file = "ddl/foreign_key_cross_type.test"
 sql = "UPDATE pn SET v = 5.25 WHERE v = 5"
 reason = "jed re-checks every row an ON UPDATE CASCADE rewrites (constraints.md §6.6, §6.7). The cascade assigns decimal 5.25 to an i32 column, which rounds to the child's own 5; no parent 5 remains, so jed raises 23503. PostgreSQL skips the RI check of an updated row whose key value is unchanged (ri_KeysEqual) and commits an orphan. jed keeps referential integrity."
+
+# --- query/distinct_on.test: jed keeps a defined row where PostgreSQL's choice is unspecified, and
+# projects only emitted rows (grammar.md §11.1).
+[[override]]
+file = "query/distinct_on.test"
+sql = "SELECT DISTINCT ON (cust) cust, id FROM o ORDER BY cust"
+reason = "jed: the kept row of a DISTINCT ON group is the first in the fully determined ORDER BY order, whose ties are broken by the primary key (grammar.md §10/§11.1), so customer 20 keeps id 3. PostgreSQL's sort leaves the order within a group unspecified and returns id 4 here. Every row PostgreSQL could keep is a valid answer for it; jed pins one."
+
+[[override]]
+file = "query/distinct_on.test"
+sql = "SELECT DISTINCT ON (cust) cust, id FROM o"
+reason = "jed: with no ORDER BY, DISTINCT ON sorts by its keys with the primary-key tie-break (grammar.md §11.1), so customer 20 keeps id 3. PostgreSQL's kept row is unspecified and is id 4 here."
+
+[[override]]
+file = "query/distinct_on.test"
+sql = "SELECT DISTINCT ON (cust) cust, 100 / (total - 7) FROM o ORDER BY cust, id"
+reason = "jed: a DISTINCT ON query projects only the rows it emits (grammar.md §11.1, cost.md §3), so the dropped row with total = 7 never evaluates 100 / 0. PostgreSQL computes a cheap select item below its sort, over every row, and traps 22012."

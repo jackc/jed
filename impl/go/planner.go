@@ -866,7 +866,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// windowing.
 	// A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10): either
 	// sets up the window machinery so the key can be sorted by the computed window value.
-	hasWindowSyntax := itemsHaveWindow(sel.Items) || orderByHasWindow(sel.OrderBy)
+	hasWindowSyntax := itemsHaveWindow(sel.Items) || orderByHasWindow(sel.OrderBy) || orderByHasWindow(sel.DistinctOn)
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys, groupKeyExprs: groupKeyExprs}
 	if hasWindowSyntax {
 		projAgg.windowing = true
@@ -914,6 +914,19 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 		}
 	}
+	distinctOnKeys := sel.DistinctOn
+	if hasWindowSyntax && orderByHasWindow(sel.DistinctOn) {
+		distinctOnKeys = append([]orderKey(nil), sel.DistinctOn...)
+		for i := range distinctOnKeys {
+			if distinctOnKeys[i].Expr != nil {
+				d, derr := desugarNamedWindows(*distinctOnKeys[i].Expr, windowsResolved)
+				if derr != nil {
+					return nil, derr
+				}
+				distinctOnKeys[i].Expr = &d
+			}
+		}
+	}
 	projections, columnNames, columnTypes, columnDerivs, columnTypmods, err := resolveProjections(s, items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
@@ -948,7 +961,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality operator
 	// (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
 	// 42883. jsonb IS distinguishable (its btree equality, §5).
-	if sel.Distinct {
+	if sel.Distinct && len(sel.DistinctOn) == 0 {
 		for i, t := range columnTypes {
 			if t.kind == rtJson {
 				// Reported at that select item (spec/design/error-fields.md §10.2), when the list has no
@@ -1042,9 +1055,21 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// expression is resolved here (introducing a new aggregate in a grouped query if it names one),
 	// collected into orderExprs, and given a placeholder sort slot orderExprBase+k rebased to
 	// final_width+k below — the window-key precedent (window.md §5.1).
+	// DISTINCT ON (grammar.md §11.1): match its keys against the ORDER BY, giving the effective sort
+	// (the ORDER BY plus any appended ON keys) and the dedup-key count. The appended keys resolve in
+	// the loop below like any other key.
+	writtenOrderLen := len(orderBy)
+	distinctOn := 0
+	if len(distinctOnKeys) > 0 {
+		orderBy, distinctOn, err = distinctOnOrder(orderBy, distinctOnKeys, items, s)
+		if err != nil {
+			return nil, err
+		}
+	}
 	order := make([]orderSlot, 0, len(orderBy))
 	var orderExprs []*rExpr
-	for _, key := range orderBy {
+	for ki, key := range orderBy {
+		appendedOn := ki >= writtenOrderLen
 		// Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
 		// general expression, or an ordinal pointing at a computed projection).
 		var slotRes resolved
@@ -1124,8 +1149,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 					return nil, rerr
 				}
 				if ty.kind == rtJson {
-					return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
-						hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
+					return nil, orderJSONError(key, appendedOn)
 				}
 				var coll *Collation
 				if key.Collation != "" {
@@ -1146,8 +1170,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
 			// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
 			if s.columnOf(r).Type.IsJson() {
-				return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
-					hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
+				return nil, orderJSONError(key, appendedOn)
 			}
 			idx := r.index
 			// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
@@ -1213,8 +1236,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		// runs. PostgreSQL accepts it; it is a degenerate (constant) leading key.
 		// A non-orderable result type — json (no btree opclass) — is 42883; jsonb orders.
 		if ty.kind == rtJson {
-			return nil, newError(UndefinedFunction, "could not identify an ordering operator for type json").
-				hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
+			return nil, orderJSONError(key, appendedOn)
 		}
 		// The collation of an expression key (collation.md §1): an explicit trailing COLLATE (rare —
 		// parseExpr usually absorbs one into the key) must be on a text key (42804); otherwise it is
@@ -1324,7 +1346,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// an ordinal (which names a select-list item by position), or a general expression that STRUCTURALLY
 	// matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases are invisible to ORDER
 	// BY (§8); a SELECT DISTINCT * projects every column, so the restriction never bites.
-	if sel.Distinct && len(sel.OrderBy) > 0 && !items.All {
+	if sel.Distinct && len(sel.DistinctOn) == 0 && len(sel.OrderBy) > 0 && !items.All {
 		projected := make(map[int]bool)
 		for _, it := range items.Items {
 			switch it.Expr.Kind {
@@ -1406,7 +1428,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		groupSets:  groupSets, groupingSpecs: groupingSpecs,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
-		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, columnTypmods: columnTypmods, distinct: sel.Distinct,
+		columnNames: columnNames, columnTypes: columnTypes, columnDerivs: columnDerivs, columnTypmods: columnTypmods, distinct: sel.Distinct && distinctOn == 0, distinctOn: distinctOn,
 		limit: sel.Limit, offset: sel.Offset, group: group,
 	}
 	plan.relMasks = computeRelMasks(plan)
@@ -1913,4 +1935,163 @@ func atOrderKey(err error, key orderKey) error {
 		e.withPosition(int32(key.location()))
 	}
 	return err
+}
+
+// sortKeyIdentity is what a sort key names, for matching DISTINCT ON keys against ORDER BY keys
+// (grammar.md §11.1): a column (input or outer, by its resolved identity) or a general expression
+// (an ordinal or output name at a computed item is that item's expression). An explicit key
+// COLLATE is part of the identity.
+type sortKeyIdentity struct {
+	isExpr    bool
+	col       resolved
+	expr      *exprNode
+	collation string
+}
+
+func (a sortKeyIdentity) equal(b sortKeyIdentity) bool {
+	if a.isExpr != b.isExpr || a.collation != b.collation {
+		return false
+	}
+	if a.isExpr {
+		return exprEqual(*a.expr, *b.expr)
+	}
+	return a.col == b.col
+}
+
+// sortKeyIdentityOf classifies one key the way the ORDER BY resolution loop targets it, with clause
+// naming the clause in its ordinal and ambiguity errors (ORDER BY / DISTINCT ON, as PostgreSQL
+// words them).
+func sortKeyIdentityOf(key *orderKey, items selectItems, s *scope, clause string) (sortKeyIdentity, error) {
+	coll := key.Collation
+	itemIdentity := func(e *exprNode) (sortKeyIdentity, error) {
+		switch e.Kind {
+		case exprColumn:
+			r, err := s.resolveBare(e.Column)
+			return sortKeyIdentity{col: r, collation: coll}, err
+		case exprQualifiedColumn:
+			r, err := s.resolveQualified(e.Qualifier, e.Column)
+			return sortKeyIdentity{col: r, collation: coll}, err
+		}
+		return sortKeyIdentity{isExpr: true, expr: e, collation: coll}, nil
+	}
+	if key.Ordinal != nil {
+		ord := *key.Ordinal
+		var ncols int64
+		if items.All {
+			ncols = int64(s.width())
+		} else {
+			ncols = int64(len(items.Items))
+		}
+		if ord < 1 || ord > ncols {
+			return sortKeyIdentity{}, newError(InvalidColumnReference,
+				fmt.Sprintf("%s position %d is not in select list", clause, ord)).withPosition(int32(key.location()))
+		}
+		pos := int(ord - 1)
+		if items.All {
+			return sortKeyIdentity{col: resolved{level: 0, index: pos}, collation: coll}, nil
+		}
+		return itemIdentity(&items.Items[pos].Expr)
+	}
+	if key.Expr != nil {
+		return sortKeyIdentity{isExpr: true, expr: key.Expr, collation: coll}, nil
+	}
+	if key.Qualifier != "" {
+		r, err := s.resolveQualifiedAt(key.Qualifier, key.Column, key.Pos)
+		return sortKeyIdentity{col: r, collation: coll}, err
+	}
+	matched, err := orderAliasMatch(items, key.Column, s)
+	if err != nil {
+		var e *EngineError
+		if errors.As(err, &e) && e.State == AmbiguousColumn {
+			return sortKeyIdentity{}, newError(AmbiguousColumn,
+				fmt.Sprintf("%s \"%s\" is ambiguous", clause, key.Column)).withPosition(int32(key.location()))
+		}
+		return sortKeyIdentity{}, err
+	}
+	if matched != nil {
+		return itemIdentity(matched)
+	}
+	r, err := s.resolveBareAt(key.Column, key.Pos)
+	return sortKeyIdentity{col: r, collation: coll}, err
+}
+
+// distinctOnOrder returns the effective sort of a DISTINCT ON query and its dedup-key count
+// (grammar.md §11.1). The ORDER BY keys are checked left to right: a leading run that matches ON
+// keys forms the dedup key, and an ON key matched after a non-matching ORDER BY key, or matched by
+// none when one did not match, is 42P10. With every ORDER BY key matching, the unmatched ON keys
+// are appended (ascending, default NULL placement) once each, in ON-list order.
+func distinctOnOrder(orderBy, on []orderKey, items selectItems, s *scope) ([]orderKey, int, error) {
+	mismatch := func(key orderKey) error {
+		return newError(InvalidColumnReference,
+			"SELECT DISTINCT ON expressions must match initial ORDER BY expressions").withPosition(int32(key.location()))
+	}
+	onIDs := make([]sortKeyIdentity, len(on))
+	for j := range on {
+		id, err := sortKeyIdentityOf(&on[j], items, s, "DISTINCT ON")
+		if err != nil {
+			return nil, 0, err
+		}
+		onIDs[j] = id
+	}
+	orderIDs := make([]sortKeyIdentity, len(orderBy))
+	for i := range orderBy {
+		id, err := sortKeyIdentityOf(&orderBy[i], items, s, "ORDER BY")
+		if err != nil {
+			return nil, 0, err
+		}
+		orderIDs[i] = id
+	}
+	matched := make([]bool, len(on))
+	skipped := false
+	prefix := 0
+	for _, oid := range orderIDs {
+		hit := -1
+		for j, id := range onIDs {
+			if id.equal(oid) {
+				matched[j] = true
+				if hit < 0 {
+					hit = j
+				}
+			}
+		}
+		switch {
+		case hit < 0:
+			skipped = true
+		case skipped:
+			return nil, 0, mismatch(on[hit])
+		default:
+			prefix++
+		}
+	}
+	effective := append([]orderKey(nil), orderBy...)
+	for j := range on {
+		dup := false
+		for _, id := range onIDs[:j] {
+			if id.equal(onIDs[j]) {
+				dup = true
+				break
+			}
+		}
+		if matched[j] || dup {
+			continue
+		}
+		if skipped {
+			return nil, 0, mismatch(on[j])
+		}
+		effective = append(effective, on[j])
+		prefix++
+	}
+	return effective, prefix, nil
+}
+
+// orderJSONError is a json sort key's 42883 (json has no btree opclass — json.md §5), at the key.
+// An appended DISTINCT ON key has no ORDER BY spelling, so PostgreSQL reports it as the grouping's
+// missing equality operator (grammar.md §11.1).
+func orderJSONError(key orderKey, appendedOn bool) error {
+	if appendedOn {
+		return newError(UndefinedFunction, "could not identify an equality operator for type json").noHint().
+			withPosition(int32(key.location()))
+	}
+	return newError(UndefinedFunction, "could not identify an ordering operator for type json").
+		hinted(hintNoOrderingOperator).withPosition(int32(key.location()))
 }

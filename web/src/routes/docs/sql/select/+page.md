@@ -23,6 +23,10 @@ FROM product
 GROUP BY category
 ORDER BY category;`;
 
+	const distinctOn = `SELECT DISTINCT ON (category) category, name, price
+FROM product
+ORDER BY category, price;`;
+
 	const filtered = `SELECT name, price
 FROM product
 WHERE price > 4
@@ -225,7 +229,8 @@ ORDER BY on_day;`;
 
 # Querying
 
-`SELECT` supports the usual shape: `WHERE`, `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT`, joins,
+`SELECT` supports the usual shape: `WHERE`, `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT` and
+`DISTINCT ON`, joins,
 `GROUP BY` with `HAVING`, set operations, subqueries, and `WITH` (common table expressions).
 An `ORDER BY` key is a **general expression** (`ORDER BY a + b`, `ORDER BY abs(x)`, `ORDER BY sum(x)`
 in a grouped query — a column name is its simplest form), an **output-column alias / name**
@@ -287,6 +292,20 @@ works written second: `WHERE total / qty > 5 AND qty <> 0` checks `qty <> 0` fir
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
 <LiveSql demo="filtered" {seed} query={filtered} rows={6} />
+
+## One row per group (`DISTINCT ON`)
+
+`SELECT DISTINCT ON (keys) …` keeps one row for each distinct value of its keys: the first row of
+each group in `ORDER BY` order. Here it is each category's cheapest product:
+
+<LiveSql demo="distinctOn" {seed} query={distinctOn} rows={2} />
+
+The keys are written like `ORDER BY` keys (a column, an output name, a position, or an expression)
+and need not be in the select list. As in PostgreSQL, they must match the leading `ORDER BY` keys;
+with no `ORDER BY`, the rows are sorted by the keys. `LIMIT` and `OFFSET` apply to the rows that
+remain, and window functions see every row. When the `ORDER BY` leaves a tie inside a group, jed
+keeps the first row by primary key, where PostgreSQL's choice is unspecified. Only the rows that are
+kept evaluate the select list.
 
 ## Window functions and named windows
 

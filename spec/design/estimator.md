@@ -415,6 +415,9 @@ the plan contract; the chosen plan still returns identical rows.
 - GROUP BY with `K` key expressions: `min(input_rows, sat_pow(default_distinct_values, K))`; an
   empty input yields zero groups.
 - DISTINCT over `K` projected expressions: the same group-count rule, capped by input rows.
+- DISTINCT ON with `K` dedup keys: the same group-count rule over the keys, capped by input rows.
+  When every key is a bare input column of a non-grouped query, the statistics rule for simple
+  DISTINCT applies to those columns (§11).
 - Sort and Window preserve input row count.
 - OFFSET `O`: `max(0, input_rows - O)`. LIMIT `L`: `min(input_rows, L)` after OFFSET. A non-literal
   LIMIT/OFFSET, if later admitted, uses the unchanged input estimate.
@@ -582,9 +585,11 @@ The following attribution rules close the remaining current-plan shapes:
 - a nested-loop join adds both input scans once and ON work over its saturated candidate pairs; an
   index-nested-loop repeats the selected inner access work by outer rows; a hash join adds its fixed
   build/probe work and ON recheck work over estimated bucket candidates;
-- `Aggregate`, `Window`, `Distinct`, `Sort`, and `Limit` transform rows in executor pipeline order;
+- `Aggregate`, `Window`, `Distinct`, `Sort`, and `Limit` transform rows in executor pipeline order
+  (a `DISTINCT ON` `Distinct` follows its `Sort`);
   unmetered bookkeeping adds no private unit. Projection work uses its real invocation population
-  (`Distinct` projects before dedup; an ordinary projection is after the final window), while
+  (`Distinct` projects before dedup; an ordinary projection, including a `DISTINCT ON` query's,
+  is after the final window), while
   `row_produced` uses final emitted rows;
 - a set-operation node owns the saturated sum of operand unit vectors. Its combine, trailing sort,
   and trailing limit are unmetered even when they change `est_rows`;

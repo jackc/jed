@@ -232,7 +232,7 @@ func valueNoOpWidening(leaf, want resolvedType) bool {
 func nonMatchingBody(q *queryPlan) bool {
 	switch {
 	case q.sel != nil:
-		return !q.sel.isAgg && !q.sel.distinct && !q.sel.hasWindow
+		return !q.sel.isAgg && !q.sel.distinct && q.sel.distinctOn == 0 && !q.sel.hasWindow
 	case q.setop != nil:
 		so := q.setop
 		return so.op == setOpUnion && so.all && nonMatchingBody(&so.lhs) && nonMatchingBody(&so.rhs)

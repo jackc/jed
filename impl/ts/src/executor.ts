@@ -795,6 +795,7 @@ export * from "./eval.ts";
 import {
   applyWindowStageSteps,
   checkAssign,
+  dedupSortedRuns,
   keyCmp,
   materializeOrderExprsSteps,
   sortRows,
@@ -1041,6 +1042,122 @@ type ViewSite = { depth: number; bodyDepth: number };
 // finishSelectSlots rebases a SELECT plan's placeholder slots once its specs are final, and enforces
 // the SELECT DISTINCT ORDER BY restriction (part of planSelectPushed; it runs on the assembled plan so
 // planSelectClauses's frame stays small — spec/design/cost.md §7.1).
+// SortKeyIdentity is what a sort key names, for matching DISTINCT ON keys against ORDER BY keys
+// (grammar.md §11.1): a column (input or outer, by its resolved identity) or a general expression
+// (an ordinal or output name at a computed item is that item's expression). An explicit key COLLATE
+// is part of the identity.
+type SortKeyIdentity =
+  | { kind: "column"; col: Resolved; collation: string | null }
+  | { kind: "expr"; expr: Expr; collation: string | null };
+
+function sortKeyIdentityEqual(a: SortKeyIdentity, b: SortKeyIdentity): boolean {
+  if (a.collation !== b.collation) return false;
+  if (a.kind === "expr" || b.kind === "expr") {
+    return a.kind === "expr" && b.kind === "expr" && exprEqual(a.expr, b.expr);
+  }
+  return (
+    a.col.level === b.col.level &&
+    a.col.index === b.col.index &&
+    a.col.layer?.rel === b.col.layer?.rel &&
+    a.col.layer?.col === b.col.layer?.col
+  );
+}
+
+// sortKeyIdentityOf classifies one key the way the ORDER BY resolution loop targets it, with clause
+// naming the clause in its ordinal and ambiguity errors (ORDER BY / DISTINCT ON, as PostgreSQL words
+// them).
+function sortKeyIdentityOf(
+  key: OrderKey,
+  items: SelectItems,
+  scope: Scope,
+  clause: string,
+): SortKeyIdentity {
+  const collation = key.collation;
+  const itemIdentity = (e: Expr): SortKeyIdentity => {
+    if (e.kind === "column") return { kind: "column", col: scope.resolveBare(e.name), collation };
+    if (e.kind === "qualifiedColumn")
+      return { kind: "column", col: scope.resolveQualified(e.qualifier, e.name), collation };
+    return { kind: "expr", expr: e, collation };
+  };
+  if (key.ordinal !== null) {
+    const ord = key.ordinal;
+    const ncols = items.kind === "all" ? scope.width() : items.items.length;
+    if (ord < 1 || ord > ncols) {
+      throw engineError(
+        "invalid_column_reference",
+        `${clause} position ${ord} is not in select list`,
+      ).withPosition(orderKeyLocation(key));
+    }
+    const pos = ord - 1;
+    if (items.kind === "all") return { kind: "column", col: { level: 0, index: pos }, collation };
+    return itemIdentity(items.items[pos]!.expr);
+  }
+  if (key.expr !== null) return { kind: "expr", expr: key.expr, collation };
+  if (key.qualifier !== null) {
+    return {
+      kind: "column",
+      col: scope.resolveQualifiedAt(key.qualifier, key.column, key.loc),
+      collation,
+    };
+  }
+  let matched: Expr | null;
+  try {
+    matched = orderAliasMatch(items, key.column, scope);
+  } catch (e) {
+    if (e instanceof EngineError && e.state === "ambiguous_column") {
+      throw engineError("ambiguous_column", `${clause} "${key.column}" is ambiguous`).withPosition(
+        orderKeyLocation(key),
+      );
+    }
+    throw e;
+  }
+  if (matched !== null) return itemIdentity(matched);
+  return { kind: "column", col: scope.resolveBareAt(key.column, key.loc), collation };
+}
+
+// distinctOnOrder returns the effective sort of a DISTINCT ON query and its dedup-key count
+// (grammar.md §11.1). The ORDER BY keys are checked left to right: a leading run that matches ON keys
+// forms the dedup key, and an ON key matched after a non-matching ORDER BY key, or matched by none
+// when one did not match, is 42P10. With every ORDER BY key matching, the unmatched ON keys are
+// appended (ascending, default NULL placement) once each, in ON-list order.
+function distinctOnOrder(
+  orderBy: OrderKey[],
+  on: OrderKey[],
+  items: SelectItems,
+  scope: Scope,
+): { order: OrderKey[]; prefix: number } {
+  const mismatch = (key: OrderKey): EngineError =>
+    engineError(
+      "invalid_column_reference",
+      "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+    ).withPosition(orderKeyLocation(key));
+  const onIds = on.map((key) => sortKeyIdentityOf(key, items, scope, "DISTINCT ON"));
+  const orderIds = orderBy.map((key) => sortKeyIdentityOf(key, items, scope, "ORDER BY"));
+  const matched = on.map(() => false);
+  let skipped = false;
+  let prefix = 0;
+  for (const oid of orderIds) {
+    let hit = -1;
+    onIds.forEach((id, j) => {
+      if (sortKeyIdentityEqual(id, oid)) {
+        matched[j] = true;
+        if (hit < 0) hit = j;
+      }
+    });
+    if (hit < 0) skipped = true;
+    else if (skipped) throw mismatch(on[hit]!);
+    else prefix++;
+  }
+  const order = orderBy.slice();
+  for (let j = 0; j < on.length; j++) {
+    if (matched[j] || onIds.slice(0, j).some((id) => sortKeyIdentityEqual(id, onIds[j]!))) continue;
+    if (skipped) throw mismatch(on[j]!);
+    order.push(on[j]!);
+    prefix++;
+  }
+  return { order, prefix };
+}
+
 function finishSelectSlots(plan: SelectPlan, sel: Select, scope: Scope): void {
   const { isAgg, hasWindow, groupKeys, aggSpecs, groupingSpecs, windowSpecs, windowKeys } = plan;
   const { projections, orderExprs, having, order } = plan;
@@ -1114,7 +1231,7 @@ function finishSelectSlots(plan: SelectPlan, sel: Select, scope: Scope): void {
   // an ordinal (which names a select-list item by position), or a general expression that STRUCTURALLY
   // matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases are invisible to ORDER
   // BY (§8); a SELECT DISTINCT * projects every column, so the restriction never bites.
-  if (sel.distinct && sel.orderBy.length > 0 && items.kind === "list") {
+  if (sel.distinct && sel.distinctOn.length === 0 && sel.orderBy.length > 0 && items.kind === "list") {
     const projected = new Set<number>();
     for (const it of items.items) {
       if (it.expr.kind === "column") {
@@ -5691,6 +5808,7 @@ export class Engine {
     if (
       sp.limit !== null &&
       !sp.distinct &&
+      sp.distinctOn === 0 &&
       (streamingScanEligible(sp) || sp.phys.indexOrder !== null || this.windowTopNEligible(sp))
     ) {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
@@ -5835,6 +5953,28 @@ export class Engine {
       plan = wrapEstimatedPlan(plan, plan.root.rows, plan.root.logicalRows, local);
       this.addExpressionListSubqueries(plan.root, sp.orderExprs, plan.root.rows, ctx);
       plan.nodes[0] = plan.root;
+    }
+    // DISTINCT ON dedups the sorted rows by its leading sort keys (estimator.md §7): the group count
+    // over those keys, with column statistics when every key is a bare input column of an ungrouped
+    // query.
+    if (sp.distinctOn > 0) {
+      const keys = sp.order.slice(0, sp.distinctOn);
+      const inputWidth = sp.rels.reduce((w, r) => w + r.colCount, 0);
+      const input = plan.root.rows;
+      const simple = !sp.isAgg && keys.every((k) => k.idx < inputWidth);
+      const rows =
+        (simple
+          ? this.estimateSimpleDistinctRows(
+              sp,
+              keys.map((k) => k.idx),
+              input,
+            )
+          : null) ??
+        (() => {
+          const maxRows = this.estimatePow(DEFAULT_DISTINCT_VALUES, keys.length);
+          return input > maxRows ? maxRows : input;
+        })();
+      plan = wrapEstimatedPlan(plan, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
     }
     if (sp.limit !== null || sp.offset !== null) {
       const rows = this.estimateWindowRows(plan.root.rows, sp.limit, sp.offset);
@@ -6848,6 +6988,11 @@ export class Engine {
     let d = depth;
     if (sp.limit !== null || sp.offset !== null) {
       r.emit(d, "Limit", limitDetail(sp.limit, sp.offset));
+      d++;
+    }
+    // A DISTINCT ON dedups after its sort, so its Distinct renders above the Sort (explain.md §4).
+    if (sp.distinctOn > 0) {
+      r.emit(d, "Distinct", `on=${sp.distinctOn}`);
       d++;
     }
     let orderNote = "";
@@ -21295,7 +21440,10 @@ export class Engine {
     // (the window stage runs over the grouped rows — §2); a plain window query is only windowing.
     // A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10): either
     // sets up the window machinery so the key can be sorted by the computed window value.
-    const hasWindowSyntax = itemsHaveWindow(sel.items) || orderByHasWindow(sel.orderBy);
+    const hasWindowSyntax =
+      itemsHaveWindow(sel.items) ||
+      orderByHasWindow(sel.orderBy) ||
+      orderByHasWindow(sel.distinctOn);
     // Window results land AFTER the materialized window keys, and (for a grouped query) after every
     // aggregate — neither final count is known until resolution finishes (an aggregate may be nested
     // in a later window argument or HAVING). So a window result carries the PLACEHOLDER base
@@ -21335,7 +21483,14 @@ export class Engine {
           if (key.expr !== null) desugarNamedWindows(key.expr, windowsResolved);
         }
       }
-      sel = { ...sel, items: itemsRef, orderBy };
+      let distinctOn = sel.distinctOn;
+      if (orderByHasWindow(sel.distinctOn)) {
+        distinctOn = cloneAst(sel.distinctOn);
+        for (const key of distinctOn) {
+          if (key.expr !== null) desugarNamedWindows(key.expr, windowsResolved);
+        }
+      }
+      sel = { ...sel, items: itemsRef, orderBy, distinctOn };
     }
     const {
       nodes: projections,
@@ -21378,7 +21533,10 @@ export class Engine {
     // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality operator
     // (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
     // 42883. jsonb IS distinguishable (its btree equality, §5).
-    const jsonCol = sel.distinct ? columnTypes.findIndex((t) => t.kind === "json") : -1;
+    const jsonCol =
+      sel.distinct && sel.distinctOn.length === 0
+        ? columnTypes.findIndex((t) => t.kind === "json")
+        : -1;
     if (jsonCol >= 0) {
       // Reported at that select item (error-fields.md §10.2), when the list has no `*` expansion to
       // shift the columns.
@@ -21401,7 +21559,7 @@ export class Engine {
     }
     // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
     // (spec/design/collation.md §1 "A sort or grouping target").
-    if (sel.distinct) {
+    if (sel.distinct && sel.distinctOn.length === 0) {
       for (const d of columnDerivs) rejectIndeterminateTarget(d);
     }
     // HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
@@ -21469,7 +21627,18 @@ export class Engine {
     // collected into orderExprs, and given a placeholder sort slot ORDER_EXPR_BASE+k rebased to
     // finalWidth+k below — the window-key precedent (window.md §5.1).
     const items = sel.items;
-    const ordered = this.planSelectOrder(sel, scope, ptypes, {
+    // DISTINCT ON (grammar.md §11.1): match its keys against the ORDER BY, giving the effective sort
+    // (the ORDER BY plus any appended ON keys) and the dedup-key count. The appended keys resolve in
+    // planSelectOrder like any other key.
+    let distinctOn = 0;
+    let orderSel = sel;
+    if (sel.distinctOn.length > 0) {
+      const effective = distinctOnOrder(sel.orderBy, sel.distinctOn, items, scope);
+      distinctOn = effective.prefix;
+      orderSel = { ...sel, orderBy: effective.order };
+    }
+    const ordered = this.planSelectOrder(orderSel, scope, ptypes, {
+      writtenOrderLen: sel.orderBy.length,
       isAgg,
       hasWindowSyntax,
       groupKeys,
@@ -21533,7 +21702,8 @@ export class Engine {
       columnTypes,
       columnDerivs,
       columnTypmods,
-      distinct: sel.distinct,
+      distinct: sel.distinct && distinctOn === 0,
+      distinctOn,
       limit: sel.limit,
       offset: sel.offset,
       group,
@@ -21587,6 +21757,7 @@ export class Engine {
     scope: Scope,
     ptypes: ParamTypes,
     ctx: {
+      writtenOrderLen: number;
       isAgg: boolean;
       hasWindowSyntax: boolean;
       groupKeys: number[];
@@ -21602,7 +21773,7 @@ export class Engine {
     const order: OrderSlot[] = [];
     const orderExprs: RExpr[] = [];
     const items = sel.items;
-    for (const key of sel.orderBy) {
+    for (const [keyIndex, key] of sel.orderBy.entries()) {
       // A key with no ordering operator is reported where it was written (error-fields.md §10.2).
       try {
         // Classify the key into a row slot (a column / ordinal-to-column) or a source expression (a
@@ -21785,6 +21956,19 @@ export class Engine {
           e.state === "undefined_function" &&
           e.message.startsWith("42883: could not identify")
         ) {
+          // An appended DISTINCT ON key has no ORDER BY spelling: PostgreSQL reports its missing
+          // operator as the grouping's equality operator (grammar.md §11.1).
+          if (
+            keyIndex >= ctx.writtenOrderLen &&
+            e.message === "42883: could not identify an ordering operator for type json"
+          ) {
+            throw engineError(
+              "undefined_function",
+              "could not identify an equality operator for type json",
+            )
+              .noHint()
+              .withPosition(orderKeyLocation(key));
+          }
           e.withPosition(orderKeyLocation(key));
         }
         throw e;
@@ -26049,7 +26233,13 @@ export class Engine {
     }
     // No blocking / re-shaping operator beyond the fold. LIMIT/OFFSET is honored via the window bounds
     // below, so it need not bail.
-    if (plan.distinct || plan.having !== null || plan.hasWindow || plan.order.length !== 0)
+    if (
+      plan.distinct ||
+      plan.distinctOn > 0 ||
+      plan.having !== null ||
+      plan.hasWindow ||
+      plan.order.length !== 0
+    )
       return false;
     if (plan.aggSpecs.length === 0) return false;
     return plan.aggSpecs.every((s) => vectorizedSpecEligible(s));
@@ -26544,12 +26734,16 @@ export class Engine {
   private boundedBlockingEligible(plan: SelectPlan): boolean {
     if (this.spillSink?.createScratch === undefined || this.session.workMem <= 0) return false;
     if (streamingScanEligible(plan)) return false;
-    if (plan.rels.length <= 1 && !plan.isAgg && !plan.distinct) return false;
+    if (plan.rels.length <= 1 && !plan.isAgg && !plan.distinct && plan.distinctOn === 0) return false;
     // A join takes the bounded lane only when it owns join state (a hash table or physical join
     // steps); a plain nested loop stays on the eager path — the lane choice every core mirrors, so a
     // query-memory threshold never depends on the core (memory.md §5.4).
     return (
-      plan.isAgg || plan.distinct || plan.phys.hashJoin !== null || plan.phys.joinSteps.length > 0
+      plan.isAgg ||
+      plan.distinct ||
+      plan.distinctOn > 0 ||
+      plan.phys.hashJoin !== null ||
+      plan.phys.joinSteps.length > 0
     );
   }
 
@@ -27234,6 +27428,29 @@ export class Engine {
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
       }
+      if (plan.distinctOn > 0) {
+        // DISTINCT ON (grammar.md §11.1): the sorted spool keeps the first row of each run of equal
+        // dedup keys. Only the previous survivor's key values are held.
+        const keys = plan.order.slice(0, plan.distinctOn);
+        const kept = spool();
+        let prev: Value[] | null = null;
+        for (const row of rows) {
+          if (shouldCooperate()) yield COOPERATE;
+          if (
+            prev !== null &&
+            keys.every(
+              (k, i) => keyCmp(prev![i]!, row[k.idx]!, k.descending, k.nullsFirst) === 0,
+            )
+          )
+            continue;
+          prev = keys.map((k) => row[k.idx]!);
+          kept.push(row);
+        }
+        rows.close();
+        rows = kept;
+        if (selectActualRootNode(plan) !== "Distinct")
+          this.recordExplainActualParent("Distinct", meter.accrued);
+      }
       if (plan.distinct) {
         const seen = map();
         const unique = spool();
@@ -27436,6 +27653,7 @@ export class Engine {
       !plan.isAgg &&
       !plan.hasWindow &&
       !plan.distinct &&
+      plan.distinctOn === 0 &&
       !needsEagerScan(plan.phys.relBounds[0]) &&
       // A set-returning relation takes the eager path (functions.md §10).
       plan.rels[0]!.srf === undefined &&
@@ -27822,6 +28040,15 @@ export class Engine {
       }
       if (selectActualRootNode(plan) !== "Sort")
         this.recordExplainActualParent("Sort", meter.accrued);
+      if (plan.distinctOn > 0) {
+        // DISTINCT ON (grammar.md §11.1): keep the first row of each key run; only the survivors are
+        // windowed and projected below.
+        rows = dedupSortedRuns(rows, plan.order.slice(0, plan.distinctOn), (row) =>
+          meter.releaseRowMasked(row, memMask),
+        );
+        if (selectActualRootNode(plan) !== "Distinct")
+          this.recordExplainActualParent("Distinct", meter.accrued);
+      }
     }
 
     // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the bigint domain
@@ -28087,6 +28314,14 @@ export class Engine {
         meter.costFirst(() => sortRows(groupRows, plan.order, meter.query));
         if (selectActualRootNode(plan) !== "Sort")
           this.recordExplainActualParent("Sort", meter.accrued);
+        if (plan.distinctOn > 0) {
+          // DISTINCT ON over the sorted group rows (grammar.md §11.1).
+          groupRows = dedupSortedRuns(groupRows, plan.order.slice(0, plan.distinctOn), (row) =>
+            meter.releaseRow(row),
+          );
+          if (selectActualRootNode(plan) !== "Distinct")
+            this.recordExplainActualParent("Distinct", meter.accrued);
+        }
       }
       if (plan.distinct) {
         // SELECT DISTINCT: project EVERY grouped row (charging its projection operatorEvals, the §3
@@ -40027,6 +40262,10 @@ export type SelectPlan = {
   // columnTypmods is each output column's typmod (create-table-as.md §2), carried the same way.
   columnTypmods: Typmod[];
   distinct: boolean;
+  // distinctOn is the number of leading order keys that form a DISTINCT ON dedup key (0 = none). The
+  // sorted rows keep the first of each run of equal keys, before LIMIT/OFFSET and projection
+  // (spec/design/grammar.md §11.1). distinct is false when this is set.
+  distinctOn: number;
   limit: bigint | null;
   offset: bigint | null;
   // relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
@@ -40063,6 +40302,7 @@ function pushedFilterDetail(sp: SelectPlan, i: number, detail: string, verbose: 
 
 function selectActualRootNode(sp: SelectPlan): string {
   if (sp.limit !== null || sp.offset !== null) return "Limit";
+  if (sp.distinctOn > 0) return "Distinct";
   if (
     sp.order.length > 0 &&
     !sp.phys.pkOrdered &&

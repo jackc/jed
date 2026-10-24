@@ -448,14 +448,14 @@ fn body_pushable(rel: &PlanRel) -> Option<&QueryPlan> {
     query_body_pushable(body).then_some(body)
 }
 
-/// The structural half of body-pushability (planner.md §3.2): a SELECT with no LIMIT or OFFSET that
-/// is either ungrouped or grouped by exactly one grouping set with at least one key (window
+/// The structural half of body-pushability (planner.md §3.2): a SELECT with no LIMIT, OFFSET, or
+/// DISTINCT ON (whose kept row a filter could change — grammar.md §11.1) that is either ungrouped or grouped by exactly one grouping set with at least one key (window
 /// functions admitted — [`body_input_column`] then requires every window to partition by the
 /// column); or a set operation without LIMIT/OFFSET whose two arms are body-pushable.
 fn query_body_pushable(q: &QueryPlan) -> bool {
     match q {
         QueryPlan::Select(b) => {
-            if b.limit.is_some() || b.offset.is_some() {
+            if b.limit.is_some() || b.offset.is_some() || b.distinct_on > 0 {
                 return false;
             }
             !b.is_agg || (b.group_sets.len() == 1 && !b.group_keys.is_empty())

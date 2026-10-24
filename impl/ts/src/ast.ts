@@ -1283,6 +1283,11 @@ export type Select = {
   // SELECT DISTINCT — deduplicate the projected output rows (NULL-safe), applied after
   // ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
   distinct: boolean;
+  // SELECT DISTINCT ON (k, …) — the ON keys, each classified like an ORDER BY key (ordinal, column,
+  // or expression; ascending, default NULL placement). Non-empty only with `distinct` set. The
+  // planner matches them against the ORDER BY and dedups the sorted rows by them
+  // (spec/design/grammar.md §11.1).
+  distinctOn: OrderKey[];
   items: SelectItems;
   // The first table reference of the FROM clause, or null for a FROM-less SELECT — the
   // select list evaluates over one virtual zero-column row (spec/design/grammar.md §34).

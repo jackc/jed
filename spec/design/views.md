@@ -833,7 +833,7 @@ in §12.
 A view is **updatable** when its stored body (§3) is a single `SELECT`, not a set operation, with:
 
 - no `WITH` clause;
-- no `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, or `OFFSET`;
+- no `DISTINCT` or `DISTINCT ON`, `GROUP BY`, `HAVING`, `LIMIT`, or `OFFSET`;
 - no aggregate or window function at the `SELECT`'s own level (one inside a subquery does not
   count), and no set-returning function in its select list;
 - exactly one `FROM` item, and that item is a table or a view, with or without an alias and a column

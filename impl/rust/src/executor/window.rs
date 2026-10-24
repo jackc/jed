@@ -971,6 +971,28 @@ pub(crate) fn apply_window_stage(
 
 /// Compare two rows by the (all-`C`) ORDER BY keys — the first non-equal key decides; a full tie is
 /// Equal (the stable sort then keeps input order). Only used when no key is collated.
+/// `DISTINCT ON` (spec/design/grammar.md §11.1): keep the first row of each run of sorted rows whose
+/// leading dedup `keys` compare equal — NULL-safe sort equality; every jed collation is deterministic,
+/// so collation-equal text is identical text and the value comparator decides. Unmetered, like the
+/// sort it follows. `dropped` sees each discarded row, so its query-memory charge can be released.
+pub(crate) fn dedup_sorted_runs(
+    rows: Vec<Row>,
+    keys: &[crate::spill::SortKey],
+    mut dropped: impl FnMut(&Row),
+) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(prev) = out.last()
+            && cmp_rows_by_order(prev, &row, keys) == std::cmp::Ordering::Equal
+        {
+            dropped(&row);
+            continue;
+        }
+        out.push(row);
+    }
+    out
+}
+
 pub(crate) fn cmp_rows_by_order(
     a: &Row,
     b: &Row,

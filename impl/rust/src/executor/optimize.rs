@@ -76,6 +76,24 @@ impl Engine {
     /// (and the attachment flag) the owned plan deliberately drops (`PlanRel` carries only names,
     /// so the plan outlives the scope).
     pub(crate) fn optimize_select(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+        // A DISTINCT ON plan always sorts and then dedups, so no rule may elide its sort or stop
+        // its input early: it is optimized as the unordered, unlimited query (planner.md §4).
+        if plan.distinct_on > 0 {
+            let order = std::mem::take(&mut plan.order);
+            let limit = plan.limit.take();
+            let offset = plan.offset.take();
+            let distinct_on = std::mem::take(&mut plan.distinct_on);
+            self.optimize_select_rules(plan, scope);
+            plan.order = order;
+            plan.limit = limit;
+            plan.offset = offset;
+            plan.distinct_on = distinct_on;
+            return;
+        }
+        self.optimize_select_rules(plan, scope);
+    }
+
+    fn optimize_select_rules(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
         self.rule_scan_bounds(plan, scope);
         self.rule_index_nested_loop(plan, scope);
         self.rule_hash_join(plan, scope);

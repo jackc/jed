@@ -1224,6 +1224,16 @@ order). `query/distinct.test`'s composite-PK section pins the streaming top-N (a
 `DESC` variant). A `DISTINCT` whose `ORDER BY` the scan does *not* satisfy — or a no-`ORDER-BY`
 `DISTINCT` — keeps the eager project-all-then-dedup path.
 
+### `SELECT DISTINCT ON` — dedup over the sorted rows, no asymmetry
+
+`DISTINCT ON` ([grammar.md](grammar.md) §11.1) dedups by its `ON` keys, which are sort keys, so
+it needs no projection to decide a duplicate. Its charges are the plain `ORDER BY` query's. An
+expression key is materialized once per sorted row and charges its `operator_eval`s. The sort and
+the dedup compare are unmetered. Projection `operator_eval` and `row_produced` are charged only for
+emitted rows, after `LIMIT`/`OFFSET`. A `DISTINCT ON` query never takes the streaming scan, the
+`ORDER BY` top-k, or a `LIMIT` early-out, so every filtered row is still scanned
+(`storage_row_read`) whatever the `LIMIT`.
+
 ### JOIN — nested-loop and deterministic hash contracts
 
 A multi-table `SELECT` ([grammar.md](grammar.md) §15) is logically left-deep. Nested loop is the

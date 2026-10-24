@@ -1199,8 +1199,9 @@ impl Engine {
             // window stage runs over the grouped rows — §2); a plain window query uses `Window`.
             // A window function may appear in the SELECT list OR in an ORDER BY key (grammar.md §10):
             // either sets up the window machinery so the key can be sorted by the computed window value.
-            let has_window_syntax =
-                items_have_window(&sel.items) || order_by_has_window(&sel.order_by);
+            let has_window_syntax = items_have_window(&sel.items)
+                || order_by_has_window(&sel.order_by)
+                || order_by_has_window(&sel.distinct_on);
             let mut agg_ctx = outline(|| -> Result<_> {
                 Ok(if is_agg && has_window_syntax {
                     AggCtx::GroupedWindow {
@@ -1266,6 +1267,20 @@ impl Engine {
                     &desugared_order
                 } else {
                     &sel.order_by
+                };
+            let desugared_on;
+            let distinct_on_ref: &[OrderKey] =
+                if has_window_syntax && order_by_has_window(&sel.distinct_on) {
+                    let mut on = sel.distinct_on.clone();
+                    for key in on.iter_mut() {
+                        if let Some(e) = key.expr.as_mut() {
+                            desugar_named_windows(e, windows_ref)?;
+                        }
+                    }
+                    desugared_on = on;
+                    &desugared_on
+                } else {
+                    &sel.distinct_on
                 };
             let (
                 mut projections,
@@ -1348,6 +1363,7 @@ impl Engine {
             // operator (PG ships no opclass — spec/design/json.md §5), so a json output column under
             // DISTINCT is 42883. jsonb IS distinguishable (its btree equality, §5).
             if sel.distinct
+                && sel.distinct_on.is_empty()
                 && let Some(i) = column_types
                     .iter()
                     .position(|t| matches!(t, ResolvedType::Json))
@@ -1356,7 +1372,7 @@ impl Engine {
             }
             // Each DISTINCT output column is a grouping target: an indeterminate one is 42P21
             // (spec/design/collation.md §1 "A sort or grouping target").
-            if sel.distinct {
+            if sel.distinct && sel.distinct_on.is_empty() {
                 for d in &column_derivs {
                     reject_indeterminate_target(d)?;
                 }
@@ -1462,9 +1478,24 @@ impl Engine {
             // aggregate in a grouped query if it names one), collected into `order_exprs`, and given a
             // placeholder sort slot `ORDER_EXPR_BASE + k` rebased to `final_width + k` below — the
             // window-key precedent (window.md §5.1). The sort then runs over the appended values.
+            // DISTINCT ON (grammar.md §11.1): match its keys against the ORDER BY, giving the effective
+            // sort (the ORDER BY plus any appended ON keys) and the dedup-key count. The appended keys
+            // resolve in the loop below like any other key.
+            let written_order_len = order_by_ref.len();
+            let distinct_on_effective;
+            let mut distinct_on = 0usize;
+            let order_by_ref: &[OrderKey] = if distinct_on_ref.is_empty() {
+                order_by_ref
+            } else {
+                let (effective, n) =
+                    distinct_on_order(order_by_ref, distinct_on_ref, items_ref, &scope)?;
+                distinct_on = n;
+                distinct_on_effective = effective;
+                &distinct_on_effective
+            };
             let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(order_by_ref.len());
             let mut order_exprs: Vec<RExpr> = Vec::new();
-            for key in order_by_ref {
+            for (key_index, key) in order_by_ref.iter().enumerate() {
                 // A key with no ordering operator is reported where it was written (error-fields.md
                 // §10.2).
                 outline(|| -> Result<()> {
@@ -1727,7 +1758,24 @@ impl Engine {
                     }
                     Ok(())
                 })
-                .map_err(|e| at_order_key(e, key))?;
+                .map_err(|e| at_order_key(e, key))
+                .map_err(|e| {
+                    // An appended DISTINCT ON key has no ORDER BY spelling: PostgreSQL reports its
+                    // missing operator as the grouping's equality operator (grammar.md §11.1).
+                    if key_index >= written_order_len
+                        && e.state == SqlState::UndefinedFunction
+                        && e.message == "could not identify an ordering operator for type json"
+                    {
+                        EngineError::new(
+                            SqlState::UndefinedFunction,
+                            "could not identify an equality operator for type json",
+                        )
+                        .no_hint()
+                        .with_position(key.location().0)
+                    } else {
+                        e
+                    }
+                })?;
             }
             // All specs are now final (an ORDER BY key may have introduced a window function / aggregate /
             // GROUPING()). Recompute `has_window` and rebase every placeholder — in the projections, HAVING,
@@ -1818,7 +1866,7 @@ impl Engine {
             // that STRUCTURALLY matches a select-list item. Otherwise 42P10 (matching PostgreSQL). Aliases
             // are invisible to ORDER BY (§8), so an aliased bare column still counts as projecting it. A
             // `SELECT DISTINCT *` projects every column, so the restriction never bites.
-            if sel.distinct && !sel.order_by.is_empty() {
+            if sel.distinct && sel.distinct_on.is_empty() && !sel.order_by.is_empty() {
                 if let SelectItems::Items(items) = items_ref {
                     let mut projected: HashSet<usize> = HashSet::new();
                     for it in items {
@@ -1953,7 +2001,8 @@ impl Engine {
                     column_types,
                     column_derivs,
                     column_typmods,
-                    distinct: sel.distinct,
+                    distinct: sel.distinct && distinct_on == 0,
+                    distinct_on,
                     limit: sel.limit,
                     offset: sel.offset,
                     rel_masks: Vec::new(),
@@ -2616,4 +2665,144 @@ fn at_order_key(e: EngineError, key: &OrderKey) -> EngineError {
     } else {
         e
     }
+}
+
+/// What a sort key names, for matching `DISTINCT ON` keys against `ORDER BY` keys (grammar.md
+/// §11.1): a column (input or outer, by its resolved identity) or a general expression (an ordinal
+/// or output name at a computed item is that item's expression). An explicit key `COLLATE` is part
+/// of the identity.
+#[derive(PartialEq)]
+enum SortKeyIdentity<'a> {
+    Column((u8, usize, usize, usize), Option<&'a str>),
+    Expr(&'a Expr, Option<&'a str>),
+}
+
+/// Classify one key the way the ORDER BY resolution loop targets it, with `clause` naming the
+/// clause in its ordinal and ambiguity errors (`ORDER BY` / `DISTINCT ON`, as PostgreSQL words them).
+fn sort_key_identity<'a>(
+    key: &'a OrderKey,
+    items: &'a SelectItems,
+    scope: &Scope,
+    clause: &str,
+) -> Result<SortKeyIdentity<'a>> {
+    let id = |r: Resolved| match r {
+        Resolved::Local(i) => (0, i, 0, 0),
+        Resolved::Outer { level, index } => (1, level, index, 0),
+        Resolved::Layer { level, rel, col } => (2, level, rel, col),
+    };
+    let coll = key.collation.as_deref();
+    let item_identity = |e: &'a Expr| -> Result<SortKeyIdentity<'a>> {
+        Ok(match e {
+            Expr::Column(name, _) => SortKeyIdentity::Column(id(scope.resolve_bare(name)?), coll),
+            Expr::QualifiedColumn {
+                qualifier, name, ..
+            } => SortKeyIdentity::Column(id(scope.resolve_qualified(qualifier, name)?), coll),
+            e => SortKeyIdentity::Expr(e, coll),
+        })
+    };
+    if let Some(ord) = key.ordinal {
+        let ncols = match items {
+            SelectItems::All(_) => scope.width() as i64,
+            SelectItems::Items(its) => its.len() as i64,
+        };
+        if ord < 1 || ord > ncols {
+            return Err(EngineError::new(
+                SqlState::InvalidColumnReference,
+                format!("{clause} position {ord} is not in select list"),
+            )
+            .with_position(key.location().0));
+        }
+        let pos = (ord - 1) as usize;
+        return match items {
+            SelectItems::All(_) => Ok(SortKeyIdentity::Column(id(Resolved::Local(pos)), coll)),
+            SelectItems::Items(its) => item_identity(&its[pos].expr),
+        };
+    }
+    if let Some(e) = &key.expr {
+        return Ok(SortKeyIdentity::Expr(e, coll));
+    }
+    if let Some(q) = &key.qualifier {
+        return Ok(SortKeyIdentity::Column(
+            id(scope.resolve_qualified_at(q, &key.column, key.pos)?),
+            coll,
+        ));
+    }
+    let alias = order_alias_match(items, &key.column, scope).map_err(|e| {
+        if e.state == SqlState::AmbiguousColumn {
+            EngineError::new(
+                SqlState::AmbiguousColumn,
+                format!("{clause} \"{}\" is ambiguous", key.column),
+            )
+            .with_position(key.location().0)
+        } else {
+            e
+        }
+    })?;
+    match alias {
+        Some(e) => item_identity(e),
+        None => Ok(SortKeyIdentity::Column(
+            id(scope.resolve_bare_at(&key.column, key.pos)?),
+            coll,
+        )),
+    }
+}
+
+/// The effective sort of a `DISTINCT ON` query and its dedup-key count (grammar.md §11.1). The
+/// ORDER BY keys are checked left to right: a leading run that matches ON keys forms the dedup key,
+/// and an ON key matched after a non-matching ORDER BY key, or matched by none when one did not
+/// match, is 42P10. With every ORDER BY key matching, the unmatched ON keys are appended (ascending,
+/// default NULL placement) once each, in ON-list order.
+pub(crate) fn distinct_on_order(
+    order_by: &[OrderKey],
+    on: &[OrderKey],
+    items: &SelectItems,
+    scope: &Scope,
+) -> Result<(Vec<OrderKey>, usize)> {
+    let mismatch = |key: &OrderKey| {
+        EngineError::new(
+            SqlState::InvalidColumnReference,
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+        )
+        .with_position(key.location().0)
+    };
+    let mut on_ids = Vec::with_capacity(on.len());
+    for key in on {
+        on_ids.push(sort_key_identity(key, items, scope, "DISTINCT ON")?);
+    }
+    let mut order_ids = Vec::with_capacity(order_by.len());
+    for key in order_by {
+        order_ids.push(sort_key_identity(key, items, scope, "ORDER BY")?);
+    }
+    let mut matched = vec![false; on.len()];
+    let mut skipped = false;
+    let mut prefix = 0;
+    for oid in &order_ids {
+        let mut hit = false;
+        for (j, id) in on_ids.iter().enumerate() {
+            if id == oid {
+                matched[j] = true;
+                hit = true;
+            }
+        }
+        if !hit {
+            skipped = true;
+        } else if skipped {
+            let j = on_ids.iter().position(|id| id == oid).unwrap();
+            return Err(mismatch(&on[j]));
+        } else {
+            prefix += 1;
+        }
+    }
+    let mut effective = order_by.to_vec();
+    for j in 0..on.len() {
+        if matched[j] || on_ids[..j].iter().any(|id| *id == on_ids[j]) {
+            continue;
+        }
+        if skipped {
+            return Err(mismatch(&on[j]));
+        }
+        effective.push(on[j].clone());
+        prefix += 1;
+    }
+    Ok((effective, prefix))
 }

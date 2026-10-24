@@ -48,9 +48,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ general non-integer DEFAULT values (no consumer yet — built-ins use overloads or `make_interval`-style 0-defaults); user-defined-function defaults (jed has no UDFs).
 - [x] **Named windows.** → [window.md](spec/design/window.md)
   - [ ] _follow-on:_ PostgreSQL's prefix-compatible sort sharing between window definitions (window.md §11).
-- [ ] **Revisit `DISTINCT ON`** — recorded out of scope in [grammar.md §11](spec/design/grammar.md), but
-  it is one of PostgreSQL's most-used extensions; decide whether to implement it or keep the
-  non-goal. _(size: M if implemented)_
+- [x] **`DISTINCT ON`** — the kept row is the first under the fully determined `ORDER BY`. → [grammar.md §11.1](spec/design/grammar.md)
+  - [ ] _follow-on:_ streaming dedup over a scan that already satisfies the order, so `LIMIT` stops the scan early (planner.md §4).
+  - [ ] _follow-on:_ push WHERE conjuncts that read only `ON` keys into a `DISTINCT ON` body (planner.md §3).
 - [ ] **Decide: SQL-language triggers and functions** — SQLite-style triggers whose bodies are plain
   SQL statements, and `CREATE FUNCTION … LANGUAGE sql`. Both stay pure, so neither conflicts with
   CLAUDE.md §13. Record each as a scheduled item or an explicit non-goal. _(size: decision; L each if built)_

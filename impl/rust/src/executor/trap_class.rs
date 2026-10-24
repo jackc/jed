@@ -200,7 +200,7 @@ fn value_noop_widening(leaf: &ResolvedType, want: &ResolvedType) -> bool {
 /// such a body.
 pub(crate) fn non_matching_body(q: &QueryPlan) -> bool {
     match q {
-        QueryPlan::Select(b) => !b.is_agg && !b.distinct && !b.has_window,
+        QueryPlan::Select(b) => !b.is_agg && !b.distinct && b.distinct_on == 0 && !b.has_window,
         QueryPlan::SetOp(so) => {
             so.op == SetOpKind::Union
                 && so.all

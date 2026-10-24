@@ -1194,7 +1194,12 @@ type selectStmt struct {
 	// Distinct is SELECT DISTINCT — deduplicate the projected output rows (NULL-safe),
 	// applied after ORDER BY and before LIMIT/OFFSET (spec/design/grammar.md §11).
 	Distinct bool
-	Items    selectItems
+	// DistinctOn holds the SELECT DISTINCT ON (k, …) keys, each classified like an ORDER BY key
+	// (ordinal, column, or expression; ascending, default NULL placement). Non-empty only with
+	// Distinct set. The planner matches them against the ORDER BY and dedups the sorted rows by
+	// them (spec/design/grammar.md §11.1).
+	DistinctOn []orderKey
+	Items      selectItems
 	// From is the first table reference of the FROM clause, or nil for a FROM-less SELECT —
 	// the select list evaluates over one virtual zero-column row (spec/design/grammar.md §34).
 	From *tableRef

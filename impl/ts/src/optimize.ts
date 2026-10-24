@@ -59,6 +59,30 @@ export function optimizeSelect(
   snap: Snapshot,
   eng: Engine,
 ): void {
+  // A DISTINCT ON plan always sorts and then dedups, so no rule may elide its sort or stop its input
+  // early: it is optimized as the unordered, unlimited query (planner.md §4).
+  if (plan.distinctOn > 0) {
+    const { order, limit, offset, distinctOn } = plan;
+    plan.order = [];
+    plan.limit = null;
+    plan.offset = null;
+    plan.distinctOn = 0;
+    optimizeSelectRules(plan, rels, snap, eng);
+    plan.order = order;
+    plan.limit = limit;
+    plan.offset = offset;
+    plan.distinctOn = distinctOn;
+    return;
+  }
+  optimizeSelectRules(plan, rels, snap, eng);
+}
+
+function optimizeSelectRules(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  snap: Snapshot,
+  eng: Engine,
+): void {
   ruleScanBounds(plan, rels, snap, eng);
   ruleIndexNestedLoop(plan, rels, snap, eng);
   ruleHashJoin(plan, rels);

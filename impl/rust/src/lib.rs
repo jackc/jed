@@ -615,6 +615,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.offset",
     // SELECT DISTINCT: deduplicate projected output rows, NULL-safe (grammar.md §11).
     "query.distinct",
+    "query.distinct_on",
     // FROM-less SELECT: one virtual zero-column row, no scan cost (grammar.md §34).
     "query.select_no_from",
     // Set-returning functions in FROM: generate_series, a computed row source, including

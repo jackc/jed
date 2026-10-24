@@ -277,7 +277,9 @@ gives the same answer for every row in one **equality class** (equal values comp
 admitted comparison, NULLs are one class to IS [NOT] NULL / IS [NOT] DISTINCT FROM, and every jed
 collation is deterministic):
 
-- `DISTINCT` keeps or drops whole classes, so filtering before or after deduplication agrees;
+- `DISTINCT` keeps or drops whole classes, so filtering before or after deduplication agrees.
+  `DISTINCT ON` does not: it keeps one row of each key class, so filtering first can change which
+  row survives. A body with `DISTINCT ON` admits no pushdown (grammar.md §11.1);
   `ORDER BY` (without `LIMIT`) reorders only.
 - A grouped body's groups are classes of its grouping keys, so a conjunct over grouping columns keeps
   or drops **whole groups** before they are aggregated; `HAVING` then judges the surviving groups as
@@ -599,7 +601,7 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 | 5 | **single-relation pipeline choice / ORDER BY via secondary-index order** | one base relation: compose every access candidate with its natural PK/index order (an ordered index's declared ASC/DESC + NULL placement, indexes.md §11), add every eligible order-only B-tree walk when LIMIT is present, and minimize cumulative scheduled cost through LIMIT/OFFSET; exact index-order shape/type gates remain | `relBounds[0]`, `pkOrdered`, `pkReverse`, `indexOrder` | estimator.md §9.1; cost.md §3 "ORDER BY satisfied by secondary-index order" |
 | 6 | **bounded costed join search** | maximal hard-fenced base INNER/CROSS islands: exhaustive Pareto-frontier left-deep DP through 8 movable relations, deterministic cheapest-next above it; ordinary access, physically-dependent INL, and safe ON-equijoin hash are chosen per step | `relationOrder`, `joinSteps`, `relBounds`, `relINLBounds` | estimator.md §9.2/§10; cost.md §3 "JOIN" |
 | 7 | **join sort-elision** | a selected fence-free left-deep INNER/CROSS tree, a LIMIT, forward driver-PK ORDER BY with no key beyond that PK, no eager non-PK bound on the driver; the materialized left subtree feeds a streaming final join step | `joinPkOrdered` | estimator.md §10.4; cost.md §3 "JOIN" (the join top-N) |
-| 8 | **blocking ORDER BY top-k** | rules 4–7 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
+| 8 | **blocking ORDER BY top-k** | rules 4–7 did not elide the sort; plain SELECT (no DISTINCT or DISTINCT ON, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
 
 Data-flow dependencies fixing the order: rules 2–3 first form the staged fixed join choice; rule 5
 reads the complete rule-1 inventory and subsumes rule 4's provisional single-relation order decision;
@@ -609,6 +611,11 @@ rule 8 reads
 the three preceding sort-elision decisions. Rules 4–6 that select scan order remain mutually
 exclusive by their gates; hash join preserves the same physical-outer then physical-inner candidate
 enumeration and may compose with join sort-elision.
+
+A `DISTINCT ON` plan ([grammar.md](grammar.md) §11.1) sets none of the order fields. Rules 4–8
+treat it as having no `ORDER BY` and no `LIMIT`/`OFFSET`: its access path and join order are
+chosen as for the unordered, unlimited query, and the executor always sorts and then dedups. A sort
+the scan could have served, and the top-N it would allow, are a follow-on.
 
 The physical fields live in a dedicated sub-struct of the plan (`phys` — Go
 `physicalPlan`, Rust/TS `PhysicalPlan`), so the stage boundary is visible in the type: the

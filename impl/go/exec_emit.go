@@ -556,7 +556,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// sorter. Results + cost are identical to the eager sort (the sort is unmetered —
 	// cost.md §3; spill.md §6).
 	if fast && len(plan.order) > 0 && !plan.phys.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
+		!plan.isAgg && !plan.hasWindow && !plan.distinct && plan.distinctOn == 0 &&
 		!plan.phys.relBounds[0].needsEagerScan() &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference takes the eager path (cte.md §5).
@@ -1005,6 +1005,16 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		if selectActualRootNode(plan) != "Sort" {
 			db.explainActual.recordParent("Sort", meter.Accrued)
 		}
+		if plan.distinctOn > 0 {
+			// DISTINCT ON (grammar.md §11.1): keep the first row of each key run; only the survivors
+			// are windowed and projected below.
+			rows = dedupSortedRuns(rows, plan.order[:plan.distinctOn], func(row storedRow) {
+				meter.releaseRowMasked(row, memMask)
+			})
+			if selectActualRootNode(plan) != "Distinct" {
+				db.explainActual.recordParent("Distinct", meter.Accrued)
+			}
+		}
 	}
 
 	// LIMIT / OFFSET window bounds over a result of n rows. Clamp in the i64 domain
@@ -1364,6 +1374,15 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			}
 			if selectActualRootNode(plan) != "Sort" {
 				db.explainActual.recordParent("Sort", meter.Accrued)
+			}
+			if plan.distinctOn > 0 {
+				// DISTINCT ON over the sorted group rows (grammar.md §11.1).
+				groupRows = dedupSortedRuns(groupRows, plan.order[:plan.distinctOn], func(row storedRow) {
+					meter.releaseRow(row)
+				})
+				if selectActualRootNode(plan) != "Distinct" {
+					db.explainActual.recordParent("Distinct", meter.Accrued)
+				}
 			}
 		}
 		if plan.distinct {

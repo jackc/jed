@@ -106,7 +106,9 @@ The fixed node vocabulary is:
 | ANALYZE wrapper | `Analyze` |
 
 A SELECT renders outermost first in this order: Limit → non-elided Sort → Distinct → Window →
-Aggregate → Filter → FROM tree. The FROM tree is the selected left-deep physical join order. A sort
+Aggregate → Filter → FROM tree. A `DISTINCT ON` query ([grammar.md](grammar.md) §11.1) dedups
+after its sort, so its `Distinct` renders above the `Sort` (Limit → Distinct → non-elided Sort →
+Window → …), with detail `on=N`, the number of dedup keys. Plain `DISTINCT` keeps detail `-`. The FROM tree is the selected left-deep physical join order. A sort
 served by scan/join order is omitted and its `ordered:` note is placed on the FROM root.
 
 `LANE TRUE` repeats one statement-level tag on every row:

@@ -20,19 +20,19 @@ func (db *engine) boundedBlockingEligible(p *selectPlan) bool {
 	if db.spill == nil || db.session.workMem == 0 {
 		return false
 	}
-	if len(p.rels) == 0 && !p.isAgg && !p.distinct {
+	if len(p.rels) == 0 && !p.isAgg && !p.distinct && p.distinctOn == 0 {
 		return false
 	}
 	if streamingScanEligible(p) {
 		return false
 	}
-	if len(p.rels) == 1 && !p.isAgg && !p.distinct {
+	if len(p.rels) == 1 && !p.isAgg && !p.distinct && p.distinctOn == 0 {
 		return false
 	}
 	// A join takes the bounded lane only when it hashes or is a multi-step physical join — the same
 	// predicate as the Rust core's blocking_spill_eligible. The lane choice must be mirrored across
 	// cores because a lane determines which rows are query-memory row buffers (memory.md §5.4).
-	return p.isAgg || p.distinct || p.phys.hashJoin != nil || len(p.phys.joinSteps) > 0
+	return p.isAgg || p.distinct || p.distinctOn > 0 || p.phys.hashJoin != nil || len(p.phys.joinSteps) > 0
 }
 
 // blockingOwner owns the lane's scratch structures, so an error path never leaks a scratch file or a
@@ -406,6 +406,43 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 		}
 		if root != "Sort" {
 			db.explainActual.recordParent("Sort", m.Accrued)
+		}
+	}
+	if p.distinctOn > 0 {
+		// DISTINCT ON (grammar.md §11.1): the sorted spool keeps the first row of each run of equal
+		// dedup keys. Only the previous survivor's key values are held.
+		keys := p.order[:p.distinctOn]
+		kept := own.spool()
+		var prev []Value
+		err := rows.each(func(row storedRow) error {
+			if err := m.PollStep(); err != nil {
+				return err
+			}
+			if prev != nil {
+				same := true
+				for i, k := range keys {
+					if keyCmp(prev[i], row[k.idx], k.descending, k.nullsFirst) != 0 {
+						same = false
+						break
+					}
+				}
+				if same {
+					return nil
+				}
+			}
+			prev = make([]Value, len(keys))
+			for i, k := range keys {
+				prev[i] = row[k.idx]
+			}
+			return kept.push(row)
+		})
+		if err != nil {
+			return emitter{}, err
+		}
+		rows.close()
+		rows = kept
+		if root != "Distinct" {
+			db.explainActual.recordParent("Distinct", m.Accrued)
 		}
 	}
 	if p.distinct {

@@ -2440,7 +2440,7 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 	} else {
 		plan = db.estimateJoinTree(sp, len(sp.rels), ctx)
 	}
-	if sp.limit != nil && !sp.distinct && (streamingScanEligible(sp) || sp.phys.indexOrder != nil || db.windowTopNEligible(sp)) {
+	if sp.limit != nil && !sp.distinct && sp.distinctOn == 0 && (streamingScanEligible(sp) || sp.phys.indexOrder != nil || db.windowTopNEligible(sp)) {
 		target := *sp.limit
 		if sp.offset != nil {
 			target = satEstimateAdd(target, *sp.offset)
@@ -2572,6 +2572,36 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 		plan = wrapEstimatedPlan(plan, plan.root.rows, plan.root.logicalRows, local)
 		db.addExpressionListSubqueries(&plan.root, sp.orderExprs, plan.root.rows, ctx)
 		plan.nodes[0] = plan.root
+	}
+
+	// DISTINCT ON dedups the sorted rows by its leading sort keys (estimator.md §7): the group count
+	// over those keys, with column statistics when every key is a bare input column of an ungrouped
+	// query.
+	if sp.distinctOn > 0 {
+		keys := sp.order[:sp.distinctOn]
+		inputWidth := 0
+		for _, r := range sp.rels {
+			inputWidth += r.colCount
+		}
+		input := plan.root.rows
+		rows := input
+		if maxRows := satEstimatePow(defaultDistinctValues, len(keys)); rows > maxRows {
+			rows = maxRows
+		}
+		if !sp.isAgg {
+			globals := make([]int, 0, len(keys))
+			for _, k := range keys {
+				if k.idx >= inputWidth {
+					globals = nil
+					break
+				}
+				globals = append(globals, k.idx)
+			}
+			if estimated, ok := db.estimateSimpleDistinctRows(sp, globals, input); ok {
+				rows = estimated
+			}
+		}
+		plan = wrapEstimatedPlan(plan, rows, rows, [estimatorUnitCount]int64{})
 	}
 
 	if sp.limit != nil || sp.offset != nil {

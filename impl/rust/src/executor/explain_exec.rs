@@ -30,6 +30,9 @@ pub(crate) fn select_actual_root_node(sp: &SelectPlan) -> String {
     if sp.limit.is_some() || sp.offset.is_some() {
         return "Limit".to_string();
     }
+    if sp.distinct_on > 0 {
+        return "Distinct".to_string();
+    }
     if !sp.order.is_empty()
         && !sp.phys.pk_ordered
         && sp.phys.index_order.is_none()
@@ -838,6 +841,11 @@ impl Engine {
         let mut d = depth;
         if sp.limit.is_some() || sp.offset.is_some() {
             r.emit(d, "Limit", limit_detail(sp.limit, sp.offset));
+            d += 1;
+        }
+        // A DISTINCT ON dedups after its sort, so its Distinct renders above the Sort (explain.md §4).
+        if sp.distinct_on > 0 {
+            r.emit(d, "Distinct", format!("on={}", sp.distinct_on));
             d += 1;
         }
         let mut order_note = String::new();

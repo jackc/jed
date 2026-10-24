@@ -368,6 +368,7 @@ impl Engine {
             && !plan.is_agg
             && !plan.has_window
             && !plan.distinct
+            && plan.distinct_on == 0
             && !matches!(
                 plan.phys.rel_bounds[0],
                 Some(ScanBound::Index(_))
@@ -835,6 +836,18 @@ impl Engine {
                 {
                     profile.record_parent("Sort".to_string(), meter.accrued);
                 }
+                if plan.distinct_on > 0 {
+                    // DISTINCT ON (grammar.md §11.1): keep the first row of each key run; only the
+                    // survivors are windowed and projected below.
+                    rows = dedup_sorted_runs(rows, &plan.order[..plan.distinct_on], |row| {
+                        meter.release_row_masked(row, &mem_mask)
+                    });
+                    if select_actual_root_node(plan) != "Distinct"
+                        && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                    {
+                        profile.record_parent("Distinct".to_string(), meter.accrued);
+                    }
+                }
             }
 
             // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the integer
@@ -1159,6 +1172,18 @@ impl Engine {
                         && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                     {
                         profile.record_parent("Sort".to_string(), meter.accrued);
+                    }
+                    if plan.distinct_on > 0 {
+                        // DISTINCT ON over the sorted group rows (grammar.md §11.1).
+                        group_rows =
+                            dedup_sorted_runs(group_rows, &plan.order[..plan.distinct_on], |row| {
+                                meter.release_row(row)
+                            });
+                        if select_actual_root_node(plan) != "Distinct"
+                            && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
+                        {
+                            profile.record_parent("Distinct".to_string(), meter.accrued);
+                        }
                     }
                 }
                 if plan.distinct {
