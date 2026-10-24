@@ -12,7 +12,7 @@ pub(crate) use crate::ast::{
     CreateTable, CreateTableAs, CreateType, CreateView, Cte, CteBody, DefaultDef, Delete,
     DropIndex, DropSequence, DropTable, DropType, DropView, Expr, FkTarget, GroupItem,
     IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind, JsonBehavior, JsonOnBehavior,
-    JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
+    JsonPassing, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, Merge, OnConflict,
     OrderKey, Overriding, QueryExpr, RefAction, Reindex, ReindexKind, ReturningClause, Select,
     SelectItems, SeqOptions, SetOp, SetOpKind, SrcPos, Statement, SubscriptSpec, TableRef,
     TableRefPos, TypeFieldDef, TypeMod, UnaryOp, Update, ViewEdit, ViewOption, WindowDef, WithExpr,
@@ -72,6 +72,7 @@ pub(crate) use index_dependencies::*;
 mod dml;
 mod error_detail;
 mod error_hint;
+mod merge;
 pub(crate) use dml::CachedInsert;
 pub(crate) use error_detail::{DUPLICATED, EXISTS};
 mod blocking_spill;
@@ -1719,6 +1720,7 @@ fn build_prefix_scope<'s>(
         lateral_hit: Default::default(),
         lateral_refused,
         shares_parent_level,
+        merge_action: None,
         hints: Default::default(),
     }
 }
@@ -1767,6 +1769,7 @@ impl<'a> Scope<'a> {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             hints: Default::default(),
         }
     }
@@ -1873,6 +1876,7 @@ pub(crate) enum DmStmt {
     Insert(Box<Insert>),
     Update(Box<Update>),
     Delete(Box<Delete>),
+    Merge(Box<Merge>),
 }
 
 /// The recursive half of a `WITH RECURSIVE` CTE (spec/design/recursive-cte.md §4): the planned
@@ -1984,6 +1988,9 @@ pub(crate) struct Scope<'a> {
     shares_parent_level: bool,
     /// What a name-resolution hint needs beyond the visible relations (error-fields.md §11.8).
     hints: ScopeHints,
+    /// The flat slot `merge_action()` reads: set only on a MERGE's RETURNING scope
+    /// (spec/design/merge.md §7). Elsewhere the function is 42601.
+    merge_action: Option<usize>,
 }
 
 /// A relation of a query level's FROM clause that a reference there cannot see. PostgreSQL's
@@ -2121,6 +2128,7 @@ impl<'a> Scope<'a> {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             hints: Default::default(),
         }
     }
@@ -2206,6 +2214,7 @@ impl<'a> Scope<'a> {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             hints: Default::default(),
         }
     }
@@ -2293,6 +2302,7 @@ impl<'a> Scope<'a> {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             hints: Default::default(),
         })
     }
@@ -2369,6 +2379,7 @@ impl<'a> Scope<'a> {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             hints: Default::default(),
         }
     }
@@ -4888,6 +4899,12 @@ fn with_has_dml(wq: &WithQuery) -> bool {
     wq.body.is_data_modifying() || wq.ctes.iter().any(|c| c.body.is_data_modifying())
 }
 
+/// Whether a `WITH` statement's primary or any CTE body is a `MERGE` (spec/design/merge.md §1).
+fn with_has_merge(wq: &WithQuery) -> bool {
+    matches!(wq.body, CteBody::Merge(_))
+        || wq.ctes.iter().any(|c| matches!(c.body, CteBody::Merge(_)))
+}
+
 /// Each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a RECURSIVE or
 /// data-modifying CTE is ALWAYS materialized; otherwise a `MATERIALIZED` hint or ≥2 references →
 /// Materialize, else Inline.
@@ -4991,6 +5008,31 @@ fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
                 n += count_self_refs_expr(f, name);
             }
             n + count_returning_refs(&del.returning, name)
+        }
+        CteBody::Merge(m) => {
+            use crate::ast::{MergeAction, MergeValue};
+            let mut n = count_self_refs_query(&m.source, name) + count_self_refs_expr(&m.on, name);
+            for c in &m.clauses {
+                if let Some(cond) = &c.condition {
+                    n += count_self_refs_expr(cond, name);
+                }
+                match &c.action {
+                    MergeAction::Update(assigns) => {
+                        for a in assigns {
+                            n += count_self_refs_expr(&a.value, name);
+                        }
+                    }
+                    MergeAction::Insert { values, .. } => {
+                        for v in values {
+                            if let MergeValue::Expr(e) = v {
+                                n += count_self_refs_expr(e, name);
+                            }
+                        }
+                    }
+                    MergeAction::Delete | MergeAction::DoNothing => {}
+                }
+            }
+            n + count_returning_refs(&m.returning, name)
         }
     }
 }

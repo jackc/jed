@@ -38,6 +38,8 @@ pub enum Statement {
     With(WithQuery),
     Update(Update),
     Delete(Delete),
+    /// `MERGE INTO … USING … ON … WHEN …` (spec/design/merge.md).
+    Merge(Merge),
     /// `EXPLAIN [ANALYZE] <statement>` — render the planner's chosen plan for the inner statement
     /// instead of running it (spec/design/explain.md). `inner` is the wrapped statement, restricted
     /// by the parser to a query (`SELECT` / set operation / `WITH`, including writable `WITH`) or DML
@@ -921,6 +923,77 @@ pub struct Delete {
     pub fk_target: Option<FkTarget>,
 }
 
+/// `MERGE INTO target [[AS] alias] USING source ON condition when_clause+ [RETURNING …]`
+/// (spec/design/merge.md). The source is carried as the query `SELECT * FROM source_ref` it is
+/// evaluated as (§3), so CTE references, privileges, and planning see an ordinary query.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Merge {
+    pub table: String,
+    /// The target name's character position (spec/design/error-fields.md §10.2).
+    pub table_pos: SrcPos,
+    /// The optional database qualifier on the target, like [`Update::db`].
+    pub db: Option<String>,
+    /// The optional target alias (`AS` optional — merge.md §1); it replaces the table's name as the
+    /// target's qualifier.
+    pub alias: Option<String>,
+    /// `SELECT * FROM source_ref` (merge.md §3).
+    pub source: QueryExpr,
+    /// The source relation's label: its alias, else its table / view / CTE / function name. `None`
+    /// for an unaliased derived table, whose columns are reachable only bare (merge.md §2).
+    pub source_label: Option<String>,
+    /// The join condition.
+    pub on: Expr,
+    /// The `WHEN` clauses in written order (at least one).
+    pub clauses: Vec<MergeClause>,
+    /// The optional terminal `RETURNING` clause (merge.md §7).
+    pub returning: Option<ReturningClause>,
+}
+
+/// Which joined rows a `WHEN` clause applies to (merge.md §4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeMatch {
+    /// `WHEN MATCHED` — a target row the join condition pairs with a source row.
+    Matched,
+    /// `WHEN NOT MATCHED [BY TARGET]` — a source row no target row matched.
+    NotMatchedByTarget,
+    /// `WHEN NOT MATCHED BY SOURCE` — a target row no source row matched.
+    NotMatchedBySource,
+}
+
+/// One `WHEN [NOT] MATCHED [BY …] [AND condition] THEN action` clause.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MergeClause {
+    pub kind: MergeMatch,
+    pub condition: Option<Expr>,
+    pub action: MergeAction,
+}
+
+/// A `WHEN` clause's action (merge.md §4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MergeAction {
+    /// `UPDATE SET col = expr | DEFAULT, …`.
+    Update(Vec<Assignment>),
+    /// `DELETE`.
+    Delete,
+    /// `INSERT [(cols)] [OVERRIDING …] VALUES (…)` or `DEFAULT VALUES` (`values` empty and
+    /// `columns = Some([])`, as for INSERT).
+    Insert {
+        columns: Option<Vec<String>>,
+        column_pos: Vec<SrcPos>,
+        overriding: Option<Overriding>,
+        values: Vec<MergeValue>,
+    },
+    /// `DO NOTHING`.
+    DoNothing,
+}
+
+/// One `INSERT VALUES` slot of a MERGE action: `DEFAULT` or an expression over the source row.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MergeValue {
+    Default,
+    Expr(Expr),
+}
+
 /// A generated referential action's keyed target (constraints.md §6.6), carried on the internal
 /// [`Update`]/[`Delete`] it drives. Shared by reference: equality is identity, and `Debug` elides
 /// the batch — it is executor state, never parsed SQL.
@@ -1294,6 +1367,8 @@ pub enum CteBody {
     Insert(Box<Insert>),
     Update(Box<Update>),
     Delete(Box<Delete>),
+    /// A `MERGE` (spec/design/merge.md §1).
+    Merge(Box<Merge>),
 }
 
 impl CteBody {

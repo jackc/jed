@@ -1297,6 +1297,7 @@ impl Engine {
         match stmt {
             Statement::Update(upd) => self.collect_update_catalog_privs(upd, req),
             Statement::Insert(ins) => self.collect_insert_catalog_privs(ins, req),
+            Statement::Merge(m) => self.collect_merge_catalog_privs(m, req),
             Statement::With(wq) => {
                 for cte in &wq.ctes {
                     self.collect_cte_catalog_privs(&cte.body, req);
@@ -1324,7 +1325,61 @@ impl Engine {
         match body {
             CteBody::Update(upd) => self.collect_update_catalog_privs(upd, req),
             CteBody::Insert(ins) => self.collect_insert_catalog_privs(ins, req),
+            CteBody::Merge(m) => self.collect_merge_catalog_privs(m, req),
             _ => {}
+        }
+    }
+
+    /// The catalog expressions a MERGE evaluates (spec/design/merge.md §10): the defaults of each
+    /// INSERT action's omitted columns and `DEFAULT` slots, each UPDATE action's `SET c = DEFAULT`,
+    /// and the target's CHECK constraints when any action writes.
+    fn collect_merge_catalog_privs(&self, m: &crate::ast::Merge, req: &mut PrivReq) {
+        use crate::ast::{MergeAction, MergeValue};
+        let Some(table) = self.table_scoped(m.db.as_deref(), &m.table) else {
+            return;
+        };
+        let locals = HashSet::new();
+        let mut writes = false;
+        for c in &m.clauses {
+            match &c.action {
+                MergeAction::Update(assigns) => {
+                    writes = true;
+                    collect_assignment_default_privs(table, assigns, req);
+                }
+                MergeAction::Insert {
+                    columns,
+                    overriding,
+                    values,
+                    ..
+                } => {
+                    writes = true;
+                    let targets: Vec<Option<usize>> = match columns {
+                        None => (0..table.columns.len()).map(Some).collect(),
+                        Some(names) => names.iter().map(|n| table.column_index(n)).collect(),
+                    };
+                    let mut defaulted = vec![true; table.columns.len()];
+                    for (p, v) in values.iter().enumerate() {
+                        if let (MergeValue::Expr(_), Some(Some(i))) = (v, targets.get(p)) {
+                            let identity_user = table.columns[*i].identity.is_some()
+                                && *overriding == Some(Overriding::User);
+                            if !identity_user {
+                                defaulted[*i] = false;
+                            }
+                        }
+                    }
+                    for (col, need) in table.columns.iter().zip(defaulted) {
+                        if let (true, Some(default)) = (need, &col.default_expr)
+                            && !default.unparsed
+                        {
+                            collect_expr_privs(&default.expr, req, &locals);
+                        }
+                    }
+                }
+                MergeAction::Delete | MergeAction::DoNothing => {}
+            }
+        }
+        if writes {
+            collect_check_privs(table, req);
         }
     }
 

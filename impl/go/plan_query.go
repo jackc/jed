@@ -310,6 +310,45 @@ func hasCteBinding(bindings []*cteBinding, name string) bool {
 // a zero-column relation flagged noReturning (a FROM reference to it is 0A000, §5). The target must
 // be a base table — a CTE name / missing table is 42P01 (§1).
 func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*catTable, *dmCte, error) {
+	// A MERGE body (spec/design/merge.md §1): its relation is its RETURNING schema. It is planned here
+	// only for that schema, so the CTE references the planning counts are restored — the orchestrator
+	// static-counts a data-modifying part's references (§3).
+	if m := body.Merge; m != nil {
+		tdef, err := db.mergeTarget(m)
+		if err != nil {
+			return nil, nil, err
+		}
+		dm := &dmCte{merge: m}
+		if m.Returning == nil {
+			dm.noReturning = true
+			table, err := cteSyntheticTableCols(lname, nil, nil, nil, nil, rename)
+			if err != nil {
+				return nil, nil, err
+			}
+			return table, dm, nil
+		}
+		type savedRefs struct {
+			refs     int
+			expanded bool
+		}
+		saved := make([]savedRefs, len(bindings))
+		for i, b := range bindings {
+			saved[i] = savedRefs{b.refs, b.expanded}
+		}
+		plan, err := db.planMerge(m, tdef, bindings, ptypes)
+		for i, b := range bindings {
+			b.refs, b.expanded = saved[i].refs, saved[i].expanded
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		ret := plan.returning
+		table, err := cteSyntheticTableCols(lname, ret.names, ret.types, ret.derivs, ret.typmods, rename)
+		if err != nil {
+			return nil, nil, err
+		}
+		return table, dm, nil
+	}
 	var tableName string
 	var tablePos srcPos
 	var returning *returningClause
@@ -819,6 +858,8 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 		out, err = db.executeInsert(wq.Body.Insert, params, ctx)
 	case wq.Body.Update != nil:
 		out, err = db.executeUpdate(wq.Body.Update, params, ctx)
+	case wq.Body.Merge != nil:
+		out, err = db.executeMerge(wq.Body.Merge, params, ctx)
 	default:
 		out, err = db.executeDelete(wq.Body.Delete, params, ctx)
 	}
@@ -832,6 +873,8 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 		db.explainActual.record("Update "+wq.Body.Update.Table, out.Cost)
 	case wq.Body.Delete != nil:
 		db.explainActual.record("Delete "+wq.Body.Delete.Table, out.Cost)
+	case wq.Body.Merge != nil:
+		db.explainActual.record("Merge "+wq.Body.Merge.Table, out.Cost)
 	}
 	// (5) Settle every foreign-key check the parts queued, against the end state of the whole
 	//     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
@@ -858,6 +901,8 @@ func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 		out, err = db.executeInsert(dm.insert, params, ctx)
 	case dm.update != nil:
 		out, err = db.executeUpdate(dm.update, params, ctx)
+	case dm.merge != nil:
+		out, err = db.executeMerge(dm.merge, params, ctx)
 	default:
 		out, err = db.executeDelete(dm.delete, params, ctx)
 	}
@@ -869,6 +914,8 @@ func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx c
 		db.explainActual.record("Insert "+dm.insert.Table, out.Cost)
 	case dm.update != nil:
 		db.explainActual.record("Update "+dm.update.Table, out.Cost)
+	case dm.merge != nil:
+		db.explainActual.record("Merge "+dm.merge.Table, out.Cost)
 	default:
 		db.explainActual.record("Delete "+dm.delete.Table, out.Cost)
 	}
@@ -1173,6 +1220,20 @@ func withHasDml(wq *withQuery) bool {
 	return false
 }
 
+// withHasMerge reports whether a WITH statement's primary or any CTE body is a MERGE
+// (spec/design/merge.md §1).
+func withHasMerge(wq *withQuery) bool {
+	if wq.Body.Merge != nil {
+		return true
+	}
+	for i := range wq.Ctes {
+		if wq.Ctes[i].Body.Merge != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // cteModes returns each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
 // RECURSIVE or data-modifying CTE is ALWAYS materialized; otherwise a MATERIALIZED hint or ≥2
 // references → Materialize, else Inline.
@@ -1249,6 +1310,24 @@ func countCteRefsDml(body *cteBody, name string) int {
 			n += countSelfRefsExpr(*upd.Filter, name)
 		}
 		return n + countReturningRefs(upd.Returning, name)
+	case body.Merge != nil:
+		m := body.Merge
+		n := countSelfRefsQuery(m.Source, name) + countSelfRefsExpr(m.On, name)
+		for ci := range m.Clauses {
+			c := &m.Clauses[ci]
+			if c.Condition != nil {
+				n += countSelfRefsExpr(*c.Condition, name)
+			}
+			for i := range c.Assignments {
+				n += countSelfRefsExpr(c.Assignments[i].Value, name)
+			}
+			for i := range c.Values {
+				if !c.Values[i].IsDefault {
+					n += countSelfRefsExpr(c.Values[i].Expr, name)
+				}
+			}
+		}
+		return n + countReturningRefs(m.Returning, name)
 	default:
 		del := body.Delete
 		n := 0

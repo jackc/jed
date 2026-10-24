@@ -1451,6 +1451,7 @@ impl Engine {
                         DmStmt::Insert(v) => Statement::Insert((**v).clone()),
                         DmStmt::Update(v) => Statement::Update((**v).clone()),
                         DmStmt::Delete(v) => Statement::Delete((**v).clone()),
+                        DmStmt::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
                     };
                     let nodes = self.estimate_explain_scoped(&stmt, &bindings[..i], Some(&ctx))?;
                     EstimatedPlan {
@@ -1479,6 +1480,7 @@ impl Engine {
                 CteBody::Insert(v) => Statement::Insert((**v).clone()),
                 CteBody::Update(v) => Statement::Update((**v).clone()),
                 CteBody::Delete(v) => Statement::Delete((**v).clone()),
+                CteBody::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
                 CteBody::Query(_) => unreachable!("a query primary was planned above"),
             };
             let nodes = self.estimate_explain_scoped(&stmt, &bindings, Some(&ctx))?;

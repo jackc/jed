@@ -90,6 +90,7 @@ import type {
   Insert,
   JsonOnBehavior,
   JsonWrapper,
+  Merge,
   OrderKey,
   QueryExpr,
   ReturningClause,
@@ -260,6 +261,9 @@ export class Scope {
   sharesParentLevel = false;
   // What a name-resolution hint needs beyond the visible relations (error-fields.md §11.8).
   hints: ScopeHints = NO_SCOPE_HINTS;
+  // The flat slot merge_action() reads: set only on a MERGE's RETURNING scope
+  // (spec/design/merge.md §7). Elsewhere the function is 42601.
+  mergeAction: number | null = null;
   constructor(
     rels: ScopeRel[],
     catalog: Engine,
@@ -1157,6 +1161,12 @@ export function withHasDml(wq: WithQuery): boolean {
   return cteBodyIsDataModifying(wq.body) || wq.ctes.some((c) => cteBodyIsDataModifying(c.body));
 }
 
+// withHasMerge reports whether a WITH statement's primary or any CTE body is a MERGE
+// (spec/design/merge.md §1).
+export function withHasMerge(wq: WithQuery): boolean {
+  return wq.body.kind === "merge" || wq.ctes.some((c) => c.body.kind === "merge");
+}
+
 // cteModes computes each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
 // RECURSIVE or data-modifying CTE is ALWAYS materialized; otherwise a MATERIALIZED hint or >=2
 // references → materialize, else inline.
@@ -1231,6 +1241,18 @@ export function countCteRefsDml(body: CteBody, name: string): number {
     let n = 0;
     for (const a of body.assignments) n += countSelfRefsExpr(a.value, name);
     if (body.filter !== null) n += countSelfRefsExpr(body.filter, name);
+    return n + countReturningRefs(body.returning, name);
+  }
+  if (body.kind === "merge") {
+    let n = countSelfRefsQuery(body.source, name) + countSelfRefsExpr(body.on, name);
+    for (const c of body.clauses) {
+      if (c.condition !== null) n += countSelfRefsExpr(c.condition, name);
+      if (c.action.kind === "update") {
+        for (const a of c.action.assignments) n += countSelfRefsExpr(a.value, name);
+      } else if (c.action.kind === "insert") {
+        for (const v of c.action.values) if (v !== null) n += countSelfRefsExpr(v, name);
+      }
+    }
     return n + countReturningRefs(body.returning, name);
   }
   // delete
@@ -2101,6 +2123,7 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete" ||
+    stmt.kind === "merge" ||
     // A WITH statement with any data-modifying part is a write (it stages INSERT/UPDATE/DELETE effects
     // — writable-cte.md): it must take the write gate, accumulate into working, and commit.
     (stmt.kind === "with" && withHasDml(stmt)) ||
@@ -2389,6 +2412,9 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
     case "delete":
       collectDeletePrivs(stmt, req, locals);
       break;
+    case "merge":
+      collectMergePrivs(stmt, req, locals);
+      break;
     case "explain":
       // EXPLAIN requires the inner statement's privileges (EXPLAIN INSERT needs INSERT, matching PG).
       // Plain EXPLAIN never executes, but authorization is checked on the inner regardless.
@@ -2450,6 +2476,29 @@ export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string
   collectReturningPrivs(del.returning, req, locals);
 }
 
+// collectMergePrivs collects a MERGE's privileges (spec/design/merge.md §10): SELECT on the target
+// (its join condition reads it), the write privilege of each action kind a clause names, SELECT on
+// what the source reads, and what every expression's sublinks and functions need.
+export function collectMergePrivs(m: Merge, req: PrivReq, locals: Set<string>): void {
+  req.tables.push({ name: m.table, priv: "select" });
+  for (const c of m.clauses) {
+    if (c.action.kind === "update") req.tables.push({ name: m.table, priv: "update" });
+    else if (c.action.kind === "delete") req.tables.push({ name: m.table, priv: "delete" });
+    else if (c.action.kind === "insert") req.tables.push({ name: m.table, priv: "insert" });
+  }
+  collectQueryPrivs(m.source, req, locals);
+  collectExprPrivs(m.on, req, locals);
+  for (const c of m.clauses) {
+    if (c.condition !== null) collectExprPrivs(c.condition, req, locals);
+    if (c.action.kind === "update") {
+      for (const a of c.action.assignments) collectExprPrivs(a.value, req, locals);
+    } else if (c.action.kind === "insert") {
+      for (const v of c.action.values) if (v !== null) collectExprPrivs(v, req, locals);
+    }
+  }
+  collectReturningPrivs(m.returning, req, locals);
+}
+
 export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
   else if (qe.kind === "withExpr") {
@@ -2492,6 +2541,7 @@ export function collectCteBodyPrivs(body: CteBody, req: PrivReq, locals: Set<str
   if (body.kind === "insert") collectInsertPrivs(body, req, locals);
   else if (body.kind === "update") collectUpdatePrivs(body, req, locals);
   else if (body.kind === "delete") collectDeletePrivs(body, req, locals);
+  else if (body.kind === "merge") collectMergePrivs(body, req, locals);
   else collectQueryPrivs(body, req, locals);
 }
 
@@ -2801,6 +2851,8 @@ export function stmtKind(stmt: Statement): string {
       return "UPDATE";
     case "delete":
       return "DELETE";
+    case "merge":
+      return "MERGE";
     case "explain":
       return "EXPLAIN";
     default:

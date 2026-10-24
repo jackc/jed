@@ -1,0 +1,34 @@
+# MERGE with bound parameters (spec/design/merge.md §2, api.md §5): a `$N` in the source, the join
+# condition, a WHEN condition, a SET right-hand side, and an INSERT value takes its type from its
+# context, as in the standalone statements. Oracle-probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.merge, dml.returning, query.select, query.order_by, query.values, types.i32, types.text, expr.arithmetic, harness.params
+
+statement ok
+CREATE TABLE mp (id i32 PRIMARY KEY, v i32, note text)
+
+statement ok
+INSERT INTO mp VALUES (1, 10, 'a'), (2, 20, 'b')
+
+# params: 1, 5, 'x'
+statement ok
+MERGE INTO mp USING (VALUES ($1::i32)) AS s(k) ON mp.id = s.k
+WHEN MATCHED AND mp.v > $2 THEN UPDATE SET v = mp.v + $2, note = $3
+
+# params: 3, 30, 'new'
+statement ok
+MERGE INTO mp USING (VALUES (1)) AS s(k) ON mp.id = $1
+WHEN NOT MATCHED THEN INSERT VALUES ($1, $2, $3)
+
+query IIT nosort
+SELECT id, v, note FROM mp ORDER BY id
+----
+1
+15
+x
+2
+20
+b
+3
+30
+new

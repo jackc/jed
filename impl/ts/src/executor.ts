@@ -60,6 +60,8 @@ import type {
   JsonTable,
   JsonWrapper,
   JtColumn,
+  Merge,
+  MergeMatch,
   OnConflict,
   OrderKey,
   QueryExpr,
@@ -102,6 +104,17 @@ import {
   seqOptionsHasAny,
 } from "./ast.ts";
 import { chooseObjectName, indexColumnNames, nameAddition } from "./autoname.ts";
+import {
+  type MergeActionPlan,
+  type MergeClausePlan,
+  type MergePlan,
+  type MergePlanned,
+  type MergeReturning,
+  mergeInsertColumns,
+  mergeSourceRel,
+  mergeTargetRel,
+  mergeVersionRel,
+} from "./merge.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -751,6 +764,7 @@ import {
   typeFromResolved,
   typeNames,
   withHasDml,
+  withHasMerge,
   withNote,
 } from "./scope.ts";
 import type { ExplainRow, PrivReq, UnseenFrame, UnseenRel } from "./scope.ts";
@@ -4262,6 +4276,7 @@ export class Engine {
   private collectCatalogExprPrivs(stmt: Statement, req: PrivReq): void {
     if (stmt.kind === "update") this.collectUpdateCatalogPrivs(stmt, req);
     else if (stmt.kind === "insert") this.collectInsertCatalogPrivs(stmt, req);
+    else if (stmt.kind === "merge") this.collectMergeCatalogPrivs(stmt, req);
     else if (stmt.kind === "with") {
       for (const cte of stmt.ctes) this.collectCteCatalogPrivs(cte.body, req);
       this.collectCteCatalogPrivs(stmt.body, req);
@@ -4279,6 +4294,42 @@ export class Engine {
   private collectCteCatalogPrivs(body: CteBody, req: PrivReq): void {
     if (body.kind === "update") this.collectUpdateCatalogPrivs(body, req);
     else if (body.kind === "insert") this.collectInsertCatalogPrivs(body, req);
+    else if (body.kind === "merge") this.collectMergeCatalogPrivs(body, req);
+  }
+
+  // collectMergeCatalogPrivs adds the catalog expressions a MERGE evaluates (spec/design/merge.md
+  // §10): the defaults of each INSERT action's omitted columns and DEFAULT slots, each UPDATE action's
+  // SET c = DEFAULT, and the target's CHECK constraints when any action writes.
+  private collectMergeCatalogPrivs(m: Merge, req: PrivReq): void {
+    const table = this.lkpTableScoped(m.db, m.table);
+    if (table === undefined) return;
+    let writes = false;
+    for (const c of m.clauses) {
+      if (c.action.kind === "update") {
+        writes = true;
+        collectAssignmentDefaultPrivs(table, c.action.assignments, req);
+      } else if (c.action.kind === "insert") {
+        writes = true;
+        const ins = c.action;
+        const targets: number[] =
+          ins.columns === null
+            ? table.columns.map((_, i) => i)
+            : ins.columns.map((n) => columnIndex(table, n));
+        const defaulted: boolean[] = table.columns.map(() => true);
+        ins.values.forEach((v, p) => {
+          const i = targets[p];
+          if (v === null || i === undefined || i < 0) return;
+          const identityUser = table.columns[i]!.identity !== null && ins.overriding === "user";
+          if (!identityUser) defaulted[i] = false;
+        });
+        table.columns.forEach((col, i) => {
+          if (defaulted[i] && col.defaultExpr !== null && !col.defaultExpr.unparsed) {
+            collectExprPrivs(col.defaultExpr.expr, req, new Set());
+          }
+        });
+      }
+    }
+    if (writes) collectCheckPrivs(table, req);
   }
 
   private collectUpdateCatalogPrivs(written: Update, req: PrivReq): void {
@@ -4550,7 +4601,14 @@ export class Engine {
         return yield* this.executeUpdateSteps(stmt, params, EMPTY_CTE_CTX);
       case "delete":
         return yield* this.executeDeleteSteps(stmt, params, EMPTY_CTE_CTX);
+      case "merge":
+        return yield* this.executeMergeSteps(stmt, params, EMPTY_CTE_CTX);
       case "explain":
+        // EXPLAIN of a MERGE — directly (refused by the parser) or in a WITH — is a deferred
+        // follow-on (spec/design/merge.md §12).
+        if (stmt.inner.kind === "with" && withHasMerge(stmt.inner)) {
+          throw engineError("feature_not_supported", "EXPLAIN MERGE is not supported");
+        }
         return yield* this.executeExplainSteps(stmt, params);
       default:
         // Transaction control (begin/commit/rollback) is handled by executeStmtParams before
@@ -11740,7 +11798,8 @@ export class Engine {
     return { entries, pages, slabs };
   }
 
-  // Execute a planned UPDATE/DELETE access path into the normalized keyed-row batch. Per-row guards,
+  // Execute a planned UPDATE/DELETE access path into the normalized keyed-row batch. A bound reading a
+  // correlated outer column (a MERGE target probe, merge.md §3) reads env.outer. Per-row guards,
   // storageRowRead, residual evaluation, and phase-2 writes remain with the caller.
   private executeMutationScan(
     plan: MutationScanPlan,
@@ -11775,12 +11834,19 @@ export class Engine {
     }
     switch (b.kind) {
       case "pk": {
-        const r = yield* scanEntriesSteps(store, b.pk, params, mask);
+        const r = yield* scanEntriesSteps(store, b.pk, params, mask, env.outer);
         if (r.entries === null) return { entries: [], pages: 0, slabs: 0, empty: true };
         return { entries: r.entries, pages: r.overlap, slabs: r.slabs, empty: false };
       }
       case "index": {
-        const r = yield* this.indexBoundEntriesSteps(tableName, b.index, params, [], mask, []);
+        const r = yield* this.indexBoundEntriesSteps(
+          tableName,
+          b.index,
+          params,
+          env.outer,
+          mask,
+          [],
+        );
         return { ...r, empty: false };
       }
       case "gin": {
@@ -11794,11 +11860,18 @@ export class Engine {
         return { ...r, empty: false };
       }
       case "pkSet": {
-        const r = yield* this.pkKeySetRowsSteps(store, b.pkSet, params, [], mask, []);
+        const r = yield* this.pkKeySetRowsSteps(store, b.pkSet, params, env.outer, mask, []);
         return { ...r, empty: false };
       }
       case "indexSet": {
-        const r = yield* this.indexKeySetEntriesSteps(tableName, b.indexSet, params, [], mask, []);
+        const r = yield* this.indexKeySetEntriesSteps(
+          tableName,
+          b.indexSet,
+          params,
+          env.outer,
+          mask,
+          [],
+        );
         // Retain first-probe order while guaranteeing that phase 2 can never receive the same row
         // twice if a future index-key generalization makes point-probe result sets overlap.
         const seen = new Set<string>();
@@ -16360,6 +16433,830 @@ export class Engine {
     );
   }
 
+  // executeMerge runs a MERGE (spec/design/merge.md): resolve against the per-clause scopes (§2), run
+  // the matching pass over the buffered source and the target probe (§3), plan one action per joined
+  // pair (§4), validate the placed rows against the statement's end state (§5), project RETURNING
+  // (§7), and write (§6). Two-phase and all-or-nothing, like every jed write. An error names the
+  // target's database (error-fields.md §12).
+  private executeMerge(m: Merge, params: Value[], ctx: CteCtx): Outcome {
+    return runSync(this.executeMergeSteps(m, params, ctx));
+  }
+
+  private *executeMergeSteps(m: Merge, params: Value[], ctx: CteCtx): Steps<Outcome> {
+    // The statement resolves before its values are bound; a plan that read one restarts it with the
+    // values visible (estimator.md §6.1).
+    const planning = Planning.begin();
+    try {
+      return yield* this.executeMergePlannedSteps(m, params, ctx, planning);
+    } catch (e) {
+      throw this.stampDatabase(m.db, e);
+    } finally {
+      planning.end();
+    }
+  }
+
+  // mergeTarget makes the target checks every MERGE makes before resolving anything (merge.md §8): a
+  // catalog relation is 42809, a read-only attachment 25006, a view 0A000, a missing table 42P01.
+  private mergeTarget(m: Merge): Table {
+    checkCatalogRelWrite(m.table);
+    this.checkAttachmentWritable(m.db);
+    if (this.dmlTargetView(m.db, m.table) !== undefined) {
+      throw engineError("feature_not_supported", "MERGE into a view is not supported");
+    }
+    this.checkTargetQualifier(m.db, m.table, m.tableLoc);
+    const table = this.lkpTableScoped(m.db, m.table);
+    if (table === undefined) {
+      throw engineError("undefined_table", "table does not exist: " + m.table).atTarget(m.tableLoc);
+    }
+    return table;
+  }
+
+  // planMerge resolves a MERGE against its target (merge.md §2): the source query, the join
+  // condition, every WHEN clause in written order, then RETURNING — PostgreSQL's analysis order.
+  private planMerge(m: Merge, table: Table, bindings: CteBinding[], ptypes: ParamTypes): MergePlan {
+    const n = table.columns.length;
+    const source = this.planQuery(m.source, null, bindings, ptypes);
+    const label = m.sourceLabel ?? "";
+    const srcTable = cteSyntheticTable(label, source, null);
+    const width = srcTable.columns.length;
+    const targetLabel = m.alias ?? table.name;
+    if (label !== "" && label === targetLabel) {
+      throw engineError("duplicate_alias", `name "${label}" specified more than once`);
+    }
+    const both = new Scope(
+      [mergeTargetRel(table, m.alias, 0), mergeSourceRel(srcTable, label, n)],
+      this,
+      null,
+      true,
+      bindings,
+    );
+    const srcOnly = new Scope([mergeSourceRel(srcTable, label, 0)], this, null, true, bindings);
+    const tgtOnly = new Scope([mergeTargetRel(table, m.alias, 0)], this, null, true, bindings);
+    const on = resolveBooleanFilter(both, m.on, ptypes);
+    // The probe form: the target is the relation, the source an enclosing level (§3). The combined
+    // resolution above already raised every name error.
+    const probeScope = new Scope(
+      [mergeTargetRel(table, m.alias, 0)],
+      this,
+      srcOnly,
+      true,
+      bindings,
+    );
+    const probe = resolveBooleanFilter(probeScope, m.on, new ParamTypes());
+
+    // An INSERT's omitted columns resolve their expression defaults once per statement
+    // (constraints.md §2); only the columns some action can default resolve.
+    const need: boolean[] = new Array(n).fill(false);
+    for (const c of m.clauses) {
+      if (c.action.kind !== "insert") continue;
+      let provided: number[];
+      try {
+        ({ provided } = mergeInsertColumns(
+          table,
+          c.action.columns,
+          [],
+          c.action.overriding,
+          c.action.values,
+        ));
+      } catch {
+        continue; // the clause's own resolution below raises the error
+      }
+      for (let i = 0; i < n; i++) if (provided[i]! < 0) need[i] = true;
+    }
+    const defaultExprs = need.some((b) => b)
+      ? this.resolveDefaultExprsFor(table, need)
+      : table.columns.map(() => null);
+
+    const forbidden = (): AggCtx => ({ collecting: false, groupKeys: [], specs: [] });
+    const clauses: MergeClausePlan[] = [];
+    for (const c of m.clauses) {
+      const scope =
+        c.match === "matched" ? both : c.match === "notMatchedByTarget" ? srcOnly : tgtOnly;
+      const condition =
+        c.condition !== null ? resolveBooleanFilter(scope, c.condition, ptypes) : null;
+      let action: MergeActionPlan;
+      switch (c.action.kind) {
+        case "doNothing":
+          action = { kind: "doNothing" };
+          break;
+        case "delete":
+          action = { kind: "delete" };
+          break;
+        case "update":
+          action = {
+            kind: "update",
+            assigns: this.mergeAssignments(scope, table, c.action.assignments, ptypes),
+          };
+          break;
+        case "insert": {
+          const { provided, slotCol } = mergeInsertColumns(
+            table,
+            c.action.columns,
+            c.action.columnLocs,
+            c.action.overriding,
+            c.action.values,
+          );
+          const nodes: (RExpr | null)[] = [];
+          for (let p = 0; p < c.action.values.length; p++) {
+            const e = c.action.values[p]!;
+            const i = slotCol[p]!;
+            // A value an OVERRIDING USER VALUE identity column discards is not resolved (as INSERT).
+            if (e === null || i < 0 || provided[i]! < 0) {
+              nodes.push(null);
+              continue;
+            }
+            const col = table.columns[i]!;
+            if (col.type.kind === "scalar") {
+              const { node, type } = resolve(scope, e, col.type.scalar, forbidden(), ptypes);
+              if (!assignableTo(type, col.type.scalar)) {
+                throw positionedAt(
+                  assignmentError(
+                    `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(type)}`,
+                  ),
+                  exprLocation(e),
+                );
+              }
+              nodes.push(node);
+            } else {
+              nodes.push(resolveContainerAssign(scope, col, e, forbidden(), ptypes));
+            }
+          }
+          action = { kind: "insert", provided, values: nodes };
+          break;
+        }
+      }
+      clauses.push({ match: c.match, condition, action });
+    }
+
+    let returning: MergeReturning | null = null;
+    if (m.returning !== null) {
+      const scope = this.mergeReturningScope(table, m.alias, srcTable, label, m.returning);
+      scope.ctes = bindings;
+      returning = resolveProjections(scope, m.returning.items, forbidden(), ptypes);
+    }
+    return { source, width, on, probe, clauses, defaultExprs, returning };
+  }
+
+  // mergeAssignments resolves one UPDATE action's assignments against its clause scope — the
+  // standalone UPDATE rules: 42703, 42701, 428C9, the scalar / container assignment gates,
+  // SET col = DEFAULT.
+  private mergeAssignments(
+    scope: Scope,
+    table: Table,
+    assigns: Assignment[],
+    ptypes: ParamTypes,
+  ): AssignPlan[] {
+    // SET col = DEFAULT resolves the assigned columns' expression defaults once per clause, as the
+    // standalone UPDATE does (constraints.md §2). An unknown column is left to the 42703 below.
+    let defaultExprs: (RExpr | null)[] = [];
+    if (assigns.some((a) => a.isDefault)) {
+      const need = table.columns.map(() => false);
+      for (const a of assigns) {
+        const idx = columnIndex(table, a.column);
+        if (a.isDefault && idx >= 0) need[idx] = true;
+      }
+      defaultExprs = this.resolveDefaultExprsFor(table, need);
+    }
+    const plans: AssignPlan[] = [];
+    for (const a of assigns) {
+      const idx = columnIndex(table, a.column);
+      if (idx < 0) {
+        throw engineError("undefined_column", "column does not exist: " + a.column).withPosition(
+          a.loc,
+        );
+      }
+      if (table.columns[idx]!.identity === "always" && !a.isDefault) {
+        throw generatedAlwaysUpdate(a.column);
+      }
+      if (plans.some((p) => p.idx === idx)) {
+        throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
+      }
+      const col = table.columns[idx]!;
+      const base = {
+        idx,
+        name: col.name,
+        decimal: col.decimal,
+        varcharLen: col.varcharLen,
+        temporal: col.temporal,
+        notNull: col.notNull,
+      };
+      if (col.type.kind === "scalar") {
+        const source = a.isDefault
+          ? (defaultExprs[idx] ?? valueToRExpr(col.default ?? nullValue()))
+          : resolveScalarAssign(scope, a.value, col.type.scalar, a.column, ptypes);
+        plans.push({ ...base, target: col.type.scalar, source });
+      } else {
+        const source = a.isDefault
+          ? (defaultExprs[idx] ?? valueToRExpr(col.default ?? nullValue()))
+          : resolveContainerAssign(
+              scope,
+              col,
+              a.value,
+              { collecting: false, groupKeys: [], specs: [] },
+              ptypes,
+            );
+        plans.push({
+          ...base,
+          target: "i32", // unused (colType drives checkAssign)
+          source,
+          colType: scope.catalog.colTypeOf(col.type),
+        });
+      }
+    }
+    return plans;
+  }
+
+  // mergeReturningScope is the RETURNING scope (merge.md §7): the source at offset 0, the target at
+  // width, and the old / new qualifier-only versions at width + n / width + 2n, over the row
+  // [source | target | old | new | action]; merge_action() reads the last slot. Aliases follow
+  // grammar.md §32.
+  private mergeReturningScope(
+    table: Table,
+    alias: string | undefined,
+    srcTable: Table,
+    label: string,
+    ret: ReturningClause,
+  ): Scope {
+    const n = table.columns.length;
+    const w = srcTable.columns.length;
+    const rels: ScopeRel[] = [mergeSourceRel(srcTable, label, 0), mergeTargetRel(table, alias, w)];
+    for (const explicit of [
+      { alias: ret.oldAlias, offset: w + n },
+      { alias: ret.newAlias, offset: w + 2 * n },
+    ]) {
+      if (explicit.alias === null) continue;
+      const a = explicit.alias;
+      if (rels.some((r) => r.label === a)) {
+        throw engineError("duplicate_alias", `table name ${a} specified more than once`);
+      }
+      rels.push(mergeVersionRel(table, a, explicit.offset));
+    }
+    for (const pseudo of [
+      { label: "old", offset: w + n, aliased: ret.oldAlias !== null },
+      { label: "new", offset: w + 2 * n, aliased: ret.newAlias !== null },
+    ]) {
+      if (!pseudo.aliased && !rels.some((r) => r.label === pseudo.label)) {
+        rels.push(mergeVersionRel(table, pseudo.label, pseudo.offset));
+      }
+    }
+    const scope = new Scope(rels, this, null, true);
+    scope.mergeAction = w + 3 * n;
+    return scope;
+  }
+
+  private *executeMergePlannedSteps(
+    m: Merge,
+    params: Value[],
+    ctx: CteCtx,
+    planning: Planning,
+  ): Steps<Outcome> {
+    const table = this.mergeTarget(m);
+    const db = m.db;
+    const relation = table.name;
+    this.ensureCollationsWritable(table.columns);
+    const n = table.columns.length;
+    const pkMembers = pkIndices(table);
+    const rindexes = this.resolveTableIndexes(table);
+    const checks = this.resolveChecks(table);
+    const store = this.lkpStoreScoped(db, table.name);
+    const colTypes = store.columnTypes();
+    const colls = this.columnCollations(table.columns);
+    const ptypes = new ParamTypes();
+    const plan = this.planMerge(m, table, ctx.bindings, ptypes);
+    const bound = bindParams(params, ptypes.finalize(), this.inputZone());
+    if (planning.bind(bound))
+      return yield* restartPlanningSteps(bound, () => this.executeMergeSteps(m, params, ctx));
+
+    // Fold the globally-uncorrelated subqueries once, in statement order: the source, the join
+    // condition, each clause's condition and action expressions, then RETURNING (cost.md §3).
+    const meter = this.session.newMeter();
+    const contradiction = whereContradicts(plan.probe);
+    const foldCost = { value: 0n };
+    yield* this.foldUncorrelatedInPlanSteps(plan.source, bound, ctx, foldCost);
+    plan.on = yield* this.foldUncorrelatedInRExprSteps(plan.on, bound, ctx, foldCost);
+    for (const c of plan.clauses) {
+      if (shouldCooperate()) yield COOPERATE;
+      if (c.condition !== null)
+        c.condition = yield* this.foldUncorrelatedInRExprSteps(c.condition, bound, ctx, foldCost);
+      if (c.action.kind === "update") {
+        for (const a of c.action.assigns) {
+          a.source = yield* this.foldUncorrelatedInRExprSteps(a.source, bound, ctx, foldCost);
+        }
+      } else if (c.action.kind === "insert") {
+        const values = c.action.values;
+        for (let p = 0; p < values.length; p++) {
+          const v = values[p]!;
+          if (v !== null)
+            values[p] = yield* this.foldUncorrelatedInRExprSteps(v, bound, ctx, foldCost);
+        }
+      }
+    }
+    if (plan.returning !== null) {
+      const nodes = plan.returning.nodes;
+      for (let i = 0; i < nodes.length; i++) {
+        if (shouldCooperate()) yield COOPERATE;
+        nodes[i] = yield* this.foldUncorrelatedInRExprSteps(nodes[i]!, bound, ctx, foldCost);
+      }
+    }
+    meter.charge(foldCost.value);
+
+    // The source (§3): `SELECT * FROM source_ref`, its rows buffered and its cost charged.
+    const q = yield* this.execQueryPlanSteps(plan.source, [], bound, ctx);
+    meter.charge(q.cost);
+    const srcRows: Row[] = q.rows;
+    const w = plan.width;
+
+    // The touched set (§9): every target column any part of the statement reads.
+    const mask: boolean[] = new Array(n).fill(false);
+    collectTouched(plan.on, 0, mask);
+    for (const c of plan.clauses) {
+      if (c.match === "notMatchedByTarget") continue;
+      if (c.condition !== null) collectTouched(c.condition, 0, mask);
+      if (c.action.kind === "update") {
+        for (const a of c.action.assigns) collectTouched(a.source, 0, mask);
+      }
+    }
+    if (plan.returning !== null) {
+      const retMask: boolean[] = new Array(w + 3 * n + 1).fill(false);
+      for (const node of plan.returning.nodes) collectTouched(node, 0, retMask);
+      for (let i = 0; i < n; i++) {
+        if (retMask[w + i] || retMask[w + n + i] || retMask[w + 2 * n + i]) mask[i] = true;
+      }
+    }
+
+    const stmtRng = new StmtRng();
+    const env: EvalEnv = {
+      params: bound,
+      outer: [],
+      runSubquery: (p, o) => this.execHiddenQueryPlan(p, o, bound, ctx),
+      runSubquerySteps: (p, o) => this.execHiddenQueryPlanSteps(p, o, bound, ctx),
+      environment: this.session.environment,
+      rng: stmtRng,
+      ctes: ctx,
+      exec: this,
+    };
+    const pkChanged: boolean[] = plan.clauses.map(
+      (c) =>
+        pkMembers.length > 0 &&
+        c.action.kind === "update" &&
+        c.action.assigns.some((a) => pkMembers.includes(a.idx)),
+    );
+    const actions: MergePlanned[] = [];
+    const affected = new Set<string>();
+    const matched = new Set<string>();
+
+    // actOnTarget plans the action a target row's chosen clause takes (§4): the 21000 check, then an
+    // UPDATE's new row (assignments, NOT NULL over the whole row, carried large values, CHECK, the
+    // re-key) or a DELETE. stored is the row as the scan returned it (its deferred values intact).
+    const self = this;
+    const actOnTarget = function* (
+      ci: number,
+      key: Uint8Array,
+      row: Row,
+      stored: Row,
+      src: number,
+      evalRow: Row,
+    ): Steps<void> {
+      const action = plan.clauses[ci]!.action;
+      if (action.kind === "doNothing") return;
+      const k = key.join(",");
+      if (affected.has(k)) {
+        throw engineError("cardinality_violation", "MERGE command cannot affect row a second time");
+      }
+      if (action.kind === "delete") {
+        affected.add(k);
+        actions.push({ kind: "delete", key, oldRow: row, src });
+        return;
+      }
+      if (action.kind !== "update") {
+        throw new Error("a target row takes UPDATE, DELETE, or DO NOTHING");
+      }
+      const newRow = row.slice();
+      let nullCol: string | null = null;
+      for (const a of action.assigns) {
+        if (shouldCooperate()) yield COOPERATE;
+        try {
+          const raw = yield* evalExprSteps(a.source, evalRow, env, meter);
+          // NOT NULL over the complete new row, after every assignment (error-fields.md §9.5).
+          if (a.notNull && raw.kind === "null") {
+            nullCol ??= a.name;
+            newRow[a.idx] = raw;
+            continue;
+          }
+          newRow[a.idx] = checkAssign(a, raw, self.inputZone());
+        } catch (e) {
+          throw stampTable(e, relation);
+        }
+      }
+      if (nullCol !== null) throw yield* self.notNullRowViolationSteps(relation, nullCol, newRow);
+      // An unassigned non-key large value is carried in its stored form (large-values.md §15);
+      // every other deferred value is resolved, unmetered.
+      for (let i = 0; i < newRow.length; i++) {
+        const carried = !action.assigns.some((a) => a.idx === i) && !pkMembers.includes(i);
+        const sv = stored[i]!;
+        const nv = newRow[i]!;
+        if (carried && sv.kind === "unfetched" && sv.ref.form !== 0x00) newRow[i] = sv;
+        else if (nv.kind === "unfetched") newRow[i] = yield* store.resolveValueSteps(i, nv.ref);
+      }
+      yield* evalChecksSteps(checks, relation, newRow, env, meter);
+      const newKey = pkChanged[ci] ? encodePkKey(colTypes, pkMembers, colls, newRow) : key;
+      const settled = yield* store.settleCarriedSteps(newKey, newRow);
+      affected.add(k);
+      actions.push({
+        kind: "update",
+        oldKey: key,
+        newKey,
+        newRow: settled,
+        oldRow: row,
+        src,
+        clause: ci,
+      });
+    };
+    // choose is the first clause of `match` with no condition, or whose condition is TRUE (§4).
+    const choose = function* (match: MergeMatch, evalRow: Row): Steps<number> {
+      for (let ci = 0; ci < plan.clauses.length; ci++) {
+        const c = plan.clauses[ci]!;
+        if (c.match !== match) continue;
+        if (c.condition === null) return ci;
+        if (yield* evalFilterSteps(c.condition, evalRow, env, meter)) return ci;
+      }
+      return -1;
+    };
+
+    // The matching pass (§3): per source row, the probe, the join condition, the matched pairs, or
+    // the not-matched action.
+    const scanPlan = this.planMutationScan(db, table, plan.probe, contradiction);
+    const hasBySource = plan.clauses.some((c) => c.match === "notMatchedBySource");
+    for (let si = 0; si < srcRows.length; si++) {
+      if (shouldCooperate()) yield COOPERATE;
+      meter.guard();
+      const src = srcRows[si]!;
+      const probeEnv: EvalEnv = { ...env, outer: [src] };
+      const batch = yield* this.executeMutationScanSteps(
+        scanPlan,
+        table.name,
+        plan.probe,
+        bound,
+        probeEnv,
+        meter,
+        mask,
+      );
+      meter.charge(
+        COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
+      );
+      let any = false;
+      for (const e of batch.entries) {
+        if (shouldCooperate()) yield COOPERATE;
+        meter.guard();
+        meter.charge(COSTS.storageRowRead);
+        const row = yield* store.resolveColumnsSteps(e.row, mask);
+        const combined = row.concat(src);
+        if (!(yield* evalFilterSteps(plan.on, combined, env, meter))) continue;
+        any = true;
+        if (hasBySource) matched.add(e.key.join(","));
+        const ci = yield* choose("matched", combined);
+        if (ci < 0) continue;
+        yield* actOnTarget(ci, e.key, store.resolveInlineColumns(row), e.row, si, combined);
+      }
+      if (any) continue;
+      const ci = yield* choose("notMatchedByTarget", src);
+      if (ci < 0) continue;
+      const action = plan.clauses[ci]!.action;
+      if (action.kind !== "insert") continue; // DO NOTHING
+      const vals: Value[] = [];
+      for (const node of action.values) {
+        if (node === null) {
+          vals.push(nullValue());
+          continue;
+        }
+        meter.guard();
+        vals.push(yield* evalExprSteps(node, src, env, meter));
+      }
+      const row = yield* this.buildInsertRowSteps(
+        table,
+        colTypes,
+        action.provided,
+        vals,
+        plan.defaultExprs,
+        stmtRng,
+        meter,
+      );
+      yield* evalChecksSteps(checks, relation, row, env, meter);
+      actions.push({ kind: "insert", row, src: si });
+    }
+    // Not matched by source (§3): one full scan in storage-key order.
+    if (hasBySource) {
+      const full = this.planMutationScan(db, table, null, false);
+      const batch = yield* this.executeMutationScanSteps(
+        full,
+        table.name,
+        null,
+        bound,
+        env,
+        meter,
+        mask,
+      );
+      meter.charge(
+        COSTS.pageRead * BigInt(batch.pages) + COSTS.valueDecompress * BigInt(batch.slabs),
+      );
+      for (const e of batch.entries) {
+        if (shouldCooperate()) yield COOPERATE;
+        meter.guard();
+        meter.charge(COSTS.storageRowRead);
+        if (matched.has(e.key.join(","))) continue;
+        const resolved = yield* store.resolveColumnsSteps(e.row, mask);
+        const ci = yield* choose("notMatchedBySource", resolved);
+        if (ci < 0) continue;
+        const row = store.resolveInlineColumns(resolved);
+        yield* actOnTarget(ci, e.key, row, e.row, -1, row);
+      }
+    }
+
+    // End-state validation (§5). The vacated keys: every updated row's old key and every deleted
+    // row's key. The placed rows: every inserted row and every updated row's new version, in
+    // action-list order.
+    const vacated = new Set<string>();
+    for (const a of actions) {
+      if (a.kind === "update") vacated.add(a.oldKey.join(","));
+      else if (a.kind === "delete") vacated.add(a.key.join(","));
+    }
+    // Each insert's primary key, computed once (a table without one allocates a rowid in phase 2).
+    const insertKeys: (Uint8Array | null)[] = actions.map((a) =>
+      a.kind === "insert" && pkMembers.length > 0
+        ? encodePkKey(colTypes, pkMembers, colls, a.row)
+        : null,
+    );
+    if (pkMembers.length > 0) {
+      const seen = new Set<string>();
+      for (let ai = 0; ai < actions.length; ai++) {
+        if (shouldCooperate()) yield COOPERATE;
+        const a = actions[ai]!;
+        if (a.kind === "delete") continue;
+        const key = a.kind === "insert" ? insertKeys[ai]! : a.newKey;
+        const row = a.kind === "insert" ? a.row : a.newRow;
+        const k = key.join(",");
+        const taken = (yield* store.getSteps(key)) !== undefined && !vacated.has(k);
+        if (taken || seen.has(k)) {
+          throw uniqueViolation(relation, pkeyName(relation)).withDetail(
+            yield* pkDetailSteps(
+              this.session,
+              relation,
+              table.columns,
+              pkMembers,
+              row,
+              DETAIL_EXISTS,
+            ),
+          );
+        }
+        seen.add(k);
+      }
+    }
+    const placed: Row[] = [];
+    for (const a of actions) {
+      if (a.kind === "insert") placed.push(a.row);
+      else if (a.kind === "update") placed.push(a.newRow);
+    }
+    if (placed.length > 0) {
+      for (const rindex of rindexes) {
+        if (shouldCooperate()) yield COOPERATE;
+        if (!rindex.unique) continue;
+        const istore = this.lkpIndexStoreScoped(db, rindex.name);
+        const batch = new Set<string>();
+        for (const row of placed) {
+          if (shouldCooperate()) yield COOPERATE;
+          const prefix = yield* this.indexPrefixSteps(colTypes, colls, rindex, row);
+          if (prefix === null) continue;
+          const k = prefix.join(",");
+          const conflict =
+            batch.has(k) ||
+            (yield* istore.rangeEntriesSteps(uniqueProbeBound(prefix))).some(
+              (e) => !vacated.has(e.key.slice(prefix.length).join(",")),
+            );
+          if (conflict) {
+            throw uniqueViolation(relation, rindex.name).withDetail(
+              yield* indexDetailByNameSteps(this.session, table, rindex, row, env, DETAIL_EXISTS),
+            );
+          }
+          batch.add(k);
+        }
+      }
+    }
+    yield* this.validateExclusionsSteps(db, table, placed, vacated);
+    // FOREIGN KEY child side: every inserted row, and every updated row whose clause assigned one of
+    // the key's columns; a self-reference may be satisfied by a placed row.
+    const { fks, temp: fkTemp } = this.targetForeignKeys(db, table.name);
+    for (const fk of fks) {
+      if (shouldCooperate()) yield COOPERATE;
+      const parent = this.fkSnap(fkTemp).table(fk.refTable);
+      if (parent === undefined) continue;
+      const parentColls = this.columnCollations(parent.columns);
+      const batch = new Set<string>();
+      if (fk.refTable === relation) {
+        for (const r of placed) {
+          if (shouldCooperate()) yield COOPERATE;
+          const p = yield* fkProbeSteps(fk, parent, parentColls, r, fk.refColumns);
+          if (p !== null) batch.add(fkProbeBytes(p).join(","));
+        }
+      }
+      for (const a of actions) {
+        if (shouldCooperate()) yield COOPERATE;
+        let row: Row;
+        if (a.kind === "insert") row = a.row;
+        else if (a.kind === "update") {
+          const action = plan.clauses[a.clause]!.action;
+          if (action.kind !== "update" || !action.assigns.some((x) => fk.columns.includes(x.idx)))
+            continue;
+          row = a.newRow;
+        } else continue;
+        const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
+        if (probe === null) {
+          if (fkMatchFullViolated(fk, row))
+            yield* this.fkChildCheckSteps(relation, table.columns, fk, null, row, fkTemp);
+          continue;
+        }
+        if (batch.has(fkProbeBytes(probe).join(","))) continue;
+        yield* this.fkChildCheckSteps(relation, table.columns, fk, probe, row, fkTemp);
+      }
+    }
+
+    // The compression attempts of every placed row's disposition plan, then the ceiling — the last
+    // abort point before a write (§5). A rowid table's 8-byte placeholder stands in for the key a
+    // phase-2 insert allocates (only the key length feeds the plan).
+    const placeholder = new Uint8Array(8);
+    let cunits = 0n;
+    for (let ai = 0; ai < actions.length; ai++) {
+      if (shouldCooperate()) yield COOPERATE;
+      const a = actions[ai]!;
+      if (a.kind === "insert")
+        cunits += BigInt(store.writeCompressUnits(insertKeys[ai] ?? placeholder, a.row));
+      else if (a.kind === "update") cunits += BigInt(store.writeCompressUnits(a.newKey, a.newRow));
+    }
+    meter.charge(COSTS.valueCompress * cunits);
+    meter.guard();
+
+    // RETURNING (§7): one row per action over [source | target | old | new | action].
+    let returned: Value[][] | null = null;
+    if (plan.returning !== null) {
+      const renv: EvalEnv = { ...env, rng: new StmtRng() };
+      const nullTarget: Row = table.columns.map(() => nullValue());
+      const nullSrc: Row = new Array(w).fill(null).map(() => nullValue());
+      returned = [];
+      for (const a of actions) {
+        if (shouldCooperate()) yield COOPERATE;
+        meter.guard();
+        meter.charge(COSTS.rowProduced);
+        let row: Row;
+        if (a.kind === "insert") {
+          row = [...srcRows[a.src]!, ...a.row, ...nullTarget, ...a.row];
+          row.push({ kind: "text", text: "INSERT" });
+        } else if (a.kind === "update") {
+          const src = a.src >= 0 ? srcRows[a.src]! : nullSrc;
+          row = [...src, ...a.newRow, ...a.oldRow, ...a.newRow];
+          row.push({ kind: "text", text: "UPDATE" });
+        } else {
+          const src = a.src >= 0 ? srcRows[a.src]! : nullSrc;
+          row = [...src, ...a.oldRow, ...a.oldRow, ...nullTarget];
+          row.push({ kind: "text", text: "DELETE" });
+        }
+        const vals: Value[] = [];
+        for (const node of plan.returning.nodes)
+          vals.push(yield* evalExprSteps(node, row, renv, meter));
+        meter.admitRow(vals); // a RETURNING result row (memory.md §5.1)
+        returned.push(vals);
+      }
+    }
+
+    // Every index entry change, per action, before the writes (§6): a deleted row's entries and an
+    // update's moved-away entries (removals), and an update's moved-to entries. An insert's entries
+    // are computed in phase 2, under the key it is placed at (a rowid table allocates it there).
+    const removes: IndexEntry[][] = table.indexes.map(() => []);
+    const updateAdds: Uint8Array[][][] = [];
+    for (const a of actions) {
+      if (shouldCooperate()) yield COOPERATE;
+      const perIndex: Uint8Array[][] = [];
+      for (let k = 0; k < rindexes.length; k++) {
+        const rindex = rindexes[k]!;
+        if (a.kind === "delete") {
+          for (const ek of yield* this.indexEntriesSteps(
+            table.columns,
+            colTypes,
+            colls,
+            rindex,
+            a.key,
+            a.oldRow,
+          )) {
+            removes[k]!.push({ key: ek, skeyLen: a.key.length });
+          }
+          perIndex.push([]);
+        } else if (a.kind === "update") {
+          const oldEks = yield* this.indexEntriesSteps(
+            table.columns,
+            colTypes,
+            colls,
+            rindex,
+            a.oldKey,
+            a.oldRow,
+          );
+          const newEks = yield* this.indexEntriesSteps(
+            table.columns,
+            colTypes,
+            colls,
+            rindex,
+            a.newKey,
+            a.newRow,
+          );
+          for (const ek of bytesDiff(oldEks, newEks)) {
+            removes[k]!.push({ key: ek, skeyLen: a.oldKey.length });
+          }
+          perIndex.push(bytesDiff(newEks, oldEks));
+        } else {
+          perIndex.push([]);
+        }
+      }
+      updateAdds.push(perIndex);
+    }
+
+    // Phase 2 (§6). 1: vacate — each deleted row and each re-keyed row's old key. 2: place — each
+    // insert (its key, or an allocated rowid) and each updated row, in action-list order. 3: per
+    // index, every removal, then every addition.
+    const writeStore = this.writeStoreScoped(db, table.name);
+    for (const a of actions) {
+      if (shouldCooperate()) yield COOPERATE;
+      if (a.kind === "delete") yield* writeStore.removeSteps(a.key);
+      else if (a.kind === "update" && !bytesEq(a.oldKey, a.newKey))
+        yield* writeStore.removeSteps(a.oldKey);
+    }
+    const adds: IndexEntry[][] = table.indexes.map(() => []);
+    const fkDeletes: Row[] = [];
+    const fkUpdates: { row: Row; oldRow: Row }[] = [];
+    for (let ai = 0; ai < actions.length; ai++) {
+      if (shouldCooperate()) yield COOPERATE;
+      const a = actions[ai]!;
+      if (a.kind === "insert") {
+        const key = insertKeys[ai] ?? encodeInt("i64", writeStore.allocRowid());
+        for (let k = 0; k < rindexes.length; k++) {
+          for (const ek of yield* this.indexEntriesSteps(
+            table.columns,
+            colTypes,
+            colls,
+            rindexes[k]!,
+            key,
+            a.row,
+          )) {
+            adds[k]!.push({ key: ek, skeyLen: key.length });
+          }
+        }
+        if (!(yield* writeStore.insertSteps(key, a.row))) {
+          // Reachable only under the writable-CTE read pin (writable-cte.md §7).
+          throw uniqueViolation(relation, pkeyName(relation));
+        }
+      } else if (a.kind === "update") {
+        for (let k = 0; k < rindexes.length; k++) {
+          for (const ek of updateAdds[ai]![k]!)
+            adds[k]!.push({ key: ek, skeyLen: a.newKey.length });
+        }
+        if (!bytesEq(a.oldKey, a.newKey)) {
+          if (!(yield* writeStore.insertSteps(a.newKey, a.newRow))) {
+            throw uniqueViolation(relation, pkeyName(relation));
+          }
+        } else {
+          yield* writeStore.replaceSteps(a.oldKey, a.newRow);
+        }
+        fkUpdates.push({ row: a.newRow, oldRow: a.oldRow });
+      } else {
+        fkDeletes.push(a.oldRow);
+      }
+    }
+    for (let k = 0; k < table.indexes.length; k++) {
+      if (shouldCooperate()) yield COOPERATE;
+      const def = table.indexes[k]!;
+      const istore = this.writeIndexStoreScoped(db, def.name);
+      for (const ek of removes[k]!) {
+        if (shouldCooperate()) yield COOPERATE;
+        yield* indexEntryRemoveSteps(istore, def.kind, ek.key, ek.skeyLen);
+      }
+      for (const ek of adds[k]!) {
+        if (shouldCooperate()) yield COOPERATE;
+        if (!(yield* indexEntryInsertSteps(istore, def.kind, ek.key, ek.skeyLen))) {
+          if (def.unique) throw uniqueViolation(relation, def.name);
+          throw engineError("data_corrupted", "index entry keys are unique (storage-key suffix)");
+        }
+      }
+    }
+    this.syncPendingWrites(meter);
+    if (actions.length > 0) this.markEstimatorMutation(db, table.name);
+    const domain = this.fkDomain(db, table.name);
+    yield* this.applyFkDeleteActionsSteps(table, fkDeletes, meter, domain);
+    yield* this.applyFkUpdateActionsSteps(table, fkUpdates, meter, domain);
+    return dmlOutcome(
+      plan.returning?.names ?? null,
+      plan.returning !== null ? typeNames(plan.returning.types) : null,
+      returned,
+      actions.length,
+      meter.accrued,
+    );
+  }
+
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
   // Outcome (the projection types are internal — only INSERT ... SELECT consumes them).
   private executeSelect(sel: Select, params: Value[]): Outcome {
@@ -16622,6 +17519,36 @@ export class Engine {
     rename: string[] | null,
     ptypes: ParamTypes,
   ): { table: Table; dm: DmCte } {
+    // A MERGE body (spec/design/merge.md §1): its relation is its RETURNING schema. It is planned here
+    // only for that schema, so the CTE references the planning counts are restored — the
+    // orchestrator static-counts a data-modifying part's references (§3).
+    if (body.kind === "merge") {
+      const tdef = this.mergeTarget(body);
+      if (body.returning === null) {
+        const table = cteSyntheticTableCols(lname, [], [], null, null, rename);
+        return { table, dm: { stmt: body, noReturning: true } };
+      }
+      const saved = bindings.map((b) => ({ refs: b.refs, expanded: b.expanded }));
+      let plan: MergePlan;
+      try {
+        plan = this.planMerge(body, tdef, bindings, ptypes);
+      } finally {
+        bindings.forEach((b, i) => {
+          b.refs = saved[i]!.refs;
+          b.expanded = saved[i]!.expanded;
+        });
+      }
+      const ret = plan.returning!;
+      const table = cteSyntheticTableCols(
+        lname,
+        ret.names,
+        ret.types,
+        ret.derivs,
+        ret.typmods,
+        rename,
+      );
+      return { table, dm: { stmt: body, noReturning: false } };
+    }
     let tableName: string;
     let returning: ReturningClause | null;
     let baseIsOld: boolean;
@@ -17171,12 +18098,15 @@ export class Engine {
       outcome = yield* this.executeInsertSteps(body, params, ctx);
     } else if (body.kind === "update") {
       outcome = yield* this.executeUpdateSteps(body, params, ctx);
+    } else if (body.kind === "merge") {
+      outcome = yield* this.executeMergeSteps(body, params, ctx);
     } else {
       outcome = yield* this.executeDeleteSteps(body, params, ctx);
     }
     if (body.kind === "insert") this.recordExplainActual("Insert " + body.table, outcome.cost);
     else if (body.kind === "update") this.recordExplainActual("Update " + body.table, outcome.cost);
     else if (body.kind === "delete") this.recordExplainActual("Delete " + body.table, outcome.cost);
+    else if (body.kind === "merge") this.recordExplainActual("Merge " + body.table, outcome.cost);
     // (5) Settle every foreign-key check the parts queued, against the end state of the whole
     //     statement (§7). A parent-side reverse match is metered (constraints.md §6.11).
     const fkMeter = this.session.newMeter();
@@ -17216,13 +18146,20 @@ export class Engine {
       outcome = yield* this.executeInsertSteps(stmt, params, ctx);
     } else if (stmt.kind === "update") {
       outcome = yield* this.executeUpdateSteps(stmt, params, ctx);
+    } else if (stmt.kind === "merge") {
+      outcome = yield* this.executeMergeSteps(stmt, params, ctx);
     } else {
       outcome = yield* this.executeDeleteSteps(stmt, params, ctx);
     }
-    this.recordExplainActual(
-      `${stmt.kind === "insert" ? "Insert" : stmt.kind === "update" ? "Update" : "Delete"} ${stmt.table}`,
-      outcome.cost,
-    );
+    const verb =
+      stmt.kind === "insert"
+        ? "Insert"
+        : stmt.kind === "update"
+          ? "Update"
+          : stmt.kind === "merge"
+            ? "Merge"
+            : "Delete";
+    this.recordExplainActual(`${verb} ${stmt.table}`, outcome.cost);
     if (outcome.kind === "query") {
       return { rows: outcome.rows, cost: outcome.cost };
     }
@@ -34843,10 +35780,12 @@ export function* scanEntriesSteps(
   pkBound: PkBound | null,
   params: Value[],
   mask: boolean[],
+  outer: Row[] = [],
 ): Steps<{ entries: Entry[] | null; overlap: number; slabs: number }> {
   if (pkBound !== null) {
-    // Top-level statement: no enclosing query, so the bound never has a correlated source.
-    const b = buildKeyBound(pkBound, params, [], []);
+    // outer is empty for a top-level statement; a MERGE target probe's bound reads the source row
+    // as a correlated outer column (merge.md §3).
+    const b = buildKeyBound(pkBound, params, outer, []);
     if (b === null) return { entries: null, overlap: 0, slabs: 0 };
     const u = yield* store.rangeScanWithUnitsSteps(b, mask);
     return { entries: u.entries, overlap: u.pages, slabs: u.slabs };
@@ -38797,7 +39736,7 @@ export type CteSource = { kind: "query"; plan: QueryPlan } | { kind: "dml"; dm: 
 export type DmCte = { stmt: DmStmt; noReturning: boolean };
 
 // DmStmt is a data-modifying statement in a writable-CTE position (a CTE body or the WITH primary).
-export type DmStmt = Insert | Update | Delete;
+export type DmStmt = Insert | Update | Delete | Merge;
 
 // CteCtx is the per-statement CTE execution context, threaded through exec_* and EvalEnv so a FROM
 // reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). `modes` and
@@ -43024,6 +43963,25 @@ export function resolveFuncCall(
   // The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
   // other (non-variadic) name it is 42883 (no such overload). Caught before the per-kind dispatch.
   if (e.variadic && !isVariadicFuncName(lname)) throw noFuncOverload(lname);
+  // merge_action() reads the action slot of a MERGE's RETURNING scope — here, or an enclosing level
+  // for a sublink in the list (spec/design/merge.md §7); anywhere else it is 42601.
+  if (lname === "merge_action" && e.args.length === 0 && !e.star) {
+    let level = 0;
+    for (let s: Scope | null = scope; s !== null; s = s.parent) {
+      if (s.mergeAction !== null) {
+        const node: RExpr =
+          level === 0
+            ? { kind: "column", index: s.mergeAction }
+            : { kind: "outerColumn", level, index: s.mergeAction };
+        return { node, type: { kind: "text" } };
+      }
+      level++;
+    }
+    throw engineError(
+      "syntax_error",
+      "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command",
+    );
+  }
   if (isVariadicFuncName(lname)) {
     rejectNamed(lname, e.argNames);
     return resolveVariadicFunc(scope, e, ag, params);

@@ -131,8 +131,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Revisit `DISTINCT ON`** — recorded out of scope in [grammar.md §11](spec/design/grammar.md), but
   it is one of PostgreSQL's most-used extensions; decide whether to implement it or keep the
   non-goal. _(size: M if implemented)_
-- [ ] **`MERGE`** — the SQL-standard (PostgreSQL 15+) `MERGE INTO … USING … ON … WHEN [NOT] MATCHED
-  THEN …`, sharing upsert's two-phase write machinery ([upsert.md](spec/design/upsert.md)). _(size: L)_
+- [x] **`MERGE`** — `MERGE INTO target [AS a] USING source ON … WHEN MATCHED / NOT MATCHED [BY
+  TARGET] / NOT MATCHED BY SOURCE [AND …] THEN UPDATE / DELETE / INSERT / DO NOTHING [RETURNING …]`
+  with PostgreSQL 18 semantics: per-clause name visibility, 21000 for a row acted on twice,
+  `merge_action()`, `WITH` on a MERGE and MERGE as a writable-CTE body. A per-source-row target probe
+  planned by the UPDATE/DELETE access-path selector, the ON CONFLICT end-state validation, and a
+  pinned action / write order. Capability `dml.merge`. → [merge.md](spec/design/merge.md)
+  - [ ] _follow-on:_ `MERGE` into an automatically updatable view; a parenthesized-join source;
+    `EXPLAIN MERGE`; a hash join for a join condition the probe cannot narrow (each source row reads
+    the whole target today) — merge.md §12.
 - [x] **`SAVEPOINT` / nested transactions** — `SAVEPOINT name`, `RELEASE [SAVEPOINT] name`,
   `ROLLBACK [TRANSACTION|WORK] TO [SAVEPOINT] name` with PostgreSQL semantics (name shadowing,
   `25P01` outside a block, `3B001` unknown name, `ROLLBACK TO` recovers a failed block). The open

@@ -1527,6 +1527,7 @@ type dmCte struct {
 	insert      *insert
 	update      *update
 	delete      *deleteStmt
+	merge       *mergeStmt
 	noReturning bool
 }
 

@@ -1369,6 +1369,58 @@ export type Delete = {
   fkTarget?: FkKeyedTarget;
 };
 
+// Merge is `MERGE INTO target [[AS] alias] USING source ON condition when_clause+ [RETURNING …]`
+// (spec/design/merge.md). The source is carried as the query `SELECT * FROM source_ref` it is
+// evaluated as (§3), so CTE references, privileges, and planning see an ordinary query.
+export type Merge = {
+  kind: "merge";
+  table: string;
+  // The target name's source character position (spec/design/error-fields.md §10.2).
+  tableLoc?: SrcLoc;
+  // The optional database qualifier on the target, like Update.db.
+  db?: string;
+  // The optional target alias (AS optional — merge.md §1); it replaces the table's name as the
+  // target's qualifier.
+  alias?: string;
+  // `SELECT * FROM source_ref` (merge.md §3).
+  source: QueryExpr;
+  // The source relation's label: its alias, else its table / view / CTE / function name. null for
+  // an unaliased derived table, whose columns are reachable only bare (merge.md §2).
+  sourceLabel: string | null;
+  // The join condition.
+  on: Expr;
+  // The WHEN clauses in written order (at least one).
+  clauses: MergeClause[];
+  // The optional terminal RETURNING clause (merge.md §7).
+  returning: ReturningClause | null;
+};
+
+// MergeMatch is which joined rows a WHEN clause applies to (merge.md §4): "matched" — a target row
+// the join condition pairs with a source row; "notMatchedByTarget" — a source row no target row
+// matched; "notMatchedBySource" — a target row no source row matched.
+export type MergeMatch = "matched" | "notMatchedByTarget" | "notMatchedBySource";
+
+// MergeClause is one `WHEN [NOT] MATCHED [BY …] [AND condition] THEN action` clause.
+export type MergeClause = {
+  match: MergeMatch;
+  condition: Expr | null;
+  action: MergeAction;
+};
+
+// MergeAction is a WHEN clause's action (merge.md §4). An INSERT's `DEFAULT VALUES` is `values`
+// empty and `columns` [] (as for INSERT); a `values` slot null is `DEFAULT`.
+export type MergeAction =
+  | { kind: "update"; assignments: Assignment[] }
+  | { kind: "delete" }
+  | {
+      kind: "insert";
+      columns: string[] | null;
+      columnLocs: SrcLoc[];
+      overriding: Overriding | null;
+      values: (Expr | null)[];
+    }
+  | { kind: "doNothing" };
+
 // A DML RETURNING clause. oldAlias / newAlias are the optional PostgreSQL-18
 // `WITH (OLD AS o, NEW AS n)` row-version aliases; aliasing a version hides its standard qualifier
 // (spec/design/grammar.md §32).
@@ -1449,11 +1501,12 @@ export type SetOp = {
 
 // CteBody is the body of a CTE, or the WITH-prefixed primary statement (spec/design/writable-cte.md):
 // an ordinary query expression (a SELECT or set operation), or a DATA-MODIFYING statement (a writable
-// CTE — INSERT/UPDATE/DELETE). The variants are already disjoint by their `kind` tags (Select/SetOp
-// vs insert/update/delete), so the union needs no extra wrapper. `cteBodyAsQuery` returns the query
-// expression for a plain body (used by the recursive-CTE analysis and the pure-query WITH path);
-// `cteBodyIsDataModifying` reports whether a body is an INSERT/UPDATE/DELETE.
-export type CteBody = QueryExpr | Insert | Update | Delete;
+// CTE — INSERT/UPDATE/DELETE/MERGE). The variants are already disjoint by their `kind` tags
+// (Select/SetOp vs insert/update/delete/merge), so the union needs no extra wrapper.
+// `cteBodyAsQuery` returns the query expression for a plain body (used by the recursive-CTE analysis
+// and the pure-query WITH path);
+// `cteBodyIsDataModifying` reports whether a body is an INSERT/UPDATE/DELETE/MERGE.
+export type CteBody = QueryExpr | Insert | Update | Delete | Merge;
 
 // cteBodyAsQuery returns the query expression if `body` is a plain query, else null (a
 // data-modifying body). Only a query body can be a recursive UNION shape (writable-cte.md §3).
@@ -1461,9 +1514,15 @@ export function cteBodyAsQuery(body: CteBody): QueryExpr | null {
   return body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr" ? body : null;
 }
 
-// cteBodyIsDataModifying reports whether `body` is a data-modifying statement (INSERT/UPDATE/DELETE).
+// cteBodyIsDataModifying reports whether `body` is a data-modifying statement
+// (INSERT/UPDATE/DELETE/MERGE).
 export function cteBodyIsDataModifying(body: CteBody): boolean {
-  return body.kind === "insert" || body.kind === "update" || body.kind === "delete";
+  return (
+    body.kind === "insert" ||
+    body.kind === "update" ||
+    body.kind === "delete" ||
+    body.kind === "merge"
+  );
 }
 
 // Cte is one common table expression in a WITH list (spec/design/cte.md). A named, statement-local
@@ -1619,6 +1678,7 @@ export type Statement =
   | WithQuery
   | Update
   | Delete
+  | Merge
   | Begin
   | Commit
   | Rollback

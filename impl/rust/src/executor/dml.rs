@@ -3396,7 +3396,7 @@ impl Engine {
     /// A DML target's foreign keys and their domain (temp-tables.md §8): the table's own FKs read
     /// from its domain snapshot, so an explicit `main`/`temp` qualifier survives a same-named
     /// table of the other domain. An attached-database table has none.
-    fn target_foreign_keys(
+    pub(crate) fn target_foreign_keys(
         &self,
         scope: Option<&str>,
         table: &str,
@@ -3416,7 +3416,7 @@ impl Engine {
     /// Parent DELETE action closure. Write actions run first for every inbound FK; NO ACTION /
     /// RESTRICT then inspect the resulting state. The writable-CTE read pin is temporarily removed
     /// so generated DML sees the parent and earlier generated writes in the transaction working set.
-    fn apply_fk_delete_actions(
+    pub(crate) fn apply_fk_delete_actions(
         &mut self,
         parent: &Table,
         rows: &[(Vec<u8>, Row)],
@@ -3498,7 +3498,7 @@ impl Engine {
     }
 
     /// Parent UPDATE action closure, parallel to [`apply_fk_delete_actions`].
-    fn apply_fk_update_actions(
+    pub(crate) fn apply_fk_update_actions(
         &mut self,
         parent: &Table,
         updates: &[(Vec<u8>, Vec<u8>, Row, Row)],

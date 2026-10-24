@@ -230,6 +230,8 @@ func stmtKind(stmt statement) string {
 		return "UPDATE"
 	case stmt.Delete != nil:
 		return "DELETE"
+	case stmt.Merge != nil:
+		return "MERGE"
 	case stmt.Explain != nil:
 		return "EXPLAIN"
 	default:
@@ -408,6 +410,12 @@ func (db *engine) dispatchStmtTarget(stmt statement, params []Value, ic *insertS
 		return db.executeUpdate(stmt.Update, params, cteCtx{})
 	case stmt.Delete != nil:
 		return db.executeDelete(stmt.Delete, params, cteCtx{})
+	case stmt.Merge != nil:
+		return db.executeMerge(stmt.Merge, params, cteCtx{})
+	// EXPLAIN of a MERGE — directly (refused by the parser) or in a WITH — is a deferred follow-on
+	// (spec/design/merge.md §12).
+	case stmt.Explain != nil && stmt.Explain.Inner.With != nil && withHasMerge(stmt.Explain.Inner.With):
+		return outcome{}, newError(FeatureNotSupported, "EXPLAIN MERGE is not supported")
 	case stmt.Explain != nil:
 		return db.executeExplain(stmt.Explain, params)
 	default:

@@ -1,0 +1,184 @@
+# MERGE errors (spec/design/merge.md §1, §2, §8): name visibility per clause kind, unreachable
+# clauses, merge_action() placement, duplicate labels, and the standalone statements' resolution
+# rules. Each failing MERGE changes nothing. Oracle-probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.merge, query.select, query.order_by, query.values, query.aggregates, types.i32, types.text, expr.arithmetic
+
+statement ok
+CREATE TABLE me (id i32 PRIMARY KEY, v i32, w text)
+
+statement ok
+INSERT INTO me VALUES (1, 10, 'a'), (2, 20, 'b')
+
+statement ok
+CREATE TABLE ms (id i32, v i32)
+
+statement ok
+INSERT INTO ms VALUES (1, 100)
+
+# A clause after an unconditional clause of the same kind can never run.
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN DELETE
+WHEN MATCHED AND me.v > 0 THEN UPDATE SET v = 0
+
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED THEN DO NOTHING
+WHEN NOT MATCHED BY TARGET THEN INSERT VALUES (ms.id, ms.v)
+
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+WHEN NOT MATCHED BY SOURCE AND me.v > 0 THEN DELETE
+
+# ... but clauses of different kinds may follow an unconditional one.
+statement ok
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN DO NOTHING
+WHEN NOT MATCHED BY SOURCE THEN DO NOTHING
+WHEN NOT MATCHED THEN DO NOTHING
+
+# merge_action() outside a MERGE's RETURNING list.
+statement error 42601
+SELECT merge_action()
+
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED AND merge_action() = 'UPDATE' THEN DELETE
+
+# The target and the source may not share a label.
+statement error 42712
+MERGE INTO me USING me ON me.id = me.id
+WHEN MATCHED THEN DELETE
+
+statement error 42712
+MERGE INTO me AS x USING ms AS x ON true
+WHEN MATCHED THEN DELETE
+
+# A NOT MATCHED [BY TARGET] clause cannot see the target; a BY SOURCE clause cannot see the source.
+statement error 42P01
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED THEN INSERT VALUES (ms.id, me.v)
+
+statement error 42P01
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED AND me.v > 0 THEN INSERT VALUES (ms.id, ms.v)
+
+statement error 42P01
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = ms.v
+
+statement error 42P01
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED BY SOURCE AND ms.v > 0 THEN DELETE
+
+# A target alias hides the table's own name.
+statement error 42P01
+MERGE INTO me AS t USING ms ON me.id = ms.id
+WHEN MATCHED THEN DELETE
+
+# A bare column both relations carry is ambiguous where both are visible.
+statement error 42702
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN UPDATE SET v = v
+
+statement error 42702
+MERGE INTO me USING ms ON id = 1
+WHEN MATCHED THEN DELETE
+
+# Unknown columns: a SET target, an INSERT column, an expression reference.
+statement error 42703
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN UPDATE SET nope = 1
+
+statement error 42703
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED THEN INSERT (id, nope) VALUES (1, 2)
+
+statement error 42703
+MERGE INTO me USING ms ON me.id = ms.nope
+WHEN MATCHED THEN DELETE
+
+# A column assigned twice.
+statement error 42701
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN UPDATE SET v = 1, v = 2
+
+# More INSERT values than target columns.
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED THEN INSERT (id) VALUES (1, 2)
+
+# A WHEN condition must be boolean.
+statement error 42804
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED AND ms.v THEN DELETE
+
+# Aggregates are not allowed in a WHEN condition, a SET, or VALUES.
+statement error 42803
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED AND count(*) > 0 THEN DELETE
+
+statement error 42803
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN UPDATE SET v = sum(ms.v)
+
+statement error 42803
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED THEN INSERT VALUES (max(ms.id), 1)
+
+# Assignment type rules: a text into an integer column.
+statement error 42804
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN UPDATE SET v = me.w
+
+statement error 42804
+MERGE INTO me USING (VALUES ('x')) AS s(t) ON false
+WHEN NOT MATCHED THEN INSERT VALUES (3, s.t)
+
+# Range and NOT NULL failures from the store coercion.
+statement error 22003
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN UPDATE SET v = 2147483647 + ms.v
+
+statement error 23502
+MERGE INTO me USING (VALUES (9)) AS s(k) ON me.id = s.k
+WHEN NOT MATCHED THEN INSERT (v) VALUES (s.k)
+
+# A missing target or source.
+statement error 42P01
+MERGE INTO nope USING ms ON true
+WHEN MATCHED THEN DELETE
+
+statement error 42P01
+MERGE INTO me USING nope ON true
+WHEN MATCHED THEN DELETE
+
+# A WHEN clause is required.
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+
+# An INSERT action is only for NOT MATCHED; UPDATE/DELETE only for MATCHED / BY SOURCE.
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN MATCHED THEN INSERT VALUES (1, 2)
+
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED THEN DELETE
+
+statement error 42601
+MERGE INTO me USING ms ON me.id = ms.id
+WHEN NOT MATCHED BY SOURCE THEN INSERT VALUES (1, 2)
+
+# Every failing statement above left the table unchanged.
+query IIT nosort
+SELECT id, v, w FROM me ORDER BY id
+----
+1
+10
+a
+2
+20
+b

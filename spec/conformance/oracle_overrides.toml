@@ -1033,6 +1033,11 @@ file = "mutation/update.test"
 sql = "UPDATE t SET a = 1, a = 2 WHERE id = 2"
 reason = "jed: assigning the same column twice in one UPDATE is 42701 (duplicate_column). PostgreSQL reports it as 42601 (syntax error — multiple assignments to same column). Both reject; the SQLSTATE differs. A documented error-class divergence."
 
+[[override]]
+file = "dml/merge_errors.test"
+sql = "MERGE INTO me USING ms ON me.id = ms.id WHEN MATCHED THEN UPDATE SET v = 1, v = 2"
+reason = "jed: assigning the same column twice in a MERGE UPDATE action is 42701 (duplicate_column), the standalone UPDATE's code (spec/design/merge.md §11). PostgreSQL reports 42601 (multiple assignments to same column). Both reject; the SQLSTATE differs."
+
 # --- subquery/errors.test: untyped `$N` placeholder surface (grammar.md §26) vs the live oracle.
 [[override]]
 file = "subquery/errors.test"

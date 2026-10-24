@@ -3404,6 +3404,21 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	if fc.Variadic && !isVariadicFuncName(name) {
 		return nil, resolvedType{}, noFuncOverload(name)
 	}
+	// merge_action() reads the action slot of a MERGE's RETURNING scope — here, or an enclosing level
+	// for a sublink in the list (spec/design/merge.md §7); anywhere else it is 42601.
+	if name == "merge_action" && len(fc.Args) == 0 && !fc.Star {
+		level := 0
+		for at := s; at != nil; at = at.parent {
+			if at.mergeAction != nil {
+				if level == 0 {
+					return &rExpr{kind: reColumn, index: *at.mergeAction}, resolvedType{kind: rtText}, nil
+				}
+				return &rExpr{kind: reOuterColumn, level: level, index: *at.mergeAction}, resolvedType{kind: rtText}, nil
+			}
+			level++
+		}
+		return nil, resolvedType{}, newError(SyntaxError, "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command")
+	}
 	if isVariadicFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err

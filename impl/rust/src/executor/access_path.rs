@@ -146,7 +146,8 @@ impl Engine {
         Ok((rows, (pages, slabs)))
     }
 
-    /// Execute a planned UPDATE/DELETE access path into the normalized keyed-row batch. This owns
+    /// Execute a planned UPDATE/DELETE access path into the normalized keyed-row batch. A bound
+    /// reading a correlated outer column (a MERGE target probe, merge.md §3) reads `env.outer`. This owns
     /// the access-method switch that used to be duplicated inline in both DML executors; per-row
     /// guards, residual evaluation, and phase-2 writes remain with the caller.
     #[allow(clippy::too_many_arguments)]
@@ -174,7 +175,7 @@ impl Engine {
                 let (entries, pages, slabs) = store.scan_with_units(mask)?;
                 (entries, (pages, slabs))
             }
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, &[], &[]) {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(bound) => {
                     let (entries, pages, slabs) = store.range_scan_with_units(&bound, mask)?;
                     (entries, (pages, slabs))
@@ -182,7 +183,7 @@ impl Engine {
                 None => (Vec::new(), (0, 0)),
             },
             Some(ScanBound::Index(ib)) => {
-                self.index_bound_entries(table_name, ib, params, &[], mask, &[])?
+                self.index_bound_entries(table_name, ib, params, env.outer, mask, &[])?
             }
             Some(ScanBound::Gin(gb)) => {
                 let query = filter.and_then(|f| gin_bound_query(f, gb));
@@ -193,11 +194,11 @@ impl Engine {
                 self.gist_bound_rows(table_name, gb, query, &[], env, meter, mask, false)?
             }
             Some(ScanBound::PkSet(ks)) => {
-                self.pk_key_set_rows(store, ks, params, &[], mask, &[], false)?
+                self.pk_key_set_rows(store, ks, params, env.outer, mask, &[], false)?
             }
             Some(ScanBound::IndexSet(ks)) => {
                 let (mut entries, units) =
-                    self.index_key_set_entries(table_name, ks, params, &[], mask, &[])?;
+                    self.index_key_set_entries(table_name, ks, params, env.outer, mask, &[])?;
                 // Retain first-probe order while guaranteeing that phase 2 can never receive the
                 // same row twice if a future index-key generalization makes probe sets overlap.
                 let mut seen = HashSet::with_capacity(entries.len());

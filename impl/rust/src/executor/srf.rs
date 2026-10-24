@@ -44,6 +44,7 @@ impl Engine {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             // Arguments are resolved with PostgreSQL's `p_lateral_active` set, so a hint never
             // suggests LATERAL from here (error-fields.md §11.8).
             hints: ScopeHints {
@@ -550,6 +551,7 @@ impl Engine {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             // Arguments are resolved with PostgreSQL's `p_lateral_active` set, so a hint never
             // suggests LATERAL from here (error-fields.md §11.8).
             hints: ScopeHints {

@@ -23,7 +23,7 @@ INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
 
 <svelte:head>
 	<title>Tables &amp; constraints — jed</title>
-	<meta name="description" content="Create and alter typed tables — from column definitions or from a query with CREATE TABLE AS — with serial and identity auto-numbering, defaults, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
+	<meta name="description" content="Create and alter typed tables — from column definitions or from a query with CREATE TABLE AS — with serial and identity auto-numbering, defaults, upserts and MERGE, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
 </svelte:head>
 
 # Tables & constraints
@@ -497,3 +497,40 @@ UPDATE account SET balance = balance + 25
 A conflict on a constraint *other* than the arbiter still raises `23505`, and a single statement whose
 proposed row conflicts with a row that same statement already inserted or updated raises `21000`.
 The whole statement is all-or-nothing.
+
+## Synchronizing a table with `MERGE`
+
+`MERGE` joins a **source** — a table, a view, a subquery, a `VALUES` list, or a CTE — to the target
+table and, for each joined row, runs the first `WHEN` clause that applies: update or delete a
+matched row, insert a row for an unmatched source row, or update or delete a target row that no
+source row matched. Run this in the panel above:
+
+```sql
+MERGE INTO account a
+USING (VALUES (1, 30.00), (3, 75.00)) AS p(id, amount) ON a.id = p.id
+WHEN MATCHED THEN UPDATE SET balance = a.balance + p.amount
+WHEN NOT MATCHED THEN INSERT VALUES (p.id, 'new', p.amount)
+RETURNING merge_action(), a.id, a.balance;
+```
+
+Account `1` is matched and gains `30.00`; account `3` is new and inserted. `merge_action()` names
+what happened to each row, and `RETURNING` reads the source's columns too (`p.amount`), as well as
+`old.` and `new.` row versions. More to try:
+
+- **Conditions** — `WHEN MATCHED AND p.amount < 0 THEN DELETE` before an unconditional `WHEN
+  MATCHED` clause; the first clause whose condition is true wins, and a clause after an unconditional
+  one of the same kind is an error (`42601`).
+- **`DO NOTHING`** — skip a row explicitly: `WHEN NOT MATCHED THEN DO NOTHING`.
+- **Rows the source does not mention** — `WHEN NOT MATCHED BY SOURCE THEN DELETE` removes every
+  target row no source row matched (or `UPDATE SET …` flags them).
+- **Defaults** — `INSERT (id, owner) VALUES (…)` fills the remaining columns from their defaults, and
+  `UPDATE SET col = DEFAULT` resets a column.
+
+Each clause sees only what it can: a `WHEN NOT MATCHED` clause reads the source row only, and a
+`WHEN NOT MATCHED BY SOURCE` clause the target row only (`42P01` otherwise). A target row may be
+updated or deleted at most once — two source rows that both act on it raise `21000` — and conditions
+always read the row as it was before the statement. Like every write, `MERGE` is all-or-nothing, and
+its constraints are checked against the statement's end state, so a `MERGE` may delete one row and
+insert another with the same key. A `MERGE` can be prefixed by `WITH`, or itself be a `WITH` query
+whose `RETURNING` rows feed the rest of the statement. `MERGE` into a view and `EXPLAIN MERGE` are
+not supported yet (`0A000`).
