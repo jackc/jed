@@ -8,7 +8,10 @@ package jed
 // decoder (lz4.md §3) is total and safe: every read is bounds-checked, the output never grows
 // past the expected length, and malformed input is a structured data_corrupted (CLAUDE.md §13).
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"sync"
+)
 
 const (
 	lz4MinMatch = 4
@@ -33,7 +36,7 @@ func lz4EmitLength(out []byte, n int) []byte {
 	return append(out, byte(n))
 }
 
-func lz4EmitSequence(out, literals []byte, offset, mlen int) []byte {
+func lz4EmitSequence[S ~string | ~[]byte](out []byte, literals S, offset, mlen int) []byte {
 	lit := len(literals)
 	ml := mlen - lz4MinMatch
 	out = append(out, byte(min(lit, 15)<<4|min(ml, 15)))
@@ -50,7 +53,7 @@ func lz4EmitSequence(out, literals []byte, offset, mlen int) []byte {
 	return out
 }
 
-func lz4EmitLastLiterals(out, literals []byte) []byte {
+func lz4EmitLastLiterals[S ~string | ~[]byte](out []byte, literals S) []byte {
 	lit := len(literals)
 	out = append(out, byte(min(lit, 15)<<4))
 	if lit >= 15 {
@@ -59,10 +62,32 @@ func lz4EmitLastLiterals(out, literals []byte) []byte {
 	return append(out, literals...)
 }
 
-// lz4Compress is the pinned encoder (lz4.md §2): one input → one output, in every core.
-func lz4Compress(src []byte) []byte {
-	out := make([]byte, 0, len(src)/2+16)
-	table := make([]int, 1<<lz4HashLog)
+// lz4Le32 reads the little-endian u32 at p (the encoder's 4-byte hash and match probe).
+func lz4Le32[S ~string | ~[]byte](src S, p int) uint32 {
+	return uint32(src[p]) | uint32(src[p+1])<<8 | uint32(src[p+2])<<16 | uint32(src[p+3])<<24
+}
+
+// lz4Compress is the pinned encoder (lz4.md §2): one input → one output, in every core. It reads a
+// string as well as a byte slice, so a resident text value compresses without first being copied.
+func lz4Compress[S ~string | ~[]byte](src S) []byte {
+	return lz4CompressInto(make([]byte, 0, len(src)/2+16), new(lz4Table), src)
+}
+
+// lz4Table is the encoder's single-candidate hash table (lz4.md §2).
+type lz4Table [1 << lz4HashLog]int
+
+// lz4Scratch is a reusable encoder output buffer and hash table, for a caller that keeps only some
+// of the blocks it computes.
+type lz4Scratch struct {
+	out   []byte
+	table lz4Table
+}
+
+var lz4ScratchPool = sync.Pool{New: func() any { return new(lz4Scratch) }}
+
+// lz4CompressInto is lz4Compress appending to out[:0] with a caller-supplied table.
+func lz4CompressInto[S ~string | ~[]byte](out []byte, table *lz4Table, src S) []byte {
+	out = out[:0]
 	for i := range table {
 		table[i] = -1
 	}
@@ -70,11 +95,10 @@ func lz4Compress(src []byte) []byte {
 	p := 0
 	limit := len(src) - lz4MFLimit // last legal match start (may be negative)
 	for p <= limit {
-		h := lz4Hash(binary.LittleEndian.Uint32(src[p:]))
+		h := lz4Hash(lz4Le32(src, p))
 		cand := table[h]
 		table[h] = p // store AFTER reading the candidate
-		if cand >= 0 && p-cand <= lz4MaxOff &&
-			binary.LittleEndian.Uint32(src[cand:]) == binary.LittleEndian.Uint32(src[p:]) {
+		if cand >= 0 && p-cand <= lz4MaxOff && lz4Le32(src, cand) == lz4Le32(src, p) {
 			maxend := len(src) - lz4LastLiterals
 			mlen := lz4MinMatch
 			for p+mlen < maxend && src[cand+mlen] == src[p+mlen] {
