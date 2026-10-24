@@ -1318,8 +1318,8 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   P6 now cost-selects the complete single-base-relation pipeline: PK, every ordered-B-tree,
   GiST/GIN, both interval-set families, full scan, and eligible order-only B-tree walks compete after
   composing natural order, the complete residual/projection, and LIMIT/OFFSET early-out. Exact ties
-  use the canonical kind/name-byte order; blocking sort remains unmetered and receives no
-  private planner weight.
+  use the canonical kind/name-byte order; a blocking sort's comparisons remain unmetered and its
+  per-row key charge is estimated as zero, so it receives no private planner weight.
   P7's two-relation selector is now the smallest instance of P8's bounded N-way search. Maximal
   all-base INNER/CROSS islands retain deterministic Pareto frontiers over estimated cost, physical
   rows, and logical rows through eight movable relations; larger islands use deterministic

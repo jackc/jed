@@ -189,8 +189,9 @@ event  = "one aggregate accumulator update — one (input row x aggregate) folde
 # Charged once per aggregate per post-WHERE input row folded into its group (or the single
 # whole-table group when there is no GROUP BY). The aggregate's ARGUMENT expression is
 # evaluated through the normal evaluator (charging its own operator_eval); each emitted
-# group row charges row_produced; the bucketing and the finalize step (e.g. AVG's division)
-# are UNMETERED, like the ORDER BY sort and the DISTINCT dedup (../design/cost.md §3).
+# group row charges row_produced; the finalize step (e.g. AVG's division) and the group table's
+# probes are UNMETERED, like the ORDER BY sort's comparisons and the DISTINCT probes; each input
+# row's grouping keys charge hash_key (../design/cost.md §3).
 
 [[unit]]
 id     = "cte_scan_row"
@@ -286,11 +287,11 @@ event  = "one code point processed while building a collation sort key for a col
 # strings or many rows stays cost-proportional and a max_cost ceiling aborts it (54P01). It is
 # charged ONLY for the ordering comparisons that actually invoke the collation: `=`/`<>` under a
 # deterministic collation are byte-equality (../design/collation.md §7) and charge nothing beyond
-# their operator_eval; a `C`/default comparison charges nothing here. The ORDER BY sort itself is
-# UNMETERED like every sort (../design/cost.md §3, ../design/spill.md §6) — its input cardinality
-# is bounded by the upstream storage_row_read / row_produced — so the collate unit lives at the
-# expression-evaluation site, the one deterministic metering point (collation.md §11). Charged at
-# the identical per-code-point point in every core, so cost stays cross-core identical (§8/§13).
+# their operator_eval; a `C`/default comparison charges nothing here. A sort on a collated key
+# builds each row's UCA sort key once and charges this unit per code point at that point, instead of
+# sort_key (specified, not yet implemented: resource.key_metering, ../design/cost.md §3 "sort_key /
+# hash_key"); the sort's comparisons over the built keys stay unmetered. Charged at the identical
+# per-code-point point in every core, so cost stays cross-core identical (§8/§13).
 
 [[unit]]
 id     = "timezone"
@@ -345,10 +346,11 @@ weight = 1
 event  = "one (input row x window function) result computed in the window stage"
 # Landed with window functions (../design/window.md §8, ../design/cost.md §3). The window-stage
 # analog of aggregate_accumulate: fires once per (input row x window function) whose value is
-# materialized into the synthetic row. The partition bucketing and per-partition sort are
-# UNMETERED (like the ORDER BY sort and the DISTINCT dedup — their input cardinality is already
-# bounded by the upstream storage_row_read / row_produced). So a row_number()-only query over N
-# rows accrues N storage_row_read + N window_result + N row_produced (+ page_read). Charged at the
+# materialized into the synthetic row. The partition table's probes and the per-partition sort's
+# comparisons are UNMETERED; each row's partition keys charge hash_key and its order keys sort_key
+# (or collate), once per shared partition/sort group (../design/cost.md §3 "sort_key / hash_key").
+# So a row_number() OVER (ORDER BY id) query over N rows with an integer id accrues N
+# storage_row_read + N window_result + N row_produced (+ page_read). Charged at the
 # identical per-(row x function) point in every core, so cost is cross-core identical (§8/§13).
 
 [[unit]]
@@ -408,3 +410,29 @@ id     = "jsonpath_step"
 weight = 1
 event  = "one unit of jsonpath evaluation: a step application, an emitted item, a member examined, or a comparison pair"
 # ../design/jsonpath.md §7: guarded as it accrues; connectives and roots are free.
+
+[[unit]]
+id     = "sort_key"
+weight = 1
+event  = "one logical payload byte of a non-collated sort-key value, charged once per row a sort receives"
+# Specified, not yet implemented (resource.key_metering; ../design/cost.md §3 "sort_key / hash_key").
+# Every row a sort receives (query, set-operation, and DISTINCT ON ORDER BY; window ORDER BY once per
+# shared partition/sort group; in-aggregate ORDER BY; ordered-set and hypothetical-set WITHIN GROUP)
+# charges payload(v) (../design/memory.md §3) for each non-collated key value, in key order, before
+# the row enters the sort, guarded after each key. NULL and fixed-width values measure 0, so integer
+# sorts are unchanged. A collated text/text[] key charges `collate` instead. The comparisons inside
+# the sort stay unmetered; a sort makes O(log n) comparisons per row, each reading at most the key,
+# so this per-row charge bounds them within a log factor. Rows a top-k heap discards still charge;
+# an elided sort receives none. Charged once per logical row, so spill does not change it.
+
+[[unit]]
+id     = "hash_key"
+weight = 1
+event  = "one logical payload byte of a grouping, dedup, or partition key value, charged once per row a table receives"
+# Specified, not yet implemented (resource.key_metering; ../design/cost.md §3 "sort_key / hash_key").
+# Every row that GROUP BY (per grouping set), SELECT DISTINCT, a DISTINCT aggregate, a set
+# operation's dedup or count table (not UNION ALL), a recursive CTE's UNION, or a window's PARTITION
+# BY receives charges payload(v) for each key value, in key order, before the row is inserted or
+# checked, guarded after each key. NULL and fixed-width values measure 0. Hashing reads each key once,
+# so this is the work; probes and collision checks stay unmetered. A hash join keeps hash_build /
+# hash_probe instead. Charged once per logical row, so spill does not change it.

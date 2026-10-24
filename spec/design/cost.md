@@ -84,7 +84,7 @@ TS; any deviation diverges the count and fails the corpus.
 The estimator selects among full, PK, ordered B-tree, GiST, GIN, both interval families, and
 secondary-index ORDER-BY/top-N alternatives by comparing the complete scheduled single-relation
 pipeline. A plain LIMIT can therefore change the access winner when early-out changes metered work;
-unmetered sorting still contributes no private planner weight. Bounded join search selects eligible
+a sort's unmetered comparisons still contribute no private planner weight. Bounded join search selects eligible
 multi-relation SELECT pipelines, and UPDATE/DELETE choose their target scan from the same estimate;
 hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estimator.md)).
 
@@ -829,19 +829,18 @@ cross-core-identical metering point:
   for the byte/code-point scan — the subsection below; `collate` and `varlen_compare` partition the
   text/bytea comparison surface, never both on one node.)
 - A **NULL** operand charges no `collate` (the comparison is Unknown before any sort key is built).
-- The **`ORDER BY` sort is unmetered**, like every sort ("What is NOT metered" below, spill.md §6):
-  a collated `ORDER BY` materializes its survivors and sorts them with a **decorate** sorter that
-  builds each row's sort key **exactly once** (no `O(n log n)` recompute), but charges no `collate` —
-  its input cardinality is already bounded by the upstream `storage_row_read` / `row_produced`. (The
-  set-operation sort path carries no `Meter` at all, so the comparison evaluator is the one
-  consistent, meterable site — collation.md §11.) Pinned cross-core by `# cost:` assertions in
-  `spec/conformance/suites/collation/collate.test`. An **`ORDER BY` *expression* key** (`ORDER BY
+- **A collated sort charges `collate` once per row.** A collated `ORDER BY` materializes its
+  survivors and sorts them with a **decorate** sorter that builds each row's sort key **exactly
+  once** (no `O(n log n)` recompute). Building that key charges `collate` per code point, and the
+  sort's comparisons over the decorated keys stay unmetered; every other sort on a collated key does
+  the same (§ "`sort_key` / `hash_key`" below, pinned by `resource/key_metering.test`). An **`ORDER BY` *expression* key** (`ORDER BY
   a + 1`, `ORDER BY abs(b)` — grammar.md §10) is the one ORDER-BY cost beyond the scan/produce
   block: its value is **materialized once per pre-sort row** (every post-`WHERE` row in a plain
   query, every group row in an aggregate query — *before* `LIMIT`, since the sort needs them all),
   so it charges an `operator_eval` per expression node per row exactly like a projection or filter
   expression. The sort *comparisons* over the materialized values stay unmetered. A bare-column /
-  ordinal key materializes nothing and adds no cost (byte-identical to before).
+  ordinal key materializes nothing; like every key, it is charged by size as the sort receives it
+  (§ "`sort_key` / `hash_key`" below).
 
 ### `varlen_compare` — a text / bytea comparison's length-scaled byte scan
 
@@ -877,10 +876,115 @@ metering point, like `collate`):
   collation). The two units partition the surface.
 - A **NULL** operand, or a non-`text`/`bytea` pair (integers, decimals — `decimal_work` handles those),
   charges no `varlen_compare`.
-- The **`ORDER BY` sort stays unmetered** like every sort (the `collate` rule above) — the unit lives
-  at the expression-evaluation site, not the sort. Pinned cross-core by `spec/conformance/suites/expr/varlen_compare.test`
+- A **sort's comparisons** charge no `varlen_compare`: the unit lives at the expression-evaluation
+  site, and a sort instead charges each row's keys once by size (`sort_key`, the subsection below). Pinned cross-core by `spec/conformance/suites/expr/varlen_compare.test`
   (and the join `# cost:` baselines in `joins/inner.test` / `joins/left.test`), with the ceiling-abort
   amplification in `resource/dos_amplification.test`.
+
+### `sort_key` / `hash_key` — per-row key work in sorts, grouping, and dedup
+
+> **Status: specified, not yet implemented.** Gated by the `resource.key_metering` capability and
+> pinned by `spec/conformance/suites/resource/key_metering.test`, which no core declares yet. Until
+> a core does, it charges none of this subsection's units; the statements elsewhere in this document
+> and in the other design docs that sorts, dedup, grouping, and partitioning charge per-row key work
+> describe a core that declares the capability.
+
+A sort, a grouping or dedup table, and a window's partitioning do work on every row's **key values**
+in proportion to their size. The comparisons inside a sort and the probes inside a hash table stay
+unmetered (§ "What is NOT metered"), because how many of them run depends on each core's algorithm.
+What every core does identically is take each row's keys once, and that is what these units charge.
+
+**Why.** Without these units a value charged once could be sorted or hashed once per row. One
+`repeat('a', 1048576)` cross joined with `generate_series(1, 20000)` charges its million bytes once
+(`scalar_byte`, §8.1), but a sort or `DISTINCT` over those rows reads the value in every row: measured
+before this rule, the Rust core spent 9 s sorting them at a cost of 1.1 million, and a collated sort of
+a 64 KiB value over 2000 rows took the Go core 6 s at a cost of 73,540. The work grew with rows ×
+value length while the cost grew with rows + value length, so `max_cost` did not bound it. Charging
+each row's key size closes that: a sort makes `O(log n)` comparisons per row, each reading at most
+the key, so its comparison work is within a `log n` factor of the charge; a hash table reads each key
+once per insert or check.
+
+**The measure.** A key value is measured by **`payload(v)`**, the shared logical size of the
+query-memory account ([memory.md](memory.md) §3): UTF-8 bytes for `text`, `json`, and `jsonpath`;
+bytes for `bytea`; 4 bytes per base-10⁴ digit group for `decimal`; the recursive container measures for arrays,
+composites, and ranges; `value_bytes(v) − VALUE` for `jsonb`. NULL and every fixed-width type measure
+**0**, so integer, date, timestamp, uuid, and boolean keys charge nothing and their costs do not
+change. The value is measured as the operator compares it: a large value the operator reads is
+measured fetched. Every core already computes this measure, pinned by
+`spec/cost/memory_sizes.toml`.
+
+**Sorts.** Every row a sort **receives** charges, for each sort key in key order:
+
+- a non-NULL key under a non-`C` collation (a collated `text` or `text[]` key, the keys a sort
+  decorates with their UCA sort key): **`collate` × the code points of the text** (for `text[]`, of
+  its non-NULL elements), the same per-code-point unit a collated comparison charges. It charges no
+  `sort_key` as well: `collate` and `sort_key` partition the keys, as `collate` and `varlen_compare`
+  partition comparisons;
+- every other key: **`sort_key` × `payload(v)`**.
+
+The charge is taken where the row's sort key is built, before the row enters the sort, and guarded
+after each key, so a ceiling aborts (`54P01`) before the sort does the work. A blocking `ORDER BY`
+builds its keys after every pre-sort row's `ORDER BY` expressions are evaluated (expression keys
+charge their `operator_eval`s first, as above), in input order, the order its collated keys are
+decorated in. A sort receives every row presented to it, including the rows a top-k heap discards and,
+under `LIMIT 0`, every row, so `LIMIT` never lowers the charge. A sort the plan does not perform
+receives nothing: an `ORDER BY` served by primary-key or index order (§ "ORDER BY satisfied by
+primary-key order", and its index and join variants) and a `DISTINCT` streamed in scan order charge no
+`sort_key`.
+
+| Sort | Rows it receives | Keys |
+|---|---|---|
+| Query `ORDER BY`: the eager sort, the external sorter, the collated survivor buffer, the top-k heap, and the bounded-spill lane | each pre-sort row (post-`WHERE`; in a grouped query each group row; in a `SELECT DISTINCT` query each kept row) | the `ORDER BY` keys |
+| A set operation's trailing `ORDER BY` | each combined output row | its `ORDER BY` keys |
+| `DISTINCT ON` | each pre-sort row | the `ON` expressions, then the remaining `ORDER BY` keys |
+| A window, once per shared partition/sort group with an `ORDER BY` ([window.md](window.md) §5.2) | each input row | the group's `ORDER BY` keys |
+| An in-aggregate `ORDER BY` ([aggregates.md](aggregates.md) §22) | each input that passes the aggregate's `FILTER` | its `ORDER BY` keys |
+| An ordered-set aggregate's `WITHIN GROUP` sort (`mode`, `percentile_disc`, `percentile_cont`) | each retained (non-NULL) input | the `WITHIN GROUP` key |
+| A hypothetical-set aggregate (`rank`, `dense_rank`, `percent_rank`, `cume_dist` with `WITHIN GROUP`) | each passing input, as it is compared with the hypothetical row | the `WITHIN GROUP` key tuple |
+
+Window definitions that share a partition/sort group are charged once for the group, not once per
+definition, because they share one sort.
+
+**Grouping and dedup tables.** Every row a table **receives** charges **`hash_key` × `payload(v)`**
+for each of its key values, in key order, before the row is inserted or checked, guarded after each
+key:
+
+| Table | Rows it receives | Keys |
+|---|---|---|
+| `GROUP BY`, once per grouping set (eager and vectorized group tables alike) | each input row, after `WHERE` | that set's grouping keys (the empty set `()` has none) |
+| `SELECT DISTINCT` (eager, grouped, and streaming-scan dedup) | each projected row it checks | every projected value |
+| A `DISTINCT` aggregate's value set | each input that passes the aggregate's `FILTER` | its arguments |
+| `UNION`, `INTERSECT`, `EXCEPT`, and `INTERSECT ALL` / `EXCEPT ALL` | each row of both operands | every output column |
+| A recursive CTE's `UNION` | each row of the non-recursive term and of every iteration, before its duplicate check | every column |
+| A window's `PARTITION BY`, once per shared partition/sort group with one | each input row | the partition keys |
+
+`UNION ALL` and a recursive CTE's `UNION ALL` build no table and charge nothing. A hash join keeps its
+own `hash_build` / `hash_probe` units (§ "JOIN"), which measure the canonical key encoding, and a
+`MERGE` that uses the hash join does too; neither is also charged `hash_key`. The window stage charges
+a group's partition keys for every row in input order, then its sort keys for every row in input
+order, matching when its partition entries and collated decorations are built
+([memory.md](memory.md) §6.2, §6.8).
+
+**Spill and lanes are invisible.** Each row is charged once, where it logically enters the operator.
+Writing it to a sort run, merging runs, partitioning a hash table to disk, and reading spilled rows
+back charge nothing more, so cost stays independent of `work_mem` and of whether an operator spilled
+([spill.md](spill.md) §6). A vectorized lane charges exactly what the row-at-a-time path does.
+
+**The estimator** counts `sort_key`, `hash_key`, and sort-site `collate` as zero, as it does
+`varlen_compare` and `collate` without admitted value-size facts ([estimator.md](estimator.md) §8), so
+these units change no plan and no `est_cost`. Pricing them from analyzed average widths is a
+follow-on under [estimator.md](estimator.md) §2's rule that a newly metered event is re-pinned before
+the estimator counts it.
+
+**Still unmetered, and still open.** The comparisons inside a sort, a hash table's probes and
+collision checks, and sort merge passes remain unmetered; the per-row charge bounds them. Two
+amplifiers of the same kind stay open: an aggregate `MIN`/`MAX` fold over `text` or `bytea` makes one
+unmetered comparison per row (§ "`decimal_work`" — unlike `GREATEST`/`LEAST`, which are metered), and
+an index build sorts its entries as unmetered maintenance (§ "What is NOT metered").
+
+**Existing costs.** A query that sorts, groups, dedups, or partitions on a variable-width key costs
+more under these units. A core that implements them re-pins the affected `# cost:` directives in the
+same change (`collation/collate.test`, among others); integer-keyed costs do not move.
 
 **Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
 each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**
@@ -1042,7 +1146,8 @@ rows. This changes memory and comparison work, not the metered schedule:
 - the blocking scan still reads and filters every input row, so `page_read`, `storage_row_read`, and
   filter/operator costs are unchanged;
 - every expression ORDER BY key and collated sort-key decoration runs at its former pre-sort point,
-  including on LIMIT 0, so trapping errors and their preceding cost are unchanged;
+  including on LIMIT 0, so trapping errors and their preceding cost are unchanged, and every row's
+  key charge (§ "`sort_key` / `hash_key`") is taken whether the heap keeps the row or not;
 - only the windowed rows are projected and charged `row_produced`, exactly as before; heap and sort
   bookkeeping remain unmetered;
 - DISTINCT, aggregate/group, window, set-operation, checked-K-overflow, and file-backed rows whose
@@ -1089,8 +1194,9 @@ breaks ties in input = PK-ascending order**:
   ties remain. (An order running past the full `DESC` key is still fine — the extra keys are
   redundant.)
 
-- **Cost — no `LIMIT`.** The scan reads every row either way, and the sort is unmetered (below), so
-  eliding it does **not** move the cost. The observable contract is the **row order** (the scan
+- **Cost — no `LIMIT`.** The scan reads every row either way, so eliding the sort removes only its
+  per-row key charge (§ "`sort_key` / `hash_key`"): nothing for fixed-width keys, `sort_key` × the key's
+  payload per row for variable-width ones. The observable contract is the **row order** (the scan
   already delivers it). `query/order_by_pk_scan.test` pins the composite-key order.
 - **Cost — with `LIMIT`.** The deliberate change: the scan short-circuits once the window is filled,
   so `storage_row_read` (and the filter `operator_eval`s) drop to the rows actually read — a top-N
@@ -1200,8 +1306,9 @@ keeps together:
   window — unchanged from its "one per row in the result set, post-`LIMIT`/`OFFSET`"
   definition (now also post-`DISTINCT`). So `row_produced` always equals the output row
   count.
-- **Dedup itself is unmetered**, like the `ORDER BY` sort and the `LIMIT` slice (a dedicated
-  dedup-comparison unit could be added later, as for the sort).
+- **Dedup charges each checked row's key once**: `hash_key` × the payload of every projected value
+  (§ "`sort_key` / `hash_key`"). The set probes themselves stay unmetered, like the `ORDER BY` sort's
+  comparisons and the `LIMIT` slice.
 
 A consequence worth stating because it is observable and is a cross-core abort-point contract
 (§6): because all filtered rows are projected, a projection that traps fires **even under a
@@ -1218,8 +1325,8 @@ preserves that order. With a `LIMIT` it therefore **short-circuits a top-N**, ex
 non-`DISTINCT` case: projection and `storage_row_read` drop to the rows actually scanned (the trap
 consequence above then narrows to *scanned* rows, not *all* filtered rows — `SELECT DISTINCT 1/a … 
 ORDER BY pk LIMIT 1` over a `pk`-ordered scan stops after the first distinct row). Without a `LIMIT`
-the cost is unchanged (every filtered row is still scanned and projected; only the sort, unmetered, is
-elided). The rows are byte-identical to the eager `DISTINCT`-then-sort (the deduped set in `ORDER BY`
+every filtered row is still scanned, projected, and checked for duplicates, so eliding the sort removes
+only its per-row key charge. The rows are byte-identical to the eager `DISTINCT`-then-sort (the deduped set in `ORDER BY`
 order). `query/distinct.test`'s composite-PK section pins the streaming top-N (and the reverse-scan
 `DESC` variant). A `DISTINCT` whose `ORDER BY` the scan does *not* satisfy — or a no-`ORDER-BY`
 `DISTINCT` — keeps the eager project-all-then-dedup path.
@@ -1228,8 +1335,9 @@ order). `query/distinct.test`'s composite-PK section pins the streaming top-N (a
 
 `DISTINCT ON` ([grammar.md](grammar.md) §11.1) dedups by its `ON` keys, which are sort keys, so
 it needs no projection to decide a duplicate. Its charges are the plain `ORDER BY` query's. An
-expression key is materialized once per sorted row and charges its `operator_eval`s. The sort and
-the dedup compare are unmetered. Projection `operator_eval` and `row_produced` are charged only for
+expression key is materialized once per sorted row and charges its `operator_eval`s. The sort charges
+each row's keys, the `ON` expressions first (§ "`sort_key` / `hash_key`"); the sort's comparisons and the dedup
+compare are unmetered. Projection `operator_eval` and `row_produced` are charged only for
 emitted rows, after `LIMIT`/`OFFSET`. A `DISTINCT ON` query never takes the streaming scan, the
 `ORDER BY` top-k, or a `LIMIT` early-out, so every filtered row is still scanned
 (`storage_row_read`) whatever the `LIMIT`.
@@ -1279,7 +1387,7 @@ is pinned here because, with no reference implementation, the count is a cross-c
   combined row** (post-join); with no residual there is no post-join WHERE charge.
   **`row_produced`** is per emitted output row (post-`LIMIT`/`OFFSET`); the combined row is simply
   wider. Join materialization buffering, physical control flow, and row concatenation are
-  **unmetered**, like the `ORDER BY` sort and the `LIMIT` slice.
+  **unmetered**, like the `ORDER BY` sort's comparisons and the `LIMIT` slice.
 
 **Nested-loop worked example.** Tables `a` (3 rows), `b` (2 rows), each small enough to be a single
 leaf page; `SELECT * FROM a JOIN b ON a.k + 0 = b.k`, with 2 pairs surviving. The expression key
@@ -1419,7 +1527,8 @@ but charges no `row_produced`. Worked examples (all asserted in the corpus):
 - `SELECT * FROM generate_series(1, 5) WHERE generate_series > 2` — 5 `generated_row` + 5
   `operator_eval` (the `>` per generated row) + 3 `row_produced` = **13**.
 - `SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2` — 5 `generated_row`
-  + 2 `row_produced` = **7** (the SRF takes the eager path; the sort/limit are unmetered).
+  + 2 `row_produced` = **7** (the SRF takes the eager path; its i64 sort key charges no `sort_key`, and the sort's comparisons
+  and the limit are unmetered).
 - `SELECT * FROM regexp_matches('abc', 'b*', 'g')` — the call node's `operator_eval` +
   `regex_compile` + `regex_step` + the capture arrays' `scalar_byte` (what `regexp_match` charges,
   [regex.md](regex.md) §8c, §8.1 below) + 4 `generated_row` + 4 `row_produced` = **244**.
@@ -1552,37 +1661,42 @@ reference to its buffer charges `cte_scan_row` per buffered row, like any materi
 still accrues, so a side-effect-only one is not free); the meter stays continuous across every
 sub-statement of the `WITH`, so a `54P01` ceiling trips at the identical accrued cost in every core.
 
-### Set operations — `lhs + rhs`, the combine unmetered
+### Set operations — `lhs + rhs`, plus the combine's keys
 
 A set operation ([grammar.md](grammar.md) §25) — `UNION`/`INTERSECT`/`EXCEPT`, each with an
 optional `ALL` — combines the result sets of two operand queries. Its cost is the **sum of the
-operand costs and nothing more**:
+operand costs plus the combine's key charge**:
 
-> `cost(a ⊕ b) = cost(a) + cost(b)`
+> `cost(a ⊕ b) = cost(a) + cost(b) + keys(a ⊕ b)`
+
+where `keys` is `hash_key` × the payload of every output column of every row of both operands for
+`UNION`, `INTERSECT`, `EXCEPT`, `INTERSECT ALL`, and `EXCEPT ALL` (§ "`sort_key` / `hash_key`"), and 0 for `UNION
+ALL`, which builds no table. It is 0 whenever every column is fixed-width.
 
 Each operand is a full `select_core` (or a nested set operation) run through the ordinary query
 path, so it **already** charges `storage_row_read` per scanned row, the `operator_eval`s of its
 own clauses, and `row_produced` per row it emits (its *pre-combine* output). The set-operation
 layer then consumes those materialized rows and does **only set-membership work** — match rows by
 the NULL-safe value-canonical key, take the multiset union / intersection / difference, emit the
-representative rows — which is **unmetered**, exactly like `DISTINCT` dedup (above), the
-`ORDER BY` sort, and the `LIMIT`/`OFFSET` slice. The trailing `ORDER BY` and `LIMIT`/`OFFSET` of a
-set operation are likewise unmetered (§ "What is NOT metered"). The integer→`decimal` and
+representative rows. Beyond each row's key charge that work is **unmetered**, exactly like
+`DISTINCT` dedup (above), the `ORDER BY` sort's comparisons, and the `LIMIT`/`OFFSET` slice. A set
+operation's trailing `ORDER BY` charges its keys like any sort (`sort_key`), and its `LIMIT`/`OFFSET`
+is unmetered (§ "What is NOT metered"). The integer→`decimal` and
 `f32`→`f64` value conversions that type unification may apply before keying (grammar.md §25) are
 structural, like a JOIN's NULL-extension, and charge nothing — as do the same conversions on a
 `VALUES`-body column. (A `CASE`/`COALESCE`/`GREATEST`/`LEAST` mixed-width float arm is instead
-wrapped in an ordinary `f32 → f64` cast, whose `operator_eval` is charged when that arm evaluates.) **No new cost unit** is introduced.
+wrapped in an ordinary `f32 → f64` cast, whose `operator_eval` is charged when that arm evaluates.)
 
 This **follows the `INSERT … SELECT` precedent** (§24, where the wrapping statement adds nothing
 to the embedded `SELECT`'s cost), not the single-`SELECT` shape. A deliberate consequence: the
 `DISTINCT` invariant "`row_produced` equals the output row count" **does not hold** for a set
 operation — the operands charge `row_produced` for their *pre-combine* rows, and the combine that
-drops/duplicates rows is unmetered, so the accrued `row_produced` reflects what the operands
+drops/duplicates rows charges no `row_produced`, so the accrued `row_produced` reflects what the operands
 produced, not the set operation's final output. This is correct and intended: cost composes from
 the independently-metered subqueries.
 
 As an `INSERT … SELECT` source (grammar.md §24) a set operation composes the same way: the
-statement's cost is the set operation's `cost(a) + cost(b)` and the INSERT adds nothing, so
+statement's cost is the set operation's `cost(a) + cost(b) + keys(a ⊕ b)` and the INSERT adds nothing, so
 `INSERT INTO t SELECT … UNION SELECT …` costs exactly what the same set operation costs as a
 query.
 
@@ -1593,14 +1707,14 @@ query's scan (plus any `ORDER BY` / `LIMIT` it carries, charged as for any query
 (2, 'b')` costs **4**; as a set-operation operand it is one more independently metered `cost(a)`. An
 INSERT's own plain `VALUES` list (also parenthesized) is not a query and keeps its slot costs.
 
-**Worked example.** Tables `a` (3 rows) and `b` (2 rows), each a single leaf page;
-`SELECT x FROM a UNION SELECT x FROM b`. The left operand materializes `a` → 1 `page_read` +
+**Worked example.** Tables `a` (3 rows) and `b` (2 rows), each a single leaf page, with an integer
+column `x`; `SELECT x FROM a UNION SELECT x FROM b`. The left operand materializes `a` → 1 `page_read` +
 3 `storage_row_read` and emits 3 rows → 3 `row_produced` (a bare-column projection is a leaf,
-charging no `operator_eval`): 7. The right operand: 1 + 2 + 2 = 5. The `UNION` dedup is
-unmetered. **Total = 7 + 5 = 12**, whatever the number of distinct output rows. `UNION ALL`
-(no dedup) costs the **same** 12 — the dedup was already free, so dropping it changes nothing.
-The cross-core contract is trivially identical: it is literally the sum of two
-independently-deterministic operand costs.
+charging no `operator_eval`): 7. The right operand: 1 + 2 + 2 = 5. The `UNION`'s keys are an
+integer column, payload 0, so `keys` is 0. **Total = 7 + 5 = 12**, whatever the number of distinct
+output rows. `UNION ALL` (no dedup) costs the **same** 12 here. Over a `text` column the `UNION`
+would add each of the 5 rows' payloads and `UNION ALL` would not. The cross-core contract is
+identical: the sum of two independently-deterministic operand costs and a per-row key measure.
 
 ### Subqueries — initplan once, correlated per outer row
 
@@ -1608,8 +1722,7 @@ A subquery ([grammar.md](grammar.md) §26) — scalar `(SELECT …)`, `x IN (SEL
 `EXISTS (SELECT …)` — composes its operand query's cost into the enclosing query with **no new
 cost unit**. The subquery runs through the ordinary query path, so it **already** charges its
 own `storage_row_read` / `operator_eval` / `row_produced` exactly as any `SELECT` does; the
-folding/membership/cardinality machinery is **unmetered**, like `DISTINCT` dedup and the
-set-operation combine. How many times that operand cost lands depends on correlation:
+folding/membership/cardinality machinery is **unmetered**, like the `LIMIT` slice. How many times that operand cost lands depends on correlation:
 
 - **Uncorrelated** (an "initplan") — executed **exactly once**, at plan setup, and folded into a
   constant. Its cost is added **once**, and the folded constant is a **leaf** (charges no
@@ -1749,14 +1862,16 @@ evaluation. It deliberately does **not** meter:
   also holds when the sort **spills to disk** under `work_mem` ([spill.md](spill.md)): the
   external merge sort's run-spill / k-way-merge comparisons and its temp-file I/O are
   sort-internal, so a larger-than-RAM `ORDER BY` charges exactly what the in-memory sort did —
-  cost is invariant to whether and how often it spilled (spill.md §6).
-  (A dedicated sort-comparison unit could be added later if wanted; it is not in this slice.)
+  cost is invariant to whether and how often it spilled (spill.md §6). The sort does charge each
+  row's keys once by size where it receives them (§ "`sort_key` / `hash_key`"), which spilling does not change
+  either.
 - **`LIMIT` / `OFFSET` slicing** — selecting the output window is an index slice over the
-  already-sorted rows, not evaluation work; like the sort it is unmetered. Its only cost
+  already-sorted rows, not evaluation work; like the sort's comparisons it is unmetered. Its only cost
   effect is *fewer* `row_produced`/projection charges (the excluded rows are never
   projected — see the `row_produced` rule above).
-- **`DISTINCT` dedup** — testing whether a projected tuple has been seen is set membership,
-  not evaluation, so it is unmetered like the sort and the slice. Its cost effect is the
+- **`DISTINCT` set probes** — testing whether a projected tuple has been seen is set membership,
+  not evaluation, so the probes are unmetered like the sort's comparisons and the slice; each checked
+  row's key is charged once (`hash_key`, § "`sort_key` / `hash_key`"). Its cost effect is the
   asymmetry above: projection `operator_eval` is charged for every filtered row, but
   `row_produced` only for the surviving distinct, windowed rows.
 - **Phase-2 row writes** in `UPDATE`/`DELETE` — the two-phase mutation's write pass does

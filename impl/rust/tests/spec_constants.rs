@@ -507,6 +507,8 @@ fn cost_schedule_matches_spec() {
             "hash_probe" => COSTS.hash_probe,
             "window_frame_step" => COSTS.window_frame_step,
             "varlen_compare" => COSTS.varlen_compare,
+            "sort_key" => COSTS.sort_key,
+            "hash_key" => COSTS.hash_key,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };

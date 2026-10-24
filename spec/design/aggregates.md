@@ -145,7 +145,9 @@ The deliberate restrictions, all matching PostgreSQL (oracle-verified):
 
 **Cost** (the cross-core contract, §8): `aggregate_accumulate` is still charged per `(input row ×
 aggregate)` — the argument is evaluated per row to *know* the value to de-duplicate — and only the
-actual **fold** (and any `decimal_work` it would charge) is skipped for a duplicate. Because the
+actual **fold** (and any `decimal_work` it would charge) is skipped for a duplicate. Each checked
+input also charges `hash_key` × its arguments' payload ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"; specified, not yet
+implemented). Because the
 first-occurrence set is deterministic (scan order is cross-core identical), the metered cost is
 deterministic and identical across cores.
 
@@ -189,8 +191,11 @@ Aggregation adds one cost unit, `aggregate_accumulate` (weight 1,
 - **`row_produced`** — per **emitted group row** (one, for whole-table aggregation; one per
   surviving group with `GROUP BY`). Projection `operator_eval`s of the output expressions
   are charged **per emitted group row** (the synthetic row, §9).
-- **Unmetered**: the bucketing/hash-insert, and the **finalize** step (including `AVG`'s
-  division and the `SUM` widening) — like the `ORDER BY` sort and the `DISTINCT` dedup.
+- **Grouping keys**: each input row charges `hash_key` × the payload of its grouping keys, once per
+  grouping set ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"; specified, not yet implemented). Fixed-width keys measure 0.
+- **Unmetered**: the group table's probes, and the **finalize** step (including `AVG`'s
+  division and the `SUM` widening) — like the `ORDER BY` sort's comparisons and the `DISTINCT`
+  probes.
 
 So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`) `+ N`
 (`aggregate_accumulate`) `+ 1` (`row_produced`) = `2N + 1`. Over an empty table it is `1`
@@ -447,9 +452,11 @@ aggregate used **without** `WITHIN GROUP` (PG: *"function mode() does not exist"
 **Cost** (the cross-core contract, §8). The aggregated argument is evaluated **per row**
 (`operator_eval`s) and `aggregate_accumulate` is charged per `(passing input row × aggregate)` — the
 identical shape as an ordinary aggregate (a single ordered-set aggregate over `N` whole-table rows is
-`N` `storage_row_read` + `N` `aggregate_accumulate` + `1` `row_produced`). The per-group **sort**, the
-mode/percentile **finalize**, and the constant fraction evaluation are **unmetered**, like the
-`ORDER BY` sort, the `DISTINCT` dedup, and `AVG`'s division (§8).
+`N` `storage_row_read` + `N` `aggregate_accumulate` + `1` `row_produced`). Each retained input's
+`WITHIN GROUP` key charges by size as it enters the per-group sort ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"). The sort's
+comparisons, the mode/percentile **finalize**, and the constant fraction evaluation are
+**unmetered**, like the `ORDER BY` sort's comparisons, the `DISTINCT` probes, and `AVG`'s division
+(§8).
 
 **Determinism.** The collected values are sorted by the same total order `ORDER BY`/`MIN`/`MAX` use
 ([../types/compare.toml](../types/compare.toml); `percentile_cont` sorts in PG's `float8` total
@@ -479,8 +486,9 @@ rule, shared with the non-aggregate path).
 
 **Cost** (the cross-core contract, §8). Every grouped row is **projected** (its projection
 `operator_eval`s charged — the §3 asymmetry the non-aggregate `DISTINCT` shares: dedup must see every
-row's projected value), and only an **emitted** (post-`LIMIT`) row charges `row_produced`. The dedup
-itself is unmetered (like the `ORDER BY` sort and the `DISTINCT` set insert). Deterministic and
+row's projected value), and only an **emitted** (post-`LIMIT`) row charges `row_produced`. Each
+checked row charges `hash_key` × its projected values' payload ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"); the dedup probes are
+unmetered. Deterministic and
 identical across cores (the output order comes from the grouped-row iteration / sort, never set
 iteration — CLAUDE.md §8/§10). New capability `query.aggregate_select_distinct`.
 
@@ -559,7 +567,8 @@ columns** — evaluated **once per group** (a direct argument, *not* a per-row o
   BY v) … GROUP BY p` uses each group's own `p`. A **constant** fraction is just the degenerate case
   (the expression ignores the row). The per-group `NULL → NULL` and out-of-range `→ 22003` rules
   (§13) are unchanged, now applied to the evaluated value.
-- **Cost.** The fraction evaluation is part of the **unmetered** finalize (like the sort), so the
+- **Cost.** The fraction evaluation is part of the **unmetered** finalize (like the sort's
+  comparisons), so the
   metered cost is unchanged from a constant fraction — deterministic and cross-core identical.
 
 New capability `query.ordered_set_nonconstant_fraction`.
@@ -616,7 +625,7 @@ aggregates, routed here rather than to the window path. jed matches:
 **Cost** (the cross-core contract, §8). Each group row's key tuple is evaluated + buffered
 (`aggregate_accumulate` per row, plus the key `operator_eval`s); the per-group hypothetical-row
 evaluation, sort comparisons, and rank count are part of the **unmetered** finalize (like the OSA
-sort). Deterministic and cross-core identical. New capability `query.hypothetical_set_aggregate`.
+sort's comparisons); each row's key tuple charges by size as it is compared ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"). Deterministic and cross-core identical. New capability `query.hypothetical_set_aggregate`.
 
 ## 20. `FILTER (WHERE cond)` on a window aggregate
 
@@ -724,8 +733,9 @@ plan's own retention is charged on top as it refolds.
 **Cost** (the cross-core contract, §8). Unchanged from the unordered aggregate except the keys: the
 argument and each key's `operator_eval`s per passing row, `aggregate_accumulate` per passing row
 (DISTINCT duplicates included, §5), and the fold's own charges (`decimal_work`, the JSON aggregates'
-`generated_row`) when the sorted arguments are folded at finalize. The buffering and the sort are
-**unmetered**, like the query `ORDER BY` sort. Deterministic and cross-core identical. New capability
+`generated_row`) when the sorted arguments are folded at finalize. Each passing input charges its
+`ORDER BY` keys by size, as every sort's rows do ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"); the buffering and the sort's
+comparisons are **unmetered**, like the query `ORDER BY` sort's. Deterministic and cross-core identical. New capability
 `query.aggregate_order_by`.
 
 ## 23. General-purpose aggregates

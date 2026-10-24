@@ -494,8 +494,9 @@ The following rules cover additional units:
   plan-time-readable array's flattened elements (a NULL array has none) — matching the per-element
   charge of the membership walk ([cost.md](cost.md) §3); an array of unknown length (an unbound
   parameter, a column) adds none. A folded `IN` list counts one per value;
-- `decimal_work`, `collate`, `varlen_compare`, regex size extras, and `scalar_byte` (the
-  output-constructing kernels of [cost.md](cost.md) §8) are zero without admitted value-size facts; constant operands may compute their exact structural work;
+- `decimal_work`, `collate` (at a comparison or a sort key), `varlen_compare`, `sort_key`,
+  `hash_key`, regex size extras, and `scalar_byte` (the output-constructing kernels of
+  [cost.md](cost.md) §8) are zero without admitted value-size facts; constant operands may compute their exact structural work;
 - constant regex compilation may count its exact compiled-program work; a parameter pattern uses
   no extra until statistics/model data define one;
 - `hash_build`/`hash_probe` use exact encoded bytes for fixed-width keys and
@@ -685,7 +686,7 @@ For every pipeline, the estimator applies the selected access work, residual, pr
 nodes at their real stages, then applies any ordering/streaming `OFFSET + LIMIT` prefix. This makes a
 plain `LIMIT` as well as an `ORDER BY ... LIMIT` capable of changing the winner when it changes
 scheduled page, row, access-method, or expression work. A blocking sort comparison still adds zero:
-the estimator does not price unmetered sorting. The winner is the lowest cumulative `est_cost`
+the estimator does not price unmetered sorting, and §8 counts a sort's per-row key charge as zero. The winner is the lowest cumulative `est_cost`
 after those effects, followed by §9's access-kind/name tie order. A natural-order form is canonical for its
 access identity, so an otherwise-identical blocking-sort duplicate is not inventoried.
 
@@ -920,7 +921,8 @@ claim a fully streaming recursive join tree; such an executor would require a br
 discount model.
 
 Join-PK order is ineligible across a semantic fence. Without an eligible ordered LIMIT, the complete
-tree retains the blocking Sort; its unmetered bookkeeping still adds no private planner weight.
+tree retains the blocking Sort; its unmetered bookkeeping and zero-estimated key charge still add no
+private planner weight.
 
 ## 11. Column-statistics refinement
 

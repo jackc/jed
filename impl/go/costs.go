@@ -54,6 +54,8 @@ type costSchedule struct {
 	DecimalTranscend    int64
 	JsonpathCompile     int64
 	JsonpathStep        int64
+	SortKey             int64
+	HashKey             int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -86,4 +88,6 @@ var costs = costSchedule{
 	DecimalTranscend:    1,
 	JsonpathCompile:     1,
 	JsonpathStep:        1,
+	SortKey:             1,
+	HashKey:             1,
 }

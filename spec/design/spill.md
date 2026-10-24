@@ -165,8 +165,9 @@ This is the load-bearing simplification, identical in spirit to the buffer pool'
   and the final in-memory buffer the latest, that tie-break is exactly input order. So the merged
   sequence equals the stable sort's, row for row, regardless of how many times it spilled. The
   result is invariant to `work_mem`, the spill count, and the database's file-vs-memory backing.
-- **Byte-identical cost.** The `ORDER BY` sort is **unmetered** (cost.md §3 "What is NOT
-  metered"), and spill adds only sort-internal I/O, which is likewise unmetered. The streaming
+- **Byte-identical cost.** The `ORDER BY` sort's comparisons are **unmetered** (cost.md §3 "What
+  is NOT metered"), each row's key is charged once where it enters the sort (cost.md §3 "`sort_key`
+  / `hash_key`"), and spill adds only sort-internal I/O, which is likewise unmetered. The streaming
   feed ([§5](#5-streaming-the-input-the-single-table-feed)) scans, filters, and produces exactly
   the rows the eager path did, charging the same `page_read` block, `storage_row_read` per
   scanned row, filter `operator_eval`, and `row_produced` per windowed row — so the accrued

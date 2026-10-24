@@ -50,6 +50,8 @@ export interface CostSchedule {
   decimalTranscend: bigint;
   jsonpathCompile: bigint;
   jsonpathStep: bigint;
+  sortKey: bigint;
+  hashKey: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -82,4 +84,6 @@ export const COSTS: CostSchedule = {
   decimalTranscend: 1n,
   jsonpathCompile: 1n,
   jsonpathStep: 1n,
+  sortKey: 1n,
+  hashKey: 1n,
 };

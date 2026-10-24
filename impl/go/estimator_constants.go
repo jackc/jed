@@ -64,7 +64,7 @@ var estimatorAccessPathOrder = [...]string{
 	"full",
 }
 
-const estimatorUnitCount = 28
+const estimatorUnitCount = 30
 const (
 	estimatorUnitStorageRowRead      = 0
 	estimatorUnitStatisticsValue     = 1
@@ -94,6 +94,8 @@ const (
 	estimatorUnitDecimalTranscend    = 25
 	estimatorUnitJsonpathCompile     = 26
 	estimatorUnitJsonpathStep        = 27
+	estimatorUnitSortKey             = 28
+	estimatorUnitHashKey             = 29
 )
 
 var estimatorUnitIDs = [...]string{
@@ -125,9 +127,13 @@ var estimatorUnitIDs = [...]string{
 	"decimal_transcend",
 	"jsonpath_compile",
 	"jsonpath_step",
+	"sort_key",
+	"hash_key",
 }
 
 var estimatorUnitWeights = [...]int64{
+	1,
+	1,
 	1,
 	1,
 	1,
