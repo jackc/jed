@@ -151,6 +151,9 @@ type scope struct {
 	// hints is what a name-resolution hint needs beyond the visible relations (error-fields.md
 	// §11.8). It never affects resolution.
 	hints scopeHints
+	// mergeAction is the flat slot merge_action() reads: set only on a MERGE's RETURNING scope
+	// (spec/design/merge.md §7). Elsewhere (nil) the function is 42601.
+	mergeAction *int
 }
 
 // lateralFence is the fence a parenthesized join's body is planned against (spec/design/grammar.md

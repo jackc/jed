@@ -2611,7 +2611,8 @@ func prefixedInterval(p []byte, phys keyBound) keyBound {
 }
 
 // executeMutationScan executes a planned UPDATE/DELETE access path into the normalized keyed-row
-// batch. It owns the access-method switch that used to be duplicated inline in both DML executors;
+// batch. A bound reading a correlated outer column (a MERGE target probe, merge.md §3) reads
+// env.outer. It owns the access-method switch that used to be duplicated inline in both DML executors;
 // per-row guards, storage_row_read, residual evaluation, and the phase-2 writes stay with the caller.
 func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, params []Value, env *evalEnv, meter *costMeter, mask []bool) (mutationScanBatch, error) {
 	// A WHERE contradiction (planner.md §3.1) reads no page and no row, and so charges nothing.
@@ -2625,7 +2626,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.pk != nil {
-		kb, empty := db.buildKeyBound(b.pk, params, nil, nil)
+		kb, empty := db.buildKeyBound(b.pk, params, env.outer, nil)
 		if empty {
 			return mutationScanBatch{empty: true}, nil
 		}
@@ -2633,7 +2634,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.index != nil {
-		entries, pages, slabs, err := db.indexBoundEntries(tableName, b.index, params, nil, mask, nil)
+		entries, pages, slabs, err := db.indexBoundEntries(tableName, b.index, params, env.outer, mask, nil)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.gin != nil {
@@ -2650,11 +2651,11 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.pkSet != nil {
-		entries, pages, slabs, err := db.pkKeySetRows(store, b.pkSet, params, nil, mask, nil, false)
+		entries, pages, slabs, err := db.pkKeySetRows(store, b.pkSet, params, env.outer, mask, nil, false)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.indexSet != nil {
-		entries, pages, slabs, err := db.indexKeySetEntries(tableName, b.indexSet, params, nil, mask, nil)
+		entries, pages, slabs, err := db.indexKeySetEntries(tableName, b.indexSet, params, env.outer, mask, nil)
 		if err != nil {
 			return mutationScanBatch{}, err
 		}

@@ -59,6 +59,28 @@ pub(crate) fn resolve_func_call(
     if variadic && !is_variadic_func_name(&lname) {
         return Err(no_func_overload(&lname));
     }
+    // `merge_action()` reads the action slot of a MERGE's RETURNING scope — here, or an enclosing
+    // level for a sublink in the list (spec/design/merge.md §7); anywhere else it is 42601.
+    if lname == "merge_action" && args.is_empty() && !star {
+        let mut level = 0;
+        let mut at = Some(scope);
+        while let Some(s) = at {
+            if let Some(slot) = s.merge_action {
+                let node = if level == 0 {
+                    RExpr::Column(slot)
+                } else {
+                    RExpr::OuterColumn { level, index: slot }
+                };
+                return Ok((node, ResolvedType::Text));
+            }
+            level += 1;
+            at = s.parent;
+        }
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command",
+        ));
+    }
     if is_variadic_func_name(&lname) {
         reject_named(&lname, arg_names)?;
         return resolve_variadic_func(scope, &lname, args, star, variadic, agg, params);
@@ -3144,6 +3166,7 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
+            | Statement::Merge(_)
     )
     // A WITH statement with any data-modifying part is a write (it stages INSERT/UPDATE/DELETE
     // effects — writable-cte.md): it must take the write gate, accumulate into `working`, and commit.
@@ -3451,6 +3474,7 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         Statement::With(wq) => collect_with_privs(wq, req, &locals),
         Statement::Update(upd) => collect_update_privs(upd, req, &locals),
         Statement::Delete(del) => collect_delete_privs(del, req, &locals),
+        Statement::Merge(m) => collect_merge_privs(m, req, &locals),
         // EXPLAIN requires the inner statement's privileges (EXPLAIN INSERT needs INSERT, matching
         // PG). Plain EXPLAIN never executes, but authorization is checked on the inner regardless
         // (spec/design/explain.md §1).
@@ -3538,6 +3562,45 @@ pub(crate) fn collect_delete_privs(del: &Delete, req: &mut PrivReq, locals: &Has
     collect_returning_privs(&del.returning, req, locals);
 }
 
+/// A MERGE's privileges (spec/design/merge.md §10): SELECT on the target (its join condition
+/// reads it), the write privilege of each action kind a clause names, SELECT on what the source
+/// reads, and what every expression's sublinks and functions need.
+pub(crate) fn collect_merge_privs(m: &Merge, req: &mut PrivReq, locals: &HashSet<String>) {
+    use crate::ast::{MergeAction, MergeValue};
+    req.need_table(&m.table, Privilege::Select);
+    for c in &m.clauses {
+        match &c.action {
+            MergeAction::Update(_) => req.need_table(&m.table, Privilege::Update),
+            MergeAction::Delete => req.need_table(&m.table, Privilege::Delete),
+            MergeAction::Insert { .. } => req.need_table(&m.table, Privilege::Insert),
+            MergeAction::DoNothing => {}
+        }
+    }
+    collect_query_privs(&m.source, req, locals);
+    collect_expr_privs(&m.on, req, locals);
+    for c in &m.clauses {
+        if let Some(cond) = &c.condition {
+            collect_expr_privs(cond, req, locals);
+        }
+        match &c.action {
+            MergeAction::Update(assigns) => {
+                for a in assigns {
+                    collect_expr_privs(&a.value, req, locals);
+                }
+            }
+            MergeAction::Insert { values, .. } => {
+                for v in values {
+                    if let MergeValue::Expr(e) = v {
+                        collect_expr_privs(e, req, locals);
+                    }
+                }
+            }
+            MergeAction::Delete | MergeAction::DoNothing => {}
+        }
+    }
+    collect_returning_privs(&m.returning, req, locals);
+}
+
 pub(crate) fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &HashSet<String>) {
     match qe {
         QueryExpr::Select(s) => collect_select_privs(s, req, locals),
@@ -3589,6 +3652,7 @@ pub(crate) fn collect_cte_body_privs(body: &CteBody, req: &mut PrivReq, locals: 
         CteBody::Insert(ins) => collect_insert_privs(ins, req, locals),
         CteBody::Update(upd) => collect_update_privs(upd, req, locals),
         CteBody::Delete(del) => collect_delete_privs(del, req, locals),
+        CteBody::Merge(m) => collect_merge_privs(m, req, locals),
     }
 }
 
@@ -3952,6 +4016,7 @@ pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
+        Statement::Merge(_) => "MERGE",
         Statement::Select(_) | Statement::SetOp(_) | Statement::With(_) => "SELECT",
         Statement::Explain { .. } => "EXPLAIN",
         Statement::Begin { .. } => "BEGIN",

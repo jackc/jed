@@ -835,6 +835,7 @@ impl Engine {
                             lateral_hit: Default::default(),
                             lateral_refused: false,
                             shares_parent_level: false,
+                            merge_action: None,
                             hints: Default::default(),
                         };
                         let left_names: Vec<&str> = seg_star
@@ -877,6 +878,7 @@ impl Engine {
                             lateral_hit: Default::default(),
                             lateral_refused: false,
                             shares_parent_level: false,
+                            merge_action: None,
                             hints: Default::default(),
                         };
                         // The synthesized predicate compares the two chosen columns through one-column pseudo
@@ -986,6 +988,7 @@ impl Engine {
                             lateral_hit: Default::default(),
                             lateral_refused: false,
                             shares_parent_level: false,
+                            merge_action: None,
                             hints: Default::default(),
                         };
                         Some(resolve_boolean_filter(
@@ -1017,6 +1020,7 @@ impl Engine {
                             lateral_hit: Default::default(),
                             lateral_refused: false,
                             shares_parent_level: false,
+                            merge_action: None,
                             hints: on_hints,
                         };
                         seg_star.extend(rel_star(k + 1));
@@ -1047,6 +1051,7 @@ impl Engine {
                 lateral_hit: Default::default(),
                 lateral_refused: false,
                 shares_parent_level: false,
+                merge_action: None,
                 hints: Default::default(),
             };
 

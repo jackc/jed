@@ -1,0 +1,189 @@
+# MERGE — the jed-specific behavior of spec/design/merge.md that PostgreSQL cannot oracle-check:
+# the narrowings (§12: a view target, a joined source, EXPLAIN MERGE), the divergences (§11: end-state
+# uniqueness, a non-boolean join condition), the deterministic cost of the matching pass (§3, §9), and
+# the session privilege envelope (§10).
+# CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.view, dml.insert, dml.insert_multi_row, dml.merge, dml.returning, query.select, query.order_by, query.values, query.explain, dml.explain, resource.cost_metering, session.privileges, types.i32, types.text, expr.arithmetic
+
+statement ok
+CREATE TABLE j (id i32 PRIMARY KEY, v i32, code text UNIQUE)
+
+statement ok
+INSERT INTO j VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+
+statement ok
+CREATE VIEW jv AS SELECT id, v FROM j
+
+# --- narrowings (§12) ---------------------------------------------------------------------------
+
+# A view target.
+statement error 0A000
+MERGE INTO jv USING (VALUES (1)) AS s(k) ON jv.id = s.k
+WHEN MATCHED THEN DELETE
+
+# A joined source, parenthesized or not.
+statement error 0A000
+MERGE INTO j USING (VALUES (1)) AS a(k) JOIN (VALUES (1)) AS b(k) ON a.k = b.k ON j.id = a.k
+WHEN MATCHED THEN DELETE
+
+statement error 0A000
+MERGE INTO j USING ((VALUES (1)) AS a(k) JOIN (VALUES (1)) AS b(k) ON a.k = b.k) AS g ON j.id = g.k
+WHEN MATCHED THEN DELETE
+
+# EXPLAIN MERGE, directly and inside a WITH.
+statement error 0A000
+EXPLAIN MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN DELETE
+
+statement error 0A000
+EXPLAIN WITH m AS (MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k WHEN MATCHED THEN DELETE)
+SELECT 1
+
+# --- divergences (§11) --------------------------------------------------------------------------
+
+# The join condition must be boolean (PostgreSQL accepts ON 1).
+statement error 42804
+MERGE INTO j USING (VALUES (1)) AS s(k) ON 1
+WHEN MATCHED THEN DELETE
+
+# End-state uniqueness: two updated rows swap their unique codes, which PostgreSQL's per-row check
+# rejects on the transient state.
+statement ok
+MERGE INTO j USING (VALUES (1, 'b'), (2, 'a')) AS s(k, c) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET code = s.c
+
+query IIT nosort
+SELECT id, v, code FROM j ORDER BY id
+----
+1
+10
+b
+2
+20
+a
+3
+30
+c
+
+# ... and two primary keys swap by re-keying.
+statement ok
+MERGE INTO j USING (VALUES (1, 2), (2, 1)) AS s(k, nk) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET id = s.nk
+
+query IIT nosort
+SELECT id, v, code FROM j ORDER BY id
+----
+1
+20
+a
+2
+10
+b
+3
+30
+c
+
+# --- cost (§3, §9) ------------------------------------------------------------------------------
+
+# The source (a 2-row VALUES), one primary-key probe per source row, the join condition, the WHEN
+# condition, and the SET.
+# cost: 10
+statement ok
+MERGE INTO j USING (VALUES (1, 5), (9, 9)) AS s(k, w) ON j.id = s.k
+WHEN MATCHED AND s.w > 0 THEN UPDATE SET v = j.v + s.w
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.w, 'z')
+
+# A join condition no access path narrows reads the whole target once per source row.
+# cost: 22
+statement ok
+MERGE INTO j USING (VALUES (5), (6)) AS s(k) ON j.v = s.k
+WHEN MATCHED THEN DELETE
+
+# A join condition on a unique secondary index probes that index once per source row.
+# cost: 10
+statement ok
+MERGE INTO j USING (VALUES ('a', 1), ('zz', 2)) AS s(c, w) ON j.code = s.c
+WHEN MATCHED THEN UPDATE SET v = j.v + s.w
+
+# NOT MATCHED BY SOURCE adds one full scan.
+# cost: 14
+query TI rowsort
+MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN NOT MATCHED BY SOURCE AND j.id = 9 THEN DELETE
+RETURNING merge_action(), j.id
+----
+DELETE
+9
+
+# A ceiling aborts the matching pass and writes nothing.
+# max_cost: 3
+statement error 54P01
+MERGE INTO j USING (VALUES (1), (2), (3)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 0
+
+query II nosort
+SELECT id, v FROM j ORDER BY id
+----
+1
+26
+2
+10
+3
+30
+
+# --- privileges (§10) ---------------------------------------------------------------------------
+
+# Each action kind needs its privilege, plus SELECT on the target.
+# default_privileges: SELECT
+statement error 42501
+MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 0
+
+# default_privileges: SELECT
+# grant: UPDATE ON j
+statement ok
+MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 0
+
+# default_privileges: SELECT
+# grant: UPDATE ON j
+statement error 42501
+MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 0
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, 0, 'q')
+
+# default_privileges: SELECT
+# grant: DELETE ON j
+statement error 42501
+MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN UPDATE SET v = 0
+
+# DO NOTHING needs no write privilege.
+# default_privileges: SELECT
+statement ok
+MERGE INTO j USING (VALUES (1)) AS s(k) ON j.id = s.k
+WHEN MATCHED THEN DO NOTHING
+
+# The target always needs SELECT.
+# default_privileges: NONE
+# grant: INSERT ON j
+statement error 42501
+MERGE INTO j USING (VALUES (7)) AS s(k) ON j.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, 0, 'q')
+
+# The source's tables need SELECT.
+statement ok
+CREATE TABLE jsrc (k i32)
+
+# default_privileges: NONE
+# grant: SELECT, INSERT ON j
+statement error 42501
+MERGE INTO j USING jsrc AS s ON j.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, 0, 'q')
+
+# default_privileges: NONE
+# grant: SELECT, INSERT ON j
+# grant: SELECT ON jsrc
+statement ok
+MERGE INTO j USING jsrc AS s ON j.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, 0, 'q')

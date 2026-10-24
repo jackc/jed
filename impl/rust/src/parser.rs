@@ -20,6 +20,7 @@ use crate::ast::{
 };
 use crate::ast::{CheckOption, FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::ast::{CycleClause, SearchClause, ViewEdit, ViewOption};
+use crate::ast::{Merge, MergeAction, MergeClause, MergeMatch, MergeValue};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::{lex, lex_with_positions};
@@ -290,6 +291,7 @@ impl Parser {
             Some("with") => self.parse_into_query(Self::parse_with_statement),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
+            Some("merge") => Ok(Statement::Merge(self.parse_merge()?)),
             Some("explain") => self.parse_explain(),
             Some("begin") | Some("start") => self.parse_begin(),
             Some("commit") | Some("end") => self.parse_commit(),
@@ -1064,6 +1066,11 @@ impl Parser {
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
+            // EXPLAIN MERGE is a deferred follow-on (spec/design/merge.md §12).
+            Some("merge") => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "EXPLAIN MERGE is not supported",
+            )),
             // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no
             // plan to render.
             Some("create") if !self.at_create_view() => {
@@ -3682,7 +3689,7 @@ impl Parser {
         // data-modifying primary's SELECT is another statement's query, where `INTO` is not allowed.
         if matches!(
             self.peek_keyword().as_deref(),
-            Some("insert") | Some("update") | Some("delete")
+            Some("insert") | Some("update") | Some("delete") | Some("merge")
         ) {
             self.into_ok = false;
             self.into_top = false;
@@ -3704,7 +3711,7 @@ impl Parser {
         let kw = self.peek_keyword();
         if matches!(
             kw.as_deref(),
-            Some("insert") | Some("update") | Some("delete")
+            Some("insert") | Some("update") | Some("delete") | Some("merge")
         ) {
             // A parenthesized data-modifying body counts one nesting level, like parse_subquery does
             // for a parenthesized query body (grammar.md §48); the primary (parenthesized = false)
@@ -3715,6 +3722,7 @@ impl Parser {
             let body = match kw.as_deref() {
                 Some("insert") => CteBody::Insert(Box::new(self.parse_insert()?)),
                 Some("update") => CteBody::Update(Box::new(self.parse_update()?)),
+                Some("merge") => CteBody::Merge(Box::new(self.parse_merge()?)),
                 _ => CteBody::Delete(Box::new(self.parse_delete()?)),
             };
             if parenthesized {
@@ -5315,7 +5323,7 @@ impl Parser {
             matches!(self.peek_at(1), Token::Comma | Token::RParen | Token::Eof)
                 || matches!(
                     self.peek_keyword_at(1).as_deref(),
-                    Some("where" | "returning")
+                    Some("where" | "returning" | "when")
                 );
         if self.peek_keyword().as_deref() == Some("default") && next_is_terminator {
             self.advance();
@@ -5363,6 +5371,274 @@ impl Parser {
             filter,
             returning,
             fk_target: None,
+        })
+    }
+
+    /// `MERGE INTO target [[AS] alias] USING source_ref ON cond when_clause+ [RETURNING …]`
+    /// (spec/design/merge.md §1). The source is one table_ref, carried as `SELECT * FROM source_ref`;
+    /// a parenthesized join, or a join after the source, is 0A000 (§12). A clause after an
+    /// unconditional clause of the same kind is 42601 here, before any name resolves (PostgreSQL's
+    /// order).
+    fn parse_merge(&mut self) -> Result<Merge> {
+        self.expect_keyword("merge")?;
+        self.expect_keyword("into")?;
+        let table_pos = self.here();
+        let (db, table) = self.parse_qualified_table_name()?;
+        // The target alias; `AS` is optional (PostgreSQL), so any word but USING is an alias.
+        let alias = if self.peek_keyword().as_deref() == Some("as") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            match self.peek() {
+                Token::QuotedIdent(w) => {
+                    let w = w.clone();
+                    self.advance();
+                    Some(w)
+                }
+                Token::Word(w) if !w.eq_ignore_ascii_case("using") => {
+                    let w = w.clone();
+                    self.advance();
+                    Some(w)
+                }
+                _ => None,
+            }
+        };
+        self.expect_keyword("using")?;
+        let source_ref = self.parse_table_ref()?;
+        let joined = matches!(&source_ref.subquery, Some(q) if matches!(&**q, QueryExpr::Select(sel) if sel.paren_join));
+        if joined
+            || matches!(
+                self.peek_keyword().as_deref(),
+                Some("join" | "inner" | "left" | "right" | "full" | "cross" | "natural")
+            )
+        {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "a joined MERGE source is not supported; write the join as a subquery",
+            ));
+        }
+        let source_label = match &source_ref.alias {
+            Some(a) => Some(a.clone()),
+            None if source_ref.subquery.is_none()
+                && source_ref.values.is_none()
+                && !source_ref.name.is_empty() =>
+            {
+                Some(source_ref.name.clone())
+            }
+            None => None,
+        };
+        let source = QueryExpr::Select(Box::new(Select {
+            distinct: false,
+            items: SelectItems::All(StarPos(None)),
+            from: Some(source_ref),
+            joins: Vec::new(),
+            filter: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            windows: Vec::new(),
+            join_group: false,
+            paren_join: false,
+            tail: Vec::new(),
+        }));
+        self.expect_keyword("on")?;
+        let on = self.parse_expr()?;
+        let mut clauses: Vec<MergeClause> = Vec::new();
+        while self.peek_keyword().as_deref() == Some("when") {
+            clauses.push(self.parse_merge_clause()?);
+        }
+        if clauses.is_empty() {
+            return Err(syntax("MERGE requires at least one WHEN clause"));
+        }
+        for kind in [
+            MergeMatch::Matched,
+            MergeMatch::NotMatchedByTarget,
+            MergeMatch::NotMatchedBySource,
+        ] {
+            let mut unconditional = false;
+            for c in clauses.iter().filter(|c| c.kind == kind) {
+                if unconditional {
+                    return Err(syntax(
+                        "unreachable WHEN clause specified after unconditional WHEN clause",
+                    ));
+                }
+                unconditional = c.condition.is_none();
+            }
+        }
+        let returning = self.parse_returning()?;
+        Ok(Merge {
+            table,
+            table_pos,
+            db,
+            alias,
+            source,
+            source_label,
+            on,
+            clauses,
+            returning,
+        })
+    }
+
+    /// One `WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [AND cond] THEN action` (merge.md §1). An
+    /// action the clause kind does not allow (INSERT for MATCHED / BY SOURCE, UPDATE or DELETE for
+    /// NOT MATCHED) is 42601, as in PostgreSQL's grammar.
+    fn parse_merge_clause(&mut self) -> Result<MergeClause> {
+        self.expect_keyword("when")?;
+        let kind = if self.peek_keyword().as_deref() == Some("not") {
+            self.advance();
+            self.expect_keyword("matched")?;
+            if self.peek_keyword().as_deref() == Some("by") {
+                self.advance();
+                match self.peek_keyword().as_deref() {
+                    Some("source") => {
+                        self.advance();
+                        MergeMatch::NotMatchedBySource
+                    }
+                    Some("target") => {
+                        self.advance();
+                        MergeMatch::NotMatchedByTarget
+                    }
+                    _ => return Err(syntax("expected SOURCE or TARGET after NOT MATCHED BY")),
+                }
+            } else {
+                MergeMatch::NotMatchedByTarget
+            }
+        } else {
+            self.expect_keyword("matched")?;
+            MergeMatch::Matched
+        };
+        let condition = if self.peek_keyword().as_deref() == Some("and") {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.expect_keyword("then")?;
+        let action = match self.peek_keyword().as_deref() {
+            Some("do") => {
+                self.advance();
+                self.expect_keyword("nothing")?;
+                MergeAction::DoNothing
+            }
+            Some("update") if kind != MergeMatch::NotMatchedByTarget => {
+                self.advance();
+                self.expect_keyword("set")?;
+                let mut assignments = Vec::new();
+                loop {
+                    let pos = self.here();
+                    let column = self.expect_identifier()?;
+                    self.expect(&Token::Eq)?;
+                    let (is_default, value) = self.parse_assignment_rhs()?;
+                    assignments.push(Assignment {
+                        column,
+                        pos,
+                        is_default,
+                        value,
+                    });
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                MergeAction::Update(assignments)
+            }
+            Some("delete") if kind != MergeMatch::NotMatchedByTarget => {
+                self.advance();
+                MergeAction::Delete
+            }
+            Some("insert") if kind == MergeMatch::NotMatchedByTarget => {
+                self.advance();
+                self.parse_merge_insert()?
+            }
+            other => {
+                return Err(syntax(format!(
+                    "unexpected MERGE action {}",
+                    other.unwrap_or_default().to_ascii_uppercase()
+                )));
+            }
+        };
+        Ok(MergeClause {
+            kind,
+            condition,
+            action,
+        })
+    }
+
+    /// A MERGE `INSERT` action after its keyword (merge.md §1): an optional column list, an optional
+    /// `OVERRIDING { SYSTEM | USER } VALUE`, then `VALUES ( slot, … )` or `DEFAULT VALUES` (which
+    /// takes neither, as for INSERT).
+    fn parse_merge_insert(&mut self) -> Result<MergeAction> {
+        let mut column_pos = Vec::new();
+        let mut columns = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut names = Vec::new();
+            loop {
+                column_pos.push(self.here());
+                names.push(self.expect_identifier()?);
+                match self.advance() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+                }
+            }
+            Some(names)
+        } else {
+            None
+        };
+        let overriding = if self.peek_keyword().as_deref() == Some("overriding") {
+            self.advance();
+            let mode = match self.peek_keyword().as_deref() {
+                Some("system") => Overriding::System,
+                Some("user") => Overriding::User,
+                other => {
+                    return Err(syntax(format!(
+                        "expected SYSTEM or USER after OVERRIDING, found {other:?}"
+                    )));
+                }
+            };
+            self.advance();
+            self.expect_keyword("value")?;
+            Some(mode)
+        } else {
+            None
+        };
+        let mut values = Vec::new();
+        if self.peek_keyword().as_deref() == Some("default") {
+            if columns.is_some() || overriding.is_some() {
+                return Err(syntax(
+                    "DEFAULT VALUES cannot be combined with a column list or OVERRIDING",
+                ));
+            }
+            self.advance();
+            self.expect_keyword("values")?;
+            columns = Some(Vec::new());
+        } else {
+            self.expect_keyword("values")?;
+            self.expect(&Token::LParen)?;
+            loop {
+                let is_default = self.peek_keyword().as_deref() == Some("default")
+                    && matches!(self.peek_at(1), Token::Comma | Token::RParen);
+                if is_default {
+                    self.advance();
+                    values.push(MergeValue::Default);
+                } else {
+                    values.push(MergeValue::Expr(self.parse_expr()?));
+                }
+                match self.advance() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+                }
+            }
+        }
+        Ok(MergeAction::Insert {
+            columns,
+            column_pos,
+            overriding,
+            values,
         })
     }
 

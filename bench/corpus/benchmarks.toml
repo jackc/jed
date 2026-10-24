@@ -1424,6 +1424,31 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# MERGE upsert (dml.merge; spec/design/merge.md §3): a one-row VALUES source probes the 1M-row target
+# by primary key; ids up to 2,000,000 make about half the iterations update a matched row and half
+# insert a new one. Rolled back each iteration. SQLite has no MERGE.
+[[bench]]
+name = "merge_upsert"
+description = "MERGE of a one-row source into 1M orders by PK (update if matched, else insert), rolled back each iteration"
+dataset = "large"
+kind = "write_rollback"
+engines = ["jed", "postgres"]
+sql = "MERGE INTO orders o USING (VALUES ($1::bigint, $2::integer)) AS s(id, amt) ON o.id = s.id WHEN MATCHED THEN UPDATE SET amount = o.amount + s.amt WHEN NOT MATCHED THEN INSERT (id, customer_id, amount, note) VALUES (s.id, 1, s.amt, 'merge')"
+warmup = 100
+iterations = 1000
+seed = 4302
+batch = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 2000000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100
+
 # UPDATE/DELETE WHERE contradiction (dml.where_contradiction): the empty literal range on the
 # unindexed amount column is proven at plan time, so jed reads none of the 1M rows; before the rule
 # the mutation full-scanned them and evaluated the WHERE per row. Rolled back each iteration.

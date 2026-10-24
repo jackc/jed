@@ -372,6 +372,12 @@ func (p *parser) parseStatement() (statement, error) {
 			return statement{}, err
 		}
 		return statement{Delete: del}, nil
+	case "merge":
+		m, err := p.parseMerge()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Merge: m}, nil
 	case "explain":
 		return p.parseExplain()
 	case "begin", "start":
@@ -1227,6 +1233,9 @@ func (p *parser) parseExplainInner() (statement, error) {
 			return statement{}, err
 		}
 		return statement{Delete: del}, nil
+	// EXPLAIN MERGE is a deferred follow-on (spec/design/merge.md §12).
+	case "merge":
+		return statement{}, newError(FeatureNotSupported, "EXPLAIN MERGE is not supported")
 	// `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no plan
 	// to render.
 	case "create":
@@ -4081,7 +4090,7 @@ func (p *parser) parseWithStatement() (statement, error) {
 	// INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr. A data-modifying
 	// primary's SELECT is another statement's query, where INTO is not allowed.
 	switch p.peekKeyword() {
-	case "insert", "update", "delete":
+	case "insert", "update", "delete", "merge":
 		p.intoOK, p.intoTop = false, false
 	}
 	body, err := p.parseCteBody(false)
@@ -4098,7 +4107,7 @@ func (p *parser) parseWithStatement() (statement, error) {
 // top-level primary uses an unprefixed query_expr.
 func (p *parser) parseCteBody(parenthesized bool) (cteBody, error) {
 	switch p.peekKeyword() {
-	case "insert", "update", "delete":
+	case "insert", "update", "delete", "merge":
 		// A parenthesized data-modifying body counts one nesting level, like parseSubquery does for a
 		// parenthesized query body (grammar.md §48); the primary (parenthesized = false) runs at the
 		// statement top level and does not.
@@ -4114,6 +4123,8 @@ func (p *parser) parseCteBody(parenthesized bool) (cteBody, error) {
 			body.Insert, err = p.parseInsert()
 		case "update":
 			body.Update, err = p.parseUpdate()
+		case "merge":
+			body.Merge, err = p.parseMerge()
 		default:
 			body.Delete, err = p.parseDelete()
 		}
@@ -5996,7 +6007,7 @@ func (p *parser) parseAssignmentRHS() (bool, exprNode, error) {
 	nextKeyword := p.peekKeywordAt(1)
 	nextKind := p.peekKindAt(1)
 	if p.peekKeyword() == "default" && (nextKind == tokComma || nextKind == tokRParen ||
-		nextKind == tokEof || nextKeyword == "where" || nextKeyword == "returning") {
+		nextKind == tokEof || nextKeyword == "where" || nextKeyword == "returning" || nextKeyword == "when") {
 		p.advance()
 		return true, exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}, nil
 	}
@@ -6053,6 +6064,275 @@ func (p *parser) parseUpdate() (*update, error) {
 		return nil, err
 	}
 	return &update{Table: table, TablePos: tablePos, DB: dbQualifier, Assignments: assignments, Filter: filter, Returning: returning}, nil
+}
+
+// parseMerge parses `MERGE INTO target [[AS] alias] USING source_ref ON cond when_clause+
+// [RETURNING …]` (spec/design/merge.md §1). The source is one table_ref, carried as `SELECT * FROM
+// source_ref`; a parenthesized join, or a join after the source, is 0A000 (§12). A clause after an
+// unconditional clause of the same kind is 42601 here, before any name resolves (PostgreSQL's
+// order).
+func (p *parser) parseMerge() (*mergeStmt, error) {
+	if err := p.expectKeyword("merge"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("into"); err != nil {
+		return nil, err
+	}
+	tablePos := p.here()
+	dbQualifier, table, err := p.parseQualifiedTableName()
+	if err != nil {
+		return nil, err
+	}
+	// The target alias; `AS` is optional (PostgreSQL), so any word but USING is an alias.
+	var alias *string
+	if p.peekKeyword() == "as" {
+		p.advance()
+		a, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		alias = &a
+	} else if t := p.peek(); t.Kind == tokQuotedIdent || (t.Kind == tokWord && t.Word != "using") {
+		p.advance()
+		a := t.Word
+		alias = &a
+	}
+	if err := p.expectKeyword("using"); err != nil {
+		return nil, err
+	}
+	sourceRef, err := p.parseTableRef()
+	if err != nil {
+		return nil, err
+	}
+	joined := sourceRef.Subquery != nil && sourceRef.Subquery.Select != nil && sourceRef.Subquery.Select.ParenJoin
+	switch p.peekKeyword() {
+	case "join", "inner", "left", "right", "full", "cross", "natural":
+		joined = true
+	}
+	if joined {
+		return nil, newError(FeatureNotSupported, "a joined MERGE source is not supported; write the join as a subquery")
+	}
+	var sourceLabel *string
+	if sourceRef.Alias != nil {
+		l := *sourceRef.Alias
+		sourceLabel = &l
+	} else if sourceRef.Subquery == nil && sourceRef.Values == nil && sourceRef.Name != "" {
+		l := sourceRef.Name
+		sourceLabel = &l
+	}
+	source := queryExpr{Select: &selectStmt{Items: selectItems{All: true}, From: &sourceRef}}
+	if err := p.expectKeyword("on"); err != nil {
+		return nil, err
+	}
+	on, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	var clauses []mergeClause
+	for p.peekKeyword() == "when" {
+		c, err := p.parseMergeClause()
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, c)
+	}
+	if len(clauses) == 0 {
+		return nil, newError(SyntaxError, "MERGE requires at least one WHEN clause")
+	}
+	for _, kind := range []mergeMatch{mergeMatched, mergeNotMatchedByTarget, mergeNotMatchedBySource} {
+		unconditional := false
+		for _, c := range clauses {
+			if c.Kind != kind {
+				continue
+			}
+			if unconditional {
+				return nil, newError(SyntaxError, "unreachable WHEN clause specified after unconditional WHEN clause")
+			}
+			unconditional = c.Condition == nil
+		}
+	}
+	returning, err := p.parseReturning()
+	if err != nil {
+		return nil, err
+	}
+	return &mergeStmt{
+		Table: table, TablePos: tablePos, DB: dbQualifier, Alias: alias, Source: source,
+		SourceLabel: sourceLabel, On: on, Clauses: clauses, Returning: returning,
+	}, nil
+}
+
+// parseMergeClause parses one `WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [AND cond] THEN action`
+// (merge.md §1). An action the clause kind does not allow (INSERT for MATCHED / BY SOURCE, UPDATE or
+// DELETE for NOT MATCHED) is 42601, as in PostgreSQL's grammar.
+func (p *parser) parseMergeClause() (mergeClause, error) {
+	var c mergeClause
+	if err := p.expectKeyword("when"); err != nil {
+		return c, err
+	}
+	if p.peekKeyword() == "not" {
+		p.advance()
+		if err := p.expectKeyword("matched"); err != nil {
+			return c, err
+		}
+		c.Kind = mergeNotMatchedByTarget
+		if p.peekKeyword() == "by" {
+			p.advance()
+			switch p.peekKeyword() {
+			case "source":
+				p.advance()
+				c.Kind = mergeNotMatchedBySource
+			case "target":
+				p.advance()
+			default:
+				return c, newError(SyntaxError, "expected SOURCE or TARGET after NOT MATCHED BY")
+			}
+		}
+	} else {
+		if err := p.expectKeyword("matched"); err != nil {
+			return c, err
+		}
+		c.Kind = mergeMatched
+	}
+	if p.peekKeyword() == "and" {
+		p.advance()
+		cond, err := p.parseExpr()
+		if err != nil {
+			return c, err
+		}
+		c.Condition = &cond
+	}
+	if err := p.expectKeyword("then"); err != nil {
+		return c, err
+	}
+	kw := p.peekKeyword()
+	switch {
+	case kw == "do":
+		p.advance()
+		if err := p.expectKeyword("nothing"); err != nil {
+			return c, err
+		}
+		c.Action = mergeDoNothing
+	case kw == "update" && c.Kind != mergeNotMatchedByTarget:
+		p.advance()
+		if err := p.expectKeyword("set"); err != nil {
+			return c, err
+		}
+		for {
+			pos := p.here()
+			column, err := p.expectIdentifier()
+			if err != nil {
+				return c, err
+			}
+			if err := p.expect(tokEq); err != nil {
+				return c, err
+			}
+			isDefault, value, err := p.parseAssignmentRHS()
+			if err != nil {
+				return c, err
+			}
+			c.Assignments = append(c.Assignments, assignment{Column: column, Pos: pos, IsDefault: isDefault, Value: value})
+			if p.peek().Kind == tokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
+		c.Action = mergeUpdate
+	case kw == "delete" && c.Kind != mergeNotMatchedByTarget:
+		p.advance()
+		c.Action = mergeDelete
+	case kw == "insert" && c.Kind == mergeNotMatchedByTarget:
+		p.advance()
+		if err := p.parseMergeInsert(&c); err != nil {
+			return c, err
+		}
+		c.Action = mergeInsert
+	default:
+		return c, newError(SyntaxError, "unexpected MERGE action "+strings.ToUpper(kw))
+	}
+	return c, nil
+}
+
+// parseMergeInsert parses a MERGE `INSERT` action after its keyword (merge.md §1): an optional column
+// list, an optional `OVERRIDING { SYSTEM | USER } VALUE`, then `VALUES ( slot, … )` or `DEFAULT
+// VALUES` (which takes neither, as for INSERT).
+func (p *parser) parseMergeInsert(c *mergeClause) error {
+	if p.peek().Kind == tokLParen {
+		p.advance()
+		c.Columns = []string{}
+		for {
+			c.ColumnPos = append(c.ColumnPos, p.here())
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return err
+			}
+			c.Columns = append(c.Columns, name)
+			t := p.advance()
+			if t.Kind == tokComma {
+				continue
+			}
+			if t.Kind == tokRParen {
+				break
+			}
+			return newError(SyntaxError, "expected ',' or ')'")
+		}
+	}
+	if p.peekKeyword() == "overriding" {
+		p.advance()
+		var mode overridingKind
+		switch p.peekKeyword() {
+		case "system":
+			mode = overridingSystem
+		case "user":
+			mode = overridingUser
+		default:
+			return newError(SyntaxError, "expected SYSTEM or USER after OVERRIDING")
+		}
+		p.advance()
+		if err := p.expectKeyword("value"); err != nil {
+			return err
+		}
+		c.Overriding = &mode
+	}
+	if p.peekKeyword() == "default" {
+		if c.Columns != nil || c.Overriding != nil {
+			return newError(SyntaxError, "DEFAULT VALUES cannot be combined with a column list or OVERRIDING")
+		}
+		p.advance()
+		if err := p.expectKeyword("values"); err != nil {
+			return err
+		}
+		c.Columns = []string{}
+		return nil
+	}
+	if err := p.expectKeyword("values"); err != nil {
+		return err
+	}
+	if err := p.expect(tokLParen); err != nil {
+		return err
+	}
+	for {
+		next := p.peekKindAt(1)
+		if p.peekKeyword() == "default" && (next == tokComma || next == tokRParen) {
+			p.advance()
+			c.Values = append(c.Values, mergeValue{IsDefault: true})
+		} else {
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			c.Values = append(c.Values, mergeValue{Expr: e})
+		}
+		t := p.advance()
+		if t.Kind == tokComma {
+			continue
+		}
+		if t.Kind == tokRParen {
+			break
+		}
+		return newError(SyntaxError, "expected ',' or ')'")
+	}
+	return nil
 }
 
 // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.

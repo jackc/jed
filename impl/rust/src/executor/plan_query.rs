@@ -326,6 +326,50 @@ impl Engine {
         rename: Option<&[String]>,
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, DmCte)> {
+        // A MERGE body (spec/design/merge.md §1): its relation is its RETURNING schema. It is planned
+        // here only for that schema, so the CTE references the planning counts are restored — the
+        // orchestrator static-counts a data-modifying part's references (§3).
+        if let CteBody::Merge(m) = body {
+            let tdef = self.merge_target(m)?;
+            let stmt = DmStmt::Merge(m.clone());
+            let Some(_) = &m.returning else {
+                let table = cte_synthetic_table_cols(lname, &[], &[], None, None, rename)?;
+                return Ok((
+                    table,
+                    DmCte {
+                        stmt,
+                        no_returning: true,
+                    },
+                ));
+            };
+            let saved: Vec<(usize, bool)> = bindings
+                .iter()
+                .map(|b| (b.refs.get(), b.expanded.get()))
+                .collect();
+            let plan = self.plan_merge(m, tdef, bindings, ptypes);
+            for (b, (refs, expanded)) in bindings.iter().zip(saved) {
+                b.refs.set(refs);
+                b.expanded.set(expanded);
+            }
+            let (_, names, types, derivs, typmods) = plan?
+                .returning
+                .expect("a MERGE with RETURNING resolves its projection");
+            let table = cte_synthetic_table_cols(
+                lname,
+                &names,
+                &types,
+                Some(&derivs),
+                Some(&typmods),
+                rename,
+            )?;
+            return Ok((
+                table,
+                DmCte {
+                    stmt,
+                    no_returning: false,
+                },
+            ));
+        }
         let (table_name, table_pos, alias, returning, base_is_old, stmt): (
             &str,
             SrcPos,
@@ -358,6 +402,7 @@ impl Engine {
                 true,
                 DmStmt::Delete(del.clone()),
             ),
+            CteBody::Merge(_) => unreachable!("a MERGE body returned above"),
             CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
         };
         // A write through an updatable view targets its base table, and its RETURNING projects the
@@ -378,7 +423,7 @@ impl Engine {
                 let mut del = (**del).clone();
                 (self.rewrite_delete_target(&mut del)?, del.db)
             }
-            CteBody::Query(_) => (None, None),
+            CteBody::Merge(_) | CteBody::Query(_) => (None, None),
         };
         let target = vw.as_ref().map_or(table_name, |vw| vw.table.as_str());
         self.check_table_qualifier(target_db.as_deref(), target)
@@ -836,6 +881,7 @@ impl Engine {
             CteBody::Insert(ins) => Some(format!("Insert {}", ins.table)),
             CteBody::Update(upd) => Some(format!("Update {}", upd.table)),
             CteBody::Delete(del) => Some(format!("Delete {}", del.table)),
+            CteBody::Merge(m) => Some(format!("Merge {}", m.table)),
             CteBody::Query(_) => None,
         };
         let outcome = match body {
@@ -869,6 +915,11 @@ impl Engine {
                 let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
                 let ctx = view.ctx();
                 self.execute_delete(*del, params, ctx)?
+            }
+            CteBody::Merge(m) => {
+                let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
+                let ctx = view.ctx();
+                self.execute_merge(*m, params, ctx)?
             }
         };
         if let Some(node) = primary_dml_node
@@ -905,6 +956,7 @@ impl Engine {
                 DmStmt::Insert(ins) => DmStmt::Insert(ins.clone()),
                 DmStmt::Update(upd) => DmStmt::Update(upd.clone()),
                 DmStmt::Delete(del) => DmStmt::Delete(del.clone()),
+                DmStmt::Merge(m) => DmStmt::Merge(m.clone()),
             },
             CteSource::Query(_) => unreachable!("exec_dm_cte requires a data-modifying binding"),
         };
@@ -912,11 +964,13 @@ impl Engine {
             DmStmt::Insert(ins) => format!("Insert {}", ins.table),
             DmStmt::Update(upd) => format!("Update {}", upd.table),
             DmStmt::Delete(del) => format!("Delete {}", del.table),
+            DmStmt::Merge(m) => format!("Merge {}", m.table),
         };
         let outcome = match stmt {
             DmStmt::Insert(ins) => self.execute_insert(*ins, params, ctx)?,
             DmStmt::Update(upd) => self.execute_update(*upd, params, ctx)?,
             DmStmt::Delete(del) => self.execute_delete(*del, params, ctx)?,
+            DmStmt::Merge(m) => self.execute_merge(*m, params, ctx)?,
         };
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.record(node, outcome.cost());
@@ -1232,6 +1286,7 @@ impl Engine {
             lateral_hit: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
+            merge_action: None,
             hints: Default::default(),
         };
         let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());

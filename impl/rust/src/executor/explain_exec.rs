@@ -409,6 +409,7 @@ impl Engine {
                         let visible: Vec<&CteBinding> = bindings[..i].iter().collect();
                         self.explain_delete(r, delete, depth + 2, &visible)?
                     }
+                    DmStmt::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
                 },
             }
         }
@@ -420,6 +421,7 @@ impl Engine {
             CteBody::Insert(insert) => self.explain_insert(r, insert, depth + 1, &visible),
             CteBody::Update(update) => self.explain_update(r, update, depth + 1, &visible),
             CteBody::Delete(delete) => self.explain_delete(r, delete, depth + 1, &visible),
+            CteBody::Merge(_) => unreachable!("EXPLAIN refuses a MERGE (merge.md §12)"),
             CteBody::Query(_) => unreachable!("a query primary was planned above"),
         }
     }

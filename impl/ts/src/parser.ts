@@ -43,6 +43,10 @@ import type {
   JsonWrapper,
   JtColumn,
   Literal,
+  Merge,
+  MergeAction,
+  MergeClause,
+  MergeMatch,
   OnConflict,
   OrderKey,
   Overriding,
@@ -563,6 +567,8 @@ class Parser {
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
+      case "merge":
+        return this.parseMerge();
       case "explain":
         return this.parseExplain();
       case "begin":
@@ -1225,6 +1231,9 @@ class Parser {
         return this.parseUpdate();
       case "delete":
         return this.parseDelete();
+      // EXPLAIN MERGE is a deferred follow-on (spec/design/merge.md §12).
+      case "merge":
+        throw engineError("feature_not_supported", "EXPLAIN MERGE is not supported");
       // `EXPLAIN CREATE TABLE … AS` (create-table-as.md §7); the column-definition form has no plan to
       // render.
       case "create": {
@@ -3147,7 +3156,7 @@ class Parser {
     // INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr. A data-modifying
     // primary's SELECT is another statement's query, where INTO is not allowed.
     const kw = this.peekKeyword();
-    if (kw === "insert" || kw === "update" || kw === "delete") {
+    if (kw === "insert" || kw === "update" || kw === "delete" || kw === "merge") {
       this.intoOk = false;
       this.intoTop = false;
     }
@@ -3162,7 +3171,7 @@ class Parser {
   // top-level primary uses an unprefixed query_expr.
   private parseCteBody(parenthesized: boolean): CteBody {
     const kw = this.peekKeyword();
-    if (kw === "insert" || kw === "update" || kw === "delete") {
+    if (kw === "insert" || kw === "update" || kw === "delete" || kw === "merge") {
       // A parenthesized data-modifying body counts one nesting level, like parseSubquery does for a
       // parenthesized query body (grammar.md §48); the primary (parenthesized = false) runs at the
       // statement top level and does not.
@@ -3174,6 +3183,8 @@ class Parser {
         body = this.parseInsert();
       } else if (kw === "update") {
         body = this.parseUpdate();
+      } else if (kw === "merge") {
+        body = this.parseMerge();
       } else {
         body = this.parseDelete();
       }
@@ -4574,7 +4585,8 @@ class Parser {
         nextKind === "rparen" ||
         nextKind === "eof" ||
         nextKeyword === "where" ||
-        nextKeyword === "returning")
+        nextKeyword === "returning" ||
+        nextKeyword === "when")
     ) {
       this.advance();
       return [true, { kind: "literal", literal: { kind: "null" } }];
@@ -4610,6 +4622,225 @@ class Parser {
     const filter = this.parseOptionalWhere();
     const returning = this.parseReturning();
     return { kind: "update", table, tableLoc, db, assignments, filter, returning };
+  }
+
+  // parseMerge parses `MERGE INTO target [[AS] alias] USING source_ref ON cond when_clause+
+  // [RETURNING …]` (spec/design/merge.md §1). The source is one table_ref, carried as
+  // `SELECT * FROM source_ref`; a parenthesized join, or a join after the source, is 0A000 (§12). A
+  // clause after an unconditional clause of the same kind is 42601 here, before any name resolves
+  // (PostgreSQL's order).
+  private parseMerge(): Merge {
+    this.expectKeyword("merge");
+    this.expectKeyword("into");
+    const tableLoc = this.here();
+    const [db, table] = this.parseQualifiedTableName();
+    // The target alias; AS is optional (PostgreSQL), so any word but USING is an alias.
+    let alias: string | undefined;
+    if (this.peekKeyword() === "as") {
+      this.advance();
+      alias = this.expectIdentifier();
+    } else if (isIdentKind(this.peek().kind) && this.peekKeyword() !== "using") {
+      alias = this.expectIdentifier();
+    }
+    this.expectKeyword("using");
+    const sourceRef = this.parseTableRef();
+    const joined = sourceRef.subquery?.kind === "select" && sourceRef.subquery.parenJoin === true;
+    const next = this.peekKeyword();
+    if (
+      joined ||
+      next === "join" ||
+      next === "inner" ||
+      next === "left" ||
+      next === "right" ||
+      next === "full" ||
+      next === "cross" ||
+      next === "natural"
+    ) {
+      throw engineError(
+        "feature_not_supported",
+        "a joined MERGE source is not supported; write the join as a subquery",
+      );
+    }
+    let sourceLabel: string | null = null;
+    if (sourceRef.alias !== null) sourceLabel = sourceRef.alias;
+    else if (
+      sourceRef.subquery === undefined &&
+      sourceRef.values === undefined &&
+      sourceRef.name !== ""
+    ) {
+      sourceLabel = sourceRef.name;
+    }
+    const source: Select = {
+      kind: "select",
+      distinct: false,
+      items: { kind: "all" },
+      from: sourceRef,
+      joins: [],
+      filter: null,
+      groupBy: [],
+      having: null,
+      orderBy: [],
+      limit: null,
+      offset: null,
+      windows: [],
+    };
+    this.expectKeyword("on");
+    const on = this.parseExpr();
+    const clauses: MergeClause[] = [];
+    while (this.peekKeyword() === "when") clauses.push(this.parseMergeClause());
+    if (clauses.length === 0) {
+      throw engineError("syntax_error", "MERGE requires at least one WHEN clause");
+    }
+    const kinds: MergeMatch[] = ["matched", "notMatchedByTarget", "notMatchedBySource"];
+    for (const kind of kinds) {
+      let unconditional = false;
+      for (const c of clauses) {
+        if (c.match !== kind) continue;
+        if (unconditional) {
+          throw engineError(
+            "syntax_error",
+            "unreachable WHEN clause specified after unconditional WHEN clause",
+          );
+        }
+        unconditional = c.condition === null;
+      }
+    }
+    const returning = this.parseReturning();
+    return {
+      kind: "merge",
+      table,
+      tableLoc,
+      db,
+      alias,
+      source,
+      sourceLabel,
+      on,
+      clauses,
+      returning,
+    };
+  }
+
+  // parseMergeClause parses one `WHEN [NOT] MATCHED [BY SOURCE | BY TARGET] [AND cond] THEN action`
+  // (merge.md §1). An action the clause kind does not allow (INSERT for MATCHED / BY SOURCE, UPDATE
+  // or DELETE for NOT MATCHED) is 42601, as in PostgreSQL's grammar.
+  private parseMergeClause(): MergeClause {
+    this.expectKeyword("when");
+    let match: MergeMatch;
+    if (this.peekKeyword() === "not") {
+      this.advance();
+      this.expectKeyword("matched");
+      if (this.peekKeyword() === "by") {
+        this.advance();
+        const by = this.peekKeyword();
+        if (by === "source") match = "notMatchedBySource";
+        else if (by === "target") match = "notMatchedByTarget";
+        else throw engineError("syntax_error", "expected SOURCE or TARGET after NOT MATCHED BY");
+        this.advance();
+      } else {
+        match = "notMatchedByTarget";
+      }
+    } else {
+      this.expectKeyword("matched");
+      match = "matched";
+    }
+    let condition: Expr | null = null;
+    if (this.peekKeyword() === "and") {
+      this.advance();
+      condition = this.parseExpr();
+    }
+    this.expectKeyword("then");
+    const kw = this.peekKeyword();
+    let action: MergeAction;
+    if (kw === "do") {
+      this.advance();
+      this.expectKeyword("nothing");
+      action = { kind: "doNothing" };
+    } else if (kw === "update" && match !== "notMatchedByTarget") {
+      this.advance();
+      this.expectKeyword("set");
+      const assignments: Assignment[] = [];
+      for (;;) {
+        const loc = this.here();
+        const column = this.expectIdentifier();
+        this.expect("eq");
+        const [isDefault, value] = this.parseAssignmentRhs();
+        assignments.push({ column, loc, isDefault, value });
+        if (this.peek().kind === "comma") {
+          this.advance();
+          continue;
+        }
+        break;
+      }
+      action = { kind: "update", assignments };
+    } else if (kw === "delete" && match !== "notMatchedByTarget") {
+      this.advance();
+      action = { kind: "delete" };
+    } else if (kw === "insert" && match === "notMatchedByTarget") {
+      this.advance();
+      action = this.parseMergeInsert();
+    } else {
+      throw engineError("syntax_error", `unexpected MERGE action ${kw.toUpperCase()}`);
+    }
+    return { match, condition, action };
+  }
+
+  // parseMergeInsert parses a MERGE INSERT action after its keyword (merge.md §1): an optional column
+  // list, an optional `OVERRIDING { SYSTEM | USER } VALUE`, then `VALUES ( slot, … )` or
+  // `DEFAULT VALUES` (which takes neither, as for INSERT).
+  private parseMergeInsert(): MergeAction {
+    const columnLocs: SrcLoc[] = [];
+    let columns: string[] | null = null;
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      columns = [];
+      for (;;) {
+        columnLocs.push(this.here() ?? 0);
+        columns.push(this.expectIdentifier());
+        const t = this.advance();
+        if (t.kind === "comma") continue;
+        if (t.kind === "rparen") break;
+        throw engineError("syntax_error", "expected ',' or ')'");
+      }
+    }
+    let overriding: Overriding | null = null;
+    if (this.peekKeyword() === "overriding") {
+      this.advance();
+      const mode = this.peekKeyword();
+      if (mode === "system") overriding = "system";
+      else if (mode === "user") overriding = "user";
+      else throw engineError("syntax_error", "expected SYSTEM or USER after OVERRIDING");
+      this.advance();
+      this.expectKeyword("value");
+    }
+    const values: (Expr | null)[] = [];
+    if (this.peekKeyword() === "default") {
+      if (columns !== null || overriding !== null) {
+        throw engineError(
+          "syntax_error",
+          "DEFAULT VALUES cannot be combined with a column list or OVERRIDING",
+        );
+      }
+      this.advance();
+      this.expectKeyword("values");
+      columns = [];
+    } else {
+      this.expectKeyword("values");
+      this.expect("lparen");
+      for (;;) {
+        const nextKind = this.peekKindAt(1);
+        if (this.peekKeyword() === "default" && (nextKind === "comma" || nextKind === "rparen")) {
+          this.advance();
+          values.push(null);
+        } else {
+          values.push(this.parseExpr());
+        }
+        const t = this.advance();
+        if (t.kind === "comma") continue;
+        if (t.kind === "rparen") break;
+        throw engineError("syntax_error", "expected ',' or ')'");
+      }
+    }
+    return { kind: "insert", columns, columnLocs, overriding, values };
   }
 
   // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.

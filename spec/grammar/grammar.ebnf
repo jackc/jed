@@ -63,6 +63,7 @@ sql_statement  ::= create_table
                  | query_statement
                  | update
                  | delete
+                 | merge
                  | analyze
                  | explain
                  | begin
@@ -630,11 +631,41 @@ update         ::= "UPDATE" qualified_table "SET"
 /* UPDATE — standalone and the ON CONFLICT DO UPDATE action — additionally accepts DEFAULT as a
  * COMPLETE assignment source (constraints.md §2, ../design/upsert.md §5). If the RHS continues
  * (`default + 1`), DEFAULT is an ordinary non-reserved identifier in `expr`; it is the complete RHS
- * when the next token is ",", ")", "WHERE", "RETURNING", or the end of the statement. The special
+ * when the next token is ",", ")", "WHERE", "RETURNING", "WHEN" (a MERGE clause), or the end of the
+ * statement. The special
  * form applies the target column's declared default else NULL per updated row. */
 update_assignment ::= identifier "=" (expr | "DEFAULT")
 
 delete         ::= "DELETE" "FROM" qualified_table where_clause? returning_clause?
+
+/* MERGE (../design/merge.md): join a data source to the target and run, per joined pair, the first
+ * WHEN clause whose kind fits and whose AND condition is TRUE. The target is a base table (a view is
+ * 0A000); its optional alias (AS optional) replaces the table's name as the qualifier. The source is
+ * one table_ref that is not a parenthesized join (0A000), evaluated as "SELECT * FROM source"; the
+ * target and source labels must differ (42712). The join condition sees both relations; a MATCHED
+ * clause sees both, a NOT MATCHED [BY TARGET] clause only the source, a NOT MATCHED BY SOURCE clause
+ * only the target (42P01 otherwise). A clause after an unconditional clause of the same kind is 42601.
+ * A target row updated or deleted twice is 21000. merge_action() is legal only in RETURNING (42601
+ * elsewhere). MATCHED, SOURCE, TARGET, BY, THEN, DO, and NOTHING are NOT reserved (§3); WHEN ends a
+ * SET right-hand side's DEFAULT form. RETURNING's "*" is the source's columns, then the target's. */
+merge          ::= "MERGE" "INTO" qualified_table ("AS"? identifier)?
+                   "USING" table_ref "ON" expr
+                   merge_when+
+                   returning_clause?
+
+merge_when     ::= "WHEN" "MATCHED" ("AND" expr)? "THEN" (merge_update | "DELETE" | "DO" "NOTHING")
+                 | "WHEN" "NOT" "MATCHED" "BY" "SOURCE" ("AND" expr)? "THEN"
+                   (merge_update | "DELETE" | "DO" "NOTHING")
+                 | "WHEN" "NOT" "MATCHED" ("BY" "TARGET")? ("AND" expr)? "THEN"
+                   (merge_insert | "DO" "NOTHING")
+
+merge_update   ::= "UPDATE" "SET" update_assignment ("," update_assignment)*
+
+merge_insert   ::= "INSERT" ("(" identifier ("," identifier)* ")")?
+                   ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
+                   ( "VALUES" "(" merge_value ("," merge_value)* ")" | "DEFAULT" "VALUES" )
+
+merge_value    ::= "DEFAULT" | expr
 
 /* The terminal clause of the three DML statements (../design/grammar.md §32): the statement
  * becomes a query result projecting each affected row — INSERT the stored row, UPDATE the new
@@ -794,7 +825,7 @@ cycle_mark_constant ::= number | string | "TRUE" | "FALSE" | "NULL" | typed_lite
  * data-modifying statement (the writable-CTE surface, ../design/writable-cte.md). A bare query
  * (no WITH) stays a plain query_expr / insert / update / delete at the statement level — this
  * production names only the positions a WITH clause governs. */
-cte_body       ::= subquery_expr | insert | update | delete
+cte_body       ::= subquery_expr | insert | update | delete | merge
 
 set_expr       ::= intersect_expr (("UNION" | "EXCEPT") ("ALL" | "DISTINCT")? intersect_expr)*
 

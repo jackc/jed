@@ -1,0 +1,260 @@
+# MERGE and constraints (spec/design/merge.md §4–§6): CHECK and NOT NULL per planned row, UNIQUE
+# and PRIMARY KEY against the statement's end state, foreign keys on both sides with their
+# referential actions, identity and sequence defaults, and secondary-index maintenance. Each failing
+# MERGE changes nothing. Oracle-probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.secondary_index, ddl.identity, ddl.serial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.merge, query.select, query.order_by, query.where_eq, query.values, types.i32, types.i64, types.text, expr.arithmetic
+
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, v i32 NOT NULL CHECK (v >= 0))
+
+statement ok
+INSERT INTO ck VALUES (1, 1), (2, 2)
+
+statement error 23514
+MERGE INTO ck USING (VALUES (1, -1)) AS s(k, w) ON ck.id = s.k
+WHEN MATCHED THEN UPDATE SET v = s.w
+
+statement error 23514
+MERGE INTO ck USING (VALUES (3, -1)) AS s(k, w) ON ck.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.w)
+
+statement error 23502
+MERGE INTO ck USING (VALUES (2, NULL::i32)) AS s(k, w) ON ck.id = s.k
+WHEN MATCHED THEN UPDATE SET v = s.w
+
+statement error 23514
+MERGE INTO ck USING (VALUES (1)) AS s(k) ON ck.id = s.k
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = -5
+
+query II nosort
+SELECT id, v FROM ck ORDER BY id
+----
+1
+1
+2
+2
+
+# UNIQUE: an inserted row may not duplicate a kept row's value...
+statement ok
+CREATE TABLE uq (id i32 PRIMARY KEY, code text UNIQUE)
+
+statement ok
+INSERT INTO uq VALUES (1, 'a'), (2, 'b')
+
+statement error 23505
+MERGE INTO uq USING (VALUES (3, 'a')) AS s(k, c) ON uq.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.c)
+
+statement error 23505
+MERGE INTO uq USING (VALUES (2, 'a')) AS s(k, c) ON uq.id = s.k
+WHEN MATCHED THEN UPDATE SET code = s.c
+
+# ... but may take the value of a row the same MERGE deletes.
+statement ok
+MERGE INTO uq USING (VALUES (1, 'z'), (3, 'b')) AS s(k, c) ON uq.id = s.k
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+WHEN MATCHED THEN UPDATE SET code = s.c
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.c)
+
+query IT nosort
+SELECT id, code FROM uq ORDER BY id
+----
+1
+z
+3
+b
+
+# NULLs never conflict on a UNIQUE column.
+statement ok
+MERGE INTO uq USING (VALUES (4), (5)) AS s(k) ON uq.id = s.k
+WHEN NOT MATCHED THEN INSERT (id) VALUES (s.k)
+
+query IT nosort
+SELECT id, code FROM uq ORDER BY id
+----
+1
+z
+3
+b
+4
+NULL
+5
+NULL
+
+# A secondary index follows inserts, updates, and deletes.
+statement ok
+CREATE TABLE ix (id i32 PRIMARY KEY, g i32, n text)
+
+statement ok
+CREATE INDEX ix_g ON ix (g)
+
+statement ok
+INSERT INTO ix VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+
+statement ok
+MERGE INTO ix USING (VALUES (1, 11), (2, NULL), (4, 40)) AS s(k, gg) ON ix.id = s.k
+WHEN MATCHED AND s.gg IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET g = s.gg
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.gg, 'new')
+
+query IIT nosort
+SELECT id, g, n FROM ix WHERE g = 11
+----
+1
+11
+a
+
+query I nosort
+SELECT count(*) FROM ix WHERE g = 20
+----
+0
+
+query IIT nosort
+SELECT id, g, n FROM ix WHERE g >= 30 ORDER BY g
+----
+3
+30
+c
+4
+40
+new
+
+# Foreign keys: an inserted child needs its parent; a deleted parent cascades or is restricted.
+statement ok
+CREATE TABLE par (id i32 PRIMARY KEY, name text)
+
+statement ok
+CREATE TABLE chi (id i32 PRIMARY KEY, pid i32 REFERENCES par (id) ON DELETE CASCADE ON UPDATE CASCADE)
+
+statement ok
+CREATE TABLE chr (id i32 PRIMARY KEY, pid i32 REFERENCES par (id))
+
+statement ok
+INSERT INTO par VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+statement ok
+INSERT INTO chi VALUES (10, 1), (20, 2), (21, 2)
+
+statement ok
+INSERT INTO chr VALUES (30, 3)
+
+statement error 23503
+MERGE INTO chi USING (VALUES (11, 9)) AS s(k, p) ON chi.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.p)
+
+statement error 23503
+MERGE INTO chi USING (VALUES (10, 9)) AS s(k, p) ON chi.id = s.k
+WHEN MATCHED THEN UPDATE SET pid = s.p
+
+statement error 23503
+MERGE INTO par USING (VALUES (3)) AS s(k) ON par.id = s.k
+WHEN MATCHED THEN DELETE
+
+statement ok
+MERGE INTO chi USING (VALUES (11, 1)) AS s(k, p) ON chi.id = s.k
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.p)
+
+# Delete parent 2 (cascading to its children) and re-key parent 1 to 100 (cascading the key).
+statement ok
+MERGE INTO par USING (VALUES (1, 100), (2, NULL)) AS s(k, nk) ON par.id = s.k
+WHEN MATCHED AND s.nk IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET id = s.nk
+
+query IT nosort
+SELECT id, name FROM par ORDER BY id
+----
+3
+three
+100
+one
+
+query II nosort
+SELECT id, pid FROM chi ORDER BY id
+----
+10
+100
+11
+100
+
+# Identity and sequence defaults draw only for the rows actually inserted.
+statement ok
+CREATE TABLE idn (id i64 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, k i32 UNIQUE, v text)
+
+statement ok
+MERGE INTO idn USING (VALUES (1, 'a'), (2, 'b')) AS s(k, v) ON idn.k = s.k
+WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)
+
+statement ok
+MERGE INTO idn USING (VALUES (2, 'B'), (3, 'c')) AS s(k, v) ON idn.k = s.k
+WHEN MATCHED THEN UPDATE SET v = s.v
+WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)
+
+query IIT nosort
+SELECT id, k, v FROM idn ORDER BY id
+----
+1
+1
+a
+2
+2
+B
+3
+3
+c
+
+statement error 428C9
+MERGE INTO idn USING (VALUES (1)) AS s(k) ON idn.k = s.k
+WHEN MATCHED THEN UPDATE SET id = 5
+
+statement error 428C9
+MERGE INTO idn USING (VALUES (9)) AS s(k) ON idn.k = s.k
+WHEN NOT MATCHED THEN INSERT (id, k) VALUES (9, s.k)
+
+statement ok
+MERGE INTO idn USING (VALUES (9)) AS s(k) ON idn.k = s.k
+WHEN NOT MATCHED THEN INSERT (id, k) OVERRIDING SYSTEM VALUE VALUES (90, s.k)
+
+query II nosort
+SELECT id, k FROM idn WHERE k = 9
+----
+90
+9
+
+statement ok
+CREATE TABLE ser (id serial PRIMARY KEY, k i32)
+
+statement ok
+MERGE INTO ser USING (VALUES (1), (2), (3)) AS s(k) ON ser.k = s.k
+WHEN NOT MATCHED AND s.k <> 2 THEN INSERT (k) VALUES (s.k)
+
+query II nosort
+SELECT id, k FROM ser ORDER BY id
+----
+1
+1
+2
+3
+
+# A table without a primary key: matched rows are identified by their storage rowid.
+statement ok
+CREATE TABLE nopk (a i32, b text)
+
+statement ok
+INSERT INTO nopk VALUES (1, 'x'), (1, 'y'), (2, 'z')
+
+statement ok
+MERGE INTO nopk USING (VALUES (1, 'u'), (3, 'w')) AS s(k, t) ON nopk.a = s.k
+WHEN MATCHED AND nopk.b = 'x' THEN DELETE
+WHEN MATCHED THEN UPDATE SET b = s.t
+WHEN NOT MATCHED THEN INSERT VALUES (s.k, s.t)
+
+query IT rowsort
+SELECT a, b FROM nopk
+----
+1
+u
+2
+z
+3
+w

@@ -26,7 +26,7 @@ func stmtIsWrite(stmt statement) bool {
 		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
 		stmt.CreateView != nil || stmt.DropView != nil || stmt.AlterView != nil ||
-		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil {
+		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil || stmt.Merge != nil {
 		return true
 	}
 	// A WITH statement with any data-modifying part is a write (it stages INSERT/UPDATE/DELETE effects
@@ -575,6 +575,9 @@ func (db *engine) collectCatalogExprPrivs(stmt statement, req *privReq) {
 	if stmt.Insert != nil {
 		db.collectInsertCatalogPrivs(stmt.Insert, req)
 	}
+	if stmt.Merge != nil {
+		db.collectMergeCatalogPrivs(stmt.Merge, req)
+	}
 	if stmt.With != nil {
 		for i := range stmt.With.Ctes {
 			db.collectCteCatalogPrivs(&stmt.With.Ctes[i].Body, req)
@@ -599,6 +602,64 @@ func (db *engine) collectCteCatalogPrivs(body *cteBody, req *privReq) {
 	}
 	if body.Insert != nil {
 		db.collectInsertCatalogPrivs(body.Insert, req)
+	}
+	if body.Merge != nil {
+		db.collectMergeCatalogPrivs(body.Merge, req)
+	}
+}
+
+// collectMergeCatalogPrivs adds the catalog expressions a MERGE evaluates (spec/design/merge.md §10):
+// the defaults of each INSERT action's omitted columns and DEFAULT slots, each UPDATE action's
+// SET c = DEFAULT, and the target's CHECK constraints when any action writes.
+func (db *engine) collectMergeCatalogPrivs(m *mergeStmt, req *privReq) {
+	table, ok := db.lkpTableScoped(m.DB, m.Table)
+	if !ok {
+		return
+	}
+	locals := map[string]bool{}
+	writes := false
+	for ci := range m.Clauses {
+		c := &m.Clauses[ci]
+		switch c.Action {
+		case mergeUpdate:
+			writes = true
+			db.collectAssignmentDefaultPrivs(table, c.Assignments, req)
+		case mergeInsert:
+			writes = true
+			n := len(table.Columns)
+			targets := make([]int, 0, n)
+			if c.Columns == nil {
+				for i := 0; i < n; i++ {
+					targets = append(targets, i)
+				}
+			} else {
+				for _, name := range c.Columns {
+					targets = append(targets, table.ColumnIndex(name))
+				}
+			}
+			defaulted := make([]bool, n)
+			for i := range defaulted {
+				defaulted[i] = true
+			}
+			for p, v := range c.Values {
+				if v.IsDefault || p >= len(targets) || targets[p] < 0 {
+					continue
+				}
+				i := targets[p]
+				identityUser := table.Columns[i].Identity != nil && c.Overriding != nil && *c.Overriding == overridingUser
+				if !identityUser {
+					defaulted[i] = false
+				}
+			}
+			for i, need := range defaulted {
+				if col := &table.Columns[i]; need && col.DefaultExpr != nil && !col.DefaultExpr.Unparsed {
+					collectExprPrivs(&col.DefaultExpr.Expr, req, locals)
+				}
+			}
+		}
+	}
+	if writes {
+		collectCheckPrivs(table, req)
 	}
 }
 
@@ -849,6 +910,8 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 		collectUpdatePrivs(stmt.Update, req, locals)
 	case stmt.Delete != nil:
 		collectDeletePrivs(stmt.Delete, req, locals)
+	case stmt.Merge != nil:
+		collectMergePrivs(stmt.Merge, req, locals)
 	case stmt.Explain != nil:
 		// EXPLAIN requires the inner statement's privileges (EXPLAIN INSERT needs INSERT, matching
 		// PG). Plain EXPLAIN never executes, but authorization is checked on the inner regardless.
@@ -929,6 +992,40 @@ func collectDeletePrivs(del *deleteStmt, req *privReq, locals map[string]bool) {
 	collectReturningPrivs(del.Returning, req, locals)
 }
 
+// collectMergePrivs collects a MERGE's privileges (spec/design/merge.md §10): SELECT on the target
+// (its join condition reads it), the write privilege of each action kind a clause names, SELECT on
+// what the source reads, and what every expression's sublinks and functions need.
+func collectMergePrivs(m *mergeStmt, req *privReq, locals map[string]bool) {
+	req.needTable(m.Table, PrivSelect)
+	for _, c := range m.Clauses {
+		switch c.Action {
+		case mergeUpdate:
+			req.needTable(m.Table, PrivUpdate)
+		case mergeDelete:
+			req.needTable(m.Table, PrivDelete)
+		case mergeInsert:
+			req.needTable(m.Table, PrivInsert)
+		}
+	}
+	collectQueryPrivs(&m.Source, req, locals)
+	collectExprPrivs(&m.On, req, locals)
+	for ci := range m.Clauses {
+		c := &m.Clauses[ci]
+		if c.Condition != nil {
+			collectExprPrivs(c.Condition, req, locals)
+		}
+		for i := range c.Assignments {
+			collectExprPrivs(&c.Assignments[i].Value, req, locals)
+		}
+		for i := range c.Values {
+			if !c.Values[i].IsDefault {
+				collectExprPrivs(&c.Values[i].Expr, req, locals)
+			}
+		}
+	}
+	collectReturningPrivs(m.Returning, req, locals)
+}
+
 func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
 	if qe.Select != nil {
 		collectSelectPrivs(qe.Select, req, locals)
@@ -989,6 +1086,8 @@ func collectCteBodyPrivs(body *cteBody, req *privReq, locals map[string]bool) {
 		collectInsertPrivs(body.Insert, req, locals)
 	case body.Update != nil:
 		collectUpdatePrivs(body.Update, req, locals)
+	case body.Merge != nil:
+		collectMergePrivs(body.Merge, req, locals)
 	default:
 		collectDeletePrivs(body.Delete, req, locals)
 	}

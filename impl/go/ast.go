@@ -36,6 +36,8 @@ type statement struct {
 	With   *withQuery
 	Update *update
 	Delete *deleteStmt
+	// Merge is `MERGE INTO … USING … ON … WHEN …` (spec/design/merge.md). Non-nil only for a MERGE.
+	Merge *mergeStmt
 	// Explain is `EXPLAIN [ANALYZE] <statement>` — render the planner's chosen plan for the inner
 	// statement instead of running it (spec/design/explain.md). Non-nil only for an EXPLAIN. Plain
 	// EXPLAIN plans but never executes; EXPLAIN ANALYZE runs the inner and reports its actual cost.
@@ -939,6 +941,75 @@ type deleteStmt struct {
 	fkTarget *fkKeyedTarget
 }
 
+// mergeStmt is `MERGE INTO target [[AS] alias] USING source ON condition when_clause+ [RETURNING …]`
+// (spec/design/merge.md). The source is carried as the query `SELECT * FROM source_ref` it is
+// evaluated as (§3), so CTE references, privileges, and planning see an ordinary query.
+type mergeStmt struct {
+	Table string
+	// TablePos is the target name's character position (spec/design/error-fields.md §10.2).
+	TablePos srcPos
+	// DB is the optional database qualifier on the target, like update.DB.
+	DB *string
+	// Alias is the optional target alias (`AS` optional — merge.md §1); it replaces the table's name
+	// as the target's qualifier.
+	Alias *string
+	// Source is `SELECT * FROM source_ref` (merge.md §3).
+	Source queryExpr
+	// SourceLabel is the source relation's label: its alias, else its table / view / CTE / function
+	// name. Nil for an unaliased derived table, whose columns are reachable only bare (merge.md §2).
+	SourceLabel *string
+	// On is the join condition.
+	On exprNode
+	// Clauses are the WHEN clauses in written order (at least one).
+	Clauses []mergeClause
+	// Returning is the optional terminal RETURNING clause (merge.md §7).
+	Returning *returningClause
+}
+
+// mergeMatch says which joined rows a WHEN clause applies to (merge.md §4).
+type mergeMatch int
+
+const (
+	// mergeMatched is `WHEN MATCHED` — a target row the join condition pairs with a source row.
+	mergeMatched mergeMatch = iota
+	// mergeNotMatchedByTarget is `WHEN NOT MATCHED [BY TARGET]` — a source row no target row matched.
+	mergeNotMatchedByTarget
+	// mergeNotMatchedBySource is `WHEN NOT MATCHED BY SOURCE` — a target row no source row matched.
+	mergeNotMatchedBySource
+)
+
+// mergeActionKind is a WHEN clause's action (merge.md §4).
+type mergeActionKind int
+
+const (
+	mergeDoNothing mergeActionKind = iota
+	mergeUpdate
+	mergeDelete
+	mergeInsert
+)
+
+// mergeClause is one `WHEN [NOT] MATCHED [BY …] [AND condition] THEN action` clause.
+type mergeClause struct {
+	Kind      mergeMatch
+	Condition *exprNode
+	Action    mergeActionKind
+	// Assignments is an UPDATE action's `SET col = expr | DEFAULT, …`.
+	Assignments []assignment
+	// Columns / ColumnPos / Overriding / Values are an INSERT action's parts, as for insert: a nil
+	// Columns is the positional form; `DEFAULT VALUES` is an empty non-nil Columns and no Values.
+	Columns    []string
+	ColumnPos  []srcPos
+	Overriding *overridingKind
+	Values     []mergeValue
+}
+
+// mergeValue is one `INSERT VALUES` slot of a MERGE action: `DEFAULT` or an expression over the
+// source row.
+type mergeValue struct {
+	IsDefault bool
+	Expr      exprNode // valid when !IsDefault
+}
+
 // returningClause is a DML RETURNING clause. OldAlias / NewAlias are the optional PostgreSQL-18
 // `WITH (OLD AS o, NEW AS n)` row-version aliases; aliasing a version hides its standard qualifier
 // (spec/design/grammar.md §32).
@@ -1281,6 +1352,8 @@ type cteBody struct {
 	Insert *insert
 	Update *update
 	Delete *deleteStmt
+	// Merge is a MERGE body (spec/design/merge.md §1).
+	Merge *mergeStmt
 }
 
 // AsQuery returns the query expression when this body is a plain query, else nil — used by the
