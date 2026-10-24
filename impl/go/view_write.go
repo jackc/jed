@@ -578,7 +578,7 @@ func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, u
 				continue
 			}
 			ls := layerBodyScope(db, table, 0, layer.belowLabel, layer.below)
-			node, err := resolveBooleanFilter(ls, layer.filter, &paramTypes{})
+			node, err := resolveOrderedFilter(ls, layer.filter, &paramTypes{})
 			if err != nil {
 				return nil, err
 			}
@@ -586,7 +586,7 @@ func (db *engine) resolveWriteFilter(s *scope, table *catTable, vw *viewWrite, u
 		}
 	}
 	if user != nil {
-		node, err := resolveBooleanFilter(s, user, ptypes)
+		node, err := resolveOrderedFilter(s, user, ptypes)
 		if err != nil {
 			return nil, err
 		}

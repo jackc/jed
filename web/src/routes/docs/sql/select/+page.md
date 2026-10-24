@@ -277,8 +277,12 @@ decides `AND` and a `TRUE` one decides `OR`, so the right operand is never evalu
 written first therefore protects what follows it — `WHERE qty <> 0 AND total / qty > 5` never
 divides by zero. In a `WHERE`, `ON`, or `HAVING`, a `NULL` condition also stops the `AND` chain,
 since the row can no longer qualify; elsewhere (the select list, `CASE`, `CHECK`) a `NULL` left
-operand decides neither, so the right operand still runs. PostgreSQL leaves the order unspecified;
-jed guarantees it.
+operand decides neither, so the right operand still runs.
+
+Like PostgreSQL, a `WHERE`, `ON`, or `HAVING` first sorts its top-level `AND` conditions cheapest
+first (by how many operators each evaluates; equal ones keep their written order), so the guard also
+works written second: `WHERE total / qty > 5 AND qty <> 0` checks `qty <> 0` first. Every other
+`AND` and `OR` runs exactly as written.
 
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 

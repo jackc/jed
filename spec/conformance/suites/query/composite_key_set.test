@@ -286,7 +286,7 @@ CREATE TABLE events (region text, day i32, seq i32, n i32, PRIMARY KEY (region, 
 statement ok
 INSERT INTO events SELECT r, d, s, d * 10 + s FROM (VALUES ('east'), ('north'), ('west')) AS rg(r), generate_series(1, 20) AS d, generate_series(1, 20) AS s
 
-# cost: 8049
+# cost: 2729
 query I nosort
 SELECT count(*) FROM events WHERE region IN ('west', 'east') AND seq = 1
 ----

@@ -375,7 +375,8 @@ restates the access predicate's own range (an index `ON t (amt) WHERE amt > 0` b
 
 ### 7.1 Boolean composition
 
-Top-level AND/OR nodes flatten in source order. Before ordinary AND folding, the estimator performs
+Top-level AND/OR nodes flatten in the predicate's order (a WHERE's, ON's, or HAVING's conjuncts are
+already cost-ordered, [planner.md](planner.md) §3.0). Before ordinary AND folding, the estimator performs
 the same deterministic contradiction and paired-range inventory the access detector uses.
 
 - **AND:** begin with `N`; apply each remaining conjunct's exact fraction to the current row count,

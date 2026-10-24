@@ -145,23 +145,22 @@ hard-fenced inputs retain their staged policies ([estimator.md §9–§10](estim
   operand runs (the node was evaluated — the same rule as `CASE`/`COALESCE`, which charge their node
   once). So the guard idiom `WHERE d <> 0 AND 10 / d > 1` never divides on a `d = 0` row. A
   left-deep chain `a AND b AND c` (the parser's shape, `(a AND b) AND c`) therefore charges every
-  `and` node — they all sit on the left spine — and evaluates the conjuncts in source order up to
+  `and` node — they all sit on the left spine — and evaluates the conjuncts left to right up to
   the first FALSE; `IN (list)` (an `or` chain, grammar.md §20) stops at the first TRUE element, and
   `BETWEEN` (an `and` of two comparisons, §21) skips its upper bound when the lower one is FALSE.
-  **PostgreSQL** documents the evaluation order of `AND`/`OR` operands as unspecified (its planner
-  may reorder a WHERE's top-level conjuncts by estimated cost), so a fixed left-to-right order is a
-  *stronger* promise than PostgreSQL's, not a divergence from it: every result jed returns is one
-  PostgreSQL could return. The observable gap is one-sided — when the trapping operand is written
-  *first* (`WHERE 10 / d > 1 AND d <> 0`), jed traps on the `d = 0` row where PostgreSQL's
-  cost-ordering may evaluate the cheaper guard first and succeed; write the guard first (or use
-  `CASE`). An **uncorrelated** subquery operand is still folded once at plan setup (§"Subqueries"
+  **PostgreSQL** documents the evaluation order of `AND`/`OR` operands as unspecified; its planner
+  sorts a filter's top-level conjuncts by estimated cost, and so does jed's
+  ([planner.md](planner.md) §3.0), so the guard idiom also holds written the other way round
+  (`WHERE 10 / d > 1 AND d <> 0`). Every other `AND`/`OR` evaluates left to right as written. An
+  **uncorrelated** subquery operand is still folded once at plan setup (§"Subqueries"
   below) whether or not a row reaches it, exactly as inside a `CASE` arm.
 - **A filter's top-level `AND` chain also stops at NULL.** A **filter context** is a predicate whose
   value is used only to keep a row when it is TRUE: a `WHERE` (of a `SELECT`, `UPDATE`, or `DELETE`,
   at any nesting depth, and a view's `WHERE` read or written through — views.md §15), a join's `ON`,
   `HAVING`, a partial index's `WHERE` ([indexes.md](indexes.md) §9), `ON CONFLICT … DO UPDATE …
   WHERE`, and a view's `WHERE` evaluated as its check option (views.md §15.6). There, the predicate's **top-level `AND` chain** — the `and` nodes reached from its root
-  through `and` nodes only — evaluates its conjuncts in source order and stops at the first one that
+  through `and` nodes only — evaluates its conjuncts in order — cost-ordered for a WHERE, ON, or HAVING
+  ([planner.md](planner.md) §3.0), as written elsewhere — and stops at the first one that
   is **not TRUE**, FALSE *or NULL*: the predicate can no longer be TRUE, so the row is rejected
   without evaluating or charging the rest. Each top-level `and` node reached charges its
   `operator_eval` on entry as usual (the whole left spine of a left-deep chain, before its first
@@ -1260,13 +1259,13 @@ is pinned here because, with no reference implementation, the count is a cross-c
   its relation delivers: for a base table per row its access path admits (after that row's
   `storage_row_read`; per fetched row of each per-outer-row INL probe), for a derived table, CTE
   reference, SRF, or catalog relation per produced row, after that relation's own charges. It is the
-  left-deep AND of that relation's pushed conjuncts in source order (each join's ON conjuncts in join
-  order, then the WHERE's); a row it rejects reaches no ON, hash, residual, or row-account work. A
+  left-deep AND of that relation's pushed conjuncts (each join's ON conjuncts in join order, then the
+  WHERE's), cost-ordered as planner.md §3.0 states; a row it rejects reaches no ON, hash, residual, or row-account work. A
   **body-pushed** conjunct moved into a derived table's body is charged by the body's plan exactly as
   if it had been written in the body's WHERE. Each join charges only its **residual ON** — the
   left-deep AND of its remaining conjuncts, or the original ON when none moved, or nothing when all
   moved — over its candidate pairs. The WHERE **residual** — the left-deep AND of every unmoved
-  conjunct in source order, or the original WHERE when none moved — is charged per **surviving
+  conjunct in the WHERE's order, or the original WHERE when none moved — is charged per **surviving
   combined row** (post-join); with no residual there is no post-join WHERE charge.
   **`row_produced`** is per emitted output row (post-`LIMIT`/`OFFSET`); the combined row is simply
   wider. Join materialization buffering, physical control flow, and row concatenation are

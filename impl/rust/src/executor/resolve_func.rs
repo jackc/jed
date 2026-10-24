@@ -1719,6 +1719,78 @@ pub(crate) fn resolve_boolean_filter(
     }
 }
 
+/// Resolve a WHERE or join ON clause and cost-order its top-level conjuncts
+/// ([`order_filter_conjuncts`]).
+pub(crate) fn resolve_ordered_filter(
+    scope: &Scope,
+    e: &Expr,
+    params: &mut ParamTypes,
+) -> Result<RExpr> {
+    Ok(order_filter_conjuncts(resolve_boolean_filter(
+        scope, e, params,
+    )?))
+}
+
+/// Stable-sort a WHERE / ON / HAVING clause's top-level AND chain by estimated per-row evaluation
+/// cost, PostgreSQL's `order_qual_clauses` (planner.md §3.0): a conjunct without a correlated
+/// subquery before one with, then fewer estimated `operator_eval` (estimator.md §8.2) first, ties
+/// in source order. An already-ordered chain is returned unchanged; a reordered one is rebuilt
+/// left-deep.
+pub(crate) fn order_filter_conjuncts(e: RExpr) -> RExpr {
+    let mut conjuncts = Vec::new();
+    estimator_flatten_boolean(&e, true, &mut conjuncts);
+    let keys: Vec<(bool, i64)> = conjuncts
+        .iter()
+        .map(|c| {
+            (
+                has_correlated_subquery(c),
+                estimator_operator_nodes(Some(c)),
+            )
+        })
+        .collect();
+    if keys.windows(2).all(|w| w[0] <= w[1]) {
+        return e;
+    }
+    let mut owned = Vec::with_capacity(keys.len());
+    flatten_and_owned(e, &mut owned);
+    let mut order: Vec<usize> = (0..owned.len()).collect();
+    order.sort_by_key(|&i| keys[i]);
+    let mut slots: Vec<Option<RExpr>> = owned.into_iter().map(Some).collect();
+    let mut out: Option<RExpr> = None;
+    for i in order {
+        let c = slots[i].take().expect("each conjunct is placed once");
+        out = Some(match out {
+            None => c,
+            Some(prev) => RExpr::And(Box::new(prev), Box::new(c)),
+        });
+    }
+    out.expect("a reordered chain has conjuncts")
+}
+
+/// `estimator_flatten_boolean` over AND, taking ownership of the conjuncts.
+fn flatten_and_owned(e: RExpr, out: &mut Vec<RExpr>) {
+    match e {
+        RExpr::And(l, r) => {
+            flatten_and_owned(*l, out);
+            flatten_and_owned(*r, out);
+        }
+        e => out.push(e),
+    }
+}
+
+/// Whether `e` contains a subquery that is re-run per row (one that references this query level or
+/// an enclosing one, so the uncorrelated fold leaves it in place).
+fn has_correlated_subquery(e: &RExpr) -> bool {
+    if let RExpr::Subquery { plan, .. } = e {
+        if query_plan_references_outer(plan, 0) {
+            return true;
+        }
+    }
+    estimator_expression_children(e)
+        .into_iter()
+        .any(has_correlated_subquery)
+}
+
 /// Per-statement accumulator of bind-parameter types, inferred from context during resolve
 /// (spec/design/api.md §5). `types[i]` is the inferred scalar type of `$(i+1)`; `None` marks a
 /// parameter referenced before any context fixed its type. Shared across every clause of a

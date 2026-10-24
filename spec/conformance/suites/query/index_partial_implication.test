@@ -117,7 +117,7 @@ SELECT id FROM pi WHERE status IN ('a', 'b') AND amt = 4
 64
 
 # a superset does not
-# cost: 1055
+# cost: 615
 query I rowsort
 SELECT id FROM pi WHERE status IN ('a', 'c') AND amt = 4
 ----

@@ -679,7 +679,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			}
 			segStar = merged
 			pair := &scope{rels: pairRels, catalog: db, ctes: ctes}
-			pred, perr := resolveBooleanFilter(pair, predAST, ptypes)
+			pred, perr := resolveOrderedFilter(pair, predAST, ptypes)
 			if perr != nil {
 				return nil, perr
 			}
@@ -689,7 +689,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 			// (error-fields.md §11.8).
 			onHints := scopeHints{unseen: onClauseUnseen(tableRefs, rels, subRels, seg), onClause: true}
 			partial := &scope{rels: rels[seg : k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes, merges: segMerges, hidden: segHidden, subRels: subRelsWithin(subRels, seg, k+1), hints: onHints}
-			pred, perr := resolveBooleanFilter(partial, j.On, ptypes)
+			pred, perr := resolveOrderedFilter(partial, j.On, ptypes)
 			if perr != nil {
 				return nil, perr
 			}
@@ -979,7 +979,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 		if ty.kind != rtBool && ty.kind != rtNull {
 			return nil, positionError(typeError("argument of HAVING must be boolean"), exprLocation(*sel.Having))
 		}
-		having = node
+		having = orderFilterConjuncts(node)
 		aggSpecs = hctx.specs
 		groupingSpecs = hctx.groupingSpecs
 	}
@@ -1024,7 +1024,7 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// restriction (each key must be a select-list item) is enforced once for both at the §11 block.
 	var filter *rExpr
 	if sel.Filter != nil {
-		filter, err = resolveBooleanFilter(s, sel.Filter, ptypes)
+		filter, err = resolveOrderedFilter(s, sel.Filter, ptypes)
 		if err != nil {
 			return nil, err
 		}
@@ -1390,6 +1390,11 @@ func (db *engine) planSelectPushed(sel *selectStmt, parent *scope, ctes []*cteBi
 	// only the optimizeSelect pass below writes it (spec/design/planner.md §2).
 	for _, c := range pushed {
 		filter = andConjunct(filter, c)
+	}
+	// The body's own conjuncts and the pushed ones form one filter, cost-ordered together
+	// (planner.md §3.0).
+	if filter != nil {
+		filter = orderFilterConjuncts(filter)
 	}
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {

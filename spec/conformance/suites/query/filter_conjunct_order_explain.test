@@ -1,0 +1,70 @@
+# EXPLAIN of filter conjunct ordering (spec/design/planner.md §3.0): a filter renders in the order it
+# runs, cheapest estimated conjunct first, ties in source order. A conjunct pushed into a derived body
+# sorts together with the body's own WHERE, and a relation's scan-pushed ON and WHERE conjuncts sort
+# together. This rendering is jed-specific and not oracle-imported.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.filter_conjunct_order, query.qualified_column, query.join_inner, query.where_pushdown, query.on_pushdown, query.derived_table, query.derived_pushdown, query.is_null, query.explain, query.explain_analyze, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE z (id i32 PRIMARY KEY, d i32)
+
+statement ok
+INSERT INTO z VALUES (1, 0), (2, 5), (3, 20), (4, NULL)
+
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT id FROM z WHERE 10 / d > 1 AND d <> 0
+----
+0
+Filter
+filter=((#1 <> 0) and ((10 / #1) > 1)); output=[#0]
+1
+22
+1
+Scan z
+Full scan; touched=2
+4
+5
+
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT id FROM (SELECT id, d FROM z WHERE 10 / d > 1) s WHERE d <> 0
+----
+0
+Subquery s
+output=[#0]
+1
+23
+1
+Filter
+filter=((#1 <> 0) and ((10 / #1) > 1)); output=[#0, #1]
+1
+22
+2
+Scan z
+Full scan; touched=2
+4
+5
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, w i32)
+
+statement ok
+INSERT INTO b VALUES (1, 1, NULL), (2, 2, 9), (3, 3, 1)
+
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT z.id, b.id FROM z JOIN b ON z.id = b.k AND (b.w IS NULL OR b.w > 5) WHERE b.id <> 3
+----
+0
+Nested Loop
+inner; on=(#0 = #3); output=[#0, #2]
+2
+27
+1
+Scan b
+Full scan; touched=3; filter=((#2 <> 3) and ((#4 is null) or (#4 > 5)))
+2
+19
+1
+Scan z
+Index-nested-loop PK bound: id = join; touched=1
+2
+4

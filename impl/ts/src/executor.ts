@@ -16864,7 +16864,7 @@ export class Engine {
       const view = this.resolveWriteFilter(tgtOnly, table, vw, null, new ParamTypes());
       return view === null ? cond : { kind: "and", lhs: view, rhs: cond };
     };
-    const on = lead(resolveBooleanFilter(both, m.on, ptypes));
+    const on = lead(resolveOrderedFilter(both, m.on, ptypes));
     // The probe form: the target is the relation, the source an enclosing level (§3). The combined
     // resolution above already raised every name error.
     const probeScope = new Scope(
@@ -16874,7 +16874,7 @@ export class Engine {
       true,
       bindings,
     );
-    const probe = lead(resolveBooleanFilter(probeScope, m.on, new ParamTypes()));
+    const probe = lead(resolveOrderedFilter(probeScope, m.on, new ParamTypes()));
     const targetFilter = this.resolveWriteFilter(tgtOnly, table, vw, null, new ParamTypes());
     const hash = this.mergeHashChoice(m.db, table, source, on, probe, both);
     const viewChecks = this.resolveViewChecks(table, vw);
@@ -19315,10 +19315,10 @@ export class Engine {
       for (const layer of viewsBottomUp(vw.top)) {
         if (layer.filter === null) continue;
         const lscope = Scope.layerBody(this, table, 0, layer.belowLabel, layer.below!);
-        join(resolveBooleanFilter(lscope, layer.filter, new ParamTypes()));
+        join(resolveOrderedFilter(lscope, layer.filter, new ParamTypes()));
       }
     }
-    if (user !== null) join(resolveBooleanFilter(scope, user, ptypes));
+    if (user !== null) join(resolveOrderedFilter(scope, user, ptypes));
     return filter;
   }
 
@@ -21424,7 +21424,7 @@ export class Engine {
           exprLocation(sel.having),
         );
       }
-      having = node;
+      having = orderFilterConjuncts(node);
       aggSpecs = hctx.specs;
       groupingSpecs = hctx.groupingSpecs ?? groupingSpecs;
     }
@@ -21453,7 +21453,7 @@ export class Engine {
     // group rows by equality, keeping the first occurrence, then LIMIT/OFFSET (aggregates.md §10) —
     // the same project->dedup->window pipeline as the non-aggregate DISTINCT path. The ORDER BY
     // restriction (each key must be a select-list item) is enforced once for both at the §11 block.
-    const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter, ptypes) : null;
+    const filter = sel.filter ? resolveOrderedFilter(scope, sel.filter, ptypes) : null;
     // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
     // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
     // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -21491,10 +21491,11 @@ export class Engine {
     // handled in the executor loop, not the predicate (grammar.md §15).
     const joins: PlanJoin[] = sel.joins.map((j, k) => ({ kind: j.kind, on: joinPreds[k]! }));
     // Body-pushed conjuncts from an enclosing SELECT (planner.md §3.2) join the WHERE as a left-deep
-    // AND after the body's own WHERE, in source order.
+    // AND after the body's own WHERE, and the whole chain is cost-ordered (planner.md §3.0).
     let fullFilter = filter;
     for (const c of pushed)
       fullFilter = fullFilter === null ? c : { kind: "and", lhs: fullFilter, rhs: c };
+    if (fullFilter !== null) fullFilter = orderFilterConjuncts(fullFilter);
 
     // Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's tables, so
     // the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
@@ -22043,7 +22044,7 @@ export class Engine {
         for (const idx of rightStar) if (!rightDrop.includes(idx)) merged.push(idx);
         segStar = merged;
         const pair = new Scope(pairRels, this, null, false, ctes);
-        joinPreds.push(resolveBooleanFilter(pair, predAst!, ptypes));
+        joinPreds.push(resolveOrderedFilter(pair, predAst!, ptypes));
       } else if (j.on !== null) {
         const partial = mkScope(seg, k + 1);
         partial.subRels = subRelsWithin(subRels, seg, k + 1);
@@ -22054,7 +22055,7 @@ export class Engine {
           onClause: true,
           lateralActive: false,
         };
-        joinPreds.push(resolveBooleanFilter(partial, j.on, ptypes));
+        joinPreds.push(resolveOrderedFilter(partial, j.on, ptypes));
         segStar.push(...rightStar);
       } else {
         joinPreds.push(null);
@@ -31572,6 +31573,126 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
       break;
   }
   return saturatingEstimateAdd(1n, children);
+}
+
+// estimatorExpressionChildren is a resolved expression's direct children in evaluation-tree order —
+// the nodes estimatorOperatorNodes recurses into (Rust's estimator_expression_children). A subquery's
+// only child is its IN lhs; a leaf has none.
+function estimatorExpressionChildren(expr: RExpr): RExpr[] {
+  const present = (...children: (RExpr | null)[]): RExpr[] =>
+    children.filter((child): child is RExpr => child !== null);
+  switch (expr.kind) {
+    case "subquery":
+      return present(expr.lhs);
+    case "inValues":
+      return [expr.lhs];
+    case "quantified":
+      return [expr.lhs, expr.array];
+    case "widthBucketArray":
+      return [expr.operand, expr.thresholds];
+    case "cast":
+    case "arrayCast":
+    case "compositeCast":
+    case "neg":
+    case "not":
+    case "isNull":
+    case "isJson":
+    case "jsonCtor":
+      return [expr.operand];
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+    case "regex":
+      return [expr.lhs, expr.rhs];
+    case "jsonGet":
+    case "jsonHasKey":
+    case "jsonDelete":
+      return [expr.base, expr.arg];
+    case "jsonContains":
+    case "jsonConcat":
+      return [expr.a, expr.b];
+    case "casing":
+      return [expr.arg];
+    case "atTimeZone":
+      return [expr.zone, expr.value];
+    case "dateTrunc":
+      return present(expr.unit, expr.value, expr.zone);
+    case "extract":
+      return [expr.value];
+    case "dateConvert":
+      return [expr.inner];
+    case "case":
+      return [...expr.arms.flatMap((arm) => [arm.cond, arm.result]), ...present(expr.els)];
+    case "greatestLeast":
+    case "nullIf":
+    case "coalesce":
+    case "scalarFunc":
+    case "hostFunc":
+    case "arrayFunc":
+    case "regexFunc":
+    case "rangeFunc":
+    case "rangeCtor":
+    case "rangeOp":
+    case "rangeSetOp":
+    case "variadic":
+    case "jsonBuild":
+    case "jsonSetInsert":
+    case "jsonObjectFromArrays":
+    case "jsonImage":
+    case "jsonPathFn":
+    case "jsonSqlFn":
+      return expr.args;
+    case "row":
+      return expr.fields;
+    case "array":
+      return expr.elements;
+    case "field":
+      return [expr.base];
+    case "subscript":
+      return [expr.base, ...rSubscriptBounds(expr.subscripts)];
+    default:
+      return [];
+  }
+}
+
+// resolveOrderedFilter resolves a WHERE or join ON clause and cost-orders its top-level conjuncts
+// (orderFilterConjuncts).
+function resolveOrderedFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr {
+  return orderFilterConjuncts(resolveBooleanFilter(scope, e, params));
+}
+
+// orderFilterConjuncts stable-sorts a WHERE / ON / HAVING clause's top-level AND chain by estimated
+// per-row evaluation cost, PostgreSQL's order_qual_clauses (planner.md §3.0): a conjunct without a
+// correlated subquery before one with, then fewer estimated operator_eval (estimator.md §8.2) first,
+// ties in source order. An already-ordered chain is returned unchanged; a reordered one is rebuilt
+// left-deep.
+export function orderFilterConjuncts(e: RExpr): RExpr {
+  const conjuncts: RExpr[] = [];
+  estimatorFlattenBoolean(e, "and", conjuncts);
+  const keys = conjuncts.map((c) => ({
+    correlated: hasCorrelatedSubquery(c),
+    nodes: estimatorOperatorNodes(c),
+  }));
+  const compare = (a: (typeof keys)[number], b: (typeof keys)[number]): number => {
+    if (a.correlated !== b.correlated) return a.correlated ? 1 : -1;
+    return a.nodes < b.nodes ? -1 : a.nodes > b.nodes ? 1 : 0;
+  };
+  if (keys.every((k, i) => i === 0 || compare(keys[i - 1]!, k) <= 0)) return e;
+  // Array.prototype.sort is stable, so ties keep source order.
+  const order = conjuncts.map((_, i) => i).sort((a, b) => compare(keys[a]!, keys[b]!));
+  let out = conjuncts[order[0]!]!;
+  for (const i of order.slice(1)) out = { kind: "and", lhs: out, rhs: conjuncts[i]! };
+  return out;
+}
+
+// hasCorrelatedSubquery reports whether e contains a subquery that is re-run per row (one that
+// references this query level or an enclosing one, so the uncorrelated fold leaves it in place).
+function hasCorrelatedSubquery(e: RExpr): boolean {
+  if (e.kind === "subquery" && queryPlanReferencesOuter(e.plan, 0)) return true;
+  return estimatorExpressionChildren(e).some(hasCorrelatedSubquery);
 }
 
 function estimatorClampPages(rows: bigint, nodes: bigint, height: bigint): bigint {

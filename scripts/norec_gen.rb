@@ -149,6 +149,11 @@
 #              (input) order. Whole-table and grouped jsonb_agg, every direction / NULL placement, a
 #              FILTER, a DISTINCT, and jsonb_object_agg's last-wins duplicate key must all match
 #              by-construction rows (the buffered sort, its spill, and the plain fold agree).
+#   conjunct_order — a filter's top-level AND chain runs cheapest conjunct first (planner.md §3.0),
+#              so a guard written AFTER a trapping division keeps it off the rows it rejects, exactly
+#              as written guard-first. WHERE, a three-conjunct chain with a NULL-bearing guard, an
+#              INNER ON, HAVING, and a guard pushed into a derived body must all match
+#              by-construction rows (and never raise 22012).
 #   contradiction — a provably-never-TRUE bare-column literal AND-chain reads no relation
 #              (planner.md §3.1); the same predicate over `col + 0` is not proven and scans. Both must be
 #              empty (an ungrouped COUNT returns 0), and satisfiable near-miss ranges must match.
@@ -634,6 +639,14 @@ CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mu
                        query.aggregates query.qualified_column query.join_inner
                        query.where_contradiction expr.arithmetic expr.comparison_value
                        null.three_valued types.i32 types.text types.boolean].freeze
+
+CONJUNCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                        query.where_eq query.comparison_order query.logical_connectives
+                        query.filter_conjunct_order query.order_by query.qualified_column
+                        query.table_alias query.join_inner query.group_by query.having
+                        query.derived_table query.derived_pushdown expr.arithmetic
+                        expr.comparison_value error.division_by_zero null.three_valued
+                        types.i32].freeze
 
 DML_CONTRADICTION_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row
                            dml.update dml.delete dml.where_contradiction query.select
@@ -4595,6 +4608,53 @@ def gen_contradiction(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: filter conjunct order -------------------------------------------------------------
+# `K / d` truncates toward zero (PostgreSQL integer division). Each predicate is written with the
+# trapping division first and again guard-first; the cost order runs the cheaper guard first in both.
+def gen_conjunct_order(seed)
+  rng = Random.new(seed)
+  rows = (1..30).to_a.sample(10, random: rng).sort.map do |id|
+    d = rng.rand < 0.15 ? nil : [0, 0, *(-6..20).to_a].sample(random: rng)
+    g = rng.rand < 0.2 ? nil : rng.rand(-2..3)
+    [id, d, g]
+  end
+  rows[rng.rand(rows.size)][1] = 0 # at least one row a written-first division would trap on
+  lit = ->(x) { x.nil? ? "NULL" : x.to_s }
+  div = ->(a, b) { q = a.abs / b.abs; (a.negative? ^ b.negative?) ? -q : q }
+  k = rng.rand(20..100)
+  m = rng.rand(-3..8)
+  ok = ->(d) { !d.nil? && d != 0 && div.call(k, d) > m }
+  ids = ->(sel) { sel.map { |id, _, _| id.to_s } }
+
+  out = header(seed, CONJUNCT_ORDER_REQ, "filter conjunct order (guard written second vs first)",
+               note: ["# The cost-ordered filter runs `d <> 0` before `#{k} / d > #{m}` either way round.",
+                      "# Expected rows known by construction; no oracle."])
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, d i32, g i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, d, g| "(#{id}, #{lit.call(d)}, #{lit.call(g)})" }.join(', ')}")
+
+  where = ids.call(rows.select { |_, d, _| ok.call(d) })
+  out << "# WHERE: guard second, then first — MUST match"
+  q(out, "I", "SELECT id FROM t WHERE #{k} / d > #{m} AND d <> 0 ORDER BY id", where)
+  q(out, "I", "SELECT id FROM t WHERE d <> 0 AND #{k} / d > #{m} ORDER BY id", where)
+
+  chain = ids.call(rows.select { |_, d, g| !g.nil? && g.positive? && ok.call(d) })
+  out << "# a three-conjunct chain whose NULL-bearing guard `g > 0` also stops the filter"
+  q(out, "I", "SELECT id FROM t WHERE #{k} / d > #{m} AND g > 0 AND d <> 0 ORDER BY id", chain)
+  q(out, "I", "SELECT id FROM t WHERE g > 0 AND d <> 0 AND #{k} / d > #{m} ORDER BY id", chain)
+
+  pairs = rows.select { |_, d, _| ok.call(d) }.flat_map { |id, _, _| [id.to_s, id.to_s] }
+  out << "# an INNER join's ON"
+  q(out, "II", "SELECT a.id, b.id FROM t a JOIN t b ON a.id = b.id AND #{k} / b.d > #{m} AND b.d <> 0 ORDER BY a.id", pairs)
+
+  out << "# HAVING"
+  q(out, "I", "SELECT id FROM t GROUP BY id, d HAVING #{k} / d > #{m} AND d <> 0 ORDER BY id", where)
+
+  out << "# a guard pushed into a derived body sorts with the body's own WHERE"
+  q(out, "I", "SELECT id FROM (SELECT id, d FROM t WHERE #{k} / d > #{m}) s WHERE d <> 0 ORDER BY id", where)
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: UPDATE/DELETE WHERE contradiction ------------------------------------------------
 # `opt` runs each mutation with a proven-contradictory WHERE; `ref` runs it with every bare column
 # spelled `x + 0` / `(s = 'v') = true`, which the proof cannot see, so it scans. Neither may change a
@@ -5580,6 +5640,7 @@ SCENARIOS = {
   "right_lateral" => method(:gen_right_lateral),
   "where_pushdown" => method(:gen_where_pushdown),
   "contradiction" => method(:gen_contradiction),
+  "conjunct_order" => method(:gen_conjunct_order),
   "dml_contradiction" => method(:gen_dml_contradiction),
   "on_pushdown" => method(:gen_on_pushdown),
   "derived_pushdown" => method(:gen_derived_pushdown),

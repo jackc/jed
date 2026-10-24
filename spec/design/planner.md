@@ -71,6 +71,55 @@ with resolution, not with the rules.
 
 ## 3. Stage 2 — rewrite rules
 
+### 3.0 Filter conjunct order (`query.filter_conjunct_order`)
+
+Before stage 2 sees a predicate, resolve **cost-orders** the top-level AND chain of every WHERE (of a
+SELECT, UPDATE, or DELETE, at any nesting depth, and a view's WHERE read or written through), every
+join's ON (MERGE's included), and every HAVING. The conjuncts are flattened through `AND` nodes only
+and **stable-sorted** by a two-part key, ascending:
+
+1. whether the conjunct contains a **correlated subquery** — a subquery whose plan references this
+   query level or an enclosing one, which the uncorrelated fold leaves in place to re-run per row
+   ([cost.md](cost.md) "Subqueries"); an uncorrelated subquery does not count, since it runs once;
+2. the conjunct's estimated `operator_eval` count for one evaluation, the estimator's `nodes(c)`
+   ([estimator.md](estimator.md) §8.2): every interior node, every short-circuit operand counted,
+   plus a folded `IN` list's values and a quantified comparison's known elements.
+
+Ties keep source order, and an already-ordered chain is left exactly as written; a reordered chain is
+rebuilt left-deep. The key reads the resolved tree only (a parameter's value only through the
+custom-plan frame, as the estimator does), so the order is deterministic and identical on every core.
+
+This is PostgreSQL's `order_qual_clauses`, which sorts a scan's, join's, or aggregate's quals by
+`cost_qual_eval`, with jed's own per-row cost estimate in place of PostgreSQL's `procost` sums. Its
+observable purpose is the guard idiom written either way round: `WHERE 10 / d > 1 AND d <> 0` runs the
+one-node `d <> 0` first, and the filter's qual-list stop ([cost.md](cost.md) §3) keeps the division
+off a `d = 0` or NULL row. With equal estimates the written order decides, so `10 / d > 1 AND
+d + 0 <> 0` still divides first, as in PostgreSQL.
+
+Two later points sort again with the same key, because they join conjuncts from different clauses
+into one filter, as PostgreSQL's flattening does:
+
+- a derived body's own WHERE together with the conjuncts §3.2 pushes into it (a view's, a derived
+  table's, an inlined CTE's body), and
+- a relation's scan-pushed filter, which joins pushed ON and WHERE conjuncts (§3.2–§3.3).
+
+A pushed conjunct is non-trapping (§3.5), and a stable sort keeps the relative order of conjuncts
+already sorted, so neither re-sort runs a conjunct that can trap on a row it did not reach before.
+
+Not sorted, as in PostgreSQL, which evaluates them as written: a partial index's WHERE, `ON CONFLICT
+… DO UPDATE … WHERE`, a view's WHERE evaluated as its check option, a MERGE `WHEN … AND` condition, and
+every value context ([cost.md](cost.md) §3) — an `AND` under `OR`, `NOT`, or `CASE`, the select list,
+`CHECK`. A deliberate difference remains where PostgreSQL's planner moves a qual elsewhere first:
+it turns some correlated `EXISTS` subqueries into semi-joins and evaluates their quals inside the
+join, while jed keeps such a conjunct last; and a `security_barrier` view lets PostgreSQL keep an
+expensive (ten operators or more) outer qual after the view's quals, while jed's pushed conjuncts,
+all non-trapping and pure, always sort with the body's.
+
+The order is cost-visible — the short-circuit skips different conjuncts — and EXPLAIN renders every
+filter in this evaluation order. Because the estimator folds AND selectivities left to right with a
+ceiling at each step ([estimator.md](estimator.md) §7.1), it can also change an estimate and so a
+selected plan.
+
 Stage 2 sits at a fixed position in each core's `planSelect`, after the logical plan and its
 `relMasks` annotation are complete and before `optimizeSelect`. Its one driver, `rewriteWhere`, runs
 contradiction detection (§3.1) and, when that does not fire, predicate pushdown of the WHERE (§3.2)
@@ -99,8 +148,8 @@ The contract every rewrite rule meets:
   every physical choice ([estimator.md](estimator.md) §1). This holds under the left-to-right
   `AND`/`OR` short-circuit ([cost.md](cost.md) §3), whose skips depend on conjunct order: a moved
   conjunct is non-trapping (§3.5), so running it ahead of an earlier conjunct cannot raise,
-  and it only removes rows; the conjuncts left behind keep their source order. So every conjunct
-  of the rewritten plan runs on a subset of the rows where the source-order AND would reach it —
+  and it only removes rows; the conjuncts left behind keep their §3.0 order. So every conjunct
+  of the rewritten plan runs on a subset of the rows where the unrewritten AND would reach it —
   reordering by pushdown can skip an error, never introduce one.
 - **Cost-identical, or an explicitly decided cost change.** Cost is an observable cross-core
   contract (CLAUDE.md §13, cost.md §1). Textbook rewrites — constant folding, CSE,
@@ -164,7 +213,7 @@ provably empty key bound already charged nothing and is unchanged.
 
 ### 3.2 WHERE pushdown (`query.where_pushdown`, `query.derived_pushdown`)
 
-With no contradiction, each top-level WHERE conjunct, in source order, is **pushed** toward relation
+With no contradiction, each top-level WHERE conjunct, in its §3.0 order, is **pushed** toward relation
 `i` when all of these hold:
 
 - it references at least one column, and every column it references belongs to relation `i` (an
@@ -258,9 +307,9 @@ therefore body-pushed only into a **non-matching** body: every SELECT it reaches
 takes the scan form (when the SELECT has another relation) or stays in the residual. Scan and ON
 pushdown filter a relation's rows before anything matches them, so they need no such condition.
 
-**Body form.** A derived body's pushed conjuncts — the WHERE's, in source order, after any §3.3 ON
-conjuncts pushed to the same relation — are appended to the body's own WHERE as a left-deep AND:
-`((W AND c1) AND c2)`, or `(c1 AND c2)` when the body has no WHERE. In a grouped body the WHERE is the
+**Body form.** A derived body's pushed conjuncts — the WHERE's, after any §3.3 ON conjuncts pushed
+to the same relation — are appended to the body's own WHERE as a left-deep AND: `((W AND c1) AND c2)`,
+or `(c1 AND c2)` when the body has no WHERE, and the whole chain is then cost-ordered again (§3.0). In a grouped body the WHERE is the
 pre-grouping filter, so the conjuncts run **below the grouping**, over the input rows. A set-operation
 body appends the same conjuncts, each rewritten to that arm's own columns, to the WHERE of every
 SELECT of its tree, which keeps its operators, unified types, and `ORDER BY`. The body (each SELECT of
@@ -298,7 +347,7 @@ shape's view expansions are discarded instead, and only the real plans count the
 
 **Scan form.** The conjuncts scan-pushed to a relation form its **pushed filter**; all conjuncts that
 were neither scan- nor body-pushed form the **residual**. Each is rebuilt as the **left-deep AND of its
-conjuncts in source order** (so a filter of `n` conjuncts has `n − 1` AND nodes; the original WHERE's
+conjuncts**, the pushed filter cost-ordered (§3.0) and the residual in its WHERE's order (so a filter of `n` conjuncts has `n − 1` AND nodes; the original WHERE's
 AND nodes are not charged anywhere). Ordinary column slots are unchanged in the plan's copy; execution
 evaluates a copy rebased to the relation's own row.
 
@@ -367,9 +416,9 @@ which pushdown does not change.
 
 A pushed ON conjunct takes the same body or scan form as a WHERE conjunct (§3.2); unlike the WHERE,
 ON pushdown always has at least two relations, so the scan form is always available. A relation's
-pushed filter, and a derived body's appended conjuncts, list the pushed conjuncts in **source order**:
-each join's ON conjuncts in join order, then the WHERE's. Each join's remaining ON conjuncts form its
-**residual ON**, the left-deep AND in source order; when none remains the join has no ON predicate at
+pushed filter, and a derived body's appended conjuncts, collect the pushed conjuncts — each join's
+ON conjuncts in join order, then the WHERE's — before the §3.0 re-sort. Each join's remaining ON conjuncts
+form its **residual ON**, the left-deep AND in the ON's order; when none remains the join has no ON predicate at
 all (an INNER join then pairs every surviving row, a LEFT/RIGHT join NULL-extends a preserved row only
 when the other side has no surviving row).
 

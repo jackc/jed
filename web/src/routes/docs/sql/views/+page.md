@@ -297,8 +297,9 @@ The options are PostgreSQL's:
 - `security_invoker` checks the tables the view reads against the session reading it (and, for a
   write, the table underneath against the session writing), instead of making the view a privilege
   boundary ([below](#privileges)).
-- `security_barrier` is accepted and stored. jed already never evaluates a condition from the outer
-  query on a row the view's own `WHERE` rejects, so it changes nothing.
+- `security_barrier` is accepted and stored. jed only moves outer conditions that cannot raise an
+  error into a view, so running one on a row the view's own `WHERE` rejects reveals nothing, and the
+  option changes nothing.
 
 Values are booleans in PostgreSQL's spellings (`true`, `on`, `yes`, `1`, …); a bare name means
 `true`. An unknown option or a bad value is `22023`. `CREATE OR REPLACE VIEW` replaces the options,
