@@ -216,6 +216,12 @@ export type IndexDef = {
   name: string;
   keys: IndexKey[];
   unique: boolean;
+  // constraint marks the unique index that backs a UNIQUE constraint (CREATE TABLE … UNIQUE,
+  // ALTER TABLE … ADD UNIQUE — constraints.md §5) rather than a bare CREATE UNIQUE INDEX
+  // (format_version 50, index_flags bit5). Only a constraint index is a constraint: DROP INDEX
+  // refuses it (2BP01) and ALTER TABLE … DROP CONSTRAINT, ON CONFLICT ON CONSTRAINT and
+  // jed_constraints see only it. Always unique and B-tree. Read through isUniqueConstraint.
+  constraint?: boolean;
   // kind selects an ordered B-tree (the default), a GIN inverted index (spec/design/gin.md), or a
   // GiST R-tree (spec/design/gist.md). Persisted as the per-index index_kind byte (v13 GIN, v20
   // GiST); a GIN/GiST index is never unique.
@@ -241,6 +247,11 @@ export type IndexDef = {
   // indexKeyOrder.
   orders?: KeyOrder[];
 };
+
+// isUniqueConstraint reports whether this index backs a UNIQUE constraint (and so is one).
+export function isUniqueConstraint(def: IndexDef): boolean {
+  return def.unique && def.constraint === true;
+}
 
 // indexKeyOrder is key element i's sort order (ASC NULLS LAST when the index carries no options).
 export function indexKeyOrder(def: IndexDef, i: number): KeyOrder {

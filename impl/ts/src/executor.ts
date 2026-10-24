@@ -148,6 +148,7 @@ import {
   canonicalKeyOrders,
   indexColumnOrdinals,
   indexKeyOrder,
+  isUniqueConstraint,
   indexKeyOrderEffective,
   indexFirstColumn,
   pkIndices,
@@ -5222,7 +5223,7 @@ export class Engine {
           );
           rows = saturatingEstimateAdd(
             rows,
-            BigInt(table.indexes.filter((index) => index.unique).length),
+            BigInt(table.indexes.filter(isUniqueConstraint).length),
           );
           break;
         }
@@ -7882,6 +7883,7 @@ export class Engine {
         name,
         keys: ru.cols.map((c) => ({ kind: "column", column: c })),
         unique: true,
+        constraint: true,
         kind: "btree",
       });
     }
@@ -7970,7 +7972,7 @@ export class Engine {
       // derived name also walks past the domain's other tables' constraint names.
       const nameTakenFk = (n: string): boolean =>
         table.checks.some((c) => c.name === n) ||
-        table.indexes.some((i) => i.unique && i.name === n) ||
+        table.indexes.some((i) => isUniqueConstraint(i) && i.name === n) ||
         resolvedFks.some((f) => f.name === n);
       let fkName: string;
       if (fk.name !== null) {
@@ -9036,7 +9038,7 @@ export class Engine {
           next = at.action.newName;
         const exists = (name: string) =>
           table.checks.some((c) => c.name === name) ||
-          table.indexes.some((i) => i.unique && i.name === name) ||
+          table.indexes.some((i) => isUniqueConstraint(i) && i.name === name) ||
           table.fks.some((f) => f.name === name) ||
           table.exclusions.some((e) => e.name === name);
         if (!exists(old))
@@ -9051,7 +9053,7 @@ export class Engine {
           return { ...e, name: next, index: next };
         });
         table.indexes = table.indexes.map((i) => {
-          if ((!i.unique && indexRename === undefined) || i.name !== old) return i;
+          if ((!isUniqueConstraint(i) && indexRename === undefined) || i.name !== old) return i;
           indexRename = { oldName: old, newName: next };
           return { ...i, name: next };
         });
@@ -9470,6 +9472,7 @@ export class Engine {
                 name,
                 keys: cols.map((column) => ({ kind: "column", column })),
                 unique: true,
+                constraint: true,
                 kind: "btree",
               });
               table.indexes.sort(compareName);
@@ -9636,7 +9639,7 @@ export class Engine {
               table.indexes = table.indexes.filter((i) => i.name !== ex.index);
               found = true;
             }
-            const ux = table.indexes.find((i) => i.unique && i.name === k);
+            const ux = table.indexes.find((i) => isUniqueConstraint(i) && i.name === k);
             if (ux) {
               const cols = sortedUnique(indexColumnOrdinals(ux)!);
               const originalCols = cols.flatMap((column) => {
@@ -11477,33 +11480,43 @@ export class Engine {
     }
     const nameKey = di.name;
     if (this.isTempIndex(di.name)) {
-      const tableKey = this.tempSnap().findIndex(di.name)![0];
+      const [tableKey, def] = this.tempSnap().findIndex(di.name)!;
+      this.checkIndexOwner(tableKey, def);
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.removeIndex(tableKey, nameKey);
-    } else {
-      const found = this.findIndex(di.name);
-      if (!found) {
-        throw engineError("undefined_object", "index does not exist: " + di.name);
-      }
-      // An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns it
-      // (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01, matching
-      // PG's "cannot drop index … because constraint … requires it" (gist.md §7).
-      const owner = this.table(found[0]);
-      if (owner?.exclusions.some((e) => e.index === nameKey)) {
-        throw engineError(
-          "dependent_objects_still_exist",
-          "cannot drop index " +
-            di.name +
-            " because constraint " +
-            di.name +
-            " on table " +
-            owner.name +
-            " requires it",
-        ).hinted(dropOwnerInstead(di.name, owner.name));
-      }
-      this.working().removeIndex(found[0], nameKey);
+      return { kind: "statement", cost: 0n, rowsAffected: null };
     }
+    const found = this.findIndex(di.name);
+    if (!found) {
+      throw engineError("undefined_object", "index does not exist: " + di.name);
+    }
+    this.checkIndexOwner(found[0], found[1]);
+    this.working().removeIndex(found[0], nameKey);
     return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // checkIndexOwner refuses a DROP INDEX of an index a constraint owns — a UNIQUE constraint's
+  // backing index or an EXCLUDE constraint's (constraints.md §5.5, gist.md §7). 2BP01, matching
+  // PostgreSQL's "cannot drop index … because constraint … requires it"; ALTER TABLE … DROP
+  // CONSTRAINT drops both.
+  private checkIndexOwner(tableKey: string, def: IndexDef): void {
+    const t = this.lkpTable(tableKey);
+    if (!t) return;
+    let owner = isUniqueConstraint(def) ? def.name : "";
+    for (const e of t.exclusions) {
+      if (e.index === def.name) owner = e.name;
+    }
+    if (owner === "") return;
+    throw engineError(
+      "dependent_objects_still_exist",
+      "cannot drop index " +
+        def.name +
+        " because constraint " +
+        owner +
+        " on table " +
+        t.name +
+        " requires it",
+    ).hinted(dropOwnerInstead(owner, t.name));
   }
 
   // executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a
@@ -11658,8 +11671,9 @@ export class Engine {
   }
 
   // executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
-  // RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
-  // (a plain `DEFAULT nextval('s')` creates none — PG). Multiple names are dropped left to right.
+  // A missing sequence is 42P01 unless IF EXISTS; an owning serial column, a column DEFAULT that
+  // names the sequence, or (under RESTRICT) a view blocks the drop with 2BP01. Multiple names are
+  // dropped left to right.
   private executeDropSequence(ds: DropSequence): Outcome {
     for (const name of ds.names) {
       // Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
@@ -11687,6 +11701,23 @@ export class Engine {
         throw engineError(
           "dependent_objects_still_exist",
           `cannot drop sequence ${seq.name} because other objects depend on it: default value for column ${colName} of table ${tableName} depends on sequence ${seq.name}`,
+        );
+      }
+      // A column DEFAULT that names the sequence depends on it (sequences.md §1): 2BP01, as in
+      // PostgreSQL. Its CASCADE would drop the default too: not supported.
+      const dep =
+        sequenceDefaultDependent(this.readSnap(), seq.name) ??
+        sequenceDefaultDependent(this.tempSnap(), seq.name);
+      if (dep !== null) {
+        if (ds.cascade) {
+          throw engineError(
+            "feature_not_supported",
+            `DROP SEQUENCE ... CASCADE of a sequence a column default uses is not supported: ${dep}`,
+          );
+        }
+        throw engineError(
+          "dependent_objects_still_exist",
+          `cannot drop sequence ${seq.name} because other objects depend on it: ${dep} depends on sequence ${seq.name}`,
         );
       }
       // A view that depends on the sequence blocks the drop under RESTRICT (2BP01); CASCADE drops
@@ -23339,9 +23370,10 @@ export class Engine {
           nullValue(),
         ]);
       }
-      // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
+      // UNIQUE: every unique b-tree index that backs a UNIQUE constraint (a bare CREATE UNIQUE
+      // INDEX is an index, not a constraint).
       for (const idx of t.indexes) {
-        if (!idx.unique) continue;
+        if (!isUniqueConstraint(idx)) continue;
         meter.guard();
         meter.charge(COSTS.generatedRow);
         out.push([
@@ -33699,7 +33731,7 @@ export function ginElementTerm(elem: ScalarType, v: Value): Uint8Array {
 function tableConstraintNameTaken(t: Table, name: string): boolean {
   return (
     t.checks.some((c) => c.name === name) ||
-    t.indexes.some((i) => i.unique && i.name === name) ||
+    t.indexes.some((i) => isUniqueConstraint(i) && i.name === name) ||
     t.fks.some((f) => f.name === name) ||
     t.exclusions.some((e) => e.name === name)
   );
@@ -34359,7 +34391,7 @@ export function resolveArbiter(
   if (pk.length > 0 && target.name === pkey) return { kind: "pk" };
   for (let i = 0; i < table.indexes.length; i++) {
     const def = table.indexes[i]!;
-    if (def.unique && def.name === target.name) return { kind: "index", indexPos: i };
+    if (isUniqueConstraint(def) && def.name === target.name) return { kind: "index", indexPos: i };
   }
   const ex = table.exclusions.findIndex((e) => e.name === target.name);
   if (ex >= 0) return { kind: "exclusion", exclusionPos: ex };
@@ -46834,4 +46866,55 @@ function checkRecordFieldValue(v: Value, decl: Type): void {
   } else if (v.kind === "array" && decl.kind === "array") {
     for (const e of v.elements) checkRecordFieldValue(e, decl.elem);
   }
+}
+
+// sequenceDefaultDependent finds a table column's or view column's expression DEFAULT that names
+// sequence seq in a constant nextval / currval / setval argument — the dependency PostgreSQL records
+// by reading the constant as a regclass, which makes DROP SEQUENCE 2BP01 (sequences.md §1). It
+// returns the first such column's description for the error message (null if none), scanning tables
+// then views in name byte order and columns in ordinal order (CLAUDE.md §8).
+function sequenceDefaultDependent(snap: Snapshot, seq: string): string | null {
+  for (const t of snap.tablesSorted()) {
+    for (const c of t.columns) {
+      if (c.defaultExpr !== null && exprTextNamesSequence(c.defaultExpr.exprText, seq))
+        return `default value for column ${c.name} of table ${t.name}`;
+    }
+  }
+  for (const v of snap.viewsSorted()) {
+    for (let i = 0; i < v.defaults.length; i++) {
+      const d = v.defaults[i];
+      if (d != null && exprTextNamesSequence(d.exprText, seq))
+        return `default value for column ${v.columns[i]} of view ${v.name}`;
+    }
+  }
+  return null;
+}
+
+// exprTextNamesSequence reports whether persisted expression text calls nextval / currval / setval
+// with a lone string-literal first argument that names seq — a constant argument, which is what
+// PostgreSQL reads as a regclass (an expression such as 'a' || 'b' is a text value resolved at run
+// time, and records nothing). Token-level, so it reads unparsable stored text too.
+function exprTextNamesSequence(text: string, seq: string): boolean {
+  let tokens: ReturnType<typeof lex>;
+  try {
+    tokens = lex(text);
+  } catch {
+    return false;
+  }
+  for (let i = 0; i + 3 < tokens.length; i++) {
+    const t = tokens[i]!;
+    const call =
+      t.kind === "word" &&
+      (t.word === "nextval" || t.word === "currval" || t.word === "setval") &&
+      tokens[i + 1]!.kind === "lparen" &&
+      tokens[i + 2]!.kind === "str" &&
+      (tokens[i + 3]!.kind === "rparen" || tokens[i + 3]!.kind === "comma");
+    if (!call) continue;
+    try {
+      if (parseNameText(tokens[i + 2]!.str!) === seq) return true;
+    } catch {
+      // An invalid name names no sequence.
+    }
+  }
+  return false;
 }

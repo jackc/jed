@@ -6,8 +6,7 @@
 # trap 23505 at INSERT (both sources, in-batch included) inside the two-phase pass, after
 # the PK duplicate check (PG's precedence). The PG-divergent block sits LAST with ledger
 # overrides (conformance.md §5): UPDATE validates uniqueness against the statement's END
-# STATE (PG checks per-row in heap order), and DROP INDEX of a constraint-backed index is
-# allowed (jed has no ALTER TABLE ... DROP CONSTRAINT).
+# STATE (PG checks per-row in heap order).
 # Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.check, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, query.select, query.order_by, types.i32, types.text, null.three_valued, resource.cost_metering
 
@@ -157,6 +156,49 @@ INSERT INTO d VALUES (4, 9, NULL)
 statement ok
 INSERT INTO d VALUES (5, 1, 1)
 
+# --- a UNIQUE constraint owns its index; a CREATE UNIQUE INDEX is only an index ---------
+# DROP INDEX of a constraint's index is 2BP01 (drop the constraint instead); the constraint
+# commands do not see a bare unique index (42704).
+
+statement ok
+CREATE TABLE own (id i32 PRIMARY KEY, a i32 UNIQUE, b i32)
+
+statement ok
+CREATE UNIQUE INDEX own_b_uix ON own (b)
+
+statement error 2BP01
+DROP INDEX own_a_key
+
+statement error 42704
+ALTER TABLE own DROP CONSTRAINT own_b_uix
+
+statement error 42704
+INSERT INTO own VALUES (1, 1, 1) ON CONFLICT ON CONSTRAINT own_b_uix DO NOTHING
+
+statement ok
+INSERT INTO own VALUES (1, 1, 1)
+
+statement error 23505
+INSERT INTO own VALUES (2, 1, 2)
+
+statement ok
+ALTER TABLE own DROP CONSTRAINT own_a_key
+
+statement ok
+INSERT INTO own VALUES (2, 1, 2)
+
+statement error 23505
+INSERT INTO own VALUES (3, 3, 2)
+
+statement ok
+DROP INDEX own_b_uix
+
+statement ok
+INSERT INTO own VALUES (3, 3, 2)
+
+statement ok
+DROP TABLE own
+
 # --- documented PG divergences (oracle-overridden; the PG-failing oks sit LAST so they
 # cannot poison the oracle replay prefix — conformance.md §5) ------------------------
 
@@ -188,12 +230,3 @@ SELECT vv FROM m ORDER BY id
 3
 2
 30
-
-# DROP INDEX of a constraint-backed unique index drops the constraint with it (jed has
-# no ALTER TABLE ... DROP CONSTRAINT — the index name is the constraint's only handle;
-# PG refuses with 2BP01)
-statement ok
-DROP INDEX m_vv_key
-
-statement ok
-INSERT INTO m VALUES (4, 30)

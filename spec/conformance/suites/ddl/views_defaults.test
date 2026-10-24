@@ -171,6 +171,10 @@ INSERT INTO dv (x) VALUES ('r') RETURNING id, x
 103
 r
 
+# the view column default depends on the sequence it names (as a table column default does)
+statement error 2BP01
+DROP SEQUENCE s
+
 # a chain of views: the view nearest the target with a default wins, else the next one down
 statement ok
 CREATE VIEW v2 AS SELECT id, a, b FROM v

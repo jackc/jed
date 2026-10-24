@@ -351,10 +351,9 @@ identity_alter_option ::= "SET" "GENERATED" ("ALWAYS" | "BY" "DEFAULT")
  *
  * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
  * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
- * not a table"). DROP TABLE drops the table's indexes with it. DROP INDEX of a
- * constraint-backed unique index drops the UNIQUE constraint with it (a documented PG
- * divergence — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the
- * constraint's only handle; indexes.md §8). */
+ * not a table"). DROP TABLE drops the table's indexes with it. DROP INDEX of an index a
+ * UNIQUE or EXCLUDE constraint owns is 2BP01; ALTER TABLE ... DROP CONSTRAINT drops it
+ * (constraints.md §5.5). */
 create_index   ::= "CREATE" "UNIQUE"? "INDEX" ( "IF" "NOT" "EXISTS" identifier | identifier? ) "ON" qualified_table
                    using_clause? "(" index_element ("," index_element)* ")"
                    ( "WHERE" expr )?               /* an optional partial-index predicate (indexes.md §9) */

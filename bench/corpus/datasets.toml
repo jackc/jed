@@ -26,7 +26,9 @@ schema_version = 1
 #    dependencies, multi-page catalog entries), so v47 datasets fail to open; invalidate them.
 # 13: the on-disk format bumped 48 → 49 (batched durability's meta-slot rule); a reader accepts
 #    only the exact current version, so invalidate the v48 datasets.
-generator_version = 13
+# 14: the on-disk format bumped 49 → 50 (index_flags bit5 is_constraint); invalidate the v49
+#    datasets.
+generator_version = 14
 
 [[dataset]]
 name = "small"

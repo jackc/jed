@@ -346,22 +346,6 @@ fn create_unique_index_build() {
     run(&mut db, "INSERT INTO d VALUES (4, 9, NULL)");
 }
 
-/// DROP INDEX of a constraint-backed unique index is allowed and drops the constraint
-/// (the documented PG divergence — indexes.md §7: jed has no ALTER TABLE, so the index
-/// name is the constraint's only handle).
-#[test]
-fn drop_index_drops_the_constraint() {
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)");
-    run(&mut db, "INSERT INTO t VALUES (1, 10)");
-    assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (2, 10)"), "23505");
-    run(&mut db, "DROP INDEX t_v_key");
-    run(&mut db, "INSERT INTO t VALUES (2, 10)"); // no longer enforced
-    assert_eq!(index_names(&db, "t"), vec![]);
-}
-
 /// Uniqueness validation is unmetered (cost.md §3): an INSERT into a uniquely-indexed
 /// table still costs 0, and a CREATE UNIQUE INDEX build charges exactly the plain build's
 /// scan. The planner treats a unique index like any other (the bounded-scan cost).

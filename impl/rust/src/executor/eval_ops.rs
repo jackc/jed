@@ -2404,7 +2404,7 @@ pub(crate) fn resolve_arbiter(
             if let Some(i) = tdef
                 .indexes
                 .iter()
-                .position(|d| d.unique && d.name == *name)
+                .position(|d| d.is_unique_constraint() && d.name == *name)
             {
                 return Ok(Some(Arbiter::Index(i)));
             }

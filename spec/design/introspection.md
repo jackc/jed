@@ -391,11 +391,10 @@ constraints.md §5.4), so it is **not** a row here; it is surfaced by `jed_colum
 **`jed_constraints` covers the four kinds the design doc enumerates — CHECK, UNIQUE, FK, EXCLUDE —
 and *only* those.** The `PRIMARY KEY` and `NOT NULL` constraints are deliberately absent: they own
 no named catalog object (constraints.md §1/§3, §5.4) and are already fully described by
-`jed_columns` (`pk_ordinal`, `not_null`). Because a jed **`UNIQUE` constraint *is* its backing
-unique index** (constraints.md §5 — there is no separate constraint object, and the catalog cannot
-distinguish a `UNIQUE` table constraint from a bare `CREATE UNIQUE INDEX`), `type = 'unique'` lists
-**every unique b-tree index**; this is honest to jed's model (a unique index *is* a uniqueness
-constraint) and gives a consumer the complete uniqueness picture in one relation. `type =
+`jed_columns` (`pk_ordinal`, `not_null`). A jed **`UNIQUE` constraint *is* its backing unique
+index** (constraints.md §5), flagged `is_constraint` in the catalog (§5.5, format v50): `type =
+'unique'` lists the unique indexes that back a `UNIQUE` constraint, and not a bare `CREATE UNIQUE
+INDEX` (which `jed_indexes` lists with `is_unique = true`), as PostgreSQL's `pg_constraint`. `type =
 'exclude'` lists the exclusion constraints: `columns` holds the excluded columns and `operators` the
 `WITH` operator of each, both in element order, so `columns[i] WITH operators[i]` is element `i`
 (`EXCLUDE USING gist (room WITH =, span WITH &&)` shows `{room,span}` and `{=,&&}`). The operator

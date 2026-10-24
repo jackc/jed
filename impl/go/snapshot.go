@@ -785,6 +785,65 @@ func (s *snapshot) sequencesOwnedBy(name string) []string {
 	return keys
 }
 
+// sequenceDefaultDependent finds a column whose expression DEFAULT names sequence seq in a constant
+// nextval / currval / setval argument — the dependency PostgreSQL records by reading the constant as
+// a regclass, which makes DROP SEQUENCE 2BP01 (sequences.md §1). It returns the first such column's
+// description for the error message, scanning tables then views (a view column default, views.md
+// §16.1), each in name byte order, and columns in ordinal order (CLAUDE.md §8).
+func (s *snapshot) sequenceDefaultDependent(seq string) (string, bool) {
+	tableKeys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	for _, tk := range tableKeys {
+		t := s.tables[tk]
+		for _, c := range t.Columns {
+			if c.DefaultExpr != nil && exprTextNamesSequence(c.DefaultExpr.ExprText, seq) {
+				return "default value for column " + c.Name + " of table " + t.Name, true
+			}
+		}
+	}
+	viewKeys := make([]string, 0, len(s.views))
+	for k := range s.views {
+		viewKeys = append(viewKeys, k)
+	}
+	sort.Strings(viewKeys)
+	for _, vk := range viewKeys {
+		v := s.views[vk]
+		for i, d := range v.Defaults {
+			if d != nil && exprTextNamesSequence(d.ExprText, seq) {
+				return "default value for column " + v.Columns[i] + " of view " + v.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// exprTextNamesSequence reports whether persisted expression text calls nextval / currval / setval
+// with a lone string-literal first argument that names seq — a constant argument, which is what
+// PostgreSQL reads as a regclass (an expression such as 'a' || 'b' is a text value resolved at run
+// time, and records nothing). Token-level, so it reads unparsable stored text too.
+func exprTextNamesSequence(text, seq string) bool {
+	tokens, err := lex(text)
+	if err != nil {
+		return false
+	}
+	for i := 0; i+3 < len(tokens); i++ {
+		t := tokens[i]
+		call := t.Kind == tokWord && (t.Word == "nextval" || t.Word == "currval" || t.Word == "setval") &&
+			tokens[i+1].Kind == tokLParen && tokens[i+2].Kind == tokStr &&
+			(tokens[i+3].Kind == tokRParen || tokens[i+3].Kind == tokComma)
+		if !call {
+			continue
+		}
+		if n, err := parseNameText(tokens[i+2].Word); err == nil && n == seq {
+			return true
+		}
+	}
+	return false
+}
+
 // compositeDependent reports whether any table column or composite-type field still references the
 // composite type name (exact name) — the DROP TYPE ... RESTRICT dependency check (2BP01). It
 // returns the first dependent's description for the error detail, or ("", false) if there are no

@@ -913,7 +913,7 @@ func (db *engine) resolveArbiter(table *catTable, target *conflictTarget, indexP
 		return &arbiter{isPK: true}, nil
 	}
 	for i, def := range table.Indexes {
-		if def.Unique && def.Name == target.Constraint {
+		if def.isUniqueConstraint() && def.Name == target.Constraint {
 			return &arbiter{indexPos: i}, nil
 		}
 	}

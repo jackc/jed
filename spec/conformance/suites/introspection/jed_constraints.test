@@ -157,13 +157,13 @@ SELECT type, expression FROM jed_constraints WHERE table_name = 'checked' ORDER 
 check
 a + b < 100 and c <> 5
 
-# --- UNIQUE: a bare CREATE UNIQUE INDEX is a uniqueness constraint too (jed's model) --------------
+# --- UNIQUE: a UNIQUE constraint is listed; a bare CREATE UNIQUE INDEX is an index, not one ------
 
 statement ok
-CREATE TABLE uix (id i32 PRIMARY KEY, k i32)
+CREATE TABLE uix (id i32 PRIMARY KEY, k i32, CONSTRAINT uix_k UNIQUE (k))
 
 statement ok
-CREATE UNIQUE INDEX uix_k ON uix (k)
+CREATE UNIQUE INDEX uix_k_bare ON uix (k)
 
 query TTT nosort
 SELECT name, type, columns FROM jed_constraints WHERE table_name = 'uix'

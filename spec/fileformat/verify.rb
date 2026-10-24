@@ -27,7 +27,9 @@ require "zlib"
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 49 # v49: batched durability — a commit writes the meta slot not holding the newest durable
+VERSION = 50 # v50: index_flags bit5 is_constraint — set on the unique index that backs a UNIQUE
+# constraint, clear on a bare CREATE UNIQUE INDEX (legal only with bit0 unique; constraints.md §5.5).
+# v49: batched durability — a commit writes the meta slot not holding the newest durable
 # meta, and a pending commit's manifest lists every page written since that floor; no byte layout
 # change (validated-cow.md §4).
 # v48: view column defaults, dependency kinds 2 (sequence) / 3 (composite type), and a
@@ -1024,9 +1026,9 @@ UNIQUE_TABLE = {
   columns: [col("id", "i32", pk: true), col("v", "i32"), col("w", "i32")],
   indexes: [
     { name: "nu", cols: [1] },
-    { name: "t_v_key", cols: [1], unique: true },
+    { name: "t_v_key", cols: [1], unique: true, constraint: true },
     { name: "uq", cols: [2], unique: true },
-    { name: "wv", cols: [2, 1], unique: true }
+    { name: "wv", cols: [2, 1], unique: true, constraint: true }
   ],
   rows: [[1, 10, 100], [2, nil, 200], [3, nil, 300]]
 }.freeze
@@ -1605,8 +1607,8 @@ FK_TABLE = {
       columns: [col("pid", "i32", pk: true), col("code", "i32"),
                 col("a", "i32"), col("b", "i32")],
       indexes: [
-        { name: "p_a_b_key", cols: [2, 3], unique: true },
-        { name: "p_code_key", cols: [1], unique: true }
+        { name: "p_a_b_key", cols: [2, 3], unique: true, constraint: true },
+        { name: "p_code_key", cols: [1], unique: true, constraint: true }
       ],
       rows: [[1, 100, 10, 20], [2, 200, 30, 40]] },
     { name: "c",
@@ -2761,8 +2763,9 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
     has_timezone_deps = timezone_deps && (timezone_deps[:dynamic] || !timezone_deps[:zones].empty?)
     orders = index_orders(ix)
     has_key_options = orders.any? { |o| o != [false, false] }
+    # bit5 is_constraint (v50 — the unique index backs a UNIQUE constraint, constraints.md §5.5).
     out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4) | (has_timezone_deps ? 8 : 0) |
-            (has_key_options ? 16 : 0)].pack("C")
+            (has_key_options ? 16 : 0) | (ix[:constraint] ? 32 : 0)].pack("C")
 
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
@@ -4860,7 +4863,9 @@ def decode_table_entry(buf, pos)
     end
     fb, pos = take(buf, pos, 1)
     # bit0 unique (v6), bit1 has_predicate (v27), bit2 has_host_deps (v31 — extensibility.md §8.1).
-    raise "reserved index flag set" if (fb.getbyte(0) & ~0b1_1111) != 0
+    raise "reserved index flag set" if (fb.getbyte(0) & ~0b11_1111) != 0
+    # v50: bit5 is_constraint — only a unique index backs a UNIQUE constraint.
+    raise "a constraint index must be unique (v50)" if (fb.getbyte(0) & 32) != 0 && (fb.getbyte(0) & 1).zero?
     kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
     raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
     has_predicate = (fb.getbyte(0) & 0b10) != 0
@@ -4909,7 +4914,7 @@ def decode_table_entry(buf, pos)
       end
       raise "index key options are all default" if orders.all? { |o| o == :asc }
     end
-    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, orders: orders,
+    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, constraint: (fb.getbyte(0) & 32) != 0, orders: orders,
                  kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
                  root_page: index_root, predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
   end

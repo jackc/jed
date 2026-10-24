@@ -461,7 +461,11 @@ impl Engine {
                         table.checks.len()
                             + table.foreign_keys.len()
                             + table.exclusions.len()
-                            + table.indexes.iter().filter(|index| index.unique).count()
+                            + table
+                                .indexes
+                                .iter()
+                                .filter(|index| index.is_unique_constraint())
+                                .count()
                     }
                     _ => 0,
                 };

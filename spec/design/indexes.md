@@ -160,9 +160,10 @@ rule (any duplicate non-NULL tuple → **23505**, and the index is not created).
 be an index, not a table — **42809** (`wrong_object_type`, new) `{name} is not an index`.
 Symmetrically, `DROP TABLE` of an index name is **42809** `{name} is not a table`.
 **`DROP TABLE` drops the table's indexes with it** (they live in its catalog entry and
-have no independent life). A **unique** index drops like any other — including one that
-backs a `UNIQUE` constraint, which drops the constraint with it (a documented PG
-divergence, §7). Cost of both DDL statements: **zero** for `DROP INDEX` (a pure
+have no independent life). A **unique** index drops like any other, but one that backs a
+`UNIQUE` constraint (or an `EXCLUDE` constraint) belongs to the constraint: its `DROP INDEX` is
+**2BP01**, and `ALTER TABLE … DROP CONSTRAINT` drops both, as in PostgreSQL
+(constraints.md §5.5). Cost of both DDL statements: **zero** for `DROP INDEX` (a pure
 catalog edit, like DROP TABLE); `CREATE INDEX` charges its build scan (§5).
 
 ## 3. The index entry: key encoding, no payload
@@ -441,11 +442,6 @@ The catalog reshape (v5) + the unique flag (v6)
 - PG reserves `ON` (and `UNIQUE`), so `CREATE INDEX on ON t (a)` is unparseable there;
   jed keeps every word non-reserved via the grammar.md §30 lookahead (the standing
   no-reserved-words stance, as for `check` / `constraint`).
-- **`DROP INDEX` of a constraint-backed unique index is allowed** and drops the `UNIQUE`
-  constraint with it. PG refuses (`2BP01`, "drop constraint instead"); the overriding
-  reason is structural — jed has no `ALTER TABLE … DROP CONSTRAINT`, so the index name
-  is the constraint's *only* handle, and refusing would make a UNIQUE constraint
-  permanent short of dropping the table.
 - **UPDATE uniqueness is validated against the statement's end state**, not per-row in
   heap order — PG fails `UPDATE t SET v = v + 1` on a unique `v` where jed succeeds (§8;
   the overriding reason is the two-phase / all-or-nothing model, CLAUDE.md §11 step 6).

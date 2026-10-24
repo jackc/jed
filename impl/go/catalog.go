@@ -290,7 +290,13 @@ type indexDef struct {
 	Name   string
 	Keys   []indexKey
 	Unique bool
-	Kind   indexKind
+	// Constraint marks the unique index that backs a UNIQUE constraint (CREATE TABLE … UNIQUE,
+	// ALTER TABLE … ADD UNIQUE — constraints.md §5) rather than a bare CREATE UNIQUE INDEX
+	// (format_version 50, index_flags bit5). Only a constraint index is a constraint: DROP INDEX
+	// refuses it (2BP01) and ALTER TABLE … DROP CONSTRAINT, ON CONFLICT ON CONSTRAINT and
+	// jed_constraints see only it. Always Unique and B-tree.
+	Constraint bool
+	Kind       indexKind
 	// Predicate is a PARTIAL index's WHERE predicate (spec/design/indexes.md §9): only rows whose
 	// predicate is TRUE are indexed / constrained. nil for an ordinary (full) index. Carries the
 	// persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the table per
@@ -309,6 +315,11 @@ type indexDef struct {
 	// written with no option bytes (byte-identical to v45); otherwise exactly len(Keys) entries.
 	// B-tree only (GIN/GiST reject ASC/DESC/NULLS). Read through keyOrder.
 	Orders []keyOrder
+}
+
+// isUniqueConstraint reports whether this index backs a UNIQUE constraint (and so is one).
+func (d *indexDef) isUniqueConstraint() bool {
+	return d.Unique && d.Constraint
 }
 
 // keyOrder is key element i's sort order (ASC NULLS LAST when the index carries no options).

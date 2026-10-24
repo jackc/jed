@@ -1469,8 +1469,9 @@ impl Engine {
                     Value::Null,
                 ]);
             }
-            // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
-            for idx in t.indexes.iter().filter(|i| i.unique) {
+            // UNIQUE: every unique b-tree index that backs a UNIQUE constraint (a bare CREATE
+            // UNIQUE INDEX is an index, not a constraint).
+            for idx in t.indexes.iter().filter(|i| i.is_unique_constraint()) {
                 meter.checkpoint()?;
                 meter.charge(COSTS.generated_row);
                 let cols: Vec<String> = idx

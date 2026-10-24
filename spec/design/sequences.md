@@ -78,12 +78,14 @@ SELECT lastval()               -- the value the most recent nextval returned thi
   ([views.md](views.md) §6.1); `CASCADE` of an owned sequence stays `0A000`. A missing sequence is
   `42P01` (sequences share the relation namespace — like `DROP TABLE`), unless `IF EXISTS`. A view
   that names the sequence in a constant `nextval` / `currval` / `setval` argument blocks the drop with
-  `2BP01` (views.md §6). **A plain `column DEFAULT nextval('s')` records no dependency:** `DROP
-  SEQUENCE` of a sequence named in some column default succeeds, and a later `INSERT` raises `42P01`
-  at evaluation. This is a **divergence**: PostgreSQL reads the constant as a `regclass` and records a
-  dependency, so it refuses that `DROP SEQUENCE` with `2BP01` (*default value for column a of table t
-  depends on sequence s*). (Pinned against the PG 18 oracle; an earlier version of this document said
-  PostgreSQL records none.)
+  `2BP01` (views.md §6). **A column `DEFAULT` that names the sequence depends on it** the same way:
+  PostgreSQL reads a constant `nextval` / `currval` / `setval` argument as a `regclass` and records a
+  dependency, so `DROP SEQUENCE` is `2BP01` (*… default value for column a of table t depends on
+  sequence s*), and its `CASCADE` (which would drop the default) is `0A000`. jed persists nothing for
+  it: the drop scans every table's and view's (and the session's temp tables') expression column
+  defaults for such a call whose first argument is a lone string literal naming the sequence, tables in name byte order.
+  A computed argument (`nextval('a' || 'b')`) is a text value resolved at evaluation and records
+  nothing, as in PostgreSQL.
 - **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** landed in **S2** (§4). **S6 (§15)** broadens
   `ALTER` to the **definition-changing option set** — the *same* order-free options as `CREATE`
   (`INCREMENT`/`MINVALUE`/`MAXVALUE`/`START`/`CACHE`/`[NO] CYCLE`), plus `RESTART` as an interleavable
