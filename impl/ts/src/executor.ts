@@ -11783,6 +11783,8 @@ export class Engine {
     }
     // The views that name the sequence keep naming it (views.md §7.2).
     this.renameSequenceInViews(existing.name, newName);
+    // So do the table and view column defaults that name it (sequences.md §15.3).
+    this.renameSequenceInDefaults(existing.name, newName);
     // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
     // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
     let w: Snapshot;
@@ -11794,6 +11796,33 @@ export class Engine {
     }
     w.removeSequence(existing.name);
     w.putSequence({ ...existing, name: newName });
+  }
+
+  // renameSequenceInDefaults rewrites every table and view column DEFAULT, persistent and session
+  // temporary, that names sequence old in a constant nextval / currval / setval argument to name next
+  // (renameSequenceInDefault).
+  private renameSequenceInDefaults(old: string, next: string): void {
+    for (const temp of [false, true]) {
+      const snap = temp ? this.tempSnap() : this.readSnap();
+      for (const tk of [...snap.tables.keys()].sort(compareTextC)) {
+        const cols = snap.tables.get(tk)!.columns;
+        for (let i = 0; i < cols.length; i++) {
+          const de = renameSequenceInDefault(cols[i]!.defaultExpr, old, next);
+          if (de !== null) this.setColumnDefaultExprRouted(tk, i, de);
+        }
+      }
+      for (const view of snap.viewsSorted()) {
+        let defaults: (DefaultExpr | null)[] | null = null;
+        for (let i = 0; i < view.defaults.length; i++) {
+          const de = renameSequenceInDefault(view.defaults[i] ?? null, old, next);
+          if (de !== null) {
+            if (defaults === null) defaults = [...view.defaults];
+            defaults[i] = de;
+          }
+        }
+        if (defaults !== null) this.putViewScoped({ ...view, defaults }, temp);
+      }
+    }
   }
 
   // indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
@@ -46901,6 +46930,13 @@ function exprTextNamesSequence(text: string, seq: string): boolean {
   } catch {
     return false;
   }
+  return sequenceArgTokens(tokens, seq).length > 0;
+}
+
+// sequenceArgTokens returns the positions of the string tokens that are a constant nextval / currval
+// / setval first argument naming seq (exprTextNamesSequence's rule).
+function sequenceArgTokens(tokens: ReturnType<typeof lex>, seq: string): number[] {
+  const out: number[] = [];
   for (let i = 0; i + 3 < tokens.length; i++) {
     const t = tokens[i]!;
     const call =
@@ -46911,10 +46947,40 @@ function exprTextNamesSequence(text: string, seq: string): boolean {
       (tokens[i + 3]!.kind === "rparen" || tokens[i + 3]!.kind === "comma");
     if (!call) continue;
     try {
-      if (parseNameText(tokens[i + 2]!.str!) === seq) return true;
+      if (parseNameText(tokens[i + 2]!.str!) === seq) out.push(i + 2);
     } catch {
       // An invalid name names no sequence.
     }
   }
-  return false;
+  return out;
+}
+
+// renameSequenceInDefault rewrites an expression DEFAULT for ALTER SEQUENCE old RENAME TO next
+// (sequences.md §15.3): each constant nextval / currval / setval argument naming old becomes next (as
+// an identifier, quoted when it must be), so the default follows the sequence as PostgreSQL's regclass
+// constant does. It returns null when the default does not name old. Text that no longer parses stays
+// unparsed (unparsable-definitions.md).
+function renameSequenceInDefault(
+  de: DefaultExpr | null,
+  old: string,
+  next: string,
+): DefaultExpr | null {
+  if (de === null) return null;
+  let tokens: ReturnType<typeof lex>;
+  try {
+    tokens = lex(de.exprText);
+  } catch {
+    return null;
+  }
+  const positions = sequenceArgTokens(tokens, old);
+  if (positions.length === 0) return null;
+  for (const i of positions) tokens[i] = { kind: "str", str: quoteIdentifier(next) };
+  let end = tokens.findIndex((t) => t.kind === "eof");
+  if (end < 0) end = tokens.length;
+  const exprText = renderTokens(tokens.slice(0, end));
+  try {
+    return { exprText, expr: parseExpression(exprText) };
+  } catch {
+    return { exprText, expr: { kind: "literal", literal: { kind: "null" } }, unparsed: true };
+  }
 }

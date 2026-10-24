@@ -816,11 +816,15 @@ it is not `[a-z_][a-z0-9_]*`, as §12.2 step 6; regenerating the
 `expr_text` + re-parsing, exactly as `serial` synthesized it) in the same statement. After the rename a
 subsequent `INSERT` advances the renamed sequence — matching PG's observable behavior. The `owned_by`
 pair (`table`, column-ordinal) is untouched, so `DROP TABLE` auto-drop (§12.3) and the `2BP01` on a
-direct `DROP SEQUENCE` of the renamed owned sequence both still hold. (A *plain* `DEFAULT nextval('s')`
-on a non-owned sequence is **not** rewritten — it has no `owned_by` link in jed, §10 decision 4 — so
-renaming such a sequence then inserting raises `42P01`. A recorded divergence: PostgreSQL binds the
-constant as a `regclass`, so its default keeps following the renamed sequence. A view that names the
-sequence is rewritten, as for an owned one ([views.md](views.md) §7.2).)
+direct `DROP SEQUENCE` of the renamed owned sequence both still hold.
+
+Every other column `DEFAULT` that names the sequence — a table's or a view's, persistent or session
+temporary — follows it too, as PostgreSQL's `regclass` constant does: each constant `nextval` /
+`currval` / `setval` first argument naming `s` (the rule §1's `DROP SEQUENCE` dependency uses) becomes
+`'s2'`, the token text re-rendered and re-parsed. The `DROP SEQUENCE` dependency then follows the new
+name. A computed argument (`nextval('p' || 'd')`) is not rewritten, as in PostgreSQL, where it is text
+resolved at evaluation. A view body that names the sequence is rewritten too ([views.md](views.md)
+§7.2).
 
 ### 15.4 Determinism
 

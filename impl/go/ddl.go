@@ -4778,6 +4778,8 @@ func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) err
 	if err := db.renameSequenceInViews(existing.Name, newName); err != nil {
 		return err
 	}
+	// So do the table and view column defaults that name it (sequences.md §15.3).
+	db.renameSequenceInDefaults(existing.Name, newName)
 	// Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
 	// scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
 	isTemp := db.isTempSequence(existing.Name)
@@ -4793,6 +4795,52 @@ func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) err
 	w.removeSequence(existing.Name)
 	w.putSequence(&def)
 	return nil
+}
+
+// renameSequenceInDefaults rewrites every table and view column DEFAULT, persistent and session
+// temporary, that names sequence old in a constant nextval / currval / setval argument to name new
+// (renameSequenceInDefault).
+func (db *engine) renameSequenceInDefaults(old, new string) {
+	for _, temp := range []bool{false, true} {
+		snap := db.readSnap()
+		if temp {
+			snap = db.tempSnap()
+		}
+		tableKeys := make([]string, 0, len(snap.tables))
+		for k := range snap.tables {
+			tableKeys = append(tableKeys, k)
+		}
+		sort.Strings(tableKeys)
+		for _, tk := range tableKeys {
+			for i, c := range snap.tables[tk].Columns {
+				if de := renameSequenceInDefault(c.DefaultExpr, old, new); de != nil {
+					db.setColumnDefaultExprRouted(tk, i, de)
+				}
+			}
+		}
+		viewKeys := make([]string, 0, len(snap.views))
+		for k := range snap.views {
+			viewKeys = append(viewKeys, k)
+		}
+		sort.Strings(viewKeys)
+		for _, vk := range viewKeys {
+			view := snap.views[vk]
+			var defaults []*defaultExprDef
+			for i, d := range view.Defaults {
+				if de := renameSequenceInDefault(d, old, new); de != nil {
+					if defaults == nil {
+						defaults = append([]*defaultExprDef(nil), view.Defaults...)
+					}
+					defaults[i] = de
+				}
+			}
+			if defaults != nil {
+				updated := *view
+				updated.Defaults = defaults
+				db.putViewScoped(&updated, temp)
+			}
+		}
+	}
 }
 
 // nextvalDefaultText is the canonical expression text of an owned sequence's generated

@@ -6249,6 +6249,8 @@ impl Engine {
         }
         // The views that name the sequence keep naming it (views.md §7.2).
         self.rename_sequence_in_views(&existing.name, new_name)?;
+        // So do the table and view column defaults that name it (sequences.md §15.3).
+        self.rename_sequence_in_defaults(&existing.name, new_name);
         // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
         // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
         let is_temp = self.is_temp_sequence(&existing.name);
@@ -6263,6 +6265,54 @@ impl Engine {
         w.remove_sequence(&old_key);
         w.put_sequence(def);
         Ok(())
+    }
+
+    /// Rewrite every table and view column `DEFAULT`, persistent and session temporary, that names
+    /// sequence `old` in a constant `nextval` / `currval` / `setval` argument to name `new`
+    /// ([`rename_sequence_in_default`]).
+    fn rename_sequence_in_defaults(&mut self, old: &str, new: &str) {
+        use super::snapshot::rename_sequence_in_default;
+        for temp in [false, true] {
+            let snap = if temp {
+                self.temp_read_snap()
+            } else {
+                self.read_snap()
+            };
+            let mut table_keys: Vec<&String> = snap.tables.keys().collect();
+            table_keys.sort();
+            let mut column_updates = Vec::new();
+            for tk in table_keys {
+                for (i, c) in snap.tables[tk].columns.iter().enumerate() {
+                    if let Some(de) = rename_sequence_in_default(c.default_expr.as_ref(), old, new)
+                    {
+                        column_updates.push((tk.clone(), i, de));
+                    }
+                }
+            }
+            let mut view_keys: Vec<&String> = snap.views.keys().collect();
+            view_keys.sort();
+            let mut view_updates = Vec::new();
+            for vk in view_keys {
+                let view = &snap.views[vk];
+                let mut defaults: Option<Vec<_>> = None;
+                for (i, d) in view.defaults.iter().enumerate() {
+                    if let Some(de) = rename_sequence_in_default(d.as_ref(), old, new) {
+                        defaults.get_or_insert_with(|| view.defaults.clone())[i] = Some(de);
+                    }
+                }
+                if let Some(defaults) = defaults {
+                    let mut updated = view.clone();
+                    updated.defaults = defaults;
+                    view_updates.push(updated);
+                }
+            }
+            for (tk, i, de) in column_updates {
+                self.set_column_default_expr_routed(&tk, i, de);
+            }
+            for view in view_updates {
+                self.put_view_scoped(view, temp);
+            }
+        }
     }
 }
 
