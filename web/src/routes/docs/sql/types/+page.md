@@ -255,10 +255,13 @@ Every example below is a **live database in your browser**. Edit the SQL and run
 
 <LiveSql demo="decimalDemo" query={decimalDemo} rows={5} />
 
-The exact math functions take an integer next to a `numeric`, as in PostgreSQL: `power(2.0, 3)` and
-`log(2, 8.0)` return `numeric`. A float function takes a number literal next to a float, so
-`power(x, 3)` on a `f64` column returns `f64`. A float column next to an integer column still needs
-a cast (`42883`), and so does a call with only integers, such as `power(2, 3)`.
+An integer argument takes a function's `numeric` overload when it has one: `power(2.0, 3)`,
+`log(2, 8.0)`, `round(5)`, `sqrt(2)` and `power(2, 3)` all return `numeric`. This is a deliberate
+difference from PostgreSQL, which resolves an integer through `double precision`: `sqrt(2)` is
+`1.414213562373095` in jed and `1.4142135623730951` in PostgreSQL. Write `sqrt(x::f64)` for the
+float version. A float-only function takes a number literal, so `sin(1)` works and `power(x, 3)` on
+an `f64` column returns `f64`, but an integer or `numeric` column next to a float still needs a cast
+(`42883`).
 
 An `f32` next to an `f64` widens exactly to `f64` first, as PostgreSQL widens `real` to
 `double precision`, so the comparison or arithmetic runs at `f64`. The widened `f32` keeps its

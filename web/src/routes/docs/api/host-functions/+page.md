@@ -151,8 +151,21 @@ so the speculation stays bounded.
 A host name — or a host **overload** of a built-in name over a *new* argument signature — resolves
 **after** the built-in catalog. So a built-in always wins an exact-signature collision (registering a
 host `abs(i64)` is accepted but never reached), and overloading is by signature: `discount(i64, i64)`
-and `discount(text, text)` are two different functions under one name. A call that matches no
-signature is `42883`, exactly as an unknown built-in.
+and `discount(text, text)` are two different functions under one name.
+
+A call that matches no signature exactly goes through the same implicit argument coercion built-ins
+use. jed picks the host function (or built-in) whose arguments need the cheapest conversions:
+
+- an integer widens to a wider integer (`i16 → i32 → i64`), the nearest width first;
+- an integer becomes `numeric` (cost more than any integer widening);
+- a number literal can become a float; an integer or `numeric` *column* never does;
+- an `f32` widens to `f64`.
+
+So a host `discount(i64, i64)` also takes `i32` columns, and a host `scale_by(numeric)` takes
+`scale_by(3)`. Your kernel always receives values of the types it declared: jed converts the
+arguments first. A built-in wins a tie, two host functions that tie are `42725`, and a call no
+conversion can reach is `42883`, exactly as an unknown built-in. A bare `NULL` or `$1` never matches
+a host signature.
 
 The registered name is used exactly as given. SQL folds a bare name to lowercase, so register names
 in lowercase: a function registered as `discount` is called as `discount(…)` or `DISCOUNT(…)`, but
@@ -234,6 +247,5 @@ owns that decision. The engine's one mechanical defense is the **cost gate** abo
 only a function that declared its cost. That is the whole trade: jed gives you a clean, first-class
 extension seam and a legible line where your code takes over.
 
-The surface is still deliberately narrow — **strict** and **exact scalar signatures** (no implicit
-promotion). Host *types* and non-strict functions come later, as does batching at more sites (filters inside joins and blocking scans, aggregate
+The surface is still deliberately narrow — **strict**, with **scalar signatures** only. Host *types* and non-strict functions come later, as does batching at more sites (filters inside joins and blocking scans, aggregate
 arguments, writes, index builds — today they call a batch kernel with one row).

@@ -10,8 +10,9 @@
 //     index expression). The catalog-bound, versioned form is step 4.
 //   - Strict — a NULL argument short-circuits to NULL before the kernel runs; the kernel never sees
 //     a NULL.
-//   - Exact scalar signatures — (name, ScalarType[]) → ScalarType, matched by equality (no implicit
-//     promotion). A built-in overload always wins over a host one (§4.2).
+//   - Scalar signatures — (name, ScalarType[]) → ScalarType, matched exactly first, then through
+//     the implicit argument-coercion pass (spec/design/arg-coercion.md §4.2). A built-in overload
+//     always wins over a host one (§4.2).
 //   - Batched kernels (§4.2.1) — every host function runs through ONE column-in → column-out batch
 //     kernel ABI. A host registers either a batch kernel (`batchKernel`) or a single-row kernel
 //     (`kernel`), which a batch evaluation loops over. The executor prefetches a batch at the sites
@@ -25,7 +26,8 @@
 
 import { type EngineError, engineError } from "./errors.ts";
 import { ALL_SCALAR_TYPES, type ScalarType } from "./types.ts";
-import type { Value } from "./value.ts";
+import { Decimal } from "./decimal.ts";
+import { decimalValue, float64Value, type Value } from "./value.ts";
 
 // A host function's planning volatility (PostgreSQL's notion). Recorded on registration; only
 // "immutable" will later admit constant-folding / an index-backing expression. This slice folds no
@@ -129,6 +131,7 @@ export class HostFuncEntry {
   // site that does not prefetch. A single-row kernel's throw propagates unchanged; a batch kernel is
   // handed a one-row batch and held to the same shape rules as callBatch.
   callOne(args: Value[]): Value {
+    args = args.map((v, i) => this.coerceArg(i, v));
     if (this.kernel !== null) return this.kernel(args);
     const outcome = this.callBatch(
       args.map((v) => [v]),
@@ -145,6 +148,7 @@ export class HostFuncEntry {
   // answering every row, fails at the first row. Results are NOT type-checked here — the replay does
   // that per row, so a type error surfaces at its own row.
   callBatch(args: Value[][], n: number): (HostOutcome | undefined)[] {
+    if (this.needsCoercion(args)) args = args.map((col, i) => col.map((v) => this.coerceArg(i, v)));
     const out: Value[] = [];
     let failed = false;
     let err: unknown;
@@ -169,6 +173,27 @@ export class HostFuncEntry {
     }
     while (outcomes.length < n) outcomes.push(undefined);
     return outcomes;
+  }
+
+  // Convert an argument the coercion pass admitted to this function's declared type
+  // (spec/design/arg-coercion.md §4): an integer for a decimal parameter at scale 0, an f32 for an
+  // f64 one. Integer widths share one value form, so integer widening needs nothing. The kernel
+  // only ever sees values of its declared types.
+  private coerceArg(i: number, v: Value): Value {
+    const t = this.argTypes[i];
+    if (t === "decimal" && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
+    if (t === "f64" && v.kind === "f32") return float64Value(v.value);
+    return v;
+  }
+
+  // Whether any column of a batch holds a value coerceArg converts.
+  private needsCoercion(args: Value[][]): boolean {
+    return args.some((col, i) => {
+      const t = this.argTypes[i];
+      if (t === "decimal") return col.some((v) => v.kind === "int");
+      if (t === "f64") return col.some((v) => v.kind === "f32");
+      return false;
+    });
   }
 
   private shapeError(n: number, got: number): EngineError {
@@ -247,6 +272,16 @@ export class HostFunctions {
   resolveHost(name: string, argTypes: ScalarType[]): number | null {
     const i = this.functions.findIndex((f) => f.name === name && sameHostSig(f.argTypes, argTypes));
     return i < 0 ? null : i;
+  }
+
+  // Every registered function with this name and arity, with its id, in registration order — the
+  // host candidates of the argument-coercion pass (spec/design/arg-coercion.md §4.2).
+  overloads(name: string, arity: number): { id: number; fn: HostFuncEntry }[] {
+    const out: { id: number; fn: HostFuncEntry }[] = [];
+    this.functions.forEach((fn, id) => {
+      if (fn.name === name && fn.argTypes.length === arity) out.push({ id, fn });
+    });
+    return out;
   }
 
   // The registered function at `id` (an index from resolveHost).

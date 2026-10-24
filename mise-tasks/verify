@@ -16,6 +16,7 @@ CHECKS = [
   ["page-service wire contract", "spec/pageservice/verify.rb"],
   ["file format", "spec/fileformat/verify.rb"],
   ["function catalog", "spec/functions/verify.rb"],
+  ["argument-coercion capture check", "spec/functions/coercion_snapshot.rb"],
   ["cost schedule", "spec/cost/verify.rb"],
   ["plan estimator", "spec/cost/estimator_verify.rb"],
   ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],

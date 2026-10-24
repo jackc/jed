@@ -3635,6 +3635,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		case sfSign:
 			// sign: -1 / 0 / +1. Decimal → numeric (scale 0); float → f64 (EXACT, in-contract).
 			// sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG dsign tests x > 0 / x < 0, so NaN → 0).
+			if vals[0].Kind == ValInt {
+				// An integer coerced to the decimal overload (arg-coercion.md §4).
+				s := int64(0)
+				if vals[0].Int > 0 {
+					s = 1
+				} else if vals[0].Int < 0 {
+					s = -1
+				}
+				return DecimalValue(decimalFromInt64(s)), nil
+			}
 			if vals[0].Kind == ValDecimal {
 				s := int64(1)
 				if vals[0].decimal().IsZero() {
@@ -3792,8 +3802,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			// the libm path; a decimal operand computes exactly via the PG-faithful kernel —
 			// byte-identical across cores (unlike the float arms). Domain errors: sqrt of a negative
 			// and the power domain errors → 2201F; ln of a non-positive → 2201E; overflow → 22003.
-			// The overload decides the kernel: a promoted integer argument of the decimal power
-			// converts to decimal (functions.md §9.2).
+			// The overload decides the kernel: an integer argument coerced to a decimal overload
+			// converts to decimal at scale 0 (arg-coercion.md §4).
 			if e.result != scalarDecimal {
 				return evalFloatFunc(e.sfunc, vals, e.result)
 			}
@@ -3817,8 +3827,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return DecimalValue(r), nil
 		case sfLog:
-			// `log` is decimal-only: 1-arg = base-10 log, 2-arg = log(base, num) in any base. A promoted
-			// integer argument converts to decimal (functions.md §9.2).
+			// `log` is decimal-only: 1-arg = base-10 log, 2-arg = log(base, num) in any base. An integer
+			// argument coerced to the decimal overload converts to decimal (arg-coercion.md §4).
 			a := valueToDecimal(vals[0])
 			var r Decimal
 			var err error
@@ -3832,14 +3842,24 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return DecimalValue(r), nil
 		case sfScale:
-			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
+			// scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383). An
+			// integer coerced to the decimal overload has scale 0 (arg-coercion.md §4).
+			if vals[0].Kind == ValInt {
+				return IntValue(0), nil
+			}
 			return IntValue(int64(vals[0].decimal().Scale)), nil
 		case sfMinScale:
 			// min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
+			if vals[0].Kind == ValInt {
+				return IntValue(0), nil
+			}
 			return IntValue(int64(minScaleOf(*vals[0].decimal()))), nil
 		case sfTrimScale:
 			// trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
 			// digits are zeros, so RoundToScale does not round).
+			if vals[0].Kind == ValInt {
+				return DecimalValue(decimalFromInt64(vals[0].Int)), nil
+			}
 			d := *vals[0].decimal()
 			return DecimalValue(d.RoundToScale(minScaleOf(d))), nil
 		default:

@@ -302,7 +302,11 @@ must carry:
   keeps working — PostgreSQL overloads by input types, and blanket name rejection (the previous
   draft's rule) forecloses the common polymorphic case. A built-in wins on an *exact*-signature
   collision (propose `42723 duplicate_function` only for the identical signature). This extends the
-  existing family-based overload selection (`family_matches`) the resolver already runs.
+  existing family-based overload selection (`family_matches`) the resolver already runs. A call that
+  matches no signature exactly — built-in or host — goes to the argument-coercion pass
+  ([arg-coercion.md](arg-coercion.md) §4.2): host candidates are scored with the built-ins by
+  per-type coercion costs, a built-in wins a tie, and the kernel receives values converted to its
+  declared types (an integer for a `decimal` parameter, an `f32` for an `f64` one).
 - **A vectorized / batched signature** — column-in → column-out. This is the single decision
   [cores.md](cores.md) §2.1 says keeps a *wrapped* core viable (it amortizes the per-row FFI upcall
   for Swift/Java/C#). Define the **batch ABI now**, but the executor may call it with a **batch of
@@ -1110,7 +1114,8 @@ cleanup, not a prerequisite. A suggested sequence:
    ✅ **landed (all three cores)**: an `ExtensionRegistry` (since absorbed into the `Environment`, environment.md) a host builds and passes in
    `CreateOptions`/`OpenOptions`, frozen for the handle and shared into every session (streaming
    included); a separate `HostFunc`/`hostFunc` resolved node reached **by id** through the registry
-   alongside the untouched built-in dispatch; built-ins win an exact-signature collision; `cost`
+   alongside the untouched built-in dispatch; built-ins win an exact-signature collision (and, since the
+   argument-coercion pass, a tied coercion — arg-coercion.md §4.2); `cost`
    (design (a) static weight) charged per call + guarded against the ceiling; wrong-typed kernel
    results caught (`22000`), and integer results outside the declared width (`22003`); `42723` for a duplicate registration. **Since landed:** the
    vectorized/batched kernel ABI (§4.2.1). **Deferred to later slices**: non-strict host functions, host

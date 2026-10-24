@@ -1008,12 +1008,11 @@ pub(crate) fn resolve_scalar_func(
             resolved_type_of(result),
         ));
     }
-    // A promoting two-argument function reconciles a mixed numeric pair as the arithmetic operators
-    // do (functions.md §9.2): power(2.0, 3) selects the decimal overload, pow(x_f64, 3) the float one.
-    if let Some(ptys) = promote_scalar_pair(scope, name, args, &mut rargs, &tys, agg, params)?
-        && let Some(desc) = lookup_scalar_overload(name, &ptys)
-    {
-        return adopt_scalar_overload(scope, name, args, desc, rargs, ptys, None, agg, params);
+    // No signature matches as written: the cheapest implicit argument coercions select among the
+    // built-in and host overloads (arg-coercion.md §4) — sqrt(2) takes sqrt(decimal), sin(1)
+    // sin(float), a host f(i64) an i32 argument.
+    if let Some(r) = resolve_coerced_call(scope, name, args, &mut rargs, &tys, agg, params)? {
+        return Ok(r);
     }
     // No overload takes the bare string literals as text, so retry with them unknown-typed, as
     // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
@@ -1035,17 +1034,6 @@ pub(crate) fn resolve_scalar_func(
     Err(no_func_overload(name))
 }
 
-/// Whether `name` has a two-argument catalog row with `arg_resolution = "promote"` — the rows whose
-/// mixed numeric pairs reconcile (functions.md §9.2).
-fn scalar_pair_promotes(name: &str) -> bool {
-    OPERATORS.iter().any(|o| {
-        o.kind == "function"
-            && o.name == name
-            && o.arg_families.len() == 2
-            && o.arg_resolution == "promote"
-    })
-}
-
 /// Whether `e` is a bare integer or decimal literal (a negative one included: the parser folds the
 /// sign into the literal).
 fn is_numeric_literal(e: &Expr) -> bool {
@@ -1053,7 +1041,7 @@ fn is_numeric_literal(e: &Expr) -> bool {
 }
 
 /// Re-resolve a numeric literal argument that faces a float argument as f64 — the type of every
-/// float overload's arguments (functions.md §9.2; PostgreSQL reads the constant as float8).
+/// float overload's arguments (PostgreSQL reads the constant as float8).
 fn float_literal(
     scope: &Scope,
     e: &Expr,
@@ -1063,42 +1051,220 @@ fn float_literal(
     resolve(scope, e, Some(ScalarType::Float64), agg, params)
 }
 
-/// Reconcile the two resolved arguments of a promoting function (functions.md §9.2) the way the
-/// arithmetic operators reconcile their operands: an integer facing a decimal reads as decimal
-/// (compare.toml's promote-to-decimal — the kernel converts the value), and an integer or decimal
-/// LITERAL facing a float is re-resolved as f64 (float.md §4/§6; a value never becomes a float).
-/// `None` when the pair needs no reconciliation or has none. A re-resolved literal replaces its
-/// entry in `rargs`; the result is the reconciled pair of types.
-fn promote_scalar_pair(
+/// Where one argument of a call comes from, for the argument-coercion pass (arg-coercion.md §4): a
+/// typed value (`None` for a container), a bare numeric constant — which may also take the literal
+/// rows of the cost table — or an unknown-typed bare `NULL` / `$N` (functions.md §9.1).
+#[derive(Clone, Copy)]
+enum ArgSource {
+    Typed(Option<ScalarType>),
+    IntLiteral(i64),
+    DecimalLiteral,
+    Unknown,
+}
+
+fn arg_source(e: &Expr, t: &ResolvedType) -> ArgSource {
+    match (e, t) {
+        (_, ResolvedType::Null) => ArgSource::Unknown,
+        (Expr::Literal(Literal::Int(v), _), _) => ArgSource::IntLiteral(*v),
+        (Expr::Literal(Literal::Decimal(_), _), _) => ArgSource::DecimalLiteral,
+        _ => ArgSource::Typed(resolved_to_scalar(t)),
+    }
+}
+
+/// The cheapest coercion of `src` into a type `accept` admits, from the ARG_COERCIONS cost table
+/// (arg-coercion.md §3): the target type and its cost, the first row in table order on a tie.
+/// A literal also takes the rows of its default type (i64, decimal); an integer constant takes a
+/// narrower integer type only when its value fits. Its own type is not considered here.
+fn cheapest_coercion(
+    src: ArgSource,
+    accept: impl Fn(ScalarType) -> bool,
+) -> Option<(u32, ScalarType)> {
+    let (own, literal) = match src {
+        ArgSource::Typed(Some(t)) => (t, None),
+        ArgSource::IntLiteral(_) => (ScalarType::Int64, Some("integer_literal")),
+        ArgSource::DecimalLiteral => (ScalarType::Decimal, Some("decimal_literal")),
+        ArgSource::Typed(None) | ArgSource::Unknown => return None,
+    };
+    let mut best: Option<(u32, ScalarType)> = None;
+    for row in ARG_COERCIONS {
+        if row.from != own.canonical_name() && Some(row.from) != literal {
+            continue;
+        }
+        let Some(to) = ScalarType::from_name(row.to) else {
+            continue;
+        };
+        if !accept(to) {
+            continue;
+        }
+        if let ArgSource::IntLiteral(v) = src
+            && matches!(to, ScalarType::Int16 | ScalarType::Int32)
+            && !to.in_range(v)
+        {
+            continue;
+        }
+        if best.is_none_or(|(c, _)| row.cost < c) {
+            best = Some((row.cost, to));
+        }
+    }
+    best
+}
+
+/// One overload considered by the coercion pass: a built-in catalog row or a host function (by
+/// registry id), its total score, and the type each coerced position converts to.
+struct CoercedCandidate {
+    builtin: Option<&'static OperatorDesc>,
+    host: Option<usize>,
+    score: u32,
+    targets: Vec<Option<ScalarType>>,
+}
+
+/// Score a built-in row against the call (arg-coercion.md §4): a family slot costs 0 for any member
+/// type, `any`, or an unknown-typed argument, else the cheapest row into one of its member types.
+/// `None` when some position is not admitted.
+fn score_builtin(
+    desc: &'static OperatorDesc,
+    srcs: &[ArgSource],
+    tys: &[ResolvedType],
+) -> Option<CoercedCandidate> {
+    let mut score = 0;
+    let mut targets = Vec::with_capacity(srcs.len());
+    for (i, slot) in desc.arg_families.iter().enumerate() {
+        if matches!(srcs[i], ArgSource::Unknown) || family_matches(slot, &tys[i]) {
+            targets.push(None);
+            continue;
+        }
+        let (cost, to) = cheapest_coercion(srcs[i], |to| {
+            arg_family(&resolved_type_of(to)) == Some(*slot)
+        })?;
+        score += cost;
+        targets.push(Some(to));
+    }
+    Some(CoercedCandidate {
+        builtin: Some(desc),
+        host: None,
+        score,
+        targets,
+    })
+}
+
+/// Score a host function against the call: a host slot names one type, which only that type
+/// matches at 0. An unknown-typed argument matches no host slot (functions.md §9.1).
+fn score_host(id: usize, arg_types: &[ScalarType], srcs: &[ArgSource]) -> Option<CoercedCandidate> {
+    let mut score = 0;
+    let mut targets = Vec::with_capacity(srcs.len());
+    for (src, slot) in srcs.iter().zip(arg_types) {
+        let own = match src {
+            ArgSource::Typed(t) => *t,
+            ArgSource::IntLiteral(_) => Some(ScalarType::Int64),
+            ArgSource::DecimalLiteral => Some(ScalarType::Decimal),
+            ArgSource::Unknown => None,
+        };
+        if matches!(src, ArgSource::Unknown) {
+            return None;
+        }
+        if own == Some(*slot) {
+            targets.push(None);
+            continue;
+        }
+        let (cost, to) = cheapest_coercion(*src, |to| to == *slot)?;
+        score += cost;
+        targets.push(Some(to));
+    }
+    Some(CoercedCandidate {
+        builtin: None,
+        host: Some(id),
+        score,
+        targets,
+    })
+}
+
+/// The argument-coercion pass (arg-coercion.md §4), reached when no built-in row and no host
+/// signature matches the call as written. Every built-in row and host function of the call's name
+/// and arity is scored by the summed cost of its coercions; the minimum wins. Among tied
+/// candidates a built-in beats a host function, the §9.1 unknown-position rule picks among tied
+/// built-ins, and anything still tied is 42725. `Ok(None)` when no candidate admits the call.
+#[allow(clippy::too_many_arguments)]
+fn resolve_coerced_call(
     scope: &Scope,
     name: &str,
     args: &[Expr],
-    rargs: &mut [RExpr],
+    rargs: &mut Vec<RExpr>,
     tys: &[ResolvedType],
     agg: &mut AggCtx,
     params: &mut ParamTypes,
-) -> Result<Option<Vec<ResolvedType>>> {
-    if tys.len() != 2 || !scalar_pair_promotes(name) {
-        return Ok(None);
-    }
-    let exact = |t: &ResolvedType| matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal);
-    let float = |t: &ResolvedType| matches!(t, ResolvedType::Float(_));
-    let (l, r) = (&tys[0], &tys[1]);
-    if exact(l) && exact(r) && std::mem::discriminant(l) != std::mem::discriminant(r) {
-        return Ok(Some(vec![ResolvedType::Decimal, ResolvedType::Decimal]));
-    }
-    if float(l) != float(r) {
-        let other = if float(l) { 1 } else { 0 };
-        if !exact(&tys[other]) || !is_numeric_literal(&args[other]) {
-            return Ok(None);
+) -> Result<Option<(RExpr, ResolvedType)>> {
+    let srcs: Vec<ArgSource> = std::iter::zip(args, tys)
+        .map(|(e, t)| arg_source(e, t))
+        .collect();
+    let mut cands: Vec<CoercedCandidate> = OPERATORS
+        .iter()
+        .filter(|o| o.kind == "function" && o.name == name && o.arg_families.len() == args.len())
+        .filter_map(|o| score_builtin(o, &srcs, tys))
+        .collect();
+    let registry = scope.catalog.session.env.functions();
+    for (id, f) in registry.overloads(name, args.len()) {
+        if let Some(c) = score_host(id, &f.arg_types, &srcs) {
+            cands.push(c);
         }
-        let (re, t) = float_literal(scope, &args[other], agg, params)?;
-        rargs[other] = re;
-        let mut out = tys.to_vec();
-        out[other] = t;
-        return Ok(Some(out));
     }
-    Ok(None)
+    let Some(min) = cands.iter().map(|c| c.score).min() else {
+        return Ok(None);
+    };
+    cands.retain(|c| c.score == min);
+    if cands.iter().any(|c| c.builtin.is_some()) {
+        cands.retain(|c| c.builtin.is_some());
+    }
+    let chosen = if cands.len() == 1 {
+        cands.pop().expect("one candidate")
+    } else if cands[0].builtin.is_some() {
+        let unknown: Vec<bool> = srcs
+            .iter()
+            .map(|s| matches!(s, ArgSource::Unknown))
+            .collect();
+        let descs: Vec<&'static OperatorDesc> =
+            cands.iter().map(|c| c.builtin.expect("built-in")).collect();
+        let pick = pick_by_unknown_positions(name, descs, &unknown)?;
+        cands
+            .into_iter()
+            .find(|c| std::ptr::eq(c.builtin.expect("built-in"), pick))
+            .expect("the picked candidate")
+    } else {
+        return Err(ambiguous_func_overload(name));
+    };
+    let mut rargs = std::mem::take(rargs);
+    let mut tys = tys.to_vec();
+    // Adopt the coerced types. A bare numeric constant is resolved again in its slot's type (an
+    // f64 or f32 float slot, a narrower host integer), as literal adaptation; an integer bound for
+    // a decimal slot, and a value, stay as resolved and convert inside the call (nothing charged).
+    for (i, target) in chosen.targets.iter().enumerate() {
+        let Some(to) = *target else { continue };
+        let literal = matches!(
+            srcs[i],
+            ArgSource::IntLiteral(_) | ArgSource::DecimalLiteral
+        );
+        if literal && !to.is_decimal() {
+            let (r, t) = resolve(scope, &args[i], Some(to), agg, params)?;
+            rargs[i] = r;
+            tys[i] = t;
+        } else {
+            tys[i] = resolved_type_of(to);
+        }
+    }
+    if let Some(desc) = chosen.builtin {
+        return adopt_scalar_overload(scope, name, args, desc, rargs, tys, None, agg, params)
+            .map(Some);
+    }
+    let id = chosen.host.expect("a host candidate");
+    let result = registry.function(id).result;
+    Ok(Some((
+        RExpr::HostFunc {
+            id,
+            name: name.to_string(),
+            args: rargs,
+            result,
+        },
+        resolved_type_of(result),
+    )))
 }
 
 /// Which arguments are bare string literals (`'…'`, not a typed literal or a cast), or `None` when

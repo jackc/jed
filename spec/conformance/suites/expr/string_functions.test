@@ -5,7 +5,7 @@
 # character-indexing functions count UNICODE CODE POINTS (matching PG's UTF8 character semantics —
 # NOT UTF-8 bytes nor UTF-16 units, the cross-core trap exercised by the astral 😀 below);
 # octet_length / bit_length count UTF-8 bytes / bits. PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, expr.text_concat, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, types.bytea, expr.text_concat, resource.cost_metering
 
 # === length(text) → int: the number of characters (code points) ========================
 
@@ -79,6 +79,13 @@ SELECT char_length(''), character_length(NULL::text)
 ----
 0
 NULL
+
+# Unlike length, the aliases take only text: there is no char_length(bytea), as in PostgreSQL.
+statement error 42883
+SELECT char_length('\x0102'::bytea)
+
+statement error 42883
+SELECT character_length('\x0102'::bytea)
 
 # === octet_length(text) → int: the number of UTF-8 BYTES (not characters) ==============
 

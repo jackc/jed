@@ -1290,7 +1290,9 @@ create/open options; the environment is immutable, so the function set is **froz
 lifetime** and shared into every session (§7 — registration is a **host-API act, never SQL**:
 there is no `CREATE FUNCTION … LANGUAGE HOST` DDL, which keeps it off the untrusted-query surface).
 This is the *function seam* of extensibility.md §5.1: **strict** (a NULL argument short-circuits to
-NULL before the kernel runs), **exact scalar signatures** (no implicit promotion), and a
+NULL before the kernel runs), **exact scalar signatures** — a call that matches none takes the
+cheapest implicit argument coercions, as built-ins do ([arg-coercion.md](arg-coercion.md) §4.2), and
+the kernel always receives its declared types — and a
 **single-row or batch kernel** (the column-in → column-out ABI, extensibility.md §4.2.1). Since step 4 an `immutable` host function
 that also declares a **component identity** may back a **persisted index** (below).
 

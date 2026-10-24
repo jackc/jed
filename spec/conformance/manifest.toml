@@ -998,11 +998,15 @@ description = "Decimal arithmetic operators + - * / % and unary - with PostgreSQ
 
 [[capability]]
 id = "expr.numeric_transcendental"
-description = "Exact-numeric transcendentals over decimal/numeric — sqrt, ln, exp, log/log10 (base 10), log(base, x), power(base, exp) — a hand-rolled PG-faithful arbitrary-precision port of numeric.c (sqrt_var/ln_var/exp_var/log_var/power_var). IN-CONTRACT (byte-identical cross-core, no determinism-ledger entry): every step is exact-decimal limb arithmetic and the result scale is chosen deterministically with no libm transcendental on the value path. Result scale ≥ NUMERIC_MIN_SIG_DIGITS (16) significant digits, never below the input scale. Domain errors: sqrt-of-negative / power domain → 2201F, ln/log of a non-positive → 2201E, exp/power overflow → 22003. arg_resolution none — a bare integer does NOT promote (sqrt(2) → 42883), a decimal literal does (sqrt(4.0) → numeric). (spec/design/decimal.md §8)"
+description = "Exact-numeric transcendentals over decimal/numeric — sqrt, ln, exp, log/log10 (base 10), log(base, x), power(base, exp) — a hand-rolled PG-faithful arbitrary-precision port of numeric.c (sqrt_var/ln_var/exp_var/log_var/power_var). IN-CONTRACT (byte-identical cross-core, no determinism-ledger entry): every step is exact-decimal limb arithmetic and the result scale is chosen deterministically with no libm transcendental on the value path. Result scale ≥ NUMERIC_MIN_SIG_DIGITS (16) significant digits, never below the input scale. Domain errors: sqrt-of-negative / power domain → 2201F, ln/log of a non-positive → 2201E, exp/power overflow → 22003. A bare integer takes these rows through the argument-coercion pass (sqrt(2) → numeric, func.arg_coercion), as does a decimal literal (sqrt(4.0) → numeric). (spec/design/decimal.md §8)"
 
 [[capability]]
 id = "func.mixed_numeric_args"
-description = "Mixed numeric arguments to the two-argument math functions (spec/design/functions.md §9.2): power / pow / log(b, x) / atan2 rows are arg_resolution = promote, so a pair that matches no overload reconciles as the arithmetic operators' operands do — an integer facing a decimal promotes to decimal (power(2.0, 3) → numeric 8.0000000000000000, PostgreSQL's implicit int → numeric), and an integer or decimal LITERAL facing a float adapts to it (pow(f64_col, 3) → f64). width_bucket's float form adapts its literal bounds the same way. A float VALUE never meets an integer/decimal value (42883, float.md §6) and two integers match no row (42883)."
+description = "Mixed numeric arguments to the two-argument math functions power / pow / log(b, x) / atan2, resolved by the argument-coercion pass (spec/design/arg-coercion.md): an integer facing a decimal takes the decimal overload (power(2.0, 3) → numeric 8.0000000000000000, PostgreSQL's implicit int → numeric), and an integer or decimal LITERAL facing a float adapts to it (pow(f64_col, 3) → f64). width_bucket's float form adapts its literal bounds the same way. A float VALUE never meets an integer/decimal value (42883, float.md §6)."
+
+[[capability]]
+id = "func.arg_coercion"
+description = "Implicit argument coercion for scalar functions (spec/design/arg-coercion.md): a call matching no built-in row or host signature as written selects the overload with the lowest total coercion cost from compare.toml's [[arg_coercion]] table — integer widening (1-2) < integer → decimal (3) < a numeric constant entering the float family (4-5). An integer takes a decimal overload where one exists (sqrt(2) → numeric 1.414213562373095, PostgreSQL float8 — a ledgered divergence); a float-only function admits a numeric constant (sin(0) → f64) but never an integer/decimal value (42883). A tie is 42725; a built-in beats a host function on a tie. The coercion charges no cost."
 
 [[capability]]
 id = "types.bytea"
@@ -1627,7 +1631,7 @@ description = "abs(x) scalar function — abs(i16|i32|i64) → same int type (ab
 
 [[capability]]
 id = "func.round"
-description = "round(x[, n]) scalar function — numeric/integer → numeric, half-away-from-zero to scale 0 or n places; integer overloads return numeric (PG round(5)); NULL propagates (spec/design/functions.md §9)"
+description = "round(x[, n]) scalar function — numeric/integer → numeric, half-away-from-zero to scale 0 or n places; an integer takes the numeric row through the argument-coercion pass (round(5) → numeric; PG float8); NULL propagates (spec/design/functions.md §9)"
 
 [[capability]]
 id = "func.unknown_args"

@@ -17,6 +17,7 @@ import {
   openDatabase,
 } from "../src/lib.ts";
 import type { HostFunctionSpec } from "../src/lib.ts";
+import type { ScalarType } from "../src/types.ts";
 import { intValue, textValue, type Value } from "../src/value.ts";
 import type { Session } from "../src/shared.ts";
 import { close, create, execute } from "../src/tooling.ts";
@@ -1474,4 +1475,146 @@ test("host function check error precedes default", () => {
   } finally {
     db.close();
   }
+});
+
+// ---- Implicit argument coercion (spec/design/arg-coercion.md §4.2) ----------------------------
+
+// The value kind a kernel received.
+function kindOf(v: Value): string {
+  switch (v.kind) {
+    case "int":
+      return "int";
+    case "decimal":
+      return "decimal";
+    case "f64":
+      return "f64";
+    case "f32":
+      return "f32";
+    default:
+      return "other";
+  }
+}
+
+// name(argTypes) -> text, returning `tag:` and the kinds of the values it received, so a test sees
+// both which overload was selected and what it was handed.
+function probe(name: string, argTypes: ScalarType[], tag: string): HostFunctionSpec {
+  return {
+    name,
+    argTypes,
+    result: "text",
+    kernel: (args) => textValue(`${tag}:${args.map(kindOf).join(",")}`),
+  };
+}
+
+// The batch-kernel form of probe for a one-argument function.
+function probeBatched(name: string, arg: ScalarType, tag: string): HostFunctionSpec {
+  return {
+    name,
+    argTypes: [arg],
+    result: "text",
+    batchKernel: (args, out) => {
+      for (const v of args[0]!) out.push(textValue(`${tag}:${kindOf(v)}`));
+    },
+    volatility: "immutable",
+  };
+}
+
+function coercionDb(...specs: HostFunctionSpec[]): Session {
+  return dbExt(regWith(...specs), [
+    "CREATE TABLE c (id i32 PRIMARY KEY, s i16, i i32, b i64, r f32)",
+    "INSERT INTO c VALUES (1, 2, 3, 4, 0.5), (2, 5, 6, 7, 1.5)",
+  ]);
+}
+
+function textOf(s: Session, sql: string): string {
+  return asText(oneVal(s, sql));
+}
+
+test("coercion widens an integer to a host signature", () => {
+  const s = coercionDb(probe("f", ["i64"], "i64"));
+  assert.equal(textOf(s, "SELECT f(i) FROM c WHERE id = 1"), "i64:int");
+  assert.equal(textOf(s, "SELECT f(s) FROM c WHERE id = 1"), "i64:int");
+});
+
+test("coercion prefers the nearer integer width", () => {
+  const s = coercionDb(probe("f", ["i32"], "i32"), probe("f", ["i64"], "i64"));
+  assert.equal(textOf(s, "SELECT f(s) FROM c WHERE id = 1"), "i32:int");
+});
+
+test("coercion narrows an integer constant only when it fits", () => {
+  const s = coercionDb(probe("f", ["i16"], "i16"), probe("f", ["i32"], "i32"));
+  assert.equal(textOf(s, "SELECT f(5)"), "i32:int");
+  assert.equal(textOf(s, "SELECT f(-40000)"), "i32:int");
+  assert.equal(
+    errCodeOf(() => queryOutcome(s, "SELECT f(3000000000)")),
+    "42883",
+  );
+});
+
+test("coercion keeps an integer in its family before decimal", () => {
+  const s = coercionDb(probe("f", ["i64"], "i64"), probe("f", ["decimal"], "decimal"));
+  assert.equal(textOf(s, "SELECT f(s) FROM c WHERE id = 1"), "i64:int");
+});
+
+test("coercion converts an integer for a decimal parameter", () => {
+  const s = coercionDb(probe("f", ["decimal"], "decimal"));
+  assert.equal(textOf(s, "SELECT f(i) FROM c WHERE id = 1"), "decimal:decimal");
+  assert.equal(textOf(s, "SELECT f(7)"), "decimal:decimal");
+});
+
+test("coercion converts in a batch kernel", () => {
+  // The batched path (§4.2.1) converts each column the same way as the row path.
+  const s = coercionDb(probeBatched("f", "decimal", "decimal"), probeBatched("g", "f64", "f64"));
+  const rows = rowsOf(s, "SELECT f(i), g(r) FROM c ORDER BY id");
+  assert.equal(rows.length, 2);
+  for (const r of rows)
+    assert.deepEqual(
+      r.map((v) => asText(v)),
+      ["decimal:decimal", "f64:f64"],
+    );
+});
+
+test("coercion widens f32 to a host f64 parameter", () => {
+  const s = coercionDb(probe("g", ["f64"], "f64"));
+  assert.equal(textOf(s, "SELECT g(r) FROM c WHERE id = 1"), "f64:f64");
+});
+
+test("coercion admits only a constant into a host float", () => {
+  const s = coercionDb(probe("g", ["f64"], "f64"));
+  assert.equal(textOf(s, "SELECT g(2)"), "f64:f64");
+  assert.equal(textOf(s, "SELECT g(2.5)"), "f64:f64");
+  assert.equal(
+    errCodeOf(() => queryOutcome(s, "SELECT g(i) FROM c WHERE id = 1")),
+    "42883",
+  );
+});
+
+test("coercion: a host beats a costlier built-in", () => {
+  // A host sqrt(i32) for an i16 argument scores 1; the built-in sqrt(decimal) scores 3.
+  const s = coercionDb(probe("sqrt", ["i32"], "host"));
+  assert.equal(textOf(s, "SELECT sqrt(s) FROM c WHERE id = 1"), "host:int");
+});
+
+test("coercion: a built-in wins a tie", () => {
+  // sin(0): the built-in sin(float) and a host sin(f64) both score 4 — the built-in wins.
+  const s = coercionDb(probe("sin", ["f64"], "host"));
+  const v = oneVal(s, "SELECT sin(0)");
+  assert.equal(v.kind, "f64");
+  assert.equal((v as { value: number }).value, 0);
+});
+
+test("coercion: tied hosts are ambiguous", () => {
+  // (i16, i16) against f(i32, i64) and f(i64, i32): both score 3 — 42725.
+  const s = coercionDb(probe("f", ["i32", "i64"], "a"), probe("f", ["i64", "i32"], "b"));
+  assert.equal(
+    errCodeOf(() => queryOutcome(s, "SELECT f(s, s) FROM c WHERE id = 1")),
+    "42725",
+  );
+});
+
+test("coercion leaves an exact host match alone", () => {
+  // An exact host signature is found before the pass runs, even where a built-in would match
+  // through a coercion.
+  const s = coercionDb(probe("sqrt", ["i64"], "host"));
+  assert.equal(textOf(s, "SELECT sqrt(b) FROM c WHERE id = 1"), "host:int");
 });

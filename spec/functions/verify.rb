@@ -59,6 +59,13 @@
 #      (kind = "function"); absent ⇒ true. traps = false requires errors = [], volatility =
 #      "immutable", and a boolean preserves_equality (which is otherwise absent). NAME-level: every
 #      overload sharing a name agrees on both (the planner looks them up by name).
+#  18. The [[arg_coercion]] cost table in ../types/compare.toml (../design/arg-coercion.md §3):
+#      `from` is a scalar id or a literal source (integer_literal | decimal_literal), `to` a scalar
+#      id, `cost` a positive integer, each (from, to) once. A value row (scalar `from`) is backed by a
+#      mode = "implicit" [[cast]] in casts.toml and never enters the float family from outside it
+#      (only a literal does — the float island). The bands hold: every row staying in its source's
+#      family is cheaper than every row leaving it, and every row entering the float family from
+#      outside costs more than every other row.
 #
 # Exit 0 = catalog is internally coherent and cross-references resolve; nonzero =
 # the offending problem.
@@ -482,7 +489,48 @@ def main
   dup_wins = win_names.tally.select { |_, n| n > 1 }.keys
   fail!("duplicate window name: #{dup_wins.join(', ')}") unless dup_wins.empty?
 
-  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates, #{set_returning.length} set-returning, #{windows.length} window — catalog coherent"
+  # (18) the argument-coercion cost table
+  casts = TomlRB.load_file(File.join(SPEC_DIR, "types", "casts.toml"))
+  coercions = check_arg_coercion(compare, scalars, casts)
+
+  puts "OK: #{operators.length} operators, #{aggregates.length} aggregates, #{set_returning.length} set-returning, #{windows.length} window, #{coercions.length} argument coercions — catalog coherent"
+end
+
+# The literal sources of the [[arg_coercion]] table and the family each belongs to (its default
+# type's family: an integer constant defaults to i64, a decimal constant to decimal).
+LITERAL_SOURCES = { "integer_literal" => "integer", "decimal_literal" => "decimal" }.freeze
+
+def check_arg_coercion(compare, scalars, casts)
+  rows = compare["arg_coercion"] || []
+  fail!("compare.toml: no [[arg_coercion]] rows") if rows.empty?
+  family_of = (scalars["type"] || []).to_h { |t| [t["id"], t["family"]] }
+  implicit = (casts["cast"] || []).select { |c| c["mode"] == "implicit" }.map { |c| [c["from"], c["to"]] }.to_set
+  seen = Set.new
+  rows.each do |r|
+    id = "arg_coercion #{r['from']} -> #{r['to']}"
+    fail!("#{id}: needs exactly from/to/cost") unless r.keys.sort == %w[cost from to]
+    fail!("#{id}: from is not a scalar id or literal source") unless family_of.key?(r["from"]) || LITERAL_SOURCES.key?(r["from"])
+    fail!("#{id}: to is not a scalar id") unless family_of.key?(r["to"])
+    fail!("#{id}: cost must be a positive integer") unless r["cost"].is_a?(Integer) && r["cost"].positive?
+    fail!("#{id}: duplicate") unless seen.add?([r["from"], r["to"]])
+    fail!("#{id}: a row into its own type") if r["from"] == r["to"]
+    next if LITERAL_SOURCES.key?(r["from"])
+
+    fail!("#{id}: no mode = \"implicit\" cast in casts.toml backs it") unless implicit.include?([r["from"], r["to"]])
+    if family_of[r["to"]] == "float" && family_of[r["from"]] != "float"
+      fail!("#{id}: only a literal enters the float family (float.md §6)")
+    end
+  end
+  source_family = ->(r) { LITERAL_SOURCES[r["from"]] || family_of[r["from"]] }
+  staying, leaving = rows.partition { |r| source_family.(r) == family_of[r["to"]] }
+  into_float, other = rows.partition { |r| family_of[r["to"]] == "float" && source_family.(r) != "float" }
+  if !staying.empty? && !leaving.empty? && staying.map { |r| r["cost"] }.max >= leaving.map { |r| r["cost"] }.min
+    fail!("arg_coercion: a row staying in its family must cost less than every row leaving it")
+  end
+  if !into_float.empty? && !other.empty? && into_float.map { |r| r["cost"] }.min <= other.map { |r| r["cost"] }.max
+    fail!("arg_coercion: a row entering the float family must cost more than every other row")
+  end
+  rows
 end
 
 main

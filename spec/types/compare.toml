@@ -201,6 +201,89 @@ left_family = "float"
 right_family = "float"
 via = "promote"
 
+# --- implicit argument coercion ----------------------------------------------
+# The cost table of the scalar-function argument-coercion pass (../design/arg-coercion.md). When a
+# call matches no signature exactly, an argument may stand in a slot of type `to` at `cost`; the
+# candidate with the lowest total wins (ties: arg-coercion.md §4). `from` is a scalar type id, or a
+# literal source: "integer_literal" (a bare integer constant, untyped — ../design/types.md §6) or
+# "decimal_literal" (a bare decimal constant); a negative constant counts. A literal source also
+# admits the rows of its default type (i64, decimal). A built-in slot names a family, which every
+# member type matches at cost 0; its cost for any other argument is the cheapest row into one of
+# its member types. A host slot names one type. Absent pairs never coerce.
+#
+# Three bands, checked by ../functions/verify.rb: staying in a family (1-2) < integer -> decimal (3)
+# < entering the float island (4-5). A value row must be backed by a mode = "implicit" cast row in
+# casts.toml; a float may be reached only from a literal (the float island, ../design/float.md §6).
+
+# widening within a tower (value)
+[[arg_coercion]]
+from = "i16"
+to = "i32"
+cost = 1
+
+[[arg_coercion]]
+from = "i32"
+to = "i64"
+cost = 1
+
+[[arg_coercion]]
+from = "i16"
+to = "i64"
+cost = 2
+
+[[arg_coercion]]
+from = "f32"
+to = "f64"
+cost = 1
+
+# an integer constant narrower than its i64 default, admitted only when its value fits
+[[arg_coercion]]
+from = "integer_literal"
+to = "i32"
+cost = 1
+
+[[arg_coercion]]
+from = "integer_literal"
+to = "i16"
+cost = 2
+
+# integer -> decimal (value; scale 0, lossless)
+[[arg_coercion]]
+from = "i16"
+to = "decimal"
+cost = 3
+
+[[arg_coercion]]
+from = "i32"
+to = "decimal"
+cost = 3
+
+[[arg_coercion]]
+from = "i64"
+to = "decimal"
+cost = 3
+
+# a numeric constant into the float island (literal only)
+[[arg_coercion]]
+from = "integer_literal"
+to = "f64"
+cost = 4
+
+[[arg_coercion]]
+from = "integer_literal"
+to = "f32"
+cost = 5
+
+[[arg_coercion]]
+from = "decimal_literal"
+to = "f64"
+cost = 4
+
+[[arg_coercion]]
+from = "decimal_literal"
+to = "f32"
+cost = 5
+
 # --- value ordering ----------------------------------------------------------
 # The total order over non-NULL integers used by ORDER BY and by index/key
 # iteration. Plain signed numeric order; matches the order-preserving key

@@ -710,6 +710,8 @@ var SupportedCapabilities = []string{
 	// PG-faithful arbitrary-precision port (numeric.c), byte-identical cross-core (decimal.md §8).
 	"expr.numeric_transcendental",
 	"func.mixed_numeric_args",
+	// implicit argument coercion for scalar functions (arg-coercion.md).
+	"func.arg_coercion",
 	// bytea scalar type (variable-width raw bytes): storage, hex- and escape-input literals, and
 	// unsigned-byte comparison/ordering. bytea is ALSO a key type — a bytea PRIMARY KEY / index /
 	// UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6).

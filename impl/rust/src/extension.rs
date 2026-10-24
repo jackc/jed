@@ -195,6 +195,11 @@ impl HostFunction {
     /// every site that does not prefetch. A batch kernel is handed a one-row batch and held to the
     /// same shape rules as [`call_batch`](Self::call_batch).
     pub(crate) fn call_one(&self, args: Vec<Value>) -> Result<Value> {
+        let args: Vec<Value> = args
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| self.coerce_arg(i, v))
+            .collect();
         match &self.kernel {
             Kernel::Row(k) => k(&args),
             Kernel::Batch(_) => {
@@ -238,6 +243,17 @@ impl HostFunction {
             !args.is_empty() || n == 1,
             "a zero-argument batch has one row"
         );
+        let coerced;
+        let args = if self.needs_coercion(args) {
+            coerced = args
+                .iter()
+                .enumerate()
+                .map(|(i, col)| col.iter().map(|v| self.coerce_arg(i, v.clone())).collect())
+                .collect::<Vec<Vec<Value>>>();
+            &coerced[..]
+        } else {
+            args
+        };
         let mut out = Vec::with_capacity(n);
         let res = match &self.kernel {
             Kernel::Batch(k) => k(args, &mut out),
@@ -273,6 +289,31 @@ impl HostFunction {
                 self.name
             ),
         )
+    }
+
+    /// Convert an argument the coercion pass admitted to this function's declared type
+    /// (spec/design/arg-coercion.md §4): an integer for a `decimal` parameter at scale 0, an `f32`
+    /// for an `f64` one. Integer widths share one value form, so integer widening needs nothing.
+    /// The kernel only ever sees values of its declared types.
+    fn coerce_arg(&self, i: usize, v: Value) -> Value {
+        match (self.arg_types[i], v) {
+            (ScalarType::Decimal, Value::Int(n)) => {
+                Value::Decimal(crate::decimal::Decimal::from_i64(n))
+            }
+            (ScalarType::Float64, Value::Float32(f)) => Value::Float64(f64::from(f)),
+            (_, v) => v,
+        }
+    }
+
+    /// Whether any column of a batch holds a value [`coerce_arg`](Self::coerce_arg) converts.
+    fn needs_coercion(&self, args: &[Vec<Value>]) -> bool {
+        args.iter()
+            .enumerate()
+            .any(|(i, col)| match self.arg_types[i] {
+                ScalarType::Decimal => col.iter().any(|v| matches!(v, Value::Int(_))),
+                ScalarType::Float64 => col.iter().any(|v| matches!(v, Value::Float32(_))),
+                _ => false,
+            })
     }
 
     /// Whether this function's signature matches `arg_tys` exactly (arity + per-position scalar type).
@@ -334,6 +375,20 @@ impl ExtensionRegistry {
         self.functions
             .iter()
             .position(|f| f.name == name && f.signature_matches(arg_tys))
+    }
+
+    /// Every registered function with this name and arity, with its id, in registration order —
+    /// the host candidates of the argument-coercion pass (spec/design/arg-coercion.md §4.2).
+    pub(crate) fn overloads<'a>(
+        &'a self,
+        name: &'a str,
+        arity: usize,
+    ) -> impl Iterator<Item = (usize, &'a HostFunction)> + 'a {
+        self.functions
+            .iter()
+            .enumerate()
+            .filter(move |(_, f)| f.name == name && f.arg_types.len() == arity)
+            .map(|(id, f)| (id, f.as_ref()))
     }
 
     /// The registered function at `id` (an index returned by [`resolve`](Self::resolve); stable for

@@ -168,6 +168,7 @@ func (f *hostFuncEntry) batchable() bool {
 // every site that does not prefetch. A batch kernel is handed a one-row batch and held to the same
 // shape rules as callBatch.
 func (f *hostFuncEntry) callOne(args []Value) (Value, error) {
+	args = f.coerceRow(args)
 	if f.batchKernel == nil {
 		return f.kernel(args)
 	}
@@ -189,6 +190,7 @@ func (f *hostFuncEntry) callOne(args []Value) (Value, error) {
 // many results, or an error after answering every row, fails at the first row. Results are NOT
 // type-checked here — the replay does that per row, so a type error surfaces at its own row.
 func (f *hostFuncEntry) callBatch(args [][]Value, n int) ([]Value, error) {
+	args = f.coerceBatch(args)
 	out := make([]Value, 0, n)
 	var err error
 	if f.batchKernel != nil {
@@ -214,6 +216,76 @@ func (f *hostFuncEntry) callBatch(args [][]Value, n int) ([]Value, error) {
 		err = f.shapeError(n, got)
 	}
 	return out, err
+}
+
+// coerceArg converts an argument the coercion pass admitted to this function's declared type at
+// position i (spec/design/arg-coercion.md §4): an integer for a decimal parameter at scale 0, an f32
+// for an f64 one. Integer widths share one value form, so integer widening needs nothing. The kernel
+// only ever sees values of its declared types. needed is false when v is already of that type.
+func (f *hostFuncEntry) coerceArg(i int, v Value) (out Value, needed bool) {
+	switch {
+	case f.argTypes[i] == scalarDecimal && v.Kind == ValInt:
+		return DecimalValue(decimalFromInt64(v.Int)), true
+	case f.argTypes[i] == scalarFloat64 && v.Kind == ValFloat32:
+		return Float64Value(float64(v.F32())), true
+	}
+	return v, false
+}
+
+// coerceRow applies coerceArg to one row's arguments, copying the row only when a value converts
+// (the caller's slice is never mutated).
+func (f *hostFuncEntry) coerceRow(args []Value) []Value {
+	var out []Value
+	for i, v := range args {
+		c, needed := f.coerceArg(i, v)
+		if !needed {
+			continue
+		}
+		if out == nil {
+			out = append([]Value(nil), args...)
+		}
+		out[i] = c
+	}
+	if out == nil {
+		return args
+	}
+	return out
+}
+
+// coerceBatch applies coerceArg to a column-major batch, copying only the columns that hold a value
+// that converts.
+func (f *hostFuncEntry) coerceBatch(args [][]Value) [][]Value {
+	var out [][]Value
+	for i, col := range args {
+		coerced := f.coerceColumn(i, col)
+		if coerced == nil {
+			continue
+		}
+		if out == nil {
+			out = append([][]Value(nil), args...)
+		}
+		out[i] = coerced
+	}
+	if out == nil {
+		return args
+	}
+	return out
+}
+
+// coerceColumn converts column i of a batch, or returns nil when no value in it converts.
+func (f *hostFuncEntry) coerceColumn(i int, col []Value) []Value {
+	var out []Value
+	for j, v := range col {
+		c, needed := f.coerceArg(i, v)
+		if !needed {
+			continue
+		}
+		if out == nil {
+			out = append([]Value(nil), col...)
+		}
+		out[j] = c
+	}
+	return out
 }
 
 func (f *hostFuncEntry) shapeError(n, got int) error {
@@ -287,6 +359,22 @@ func (r *hostRegistry) resolveHost(name string, argTypes []scalarType) (int, boo
 		}
 	}
 	return 0, false
+}
+
+// overloads lists the ids of every registered function with this name and arity, in registration
+// order — the host candidates of the argument-coercion pass (spec/design/arg-coercion.md §4.2).
+// nil-safe.
+func (r *hostRegistry) overloads(name string, arity int) []int {
+	if r == nil {
+		return nil
+	}
+	var ids []int
+	for i := range r.functions {
+		if r.functions[i].name == name && len(r.functions[i].argTypes) == arity {
+			ids = append(ids, i)
+		}
+	}
+	return ids
 }
 
 // function returns the registered function at id (an index from resolveHost).
