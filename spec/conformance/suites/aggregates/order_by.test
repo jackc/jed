@@ -19,7 +19,7 @@ INSERT INTO t VALUES (1, 1, 30, 4, 'b'), (2, 1, 10, 2, 'a'), (3, 1, NULL, 3, 'c'
 # The array follows the ORDER BY key, not the scan (PK) order. A bare-column key evaluates for
 # free, so the cost is the unordered aggregate's: 1 page_read + 6 storage_row_read + 6
 # aggregate_accumulate + 6 generated_row (the fold, now at finalize) + 1 row_produced; the buffer
-# and the sort are unmetered.
+# and the sort's comparisons are unmetered, and the integer sort keys charge no sort_key.
 # cost: 20
 query T nosort
 SELECT jsonb_agg(x ORDER BY y) FROM t

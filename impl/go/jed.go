@@ -778,6 +778,9 @@ var SupportedCapabilities = []string{
 	// Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
 	// accrued cost via the `# cost:` directive (CLAUDE.md §13).
 	"resource.cost_metering",
+	// Per-row key metering — sorts, grouping, dedup, and partitioning charge each row's keys by
+	// size (cost.md §3 "sort_key / hash_key").
+	"resource.key_metering",
 	// Cost ceiling — a caller-set `max_cost` aborts a query (54P01) the instant accrued cost
 	// reaches it; the `# max_cost:` directive runs a record under a ceiling (cost.md §6).
 	"resource.cost_limit",

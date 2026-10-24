@@ -289,8 +289,7 @@ event  = "one code point processed while building a collation sort key for a col
 # deterministic collation are byte-equality (../design/collation.md §7) and charge nothing beyond
 # their operator_eval; a `C`/default comparison charges nothing here. A sort on a collated key
 # builds each row's UCA sort key once and charges this unit per code point at that point, instead of
-# sort_key (specified, not yet implemented: resource.key_metering, ../design/cost.md §3 "sort_key /
-# hash_key"); the sort's comparisons over the built keys stay unmetered. Charged at the identical
+# sort_key (resource.key_metering, ../design/cost.md §3 "sort_key / hash_key"); the sort's comparisons over the built keys stay unmetered. Charged at the identical
 # per-code-point point in every core, so cost stays cross-core identical (§8/§13).
 
 [[unit]]
@@ -415,7 +414,7 @@ event  = "one unit of jsonpath evaluation: a step application, an emitted item, 
 id     = "sort_key"
 weight = 1
 event  = "one logical payload byte of a non-collated sort-key value, charged once per row a sort receives"
-# Specified, not yet implemented (resource.key_metering; ../design/cost.md §3 "sort_key / hash_key").
+# resource.key_metering; ../design/cost.md §3 "sort_key / hash_key".
 # Every row a sort receives (query, set-operation, and DISTINCT ON ORDER BY; window ORDER BY once per
 # shared partition/sort group; in-aggregate ORDER BY; ordered-set and hypothetical-set WITHIN GROUP)
 # charges payload(v) (../design/memory.md §3) for each non-collated key value, in key order, before
@@ -429,7 +428,7 @@ event  = "one logical payload byte of a non-collated sort-key value, charged onc
 id     = "hash_key"
 weight = 1
 event  = "one logical payload byte of a grouping, dedup, or partition key value, charged once per row a table receives"
-# Specified, not yet implemented (resource.key_metering; ../design/cost.md §3 "sort_key / hash_key").
+# resource.key_metering; ../design/cost.md §3 "sort_key / hash_key".
 # Every row that GROUP BY (per grouping set), SELECT DISTINCT, a DISTINCT aggregate, a set
 # operation's dedup or count table (not UNION ALL), a recursive CTE's UNION, or a window's PARTITION
 # BY receives charges payload(v) for each key value, in key order, before the row is inserted or

@@ -116,7 +116,8 @@ SELECT n FROM ci UNION SELECT n FROM ck
 # values convert (rendered at scale 0), the decimal keeps its scale. {5, 7, 8.25}, output type D.
 # cost = 2 + 2 + 2 = 6.
 # names: n
-# cost: 9
+# Per-row keys add 12 (cost.md §3 "sort_key / hash_key"): 9 before them.
+# cost: 21
 query D rowsort
 SELECT n FROM ci UNION SELECT n FROM ck UNION SELECT n FROM cd
 ----

@@ -460,6 +460,9 @@ func (db *engine) execBoundedBlockingLane(p *selectPlan, env *evalEnv, m *costMe
 				}
 				out[i] = v
 			}
+			if err := chargeHashKeys(m, out); err != nil {
+				return err
+			}
 			inserted, err := seen.insert(out)
 			if err != nil || !inserted {
 				return err
@@ -538,6 +541,9 @@ func (db *engine) blockingOrder(p *selectPlan, rows *rowSpool, env *evalEnv, m *
 		}
 		for _, k := range p.order {
 			key := row[k.idx]
+			if err := chargeSortKey(m, key, k.collation); err != nil {
+				return err
+			}
 			if k.collation != nil && (key.Kind == ValText || key.Kind == ValArray) {
 				b, err := collationSortKey(k.collation, key)
 				if err != nil {

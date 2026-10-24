@@ -42,8 +42,11 @@ banana
 
 # A residual WHERE composes with whole-pipeline selection. At five rows, the generic inequality
 # estimate prices the full scan plus blocking sort below the order-only index walk. Runtime charges
-# page(1) + rows(5) + filters(5) + produced(2) = 13; sort itself remains unmetered.
-# cost: 13
+# page(1) + rows(5) + filters(5) + produced(2) = 13, plus the four passing names' sort_key; the
+# sort's comparisons remain unmetered. The estimator counts sort_key as zero, so it does not see
+# that the index walk would now cost less (cost.md §3 "sort_key / hash_key").
+# Per-row keys add 26 (cost.md §3 "sort_key / hash_key"): 13 before them.
+# cost: 39
 query IT nosort
 SELECT id, name FROM t WHERE amt >= 20 ORDER BY name LIMIT 2
 ----
@@ -54,7 +57,8 @@ cherry
 
 # With OFFSET, the estimator prices the full scan plus blocking sort below the three-look-up index
 # prefix. Runtime charges one table page + five rows + two produced = 8.
-# cost: 8
+# Per-row keys add 31 (cost.md §3 "sort_key / hash_key"): 8 before them.
+# cost: 39
 query IT nosort
 SELECT id, name FROM t ORDER BY name LIMIT 2 OFFSET 1
 ----
@@ -66,7 +70,8 @@ cherry
 # CONTRAST — no LIMIT keeps the eager full scan + sort (the index walk + a lookup per row would cost
 # more). The full result is name order, computed by reading every row. 1 table page + 5 storage_row_read
 # + 5 produced = 11. (No collate units — `name` is the default C-collation text, byte order.)
-# cost: 11
+# Per-row keys add 31 (cost.md §3 "sort_key / hash_key"): 11 before them.
+# cost: 42
 query IT nosort
 SELECT id, name FROM t ORDER BY name
 ----

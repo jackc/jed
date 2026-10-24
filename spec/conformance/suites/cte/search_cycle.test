@@ -27,7 +27,8 @@ INSERT INTO edge VALUES (1, 2), (2, 3), (3, 1), (3, 4)
 
 # The cost is the recursion's (190 without the clause) plus each row's added-column expressions;
 # the path arrays are growth kernels, charged by the bytes each step builds (cost.md §8.1).
-# cost: 1599
+# Per-row keys add 992 (cost.md §3 "sort_key / hash_key"): 1599 before them.
+# cost: 2591
 query IT nosort
 WITH RECURSIVE r(id) AS (
   SELECT id FROM tree WHERE parent IS NULL
@@ -49,7 +50,8 @@ SELECT * FROM r ORDER BY ord
 5
 {(1),(3),(5)}
 
-# cost: 206
+# Per-row keys add 384 (cost.md §3 "sort_key / hash_key"): 206 before them.
+# cost: 590
 query IT nosort
 WITH RECURSIVE r(id) AS (
   SELECT id FROM tree WHERE parent IS NULL
@@ -163,7 +165,8 @@ SELECT * FROM r
 
 # --- CYCLE -------------------------------------------------------------------------------------
 
-# cost: 1395
+# Per-row keys add 976 (cost.md §3 "sort_key / hash_key"): 1395 before them.
+# cost: 2371
 query IBT nosort
 WITH RECURSIVE g(node) AS (
   SELECT 1

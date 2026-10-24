@@ -14,9 +14,14 @@ pub(crate) fn sort_rows(
     rows: &mut Vec<Row>,
     order: &[crate::spill::SortKey],
     acct: &crate::cost::QueryAccount,
+    meter: &mut Meter,
 ) -> Result<()> {
     if order.iter().any(|(_, _, _, c)| c.is_some()) {
-        return sort_rows_collated(rows, order, acct);
+        return sort_rows_collated(rows, order, acct, meter);
+    }
+    // Every row the sort receives charges its keys (cost.md §3 "sort_key / hash_key").
+    for row in rows.iter() {
+        charge_sort_keys(meter, row, order)?;
     }
     rows.sort_by(|a, b| cmp_rows_by_order(a, b, order));
     Ok(())
@@ -440,12 +445,17 @@ pub(crate) fn window_coll_keys(
     meter: &mut Meter,
 ) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
     if !order.iter().any(|(_, _, _, c)| c.is_some()) {
+        for row in rows.iter() {
+            charge_sort_keys(meter, row, order)?;
+        }
         return Ok(Vec::new());
     }
     let mut all = Vec::with_capacity(rows.len());
     for row in rows.iter() {
         let mut keys = Vec::new();
         for (idx, _, _, coll) in order {
+            // Each key is charged as the sort receives the row, just before its decoration.
+            charge_sort_key(meter, &row[*idx], coll.as_deref())?;
             if let Some(c) = coll {
                 // NULL (a collated slot is text / text[]) is `None` — handled by NULL placement.
                 keys.push(collation_sort_key(c, &row[*idx])?);
@@ -491,8 +501,9 @@ pub(crate) fn apply_window_stage(
     }
     // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
     // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
-    // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
-    // purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
+    // results over the shared sorted partitions. Each group charges every row's partition keys, then
+    // every row's order keys (cost.md §3 "sort_key / hash_key"); the probes and comparisons are
+    // unmetered, so sharing saves those charges and wall-clock without changing the rows.
     let groups = group_window_specs(specs);
     let mut spec_group = vec![0usize; specs.len()];
     let mut group_cache: Vec<(Vec<Vec<usize>>, Vec<Vec<Option<Vec<u8>>>>)> =
@@ -511,6 +522,7 @@ pub(crate) fn apply_window_stage(
         let mut partitions: Vec<Vec<usize>> = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             let key: Vec<Value> = rep.partition.iter().map(|&p| row[p].clone()).collect();
+            charge_hash_keys(meter, &key)?;
             let pi = match index.get(&key) {
                 Some(&p) => p,
                 None => {
@@ -1064,8 +1076,8 @@ pub(crate) fn cmp_window_rows(
 /// Decorate-sort-undecorate: each collated key's UCA sort key is built ONCE per row up front
 /// (propagating a `sort_key` failure — e.g. 0A000 for an unmapped code point — at this deterministic
 /// per-row point, not inside the comparator), then the rows are sorted by the precomputed key bytes
-/// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
-/// (cost.md §3); the `collate` cost is charged at the comparison evaluator (collation.md §11). A
+/// for collated slots and the value comparator for the rest. The comparisons are unmetered like every
+/// sort's (cost.md §3); each row's keys charge as they are decorated (§ "sort_key / hash_key"). A
 /// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
 /// Each row's decoration reserves its [`crate::memsize::sort_key_bytes`] as it is built; all are
 /// released once the rows are undecorated (memory.md §6.8).
@@ -1073,11 +1085,12 @@ pub(crate) fn sort_rows_collated(
     rows: &mut Vec<Row>,
     order: &[crate::spill::SortKey],
     acct: &crate::cost::QueryAccount,
+    meter: &mut Meter,
 ) -> Result<()> {
     let mut charge = crate::cost::StateCharge::new(acct.clone());
     let mut decorated: Vec<(Vec<Option<Vec<u8>>>, Row)> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        let keys = collation_keys_for_row(&row, order)?;
+        let keys = collation_keys_for_row(&row, order, meter)?;
         if charge.active() {
             charge.reserve_direct(crate::memsize::sort_key_bytes(&keys))?;
         }
@@ -1148,9 +1161,13 @@ fn cmp_decorated_parts(
 fn collation_keys_for_row(
     row: &Row,
     order: &[crate::spill::SortKey],
+    meter: &mut Meter,
 ) -> Result<Vec<Option<Vec<u8>>>> {
     let mut keys = Vec::new();
     for (idx, _, _, coll) in order {
+        // Every key of the row is charged as the sort receives it, each just before its decoration
+        // (cost.md §3 "sort_key / hash_key").
+        charge_sort_key(meter, &row[*idx], coll.as_deref())?;
         if let Some(c) = coll {
             keys.push(collation_sort_key(c, &row[*idx])?);
         }
@@ -1220,10 +1237,13 @@ impl TopKKeeper {
         by_key.then_with(|| a.pos.cmp(&b.pos))
     }
 
-    pub(crate) fn push(&mut self, row: Row) -> Result<()> {
+    /// Push one row. `meter` charges its sort keys (cost.md §3 "sort_key / hash_key"), whether the
+    /// heap keeps the row or not.
+    pub(crate) fn push(&mut self, row: Row, meter: &mut Meter) -> Result<()> {
         let keys = if self.collated {
-            collation_keys_for_row(&row, &self.order)?
+            collation_keys_for_row(&row, &self.order, meter)?
         } else {
+            charge_sort_keys(meter, &row, &self.order)?;
             Vec::new()
         };
         let item = TopKItem {
@@ -1327,11 +1347,12 @@ pub(crate) fn top_k_rows(
     order: &[crate::spill::SortKey],
     k: i64,
     acct: &crate::cost::QueryAccount,
+    meter: &mut Meter,
 ) -> Result<Vec<Row>> {
     let collated = order.iter().any(|key| key.3.is_some());
     let mut keeper = TopKKeeper::new(k, order, collated).with_decorations(acct);
     for row in rows {
-        keeper.push(row)?;
+        keeper.push(row, meter)?;
     }
     Ok(keeper.finish())
 }

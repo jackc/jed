@@ -140,7 +140,8 @@ b
 # table (no short-circuit). Byte order is 'A'(0x41) < 'a'(0x61), the OPPOSITE of unicode, and the
 # cost is higher. 1 page + 4 scanned + 2 produced = 7 — the proof the collation-match gate (not a
 # blanket "any ORDER BY on the PK") is what admits the skip-sort.
-# cost: 7
+# Per-row keys add 4 (cost.md §3 "sort_key / hash_key"): 7 before them.
+# cost: 11
 query T nosort
 SELECT name FROM cp ORDER BY name COLLATE "C" LIMIT 2
 ----

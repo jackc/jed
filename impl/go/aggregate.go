@@ -716,6 +716,11 @@ func (a *acc) fold(v Value, m *costMeter) error {
 				}
 				a.osaFloats = append(a.osaFloats, f)
 			} else {
+				// The retained value is the finalize sort's key (cost.md §3 "sort_key / hash_key");
+				// percentile_cont's widened f64 measures 0.
+				if err := chargeSortKey(m, v, a.osaCollation); err != nil {
+					return err
+				}
 				a.osaVals = append(a.osaVals, v)
 			}
 		}
@@ -1437,6 +1442,9 @@ func aggOrderTuple(order *aggOrder, v Value, row storedRow, env *evalEnv, m *cos
 	for i, k := range order.keys {
 		kv, err := k.eval(row, env, m)
 		if err != nil {
+			return nil, err
+		}
+		if err := chargeSortKey(m, kv, order.sorts[i].collation); err != nil {
 			return nil, err
 		}
 		if c := order.sorts[i].collation; c != nil && (kv.Kind == ValText || kv.Kind == ValArray) {

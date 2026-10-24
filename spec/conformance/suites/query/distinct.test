@@ -7,8 +7,9 @@
 #
 # Cost asymmetry (cost.md §3): DISTINCT must project EVERY filtered row to compute its dedup
 # key, so projection operator_eval is charged per filtered row (independent of LIMIT and of
-# duplicates), while row_produced counts only the emitted distinct+windowed rows. Dedup
-# itself is unmetered, like the sort and the slice. EXCEPTION — when the ORDER BY is satisfied by
+# duplicates), while row_produced counts only the emitted distinct+windowed rows. Each checked
+# row's values charge hash_key by size (0 for integers); the dedup probes are unmetered, like the
+# sort's comparisons and the slice. EXCEPTION — when the ORDER BY is satisfied by
 # the primary-key scan order (query.order_by_pk_scan), the dedup runs STREAMING in scan order and
 # the sort is elided, so with a LIMIT it STOPS once the window fills (a top-N): projection +
 # storage_row_read then drop to the rows actually scanned (the composite-PK section at the end).

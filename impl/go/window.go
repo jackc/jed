@@ -46,10 +46,15 @@ func not3(a ThreeValued) ThreeValued {
 // both have the core type []Value, so a single comparator family serves every sort site.
 // A collated sort's decorations are transient operator state charged to acct (memory.md §6.8); a
 // rejected reservation is returned for the caller's cost-first check.
-func sortRows[R ~[]Value](rows []R, order []orderSlot, acct queryAccount) error {
+func sortRows[R ~[]Value](rows []R, order []orderSlot, acct queryAccount, m *costMeter) error {
 	for _, k := range order {
 		if k.collation != nil {
-			return sortRowsCollated(rows, order, acct)
+			return sortRowsCollated(rows, order, acct, m)
+		}
+	}
+	for _, row := range rows {
+		if err := chargeSortKeys(m, row, order); err != nil {
+			return err
 		}
 	}
 	slices.SortStableFunc(rows, func(a, b R) int { return cmpRowsByOrder(a, b, order) })
@@ -508,8 +513,9 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 	}
 	// The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
 	// ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
-	// results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
-	// purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
+	// results over the shared sorted partitions. Each group charges every row's partition keys, then
+	// every row's order keys (cost.md §3 "sort_key / hash_key"); the probes and comparisons are
+	// unmetered, so sharing saves those charges and wall-clock without changing the rows.
 	groups := groupWindowSpecs(specs)
 	specGroup := make([]int, len(specs))
 	type groupShared struct {
@@ -535,6 +541,9 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 			key := make([]Value, len(rep.partition))
 			for j, p := range rep.partition {
 				key[j] = rows[i][p]
+			}
+			if err := chargeHashKeys(meter, key); err != nil {
+				return err
 			}
 			k := distinctRowKey(key)
 			pi, ok := index[k]
@@ -1144,12 +1153,21 @@ func windowCollKeys(rows []storedRow, order []orderSlot, charge *stateCharge, me
 		}
 	}
 	if !collated {
+		for _, row := range rows {
+			if err := chargeSortKeys(meter, row, order); err != nil {
+				return nil, err
+			}
+		}
 		return nil, nil
 	}
 	all := make([][][]byte, len(rows))
 	for i, row := range rows {
 		var keys [][]byte
 		for _, k := range order {
+			// Each key is charged as the sort receives the row, just before its decoration.
+			if err := chargeSortKey(meter, row[k.idx], k.collation); err != nil {
+				return nil, err
+			}
 			if k.collation == nil {
 				continue
 			}
@@ -1228,7 +1246,7 @@ func cmpWindowRows(a, b int, rows []storedRow, order []orderSlot, collKeys [][][
 // collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
 // Each row's decoration reserves its memSortKeyBytes as it is built; all are released once the rows
 // are undecorated (memory.md §6.8).
-func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot, acct queryAccount) error {
+func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot, acct queryAccount, m *costMeter) error {
 	type deco struct {
 		keys [][]byte // one per collated slot, in slot order; nil entry ⇒ a NULL value
 		row  R
@@ -1236,7 +1254,7 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot, acct queryAccount
 	charge := newStateCharge(acct)
 	d := make([]deco, len(rows))
 	for i, row := range rows {
-		keys, err := collationKeysForRow(row, order)
+		keys, err := collationKeysForRow(row, order, m)
 		if err != nil {
 			charge.releaseAll()
 			return err
@@ -1261,9 +1279,14 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot, acct queryAccount
 
 // collationKeysForRow decorates one row with its collated ORDER BY keys. Keeping this as the
 // single row-level primitive makes full sort and bounded top-k fail at the same input row.
-func collationKeysForRow[R ~[]Value](row R, order []orderSlot) ([][]byte, error) {
+func collationKeysForRow[R ~[]Value](row R, order []orderSlot, m *costMeter) ([][]byte, error) {
 	var keys [][]byte
 	for _, k := range order {
+		// Every key of the row is charged as the sort receives it, each just before its decoration
+		// (cost.md §3 "sort_key / hash_key").
+		if err := chargeSortKey(m, row[k.idx], k.collation); err != nil {
+			return nil, err
+		}
 		if k.collation == nil {
 			continue
 		}

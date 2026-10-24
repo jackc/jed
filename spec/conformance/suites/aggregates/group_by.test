@@ -2,7 +2,7 @@
 # §5-6, grammar.md §18). NULL is its own single group; decimal keys bucket value-canonically;
 # a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803. ORDER BY over a grouping
 # column sorts the group rows. Cost = rows scanned + rows x aggregates accumulated + 1 per
-# emitted group (the bucketing/sort is unmetered — cost.md §3).
+# emitted group, plus each row's grouping and sort keys by size (0 for integers — cost.md §3 "sort_key / hash_key").
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, query.order_by_expr, query.order_by_alias, query.limit, types.i32, types.decimal, resource.cost_metering
 
 statement ok
@@ -49,7 +49,8 @@ statement ok
 INSERT INTO td VALUES (1, 1.5), (2, 1.50), (3, 2.00)
 
 # names: d, count
-# cost: 9
+# Per-row keys add 20 (cost.md §3 "sort_key / hash_key"): 9 before them.
+# cost: 29
 query DI nosort
 SELECT d, COUNT(*) FROM td GROUP BY d ORDER BY d
 ----

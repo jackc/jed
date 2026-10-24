@@ -94,7 +94,7 @@ SELECT 1 HAVING false
 ----
 
 # --- DISTINCT and the window ----------------------------------------------------------
-# DISTINCT over one row: dedup is unmetered; the literal projection is a leaf.
+# DISTINCT over one row: its integer key charges no hash_key; the literal projection is a leaf.
 # cost: 1
 query I nosort
 SELECT DISTINCT 1
@@ -113,7 +113,7 @@ SELECT 1 OFFSET 1
 ----
 
 # --- set operations (grammar.md §25) --------------------------------------------------
-# Each operand costs its own 1; the combine is unmetered. No ORDER BY → rowsort.
+# Each operand costs its own 1; the combine's integer keys charge nothing. No ORDER BY → rowsort.
 # cost: 2
 query I rowsort
 SELECT 1 UNION SELECT 2

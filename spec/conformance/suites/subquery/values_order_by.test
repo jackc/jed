@@ -20,7 +20,8 @@ SELECT * FROM (VALUES (3), (1), (2) ORDER BY 1 LIMIT 2) AS v
 2
 
 # ORDER BY a default column name, descending.
-# cost: 5
+# Per-row keys add 3 (cost.md §3 "sort_key / hash_key"): 5 before them.
+# cost: 8
 query IT rowsort
 SELECT * FROM (VALUES (3, 'a'), (1, 'b'), (2, 'c') ORDER BY column2 DESC LIMIT 1) AS v
 ----

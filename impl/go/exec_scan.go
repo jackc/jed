@@ -650,6 +650,9 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 				}
 				projected[i] = v
 			}
+			if err := chargeHashKeys(c.meter, projected); err != nil {
+				return nil, false, err
+			}
 			inserted, err := c.seen.insert(projected)
 			if err = c.meter.costFirst(err); err != nil {
 				return nil, false, err
@@ -1123,6 +1126,10 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 					return false, err
 				}
 				projected[i] = v
+			}
+			if err := chargeHashKeys(meter, projected); err != nil {
+				distinctWork += meter.Accrued - before
+				return false, err
 			}
 			distinctWork += meter.Accrued - before
 			inserted, err := seen.insert(projected)
@@ -1696,7 +1703,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 			// The selection discards rows: release the buffer, re-reserve the kept rows.
 			charge.releaseAll()
 			var err error
-			rows, err = topKRows(rows, plan.order, *plan.phys.topK, meter.query)
+			rows, err = topKRows(rows, plan.order, *plan.phys.topK, meter.query, meter)
 			if err = meter.costFirst(err); err != nil {
 				return emitter{}, err
 			}
@@ -1707,7 +1714,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 					}
 				}
 			}
-		} else if err := meter.costFirst(sortRows(rows, plan.order, meter.query)); err != nil {
+		} else if err := meter.costFirst(sortRows(rows, plan.order, meter.query, meter)); err != nil {
 			return emitter{}, err
 		}
 		sorted = &sortedRows{mem: rows, charge: charge}
@@ -1720,7 +1727,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		var t *topKKeeper
 		var s *sorter
 		if useTopK {
-			t = newTopKKeeper(*plan.phys.topK, plan.order, false)
+			t = newTopKKeeper(*plan.phys.topK, plan.order, false, meter)
 			t.charge = meter.stateCharge()
 		} else {
 			s = db.newSorterFor(plan.order)
@@ -1754,7 +1761,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 					var pushed error
 					if useTopK {
 						pushed = t.push(row)
-					} else {
+					} else if pushed = chargeSortKeys(meter, row, plan.order); pushed == nil {
 						pushed = s.push(row)
 					}
 					if err := meter.costFirst(pushed); err != nil {

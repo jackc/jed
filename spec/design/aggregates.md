@@ -146,8 +146,7 @@ The deliberate restrictions, all matching PostgreSQL (oracle-verified):
 **Cost** (the cross-core contract, §8): `aggregate_accumulate` is still charged per `(input row ×
 aggregate)` — the argument is evaluated per row to *know* the value to de-duplicate — and only the
 actual **fold** (and any `decimal_work` it would charge) is skipped for a duplicate. Each checked
-input also charges `hash_key` × its arguments' payload ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"; specified, not yet
-implemented). Because the
+input also charges `hash_key` × its arguments' payload ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"). Because the
 first-occurrence set is deterministic (scan order is cross-core identical), the metered cost is
 deterministic and identical across cores.
 
@@ -192,7 +191,7 @@ Aggregation adds one cost unit, `aggregate_accumulate` (weight 1,
   surviving group with `GROUP BY`). Projection `operator_eval`s of the output expressions
   are charged **per emitted group row** (the synthetic row, §9).
 - **Grouping keys**: each input row charges `hash_key` × the payload of its grouping keys, once per
-  grouping set ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"; specified, not yet implemented). Fixed-width keys measure 0.
+  grouping set ([cost.md](cost.md) §3 "`sort_key` / `hash_key`"). Fixed-width keys measure 0.
 - **Unmetered**: the group table's probes, and the **finalize** step (including `AVG`'s
   division and the `SUM` widening) — like the `ORDER BY` sort's comparisons and the `DISTINCT`
   probes.

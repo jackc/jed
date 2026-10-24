@@ -1,6 +1,7 @@
 # Bounded top-k for blocking ORDER BY ... LIMIT (planner.md §4, spill.md §5). The rule retains
 # K=OFFSET+LIMIT rows with the exact ORDER BY comparator and input position as stable tie-break.
-# Sort/heap bookkeeping is unmetered: every cost below is the former full-sort cost.
+# Sort/heap bookkeeping is unmetered and every row the heap receives charges its keys, so every
+# cost below is the full sort's cost.
 # requires: ddl.create_table, ddl.primary_key, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.order_by_expr, query.order_by_topk, query.limit, query.offset, query.join_inner, expr.arithmetic, expr.collate, types.i32, types.text, error.division_by_zero, resource.cost_metering
 
 # load-collation: unicode = collation/17.0.0/root.allkeys
@@ -75,7 +76,8 @@ SELECT id FROM tk ORDER BY a + b, id DESC LIMIT 3
 
 # Collated keys build every UCA decoration before selection. unicode orders a < A < ä < b < n < ñ < z.
 # names: id
-# cost: 12
+# Per-row keys add 8 (cost.md §3 "sort_key / hash_key"): 12 before them.
+# cost: 20
 query I nosort
 SELECT id FROM tk ORDER BY s COLLATE "unicode", id LIMIT 3
 ----

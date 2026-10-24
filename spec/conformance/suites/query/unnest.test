@@ -83,7 +83,8 @@ SELECT * FROM unnest('[5:7]={10,20,30}'::i32[]) AS u ORDER BY u
 30
 
 # --- a text[] element type: the produced column is text --------------------------------
-# cost: 7
+# Per-row keys add 3 (cost.md §3 "sort_key / hash_key"): 7 before them.
+# cost: 10
 query T nosort
 SELECT * FROM unnest(ARRAY['a','b','c']) AS u ORDER BY u
 ----

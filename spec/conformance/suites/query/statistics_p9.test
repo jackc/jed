@@ -38,7 +38,8 @@ Index bound: using p9_stats_skew_idx; touched=2
 statement ok
 ANALYZE p9_stats (skew, label)
 
-# cost: 4
+# Per-row keys add 9 (cost.md §3 "sort_key / hash_key"): 4 before them.
+# cost: 13
 query TTIBIIIII nosort
 SELECT table_name, column_name, analyzed_rows, is_stale, null_count, distinct_count,
        sample_rows, average_width, mcv_count, histogram_count

@@ -86,6 +86,8 @@ mod estimate_plan;
 mod execute;
 mod explain_exec;
 mod kernels;
+mod key_meter;
+pub(crate) use key_meter::*;
 mod optimize;
 mod plan_params;
 mod plan_query;

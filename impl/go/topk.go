@@ -67,10 +67,13 @@ type topKKeeper struct {
 	// collated: each retained item reserves its sort keys with its row, released when it is evicted
 	// or the heap is finished. nil (inert) unless withDecorations.
 	decorations *stateCharge
+	// meter charges every pushed row's sort keys (cost.md §3 "sort_key / hash_key"), including the
+	// rows the heap discards.
+	meter *costMeter
 }
 
-func newTopKKeeper(k int64, order []orderSlot, collated bool) *topKKeeper {
-	return &topKKeeper{k: k, collated: collated, selection: topKHeap{order: order, collated: collated}}
+func newTopKKeeper(k int64, order []orderSlot, collated bool, m *costMeter) *topKKeeper {
+	return &topKKeeper{k: k, collated: collated, selection: topKHeap{order: order, collated: collated}, meter: m}
 }
 
 // withDecorations charges the retained items' collation decorations to acct (memory.md §6.8). A
@@ -87,10 +90,12 @@ func (t *topKKeeper) push(row storedRow) error {
 	t.nextPos++
 	if t.collated {
 		var err error
-		item.keys, err = collationKeysForRow(row, t.selection.order)
+		item.keys, err = collationKeysForRow(row, t.selection.order, t.meter)
 		if err != nil {
 			return err
 		}
+	} else if err := chargeSortKeys(t.meter, row, t.selection.order); err != nil {
+		return err
 	}
 	// A collated LIMIT 0 must still build every sort key: the old decorate-sort path could trap
 	// here after scan/filter completed. The all-C path has no fallible sort work to preserve.
@@ -149,7 +154,7 @@ func (t *topKKeeper) finish() []storedRow {
 // topKRows consumes the already-materialized pre-sort sequence. Expression ORDER BY values have
 // already been appended by the caller; collated sort keys are built for every input row, in input
 // order, before any output is returned, preserving the full sort's error timing.
-func topKRows(rows []storedRow, order []orderSlot, k int64, acct queryAccount) ([]storedRow, error) {
+func topKRows(rows []storedRow, order []orderSlot, k int64, acct queryAccount, m *costMeter) ([]storedRow, error) {
 	collated := false
 	for _, key := range order {
 		if key.collation != nil {
@@ -157,7 +162,7 @@ func topKRows(rows []storedRow, order []orderSlot, k int64, acct queryAccount) (
 			break
 		}
 	}
-	t := newTopKKeeper(k, order, collated).withDecorations(acct)
+	t := newTopKKeeper(k, order, collated, m).withDecorations(acct)
 	for i, row := range rows {
 		if err := t.push(row); err != nil {
 			t.decorations.releaseAll()

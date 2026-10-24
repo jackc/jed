@@ -823,13 +823,15 @@ impl Engine {
                     // then re-reserve the kept rows (never more than was released).
                     meter.release_rows_masked(&rows, &mem_mask);
                     let acct = meter.query.clone();
-                    rows = meter.cost_first(top_k_rows(rows, &plan.order, k, &acct))?;
+                    let r = top_k_rows(rows, &plan.order, k, &acct, meter);
+                    rows = meter.cost_first(r)?;
                     for row in &rows {
                         meter.admit_row_masked(row, &mem_mask)?;
                     }
                 } else {
                     let acct = meter.query.clone();
-                    meter.cost_first(sort_rows(&mut rows, &plan.order, &acct))?;
+                    let r = sort_rows(&mut rows, &plan.order, &acct, meter);
+                    meter.cost_first(r)?;
                 }
                 if select_actual_root_node(plan) != "Sort"
                     && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
@@ -950,6 +952,7 @@ impl Engine {
                         meter.checkpoint()?; // enforce the cost ceiling per folded row (CLAUDE.md §13)
                         let key: Vec<Value> =
                             gset.key_cols.iter().map(|&gk| row[gk].clone()).collect();
+                        charge_hash_keys(meter, &key)?;
                         let gi = match index.get(&key) {
                             Some(&i) => i,
                             None => {
@@ -983,11 +986,12 @@ impl Engine {
                             // NULLS FIRST/LAST). The hypothetical row itself is evaluated per group at
                             // finalize. No DISTINCT (rejected at resolve).
                             if let Some(hp) = &spec.hypo {
-                                let tuple = hp
-                                    .keys
-                                    .iter()
-                                    .map(|k| k.eval(row, &env, meter))
-                                    .collect::<Result<Vec<Value>>>()?;
+                                let mut tuple = Vec::with_capacity(hp.keys.len());
+                                for (k, sort) in hp.keys.iter().zip(&hp.sorts) {
+                                    let kv = k.eval(row, &env, meter)?;
+                                    charge_sort_key(meter, &kv, sort.collation.as_deref())?;
+                                    tuple.push(kv);
+                                }
                                 if meter.query_memory_active() {
                                     let bytes = crate::memsize::row_bytes(&tuple);
                                     meter.reserve_query(bytes)?;
@@ -1016,9 +1020,11 @@ impl Engine {
                             // `insert` returns false when the value is a repeat. A NULL is skipped too,
                             // except by the JSON array aggregates, which fold it (aggregates.md §5).
                             if let Some(seen) = &mut groups[gi].2[si] {
-                                if (matches!(v, Value::Null) && !spec.plan.distinct_keeps_null())
-                                    || !seen.insert(v.clone())
-                                {
+                                if matches!(v, Value::Null) && !spec.plan.distinct_keeps_null() {
+                                    continue;
+                                }
+                                charge_hash_key(meter, &v)?;
+                                if !seen.insert(v.clone()) {
                                     continue;
                                 }
                                 if meter.query_memory_active() {
@@ -1167,7 +1173,8 @@ impl Engine {
                 if !plan.order.is_empty() {
                     materialize_order_exprs(&mut group_rows, &plan.order_exprs, &env, meter)?;
                     let acct = meter.query.clone();
-                    meter.cost_first(sort_rows(&mut group_rows, &plan.order, &acct))?;
+                    let r = sort_rows(&mut group_rows, &plan.order, &acct, meter);
+                    meter.cost_first(r)?;
                     if select_actual_root_node(plan) != "Sort"
                         && let Some(profile) = self.explain_actual.borrow_mut().as_mut()
                     {
@@ -1201,6 +1208,7 @@ impl Engine {
                         for p in &plan.projections {
                             out.push(p.eval(srow, &env, meter)?);
                         }
+                        charge_hash_keys(meter, &out)?;
                         if seen.insert(out.clone()) {
                             if meter.query_memory_active() {
                                 let bytes = crate::memsize::entry_bytes(&out);
@@ -1252,6 +1260,7 @@ impl Engine {
                     for p in &plan.projections {
                         out.push(p.eval(row, &env, meter)?);
                     }
+                    charge_hash_keys(meter, &out)?;
                     if seen.insert(out.clone()) {
                         if meter.query_memory_active() {
                             let bytes = crate::memsize::entry_bytes(&out);

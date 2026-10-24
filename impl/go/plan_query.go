@@ -580,6 +580,28 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	// For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
 	// NULL-safe distinctRowKey the set operators use.
 	seen := map[string]bool{}
+	// chargeKeys charges a UNION row's columns as hash_key before its duplicate check (cost.md §3
+	// "sort_key / hash_key"); UNION ALL builds no table. The charge lands on its own meter, which
+	// feeds the session's lifetime total, and in totalCost, which the statement ceiling guards.
+	keyMeter := db.session.newMeter()
+	chargeKeys := func(row storedRow) error {
+		if rt.unionAll {
+			return nil
+		}
+		var units int64
+		for _, v := range row {
+			units += costs.HashKey * memPayloadBytes(v)
+		}
+		if units == 0 {
+			return nil
+		}
+		keyMeter.Charge(units)
+		*totalCost += units
+		if err := guard(*totalCost); err != nil {
+			return err
+		}
+		return keyMeter.Guard()
+	}
 	keep := func(row storedRow) bool {
 		if rt.unionAll {
 			return true
@@ -601,6 +623,9 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	defer seenCharge.releaseAll()
 	var result, working []storedRow
 	for _, row := range anchorRows {
+		if err := chargeKeys(row); err != nil {
+			return nil, err
+		}
 		if keep(row) {
 			if !rt.unionAll && seenCharge.active() {
 				if err := seenCharge.reserveDirect(memEntryBytes(row)); err != nil {
@@ -666,6 +691,9 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 		}
 		for _, vrow := range rr.rows {
 			row := storedRow(vrow)
+			if err := chargeKeys(row); err != nil {
+				return nil, err
+			}
 			if keep(row) {
 				if !rt.unionAll && seenCharge.active() {
 					if err := seenCharge.reserveDirect(memEntryBytes(row)); err != nil {
@@ -1922,7 +1950,8 @@ func (db *engine) planSetOp(so *setOp, parent *scope, ctes []*cteBinding, ptypes
 
 // execSetOpPlan executes a resolved set operation: run both operands against the outer
 // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
-// rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+// rhs.cost plus the combine's and the sort's per-row keys (cost.md §3 "sort_key / hash_key"); the
+// combine's probes, the sort's comparisons, and the window are unmetered.
 func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	left, err := db.execQueryPlan(&plan.lhs, outer, params, ctes)
 	if err != nil {
@@ -1944,12 +1973,25 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 		return selectResult{}, err
 	}
 
+	// The combine and the sort charge their per-row keys on a meter that starts from both arms' cost,
+	// so its guard sees the whole statement: every left row, then every right row, unless UNION ALL.
+	meter := db.session.newMeter()
+	meter.Accrued = left.cost + right.cost
+	if !(plan.op == setOpUnion && plan.all) {
+		for _, arm := range [][][]Value{left.rows, right.rows} {
+			for _, row := range arm {
+				if err := chargeHashKeys(meter, row); err != nil {
+					return selectResult{}, err
+				}
+			}
+		}
+	}
 	rows, err := combineSetop(plan.op, plan.all, left.rows, right.rows, acct)
 	if err != nil {
 		return selectResult{}, err
 	}
 	acct.release(coerced - measureRows(acct, rows))
-	cost := left.cost + right.cost
+	cost := meter.Accrued
 	rootNode := setOpNodeName(plan.op)
 	if plan.limit != nil || plan.offset != nil {
 		rootNode = "Limit"
@@ -1961,9 +2003,10 @@ func (db *engine) execSetOpPlan(plan *setOpPlan, outer []storedRow, params []Val
 	}
 
 	if len(plan.order) > 0 {
-		if err := sortRows(rows, plan.order, acct); err != nil {
+		if err := sortRows(rows, plan.order, acct, meter); err != nil {
 			return selectResult{}, err
 		}
+		cost = meter.Accrued
 		if rootNode != "Sort" {
 			db.explainActual.recordParent("Sort", cost)
 		}

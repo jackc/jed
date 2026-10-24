@@ -2,7 +2,8 @@
 # The bare form is distinct (one row per left key absent from the right); EXCEPT ALL keeps
 # max(0, m - n) copies, where m, n are a row's multiplicity in the left and right operand.
 # Matching is NULL-safe (NULL == NULL) and value-canonical. Output columns count + names from
-# the left operand. Cost = lhs.cost + rhs.cost (the difference is unmetered) — cost.md §3.
+# the left operand. Cost = lhs.cost + rhs.cost + each operand row's hash_key (0 for an integer
+# column; the difference itself is unmetered) — cost.md §3.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.except, query.where_eq, query.comparison_order, query.order_by, types.i32, types.decimal, resource.cost_metering
 
 statement ok
@@ -120,7 +121,8 @@ INSERT INTO ri VALUES (1, 1)
 # ld {1.0, 2.5} EXCEPT ri-as-decimal {1}: 1.0 == 1 removed, 2.5 survives (left value `2.5`).
 # Output type decimal. cost = 2*2 + 2*1 = 6.
 # names: n
-# cost: 8
+# Per-row keys add 12 (cost.md §3 "sort_key / hash_key"): 8 before them.
+# cost: 20
 query D rowsort
 SELECT n FROM ld EXCEPT SELECT n FROM ri
 ----

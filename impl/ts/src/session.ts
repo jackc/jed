@@ -39,6 +39,7 @@ import {
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { COSTS, DEFAULT_SCALAR_BYTES } from "./costs.ts";
 import { entryBytes } from "./memsize.ts";
+import { chargeHashKeys } from "./key_meter.ts";
 import type { TableStore } from "./storage.ts";
 import type { KeyBound } from "./pmap.ts";
 
@@ -731,6 +732,7 @@ function* streamRowsSequence(
         if (at >= 0) ra!.setRow(ra!.project, at, env, meter);
         const projected = evalExpressionsMaybeSteps(sp.projections, row, projectEnv, meter);
         const tuple = isPendingEval(projected) ? yield* projected : projected;
+        chargeHashKeys(meter, tuple); // the dedup set receives the row (cost.md §3)
         const key = distinctRowKey(tuple);
         // A new value reserves its dedup entry until the scan ends (memory.md §6.2).
         if (!meter.costFirst(() => seen.insert(key, tuple))) continue;

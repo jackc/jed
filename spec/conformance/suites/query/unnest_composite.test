@@ -20,7 +20,8 @@ CREATE TYPE addr AS (street text, zip i32)
 # composite total order puts (Main,…) before (Side,…). One column named `u`, typed addr.
 # names: u
 # types: addr
-# cost: 4
+# Per-row keys add 136 (cost.md §3 "sort_key / hash_key"): 4 before them.
+# cost: 140
 query T nosort
 SELECT u FROM unnest('{"(Main,90210)","(Side,5)"}'::addr[]) AS u ORDER BY u
 ----
@@ -31,7 +32,8 @@ SELECT u FROM unnest('{"(Main,90210)","(Side,5)"}'::addr[]) AS u ORDER BY u
 # (ORDER BY u — the whole composite — since ORDER BY by a bare field expression is a separate
 # follow-on; the composite order puts Main before Side.)
 # names: street, zip
-# cost: 8
+# Per-row keys add 136 (cost.md §3 "sort_key / hash_key"): 8 before them.
+# cost: 144
 query TI nosort
 SELECT (u).street, (u).zip FROM unnest('{"(Main,90210)","(Side,5)"}'::addr[]) AS u ORDER BY u
 ----
@@ -62,7 +64,8 @@ SELECT count(*) FROM unnest('{"(Main,90210)",NULL}'::addr[])
 2
 
 # --- a multidimensional array flattens in row-major order -------------------------------
-# cost: 8
+# Per-row keys add 260 (cost.md §3 "sort_key / hash_key"): 8 before them.
+# cost: 268
 query T nosort
 SELECT u FROM unnest('{{"(a,1)","(b,2)"},{"(c,3)","(d,4)"}}'::addr[]) AS u ORDER BY u
 ----

@@ -3,9 +3,10 @@
 # keeps every row. Output column count + NAMES come from the LEFT operand. Output order with no
 # ORDER BY is unspecified (compared rowsort); a trailing ORDER BY/LIMIT/OFFSET applies to the
 # whole combined result and resolves keys by OUTPUT column name. Cost is the cross-core contract
-# of cost.md §3: cost = lhs.cost + rhs.cost; the dedup, the ORDER BY sort, and the LIMIT/OFFSET
-# slice are all unmetered — so a bare-column `SELECT col FROM t` operand costs 2*|t|
-# (storage_row_read + row_produced per row), and LIMIT does NOT lower the cost.
+# of cost.md §3: cost = lhs.cost + rhs.cost, plus each row's keys by size for the dedup and the
+# ORDER BY sort (0 for integer columns); the dedup probes, the sort's comparisons, and the
+# LIMIT/OFFSET slice are unmetered — so a bare-column integer `SELECT col FROM t` operand costs
+# 2*|t| (storage_row_read + row_produced per row), and LIMIT does NOT lower the cost.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.column_alias, query.limit, query.offset, types.i32, types.decimal, resource.cost_metering
 
 statement ok
@@ -34,8 +35,8 @@ SELECT k FROM a UNION ALL SELECT k FROM b
 30
 40
 
-# UNION (bare) deduplicates across both operands: distinct {10,20,30,40}. Dedup is unmetered,
-# so the cost is the SAME 12 as UNION ALL.
+# UNION (bare) deduplicates across both operands: distinct {10,20,30,40}. Its integer keys charge
+# no hash_key, so the cost is the SAME 12 as UNION ALL.
 # names: k
 # cost: 14
 query I rowsort
@@ -215,7 +216,8 @@ INSERT INTO ad VALUES (1, 5.0), (2, 9.50)
 # LEFT (first-scanned) operand's value `5`. Distinct set {5, 7, 9.50}, output type decimal.
 # cost = 2*2 + 2*2 = 8.
 # names: n
-# cost: 10
+# Per-row keys add 16 (cost.md §3 "sort_key / hash_key"): 10 before them.
+# cost: 26
 query D rowsort
 SELECT n FROM ai UNION SELECT n FROM ad
 ----
@@ -225,7 +227,8 @@ SELECT n FROM ai UNION SELECT n FROM ad
 
 # Ordered, deduplicated (no ties survive dedup): 5, 7, 9.50.
 # names: n
-# cost: 10
+# Per-row keys add 28 (cost.md §3 "sort_key / hash_key"): 10 before them.
+# cost: 38
 query D nosort
 SELECT n FROM ai UNION SELECT n FROM ad ORDER BY n
 ----

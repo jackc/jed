@@ -57,7 +57,8 @@ SELECT js->>'o' FROM t
 {"k": 1}
 
 # jsonb_each_text renders each container member: 15 bytes for a, 13 for o, nothing for the string s.
-# cost: 36
+# Per-row keys add 3 (cost.md §3 "sort_key / hash_key"): 36 before them.
+# cost: 39
 query TT nosort
 SELECT key, value FROM t, jsonb_each_text(t.j) ORDER BY key
 ----
