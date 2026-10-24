@@ -230,6 +230,7 @@ generation (in the slot it was written to) and the pending set empties. The flus
   handle's `synchronous` setting, [pageservice/README.md](../pageservice/README.md) §6.6).
 - **Compaction** writes a new, already durable image and empties the pending set.
 - **Stabilization** of an adopted generation (§3) is a flush.
+- **The batch deadline** (the time-based flush, §4.1).
 
 **Trailing truncation** ([fileformat/format.md](../fileformat/format.md) *Trailing truncation*) runs
 only at a durable barrier, with nothing pending. Two rules keep it inside the batch protocol:
@@ -239,7 +240,7 @@ only at a durable barrier, with nothing pending. Two rules keep it inside the ba
   floor and on no pending set. A commit inside a batch never lowers it; the batch's later commits
   draw from the lowered high-water, which hands out only those floor-free pages, so rule 3 holds.
 - The file is shortened only right after a barrier that covers the newest generation: at once for a
-  `synchronous = on` commit, otherwise at the batch's flush — the cap, close, detach, or an ownership
+  `synchronous = on` commit, otherwise at the batch's flush — the cap, the deadline, close, detach, or an ownership
   release — to one growth step past the newest generation's high-water. Until then the floor's pages
   above the new `page_count` stay in the file, so the floor's meta stays usable (open skips a slot
   whose `page_count` exceeds the file). The owner's flushes for its page clients (before a
@@ -271,6 +272,67 @@ issued all of its writes to the operating system, meta last, before it returns, 
 process alone, with the kernel surviving, loses no acknowledged commit. (The simulator's process-crash
 model lets each write of the crashing step be issued or not independently, which is more pessimistic;
 it checks only the floor.)
+
+### 4.1 The time-based flush
+
+A relaxed batch that nothing else ends becomes durable once it has been pending for the handle's
+**`flush_interval_ms`** (default **1000**; `0` turns the time-based flush off). The interval is
+measured on the handle's clock source ([environment.md](environment.md) §4), the same seam `now()`
+reads, so a manual clock makes it exactly reproducible:
+
+1. **Reading.** Every relaxed commit of a file domain whose handle has a non-zero interval reads the
+   clock **once**, after waiting for any in-flight flush and before planning, and so does any other
+   commit of the file's owner that begins inside a batch (a `synchronous = on` owner's relaxed page
+   clients may have opened one). A `synchronous = on` commit with nothing pending, an in-memory
+   domain, and a page client's storage read nothing; the owner's interval and clock time every batch
+   in its file.
+2. **Deadline.** A commit that begins with nothing pending starts a batch; if it leaves pages
+   pending, the batch's **deadline** is its reading plus the interval (saturating). Each file domain
+   has its own batch and deadline.
+3. **Flush first.** A commit that begins with a pending batch and reads a value at or past the
+   deadline flushes the batch **before** it plans, exactly like any other flush point; it then begins
+   with nothing pending and starts the next batch with the same reading. A failed flush is the
+   commit's error and poisons the handle. The commit is never part of the batch it ended.
+   A synchronous commit's own barrier then ends the batch it began in.
+4. **Page clients** ([page-service.md](page-service.md) §6). A relaxed page client plans against the
+   owner's batch when its `begin_write` is granted, so the owner applies rule 3 there: with a batch
+   pending it reads its clock and, at or past the deadline, flushes first (shrinking nothing, like the
+   flush before a synchronous client), and `write_begun` names the empty set. A relaxed client commit
+   that starts a batch sets the deadline from a reading the owner takes when it applies the commit;
+   one that reaches the cap ends it. A client commit is never flushed before it lands: it joins the
+   batch it planned against, however late. (One recorded divergence: a Node owner serves from a worker
+   thread that can read only the wall clock, so with any other clock source it skips this flush and
+   dates a client-started batch when its engine thread next runs; the simulator's in-thread service
+   and every wall-clock owner follow the rule exactly.)
+5. **Idle flush.** A batch that no commit follows is flushed by an **idle flusher** (a thread in
+   Rust, a goroutine in Go, a timer on the TypeScript event loop) that wakes when the deadline should
+   have passed, excludes the domain's commits, reads the clock, and flushes if the reading is at or
+   past the deadline (otherwise it waits again). On a page-service owner it first takes the writer
+   gate, without waiting: a holder may be a relaxed client planning against the batch, so while the
+   gate is held the flusher waits again. Its flush shortens the file like the cap flush, and
+   its failure revokes the storage like the cap flush's. The flusher stops at `close` and detach.
+
+Rule 3 is what keeps the idle flusher invisible to the bytes. The flusher flushes only once the clock
+has passed the deadline, and the clock does not move backward, so the next commit (or relaxed
+client's `begin_write`) would have found the deadline passed and flushed before planning anyway. The idle flush does early what that commit
+would have done, so which commits a flush covers, which slot each meta lands in, and every page id
+are functions of the commit sequence and its clock readings alone, with or without the flusher. The
+two cases where this does not hold are out of the contract: a wall clock stepped backward (the
+flusher may then flush a batch a later commit would have extended), and an advancing clock
+([environment.md](environment.md) §4), whose readings count the flusher's own reads. The
+deterministic simulator runs no idle flusher (as it runs the cap flush inline) and moves time only on
+its `clock` steps.
+
+The time-based flush bounds how long an acknowledged relaxed commit stays undurable while the handle
+is idle: about the interval plus one barrier. While commits keep arriving, it ends a batch at the
+first commit past the deadline, so a power loss loses at most about one interval of acknowledged
+commits (and never more than one cap's worth). It changes nothing under `synchronous = on`, and
+results, plans, and cost do not depend on it. Nor does `max_storage_bytes`: the check a commit that
+also writes an in-memory database makes before any database writes ([memory.md](memory.md) §8.3)
+plans the file's pending batch as it stands, even when the commit will flush it at the deadline, and
+the answer is the same either way, because the file form limits live pages (§8.7), whose count does
+not depend on which page ids a commit takes. A flush that a page client's `begin_write`, the cap,
+close, or compaction performs ends the batch and its deadline with it.
 
 ## 5. Integration and verification
 

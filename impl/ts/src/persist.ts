@@ -18,7 +18,14 @@ import { unselectedKeyPage } from "./crypto.ts";
 import { engineError } from "./errors.ts";
 import { runSync, type Steps } from "./execution.ts";
 import type { FileHost } from "./filehost.ts";
+import {
+  BatchDeadline,
+  type DeadlineSlot,
+  type Durability,
+  type IdleTarget,
+} from "./idle_flush.ts";
 import { cacheLeaves } from "./paging.ts";
+import { wallClock } from "./seam.ts";
 import type { SpillSink } from "./spill.ts";
 import {
   catalogPageCount,
@@ -240,7 +247,10 @@ export function* precheckBudgetSteps(
 ): Steps<void> {
   if (db.paging === null || db.storageBudget.limit <= 0n) return;
   if (db.persistHook !== null) {
-    // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
+    // Plan as the commit will: a pending relaxed batch reuses only pages free at its floor. A commit
+    // past its batch's deadline flushes first and plans without that restriction (validated-cow.md
+    // §4.1); the answer is the same, since live pages (memory.md §8.7) do not depend on which page
+    // ids a commit takes.
     const allowed = batchOpen(db) ? yield* floorFreeSteps(db) : null;
     const write = yield* incrementalImageSteps(
       snap,
@@ -292,10 +302,50 @@ export function* persistSteps(
   budget: BudgetCtx | null = null,
   truncate = true,
 ): Steps<IncrementalWrite> {
+  // The batch deadline (validated-cow.md §4.1): the idle flusher is held off from the clock reading to
+  // the publish, so it never runs inside a commit that awaits. The file's owner times every batch, a
+  // synchronous one's included, since its relaxed page clients may open one; a page client's storage
+  // times none.
+  const deadline = timedFile(db) ? db.batchDeadline : null;
+  if (deadline === null) {
+    return yield* persistBodySteps(db, snap, canReclaim, canReuse, budget, truncate, null);
+  }
+  deadline.enter();
+  try {
+    return yield* persistBodySteps(db, snap, canReclaim, canReuse, budget, truncate, deadline);
+  } finally {
+    deadline.leave();
+  }
+}
+
+function* persistBodySteps(
+  db: Engine,
+  snap: Snapshot,
+  canReclaim: boolean | undefined,
+  canReuse: boolean,
+  budget: BudgetCtx | null,
+  truncate: boolean,
+  deadline: BatchDeadline | null,
+): Steps<IncrementalWrite> {
   let allowed: Set<number> | null = null;
+  let pending = false;
+  let now = 0n;
+  let read = false;
   if (db.paging !== null && db.persistHook !== null) {
-    const pending = batchOpen(db);
+    pending = batchOpen(db);
     db.paging.checkDurableCommit();
+    if (deadline !== null && (pending || relaxedFile(db))) {
+      // One clock reading per relaxed commit, or per commit that begins inside a batch (rule 1); past
+      // the deadline, flush the batch before planning (rule 3). A failed flush is the commit's error and
+      // poisons the storage.
+      read = true;
+      now = db.environment.clockSource().nowMicros();
+      if (pending && deadline.passed(now)) {
+        yield* db.paging.flushPendingSteps();
+        deadline.clear();
+        pending = false;
+      }
+    }
     allowed = yield* reuseAllowedSteps(db, pending);
   }
   const write =
@@ -317,9 +367,94 @@ export function* persistSteps(
   // store (persistHook null) keeps its free-list in RAM.
   if (db.persistHook !== null) {
     const live = yield* admitFileSteps(db, write, budget?.prev ?? db.committed, budget);
-    yield* commitFileSteps(db, snap, write, live, reclaim, canReuse, allowed, truncate);
+    const capReached = yield* commitFileSteps(
+      db,
+      snap,
+      write,
+      live,
+      reclaim,
+      canReuse,
+      allowed,
+      truncate,
+    );
+    // A synchronous commit's own barrier ends the batch it began in.
+    if (deadline !== null && read) {
+      deadline.afterCommit(
+        !pending,
+        relaxedFile(db) && !capReached,
+        now,
+        idleTarget(db),
+        db.environment.clockSource(),
+      );
+    }
   } else commitInMemory(db, snap, write, reclaim);
   return write;
+}
+
+// idleTarget is db's domain as its idle flusher flushes it (validated-cow.md §4.1 rule 5), read when the
+// timer fires: the storage then in place (compaction may have replaced it), flushed like the cap flush
+// under a page-service owner's writer gate, so it never runs beside a client's begin_write or commit.
+function idleTarget(db: Engine): IdleTarget {
+  return {
+    pending: () => {
+      const paging = db.paging;
+      return (
+        paging !== null && timedFile(db) && !paging.commitRequiresReopen() && paging.hasPending()
+      );
+    },
+    flush: (begin) => {
+      let release: (() => void) | null = null;
+      if (db.flushGate !== null) {
+        release = db.flushGate();
+        if (release === null) return false;
+      }
+      try {
+        if (begin()) runSync(capFlushSteps(db));
+      } finally {
+        release?.();
+      }
+      return true;
+    },
+  };
+}
+
+// armClientBatch arms db's idle flusher for a batch a relaxed page client's commit started on its
+// service (validated-cow.md §4.1 rule 4): the service runs on another thread, so it asks the engine
+// thread to (owner.ts).
+export function armClientBatch(db: Engine): void {
+  if (!timedFile(db)) return;
+  db.batchDeadline.armClientBatch(idleTarget(db), db.environment.clockSource());
+}
+
+// bindBatchDeadline keeps db's batch deadline in a page-service owner's shared state (validated-cow.md
+// §4.1 rule 4), where its service reads and sets it under the writer gate.
+export function bindBatchDeadline(db: Engine, slot: DeadlineSlot): void {
+  db.batchDeadline.bind(slot, db.environment.clockSource() === wallClock());
+}
+
+// setDurability sets the handle's durability settings on domain db: synchronous = off and its
+// time-based flush (validated-cow.md §4, §4.1). A durable domain only batches; in-memory and page-client
+// storage never read the settings.
+export function setDurability(db: Engine, d: Durability): void {
+  db.relaxed = d.relaxed;
+  const slot = db.batchDeadline.slot();
+  db.batchDeadline.stop();
+  db.batchDeadline = new BatchDeadline(d.flushIntervalMs, d.idleFlush);
+  if (slot !== null) bindBatchDeadline(db, slot);
+}
+
+// durabilityOf is db's durability settings, which a file attachment follows.
+export function durabilityOf(db: Engine): Durability {
+  return {
+    relaxed: db.relaxed,
+    flushIntervalMs: db.batchDeadline.intervalMs,
+    idleFlush: db.batchDeadline.idle,
+  };
+}
+
+// stopIdleFlush ends db's idle flusher (close, detach, a role change).
+export function stopIdleFlush(db: Engine): void {
+  db.batchDeadline.stop();
 }
 
 // DirectorySync makes the directory holding the database file at path durable, through files (null is
@@ -329,6 +464,17 @@ type DirectorySync = (files: FileHost | null, path: string) => void;
 // §4): a durable domain of a relaxed handle.
 function relaxedFile(db: Engine): boolean {
   return db.relaxed && db.persistHook !== null && db.paging !== null;
+}
+
+// timedFile reports whether db's commits time batches (validated-cow.md §4.1 rule 1): a durable domain
+// with a non-zero interval that is not a page client's storage, whose owner times its batches.
+function timedFile(db: Engine): boolean {
+  return (
+    db.batchDeadline.timed() &&
+    db.persistHook !== null &&
+    db.paging !== null &&
+    !db.paging.trustsMeta()
+  );
 }
 
 // reuseAllowedSteps is the reuse restriction of the commit about to plan (validated-cow.md §4 rule 3).
@@ -455,7 +601,8 @@ export function* writeKeyBlockSteps(db: Engine, block: Uint8Array): Steps<void> 
 // Write tree/catalog first so reclamation can read the new catalog. Joint allocation then reserves
 // descriptor and free-list pages from the prior safe free set, protecting every new write from reuse.
 // The inline/overflow descriptor hashes those body pages and the single final sync publishes them.
-// live is the admitted live-page count the meta publishes (memory.md §8.7).
+// live is the admitted live-page count the meta publishes (memory.md §8.7). Returns whether the commit
+// reached the relaxed batch cap (a flush followed).
 // Each write, barrier, and read below completes before the next begins, in the synchronous order
 // (ts-runtime.md §11.2); after beginDurableCommitSteps any failure keeps the commit guard armed.
 function* commitFileSteps(
@@ -467,7 +614,7 @@ function* commitFileSteps(
   canReuse: boolean,
   allowed: Set<number> | null,
   truncate: boolean,
-): Steps<void> {
+): Steps<boolean> {
   syncDirectoryOnce(db);
   const paging = db.paging!;
   yield* paging.beginDurableCommitSteps();
@@ -546,6 +693,7 @@ function* commitFileSteps(
   db.freeGenTxid = plan.newGen;
   db.live = live;
   if (capReached) yield* capFlushSteps(db);
+  return capReached;
 }
 
 // commitInMemory is the IN-MEMORY branch of persistImpl: a MemoryBlockStore is never reopened, so it

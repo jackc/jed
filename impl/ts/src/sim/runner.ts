@@ -37,7 +37,7 @@ import type { PageClient } from "../pageservice/client.ts";
 import { readFreeListChain } from "../pageservice/delta.ts";
 import { ServiceHandoff } from "../pageservice/handoff.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
-import { persistImpl } from "../persist.ts";
+import { persistImpl, setDurability } from "../persist.ts";
 import { Environment } from "../environment.ts";
 import { type ClockSource, osRandomSource, type RandomSource, SeededRandom } from "../seam.ts";
 import { attachFile, Database, type Session } from "../shared.ts";
@@ -417,6 +417,12 @@ class SimDB {
   // recovery whose adopted generation awaits stabilization, which the commit's own first barrier makes
   // the floor.
   batchPending = false;
+  // deadline is the simulated-clock deadline of the batch pending on this database's file
+  // (validated-cow.md §4.1): the clock of the step that started it plus the trace's flush interval.
+  deadline = 0n;
+  // due is whether the step began with that batch past its deadline: a commit of this database in the
+  // step must flush it first.
+  due = false;
   // shrinkDue is set when a relaxed commit lowered the high-water: the next flush (the batch cap, close)
   // must shorten the file (format.md *Trailing truncation*).
   shrinkDue = false;
@@ -597,6 +603,9 @@ export class SimRunner {
   // barriers, flushing inline (TypeScript always does) so the barrier lands in the step that reached
   // the batch cap.
   private relaxed: boolean;
+  // flushIntervalMs is the header's flush_interval_ms (validated-cow.md §4.1; absent: 0, no time-based
+  // flush), measured on the simulated clock with no idle flusher.
+  private flushIntervalMs: number;
 
   fs: SimFS;
   private db: Database | null = null; // the database of the process running the current step
@@ -653,6 +662,7 @@ export class SimRunner {
     this.maxQueryMemory = parseInt64(tr.header.get("max_query_memory_bytes"));
     this.maxStorageBytes = parseInt64(tr.header.get("max_storage_bytes"));
     this.relaxed = tr.header.get("synchronous") === "off";
+    this.flushIntervalMs = atoi(tr.header.get("flush_interval_ms"));
     let sector = atoi(tr.header.get("sector"));
     if (sector <= 0) sector = SECTOR_DEFAULT;
     this.fs = new SimFS(this.seed, sector, ps);
@@ -902,6 +912,7 @@ export class SimRunner {
         shutdownGraceMs: SIM_SERVICE_GRACE_MS,
         // The handle's setting, which its file attachments follow whatever role it holds.
         synchronous: this.relaxed ? "off" : "on",
+        flushIntervalMs: this.flushIntervalMs,
         // Every process seals its scratch files, so encrypting a plaintext database is allowed (S13).
         scratchEncryption: this.encrypted ? "on" : "auto",
       },
@@ -1012,7 +1023,12 @@ export class SimRunner {
     // Create, compaction, and attachments go through the simulated filesystem.
     e.fileHost = this.fs;
     e.persistHook = persistImpl;
-    e.relaxed = this.relaxed;
+    // Every flush lands in the step that caused it: no idle flusher.
+    setDurability(e, {
+      relaxed: this.relaxed,
+      flushIntervalMs: this.flushIntervalMs,
+      idleFlush: false,
+    });
     // Spill and temp-table spill scratch files, whose operations can fail; sealed in an encrypted trace
     // (encrypted.md §11), whatever main is now, so encrypting a plaintext database is allowed (S13).
     e.spillSink = sealScratch(this.fs.spillSink(), this.encrypted, env);
@@ -1172,10 +1188,18 @@ export class SimRunner {
     const armed = this.armed;
     this.armed = null;
     const start = new Map<string, bigint>();
+    const now = this.clock;
+    const timed = this.flushIntervalMs > 0;
     for (const [name, d] of this.dbs) {
       start.set(name, d.version);
-      d.batchOpen = this.relaxed && !this.engineFlushed(d);
-      d.batchPending = this.relaxed && this.enginePending(d);
+      const open = this.relaxed && !this.engineFlushed(d);
+      const pending = this.relaxed && this.enginePending(d);
+      // A batch past its deadline is flushed by the step's commit before it plans (validated-cow.md
+      // §4.1), so that commit plans with nothing pending.
+      const due = pending && timed && now >= d.deadline;
+      d.batchOpen = open && !due;
+      d.batchPending = pending && !due;
+      d.due = due;
     }
     const pid = this.stepPid(st);
     if (pid !== null && st.kind !== "spawn" && !this.selectProc(pid)) {
@@ -1247,6 +1271,21 @@ export class SimRunner {
       // Under synchronous = off a barrier proves the step's starting version durable only when the
       // engine was not batching then: a pending version may be durable by accident (a file growth is a
       // full fsync) and still be overwritten by the next commit of its batch (validated-cow.md §4).
+      // A commit past its batch's deadline flushes before it plans (validated-cow.md §4.1).
+      if (
+        d.due &&
+        s0 !== undefined &&
+        d.version > s0 &&
+        !this.fs.dead &&
+        this.fs.fired === "" &&
+        !f.barrierOK
+      ) {
+        this.fail(
+          i,
+          `time-based flush: version ${d.version} of ${name} committed past its batch's deadline without a flush`,
+        );
+        return false;
+      }
       if (f.barrierOK && !d.batchOpen && s0 !== undefined && s0 > d.floor) d.floor = s0;
       if (
         !this.relaxed ||
@@ -1274,6 +1313,20 @@ export class SimRunner {
     }
     // Checked against the floor this step leaves (a flush in the step moved it).
     for (const d of this.order()) if (!this.checkTruncated(i, d)) return false;
+    // A batch this step started ends at the step's clock plus the interval (validated-cow.md §4.1).
+    if (this.relaxed && timed) {
+      const interval = BigInt(this.flushIntervalMs) * 1000n;
+      const max = (1n << 63n) - 1n;
+      for (const d of this.order()) {
+        // A batch starts in a step that began with nothing pending, or whose commit flushed a batch
+        // past its deadline.
+        const started = d.due ? d.version > (start.get(d.name) ?? 0n) : !d.batchPending;
+        if (started && this.enginePending(d)) {
+          const deadline = now + interval;
+          d.deadline = deadline > max ? max : deadline;
+        }
+      }
+    }
     if (armed === null) {
       this.clearKeyChanges();
       return true;
@@ -1710,6 +1763,14 @@ export class SimRunner {
         if (now > d.maxAttempted) d.maxAttempted = now;
         // Acknowledged under synchronous = on; a relaxed client's commit joins the owner's batch (§8.2).
         if (!this.relaxed) d.floor = now;
+        // A page client planned against the owner's batch at its begin_write, which is where the owner
+        // flushes a batch past its deadline (validated-cow.md §4.1): its commit joins the batch, however
+        // late.
+        if (d.due && (serviceCoreOf(this.database, d)?.client ?? null) !== null) {
+          d.due = false;
+          d.batchOpen = true;
+          d.batchPending = true;
+        }
         this.checkGrowth(i, d, quiet);
         if (this.violation !== "") return;
         if (this.service) {

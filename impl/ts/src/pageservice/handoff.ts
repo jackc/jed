@@ -11,6 +11,7 @@ import { FileCoordinator, osLocks } from "../coordinator.ts";
 import { type PageCodec, sealScratch } from "../crypto.ts";
 import type { Environment } from "../environment.ts";
 import type { Engine } from "../executor.ts";
+import { DEFAULT_FLUSH_INTERVAL_MS } from "../idle_flush.ts";
 import type { FileHost } from "../filehost.ts";
 import type { LockHost } from "../lockhost.ts";
 import type { ServiceHandoffHost, ServiceRole } from "../shared.ts";
@@ -34,6 +35,7 @@ export type HandoffOptions = {
   idleInTransactionTimeoutMs?: number;
   maxConnections?: number;
   synchronous?: "on" | "off";
+  flushIntervalMs?: number;
   skipFsync?: boolean;
   scratchEncryption?: "auto" | "on";
 };
@@ -60,6 +62,8 @@ export class ServiceHandoff implements ServiceHandoffHost {
   // relaxed is the handle's synchronous = off, whatever role it holds: its file attachments follow it
   // (validated-cow.md §4).
   readonly relaxed: boolean;
+  // flushIntervalMs is the handle's time-based flush interval (validated-cow.md §4.1).
+  readonly flushIntervalMs: number;
   private readonly readOnly: boolean;
   private readonly timeoutMs: number | undefined;
   private readonly clientOpen: ClientOpenOptions;
@@ -103,6 +107,7 @@ export class ServiceHandoff implements ServiceHandoffHost {
     this.background = hosts.background ?? true;
     this.ownership = options.ownership ?? "prefer";
     this.relaxed = options.synchronous === "off";
+    this.flushIntervalMs = options.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
     this.yieldGraceMs = options.yieldGraceMs ?? DEFAULT_YIELD_GRACE_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
     this.skipFsync = options.skipFsync ?? false;

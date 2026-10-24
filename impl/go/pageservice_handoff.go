@@ -185,7 +185,11 @@ func (c *sharedCore) installRole(next *serviceRole, e *engine) {
 	st := c.storage
 	st.mu.Lock()
 	c.liveMu.Lock()
+	// An owner's idle flusher takes its writer gate first (validated-cow.md §4.1 rule 5).
+	st.setFlushGate(next.owner)
 	if e != nil {
+		// The paging is replaced: its batch, if any, ended with the old role.
+		st.deadline.clear()
 		st.paging = e.paging
 		st.pageCount = e.pageCount
 		st.freePages = e.freePages

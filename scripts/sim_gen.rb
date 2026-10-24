@@ -37,6 +37,7 @@ module SimGen
     "max_query_memory_bytes" => [0],
     "max_storage_bytes" => [0],
     "synchronous" => ["on"],
+    "flush_interval_ms" => [0], # the time-based flush of a relaxed batch (validated-cow.md §4.1)
     "encrypted" => [0],
     "conversion" => 0,   # S13: the permille chance a rekey decrypts its database instead
     "gist" => 0,         # S13: i32range columns with GiST indexes, for the GiST child pointer
@@ -195,6 +196,12 @@ module SimGen
       # that leaves it at "on" generates exactly the traces it did before the mode existed.
       synchronous = knob_value(@p["synchronous"])
       header << "# synchronous: #{synchronous}" if synchronous != "on"
+      # Its time-based flush (§4.1), on the simulated clock: drawn only for a relaxed trace, so a profile
+      # that leaves it at 0 generates exactly the traces it did before the knob existed.
+      if synchronous == "off"
+        interval = knob_value(@p["flush_interval_ms"])
+        header << "# flush_interval_ms: #{interval}" if interval.positive?
+      end
       # Encryption at rest (slice S12): main is encrypted under host key 0, its key entropy seeded by the
       # trace's seed, so the cores' images stay byte-identical.
       @encrypted = knob_value(@p["encrypted"]) == 1

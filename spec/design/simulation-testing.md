@@ -1,8 +1,8 @@
 # Deterministic simulation testing — design
 
-> **Status: S1–S13 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
+> **Status: S1–S14 landed in all three cores** (§14; S5, the shared-mode multi-process slice, was
 > retired with shared mode and succeeded by S8, an owner and its page clients), including spill faults, temp-table spill, file
-> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), trailing truncation (S10), backups (page-service.md §9), file attachments under the page service (S11), and encryption at rest (S12–S13). A seeded simulator that runs long, randomized
+> attachments, `create`, the bounded-growth invariant, the `corrupt` mode, batched durability (S9), trailing truncation (S10), backups (page-service.md §9), file attachments under the page service (S11), encryption at rest (S12–S13), and the time-based flush (S14). A seeded simulator that runs long, randomized
 > multi-session histories against a database whose storage is a fault-injecting simulated disk.
 > Each run is a pure function of its seed: a failure replays exactly, shrinks to a small trace, and
 > becomes a regression test. It targets the **storage, commit, and recovery state machine**
@@ -151,7 +151,10 @@ checks are part of the step. There is no separate `recover` step.
 **Header knobs** are `seed`, `page_size`, `cache_bytes` (0 or absent: the engine default), `clock`
 (the simulated clock's start, in microseconds), `sector` (the tear granularity, default 64 bytes),
 `synchronous` (`on`, the default, or `off`: every process batches its barriers, [validated-cow.md](validated-cow.md)
-§4, and runs the cap flush inline so the barrier lands in the step that reached the cap), and the
+§4, and runs the cap flush inline so the barrier lands in the step that reached the cap),
+`flush_interval_ms` (absent or 0: no time-based flush; otherwise a relaxed batch's deadline,
+validated-cow.md §4.1, measured on the simulated clock, with no idle flusher, so a deadline flush
+lands in the commit that finds the deadline passed), and the
 informational `profile`, and `encrypted: 1` (S12: main and every file attachment are created
 encrypted under key 0, and every process seals its scratch files; each process's key entropy is the
 insecure seeded source, seeded from lane 14 of the decision function so the cores' images stay
@@ -382,6 +385,15 @@ belongs to the corpus.
   from the floor up, since the simulated process crash may drop writes of the step that acknowledged
   a commit (§6.3) — a more pessimistic model than the in-order issue that makes a real process crash
   lose no acknowledged relaxed commit.
+- **The time-based flush** ([validated-cow.md](validated-cow.md) §4.1). The runner keeps each
+  database's batch deadline itself: a step that starts a batch (it began with nothing pending, or
+  its commit flushed a batch past its deadline, and the engine holds pages pending at its end) sets
+  it to the simulated clock plus `flush_interval_ms`. A step that begins with a batch past its
+  deadline is treated as beginning with nothing pending, since its commit flushes first, and if it
+  publishes a new version of that database without that file's barrier completing, it is a
+  violation ("committed past its batch's deadline without a flush"). A page client's commit is the
+  exception: it planned at its `begin_write`, where the owner flushes a batch past its deadline, so it
+  joins the batch however late it lands.
 - **Under either mode**, a page-service owner that dies may take every version above the floor with
   it, so until a process observes the database again it may see any version from the floor up. A
   generation an owner adopted without stabilizing it (a read-only adoption needs no sync,
@@ -966,6 +978,11 @@ primitive) gets a simulated implementation.
 
     Swept on all three cores: every profile at seeds 1–8 (the `ci` sweep), and the four encryption
     profiles at seeds 9–48 with `--check-images`, which decoded about 9,500 crash and backup images.
+
+14. **S14 — The time-based flush. Landed.** The `flush_interval_ms` header knob, drawn by the
+    `relaxed` and `service-relaxed` profiles (0, 1000, or 4000 ms) alongside heavier `clock` steps, and the deadline model and
+    violation of §8.2. Deleting the engine's flush before a commit past the deadline is caught in 4 of
+    60 `relaxed` traces.
 
 ## 15. Open questions
 

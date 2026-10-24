@@ -103,6 +103,9 @@ const PENDING_COUNT = 13;
 const KEY_STATE = 14;
 const BATCH_LOCK = 15;
 const BATCH_GENERATION = 16;
+// WALL_CLOCK_STATE is 1 when the owner's clock source is the wall clock, which the worker can read too
+// (the time-based flush, validated-cow.md §4.1); 0 for a host clock source only the engine thread reads.
+const WALL_CLOCK_STATE = 17;
 const HEADER_I32 = 20;
 const PENDING_OVERFLOW = -1;
 
@@ -119,7 +122,12 @@ const ENGINE_OLDEST = 4;
 const REQUESTER = 5;
 // FLOOR_TXID is the txid of the newest durable meta, in FLOOR_SLOT.
 const FLOOR_TXID = 6;
-const BIG_SLOTS = 8;
+// The time-based flush (validated-cow.md §4.1): the pending batch's deadline in clock micros (-1: none)
+// and the owner's flush interval in micros (0: off). The engine thread's commits and idle flusher and
+// the worker's rule-4 steps read and set the deadline, always holding the writer gate.
+const BATCH_DEADLINE = 7;
+const FLUSH_INTERVAL = 8;
+const BIG_SLOTS = 10;
 
 // Byte offsets of the other regions (each 8-byte aligned).
 const BIG_OFFSET = HEADER_I32 * 4;
@@ -177,7 +185,10 @@ export class ServiceState {
     );
     this.pendingDigest = new BigInt64Array(buffer, PENDING_DIGEST_OFFSET, PENDING_SLOTS);
     this.pendingIndex = new Uint32Array(buffer, PENDING_INDEX_OFFSET, PENDING_SLOTS);
-    if (shared === undefined) this.big[ENGINE_OLDEST] = -1n;
+    if (shared === undefined) {
+      this.big[ENGINE_OLDEST] = -1n;
+      this.big[BATCH_DEADLINE] = -1n;
+    }
   }
 
   // lock takes the state lock, sleeping in Atomics.wait while another thread holds it (no spin).
@@ -412,10 +423,38 @@ export class ServiceState {
       Atomics.store(this.header, FLOOR_SLOT, Atomics.load(this.header, FLOOR_SLOT) ^ 1);
       Atomics.store(this.big, FLOOR_TXID, newest > committed ? newest : committed);
       Atomics.store(this.header, PENDING_COUNT, 0);
+      // The flush ends the batch and its deadline (validated-cow.md §4.1).
+      Atomics.store(this.big, BATCH_DEADLINE, -1n);
       this.bumpBatch();
     } finally {
       this.unlockBatch();
     }
+  }
+
+  // --- the time-based flush (validated-cow.md §4.1): the BatchDeadline's DeadlineSlot ---
+
+  deadline(): bigint | null {
+    const deadline = Atomics.load(this.big, BATCH_DEADLINE);
+    return deadline < 0n ? null : deadline;
+  }
+
+  setDeadline(deadline: bigint | null): void {
+    Atomics.store(this.big, BATCH_DEADLINE, deadline ?? -1n);
+  }
+
+  bindTiming(interval: bigint, wallClock: boolean): void {
+    Atomics.store(this.big, FLUSH_INTERVAL, interval);
+    Atomics.store(this.header, WALL_CLOCK_STATE, wallClock ? 1 : 0);
+  }
+
+  // flushInterval is the owner's flush interval in micros (0n: the time-based flush is off).
+  flushInterval(): bigint {
+    return Atomics.load(this.big, FLUSH_INTERVAL);
+  }
+
+  // wallClock reports whether the owner's clock source is the wall clock.
+  wallClock(): boolean {
+    return Atomics.load(this.header, WALL_CLOCK_STATE) === 1;
   }
 
   // --- handoff (README §6.5) ---

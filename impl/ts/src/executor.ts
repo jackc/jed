@@ -202,6 +202,7 @@ import {
 } from "./rewrite.ts";
 import { type Collation, serializeTable, sortKey as collationSortKey } from "./collation.ts";
 import { Environment } from "./environment.ts";
+import { BatchDeadline } from "./idle_flush.ts";
 import { COSTS, MEMORY_ENTRY, MEMORY_ROW, MEMORY_VALUE } from "./costs.ts";
 import {
   entryBytes,
@@ -2151,6 +2152,13 @@ export class Engine {
   // manifest lists, and the only free pages it may reuse. Null outside such a write transaction, and
   // when the owner had nothing pending.
   serviceBatch: { pending: ManifestEntry[]; reuse: Set<number> } | null;
+  // batchDeadline is the time-based flush of a relaxed batch (spec/design/validated-cow.md §4.1): the
+  // handle's flushIntervalMs and the batch deadline this domain's commits and idle flusher share. Off
+  // (interval 0) until an open sets the handle's durability (setDurability).
+  batchDeadline: BatchDeadline;
+  // flushGate takes a page-service owner's writer gate for the idle flusher, returning its release, or
+  // null when the gate is busy; null on every other domain, whose commits the in-commit guard excludes.
+  flushGate: (() => (() => void) | null) | null;
   // commitStagesRows is whether the last commitTx staged any record version into main (memory.md
   // §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
   // database can be repaired. Read by Session.publish, which persists main after commitTx.
@@ -2231,6 +2239,8 @@ export class Engine {
     this.floorFree = null;
     this.floorFreeTxid = -1n;
     this.serviceBatch = null;
+    this.batchDeadline = new BatchDeadline();
+    this.flushGate = null;
     this.commitStagesRows = false;
   }
 

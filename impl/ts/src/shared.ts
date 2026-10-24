@@ -112,9 +112,12 @@ import {
   precheckBudgetSteps,
   type StagedCommit,
   stageTemp,
+  durabilityOf,
+  stopIdleFlush,
   storageBytes,
   writeKeyBlockSteps,
 } from "./persist.ts";
+import type { Durability } from "./idle_flush.ts";
 import type { Statement } from "./ast.ts";
 
 // afterPersistHook is a test-only seam (null in production, a single null-check per commit): it fires in
@@ -227,8 +230,10 @@ export interface ServiceHandoffHost {
   readonly ownership: "prefer" | "yield" | "never";
   readonly yieldGraceMs: number;
   readonly shutdownGraceMs: number;
-  // relaxed is the handle's synchronous = off, whatever role it holds (validated-cow.md §4).
+  // relaxed is the handle's synchronous = off, whatever role it holds (validated-cow.md §4), and
+  // flushIntervalMs its time-based flush interval (§4.1).
   readonly relaxed: boolean;
+  readonly flushIntervalMs: number;
   // skipFsync is the handle's fsync=off open setting (a backup's file skips its barriers too).
   readonly skipFsync: boolean;
   // elect runs the election loop under the open timeout, keeping the path claim: it returns the new
@@ -752,6 +757,16 @@ class SharedCore {
     if (role.engine !== null) {
       const engine = role.engine;
       engine.reclaimWithinSession = true;
+      // An owner's idle flusher takes the writer gate, so it never flushes beside a client's
+      // begin_write flush or commit (validated-cow.md §4.1).
+      const service = role.service;
+      engine.flushGate =
+        service === null
+          ? null
+          : () => {
+              if (!service.tryGate()) return null;
+              return () => service.releaseGate();
+            };
       engine.storageBudget.limit = this.storage.storageBudget.limit;
       this.storage = engine;
       this.committed = engine.committed;
@@ -998,6 +1013,7 @@ class SharedCore {
       { kind: "none", engine: null, service: null, client: null, coordinator: null },
       pauseUntilMs,
     );
+    stopIdleFlush(storage);
     const paging = storage.paging;
     if (paging !== null) {
       // Pending relaxed commits become durable before ownership moves (page-service.md §6). A failed
@@ -1651,6 +1667,7 @@ class SharedCore {
 // paging, returning the first error (null when none). The paging is closed whether the flush failed or
 // not.
 function closeDomain(st: Engine): unknown {
+  stopIdleFlush(st);
   const paging = st.paging;
   if (paging === null) return null;
   let error: unknown = null;
@@ -2023,8 +2040,8 @@ export function attachFile(
 // feature_not_supported (a pure in-memory build has no file layer to reach).
 // files is main's file host (null is the host's own), so an attachment opens through the same
 // filesystem as main — the deterministic simulator's (simulation-testing.md §14 S4) included.
-// relaxed is main's synchronous = off, which a file attachment follows (validated-cow.md §4), under
-// the page service too.
+// durability is main's synchronous = off and time-based flush, which a file attachment follows
+// (validated-cow.md §4, §4.1), under the page service too.
 // mainHandoff is main's page-service handoff (null when main is not under the page service): a file
 // attachment under the page service copies its hosts and limits (page-service.md §5.5). The opener
 // returns an opened file (its storage Engine and coordinator), or, under the page service, the inner
@@ -2037,7 +2054,7 @@ type FileAttachOpener = (
   readOnly: boolean,
   files: FileHost | null,
   environment: Environment,
-  relaxed: boolean,
+  durability: Durability,
   mainHandoff: ServiceHandoffHost | null,
   // seals is whether the handle's scratch files are sealed (encrypted.md §11): a service attachment
   // then seals its own.
@@ -2172,7 +2189,13 @@ export class Database {
         c.storage.fileHost,
         c.environment,
         // A page client's own storage never batches; the handle's setting is its handoff's.
-        c.handoff !== null ? c.handoff.relaxed : c.storage.relaxed,
+        c.handoff !== null
+          ? {
+              relaxed: c.handoff.relaxed,
+              flushIntervalMs: c.handoff.flushIntervalMs,
+              idleFlush: c.handoff.background,
+            }
+          : durabilityOf(c.storage),
         c.handoff,
         c.storage.spillSink?.encrypts?.() ?? false,
       );
@@ -2818,6 +2841,7 @@ export class Database {
       const domains = [core.storage];
       for (const att of core.attachments.values()) if (att.svc === null) domains.push(att.storage);
       for (const st of domains) {
+        stopIdleFlush(st);
         const paging = st.paging;
         if (paging === null || !paging.writeSideAsync()) continue;
         try {

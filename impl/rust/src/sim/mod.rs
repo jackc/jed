@@ -624,6 +624,12 @@ struct SimDb {
     /// recovery whose adopted generation awaits stabilization, which the commit's own first barrier
     /// makes the floor.
     batch_pending: bool,
+    /// The simulated-clock deadline of the batch pending on this database's file (validated-cow.md
+    /// §4.1): the clock of the step that started it plus the trace's flush interval.
+    deadline: i64,
+    /// Whether the step began with that batch past its deadline: a commit of this database in the
+    /// step must flush it first.
+    due: bool,
     /// Set when a relaxed commit lowered the high-water: the next flush (the batch cap, close) must
     /// shorten the file (format.md *Trailing truncation*).
     shrink_due: bool,
@@ -685,6 +691,8 @@ impl SimDb {
             last: Growth::default(),
             batch_open: false,
             batch_pending: false,
+            deadline: 0,
+            due: false,
             shrink_due: false,
             owner_lost: false,
             key: -1,
@@ -742,6 +750,9 @@ struct Runner<'a> {
     /// The header's synchronous = off (validated-cow.md §4): every process batches its barriers,
     /// flushing inline so the barrier lands in the step that reached the batch cap.
     relaxed: bool,
+    /// The header's flush_interval_ms (validated-cow.md §4.1; absent: 0, no time-based flush),
+    /// measured on the simulated clock with no idle flusher.
+    flush_interval_ms: u64,
 
     sessions: HashMap<String, SimSession>,
     /// The database of the process running the current step.
@@ -991,6 +1002,7 @@ impl<'a> Runner<'a> {
             max_query_memory,
             max_storage_bytes,
             relaxed: tr.header("synchronous") == "off",
+            flush_interval_ms: tr.header("flush_interval_ms").parse().unwrap_or(0),
             sessions: HashMap::new(),
             db: None,
             service: tr.header("processes") == "service",
@@ -1275,7 +1287,7 @@ impl<'a> Runner<'a> {
             // Create, compaction, and attachments go through the simulated filesystem.
             db.sim_set_files(Arc::new(SimHost(self.fs.clone())));
             // Every flush lands in the step that caused it.
-            db.sim_set_relaxed(self.relaxed, true);
+            db.sim_set_relaxed(self.relaxed, true, self.flush_interval_ms);
             if self.max_storage_bytes > 0 {
                 db.set_max_storage_bytes("main", self.max_storage_bytes)?;
             }
@@ -1352,6 +1364,7 @@ impl<'a> Runner<'a> {
             } else {
                 crate::file::Synchronous::On
             },
+            flush_interval_ms: self.flush_interval_ms,
             ..OpenOptions::default()
         };
         let opened = Database::sim_open_service(
@@ -2019,12 +2032,18 @@ impl<'a> Runner<'a> {
             .iter()
             .map(|(name, d)| (name.clone(), d.version))
             .collect();
+        let now = self.clock.load(Ordering::Relaxed);
+        let timed = self.flush_interval_ms > 0;
         for name in self.order() {
             let open = self.relaxed && !self.engine_flushed(&name);
             let pending = self.relaxed && self.engine_pending(&name);
             let d = self.sdb(&name);
-            d.batch_open = open;
-            d.batch_pending = pending;
+            // A batch past its deadline is flushed by the step's commit before it plans
+            // (validated-cow.md §4.1), so that commit plans with nothing pending.
+            let due = pending && timed && now >= d.deadline;
+            d.batch_open = open && !due;
+            d.batch_pending = pending && !due;
+            d.due = due;
         }
         if let Some(pid) = self.step_pid(st)
             && st.kind != "spawn"
@@ -2112,6 +2131,19 @@ impl<'a> Runner<'a> {
                 // when the engine was not batching then: a pending version may be durable by
                 // accident (a file growth is a full fsync) and still be overwritten by the next
                 // commit of its batch (validated-cow.md §4).
+                // A commit past its batch's deadline flushes before it plans (validated-cow.md §4.1).
+                if d.due
+                    && d.version > began
+                    && !disk.dead()
+                    && disk.fired.is_empty()
+                    && !disk.barrier_ok(id)
+                {
+                    violation = Some(format!(
+                        "time-based flush: version {} of {name} committed past its batch's deadline without a flush",
+                        d.version
+                    ));
+                    break;
+                }
                 if disk.barrier_ok(id) && !d.batch_open && began > d.floor {
                     d.floor = began;
                 }
@@ -2149,6 +2181,24 @@ impl<'a> Runner<'a> {
         for name in self.order() {
             if !self.check_truncated(i, &name) {
                 return false;
+            }
+        }
+        // A batch this step started ends at the step's clock plus the interval (validated-cow.md §4.1).
+        if self.relaxed && timed {
+            let interval =
+                i64::try_from(self.flush_interval_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
+            for name in self.order() {
+                // A batch starts in a step that began with nothing pending, or whose commit flushed
+                // a batch past its deadline.
+                let d = &self.dbs[&name];
+                let started = if d.due {
+                    d.version > start.get(&name).copied().unwrap_or(0)
+                } else {
+                    !d.batch_pending
+                };
+                if started && self.engine_pending(&name) {
+                    self.sdb(&name).deadline = now.saturating_add(interval);
+                }
             }
         }
         let Some(armed) = armed else {
@@ -2529,6 +2579,19 @@ impl<'a> Runner<'a> {
                 d.max_attempted = d.max_attempted.max(now);
                 if !relaxed {
                     d.floor = now; // acknowledged under synchronous = on; a relaxed client's joins the owner's batch (§8.2)
+                }
+                // A page client planned against the owner's batch at its begin_write, which is where
+                // the owner flushes a batch past its deadline (validated-cow.md §4.1): its commit
+                // joins the batch, however late.
+                let client = self
+                    .db()
+                    .sim_service_db(name)
+                    .is_some_and(|db| db.sim_page_client().is_some());
+                let d = self.sdb(name);
+                if client && d.due {
+                    d.due = false;
+                    d.batch_open = true;
+                    d.batch_pending = true;
                 }
                 self.check_growth(i, name, quiet);
                 if !self.violation.is_empty() {

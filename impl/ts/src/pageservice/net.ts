@@ -64,10 +64,13 @@ export type OwnerServeArgs = {
   idleTimeoutMs: number;
   idleSessionTimeoutMs: number;
   maxConnections: number;
-  // The service's events for the engine thread: a gate handed over for a maintenance commit, and an
-  // accepted ownership request. localOldest is the oldest version a local reader pins (null: none).
+  // The service's events for the engine thread: a gate handed over for a maintenance commit, an
+  // accepted ownership request, and a batch a relaxed client commit started (validated-cow.md §4.1
+  // rule 4), which arms the idle flusher. localOldest is the oldest version a local reader pins (null:
+  // none).
   onMaintain: () => void;
   onYield: () => void;
+  onBatch: () => void;
   localOldest: () => bigint | null;
 };
 

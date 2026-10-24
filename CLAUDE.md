@@ -741,10 +741,13 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   and the newest attempted commit and never corrupts; a process crash loses no acknowledged commit.
   The batch ends at the inline-manifest cap (flushed on a background goroutine/thread in Go/Rust,
   inline in TS — the next commit waits, so bytes never depend on timing), at close, before a synchronous
-  page client's `begin_write`, and at compaction. A relaxed page client commits into its owner's batch:
+  page client's `begin_write`, at compaction, and once the batch has been pending for `flush_interval_ms`
+  (default 1000; on the environment's clock, flushed by the next commit before it plans or by an idle
+  flusher that does only what that commit would, so bytes stay a function of commits and clock
+  readings — §4.1). A relaxed page client commits into its owner's batch:
   its `begin_write` carries the setting, `write_begun` names the owner's pending set and floor-free
   pages, and the owner checks the client's cumulative manifest and skips the barrier. Under
-  `synchronous = on` with nothing pending the slot rule is `txid & 1` and nothing changes. No time-based flush yet (its interval is undecided). Trailing truncation runs only
+  `synchronous = on` with nothing pending the slot rule is `txid & 1` and nothing changes. Trailing truncation runs only
   with nothing pending: only a batch's first commit lowers the high-water, and the file is shortened
   at the flush, never while the batch is pending. [spec/design/validated-cow.md](spec/design/validated-cow.md) §4.
 - **Live page count (format v34).** Meta offset 56 records the exact number of pages reachable

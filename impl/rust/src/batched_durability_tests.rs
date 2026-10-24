@@ -1,10 +1,12 @@
 //! Batched durability under synchronous = off (spec/design/validated-cow.md §4): host-API and
 //! byte-level assertions the corpus cannot express — barrier counts, meta-slot placement, the batch
-//! cap, close's flush, and byte identity between the background and inline cap flush. Crash recovery
+//! cap, close's flush, byte identity between the background and inline cap flush, and the time-based
+//! flush (§4.1) on a manual clock. Crash recovery
 //! under relaxed mode is the simulator's (spec/design/simulation-testing.md, the relaxed profile).
 //! Mirrors the Go batched_durability_test.go.
 use super::*;
 use crate::blockstore::{BlockStore, ClosedBlockStore};
+use crate::environment::Environment;
 use crate::file::Synchronous;
 
 /// One recorded host operation.
@@ -80,11 +82,25 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A relaxed database with no time-based flush, so wall time never moves a flush.
 fn relaxed_db(path: &std::path::Path, page_size: u32, inline: bool) -> Database {
+    relaxed_db_timed(path, page_size, inline, 0, Environment::default())
+}
+
+/// A relaxed database whose batches end `interval_ms` after they start on `env`'s clock.
+fn relaxed_db_timed(
+    path: &std::path::Path,
+    page_size: u32,
+    inline: bool,
+    interval_ms: u64,
+    env: Environment,
+) -> Database {
     let db = Database::create(CreateOptions {
         path: Some(path.to_path_buf()),
         page_size,
         synchronous: Synchronous::Off,
+        flush_interval_ms: interval_ms,
+        environment: env,
         ..CreateOptions::default()
     })
     .unwrap();
@@ -268,6 +284,7 @@ fn relaxed_newest_meta_vouches_for_the_whole_batch() {
         &path,
         OpenOptions {
             synchronous: Synchronous::Off,
+            flush_interval_ms: 0,
             ..OpenOptions::default()
         },
     )
@@ -470,6 +487,8 @@ fn relaxed_trailing_truncation_waits_for_the_flush() {
         &path,
         OpenOptions {
             synchronous: Synchronous::Off,
+            // No time-based flush: wall time must not end a batch here.
+            flush_interval_ms: 0,
             skip_fsync: true,
             ..OpenOptions::default()
         },
@@ -534,5 +553,249 @@ fn relaxed_trailing_truncation_waits_for_the_flush() {
     drop(rows);
     drop(s);
     re.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A manual clock and an environment that reads it.
+fn manual_env() -> (Arc<crate::seam::ManualClock>, Environment) {
+    let clock = crate::seam::manual_clock(0);
+    let env = Environment::builder()
+        .clock_source(Arc::clone(&clock) as Arc<dyn crate::seam::ClockSource>)
+        .build();
+    (clock, env)
+}
+
+fn pending(db: &Database) -> bool {
+    db.0.storage.lock().unwrap().paging.pager().has_pending()
+}
+
+/// A commit that reads the clock at or past its batch's deadline flushes the batch before it plans
+/// (validated-cow.md §4.1 rule 3), and starts the next batch itself.
+#[test]
+fn relaxed_deadline_flushes_before_the_next_commit() {
+    let dir = scratch("deadline");
+    let path = dir.join("deadline.jed");
+    let (clock, env) = manual_env();
+    let mut db = relaxed_db_timed(&path, 0, true, 1_000, env);
+    exec(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)");
+    let ops = record(&db, false);
+    exec(&mut db, "INSERT INTO t VALUES (1)");
+    clock.advance(999_999);
+    exec(&mut db, "INSERT INTO t VALUES (2)");
+    assert_eq!(syncs(&ops), 0, "a commit before the deadline flushed");
+    clock.advance(1);
+    let before = db.version();
+    exec(&mut db, "INSERT INTO t VALUES (3)");
+    assert_eq!(
+        syncs(&ops),
+        1,
+        "the commit at the deadline did not flush first"
+    );
+    // The flush made `before` the floor, so the new commit wrote the other slot and is pending.
+    assert_eq!(meta_txid_at(&path, (before & 1) as usize), before);
+    assert_eq!(
+        meta_txid_at(&path, ((before & 1) ^ 1) as usize),
+        db.version()
+    );
+    assert!(pending(&db), "the commit after the flush is not pending");
+    // Its batch started at the reading of the flushing commit: the next deadline is a whole interval on.
+    clock.advance(999_999);
+    exec(&mut db, "INSERT INTO t VALUES (4)");
+    assert_eq!(syncs(&ops), 1, "the new batch ended early");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wait up to five seconds for `cond`.
+fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    cond()
+}
+
+/// The idle flusher flushes a batch no commit follows once the clock passes its deadline, and never
+/// before (validated-cow.md §4.1 rule 5).
+#[test]
+fn relaxed_idle_flusher_waits_for_the_clock() {
+    let dir = scratch("idle");
+    let path = dir.join("idle.jed");
+    let (clock, env) = manual_env();
+    let mut db = relaxed_db_timed(&path, 0, false, 20, env);
+    exec(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)");
+    let ops = record(&db, false);
+    exec(&mut db, "INSERT INTO t VALUES (1)");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(
+        syncs(&ops),
+        0,
+        "the flusher flushed before the clock passed the deadline"
+    );
+    assert!(pending(&db));
+    clock.advance(20_000);
+    assert!(
+        eventually(|| !pending(&db)),
+        "the idle flusher never flushed the batch"
+    );
+    assert_eq!(syncs(&ops), 1);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same commits and clock readings write the same file whether the idle flusher ran each flush
+/// or the next commit did (validated-cow.md §4.1).
+#[test]
+fn relaxed_idle_flusher_writes_the_same_bytes() {
+    let dir = scratch("idle-bytes");
+    let mut images = Vec::new();
+    for background in [true, false] {
+        let path = dir.join(format!("idle{background}.jed"));
+        let (clock, env) = manual_env();
+        let mut db = relaxed_db_timed(&path, 256, !background, 10, env);
+        exec(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v text)");
+        for i in 1..=40 {
+            exec(
+                &mut db,
+                &format!("INSERT INTO t VALUES ({i}, repeat('v', {}))", i % 30),
+            );
+            if i % 6 == 0 {
+                exec(&mut db, &format!("DELETE FROM t WHERE id = {}", i - 2));
+            }
+            if i % 5 == 0 {
+                clock.advance(10_000);
+                if background {
+                    assert!(
+                        eventually(|| !pending(&db)),
+                        "the idle flusher never flushed after commit {i}"
+                    );
+                }
+            }
+        }
+        db.close().unwrap();
+        images.push(std::fs::read(&path).unwrap());
+    }
+    assert!(
+        images[0] == images[1],
+        "the idle flusher changed the file's bytes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A batch's deadline is per database: an attachment follows its handle's interval and clock but
+/// keeps its own batch.
+#[test]
+fn relaxed_deadline_is_per_database() {
+    let dir = scratch("deadline-attach");
+    let path = dir.join("main.jed");
+    let (clock, env) = manual_env();
+    let mut db = relaxed_db_timed(&path, 0, true, 1_000, env.clone());
+    let other = dir.join("other.jed");
+    Database::create(CreateOptions {
+        path: Some(other.clone()),
+        environment: env,
+        ..CreateOptions::default()
+    })
+    .unwrap()
+    .close()
+    .unwrap();
+    db.attach("o", AttachSource::file(&other), false).unwrap();
+    exec(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)");
+    clock.advance(500_000);
+    exec(&mut db, "CREATE TABLE o.u (id i32 PRIMARY KEY)");
+    clock.advance(500_000);
+    // Main's deadline has passed; the attachment's has not.
+    exec(&mut db, "INSERT INTO o.u VALUES (1)");
+    let attached_pending = |db: &Database| {
+        db.0.attachments
+            .lock()
+            .unwrap()
+            .get_mut("o")
+            .unwrap()
+            .with_storage(|st| st.paging.pager().has_pending())
+    };
+    assert!(
+        attached_pending(&db),
+        "the attachment's batch ended at main's deadline"
+    );
+    assert!(pending(&db), "main flushed without a commit of its own");
+    exec(&mut db, "INSERT INTO t VALUES (1)");
+    assert!(attached_pending(&db));
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `max_storage_bytes` precheck of a commit that also writes an in-memory attachment plans a
+/// pending batch's reuse restriction, while the commit itself may first flush the batch at its
+/// deadline (validated-cow.md §4.1) and plan without it. The answer cannot differ: the file form
+/// limits live pages (memory.md §8.7), which do not depend on which page ids a commit takes. Run the
+/// same transactions with no batching, with batches, and with a deadline flush before every commit:
+/// every `54P06` lands on the same transaction.
+#[test]
+fn relaxed_storage_precheck_ignores_the_deadline() {
+    let dir = scratch("precheck");
+    let mut runs = Vec::new();
+    for (k, mode) in ["on", "batched", "deadline"].into_iter().enumerate() {
+        let path = dir.join(format!("precheck{k}.jed"));
+        let (clock, env) = manual_env();
+        let mut db = if mode == "on" {
+            Database::create(CreateOptions {
+                path: Some(path.clone()),
+                page_size: 512,
+                environment: env,
+                ..CreateOptions::default()
+            })
+            .unwrap()
+        } else {
+            let interval = if mode == "deadline" { 1 } else { 0 };
+            relaxed_db_timed(&path, 512, true, interval, env)
+        };
+        db.attach("m", AttachSource::memory(), false).unwrap();
+        exec(&mut db, "CREATE TABLE t (id i64 PRIMARY KEY, v text)");
+        exec(&mut db, "CREATE TABLE m.log (id i64 PRIMARY KEY)");
+        db.set_max_storage_bytes("main", 40 * 512).unwrap();
+        let mut outcomes = Vec::new();
+        for i in 0..120i64 {
+            let sql = match i % 4 {
+                0 | 1 => format!(
+                    "INSERT INTO t SELECT g, md5(g::text) || md5((g + 1)::text) FROM generate_series({}, {}) g",
+                    i * 10,
+                    i * 10 + 9
+                ),
+                2 => format!("DELETE FROM t WHERE id % 50 = {}", i % 50),
+                _ => format!(
+                    "UPDATE t SET v = left(md5(v), {}) || v WHERE id % 5 = 0",
+                    1 + i % 20
+                ),
+            };
+            let mut sess = db.session(SessionOptions::default());
+            let run = |sess: &mut Session| -> Result<()> {
+                sess.begin(true)?;
+                sess.execute(&sql, &[])?;
+                sess.execute(&format!("INSERT INTO m.log VALUES ({i})"), &[])?;
+                sess.commit()
+            };
+            let failed = run(&mut sess).err().map(|e| e.code().to_string());
+            drop(sess);
+            outcomes.push(failed);
+            clock.advance(1_000);
+        }
+        assert!(
+            outcomes.iter().any(|o| o.as_deref() == Some("54P06")),
+            "{mode}: the limit never tripped at {} bytes",
+            db.storage_bytes("main").unwrap()
+        );
+        assert!(
+            outcomes.iter().any(Option::is_none),
+            "{mode}: every commit failed"
+        );
+        runs.push(outcomes);
+        db.close().unwrap();
+    }
+    assert!(runs[0] == runs[1], "batching moved a 54P06");
+    assert!(runs[0] == runs[2], "the deadline flush moved a 54P06");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -50,7 +50,14 @@ import {
 import { runSync, type Steps } from "./execution.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager, type PageTransform } from "./pager.ts";
-import { persistImpl, registerDirectorySync, repairKeyBlockSteps } from "./persist.ts";
+import { DEFAULT_FLUSH_INTERVAL_MS, type Durability } from "./idle_flush.ts";
+import {
+  persistImpl,
+  registerDirectorySync,
+  repairKeyBlockSteps,
+  setDurability,
+  stopIdleFlush,
+} from "./persist.ts";
 import {
   type AttachSource,
   buildInMemory,
@@ -122,11 +129,18 @@ export type Locking = "auto" | "exclusive" | "none";
 // handle setting, not stored in the file; the handle's file attachments follow it. Ignored in memory.
 export type Synchronous = "on" | "off";
 
+// DEFAULT_FLUSH_INTERVAL_MS is the default flushIntervalMs (spec/design/validated-cow.md §4.1).
+export { DEFAULT_FLUSH_INTERVAL_MS };
+
 export type CreateOptions = {
   path?: string;
   pageSize?: number;
   skipFsync?: boolean;
   synchronous?: Synchronous;
+  // flushIntervalMs is how long a synchronous = "off" batch may stay pending, in milliseconds, before it
+  // is flushed (spec/design/validated-cow.md §4.1), measured on the environment's clock source. 0 turns
+  // the time-based flush off. Ignored under synchronous = "on". Default DEFAULT_FLUSH_INTERVAL_MS.
+  flushIntervalMs?: number;
   locking?: Locking;
   fileLockTimeoutMs?: number;
   // idleInTransactionTimeoutMs, idleSessionTimeoutMs, yieldGraceMs, shutdownGraceMs, maxConnections,
@@ -268,6 +282,11 @@ export type OpenOptions = {
   skipFsync?: boolean;
   // synchronous is the durability mode (Synchronous above; transactions.md §9). Default "on".
   synchronous?: Synchronous;
+  // flushIntervalMs is how long a synchronous = "off" batch may stay pending, in milliseconds, before it
+  // is flushed (spec/design/validated-cow.md §4.1), measured on the environment's clock source. 0 turns
+  // the time-based flush off. Ignored under synchronous = "on"; the handle's file attachments follow it.
+  // Default DEFAULT_FLUSH_INTERVAL_MS.
+  flushIntervalMs?: number;
   locking?: Locking;
   fileLockTimeoutMs?: number;
   // idleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
@@ -401,7 +420,7 @@ export function* openViaSteps(
     db.readOnly = readOnly;
     if (!readOnly && held === null) yield* repairKeyBlockSteps(db);
     db.storageBudget.limit = opts.maxStorageBytes ?? 0n;
-    db.relaxed = opts.synchronous === "off";
+    setDurability(db, durabilityOptions(opts));
     // Scratch is independent of the persistence path, so read-only database filesystems remain
     // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1). An encrypted database seals
     // its scratch files (spec/fileformat/encrypted.md §11).
@@ -430,7 +449,19 @@ export { repairKeyBlockSteps };
 // its own (openServiceAttachment). Under "exclusive" it is a non-serving owner of its file: another
 // process holding the file makes the attach wait, then fail 55006. Either way it follows the handle's
 // synchronous setting (validated-cow.md §4).
-registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHandoff, seals) => {
+// durabilityOptions is the durability an open or create's options set (validated-cow.md §4, §4.1).
+function durabilityOptions(opts: {
+  synchronous?: Synchronous;
+  flushIntervalMs?: number;
+}): Durability {
+  return {
+    relaxed: opts.synchronous === "off",
+    flushIntervalMs: opts.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS,
+    idleFlush: true,
+  };
+}
+
+registerFileAttachOpener((source, readOnly, files, environment, durability, mainHandoff, seals) => {
   const path = source.path!;
   const locking = resolvedLocking(source.locking);
   if (locking === "auto") {
@@ -440,21 +471,22 @@ registerFileAttachOpener((source, readOnly, files, environment, relaxed, mainHan
       readOnly,
       files,
       environment,
-      relaxed,
+      durability,
       mainHandoff,
       seals,
     );
   }
   const coordinator = FileCoordinator.open(path, locking, source.fileLockTimeoutMs);
   try {
-    // A file attachment follows the handle's synchronous setting (validated-cow.md §4).
+    // A file attachment follows the handle's synchronous setting and time-based flush
+    // (validated-cow.md §4, §4.1).
     const engine = openVia(files ?? osFiles, coordinator?.path ?? path, {
       readOnly,
       locking: "none",
       environment,
-      synchronous: relaxed ? "off" : "on",
       credential: source.credential,
     });
+    setDurability(engine, durability);
     return { kind: "file", engine, coordinator };
   } catch (error) {
     coordinator?.close();
@@ -474,7 +506,7 @@ function openServiceAttachment(
   readOnly: boolean,
   files: FileHost | null,
   environment: Environment,
-  relaxed: boolean,
+  durability: Durability,
   mainHandoff: ServiceHandoffHost | null,
   seals: boolean,
 ): OpenedAttachment {
@@ -488,8 +520,10 @@ function openServiceAttachment(
     fileLockTimeoutMs: source.fileLockTimeoutMs,
     environment,
     maxStorageBytes: source.maxStorageBytes,
-    // The attachment follows the handle's synchronous setting (validated-cow.md §4).
-    synchronous: relaxed ? "off" : "on",
+    // The attachment follows the handle's synchronous setting and time-based flush (validated-cow.md
+    // §4, §4.1).
+    synchronous: durability.relaxed ? "off" : "on",
+    flushIntervalMs: durability.flushIntervalMs,
     credential: source.credential,
     // The attachment seals its scratch files when the handle does (encrypted.md §11).
     scratchEncryption: seals ? "on" : "auto",
@@ -517,6 +551,8 @@ function openServiceAttachment(
     environment,
     (held) => {
       const engine = openVia(hostFiles ?? osFiles, real, { ...options, locking: "none" }, held);
+      // The owner's storage keeps main's idle-flusher choice (the simulator runs none).
+      setDurability(engine, durability);
       // An owner's storage reaches the same file and spill hosts a client's does.
       engine.fileHost = hostFiles;
       adoptClient?.(engine);
@@ -754,7 +790,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         scratchEncryption: opts.scratchEncryption,
       });
       engine.storageBudget.limit = maxStorageBytes;
-      engine.relaxed = opts.synchronous === "off";
+      setDurability(engine, durabilityOptions(opts));
       if (coordinator?.serving === true) {
         // The creator is the owner (README §6.1); its handle keeps the path claim across roles.
         const path = coordinator.path;
@@ -773,6 +809,7 @@ export function createDatabase(opts: CreateOptions = {}): Database {
               {
                 skipFsync: opts.skipFsync,
                 synchronous: opts.synchronous,
+                flushIntervalMs: opts.flushIntervalMs,
                 environment,
                 locking: "none",
                 scratchEncryption: opts.scratchEncryption,
@@ -937,6 +974,7 @@ export function close(db: Engine): void {
   db.rollbackTx();
   db.releaseTempStorage();
   db.path = null;
+  stopIdleFlush(db);
   if (db.paging !== null) {
     const paging = db.paging;
     db.paging = null;

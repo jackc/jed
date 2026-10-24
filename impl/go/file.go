@@ -42,6 +42,18 @@ const (
 	SynchronousOff
 )
 
+// DefaultFlushIntervalMs is the default FlushIntervalMs: how long a SynchronousOff batch may stay
+// pending before it is flushed (spec/design/validated-cow.md §4.1).
+const DefaultFlushIntervalMs = 1000
+
+// flushIntervalMs resolves a FlushIntervalMs option: nil is DefaultFlushIntervalMs.
+func flushIntervalMs(opt *uint64) uint64 {
+	if opt == nil {
+		return DefaultFlushIntervalMs
+	}
+	return *opt
+}
+
 // ScratchEncryption is whether a handle seals its scratch files — spill runs, hash partitions, row
 // spools and spilled temp domains (spec/design/encryption.md §6, spec/fileformat/encrypted.md §11).
 // Fixed at open/create for the handle's life.
@@ -173,7 +185,11 @@ type OpenOptions struct {
 	// Synchronous is the durability mode (SynchronousOn, the default, or SynchronousOff — transactions.md
 	// §9). A handle setting, not stored in the file; the handle's file attachments follow it.
 	Synchronous Synchronous
-	Locking     Locking
+	// FlushIntervalMs is how long a SynchronousOff batch may stay pending, in milliseconds, before it is
+	// flushed (spec/design/validated-cow.md §4.1), measured on the Environment's clock source. nil is
+	// DefaultFlushIntervalMs (1000); &0 turns the time-based flush off. Ignored under SynchronousOn.
+	FlushIntervalMs *uint64
+	Locking         Locking
 	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
 	FileLockTimeoutMs *uint64
 	// IdleInTransactionTimeoutMs is a page-service owner's idle-in-transaction timeout for client write
@@ -343,7 +359,7 @@ func (db *engine) persist(snap *snapshot) error {
 		paging: db.paging, liveAtCompaction: db.liveAtCompaction, freeGenTxid: db.freeGenTxid,
 		path: db.path, dirSynced: db.dirSynced,
 	}
-	err = st.commitFile(snap, write, live, db.openStreams == 0, true, nil)
+	_, err = st.commitFile(snap, write, live, db.openStreams == 0, true, nil)
 	db.dirSynced = st.dirSynced
 	if err != nil {
 		return err

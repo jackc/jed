@@ -933,7 +933,8 @@ func (sc *psServerConn) waitForGate(requestID uint32, m psBeginWrite) {
 		st.mu.Lock()
 		var ferr error
 		if relaxed {
-			ferr = st.awaitFlush()
+			// A batch past its deadline is flushed first (validated-cow.md §4.1 rule 4).
+			ferr = st.beginClientBatch()
 		} else {
 			ferr = st.flush(false)
 		}
@@ -1257,10 +1258,12 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 	o.commitMu.Lock()
 	st.mu.Lock()
 	capReached := false
+	beganEmpty := false
 	err := st.paging.withPager(func(p *pager) error {
 		// The slot not holding the floor (README.md §3.5). A synchronous client's commit keeps its own
 		// barrier (the begin_write flush left nothing pending); a relaxed one joins the batch.
 		slot := p.commitSlot()
+		beganEmpty = len(p.pending) == 0
 		// A client cannot know that slot, so an encrypted meta, already checked against the database
 		// key, is resealed for it (spec/fileformat/encrypted.md §14).
 		sealed, err := sealMeta(p, slot, d.meta, d.manifestChain())
@@ -1302,6 +1305,9 @@ func (sc *psServerConn) finishClientCommit(requestID uint32, w *psWriteTxn) erro
 		return nil
 	}
 	st.pageCount, st.freePages = d.m.pageCount, free
+	if w.relaxed {
+		st.afterClientCommit(beganEmpty, capReached)
+	}
 	st.mu.Unlock()
 	c.liveMu.Lock()
 	sc.unpinLocked(w.base)

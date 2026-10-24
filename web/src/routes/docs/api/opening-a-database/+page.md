@@ -82,8 +82,8 @@ If losing the last few commits in a power failure is acceptable but a damaged fi
 create the database with `synchronous` off: `synchronous: Synchronous::Off` (Rust),
 `Synchronous: jed.SynchronousOff` (Go), or `{ synchronous: "off" }` (TypeScript, including the
 browser's OPFS `create` / `open`). A commit then returns as soon as its pages are written, and a single
-flush later makes a whole run of commits durable together — when the run fills its batch, and when
-you close the database. A power loss or OS crash can lose the commits made since the last flush, but
+flush later makes a whole run of commits durable together — when the run fills its batch, once it has
+been pending for the flush interval (one second by default), and when you close the database. A power loss or OS crash can lose the commits made since the last flush, but
 the file always reopens to one complete committed state, never a mix; a crash of your process alone
 loses nothing it committed. Query results and costs are the same in both modes.
 
@@ -92,8 +92,10 @@ opened with `synchronous` off adds its commits to the owning process's batch, wh
 on makes each of its commits durable before it returns, whatever the other processes chose.
 
 `close` reports a flush that failed. After any failed flush the handle refuses further reads and
-writes until you reopen it. There is no timed flush yet, so a relaxed database that sits idle stays
-unflushed until its next batch fills or it closes. This is different from `skip_fsync`, which skips
+writes until you reopen it. Set the interval with `flush_interval_ms` (Rust), `FlushIntervalMs` (Go),
+or `flushIntervalMs` (TypeScript); `0` turns the timed flush off, so an idle database stays unflushed
+until its next batch fills or it closes. The interval is measured on the database's clock source, so
+a test that installs a manual clock controls exactly when it fires. This is different from `skip_fsync`, which skips
 the flushes entirely and can leave a corrupted file after an OS crash: use it only for scratch data.
 
 ## Opening a file from a newer jed

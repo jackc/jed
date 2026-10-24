@@ -426,6 +426,12 @@ type simDB struct {
 	// recovery whose adopted generation awaits stabilization, which the commit's own first barrier makes
 	// the floor.
 	batchPending bool
+	// deadline is the simulated-clock deadline of the batch pending on this database's file
+	// (validated-cow.md §4.1): the clock of the step that started it plus the trace's flush interval.
+	deadline int64
+	// due is whether the step began with that batch past its deadline: a commit of this database in the
+	// step must flush it first.
+	due bool
 	// shrinkDue is set when a relaxed commit lowered the high-water: the next flush (the batch cap, close)
 	// must shorten the file (format.md *Trailing truncation*, validated-cow.md §4).
 	shrinkDue bool
@@ -477,6 +483,9 @@ type simRunner struct {
 	// relaxed is the header's synchronous = off (validated-cow.md §4): every process batches its
 	// barriers, flushing inline so the barrier lands in the step that reached the batch cap.
 	relaxed bool
+	// flushIntervalMs is the header's flush_interval_ms (validated-cow.md §4.1; absent: 0, no time-based
+	// flush), measured on the simulated clock with no idle flusher.
+	flushIntervalMs uint64
 
 	fs       *simFS
 	db       *Database // the database of the process running the current step
@@ -692,6 +701,7 @@ func newSimRunner(tr simTrace) *simRunner {
 	tempBuffers, _ := strconv.Atoi(tr.header["temp_buffers"])
 	maxQueryMemory, _ := strconv.ParseInt(tr.header["max_query_memory_bytes"], 10, 64)
 	maxStorageBytes, _ := strconv.ParseInt(tr.header["max_storage_bytes"], 10, 64)
+	flushIntervalMs, _ := strconv.ParseUint(tr.header["flush_interval_ms"], 10, 64)
 	r := &simRunner{
 		tr:              tr,
 		seed:            seed,
@@ -703,6 +713,7 @@ func newSimRunner(tr simTrace) *simRunner {
 		maxQueryMemory:  maxQueryMemory,
 		maxStorageBytes: maxStorageBytes,
 		relaxed:         tr.header["synchronous"] == "off",
+		flushIntervalMs: flushIntervalMs,
 		fs:              newSimFS(seed, sector, uint32(ps)),
 		sessions:        map[string]*simSession{},
 		service:         tr.header["processes"] == "service",
@@ -879,6 +890,8 @@ func (r *simRunner) openServiceProc(pid int, env *Environment) (*Database, error
 	if r.relaxed {
 		opts.Synchronous = SynchronousOff
 	}
+	interval := r.flushIntervalMs
+	opts.FlushIntervalMs = &interval
 	h := newServiceHandoff(host, simDiskPath, opts)
 	h.files, h.spill, h.background = r.fs, r.fs.spillHost(), false
 	db, err := openServiceWith(h, true)
@@ -957,8 +970,8 @@ func (r *simRunner) openDatabase(env *Environment, coord *fileCoordinator) (*Dat
 	e.spill = sealScratch(r.fs.spillHost(), r.encrypted, env)
 	db := databaseOver(sharedCoreFromEngineCoordinated(e, coord))
 	db.core.storage.files = r.fs // create, compaction, and attachments go through the simulated filesystem
-	db.core.storage.relaxed = r.relaxed
-	db.core.storage.inlineFlush = true // every flush lands in the step that caused it
+	db.core.storage.setSynchronous(r.relaxed, r.flushIntervalMs, env)
+	db.core.storage.inlineFlush = true // every flush lands in the step that caused it (and no idle flusher runs)
 	if r.maxStorageBytes > 0 {
 		if err := db.SetMaxStorageBytes("main", r.maxStorageBytes); err != nil {
 			return nil, err
@@ -1120,10 +1133,17 @@ func (r *simRunner) step(i int) (cont bool) {
 	armed := r.armed
 	r.armed = nil
 	start := map[string]uint64{}
+	timed := r.flushIntervalMs > 0
 	for name, d := range r.dbs {
 		start[name] = d.version
-		d.batchOpen = r.relaxed && !r.engineFlushed(d)
-		d.batchPending = r.relaxed && r.enginePending(d)
+		open := r.relaxed && !r.engineFlushed(d)
+		pending := r.relaxed && r.enginePending(d)
+		// A batch past its deadline is flushed by the step's commit before it plans (validated-cow.md
+		// §4.1), so that commit plans with nothing pending.
+		due := pending && timed && r.clock >= d.deadline
+		d.batchOpen = open && !due
+		d.batchPending = pending && !due
+		d.due = due
 	}
 	if pid, ok := r.stepPid(st); ok {
 		if st.kind != "spawn" && !r.selectProc(pid) {
@@ -1193,6 +1213,11 @@ func (r *simRunner) step(i int) (cont bool) {
 		// Under synchronous = off a barrier proves the step's starting version durable only when the
 		// engine was not batching then: a pending version may be durable by accident (a file growth is
 		// a full fsync) and still be overwritten by the next commit of its batch (validated-cow.md §4).
+		// A commit past its batch's deadline flushes before it plans (validated-cow.md §4.1).
+		if d.due && d.version > start[name] && !r.fs.dead && r.fs.fired == "" && !f.barrierOK {
+			r.fail(i, "time-based flush: version %d of %s committed past its batch's deadline without a flush", d.version, d.name)
+			return false
+		}
 		if f.barrierOK && !d.batchOpen && start[name] > d.floor {
 			d.floor = start[name]
 		}
@@ -1214,6 +1239,24 @@ func (r *simRunner) step(i int) (cont bool) {
 	for _, d := range r.order() {
 		if !r.checkTruncated(i, d) {
 			return false
+		}
+	}
+	// A batch this step started ends at the step's clock plus the interval (validated-cow.md §4.1).
+	if r.relaxed && timed {
+		interval := int64(1<<63 - 1)
+		if r.flushIntervalMs <= uint64(interval)/1000 {
+			interval = int64(r.flushIntervalMs) * 1000
+		}
+		for _, d := range r.order() {
+			// A batch starts in a step that began with nothing pending, or whose commit flushed a batch
+			// past its deadline.
+			started := !d.batchPending
+			if d.due {
+				started = d.version > start[d.name]
+			}
+			if started && r.enginePending(d) {
+				d.deadline = satAddInt64(r.clock, interval)
+			}
 		}
 	}
 	if armed == nil {
@@ -1736,6 +1779,14 @@ func (r *simRunner) stepCommit(i int, st simStep) {
 			d.maxAttempted = max(d.maxAttempted, now)
 			if !r.relaxed {
 				d.floor = now // acknowledged under synchronous = on; a relaxed client's joins the owner's batch (§8.2)
+			}
+			// A page client planned against the owner's batch at its begin_write, which is where the owner
+			// flushes a batch past its deadline (validated-cow.md §4.1): its commit joins the batch, however
+			// late.
+			if c := simServiceCore(r.db, d); c != nil && c.pageClient() != nil && d.due {
+				d.due = false
+				d.batchOpen = true
+				d.batchPending = true
 			}
 			r.checkGrowth(i, d, quiet)
 			if r.violation != "" {

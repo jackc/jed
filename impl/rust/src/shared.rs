@@ -411,13 +411,16 @@ pub(crate) struct Storage {
     /// outside a relaxed client's write transaction.
     service_pending: Vec<(u32, u64)>,
     service_reuse: Option<Arc<HashSet<u32>>>,
+    /// The time-based flush of a relaxed batch (validated-cow.md §4.1): the handle's
+    /// `flush_interval_ms`, its clock, and the batch deadline its commits and idle flusher share.
+    deadline: crate::idle_flush::DeadlineFlush,
 }
 
 /// One cap flush (validated-cow.md §4). A failed barrier may have dropped pending pages from the OS
 /// cache ("fsyncgate"), so pages the published snapshot needs could now read stale: the storage is
 /// revoked, and every later read, commit, and close fails `58030` until the database is reopened
 /// through recovery.
-fn cap_flush(paging: &crate::paging::SharedPaging) -> Result<()> {
+pub(crate) fn cap_flush(paging: &crate::paging::SharedPaging) -> Result<()> {
     let result = paging.pager().flush_pending(true);
     if let Err(e) = &result {
         paging.revoke(EngineError::new(
@@ -543,6 +546,7 @@ impl Storage {
             floor_free: None,
             service_pending: Vec::new(),
             service_reuse: None,
+            deadline: crate::idle_flush::DeadlineFlush::default(),
         })
     }
 
@@ -782,8 +786,10 @@ impl Storage {
         }
         if self.path.is_some() {
             self.await_flush()?;
-            // Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its
-            // floor.
+            // Plan as the commit will: a pending relaxed batch reuses only pages free at its floor.
+            // A commit past its batch's deadline flushes first and plans without that restriction
+            // (validated-cow.md §4.1); the answer is the same, since live pages (memory.md §8.7) do
+            // not depend on which page ids a commit takes.
             let allowed = self.floor_free_for(self.batch_open());
             let write = snap.incremental_image_allowed(
                 self.page_size,
@@ -837,8 +843,79 @@ impl Storage {
     /// Make every pending commit durable (validated-cow.md §4): close, detach, ownership release,
     /// and a page client's `begin_write`.
     pub(crate) fn flush(&mut self) -> Result<()> {
+        let held = self.deadline.hold();
+        let batch = held.as_ref().map(crate::idle_flush::Held::lock);
         self.await_flush()?;
-        self.paging.pager().flush_pending(true)
+        self.paging.pager().flush_pending(true)?;
+        if let Some(mut batch) = batch {
+            batch.clear();
+        }
+        Ok(())
+    }
+
+    /// A relaxed page client's `begin_write` on the owner (validated-cow.md §4.1 rule 4): the
+    /// client is about to plan against the pending batch, so a batch past its deadline is flushed
+    /// first, as the owner's own commit would (shrinking nothing, like the flush before a
+    /// synchronous client).
+    #[cfg(unix)]
+    pub(crate) fn begin_client_batch(&mut self) -> Result<()> {
+        let held = self.deadline.hold();
+        let mut batch = held.as_ref().map(crate::idle_flush::Held::lock);
+        self.await_flush()?;
+        if let Some(batch) = batch.as_mut()
+            && self.paging.pager().has_pending()
+            && batch.passed(self.deadline.now())
+        {
+            self.paging.pager().flush_pending(false)?;
+            batch.clear();
+        }
+        Ok(())
+    }
+
+    /// A relaxed page client's commit on the owner (validated-cow.md §4.1 rule 4): one that started
+    /// a batch sets its deadline from a reading taken now; one that reached the cap ends it.
+    #[cfg(unix)]
+    fn after_client_commit(&mut self, began_empty: bool, cap_reached: bool) {
+        let Some(held) = self.deadline.hold() else {
+            return;
+        };
+        let mut batch = held.lock();
+        if cap_reached {
+            batch.clear();
+        } else if began_empty {
+            let now = self.deadline.now();
+            let background = (!self.inline_flush).then_some(&self.paging);
+            self.deadline
+                .after_commit(&held, &mut batch, true, true, now, background);
+        }
+    }
+
+    /// The writer gate this domain's idle flusher takes first: a page-service owner's, or `None`.
+    #[cfg(unix)]
+    pub(crate) fn set_flush_gate(&mut self, gate: Option<crate::idle_flush::FlushGate>) {
+        self.deadline.set_gate(gate);
+    }
+
+    /// End the time-based flush's batch (validated-cow.md §4.1): another flush made it durable, or
+    /// the domain's paging is being replaced.
+    pub(crate) fn end_timed_batch(&mut self) {
+        if let Some(held) = self.deadline.hold() {
+            held.lock().clear();
+        }
+    }
+
+    /// Set the handle's durability mode on this domain: `synchronous = off` (`relaxed`) and its
+    /// time-based flush (validated-cow.md §4.1).
+    pub(crate) fn set_synchronous(
+        &mut self,
+        relaxed: bool,
+        flush_interval_ms: u64,
+        env: &crate::environment::Environment,
+    ) {
+        self.relaxed = relaxed;
+        let gate = self.deadline.take_gate();
+        self.deadline = crate::idle_flush::DeadlineFlush::new(flush_interval_ms, env);
+        self.deadline.set_gate(gate);
     }
 
     /// The owner's flush before granting a page client's `begin_write`: like [`flush`](Storage::flush),
@@ -848,7 +925,9 @@ impl Storage {
     #[cfg(unix)]
     pub(crate) fn flush_for_client(&mut self) -> Result<()> {
         self.await_flush()?;
-        self.paging.pager().flush_pending(false)
+        self.paging.pager().flush_pending(false)?;
+        self.end_timed_batch();
+        Ok(())
     }
 
     /// End a batch that reached the cap: the flush runs on its own thread (or inline for the
@@ -1002,9 +1081,30 @@ impl Storage {
     ) -> Result<()> {
         if self.path.is_some() {
             let ctx = budget.expect("a file commit names its previous snapshot");
+            // The batch deadline (validated-cow.md §4.1): held from the clock reading to the
+            // publish, so the idle flusher never runs inside a commit. The file's owner times every
+            // batch, a synchronous one's included, since its relaxed page clients may open one.
+            let held = if self.service_client {
+                None
+            } else {
+                self.deadline.hold()
+            };
+            let mut batch = held.as_ref().map(crate::idle_flush::Held::lock);
             self.await_flush()?;
             self.paging.pager().check_commit()?;
-            let pending = self.batch_open();
+            let mut pending = self.batch_open();
+            // One reading by a relaxed commit, or by any commit that begins inside a batch (rule 1).
+            let now =
+                (batch.is_some() && (pending || self.relaxed_file())).then(|| self.deadline.now());
+            if let (Some(batch), Some(now)) = (batch.as_mut(), now)
+                && pending
+                && batch.passed(now)
+            {
+                // Past the deadline: flush the batch before planning (rule 3).
+                self.paging.pager().flush_pending(true)?;
+                batch.clear();
+                pending = false;
+            }
             let allowed = self.reuse_allowed(pending);
             let write = snap.incremental_image_allowed(
                 self.page_size,
@@ -1015,14 +1115,21 @@ impl Storage {
                 Some(&self.paging),
             )?;
             let live = self.admit_file(&write, ctx)?;
-            self.commit_file(
+            let cap_reached = self.commit_file(
                 snap,
                 write,
                 live,
                 can_reclaim,
                 can_reuse,
                 allowed.as_deref(),
-            )
+            )?;
+            if let (Some(held), Some(batch), Some(now)) = (&held, batch.as_mut(), now) {
+                let background = (!self.inline_flush).then_some(&self.paging);
+                let continues = self.relaxed_file() && !cap_reached;
+                self.deadline
+                    .after_commit(held, batch, !pending, continues, now, background);
+            }
+            Ok(())
         } else {
             let write = self.plan_in_memory(snap, can_reuse, budget)?;
             self.commit_in_memory(snap, write, can_reclaim)
@@ -1030,7 +1137,8 @@ impl Storage {
     }
 
     /// File commit: write body pages so the reclamation walk can read the new catalog, then
-    /// jointly allocate free-list/manifest pages. Publish the validated meta and sync once.
+    /// jointly allocate free-list/manifest pages. Publish the validated meta and sync once. Returns
+    /// whether the commit reached the relaxed batch cap (a flush follows).
     fn commit_file(
         &mut self,
         snap: &Snapshot,
@@ -1039,7 +1147,7 @@ impl Storage {
         can_reclaim: bool,
         can_reuse: bool,
         allowed: Option<&HashSet<u32>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.sync_directory_once();
         let ps = self.page_size as usize;
         // Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new
@@ -1120,7 +1228,7 @@ impl Storage {
         if cap_reached {
             self.start_cap_flush();
         }
-        Ok(())
+        Ok(cap_reached)
     }
 
     /// The IN-MEMORY branch of [`commit_durable`]: a `MemoryBlockStore` is never reopened, so it keeps
@@ -1243,6 +1351,7 @@ impl Storage {
         // A file's old pager is already closed and poisoned here, so a failed reload leaves the
         // handle needing a reopen; an in-memory domain keeps its old store untouched.
         let engine = Engine::open_shared_paging(Arc::clone(&paging), &snap.env)?;
+        self.end_timed_batch();
         self.paging = paging;
         self.page_count = engine.page_count;
         self.free_pages = engine.free_pages.clone();
@@ -1309,6 +1418,7 @@ impl Storage {
             Some((name, self.budget.limit)),
         )?;
         let engine = Engine::open_shared_paging(Arc::clone(&paging), &snap.env)?;
+        self.end_timed_batch();
         self.paging = paging;
         self.page_count = engine.page_count;
         self.free_pages = engine.free_pages.clone();
@@ -1692,7 +1802,7 @@ impl Shared {
     pub(crate) fn page_service_flush(&self, relaxed: bool) -> Result<()> {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         if relaxed {
-            st.await_flush()
+            st.begin_client_batch()
         } else {
             st.flush_for_client()
         }
@@ -1743,12 +1853,14 @@ impl Shared {
         relaxed: bool,
     ) -> Result<bool> {
         let mut st = self.storage.lock().expect("storage lock not poisoned");
+        let mut began_empty = false;
         let cap_reached = {
             let mut pager = st.paging.pager();
             // The slot not holding the floor (README.md §3.5). A synchronous client's commit keeps
             // its own barrier (the begin_write flush left nothing pending); a relaxed one joins the
             // batch.
             let slot = pager.commit_slot();
+            began_empty = !pager.has_pending();
             // A client cannot know that slot, so an encrypted meta, already checked against the
             // database key, is resealed for it (spec/fileformat/encrypted.md §14).
             if let Some(codec) = st.paging.codec() {
@@ -1778,6 +1890,9 @@ impl Shared {
         )?;
         st.page_count = delta.page_count;
         st.free_pages = free;
+        if relaxed {
+            st.after_client_commit(began_empty, cap_reached);
+        }
         Ok(cap_reached)
     }
 
@@ -2829,6 +2944,7 @@ impl Database {
             floor_free: None,
             service_pending: Vec::new(),
             service_reuse: None,
+            deadline: crate::idle_flush::DeadlineFlush::default(),
         };
         let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -3452,6 +3568,7 @@ impl Database {
                     let open_opts = OpenOptions {
                         skip_fsync: opts.skip_fsync,
                         synchronous: opts.synchronous,
+                        flush_interval_ms: opts.flush_interval_ms,
                         locking: Locking::Auto,
                         file_lock_timeout_ms: opts.file_lock_timeout_ms,
                         environment: env,
@@ -3479,7 +3596,11 @@ impl Database {
                 {
                     let mut storage = db.0.storage.lock().expect("storage lock not poisoned");
                     storage.budget.limit = opts.max_storage_bytes;
-                    storage.relaxed = opts.synchronous == crate::file::Synchronous::Off;
+                    storage.set_synchronous(
+                        opts.synchronous == crate::file::Synchronous::Off,
+                        opts.flush_interval_ms,
+                        &db.0.env,
+                    );
                 }
                 Ok(db)
             }
@@ -3511,6 +3632,7 @@ impl Database {
         }
         let max_storage_bytes = opts.max_storage_bytes;
         let relaxed = opts.synchronous == crate::file::Synchronous::Off;
+        let flush_interval_ms = opts.flush_interval_ms;
         let coordinator = FileCoordinator::open(path.as_ref(), locking, opts.file_lock_timeout_ms)?;
         let canonical = coordinator
             .as_ref()
@@ -3527,7 +3649,7 @@ impl Database {
         {
             let mut storage = db.0.storage.lock().expect("storage lock not poisoned");
             storage.budget.limit = max_storage_bytes;
-            storage.relaxed = relaxed;
+            storage.set_synchronous(relaxed, flush_interval_ms, &db.0.env);
         }
         Ok(db)
     }
@@ -3624,9 +3746,14 @@ impl Database {
             // Through main's file host (crate::filehost), so the simulated filesystem serves
             // attachments too.
             // A file attachment also follows the handle's synchronous setting (validated-cow.md §4).
-            let (files, relaxed, inline_flush) = {
+            let (files, relaxed, inline_flush, deadline) = {
                 let main = self.0.storage.lock().expect("storage lock not poisoned");
-                (main.files.clone(), main.relaxed, main.inline_flush)
+                (
+                    main.files.clone(),
+                    main.relaxed,
+                    main.inline_flush,
+                    main.deadline.settings(),
+                )
             };
             let os = crate::filehost::OsFileHost;
             let host: &dyn crate::filehost::FileHost = match &files {
@@ -3686,6 +3813,7 @@ impl Database {
                 floor_free: None,
                 service_pending: Vec::new(),
                 service_reuse: None,
+                deadline,
             };
             Some((storage, engine.committed, coordinator))
         } else {
@@ -5138,11 +5266,17 @@ impl Database {
             .files = Some(files);
     }
 
-    /// Set main's synchronous = off (`relaxed`) and whether its cap flush runs on the committing
-    /// thread, so every flush lands in the step that caused it. File attachments inherit both.
-    pub(crate) fn sim_set_relaxed(&self, relaxed: bool, inline_flush: bool) {
+    /// Set main's synchronous = off (`relaxed`), its time-based flush interval, and whether its cap
+    /// flush runs on the committing thread (with no idle flusher), so every flush lands in the step
+    /// that caused it. File attachments inherit all three.
+    pub(crate) fn sim_set_relaxed(
+        &self,
+        relaxed: bool,
+        inline_flush: bool,
+        flush_interval_ms: u64,
+    ) {
         let mut st = self.0.storage.lock().expect("storage lock not poisoned");
-        st.relaxed = relaxed;
+        st.set_synchronous(relaxed, flush_interval_ms, &self.0.env);
         st.inline_flush = inline_flush;
     }
 
