@@ -32,7 +32,7 @@ import (
 
 // mutationGeneration is the private ownership proof for Go dirty-node transients
 // (transactions.md §3). A clone, cursor pin, or publication atomically invalidates the token;
-// subsequent INSERTs path-copy old-generation nodes under a fresh token. The byte makes the object
+// subsequent INSERTs and REMOVEs path-copy old-generation nodes under a fresh token. The byte makes the object
 // non-zero-sized: distinct pointers to zero-sized Go values are not guaranteed to compare unequal.
 // Neither the token nor a node's owner is serialized, rendered, hashed, or metered.
 type mutationGeneration struct {
@@ -418,7 +418,7 @@ func (m *pMap) freezeMutationGeneration() {
 	}
 }
 
-// mutationGeneration returns the active token for this map's next INSERT. Only a working map calls
+// mutationGeneration returns the active token for this map's next INSERT or REMOVE. Only a working map calls
 // this mutating helper; committed readers merely invalidate tokens atomically at alias boundaries.
 func (m *pMap) mutationGeneration() *mutationGeneration {
 	if m.generation == nil || !m.generation.active.Load() {
@@ -518,7 +518,7 @@ func (m *pMap) Remove(key []byte, cap pageCap, shape leafShape, src leafSource) 
 	if m.root == nil {
 		return nil, false, nil
 	}
-	newRoot, removed, ok, err := nodeRemove(m.root, key, src, cap, shape)
+	newRoot, removed, ok, err := nodeRemove(m.root, key, m.mutationGeneration(), src, cap, shape)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1371,35 +1371,49 @@ func underfull(n *pnode, cap pageCap, shape leafShape) bool {
 // equal to the key just routes right — it is never itself deleted or replaced; separators may go
 // stale, format.md "Delete"). Returns the rebuilt subtree (possibly underfull — the caller
 // rebalances it) and the removed row. The touched child is rebalanced via rebalanceChild.
-func nodeRemove(n *pnode, key []byte, src leafSource, cap pageCap, shape leafShape) (*pnode, storedRow, bool, error) {
+func nodeRemove(n *pnode, key []byte, generation *mutationGeneration, src leafSource, cap pageCap, shape leafShape) (*pnode, storedRow, bool, error) {
 	if n.isLeaf() {
 		i, found := n.search(key)
 		if !found {
 			return n, nil, false, nil
 		}
+		// A dirty leaf this generation owns is edited in place, as nodeInsert does; any other leaf is
+		// copied into a new one the generation owns.
+		if ownedBy(n, generation) {
+			var removed storedRow
+			n.keys = removeKeyAtMutable(n.keys, i)
+			n.vals, removed = removeValAtMutable(n.vals, i)
+			n.weights = removeWeightAtMutable(n.weights, i)
+			return n, removed, true, nil
+		}
 		keys, rows, weights, err := n.decodedParts()
 		if err != nil {
 			return nil, nil, false, err
 		}
-		vals, removed := removeValAt(rows, i)
-		return &pnode{keys: removeKeyAt(keys, i), vals: vals, weights: removeWeightAt(weights, i)}, removed, true, nil
+		vals, removed := removeValAtMutable(rows, i)
+		return &pnode{keys: removeKeyAtMutable(keys, i), vals: vals, weights: removeWeightAtMutable(weights, i), owner: generation}, removed, true, nil
 	}
 	i := n.childSlot(key)
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	newChild, removed, ok, err := nodeRemove(childNode, key, src, cap, shape)
+	newChild, removed, ok, err := nodeRemove(childNode, key, generation, src, cap, shape)
 	if err != nil {
 		return nil, nil, false, err
 	}
 	if !ok {
 		return n, nil, false, nil
 	}
-	children := cloneChildren(n.children)
-	children[i] = residentRef(newChild)
-	rebuilt := &pnode{keys: cloneKeys(n.keys), children: children}
-	out, err := rebalanceChild(rebuilt, i, src, cap, shape)
+	rebuilt := n
+	if ownedBy(n, generation) {
+		n.children[i] = residentRef(newChild)
+	} else {
+		children := cloneChildren(n.children)
+		children[i] = residentRef(newChild)
+		rebuilt = &pnode{keys: cloneKeys(n.keys), children: children, owner: generation}
+	}
+	out, err := rebalanceChild(rebuilt, i, generation, src, cap, shape)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -1410,7 +1424,7 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap pageCap, shape leafSha
 // one), then split the merged node back if it overflows — the unified rebalance (no borrow). The
 // returned parent may itself have lost a key and become underfull; its own parent handles that as
 // the recursion unwinds.
-func rebalanceChild(n *pnode, i int, src leafSource, cap pageCap, shape leafShape) (*pnode, error) {
+func rebalanceChild(n *pnode, i int, generation *mutationGeneration, src leafSource, cap pageCap, shape leafShape) (*pnode, error) {
 	// children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
@@ -1428,7 +1442,7 @@ func rebalanceChild(n *pnode, i int, src leafSource, cap pageCap, shape leafShap
 	if i+1 >= len(n.children) {
 		j = i - 1
 	}
-	return mergeAt(n, j, src, cap, shape)
+	return mergeAt(n, j, generation, src, cap, shape)
 }
 
 // mergeAt merges children[j] and children[j+1] into one node M (format.md "Delete"): a LEAF merge
@@ -1439,7 +1453,7 @@ func rebalanceChild(n *pnode, i int, src leafSource, cap pageCap, shape leafShap
 // separator replace the pair (the parent's key count is unchanged). An INTERIOR M that overflows
 // but admits no valid split (near-cap separators) ABANDONS the merge — the parent is returned
 // unchanged (format.md "Delete", the deterministic abandon rule).
-func mergeAt(n *pnode, j int, src leafSource, cap pageCap, shape leafShape) (*pnode, error) {
+func mergeAt(n *pnode, j int, generation *mutationGeneration, src leafSource, cap pageCap, shape leafShape) (*pnode, error) {
 	// Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
 	// still be an OnDisk leaf the delete never touched.
 	left, err := resolveChild(n.children[j], src)
@@ -1471,7 +1485,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap pageCap, shape leafShape) (*pn
 		mweights := make([]uint32, 0, len(leftWeights)+len(rightWeights))
 		mweights = append(mweights, leftWeights...)
 		mweights = append(mweights, rightWeights...)
-		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1, nil) // merge-overflow: balanced
+		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1, generation) // merge-overflow: balanced
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 		mkeys = append(mkeys, left.keys...)
@@ -1481,7 +1495,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap pageCap, shape leafShape) (*pn
 		mchildren = append(mchildren, left.children...)
 		mchildren = append(mchildren, right.children...)
 		var ok bool
-		merged, ok = buildInterior(mkeys, mchildren, cap, -1, nil)
+		merged, ok = buildInterior(mkeys, mchildren, cap, -1, generation)
 		if !ok {
 			// No valid 2-way split point (near-cap separators): abandon the merge — the two
 			// children and the parent separator stay exactly as they were (underfull tolerated).
@@ -1489,18 +1503,26 @@ func mergeAt(n *pnode, j int, src leafSource, cap pageCap, shape leafShape) (*pn
 		}
 	}
 
-	keys := cloneKeys(n.keys)
-	children := cloneChildren(n.children)
-	if merged.whole != nil {
-		keys = removeKeyAt(keys, j)
-		children[j] = residentRef(merged.whole)
-		children = removeChildAt(children, j+1)
-		return &pnode{keys: keys, children: children}, nil
+	parent := n
+	if !ownedBy(n, generation) {
+		parent = &pnode{keys: cloneKeys(n.keys), children: cloneChildren(n.children), owner: generation}
 	}
-	keys[j] = merged.sep
-	children[j] = residentRef(merged.left)
-	children[j+1] = residentRef(merged.right)
-	return &pnode{keys: keys, children: children}, nil
+	if merged.whole != nil {
+		parent.keys = removeKeyAtMutable(parent.keys, j)
+		parent.children[j] = residentRef(merged.whole)
+		parent.children = removeChildAtMutable(parent.children, j+1)
+		return parent, nil
+	}
+	parent.keys[j] = merged.sep
+	parent.children[j] = residentRef(merged.left)
+	parent.children[j+1] = residentRef(merged.right)
+	return parent, nil
+}
+
+// ownedBy reports whether n is a dirty node generation may edit in place: only the active generation
+// that built it, which a clone, cursor pin, or publication invalidates before exposing an alias.
+func ownedBy(n *pnode, generation *mutationGeneration) bool {
+	return n.page == 0 && n.owner == generation && generation.active.Load()
 }
 
 // --- immutable slice helpers (each returns a fresh slice, leaving the input untouched) -------
@@ -1603,31 +1625,29 @@ func insertChildAtMutable(s []childRef, i int, x childRef) []childRef {
 	return s
 }
 
-func removeKeyAt(s [][]byte, i int) [][]byte {
-	out := make([][]byte, len(s)-1)
-	copy(out, s[:i])
-	copy(out[i:], s[i+1:])
-	return out
+// The mutable remove helpers shift a slice the caller owns down over index i, clearing the vacated
+// last slot so it holds no reference.
+
+func removeKeyAtMutable(s [][]byte, i int) [][]byte {
+	copy(s[i:], s[i+1:])
+	s[len(s)-1] = nil
+	return s[:len(s)-1]
 }
 
-func removeValAt(s []storedRow, i int) ([]storedRow, storedRow) {
+func removeValAtMutable(s []storedRow, i int) ([]storedRow, storedRow) {
 	removed := s[i]
-	out := make([]storedRow, len(s)-1)
-	copy(out, s[:i])
-	copy(out[i:], s[i+1:])
-	return out, removed
+	copy(s[i:], s[i+1:])
+	s[len(s)-1] = nil
+	return s[:len(s)-1], removed
 }
 
-func removeWeightAt(s []uint32, i int) []uint32 {
-	out := make([]uint32, len(s)-1)
-	copy(out, s[:i])
-	copy(out[i:], s[i+1:])
-	return out
+func removeWeightAtMutable(s []uint32, i int) []uint32 {
+	copy(s[i:], s[i+1:])
+	return s[:len(s)-1]
 }
 
-func removeChildAt(s []childRef, i int) []childRef {
-	out := make([]childRef, len(s)-1)
-	copy(out, s[:i])
-	copy(out[i:], s[i+1:])
-	return out
+func removeChildAtMutable(s []childRef, i int) []childRef {
+	copy(s[i:], s[i+1:])
+	s[len(s)-1] = childRef{}
+	return s[:len(s)-1]
 }
