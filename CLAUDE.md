@@ -740,9 +740,11 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   and keeps the batch's pages off the free list, so a power loss recovers a complete generation between the floor
   and the newest attempted commit and never corrupts; a process crash loses no acknowledged commit.
   The batch ends at the inline-manifest cap (flushed on a background goroutine/thread in Go/Rust,
-  inline in TS — the next commit waits, so bytes never depend on timing), at close, before a page
-  client's `begin_write`, and at compaction. Under `synchronous = on` the slot rule is `txid & 1` and
-  nothing changes. No time-based flush yet (its interval is undecided). Trailing truncation runs only
+  inline in TS — the next commit waits, so bytes never depend on timing), at close, before a synchronous
+  page client's `begin_write`, and at compaction. A relaxed page client commits into its owner's batch:
+  its `begin_write` carries the setting, `write_begun` names the owner's pending set and floor-free
+  pages, and the owner checks the client's cumulative manifest and skips the barrier. Under
+  `synchronous = on` with nothing pending the slot rule is `txid & 1` and nothing changes. No time-based flush yet (its interval is undecided). Trailing truncation runs only
   with nothing pending: only a batch's first commit lowers the high-water, and the file is shortened
   at the flush, never while the batch is pending. [spec/design/validated-cow.md](spec/design/validated-cow.md) §4.
 - **Live page count (format v34).** Meta offset 56 records the exact number of pages reachable
@@ -868,7 +870,8 @@ session/clock/state dependencies, and pin named timezone data until an explicit 
   clean break (bundle marker `protocol-v2`; shared mode had no production users). A file attachment is
   elected owner or page client of its own file, and a writer takes every gate, local or remote, in
   real-path byte order (no cross-owner wait cycle; `lock_timeout_ms` backstop); it follows the handle's
-  `synchronous` setting, its owner flushing its own batch before granting its gate. Decided at ratification: the
+  `synchronous` setting: its owner flushes its batch before granting its gate to a synchronous
+  client and names the batch to a relaxed one. Decided at ratification: the
   endpoint lives in the bundle (runtime-directory fallback); `begin_read` is always a round trip; no
   client request timeout; Rust on Windows is a non-serving owner only for now. Rust/Go use
   `flock`/`LockFileEx` without dependencies; Node uses the first-party minimal Rust Node-API lock

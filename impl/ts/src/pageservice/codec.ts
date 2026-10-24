@@ -21,6 +21,8 @@ export const PS_MAX_FRAME_LENGTH = 16777216;
 export const PS_HEADER_LENGTH = 9;
 export const PS_MAX_READ_PAGES_CAP = 1024;
 export const PS_MAX_INVALIDATION_ENTRIES = 65536;
+// The most floor-free pages a relaxed write_begun offers for reuse inside a batch (README §3.5).
+export const PS_MAX_REUSE_PAGES = 65536;
 export const PS_INVALIDATION_WINDOW_COMMITS = 256;
 export const PS_ENDPOINT_MAX_PATH_BYTES = 100;
 export const PS_OWNER_RECORD_MAGIC = "JEDOWNER";
@@ -117,7 +119,15 @@ export type PsBeginWrite = {
   incarnation: Uint8Array;
   lastTxid: bigint;
   lockTimeoutMs: bigint;
+  flags: number;
 };
+
+// PS_BEGIN_WRITE_RELAXED is begin_write's flags bit 0: the client's handle runs synchronous = off, so
+// the owner names its pending batch instead of flushing it (README §3.5).
+export const PS_BEGIN_WRITE_RELAXED = 1;
+
+// PsDigest is one digest_list item: a page index and its CRC-64 manifest digest.
+export type PsDigest = { index: number; digest: bigint };
 export type PsCommitBegin = {
   kind: "commit_begin";
   txid: bigint;
@@ -155,6 +165,10 @@ export type PsWriteBegun = {
   indices: number[];
   reuseGrant: boolean;
   meta: Uint8Array;
+  // pending is the owner's pending set for a relaxed begin_write, ascending; reuse narrows the grant
+  // while it is non-empty (README §3.5).
+  pending: PsDigest[];
+  reuse: number[];
 };
 export type PsCommitted = { kind: "committed"; txid: bigint };
 export type PsCommitStatusReply = { kind: "commit_status_reply"; status: number };
@@ -343,6 +357,14 @@ class Writer {
     for (const v of list) this.u32(v);
   }
 
+  digestList(list: PsDigest[]): void {
+    this.u32(list.length);
+    for (const item of list) {
+      this.u32(item.index);
+      this.u64(item.digest);
+    }
+  }
+
   pageList(list: Uint8Array[]): void {
     this.u32(list.length);
     for (const p of list) this.page(p);
@@ -386,6 +408,7 @@ function writeBody(w: Writer, m: PsMessage): void {
       w.id16(m.incarnation);
       w.u64(m.lastTxid);
       w.u64(m.lockTimeoutMs);
+      w.u8(m.flags);
       return;
     case "commit_begin":
       w.u64(m.txid);
@@ -428,6 +451,8 @@ function writeBody(w: Writer, m: PsMessage): void {
       w.u32List(m.indices);
       w.bool(m.reuseGrant);
       w.page(m.meta);
+      w.digestList(m.pending);
+      w.u32List(m.reuse);
       return;
     case "committed":
       w.u64(m.txid);
@@ -581,6 +606,16 @@ class Reader {
     return out;
   }
 
+  digestList(): PsDigest[] {
+    const count = this.count(12);
+    const out: PsDigest[] = [];
+    for (let i = 0; i < count; i++) {
+      const index = this.u32();
+      out.push({ index, digest: this.u64() });
+    }
+    return out;
+  }
+
   pageList(): Uint8Array[] {
     const count = this.count(this.pageSize);
     const out: Uint8Array[] = [];
@@ -623,6 +658,7 @@ function readBody(r: Reader, code: number): PsMessage {
         incarnation: r.id16(),
         lastTxid: r.u64(),
         lockTimeoutMs: r.u64(),
+        flags: r.u8(),
       };
     case PS_CODE_COMMIT_BEGIN:
       return {
@@ -671,6 +707,8 @@ function readBody(r: Reader, code: number): PsMessage {
         indices: r.u32List(),
         reuseGrant: r.bool(),
         meta: r.page(),
+        pending: r.digestList(),
+        reuse: r.u32List(),
       };
     case PS_CODE_COMMITTED:
       return { kind: "committed", txid: r.u64() };

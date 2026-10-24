@@ -302,8 +302,14 @@ export class SharedPaging {
   setBatchMirror(mirror: BatchMirror | null): void {
     this.pager.setBatchMirror(mirror);
   }
-  setFloorSlot(slot: number): void {
-    this.pager.setFloorSlot(slot);
+  setFloorSlot(slot: number, txid: bigint): void {
+    this.pager.setFloorSlot(slot, txid);
+  }
+  floorMetaSlot(): number {
+    return this.pager.floorMetaSlot();
+  }
+  floorMetaTxid(): bigint {
+    return this.pager.floorMetaTxid();
   }
   commitSlot(): number {
     return this.pager.commitSlot();

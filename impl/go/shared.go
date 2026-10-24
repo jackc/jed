@@ -332,6 +332,12 @@ type storage struct {
 	// floorFree is the free list as of the floor — recorded by the first commit of a relaxed batch —
 	// the only pages a pending commit may reuse (validated-cow.md §4 rule 3).
 	floorFree map[uint32]bool
+	// servicePending and serviceReuse are a page client's view of its owner's batch for the write
+	// transaction in progress, from a relaxed write_begun (spec/pageservice/README.md §3.5): the pending
+	// set its cumulative manifest lists, and the only free pages it may reuse while that set is
+	// non-empty. Empty outside a relaxed client's write transaction.
+	servicePending []manifestEntry
+	serviceReuse   map[uint32]bool
 }
 
 // backgroundFlush is one background cap flush (validated-cow.md §4).
@@ -399,31 +405,65 @@ func capFlush(paging *sharedPaging) error {
 // reuseAllowed is the reuse restriction of the commit about to plan (validated-cow.md §4 rule 3).
 // With nothing pending the floor is the committed generation, so a relaxed domain records the pages
 // free now — the floor's free list — and allows them all; while a batch is pending only those not yet
-// consumed may be reused, since a page freed during the batch may still be needed by the floor. A
-// synchronous = on domain is never restricted. Caller holds st.mu.
+// consumed may be reused, since a page freed during the batch may still be needed by the floor. The
+// restriction binds every commit that begins inside a batch, a synchronous = on owner's included,
+// since its relaxed page clients may have opened one (page-service.md §6). Caller holds st.mu.
 func (st *storage) reuseAllowed(pending bool) map[uint32]bool {
-	if !st.relaxedFile() {
-		return nil
+	if pending {
+		return st.floorFreeFor(true)
 	}
-	if !pending {
-		st.floorFree = make(map[uint32]bool, len(st.freePages))
-		for _, p := range st.freePages {
-			st.floorFree[p] = true
-		}
-		return nil
+	if st.relaxedFile() {
+		st.recordFloorFree()
 	}
-	return st.floorFreeFor(true)
+	return nil
 }
 
-// floorFreeFor is the restriction a pending batch plans under, without recording a new floor.
+// recordFloorFree records the committed free list as the floor's, for a batch about to start: by the
+// domain's own first relaxed commit, or by a relaxed page client's (README.md §3.5). Caller holds st.mu.
+func (st *storage) recordFloorFree() {
+	st.floorFree = make(map[uint32]bool, len(st.freePages))
+	for _, p := range st.freePages {
+		st.floorFree[p] = true
+	}
+}
+
+// floorFreeFor is the restriction a pending batch plans under, without recording a new floor. A page
+// client's is the reuse list its owner sent.
 func (st *storage) floorFreeFor(pending bool) map[uint32]bool {
-	if !pending || !st.relaxedFile() {
+	if !pending {
 		return nil
+	}
+	if st.serviceClient {
+		if st.serviceReuse == nil {
+			return map[uint32]bool{}
+		}
+		return st.serviceReuse
 	}
 	if st.floorFree == nil {
 		return map[uint32]bool{}
 	}
 	return st.floorFree
+}
+
+// batchEntries is the pending set the commit about to plan carries in its manifest: the domain's own,
+// or, on a page client, its owner's from a relaxed write_begun. Caller holds st.mu.
+func (st *storage) batchEntries() []manifestEntry {
+	if st.serviceClient {
+		return st.servicePending
+	}
+	var pending []manifestEntry
+	_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
+	return pending
+}
+
+// batchOpen reports whether the commit about to plan begins inside a batch. Caller holds st.mu.
+func (st *storage) batchOpen() bool {
+	if st.serviceClient {
+		return len(st.servicePending) > 0
+	}
+	open := false
+	_ = st.paging.withPager(func(p *pager) error { open = len(p.pending) > 0; return nil })
+	return open
 }
 
 // relaxedFile reports whether this domain's commits batch their barrier.
@@ -592,6 +632,8 @@ func (c *sharedCore) persist(snap *snapshot, stagesRows bool) error {
 func (c *sharedCore) persistClient(snap *snapshot, stagesRows bool, r *serviceRole) error {
 	budget := &budgetCtx{name: c.domainName(), prev: c.roots.Load().committed, stagesRows: stagesRows, guard: c.roleGuard(r)}
 	err := c.storage.commitDurable(snap, false, r.client.reuseGrant, budget)
+	// The commit ends the write transaction, whatever its outcome: the owner's batch it named is gone.
+	c.storage.setServiceBatch(nil, nil)
 	if err == nil {
 		return nil
 	}
@@ -634,9 +676,8 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool, budg
 		if err := st.awaitFlush(); err != nil {
 			return err
 		}
-		pending := false
+		pending := st.batchOpen()
 		if err := st.paging.withPager(func(p *pager) error {
-			pending = len(p.pending) > 0
 			return p.checkValidatedCommit()
 		}); err != nil {
 			return err
@@ -684,8 +725,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, live liveC
 		return err
 	}
 	relaxed := st.relaxedFile()
-	var pending []manifestEntry
-	_ = st.paging.withPager(func(p *pager) error { pending = p.pendingEntries(); return nil })
+	pending := st.batchEntries()
 	// Only the file's owner lowers the high-water, and only against a durable floor: a page client's
 	// delta never shrinks it, and a commit inside a relaxed batch may not cut pages the floor's batch
 	// has yet to make durable (format.md *Trailing truncation*, validated-cow.md §4).
@@ -899,9 +939,7 @@ func (st *storage) precheckBudget(snap *snapshot, reuse bool, budget *budgetCtx)
 			return err
 		}
 		// Plan exactly as the commit will: a pending relaxed batch reuses only pages free at its floor.
-		pending := false
-		_ = st.paging.withPager(func(p *pager) error { pending = len(p.pending) > 0; return nil })
-		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, reuse, st.floorFreeFor(pending), st.paging)
+		write, err := snap.incrementalImageAllowed(st.pageSize, st.pageCount, st.freePages, reuse, st.floorFreeFor(st.batchOpen()), st.paging)
 		if err != nil {
 			return err
 		}

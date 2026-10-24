@@ -13,6 +13,7 @@ import {
   pageChecksum,
   parseCommitMeta,
   type CommitMeta,
+  type ManifestEntry,
 } from "../commit_manifest.ts";
 import type { PageCodec } from "../crypto.ts";
 import type { PsCommitBegin, PsIndexedPage } from "./codec.ts";
@@ -35,6 +36,10 @@ export type DeltaBase = {
   pageCount: number;
   // granted is the reusable free pages when the reuse grant passed; null otherwise.
   granted: Set<number> | null;
+  // pending is the owner's pending set named in a relaxed write_begun (README §3.5), page index to
+  // CRC-64: the delta's cumulative manifest must list each with this digest, and none of them arrives
+  // in commit_pages.
+  pending?: Map<number, bigint> | null;
   // codec is an encrypted database's page codec (spec/fileformat/encrypted.md §14), null in plaintext:
   // the meta must authenticate under it, the inline manifest starts at 96, body pages are ciphertext
   // checked by their manifest identity alone, and the key block (pages 2–3) is never written.
@@ -75,9 +80,13 @@ export class Delta {
   // manifest is the overflow chain, in chain order; it arrives whole in commit_begin.
   readonly manifest: PsIndexedPage[] = [];
   // written is every index the delta writes (listed and manifest pages), ascending: the invalidation
-  // window's entry.
+  // window's entry. A relaxed delta's carried pending pages are listed but not written, so they are
+  // not in it.
   readonly written: number[] = [];
-  // expected maps every listed index to the CRC-64 of its bytes.
+  // protectedPages is every index the manifest protects (listed and manifest pages, carried pending
+  // pages included): the validation the owner's reload may reuse.
+  readonly protectedPages = new Set<number>();
+  // expected maps every listed index the delta sends to the CRC-64 of its bytes.
   private readonly expected = new Map<number, bigint>();
   private readonly received = new Set<number>();
 
@@ -109,16 +118,32 @@ export class Delta {
     if (cb.manifestPages.length !== m.overflowCount) {
       throw failure("commit_begin carries the wrong number of manifest pages");
     }
-    const protectedPages = new Set<number>();
+    const protectedPages = d.protectedPages;
     let last = 1;
     let rootSeen = false;
     let freeHeadSeen = m.freeListHead === 0;
     let listed = 0;
+    let carried = 0;
+    const pending = base.pending ?? null;
     const list = (entries: Uint8Array, at: number, count: number): void => {
       for (let i = 0; i < count; i++) {
         const e = at + i * 12;
         const index = u32(entries, e);
         if (index <= last) throw failure("manifest indices are not strictly ascending");
+        const digest = pending?.get(index);
+        if (digest !== undefined) {
+          // A page an earlier commit of the batch wrote: listed, never sent again.
+          if (u64(entries, e + 4) !== digest) {
+            throw failure(`pending page ${index} is listed with another digest`);
+          }
+          last = index;
+          protectedPages.add(index);
+          rootSeen ||= index === m.rootPage;
+          freeHeadSeen ||= index === m.freeListHead;
+          listed++;
+          carried++;
+          continue;
+        }
         if (!legal(base, index, m.pageCount)) {
           throw failure(`page ${index} is neither beyond the high-water nor a granted free page`);
         }
@@ -171,6 +196,9 @@ export class Delta {
     if (listed !== m.dirtyCount || !rootSeen || !freeHeadSeen) {
       throw failure("the manifest does not cover the catalog root and free-list head");
     }
+    if (carried !== (pending?.size ?? 0)) {
+      throw failure("the manifest does not list the owner's pending pages");
+    }
     // An encrypted meta must authenticate under the database key, under either slot index (a client
     // cannot know the slot), or the delta is a client bug (encrypted.md §14).
     if (codec !== null) {
@@ -179,7 +207,9 @@ export class Delta {
         throw failure("the meta does not authenticate under the database key");
       }
     }
-    d.written.push(...[...protectedPages].sort((a, b) => a - b));
+    d.written.push(
+      ...[...protectedPages].filter((index) => !pending?.has(index)).sort((a, b) => a - b),
+    );
     return d;
   }
 
@@ -195,6 +225,14 @@ export class Delta {
       throw failure(`page ${pg.index} does not match its manifest identity`);
     }
     this.received.add(pg.index);
+  }
+
+  // own is the delta's own listed body pages with their digests, ascending: what a relaxed commit adds
+  // to the owner's pending set (validated-cow.md §4).
+  own(): ManifestEntry[] {
+    return [...this.expected]
+      .map(([index, checksum]) => ({ index, checksum }))
+      .sort((a, b) => a.index - b.index);
   }
 
   // complete runs check C at commit_end: every listed page arrived.

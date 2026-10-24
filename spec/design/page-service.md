@@ -332,12 +332,24 @@ carry everything required.
   no barrier, no `txid` advance) needs an explicit carve-out for it, and it is a distinct delta kind
   in the replication log (§10) and in simulation histories (§15).
 - **Relaxed durability.** Under `synchronous = off` the owner's own commits, its maintenance commits
-  included, batch their barrier ([validated-cow.md](validated-cow.md) §4). A client cannot see the
-  owner's pending set, which a cumulative manifest would have to name, so the owner flushes it before
-  granting a `begin_write`, and every client commit keeps its own barrier at the point of no return:
-  a client's `synchronous` setting does not reach the owner, so the owner treats it as `on`. Close,
-  yield, and shutdown flush before ownership moves; a successor after an owner crash stabilizes the
-  adopted generation as always (validated-cow.md §3).
+  included, batch their barrier ([validated-cow.md](validated-cow.md) §4), and so do the commits of a
+  page client whose own handle is relaxed: the owner keeps one pending set and one floor for the file,
+  whoever wrote the pages. A client cannot see the owner's pending set, so the owner names it: a relaxed
+  client's `begin_write` carries a relaxed bit, and `write_begun` answers with the pending set (each
+  page and its manifest digest) and the floor-free pages the client may reuse
+  ([pageservice/README.md](../pageservice/README.md) §3.5). The client then plans exactly as the
+  owner would inside the batch — a cumulative manifest, reuse only of pages free at the floor, the
+  pending pages kept off its free list — and the owner checks the listed pending entries against its
+  own, writes the meta to the slot not holding the floor, adds the client's pages to the pending set,
+  and acknowledges without a barrier. A client commit that brings the pending set to the batch cap is
+  flushed by the owner before the gate moves on. A client whose handle runs `synchronous = on` is
+  unchanged: the owner flushes before granting its `begin_write`, and its commit keeps its own barrier
+  at the point of no return, whatever the owner's setting. A pending batch therefore binds every commit
+  that begins inside it, including an owner commit under `synchronous = on`, which reuses only pages
+  free at the floor and ends the batch with its barrier. Close, yield, and shutdown flush before
+  ownership moves; a successor after an owner crash stabilizes the adopted generation as always
+  (validated-cow.md §3). An owner crash may lose acknowledged relaxed client commits back to the
+  floor, newest first, exactly as it may lose its own.
 - **Trailing truncation is owner-only too** ([../fileformat/format.md](../fileformat/format.md)
   *Trailing truncation*). A client's delta never lowers the page count (the owner rejects one that
   does), so a client plans exactly as before. The owner's own commits truncate as an alone process
@@ -345,7 +357,7 @@ carry everything required.
   the high-water (its top page is `page_count − 1`) and no pin holds the watermark back, so the space
   a client's commits leave at the top is returned without waiting for the next rebuild. At most one
   maintenance commit follows a client commit. Under `synchronous = off` the owner's flush before granting a
-  `begin_write` shrinks nothing, in every core (the Node core runs it on the service worker, outside
+  `begin_write`, and its cap flush after a relaxed client commit, shrink nothing, in every core (the Node core runs it on the service worker, outside
   the engine's pager): a truncation an owner commit deferred waits for the owner's next barrier over a
   commit of its own ([validated-cow.md](validated-cow.md) §4).
 - **Compaction** is an ordinary owner operation: it requires the owner's watermark drained (now

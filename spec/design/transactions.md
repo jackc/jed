@@ -461,8 +461,8 @@ database-level **`synchronous`** setting governs *when* the fsync fires relative
   - every relaxed commit writes its pages and meta before it returns (meta last), so a crash of the
     process alone loses no acknowledged commit;
   - a flush happens when a batch reaches the **cap** (its pending pages fill one page's worth of
-    manifest entries), on `close`, before a page client's write transaction is granted the owner's
-    gate, at compaction or the stabilization of an adopted generation, and (in an encrypted
+    manifest entries), on `close`, before the owner grants its gate to a page client whose own handle runs
+    `synchronous = on` (a relaxed client instead commits into the owner's batch, page-service.md §6), at compaction or the stabilization of an adopted generation, and (in an encrypted
     database) at a credential change, whose key-block barriers are whole-file syncs
     ([encryption.md](encryption.md) §5); the cap flush runs on a
     background goroutine/thread in Go and Rust and inline in TypeScript, and the next commit waits for
@@ -687,8 +687,8 @@ a")` drives the same mechanism ([api.md](api.md) §2.2).
   [validated-cow.md](validated-cow.md) §4): the batch cap, the background cap flush, and fsync
   coalescing across every committer of the handle (its sessions on any thread, and its owner-side
   maintenance commits) — successive commits share one barrier. Still open: a **time-based** flush
-  (its interval and knob are undecided), and coalescing for page clients' commits (a client's
-  `synchronous` setting does not reach the owner, which barriers every client commit). Under
+  (its interval and knob are undecided), while page clients' commits coalesce too: a relaxed client's
+  `begin_write` carries its setting, and its commits join the owner's batch (page-service.md §6). Under
   `synchronous=on` a commit holds the writer gate through its barrier, as PostgreSQL makes a commit
   visible only once durable; overlapping the next writer with that barrier would need it to build on
   an unpublished snapshot (early lock release), which is not foreclosed and not planned.

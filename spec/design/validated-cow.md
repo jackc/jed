@@ -172,7 +172,10 @@ Each durable file domain (the main file, each writable file attachment) keeps tw
 - the **pending set**: the page id and CRC-64 digest of every body page (tree, catalog, overflow,
   GiST, and free-list pages — never meta or manifest pages) written by a commit after the floor.
 
-The rules:
+The rules bind every commit that begins with a non-empty pending set, whatever its own handle's
+setting: under the page service a batch may hold a relaxed client's pages while the owner runs
+`synchronous = on`, and the owner's next commit then plans inside the batch and ends it with its
+barrier ([page-service.md](page-service.md) §6). The rules:
 
 1. **Slot.** A commit writes its meta to the slot that does **not** hold the floor. When nothing is
    pending, the floor is the previous generation, so this alternates exactly as `txid & 1` does under
@@ -215,13 +218,16 @@ generation (in the slot it was written to) and the pending set empties. The flus
   a one-row commit dirties three or four pages, so one barrier serves about a hundred commits.
 - **Close** (and detaching a file attachment) flushes before releasing the file; a failed flush is
   the error `close` reports.
-- **A page client's `begin_write`.** The owner flushes before granting the gate
-  ([page-service.md](page-service.md) §6), so a client plans against a durable floor with its own
-  manifest only (the client cannot see the owner's pending set). The floor and pending set belong
-  to one file domain, so under the service each file attachment's owner flushes that attachment's
-  pending set before granting its gate, independently of `main` (a file attachment follows its
-  handle's `synchronous` setting, [pageservice/README.md](../pageservice/README.md) §6.6); a client
-  never commits on top of another process's pending batch.
+- **A page client's `begin_write`**, when the client's handle runs `synchronous = on`. The owner
+  flushes before granting the gate ([page-service.md](page-service.md) §6), so the client plans
+  against a durable floor with its own manifest only. A **relaxed** client is not flushed: the owner
+  names its pending set and the floor-free pages in `write_begun`, and the client commits into the
+  batch under rules 1–4, its pages joining the pending set ([pageservice/README.md](../pageservice/README.md)
+  §3.5). The cap counts the client's pages too: a client commit that reaches it is flushed by the
+  owner before any maintenance commit, and that flush, like the begin_write one, shrinks nothing. The
+  floor and pending set belong to one file domain, so under the service each file attachment's owner
+  decides for that attachment's pending set, independently of `main` (a file attachment follows its
+  handle's `synchronous` setting, [pageservice/README.md](../pageservice/README.md) §6.6).
 - **Compaction** writes a new, already durable image and empties the pending set.
 - **Stabilization** of an adopted generation (§3) is a flush.
 
@@ -236,8 +242,9 @@ only at a durable barrier, with nothing pending. Two rules keep it inside the ba
   `synchronous = on` commit, otherwise at the batch's flush — the cap, close, detach, or an ownership
   release — to one growth step past the newest generation's high-water. Until then the floor's pages
   above the new `page_count` stay in the file, so the floor's meta stays usable (open skips a slot
-  whose `page_count` exceeds the file). The owner's flush before a client's `begin_write` shrinks
-  nothing; the shrink waits for the owner's next barrier over a commit of its own.
+  whose `page_count` exceeds the file). The owner's flushes for its page clients (before a
+  synchronous client's `begin_write`, after a relaxed client commit reaches the cap) shrink nothing;
+  the shrink waits for the owner's next barrier over a commit of its own.
 
 The cap flush may run **in the background** (a goroutine in Go, a thread in Rust): the commit that
 reached the cap returns at once, and the domain's next commit, compaction, flush, or close first waits

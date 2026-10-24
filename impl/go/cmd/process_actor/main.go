@@ -30,7 +30,8 @@ func run() error {
 	// Positional arguments after the path: the open timeout, then the page-service owner's
 	// idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
 	// handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
-	// shutdown_grace, idle_session (milliseconds), max_connections.
+	// shutdown_grace, idle_session (milliseconds), max_connections; synchronous=off batches the handle's
+	// barriers (spec/design/validated-cow.md §4).
 	timeout := uint64(5000)
 	var idle *uint64
 	var positional []string
@@ -65,6 +66,10 @@ func run() error {
 		ownership = jed.OwnershipNever
 	}
 	maxConnections, _ := strconv.Atoi(options["max_connections"])
+	synchronous := jed.SynchronousOn
+	if options["synchronous"] == "off" {
+		synchronous = jed.SynchronousOff
+	}
 	// key=<64 hex digits>: the host key of an encrypted database (spec/design/encryption.md §8).
 	var credential *jed.Credential
 	if key, ok := options["key"]; ok {
@@ -107,13 +112,13 @@ func run() error {
 		db, err = jed.CreateDatabase(jed.CreateOptions{
 			Path: os.Args[2], Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle,
 			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
-			Credential: credential,
+			Credential: credential, Synchronous: synchronous,
 		})
 	} else {
 		db, err = jed.OpenDatabaseWithOptions(os.Args[2], jed.OpenOptions{
 			Locking: locking, FileLockTimeoutMs: &timeout, IdleInTransactionTimeoutMs: idle, ReadOnly: readOnly,
 			IdleSessionTimeoutMs: millis("idle_session"), YieldGraceMs: millis("yield_grace"), ShutdownGraceMs: millis("shutdown_grace"), MaxConnections: maxConnections, Ownership: ownership,
-			Credential: credential,
+			Credential: credential, Synchronous: synchronous,
 		})
 	}
 	if err != nil {

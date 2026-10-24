@@ -1708,9 +1708,8 @@ export class SimRunner {
         d.version = now;
         d.lastDigest = inflight.digest;
         if (now > d.maxAttempted) d.maxAttempted = now;
-        if (!this.relaxed || (serviceCoreOf(this.database, d)?.client ?? null) !== null) {
-          d.floor = now; // acknowledged under synchronous = on, or a page client's commit (§8.2)
-        }
+        // Acknowledged under synchronous = on; a relaxed client's commit joins the owner's batch (§8.2).
+        if (!this.relaxed) d.floor = now;
         this.checkGrowth(i, d, quiet);
         if (this.violation !== "") return;
         if (this.service) {

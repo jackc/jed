@@ -368,8 +368,9 @@ belongs to the corpus.
 - **Under `synchronous = off`** a barrier proves less. A file growth is a full fsync (hosts.md §2.1),
   so a pending version can become durable by accident and still be overwritten by the next commit of
   its batch, which writes the same slot. So the step-start rule above applies only when the engine
-  held nothing pending as the step began, and the acknowledged-commit rule only to a page client's
-  commit, which keeps its own barrier. The floor otherwise moves when the engine itself holds nothing
+  held nothing pending as the step began, and the acknowledged-commit rule not at all: every process
+  of a relaxed trace is relaxed, so a page client's commit joins the owner's batch too (page-service.md
+  §6). The floor otherwise moves when the engine itself holds nothing
   pending at a step's end (no pending set, no adopted generation awaiting stabilization, no failed
   barrier) and the file's directory entry is durable: it then treats its published version as
   flushed, and the runner holds it to that — after checking the claim against the disk. (A process
@@ -622,6 +623,7 @@ defaults, which `mixed.toml` restates):
 | `corruption` | `corrupt` steps, with and without `reseal` |
 | `service` | An owner and page clients: spawns, exits, kills, lost connections, client commits, promotion (S8); half the traces relaxed |
 | `relaxed` | `synchronous = off`: batched commits, cap flushes, crashes and faulted commits mid-batch and at the flush (S9) |
+| `service-relaxed` | Every process relaxed under the page service: page clients commit into their owner's batch, with churn and power losses mid-batch (S9) |
 | `truncation` | Bulk inserts, heavy deletes and drops, then long quiet runs, so commits lower the high-water and shorten the file (S10); half the traces relaxed |
 | `service-attachments` | Owners and page clients of main and of up to two file attachments: attach in every process, client commits of attachments, per-database promotion and recovery (S11); half the traces relaxed |
 | `encryption` | Encrypted main: credential changes, rekeys and conversions under crashes (S12), page replay at every pointer kind, backups and restores, GiST indexes and compressed out-of-line values (S13); half the traces relaxed |
@@ -827,6 +829,12 @@ primitive) gets a simulated implementation.
    the file grows and each growth's full fsync makes the batch durable early. Only one or two in a hundred `relaxed` traces catch
    a plant that drops it, so each core carries a deterministic unit test instead — a crash that lands
    only a batch's second commit, whose meta must be rejected.
+   Relaxed page clients commit into their owner's batch (page-service.md §6), so a page client's
+   acknowledged commit no longer moves the floor in a relaxed trace, and the `service-relaxed` profile
+   puts the client side of rule 3 under power loss. Its plant (`relaxed-client-reuse`: the owner offers
+   a client every committed free page inside a batch) is caught by only one or two traces in a hundred,
+   for the reason above; the owner's check of a client's carried pending entries is a per-core unit
+   test.
 
 10. **S10 — Trailing truncation. Landed.** The exact high-water check after every quiet commit and the
     file-length bound after a commit that lowered it (§8.3), the shrinking `set_size` of the simulated

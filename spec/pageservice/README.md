@@ -27,6 +27,7 @@ All integers are **big-endian** and unsigned, as in the file format. The field t
 | `string` | `u32` byte length, then that many bytes of valid UTF-8 |
 | `page` | exactly `page_size` bytes, where `page_size` is the connection's (from `hello_ok`) |
 | `u32_list` | `u32` count, then `count` × `u32` |
+| `digest_list` | `u32` count, then `count` × (`u32` page index, `u64` CRC-64 page digest) |
 | `page_list` | `u32` count, then `count` × `page` |
 | `indexed_page_list` | `u32` count, then `count` × (`u32` page index, `page`) |
 | `credential` | `u8` kind, then: `0` none (nothing follows); `1` a passphrase (a `string`); `2` a key (32 raw bytes). Any other kind is malformed |
@@ -141,7 +142,7 @@ it ends. Its messages:
 
 | Message | Body | Reply |
 |---|---|---|
-| `begin_write` | `incarnation id16`, `last_txid u64` (as `begin_read`), `lock_timeout_ms u64` (the client session's; 0 = no deadline) | `write_begun`: `incarnation id16`, `txid u64`, `invalidate u8`, `indices u32_list` (as `read_begun`), `reuse_grant bool`, `meta page` |
+| `begin_write` | `incarnation id16`, `last_txid u64` (as `begin_read`), `lock_timeout_ms u64` (the client session's; 0 = no deadline), `flags u8` (bit 0: **relaxed** — the client's handle runs `synchronous = off`; bits 1–7 are 0) | `write_begun`: `incarnation id16`, `txid u64`, `invalidate u8`, `indices u32_list` (as `read_begun`), `reuse_grant bool`, `meta page`, `pending digest_list`, `reuse u32_list` |
 | `commit_begin` | `txid u64` (the new one), `meta page`, `manifest_pages indexed_page_list` (the manifest overflow chain, in chain order) | none |
 | `commit_pages` | `pages indexed_page_list` | none |
 | `commit_end` | empty | `committed`: `txid u64` |
@@ -155,10 +156,27 @@ on expiry, while it keeps serving the connection's other requests (§2). With th
 committed snapshot for the connection — the **write pin**, counted like a read pin and released when
 the write transaction ends — and replies with the same cache answer as `begin_read`, plus the reuse
 grant: true when every pin on the database, the write pin included, is at or after the free list's
-generation (page-service.md §6). The meta is the pinned snapshot's. An owner whose own commits are
-pending a flush under `synchronous = off` ([validated-cow.md](../design/validated-cow.md) §4) first
-flushes them, with the gate held and before pinning, so the client plans against a durable committed
-meta; a failed flush poisons the owner, which stops serving.
+generation (page-service.md §6). The meta is the pinned snapshot's.
+
+**The owner's batch.** Under `synchronous = off` ([validated-cow.md](../design/validated-cow.md) §4)
+the owner's file may have a **pending set**: the body pages written since its durable floor, by the
+owner's relaxed commits and by relaxed client commits alike. With the gate held, and before pinning,
+the owner first waits for any cap flush in progress. Then:
+
+- A begin_write **without** the relaxed bit gets a durable floor: the owner flushes any pending set, so
+  the client plans exactly as under `synchronous = on`. `pending` and `reuse` are empty.
+- A **relaxed** begin_write is not flushed. `pending` is the pending set, in ascending page order, each
+  page with its manifest digest; it is empty when nothing is pending, and the client's commit then
+  starts a batch. It always holds fewer entries than the batch cap, since a commit that reaches the cap
+  is flushed before the gate is next granted. With a non-empty `pending` the reuse grant narrows to
+  `reuse` (rule 3): the pages of the committed free list that were also on the floor's free list,
+  ascending, at most the first **65 536** of them; `reuse` is empty when the grant is false or nothing
+  is pending, and with nothing pending a grant covers the whole committed free list.
+
+A failed flush poisons the owner, which stops serving. A relaxed client plans its commit as the owner
+would plan one inside the batch: its manifest lists `pending` with its own pages (rule 2), it reuses
+only the pages in `reuse` (rule 3), its free list excludes the pending pages (rule 4), and it never
+lowers the high-water.
 
 A connection that holds the gate may name the write pin's `txid` in `read_pages`.
 
@@ -169,19 +187,21 @@ one `commit_begin` cannot be committed (the client refuses it with `54000`). `tx
 are checked against the owner state fixed at `begin_write`: the committed `txid` and page count, and,
 under the reuse grant, the free pages of the committed free list (the **granted** pages). A page index
 is **legal** when it is at least 2, below the new meta's page count, and either at least the committed
-page count or granted.
+page count or granted. The **granted** pages are `reuse` when the write transaction began with a
+non-empty `pending`; otherwise the committed free list under a grant, and none without.
 
 - **Check A, at `commit_begin`, before anything is written:** `txid` is the committed `txid` + 1; the
   meta is one page that parses as a meta page of the file's format and page size, names `txid`, and has
   a page count no smaller than the committed one and a nonzero dirty count; `manifest_pages` is exactly
   the meta's manifest chain (its head, length, per-page header and ordinal, and chain CRC, as recovery
-  checks them, format.md); every listed index is legal and strictly ascending, and every manifest page
-  index is legal and not listed; and the listed pages include the catalog root and the free-list head.
+  checks them, format.md); the listed indices are strictly ascending, and include every `pending` page with its
+  `pending` digest, and every other listed index is legal; every manifest page index is legal and
+  not listed; and the listed pages include the catalog root and the free-list head.
   The manifest pages are then written.
-- **Check B, for each `commit_pages` page, before it is written:** its index is listed and not yet
+- **Check B, for each `commit_pages` page, before it is written:** its index is listed, not a `pending` page, and not yet
   received, its page type is a body type (1–7), its CRC-32 is valid, and its CRC-64 matches the
   manifest.
-- **Check C, at `commit_end`:** every listed page arrived.
+- **Check C, at `commit_end`:** every listed page that is not a `pending` page arrived.
 
 When a check fails, the owner discards the rest of the delta and answers `commit_end` with a fatal
 `08P01`; the write transaction ends with it. Pages already written are unreachable orphans (beyond the
@@ -190,9 +210,14 @@ committed high-water or granted free pages), and no meta is written. A `commit_b
 revocation below).
 
 Check C passing is the **point of no return**: the owner writes the meta to the slot that does not hold
-the committed meta (slot `txid & 1` unless a relaxed batch left the committed meta in the other slot),
-executes the single durable barrier — whatever either process's `synchronous` setting — publishes the commit (§4, §6.4), answers `committed`, and only then releases the
-gate, whatever happens to the connection. A write or sync failure poisons the owner: it stops serving
+the floor (slot `txid & 1` unless a relaxed batch left the floor in the other slot). A write
+transaction begun without the relaxed bit then executes the single durable barrier, whatever the
+owner's own `synchronous` setting, and its meta is the floor. A relaxed one executes no barrier: its
+listed pages join the owner's pending set. The owner publishes the commit (§4, §6.4) and answers
+`committed`. When a relaxed client commit leaves the pending set at or above the batch cap, the owner
+flushes next, before any maintenance commit, and that flush, like the begin_write flush, shrinks
+nothing (format.md *Trailing truncation*). Only then does it release the gate, whatever happens to
+the connection. A write or sync failure poisons the owner: it stops serving
 (every connection closes) and its own handle refuses commits until reopened. A failure after check C
 sends no error frame, since the meta may already be durable: the client sees a lost connection and
 resolves the outcome (§6.4).
@@ -245,8 +270,9 @@ and is allowed on a read-only connection.
 - **Incarnation id.** 16 random bytes an owner draws when it becomes owner, redrawn if all zero.
   It never changes during that ownership.
 - **Invalidation window.** The owner retains the written-index sets of its most recent **256**
-  commits (page-service.md §5.4): every index a commit's manifest lists (dirty body, free-list, and
-  manifest-overflow pages), the meta slots excluded. The window begins at the snapshot the owner
+  commits (page-service.md §5.4): every index a commit wrote (dirty body, free-list, and
+  manifest-overflow pages), the meta slots excluded: the pages its manifest lists, less the pending
+  pages a relaxed commit's cumulative manifest carries from earlier commits of its batch. The window begins at the snapshot the owner
   recovered at open; a compaction resets it to the compacted snapshot, so every older `last_txid`
   receives `invalidate = 1`.
 - **Pins.** Each connection's pins, its write pin included, are counted per `txid` and are part of
@@ -609,9 +635,10 @@ ordinary connection to the attached file's owner.
   acknowledgement resolved by the attachment's own re-election. A transaction still writes at most one
   durable database (attached-databases.md §5).
 - **Durability.** An attachment follows its handle's `synchronous` setting (validated-cow.md §4). Its
-  floor and pending set are its own file domain's: under `synchronous = off` the attachment's owner
-  flushes the attachment's pending batch before granting its gate to a client (§3.5), local or
-  remote, independently of main, and that flush shrinks nothing. Trailing truncation of the attached
+  floor and pending set are its own file domain's, independently of main: the attachment's owner
+  flushes the attachment's pending batch before granting its gate to a client whose handle is not
+  relaxed, and that flush shrinks nothing; a relaxed client's `begin_write` to the attachment's owner
+  carries the relaxed bit, receives the attachment's pending set, and commits into its batch (§3.5). Trailing truncation of the attached
   file follows the owner rules of page-service.md §6: only its owner's own commits truncate, and a
   client committing to the attachment through its owner never does.
 - **Role changes.** A transaction that pinned an attachment, or took its gate, under a role the

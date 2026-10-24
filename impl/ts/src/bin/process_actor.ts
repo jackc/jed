@@ -34,7 +34,8 @@ if (action === undefined || path === undefined) {
 // Positional arguments after the path: the open timeout, then the page-service owner's
 // idle-in-transaction timeout (spec/design/page-service.md §11.1). key=value arguments set the
 // handoff options (spec/pageservice/README.md §6.5): ownership=prefer|yield|never, yield_grace,
-// shutdown_grace, idle_session (milliseconds), max_connections.
+// shutdown_grace, idle_session (milliseconds), max_connections; synchronous=off batches the handle's
+// barriers (spec/design/validated-cow.md §4).
 const positional: string[] = [];
 const options = new Map<string, string>();
 for (const arg of rest) {
@@ -58,6 +59,7 @@ const handoffOptions = {
   shutdownGraceMs: millis("shutdown_grace"),
   idleSessionTimeoutMs: millis("idle_session"),
   maxConnections: millis("max_connections"),
+  synchronous: options.get("synchronous") === "off" ? ("off" as const) : ("on" as const),
 };
 if (action === "owner-idle") {
   // The corpus-through-a-client driver (spec/pageservice/README.md §7): open and close databases as

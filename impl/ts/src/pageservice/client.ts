@@ -40,7 +40,7 @@ import type { Environment } from "../environment.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import { persistImpl } from "../persist.ts";
-import type { ClientReadBegun, PageClientHandle } from "../shared.ts";
+import type { ClientReadBegun, ClientWriteBegun, PageClientHandle } from "../shared.ts";
 import { FileSpillSink } from "../spillfile.ts";
 import { ERRORS } from "../sqlstate.ts";
 import { type BlockingChannel, ProcessWorker } from "./blocking.ts";
@@ -56,6 +56,7 @@ import type { ClientLink, StreamTransport } from "./net.ts";
 import {
   decodeFrame,
   encodeFrame,
+  PS_BEGIN_WRITE_RELAXED,
   PS_ERROR_FLAG_FATAL,
   PS_HELLO_FLAG_READ_ONLY,
   PS_HELLO_OK_FLAG_CONNECTION_READ_ONLY,
@@ -504,14 +505,16 @@ export class PageClient implements PageClientHandle {
   }
 
   // beginWrite takes the owner's writer gate (README §3.5), waiting at most timeoutMs, and holds the
-  // write pin it carries until endWrite or the commit.
-  beginWrite(timeoutMs: number): ClientReadBegun {
+  // write pin it carries until endWrite or the commit. A relaxed one sets the relaxed bit, so the owner
+  // names its pending batch instead of flushing it.
+  beginWrite(timeoutMs: number, relaxed: boolean): ClientWriteBegun {
     if (this.readOnly) throw errClientReadOnly();
     const reply = this.roundTrip({
       kind: "begin_write",
       incarnation: this.incarnation,
       lastTxid: this.adopted,
       lockTimeoutMs: BigInt(Math.max(0, Math.floor(timeoutMs))),
+      flags: relaxed ? PS_BEGIN_WRITE_RELAXED : 0,
     });
     if (reply.kind !== "write_begun") {
       this.breakWith(engineError("protocol_violation", "unexpected reply to begin_write"));
@@ -527,6 +530,8 @@ export class PageClient implements PageClientHandle {
         reply.invalidate === PS_INVALIDATE_ALL || !sameId(reply.incarnation, this.incarnation),
       indices: reply.indices,
       meta: reply.meta,
+      pending: reply.pending.map((e) => ({ index: e.index, checksum: e.digest })),
+      reuse: reply.reuse,
     };
   }
 

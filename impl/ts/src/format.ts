@@ -4351,6 +4351,19 @@ function* readFreeListSteps(
   return free;
 }
 
+// readFloorFreeSteps reads the free list of the floor — the newest durable meta (validated-cow.md §4)
+// — from that meta's slot: the reuse restriction of a batch this engine did not start, which a
+// page-service client's relaxed commit opened (page-service.md §6). The floor's free-list pages are
+// never rewritten while the batch is pending (rule 3), so they still hold its list.
+export function* readFloorFreeSteps(paging: SharedPaging): Steps<number[]> {
+  const block = yield* paging.readPageSteps(paging.floorMetaSlot());
+  const mt = parseCommitMeta(block, paging.pageSize(), 0xffff_ffff);
+  if (mt === null || mt.txid !== paging.floorMetaTxid()) {
+    throw engineError("data_corrupted", "the floor's meta slot does not hold the floor");
+  }
+  return yield* readFreeListSteps(paging, mt.freeListHead, mt.freeListTag, mt.pageCount, new Set());
+}
+
 // serializeFreeList serializes the full free-list `persist` (ascending — the pages dead at the new
 // committed snapshot, including this commit's fresh orphans) into a page_type 7 chain (v25 —
 // spec/fileformat/format.md *Free-list page*), and returns the chain pages, its head (0 when empty), the

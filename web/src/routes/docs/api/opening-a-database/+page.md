@@ -87,6 +87,10 @@ you close the database. A power loss or OS crash can lose the commits made since
 the file always reopens to one complete committed state, never a mix; a crash of your process alone
 loses nothing it committed. Query results and costs are the same in both modes.
 
+When several processes share a file, each process's own setting decides its commits: a process
+opened with `synchronous` off adds its commits to the owning process's batch, while one opened with it
+on makes each of its commits durable before it returns, whatever the other processes chose.
+
 `close` reports a flush that failed. After any failed flush the handle refuses further reads and
 writes until you reopen it. There is no timed flush yet, so a relaxed database that sits idle stays
 unflushed until its next batch fills or it closes. This is different from `skip_fsync`, which skips

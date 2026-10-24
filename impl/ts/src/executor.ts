@@ -169,6 +169,7 @@ import {
   unparsableIndexError,
   unparsableViewError,
 } from "./unparsed.ts";
+import type { ManifestEntry } from "./commit_manifest.ts";
 import { Meter, type QueryAccount, queryMemoryPeak, StateCharge } from "./cost.ts";
 import { HostBatch, ReadAhead, readAheadCap } from "./host_batch.ts";
 import { mergeHashJoinPlan, optimizeSelect } from "./optimize.ts";
@@ -2140,9 +2141,16 @@ export class Engine {
   // relaxed is the handle's synchronous = off (spec/design/validated-cow.md §4): a durable (file or
   // OPFS) commit defers its barrier to a flush. Never set on in-memory or page-client storage.
   relaxed: boolean;
-  // floorFree is the free list as of the floor — recorded by the first commit of a relaxed batch — the
-  // only pages a pending commit may reuse (validated-cow.md §4 rule 3).
+  // floorFree is the free list as of the floor — recorded by the first commit of a relaxed batch, or
+  // read from the floor's meta when a page-service client's commit started the batch — the only pages
+  // a pending commit may reuse (validated-cow.md §4 rule 3). floorFreeTxid is the floor it belongs to.
   floorFree: Set<number> | null;
+  floorFreeTxid: bigint;
+  // serviceBatch is a page client's view of its owner's batch for the write transaction in progress,
+  // from a relaxed write_begun (spec/pageservice/README.md §3.5): the pending set its cumulative
+  // manifest lists, and the only free pages it may reuse. Null outside such a write transaction, and
+  // when the owner had nothing pending.
+  serviceBatch: { pending: ManifestEntry[]; reuse: Set<number> } | null;
   // commitStagesRows is whether the last commitTx staged any record version into main (memory.md
   // §8.3): a commit that stages none — pure deletes and drops — may exceed max_storage_bytes so a full
   // database can be repaired. Read by Session.publish, which persists main after commitTx.
@@ -2221,6 +2229,8 @@ export class Engine {
     this.storageBudget = { limit: 0n, lastCatRoot: 0, lastWritten: [], lastCatalogPages: 0 };
     this.relaxed = false;
     this.floorFree = null;
+    this.floorFreeTxid = -1n;
+    this.serviceBatch = null;
     this.commitStagesRows = false;
   }
 

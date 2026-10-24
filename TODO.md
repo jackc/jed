@@ -501,16 +501,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   Pending commits write the slot not holding the newest durable meta, carry cumulative manifests,
   reuse only pages the floor had free, and keep the batch off the free list, so recovery lands between
   the last flush and the newest attempted commit and never corrupts. The batch ends at the
-  inline-manifest cap (a background flush in Go/Rust, inline in TS), at close, before a page client's
-  `begin_write`, and at compaction. Simulator S9 (`relaxed` profile, engine-aligned floor oracle).
+  inline-manifest cap (a background flush in Go/Rust, inline in TS), at close, before a synchronous page client's
+  `begin_write` (a relaxed client commits into the owner's batch), and at compaction. Simulator S9 (`relaxed` profile, engine-aligned floor oracle).
   → [validated-cow.md §4](spec/design/validated-cow.md), [transactions.md §9](spec/design/transactions.md)
   - [ ] _follow-on — needs a decision:_ a **time-based flush** — a background flusher that makes an
     idle relaxed batch durable after an interval. Its default interval and the knob's name are a
     product decision (no spec names one); until then an idle relaxed handle stays undurable until its
     next cap flush or `close`. _(size: S + decision)_
-  - [ ] _follow-on:_ honor a page client's own `synchronous = off`: a client's setting does not reach
-    the owner (no wire field), so every client commit keeps its barrier; batching them needs a commit
-    flag in `spec/pageservice/` and a way to name the owner's pending set. _(size: M)_
+  - [x] _follow-on:_ honor a page client's own `synchronous = off`: a relaxed client's `begin_write`
+    carries a relaxed bit, `write_begun` names the owner's pending set and the floor-free pages it may
+    reuse, and the client commits into the owner's batch (cumulative manifest, owner checks the carried
+    entries, no barrier, the cap flushed by the owner); a synchronous client keeps its barrier, and an
+    owner commit inside a client-opened batch follows rule 3. Process corpus `service_relaxed_clients`.
+    → [pageservice/README.md §3.5](spec/pageservice/README.md), [page-service.md §6](spec/design/page-service.md)
 
 ---
 

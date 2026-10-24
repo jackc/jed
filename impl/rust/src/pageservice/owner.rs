@@ -39,14 +39,14 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::file::Ownership;
 use crate::filehost::{FileHost, PageReader};
 use crate::pageservice::codec::{
-    BeginRead, BeginWrite, COMMIT_STATUS_COMMITTED, COMMIT_STATUS_NOT_COMMITTED,
-    COMMIT_STATUS_UNKNOWN, CommitBegin, CommitPages, CommitStatusReply, Committed,
-    ERROR_FLAG_FATAL, ErrorReply, HELLO_FLAG_READ_ONLY, HELLO_OK_FLAG_CONNECTION_READ_ONLY,
-    HELLO_OK_FLAG_OWNER_READ_ONLY, HELLO_OK_FLAG_OWNER_YIELDS, Hello, HelloOk, INVALIDATE_ALL,
-    INVALIDATE_EXACT, INVALIDATION_WINDOW_COMMITS, Id16, MAX_INVALIDATION_ENTRIES,
-    MAX_READ_PAGES_CAP, Message, NOTICE_SHUTDOWN_BEGUN, NOTICE_YIELD_BEGUN, NOTICE_YIELD_CANCELLED,
-    Notice, OWNERSHIP_REFUSED, OWNERSHIP_YIELDING, OwnerRecord, OwnershipReply, PROTOCOL_VERSION,
-    Pages, encode_frame, max_read_pages, read_frame,
+    BEGIN_WRITE_RELAXED, BeginRead, BeginWrite, COMMIT_STATUS_COMMITTED,
+    COMMIT_STATUS_NOT_COMMITTED, COMMIT_STATUS_UNKNOWN, CommitBegin, CommitPages,
+    CommitStatusReply, Committed, ERROR_FLAG_FATAL, ErrorReply, HELLO_FLAG_READ_ONLY,
+    HELLO_OK_FLAG_CONNECTION_READ_ONLY, HELLO_OK_FLAG_OWNER_READ_ONLY, HELLO_OK_FLAG_OWNER_YIELDS,
+    Hello, HelloOk, INVALIDATE_ALL, INVALIDATE_EXACT, INVALIDATION_WINDOW_COMMITS, Id16,
+    MAX_INVALIDATION_ENTRIES, MAX_READ_PAGES_CAP, Message, NOTICE_SHUTDOWN_BEGUN,
+    NOTICE_YIELD_BEGUN, NOTICE_YIELD_CANCELLED, Notice, OWNERSHIP_REFUSED, OWNERSHIP_YIELDING,
+    OwnerRecord, OwnershipReply, PROTOCOL_VERSION, Pages, encode_frame, max_read_pages, read_frame,
 };
 use crate::pageservice::delta::{Delta, DeltaBase, begin_delta};
 use crate::pageservice::net::{PsListener, PsStream};
@@ -416,6 +416,8 @@ struct Conns {
 /// A client write transaction: the connection holds the gate and a write pin on `base`.
 struct WriteTxn {
     base: u64,
+    /// A `begin_write` with the relaxed bit: the commit joins the owner's batch (README.md §3.5).
+    relaxed: bool,
     check: DeltaBase,
     /// The CommitDelta being received (between `commit_begin` and `commit_end`).
     delta: Option<Delta>,
@@ -1280,12 +1282,14 @@ impl PageServiceOwner {
             .acquire(m.lock_timeout_ms, &|| conn.closed.load(Ordering::Acquire));
         // Declared before the state guard, so a final drop of the core never runs under it.
         let shared = self.shared.upgrade();
-        // The owner's own relaxed commits are flushed before a client plans against the committed
-        // meta: a client cannot name the owner's pending set in its manifest (README.md §3.5). A
-        // failed flush poisons the owner, which stops serving.
+        let relaxed = m.flags & BEGIN_WRITE_RELAXED != 0;
+        // The owner's batch (README.md §3.5): a synchronous client plans against a durable floor,
+        // so the pending set is flushed first; a relaxed one is told the pending set instead, once
+        // any cap flush in progress has finished. A failed flush poisons the owner, which stops
+        // serving.
         let mut flush_failed = false;
         let result = match (result, &shared) {
-            (Ok(()), Some(core)) => match core.page_service_flush() {
+            (Ok(()), Some(core)) => match core.page_service_flush(relaxed) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     self.gate.release();
@@ -1315,13 +1319,14 @@ impl PageServiceOwner {
             return;
         }
         let Some((begun, check)) =
-            shared.page_service_begin_write(&mut state.pins, &m.incarnation, m.last_txid)
+            shared.page_service_begin_write(&mut state.pins, &m.incarnation, m.last_txid, relaxed)
         else {
             self.gate.release();
             return;
         };
         state.write = Some(WriteTxn {
             base: begun.txid,
+            relaxed,
             check,
             delta: None,
             failure: None,
@@ -1555,26 +1560,30 @@ impl PageServiceOwner {
         }
         w.finishing = true;
         let base = w.base;
+        let relaxed = w.relaxed;
         let delta = w.delta.take().expect("checked above");
         state.idle_deadline = None;
         drop(state);
-        self.finish_client_commit(shared, conn, request_id, base, delta)
+        self.finish_client_commit(shared, conn, request_id, base, relaxed, delta)
     }
 
-    /// Publish a validated delta (page-service.md §5.6): meta, the single durable barrier,
-    /// structural adoption (page accounting, the invalidation and resolution windows), the
-    /// acknowledgement, then — still holding the gate — the catalog adoption and a maintenance commit
-    /// if one is due. A write or sync failure poisons the owner, which stops serving.
+    /// Publish a validated delta (page-service.md §5.6): meta, the single durable barrier (a
+    /// relaxed delta joins the owner's batch instead), structural adoption (page accounting, the
+    /// invalidation and resolution windows), the acknowledgement, then — still holding the gate — a
+    /// cap flush if the relaxed delta filled the batch, the catalog adoption, and a maintenance
+    /// commit if one is due. A write or sync failure poisons the owner, which stops serving.
     fn finish_client_commit(
         &self,
         shared: &Shared,
         conn: &ServerConn,
         request_id: u32,
         base: u64,
+        relaxed: bool,
         mut delta: Delta,
     ) -> Result<Option<Message>> {
         let commit = self.commit_lock.lock().expect("commit lock poisoned");
-        if shared.page_service_commit_delta(&mut delta).is_err() {
+        let committed = shared.page_service_commit_delta(&mut delta, relaxed);
+        let Ok(cap_reached) = committed else {
             drop(commit);
             self.stop_serving();
             {
@@ -1587,7 +1596,7 @@ impl PageServiceOwner {
             // and resolves it with commit_status (under the next owner) rather than an error frame.
             conn.hang_up();
             return Ok(None);
-        }
+        };
         {
             let mut state = conn.state.lock().expect("connection state lock poisoned");
             shared.page_service_publish_commit(
@@ -1610,6 +1619,13 @@ impl PageServiceOwner {
                     &Message::Committed(Committed { txid: delta.txid }),
                 );
             }
+        }
+        // The flush runs at once, before any maintenance commit; a failed barrier revoked the
+        // storage, and the owner stops serving.
+        if cap_reached && shared.page_service_cap_flush().is_err() {
+            self.stop_serving();
+            self.gate.release();
+            return Ok(None);
         }
         if shared.adopt_foreign(self).is_ok() {
             shared.maintenance_commit(self);

@@ -115,14 +115,29 @@ function syncCodecMissing(): EngineError {
   );
 }
 
+// BatchState is one reading of a BatchMirror: its generation, the floor's slot and txid, and the
+// pending set in page order (null when it outgrew the mirror).
+export type BatchState = {
+  generation: number;
+  floorSlot: number;
+  floorTxid: bigint;
+  entries: ManifestEntry[] | null;
+};
+
 // BatchMirror is where a page-service owner's batched-durability facts are mirrored for its service
-// (spec/design/validated-cow.md §4, page-service.md §6): the floor slot and whether a batch is pending.
-// The service flushes a pending batch before granting a client begin_write and moves the floor at each
-// client commit; the pager reconciles with the mirror before it reads its own batch state.
+// (spec/design/validated-cow.md §4, page-service.md §6): the floor and the pending set. The service
+// flushes a pending batch before granting a synchronous client's begin_write, names it to a relaxed
+// one, and records each client commit — moving the floor, or adding a relaxed commit's pages to the
+// pending set; the pager reconciles with the mirror, when its generation changed, before it reads its
+// own batch state. Under a mirror the service, not the meta a reload selects, decides where an adopted
+// client commit stands in the batch.
 export interface BatchMirror {
-  floorSlot(): number;
-  batchPending(): boolean;
-  publishBatch(floorSlot: number, pending: boolean): void;
+  batchGeneration(): number;
+  batchState(): BatchState;
+  // publishBatch replaces the mirrored batch, returning its new generation.
+  publishBatch(floorSlot: number, floorTxid: bigint, entries: ManifestEntry[]): number;
+  // batchFlushed records a flush: the newest meta (newest, or a newer published one) is the floor.
+  batchFlushed(newest: bigint): void;
 }
 
 // A block device: fixed-size pages addressed by index, over a BlockStore host kept open for the
@@ -159,11 +174,16 @@ export class Pager {
   // newest durable meta; every file commit writes the other one. pending is the CRC-64 of every body
   // page (never a meta or manifest page) written by a commit after the floor — what a pending commit's
   // manifest lists besides its own pages. Empty under synchronous = on. publishedMeta is the identity
-  // of the last meta this pager wrote or selected, so a selection of a different one is an adoption.
+  // of the last meta this pager wrote or selected, so a selection of a different one is an adoption;
+  // publishedTxid is its txid, and floorTxid the floor's. mirrorGeneration is the mirror's generation
+  // this pager last read or wrote.
   private floorSlot = 1;
+  private floorTxid = 0n;
   private pending = new Map<number, bigint>();
   private publishedMeta = "";
+  private publishedTxid = 0n;
   private batchMirror: BatchMirror | null = null;
+  private mirrorGeneration = Number.NaN;
   // shrinkPending is set when a commit of the current batch lowered the high-water (format.md *Trailing
   // truncation*) and the file has not been shortened yet: the shrink waits for the barrier that makes
   // the newest generation durable. shrinkPages is that newest generation's high-water.
@@ -544,9 +564,16 @@ export class Pager {
     if (identity !== this.acknowledgedMeta) this.adoptedNeedsSync = needsSync;
     if (identity !== this.publishedMeta) {
       this.publishedMeta = identity;
+      this.publishedTxid = txid;
+      if (this.batchMirror !== null) {
+        // A page-service owner adopting its clients' commits: the service recorded where each stands
+        // in the batch (durable, or pending under a relaxed client), so the mirror decides.
+        this.reconcileBatch();
+        return;
+      }
       this.floorSlot = bothSlots ? Number(txid & 1n) : slot;
+      this.floorTxid = txid;
       this.pending.clear();
-      this.publishBatch();
     }
   }
 
@@ -559,22 +586,54 @@ export class Pager {
   }
 
   // reconcileBatch adopts what the service did meanwhile: a flush before a client begin_write empties
-  // the pending set, and a client commit moves the floor.
+  // the pending set, a synchronous client commit moves the floor, and a relaxed one adds its pages to
+  // the pending set. An overflowed mirror (only ever while a commit that outgrew it awaits its flush)
+  // leaves this pager's own entries in place.
   private reconcileBatch(): void {
     const mirror = this.batchMirror;
-    if (mirror === null) return;
-    this.floorSlot = mirror.floorSlot();
-    if (!mirror.batchPending()) this.pending.clear();
+    if (mirror === null || mirror.batchGeneration() === this.mirrorGeneration) return;
+    const state = mirror.batchState();
+    this.mirrorGeneration = state.generation;
+    this.floorSlot = state.floorSlot;
+    this.floorTxid = state.floorTxid;
+    if (state.entries !== null) {
+      this.pending = new Map(state.entries.map((e) => [e.index, e.checksum]));
+    }
   }
 
   private publishBatch(): void {
-    this.batchMirror?.publishBatch(this.floorSlot, this.pending.size > 0);
+    const mirror = this.batchMirror;
+    if (mirror === null) return;
+    this.mirrorGeneration = mirror.publishBatch(
+      this.floorSlot,
+      this.floorTxid,
+      this.sortedPending(),
+    );
   }
 
-  // setFloorSlot sets the floor slot of a freshly created file (both slots carry the bootstrap txid).
-  setFloorSlot(slot: number): void {
+  private sortedPending(): ManifestEntry[] {
+    return [...this.pending]
+      .map(([index, checksum]) => ({ index, checksum }))
+      .sort((a, b) => a.index - b.index);
+  }
+
+  // setFloorSlot sets the floor of a freshly created file (both slots carry the bootstrap txid).
+  setFloorSlot(slot: number, txid: bigint): void {
     this.floorSlot = slot;
+    this.floorTxid = txid;
+    this.publishedTxid = txid;
     this.publishBatch();
+  }
+
+  // floorMetaSlot is the slot holding the floor's meta; floorMetaTxid is its txid.
+  floorMetaSlot(): number {
+    this.reconcileBatch();
+    return this.floorSlot;
+  }
+
+  floorMetaTxid(): bigint {
+    this.reconcileBatch();
+    return this.floorTxid;
   }
 
   // commitSlot is the meta slot the next commit writes: the one not holding the floor (format.md, *Slot
@@ -593,9 +652,7 @@ export class Pager {
   // pendingEntries is the pending set in page order.
   pendingEntries(): ManifestEntry[] {
     this.reconcileBatch();
-    return [...this.pending]
-      .map(([index, checksum]) => ({ index, checksum }))
-      .sort((a, b) => a.index - b.index);
+    return this.sortedPending();
   }
 
   // recordCommit records a commit whose meta (txid, checksum) was written to slot. durable is whether
@@ -610,8 +667,10 @@ export class Pager {
   ): void {
     this.reconcileBatch();
     this.publishedMeta = `${txid}:${checksum}`;
+    this.publishedTxid = txid;
     if (durable) {
       this.floorSlot = slot;
+      this.floorTxid = txid;
       this.pending.clear();
     } else {
       for (const e of dirty) this.pending.set(e.index, e.checksum);
@@ -650,9 +709,15 @@ export class Pager {
       this.poisoned = true;
       throw e;
     }
-    this.floorSlot ^= 1;
-    this.pending.clear();
-    this.publishBatch();
+    if (this.batchMirror !== null) {
+      // The newest meta may be a client commit this pager has not adopted yet: the mirror knows.
+      this.batchMirror.batchFlushed(this.publishedTxid);
+      this.reconcileBatch();
+    } else {
+      this.floorSlot ^= 1;
+      this.floorTxid = this.publishedTxid;
+      this.pending.clear();
+    }
     yield* this.shrinkAfterBarrierSteps();
   }
 

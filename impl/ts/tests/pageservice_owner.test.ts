@@ -324,6 +324,65 @@ test("pageservice delta: a valid delta passes; each structural fault is refused"
   }
 });
 
+// A relaxed client's delta is checked against the owner's named pending set (README §3.5): the
+// cumulative manifest lists each pending page with its digest, those pages never arrive again, and the
+// invalidation entry names only the pages the delta wrote.
+test("pageservice delta: a relaxed delta carries the owner's pending set", () => {
+  const ps = 512;
+  const { cb, body: all } = testDelta(ps, 10, [12, 4, 13]);
+  const pending = new Map<number, bigint>();
+  const body: PsIndexedPage[] = [];
+  for (const pg of all) {
+    if (pg.index === 4) pending.set(4, crc64Update(0n, pg.page));
+    else body.push(pg);
+  }
+  const base: DeltaBase = {
+    committedTxid: 5n,
+    pageSize: ps,
+    pageCount: 10,
+    granted: new Set(),
+    pending,
+  };
+  applyDelta(base, cb, body);
+  assert.deepEqual(Delta.begin(base, cb).written, [12, 13], "written is the delta's own pages");
+  const cases: [string, (b: DeltaBase) => PsIndexedPage[]][] = [
+    [
+      "pending digest differs",
+      (b) => {
+        b.pending = new Map([[4, pending.get(4)! ^ 1n]]);
+        return body;
+      },
+    ],
+    [
+      "pending page not listed",
+      (b) => {
+        b.pending = new Map([
+          [4, pending.get(4)!],
+          [5, 9n],
+        ]);
+        return body;
+      },
+    ],
+    ["pending page sent again", () => all],
+    [
+      "no pending set",
+      (b) => {
+        b.pending = null;
+        return body;
+      },
+    ],
+  ];
+  for (const [name, mutate] of cases) {
+    const b = { ...base };
+    const pages = mutate(b);
+    const m = cloneDelta(cb, pages);
+    assert.throws(() => applyDelta(b, m.cb, m.body), DeltaFailure, name);
+  }
+  // A pending page sent again is refused by check B itself, before any legality test.
+  const d = Delta.begin(base, cb);
+  assert.throws(() => d.checkPage(all.find((pg) => pg.index === 4)!), DeltaFailure);
+});
+
 test("pageservice state: the resolution window answers commit_status", () => {
   const s = new ServiceState();
   const metaOf = (txid: bigint): Uint8Array => {

@@ -404,25 +404,31 @@ class SimServed implements ServedDb, OwnerLink {
     this.storage.paging?.abandonDurableCommit();
   }
 
-  commitDelta(d: Delta): boolean {
+  commitDelta(d: Delta, relaxed: boolean): boolean {
     try {
       const paging = this.storage.paging;
       if (paging === null) return false;
-      // The slot not holding the committed meta (README §3.5), as the production worker writes it.
+      // The slot not holding the floor (README §3.5), as the production worker writes it: a
+      // synchronous client's commit keeps its own barrier, a relaxed one's pages join the batch.
       const slot = this.state.floorSlot() ^ 1;
       paging.writeBlock(slot, d.meta);
-      paging.sync();
-      this.state.publishBatch(slot, false);
+      if (relaxed) {
+        this.state.addPending(d.own());
+      } else {
+        paging.sync();
+        this.state.floorAt(slot, d.txid);
+      }
       paging.finishDurableCommit(d.txid, metaChecksum(d.meta));
-      paging.cacheValidation(d.meta, new Set(d.written));
+      paging.cacheValidation(d.meta, d.protectedPages);
       return true;
     } catch {
       return false;
     }
   }
 
-  // flushBatch is the owner's batch flush before a begin_write (validated-cow.md §4), through the
-  // owner's pager as the client commits are.
+  // flushBatch is the owner's batch flush before a synchronous client's begin_write, or after a relaxed
+  // client commit filled the batch (validated-cow.md §4), through the owner's pager as the client
+  // commits are.
   flushBatch(): boolean {
     try {
       const paging = this.storage.paging;

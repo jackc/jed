@@ -19,6 +19,10 @@ pub(crate) struct DeltaBase {
     pub(crate) page_count: u32,
     /// The reusable free pages when the reuse grant passed; `None` otherwise.
     pub(crate) granted: Option<HashSet<u32>>,
+    /// The owner's pending set named in a relaxed `write_begun` (README.md §3.5): the delta's
+    /// cumulative manifest must list each with this digest, and none of them arrives in
+    /// `commit_pages`.
+    pub(crate) pending: HashMap<u32, u64>,
     /// The file is the encrypted variant: the inline manifest starts at 96, body pages are
     /// ciphertext checked by their manifest identity alone, and the key block (pages 2–3) is never
     /// written by a delta (spec/fileformat/encrypted.md §6, §14).
@@ -62,7 +66,8 @@ pub(crate) struct Delta {
     /// Every index the commit depends on (listed and manifest pages): the pager's validated set
     /// once the commit is published, so the owner's reload need not re-read them.
     pub(crate) protected: HashSet<u32>,
-    /// Every index the delta writes, ascending: the invalidation window's entry.
+    /// Every index the delta writes, ascending: the invalidation window's entry. A relaxed delta's
+    /// carried pending pages are listed but not written, so they are not in it.
     pub(crate) written: Vec<u32>,
 }
 
@@ -87,6 +92,8 @@ struct Listing {
     root_seen: bool,
     free_head_seen: bool,
     listed: u32,
+    /// The owner's pending pages listed so far.
+    carried: usize,
 }
 
 impl Listing {
@@ -103,6 +110,21 @@ impl Listing {
             let index = u32_at(entry, 0);
             if index <= self.last {
                 return Err(invalid("manifest indices are not strictly ascending"));
+            }
+            if let Some(&digest) = base.pending.get(&index) {
+                // A page an earlier commit of the batch wrote: listed, never sent again.
+                if u64_at(entry, 4) != digest {
+                    return Err(invalid(format!(
+                        "pending page {index} is listed with another digest"
+                    )));
+                }
+                self.last = index;
+                delta.protected.insert(index);
+                self.root_seen |= index == root_page;
+                self.free_head_seen |= index == delta.free_list_head;
+                self.listed += 1;
+                self.carried += 1;
+                continue;
             }
             if !base.legal(index, delta.page_count) {
                 return Err(invalid(format!(
@@ -170,6 +192,7 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
         root_seen: false,
         free_head_seen: m.free_list_head == 0,
         listed: 0,
+        carried: 0,
     };
     let meta = delta.meta.clone();
     listing.list(
@@ -221,7 +244,17 @@ pub(crate) fn begin_delta(base: &DeltaBase, cb: CommitBegin) -> Result<Delta> {
             "the manifest does not cover the catalog root and free-list head",
         ));
     }
-    delta.written = delta.protected.iter().copied().collect();
+    if listing.carried != base.pending.len() {
+        return Err(invalid(
+            "the manifest does not list the owner's pending pages",
+        ));
+    }
+    delta.written = delta
+        .protected
+        .iter()
+        .copied()
+        .filter(|index| !base.pending.contains_key(index))
+        .collect();
     delta.written.sort_unstable();
     Ok(delta)
 }
@@ -249,6 +282,15 @@ impl Delta {
         }
         self.received.insert(index);
         Ok(())
+    }
+
+    /// The delta's own listed body pages with their digests: what a relaxed commit adds to the
+    /// owner's pending set (validated-cow.md §4).
+    pub(crate) fn own(&self) -> Vec<(u32, u64)> {
+        self.expected
+            .iter()
+            .map(|(&index, &digest)| (index, digest))
+            .collect()
     }
 
     /// Check C at `commit_end`: every listed page arrived.
@@ -331,6 +373,7 @@ mod tests {
             page_size: PS,
             page_count: 10,
             granted: Some(HashSet::from([3])),
+            pending: HashMap::new(),
             encrypted: false,
         };
         // 40 dirty pages overflow the 512-byte meta's 37 inline entries into one manifest page.
@@ -405,6 +448,58 @@ mod tests {
                 apply_delta(&base, c, &pages).is_err(),
                 "trial {trial}: a corrupted delta passed validation"
             );
+        }
+    }
+
+    /// A relaxed client's delta is checked against the owner's named pending set (README.md §3.5):
+    /// the cumulative manifest lists each pending page with its digest, those pages never arrive
+    /// again, and the invalidation entry names only the pages the delta wrote.
+    #[test]
+    fn relaxed_delta_validation_checks_the_pending_set() {
+        let (cb, all) = test_delta(10, &[12, 4, 13]);
+        let mut body = Vec::new();
+        let mut pending = HashMap::new();
+        for page in &all {
+            if page.index == 4 {
+                pending.insert(4, format::commit_crc64(0, &page.page));
+            } else {
+                body.push(page.clone());
+            }
+        }
+        let base = DeltaBase {
+            committed_txid: 5,
+            page_size: PS,
+            page_count: 10,
+            granted: Some(HashSet::new()),
+            pending: pending.clone(),
+            encrypted: false,
+        };
+        apply_delta(&base, cb.clone(), &body).expect("a valid relaxed delta is accepted");
+        let delta = begin_delta(&base, cb.clone()).unwrap();
+        assert_eq!(delta.written, vec![12, 13], "the delta's own pages");
+
+        let digest = pending[&4];
+        type Mutation = fn(&mut DeltaBase, &mut Vec<IndexedPage>, &[IndexedPage], u64);
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("pending digest differs", |b, _, _, digest| {
+                b.pending = HashMap::from([(4, digest ^ 1)])
+            }),
+            ("pending page not listed", |b, _, _, digest| {
+                b.pending = HashMap::from([(4, digest), (5, 9)])
+            }),
+            ("pending page sent again", |_, body, all, _| {
+                *body = all.to_vec()
+            }),
+            ("no pending set", |b, _, _, _| b.pending = HashMap::new()),
+        ];
+        for (name, mutate) in cases {
+            let mut b = base.clone();
+            let mut pages = body.clone();
+            mutate(&mut b, &mut pages, &all, digest);
+            match apply_delta(&b, cb.clone(), &pages) {
+                Err(e) if e.state == SqlState::ProtocolViolation => {}
+                other => panic!("{name}: got {:?}, want 08P01", other.err()),
+            }
         }
     }
 }

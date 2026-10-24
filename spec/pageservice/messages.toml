@@ -18,6 +18,8 @@ max_frame_length = 16777216
 header_length = 9
 max_read_pages_cap = 1024
 max_invalidation_entries = 65536
+# the most floor-free pages a relaxed write_begun offers for reuse inside a batch (README.md §3.5)
+max_reuse_pages = 65536
 invalidation_window_commits = 256
 endpoint_max_path_bytes = 100
 owner_record_magic = "JEDOWNER"
@@ -63,7 +65,7 @@ code = 0x05
 direction = "request"
 reply = "write_begun"
 phase = 3
-fields = ["incarnation:id16", "last_txid:u64", "lock_timeout_ms:u64"]
+fields = ["incarnation:id16", "last_txid:u64", "lock_timeout_ms:u64", "flags:u8"]
 
 [[message]]
 name = "commit_begin"
@@ -160,7 +162,7 @@ name = "write_begun"
 code = 0x45
 direction = "reply"
 phase = 3
-fields = ["incarnation:id16", "txid:u64", "invalidate:u8", "indices:u32_list", "reuse_grant:bool", "meta:page"]
+fields = ["incarnation:id16", "txid:u64", "invalidate:u8", "indices:u32_list", "reuse_grant:bool", "meta:page", "pending:digest_list", "reuse:u32_list"]
 
 [[message]]
 name = "committed"

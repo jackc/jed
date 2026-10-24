@@ -61,9 +61,9 @@ var psCatalog = map[string]psCatalogEntry{
 	},
 	"begin_write": {
 		psCodeBeginWrite,
-		[]string{"incarnation:id16", "last_txid:u64", "lock_timeout_ms:u64"},
+		[]string{"incarnation:id16", "last_txid:u64", "lock_timeout_ms:u64", "flags:u8"},
 		func(f psFixtureFields) psMessage {
-			return psBeginWrite{incarnation: f.id("incarnation"), lastTxid: f.u64("last_txid"), lockTimeoutMs: f.u64("lock_timeout_ms")}
+			return psBeginWrite{incarnation: f.id("incarnation"), lastTxid: f.u64("last_txid"), lockTimeoutMs: f.u64("lock_timeout_ms"), flags: f.u8("flags")}
 		},
 	},
 	"commit_begin": {
@@ -107,9 +107,9 @@ var psCatalog = map[string]psCatalogEntry{
 	},
 	"write_begun": {
 		psCodeWriteBegun,
-		[]string{"incarnation:id16", "txid:u64", "invalidate:u8", "indices:u32_list", "reuse_grant:bool", "meta:page"},
+		[]string{"incarnation:id16", "txid:u64", "invalidate:u8", "indices:u32_list", "reuse_grant:bool", "meta:page", "pending:digest_list", "reuse:u32_list"},
 		func(f psFixtureFields) psMessage {
-			return psWriteBegun{incarnation: f.id("incarnation"), txid: f.u64("txid"), invalidate: f.u8("invalidate"), indices: f.u32List("indices"), reuseGrant: f.boolean("reuse_grant"), meta: f.page("meta")}
+			return psWriteBegun{incarnation: f.id("incarnation"), txid: f.u64("txid"), invalidate: f.u8("invalidate"), indices: f.u32List("indices"), reuseGrant: f.boolean("reuse_grant"), meta: f.page("meta"), pending: f.digestList("pending"), reuse: f.u32List("reuse")}
 		},
 	},
 	"committed": {
@@ -243,6 +243,26 @@ func (f psFixtureFields) u32List(name string) []uint32 {
 	return out
 }
 
+func (f psFixtureFields) digestList(name string) []manifestEntry {
+	out := []manifestEntry{}
+	if f.str(name) == "" {
+		return out
+	}
+	for _, item := range strings.Split(f.str(name), ",") {
+		index, digest, _ := strings.Cut(item, "=")
+		i, err := strconv.ParseUint(index, 10, 32)
+		if err != nil {
+			f.t.Fatalf("f_%s: %v", name, err)
+		}
+		d, err := strconv.ParseUint(digest, 10, 64)
+		if err != nil {
+			f.t.Fatalf("f_%s: %v", name, err)
+		}
+		out = append(out, manifestEntry{index: uint32(i), digest: d})
+	}
+	return out
+}
+
 func (f psFixtureFields) pageList(name string) [][]byte {
 	out := [][]byte{}
 	if f.str(name) == "" {
@@ -330,6 +350,7 @@ func TestPageServiceConstantsMatchCatalog(t *testing.T) {
 		"header_length":               psHeaderLength,
 		"max_read_pages_cap":          psMaxReadPagesCap,
 		"max_invalidation_entries":    psMaxInvalidationEntries,
+		"max_reuse_pages":             psMaxReuse,
 		"invalidation_window_commits": psInvalidationWindowCommits,
 		"endpoint_max_path_bytes":     psEndpointMaxPathBytes,
 		"owner_record_version":        psOwnerRecordVersion,

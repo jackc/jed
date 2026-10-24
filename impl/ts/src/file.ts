@@ -211,7 +211,7 @@ export function createVia(files: FileHost, path: string, opts: DatabaseOptions =
   }
   db.paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize), codec);
   // Both slots carry the bootstrap txid, so the floor slot is txid & 1 (format.md, *Slot alternation*).
-  db.paging.setFloorSlot(Number(db.committed.txid & 1n));
+  db.paging.setFloorSlot(Number(db.committed.txid & 1n), db.committed.txid);
   db.committed.storePaging = db.paging;
   // Scratch is independent of the persistence path: a read-only database directory must still be
   // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1). An encrypted database never spills

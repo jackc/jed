@@ -24,6 +24,7 @@ const (
 	psHeaderLength              = 9        // length u32 + code u8 + request_id u32
 	psMaxReadPagesCap           = 1024     // the cap in hello_ok's max_read_pages formula
 	psMaxInvalidationEntries    = 65536    // the longest exact read_begun index list
+	psMaxReuse                  = 65536    // the most floor-free pages a relaxed write_begun offers
 	psInvalidationWindowCommits = 256      // commits whose written-index sets an owner retains
 	psEndpointMaxPathBytes      = 100      // the longest socket path an owner binds
 	psOwnerRecordMagic          = "JEDOWNER"
@@ -139,7 +140,12 @@ type psBeginWrite struct {
 	incarnation   id16
 	lastTxid      uint64
 	lockTimeoutMs uint64
+	flags         uint8
 }
+
+// psBeginWriteRelaxed is begin_write's flags bit 0: the client's handle runs synchronous = off, so the
+// owner names its pending batch instead of flushing it (README.md §3.5).
+const psBeginWriteRelaxed = 1
 
 type psCommitBegin struct {
 	txid          uint64
@@ -190,6 +196,10 @@ type psWriteBegun struct {
 	indices     []uint32
 	reuseGrant  bool
 	meta        []byte
+	// pending is the owner's pending set for a relaxed begin_write, ascending; reuse narrows the grant
+	// while it is non-empty (README.md §3.5).
+	pending []manifestEntry
+	reuse   []uint32
 }
 
 type psCommitted struct {
@@ -335,6 +345,14 @@ func (w *psWriter) u32List(v []uint32) {
 	}
 }
 
+func (w *psWriter) digestList(v []manifestEntry) {
+	w.count(len(v))
+	for _, e := range v {
+		w.u32(e.index)
+		w.u64(e.digest)
+	}
+}
+
 func (w *psWriter) pageList(v [][]byte) {
 	w.count(len(v))
 	for _, p := range v {
@@ -375,6 +393,7 @@ func (m psBeginWrite) psEncodeBody(w *psWriter) {
 	w.id(m.incarnation)
 	w.u64(m.lastTxid)
 	w.u64(m.lockTimeoutMs)
+	w.u8(m.flags)
 }
 
 func (m psCommitBegin) psEncodeBody(w *psWriter) {
@@ -420,6 +439,8 @@ func (m psWriteBegun) psEncodeBody(w *psWriter) {
 	w.u32List(m.indices)
 	w.boolean(m.reuseGrant)
 	w.page(m.meta)
+	w.digestList(m.pending)
+	w.u32List(m.reuse)
 }
 
 func (m psCommitted) psEncodeBody(w *psWriter)         { w.u64(m.txid) }
@@ -637,6 +658,18 @@ func (r *psReader) u32List() []uint32 {
 	return out
 }
 
+func (r *psReader) digestList() []manifestEntry {
+	n := r.count(12)
+	if r.err != nil {
+		return nil
+	}
+	out := make([]manifestEntry, n)
+	for i := range out {
+		out[i] = manifestEntry{index: r.u32(), digest: r.u64()}
+	}
+	return out
+}
+
 func (r *psReader) pageList() [][]byte {
 	n := r.count(uint64(r.pageSize))
 	if r.err != nil {
@@ -700,7 +733,7 @@ func decodePSFrame(frame []byte, pageSize uint32) (uint32, psMessage, error) {
 	case psCodeEndRead:
 		m = psEndRead{txid: r.u64()}
 	case psCodeBeginWrite:
-		m = psBeginWrite{incarnation: r.id(), lastTxid: r.u64(), lockTimeoutMs: r.u64()}
+		m = psBeginWrite{incarnation: r.id(), lastTxid: r.u64(), lockTimeoutMs: r.u64(), flags: r.u8()}
 	case psCodeCommitBegin:
 		m = psCommitBegin{txid: r.u64(), meta: r.page(), manifestPages: r.indexedPageList()}
 	case psCodeCommitPages:
@@ -720,7 +753,7 @@ func decodePSFrame(frame []byte, pageSize uint32) (uint32, psMessage, error) {
 	case psCodePages:
 		m = psPages{pages: r.pageList()}
 	case psCodeWriteBegun:
-		m = psWriteBegun{incarnation: r.id(), txid: r.u64(), invalidate: r.u8(), indices: r.u32List(), reuseGrant: r.boolean(), meta: r.page()}
+		m = psWriteBegun{incarnation: r.id(), txid: r.u64(), invalidate: r.u8(), indices: r.u32List(), reuseGrant: r.boolean(), meta: r.page(), pending: r.digestList(), reuse: r.u32List()}
 	case psCodeCommitted:
 		m = psCommitted{txid: r.u64()}
 	case psCodeCommitStatusReply:

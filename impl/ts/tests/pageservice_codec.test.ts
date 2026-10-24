@@ -19,6 +19,7 @@ import {
   PS_MAX_FRAME_LENGTH,
   PS_MAX_INVALIDATION_ENTRIES,
   PS_MAX_READ_PAGES_CAP,
+  PS_MAX_REUSE_PAGES,
   PS_MESSAGE_CODES,
   PS_OWNER_RECORD_MAGIC,
   PS_OWNER_RECORD_VERSION,
@@ -115,6 +116,13 @@ function parseValue(type: string, text: string, pageSize: number): unknown {
       return parsePage(text, pageSize);
     case "u32_list":
       return text === "" ? [] : text.split(",").map(Number);
+    case "digest_list":
+      return text === ""
+        ? []
+        : text.split(",").map((item) => {
+            const [index, digest] = item.split("=");
+            return { index: Number(index), digest: BigInt(digest!) };
+          });
     case "page_list":
       return text === "" ? [] : text.split(";").map((p) => parsePage(p, pageSize));
     case "indexed_page_list":
@@ -298,6 +306,7 @@ test("codec constants match messages.toml", () => {
     header_length: PS_HEADER_LENGTH,
     max_read_pages_cap: PS_MAX_READ_PAGES_CAP,
     max_invalidation_entries: PS_MAX_INVALIDATION_ENTRIES,
+    max_reuse_pages: PS_MAX_REUSE_PAGES,
     invalidation_window_commits: PS_INVALIDATION_WINDOW_COMMITS,
     endpoint_max_path_bytes: PS_ENDPOINT_MAX_PATH_BYTES,
     owner_record_magic: PS_OWNER_RECORD_MAGIC,
@@ -331,6 +340,8 @@ function zeroValue(type: string, pageSize: number): unknown {
       return new Uint8Array(pageSize).fill(9);
     case "u32_list":
       return [1, 2];
+    case "digest_list":
+      return [{ index: 4, digest: 0xfedcba9876543210n }];
     case "page_list":
       return [new Uint8Array(pageSize).fill(1)];
     case "indexed_page_list":
