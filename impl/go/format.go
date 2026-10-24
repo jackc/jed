@@ -3905,6 +3905,7 @@ func decodeCollationEntry(buf []byte, pos *int, env *Environment) (*Collation, b
 		Description:    desc,
 		Singles:        loaded.Singles,
 		Contractions:   loaded.Contractions,
+		maxContraction: loaded.maxContraction,
 	}
 	return coll, isDefault, nil
 }

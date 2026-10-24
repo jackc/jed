@@ -354,10 +354,22 @@ export function sortKey(coll: Collation, s: string): Uint8Array {
   return Uint8Array.from(out);
 }
 
+// The longest contraction sequence per contractions table, computed once. Keyed by the array, which
+// a file's collation shares with the loaded one it resolves to.
+const longestContractionCache = new WeakMap<ContractionEntry[], number>();
+
+function longestContraction(contractions: ContractionEntry[]): number {
+  let n = longestContractionCache.get(contractions);
+  if (n === undefined) {
+    n = 0;
+    for (const c of contractions) if (c.seq.length > n) n = c.seq.length;
+    longestContractionCache.set(contractions, n);
+  }
+  return n;
+}
+
 function collationElements(coll: Collation, cps: number[]): Ce[] {
-  let maxContraction = 0;
-  for (const c of coll.contractions)
-    if (c.seq.length > maxContraction) maxContraction = c.seq.length;
+  const maxContraction = longestContraction(coll.contractions);
   const out: Ce[] = [];
   let i = 0;
   while (i < cps.length) {
@@ -387,14 +399,30 @@ function collationElements(coll: Collation, cps: number[]): Ce[] {
   return out;
 }
 
+// Binary search: the table contract keeps singles ascending by code point.
 function lookupSingle(coll: Collation, cp: number): Ce[] | null {
-  for (const s of coll.singles) if (s.cp === cp) return s.ces;
-  return null;
+  const singles = coll.singles;
+  let lo = 0;
+  let hi = singles.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (singles[mid].cp < cp) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < singles.length && singles[lo].cp === cp ? singles[lo].ces : null;
 }
 
+// Binary search: the table contract keeps contractions lexicographic by sequence.
 function lookupContraction(coll: Collation, seq: number[]): Ce[] | null {
-  for (const c of coll.contractions) if (eqSeq(c.seq, seq)) return c.ces;
-  return null;
+  const contractions = coll.contractions;
+  let lo = 0;
+  let hi = contractions.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (seqLess(contractions[mid].seq, seq)) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < contractions.length && eqSeq(contractions[lo].seq, seq) ? contractions[lo].ces : null;
 }
 
 function eqSeq(a: number[], b: number[]): boolean {
