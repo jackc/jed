@@ -15,6 +15,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   non-reserved identifiers, the deliberate narrowings, and how the grammar grows.
 - [functions.md](functions.md) — the function/operator catalog: the family-based operand
   contract, the truth-value result types, NULL propagation vs detection, and how it grows.
+- [arg-coercion.md](arg-coercion.md) — implicit argument coercion for scalar functions: the
+  compare.toml cost table, the cheapest-conversion pass over built-in and host overloads, why an
+  integer takes the `decimal` overload, and the capture check.
 - [codegen.md](codegen.md) — the codegen "middle path": what is generated (data-shaped
   descriptor tables) vs hand-written (parser/executor/evaluator), the drift gate, and the
   per-core cross-check.

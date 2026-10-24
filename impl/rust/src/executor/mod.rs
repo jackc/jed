@@ -36,7 +36,7 @@ pub(crate) use crate::error::{EngineError, Result, SqlState};
 pub(crate) use crate::interval::{self, Interval, parse_interval};
 pub(crate) use crate::json::{self, JsonNode};
 pub(crate) use crate::operators::{
-    AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, SET_RETURNING, WINDOWS,
+    AGGREGATES, ARG_COERCIONS, AggregateDesc, OPERATORS, OperatorDesc, SET_RETURNING, WINDOWS,
 };
 pub(crate) use crate::pmap::KeyBound;
 pub(crate) use crate::privileges::{Privilege, PrivilegeSet};

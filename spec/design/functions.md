@@ -287,10 +287,11 @@ rejected `42803` in a `WHERE`.
 **`arg_resolution = "none"`.** Unlike a binary arithmetic/comparison operator, a scalar
 function does **not** reconcile its arguments to one common type: `round(numeric, integer)`
 keeps a decimal value and an integer count side by side. Each argument is matched to its
-declared family directly; there is no promotion *between* arguments. (A general implicit
-*argument* coercion — e.g. silently widening an `int` argument to `decimal` — is deliberately
-**not** built; PG's `round(5)` convenience is provided by explicit integer overloads
-instead, below, keeping the type system honest, CLAUDE.md §4.)
+declared family directly; there is no promotion *between* arguments. A call that matches no row
+as written goes to the **argument-coercion pass** ([arg-coercion.md](arg-coercion.md)), which
+selects the overload with the cheapest admissible argument conversions from compare.toml's
+`[[arg_coercion]]` table: an integer takes a `decimal` row (`round(5)`, `sqrt(2)`), and a numeric
+constant may enter the float family (`sin(1)`).
 
 **`abs`** carries `result = "promoted"` — for a one-argument function the promoted operand
 type is just the operand's own type, so `abs(i16) → i16`, `abs(i64) → i64`,
@@ -304,13 +305,13 @@ carries `errors = ["22003"]`. Over `decimal` it clears the sign and cannot overf
 engine-wide decimal rounding mode ([decimal.md](decimal.md) §3) — reusing the existing
 decimal scale-coercion routine. `round(numeric)` rounds to **scale 0**; `round(numeric, n)`
 rounds to **`n` fractional places** (PG parity includes a negative `n`, rounding to the left
-of the point: `round(150, -2) → 200`). Two **integer overloads**, `round(integer)` and
-`round(integer, integer)`, return `numeric` so that PostgreSQL's `round(5) → 5` works
-without an implicit coercion pass — they are authored as concrete catalog rows. All of
-`round`'s forms `propagate` NULL (any NULL argument → NULL), as does `abs`. The **decimal**
-overloads carry `errors = ["22003"]`: a round-up carry can push a value at the integer-digit
-format cap over it ([decimal.md](decimal.md) §2/§4 — exactly PG); the integer overloads
-cannot (an i64 is at most 19 digits). `round`'s scale argument clamps to `max_scale`
+of the point: `round(150, -2) → 200`). An integer argument has no row of its own: the
+argument-coercion pass selects the `decimal` row, so `round(5)` is `numeric` 5 where PostgreSQL
+returns `float8` ([arg-coercion.md](arg-coercion.md) §6). All of `round`'s forms `propagate` NULL
+(any NULL argument → NULL), as does `abs`. The **decimal** overloads carry `errors = ["22003"]`:
+a round-up carry can push a value at the integer-digit format cap over it
+([decimal.md](decimal.md) §2/§4 — exactly PG); an integer argument cannot reach it (an i64 is at
+most 19 digits). `round`'s scale argument clamps to `max_scale`
 (16383) like PG `numeric_round`.
 
 **Cost.** A scalar-function call charges one `operator_eval` ([cost.md](cost.md)) — the same
@@ -353,8 +354,7 @@ PostgreSQL does; only an integer argument selects the position form.
 **Two PostgreSQL heuristics are deliberately left out.** PostgreSQL then prefers a category's
 *preferred* type (`float8` among the numeric types) and, failing that, assumes an unknown argument
 has the type shared by the known ones. Neither carries over to jed's catalog, which is
-family-based and holds jed-only overloads (the integer `round`/`ceil`/`floor`/`trunc` rows, which
-stand in for PostgreSQL's implicit int→numeric cast, and `round(float, integer)`). Applied here
+family-based and holds jed-only overloads (`round(float, integer)`). Applied here
 they would pick overloads PostgreSQL does not have: `round($1, 2)` would type `$1` as `f64` or
 `i64`, where PostgreSQL types it numeric. Silently choosing binary float over exact `decimal` is
 also against the strict type system (CLAUDE.md §4, §8). So jed stops at `42725`, and the caller
@@ -395,37 +395,24 @@ and VARIADIC functions, aggregates) keep their own argument typing. An unknown a
 matches a host-registered function's signature ([extensibility.md](extensibility.md) §4.2), so it
 stays `42883` there.
 
-### 9.2 Mixed numeric pairs — `arg_resolution = "promote"` on a two-argument function
+### 9.2 Mixed numeric pairs — the argument-coercion pass
 
 PostgreSQL resolves `power(2.0, 3)` to `power(numeric, numeric)`: the `int4` argument casts
-implicitly to `numeric`, and the overload with an exact match on the other argument wins. jed builds
-no general implicit-coercion pass (§9). Instead, a two-argument function row may say
-`arg_resolution = "promote"`, meaning its arguments reconcile the way the arithmetic operators'
-operands do (§4, [../types/compare.toml](../types/compare.toml)). The rows that do are
-`power`/`pow` and `log(b, x)` over `decimal`, and `power`/`pow` and `atan2` over `float`.
+implicitly to `numeric`. jed reaches the same overload through the argument-coercion pass
+([arg-coercion.md](arg-coercion.md)), which replaced the per-row `arg_resolution = "promote"` this
+section used to describe. An integer facing a decimal takes the `decimal × decimal` row (`power(2.0,
+3)`, `power(int_col, 0.5)`, `log(2, 8.0)` → `numeric`); an integer or decimal *constant* facing a
+float takes the float row (`pow(f, 3)`, `atan2(1.0::f64, 1)` → `f64`). A float *value* never meets
+an integer or decimal *value* — float is a strict island ([float.md](float.md) §6) — so
+`power(f, i)` stays `42883` where PostgreSQL casts `i` to `float8` (an oracle override). Two
+integers take the `decimal` row too (`power(2, 10)` → `numeric`; PostgreSQL returns `float8`,
+arg-coercion.md §6).
 
-When the call matches no row as written (and no host function, which is tried first), each
-argument keeps its resolved type, and the pair is reconciled once:
-
-- **An integer facing a decimal** reads as `decimal` (compare.toml's `promote-to-decimal`), and the
-  row over `decimal × decimal` is looked up again. The kernel converts the integer value at scale
-  0, as a cast to `numeric` would, but no cast is charged: the call costs one less than the
-  spelling with an explicit `::numeric`. So `power(2.0, 3)`, `power(int_col, 0.5)`, and
-  `log(2, 8.0)` return `numeric`, as in PostgreSQL.
-- **An integer or decimal literal facing a float** is resolved again as `f64` and the float row is
-  looked up again: `pow(f, 3)`, `power(2.5::f32, 2)`, and `atan2(1.0::f64, 1)` return `f64`, as in
-  PostgreSQL, which reads the constant as `float8`. Only a literal adapts (a negative literal
-  too). A float *value* never meets an integer or decimal *value* — float is a strict island
-  ([float.md](float.md) §6) — so `power(f, i)` stays `42883` where PostgreSQL casts `i` to
-  `float8` (an oracle override).
-
-Anything else is unchanged. Two integers still match no row (`power(2, 3)` is `42883`; PostgreSQL
-returns a `float8`, an oracle override, [decimal.md](decimal.md) §8), and a bare `NULL` or `$N`
-follows §9.1 and does not reconcile. The resolver-routed functions with numeric pairs reconcile by
-the same rules in their own resolvers: `mod`/`div`/`gcd`/`lcm` promote an integer beside a decimal,
-and `width_bucket`'s float form adapts its literal operands to `f64`, so `width_bucket(f, 0, 10, 5)`
-resolves as in PostgreSQL. `round`/`trunc(decimal, integer)` need nothing: their rows already take
-the mixed pair.
+The integer is converted at scale 0 inside the call, as the arithmetic promotions do, and nothing
+is charged: `power(2.0, 3)` costs one less than the spelling with an explicit `::numeric`. The
+resolver-routed functions with numeric pairs reconcile by the same rules in their own resolvers:
+`mod`/`div`/`gcd`/`lcm` promote an integer beside a decimal, and `width_bucket`'s float form adapts
+its literal operands to `f64`, so `width_bucket(f, 0, 10, 5)` resolves as in PostgreSQL.
 
 ## 10. Set-returning functions (`generate_series`) — the fourth function mold
 

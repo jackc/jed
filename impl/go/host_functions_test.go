@@ -1456,3 +1456,154 @@ func TestHostFuncCheckErrorPrecedesDefault(t *testing.T) {
 	defer db.Close()
 	wantHostCode(t, db, "INSERT INTO t (id, a) VALUES (1, 1)", "XX002")
 }
+
+// ── Implicit argument coercion (spec/design/arg-coercion.md §4.2) ───────────────────────────────
+// A call matching no signature exactly is resolved by the cheapest coercions, over the built-in rows
+// and the host functions together. These mirror the Rust/TS argument-coercion tests one-for-one.
+
+// coercionKind is the value kind a kernel received: the kernel only ever sees its declared types.
+func coercionKind(v Value) string {
+	switch v.Kind {
+	case ValInt:
+		return "int"
+	case ValDecimal:
+		return "decimal"
+	case ValFloat64:
+		return "f64"
+	case ValFloat32:
+		return "f32"
+	}
+	return "other"
+}
+
+// coercionProbe is name(argTypes) -> text, returning tag: and the kinds of the values it received,
+// so a test sees both which overload was selected and what it was handed.
+func coercionProbe(name string, argTypes []string, tag string) *HostFunction {
+	return NewHostFunction(name, argTypes, "text", func(args []Value) (Value, error) {
+		kinds := make([]string, len(args))
+		for i, a := range args {
+			kinds[i] = coercionKind(a)
+		}
+		return TextValue(tag + ":" + strings.Join(kinds, ",")), nil
+	})
+}
+
+// coercionProbeBatched is the batch-kernel form of coercionProbe for a one-argument function.
+func coercionProbeBatched(name, arg, tag string) *HostFunction {
+	return NewHostBatchFunction(name, []string{arg}, "text", func(args [][]Value, out []Value) ([]Value, error) {
+		for _, v := range args[0] {
+			out = append(out, TextValue(tag+":"+coercionKind(v)))
+		}
+		return out, nil
+	}).WithVolatility(VolatilityImmutable)
+}
+
+func coercionDB(t *testing.T, funcs ...*HostFunction) *Session {
+	t.Helper()
+	return dbExt(t, envWith(t, funcs...),
+		"CREATE TABLE c (id i32 PRIMARY KEY, s i16, i i32, b i64, r f32)",
+		"INSERT INTO c VALUES (1, 2, 3, 4, 0.5), (2, 5, 6, 7, 1.5)")
+}
+
+// wantText asserts sql returns the one text value want.
+func wantText(t *testing.T, s *Session, sql, want string) {
+	t.Helper()
+	v := oneVal(t, s, sql)
+	if v.Kind != ValText || v.str() != want {
+		t.Fatalf("%q = %v, want %q", sql, v, want)
+	}
+}
+
+func TestCoercionWidensAnIntegerToAHostSignature(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("f", []string{"i64"}, "i64"))
+	wantText(t, s, "SELECT f(i) FROM c WHERE id = 1", "i64:int")
+	wantText(t, s, "SELECT f(s) FROM c WHERE id = 1", "i64:int")
+}
+
+func TestCoercionPrefersTheNearerIntegerWidth(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("f", []string{"i32"}, "i32"), coercionProbe("f", []string{"i64"}, "i64"))
+	wantText(t, s, "SELECT f(s) FROM c WHERE id = 1", "i32:int")
+}
+
+func TestCoercionNarrowsAnIntegerConstantOnlyWhenItFits(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("f", []string{"i16"}, "i16"), coercionProbe("f", []string{"i32"}, "i32"))
+	wantText(t, s, "SELECT f(5)", "i32:int")
+	wantText(t, s, "SELECT f(-40000)", "i32:int")
+	wantErr(t, s, "SELECT f(3000000000)", "42883")
+}
+
+func TestCoercionKeepsAnIntegerInItsFamilyBeforeDecimal(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("f", []string{"i64"}, "i64"), coercionProbe("f", []string{"decimal"}, "decimal"))
+	wantText(t, s, "SELECT f(s) FROM c WHERE id = 1", "i64:int")
+}
+
+func TestCoercionConvertsAnIntegerForADecimalParameter(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("f", []string{"decimal"}, "decimal"))
+	wantText(t, s, "SELECT f(i) FROM c WHERE id = 1", "decimal:decimal")
+	wantText(t, s, "SELECT f(7)", "decimal:decimal")
+}
+
+func TestCoercionConvertsInABatchKernel(t *testing.T) {
+	t.Parallel()
+	// The batched path (§4.2.1) converts each column the same way as the row path.
+	s := coercionDB(t, coercionProbeBatched("f", "decimal", "decimal"), coercionProbeBatched("g", "f64", "f64"))
+	rows := hostRows(t, s, "SELECT f(i), g(r) FROM c ORDER BY id")
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for _, r := range rows {
+		if r[0].str() != "decimal:decimal" || r[1].str() != "f64:f64" {
+			t.Fatalf("row = %v, want [decimal:decimal f64:f64]", r)
+		}
+	}
+}
+
+func TestCoercionWidensF32ToAHostF64Parameter(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("g", []string{"f64"}, "f64"))
+	wantText(t, s, "SELECT g(r) FROM c WHERE id = 1", "f64:f64")
+}
+
+func TestCoercionAdmitsOnlyAConstantIntoAHostFloat(t *testing.T) {
+	t.Parallel()
+	s := coercionDB(t, coercionProbe("g", []string{"f64"}, "f64"))
+	wantText(t, s, "SELECT g(2)", "f64:f64")
+	wantText(t, s, "SELECT g(2.5)", "f64:f64")
+	wantErr(t, s, "SELECT g(i) FROM c WHERE id = 1", "42883")
+}
+
+func TestCoercionHostBeatsACostlierBuiltin(t *testing.T) {
+	t.Parallel()
+	// A host sqrt(i32) for an i16 argument scores 1; the built-in sqrt(decimal) scores 3.
+	s := coercionDB(t, coercionProbe("sqrt", []string{"i32"}, "host"))
+	wantText(t, s, "SELECT sqrt(s) FROM c WHERE id = 1", "host:int")
+}
+
+func TestCoercionBuiltinWinsATie(t *testing.T) {
+	t.Parallel()
+	// sin(0): the built-in sin(float) and a host sin(f64) both score 4 — the built-in wins.
+	s := coercionDB(t, coercionProbe("sin", []string{"f64"}, "host"))
+	if v := oneVal(t, s, "SELECT sin(0)"); v.Kind != ValFloat64 || v.F64() != 0 {
+		t.Fatalf("sin(0) = %v, want f64 0", v)
+	}
+}
+
+func TestCoercionTiedHostsAreAmbiguous(t *testing.T) {
+	t.Parallel()
+	// (i16, i16) against f(i32, i64) and f(i64, i32): both score 3 — 42725.
+	s := coercionDB(t, coercionProbe("f", []string{"i32", "i64"}, "a"), coercionProbe("f", []string{"i64", "i32"}, "b"))
+	wantErr(t, s, "SELECT f(s, s) FROM c WHERE id = 1", "42725")
+}
+
+func TestCoercionLeavesAnExactHostMatchAlone(t *testing.T) {
+	t.Parallel()
+	// An exact host signature is found before the pass runs, even where a built-in would match
+	// through a coercion.
+	s := coercionDB(t, coercionProbe("sqrt", []string{"i64"}, "host"))
+	wantText(t, s, "SELECT sqrt(b) FROM c WHERE id = 1", "host:int")
+}

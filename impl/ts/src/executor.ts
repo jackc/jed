@@ -507,6 +507,7 @@ import {
 } from "./interval.ts";
 import {
   AGGREGATES,
+  ARG_COERCIONS,
   type AggregateDesc,
   OPERATORS,
   type OperatorDesc,
@@ -44590,11 +44591,26 @@ export function selectUnknownOverload(
       ),
   );
   if (candidates.length <= 1) return candidates[0];
-  // At each unknown position pick text if any candidate accepts it, else the one family every
-  // candidate agrees on; a disagreement without text is ambiguous.
-  const picked: (string | null)[] = tys.map(() => null);
-  for (let i = 0; i < tys.length; i++) {
-    if (!unknown(i)) continue;
+  return pickByUnknownPositions(
+    name,
+    candidates,
+    tys.map((_, i) => unknown(i)),
+  );
+}
+
+// pickByUnknownPositions is step 3 of the unknown-argument rule (functions.md §9.1), over two or
+// more candidate rows: at each unknown position pick text if any candidate accepts it, else the one
+// family every candidate agrees on (a disagreement without text is ambiguous), then keep the
+// candidates that accept every picked family. Exactly one must remain; anything else is 42725. The
+// argument-coercion pass applies it to its tied built-in candidates too (arg-coercion.md §4).
+export function pickByUnknownPositions(
+  name: string,
+  candidates: OperatorDesc[],
+  unknown: boolean[],
+): OperatorDesc {
+  const picked: (string | null)[] = unknown.map(() => null);
+  for (let i = 0; i < unknown.length; i++) {
+    if (!unknown[i]) continue;
     const first = candidates[0]!.argFamilies[i]!;
     if (candidates.some((o) => o.argFamilies[i] === "text")) picked[i] = "text";
     else if (candidates.every((o) => o.argFamilies[i] === first)) picked[i] = first;
@@ -44604,7 +44620,7 @@ export function selectUnknownOverload(
     picked.every((p, i) => p === null || o.argFamilies[i] === p),
   );
   if (kept.length !== 1) throw ambiguousFuncOverload(name);
-  return kept[0];
+  return kept[0]!;
 }
 
 // familyParamType is the concrete type an unknown-typed bind parameter adopts in a function slot of
@@ -45552,12 +45568,7 @@ export function resolveScalarFunc(
       scope.catalog.traceSequence(first.literal.text);
     }
   }
-  let name = e.name as ScalarFuncName;
-  // char_length / character_length are SQL-standard aliases of length (string-functions.md) with NO
-  // catalog row of their own, so rewrite them to length BEFORE the lookup (unlike power/ceiling,
-  // which DO have their own catalog rows and are looked up by the spelled name — matching Rust/Go).
-  if ((name as string) === "char_length" || (name as string) === "character_length")
-    name = "length";
+  const name = e.name as ScalarFuncName;
   const rargs: RExpr[] = [];
   const tys: ResolvedType[] = [];
   for (const a of e.args) {
@@ -45573,18 +45584,15 @@ export function resolveScalarFunc(
   if (!desc) {
     // Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
     // promotion. A built-in overload (above) always wins; a host function is reached only when no
-    // built-in matches. Use the ORIGINAL name (not the char_length→length built-in alias rewrite).
-    // `id` indexes the frozen registry; the kernel is reached by id at eval.
+    // built-in matches. `id` indexes the frozen registry; the kernel is reached by id at eval.
     const host = resolveHostScalar(scope, e.name, rargs, tys);
     if (host) return host;
-    // A promoting two-argument function reconciles a mixed numeric pair as the arithmetic
-    // operators do (functions.md §9.2): power(2.0, 3) selects the decimal overload, pow(x_f64, 3)
-    // the float one.
-    const ptys = promoteScalarPair(scope, name, e.args, rargs, tys, ag, params);
-    if (ptys) {
-      desc = lookupScalarOverload(name, ptys);
-      if (desc) tys.splice(0, tys.length, ...ptys);
-    }
+    // No signature matches as written: the cheapest implicit argument coercions select among the
+    // built-in and host overloads (arg-coercion.md §4) — sqrt(2) takes sqrt(decimal), sin(1)
+    // sin(float), a host f(i64) an i32 argument.
+    const coerced = resolveCoercedCall(scope, name, e.args, rargs, tys, ag, params);
+    if (coerced !== null && "node" in coerced) return coerced;
+    if (coerced !== null) desc = coerced.desc;
     if (!desc) {
       // No overload takes the bare string literals as text, so retry with them unknown-typed, as
       // PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
@@ -45639,6 +45647,11 @@ export function resolveScalarFunc(
   // `position(string, substring)` — the POSITION(sub IN s) special form's call — shares the strpos
   // kernel, over text and bytea (string-functions.md §3/§4).
   if ((func as string) === "position") func = "strpos";
+  // char_length / character_length are SQL-standard aliases of length (string-functions.md) with
+  // their own text-only catalog rows, looked up above by the spelled name like Rust/Go; they share
+  // the length kernel.
+  if ((func as string) === "char_length" || (func as string) === "character_length")
+    func = "length";
   // Every float function computes at the operand's float width (argWidth), so a f32 operand
   // rounds at binary32 even where the catalog's result is f64; abs(float) also keeps that width
   // as its result. Non-float args carry no width. pow is the one (float, float) function — it
@@ -45675,18 +45688,6 @@ export function resolveScalarFunc(
   return scalarFuncNode(func, rargs, result, argWidth);
 }
 
-// scalarPairPromotes reports whether name has a two-argument catalog row with arg_resolution
-// "promote" — the rows whose mixed numeric pairs reconcile (functions.md §9.2).
-function scalarPairPromotes(name: string): boolean {
-  return OPERATORS.some(
-    (o) =>
-      o.kind === "function" &&
-      o.name === name &&
-      o.argFamilies.length === 2 &&
-      o.argResolution === "promote",
-  );
-}
-
 // isNumericLiteral reports whether e is a bare integer or decimal literal (a negative one included:
 // the parser folds the sign into the literal).
 function isNumericLiteral(e: Expr): boolean {
@@ -45694,7 +45695,7 @@ function isNumericLiteral(e: Expr): boolean {
 }
 
 // floatLiteral re-resolves a numeric literal argument that faces a float argument as f64 — the type
-// of every float overload's arguments (functions.md §9.2; PostgreSQL reads the constant as float8).
+// of every float overload's arguments (PostgreSQL reads the constant as float8).
 function floatLiteral(
   scope: Scope,
   e: Expr,
@@ -45704,13 +45705,122 @@ function floatLiteral(
   return resolve(scope, e, "f64", ag, params);
 }
 
-// promoteScalarPair reconciles the two resolved arguments of a promoting function (functions.md
-// §9.2) the way the arithmetic operators reconcile their operands: an integer facing a decimal reads
-// as decimal (compare.toml's promote-to-decimal — the kernel converts the value), and an integer or
-// decimal LITERAL facing a float is re-resolved as f64 (float.md §4/§6; a value never becomes a
-// float). null when the pair needs no reconciliation or has none. A re-resolved literal replaces its
-// entry in rargs; the result is the reconciled pair of types.
-function promoteScalarPair(
+// An argument's source for the argument-coercion pass (arg-coercion.md §4): a typed value (ty null
+// for a container), a bare numeric constant — which may also take the literal rows of the cost table
+// — or an unknown-typed bare NULL / $N (functions.md §9.1).
+type ArgSource =
+  | { kind: "typed"; ty: ScalarType | null }
+  | { kind: "intLiteral"; value: bigint }
+  | { kind: "decimalLiteral" }
+  | { kind: "unknown" };
+
+function argSource(e: Expr, t: ResolvedType): ArgSource {
+  if (t.kind === "null") return { kind: "unknown" };
+  if (e.kind === "literal" && e.literal.kind === "int")
+    return { kind: "intLiteral", value: e.literal.int };
+  if (e.kind === "literal" && e.literal.kind === "decimal") return { kind: "decimalLiteral" };
+  return { kind: "typed", ty: resolvedToScalar(t) };
+}
+
+// cheapestCoercion is the cheapest coercion of src into a type accept admits, from the
+// ARG_COERCIONS cost table (arg-coercion.md §3): the target type and its cost, the first row in
+// table order on a tie. A literal also takes the rows of its default type (i64, decimal); an
+// integer constant takes a narrower integer type only when its value fits. Its own type is not
+// considered here.
+function cheapestCoercion(
+  src: ArgSource,
+  accept: (to: ScalarType) => boolean,
+): { cost: number; to: ScalarType } | null {
+  let own: ScalarType;
+  let literal: string | null = null;
+  if (src.kind === "typed" && src.ty !== null) own = src.ty;
+  else if (src.kind === "intLiteral") {
+    own = "i64";
+    literal = "integer_literal";
+  } else if (src.kind === "decimalLiteral") {
+    own = "decimal";
+    literal = "decimal_literal";
+  } else return null;
+  let best: { cost: number; to: ScalarType } | null = null;
+  for (const row of ARG_COERCIONS) {
+    if (row.from !== own && row.from !== literal) continue;
+    const to = scalarTypeFromName(row.to);
+    if (to === undefined || !accept(to)) continue;
+    if (src.kind === "intLiteral" && (to === "i16" || to === "i32") && !inRange(to, src.value))
+      continue;
+    if (best === null || row.cost < best.cost) best = { cost: row.cost, to };
+  }
+  return best;
+}
+
+// One overload considered by the coercion pass: a built-in catalog row or a host function (by
+// registry id), its total score, and the type each coerced position converts to.
+interface CoercedCandidate {
+  builtin: OperatorDesc | null;
+  host: number | null;
+  score: number;
+  targets: (ScalarType | null)[];
+}
+
+// scoreBuiltin scores a built-in row against the call (arg-coercion.md §4): a family slot costs 0
+// for any member type, any, or an unknown-typed argument, else the cheapest row into one of its
+// member types. null when some position is not admitted.
+function scoreBuiltin(
+  desc: OperatorDesc,
+  srcs: ArgSource[],
+  tys: ResolvedType[],
+): CoercedCandidate | null {
+  let score = 0;
+  const targets: (ScalarType | null)[] = [];
+  for (let i = 0; i < desc.argFamilies.length; i++) {
+    const slot = desc.argFamilies[i]!;
+    if (srcs[i]!.kind === "unknown" || familyMatches(slot, tys[i]!)) {
+      targets.push(null);
+      continue;
+    }
+    const c = cheapestCoercion(srcs[i]!, (to) => argFamily(resolvedTypeOf(to)) === slot);
+    if (c === null) return null;
+    score += c.cost;
+    targets.push(c.to);
+  }
+  return { builtin: desc, host: null, score, targets };
+}
+
+// scoreHost scores a host function against the call: a host slot names one type, which only that
+// type matches at 0. An unknown-typed argument matches no host slot (functions.md §9.1).
+function scoreHost(
+  id: number,
+  argTypes: readonly ScalarType[],
+  srcs: ArgSource[],
+): CoercedCandidate | null {
+  let score = 0;
+  const targets: (ScalarType | null)[] = [];
+  for (let i = 0; i < srcs.length; i++) {
+    const src = srcs[i]!;
+    const slot = argTypes[i]!;
+    if (src.kind === "unknown") return null;
+    const own: ScalarType | null =
+      src.kind === "typed" ? src.ty : src.kind === "intLiteral" ? "i64" : "decimal";
+    if (own === slot) {
+      targets.push(null);
+      continue;
+    }
+    const c = cheapestCoercion(src, (to) => to === slot);
+    if (c === null) return null;
+    score += c.cost;
+    targets.push(c.to);
+  }
+  return { builtin: null, host: id, score, targets };
+}
+
+// resolveCoercedCall is the argument-coercion pass (arg-coercion.md §4), reached when no built-in
+// row and no host signature matches the call as written. Every built-in row and host function of
+// the call's name and arity is scored by the summed cost of its coercions; the minimum wins. Among
+// tied candidates a built-in beats a host function, the §9.1 unknown-position rule picks among tied
+// built-ins, and anything still tied is 42725. null when no candidate admits the call. A selected
+// built-in row comes back as {desc}, with rargs and tys updated in place for the caller's adoption;
+// a selected host function comes back as its resolved node.
+function resolveCoercedCall(
   scope: Scope,
   name: string,
   args: Expr[],
@@ -45718,22 +45828,62 @@ function promoteScalarPair(
   tys: ResolvedType[],
   ag: AggCtx,
   params: ParamTypes,
-): ResolvedType[] | null {
-  if (tys.length !== 2 || !scalarPairPromotes(name)) return null;
-  const exact = (t: ResolvedType) => t.kind === "int" || t.kind === "decimal";
-  const l = tys[0]!;
-  const r = tys[1]!;
-  if (exact(l) && exact(r) && l.kind !== r.kind) return [{ kind: "decimal" }, { kind: "decimal" }];
-  if ((l.kind === "float") !== (r.kind === "float")) {
-    const other = l.kind === "float" ? 1 : 0;
-    if (!exact(tys[other]!) || !isNumericLiteral(args[other]!)) return null;
-    const re = floatLiteral(scope, args[other]!, ag, params);
-    rargs[other] = re.node;
-    const out = [l, r];
-    out[other] = re.type;
-    return out;
+): { desc: OperatorDesc } | { node: RExpr; type: ResolvedType } | null {
+  const srcs = args.map((a, i) => argSource(a, tys[i]!));
+  let cands: CoercedCandidate[] = [];
+  for (const o of OPERATORS) {
+    if (o.kind !== "function" || o.name !== name || o.argFamilies.length !== args.length) continue;
+    const c = scoreBuiltin(o, srcs, tys);
+    if (c !== null) cands.push(c);
   }
-  return null;
+  const registry = scope.catalog.session.environment.hostFunctions();
+  if (registry) {
+    for (const { id, fn } of registry.overloads(name, args.length)) {
+      const c = scoreHost(id, fn.argTypes, srcs);
+      if (c !== null) cands.push(c);
+    }
+  }
+  if (cands.length === 0) return null;
+  const min = Math.min(...cands.map((c) => c.score));
+  cands = cands.filter((c) => c.score === min);
+  if (cands.some((c) => c.builtin !== null)) cands = cands.filter((c) => c.builtin !== null);
+  let chosen: CoercedCandidate;
+  if (cands.length === 1) {
+    chosen = cands[0]!;
+  } else if (cands[0]!.builtin !== null) {
+    const unknown = srcs.map((s) => s.kind === "unknown");
+    const pick = pickByUnknownPositions(
+      name,
+      cands.map((c) => c.builtin!),
+      unknown,
+    );
+    chosen = cands.find((c) => c.builtin === pick)!;
+  } else {
+    throw ambiguousFuncOverload(name);
+  }
+  // Adopt the coerced types. A bare numeric constant is resolved again in its slot's type (an f64
+  // or f32 float slot, a narrower host integer), as literal adaptation; an integer bound for a
+  // decimal slot, and a value, stay as resolved and convert inside the call (nothing charged).
+  for (let i = 0; i < chosen.targets.length; i++) {
+    const to = chosen.targets[i];
+    if (to === null || to === undefined) continue;
+    const src = srcs[i]!;
+    const literal = src.kind === "intLiteral" || src.kind === "decimalLiteral";
+    if (literal && to !== "decimal") {
+      const r = resolve(scope, args[i]!, to, ag, params);
+      rargs[i] = r.node;
+      tys[i] = r.type;
+    } else {
+      tys[i] = resolvedTypeOf(to);
+    }
+  }
+  if (chosen.builtin !== null) return { desc: chosen.builtin };
+  const id = chosen.host!;
+  const result = registry!.functionAt(id).result;
+  return {
+    node: { kind: "hostFunc", id, name, args: rargs, result },
+    type: resolvedTypeOf(result),
+  };
 }
 
 // bareStringLiterals marks the arguments that are bare string literals ('…', not a typed literal or

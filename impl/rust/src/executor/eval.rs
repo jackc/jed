@@ -2038,6 +2038,8 @@ impl RExpr {
                     // in-contract). sign(NaN) = sign(±0) = 0, sign(±Inf) = ±1 (PG dsign tests
                     // x > 0 / x < 0, so NaN falls through to 0). Dispatches on the operand, like abs.
                     ScalarFunc::Sign => match &vals[0] {
+                        // An integer coerced to the decimal overload (arg-coercion.md §4).
+                        Value::Int(n) => Ok(Value::Decimal(Decimal::from_i64(n.signum()))),
                         Value::Decimal(d) => {
                             let s = if d.is_zero() {
                                 0
@@ -2176,17 +2178,21 @@ impl RExpr {
                     // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
                     ScalarFunc::Scale => match &vals[0] {
                         Value::Decimal(d) => Ok(Value::Int(d.scale() as i64)),
+                        // An integer coerced to the decimal overload has scale 0 (arg-coercion.md §4).
+                        Value::Int(_) => Ok(Value::Int(0)),
                         _ => unreachable!("resolver restricts scale to a decimal operand"),
                     },
                     // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
                     ScalarFunc::MinScale => match &vals[0] {
                         Value::Decimal(d) => Ok(Value::Int(min_scale_of(d) as i64)),
+                        Value::Int(_) => Ok(Value::Int(0)),
                         _ => unreachable!("resolver restricts min_scale to a decimal operand"),
                     },
                     // trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the
                     // dropped digits are zeros, so round_to_scale does not round).
                     ScalarFunc::TrimScale => match &vals[0] {
                         Value::Decimal(d) => Ok(Value::Decimal(d.round_to_scale(min_scale_of(d)))),
+                        Value::Int(n) => Ok(Value::Decimal(Decimal::from_i64(*n))),
                         _ => unreachable!("resolver restricts trim_scale to a decimal operand"),
                     },
                     // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
@@ -2254,35 +2260,28 @@ impl RExpr {
                         Ok(Value::Decimal(d.trunc_places(places)))
                     }
                     // EXACT-numeric transcendentals over decimal (decimal.md §8): sqrt / exp / ln /
-                    // log / log10 / power. A hand-rolled PG-faithful arbitrary-precision port —
+                    // log / log10 / power. An integer argument coerced to the decimal overload
+                    // (arg-coercion.md §4) converts at scale 0. A hand-rolled PG-faithful arbitrary-precision port —
                     // byte-identical across cores by construction (unlike the libm float arms below,
                     // which ride the `R`-tag ULP exemption). Guarded on a Decimal operand so the
                     // float overloads still reach the libm arm. Domain errors: sqrt of a negative and
                     // the power domain errors → 2201F; ln/log of a non-positive → 2201E; exp/power
                     // overflow → 22003.
-                    ScalarFunc::Sqrt if matches!(&vals[0], Value::Decimal(_)) => {
-                        let Value::Decimal(d) = &vals[0] else {
-                            unreachable!()
-                        };
-                        Ok(Value::Decimal(d.dec_sqrt_metered(Some(m))?))
+                    ScalarFunc::Sqrt if matches!(&vals[0], Value::Decimal(_) | Value::Int(_)) => {
+                        Ok(Value::Decimal(
+                            value_to_decimal(&vals[0]).dec_sqrt_metered(Some(m))?,
+                        ))
                     }
-                    ScalarFunc::Exp if matches!(&vals[0], Value::Decimal(_)) => {
-                        let Value::Decimal(d) = &vals[0] else {
-                            unreachable!()
-                        };
-                        Ok(Value::Decimal(d.dec_exp_metered(Some(m))?))
-                    }
-                    ScalarFunc::Ln if matches!(&vals[0], Value::Decimal(_)) => {
-                        let Value::Decimal(d) = &vals[0] else {
-                            unreachable!()
-                        };
-                        Ok(Value::Decimal(d.dec_ln_metered(Some(m))?))
-                    }
-                    ScalarFunc::Log10 if matches!(&vals[0], Value::Decimal(_)) => {
-                        let Value::Decimal(d) = &vals[0] else {
-                            unreachable!()
-                        };
-                        Ok(Value::Decimal(d.dec_log10_metered(Some(m))?))
+                    ScalarFunc::Exp if matches!(&vals[0], Value::Decimal(_) | Value::Int(_)) => Ok(
+                        Value::Decimal(value_to_decimal(&vals[0]).dec_exp_metered(Some(m))?),
+                    ),
+                    ScalarFunc::Ln if matches!(&vals[0], Value::Decimal(_) | Value::Int(_)) => Ok(
+                        Value::Decimal(value_to_decimal(&vals[0]).dec_ln_metered(Some(m))?),
+                    ),
+                    ScalarFunc::Log10 if matches!(&vals[0], Value::Decimal(_) | Value::Int(_)) => {
+                        Ok(Value::Decimal(
+                            value_to_decimal(&vals[0]).dec_log10_metered(Some(m))?,
+                        ))
                     }
                     // `log` is decimal-only (no float `log` in the catalog): 1-arg = base-10 log,
                     // 2-arg = log(base, num) in an arbitrary base. A promoted integer argument

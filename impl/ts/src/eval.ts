@@ -2650,17 +2650,24 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     return intValue(idx);
   }
   if (e.func === "scale") {
-    // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383).
-    return intValue(BigInt((vals[0] as { dec: Decimal }).dec.scale));
+    // scale(numeric) → the display (fractional-digit) scale, as i32 (always ≤ 16383). An integer
+    // coerced to the decimal overload has scale 0 (arg-coercion.md §4).
+    const v = vals[0]!;
+    if (v.kind === "int") return intValue(0n);
+    return intValue(BigInt((v as { dec: Decimal }).dec.scale));
   }
   if (e.func === "min_scale") {
     // min_scale(numeric) → the smallest exact scale (trailing fractional zeros dropped).
-    return intValue(BigInt(minScaleOf((vals[0] as { dec: Decimal }).dec)));
+    const v = vals[0]!;
+    if (v.kind === "int") return intValue(0n);
+    return intValue(BigInt(minScaleOf((v as { dec: Decimal }).dec)));
   }
   if (e.func === "trim_scale") {
     // trim_scale(numeric) → the value re-scaled down to its min_scale (exact; the dropped
-    // digits are zeros, so roundToScale does not round).
-    const d = (vals[0] as { dec: Decimal }).dec;
+    // digits are zeros, so roundToScale does not round). A coerced integer is already scale 0.
+    const v = vals[0]!;
+    if (v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
+    const d = (v as { dec: Decimal }).dec;
     return decimalValue(d.roundToScale(minScaleOf(d)));
   }
   const v0 = vals[0];
@@ -2695,8 +2702,9 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     return decimalValue((v0 as { dec: Decimal }).dec.abs());
   }
   if (e.func === "sign") {
-    // sign over a decimal → numeric at scale 0 (-1 / 0 / +1).
-    const d = (v0 as { dec: Decimal }).dec;
+    // sign over a decimal → numeric at scale 0 (-1 / 0 / +1). An integer coerced to the decimal
+    // overload (arg-coercion.md §4) converts at scale 0.
+    const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
     const s = d.limbs.length === 0 ? 0n : d.neg ? -1n : 1n;
     return decimalValue(Decimal.fromBigInt(s));
   }
@@ -2722,8 +2730,8 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     // EXACT-numeric transcendentals over decimal (decimal.md §8). Float operands returned
     // above; here the operand is decimal — a PG-faithful arbitrary-precision kernel,
     // byte-identical across cores. Domain errors: sqrt of a negative and the power domain
-    // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003. A promoted
-    // integer argument of log/power converts to decimal (functions.md §9.2).
+    // errors → 2201F; ln/log of a non-positive → 2201E; exp/power overflow → 22003. An integer
+    // argument coerced to the decimal overload converts at scale 0 (arg-coercion.md §4).
     const toDec = (v: Value): Decimal =>
       v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec;
     const a = toDec(v0);

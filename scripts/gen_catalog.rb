@@ -19,6 +19,7 @@ REPO = File.expand_path("..", __dir__)
 CATALOG = File.join(REPO, "spec", "functions", "catalog.toml")
 RANGES_SRC = File.join(REPO, "spec", "types", "ranges.toml")
 CASTS_SRC = File.join(REPO, "spec", "types", "casts.toml")
+COMPARE_SRC = File.join(REPO, "spec", "types", "compare.toml")
 
 # (relative path, builder method) for each generated file.
 TARGETS = [
@@ -94,6 +95,14 @@ def non_trapping_casts
     fail!("#{CASTS_SRC}: cast #{id}: traps = false requires a boolean preserves_equality") unless [true, false].include?(pe)
     [c["from"], c["to"], pe]
   end
+end
+
+# The [[arg_coercion]] cost table of spec/types/compare.toml (arg-coercion.md §3): each row is
+# [from, to, cost], in file order. spec/functions/verify.rb checks the rows; this only emits them.
+def arg_coercions
+  rows = TomlRB.load_file(COMPARE_SRC)["arg_coercion"] || []
+  fail!("#{COMPARE_SRC}: no [[arg_coercion]] rows") if rows.empty?
+  rows.map { |r| [r["from"], r["to"], r["cost"]] }
 end
 
 # The two trap-classification fields of an operator row (functions.md §15): absent traps ⇒ true.
@@ -322,6 +331,21 @@ def rust_file(ops, aggs, srfs, wins)
     #[rustfmt::skip]
     pub const NON_TRAPPING_CASTS: &[CastTrapDesc] = &[
     #{non_trapping_casts.map { |f, t, pe| "    CastTrapDesc { from: #{rust_str(f)}, to: #{rust_str(t)}, preserves_equality: #{pe} }," }.join("\n")}
+    ];
+
+    /// One row of the argument-coercion cost table (spec/types/compare.toml, arg-coercion.md §3): an
+    /// argument from `from` (a scalar id, or "integer_literal" / "decimal_literal") may stand in a slot
+    /// of scalar type `to` at `cost`.
+    pub struct ArgCoercionDesc {
+        pub from: &'static str,
+        pub to: &'static str,
+        pub cost: u32,
+    }
+
+    /// Every argument coercion, in compare.toml order. A pair absent from this table never coerces.
+    #[rustfmt::skip]
+    pub const ARG_COERCIONS: &[ArgCoercionDesc] = &[
+    #{arg_coercions.map { |f, t, c| "    ArgCoercionDesc { from: #{rust_str(f)}, to: #{rust_str(t)}, cost: #{c} }," }.join("\n")}
     ];
   RS
 end
@@ -576,6 +600,21 @@ def go_file(ops, aggs, srfs, wins)
     var nonTrappingCasts = []castTrapDesc{
     #{non_trapping_casts.map { |f, t, pe| "\t{From: #{go_str(f)}, To: #{go_str(t)}, PreservesEq: #{pe}}," }.join("\n")}
     }
+
+    // argCoercionDesc is one row of the argument-coercion cost table (spec/types/compare.toml,
+    // arg-coercion.md §3): an argument from From (a scalar id, or "integer_literal" /
+    // "decimal_literal") may stand in a slot of scalar type To at Cost.
+    type argCoercionDesc struct {
+    \tFrom string
+    \tTo   string
+    \tCost int
+    }
+
+    // argCoercions lists every argument coercion, in compare.toml order. A pair absent from it never
+    // coerces.
+    var argCoercions = []argCoercionDesc{
+    #{arg_coercions.map { |f, t, c| "\t{From: #{go_str(f)}, To: #{go_str(t)}, Cost: #{c}}," }.join("\n")}
+    }
   GO
 end
 
@@ -819,6 +858,20 @@ def ts_file(ops, aggs, srfs, wins)
     // planner.md §3.5). A cast absent from this table may trap.
     export const NON_TRAPPING_CASTS: readonly CastTrapDesc[] = [
     #{non_trapping_casts.map { |f, t, pe| "  { from: #{ts_str(f)}, to: #{ts_str(t)}, preservesEquality: #{pe} }," }.join("\n")}
+    ];
+
+    // One row of the argument-coercion cost table (spec/types/compare.toml, arg-coercion.md §3): an
+    // argument from `from` (a scalar id, or "integer_literal" / "decimal_literal") may stand in a slot
+    // of scalar type `to` at `cost`.
+    export interface ArgCoercionDesc {
+      from: string;
+      to: string;
+      cost: number;
+    }
+
+    // Every argument coercion, in compare.toml order. A pair absent from this table never coerces.
+    export const ARG_COERCIONS: readonly ArgCoercionDesc[] = [
+    #{arg_coercions.map { |f, t, c| "  { from: #{ts_str(f)}, to: #{ts_str(t)}, cost: #{c} }," }.join("\n")}
     ];
   TS
 end

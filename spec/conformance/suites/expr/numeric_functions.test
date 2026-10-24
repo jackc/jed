@@ -2,11 +2,11 @@
 # sign, mod, div, gcd, lcm, factorial, width_bucket — the exact follow-ons named in float.md §8.
 # Unlike the float transcendentals these are EXACT and IN-CONTRACT (byte-identical cross-core, no
 # determinism-ledger entry): integer/decimal arithmetic is reproducible. They charge one
-# operator_eval per call and propagate NULL. arg_resolution = "none": like sqrt, a bare integer
-# where only a decimal/float overload exists is 42883 (no implicit cross-family promotion — a
-# documented divergence from PG's implicit cast, oracle_overrides.toml). PostgreSQL-oracle-checked.
+# operator_eval per call and propagate NULL. A bare integer where only a decimal/float overload
+# exists takes the decimal overload (the argument-coercion pass, arg-coercion.md), where PostgreSQL
+# casts it to float8 — a documented divergence (oracle_overrides.toml). PostgreSQL-oracle-checked.
 # Gated by the type capabilities the overloads use. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f64, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f64, resource.cost_metering, func.arg_coercion
 
 statement ok
 CREATE TABLE nm (id i32 PRIMARY KEY, d numeric, f f64)
@@ -66,9 +66,11 @@ SELECT sign(f64 '-Infinity')
 ----
 -1
 
-# sign over a bare integer is 42883: no implicit int→decimal/float promotion (like sqrt(int)).
-statement error 42883
+# sign over a bare integer takes the decimal overload (arg-coercion.md §6; PostgreSQL: float8 1).
+query D nosort
 SELECT sign(2)
+----
+1
 
 # --- mod(a, b): the function spelling of the `%` (mod) operator; sign of the dividend --
 query I nosort

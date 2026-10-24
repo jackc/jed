@@ -438,36 +438,33 @@ file = "cte/recursive_errors.test"
 sql = "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 3), b(n) AS (SELECT n FROM a) SELECT n FROM a"
 reason = "jed: mutual recursion surfaces via forward-only visibility as 42P01 (recursive reference to a later CTE is out of scope — recursive-cte.md §3). PostgreSQL detects mutual recursion specifically and raises 0A000 (mutual recursion between WITH items is not implemented). A documented error-code divergence for a case neither engine executes."
 
-# --- float math functions: argument resolution is `none` (catalog), so a bare integer or
-# decimal literal does NOT implicitly promote to the float family. PostgreSQL resolves these
-# by casting the argument to double precision and returns a value; jed rejects 42883. The
-# strict type system (§4): cross-family int/decimal -> float is explicit-only (float.md).
+# --- an integer argument takes the DECIMAL overload (arg-coercion.md §6): where a function has a
+# decimal row, jed's argument-coercion pass resolves an integer to it, while PostgreSQL resolves the
+# integer through its preferred numeric type float8. Same digits for an integral result but the `D`
+# tag instead of `R`; different digits for the transcendentals (decimal's 16-significant-digit scale
+# vs float8's shortest round-trip). A deliberate, documented divergence: integer -> decimal is the
+# only lossless target, and the float island keeps a column out of float8 (arg-coercion.md §6.2).
 [[override]]
 file = "expr/float_math.test"
 sql = "SELECT sqrt(4)"
-reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and an integer literal does not implicitly promote to float, so 42883. PostgreSQL casts int -> double precision and returns 2. The strict type system (§4): int<->float is explicit-cast-only (float.md). (A bare DECIMAL literal like sqrt(4.0) now resolves to the EXACT-numeric kernel — decimal.md §8 — and matches PG; only the bare INTEGER stays 42883.)"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so sqrt(4) is numeric 2.000000000000000 (the exact kernel, decimal.md §8). PostgreSQL casts int -> double precision and returns 2 (`R`). A documented divergence (arg-coercion.md §6)."
 
-# --- exact-numeric transcendentals: argument resolution is `none` (catalog), so a bare INTEGER
-# does NOT promote. PostgreSQL resolves sqrt/ln/power(int...) by casting int -> double precision and
-# returns a float8 value; jed rejects 42883 (no int->numeric/float promotion for these — the same
-# strict-typing divergence the float-math functions carry). decimal.md §8. (A bare DECIMAL literal
-# DOES resolve to the numeric kernel and matches PG, so only the bare-integer forms diverge.)
 [[override]]
 file = "expr/numeric_transcendental.test"
 sql = "SELECT sqrt(2)"
-reason = "jed: sqrt's numeric overload is arg_resolution = none, and a bare integer does not implicitly promote to decimal (nor float), so 42883. PostgreSQL casts int -> double precision and returns 1.4142135623730951. The strict type system (§4): int<->decimal/float for these functions is explicit-cast-only (decimal.md §8)."
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so sqrt(2) is numeric 1.414213562373095. PostgreSQL casts int -> double precision and returns 1.4142135623730951 (`R`). A documented value divergence (arg-coercion.md §6)."
 
 [[override]]
 file = "expr/numeric_transcendental.test"
 sql = "SELECT ln(2)"
-reason = "jed: ln's numeric overload is arg_resolution = none, and a bare integer does not implicitly promote, so 42883. PostgreSQL casts int -> double precision and returns a value. Explicit-cast-only for these functions (decimal.md §8)."
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so ln(2) is numeric 0.6931471805599453. PostgreSQL casts int -> double precision and returns float8 0.6931471805599453 (`R`). A documented divergence (arg-coercion.md §6)."
 
 [[override]]
 file = "expr/numeric_transcendental.test"
 sql = "SELECT power(2, 10)"
-reason = "jed: power's numeric overload promotes only a MIXED integer/decimal pair (arg_resolution = promote, functions.md §9.2); two integers match no row, so 42883. PostgreSQL casts int -> double precision and returns 1024. Explicit-cast-only for an all-integer call (decimal.md §8). (`pow(numeric, numeric)` is a PG alias of power and matches jed, so it needs no override.)"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so power(2, 10) is numeric 1024.0000000000000. PostgreSQL casts both integers to double precision and returns 1024 (`R`). A documented value divergence (arg-coercion.md §6)."
 
-# --- a float VALUE never meets an integer value in a promoting function (functions.md §9.2): only a
+# --- a float VALUE never meets an integer value (functions.md §9.2, arg-coercion.md §3): only a
 # numeric LITERAL adapts to a float argument, exactly as for the arithmetic operators (float.md §6).
 # PostgreSQL casts the integer to double precision implicitly.
 [[override]]
@@ -972,7 +969,7 @@ reason = "jed: an untyped literal adapts to the sibling column's type, so 100000
 [[override]]
 file = "expr/scalar_functions.test"
 sql = "SELECT round(i32) FROM n WHERE id = 1"
-reason = "jed: round() over an integer argument returns decimal/numeric (the catalog round overloads — the `D` tag). PostgreSQL has no round(integer); it resolves the call to round(double precision) and returns double precision (the `R` tag). A documented result-type divergence; the rounded value is the integer itself, kept at jed's committed decimal rendering."
+reason = "jed: round() over an integer argument returns decimal/numeric (the argument-coercion pass selects round(decimal), arg-coercion.md §6 — the `D` tag). PostgreSQL has no round(integer); it resolves the call to round(double precision) and returns double precision (the `R` tag). A documented result-type divergence; the rounded value is the integer itself, kept at jed's committed decimal rendering."
 
 [[override]]
 file = "expr/scalar_functions.test"
@@ -1239,16 +1236,14 @@ file = "types/utf16_split.test"
 sql = "SELECT s FROM u WHERE s >= '豈' COLLATE \"C\" INTERSECT SELECT s FROM u WHERE s <= '😀' COLLATE \"C\" ORDER BY s COLLATE \"C\""
 reason = "jed: a set operation with COLLATE in the trailing ORDER BY -- PostgreSQL cannot describe (prepare) the result columns of this query shape, so the oracle cannot regenerate the rows. jed orders by the C (code-point) sort key; the committed rows are correct by construction (the UTF-8-not-UTF-16 pin, types.md §11) and verified by cross-core differential agreement."
 
-# --- sign(integer): arg_resolution = none (catalog), so a bare integer does NOT implicitly promote
-# to the decimal/float overload — exactly the sqrt(int) divergence above. jed rejects 42883;
-# PostgreSQL resolves sign(int) to sign(double precision) via its preferred-type rule and returns 1.
+# --- sign(integer): the decimal overload, exactly the sqrt(int) divergence above (arg-coercion.md §6).
 [[override]]
 file = "expr/numeric_functions.test"
 sql = "SELECT sign(2)"
-reason = "jed: sign has decimal + float overloads with arg_resolution = none (catalog), and an integer literal does not implicitly promote to either family, so 42883. PostgreSQL resolves sign(int) to float8 (its preferred numeric type) and returns 1. The strict type system (§4): cross-family int -> decimal/float is explicit-cast-only, the same divergence sqrt(int) carries."
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so sign(2) is numeric 1 (`D`). PostgreSQL resolves sign(int) to float8 (its preferred numeric type) and returns 1 (`R`). A documented result-type divergence (arg-coercion.md §6)."
 
-# --- ceil/floor/trunc integer overloads: jed returns decimal/numeric (the `D` tag), like the round
-# integer overloads. PostgreSQL has no single-arg ceil/floor/trunc(integer); it resolves the call to
+# --- ceil/floor/trunc over an integer: jed returns decimal/numeric (the `D` tag), like round(int) —
+# the argument-coercion pass selects the decimal row (arg-coercion.md §6). PostgreSQL has no single-arg ceil/floor/trunc(integer); it resolves the call to
 # the double-precision overload via its preferred-type rule and returns double precision (the `R`
 # tag). A documented result-type divergence (jed keeps floats out of the value path, float.md §8); the
 # value is the integer itself, at jed's committed decimal rendering. PG's 2-arg trunc is numeric-only,
@@ -1256,17 +1251,56 @@ reason = "jed: sign has decimal + float overloads with arg_resolution = none (ca
 [[override]]
 file = "expr/numeric_functions.test"
 sql = "SELECT ceil(5)"
-reason = "jed: ceil() over an integer argument returns decimal/numeric (the catalog ceil integer overload — the `D` tag), like round(int). PostgreSQL has no ceil(integer); it resolves the call to ceil(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+reason = "jed: ceil() over an integer argument returns decimal/numeric (the argument-coercion pass selects ceil(decimal) — the `D` tag), like round(int). PostgreSQL has no ceil(integer); it resolves the call to ceil(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
 
 [[override]]
 file = "expr/numeric_functions.test"
 sql = "SELECT floor(5)"
-reason = "jed: floor() over an integer argument returns decimal/numeric (the catalog floor integer overload — the `D` tag), like round(int). PostgreSQL has no floor(integer); it resolves the call to floor(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+reason = "jed: floor() over an integer argument returns decimal/numeric (the argument-coercion pass selects floor(decimal) — the `D` tag), like round(int). PostgreSQL has no floor(integer); it resolves the call to floor(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
 
 [[override]]
 file = "expr/numeric_functions.test"
 sql = "SELECT trunc(5)"
-reason = "jed: trunc() over a single integer argument returns decimal/numeric (the catalog trunc integer overload — the `D` tag), like round(int). PostgreSQL has no single-arg trunc(integer); it resolves the call to trunc(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+reason = "jed: trunc() over a single integer argument returns decimal/numeric (the argument-coercion pass selects trunc(decimal) — the `D` tag), like round(int). PostgreSQL has no single-arg trunc(integer); it resolves the call to trunc(double precision) and returns double precision (the `R` tag). A documented result-type divergence (floats out of the value path, float.md §8); the value is the integer itself."
+
+# --- expr/arg_coercion.test (arg-coercion.md): every integer-argument record takes a decimal overload
+# where PostgreSQL resolves through float8 — the same documented divergence as sqrt(2) above. The
+# float-only records (sin/radians/degrees/atan2 over constants) agree with PostgreSQL.
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT exp(1), log10(100), log(100), log(2, 8), pow(2, 3)"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so every column is numeric (`D`). PostgreSQL resolves the integers through float8 (`R`), except log(int) and log(int, int), which it has only over numeric. A documented divergence (arg-coercion.md §6)."
+
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT sign(-5), sign(0), scale(5), min_scale(5), trim_scale(5)"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so sign is numeric (`D`); PostgreSQL resolves sign(int) through float8 (`R`). scale/min_scale/trim_scale exist only over numeric in both engines and agree. A documented divergence (arg-coercion.md §6)."
+
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT round(5, 2), round(7), ceil(7), ceiling(7), floor(-7)"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so round/ceil/ceiling/floor over an integer are numeric (`D`); PostgreSQL resolves the one-argument forms through float8 (`R`). round(int, int) is numeric in both. A documented divergence (arg-coercion.md §6)."
+
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT sqrt(i), sign(s), power(b, 2), round(b, 1), scale(b) FROM ac WHERE id = 1"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, and an integer VALUE converts the same way at scale 0, so sqrt/sign/power are numeric (`D`). PostgreSQL resolves them through float8 (`R`); round(int, int) and scale agree. A documented divergence (arg-coercion.md §6)."
+
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT power(NULL, 2)"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload; the bare NULL adopts the selected decimal row, so the NULL is numeric (`D`). PostgreSQL resolves power(unknown, int) to float8 (`R`). A documented divergence (arg-coercion.md §6)."
+
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT sin(i) FROM ac WHERE id = 1"
+reason = "jed: float is a strict island (float.md §6) — an integer VALUE never becomes a float, so the float-only sin has no admissible overload (42883); only a numeric constant enters the float family (arg-coercion.md §3). PostgreSQL casts int -> double precision implicitly and returns a value."
+
+[[override]]
+file = "expr/arg_coercion.test"
+sql = "SELECT sqrt(i) FROM ac WHERE id = 1"
+reason = "jed: the argument-coercion pass (arg-coercion.md §4) prefers integer -> decimal (cost 3) to a constant entering the float family (cost 4): an integer takes the decimal overload, so sqrt(i) is numeric 3.000000000000000 (`D`). PostgreSQL resolves it through float8 and returns 3 (`R`). A documented divergence (arg-coercion.md §6)."
+
 
 # --- regexp_* flag set: jed's RE2-able flavor (regex.md §1/§8b) knows only the `i` and `g` flags,
 # unlike PostgreSQL's larger c/g/m/n/p/q/s/t/w/x set. Any other flag is 2201B

@@ -5,11 +5,11 @@
 # IN-CONTRACT: byte-identical cross-core by construction (every step is exact-decimal limb
 # arithmetic; the result scale is chosen deterministically with NO libm transcendental on the
 # value path), so they carry the exact `D` render tag — not `R`. The result scale follows PG
-# (≥ 16 significant digits, never below the input scale). arg_resolution = `none`: a bare
-# INTEGER does NOT promote (sqrt(2) → 42883, a documented jed strictness vs PG's int→float8),
-# but a decimal literal/value does. Domain errors: sqrt-of-negative / power domain → 2201F,
+# (≥ 16 significant digits, never below the input scale). A bare INTEGER takes the decimal
+# overload through the argument-coercion pass (sqrt(2) → numeric, where PG casts int → float8 —
+# a documented value divergence, arg-coercion.md §6), as does a decimal literal/value. Domain errors: sqrt-of-negative / power domain → 2201F,
 # ln/log of a non-positive → 2201E, exp/power overflow → 22003. PostgreSQL-oracle-checked.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, cast.operator, cast.explicit, expr.numeric_transcendental
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, cast.operator, cast.explicit, expr.numeric_transcendental, func.arg_coercion
 
 statement ok
 CREATE TABLE nt (id i32 PRIMARY KEY, d numeric)
@@ -251,7 +251,7 @@ SELECT pow(2::numeric, 3::numeric)
 ----
 8.0000000000000000
 
-# --- domain errors (2201E/2201F) + no bare-integer promotion (42883) ---
+# --- domain errors (2201E/2201F) ---
 statement error 2201F
 SELECT sqrt(-1::numeric)
 
@@ -279,11 +279,18 @@ SELECT power(0::numeric, -1::numeric)
 statement error 2201F
 SELECT power(-2::numeric, 0.5::numeric)
 
-statement error 42883
+# --- a bare integer takes the decimal overload (arg-coercion.md §6) ---
+query D nosort
 SELECT sqrt(2)
+----
+1.414213562373095
 
-statement error 42883
+query D nosort
 SELECT ln(2)
+----
+0.6931471805599453
 
-statement error 42883
+query D nosort
 SELECT power(2, 10)
+----
+1024.0000000000000

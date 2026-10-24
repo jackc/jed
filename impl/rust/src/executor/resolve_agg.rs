@@ -620,11 +620,23 @@ pub(crate) fn select_unknown_overload(
     if candidates.len() <= 1 {
         return Ok(candidates.first().copied());
     }
-    // At each unknown position pick `text` if any candidate accepts it, else the one family every
-    // candidate agrees on; a disagreement without `text` is ambiguous.
-    let mut picked: Vec<Option<&str>> = vec![None; arg_tys.len()];
-    for i in 0..arg_tys.len() {
-        if !unknown(i) {
+    let unknown: Vec<bool> = (0..arg_tys.len()).map(unknown).collect();
+    pick_by_unknown_positions(name, candidates, &unknown).map(Some)
+}
+
+/// Step 3 of the unknown-argument rule (functions.md §9.1), over two or more candidate rows: at
+/// each unknown position pick `text` if any candidate accepts it, else the one family every
+/// candidate agrees on (a disagreement without `text` is ambiguous), then keep the candidates that
+/// accept every picked family. Exactly one must remain; anything else is 42725. The argument-coercion
+/// pass applies it to its tied built-in candidates too (arg-coercion.md §4).
+pub(crate) fn pick_by_unknown_positions(
+    name: &str,
+    candidates: Vec<&'static OperatorDesc>,
+    unknown: &[bool],
+) -> Result<&'static OperatorDesc> {
+    let mut picked: Vec<Option<&str>> = vec![None; unknown.len()];
+    for i in 0..unknown.len() {
+        if !unknown[i] {
             continue;
         }
         let first = candidates[0].arg_families[i];
@@ -646,7 +658,7 @@ pub(crate) fn select_unknown_overload(
         })
         .collect();
     match kept.as_slice() {
-        [one] => Ok(Some(*one)),
+        [one] => Ok(*one),
         _ => Err(ambiguous_func_overload(name)),
     }
 }

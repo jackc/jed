@@ -9,7 +9,7 @@
 # (round(2.5) = 3), matching jed's decimal round (decimal.md §3). PostgreSQL-oracle-checkable.
 # Gated by types.f64 (the float surface that already owns the sqrt kernel). Format:
 # ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i32, types.f64, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i32, types.f64, resource.cost_metering, func.arg_coercion
 
 statement ok
 CREATE TABLE f (id i32 PRIMARY KEY, x f64)
@@ -154,12 +154,13 @@ SELECT exp(x) FROM big
 statement error 22003
 SELECT pow(a, b) FROM g WHERE id = 2
 
-# --- argument resolution is `none`: a bare INTEGER literal does NOT promote to float ---
-# (an explicit f64 is required), so there is no matching float overload → 42883. (A bare
-# DECIMAL literal like `sqrt(4.0)` now resolves to the EXACT-numeric kernel — decimal.md §8,
-# suites/expr/numeric_transcendental.test — so it is no longer tested here.) ----------
-statement error 42883
+# --- a bare INTEGER argument takes the decimal overload, not the float one: the argument-coercion
+# pass prefers integer -> decimal over a literal entering the float family (arg-coercion.md §6), so
+# sqrt(4) is the EXACT-numeric kernel (decimal.md §8), where PostgreSQL returns float8 2. --------
+query D nosort
 SELECT sqrt(4)
+----
+2.000000000000000
 
 # --- wrong arity / unknown name → 42883 -----------------------------------------------
 statement error 42883

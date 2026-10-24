@@ -203,11 +203,22 @@ func selectUnknownOverload(name string, tys []resolvedType, literals []bool) (*o
 	case 1:
 		return candidates[0], nil
 	}
-	// At each unknown position pick text if any candidate accepts it, else the one family every
-	// candidate agrees on; a disagreement without text is ambiguous.
-	picked := make([]string, len(tys))
+	isUnknown := make([]bool, len(tys))
 	for i := range tys {
-		if !unknown(i) {
+		isUnknown[i] = unknown(i)
+	}
+	return pickByUnknownPositions(name, candidates, isUnknown)
+}
+
+// pickByUnknownPositions is step 3 of the unknown-argument rule (functions.md §9.1), over two or
+// more candidate rows: at each unknown position pick text if any candidate accepts it, else the one
+// family every candidate agrees on (a disagreement without text is ambiguous), then keep the
+// candidates that accept every picked family. Exactly one must remain; anything else is 42725. The
+// argument-coercion pass applies it to its tied built-in candidates too (arg-coercion.md §4).
+func pickByUnknownPositions(name string, candidates []*operatorDesc, unknown []bool) (*operatorDesc, error) {
+	picked := make([]string, len(unknown))
+	for i := range unknown {
+		if !unknown[i] {
 			continue
 		}
 		first := candidates[0].ArgFamilies[i]
@@ -3676,7 +3687,7 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		anyFloat := isFloatKind(tys[0].kind) || isFloatKind(tys[1].kind) || isFloatKind(tys[2].kind)
 		if anyFloat {
-			// A numeric literal beside a float operand adapts to f64 (functions.md §9.2).
+			// A numeric literal beside a float operand adapts to f64 (PostgreSQL reads it as float8).
 			for i := 0; i < 3; i++ {
 				if (tys[i].kind == rtInt || tys[i].kind == rtDecimal) && isNumericLiteral(fc.Args[i]) {
 					r, t, err := floatLiteral(s, fc.Args[i], ag, params)
@@ -4062,14 +4073,11 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	if id, result, ok := resolveHostScalar(s, name, tys); ok {
 		return &rExpr{kind: reHostFunc, index: id, cText: name, sargs: rargs, result: result}, resolvedTypeOf(result), nil
 	}
-	// A promoting two-argument function reconciles a mixed numeric pair as the arithmetic operators
-	// do (functions.md §9.2): power(2.0, 3) selects the decimal overload, pow(x_f64, 3) the float one.
-	if ptys, ok, err := promoteScalarPair(s, fc, rargs, tys, ag, params); err != nil {
-		return nil, resolvedType{}, err
-	} else if ok {
-		if desc := lookupScalarOverload(name, ptys); desc != nil {
-			return adoptScalarOverload(s, fc, desc, rargs, ptys, nil, ag, params)
-		}
+	// No signature matches as written: the cheapest implicit argument coercions select among the
+	// built-in and host overloads (arg-coercion.md §4) — sqrt(2) takes sqrt(decimal), sin(1)
+	// sin(float), a host f(i64) an i32 argument.
+	if r, t, ok, err := resolveCoercedCall(s, fc, rargs, tys, ag, params); err != nil || ok {
+		return r, t, err
 	}
 	// No overload takes the bare string literals as text, so retry with them unknown-typed, as
 	// PostgreSQL types them (functions.md §9.1): sha256('abc') reads 'abc' as bytea input.
@@ -4085,18 +4093,6 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	return nil, resolvedType{}, noFuncOverload(name)
 }
 
-// scalarPairPromotes reports whether name has a two-argument catalog row with arg_resolution
-// "promote" — the rows whose mixed numeric pairs reconcile (functions.md §9.2).
-func scalarPairPromotes(name string) bool {
-	for i := range operators {
-		o := &operators[i]
-		if o.Kind == "function" && o.Name == name && len(o.ArgFamilies) == 2 && o.ArgResolution == "promote" {
-			return true
-		}
-	}
-	return false
-}
-
 // isNumericLiteral reports whether e is a bare integer or decimal literal (a negative one included:
 // the parser folds the sign into the literal).
 func isNumericLiteral(e *exprNode) bool {
@@ -4104,45 +4100,257 @@ func isNumericLiteral(e *exprNode) bool {
 }
 
 // floatLiteral re-resolves a numeric literal argument that faces a float argument as f64 — the type
-// of every float overload's arguments (functions.md §9.2; PostgreSQL reads the constant as float8).
+// of every float overload's arguments (PostgreSQL reads the constant as float8).
 func floatLiteral(s *scope, e *exprNode, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	f64 := scalarFloat64
 	return resolve(s, *e, &f64, ag, params)
 }
 
-// promoteScalarPair reconciles the two resolved arguments of a promoting function (functions.md
-// §9.2) the way the arithmetic operators reconcile their operands: an integer facing a decimal reads
-// as decimal (compare.toml's promote-to-decimal — the kernel converts the value), and an integer or
-// decimal LITERAL facing a float is re-resolved as f64 (float.md §4/§6; a value never becomes a
-// float). ok is false when the pair needs no reconciliation or has none. A re-resolved literal
-// replaces its entry in rargs; the returned types are the reconciled pair.
-func promoteScalarPair(s *scope, fc *funcCallExpr, rargs []*rExpr, tys []resolvedType, ag *aggCtx, params *paramTypes) ([]resolvedType, bool, error) {
-	if len(tys) != 2 || !scalarPairPromotes(fc.Name) {
-		return nil, false, nil
-	}
-	exact := func(k rtKind) bool { return k == rtInt || k == rtDecimal }
-	l, r := tys[0].kind, tys[1].kind
+// argSourceKind is where one argument of a call comes from, for the argument-coercion pass
+// (arg-coercion.md §4).
+type argSourceKind int
+
+const (
+	// argTyped is a typed value; argSource.scalar holds its type, ok=false for a container.
+	argTyped argSourceKind = iota
+	// argIntLiteral is a bare integer constant (argSource.lit holds its value), which may also take
+	// the integer_literal rows of the cost table.
+	argIntLiteral
+	// argDecimalLiteral is a bare decimal constant, which may also take the decimal_literal rows.
+	argDecimalLiteral
+	// argUnknown is an unknown-typed bare NULL / $N (functions.md §9.1).
+	argUnknown
+)
+
+// argSource is one argument's source for the argument-coercion pass.
+type argSource struct {
+	kind     argSourceKind
+	scalar   scalarType // argTyped: the value's scalar type (when isScalar)
+	scalarOK bool       // argTyped: false for a container type
+	lit      int64      // argIntLiteral: the constant
+}
+
+func argSourceOf(e *exprNode, t resolvedType) argSource {
 	switch {
-	case exact(l) && exact(r) && l != r:
-		dec := resolvedType{kind: rtDecimal}
-		return []resolvedType{dec, dec}, true, nil
-	case isFloatKind(l) != isFloatKind(r):
-		other := 0
-		if isFloatKind(l) {
-			other = 1
-		}
-		if !exact(tys[other].kind) || !isNumericLiteral(fc.Args[other]) {
-			return nil, false, nil
-		}
-		re, t, err := floatLiteral(s, fc.Args[other], ag, params)
-		if err != nil {
-			return nil, false, err
-		}
-		out := []resolvedType{tys[0], tys[1]}
-		rargs[other], out[other] = re, t
-		return out, true, nil
+	case t.kind == rtNull:
+		return argSource{kind: argUnknown}
+	case e.Kind == exprLiteral && e.Literal.Kind == literalInt:
+		return argSource{kind: argIntLiteral, lit: e.Literal.Int}
+	case e.Kind == exprLiteral && e.Literal.Kind == literalDecimal:
+		return argSource{kind: argDecimalLiteral}
 	}
-	return nil, false, nil
+	st, ok := resolvedToScalar(t)
+	return argSource{kind: argTyped, scalar: st, scalarOK: ok}
+}
+
+// ownType is the type a source has as written: a literal's default type (i64, decimal); ok=false
+// for an unknown-typed argument or a container.
+func (a argSource) ownType() (scalarType, bool) {
+	switch a.kind {
+	case argIntLiteral:
+		return scalarInt64, true
+	case argDecimalLiteral:
+		return scalarDecimal, true
+	case argTyped:
+		return a.scalar, a.scalarOK
+	}
+	return 0, false
+}
+
+// cheapestCoercion is the cheapest coercion of src into a type accept admits, from the argCoercions
+// cost table (arg-coercion.md §3): the cost and target type, the first row in table order on a tie.
+// A literal also takes the rows of its default type (i64, decimal); an integer constant takes a
+// narrower integer type only when its value fits. Its own type is not considered here. ok=false when
+// no row admits it.
+func cheapestCoercion(src argSource, accept func(scalarType) bool) (int, scalarType, bool) {
+	own, ok := src.ownType()
+	if !ok {
+		return 0, 0, false
+	}
+	literal := ""
+	switch src.kind {
+	case argIntLiteral:
+		literal = "integer_literal"
+	case argDecimalLiteral:
+		literal = "decimal_literal"
+	}
+	bestCost, bestTo, found := 0, scalarType(0), false
+	for _, row := range argCoercions {
+		if row.From != own.CanonicalName() && (literal == "" || row.From != literal) {
+			continue
+		}
+		to, ok := scalarTypeFromName(row.To)
+		if !ok || !accept(to) {
+			continue
+		}
+		if src.kind == argIntLiteral && (to == scalarInt16 || to == scalarInt32) && !to.InRange(src.lit) {
+			continue
+		}
+		if !found || row.Cost < bestCost {
+			bestCost, bestTo, found = row.Cost, to, true
+		}
+	}
+	return bestCost, bestTo, found
+}
+
+// coercedCandidate is one overload considered by the coercion pass: a built-in catalog row or a host
+// function (by registry id), its total score, and the type each coerced position converts to
+// (hasTarget false where the argument matches as written).
+type coercedCandidate struct {
+	builtin   *operatorDesc
+	host      int
+	score     int
+	targets   []scalarType
+	hasTarget []bool
+}
+
+// scoreBuiltin scores a built-in row against the call (arg-coercion.md §4): a family slot costs 0
+// for any member type, any, or an unknown-typed argument, else the cheapest row into one of its
+// member types. ok=false when some position is not admitted.
+func scoreBuiltin(desc *operatorDesc, srcs []argSource, tys []resolvedType) (coercedCandidate, bool) {
+	c := coercedCandidate{builtin: desc, targets: make([]scalarType, len(srcs)), hasTarget: make([]bool, len(srcs))}
+	for i, slot := range desc.ArgFamilies {
+		if srcs[i].kind == argUnknown || familyMatches(slot, tys[i]) {
+			continue
+		}
+		cost, to, ok := cheapestCoercion(srcs[i], func(to scalarType) bool {
+			return argFamily(resolvedTypeOf(to)) == slot
+		})
+		if !ok {
+			return coercedCandidate{}, false
+		}
+		c.score += cost
+		c.targets[i], c.hasTarget[i] = to, true
+	}
+	return c, true
+}
+
+// scoreHost scores a host function against the call: a host slot names one type, which only that
+// type matches at 0. An unknown-typed argument matches no host slot (functions.md §9.1).
+func scoreHost(id int, argTypes []scalarType, srcs []argSource) (coercedCandidate, bool) {
+	c := coercedCandidate{host: id, targets: make([]scalarType, len(srcs)), hasTarget: make([]bool, len(srcs))}
+	for i, slot := range argTypes {
+		if srcs[i].kind == argUnknown {
+			return coercedCandidate{}, false
+		}
+		if own, ok := srcs[i].ownType(); ok && own == slot {
+			continue
+		}
+		cost, to, ok := cheapestCoercion(srcs[i], func(to scalarType) bool { return to == slot })
+		if !ok {
+			return coercedCandidate{}, false
+		}
+		c.score += cost
+		c.targets[i], c.hasTarget[i] = to, true
+	}
+	return c, true
+}
+
+// resolveCoercedCall is the argument-coercion pass (arg-coercion.md §4), reached when no built-in
+// row and no host signature matches the call as written. Every built-in row and host function of
+// the call's name and arity is scored by the summed cost of its coercions; the minimum wins. Among
+// tied candidates a built-in beats a host function, the §9.1 unknown-position rule picks among tied
+// built-ins, and anything still tied is 42725. ok=false when no candidate admits the call.
+func resolveCoercedCall(s *scope, fc *funcCallExpr, rargs []*rExpr, tys []resolvedType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, bool, error) {
+	name := fc.Name
+	srcs := make([]argSource, len(fc.Args))
+	for i, a := range fc.Args {
+		srcs[i] = argSourceOf(a, tys[i])
+	}
+	var cands []coercedCandidate
+	for i := range operators {
+		o := &operators[i]
+		if o.Kind != "function" || o.Name != name || len(o.ArgFamilies) != len(fc.Args) {
+			continue
+		}
+		if c, ok := scoreBuiltin(o, srcs, tys); ok {
+			cands = append(cands, c)
+		}
+	}
+	reg := s.catalog.session.env.hosts
+	for _, id := range reg.overloads(name, len(fc.Args)) {
+		if c, ok := scoreHost(id, reg.function(id).argTypes, srcs); ok {
+			cands = append(cands, c)
+		}
+	}
+	if len(cands) == 0 {
+		return nil, resolvedType{}, false, nil
+	}
+	minScore := cands[0].score
+	for _, c := range cands[1:] {
+		if c.score < minScore {
+			minScore = c.score
+		}
+	}
+	anyBuiltin := false
+	kept := cands[:0]
+	for _, c := range cands {
+		if c.score == minScore {
+			kept = append(kept, c)
+			anyBuiltin = anyBuiltin || c.builtin != nil
+		}
+	}
+	if anyBuiltin {
+		builtins := kept[:0]
+		for _, c := range kept {
+			if c.builtin != nil {
+				builtins = append(builtins, c)
+			}
+		}
+		kept = builtins
+	}
+	var chosen coercedCandidate
+	switch {
+	case len(kept) == 1:
+		chosen = kept[0]
+	case kept[0].builtin != nil:
+		unknown := make([]bool, len(srcs))
+		for i, src := range srcs {
+			unknown[i] = src.kind == argUnknown
+		}
+		descs := make([]*operatorDesc, len(kept))
+		for i, c := range kept {
+			descs[i] = c.builtin
+		}
+		pick, err := pickByUnknownPositions(name, descs, unknown)
+		if err != nil {
+			return nil, resolvedType{}, false, err
+		}
+		for _, c := range kept {
+			if c.builtin == pick {
+				chosen = c
+				break
+			}
+		}
+	default:
+		return nil, resolvedType{}, false, ambiguousFuncOverload(name)
+	}
+	// Adopt the coerced types. A bare numeric constant is resolved again in its slot's type (an f64
+	// or f32 float slot, a narrower host integer), as literal adaptation; an integer bound for a
+	// decimal slot, and a value, stay as resolved and convert inside the call (nothing charged).
+	ctys := append([]resolvedType(nil), tys...)
+	for i := range chosen.targets {
+		if !chosen.hasTarget[i] {
+			continue
+		}
+		to := chosen.targets[i]
+		literal := srcs[i].kind == argIntLiteral || srcs[i].kind == argDecimalLiteral
+		if literal && to != scalarDecimal {
+			r, t, err := resolve(s, *fc.Args[i], &to, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, false, err
+			}
+			rargs[i], ctys[i] = r, t
+		} else {
+			ctys[i] = resolvedTypeOf(to)
+		}
+	}
+	if chosen.builtin != nil {
+		r, t, err := adoptScalarOverload(s, fc, chosen.builtin, rargs, ctys, nil, ag, params)
+		return r, t, true, err
+	}
+	result := reg.function(chosen.host).result
+	return &rExpr{kind: reHostFunc, index: chosen.host, cText: name, sargs: rargs, result: result}, resolvedTypeOf(result), true, nil
 }
 
 // bareStringLiterals marks the arguments that are bare string literals ('…', not a typed literal or

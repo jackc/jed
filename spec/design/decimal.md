@@ -325,14 +325,13 @@ negative trap **`2201E`** (`invalid_argument_for_log`); an `exp`/`power` result 
 format traps **`22003`**. Like `decimal` generally (§2), these are **finite-only** — there is no NaN
 or ±Infinity to produce.
 
-**Argument resolution — `arg_resolution = "none"` (a documented strictness vs PG).** A bare
-*integer* literal does **not** promote (`sqrt(2)` → `42883`), matching the existing float-root /
-`sign` behavior — PostgreSQL instead casts `int → double precision` and returns a float8 value
-(ledgered in `oracle_overrides.toml`). A *decimal* literal **does** resolve to the numeric kernel
-(`sqrt(4.0)` → `2.0000000000000000`, matching PG). The two-argument `log`/`power`/`pow` rows are
-`arg_resolution = "promote"` instead: a mixed integer/decimal pair promotes the integer to
-decimal, so `power(2.0, 3)` and `log(2, 8.0)` resolve to the numeric kernel as in PG
-([functions.md](functions.md) §9.2). Two integers still match no row.
+**Argument resolution — an integer takes the numeric kernel (a documented divergence from PG).**
+An integer argument, constant or value, resolves to these rows through the argument-coercion pass
+([arg-coercion.md](arg-coercion.md)): `sqrt(2)` → `1.414213562373095`, `power(2, 10)` →
+`1024.0000000000000`. PostgreSQL instead casts `int → double precision` and returns a float8 value
+(ledgered in `oracle_overrides.toml`; arg-coercion.md §6 weighs the choice). A *decimal* literal
+resolves to the numeric kernel directly (`sqrt(4.0)` → `2.0000000000000000`, matching PG), and a
+mixed integer/decimal pair takes it too (`power(2.0, 3)`, `log(2, 8.0)`, as in PG).
 
 **Cost and allocation.** Each SQL call charges one `operator_eval` plus the guarded
 `decimal_transcend` work in cost.md §8. The exact step sites are:

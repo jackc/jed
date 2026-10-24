@@ -1777,3 +1777,200 @@ fn hostfunc_check_error_precedes_default() {
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Implicit argument coercion (spec/design/arg-coercion.md §4.2) ───────────────────────────────
+// A call matching no signature exactly is resolved by the cheapest coercions, over the built-in rows
+// and the host functions together. These mirror the Go/TS argument-coercion tests one-for-one.
+
+/// The value kind a kernel received: the kernel only ever sees its declared types.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Int(_) => "int",
+        Value::Decimal(_) => "decimal",
+        Value::Float64(_) => "f64",
+        Value::Float32(_) => "f32",
+        _ => "other",
+    }
+}
+
+/// `name(arg_types) -> text`, returning `tag:` and the kinds of the values it received, so a test
+/// sees both which overload was selected and what it was handed.
+fn probe(name: &str, arg_types: Vec<ScalarType>, tag: &'static str) -> HostFunction {
+    HostFunction::new(
+        name,
+        arg_types,
+        ScalarType::Text,
+        Box::new(move |args: &[Value]| -> jed::Result<Value> {
+            let kinds: Vec<&str> = args.iter().map(kind).collect();
+            Ok(Value::Text(format!("{tag}:{}", kinds.join(","))))
+        }),
+    )
+}
+
+/// The batch-kernel form of [`probe`] for a one-argument function.
+fn probe_batched(name: &str, arg: ScalarType, tag: &'static str) -> HostFunction {
+    HostFunction::batched(
+        name,
+        vec![arg],
+        ScalarType::Text,
+        Box::new(
+            move |args: &[Vec<Value>], out: &mut Vec<Value>| -> jed::Result<()> {
+                for v in &args[0] {
+                    out.push(Value::Text(format!("{tag}:{}", kind(v))));
+                }
+                Ok(())
+            },
+        ),
+    )
+    .volatility(Volatility::Immutable)
+}
+
+fn coercion_db(funcs: Vec<HostFunction>) -> Session {
+    db_with_ext(
+        registry(funcs),
+        &[
+            "CREATE TABLE c (id i32 PRIMARY KEY, s i16, i i32, b i64, r f32)",
+            "INSERT INTO c VALUES (1, 2, 3, 4, 0.5), (2, 5, 6, 7, 1.5)",
+        ],
+    )
+}
+
+fn text(s: &str) -> Value {
+    Value::Text(s.into())
+}
+
+#[test]
+fn coercion_widens_an_integer_to_a_host_signature() {
+    let mut db = coercion_db(vec![probe("f", vec![ScalarType::Int64], "i64")]);
+    assert_eq!(
+        one(&mut db, "SELECT f(i) FROM c WHERE id = 1"),
+        text("i64:int")
+    );
+    assert_eq!(
+        one(&mut db, "SELECT f(s) FROM c WHERE id = 1"),
+        text("i64:int")
+    );
+}
+
+#[test]
+fn coercion_prefers_the_nearer_integer_width() {
+    let mut db = coercion_db(vec![
+        probe("f", vec![ScalarType::Int32], "i32"),
+        probe("f", vec![ScalarType::Int64], "i64"),
+    ]);
+    assert_eq!(
+        one(&mut db, "SELECT f(s) FROM c WHERE id = 1"),
+        text("i32:int")
+    );
+}
+
+#[test]
+fn coercion_narrows_an_integer_constant_only_when_it_fits() {
+    let mut db = coercion_db(vec![
+        probe("f", vec![ScalarType::Int16], "i16"),
+        probe("f", vec![ScalarType::Int32], "i32"),
+    ]);
+    assert_eq!(one(&mut db, "SELECT f(5)"), text("i32:int"));
+    assert_eq!(one(&mut db, "SELECT f(-40000)"), text("i32:int"));
+    assert_eq!(
+        err_code(db.query_outcome("SELECT f(3000000000)", &[])),
+        "42883"
+    );
+}
+
+#[test]
+fn coercion_keeps_an_integer_in_its_family_before_decimal() {
+    let mut db = coercion_db(vec![
+        probe("f", vec![ScalarType::Int64], "i64"),
+        probe("f", vec![ScalarType::Decimal], "decimal"),
+    ]);
+    assert_eq!(
+        one(&mut db, "SELECT f(s) FROM c WHERE id = 1"),
+        text("i64:int")
+    );
+}
+
+#[test]
+fn coercion_converts_an_integer_for_a_decimal_parameter() {
+    let mut db = coercion_db(vec![probe("f", vec![ScalarType::Decimal], "decimal")]);
+    assert_eq!(
+        one(&mut db, "SELECT f(i) FROM c WHERE id = 1"),
+        text("decimal:decimal")
+    );
+    assert_eq!(one(&mut db, "SELECT f(7)"), text("decimal:decimal"));
+}
+
+#[test]
+fn coercion_converts_in_a_batch_kernel() {
+    // The batched path (§4.2.1) converts each column the same way as the row path.
+    let mut db = coercion_db(vec![
+        probe_batched("f", ScalarType::Decimal, "decimal"),
+        probe_batched("g", ScalarType::Float64, "f64"),
+    ]);
+    let rows = query(&mut db, "SELECT f(i), g(r) FROM c ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    for r in rows {
+        assert_eq!(r, vec![text("decimal:decimal"), text("f64:f64")]);
+    }
+}
+
+#[test]
+fn coercion_widens_f32_to_a_host_f64_parameter() {
+    let mut db = coercion_db(vec![probe("g", vec![ScalarType::Float64], "f64")]);
+    assert_eq!(
+        one(&mut db, "SELECT g(r) FROM c WHERE id = 1"),
+        text("f64:f64")
+    );
+}
+
+#[test]
+fn coercion_admits_only_a_constant_into_a_host_float() {
+    let mut db = coercion_db(vec![probe("g", vec![ScalarType::Float64], "f64")]);
+    assert_eq!(one(&mut db, "SELECT g(2)"), text("f64:f64"));
+    assert_eq!(one(&mut db, "SELECT g(2.5)"), text("f64:f64"));
+    assert_eq!(
+        err_code(db.query_outcome("SELECT g(i) FROM c WHERE id = 1", &[])),
+        "42883"
+    );
+}
+
+#[test]
+fn coercion_host_beats_a_costlier_builtin() {
+    // A host sqrt(i32) for an i16 argument scores 1; the built-in sqrt(decimal) scores 3.
+    let mut db = coercion_db(vec![probe("sqrt", vec![ScalarType::Int32], "host")]);
+    assert_eq!(
+        one(&mut db, "SELECT sqrt(s) FROM c WHERE id = 1"),
+        text("host:int")
+    );
+}
+
+#[test]
+fn coercion_builtin_wins_a_tie() {
+    // sin(1): the built-in sin(float) and a host sin(f64) both score 4 — the built-in wins.
+    let mut db = coercion_db(vec![probe("sin", vec![ScalarType::Float64], "host")]);
+    assert_eq!(one(&mut db, "SELECT sin(0)"), Value::Float64(0.0));
+}
+
+#[test]
+fn coercion_tied_hosts_are_ambiguous() {
+    // (i16, i16) against f(i32, i64) and f(i64, i32): both score 3 — 42725.
+    let mut db = coercion_db(vec![
+        probe("f", vec![ScalarType::Int32, ScalarType::Int64], "a"),
+        probe("f", vec![ScalarType::Int64, ScalarType::Int32], "b"),
+    ]);
+    assert_eq!(
+        err_code(db.query_outcome("SELECT f(s, s) FROM c WHERE id = 1", &[])),
+        "42725"
+    );
+}
+
+#[test]
+fn coercion_leaves_an_exact_host_match_alone() {
+    // An exact host signature is found before the pass runs, even where a built-in would match
+    // through a coercion.
+    let mut db = coercion_db(vec![probe("sqrt", vec![ScalarType::Int64], "host")]);
+    assert_eq!(
+        one(&mut db, "SELECT sqrt(b) FROM c WHERE id = 1"),
+        text("host:int")
+    );
+}

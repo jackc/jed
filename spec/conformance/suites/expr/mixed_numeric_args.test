@@ -1,11 +1,10 @@
-# Mixed numeric arguments to the two-argument math functions (spec/design/functions.md §9.2). The
-# catalog rows of power / pow / log(b, x) / atan2 are arg_resolution = "promote": a pair that matches
-# no row reconciles as the arithmetic operators' operands do. An integer facing a decimal promotes to
-# decimal (PostgreSQL's implicit int → numeric selects the numeric overload), and an integer or
-# decimal LITERAL facing a float adapts to that float (PostgreSQL's numeric constant → float8). A
-# VALUE never becomes a float (float.md §6), and two integers still match no row. width_bucket's
-# float form adapts its literal bounds the same way. PostgreSQL-oracle-checked.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.where_eq, types.i32, types.i64, types.decimal, types.f32, types.f64, expr.numeric_transcendental, func.mixed_numeric_args
+# Mixed numeric arguments to the two-argument math functions power / pow / log(b, x) / atan2. A
+# pair that matches no row is resolved by the argument-coercion pass (spec/design/arg-coercion.md):
+# an integer facing a decimal takes the decimal overload (PostgreSQL's implicit int → numeric), and
+# an integer or decimal LITERAL facing a float adapts to that float (PostgreSQL's numeric constant →
+# float8). A VALUE never becomes a float (float.md §6). width_bucket's float form adapts its literal
+# bounds the same way, in its own resolver. PostgreSQL-oracle-checked.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.where_eq, types.i32, types.i64, types.decimal, types.f32, types.f64, expr.numeric_transcendental, func.mixed_numeric_args, func.arg_coercion
 
 statement ok
 CREATE TABLE mn (id i32 PRIMARY KEY, i i32, b i64, d numeric, f f64)

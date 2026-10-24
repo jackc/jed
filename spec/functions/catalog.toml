@@ -2061,7 +2061,8 @@ null           = "propagates"
 errors         = []
 
 # round's carry can push a value at the integer-digit cap over it (decimal.md §2/§4) —
-# 22003, exactly PG. The integer overloads below cannot (an i64 is at most 19 digits).
+# 22003, exactly PG. An integer argument has no row of its own: the argument-coercion pass
+# (../design/arg-coercion.md) selects the decimal row, so round(5) is numeric (PG: float8).
 [[operator]]
 volatility     = "immutable"
 name           = "round"
@@ -2084,28 +2085,6 @@ result         = "decimal"
 null           = "propagates"
 errors         = ["22003"]
 
-[[operator]]
-volatility     = "immutable"
-name           = "round"
-kind           = "function"
-arity          = 1
-arg_families   = ["integer"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
-
-[[operator]]
-volatility     = "immutable"
-name           = "round"
-kind           = "function"
-arity          = 2
-arg_families   = ["integer", "integer"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
-
 # ceil / ceiling / floor / trunc — the EXACT-numeric rounding-to-a-bound functions
 # (../design/decimal.md §6, functions.md §9), the decimal siblings of `round`. All produce scale 0
 # except trunc's 2-arg form: trunc(numeric, n) truncates TOWARD ZERO to n places (n < 0 truncates
@@ -2113,8 +2092,8 @@ errors         = []
 # toward zero. `ceiling` is a pure alias of `ceil`. ceil/floor over a non-integer decimal carry
 # 22003 (a round-up carry can cross the integer-digit cap, exactly like round); trunc never grows
 # the magnitude, so it cannot overflow, and ceil/floor over an integer (already scale 0) cannot
-# either. As with round, the INTEGER overloads return decimal/numeric (jed keeps floats out of the
-# value path — ../design/float.md §8); PG resolves the single-arg ceil/floor/trunc(int) to double
+# either. As with round, an integer argument takes the decimal row through the argument-coercion
+# pass (../design/arg-coercion.md §6); PG resolves the single-arg ceil/floor/trunc(int) to double
 # precision, a documented result-type divergence (oracle_overrides.toml), value-identical. PG's
 # 2-arg trunc is numeric-only, so trunc(int, int) → numeric matches PG with no override.
 [[operator]]
@@ -2130,17 +2109,6 @@ errors         = ["22003"]
 
 [[operator]]
 volatility     = "immutable"
-name           = "ceil"
-kind           = "function"
-arity          = 1
-arg_families   = ["integer"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
-
-[[operator]]
-volatility     = "immutable"
 name           = "ceiling"
 kind           = "function"
 arity          = 1
@@ -2149,17 +2117,6 @@ arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
 errors         = ["22003"]
-
-[[operator]]
-volatility     = "immutable"
-name           = "ceiling"
-kind           = "function"
-arity          = 1
-arg_families   = ["integer"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
 
 [[operator]]
 volatility     = "immutable"
@@ -2174,32 +2131,10 @@ errors         = ["22003"]
 
 [[operator]]
 volatility     = "immutable"
-name           = "floor"
-kind           = "function"
-arity          = 1
-arg_families   = ["integer"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
-
-[[operator]]
-volatility     = "immutable"
 name           = "trunc"
 kind           = "function"
 arity          = 1
 arg_families   = ["decimal"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
-
-[[operator]]
-volatility     = "immutable"
-name           = "trunc"
-kind           = "function"
-arity          = 1
-arg_families   = ["integer"]
 arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
@@ -2211,17 +2146,6 @@ name           = "trunc"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "integer"]
-arg_resolution = "none"
-result         = "decimal"
-null           = "propagates"
-errors         = []
-
-[[operator]]
-volatility     = "immutable"
-name           = "trunc"
-kind           = "function"
-arity          = 2
-arg_families   = ["integer", "integer"]
 arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
@@ -2377,7 +2301,7 @@ name           = "pow"
 kind           = "function"
 arity          = 2
 arg_families   = ["float", "float"]
-arg_resolution = "promote"
+arg_resolution = "none"
 result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
@@ -2394,7 +2318,7 @@ name           = "power"
 kind           = "function"
 arity          = 2
 arg_families   = ["float", "float"]
-arg_resolution = "promote"
+arg_resolution = "none"
 result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
@@ -2407,12 +2331,9 @@ errors         = ["22003"]
 # with NO libm transcendental on the value path (the result scale is chosen deterministically, never
 # from a platform `log`/`log10`). Result is an unconstrained `numeric`; the result SCALE follows PG's
 # rule (≥ NUMERIC_MIN_SIG_DIGITS = 16 significant digits, never below the input's scale).
-# The one-argument rows are arg_resolution = "none", like the float roots and `sign`: a bare INTEGER
-# does NOT promote (`sqrt(2)` → 42883, a documented jed strictness vs PG's int→float8), but a decimal
-# literal/value does (`sqrt(4.0)` → numeric 2.0000000000000000, matching PG). The two-argument
-# log/power/pow rows are arg_resolution = "promote" (functions.md §9.2): a MIXED integer/decimal pair
-# promotes the integer to decimal, as PG's int→numeric implicit cast does (`power(2.0, 3)` →
-# numeric), while two integers still match no row (42883). Domain errors match PG: sqrt of a negative
+# An integer argument takes these rows through the argument-coercion pass (../design/arg-coercion.md):
+# `sqrt(2)` and `power(2, 10)` are numeric where PG resolves them through float8 (a documented
+# value divergence, arg-coercion.md §6), and `power(2.0, 3)` is numeric, as in PG. Domain errors match PG: sqrt of a negative
 # and the power domain errors trap 2201F; ln/log of a non-positive trap 2201E; exp/power overflow
 # traps 22003.
 
@@ -2480,7 +2401,7 @@ name           = "log"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
-arg_resolution = "promote"
+arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
 errors         = ["2201E"]
@@ -2497,7 +2418,7 @@ name           = "power"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
-arg_resolution = "promote"
+arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
 errors         = ["2201F", "22003"]
@@ -2508,7 +2429,7 @@ name           = "pow"
 kind           = "function"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
-arg_resolution = "promote"
+arg_resolution = "none"
 result         = "decimal"
 null           = "propagates"
 errors         = ["2201F", "22003"]
@@ -2647,15 +2568,15 @@ null           = "propagates"
 errors         = []
 
 # atan2(y, x) — the inverse tangent of y/x in radians, using the signs of BOTH operands to pick
-# the quadrant (float.md §8). TRANSCENDENTAL, exempted. Two float operands reconciled to one
-# width (arg_resolution = "promote", like pow), result f64; no domain trap (atan2(0, 0) = 0).
+# the quadrant (float.md §8). TRANSCENDENTAL, exempted. Both operands widen to f64 (the result
+# width, like pow), result f64; no domain trap (atan2(0, 0) = 0).
 [[operator]]
 volatility     = "immutable"
 name           = "atan2"
 kind           = "function"
 arity          = 2
 arg_families   = ["float", "float"]
-arg_resolution = "promote"
+arg_resolution = "none"
 result         = "f64"
 null           = "propagates"
 errors         = []
@@ -2755,9 +2676,9 @@ errors         = ["22003"]
 # sign / mod / div / gcd / lcm / factorial / width_bucket and the decimal-introspection trio
 # scale / min_scale / trim_scale — the EXACT numeric follow-ons named in float.md §8 / decimal.md.
 # Unlike the float transcendentals these are EXACT and IN-CONTRACT (no determinism-ledger entry):
-# integer/decimal arithmetic is byte-identical cross-core. arg_resolution = "none" (no cross-family
-# promotion), so — like sqrt — a bare integer where only a decimal/float overload exists is 42883,
-# a documented divergence from PG's implicit int→numeric/float8 cast (oracle_overrides.toml).
+# integer/decimal arithmetic is byte-identical cross-core. An integer argument where only a decimal
+# or float overload exists takes the decimal row through the argument-coercion pass
+# (../design/arg-coercion.md), where PG casts it to float8 (a documented divergence, §6).
 #
 # sign(x): -1 / 0 / +1 with the operand's sign. The DECIMAL overload returns numeric at SCALE 0
 # (PG sign(numeric)); the FLOAT overload returns f64 and is EXACT/in-contract (the float.md §8

@@ -39,8 +39,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 - [x] **Predicate forms** (`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`CASE`, regex operators, `SIMILAR TO`). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
 - [x] **Left-to-right short-circuit `AND` / `OR`** (PostgreSQL's qual-list NULL rule in filters, whose conjuncts are cost-ordered like PostgreSQL's). → [cost.md §3](spec/design/cost.md), [planner.md §3.0](spec/design/planner.md), `expr/short_circuit.test`, `expr/filter_conjunct_order.test`
-- [x] **Scalar functions.** → [functions.md §9](spec/design/functions.md)
-  - [ ] _follow-on:_ a general implicit argument-coercion pass.
+- [x] **Scalar functions**, with implicit argument coercion. → [functions.md §9](spec/design/functions.md), [arg-coercion.md](spec/design/arg-coercion.md)
+  - [ ] _follow-on:_ have the `div`/`gcd`/`lcm`/`width_bucket` resolvers read their numeric reconciliation from the argument-coercion table (a no-behavior-change cleanup, [arg-coercion.md §9](spec/design/arg-coercion.md) slice 5).
 - [x] **Scalar string / text functions** (code-point semantics). → [string-functions.md](spec/design/string-functions.md)
   - [ ] _follow-on:_ full-Unicode `initcap` word classification + non-ASCII titlecasing.
 - [x] **Named + optional (DEFAULT) function arguments.** → [functions.md §11](spec/design/functions.md)

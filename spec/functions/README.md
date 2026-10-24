@@ -35,3 +35,10 @@ The catalog has grown well past the original operator set. Authored kinds:
 > exist — only `=`). The `precedence` and `cost` fields are authored, and
 > `IS [NOT] DISTINCT FROM` plus the named / `DEFAULT`-argument functions have landed.
 > Coherence is checked by [verify.rb](verify.rb) (`mise run verify`).
+>
+> [coercion_snapshot.toml](coercion_snapshot.toml) is the argument-coercion capture check
+> ([../design/arg-coercion.md](../design/arg-coercion.md) §7): the row the coercion pass selects
+> for every numeric argument tuple that matches no row exactly, generated and checked by
+> [coercion_snapshot.rb](coercion_snapshot.rb). A catalog change that moves an entry fails
+> `mise run verify` until the snapshot is rewritten (`ruby spec/functions/coercion_snapshot.rb
+> --write`), so the move shows in the change's diff.

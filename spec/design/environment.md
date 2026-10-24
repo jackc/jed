@@ -162,7 +162,7 @@ control time and randomness.
 ## 5. Host functions and host types
 
 - **The `ExtensionRegistry` is absorbed.** Registration moves onto the environment with unchanged
-  semantics (exact signatures, strictness, batch kernels, component identity and semantic version,
+  semantics (exact signatures with the argument-coercion fallback of arg-coercion.md §4.2, strictness, batch kernels, component identity and semantic version,
   cost declaration — api.md §12, extensibility.md §4.2/§7). It was already frozen per handle; it is
   now frozen per environment.
 - **Host types**, when ratified (extensibility.md §4.3), register on the environment too. A file
