@@ -38,6 +38,7 @@ import {
 } from "./executor.ts";
 import { COSTS } from "./costs.ts";
 import { chargeHashKeys, chargeSortKey, chargeSortKeys } from "./key_meter.ts";
+import { KeyMap } from "./keyset.ts";
 import { entryBytes, rowBytes, sortKeyBytes, valueBytes } from "./memsize.ts";
 import { engineError } from "./errors.ts";
 import { intervalCmp } from "./interval.ts";
@@ -500,7 +501,7 @@ export function* applyWindowStageSteps(
     for (const si of group) specGroup[si] = gi;
     // Partition the row indices by the partition-key values. The Map is an index only (never
     // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
-    const index = new Map<string, number>();
+    const index = new KeyMap<number>();
     const partitions: number[][] = [];
     for (let i = 0; i < n; i++) {
       const keyVals = rep.partition.map((p) => rows[i]![p]!);

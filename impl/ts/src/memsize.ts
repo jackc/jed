@@ -19,10 +19,12 @@ import type { Value } from "./value.ts";
 
 // utf8Length is the UTF-8 byte length of a JS (UTF-16) string, measured without allocating an encoded
 // copy. A surrogate pair is one 4-byte code point; a lone surrogate encodes as U+FFFD (3 bytes), the
-// TextEncoder behavior.
+// TextEncoder behavior. A long string is measured by TextEncoder.encodeInto in chunks that never split
+// a surrogate pair, which runs natively and is many times faster than the loop; the counts agree.
 export function utf8Length(s: string): number {
-  let n = 0;
   const len = s.length;
+  if (len > UTF8_NATIVE_MIN) return utf8LengthNative(s);
+  let n = 0;
   for (let i = 0; i < len; i++) {
     const c = s.charCodeAt(i);
     if (c < 0x80) n += 1;
@@ -34,6 +36,29 @@ export function utf8Length(s: string): number {
         i++;
       } else n += 3;
     } else n += 3;
+  }
+  return n;
+}
+
+const UTF8_NATIVE_MIN = 256;
+const UTF8_CHUNK = 16384;
+const utf8Encoder = new TextEncoder();
+// Each UTF-16 unit of a chunk encodes to at most three bytes.
+const utf8Scratch = new Uint8Array(3 * UTF8_CHUNK);
+
+function utf8LengthNative(s: string): number {
+  const len = s.length;
+  let n = 0;
+  for (let i = 0; i < len; ) {
+    let end = Math.min(i + UTF8_CHUNK, len);
+    // A high surrogate ending the chunk starts the next one, so a pair is encoded whole; a lone one
+    // is U+FFFD wherever it falls.
+    if (end < len) {
+      const c = s.charCodeAt(end - 1);
+      if (c >= 0xd800 && c <= 0xdbff) end--;
+    }
+    n += utf8Encoder.encodeInto(s.slice(i, end), utf8Scratch).written;
+    i = end;
   }
   return n;
 }

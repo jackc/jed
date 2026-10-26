@@ -77,3 +77,14 @@ test("utf8Length matches TextEncoder without allocating", () => {
     assert.equal(utf8Length(s), enc.encode(s).length, JSON.stringify(s));
   }
 });
+
+test("utf8Length's chunked long-string path matches TextEncoder", () => {
+  const enc = new TextEncoder();
+  // Long strings take the chunked encodeInto path; put pairs and lone surrogates on chunk boundaries.
+  for (const pad of [255, 256, 16382, 16383, 16384, 32767]) {
+    for (const tail of ["🙂", "\ud800", "\udc00", "\ud800\ud800x", "é中"]) {
+      const s = "a".repeat(pad) + tail + "b".repeat(pad % 7);
+      assert.equal(utf8Length(s), enc.encode(s).length, `${pad} ${JSON.stringify(tail)}`);
+    }
+  }
+});
