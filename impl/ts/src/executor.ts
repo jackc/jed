@@ -433,6 +433,7 @@ import {
   SpillSet,
   SpoolSorter,
 } from "./blocking.ts";
+import { KeyMap, KeySet } from "./keyset.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -18514,7 +18515,7 @@ export class Engine {
     // NULL-safe distinctRowKey the set operators use.
     // The UNION dedup set is operator state (memory.md §6.2): an entry per kept row, reserved before
     // its result copy, returned when the recursive CTE completes.
-    const seen = new Set<string>();
+    const seen = new KeySet();
     const seenCharge = new StateCharge(acct);
     // chargeKeys charges a UNION row's columns as hash_key before its duplicate check (cost.md §3
     // "sort_key / hash_key"); UNION ALL builds no table. The charge lands on its own meter, which
@@ -28130,8 +28131,8 @@ export class Engine {
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
-      const newSeen = (): (Set<string> | null)[] =>
-        plan.aggSpecs.map((s) => (s.distinct ? new Set<string>() : null));
+      const newSeen = (): (KeySet | null)[] =>
+        plan.aggSpecs.map((s) => (s.distinct ? new KeySet() : null));
       // One grouping set per plan.groupSets (spec/design/aggregates.md §12): a plain GROUP BY /
       // whole-table aggregate has exactly one; ROLLUP / CUBE / GROUPING SETS have several. Each set is
       // bucketed independently over the SAME post-WHERE rows and its groups projected into the shared
@@ -28165,13 +28166,13 @@ export class Engine {
       let groupRows: Value[][] = [];
       for (const gset of plan.groupSets) {
         if (shouldCooperate()) yield COOPERATE;
-        const index = new Map<string, number>();
+        const index = new KeyMap<number>();
         // Per group: key, accumulators, DISTINCT sets, and the group's query-memory charge — its
         // entry plus everything its accumulators retain (memory.md §6.2/§6.3).
         const groups: {
           keys: Value[];
           accs: Acc[];
-          seen: (Set<string> | null)[];
+          seen: (KeySet | null)[];
           charge: number;
         }[] = [];
         // An empty grouping set (the () / whole-table grand total) is one pre-created group, so it
@@ -28381,7 +28382,7 @@ export class Engine {
         // first occurrence in the (already ORDER-BY-sorted) order, then LIMIT/OFFSET. `seen` is
         // membership-only; output order comes from the deterministic group iteration / sort, never
         // Set iteration (no order leak — CLAUDE.md §8/§10).
-        const seen = new Set<string>();
+        const seen = new KeySet();
         const distinctRows: Value[][] = [];
         let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
         for (const srow of groupRows) {
@@ -28418,7 +28419,7 @@ export class Engine {
       // Project every filtered row (charging projection cost per row, the §3 asymmetry),
       // keeping first occurrences. `seen` is membership-only: output order comes from the
       // deterministic source iteration, never from Set iteration (no order leak — §8/§10).
-      const seen = new Set<string>();
+      const seen = new KeySet();
       const distinctRows: Value[][] = [];
       let seenCharge = 0; // the dedup set's entries (memory.md §6.2)
       for (const row of rows) {
@@ -42233,7 +42234,7 @@ export function finalizeHypothetical(
   let le = 0n; // rows that sort ≤ hyp (for cume_dist's rank with flag +1)
   // The distinct strictly-before key tuples (for dense_rank), value-canonical (the group-key
   // distinctRowKey, the same form the GROUP BY bucketing uses — collapses 1.5/1.50, NULL with NULL).
-  const distinct = new Set<string>();
+  const distinct = new KeySet();
   for (const r of rows) {
     const ord = hypoCmp(r, hyp, sorts);
     if (ord < 0) {

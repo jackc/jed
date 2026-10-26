@@ -28,6 +28,7 @@ import {
   zoneRenderCount,
 } from "./value.ts";
 import { type QueryAccount, StateCharge } from "./cost.ts";
+import { KeyMap, KeySet } from "./keyset.ts";
 import { entryBytes, payloadBytes, utf8Length, valueBytes } from "./memsize.ts";
 import { COSTS } from "./costs.ts";
 import {
@@ -961,7 +962,7 @@ export function combineSetop(
   };
   const out: Value[][] = [];
   if (op === "union") {
-    const seen = new Set<string>();
+    const seen = new KeySet();
     for (const row of left.concat(right)) {
       const k = distinctRowKey(row);
       if (!seen.has(k)) {
@@ -972,7 +973,7 @@ export function combineSetop(
     }
   } else if (all) {
     // INTERSECT ALL / EXCEPT ALL: a count per distinct right-arm row.
-    const counts = new Map<string, number>();
+    const counts = new KeyMap<number>();
     for (const row of right) {
       const k = distinctRowKey(row);
       const c = counts.get(k);
@@ -989,7 +990,7 @@ export function combineSetop(
     }
   } else {
     // INTERSECT / EXCEPT (distinct): one copy per distinct left key present in (absent from) the right.
-    const rightSet = new Set<string>();
+    const rightSet = new KeySet();
     for (const row of right) {
       const k = distinctRowKey(row);
       if (!rightSet.has(k)) {
@@ -997,7 +998,7 @@ export function combineSetop(
         rightSet.add(k);
       }
     }
-    const emitted = new Set<string>();
+    const emitted = new KeySet();
     for (const row of left) {
       const k = distinctRowKey(row);
       if (rightSet.has(k) === (op === "intersect") && !emitted.has(k)) {

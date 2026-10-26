@@ -11,6 +11,7 @@
 // discarded. A rejected reservation throws 54P05 for the lane's Meter.costFirst (§6.7).
 import { StateCharge } from "./cost.ts";
 import { MEMORY_ENTRY } from "./costs.ts";
+import { KeyMap, KeySet, keyHash } from "./keyset.ts";
 import { hashRowBytes, keyBytes, rowBytes } from "./memsize.ts";
 import { decodeSpillRow, encodeSpillRow, type SpillScratch, type SpillSink } from "./spill.ts";
 import type { Row } from "./storage.ts";
@@ -98,52 +99,69 @@ export class RowSpool implements Iterable<Row> {
 
 const PARTITIONS = 4096;
 const textEncoder = new TextEncoder();
-function hashKey(key: Uint8Array): number {
-  let hash = 2166136261;
-  for (const byte of key) hash = Math.imul(hash ^ byte, 16777619);
-  return hash >>> 0;
-}
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-  return a.length === b.length && a.every((byte, i) => byte === b[i]);
+  if (a.length !== b.length) return false;
+  let i = 0;
+  // Compare by 32-bit words where both views allow it; a spilled key can be megabytes long.
+  if ((a.byteOffset & 3) === 0 && (b.byteOffset & 3) === 0) {
+    const words = a.length >>> 2;
+    const wa = new Int32Array(a.buffer, a.byteOffset, words);
+    const wb = new Int32Array(b.buffer, b.byteOffset, words);
+    for (; i < words; i++) if (wa[i] !== wb[i]) return false;
+    i = words << 2;
+  }
+  for (; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
+
+// A key's place in a spilled SpillMap's directory: its encoded bytes, hash, bucket offset, and node
+// offset (0 while absent).
+type Located = { key: string; bytes: Uint8Array; hash: number; bucket: number; node: number };
 
 // The disk directory is fixed-size; its chains stream one record at a time even if every key
 // hashes to one partition. Existing keys replace a value pointer, so repeated updates never grow
 // a resident directory or a chain of stale versions. A single value can exceed work_mem.
 export class SpillMap {
   // Each resident entry keeps its measured key and value bytes, so a replacement charges the growth.
-  private memory = new Map<string, { value: Row; keyLen: number; valueLen: number }>();
+  private memory = new KeyMap<{ value: Row; keyLen: number; valueLen: number }>();
   private bytes = 0;
   private file: SpillScratch | null = null;
   private sink: SpillSink;
   private budget: number;
   // The resident entries' query-memory charge, returned on spill or discard.
   private charge: StateCharge;
+  // The last disk lookup, so a get then set of one key (a GROUP BY state update, an insert) encodes,
+  // hashes, and walks its chain once.
+  private located: Located | null = null;
   constructor(budget: number, sink: SpillSink, charge: StateCharge = new StateCharge()) {
     this.budget = budget;
     this.sink = sink;
     this.charge = charge;
   }
-  private find(key: Uint8Array): { bucket: number; node: number } {
+  private locate(key: string): Located {
+    const last = this.located;
+    if (last !== null && last.key === key) return last;
     const file = this.file!;
-    const hash = hashKey(key);
+    const bytes = textEncoder.encode(key);
+    const hash = keyHash(key) >>> 0;
     const bucket = (hash % PARTITIONS) * 8;
     let node = numberAt(file, bucket);
     while (node !== 0) {
       const keyLength = numberAt(file, node + 16);
       if (
         numberAt(file, node + 24) === hash &&
-        keyLength === key.length &&
-        equalBytes(file.read(node + 32, keyLength), key)
+        keyLength === bytes.length &&
+        equalBytes(file.read(node + 32, keyLength), bytes)
       )
-        return { bucket, node };
+        break;
       node = numberAt(file, node);
     }
-    return { bucket, node: 0 };
+    this.located = { key, bytes, hash, bucket, node };
+    return this.located;
   }
   get(key: string): Row | undefined {
     if (this.file === null) return this.memory.get(key)?.value;
-    const { node } = this.find(textEncoder.encode(key));
+    const { node } = this.locate(key);
     return node === 0 ? undefined : readRecord(this.file, numberAt(this.file, node + 8));
   }
   // set stores `value` under the canonical `key`. keyLen is key_bytes of the logical key row and
@@ -179,20 +197,20 @@ export class SpillMap {
   }
   private write(key: string, value: Row): void {
     const file = this.file!;
-    const bytes = textEncoder.encode(key);
-    const { bucket, node } = this.find(bytes);
+    const loc = this.locate(key);
     const record = writeRecord(file, value);
-    if (node !== 0) {
-      file.write(node + 8, u64(record));
+    if (loc.node !== 0) {
+      file.write(loc.node + 8, u64(record));
       return;
     }
     const at = file.size;
-    file.write(at, u64(numberAt(file, bucket)));
+    file.write(at, u64(numberAt(file, loc.bucket)));
     file.write(at + 8, u64(record));
-    file.write(at + 16, u64(bytes.length));
-    file.write(at + 24, u64(hashKey(bytes)));
-    file.write(at + 32, bytes);
-    file.write(bucket, u64(at));
+    file.write(at + 16, u64(loc.bytes.length));
+    file.write(at + 24, u64(loc.hash));
+    file.write(at + 32, loc.bytes);
+    file.write(loc.bucket, u64(at));
+    loc.node = at;
   }
   // release returns the resident charge now — the map is discarded at this stage boundary.
   release(): void {
@@ -202,6 +220,7 @@ export class SpillMap {
     this.memory.clear();
     this.file?.close();
     this.file = null;
+    this.located = null;
     this.charge.releaseAll();
   }
 }
@@ -212,7 +231,7 @@ export class SpillMultiMap {
   // The disk-chain index (used only once spilled): uncharged, since a spilled table reserves nothing.
   private index: SpillMap;
   private file: SpillScratch | null = null;
-  private memory = new Map<string, Row[]>();
+  private memory = new KeyMap<Row[]>();
   private bytes = 0;
   private budget: number;
   private sink: SpillSink;
@@ -570,14 +589,14 @@ export class SortedSpool implements Iterable<Row> {
 // spill-capable SpillMap. Either way each first occurrence reserves its entry, ENTRY + key_bytes(row),
 // while resident (memory.md §6.2/§6.6).
 export class SpillSet {
-  private resident: Set<string> | null;
+  private resident: KeySet | null;
   private disk: SpillMap | null;
   private charge: StateCharge;
   constructor(budget: number, sink: SpillSink | null, charge: StateCharge = new StateCharge()) {
     this.charge = charge;
     this.disk =
       budget > 0 && sink?.createScratch !== undefined ? new SpillMap(budget, sink, charge) : null;
-    this.resident = this.disk === null ? new Set<string>() : null;
+    this.resident = this.disk === null ? new KeySet() : null;
   }
   // insert adds `row` under its canonical `key` and reports whether it was new; a rejected reservation
   // throws 54P05 for the caller's Meter.costFirst.
