@@ -138,7 +138,19 @@ module JedNative
       end
       arguments = (node[:args] || []).map { |arg| compile(arg, columns) }
       return super if builtin_function_signature?(node[:name], arguments.map(&:type))
-      function = resolve_host_function(node[:name], arguments.map(&:type))
+      begin
+        function = resolve_host_function(node[:name], arguments.map(&:type))
+      rescue Error => error
+        raise unless error.sqlstate == '42883' && ArgCoercion.eligible?(node)
+        # No signature matches as written: the coercion pass ranks built-in rows and host
+        # functions together, a built-in winning a tie (arg-coercion.md §4.2).
+        candidate = ArgCoercion.select(node[:name], ArgCoercion.expression_sources(arguments),
+                                       arguments.map(&:type), host_functions_named(node[:name]))
+        raise unless candidate
+        return super if candidate.entry
+        function = candidate.host
+        arguments = adopt_coercions(arguments, candidate)
+      end
       if node[:over] || node[:filter] || node[:distinct] || node[:within_group] || !(node[:order_by] || []).empty?
         raise Error.new('42809', 'host scalar function is not an aggregate or window function')
       end
