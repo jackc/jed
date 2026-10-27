@@ -675,7 +675,8 @@ module JedNative
         chain = 0
         compared = false
         loop do
-          if minimum <= 30 && (at?('is') || at?('between') || at?('in') || at?('like') || at?('ilike') || (at?('not') && %w[in between like ilike].any? { |word| at?(word, 1) }))
+          if minimum <= 30 && (at?('is') || at?('between') || at?('in') || at?('like') || at?('ilike') || similar_to?(0) ||
+                                (at?('not') && (%w[in between like ilike].any? { |word| at?(word, 1) } || similar_to?(1))))
             syntax('comparison predicates cannot be chained') if compared
             compared = true
             left = predicate(left)
@@ -709,6 +710,8 @@ module JedNative
         left
       end
     end
+
+    def similar_to?(offset) = at?('similar', offset) && at?('to', offset + 1)
 
     def predicate(left)
       if accept('is')
@@ -752,6 +755,13 @@ module JedNative
         expect('and')
         high = expression(31)
         { kind: :between, expr: left, low: low, high: high, negated: negated, symmetric: symmetric }
+      elsif similar_to?(0)
+        # SIMILAR TO keeps its own node so stored text round-trips; resolution
+        # desugars it to `~ similar_to_escape(p [, e])` (regex.md §8f.2).
+        @index += 2
+        right = expression(31)
+        escape = accept('escape') ? expression(31) : nil
+        { kind: :binary, op: negated ? 'not similar to' : 'similar to', left: left, right: right, escape: escape }
       else
         op = accept('ilike') ? 'ilike' : (expect('like'); 'like')
         right = expression(31)
@@ -952,7 +962,14 @@ module JedNative
           arg = accept('*') ? { kind: :star } : expression
           args << arg
           names << arg_name
-          if !quoted && args.length == 1 && name == 'substring' && (at?('from') || at?('for'))
+          if !quoted && args.length == 1 && name == 'substring' && accept('similar')
+            # SUBSTRING(x SIMILAR p ESCAPE e) is substring(x, p, e); ESCAPE is required.
+            pattern = expression
+            expect('escape')
+            escape = expression
+            expect(')')
+            return { kind: :call, name: name, args: [arg, pattern, escape] }
+          elsif !quoted && args.length == 1 && name == 'substring' && (at?('from') || at?('for'))
             start = literal(1, 'i64', true)
             count = nil
             if accept('from')

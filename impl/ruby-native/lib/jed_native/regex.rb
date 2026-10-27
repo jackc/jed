@@ -77,7 +77,10 @@ module JedNative
     CONTROLS = { 'n' => "\n", 't' => "\t", 'r' => "\r", 'f' => "\f", 'v' => "\v" }.freeze
     attr_reader :code, :groups
 
-    def initialize(pattern, insensitive: false, dotall: false, multiline: false, literal: false, newline_sensitive: false)
+    # wrapper: :search is the unanchored §3.2 program; :leftmost / :rightmost
+    # are SIMILAR substring's gated wrappers (regex.md §8f.3), whose Gate
+    # admits only positions in a run's gate set.
+    def initialize(pattern, insensitive: false, dotall: false, multiline: false, literal: false, newline_sensitive: false, wrapper: :search)
       @insensitive, @dotall, @multiline = insensitive, dotall, multiline
       @newline_sensitive = newline_sensitive && !literal
       @characters, @position, @groups, @depth = RegexText.new(pattern), 0, 0, 0
@@ -85,8 +88,11 @@ module JedNative
       root = literal ? [:concat, @characters.map { |char| [:char, fold(char)] }] : alternatives
       @position = @characters.length if literal
       invalid('unbalanced parenthesis') unless @position == @characters.length
-      raise Error.new('54001', 'regular expression program is too large') if size(root) + 6 > LIMIT
-      @code = [[:split, 3, 1], [:any_char], [:jump, 0], [:save, 0]]
+      gated = wrapper != :search
+      raise Error.new('54001', 'regular expression program is too large') if size(root) + (gated ? 7 : 6) > LIMIT
+      @code = [wrapper == :rightmost ? [:split, 1, 3] : [:split, 3, 1], [:any_char], [:jump, 0]]
+      @code << [:gate] if gated
+      @code << [:save, 0]
       emit(root)
       @code << [:save, 1] << [:match]
       @marks = Array.new(@code.length, 0)
@@ -102,11 +108,13 @@ module JedNative
 
     def match?(text, context: nil) = !search(input(text), 0, context: context).nil?
 
-    def search(input, start = 0, context: nil)
+    # gate: one flag per position for the gated wrappers; ends: an ends run
+    # records every position a match ends at and does not stop (§8f.3).
+    def search(input, start = 0, context: nil, gate: nil, ends: nil)
       return nil if start > input.length
       current = []
       generation = next_generation
-      closure(current, 0, nil, start, input, generation, context)
+      closure(current, 0, nil, start, input, generation, context, gate)
       matched = nil
       position = start
       while position <= input.length
@@ -127,10 +135,15 @@ module JedNative
               instruction[1] ? !included && (!@newline_sensitive || !instruction[3] || char != "\n") : included
             end
           when :match
+            if ends
+              ends[position] = true
+              index += 1
+              next
+            end
             matched = saves
             break
           end
-          closure(following, pc + 1, saves, position + 1, input, generation, context) if accepts
+          closure(following, pc + 1, saves, position + 1, input, generation, context, gate) if accepts
           index += 1
         end
         current = following
@@ -152,7 +165,7 @@ module JedNative
       @generation += 1
     end
 
-    def closure(list, pc, saves, position, input, generation, context)
+    def closure(list, pc, saves, position, input, generation, context, gate = nil)
       stack = [[pc, saves]]
       until stack.empty?
         pc, saves = stack.pop
@@ -169,6 +182,7 @@ module JedNative
         when :end then stack << [pc + 1, saves] if position == input.length
         when :line_start then stack << [pc + 1, saves] if position.zero? || input[position - 1] == "\n"
         when :line_end then stack << [pc + 1, saves] if position == input.length || input[position] == "\n"
+        when :gate then stack << [pc + 1, saves] if gate && gate[position]
         else list << [pc, saves]
         end
       end
@@ -303,7 +317,9 @@ module JedNative
       end
       return [:start] if char == 'A' && !in_class
       return [:end] if char == 'z' && !in_class
-      return [:char, char] if '.+*?()[]{}|^$\\-'.include?(char)
+      # Any other escaped code point that is not an ASCII letter or digit is
+      # itself (regex.md §2), as in PostgreSQL and PCRE.
+      return [:char, char] unless char.match?(/\A[A-Za-z0-9]\z/)
       invalid("invalid escape \\#{char}")
     end
 
@@ -311,7 +327,7 @@ module JedNative
       negated = peek == '^'
       take if negated
       ranges, first = [], true
-      while peek && peek != ']'
+      while peek && (peek != ']' || first)
         invalid('unbalanced bracket expression') if peek == '[' && @characters[@position + 1] == ':'
         node = take == '\\' ? escape(true) : [:char, fold(@characters[@position - 1])]
         if node[0] == :char && peek == '-' && @characters[@position + 1] && @characters[@position + 1] != ']'

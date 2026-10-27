@@ -46,7 +46,41 @@ module NativeRegexTests
         raise "regex match vector #{example['pattern'].inspect}: #{[captures, meter.cost].inspect} expected #{[example['caps'], example['steps']].inspect}"
       end
     end
-    puts "ruby-native regex: #{programs.length} program vectors and #{matches.length} match/cost vectors passed"
+    similar = TomlRB.load_file(File.join(ROOT, 'spec/regex/similar_vectors.toml')).fetch('case')
+    similar.each { |example| similar_vector(example) }
+    puts "ruby-native regex: #{programs.length} program vectors, #{matches.length} match/cost vectors and #{similar.length} SIMILAR vectors passed"
+  end
+
+  def sqlstate
+    yield
+    nil
+  rescue JedNative::Error => error
+    error.sqlstate
+  end
+
+  def similar_vector(example)
+    pattern, escape, input = example.fetch('pattern'), example['escape'], example.fetch('input')
+    label = "SIMILAR vector #{pattern.inspect}"
+    if example['error']
+      raise "#{label}: expected #{example['error']}" unless sqlstate { JedNative::Similar.translate(pattern, escape) } == example['error']
+      return
+    end
+    translated = JedNative::Similar.translate(pattern, escape)
+    program, meter = JedNative::Similar.compile(translated), Meter.new(0)
+    matched = program.match?(input, context: meter)
+    actual = [translated, matched, program.code.length, meter.cost]
+    expected = example.values_at('translation', 'similar', 'similar_compile', 'similar_steps')
+    raise "#{label}: #{actual.inspect} expected #{expected.inspect}" unless actual == expected
+    if example['substring_error']
+      raise "#{label}: expected substring #{example['substring_error']}" unless sqlstate { JedNative::Similar::Matcher.new(pattern, escape || '\\') } == example['substring_error']
+      return
+    end
+    matcher, meter = JedNative::Similar::Matcher.new(pattern, escape || '\\'), Meter.new(0)
+    original = JedNative::RegexText.new(input)
+    span = matcher.span(original, meter)
+    actual = [span && original.slice(*span), matcher.instructions, meter.cost]
+    expected = [example['substring_null'] ? nil : example['substring'], example['substring_compile'], example['substring_steps']]
+    raise "#{label}: substring #{actual.inspect} expected #{expected.inspect}" unless actual == expected
   end
 end
 
