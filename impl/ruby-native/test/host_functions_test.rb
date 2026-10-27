@@ -30,7 +30,7 @@ module NativeHostFunctionTests
       assert(s.execute('select twice(3)').cost == 4, 'declared call cost plus row produced')
       assert(s.execute("select greet(NULL::text)").rows == [[nil]] && calls.empty?, 'strict NULL skips host kernel')
       assert(s.execute('select greet($1)', 'hello').rows == [['HELLO']], 'host signature infers parameter type')
-      error('42883') { s.execute('select twice(3::i32)') }
+      assert(s.execute('select twice(3::i32)').rows == [[6]], 'host i64 slot admits a coerced i32 argument')
       s.max_cost = 3
       error('54P01') { s.execute('select twice(3)') }
       s.max_cost = 0
@@ -39,6 +39,38 @@ module NativeHostFunctionTests
       assert(s.execute('select x from t').rows == [[8]], 'host default and check')
       error('42P17') { s.execute("create table bad(x text check(greet(x) <> ''))") }
       error('42P17') { s.execute('create index bad_ix on t(greet(x::text))') }
+    end
+    # The argument-coercion pass ranks host overloads by exact-type costs (arg-coercion.md §4.1).
+    seen = []
+    coerced = JedNative::Environment.new
+      .register_function(name: 'near', args: ['i32'], returns: 'text') { |_v| 'i32' }
+      .register_function(name: 'near', args: ['i64'], returns: 'text') { |_v| 'i64' }
+      .register_function(name: 'narrow', args: ['i16'], returns: 'text') { |_v| 'i16' }
+      .register_function(name: 'narrow', args: ['i32'], returns: 'text') { |_v| 'i32' }
+      .register_function(name: 'band', args: ['i64'], returns: 'text') { |_v| 'i64' }
+      .register_function(name: 'band', args: ['decimal'], returns: 'text') { |_v| 'decimal' }
+      .register_function(name: 'flt', args: ['f64'], returns: 'f64') { |v| seen << v; v }
+      .register_function(name: 'dec', args: ['decimal'], returns: 'text') { |v| v.class.name.split('::').last }
+      .register_function(name: 'sqrt', args: ['i32'], returns: 'text') { |_v| 'host' }
+      .register_function(name: 'sin', args: ['f64'], returns: 'text') { |_v| 'host' }
+      .register_function(name: 'tie', args: ['i32', 'i64'], returns: 'text') { |*_v| 'a' }
+      .register_function(name: 'tie', args: ['i64', 'i32'], returns: 'text') { |*_v| 'b' }
+      .register_function(name: 'bdec', args: ['decimal'], returns: 'text', batch_kernel: ->(columns, out) { columns[0].each { |v| out << v.class.name.split('::').last } })
+    JedNative.memory(environment: coerced) do |core|
+      core.execute('create table c(id i64 primary key, s i16, i i32)')
+      core.execute('insert into c values(1, 2, 3)')
+      assert(core.execute('select near(s) from c').rows == [['i32']], 'nearer host widening wins')
+      assert(core.execute('select narrow(5)').rows == [['i32']], 'integer constant prefers i32 over i16')
+      error('42883') { core.execute('select narrow(3000000000)') }
+      assert(core.execute('select band(s) from c').rows == [['i64']], 'tower widening beats decimal')
+      assert(core.execute('select flt(2)').rows == [[2.0]] && seen == [2.0], 'numeric constant enters a host f64 slot')
+      error('42883') { core.execute('select flt(i) from c') }
+      assert(core.execute('select dec(i) from c').rows == [['Decimal']], 'host decimal slot receives a converted integer')
+      assert(core.execute('select sqrt(s) from c').rows == [['host']], 'cheaper host coercion beats built-in decimal')
+      assert(core.execute('select sqrt(i) from c').rows == [['host']], 'exact host signature')
+      assert(core.execute('select sin(0)').rows == [[0.0]], 'built-in wins a coercion tie')
+      error('42725') { core.execute('select tie(s, s) from c') }
+      assert(core.execute('select bdec(i) from c').rows == [['Decimal']], 'batch kernel receives a converted integer')
     end
     bad = base.register_function(name: 'badkind', args: [], returns: 'i64') { 'wrong' }
               .register_function(name: 'badwidth', args: [], returns: 'i16') { 1 << 20 }
