@@ -74,6 +74,7 @@ module JedNative
               next unless accepted
               if seen
                 result_row = projection_kernel ? projection_kernel.call(self, row, @params) : expressions.map { |expression| evaluate(expression, row) }
+                charge_hash_keys(result_row)
                 if seen.is_a?(Hash)
                   next if seen.key?(result_row)
                   query_memory_add(seen_owner, MemorySchedule::ENTRY + query_memory_key_bytes(result_row)) if seen_owner

@@ -275,7 +275,10 @@ module JedNative
       end
       anchor_expressions, step_expressions, cycle_filter = cte_generated_expressions(cte, columns, added)
       rows = relation.rows.map { |row| row + anchor_expressions.map { |expression| evaluate(expression, row) } }
-      rows = rows.uniq unless body[:all]
+      unless body[:all]
+        rows.each { |row| charge_hash_keys(row) }
+        rows = rows.uniq
+      end
       if @query_memory
         result_owner = query_memory_owner
         dedup_owner = query_memory_owner unless body[:all]
@@ -305,6 +308,7 @@ module JedNative
           own + step_expressions.map { |expression| evaluate(expression, context) }
         end
         unless body[:all]
+          working.each { |row| charge_hash_keys(row) }
           working = working.reject { |row| seen.key?(row) }.uniq
           working.each { |row| seen[row] = true }
         end

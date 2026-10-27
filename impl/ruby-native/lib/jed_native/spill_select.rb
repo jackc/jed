@@ -110,6 +110,7 @@ module JedNative
         seen, output = spill_owner(owners, SpillStateMap), spill_owner(owners, RowSpool)
         rows.each do |row|
           values = expressions.map { |expression| evaluate(expression, row) }
+          charge_hash_keys(values)
           output.push(values) if seen.insert(values)
         end
         rows.close
@@ -438,6 +439,7 @@ module JedNative
       end
       sorter = spill_owner(owners, ExternalSorter, &compare)
       decorated.each do |row|
+        charge_sort_keys(row.last(orderings.length))
         keys = row.last(orderings.length).map do |value|
           spill_collation_sort_value(value)
         end
@@ -475,6 +477,7 @@ module JedNative
           tuple = key_indices.map do |index|
             keys[index].kind == :column ? row[keys[index].value] : row[scope.length + decorated.index(index)]
           end
+          charge_hash_keys(tuple)
           found, state = groups.get(tuple)
           if found
             state = state.dup
@@ -489,6 +492,7 @@ module JedNative
               values = aggregate.extra[:aggregate_order].map { |argument, _| evaluate(argument, row) }
               next if !AggregateExecution::HYPOTHETICAL.include?(aggregate.value) && values.first.nil?
               values[0] = values[0].to_f if aggregate.value == 'percentile_cont' && !values[0].is_a?(IntervalValue)
+              charge_sort_keys(values)
               collections.push(state[0] * aggregates.length + index, values)
               next
             end
@@ -496,8 +500,10 @@ module JedNative
             values = kernel ? kernel.call(self, row, @params) : aggregate.args.map { |argument| argument.kind == :star ? 1 : evaluate(argument, row) }
             charge if aggregate.value == 'string_agg' || aggregate.value.include?('object_agg') || AggregateExecution::PAIRS.include?(aggregate.value)
             orders = (aggregate.extra[:aggregate_order] || []).map { |argument, _| evaluate(argument, row) }
+            charge_sort_keys(orders)
             if aggregate.extra[:distinct]
               next if values.first.nil? && !aggregate.value.match?(/\A(?:array_agg|string_agg|json)/)
+              charge_hash_key(values.first)
               next unless seen.insert([state[0], index, *values])
             end
             unless orders.empty?

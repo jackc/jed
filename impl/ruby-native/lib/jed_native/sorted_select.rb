@@ -87,6 +87,7 @@ module JedNative
           next unless accepted
           sort_start = @cost if @explain_profile_frames
           values = key_kernel ? key_kernel.call(self, row, @params) : keys.map { |expression| evaluate(expression, row) }
+          charge_sort_keys(values)
           profile_accumulate(:sort, @cost - sort_start) if @explain_profile_frames
           next if capacity == 0
           entry = [row, values, ordinal]

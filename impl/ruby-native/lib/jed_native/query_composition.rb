@@ -70,6 +70,10 @@ module JedNative
       lrows, rrows = [left, right].map do |relation|
         relation.rows.map { |row| row.each_with_index.map { |value, index| cast_value(value, columns[index][:type]) } }
       end
+      unless operation == 'union' && stmt[:all]
+        lrows.each { |row| charge_hash_keys(row) }
+        rrows.each { |row| charge_hash_keys(row) }
+      end
       if @query_memory
         memory_owner = query_memory_owner
         [left, right].each do |relation|
@@ -213,6 +217,7 @@ module JedNative
       rows = relation.rows
       unless keys.empty?
         keyed = rows.each_with_index.map { |row, index| [row, keys.map { |key| evaluate(key, row) }, index] }
+        keyed.each { |_, values| charge_sort_keys(values) }
         keyed.sort! do |left, right|
           comparison = 0
           orders.each_with_index do |order, index|
