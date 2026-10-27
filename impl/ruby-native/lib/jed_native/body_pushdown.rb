@@ -93,7 +93,7 @@ module JedNative
     end
 
     def rewrite_body_predicate(query, indexed, output_types, equality_preserved)
-      return if query[:limit] || query[:offset] || query[:with]
+      return if query[:limit] || query[:offset] || query[:with] || query[:distinct_on]
       indices = body_slot_indices(indexed).uniq
       if %i[set_operation setop].include?(query[:kind])
         return if !equality_preserved && !(query[:op].to_s == 'union' && query[:all])

@@ -93,7 +93,7 @@ module JedNative
       end
       projections = statement[:columns] || []
       aliases = projections.to_h { |item| [item[:alias] || expression_name(item[:expr]), item[:expr]] }
-      if statement[:distinct]
+      if statement[:distinct] && !statement[:distinct_on]
         (statement[:order_by] || []).each do |order|
           key = order[:expr]
           next if key[:kind] == :literal && key[:value].is_a?(Integer)
@@ -143,6 +143,10 @@ module JedNative
       validator.call(statement[:windows])
       (statement[:order_by] || []).each do |order|
         key = order[:expr]
+        key = aliases[key[:name]] if key[:kind] == :column && !key[:table] && aliases[key[:name]]
+        validator.call(key)
+      end
+      (statement[:distinct_on] || []).each do |key|
         key = aliases[key[:name]] if key[:kind] == :column && !key[:table] && aliases[key[:name]]
         validator.call(key)
       end

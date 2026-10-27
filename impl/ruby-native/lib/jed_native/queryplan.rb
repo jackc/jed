@@ -247,6 +247,7 @@ module JedNative
       raise Error.new('42804', 'WHERE requires boolean') if predicate && !%w[boolean unknown].include?(predicate.type)
       node = stored ? plan_scan(stored, predicate, statement) : plan_node('Result', '-', 1, 0, [], :scan)
       streaming_order = node.access ? node.access[:order] : :blocking
+      streaming_order = :blocking if statement[:distinct_on]
       if %i[forward reverse].include?(streaming_order)
         node.detail += if %i[secondary secondary_interval].include?(node.access[:kind])
           "; ordered: index order: #{node.access[:name]}"
@@ -279,16 +280,19 @@ module JedNative
       if outputs.any? { |expression| expression_nodes(expression).any? { |part| part.kind == :window } } || !(statement[:windows] || {}).empty?
         raise Error.new('0A000', 'window EXPLAIN requires resolved window plan frames')
       end
-      node = plan_node('Distinct', '-', estimate_distinct_rows(node.rows, outputs), node.cost, [node], :distinct) if statement[:distinct]
+      distinct_on = statement[:distinct_on] && plan_distinct_on_keys(statement, projections, outputs, columns)
+      node = plan_node('Distinct', '-', estimate_distinct_rows(node.rows, outputs), node.cost, [node], :distinct) if statement[:distinct] && !distinct_on
       orders = statement[:order_by] || []
-      unless orders.empty? || %i[forward reverse].include?(streaming_order)
+      unless (orders.empty? && !distinct_on) || %i[forward reverse].include?(streaming_order)
         order_work = orders.sum do |order|
           expression = order[:expr]
           projection = expression[:kind] == :literal && expression[:value].is_a?(Integer) || expression[:kind] == :column && !expression[:table] && projections.any? { |item| (item[:alias] || expression_name(item[:expr])) == expression[:name] }
           projection ? 0 : expression_work(plan_compile(expression, columns))
         end
-        node = plan_node('Sort', "keys=#{orders.length}", node.rows, node.cost + order_work * node.rows, [node], :sort)
+        order_work += distinct_on[:work] if distinct_on
+        node = plan_node('Sort', "keys=#{orders.length + (distinct_on ? distinct_on[:appended] : 0)}", node.rows, node.cost + order_work * node.rows, [node], :sort)
       end
+      node = plan_node('Distinct', "on=#{distinct_on[:keys].length}", estimate_distinct_rows(node.rows, distinct_on[:keys]), node.cost, [node], :distinct) if distinct_on
       if statement[:limit] || statement[:offset]
         limit = statement[:limit] && plan_constant(plan_compile(statement[:limit], []))
         offset = statement[:offset] ? plan_constant(plan_compile(statement[:offset], [])) : 0
@@ -415,6 +419,26 @@ module JedNative
       return expression.flat_map { |part| expression_nodes(part) } if expression.is_a?(Array)
       return [] unless expression.is_a?(Expression)
       [expression] + (expression.args || []).flat_map { |argument| expression_nodes(argument) }
+    end
+
+    # DISTINCT ON's dedup keys and the ON keys its ORDER BY does not name,
+    # which are appended to the sort (grammar.md §11.1).
+    def plan_distinct_on_keys(statement, projections, outputs, scope)
+      resolve = lambda do |node|
+        if node[:kind] == :literal && node[:value].is_a?(Integer)
+          raise Error.new('42P10', "DISTINCT ON position #{node[:value]} is not in select list") unless node[:value].between?(1, outputs.length)
+          [outputs[node[:value] - 1], true]
+        elsif node[:kind] == :column && !node[:table] && (index = projections.index { |item| (item[:alias] || expression_name(item[:expr])) == node[:name] })
+          [outputs[index], true]
+        else
+          [plan_compile(node, scope), false]
+        end
+      end
+      identity = ->(expression) { expression.kind == :column ? [:slot, expression.value] : [:expr, aggregate_expression_key(expression)] }
+      keys = statement[:distinct_on].map { |node| resolve.call(node) }.uniq { |expression, _| identity.call(expression) }
+      ordered = (statement[:order_by] || []).map { |order| identity.call(resolve.call(order[:expr]).first) }
+      appended = keys.reject { |expression, _| ordered.include?(identity.call(expression)) }
+      { keys: keys.map(&:first), appended: appended.length, work: appended.sum { |expression, output| output ? 0 : expression_work(expression) } }
     end
 
     def expression_work(expression)

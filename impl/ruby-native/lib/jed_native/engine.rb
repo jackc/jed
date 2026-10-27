@@ -673,7 +673,8 @@ module JedNative
         return select(stmt[:query]) if stmt[:kind] == :with
         return select_values(stmt) if stmt[:kind] == :values
         return select_set(stmt) if %i[set_operation setop].include?(stmt[:kind])
-        raise Error.new('0A000', 'DISTINCT ON is not supported') if stmt[:distinct_on]
+        distinct_on = stmt[:distinct_on]
+        plain_distinct = stmt[:distinct] && !distinct_on
         from = stmt[:from] || []
         from = [from] unless from.is_a?(Array)
         raise Error.new('42601', 'SELECT * requires a FROM relation') if from.empty? && (stmt[:columns] || []).any? { |item| item.dig(:expr, :kind) == :star }
@@ -728,11 +729,12 @@ module JedNative
         projections = expand_stars(stmt[:columns] || stmt[:projections], rel.columns)
         compiled = projections.map { |p| compile(p[:expr], rel.columns) }
         group_nodes = respond_to?(:resolve_group_nodes) ? resolve_group_nodes(stmt, rel.columns) : (stmt[:group_by] || [])
-        grouped = !group_nodes.empty? || !!stmt[:having] || compiled.any? { |e| aggregate_expr?(e) } || contains_aggregate?(stmt[:windows])
+        grouped = !group_nodes.empty? || !!stmt[:having] || compiled.any? { |e| aggregate_expr?(e) } || contains_aggregate?(stmt[:windows]) ||
+                  (distinct_on || []).any? { |key| contains_aggregate?(key) }
         complex_groups = group_nodes.any? { |g| %i[grouping_sets rollup cube].include?(g[:kind]) }
         group_exprs = (complex_groups ? [] : group_nodes).map { |g| compile(g, rel.columns) }
         group_exprs.each { |expression| ensure_comparable_type(expression.type) }
-        compiled.each { |expression| ensure_comparable_type(expression.type) } if stmt[:distinct]
+        compiled.each { |expression| ensure_comparable_type(expression.type) } if plain_distinct
         validate_aggregate_scope(stmt, rel.columns, grouped) if respond_to?(:validate_aggregate_scope)
         contexts = if grouped && respond_to?(:build_aggregate_contexts)
           build_aggregate_contexts(stmt, rel, group_nodes)
@@ -756,17 +758,18 @@ module JedNative
         columns = projections.zip(compiled).map { |p, e| { name: p[:alias] || expression_name(p[:expr]), type: e.type } }
         prepare_window_values(stmt, rel.columns, contexts) if respond_to?(:prepare_window_values)
         profile_checkpoint(:window) if @explain_profile_frames
-        defer_projection = !stmt[:distinct] && (cursor_output? || !grouped && !contains_window?(stmt[:columns]))
+        # DISTINCT ON projects only the rows its dedup keeps (grammar.md §11.1).
+        defer_projection = !plain_distinct && (distinct_on || cursor_output? || !grouped && !contains_window?(stmt[:columns]))
         # A DISTINCT query sorts before it dedups, so its sort receives every
         # row (cost.md §3 "sort_key / hash_key").
-        distinct_sort = distinct_sort_keys(stmt, projections, columns, rel.columns) if stmt[:distinct]
+        distinct_sort = distinct_sort_keys(stmt, projections, columns, rel.columns) if plain_distinct
         if defer_projection
           output_owner = query_memory_owner if @query_memory && query_memory_collect_result?
           results = contexts.map { |row, group| [nil, row, group, {}] }
         elsif @query_memory
-          output_owner = query_memory_owner if stmt[:distinct] || query_memory_collect_result?
-          distinct_owner = query_memory_owner if stmt[:distinct]
-          seen = {} if stmt[:distinct]
+          output_owner = query_memory_owner if plain_distinct || query_memory_collect_result?
+          distinct_owner = query_memory_owner if plain_distinct
+          seen = {} if plain_distinct
           results = contexts.filter_map do |row, group|
             values = compiled.map { |e| evaluate(e, row, group) }
             if seen
@@ -780,12 +783,12 @@ module JedNative
             [values, row, group]
           end
           query_memory_release(distinct_owner) if distinct_owner
-          query_memory_release(rel) if stmt[:distinct]
+          query_memory_release(rel) if plain_distinct
         else
           results = contexts.map do |row, group|
             [compiled.map { |e| evaluate(e, row, group) }, row, group]
           end
-          if stmt[:distinct]
+          if plain_distinct
             results.each do |entry|
               distinct_sort&.each { |slot, expression| charge_sort_key(slot ? entry[0][slot] : evaluate(expression, entry[1], entry[2])) }
               charge_hash_keys(entry[0])
@@ -795,7 +798,7 @@ module JedNative
         end
         profile_checkpoint(:distinct) if @explain_profile_frames
         orders = stmt[:order_by] || []
-        unless orders.empty?
+        unless orders.empty? && !distinct_on
           order_exprs = orders.map do |order|
             node = order[:expr] || order
             if node[:kind] == :literal && node[:value].is_a?(Integer)
@@ -809,7 +812,9 @@ module JedNative
             end
           end
           order_exprs.each { |kind, expression, _| ensure_comparable_type(kind == :output ? columns[expression][:type] : expression.type) }
+          dedup_width = distinct_on_order(distinct_on, order_exprs, projections, compiled, columns, rel.columns) if distinct_on
           sort_memory_owner = query_memory_owner if @query_memory
+          keyed_ordinal = 0
           keyed = results.map do |entry|
             keys = order_exprs.map do |kind, expression, _|
               if kind == :output && defer_projection
@@ -821,7 +826,7 @@ module JedNative
               end
             end
             query_memory_add(sort_memory_owner, query_memory_collation_bytes(keys, sort_memory_owner)) if @query_memory
-            [entry, keys]
+            [entry, keys, keyed_ordinal += 1]
           end
           keyed.each { |_, keys| charge_sort_keys(keys) } unless distinct_sort
           keyed.sort! do |a, b|
@@ -830,7 +835,15 @@ module JedNative
               comparison = order_compare(a[1][i], b[1][i], order)
               break unless comparison.zero?
             end
-            comparison
+            comparison.zero? ? a[2] <=> b[2] : comparison
+          end
+          if dedup_width
+            previous = nil
+            keyed.select! do |_, keys, _|
+              duplicate = previous && dedup_width.times.all? { |i| order_compare(keys[i], previous[i], order_exprs[i][2]).zero? }
+              previous = keys unless duplicate
+              !duplicate
+            end
           end
           results = keyed.map(&:first)
           query_memory_release(sort_memory_owner) if @query_memory
@@ -887,6 +900,57 @@ module JedNative
         @ctes = old_ctes
         @window_values = old_windows
       end
+    end
+
+    # Resolves DISTINCT ON keys like ORDER BY keys, checks that they lead the
+    # ORDER BY (42P10), appends unmatched keys to the sort, and returns the
+    # dedup width: the leading run of sort keys that are ON keys.
+    def distinct_on_order(keys, order_exprs, projections, compiled, columns, input_columns)
+      identity = lambda do |kind, expression|
+        expression = compiled[expression] if kind == :output
+        expression.kind == :column ? [:slot, expression.value] : [:expr, aggregate_expression_key(expression)]
+      end
+      resolved = keys.map do |node|
+        if node[:kind] == :literal && node[:value].is_a?(Integer)
+          unless node[:value].between?(1, columns.length)
+            raise Error.new('42P10', "DISTINCT ON position #{node[:value]} is not in select list")
+          end
+          [:output, node[:value] - 1, {}]
+        elsif node[:kind] == :column && !node[:table] && (index = columns.index { |column| column[:name] == node[:name] })
+          matches = columns.each_index.select { |ordinal| columns[ordinal][:name] == node[:name] }
+          if matches.map { |ordinal| projections[ordinal][:expr] }.uniq.length > 1
+            raise Error.new('42702', "DISTINCT ON \"#{node[:name]}\" is ambiguous")
+          end
+          [:output, index, {}]
+        else
+          [:input, compile(node, input_columns), {}]
+        end
+      end
+      resolved.each { |kind, expression, _| ensure_comparable_type(kind == :output ? columns[expression][:type] : expression.type) }
+      pending = resolved.map { |kind, expression, _| identity.call(kind, expression) }.uniq
+      unmatched = false
+      order_exprs.each do |kind, expression, _|
+        found = pending.include?(identity.call(kind, expression))
+        if found && unmatched
+          raise Error.new('42P10', 'SELECT DISTINCT ON expressions must match initial ORDER BY expressions')
+        end
+        unmatched ||= !found
+      end
+      sorted = order_exprs.map { |kind, expression, _| identity.call(kind, expression) }
+      width = 0
+      width += 1 while width < sorted.length && pending.include?(sorted[width])
+      missing = pending - sorted.take(width)
+      unless missing.empty?
+        raise Error.new('42P10', 'SELECT DISTINCT ON expressions must match initial ORDER BY expressions') if unmatched
+        resolved.each do |entry|
+          key = identity.call(entry[0], entry[1])
+          next unless missing.include?(key)
+          missing.delete(key)
+          order_exprs << entry
+          width += 1
+        end
+      end
+      width
     end
 
     def distinct_sort_keys(stmt, projections, columns, input_columns)
