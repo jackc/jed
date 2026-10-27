@@ -2373,8 +2373,9 @@ export class Database {
 
   // integrityCheck checks database name — `main` or an attachment, by exact name — and returns its
   // findings (spec/design/integrity-check.md): every page the pinned generation reaches is read and
-  // verified, the invariants between pages are checked, and under level `full` every index is probed
-  // for every entry its table derives. A finding is a fact about the database, never an
+  // verified, the invariants between pages are checked, under level `full` every index is probed
+  // for every entry its table derives, and under opts.constraints declared constraints are re-checked
+  // against the stored rows. A finding is a fact about the database, never an
   // error: the call fails only with 42704 (an unknown name, or `temp`), 57014 when opts.signal or the
   // worker's cancellation aborts it, or an I/O error. It pins the committed snapshot as a read session
   // does and never takes the writer gate, so commits proceed and are not seen. Not metered and not

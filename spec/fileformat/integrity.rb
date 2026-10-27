@@ -8,7 +8,7 @@
 # list's chain must load (as `open` requires), and everything after that is a finding, not an error.
 # It covers the checks it can evaluate without SQL. Index agreement for an expression or partial index
 # whose text falls outside the subset expr.rb evaluates is listed under `reference_unchecked` (not part
-# of the cross-core report), as are constraints until slice I4.
+# of the cross-core report), as is a constraint the reference cannot evaluate (integrity-check.md §6).
 
 require "json"
 
@@ -41,9 +41,13 @@ class IntegrityCheck
     end
   end
 
-  def initialize(image, level: "full", max_findings: 100)
+  def initialize(image, level: "full", max_findings: 100, constraints: false)
     @image = image
     @level = level
+    @constraints = constraints
+    @tables = {}
+    @index_clean = {}
+    @index_entries = {}
     @max = max_findings
     @findings = []
     @skipped = []
@@ -66,7 +70,9 @@ class IntegrityCheck
     catalog = load_catalog
     catch(:truncated) do
       check_sequences(catalog[:sequences])
-      catalog[:tables].sort_by { |t| t[:name].b }.each { |t| check_table(t) }
+      tables = catalog[:tables].sort_by { |t| t[:name].b }
+      tables.each { |t| check_table(t) }
+      tables.each { |t| check_constraints(t) } if @constraints
       check_free_list
       if !@damaged && @meta[:live] != @reached.size
         add("live_count_mismatch", detail: "meta records #{@meta[:live]} live pages, #{@reached.size} are reachable")
@@ -181,6 +187,7 @@ class IntegrityCheck
                                 detail: "catalog records #{t[:row_count]} rows, the tree holds #{rows.size}")
     end
     @damaged ||= damaged
+    @tables[t[:name]] = { table: t, rows: damaged ? nil : rows }
     t[:indexes].sort_by { |ix| ix[:name].b }.each { |ix| check_index(t, ix, damaged ? nil : rows) }
   end
 
@@ -247,6 +254,8 @@ class IntegrityCheck
       count = ix[:kind] == "gin" ? walk.postings : entries.size
     end
     @damaged ||= !readable
+    @index_clean[ix[:name]] = readable && @findings.size == before
+    @index_entries[ix[:name]] = entries
     return unless @level == "full"
 
     return skip(ix[:name], "table_unreadable") if rows.nil?
@@ -344,6 +353,222 @@ class IntegrityCheck
       @entry_sets ||= {}
       (@entry_sets[ix[:name]] ||= entries.to_set).include?(entry)
     end
+  end
+
+  # --- constraints (integrity-check.md §3.4) ---------------------------------------------------------
+
+  def check_constraints(t)
+    rows = @tables[t[:name]][:rows]
+    named = (t[:checks] || []).map { |c| [c[:name], 0, c] } +
+            t[:indexes].select { |ix| ix[:unique] }.map { |ix| [ix[:name], 1, ix] } +
+            (t[:fks] || []).map { |fk| [fk[:name], 2, fk] }
+    named = named.sort_by { |name, kind, _| [name.b, kind] }
+    return ([t[:name]] + named.map(&:first)).each { |o| skip(o, "table_unreadable") } if rows.nil?
+
+    check_columns(t, rows)
+    named.each do |name, kind, c|
+      case kind
+      when 0 then check_check(t, rows, c)
+      when 1 then check_unique(t, c)
+      else check_foreign_key(t, rows, c)
+      end
+    rescue StoredExpr::Unsupported
+      @unchecked << { object: name, check: "constraints" }
+    end
+  end
+
+  # Findings gathered before reporting, so a value outside what the reference evaluates leaves the
+  # whole object unchecked rather than half-reported.
+  def report_all(found)
+    found.each { |kind, object, key, detail| add(kind, object: object, key: key, detail: detail) }
+  end
+
+  def check_columns(t, rows)
+    found = []
+    rows.each do |key, row|
+      t[:columns].each_with_index do |c, ci|
+        v = row[ci]
+        if v.nil?
+          if c[:not_null] || c[:pk]
+            found << ["not_null_violation", t[:name], key, "column #{c[:name]} is NULL"]
+          end
+        elsif !typmod_fixed?(c, v)
+          found << ["typmod_violation", t[:name], key, "column #{c[:name]} exceeds its typmod"]
+        end
+      end
+    end
+    report_all(found)
+  rescue StoredExpr::Unsupported
+    @unchecked << { object: t[:name], check: "constraints" }
+  end
+
+  # Whether the column's write-time typmod coercion leaves the stored value unchanged (and does not
+  # raise).
+  def typmod_fixed?(c, v)
+    case c[:type]
+    when "text"
+      c[:varchar_len].nil? || v.length <= c[:varchar_len]
+    when "decimal"
+      return true if c[:precision].nil?
+
+      m = v.match(/\A-?(\d+)(?:\.(\d+))?\z/) or raise StoredExpr::Unsupported, "decimal #{v}"
+      int_digits = m[1].sub(/\A0+/, "").size
+      (m[2] || "").size == c[:scale] && int_digits <= c[:precision] - c[:scale]
+    when "timestamp", "timestamptz"
+      p = c[:temporal]&.dig(:precision)
+      return true if p.nil? || v >= 2**63 - 1 || v <= -(2**63)
+
+      unit = 10**(6 - p)
+      half = unit / 2
+      rounded = v >= 0 ? (v + half) / unit * unit : -((-v + half) / unit * unit)
+      rounded == v
+    when "interval"
+      raise StoredExpr::Unsupported, "interval typmod" if c[:temporal]
+
+      true
+    else
+      true
+    end
+  end
+
+  def check_check(t, rows, c)
+    ast = StoredExpr.parse(c[:expr])
+    found = []
+    rows.each do |key, row|
+      ok = StoredExpr.truth(StoredExpr.value_of(ast, t[:columns], row))
+      found << ["check_violation", c[:name], key, "the row fails the check"] if ok == false
+    rescue StoredExpr::EvalError => e
+      found << ["check_error", c[:name], key, "#{e.code}: #{e.message}"]
+    end
+    report_all(found)
+  end
+
+  # Adjacent entries of a unique index with equal, NULL-free key prefixes.
+  def check_unique(t, ix)
+    return skip(ix[:name], "index_unreadable") unless @index_clean[ix[:name]]
+
+    types = index_element_types(t, ix)
+    orders = index_orders(ix)
+    found = []
+    prev = nil
+    @index_entries[ix[:name]].each do |entry|
+      prefix, has_null, skey = split_index_entry(entry, types, orders)
+      if prev && !has_null && prefix == prev
+        found << ["unique_violation", ix[:name], skey, "the key repeats the previous entry's"]
+      end
+      prev = has_null ? nil : prefix
+    end
+    report_all(found)
+  end
+
+  # Each key element's type: a column's, or an expression's result type.
+  def index_element_types(t, ix)
+    ix[:cols].map do |c|
+      if c.is_a?(Hash)
+        StoredExpr.value_of(StoredExpr.parse(c[:expr]), t[:columns], Array.new(t[:columns].size)).first
+      else
+        coll = t[:columns][c][:collation]
+        raise StoredExpr::Unsupported, "collated key" if coll && coll != "C"
+
+        t[:columns][c][:type]
+      end
+    end
+  end
+
+  # [key prefix, whether an element is NULL, storage key] of an ordered index entry.
+  def split_index_entry(entry, types, orders)
+    pos = 0
+    has_null = false
+    types.each_with_index do |type, i|
+      present, null = ordered_slot_tags(*orders[i])
+      tag = entry.getbyte(pos)
+      pos += 1
+      if tag == null
+        has_null = true
+        next
+      end
+      raise StoredExpr::Unsupported, "bad slot tag" unless tag == present
+
+      pos = skip_key_body(type, entry, pos, orders[i][0])
+    end
+    [entry.byteslice(0, pos), has_null, entry.byteslice(pos..)]
+  end
+
+  def skip_key_body(type, buf, pos, desc)
+    case type
+    when "text", "bytea"
+      flip = desc ? 0xFF : 0
+      loop do
+        b = buf.getbyte(pos) ^ flip
+        pos += 1
+        next unless b.zero?
+
+        n = buf.getbyte(pos) ^ flip
+        pos += 1
+        return pos if n == 0x01
+      end
+    when "uuid" then pos + 16
+    when "boolean" then pos + 1
+    else
+      w = WIDTH[type] or raise StoredExpr::Unsupported, "key of #{type}"
+      pos + w
+    end
+  end
+
+  def check_foreign_key(t, rows, fk)
+    ref = @tables[fk[:ref_table]]
+    return skip(fk[:name], "table_unreadable") if ref[:rows].nil?
+
+    rt = ref[:table]
+    # The referenced key as the write path picks it: the primary key over the same column set, else
+    # the first unique index (name order) over exactly that set.
+    by_pk = rt[:pk].sort == fk[:ref].sort
+    via = by_pk ? nil : rt[:indexes].sort_by { |ix| ix[:name].b }.find { |ix| ix[:unique] && ix[:cols].sort == fk[:ref].sort }
+    raise StoredExpr::Unsupported, "foreign key target" if via.nil? && !by_pk
+    return skip(fk[:name], "index_unreadable") if via && !@index_clean[via[:name]]
+
+    target = via ? via[:cols] : rt[:pk]
+
+    full = (fk[:actions] & 0x40) != 0
+    keys = via ? @index_entries[via[:name]] : ref[:rows].map(&:first).to_set
+    found = []
+    rows.each do |key, row|
+      vals = fk[:local].map { |ci| row[ci] }
+      nulls = vals.count(&:nil?)
+      next if nulls == vals.size || (nulls.positive? && !full)
+
+      ok = nulls.zero? && begin
+        bodies = target.map do |rci|
+          i = fk[:ref].index(rci)
+          ref_key_body(rt[:columns][rci], t[:columns][fk[:local][i]], vals[i])
+        end
+        if bodies.include?(nil)
+          false
+        elsif via
+          prefix = bodies.each_with_index.map { |b, i| ordered_slot_tags(*index_orders(via)[i])[0].chr.b + b }.join.b
+          keys.any? { |e| e.start_with?(prefix) }
+        else
+          keys.include?(bodies.join.b)
+        end
+      end
+      found << ["foreign_key_violation", fk[:name], key, "no referenced row"] unless ok
+    end
+    report_all(found)
+  end
+
+  # The referenced column's key body for a referencing value; nil when the value is outside the
+  # referenced type (no row can hold it).
+  def ref_key_body(ref_col, local_col, v)
+    coll = ref_col[:collation]
+    raise StoredExpr::Unsupported, "collated foreign key" if coll && coll != "C"
+
+    if StoredExpr::INT_RANK.key?(ref_col[:type])
+      raise StoredExpr::Unsupported, "foreign key over #{local_col[:type]}" unless StoredExpr::INT_RANK.key?(local_col[:type])
+      return nil unless StoredExpr::INT_RANGE[ref_col[:type]].cover?(v)
+    elsif ref_col[:type] != local_col[:type]
+      raise StoredExpr::Unsupported, "foreign key from #{local_col[:type]} to #{ref_col[:type]}"
+    end
+    key_body(ref_col[:type], v)
   end
 
   def skip(object, reason)
@@ -629,6 +854,7 @@ end
 
 def integrity_check_files(args)
   level = args.delete("--quick") ? "quick" : "full"
+  constraints = !args.delete("--constraints").nil?
   max = 100
   if (i = args.index("--max-findings"))
     max = Integer(args[i + 1])
@@ -636,7 +862,7 @@ def integrity_check_files(args)
   end
   failed = false
   args.each do |path|
-    report = IntegrityCheck.new(File.binread(path), level: level, max_findings: max).run
+    report = IntegrityCheck.new(File.binread(path), level: level, max_findings: max, constraints: constraints).run
     failed ||= !report[:findings].empty?
     puts JSON.generate({ file: path, **report })
   rescue StandardError => e
@@ -681,6 +907,40 @@ INTEGRITY_U_TABLE = {
   end
 }.freeze
 
+# The I4 tables: a parent `p` with NOT NULL, varchar, decimal and timestamp typmods, two CHECKs and two
+# UNIQUE constraints, and a child `c` with foreign keys to p's primary key, to its unique code, and
+# (MATCH FULL) to its unique (pid, code). A file the engine would never write: `bad` lists rows that
+# break constraints (integrity_constraint_tables), with every index built from the stored rows.
+def integrity_constraint_tables(bad: {}, child_bad: {})
+  p_rows = (1..30).map do |i|
+    [i, "c#{i}", "n#{i}", format("%d.25", i), i * 1_000_000, i]
+  end
+  bad.each { |i, changes| changes.each { |ci, v| p_rows[i - 1][ci] = v } }
+  c_rows = (1..30).map do |i|
+    ab = (i % 5).zero? ? [nil, nil] : [i, "c#{i}"]
+    [i, (i % 30) + 1, "c#{((i * 7) % 30) + 1}", *ab]
+  end
+  child_bad.each { |i, changes| changes.each { |ci, v| c_rows[i - 1][ci] = v } }
+  [{ name: "c",
+     columns: [col("id", "i32", pk: true), col("pid", "i32"), col("pcode", "text"), col("a", "i32"),
+               col("b", "text")],
+     fks: [{ name: "c_ab_fkey", local: [3, 4], ref_table: "p", ref: [0, 1], actions: 0x40 },
+           { name: "c_pcode_fkey", local: [2], ref_table: "p", ref: [1] },
+           { name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0] }],
+     rows: c_rows },
+   { name: "p",
+     columns: [col("pid", "i32", pk: true), col("code", "text"), col("name", "text", not_null: true, varchar_len: 5),
+               col("amt", "decimal", precision: 6, scale: 2), col("ts", "timestamp", temporal: temporal(precision: 0)),
+               col("qty", "i32")],
+     checks: [{ name: "p_qty_check", expr: "qty >= 0" }, { name: "p_qty_next_check", expr: "qty + 1 > 0" }],
+     indexes: [{ name: "p_code_key", cols: [1], unique: true, constraint: true },
+               { name: "p_pid_code_key", cols: [0, 1], unique: true, constraint: true }],
+     rows: p_rows }]
+end
+
+INTEGRITY_CONSTRAINT_RUNS = [{ level: "quick", max_findings: 100, constraints: true },
+                             { level: "full", max_findings: 100, constraints: true }].freeze
+
 INTEGRITY_DEFAULT_RUNS = [{ level: "quick", max_findings: 100 }, { level: "full", max_findings: 100 }].freeze
 
 INTEGRITY_FIXTURES = [
@@ -704,7 +964,21 @@ INTEGRITY_FIXTURES = [
   { name: "gist_bound_shrunk", damage: :gist_bound_shrunk, table: INTEGRITY_U_TABLE },
   { name: "expr_entry_wrong", damage: :expr_entry_wrong, table: INTEGRITY_U_TABLE },
   { name: "expr_overflow", damage: :expr_overflow, table: INTEGRITY_U_TABLE },
-  { name: "partial_entry_extra", damage: :partial_entry_extra, table: INTEGRITY_U_TABLE }
+  { name: "partial_entry_extra", damage: :partial_entry_extra, table: INTEGRITY_U_TABLE },
+  { name: "constraints_clean", damage: nil, tables: integrity_constraint_tables, runs: INTEGRITY_CONSTRAINT_RUNS },
+  { name: "constraints_broken", damage: nil, runs: INTEGRITY_CONSTRAINT_RUNS + [{ level: "quick", max_findings: 3, constraints: true }],
+    tables: integrity_constraint_tables(
+      # 3: NULL name; 4: name over varchar(5); 5: amt scale 1; 6: amt over decimal(6,2);
+      # 7: ts not whole seconds; 8: qty fails p_qty_check; 9: qty + 1 overflows; 10: code repeats 11's.
+      bad: { 3 => { 2 => nil }, 4 => { 2 => "toolong" }, 5 => { 3 => "5.5" }, 6 => { 3 => "12345.25" },
+             7 => { 4 => 7_500_000 }, 8 => { 5 => -1 }, 9 => { 5 => 2**31 - 1 }, 10 => { 1 => "c11" } },
+      # 2: no parent 99; 3: no code zz; 4: MATCH FULL with b NULL; 6: (6, c7) is no parent's pair.
+      child_bad: { 2 => { 1 => 99 }, 3 => { 2 => "zz" }, 4 => { 4 => nil }, 6 => { 4 => "c7" } }
+    ) },
+  { name: "constraints_parent_unreadable", damage: :parent_leaf_checksum, tables: integrity_constraint_tables,
+    runs: INTEGRITY_CONSTRAINT_RUNS },
+  { name: "constraints_unique_unreadable", damage: :unique_keys_swapped, tables: integrity_constraint_tables,
+    runs: INTEGRITY_CONSTRAINT_RUNS }
 ].freeze
 
 # Table and index root pages by name, from a plaintext from-scratch catalog of tables only.
@@ -748,9 +1022,10 @@ end
 
 def integrity_fixture_image(fx)
   ps = 256
-  image = build_image([], [], [fx[:table] || INTEGRITY_TABLE], ps)
+  image = build_image([], [], fx[:tables] || [fx[:table] || INTEGRITY_TABLE], ps)
   roots = integrity_roots(image, ps)
   return integrity_u_damage(image, ps, roots, fx[:damage]) if roots.key?("u")
+  return integrity_constraint_damage(image, ps, roots, fx[:damage]) if roots.key?("p")
 
   table_leaves = integrity_leaves(image, ps, roots["t"])
   index_leaves = integrity_leaves(image, ps, roots["t_v_idx"])
@@ -921,9 +1196,32 @@ def integrity_u_damage(image, ps, roots, damage)
   image
 end
 
+def integrity_constraint_damage(image, ps, roots, damage)
+  case damage
+  when nil
+    nil
+  when :parent_leaf_checksum
+    # The last byte of p's second leaf flips: p is unreadable, so its constraints and the foreign keys
+    # into it are skipped.
+    leaf = integrity_leaves(image, ps, roots["p"])[1]
+    image.setbyte(leaf * ps + ps - 1, image.getbyte(leaf * ps + ps - 1) ^ 0x01)
+  when :unique_keys_swapped
+    # p_code_key's second leaf stores its first two entries in the wrong order: its uniqueness and
+    # c_pcode_fkey, which looks codes up through it, are skipped.
+    leaf = integrity_leaves(image, ps, roots["p_code_key"])[1]
+    keys = integrity_index_keys(image, ps, leaf)
+    keys[0], keys[1] = keys[1], keys[0]
+    integrity_write_index_leaf(image, ps, leaf, keys)
+  else
+    raise "unknown integrity damage #{damage}"
+  end
+  image
+end
+
 def integrity_expected(fx, image)
   runs = (fx[:runs] || INTEGRITY_DEFAULT_RUNS).map do |run|
-    report = IntegrityCheck.new(image, level: run[:level], max_findings: run[:max_findings]).run
+    report = IntegrityCheck.new(image, level: run[:level], max_findings: run[:max_findings],
+                                constraints: run[:constraints] || false).run
     { **run, report: integrity_contract(report) }
   end
   "#{JSON.pretty_generate({ fixture: "#{fx[:name]}.jed", runs: runs })}\n"
@@ -983,14 +1281,15 @@ def verify_integrity(goldens)
     json = File.join(INTEGRITY_DIR, "#{fx[:name]}.json")
     fail!("integrity/#{fx[:name]}.json: missing or stale (regenerate)") unless File.exist?(json) && File.read(json) == integrity_expected(fx, image)
     (fx[:runs] || INTEGRITY_DEFAULT_RUNS).each do |run|
-      reports << [fx[:name], IntegrityCheck.new(image, level: run[:level], max_findings: run[:max_findings]).run]
+      reports << [fx[:name], IntegrityCheck.new(image, level: run[:level], max_findings: run[:max_findings],
+                                constraints: run[:constraints] || false).run]
     end
   end
   verify_integrity_registry(reports)
   goldens.each do |fx|
     image = File.binread(File.join(fixtures_dir, fx[:file]))
     %w[quick full].each do |level|
-      report = IntegrityCheck.new(image, level: level, max_findings: 0).run
+      report = IntegrityCheck.new(image, level: level, max_findings: 0, constraints: level == "full").run
       fail!("#{fx[:file]}: #{level} integrity check reports #{report[:findings].first}") unless report[:findings].empty?
     end
   end

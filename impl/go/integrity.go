@@ -45,6 +45,10 @@ const defaultIntegrityMaxFindings = 100
 type IntegrityCheckOptions struct {
 	// Level is IntegrityFull (the zero value) or IntegrityQuick.
 	Level IntegrityLevel
+	// Constraints also re-checks declared constraints against the stored rows (§3.4), independent of
+	// Level: NOT NULL and column typmods, CHECK, uniqueness of every unique B-tree index, and foreign
+	// keys. Off by default: a CHECK may need a host function or loaded data the handle lacks.
+	Constraints bool
 	// MaxFindings stops the check after this many findings, setting IntegrityReport.Truncated. Zero is
 	// the default limit of 100; a negative value (IntegrityUnlimited) sets no limit. (The design's
 	// max_findings spells "no limit" as 0; Go keeps the zero value for the default.)
@@ -100,7 +104,9 @@ func (r IntegrityReport) OK() bool { return len(r.Findings) == 0 && !r.Truncated
 // manifest, and catalog; walks every table, index, and overflow chain, checking page verification,
 // node types, tree shape, key order, stored values, primary keys, and row counts; checks the free list
 // and the live page count; and, at IntegrityFull, that each index (B-tree, expression, partial, GIN,
-// GiST) holds exactly the entries the write path derives from its table's rows. Pages come through
+// GiST) holds exactly the entries the write path derives from its table's rows. With
+// opts.Constraints it then re-checks every table's declared constraints against its rows (NOT NULL,
+// typmods, CHECK, unique indexes, foreign keys) as their own stage. Pages come through
 // the handle's pager, so a page cached since it was verified is not re-read; a host that wants every
 // byte read from storage checks a freshly opened handle. It never writes.
 //
@@ -362,6 +368,12 @@ type integrityChecker struct {
 	report    IntegrityReport
 	// eng is the transient engine index agreement resolves and evaluates definitions through.
 	eng *engine
+	// constraints runs the constraint stage (§3.4, §4 step 3).
+	constraints bool
+	// tableUnreadable records, per table, that its tree left rows unread; indexClean, per index, that
+	// its structural walk reported nothing. The constraint stage's skips read both (§3.5).
+	tableUnreadable map[string]bool
+	indexClean      map[string]bool
 }
 
 func newIntegrityChecker(ctx context.Context, db string, opts IntegrityCheckOptions, snap *snapshot, paging *sharedPaging, gen integrityGeneration) *integrityChecker {
@@ -384,6 +396,10 @@ func newIntegrityChecker(ctx context.Context, db string, opts IntegrityCheckOpti
 		pcap:    pcap,
 		first:   pcap.firstBody(),
 		reached: make([]uint64, (uint64(gen.meta.pageCount)+63)/64),
+
+		constraints:     opts.Constraints,
+		tableUnreadable: map[string]bool{},
+		indexClean:      map[string]bool{},
 	}
 }
 
@@ -417,6 +433,13 @@ func (k *integrityChecker) run(generation func() error) (IntegrityReport, error)
 		for _, name := range names {
 			if err := k.checkTable(name); err != nil {
 				return err
+			}
+		}
+		if k.constraints {
+			for _, name := range names {
+				if err := k.checkConstraints(name); err != nil {
+					return err
+				}
 			}
 		}
 		if err := k.checkFreeList(); err != nil {
@@ -717,6 +740,7 @@ func (k *integrityChecker) checkTable(name string) error {
 		}
 	}
 	k.damaged = k.damaged || tableDamaged
+	k.tableUnreadable[name] = tableDamaged
 	indexes := append([]indexDef(nil), table.Indexes...)
 	sort.Slice(indexes, func(a, b int) bool { return indexes[a].Name < indexes[b].Name })
 	for _, def := range indexes {
@@ -764,6 +788,7 @@ func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls 
 		}
 	}
 	k.damaged = k.damaged || !readable
+	k.indexClean[def.Name] = readable && len(k.report.Findings) == before
 	if !k.full {
 		return nil
 	}
@@ -888,30 +913,8 @@ func (k *integrityChecker) resolveForAgreement(table *catTable, def indexDef) (r
 	}
 	// The collations the index's keys encode under or its expressions compare with: a key column's,
 	// an expression key's derived collation, and every column an expression or the predicate reads.
-	unavailable := func(name string) bool {
-		if name == "" {
-			return false
-		}
-		if _, _, _, _, skewed := k.snap.collationSkew(name); skewed {
-			return true
-		}
-		return env.collation(name) == nil
-	}
-	var refs func(node *rExpr) bool
-	refs = func(node *rExpr) bool {
-		if node == nil {
-			return false
-		}
-		if node.kind == reColumn && node.index < len(table.Columns) && unavailable(table.Columns[node.index].Collation) {
-			return true
-		}
-		for _, child := range rexprChildren(node) {
-			if refs(child) {
-				return true
-			}
-		}
-		return false
-	}
+	unavailable := k.collationUnavailable
+	refs := func(node *rExpr) bool { return k.readsUnavailableCollation(table, node) }
 	for _, key := range rindex.Keys {
 		if key.Expr == nil {
 			if unavailable(table.Columns[key.Col].Collation) {
@@ -927,6 +930,35 @@ func (k *integrityChecker) resolveForAgreement(table *catTable, def indexDef) (r
 		return resolvedIndex{}, IntegritySkipMissingLoadedData, nil
 	}
 	return rindex, "", nil
+}
+
+// collationUnavailable reports whether the named collation (non-empty) is not loaded, or is loaded at
+// another version than the catalog pins (§3.5 missing_loaded_data).
+func (k *integrityChecker) collationUnavailable(name string) bool {
+	if name == "" {
+		return false
+	}
+	if _, _, _, _, skewed := k.snap.collationSkew(name); skewed {
+		return true
+	}
+	return k.snap.env.collation(name) == nil
+}
+
+// readsUnavailableCollation reports whether the resolved expression reads a column of table whose
+// collation is unavailable.
+func (k *integrityChecker) readsUnavailableCollation(table *catTable, node *rExpr) bool {
+	if node == nil {
+		return false
+	}
+	if node.kind == reColumn && node.index < len(table.Columns) && k.collationUnavailable(table.Columns[node.index].Collation) {
+		return true
+	}
+	for _, child := range rexprChildren(node) {
+		if k.readsUnavailableCollation(table, child) {
+			return true
+		}
+	}
+	return false
 }
 
 // ginHolds reports whether the GIN index holds the posting (term, key), found as its maintenance

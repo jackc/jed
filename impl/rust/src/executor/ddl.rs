@@ -127,6 +127,26 @@ fn verify_index_host_deps(
     Ok(())
 }
 
+/// Whether `node` reads a column of `table` whose collation `unavailable` reports (the integrity
+/// check's `missing_loaded_data`, spec/design/integrity-check.md §3.5).
+fn reads_unavailable_collation(
+    node: &RExpr,
+    table: &Table,
+    unavailable: &dyn Fn(Option<&str>) -> bool,
+) -> bool {
+    if let RExpr::Column(i) = node
+        && table
+            .columns
+            .get(*i)
+            .is_some_and(|c| unavailable(c.collation.as_deref()))
+    {
+        return true;
+    }
+    estimator_expression_children(node)
+        .into_iter()
+        .any(|child| reads_unavailable_collation(child, table, unavailable))
+}
+
 /// Why the integrity check cannot derive an index's entries in this binary and environment
 /// (spec/design/integrity-check.md §3.5), in skip precedence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4878,39 +4898,16 @@ impl Engine {
         // The collations the index's keys encode under or its expressions compare with — a key
         // column's, an expression key's derived collation, and every column an expression key or the
         // predicate reads — must be loaded at the catalog's pinned version (`C` never counts).
-        let unavailable = |name: Option<&str>| match name {
-            None | Some("C") => false,
-            Some(name) => {
-                self.committed.collation_skew(name).is_some()
-                    || self.session.env.collation(name).is_none()
-            }
-        };
-        fn reads_unavailable(
-            node: &RExpr,
-            table: &Table,
-            unavailable: &dyn Fn(Option<&str>) -> bool,
-        ) -> bool {
-            if let RExpr::Column(i) = node
-                && table
-                    .columns
-                    .get(*i)
-                    .is_some_and(|c| unavailable(c.collation.as_deref()))
-            {
-                return true;
-            }
-            estimator_expression_children(node)
-                .into_iter()
-                .any(|child| reads_unavailable(child, table, unavailable))
-        }
+        let unavailable = |name: Option<&str>| self.collation_unavailable(name);
         let missing = keys.iter().any(|k| match k {
             ResolvedKey::Column(ci) => unavailable(table.columns[*ci].collation.as_deref()),
             ResolvedKey::Expr(rexpr, _, coll) => {
                 unavailable(coll.as_ref().map(|c| c.name.as_str()))
-                    || reads_unavailable(rexpr, table, &unavailable)
+                    || reads_unavailable_collation(rexpr, table, &unavailable)
             }
         }) || predicate
             .as_ref()
-            .is_some_and(|p| reads_unavailable(p, table, &unavailable));
+            .is_some_and(|p| reads_unavailable_collation(p, table, &unavailable));
         if missing {
             return Ok(Err(IndexDeriveSkip::LoadedData));
         }
@@ -4922,6 +4919,73 @@ impl Engine {
             keys,
             predicate,
         }))
+    }
+
+    /// Whether collation `name` is not loaded at the catalog's pinned version (`C` and no collation
+    /// never count) — the integrity check's `missing_loaded_data` (spec/design/integrity-check.md
+    /// §3.5).
+    pub(crate) fn collation_unavailable(&self, name: Option<&str>) -> bool {
+        match name {
+            None | Some("C") => false,
+            Some(name) => {
+                self.committed.collation_skew(name).is_some()
+                    || self.session.env.collation(name).is_none()
+            }
+        }
+    }
+
+    /// Resolve a `CHECK` for the integrity check's constraint pass (spec/design/integrity-check.md
+    /// §3.4, §3.5): the write path's resolution ([`resolve_checks`](Self::resolve_checks)), except
+    /// that the reasons this environment cannot evaluate it are told apart, as for an index — stored
+    /// text this binary does not parse, then a host function not registered at the pinned component
+    /// and version, then a collation of a column it reads not loaded at the pinned version. Any other
+    /// resolution failure fails the call.
+    pub(crate) fn resolve_check_for_check(
+        &self,
+        table: &Table,
+        check: &CheckConstraint,
+    ) -> Result<std::result::Result<RExpr, IndexDeriveSkip>> {
+        if check.unparsed {
+            return Ok(Err(IndexDeriveSkip::Unparsable));
+        }
+        let scope = Scope::single(self, table);
+        let params = &mut ParamTypes::default();
+        let node = match resolve(&scope, &check.expr, None, &mut AggCtx::Forbidden, params) {
+            Ok((node, _)) => node,
+            Err(e) if e.state == SqlState::UndefinedFunction => {
+                return Ok(Err(IndexDeriveSkip::HostFunction));
+            }
+            Err(e) if e.state == SqlState::CollationVersionMismatch => {
+                return Ok(Err(IndexDeriveSkip::LoadedData));
+            }
+            Err(e) => return Err(e),
+        };
+        let reg = self.session.env.functions();
+        if verify_check_host_deps(&check.name, &node, reg, &check.host_deps).is_err() {
+            return Ok(Err(IndexDeriveSkip::HostFunction));
+        }
+        let unavailable = |name: Option<&str>| self.collation_unavailable(name);
+        if reads_unavailable_collation(&node, table, &unavailable) {
+            return Ok(Err(IndexDeriveSkip::LoadedData));
+        }
+        Ok(Ok(node))
+    }
+
+    /// Evaluate a resolved `CHECK` over one stored row for the integrity check (§3.4), as the write
+    /// path does ([`eval_checks`](Self::eval_checks)) but unmetered — maintenance evaluation, like
+    /// [`index_entries`](Self::index_entries). The caller resets the scalar allowance per row.
+    pub(crate) fn eval_check_for_check(&self, check: &RExpr, row: &Row) -> Result<Value> {
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng: &rng,
+            ctes: CteCtx::empty(),
+            host_batch: None,
+        };
+        let mut m = self.session.scratch_meter();
+        check.eval(row, &env, &mut m)
     }
 
     /// Resolve every index of a table once per statement (the maintenance driver — INSERT / UPDATE

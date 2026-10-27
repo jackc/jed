@@ -207,8 +207,10 @@ primary key, row counts, GiST bounding boxes, the free list, and the live page c
 `full` level also checks that each index — B-tree, expression, partial, GIN and GiST alike — holds
 exactly the entries its table's rows produce; `quick` skips that. An index the check cannot evaluate
 (its definition names a host function this environment does not register, or time-zone or collation
-data that is not loaded) is listed under `skipped` rather than reported as damage. The check reads a
-snapshot like any reader, so it never blocks writers, and it never writes.
+data that is not loaded) is listed under `skipped` rather than reported as damage. Set `constraints`
+to also re-check the stored rows against `NOT NULL`, column typmods (`varchar(n)`, `decimal(p,s)`,
+timestamp precision), `CHECK`, `UNIQUE` and foreign keys, which a file jed wrote always satisfies.
+The check reads a snapshot like any reader, so it never blocks writers, and it never writes.
 
 It returns a report rather than failing: a list of findings, each with a stable `kind` (such as
 `page_corrupt`, `row_count_mismatch` or `index_entry_missing`), the table or index it concerns, and

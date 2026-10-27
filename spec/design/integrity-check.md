@@ -3,7 +3,7 @@
 > A host-API operation that checks one database's storage on a live handle and returns structured
 > findings: SQLite's `PRAGMA integrity_check` / `quick_check`, and the job PostgreSQL's `amcheck`
 > (`bt_index_check … heapallindexed`) does for its B-trees. **Status: slices I1 (the reference and
-> fixtures), I2 (the cores) and I3 (every index kind) landed; I4–I5 are next.** The invariants first existed as test-only
+> fixtures), I2 (the cores) and I3 (every index kind) and I4 (constraints) landed; I5 is next.** The invariants first existed as test-only
 > checkers in each core's simulation runner and in `spec/fileformat/verify.rb --check-image`
 > ([simulation-testing.md](simulation-testing.md) §8.3); this doc moves them into the engine, extends
 > them where they stop short, and fixes the result as a cross-core contract.
@@ -219,15 +219,56 @@ entries as it checks its structure, so the count needs no second pass. This is P
 B-tree indexes the simulation checker covers today.
 
 **`constraints`** (independent of `level`) re-checks declared constraints against the stored rows,
-which a valid file always satisfies:
+which a valid file always satisfies. It runs as its own stage after every table's trees (§4), so a
+foreign key knows whether the table it references was readable. Per table, in this order:
 
-- `NOT NULL` and column typmods (`varchar(n)` length, `numeric(p,s)`, temporal precision);
-- `CHECK` constraints, evaluated as at write time ([constraints.md](constraints.md) §4);
-- `UNIQUE` / primary-key uniqueness under the index's NULLS [NOT] DISTINCT rule, found as adjacent
-  index entries with equal key prefixes;
-- `FOREIGN KEY`: each referencing row's key, under its `MATCH` rule, is present in the referenced
-  table's key index (constraints.md §6);
-- exclusion constraints are a follow-on (§8).
+1. **The column pass** (object: the table). For each row in storage-key order, each column in
+   ordinal order: a `NOT NULL` column (primary-key columns included) holding NULL is
+   `not_null_violation`; otherwise a non-NULL value of a column with a typmod is `typmod_violation`
+   when the column's write-time typmod coercion would raise or change its stored bytes. The typmods
+   are `varchar(n)` (more than `n` characters, trailing spaces past `n` included, since the coercion
+   would cut them), `decimal(p, s)` (a scale other than `s`, or more than `p − s` integer digits),
+   `timestamp(p)` / `timestamptz(p)` (microseconds not already rounded to `p` digits, half away from
+   zero; infinities are unchanged), and an `interval` field qualifier or precision. Typmods inside
+   arrays and composite fields are a follow-on (§8).
+2. **Named constraints, in name byte order**, ties by kind in the order below:
+   - **`CHECK`** (object: the constraint). Each row in storage-key order is evaluated as at write time
+     ([constraints.md](constraints.md) §4): FALSE is `check_violation`, an error `check_error`; TRUE
+     and NULL pass.
+   - **Uniqueness** (object: the unique index, whether it backs a `UNIQUE` constraint or was created
+     with `CREATE UNIQUE INDEX`; a partial one holds only its admitted rows). The index's entries are
+     read in order; an entry whose key prefix (everything before its storage key) equals the
+     previous entry's, with no NULL element (jed's NULLs are always distinct), is `unique_violation`
+     keyed by its own storage key. The primary key needs no pass: storage keys ascending strictly
+     with `row_key_not_primary_key` clean already make it unique.
+   - **`FOREIGN KEY`** (object: the constraint). Each referencing row in storage-key order is exempt
+     under its `MATCH` rule ([constraints.md](constraints.md) §6.3): `MATCH SIMPLE` when any key
+     column is NULL, `MATCH FULL` when all are; a `MATCH FULL` row with some but not all NULL is a
+     violation. Otherwise the key, converted to the referenced columns' types as at write time, must
+     be found through the referenced key, chosen as the write path chooses it: a point lookup in the
+     referenced table when the referenced columns are its primary-key columns (in any order), else a
+     prefix lookup in the first unique index, in name order, whose key columns are exactly that set.
+     Not found, or a key that cannot be converted, is `foreign_key_violation` keyed by the
+     referencing row.
+3. Exclusion constraints are a follow-on (§8).
+
+Skips, each decided before rows are read (§3.5), with one exception to §3.5's order: a table whose
+tree was unreadable records `table_unreadable` for each of its constraint objects (the table itself
+for the column pass) and nothing else. Otherwise:
+
+- a `CHECK`, like an index, may skip as `unparsable_definition`, `missing_host_function`, or
+  `missing_loaded_data` (a collation of a column it references);
+- a uniqueness pass over an index with an expression key takes that index's definition skip
+  (§3.5), since the key's type is needed to split its entries; column keys need no evaluation, so a
+  column-keyed unique index never takes one (a partial index's predicate is not evaluated here). It
+  then records `index_unreadable` when its index walk reported any finding;
+- a foreign key records `missing_loaded_data` when a referenced column's collation is not loaded or
+  is skewed (its probe would encode under the wrong collation), then `table_unreadable` when the
+  referenced table's tree was unreadable, then `index_unreadable` when the referenced unique index's
+  walk reported a finding.
+
+A uniqueness pass that meets an entry it cannot split (possible only in an index whose walk was
+clean but whose bytes are not an entry) compares nothing across it.
 
 Expression evaluation (expression indexes, partial predicates, `CHECK`) runs in the handle's
 environment ([environment.md](environment.md)): its loaded collations and time zones and its
@@ -248,7 +289,7 @@ before any row is read, so an empty table's index still records them. Registered
 | `missing_host_function` | an expression names a host function the environment does not register at the component and version the index pinned |
 | `missing_loaded_data` | a time zone the object pins, or a collation its entries depend on, is not loaded or is at another version than the catalog pins (`XX002`, [collation.md](collation.md)); for an index of any kind the collations are a bare key column's, an expression key's derived collation, and those of every column an expression key or the predicate references |
 | `table_unreadable` | the table's tree left rows unread, so its indexes' agreement and its constraints are not checked (§5.2) |
-| `index_unreadable` | the index's walk reported a finding, so its agreement is not checked (§5.2) |
+| `index_unreadable` | the index's walk reported a finding, so its agreement, its uniqueness, and the foreign keys that reference through it are not checked (§5.2) |
 
 ## 4. Findings as shared data
 
@@ -278,14 +319,15 @@ walks the same bytes with the same rules in the same order:
 
 1. generation (§3.1);
 2. each table in name byte order: its tree (§3.2), then each of its indexes in index-name byte order
-   (structure, then agreement under `full`), then its constraints under `constraints`, each in
-   constraint-name byte order;
-3. space accounting (§3.3).
+   (structure, then agreement under `full`);
+3. under `constraints`, each table in name byte order: its column pass, then its named constraints
+   in name byte order (§3.4);
+4. space accounting (§3.3).
 
 Within a tree, findings follow a depth-first walk in child order, so page and row findings come in
 key order. On one page the order is `tree_depth_uneven`, `keys_unordered`, `separator_violation`,
-then its rows; on one row, its value finding, then `row_key_not_primary_key`. Per row, a constraint
-pass reports in column ordinal order. A skip is recorded where its check would have run.
+then its rows; on one row, its value finding, then `row_key_not_primary_key`. The column pass reports
+per row in column ordinal order. A skip is recorded where its check would have run.
 
 `max_findings` truncates this sequence, so a truncated report is a prefix of the full one. When the
 next finding would exceed the limit the check stops, sets `truncated`, and reports `pages` and `rows`
@@ -357,14 +399,16 @@ CLAUDE.md §9: nothing in the check requires a table to fit in memory.
 The check is host API, so it is not in the SQL corpus. Its contract is tested with:
 
 - **The reference.** `spec/fileformat/integrity.rb` is a fourth voice, run as `ruby
-  spec/fileformat/verify.rb --integrity-check [--quick] [--max-findings N] FILE…`. It checks a file
+  spec/fileformat/verify.rb --integrity-check [--quick] [--constraints] [--max-findings N] FILE…`. It checks a file
   as a freshly opened handle sees it, so what `open` reads (meta, manifest, catalog, free-list chain)
   must load and anything else is a finding. It derives what it can without SQL: every check of
-  §3.1–§3.3, and agreement for every index kind whose key expressions and predicate fall in the small
+  §3.1–§3.3, the constraint pass of §3.4, and agreement for every index kind whose key expressions and predicate fall in the small
   expression subset it evaluates (column references; integer, text and boolean literals; `+ - *` with
   the integer overflow trap; `||`; comparisons; `AND`/`OR`/`NOT`; `IS [NOT] NULL`; `lower`/`upper`
   over ASCII text). An index outside that subset (a host function, a time zone, non-ASCII case
-  mapping, text this binary cannot parse), and constraints until I4, are listed under
+  mapping, text this binary cannot parse), and likewise a `CHECK` outside it, an `interval` typmod
+  column pass, or a uniqueness or foreign-key pass over a key type whose bytes it cannot split or
+  encode, is listed under
   `reference_unchecked`, outside the cross-core report. The skips that need jed's parser or the
   environment (`unparsable_definition`, `missing_host_function`, `missing_loaded_data`) are therefore
   per-core unit tests over the goldens that carry them, not fixtures.
@@ -382,7 +426,14 @@ The check is host API, so it is not in the SQL corpus. Its contract is tested wi
   to each kind: a posting dropped from a run and one added, a run whose recorded body overruns it
   (`page_corrupt`), a GiST leaf entry dropped, a GiST interior
   bound shrunk (`gist_bounds_violation`), a wrong expression-index entry, a row whose `v + 1`
-  overflows (`index_entry_error`), and a partial-index entry for a row its predicate excludes. The
+  overflows (`index_entry_error`), and a partial-index entry for a row its predicate excludes. I4 adds
+  fixtures, run with `constraints`, over a parent `p` (NOT NULL, `varchar`, `decimal` and `timestamp`
+  typmods, two CHECKs, two UNIQUE constraints) and a child `c` with three foreign keys (to the primary
+  key, to a unique text column, and `MATCH FULL` to a two-column unique key): one clean, one built
+  from rows that break every constraint kind (a file the engine never writes, its indexes consistent
+  with its rows), one whose parent leaf fails its checksum (`table_unreadable` for the parent's
+  constraints and the foreign keys into it), and one whose unique index is misordered
+  (`index_unreadable` for its uniqueness and the foreign key through it). The
   `.json` holds the expected report (§2 minus `detail`) for `quick` and `full`, and for one fixture a
   truncated run.
   Every core must reproduce each exactly when it opens the fixture as a file (an in-memory copy has
@@ -420,6 +471,7 @@ this file sound?". Attachments are checked by opening them directly.
 ## 8. Follow-ons
 
 - exclusion-constraint re-checking (GiST probe per row);
+- typmods inside arrays and composite fields, and composite fields' `NOT NULL`;
 - a metered SQL form, if a use appears;
 - checking all attached databases in one call (today the host loops);
 - an in-memory attachment's version does not advance per commit, so a commit to one racing its check
@@ -435,7 +487,7 @@ this file sound?". Attachments are checked by opening them directly.
 | **I1** ✅ | `spec/integrity/findings.toml`; the reference `spec/fileformat/integrity.rb` (`verify.rb --integrity-check`); the damaged fixtures and expected reports; the clean-golden and registry checks in `mise run verify` |
 | **I2** ✅ | Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API, with `full` agreement for the column B-tree indexes the reference covers; the simulation image checker rebuilt on it; every fixture's report reproduced and every clean golden clean in every core; the live-only kinds unit-tested |
 | **I3** ✅ | `full` for every other index kind (expression, partial, GIN, GiST) and GiST bounds, in the cores and the reference, with fixtures |
-| **I4** | `constraints` option, in the cores and (except `CHECK`, which needs SQL evaluation) the reference, with fixtures |
+| **I4** ✅ | `constraints` option, in the cores and the reference (`CHECK` within its expression subset), with fixtures |
 | **I5** | `jed check` in the CLI and cli.md; `/web` docs (each `api/` language page) |
 
 I2 is the largest, and I3–I5 each depend only on it, so they can run in parallel once it lands.

@@ -22,6 +22,7 @@ import (
 type integrityFixtureRun struct {
 	Level       string `json:"level"`
 	MaxFindings int    `json:"max_findings"`
+	Constraints bool   `json:"constraints"`
 	Report      struct {
 		Findings []struct {
 			Kind     string  `json:"kind"`
@@ -119,7 +120,7 @@ func TestIntegrityFixtures(t *testing.T) {
 			}
 			defer db.Close()
 			for _, run := range spec.Runs {
-				opts := IntegrityCheckOptions{MaxFindings: run.MaxFindings}
+				opts := IntegrityCheckOptions{MaxFindings: run.MaxFindings, Constraints: run.Constraints}
 				if run.MaxFindings == 0 {
 					opts.MaxFindings = IntegrityUnlimited
 				}
@@ -153,17 +154,23 @@ func TestIntegrityFixtures(t *testing.T) {
 	}
 }
 
-// integrityGoldenSkips is the full-level skip list of each golden that has one under goldenEnv
-// (Unicode and time-zone data, no host functions; §3.5): geo_hash is not registered, stored text this
-// binary cannot parse, and an index ordered for a collation version other than the loaded one (its
-// agreement is skipped rather than reported as missing entries). Tables walk in name order.
+// integrityGoldenSkips is the full-level (constraints on) skip list of each golden that has one under
+// goldenEnv (Unicode and time-zone data, no host functions; §3.5): geo_hash is not registered, stored
+// text this binary cannot parse, and an index ordered for a collation version other than the loaded
+// one (its agreement is skipped rather than reported as missing entries). Tables walk in name order;
+// constraint skips follow every table's index skips.
 var integrityGoldenSkips = map[string][]IntegritySkip{
 	"collation_skew_corrupt.jed": {{Object: "t_name_idx", Reason: IntegritySkipMissingLoadedData}},
 	"hostfunc_index_table.jed":   {{Object: "t_geo_idx", Reason: IntegritySkipMissingHostFunction}},
+	// The constraint stage: a CHECK calling the unregistered geo_hash skips, though its table is empty
+	// (decided before rows).
+	"hostfunc_check_table.jed": {{Object: "t_a_check1", Reason: IntegritySkipMissingHostFunction}},
 	"unparsable_definitions.jed": {
 		{Object: "e_r_excl", Reason: IntegritySkipUnparsableDefinition},
 		{Object: "p_future_idx", Reason: IntegritySkipUnparsableDefinition},
 		{Object: "x_future_idx", Reason: IntegritySkipUnparsableDefinition},
+		// The constraint stage, after every table's indexes: a CHECK whose text does not parse.
+		{Object: "c_v_check", Reason: IntegritySkipUnparsableDefinition},
 	},
 }
 
@@ -192,7 +199,8 @@ func TestIntegrityGoldensClean(t *testing.T) {
 			continue
 		}
 		for _, level := range []IntegrityLevel{IntegrityQuick, IntegrityFull} {
-			report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: level, MaxFindings: IntegrityUnlimited})
+			// The full run also re-checks constraints (§6): a valid golden satisfies them all.
+			report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Level: level, MaxFindings: IntegrityUnlimited, Constraints: level == IntegrityFull})
 			if err != nil {
 				t.Errorf("%s (level %d): %v", name, level, err)
 			} else if damaged {
@@ -226,11 +234,14 @@ func TestIntegrityGoldensClean(t *testing.T) {
 // Every kind and skip reason the check emits is registered (spec/integrity/findings.toml), and every
 // registered kind the check can emit in this slice is one of the generated constants.
 func TestIntegrityKindsRegistered(t *testing.T) {
-	src, err := os.ReadFile("integrity.go")
-	if err != nil {
-		t.Fatal(err)
+	var text string
+	for _, file := range []string{"integrity.go", "integrity_constraints.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text += string(src)
 	}
-	text := string(src)
 	consts := map[string]string{
 		IntegrityMetaInvalid: "IntegrityMetaInvalid", IntegrityManifestPageMismatch: "IntegrityManifestPageMismatch",
 		IntegrityCatalogPageCorrupt: "IntegrityCatalogPageCorrupt", IntegrityCatalogMismatch: "IntegrityCatalogMismatch",
@@ -245,6 +256,9 @@ func TestIntegrityKindsRegistered(t *testing.T) {
 		IntegrityFreePageLive: "IntegrityFreePageLive", IntegrityFreePageManifestDependency: "IntegrityFreePageManifestDependency",
 		IntegrityIndexEntryMissing: "IntegrityIndexEntryMissing", IntegrityIndexEntryCountMismatch: "IntegrityIndexEntryCountMismatch",
 		IntegrityIndexEntryError: "IntegrityIndexEntryError", IntegrityGistBoundsViolation: "IntegrityGistBoundsViolation",
+		IntegrityNotNullViolation: "IntegrityNotNullViolation", IntegrityTypmodViolation: "IntegrityTypmodViolation",
+		IntegrityCheckViolation: "IntegrityCheckViolation", IntegrityCheckError: "IntegrityCheckError",
+		IntegrityUniqueViolation: "IntegrityUniqueViolation", IntegrityForeignKeyViolation: "IntegrityForeignKeyViolation",
 		IntegritySkipTableUnreadable: "IntegritySkipTableUnreadable", IntegritySkipIndexUnreadable: "IntegritySkipIndexUnreadable",
 		IntegritySkipUnparsableDefinition: "IntegritySkipUnparsableDefinition",
 		IntegritySkipMissingHostFunction:  "IntegritySkipMissingHostFunction",
@@ -640,5 +654,68 @@ func TestIntegrityEveryIndexKindClean(t *testing.T) {
 	}
 	if !report.OK() || len(report.Skipped) != 0 {
 		t.Fatalf("findings %+v skipped %+v", report.Findings, report.Skipped)
+	}
+}
+
+// Every unique index's entries split into key prefix and storage key, whatever its element types —
+// scalars, DESC/NULLS FIRST orders, a collated text key, and the range, array and composite container
+// keys — so the uniqueness pass reads each entry's key prefix exactly (§3.4). A valid database then
+// checks clean with constraints on.
+func TestIntegrityUniqueEntrySplit(t *testing.T) {
+	db := memDBIn(goldenEnv())
+	defer db.Close()
+	s := db.Session(SessionOptions{})
+	for _, sql := range []string{
+		"CREATE TYPE pair AS (a text, b i32)",
+		`CREATE TABLE u (id i32 PRIMARY KEY, r i32range, a text[], c pair, d decimal, x text COLLATE "unicode", n numrange, ts timestamp)`,
+		"CREATE UNIQUE INDEX u_r ON u (r DESC NULLS FIRST)",
+		"CREATE UNIQUE INDEX u_a ON u (a)",
+		"CREATE UNIQUE INDEX u_c ON u (c DESC)",
+		"CREATE UNIQUE INDEX u_dx ON u (d, x DESC)",
+		"CREATE UNIQUE INDEX u_n ON u (n, ts)",
+		"CREATE UNIQUE INDEX u_expr ON u ((d * 2))",
+		`INSERT INTO u SELECT g, int4range(g, g + g % 3 + 1), ARRAY['x' || g, NULL, ''], ROW('s' || g, CASE WHEN g % 2 = 0 THEN g END)::pair,
+		    g * 1.25 - 40, 'é' || g, numrange(g * 0.5, NULL), '2026-01-01'::timestamp + g * interval '1 hour'
+		 FROM generate_series(1, 60) g`,
+		"INSERT INTO u (id) VALUES (100), (101)",
+	} {
+		mustExec(t, s, sql)
+	}
+	pin, err := db.core.integrityPin(context.Background(), "main", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pin.release()
+	k := newIntegrityChecker(context.Background(), "main", IntegrityCheckOptions{}, pin.snap, pin.paging, pin.gen)
+	table, store := pin.snap.tables["u"], pin.snap.stores["u"]
+	for i := range table.Indexes {
+		def := &table.Indexes[i]
+		types, collated, reason, err := k.uniqueEntrySlots(table, store, def)
+		if err != nil || reason != "" {
+			t.Fatalf("%s: %v %q", def.Name, err, reason)
+		}
+		var root pageRef
+		if r := pin.snap.indexStores[def.Name].treeRoot(); r != nil {
+			root = r.ref()
+		}
+		entries := 0
+		err = k.scanRows(root, nil, 0, func(entry []byte, _ storedRow) error {
+			entries++
+			n, _, ok := splitUniqueEntry(entry, def, types, collated)
+			if !ok {
+				t.Fatalf("%s: entry %x does not split", def.Name, entry)
+			}
+			if _, found, err := store.Get(entry[n:]); err != nil || !found {
+				t.Fatalf("%s: entry %x splits at %d into no row's key (%v)", def.Name, entry, n, err)
+			}
+			return nil
+		})
+		if err != nil || entries != 62 {
+			t.Fatalf("%s: %d entries, %v", def.Name, entries, err)
+		}
+	}
+	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{Constraints: true, MaxFindings: IntegrityUnlimited})
+	if err != nil || !report.OK() || len(report.Skipped) != 0 {
+		t.Fatalf("%v: %+v", err, report)
 	}
 }

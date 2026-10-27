@@ -84,6 +84,7 @@ fn integrity_checked(
     let opts = IntegrityCheckOptions {
         level: IntegrityLevel::Full,
         max_findings: 0,
+        constraints: false,
         cancel: None,
     };
     let report = crate::integrity::run(&engine.committed, &paging, generation, "main", &opts)

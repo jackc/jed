@@ -92,7 +92,13 @@ function sqlstate(code: string): (error: unknown) => boolean {
   };
 }
 
-type Run = { level: "quick" | "full"; max_findings: number; report: Contract };
+// constraints is absent from runs that predate the option (= false).
+type Run = {
+  level: "quick" | "full";
+  max_findings: number;
+  constraints?: boolean;
+  report: Contract;
+};
 const FIXTURE_DIR = dirname(specPath("fileformat/integrity/clean.json"));
 const GOLDEN_DIR = dirname(specPath("fileformat/fixtures/empty_db.jed"));
 const FIXTURES = readdirSync(FIXTURE_DIR)
@@ -109,8 +115,16 @@ test("every damaged fixture reproduces its expected report", () => {
     const db = openDatabase(copyOf(join(FIXTURE_DIR, fx.fixture)), { readOnly: true });
     try {
       for (const run of fx.runs) {
-        const r = db.integrityCheck("main", { level: run.level, maxFindings: run.max_findings });
-        assert.deepEqual(contract(r), run.report, `${fx.fixture} ${run.level} ${run.max_findings}`);
+        const r = db.integrityCheck("main", {
+          level: run.level,
+          maxFindings: run.max_findings,
+          constraints: run.constraints ?? false,
+        });
+        assert.deepEqual(
+          contract(r),
+          run.report,
+          `${fx.fixture} ${run.level} ${run.max_findings} ${run.constraints ?? false}`,
+        );
         assert.equal(r.ok, run.report.findings.length === 0 && !run.report.truncated);
         for (const f of r.findings) assert.equal(typeof f.detail, "string");
       }
@@ -127,7 +141,7 @@ const NOT_CLEAN = (f: string): boolean =>
   f === "cow_invalid_free_list.jed" ||
   f === "collation_skew_corrupt.jed";
 
-test("every clean golden checks with no findings at both levels", () => {
+test("every clean golden checks with no findings at both levels and with constraints", () => {
   const goldens = readdirSync(GOLDEN_DIR).filter((f) => f.endsWith(".jed"));
   let checked = 0;
   for (const name of goldens.sort()) {
@@ -146,6 +160,22 @@ test("every clean golden checks with no findings at both levels", () => {
           assert.deepEqual(r.skipped, [], `${name} ${level}`);
         assert.ok(r.ok);
       }
+      // full with constraints: no findings; the definition-level skips are the I3 ones plus the
+      // unparsed CHECK (the test below).
+      const r = db.integrityCheck("main", { maxFindings: 0, constraints: true });
+      assert.deepEqual(r.findings, [], `${name} constraints`);
+      assert.deepEqual(
+        r.skipped,
+        name === "unparsable_definitions.jed"
+          ? [
+              { object: "e_r_excl", reason: "unparsable_definition" },
+              { object: "p_future_idx", reason: "unparsable_definition" },
+              { object: "x_future_idx", reason: "unparsable_definition" },
+              { object: "c_v_check", reason: "unparsable_definition" },
+            ]
+          : [],
+        `${name} constraints`,
+      );
     } finally {
       db.close();
     }
@@ -218,6 +248,27 @@ test("indexes whose definition or environment cannot be evaluated are skipped", 
   assert.deepEqual([r.findings, r.skipped], [[], []]);
 });
 
+// A CHECK's definition-level skips (§3.5) under constraints: an unparsed CHECK, and one calling a host
+// function the environment does not register. The goldens' rows are empty or satisfy their checks.
+test("CHECK constraints whose definition or environment cannot be evaluated are skipped", () => {
+  const check = (golden: string, environment: Environment): IntegrityReport => {
+    const db = openDatabase(copyOf(join(GOLDEN_DIR, golden)), { readOnly: true, environment });
+    try {
+      return db.integrityCheck("main", { level: "quick", constraints: true });
+    } finally {
+      db.close();
+    }
+  };
+  let r = check("unparsable_definitions.jed", GOLDEN_ENV);
+  assert.deepEqual(r.findings, []);
+  assert.deepEqual(r.skipped, [{ object: "c_v_check", reason: "unparsable_definition" }]);
+  r = check("hostfunc_check_table.jed", new Environment());
+  assert.deepEqual(r.findings, []);
+  assert.deepEqual(r.skipped, [{ object: "t_a_check1", reason: "missing_host_function" }]);
+  r = check("hostfunc_check_table.jed", GOLDEN_ENV);
+  assert.deepEqual([r.findings, r.skipped], [[], []]);
+});
+
 test("every kind and skip reason the check emits is registered", () => {
   const registry = specPath("integrity/findings.toml");
   const kinds = readTomlTables(registry, "finding").map((r) => r.str("kind"));
@@ -226,7 +277,19 @@ test("every kind and skip reason the check emits is registered", () => {
   assert.deepEqual(new Set(Object.values(IntegritySkipReason)), new Set(reasons));
   // The check's own emission sites: every kind passed to add, and every skip reason.
   const source = readFileSync(new URL("../src/integrity.ts", import.meta.url), "utf8");
-  const emitted = [...source.matchAll(/this\.add\(\s*(?:\n\s*)?"([a-z_]+)"/g)].map((m) => m[1]!);
+  const emitted = [...source.matchAll(/(?:this|self)\.add\(\s*(?:\n\s*)?"([a-z_]+)"/g)].map(
+    (m) => m[1]!,
+  );
+  // The constraint pass (§3.4) emits each of its six kinds.
+  for (const k of [
+    "not_null_violation",
+    "typmod_violation",
+    "check_violation",
+    "check_error",
+    "unique_violation",
+    "foreign_key_violation",
+  ])
+    assert.ok(emitted.includes(k), `constraint kind ${k} is never emitted`);
   emitted.push(...[...source.matchAll(/e\.kind/g)].map(() => "page_out_of_range"));
   emitted.push("page_reached_twice", "overflow_chain_corrupt", "value_undecodable");
   assert.ok(emitted.length > 20);
@@ -366,6 +429,21 @@ test("the async API returns the same report across the worker boundary", async (
     await assert.rejects(db.integrityCheck("main", { signal: aborted.signal }), sqlstate("57014"));
   } finally {
     await db.close();
+  }
+  // The constraints option crosses the worker boundary.
+  const cfx = FIXTURES.find((f) => f.fixture === "constraints_broken.jed")!;
+  const cdb = await openAsync(copyOf(join(FIXTURE_DIR, cfx.fixture)), { readOnly: true });
+  try {
+    for (const run of cfx.runs) {
+      const r = await cdb.integrityCheck("main", {
+        level: run.level,
+        maxFindings: run.max_findings,
+        constraints: run.constraints ?? false,
+      });
+      assert.deepEqual(contract(r), run.report);
+    }
+  } finally {
+    await cdb.close();
   }
 });
 

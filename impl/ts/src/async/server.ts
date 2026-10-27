@@ -455,6 +455,7 @@ export class RuntimeServer {
       if (typeof name !== "string") throw new TransportError("PROTOCOL", "a database name is text");
       return yield* db.integrityCheckSteps(name, {
         level: args.level as IntegrityCheckOptions["level"],
+        constraints: args.constraints as boolean | undefined,
         maxFindings: args.maxFindings as number | undefined,
       });
     }

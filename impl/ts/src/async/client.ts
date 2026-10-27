@@ -1000,7 +1000,8 @@ export class AsyncDatabase extends AsyncHandle {
    * Check database `name` (`"main"` or an attachment, matched exactly) and return its findings
    * (spec/design/integrity-check.md): every page its committed generation reaches is read and
    * verified, and under level `full` (the default) every index is checked against its
-   * table. A finding is a fact about the database, never an error; the call rejects only with
+   * table. With `constraints`, declared constraints (NOT NULL, typmods, CHECK, uniqueness, foreign
+   * keys) are also re-checked against the stored rows. A finding is a fact about the database, never an error; the call rejects only with
    * `42704` for an unknown name, `57014` when `signal` aborts it, or an I/O error. It pins a
    * snapshot as a read session does and never waits for the writer. Stops after `maxFindings`
    * (default 100; 0 for no limit) and then sets `truncated`.
@@ -1009,10 +1010,10 @@ export class AsyncDatabase extends AsyncHandle {
     name: string,
     options: IntegrityCheckOptions = {},
   ): Promise<IntegrityReport> {
-    const { signal, level, maxFindings } = options;
+    const { signal, level, constraints, maxFindings } = options;
     return (await this.call(
       "integrityCheck",
-      { name, level, maxFindings },
+      { name, level, constraints, maxFindings },
       { signal },
     )) as IntegrityReport;
   }

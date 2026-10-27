@@ -8413,20 +8413,36 @@ export class Engine {
   private resolveChecks(table: Table, ptypes: ParamTypes = new ParamTypes()): NamedCheck[] {
     if (table.checks.length === 0) return [];
     const scope = Scope.single(this, table);
-    return table.checks.map((c) => {
-      if (c.unparsed) throw unparsableCheckError(table.name, c.name);
-      const node = resolve(
-        scope,
-        c.expr,
-        null,
-        { collecting: false, groupKeys: [], specs: [] },
-        ptypes,
-      ).node;
-      // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match the
-      // dependency persisted with the check, else XX002 before any mutation.
-      verifyCheckHostDeps(c.name, node, this.session.environment.hostFunctions(), c.hostDeps ?? []);
-      return { name: c.name, node };
-    });
+    return table.checks.map((c) => ({
+      name: c.name,
+      node: this.resolveCheckIn(scope, table, c, ptypes),
+    }));
+  }
+
+  // resolveCheck resolves one stored CHECK constraint as a write statement does (resolveChecks): the
+  // integrity check evaluates it per stored row through this (spec/design/integrity-check.md §3.4).
+  resolveCheck(table: Table, c: CheckConstraint): RExpr {
+    return this.resolveCheckIn(Scope.single(this, table), table, c, new ParamTypes());
+  }
+
+  private resolveCheckIn(
+    scope: Scope,
+    table: Table,
+    c: CheckConstraint,
+    ptypes: ParamTypes,
+  ): RExpr {
+    if (c.unparsed) throw unparsableCheckError(table.name, c.name);
+    const node = resolve(
+      scope,
+      c.expr,
+      null,
+      { collecting: false, groupKeys: [], specs: [] },
+      ptypes,
+    ).node;
+    // Reopen soundness (spec/design/extensibility.md §7.1.2): every host call must still match the
+    // dependency persisted with the check, else XX002 before any mutation.
+    verifyCheckHostDeps(c.name, node, this.session.environment.hostFunctions(), c.hostDeps ?? []);
+    return node;
   }
 
   // maintenanceEnv builds the unmetered eval env for phase-1 index-expression / CHECK evaluation
@@ -29277,9 +29293,15 @@ export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number |
   if (at >= key.length) return null;
   const order = slot.order ?? KEY_ORDER_ASC;
   if (key[at] === keyOrderNullTag(order)) return 1;
-  const body = at + 1;
   // m un-inverts a DESC body byte (b ^ m is the ASC byte).
-  const m = order.desc ? 0xff : 0x00;
+  const n = keyBodyLen(slot, key, at + 1, order.desc ? 0xff : 0x00);
+  return n === null ? null : 1 + n;
+}
+
+// keyBodyLen is the byte length of a self-delimited key body of slot's form starting at key[body],
+// each byte read as b ^ m (m = 0xFF for an inverted DESC body); null for a malformed (truncated) body.
+// The slot's order is ignored: the caller has read the tag and chosen m.
+export function keyBodyLen(slot: KeySlot, key: Uint8Array, body: number, m: number): number | null {
   let n: number;
   switch (slot.kind) {
     case "fixed":
@@ -29333,7 +29355,7 @@ export function keySlotLen(slot: KeySlot, key: Uint8Array, at: number): number |
       break;
     }
   }
-  return 1 + n;
+  return n;
 }
 
 // indexEntryRowKey skips slots past prefixLen in an index entry key and returns the storage-key
