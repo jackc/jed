@@ -35,6 +35,9 @@ module RubyStorageTest
     accepted = 0
     Dir[File.join(FIXTURES, '*.jed')].sort.each do |path|
       name = File.basename(path)
+      # The encrypted file variant (spec/fileformat/encrypted.md) is not built in this core yet.
+      next if name.start_with?('encrypted_')
+
       begin
         codec.decode_image(File.binread(path))
         raise "accepted corrupt #{name}" if REJECTED.include?(name)
@@ -50,7 +53,7 @@ module RubyStorageTest
     codec = JedNative::FileFormat.new
     count = 0
     Dir[File.join(FIXTURES, '*_table.jed')].sort.each do |path|
-      next if File.basename(path).match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon/)
+      next if File.basename(path).match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon|^encrypted_/)
 
       expected = File.binread(path)
       state = codec.decode_image(expected)
@@ -164,6 +167,31 @@ module RubyStorageTest
       database = JedNative.open(path)
       db = database.session
       assert(db.query('select id,v from t order by id').rows == [[1, 'hello'], [2, 'hello']])
+      db.close
+      database.close
+    end
+  end
+
+  # Format v50: a reopened file keeps a UNIQUE constraint's index apart from a bare unique index.
+  def self.unique_ownership_reopen
+    Dir.mktmpdir('jed-ruby-unique') do |dir|
+      path = File.join(dir, 'unique.jed')
+      database = JedNative.create(path, page_size: 256)
+      db = database.session
+      db.execute('create table own (id i32 primary key, a i32 unique, b i32)')
+      db.execute('create unique index own_b_uix on own (b)')
+      db.close
+      database.close
+      database = JedNative.open(path)
+      db = database.session
+      assert(db.query("select name from jed_constraints where table_name = 'own' order by name").rows == [['own_a_key']])
+      error('2BP01') { db.execute('drop index own_a_key') }
+      error('42704') { db.execute('alter table own drop constraint own_b_uix') }
+      db.execute('insert into own values (1, 1, 1)')
+      error('23505') { db.execute('insert into own values (2, 2, 1)') }
+      db.execute('alter table own drop constraint own_a_key')
+      db.execute('drop index own_b_uix')
+      db.execute('insert into own values (2, 1, 1)')
       db.close
       database.close
     end
@@ -284,7 +312,7 @@ module RubyStorageTest
   end
 
   def self.run
-    tests = %i[golden_decode golden_encode durable_recovery locking storage_limit_and_serialization io_failure sql_reopen view_query_reopen view_catalog_reopen exclusion_reopen statistics_reopen temporal_containers_reopen collation_upgrade incremental_reclamation]
+    tests = %i[golden_decode golden_encode durable_recovery locking storage_limit_and_serialization io_failure sql_reopen unique_ownership_reopen view_query_reopen view_catalog_reopen exclusion_reopen statistics_reopen temporal_containers_reopen collation_upgrade incremental_reclamation]
     tests.each do |name|
       public_send(name)
       puts "ruby-native storage: #{name} passed"

@@ -85,7 +85,7 @@ JedNative.memory do |db|
 end
 ```
 
-`JedNative.create(path)` and `JedNative.open(path)` use the shared v49 file format
+`JedNative.create(path)` and `JedNative.open(path)` use the shared v50 file format
 and a pure Ruby `flock` host. The default `locking: :auto` uses protocol-v2
 page-service ownership: one process owns the file and other processes run their
 own Ruby engine as page clients. Use `locking: :exclusive` to require sole access.

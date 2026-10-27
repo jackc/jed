@@ -15,7 +15,7 @@ module JedNative
   class FileFormat
     include PersistentTrees
     MAGIC = "JEDB".b
-    VERSION = 49
+    VERSION = 50
     PAGE_HEADER = 16 # v7: the 12-byte v6 header (page_type/item_count/next_page) + a 4-byte per-page crc32 at offset 12
     ROOT_PAGE = 2  # the catalog root of a *fresh empty* db; relocatable thereafter (meta.root_page)
     TXID = 1
@@ -772,14 +772,15 @@ module JedNative
           end
         end
         # index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9),
-        # bit2 has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1).
+        # bit2 has_host_deps (v31 — a host-function index dependency, extensibility.md §8.1), bit3
+        # has_timezone_deps (v32), bit4 has_key_options (v46), bit5 is_constraint (v50 — constraints.md §5.5).
         host_deps = ix[:host_deps] || []
         timezone_deps = ix[:timezone_deps]
         has_timezone_deps = timezone_deps && (timezone_deps[:dynamic] || !timezone_deps[:zones].empty?)
         orders = index_orders(ix)
         has_key_options = orders.any? { |o| o != [false, false] }
         out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0) | (host_deps.empty? ? 0 : 4) | (has_timezone_deps ? 8 : 0) |
-                (has_key_options ? 16 : 0)].pack("C")
+                (has_key_options ? 16 : 0) | (ix[:unique] && ix[:constraint] ? 32 : 0)].pack("C")
     
         # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
         out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
@@ -2596,7 +2597,9 @@ module JedNative
         end
         fb, pos = take(buf, pos, 1)
         # bit0 unique (v6), bit1 has_predicate (v27), bit2 has_host_deps (v31 — extensibility.md §8.1).
-        raise "reserved index flag set" if (fb.getbyte(0) & ~0b1_1111) != 0
+        raise "reserved index flag set" if (fb.getbyte(0) & ~0b11_1111) != 0
+        # bit5 is_constraint (v50): only a unique index backs a UNIQUE constraint (constraints.md §5.5).
+        raise "a constraint index must be unique" if (fb.getbyte(0) & 0b10_0000) != 0 && (fb.getbyte(0) & 1).zero?
         kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
         raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
         has_predicate = (fb.getbyte(0) & 0b10) != 0
@@ -2644,7 +2647,7 @@ module JedNative
           end
           raise "index key options are all default" if orders.all? { |o| o == :asc }
         end
-        indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, orders: orders,
+        indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, constraint: (fb.getbyte(0) & 0b10_0000) != 0, orders: orders,
                      kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
                      root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
       end
