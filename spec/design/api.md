@@ -608,6 +608,13 @@ host's job, as for every other write; a hard-linked file (allowed only uncoordin
 names pointing at the old inode. A rewrite that keeps the page size is the only form today; changing
 `page_size` during compaction is a possible follow-on.
 
+### 2.7 Integrity check (`integrity_check`)
+
+A host may check one database's storage on a live handle — page verification, tree shape, space
+accounting, index ↔ table agreement, and optionally constraints — and get structured findings back,
+SQLite's `PRAGMA integrity_check`. The call, its options, its report, and the cross-core finding
+contract are in [integrity-check.md](integrity-check.md) (designed, not built).
+
 ## 3. Persistence & durability
 
 The on-disk model is the **page-backed copy-on-write B-tree** with **incremental commit**
