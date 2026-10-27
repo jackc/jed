@@ -42,7 +42,7 @@ module JedNative
     def dispatch(statement)
       kind = statement[:kind]
       targets = case kind
-                when :insert, :update, :delete, :create_index then [statement[:table]]
+                when :insert, :update, :delete, :merge, :create_index then [statement[:table]]
                 when :drop_table, :drop_view, :truncate then statement[:names] || [statement[:name] || statement[:table]]
                 when :alter_table, :alter_view then [statement[:name]]
                 else []

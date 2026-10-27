@@ -43,7 +43,7 @@ module JedNative
       end
       visit_view_nodes(query) do |node|
         raise Error.new('42P02', 'views cannot contain parameters') if node[:kind] == :param
-        raise Error.new('0A000', 'views cannot contain data-modifying CTEs') if %i[insert update delete].include?(node[:kind])
+        raise Error.new('0A000', 'views cannot contain data-modifying CTEs') if %i[insert update delete merge].include?(node[:kind])
       end
       dependencies = {}
       frozen_query = freeze_view_query(query, {}, [], dependencies)

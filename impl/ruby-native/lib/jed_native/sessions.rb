@@ -458,7 +458,7 @@ module JedNative
       return false unless node.is_a?(Hash)
       kind = node[:kind]
       return false if kind == :explain && !node[:analyze]
-      return true if %i[insert update delete truncate create_table drop_table alter_table create_view alter_view drop_view create_type drop_type alter_type create_index drop_index reindex analyze create_sequence drop_sequence alter_sequence].include?(kind)
+      return true if %i[insert update delete merge truncate create_table drop_table alter_table create_view alter_view drop_view create_type drop_type alter_type create_index drop_index reindex analyze create_sequence drop_sequence alter_sequence].include?(kind)
       return true if kind == :call && %w[nextval setval].include?(node[:name])
       node.any? do |_, value|
         value.is_a?(Hash) ? statement_writes?(value) : value.is_a?(Array) && value.any? { |child| child.is_a?(Hash) && statement_writes?(child) }

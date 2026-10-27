@@ -184,6 +184,7 @@ module JedNative
       when 'insert' then insert_statement
       when 'update' then update_statement
       when 'delete' then delete_statement
+      when 'merge' then merge_statement
       when 'begin', 'start' then begin_statement
       when 'commit', 'end'
         advance
@@ -247,7 +248,7 @@ module JedNative
         expect(')')
       end
       body = statement
-      supported = %i[select set_operation values insert update delete].include?(body[:kind]) || body[:kind] == :create_table && body[:query]
+      supported = %i[select set_operation values insert update delete merge].include?(body[:kind]) || body[:kind] == :create_table && body[:query]
       syntax('EXPLAIN requires a query or data-modifying statement') unless supported
       { kind: :explain, statement: body, **options }
     end

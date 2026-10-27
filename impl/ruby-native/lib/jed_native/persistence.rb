@@ -15,7 +15,7 @@ module JedNative
     end
 
     def dispatch(statement)
-      if %i[insert update delete create_index alter_table].include?(statement[:kind])
+      if %i[insert update delete merge create_index alter_table].include?(statement[:kind])
         stored = @tables[statement[:table] || statement[:name]]
         if stored && !stored[:collation_skew].to_a.empty?
           raise Error.new('XX002', "table requires collation upgrade: #{stored[:collation_skew].join(', ')}")

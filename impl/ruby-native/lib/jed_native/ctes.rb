@@ -102,13 +102,13 @@ module JedNative
           next
         end
         references = cte_reference_count(primary, cte[:name])
-        read_from_mutation = %i[insert update delete].include?(primary[:kind]) && references.positive?
+        read_from_mutation = %i[insert update delete merge].include?(primary[:kind]) && references.positive?
         items.drop(ordinal + 1).each do |later|
           count = cte_reference_count(later[:query], cte[:name])
           references += count
-          read_from_mutation ||= %i[insert update delete].include?(later[:query][:kind]) && count.positive?
+          read_from_mutation ||= %i[insert update delete merge].include?(later[:query][:kind]) && count.positive?
         end
-        modifying = %i[insert update delete].include?(body[:kind])
+        modifying = %i[insert update delete merge].include?(body[:kind])
         if modifying && !body[:returning] && references.positive?
           raise Error.new('0A000', 'data-modifying CTE has no RETURNING clause')
         end
@@ -195,7 +195,7 @@ module JedNative
       when Hash
         (node[:with] || []).each do |cte|
           body = cte[:query]
-          if !top_level && %i[insert update delete].include?(body[:kind])
+          if !top_level && %i[insert update delete merge].include?(body[:kind])
             raise Error.new('0A000', 'data-modifying CTE must be at statement top level')
           end
           if (cte[:search] || cte[:cycle]) && (!node[:recursive] || cte_reference_count(body, cte[:name]).zero?)
@@ -474,7 +474,7 @@ module JedNative
     def writable_with?(statement)
       return writable_with?(statement[:query]) if statement[:kind] == :create_table && statement[:query]
       items = statement[:with] || []
-      !items.empty? && (%i[insert update delete].include?(statement[:kind]) || items.any? { |cte| %i[insert update delete].include?(cte[:query][:kind]) })
+      !items.empty? && (%i[insert update delete merge].include?(statement[:kind]) || items.any? { |cte| %i[insert update delete merge].include?(cte[:query][:kind]) })
     end
 
     def cte_reference_count(node, name)
