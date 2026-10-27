@@ -119,6 +119,15 @@ module JedNative
         @writer = token
       end
     end
+    # Take the writer gate only if it is free (the idle flusher, validated-cow.md §4.1 rule 5).
+    def try_acquire(token)
+      @mutex.synchronize do
+        next false if @closed || @writer || @draining || @exclusive
+
+        @writer = token
+        true
+      end
+    end
     def release(token)
       @mutex.synchronize do
         if @writer.equal?(token)
@@ -331,6 +340,8 @@ module JedNative
         maximum = @options[:max_connections]
         count = @owner.instance_variable_get(:@mutex).synchronize { @owner.instance_variable_get(:@connections).length }
         return fail_request(request, Error.new('53300', 'page-service connection limit exceeded'), true) if maximum.positive? && count > maximum
+        # A stream server strips the credential before an owner sees the hello (README.md §3.1).
+        raise Error.new('08P01', 'an owner endpoint receives no credential') unless fields[:credential].nil?
         @read_only = fields[:flags] & 1 == 1
         @hello = true
         flags = (@read_only ? 1 : 0) | (@storage.read_only? ? 2 : 0) | (@options[:ownership] == :yield ? 4 : 0)
@@ -393,7 +404,10 @@ module JedNative
             @base = @storage.meta.dup
             @grant = @storage.send(:effective_reader_watermark) >= @storage.instance_variable_get(:@free_generation)
             @granted_pages = @grant ? @storage.instance_variable_get(:@free_pages).to_set : Set.new
-            send_frame(:write_begun, request, reply.merge(reuse_grant: @grant))
+            # Every begin_write, relaxed or not, is answered with a flushed floor (the flush above), so
+            # no pending set is named and the grant covers the committed free list (README.md §3.5).
+            raise Error.new('08P01', 'reserved begin_write flags') unless (fields[:flags] & ~1).zero?
+            send_frame(:write_begun, request, reply.merge(reuse_grant: @grant, pending: [], reuse: []))
           rescue Error => error
             @waiting = false
             @owner.release(self)

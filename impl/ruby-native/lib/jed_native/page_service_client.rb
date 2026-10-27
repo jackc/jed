@@ -8,7 +8,7 @@ module JedNative
       @codec = storage.instance_variable_get(:@codec)
       @connection = PageServiceConnection.new(socket)
       name, hello = @connection.request(:hello, protocol_min: 1, protocol_max: 1, format_version: FileFormat::VERSION,
-                                               flags: storage.read_only? ? 1 : 0, client_name: 'jed-ruby-native')
+                                               flags: storage.read_only? ? 1 : 0, client_name: 'jed-ruby-native', credential: nil)
       raise Error.new('08P01', 'expected hello_ok') unless name == :hello_ok && hello[:protocol] == 1 && hello[:format_version] == FileFormat::VERSION && @codec.valid_page_size?(hello[:page_size])
       @page_size, @connection_id, @owner_flags = hello.values_at(:page_size, :connection_id, :flags)
       @connection.page_size = @page_size
@@ -90,7 +90,9 @@ module JedNative
         end
         raise Error.new('08006', 'owner yielded to a writer')
       end
-      name, reply = @connection.request(:begin_write, current.merge(lock_timeout_ms: timeout_ms))
+      # flags bit0 (relaxed) stays clear: this client commits synchronously through its owner even when
+      # its handle runs synchronous = off, so the owner flushes its batch first and names no pending set.
+      name, reply = @connection.request(:begin_write, current.merge(lock_timeout_ms: timeout_ms, flags: 0))
       raise Error.new('08P01', 'expected write_begun') unless name == :write_begun
       @state_mutex.synchronize { @write_token, @write_txid, @grant = token, reply[:txid], reply[:reuse_grant] }
       @adopt_mutex.synchronize { adopt(reply) }
