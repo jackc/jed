@@ -261,13 +261,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     `42883` there today); the dedicated resolvers (array, range-constructor, json-set functions)
     still type their own arguments; a parameter already typed by an earlier occurrence still counts
     as unknown in a later function argument.
-- [ ] **Integrity-check host API** — SQLite's `PRAGMA integrity_check` / `quick_check`: verify page
+- [x] **Integrity-check host API** — SQLite's `PRAGMA integrity_check` / `quick_check`: verify page
   checksums, tree invariants, free-list and live-count accounting, and index ↔ table agreement on a
   live database, returning structured findings. The checkers already exist in the simulation runners
   and `spec/fileformat/verify.rb`; expose them through the host API and the CLI. Designed in
   [integrity-check.md](spec/design/integrity-check.md); I1 (registry, Ruby reference, damaged fixtures),
-  I2 (the check + host API in all three cores) and I3 (expression, partial, GIN and GiST agreement, GiST
-  bounds) and I4 (the `constraints` option) landed; I5 (CLI) open (§9). Exclusion constraints and
+  I2 (the check + host API in all three cores), I3 (expression, partial, GIN and GiST agreement, GiST
+  bounds), I4 (the `constraints` option) and I5 (`jed check`) landed (§9). Exclusion constraints and
   typmods inside arrays/composites are follow-ons (§8). _(size: M)_
   - [ ] _follow-on:_ an in-memory attachment's commits share one version, so the check cannot tell a
     commit racing it apart (spurious findings possible); give them distinct versions in every core

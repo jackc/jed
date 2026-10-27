@@ -81,7 +81,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [api.md](api.md) — the host/embedding API: open/create/commit/close a database file,
   prepare/execute/query, the `Rows` cursor, `$N` bind parameters, and the structured-error
   surface — the same shape across cores (CLAUDE.md §1/§2).
-- [integrity-check.md](integrity-check.md) — the integrity-check host API (**I1–I4 landed: reference, fixtures, all three cores, every index kind, constraints**):
+- [integrity-check.md](integrity-check.md) — the integrity-check host API (**landed: reference, fixtures, all three cores, every index kind, constraints, `jed check`**):
   SQLite-style `quick`/`full` checks of a live database's pages, trees, space accounting, index ↔
   table agreement, and constraints, returning findings that are a cross-core contract; `jed check`.
 - [ts-runtime.md](ts-runtime.md) — proposed async-only public JS API for browser and Node:

@@ -3,6 +3,7 @@
 //! it links the Rust core through the public embedding API and adds no engine behavior.
 
 mod args;
+mod check;
 mod credential;
 mod csv;
 mod dump;
@@ -41,6 +42,11 @@ fn run() -> u8 {
     // reserved first token; a database file named `pages` is reached as `jed ./pages`.
     if argv.first().map(String::as_str) == Some("pages") {
         return remote::pages(&argv[1..]);
+    }
+    // `jed check DBFILE` (cli.md §3.2): the integrity check. A database file named `check` is
+    // reached as `jed ./check`.
+    if argv.first().map(String::as_str) == Some("check") {
+        return check::run(&argv[1..]);
     }
 
     let parsed = match args::parse(argv.into_iter()) {

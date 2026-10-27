@@ -200,6 +200,8 @@ run an integrity check, jed's version of SQLite's `PRAGMA integrity_check`:
 `db.integrity_check("main", &IntegrityCheckOptions::default())` (Rust),
 `db.IntegrityCheck(ctx, "main", jed.IntegrityCheckOptions{})` (Go) or
 `await db.integrityCheck("main")` (TypeScript). Pass an attachment's name to check that database.
+From a shell, `jed check app.jed` runs the same check on a file and exits `0` when it finds nothing
+and `2` when it does (`--quick`, `--constraints`, `--max-findings N`, `--format json`).
 
 It walks every page reachable from the catalog: page checksums (or authentication tags), B-tree
 shape and key order, each row's values and large-value chains, that each row is stored under its
@@ -208,7 +210,7 @@ primary key, row counts, GiST bounding boxes, the free list, and the live page c
 exactly the entries its table's rows produce; `quick` skips that. An index the check cannot evaluate
 (its definition names a host function this environment does not register, or time-zone or collation
 data that is not loaded) is listed under `skipped` rather than reported as damage. Set `constraints`
-to also re-check the stored rows against `NOT NULL`, column typmods (`varchar(n)`, `decimal(p,s)`,
+(`constraints: true` / `Constraints: true` / `{ constraints: true }`) to also re-check the stored rows against `NOT NULL`, column typmods (`varchar(n)`, `decimal(p,s)`,
 timestamp precision), `CHECK`, `UNIQUE` and foreign keys, which a file jed wrote always satisfies.
 The check reads a snapshot like any reader, so it never blocks writers, and it never writes.
 

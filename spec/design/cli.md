@@ -50,6 +50,7 @@ binary).
 ```
 jed [OPTIONS] [DBFILE]
 jed pages [--read-only] DBFILE
+jed check [--quick] [--constraints] [--max-findings N] [--format text|json] DBFILE   (§3.2)
 
   (no DBFILE)             transient in-memory database
   ssh://[user@]host[:port]/path
@@ -171,6 +172,32 @@ applied migration; errors carry the migration name, direction, failing statement
 Exit codes extend §3's: `0` success · `1` usage/open/load error · **`2` a migration failed** (a
 statement error, or a down through an irreversible migration). The interactive TUI is out of scope
 for migrations in v1. Full contract: [`/migrate/design.md`](../../migrate/design.md) §9.
+
+### 3.2 The `check` subcommand
+
+`jed check` is the third reserved first-token word: the integrity check
+([integrity-check.md](integrity-check.md)) as a command, SQLite's `PRAGMA integrity_check` for a file
+on disk. A database file literally named `check` is reached as `jed ./check`.
+
+```
+jed check [--quick] [--constraints] [--max-findings N] [--format text|json] [credential flags] DBFILE
+
+  --quick              skip index ↔ table agreement (SQLite's quick_check)
+  --constraints        also re-check NOT NULL, typmods, CHECK, UNIQUE and foreign keys
+  --max-findings N     stop after N findings (default 100; 0 = no limit)
+  --format FORMAT      text (default) | json
+```
+
+It opens DBFILE **read-only** (the §3 credential flags open an encrypted file) and checks `main`; an
+attachment is a file of its own, checked by naming it. A fresh open reads every page from the file,
+which is what a check of a file on disk wants. `text` prints one line per finding — its kind, then
+the object, `page N`, and `key HEX` when the finding has them, then `: ` and the detail — then one
+`skipped OBJECT: REASON` line per skip, then a summary: `ok: P pages, R rows checked`, or the finding
+count in place of `ok` (with a note when `--max-findings` stopped the check). `json` prints the report
+of integrity-check.md §2 as one object, each `key` in lowercase hex. Exit codes follow §3's: `0`
+nothing found · `1` usage or open error · **`2` findings**. A file too damaged to open (`XX001` at
+open) is the answer to "is it sound?", not an open error: it prints `open_failed: XX001 MESSAGE`
+(`json`: `{"open_failed":{"code":"XX001","message":…}}`) and exits `2`.
 
 **`--import-csv TABLE=FILE` imports a CSV** — the read half of the CSV story (`--format
 csv` + `-o` is the export half). It parses the RFC 4180 dialect the exporter writes

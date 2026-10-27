@@ -1136,3 +1136,166 @@ fn encrypted_databases_take_a_key_or_passphrase_file() {
     remove_db(&db);
     remove_db(&mdb);
 }
+
+/// A copy of a shared integrity fixture (spec/fileformat/integrity/), so opening it leaves no lock
+/// bundle in the spec tree.
+fn integrity_fixture(name: &str) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../spec/fileformat/integrity")
+        .join(format!("{name}.jed"));
+    let dst = tmp(&format!("check_{name}.jed"));
+    std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+    dst
+}
+
+#[test]
+fn check_reports_findings_and_exits_by_verdict() {
+    // A clean database: exit 0 and the summary line.
+    let db = tmp("check_clean.jed");
+    let db_str = db.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            db_str,
+            "-q",
+            "-c",
+            "CREATE TABLE t (id i32 PRIMARY KEY, v i32 CHECK (v > 0)); CREATE INDEX ON t (v); \
+             INSERT INTO t VALUES (1, 10), (2, 20)",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "{}", r.stderr);
+    let r = run(&["check", "--constraints", db_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "{}", r.stderr);
+    assert!(r.stdout.starts_with("ok: "), "{}", r.stdout);
+    remove_db(&db);
+
+    // A damaged one: one line per finding, then the summary; exit 2.
+    let bad = integrity_fixture("expr_overflow");
+    let r = run(&["check", bad.to_str().unwrap()], "");
+    assert_eq!(r.code, 2, "{}", r.stderr);
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", r.stdout);
+    assert!(
+        lines[0].starts_with("index_entry_error u_v1_idx key 8000000a: "),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        lines[1].starts_with("index_entry_count_mismatch u_v1_idx: "),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(lines[2], "2 findings: 53 pages, 40 rows checked");
+    // --quick skips index agreement, so the same file checks clean.
+    let r = run(&["check", "--quick", bad.to_str().unwrap()], "");
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    remove_db(&bad);
+
+    // JSON is the report object; --max-findings truncates it.
+    let broken = integrity_fixture("constraints_broken");
+    let broken_str = broken.to_str().unwrap();
+    let r = run(
+        &[
+            "check",
+            "--constraints",
+            "--format",
+            "json",
+            "--max-findings",
+            "2",
+            broken_str,
+        ],
+        "",
+    );
+    assert_eq!(r.code, 2, "{}", r.stderr);
+    assert!(
+        r.stdout.starts_with(
+            "{\"findings\":[{\"kind\":\"foreign_key_violation\",\"database\":\"main\",\"object\":\"c_ab_fkey\",\"page\":null,\"key\":\"80000004\","
+        ),
+        "{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout
+            .ends_with(",\"truncated\":true,\"skipped\":[],\"pages\":27,\"rows\":60}\n"),
+        "{}",
+        r.stdout
+    );
+    // Without --constraints the same rows are structurally sound.
+    let r = run(&["check", broken_str], "");
+    assert_eq!(r.code, 0, "{}", r.stdout);
+    remove_db(&broken);
+}
+
+#[test]
+fn check_usage_and_open_errors_exit_1() {
+    let r = run(&["check"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("missing DBFILE"), "{}", r.stderr);
+    let r = run(&["check", "--format", "xml", "x.jed"], "");
+    assert_eq!(r.code, 1);
+    let missing = tmp("check_missing.jed");
+    let r = run(&["check", missing.to_str().unwrap()], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("58P01"), "{}", r.stderr);
+    let r = run(&["check", "--help"], "");
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.starts_with("usage: jed check"), "{}", r.stdout);
+}
+
+#[test]
+fn check_takes_the_credential_of_an_encrypted_database() {
+    let db = tmp("check_enc.jed");
+    let db_str = db.to_str().unwrap();
+    let key = tmp("check_enc.key");
+    std::fs::write(&key, format!("{}\n", "4b".repeat(32))).unwrap();
+    let key_str = key.to_str().unwrap();
+    let r = run(
+        &[
+            "--create",
+            "--key-file",
+            key_str,
+            db_str,
+            "-q",
+            "-c",
+            "CREATE TABLE t (id i32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+        ],
+        "",
+    );
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "{}", r.stderr);
+    let r = run(&["check", db_str], "");
+    assert_eq!(r.code, 1);
+    assert!(
+        r.stderr.contains("28P02") && r.stderr.contains("--key-file"),
+        "{}",
+        r.stderr
+    );
+    let r = run(&["check", "--key-file", key_str, db_str], "");
+    assert_eq!(r.code, 0, "{}{}", r.stdout, r.stderr);
+    let _ = std::fs::remove_file(&key);
+    remove_db(&db);
+}
+
+#[test]
+fn check_reports_a_file_too_damaged_to_open() {
+    // Both meta slots fail their checksum: open fails XX001, which is the check's answer, not a
+    // usage error.
+    let db = integrity_fixture("u_clean");
+    let mut bytes = std::fs::read(&db).unwrap();
+    for off in [40, 256 + 40] {
+        bytes[off] ^= 0xFF;
+    }
+    std::fs::write(&db, &bytes).unwrap();
+    let r = run(&["check", db.to_str().unwrap()], "");
+    assert_eq!(r.code, 2, "{}", r.stderr);
+    assert!(r.stdout.starts_with("open_failed: XX001 "), "{}", r.stdout);
+    let r = run(&["check", "--format", "json", db.to_str().unwrap()], "");
+    assert_eq!(r.code, 2);
+    assert!(
+        r.stdout
+            .starts_with("{\"open_failed\":{\"code\":\"XX001\",\"message\":"),
+        "{}",
+        r.stdout
+    );
+    remove_db(&db);
+}
