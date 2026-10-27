@@ -30,6 +30,8 @@ format** that realizes it.
 | [lz4.rb](lz4.rb) | The Ruby reference codec (used by verify.rb for goldens + vectors). |
 | [fixtures/](fixtures/) | Byte-exact golden `.jed` files at `page_size = 256` (reviewable hex); the `encrypted_*` goldens at 1024, the encrypted variant's minimum. Each core reads them and writes bytes equal to them. |
 | [verify.rb](verify.rb) | Independent Ruby reference that (re)generates and validates the goldens + LZ4 vectors — a *fourth* implementation, so the goldens are not self-certified by the cores. `--generate` rewrites them; bare run verifies. Test-time only; run via `mise run verify`. |
+| [integrity.rb](integrity.rb) | The integrity-check reference ([../design/integrity-check.md](../design/integrity-check.md)): checks a file as a fresh handle would and prints the report every core's `integrity_check` must return. Run as `ruby verify.rb --integrity-check [--quick] [--max-findings N] FILE…`; also generates and verifies `integrity/`. |
+| [integrity/](integrity/) | Damaged images (`<name>.jed`, one deterministic damage each) and their expected integrity reports (`<name>.json`); the finding kinds are registered in [../integrity/findings.toml](../integrity/findings.toml). |
 
 ## Scope (`format_version` 33)
 

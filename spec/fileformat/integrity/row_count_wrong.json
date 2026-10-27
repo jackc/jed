@@ -1,0 +1,43 @@
+{
+  "fixture": "row_count_wrong.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "row_count_mismatch",
+            "database": "main",
+            "object": "t",
+            "page": null,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "row_count_mismatch",
+            "database": "main",
+            "object": "t",
+            "page": null,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "fixture": "free_page_live.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "free_page_live",
+            "database": "main",
+            "object": null,
+            "page": 3,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 13,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "free_page_live",
+            "database": "main",
+            "object": null,
+            "page": 3,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 13,
+        "rows": 40
+      }
+    }
+  ]
+}
