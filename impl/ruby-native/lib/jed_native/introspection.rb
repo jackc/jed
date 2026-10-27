@@ -193,11 +193,7 @@ module JedNative
         used << name
         constraint.merge(name: name)
       end
-      table[:indexes].each do |index|
-        next unless index[:unique] && !constraints.any? { |constraint| constraint[:kind] == :unique && constraint[:name] == index[:name] }
-        names = (index[:elements] || []).map { |element| catalog_expression(element[:expr]) }
-        constraints << { kind: :unique, name: index[:name], columns: index[:columns] || names }
-      end
+      # A bare CREATE UNIQUE INDEX is an index, not a constraint (constraints.md §5.5).
       constraints
     end
 

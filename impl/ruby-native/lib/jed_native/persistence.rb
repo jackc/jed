@@ -234,8 +234,11 @@ module JedNative
           checks << { name: name, expr: catalog_expression(constraint[:expr]), host_deps: constraint[:host_deps] || constraint.dig(:storage_check, :host_deps) || [] }
         when :unique
           name = constraint[:name] || "#{table[:name]}_#{constraint[:columns].join('_')}_key"
-          unless indexes.any? { |index| index[:name] == name }
-            indexes << { name: name, cols: constraint[:columns].map { |column| column_ordinal(table, column) }, unique: true, kind: 'btree' }
+          # v50: the index backing a UNIQUE constraint carries is_constraint (constraints.md §5.5).
+          if (backing = indexes.find { |index| index[:name] == name })
+            backing[:constraint] = true if backing[:unique]
+          else
+            indexes << { name: name, cols: constraint[:columns].map { |column| column_ordinal(table, column) }, unique: true, constraint: true, kind: 'btree' }
           end
         when :foreign_key
           parent = table(constraint[:table] || constraint[:ref_table])
@@ -410,7 +413,7 @@ module JedNative
                            elements: exclusion[:elements].map { |ordinal, operator| { expr: { kind: :column, name: columns[ordinal][:name] }, op: operator } } }
         end
         indexes.each do |index|
-          next unless index[:unique] && !index[:where] && index[:elements].all? { |element| element[:expr][:kind] == :column }
+          next unless index[:unique] && index[:storage_index][:constraint] && !index[:where] && index[:elements].all? { |element| element[:expr][:kind] == :column }
 
           constraints << { kind: :unique, name: index[:name], columns: index[:columns] }
         end

@@ -191,11 +191,9 @@ module JedNative
     def drop_index(statement)
       owner = @tables.values.find { |table| table[:constraints].any? { |constraint| constraint[:kind] == :unique && constraint[:name] == statement[:name] } }
       return super unless owner
-      constraint = owner[:constraints].find { |item| item[:name] == statement[:name] }
-      drop_incoming_foreign_keys(owner, constraint[:columns], statement[:cascade])
-      @tables[owner[:name]] = owner.merge(constraints: owner[:constraints] - [constraint], indexes: owner[:indexes].reject { |index| index[:name] == statement[:name] })
-      @dirty = true
-      Result.new
+
+      # A UNIQUE constraint owns its index (constraints.md §5.5): drop the constraint instead.
+      raise Error.new('2BP01', "cannot drop index #{statement[:name]} because constraint #{statement[:name]} on table #{owner[:name]} requires it")
     end
 
     def reindex_targets(statement)

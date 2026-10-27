@@ -342,7 +342,8 @@ module JedNative
         elements = kind == :exclude ? constraint[:elements] : constraint[:columns].map { |n| { expr: { kind: :column, name: n }, op: '=' } }
         { name: name, kind: kind, columns: constraint[:columns], elements: elements, where: constraint[:where] }
       end
-      t[:indexes].select { |index| index[:unique] }.each do |index|
+      # ON CONFLICT ON CONSTRAINT names only a constraint; a bare unique index arbitrates a column list.
+      t[:indexes].select { |index| index[:unique] && !conflict[:constraint] }.each do |index|
         elements = index[:elements] || index[:columns].map { |n| { expr: { kind: :column, name: n } } }
         names = elements.map { |element| element[:expr][:name] if element[:expr][:kind] == :column }
         arbiters << { name: index[:name], kind: :unique, columns: names, elements: elements, where: index[:where] }
