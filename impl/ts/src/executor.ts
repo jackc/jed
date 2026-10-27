@@ -8446,6 +8446,13 @@ export class Engine {
     };
   }
 
+  // indexMaintenanceEnv is the unmetered maintenance eval env (maintenanceEnv) for a caller outside a
+  // statement: the integrity check derives each row's index entries through it, as a write would
+  // (spec/design/integrity-check.md §3.4).
+  indexMaintenanceEnv(): EvalEnv {
+    return { ...this.maintenanceEnv(new StmtRng()), maintenanceMeter: () => new Meter() };
+  }
+
   // resolveIndex resolves an index's key elements for one statement's maintenance
   // (spec/design/indexes.md §4), modeled on resolveChecks: a column key keeps its ordinal; an
   // expression key resolves against the table's columns to an RExpr + its encoding Type + collation.
@@ -33665,7 +33672,8 @@ export function* indexSlotKeySteps(
     if (v.kind === "null") return null;
     return encodeColTypeKey(colTypes[key.column]!, v, colls[key.column]!);
   }
-  const v = yield* evalExprSteps(key.expr, row, env, env.exec.session.scratchMeter());
+  const meter = env.maintenanceMeter?.() ?? env.exec.session.scratchMeter();
+  const v = yield* evalExprSteps(key.expr, row, env, meter);
   if (v.kind === "null") return null;
   return encodeTypedKey(key.type, v, key.coll);
 }
@@ -33725,7 +33733,8 @@ export function* indexRowQualifiesSteps(
   env: EvalEnv,
 ): Steps<boolean> {
   if (rindex.predicate === undefined) return true;
-  return yield* evalFilterSteps(rindex.predicate, row, env, env.exec.session.scratchMeter());
+  const meter = env.maintenanceMeter?.() ?? env.exec.session.scratchMeter();
+  return yield* evalFilterSteps(rindex.predicate, row, env, meter);
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
@@ -40793,6 +40802,10 @@ export type EvalEnv = {
   // The evaluating site's prefetched host-function outcomes (extensibility.md §4.2.1), or undefined —
   // a host call then invokes its kernel for the current row alone.
   hostBatch?: HostBatch;
+  // maintenanceMeter, when set, supplies the meter index maintenance evaluates a key expression or a
+  // partial predicate under, in place of the session's scratch meter: the integrity check derives
+  // entries outside any statement, so it charges no session allowance (integrity-check.md §5.4).
+  maintenanceMeter?: () => Meter;
 };
 
 // ============================================================================

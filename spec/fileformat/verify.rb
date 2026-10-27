@@ -196,6 +196,7 @@ S_COMPRESS = 32 # payloads below this are never fed to the encoder (large-values
 
 require_relative "lz4"
 require_relative "xaes"
+require_relative "expr"
 
 # --- the encrypted variant (spec/fileformat/encrypted.md) -------------------------------------
 # `$enc` is nil while a plaintext image is built or decoded. For an encrypted one it holds the page
@@ -3162,7 +3163,13 @@ def index_entry_key(table, ix, storage_key, row)
   ix[:cols].each_with_index do |ci, i|
     desc, nulls_first = orders[i]
     present, null = ordered_slot_tags(desc, nulls_first)
-    v = row[ci]
+    if ci.is_a?(Hash)
+      # An expression element (indexes.md §1): its value and type from the stored text.
+      type, v = StoredExpr.value_of(StoredExpr.parse(ci[:expr]), table[:columns], row)
+    else
+      type = table[:columns][ci][:type]
+      v = row[ci]
+    end
     if v.nil?
       out << [null].pack("C")
     else
@@ -3172,9 +3179,9 @@ def index_entry_key(table, ix, storage_key, row)
       # stored order is deliberately WRONG for the loaded collation (the skew read-safety regression
       # fixture, spec/design/collation.md §12/§14). Absent the override, the index keys use the
       # column's frozen collation, as every other fixture does.
-      coll = ix.key?(:key_collation) ? ix[:key_collation] : table[:columns][ci][:collation]
+      coll = ix.key?(:key_collation) ? ix[:key_collation] : (ci.is_a?(Hash) ? nil : table[:columns][ci][:collation])
       coll = nil if coll == "C"
-      body = key_body(table[:columns][ci][:type], v, coll)
+      body = key_body(type, v, coll)
       # A DESC element's body is bitwise inverted (§2.16).
       body = body.bytes.map { |b| b ^ 0xFF }.pack("C*") if desc
       out << body
@@ -3184,10 +3191,14 @@ def index_entry_key(table, ix, storage_key, row)
   out
 end
 
-# Whether a (partial) index holds `row`: a fixture's `where:` lambda mirrors the index's SQL predicate
-# (indexes.md §9, gist.md §7.1); an index without one holds every row.
-def index_admits?(ix, row)
-  ix[:where].nil? || ix[:where].call(row)
+# Whether a (partial) index holds `row` (indexes.md §9, gist.md §7.1): a fixture's `where:` lambda
+# mirrors the index's SQL predicate, else the predicate text is evaluated (expr.rb); an index without
+# one holds every row.
+def index_admits?(table, ix, row)
+  return ix[:where].call(row) if ix[:where]
+  return true unless ix[:predicate]
+
+  StoredExpr.filter?(StoredExpr.parse(ix[:predicate]), table[:columns], row)
 end
 
 # An index's (entry_key, record-plan) pairs in entry-key order. An index record has an EMPTY
@@ -3197,7 +3208,7 @@ end
 # wrongly trusts it loses rows.
 def index_entries(table, ix)
   return [] if ix[:forged_empty]
-  table_entries(table).select { |_k, row| index_admits?(ix, row) }.map do |storage_key, row|
+  table_entries(table).select { |_k, row| index_admits?(table, ix, row) }.map do |storage_key, row|
     key = index_entry_key(table, ix, storage_key, row)
     [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
   end.sort_by { |key, _| key }
@@ -3573,7 +3584,7 @@ def serialize_gist_index(table, ix, next_index, pages)
   ops = gist_opclasses_for(table, ix)
   entries = []
   table_entries(table).each do |storage_key, row|
-    next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(ix, row)
+    next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(table, ix, row)
 
     entries << [gist_leaf_bound(ops, row, ix[:cols]), storage_key]
   end
@@ -3590,7 +3601,7 @@ def gist_leaf_keys_sorted(table, ix)
   ops = gist_opclasses_for(table, ix)
   keys = []
   table_entries(table).each do |storage_key, row|
-    next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(ix, row)
+    next if ix[:cols].any? { |ci| row[ci].nil? } || !index_admits?(table, ix, row)
 
     keys << (gist_encode_bound(ops, gist_leaf_bound(ops, row, ix[:cols])) + storage_key).b
   end
@@ -5266,7 +5277,14 @@ def decode_range_body(elem_type, buf, pos)
     upper, npos = decode_value(elem_type, "\x00".b + buf.byteslice(pos..), 0)
     pos += (npos - 1)
   end
-  [{ lower: lower, upper: upper, lower_inc: (flags & 0x08) != 0, upper_inc: (flags & 0x10) != 0 }, pos]
+  lower_inc = (flags & 0x08) != 0
+  upper_inc = (flags & 0x10) != 0
+  # A stored range is canonical and non-empty, so finite bounds are ordered (XX001 in the cores).
+  unless lower.nil? || upper.nil?
+    c = key_body(elem_type, lower) <=> key_body(elem_type, upper)
+    raise "range bounds are out of order" if c.positive? || (c.zero? && !(lower_inc && upper_inc))
+  end
+  [{ lower: lower, upper: upper, lower_inc: lower_inc, upper_inc: upper_inc }, pos]
 end
 
 # Decode a composite value body (inverse of encode_composite_body): read the null bitmap

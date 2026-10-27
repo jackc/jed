@@ -21,8 +21,9 @@ use crate::cancel::CancellationToken;
 use crate::catalog::{ColType, IndexDef, IndexKind, Table};
 use crate::collation::Collation;
 use crate::error::{EngineError, Result};
-use crate::executor::{Snapshot, encode_pk_key, index_entry_keys_columns};
+use crate::executor::{Engine, IndexDeriveSkip, ResolvedIndex, Snapshot, encode_pk_key};
 use crate::format::{Cap, IntegrityFree, IntegrityGeneration, PageRef, TreeRead};
+use crate::gist::{DecodedBound, GistOpclass};
 use crate::integrity_kinds as kinds;
 use crate::paging::SharedPaging;
 use crate::pmap::Node;
@@ -206,6 +207,9 @@ struct Checker<'a> {
     chain_pages: u64,
     /// Some tree was unreadable (§5.2): the live page count is not compared.
     damaged: bool,
+    /// The write path's index-entry derivation, over the pinned snapshot and the handle's
+    /// environment (§3.4). Maintenance evaluation is unmetered.
+    engine: Engine,
 }
 
 /// Check `snap`, the pinned generation `generation` of database `database` read through `paging`
@@ -234,6 +238,7 @@ pub(crate) fn run(
         reached: RefCell::new(PageSet::new(generation.page_count)),
         chain_pages: 0,
         damaged: false,
+        engine: Engine::from_snapshot(snap.clone()),
     };
     match c.check(generation) {
         Ok(()) => {}
@@ -768,16 +773,18 @@ impl Checker<'_> {
         Ok(())
     }
 
-    /// Walk a GiST R-tree (gist.md §4.1) for page verification, node types, and uniform leaf depth.
-    /// Bounding-box containment is slice I3's.
-    fn walk_gist(&mut self, object: &str, root: PageRef) -> Step<bool> {
+    /// Walk a GiST R-tree (gist.md §4.1): page verification, node types, uniform leaf depth, every
+    /// bound decoding under the index's opclasses, and each interior bound containing every bound in
+    /// the child it names (§3.2). Returns whether every page was read, and the leaf entry count.
+    fn walk_gist(&mut self, object: &str, root: PageRef, ops: &[GistOpclass]) -> Step<(bool, u64)> {
         let mut readable = true;
+        let mut entries = 0u64;
         let mut leaf_depth: Option<usize> = None;
-        let mut pending: Vec<(PageRef, usize)> = Vec::new();
+        let mut pending: Vec<(PageRef, usize, Option<Arc<DecodedBound>>)> = Vec::new();
         if root.page != 0 {
-            pending.push((root, 0));
+            pending.push((root, 0, None));
         }
-        while let Some((page, depth)) = pending.pop() {
+        while let Some((page, depth, parent)) = pending.pop() {
             self.poll()?;
             if !self.reach(object, page.page)? {
                 readable = false;
@@ -796,8 +803,8 @@ impl Checker<'_> {
                 continue;
             }
             let parsed = crate::format::integrity_read_page(self.paging, page)
-                .and_then(|raw| Ok((raw.page_type, gist_children(&raw, self.cap)?)));
-            let (page_type, children) = match parsed {
+                .and_then(|raw| Ok((raw.page_type, gist_items(&raw, ops, self.cap)?)));
+            let (page_type, items) = match parsed {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     let detail = corrupt_message(e)?;
@@ -812,7 +819,7 @@ impl Checker<'_> {
                     continue;
                 }
             };
-            let Some(children) = children else {
+            let Some(items) = items else {
                 readable = false;
                 let detail = format!("page type {page_type} in a GiST tree");
                 self.add(
@@ -824,15 +831,34 @@ impl Checker<'_> {
                 )?;
                 continue;
             };
-            if page_type == crate::gist::PAGE_GIST_LEAF {
+            let leaf = page_type == crate::gist::PAGE_GIST_LEAF;
+            if leaf {
                 self.check_leaf_depth(object, page.page, depth, &mut leaf_depth)?;
+            }
+            if let Some(parent) = &parent
+                && !items.iter().all(|item| parent.contains(&item.bound))
+            {
+                let detail = "a bound lies outside its parent's bound for this page".to_string();
+                self.add(
+                    kinds::GIST_BOUNDS_VIOLATION,
+                    Some(object),
+                    Some(page.page),
+                    None,
+                    detail,
+                )?;
+            }
+            if leaf {
+                entries += items.len() as u64;
                 continue;
             }
-            for child in children.into_iter().rev() {
-                pending.push((child, depth + 1));
+            // Pushed last child first, so the walk visits them in child order.
+            for item in items.into_iter().rev() {
+                if let GistTarget::Child(child) = item.target {
+                    pending.push((child, depth + 1, Some(Arc::new(item.bound))));
+                }
             }
         }
-        Ok(readable)
+        Ok((readable, entries))
     }
 
     fn check_index(
@@ -844,28 +870,70 @@ impl Checker<'_> {
     ) -> Step<()> {
         let snap = self.snap;
         let before = self.report.findings.len();
-        let mut entries = 0u64;
-        let readable = if idx.kind == IndexKind::Gist {
-            match gist_roots.get(&idx.name) {
-                Some(&root) => self.walk_gist(&idx.name, root)?,
+        let ops = gist_ops(ctx.table, idx);
+        let gist_root = gist_roots.get(&idx.name).copied();
+        let (readable, entries) = match idx.kind {
+            IndexKind::Gist => match gist_root {
+                Some(root) => self.walk_gist(&idx.name, root, &ops)?,
                 // The catalog chain could not be read, so the tree's root is not known.
-                None => false,
+                None => (false, 0),
+            },
+            kind => {
+                let root = snap
+                    .index_store(&idx.name)
+                    .tree_root()
+                    .map_or(PageRef::NONE, |n| n.page_ref());
+                let no_columns = Arc::new(Vec::new());
+                let gin = kind == IndexKind::Gin;
+                let mut entries = 0u64;
+                let mut runs_ok = true;
+                let walked =
+                    self.walk_btree(&idx.name, root, &no_columns, true, &mut |c, page, node| {
+                        if !gin {
+                            entries += node.len() as u64;
+                            return Ok(());
+                        }
+                        // A GIN record is a posting run: count its postings from its tail (§3.2).
+                        let mut postings = 0u64;
+                        for i in 0..node.len() {
+                            match crate::gin_runs::run_postings(node.key_at(i)) {
+                                Ok(n) => postings += n,
+                                Err(e) => {
+                                    runs_ok = false;
+                                    let object = Some(idx.name.as_str());
+                                    return c.add(
+                                        kinds::PAGE_CORRUPT,
+                                        object,
+                                        Some(page),
+                                        None,
+                                        e.message.clone(),
+                                    );
+                                }
+                            }
+                        }
+                        entries += postings;
+                        Ok(())
+                    })?;
+                (walked && runs_ok, entries)
             }
-        } else {
-            let root = snap
-                .index_store(&idx.name)
-                .tree_root()
-                .map_or(PageRef::NONE, |n| n.page_ref());
-            let no_columns = Arc::new(Vec::new());
-            self.walk_btree(&idx.name, root, &no_columns, true, &mut |_, _, node| {
-                entries += node.len() as u64;
-                Ok(())
-            })?
         };
         self.damaged |= !readable;
         if !self.full {
             return Ok(());
         }
+        // The definition and the environment decide the first skips, before any row is read (§3.5).
+        let rindex = match self.engine.resolve_index_for_check(ctx.table, idx)? {
+            Ok(rindex) => rindex,
+            Err(skip) => {
+                let reason = match skip {
+                    IndexDeriveSkip::Unparsable => kinds::SKIP_UNPARSABLE_DEFINITION,
+                    IndexDeriveSkip::HostFunction => kinds::SKIP_MISSING_HOST_FUNCTION,
+                    IndexDeriveSkip::LoadedData => kinds::SKIP_MISSING_LOADED_DATA,
+                };
+                self.skip(&idx.name, reason);
+                return Ok(());
+            }
+        };
         if !table_ok {
             self.skip(&idx.name, kinds::SKIP_TABLE_UNREADABLE);
             return Ok(());
@@ -876,19 +944,25 @@ impl Checker<'_> {
             self.skip(&idx.name, kinds::SKIP_INDEX_UNREADABLE);
             return Ok(());
         }
-        // Agreement for the indexes the reference derives today; the other kinds are slice I3's.
-        let derivable = idx.kind == IndexKind::Btree
-            && idx.predicate.is_none()
-            && idx.column_ordinals().is_some();
-        if !derivable {
-            return Ok(());
-        }
-        self.check_agreement(ctx, idx, entries)
+        let lookup = match idx.kind {
+            IndexKind::Btree => Lookup::Btree,
+            IndexKind::Gin => Lookup::Gin,
+            IndexKind::Gist => Lookup::Gist(gist_root.unwrap_or(PageRef::NONE), ops),
+        };
+        self.check_agreement(ctx, idx, &rindex, &lookup, entries)
     }
 
     /// Every entry the index derives from each table row, in storage-key order, is found through
-    /// the index's own lookup; and the index holds no other entries (§3.4).
-    fn check_agreement(&mut self, ctx: &TableCtx<'_>, idx: &IndexDef, entries: u64) -> Step<()> {
+    /// the index's own lookup; and the index holds no other entries (§3.4). The entries are the
+    /// write path's: expression keys, the partial predicate as a filter, GIN terms, the GiST bound.
+    fn check_agreement(
+        &mut self,
+        ctx: &TableCtx<'_>,
+        idx: &IndexDef,
+        rindex: &ResolvedIndex,
+        lookup: &Lookup,
+        entries: u64,
+    ) -> Step<()> {
         let snap = self.snap;
         let istore = snap.index_store(&idx.name);
         let root = snap
@@ -908,35 +982,52 @@ impl Checker<'_> {
                     let Some(row) = c.decode_row(ctx, page, node, i, false)? else {
                         continue;
                     };
-                    let derived = index_entry_keys_columns(
+                    // Each row's derivation has a write's scalar allowance, as one INSERT would.
+                    c.engine.session.scalar_bytes.set(0);
+                    let derived = c.engine.index_entries(
                         &ctx.table.columns,
                         &ctx.col_types,
                         &ctx.colls,
-                        idx,
+                        rindex,
                         key,
                         &row,
                     );
-                    match derived {
-                        Ok(derived) => {
-                            for entry in derived {
-                                if istore.get(&entry)?.is_some() {
-                                    found.set(found.get() + 1);
-                                } else {
-                                    let detail = "no entry for the row".to_string();
-                                    c.add(
-                                        kinds::INDEX_ENTRY_MISSING,
-                                        Some(&idx.name),
-                                        None,
-                                        Some(key),
-                                        detail,
-                                    )?;
-                                }
-                            }
-                        }
+                    let derived = match derived {
+                        Ok(derived) => derived,
+                        Err(e) if e.state == SqlState::QueryCanceled => return Err(Halt::Error(e)),
                         Err(e) => {
-                            let detail = e.message.clone();
+                            let detail = format!("{}: {}", e.code(), e.message);
                             c.add(
                                 kinds::INDEX_ENTRY_ERROR,
+                                Some(&idx.name),
+                                None,
+                                Some(key),
+                                detail,
+                            )?;
+                            continue;
+                        }
+                    };
+                    for entry in derived {
+                        // GIN and GiST entries are `term ‖ k` and `bound ‖ k`.
+                        let head = &entry[..entry.len() - key.len()];
+                        let present = match lookup {
+                            Lookup::Btree => istore.get(&entry)?.is_some(),
+                            Lookup::Gin => {
+                                match crate::gin_runs::run_at_or_after(&istore, head, key)? {
+                                    // A run that does not decode holds nothing (§3.4).
+                                    Some(run) => crate::gin_runs::decode_run(head.len(), &run)
+                                        .is_ok_and(|keys| keys.iter().any(|k| k == key)),
+                                    None => false,
+                                }
+                            }
+                            Lookup::Gist(root, ops) => c.gist_holds(*root, ops, head, key)?,
+                        };
+                        if present {
+                            found.set(found.get() + 1);
+                        } else {
+                            let detail = "no entry for the row".to_string();
+                            c.add(
+                                kinds::INDEX_ENTRY_MISSING,
                                 Some(&idx.name),
                                 None,
                                 Some(key),
@@ -962,6 +1053,45 @@ impl Checker<'_> {
             )?;
         }
         Ok(())
+    }
+
+    /// The GiST lookup (§3.4): descend from `root` into every child whose bound contains `bound`;
+    /// present when a leaf holds exactly `bound` with storage key `key`. The tree was walked
+    /// cleanly, so a page that no longer reads fails the call.
+    fn gist_holds(
+        &self,
+        root: PageRef,
+        ops: &[GistOpclass],
+        bound: &[u8],
+        key: &[u8],
+    ) -> Step<bool> {
+        let want = DecodedBound::decode(ops, bound)?;
+        let mut pending = Vec::new();
+        if root.page != 0 {
+            pending.push(root);
+        }
+        while let Some(page) = pending.pop() {
+            self.poll()?;
+            let raw = crate::format::integrity_read_page(self.paging, page)?;
+            let Some(items) = gist_items(&raw, ops, self.cap)? else {
+                continue;
+            };
+            for item in items {
+                match item.target {
+                    GistTarget::Leaf(skey) => {
+                        if item.raw == bound && skey == key {
+                            return Ok(true);
+                        }
+                    }
+                    GistTarget::Child(child) => {
+                        if item.bound.contains(&want) {
+                            pending.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The free list (§3.3): its chain pages first, then each entry in list order.
@@ -1062,41 +1192,81 @@ impl Checker<'_> {
     }
 }
 
-/// A GiST page's child pointers: `Some([])` for a leaf (its entries parsed and discarded), the
-/// children of an interior, `None` for another page type (gist.md §4.1).
-fn gist_children(raw: &crate::format::RawPage, cap: Cap) -> Result<Option<Vec<PageRef>>> {
+/// How agreement finds a derived entry in its index (§3.4).
+enum Lookup {
+    /// A point `get` of the entry key.
+    Btree,
+    /// The first run at or after `term ‖ k`, decoded with the term's length.
+    Gin,
+    /// A descent of the stored R-tree from its root, under the index's opclasses.
+    Gist(PageRef, Vec<GistOpclass>),
+}
+
+/// A GiST index's opclasses, one per indexed column (gist.md §6, §7); empty for another kind.
+fn gist_ops(table: &Table, idx: &IndexDef) -> Vec<GistOpclass> {
+    if idx.kind != IndexKind::Gist {
+        return Vec::new();
+    }
+    idx.column_ordinals()
+        .unwrap_or_default()
+        .iter()
+        .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
+        .collect()
+}
+
+/// What one GiST entry names: a leaf's storage key, or an interior's child page.
+enum GistTarget {
+    Leaf(Vec<u8>),
+    Child(PageRef),
+}
+
+/// One GiST node entry: its bound decoded under the index's opclasses and as stored, and its target.
+struct GistItem {
+    bound: DecodedBound,
+    raw: Vec<u8>,
+    target: GistTarget,
+}
+
+/// A GiST page's entries (gist.md §4.1), every bound decoded exactly under `ops` (`XX001`
+/// otherwise); `None` for another page type.
+fn gist_items(
+    raw: &crate::format::RawPage,
+    ops: &[GistOpclass],
+    cap: Cap,
+) -> Result<Option<Vec<GistItem>>> {
+    let leaf = match raw.page_type {
+        crate::gist::PAGE_GIST_LEAF => true,
+        crate::gist::PAGE_GIST_INTERIOR => false,
+        _ => return Ok(None),
+    };
     let payload = &raw.content;
     let mut pos = 0usize;
-    let take_len = |pos: &mut usize| -> Result<()> {
+    let take = |pos: &mut usize| -> Result<Vec<u8>> {
         let at = *pos;
         let len = payload
             .get(at..at + 2)
             .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
             .ok_or_else(truncated)?;
-        if at + 2 + len > payload.len() {
-            return Err(truncated());
-        }
+        let bytes = payload.get(at + 2..at + 2 + len).ok_or_else(truncated)?;
         *pos = at + 2 + len;
-        Ok(())
+        Ok(bytes.to_vec())
     };
-    match raw.page_type {
-        crate::gist::PAGE_GIST_LEAF => {
-            for _ in 0..raw.item_count {
-                take_len(&mut pos)?; // the bound
-                take_len(&mut pos)?; // the storage key
-            }
-            Ok(Some(Vec::new()))
-        }
-        crate::gist::PAGE_GIST_INTERIOR => {
-            let mut children = Vec::new();
-            for _ in 0..raw.item_count {
-                take_len(&mut pos)?;
-                children.push(crate::format::integrity_read_ptr(payload, &mut pos, cap)?);
-            }
-            Ok(Some(children))
-        }
-        _ => Ok(None),
+    let mut items = Vec::with_capacity(raw.item_count as usize);
+    for _ in 0..raw.item_count {
+        let bound_raw = take(&mut pos)?;
+        let bound = DecodedBound::decode(ops, &bound_raw)?;
+        let target = if leaf {
+            GistTarget::Leaf(take(&mut pos)?)
+        } else {
+            GistTarget::Child(crate::format::integrity_read_ptr(payload, &mut pos, cap)?)
+        };
+        items.push(GistItem {
+            bound,
+            raw: bound_raw,
+            target,
+        });
     }
+    Ok(Some(items))
 }
 
 fn truncated() -> EngineError {
@@ -1127,6 +1297,7 @@ mod tests {
             kinds::VALUE_UNDECODABLE,
             kinds::OVERFLOW_CHAIN_CORRUPT,
             kinds::ROW_COUNT_MISMATCH,
+            kinds::GIST_BOUNDS_VIOLATION,
             kinds::LIVE_COUNT_MISMATCH,
             kinds::FREE_LIST_CORRUPT,
             kinds::FREE_PAGE_OUT_OF_RANGE,
@@ -1140,7 +1311,13 @@ mod tests {
         for kind in emitted {
             assert!(kinds::FINDING_KINDS.contains(&kind), "{kind} unregistered");
         }
-        for reason in [kinds::SKIP_TABLE_UNREADABLE, kinds::SKIP_INDEX_UNREADABLE] {
+        for reason in [
+            kinds::SKIP_UNPARSABLE_DEFINITION,
+            kinds::SKIP_MISSING_HOST_FUNCTION,
+            kinds::SKIP_MISSING_LOADED_DATA,
+            kinds::SKIP_TABLE_UNREADABLE,
+            kinds::SKIP_INDEX_UNREADABLE,
+        ] {
             assert!(
                 kinds::SKIP_REASONS.contains(&reason),
                 "{reason} unregistered"

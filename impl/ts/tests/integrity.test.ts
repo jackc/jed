@@ -141,7 +141,9 @@ test("every clean golden checks with no findings at both levels", () => {
       for (const level of ["quick", "full"] as const) {
         const r = db.integrityCheck("main", { level, maxFindings: 0 });
         assert.deepEqual(r.findings, [], `${name} ${level}`);
-        assert.deepEqual(r.skipped, [], `${name} ${level}`);
+        // unparsable_definitions skips its unparsed indexes (the test below).
+        if (name !== "unparsable_definitions.jed" || level === "quick")
+          assert.deepEqual(r.skipped, [], `${name} ${level}`);
         assert.ok(r.ok);
       }
     } finally {
@@ -151,8 +153,9 @@ test("every clean golden checks with no findings at both levels", () => {
   }
   assert.ok(checked > 80, `only ${checked} goldens checked`);
 
-  // collation_skew_corrupt's index is ordered for another collation version: full finds every entry
-  // missing, quick (no agreement) finds nothing.
+  // collation_skew_corrupt's index is keyed under another version of its collation than the one
+  // loaded: full skips its agreement (missing_loaded_data, §3.5) rather than report every entry
+  // missing, and quick (no agreement) finds nothing.
   const db = openDatabase(copyOf(specPath("fileformat/fixtures/collation_skew_corrupt.jed")), {
     readOnly: true,
     environment: GOLDEN_ENV,
@@ -160,11 +163,59 @@ test("every clean golden checks with no findings at both levels", () => {
   try {
     assert.ok(db.integrityCheck("main", { level: "quick" }).ok);
     const full = db.integrityCheck("main");
-    assert.ok(full.findings.length > 0);
-    assert.ok(full.findings.every((f) => f.kind.startsWith("index_entry_")));
+    assert.deepEqual(full.findings, []);
+    assert.deepEqual(full.skipped, [{ object: "t_name_idx", reason: "missing_loaded_data" }]);
   } finally {
     db.close();
   }
+});
+
+// The definition-level skips (§3.5) need this binary's parser and an environment, which the reference
+// lacks, so no shared fixture expresses them.
+test("indexes whose definition or environment cannot be evaluated are skipped", () => {
+  const check = (golden: string, environment: Environment): IntegrityReport => {
+    const db = openDatabase(copyOf(join(GOLDEN_DIR, golden)), { readOnly: true, environment });
+    try {
+      assert.deepEqual(db.integrityCheck("main", { level: "quick" }).skipped, [], golden);
+      return db.integrityCheck("main", { level: "full" });
+    } finally {
+      db.close();
+    }
+  };
+  // Stored text a newer jed wrote: tables walk in name order (c, d, e, p, t, x).
+  let r = check("unparsable_definitions.jed", GOLDEN_ENV);
+  assert.deepEqual(r.findings, []);
+  assert.deepEqual(r.skipped, [
+    { object: "e_r_excl", reason: "unparsable_definition" },
+    { object: "p_future_idx", reason: "unparsable_definition" },
+    { object: "x_future_idx", reason: "unparsable_definition" },
+  ]);
+  // A host function not registered, or registered at another version, than the one the index pinned.
+  const geoHash = (semanticVersion: number): Environment =>
+    Environment.builder()
+      .registerFunction({
+        name: "geo_hash",
+        argTypes: ["i64"],
+        result: "i64",
+        kernel: (args) => args[0]!,
+        volatility: "immutable",
+        componentId: "com.example/geo_hash",
+        semanticVersion,
+      })
+      .build();
+  for (const env of [new Environment(), geoHash(2)]) {
+    r = check("hostfunc_index_table.jed", env);
+    assert.deepEqual(r.findings, []);
+    assert.deepEqual(r.skipped, [{ object: "t_geo_idx", reason: "missing_host_function" }]);
+  }
+  r = check("hostfunc_index_table.jed", GOLDEN_ENV);
+  assert.deepEqual([r.findings, r.skipped], [[], []]);
+  // A time zone the index pinned that the environment does not load.
+  r = check("timezone_index_table.jed", new Environment());
+  assert.deepEqual(r.findings, []);
+  assert.deepEqual(r.skipped, [{ object: "t_zone_idx", reason: "missing_loaded_data" }]);
+  r = check("timezone_index_table.jed", GOLDEN_ENV);
+  assert.deepEqual([r.findings, r.skipped], [[], []]);
 });
 
 test("every kind and skip reason the check emits is registered", () => {

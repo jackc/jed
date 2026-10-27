@@ -524,6 +524,38 @@ fn search_node(
     }
 }
 
+// ---- integrity check (spec/design/integrity-check.md §3.2, §3.4) -----------------------------
+
+/// A tuple bound decoded under an index's opclasses, for the integrity check's containment and
+/// descent tests.
+pub(crate) struct DecodedBound(Vec<GistBoundKey>);
+
+impl DecodedBound {
+    /// Decode a tuple bound's bytes `raw` under `ops`, consuming them exactly (trailing bytes are
+    /// `XX001`).
+    pub(crate) fn decode(ops: &[GistOpclass], raw: &[u8]) -> Result<DecodedBound> {
+        let mut pos = 0usize;
+        let bound = read_bound(ops, raw, &mut pos)?;
+        if pos != raw.len() {
+            return Err(corrupt("gist: bound has trailing bytes"));
+        }
+        Ok(DecodedBound(bound))
+    }
+
+    /// Whether this bound contains `inner`, per component (integrity-check.md §3.2): range `@>`
+    /// (anything contains `empty`, `empty` contains only `empty`); scalar `[min, max]` bytewise.
+    pub(crate) fn contains(&self, inner: &DecodedBound) -> bool {
+        self.0.iter().zip(&inner.0).all(|(a, b)| match (a, b) {
+            (GistBoundKey::Range(a), GistBoundKey::Range(b)) => range_contains(a, b),
+            (
+                GistBoundKey::Scalar { min: a0, max: a1 },
+                GistBoundKey::Scalar { min: b0, max: b1 },
+            ) => a0 <= b0 && b1 <= a1,
+            _ => false,
+        })
+    }
+}
+
 // ---- on-disk node codec (gist.md §4.1) -------------------------------------------------------
 
 /// One serialized GiST node page: its page number, type (leaf 5 / interior 6), the entry count

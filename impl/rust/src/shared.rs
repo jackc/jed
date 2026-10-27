@@ -3156,9 +3156,11 @@ impl Database {
     /// Check the storage of database `name` — `main` or an attachment — and report what is wrong with
     /// it (spec/design/integrity-check.md): the pinned generation's meta, manifest, catalog and
     /// sequences; every table's and index's tree (page verification, node types, key order and
-    /// separator bounds, leaf depth, value decoding, primary-key placement, row counts); and the space
-    /// accounting (free list, live page count). Under [`IntegrityLevel::Full`](crate::IntegrityLevel)
-    /// it also checks that each column B-tree index holds exactly the entries its table derives.
+    /// separator bounds, leaf depth, value decoding, primary-key placement, row counts, GIN posting
+    /// runs, GiST bounds); and the space accounting (free list, live page count). Under
+    /// [`IntegrityLevel::Full`](crate::IntegrityLevel) it also checks that every index holds exactly
+    /// the entries its table derives, evaluating expression keys and partial predicates in the
+    /// handle's environment; an index this binary or environment cannot derive is skipped.
     ///
     /// The check pins the committed snapshot as a read session does and never takes the writer
     /// gate: commits proceed meanwhile and are not seen. Pages are read through the handle's pager,

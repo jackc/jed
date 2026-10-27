@@ -2,7 +2,7 @@
 // generation that reports structured findings instead of failing on the first problem. It reads every
 // page the generation reaches — catalog, table and index trees, overflow chains, the free list —
 // through the handle's paging context, checks the invariants between them, and, at level `full`,
-// probes each column B-tree index once per row its table derives an entry for.
+// probes every index once per entry its table derives, deriving entries through the write path.
 //
 // The report is a cross-core contract (§4): the same findings in the same order, the same skips and
 // counters, as spec/fileformat/integrity.rb. Finding order is the walk order: generation, then each
@@ -16,7 +16,7 @@
 // It is unmetered, like compaction: no session cost or memory account is charged.
 
 import { NO_TAG, capFirstBody, type Cap } from "./cap.ts";
-import type { ColType } from "./catalog.ts";
+import type { ColType, IndexDef, Table } from "./catalog.ts";
 import { indexColumnOrdinals } from "./catalog.ts";
 import type { Collation } from "./collation.ts";
 import {
@@ -30,7 +30,13 @@ import {
 import { cancellationCheckpoint, throwIfAborted } from "./cancel.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { COOPERATE, shouldCooperate, type Steps } from "./execution.ts";
-import { encodePkKey, indexEntryKeysColumnsSteps, type Engine } from "./executor.ts";
+import {
+  encodePkKey,
+  type Engine,
+  gistOpclassFor,
+  indexEntryKeysSteps,
+  type ResolvedIndex,
+} from "./executor.ts";
 import {
   catalogImagePages,
   chainPayload,
@@ -48,11 +54,21 @@ import {
   parsePage,
   type TreeRef,
 } from "./format.ts";
+import { ginDecodeRun, ginRunAtOrAfterSteps, ginRunPostings } from "./gin_runs.ts";
+import {
+  type GistBound,
+  type GistOpclass,
+  gistBoundContains,
+  gistDecodeBound,
+  gistSplitLeafKey,
+} from "./gist.ts";
+import { verifyIndexTimezoneDeps } from "./index_dependencies.ts";
 import type { IntegrityKindName, IntegritySkipReasonName } from "./integrity_kinds.ts";
 import type { SharedPaging } from "./paging.ts";
 import { compareBytes } from "./pmap.ts";
 import type { Snapshot } from "./snapshot.ts";
-import type { Row } from "./storage.ts";
+import type { Row, TableStore } from "./storage.ts";
+import { indexUnparsed } from "./unparsed.ts";
 import { compareTextC } from "./value.ts";
 
 export {
@@ -167,6 +183,8 @@ class Checker {
   private damaged = false;
   private reached: Uint8Array = new Uint8Array(0);
   private reachedCount = 0;
+  // ginPostings counts a GIN tree's postings during its walk (§3.2).
+  private ginPostings = 0;
   private first = 2;
   private pageCount = 0;
   private readonly tagLen: number;
@@ -608,9 +626,13 @@ class Checker {
       const before = this.findings.length;
       let entries = 0;
       let indexReadable: boolean;
+      const ops = def.kind === "gist" ? gistOpclasses(table, def) : [];
       if (def.kind === "gist") {
-        indexReadable = yield* this.gist(def.name, snap.gistRoots.get(def.name) ?? NO_TREE_REF);
+        const walk = yield* this.gist(def.name, snap.gistRoots.get(def.name) ?? NO_TREE_REF, ops);
+        indexReadable = walk.readable;
+        entries = walk.entries;
       } else {
+        this.ginPostings = 0;
         indexReadable = yield* this.btree(
           def.name,
           treeRef(snap.indexStore(def.name).treeRoot()),
@@ -618,10 +640,27 @@ class Checker {
           (): undefined => {
             entries++;
           },
+          def.kind === "gin",
         );
+        if (def.kind === "gin") entries = this.ginPostings;
       }
       if (!indexReadable) this.damaged = true;
       if (this.level !== "full") continue;
+      // §3.5: the definition's own skips first, decided before any row is read.
+      let reason = this.definitionSkip(def);
+      let rindex: ResolvedIndex | null = null;
+      if (reason === null) {
+        try {
+          rindex = this.target.storage.resolveIndex(table, def);
+        } catch (e) {
+          reason = resolveSkip(e);
+        }
+        if (rindex !== null && this.collationSkip(table, rindex)) reason = "missing_loaded_data";
+      }
+      if (reason !== null) {
+        this.skipped.push({ object: def.name, reason });
+        continue;
+      }
       if (!tableReadable) {
         this.skipped.push({ object: def.name, reason: "table_unreadable" });
         continue;
@@ -632,53 +671,172 @@ class Checker {
         this.skipped.push({ object: def.name, reason: "index_unreadable" });
         continue;
       }
-      // I2 derives agreement for column-keyed, non-partial B-tree indexes only (§9).
-      if (def.kind !== "btree" || def.predicate !== undefined || indexColumnOrdinals(def) === null)
-        continue;
-      let found = 0;
-      const ist = snap.indexStore(def.name);
-      const tagLen = this.tagLen;
-      const paging = this.paging;
-      const fetch: PageFetch = (p, t) => paging.readBodySteps(p, t);
-      yield* this.rewalk(
-        treeRef(store.treeRoot()),
-        colTypes,
-        function* (this: Checker, _page: number, leaf: LeafView, i: number): Steps<void> {
-          yield* this.poll();
-          const key = leaf.keys[i]!;
-          const row: Row = new Array(colTypes.length);
-          for (let c = 0; c < colTypes.length; c++)
-            row[c] = yield* decodeLeafValueSteps(leaf, colTypes, i, c, fetch, tagLen);
-          let want: Uint8Array[];
-          try {
-            want = yield* indexEntryKeysColumnsSteps(table.columns, colTypes, colls, def, key, row);
-          } catch (e) {
-            if (fatal(e)) throw e;
-            this.add("index_entry_error", def.name, null, key, message(e));
-            return;
-          }
-          for (const entry of want) {
-            let present: boolean;
+      yield* this.agreement(name, def, rindex!, ops, colTypes, colls, entries);
+    }
+  }
+
+  // definitionSkip is the first of the definition-level skips (§3.5) that applies to an index, decided
+  // from its definition and the handle's environment alone: a stored expression this binary cannot
+  // parse; a host function the environment does not register at the component and version the index
+  // pinned; a time zone the index pinned that is not loaded or is at another version. Collations are
+  // collationSkip's, after the index resolves.
+  private definitionSkip(def: IndexDef): IntegritySkipReasonName | null {
+    if (indexUnparsed(def)) return "unparsable_definition";
+    const env = this.target.storage.environment;
+    const registered = env.hostFunctions()?.entries() ?? [];
+    for (const dep of def.hostDeps ?? []) {
+      const ok = registered.some(
+        (hf) =>
+          hf.name === dep.name &&
+          hf.argTypes.length === dep.argTypes.length &&
+          hf.argTypes.every((t, i) => t === dep.argTypes[i]) &&
+          hf.componentId === dep.componentId &&
+          hf.semanticVersion === dep.semanticVersion,
+      );
+      if (!ok) return "missing_host_function";
+    }
+    try {
+      verifyIndexTimezoneDeps(def.timezoneDeps, env);
+    } catch (e) {
+      if (e instanceof EngineError && e.code() === "XX002") return "missing_loaded_data";
+      throw e;
+    }
+    return null;
+  }
+
+  // collationSkip reports whether a resolved index depends on a collation the environment does not
+  // load, or loads at a version other than the catalog's pin (§3.5): a bare column key's column
+  // collation (any index kind), an expression key's derived collation, and the collation of every
+  // column an expression key or the partial predicate reads. C (no collation) never counts.
+  private collationSkip(table: Table, rindex: ResolvedIndex): boolean {
+    const snap = this.target.snap;
+    const env = this.target.storage.environment;
+    const unavailable = (name: string | null | undefined): boolean =>
+      name !== null &&
+      name !== undefined &&
+      name !== "" &&
+      (snap.collationSkew(name) !== undefined || env.collation(name) === undefined);
+    const refs = (node: unknown): boolean =>
+      rexprColumns(node).some((i) => unavailable(table.columns[i]?.collation));
+    for (const key of rindex.keys) {
+      if (key.kind === "column") {
+        if (unavailable(table.columns[key.column]!.collation)) return true;
+      } else if (unavailable(key.coll?.name) || refs(key.expr)) return true;
+    }
+    return rindex.predicate !== undefined && refs(rindex.predicate);
+  }
+
+  // agreement checks that an index holds exactly the entries its table derives (§3.4): each row's
+  // entries, derived through the write path's own derivation (index-entry keys, the partial predicate
+  // as a filter, GIN terms, the GiST leaf bound), are looked up through the index's own lookup, and
+  // the entries found must number the index's entry count.
+  private *agreement(
+    table: string,
+    def: IndexDef,
+    rindex: ResolvedIndex,
+    ops: GistOpclass[],
+    colTypes: ColType[],
+    colls: (Collation | null)[],
+    entries: number,
+  ): Steps<void> {
+    const snap = this.target.snap;
+    const columns = snap.tables.get(table)!.columns;
+    const store = snap.stores.get(table)!;
+    const ist = def.kind === "gist" ? null : snap.indexStore(def.name);
+    const gistRoot = snap.gistRoots.get(def.name) ?? NO_TREE_REF;
+    const env = this.target.storage.indexMaintenanceEnv();
+    const tagLen = this.tagLen;
+    const paging = this.paging;
+    const fetch: PageFetch = (p, t) => paging.readBodySteps(p, t);
+    let found = 0;
+    yield* this.rewalk(
+      treeRef(store.treeRoot()),
+      colTypes,
+      function* (this: Checker, _page: number, leaf: LeafView, i: number): Steps<void> {
+        yield* this.poll();
+        const key = leaf.keys[i]!;
+        const row: Row = new Array(colTypes.length);
+        for (let c = 0; c < colTypes.length; c++)
+          row[c] = yield* decodeLeafValueSteps(leaf, colTypes, i, c, fetch, tagLen);
+        let want: Uint8Array[];
+        try {
+          want = yield* indexEntryKeysSteps(columns, colTypes, colls, rindex, key, row, env);
+        } catch (e) {
+          if (evalFatal(e)) throw e;
+          this.add("index_entry_error", def.name, null, key, message(e));
+          return;
+        }
+        for (const entry of want) {
+          let present: boolean;
+          if (def.kind === "gin") present = yield* this.ginHolds(ist!, entry, key);
+          else if (def.kind === "gist") present = yield* this.gistHolds(gistRoot, ops, entry);
+          else {
             try {
-              present = (yield* ist.getSteps(entry)) !== undefined;
+              present = (yield* ist!.getSteps(entry)) !== undefined;
             } catch (e) {
               if (fatal(e)) throw e;
               present = false;
             }
-            if (present) found++;
-            else this.add("index_entry_missing", def.name, null, key, "no entry for the row");
           }
-        }.bind(this),
+          if (present) found++;
+          else this.add("index_entry_missing", def.name, null, key, "no entry for the row");
+        }
+      }.bind(this),
+    );
+    if (entries !== found) {
+      this.add(
+        "index_entry_count_mismatch",
+        def.name,
+        null,
+        null,
+        `index holds ${entries} entries, ${found} derive from rows`,
       );
-      if (entries !== found) {
-        this.add(
-          "index_entry_count_mismatch",
-          def.name,
-          null,
-          null,
-          `index holds ${entries} entries, ${found} derive from rows`,
-        );
+    }
+  }
+
+  // ginHolds looks up one derived GIN posting (term ‖ storage key) as the index's own lookup does: the
+  // first run at or after term ‖ key within the term's range, decoded with the term's length, holds
+  // key. A run that does not decode holds nothing (§3.4).
+  private *ginHolds(ist: TableStore, entry: Uint8Array, key: Uint8Array): Steps<boolean> {
+    const term = entry.subarray(0, entry.length - key.length);
+    try {
+      const run = yield* ginRunAtOrAfterSteps(ist, term, key);
+      if (run === null) return false;
+      return ginDecodeRun(term.length, run).some((k) => compareBytes(k, key) === 0);
+    } catch (e) {
+      if (fatal(e)) throw e;
+      return false;
+    }
+  }
+
+  // gistHolds looks up one derived GiST leaf entry (bound ‖ storage key): it descends into every child
+  // whose bound contains the derived bound, and the entry is present when a leaf holds the identical
+  // bound bytes with that storage key (§3.4).
+  private *gistHolds(root: TreeRef, ops: GistOpclass[], entry: Uint8Array): Steps<boolean> {
+    if (root.page === 0) return false;
+    try {
+      const want = gistSplitLeafKey(ops, entry);
+      const stack: TreeRef[] = [root];
+      while (stack.length > 0) {
+        const ref = stack.pop()!;
+        const node = parseGistNode(yield* this.readPage(ref.page, ref.tag), this.tagLen, ops);
+        if (node === null) continue;
+        for (const it of node.items) {
+          if (node.leaf) {
+            if (
+              compareBytes(it.raw, want.boundBytes) === 0 &&
+              compareBytes(it.skey!, want.skey) === 0
+            )
+              return true;
+          } else if (gistBoundContains(it.bound, want.bound)) {
+            stack.push(it.child!);
+          }
+        }
       }
+      return false;
+    } catch (e) {
+      if (fatal(e)) throw e;
+      return false;
     }
   }
 
@@ -754,7 +912,13 @@ class Checker {
   // verification, node types, uniform leaf depth, strict key order within a node, and every key within
   // the bounds its parent's separators give it. Each leaf record goes to visit in key order. The walk
   // keeps one root-to-leaf path. It returns false when part of the tree could not be read (§5.2).
-  private *btree(object: string, root: TreeRef, colTypes: ColType[], visit: Visit): Steps<boolean> {
+  private *btree(
+    object: string,
+    root: TreeRef,
+    colTypes: ColType[],
+    visit: Visit,
+    gin = false,
+  ): Steps<boolean> {
     if (root.page === 0) return true;
     let readable = true;
     let leafDepth: number | null = null;
@@ -817,6 +981,22 @@ class Checker {
           }
           if (leaf !== null) {
             this.checkKeys(object, node.page, leaf.keys, node.lo, node.hi);
+            if (gin) {
+              // A GIN tree's records are posting runs, counted from their tails (§3.2); the first run
+              // that does not parse makes the leaf unreadable.
+              let postings = 0;
+              try {
+                for (const k of leaf.keys) postings += ginRunPostings(k);
+                this.ginPostings += postings;
+              } catch (e) {
+                if (fatal(e)) throw e;
+                readable = false;
+                this.add("page_corrupt", object, node.page, null, message(e));
+                leaf = null;
+              }
+            }
+          }
+          if (leaf !== null) {
             for (let i = 0; i < leaf.n; i++) {
               const steps = visit(node.page, leaf, i);
               if (steps !== undefined) yield* steps;
@@ -888,18 +1068,22 @@ class Checker {
     }
   }
 
-  // gist walks a GiST R-tree (gist.md §4.1) for page reach and verification, node types, and uniform
-  // leaf depth. Bounding-box containment is slice I3's.
-  private *gist(object: string, root: TreeRef): Steps<boolean> {
-    if (root.page === 0) return true;
+  // gist walks a GiST R-tree (gist.md §4.1) for page reach and verification, node types, uniform leaf
+  // depth, every bound decoding under the index's opclasses, and each interior entry's bound containing
+  // every bound in the child it names (§3.2). It returns whether the tree was readable and its leaf
+  // entry count.
+  private *gist(
+    object: string,
+    root: TreeRef,
+    ops: GistOpclass[],
+  ): Steps<{ readable: boolean; entries: number }> {
+    if (root.page === 0) return { readable: true, entries: 0 };
     let readable = true;
+    let entries = 0;
     let leafDepth: number | null = null;
-    const stack: { children: TreeRef[]; i: number; depth: number }[] = [];
-    let next: { page: number; tag: Uint8Array; depth: number } | null = {
-      page: root.page,
-      tag: root.tag,
-      depth: 0,
-    };
+    const stack: { items: GistItem[]; i: number; depth: number }[] = [];
+    let next: { page: number; tag: Uint8Array; depth: number; parent: GistBound[] | null } | null =
+      { page: root.page, tag: root.tag, depth: 0, parent: null };
     while (next !== null) {
       const node = next;
       next = null;
@@ -916,17 +1100,17 @@ class Checker {
         );
       } else {
         let pg: ReturnType<typeof parsePage> | null = null;
-        let children: TreeRef[] | null = null;
+        let parsed: GistNode | null = null;
         try {
           pg = yield* this.readPage(node.page, node.tag);
-          children = parseGist(pg, this.tagLen);
+          parsed = parseGistNode(pg, this.tagLen, ops);
         } catch (e) {
           if (fatal(e)) throw e;
           readable = false;
           pg = null;
           this.add("page_corrupt", object, node.page, null, message(e));
         }
-        if (pg !== null && children === null) {
+        if (pg !== null && parsed === null) {
           readable = false;
           this.add(
             "page_type_wrong",
@@ -935,32 +1119,49 @@ class Checker {
             null,
             `page type ${pg.pageType} in a GiST tree`,
           );
-        } else if (pg !== null && pg.pageType === PAGE_GIST_LEAF) {
-          leafDepth ??= node.depth;
-          if (node.depth !== leafDepth) {
+        } else if (parsed !== null) {
+          if (parsed.leaf) {
+            leafDepth ??= node.depth;
+            if (node.depth !== leafDepth) {
+              this.add(
+                "tree_depth_uneven",
+                object,
+                node.page,
+                null,
+                `leaf at depth ${node.depth}, others at ${leafDepth}`,
+              );
+            }
+          }
+          const parent = node.parent;
+          if (parent !== null && !parsed.items.every((it) => gistBoundContains(parent, it.bound))) {
             this.add(
-              "tree_depth_uneven",
+              "gist_bounds_violation",
               object,
               node.page,
               null,
-              `leaf at depth ${node.depth}, others at ${leafDepth}`,
+              "a bound lies outside its parent's bound for this page",
             );
           }
-        } else if (children !== null) {
-          stack.push({ children, i: 0, depth: node.depth });
+          if (parsed.leaf) entries += parsed.items.length;
+          else stack.push({ items: parsed.items, i: 0, depth: node.depth });
         }
       }
       while (stack.length > 0) {
         const top = stack[stack.length - 1]!;
-        if (top.i < top.children.length) {
-          const c = top.children[top.i++]!;
-          next = { page: c.page, tag: c.tag, depth: top.depth + 1 };
+        if (top.i < top.items.length) {
+          const it = top.items[top.i++]!;
+          next = {
+            page: it.child!.page,
+            tag: it.child!.tag,
+            depth: top.depth + 1,
+            parent: it.bound,
+          };
           break;
         }
         stack.pop();
       }
     }
-    return readable;
+    return { readable, entries };
   }
 
   // --- space accounting (§3.3) ---
@@ -1100,43 +1301,109 @@ function treeRef(n: { page: number; tag?: Uint8Array } | null): TreeRef {
   return n === null || n.page === 0 ? NO_TREE_REF : { page: n.page, tag: n.tag ?? NO_TAG };
 }
 
-// parseGist returns a GiST page's child pointers ([] for a leaf, whose entries are parsed and
-// discarded), or null for a page of another type (gist.md §4.1). A malformed entry is data_corrupted.
-function parseGist(pg: ReturnType<typeof parsePage>, tagLen: number): TreeRef[] | null {
+// One GiST node entry: its decoded bound, the bound's bytes, and the leaf's storage key or the
+// interior's child pointer.
+type GistItem = {
+  bound: GistBound[];
+  raw: Uint8Array;
+  skey: Uint8Array | null;
+  child: TreeRef | null;
+};
+type GistNode = { leaf: boolean; items: GistItem[] };
+
+// parseGistNode parses a GiST page's entries (gist.md §4.1), decoding every bound under ops exactly
+// (§3.2), or returns null for a page of another type. A malformed entry or bound is data_corrupted.
+function parseGistNode(
+  pg: ReturnType<typeof parsePage>,
+  tagLen: number,
+  ops: GistOpclass[],
+): GistNode | null {
   const buf = pg.payload;
   let pos = 0;
-  const take = (n: number): number => {
+  const take = (n: number): Uint8Array => {
     if (n > buf.length - pos) throw engineError("data_corrupted", "unexpected end of page data");
     const at = pos;
     pos += n;
-    return at;
+    return buf.subarray(at, pos);
   };
   const u16 = (): number => {
-    const at = take(2);
-    return (buf[at]! << 8) | buf[at + 1]!;
+    const b = take(2);
+    return (b[0]! << 8) | b[1]!;
   };
+  const items: GistItem[] = [];
   if (pg.pageType === PAGE_GIST_LEAF) {
     for (let i = 0; i < pg.itemCount; i++) {
-      take(u16());
-      take(u16());
+      const raw = take(u16());
+      const skey = take(u16());
+      items.push({ bound: gistDecodeBound(ops, raw), raw, skey, child: null });
     }
-    return [];
+    return { leaf: true, items };
   }
   if (pg.pageType !== PAGE_GIST_INTERIOR) return null;
   if (pg.itemCount * (6 + tagLen) > buf.length)
     throw engineError("data_corrupted", "GiST interior item count overruns page");
-  const children: TreeRef[] = [];
   for (let i = 0; i < pg.itemCount; i++) {
-    take(u16());
-    const at = take(4);
-    const page =
-      ((buf[at]! << 24) | (buf[at + 1]! << 16) | (buf[at + 2]! << 8) | buf[at + 3]!) >>> 0;
-    const tag = tagLen === 0 ? NO_TAG : buf.slice(take(tagLen), pos);
+    const raw = take(u16());
+    const p = take(4);
+    const page = ((p[0]! << 24) | (p[1]! << 16) | (p[2]! << 8) | p[3]!) >>> 0;
+    const tag = tagLen === 0 ? NO_TAG : take(tagLen).slice();
     if (page === 0 && tag.some((b) => b !== 0))
       throw engineError("data_corrupted", "a pointer to no page carries a tag");
-    children.push({ page, tag });
+    items.push({ bound: gistDecodeBound(ops, raw), raw, skey: null, child: { page, tag } });
   }
-  return children;
+  return { leaf: false, items };
+}
+
+// gistOpclasses are a GiST index's per-column opclasses (gist.md §5, §6): its key columns in order.
+function gistOpclasses(table: Table, def: IndexDef): GistOpclass[] {
+  return (indexColumnOrdinals(def) ?? []).map((ci) => gistOpclassFor(table.columns[ci]!.type));
+}
+
+// resolveSkip maps a failure to resolve an index for maintenance onto its skip reason (§3.5): XX003 is
+// an unparsed definition, 42883 a host function the environment no longer registers, and XX002 data
+// (a collation or time zone) the environment does not load at the pinned version. Anything else ends
+// the check.
+function resolveSkip(e: unknown): IntegritySkipReasonName {
+  if (e instanceof EngineError) {
+    switch (e.code()) {
+      case "XX003":
+        return "unparsable_definition";
+      case "42883":
+        return "missing_host_function";
+      case "XX002":
+        return "missing_loaded_data";
+    }
+  }
+  throw e;
+}
+
+// rexprColumns is the column ordinals a resolved index expression reads: every `column` node anywhere
+// in it. An index expression holds no subquery or outer reference, so every column node is the table's.
+function rexprColumns(root: unknown): number[] {
+  const out: number[] = [];
+  const seen = new Set<object>();
+  const walk = (v: unknown): void => {
+    if (v === null || typeof v !== "object" || ArrayBuffer.isView(v) || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const x of v) walk(x);
+      return;
+    }
+    const o = v as { kind?: unknown; index?: unknown };
+    if (o.kind === "column" && typeof o.index === "number") out.push(o.index);
+    for (const x of Object.values(v)) walk(x);
+  };
+  walk(root);
+  return out;
+}
+
+// evalFatal reports whether an error deriving a row's index entries ends the check instead of being
+// the row's index_entry_error (§3.4): a cancellation, a device or connection error, or anything that
+// is not an engine error (a bug). An evaluation that raises is a finding.
+function evalFatal(e: unknown): boolean {
+  if (!(e instanceof EngineError)) return true;
+  const code = e.code();
+  return code === "57014" || code.startsWith("58") || code.startsWith("08");
 }
 
 // paddedEqual reports whether stored (a page's content, zero-padded to the page) holds exactly want.

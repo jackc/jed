@@ -32,6 +32,21 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Open a copy of `image` read-only, as `jed check` would.
 fn open_copy(name: &str, image: &[u8], credential: Option<Credential>) -> jed::Result<Database> {
+    open_copy_in(
+        name,
+        image,
+        credential,
+        super::fileformat_golden::golden_env(),
+    )
+}
+
+/// [`open_copy`] in `environment`.
+fn open_copy_in(
+    name: &str,
+    image: &[u8],
+    credential: Option<Credential>,
+    environment: jed::Environment,
+) -> jed::Result<Database> {
     let path = tmp(&format!("integrity_{name}"));
     std::fs::write(&path, image).unwrap();
     Database::open_with_options(
@@ -39,7 +54,7 @@ fn open_copy(name: &str, image: &[u8], credential: Option<Credential>) -> jed::R
         OpenOptions {
             read_only: true,
             credential,
-            environment: super::fileformat_golden::golden_env(),
+            environment,
             ..OpenOptions::default()
         },
     )
@@ -294,9 +309,27 @@ fn damaged_fixtures_reproduce_their_reports() {
 /// torn `cow_*` images, through recovery's fallback generation.
 const UNOPENABLE: &[&str] = &["cow_invalid_free_list.jed"];
 
+/// The `full` skips of each golden that has any in the golden environment (integrity-check.md §3.5):
+/// stored text this binary cannot parse, and an index pinned to a collation version other than the
+/// loaded one (its agreement is skipped rather than reported as missing entries). Tables walk in
+/// name order.
+const GOLDEN_SKIPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "collation_skew_corrupt.jed",
+        &[("t_name_idx", kinds::SKIP_MISSING_LOADED_DATA)],
+    ),
+    (
+        "unparsable_definitions.jed",
+        &[
+            ("e_r_excl", kinds::SKIP_UNPARSABLE_DEFINITION),
+            ("p_future_idx", kinds::SKIP_UNPARSABLE_DEFINITION),
+            ("x_future_idx", kinds::SKIP_UNPARSABLE_DEFINITION),
+        ],
+    ),
+];
+
 /// Every golden that opens checks with no findings at both levels, file-backed and (plaintext) in
-/// memory — except `collation_skew_corrupt.jed`, whose index is deliberately ordered for another
-/// collation version (integrity-check.md §6).
+/// memory, skipping under `full` exactly what [`GOLDEN_SKIPS`] lists.
 #[test]
 fn clean_goldens_check_clean() {
     let dir = spec("fileformat/fixtures");
@@ -311,7 +344,7 @@ fn clean_goldens_check_clean() {
     for name in &names {
         // The malformed goldens are damaged on purpose (each one's damage is what open or a read
         // must reject); the skewed index is ordered for another collation version.
-        if name == "collation_skew_corrupt.jed" || name.starts_with("malformed_") {
+        if name.starts_with("malformed_") {
             continue;
         }
         let image = std::fs::read(dir.join(name)).unwrap();
@@ -342,26 +375,28 @@ fn clean_goldens_check_clean() {
                     "{name} {level:?} ({backing}): {:#?}",
                     report.findings
                 );
+                let want: Vec<(String, &str)> = match level {
+                    IntegrityLevel::Quick => Vec::new(),
+                    IntegrityLevel::Full => GOLDEN_SKIPS
+                        .iter()
+                        .find(|(golden, _)| golden == name)
+                        .map_or(&[][..], |(_, skips)| skips)
+                        .iter()
+                        .map(|(object, reason)| (object.to_string(), *reason))
+                        .collect(),
+                };
+                let got: Vec<(String, &str)> = report
+                    .skipped
+                    .iter()
+                    .map(|s| (s.object.clone(), s.reason))
+                    .collect();
+                assert_eq!(got, want, "{name} {level:?} ({backing}) skips");
             }
         }
         checked += 1;
     }
     assert_eq!(unopenable, UNOPENABLE, "the goldens that do not open");
     assert!(checked > 60, "checked {checked} goldens");
-}
-
-/// A skewed index is the one golden with findings: its entries are ordered for another collation,
-/// so `full` misses them.
-#[test]
-fn collation_skew_index_is_found() {
-    let image = std::fs::read(spec("fileformat/fixtures/collation_skew_corrupt.jed")).unwrap();
-    let Ok(db) = open_copy("skew.jed", &image, None) else {
-        return; // the golden tests decide whether it opens
-    };
-    let report = db
-        .integrity_check("main", &IntegrityCheckOptions::default())
-        .unwrap();
-    assert!(!report.ok());
 }
 
 fn create_file(path: &Path) -> Database {
@@ -596,4 +631,97 @@ fn live_only_findings() {
         .integrity_check("main", &IntegrityCheckOptions::default())
         .unwrap();
     assert!(r.ok(), "{:#?}", r.findings);
+}
+
+/// The golden environment's parts, each optional: the Unicode bundle, the time-zone bundle, and the
+/// `geo_hash` host function.
+fn environment(time_zones: bool, geo_hash: bool) -> jed::Environment {
+    let unicode = std::fs::read(spec("collation/fixtures/unicode.jucd")).unwrap();
+    let mut builder = jed::Environment::builder()
+        .load_unicode_data(&unicode)
+        .expect("load unicode.jucd");
+    if time_zones {
+        builder = builder
+            .load_time_zone_data(&std::fs::read(spec("tz/fixtures/tzdata.jtz")).unwrap())
+            .expect("load tzdata.jtz");
+    }
+    if geo_hash {
+        builder = builder
+            .register_function(super::fileformat_golden::geo_hash_golden_function())
+            .expect("register geo_hash");
+    }
+    builder.build()
+}
+
+/// The skips of a `full` check of `db`, as `(object, reason)`.
+fn skips(db: &Database) -> Vec<(String, &'static str)> {
+    let r = db
+        .integrity_check("main", &opts(IntegrityLevel::Full, 0))
+        .unwrap();
+    assert!(r.findings.is_empty(), "{:#?}", r.findings);
+    r.skipped
+        .iter()
+        .map(|s| (s.object.clone(), s.reason))
+        .collect()
+}
+
+/// An index whose stored text this binary does not parse is skipped, in the order its table and
+/// index are walked (integrity-check.md §3.5): the reference has no parser, so no fixture can.
+#[test]
+fn unparsable_definitions_are_skipped() {
+    let image = std::fs::read(spec("fileformat/fixtures/unparsable_definitions.jed")).unwrap();
+    let db = open_copy("unparsable.jed", &image, None).unwrap();
+    assert_eq!(
+        skips(&db),
+        [
+            ("e_r_excl".to_string(), kinds::SKIP_UNPARSABLE_DEFINITION),
+            (
+                "p_future_idx".to_string(),
+                kinds::SKIP_UNPARSABLE_DEFINITION
+            ),
+            (
+                "x_future_idx".to_string(),
+                kinds::SKIP_UNPARSABLE_DEFINITION
+            ),
+        ]
+    );
+}
+
+/// An expression index over a host function the environment does not register is skipped; with
+/// it registered at the pinned component and version, its (empty) table agrees.
+#[test]
+fn missing_host_function_is_skipped() {
+    let image = std::fs::read(spec("fileformat/fixtures/hostfunc_index_table.jed")).unwrap();
+    let without = open_copy_in(
+        "hostfunc_without.jed",
+        &image,
+        None,
+        environment(true, false),
+    )
+    .expect("the file opens without its host function");
+    assert_eq!(
+        skips(&without),
+        [("t_geo_idx".to_string(), kinds::SKIP_MISSING_HOST_FUNCTION)]
+    );
+    let with = open_copy_in("hostfunc_with.jed", &image, None, environment(true, true)).unwrap();
+    assert_eq!(skips(&with), []);
+}
+
+/// An expression index pinned to time-zone data the environment does not load is skipped.
+#[test]
+fn missing_time_zone_data_is_skipped() {
+    let image = std::fs::read(spec("fileformat/fixtures/timezone_index_table.jed")).unwrap();
+    let without = open_copy_in(
+        "timezone_without.jed",
+        &image,
+        None,
+        environment(false, true),
+    )
+    .expect("the file opens without its time-zone data");
+    assert_eq!(
+        skips(&without),
+        [("t_zone_idx".to_string(), kinds::SKIP_MISSING_LOADED_DATA)]
+    );
+    let with = open_copy_in("timezone_with.jed", &image, None, environment(true, true)).unwrap();
+    assert_eq!(skips(&with), []);
 }

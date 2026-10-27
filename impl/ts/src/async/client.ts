@@ -999,7 +999,7 @@ export class AsyncDatabase extends AsyncHandle {
   /**
    * Check database `name` (`"main"` or an attachment, matched exactly) and return its findings
    * (spec/design/integrity-check.md): every page its committed generation reaches is read and
-   * verified, and under level `full` (the default) each column B-tree index is checked against its
+   * verified, and under level `full` (the default) every index is checked against its
    * table. A finding is a fact about the database, never an error; the call rejects only with
    * `42704` for an unknown name, `57014` when `signal` aborts it, or an I/O error. It pins a
    * snapshot as a read session does and never waits for the writer. Stops after `maxFindings`

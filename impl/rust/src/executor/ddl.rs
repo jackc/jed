@@ -127,6 +127,18 @@ fn verify_index_host_deps(
     Ok(())
 }
 
+/// Why the integrity check cannot derive an index's entries in this binary and environment
+/// (spec/design/integrity-check.md §3.5), in skip precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexDeriveSkip {
+    /// A key expression or the predicate did not parse (`XX003`).
+    Unparsable,
+    /// A host function is not registered at the component and version the index pinned.
+    HostFunction,
+    /// A time zone or collation is not loaded at the version the index pinned (`XX002`).
+    LoadedData,
+}
+
 /// [`verify_index_host_deps`] for a `CHECK` (spec/design/extensibility.md §7.1.2): every host call
 /// the resolved check makes must match a dependency persisted with it, else `XX002`. Unlike an index
 /// there is no read-side fallback to take — only a statement that evaluates the check resolves it. A
@@ -4731,18 +4743,7 @@ impl Engine {
         verify_index_timezone_deps(&def.timezone_deps, &self.session.env)?;
         let mut keys = Vec::with_capacity(def.keys.len());
         for k in &def.keys {
-            match k {
-                IndexKey::Column(ord) => keys.push(ResolvedKey::Column(*ord)),
-                IndexKey::Expr(e) => {
-                    let scope = Scope::index(self, table);
-                    let (rexpr, rtype) =
-                        resolve(&scope, &e.expr, None, &mut AggCtx::Forbidden, params)?;
-                    let ty = resolved_to_key_type(&rtype)
-                        .expect("index expression result type validated indexable at CREATE INDEX");
-                    let coll = resolve_deriv(scope.catalog, derive_collation(&scope, &e.expr)?)?;
-                    keys.push(ResolvedKey::Expr(rexpr, ty, coll));
-                }
-            }
+            keys.push(self.resolve_index_key(table, k, params)?);
         }
         // A partial index's predicate (indexes.md §9), re-resolved against the table's columns — it
         // was validated boolean + immutable at CREATE INDEX, so this cannot newly fail (a
@@ -4778,6 +4779,149 @@ impl Engine {
             keys,
             predicate,
         })
+    }
+
+    /// One index key element resolved for maintenance: a column keeps its ordinal; an expression
+    /// resolves to an `RExpr` + its encoding `Type` + collation.
+    fn resolve_index_key(
+        &self,
+        table: &Table,
+        key: &IndexKey,
+        params: &mut ParamTypes,
+    ) -> Result<ResolvedKey> {
+        match key {
+            IndexKey::Column(ord) => Ok(ResolvedKey::Column(*ord)),
+            IndexKey::Expr(e) => {
+                let scope = Scope::index(self, table);
+                let (rexpr, rtype) =
+                    resolve(&scope, &e.expr, None, &mut AggCtx::Forbidden, params)?;
+                let ty = resolved_to_key_type(&rtype)
+                    .expect("index expression result type validated indexable at CREATE INDEX");
+                let coll = resolve_deriv(scope.catalog, derive_collation(&scope, &e.expr)?)?;
+                Ok(ResolvedKey::Expr(rexpr, ty, coll))
+            }
+        }
+    }
+
+    /// Resolve an index for the integrity check's agreement (spec/design/integrity-check.md §3.4,
+    /// §3.5): the write path's [`resolve_index`](Self::resolve_index), except that the reasons this
+    /// environment cannot derive the index's entries are told apart, in skip precedence — stored text
+    /// this binary does not parse, then a host function not registered at the pinned component and
+    /// version, then a time zone or collation not loaded at the pinned version. Any other resolution
+    /// failure fails the call.
+    pub(crate) fn resolve_index_for_check(
+        &self,
+        table: &Table,
+        def: &IndexDef,
+    ) -> Result<std::result::Result<ResolvedIndex, IndexDeriveSkip>> {
+        if def.unparsed() {
+            return Ok(Err(IndexDeriveSkip::Unparsable));
+        }
+        let params = &mut ParamTypes::default();
+        let mut host = false;
+        let mut loaded = false;
+        let mut other: Option<EngineError> = None;
+        let mut note = |e: EngineError| match e.state {
+            SqlState::UndefinedFunction => host = true,
+            SqlState::CollationVersionMismatch => loaded = true,
+            _ => {
+                other.get_or_insert(e);
+            }
+        };
+        let mut keys = Vec::with_capacity(def.keys.len());
+        for k in &def.keys {
+            match self.resolve_index_key(table, k, params) {
+                Ok(rk) => keys.push(rk),
+                Err(e) => note(e),
+            }
+        }
+        let predicate = match &def.predicate {
+            None => None,
+            Some(p) => {
+                let scope = Scope::index(self, table);
+                match resolve_boolean_filter(&scope, &p.expr, params) {
+                    Ok(pred) => Some(pred),
+                    Err(e) => {
+                        note(e);
+                        None
+                    }
+                }
+            }
+        };
+        let reg = self.session.env.functions();
+        let exprs = keys
+            .iter()
+            .filter_map(|k| match k {
+                ResolvedKey::Expr(rexpr, ..) => Some(rexpr),
+                ResolvedKey::Column(_) => None,
+            })
+            .chain(predicate.as_ref());
+        for rexpr in exprs {
+            if !def.host_deps.is_empty()
+                && verify_index_host_deps(rexpr, reg, &def.host_deps).is_err()
+            {
+                host = true;
+            }
+        }
+        if verify_index_timezone_deps(&def.timezone_deps, &self.session.env).is_err() {
+            loaded = true;
+        }
+        if host {
+            return Ok(Err(IndexDeriveSkip::HostFunction));
+        }
+        if loaded {
+            return Ok(Err(IndexDeriveSkip::LoadedData));
+        }
+        if let Some(e) = other {
+            return Err(e);
+        }
+        // The collations the index's keys encode under or its expressions compare with — a key
+        // column's, an expression key's derived collation, and every column an expression key or the
+        // predicate reads — must be loaded at the catalog's pinned version (`C` never counts).
+        let unavailable = |name: Option<&str>| match name {
+            None | Some("C") => false,
+            Some(name) => {
+                self.committed.collation_skew(name).is_some()
+                    || self.session.env.collation(name).is_none()
+            }
+        };
+        fn reads_unavailable(
+            node: &RExpr,
+            table: &Table,
+            unavailable: &dyn Fn(Option<&str>) -> bool,
+        ) -> bool {
+            if let RExpr::Column(i) = node
+                && table
+                    .columns
+                    .get(*i)
+                    .is_some_and(|c| unavailable(c.collation.as_deref()))
+            {
+                return true;
+            }
+            estimator_expression_children(node)
+                .into_iter()
+                .any(|child| reads_unavailable(child, table, unavailable))
+        }
+        let missing = keys.iter().any(|k| match k {
+            ResolvedKey::Column(ci) => unavailable(table.columns[*ci].collation.as_deref()),
+            ResolvedKey::Expr(rexpr, _, coll) => {
+                unavailable(coll.as_ref().map(|c| c.name.as_str()))
+                    || reads_unavailable(rexpr, table, &unavailable)
+            }
+        }) || predicate
+            .as_ref()
+            .is_some_and(|p| reads_unavailable(p, table, &unavailable));
+        if missing {
+            return Ok(Err(IndexDeriveSkip::LoadedData));
+        }
+        Ok(Ok(ResolvedIndex {
+            name: def.name.clone(),
+            unique: def.unique,
+            kind: def.kind,
+            orders: (0..keys.len()).map(|i| def.key_order(i)).collect(),
+            keys,
+            predicate,
+        }))
     }
 
     /// Resolve every index of a table once per statement (the maintenance driver — INSERT / UPDATE
