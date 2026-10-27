@@ -326,6 +326,7 @@ require_relative 'jed_native/deep_stack'
 
 require_relative 'jed_native/paged_constraints'
 require_relative 'jed_native/storage_rewrite'
+require_relative 'jed_native/integrity'
 
 require_relative 'jed_native/host_batches'
 require_relative 'jed_native/storage_operations'

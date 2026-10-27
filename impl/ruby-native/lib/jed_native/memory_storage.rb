@@ -7,7 +7,7 @@ module JedNative
   # The in-memory host stores the same packed pages. Its free list stays in RAM,
   # so it emits no free-list or manifest pages and has no durability barrier.
   class MemoryStorage
-    attr_reader :page_size, :page_count, :state
+    attr_reader :page_size, :page_count, :state, :root
     attr_writer :reuse_allowed_provider
 
     def initialize(codec, page_size: 8192, image: nil, state: nil)
@@ -15,6 +15,8 @@ module JedNative
       image ||= codec.build_image([], [], [], page_size)
       @pages = PendingPages.new(page_size)
       @page_count = image.bytesize / page_size
+      # The catalog root, for the integrity check: the image's meta names it until a commit moves it.
+      @root = (codec.select_meta(image, page_size)[:root_page] rescue FileFormat::ROOT_PAGE)
       @page_count.times { |page| @pages[page] = image.byteslice(page * page_size, page_size) }
       @free = state ? state.fetch(:free_pages, []) : []
       @live_pages = state ? state.fetch(:live_pages) : Set[2]
@@ -46,6 +48,7 @@ module JedNative
     def adopt(plan, state)
       @pages.merge!(plan.pages.pages)
       @page_count, @free = plan.pages.page_count, plan.allocator.remaining
+      @root = plan.root
       @live_pages, @last_written = plan.live_pages, plan.pages.pages.keys
       @page_ids, @overflow_ids = plan.adopt, plan.overflow_ids
       @catalog_pages = plan.pages.pages.count { |_, bytes| bytes.getbyte(0) == FileFormat::PAGE_CATALOG }
