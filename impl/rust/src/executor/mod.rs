@@ -67,6 +67,7 @@ mod autoname;
 pub(crate) use autoname::*;
 mod create_table_as;
 mod ddl;
+pub(crate) use ddl::IndexDeriveSkip;
 mod index_dependencies;
 pub(crate) use index_dependencies::*;
 mod dml;

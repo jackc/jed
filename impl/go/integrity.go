@@ -15,6 +15,7 @@ package jed
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"runtime"
@@ -98,10 +99,10 @@ func (r IntegrityReport) OK() bool { return len(r.Findings) == 0 && !r.Truncated
 // proceed meanwhile and the check does not see them. It verifies the pinned generation's meta,
 // manifest, and catalog; walks every table, index, and overflow chain, checking page verification,
 // node types, tree shape, key order, stored values, primary keys, and row counts; checks the free list
-// and the live page count; and, at IntegrityFull, that each plain-column B-tree index holds exactly
-// the entries its table derives. Pages come through the handle's pager, so a page cached since it was
-// verified is not re-read; a host that wants every byte read from storage checks a freshly opened
-// handle. It never writes.
+// and the live page count; and, at IntegrityFull, that each index (B-tree, expression, partial, GIN,
+// GiST) holds exactly the entries the write path derives from its table's rows. Pages come through
+// the handle's pager, so a page cached since it was verified is not re-read; a host that wants every
+// byte read from storage checks a freshly opened handle. It never writes.
 //
 // A damaged page is a finding (XX001 while reading never fails the call). The call fails only for
 // 42704 when name is not `main` or an attachment (`temp` included), 57014 when ctx is canceled (polled
@@ -359,6 +360,8 @@ type integrityChecker struct {
 	// freeChain is the free-list chain pages read and verified so far; they count toward pages.
 	freeChain uint64
 	report    IntegrityReport
+	// eng is the transient engine index agreement resolves and evaluates definitions through.
+	eng *engine
 }
 
 func newIntegrityChecker(ctx context.Context, db string, opts IntegrityCheckOptions, snap *snapshot, paging *sharedPaging, gen integrityGeneration) *integrityChecker {
@@ -730,16 +733,18 @@ func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls 
 	before := len(k.report.Findings)
 	readable := true
 	var entries uint64
+	var gistOps []gistOpclass
 	if def.Kind == indexGist {
-		walk := &integrityGist{k: k, object: def.Name, leafDepth: -1, readable: true}
+		gistOps = gistOpclassesFor(def.columnOrdinals(), table.Columns)
+		walk := &integrityGist{k: k, object: def.Name, ops: gistOps, leafDepth: -1, readable: true}
 		if !k.gistKnown {
 			walk.readable = false
 		} else if root := k.gistRoots[def.Name]; root.page != 0 {
-			if err := walk.visit(root, 0); err != nil {
+			if err := walk.visit(root, 0, nil); err != nil {
 				return err
 			}
 		}
-		readable = walk.readable
+		readable, entries = walk.readable, walk.entries
 	} else {
 		var root pageRef
 		if ist := k.snap.indexStores[def.Name]; ist != nil {
@@ -747,16 +752,28 @@ func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls 
 				root = r.ref()
 			}
 		}
-		walk := &integrityTree{k: k, object: def.Name, leafDepth: -1, readable: true}
+		walk := &integrityTree{k: k, object: def.Name, gin: def.Kind == indexGin, leafDepth: -1, readable: true}
 		if root.page != 0 {
 			if err := walk.visit(root, 0, nil, nil); err != nil {
 				return err
 			}
 		}
 		readable, entries = walk.readable, walk.records
+		if walk.gin {
+			entries = walk.postings
+		}
 	}
 	k.damaged = k.damaged || !readable
 	if !k.full {
+		return nil
+	}
+	// The definition and environment skips come first, decided before any row is read (§3.5).
+	rindex, reason, err := k.resolveForAgreement(table, def)
+	if err != nil {
+		return err
+	}
+	if reason != "" {
+		k.skip(def.Name, reason)
 		return nil
 	}
 	if tableDamaged {
@@ -767,22 +784,43 @@ func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls 
 		k.skip(def.Name, IntegritySkipIndexUnreadable)
 		return nil
 	}
-	// Agreement for the column B-tree indexes; the other kinds are slice I3's.
-	if def.Kind != indexBtree || def.Predicate != nil || def.columnOrdinals() == nil {
-		return nil
-	}
 	ist := k.snap.indexStores[def.Name]
-	if ist == nil {
+	if ist == nil && def.Kind != indexGist {
 		return newError(DataCorrupted, "index "+def.Name+" has no store")
 	}
+	eng := k.engine()
+	env := eng.indexMaintEnv()
 	var found uint64
-	err := k.scanRows(tableRoot, store.colTypes, 0, func(key []byte, row storedRow) error {
-		eks, err := indexEntryKeysColumns(table.Columns, store.colTypes, colls, def, key, row)
+	err = k.scanRows(tableRoot, store.colTypes, 0, func(key []byte, row storedRow) error {
+		// Each row's derivation is one maintenance evaluation, with its own scalar allowance as the
+		// write that stored it had (unmetered otherwise: §5.4).
+		eng.session.resetStatementMemory()
+		eks, err := indexEntryKeys(table.Columns, store.colTypes, colls, &rindex, key, row, env)
 		if err != nil {
+			var ee *EngineError
+			if !errors.As(err, &ee) {
+				return err
+			}
 			return k.add(IntegrityIndexEntryError, def.Name, nil, key, err.Error())
 		}
+		if def.Kind == indexGin {
+			// Entry order is the terms' byte order, column tag included (§3.4).
+			n := len(key)
+			sort.SliceStable(eks, func(a, b int) bool {
+				return bytes.Compare(eks[a][:len(eks[a])-n], eks[b][:len(eks[b])-n]) < 0
+			})
+		}
 		for _, ek := range eks {
-			_, ok, err := ist.Get(ek)
+			var ok bool
+			var err error
+			switch def.Kind {
+			case indexGin:
+				ok, err = k.ginHolds(ist, ek[:len(ek)-len(key)], key)
+			case indexGist:
+				ok, err = k.gistHolds(gistOps, k.gistRoots[def.Name], ek[:len(ek)-len(key)], key)
+			default:
+				_, ok, err = ist.Get(ek)
+			}
 			if err != nil {
 				return err
 			}
@@ -804,6 +842,159 @@ func (k *integrityChecker) checkIndex(table *catTable, store *tableStore, colls 
 	return nil
 }
 
+// engine is the transient read engine the agreement pass resolves and evaluates index definitions
+// through: the pinned snapshot in the handle's environment, with a fresh default session (no cost
+// ceiling — the check is unmetered).
+func (k *integrityChecker) engine() *engine {
+	if k.eng == nil {
+		k.eng = &engine{committed: k.snap, pageSize: k.paging.pgr.pageSize, session: newSession(k.snap.env)}
+	}
+	return k.eng
+}
+
+// resolveForAgreement resolves def as the write path does for maintenance, or names the skip that
+// prevents its agreement check (§3.5), in the registered order: its stored text does not parse; a host
+// function it pinned is not registered at that component and version; a collation or time zone it
+// depends on is not loaded or is at another version.
+func (k *integrityChecker) resolveForAgreement(table *catTable, def indexDef) (resolvedIndex, string, error) {
+	if def.unparsed() {
+		return resolvedIndex{}, IntegritySkipUnparsableDefinition, nil
+	}
+	env := k.snap.env
+	for _, dep := range def.HostDeps {
+		id, ok := env.hosts.resolveHost(dep.Name, dep.ArgTypes)
+		if !ok || !hostDepMatches(env.hosts.function(id), []hostFuncDep{dep}) {
+			return resolvedIndex{}, IntegritySkipMissingHostFunction, nil
+		}
+	}
+	if verifyIndexTimezoneDeps(def.TimezoneDeps, env) != nil {
+		return resolvedIndex{}, IntegritySkipMissingLoadedData, nil
+	}
+	rindex, err := k.engine().resolveIndex(table, def)
+	if err != nil {
+		var ee *EngineError
+		if !errors.As(err, &ee) {
+			return resolvedIndex{}, "", err
+		}
+		switch ee.State {
+		case UnparsableStoredDefinition:
+			return resolvedIndex{}, IntegritySkipUnparsableDefinition, nil
+		case UndefinedFunction:
+			return resolvedIndex{}, IntegritySkipMissingHostFunction, nil
+		case CollationVersionMismatch:
+			return resolvedIndex{}, IntegritySkipMissingLoadedData, nil
+		}
+		return resolvedIndex{}, "", err
+	}
+	// The collations the index's keys encode under or its expressions compare with: a key column's,
+	// an expression key's derived collation, and every column an expression or the predicate reads.
+	unavailable := func(name string) bool {
+		if name == "" {
+			return false
+		}
+		if _, _, _, _, skewed := k.snap.collationSkew(name); skewed {
+			return true
+		}
+		return env.collation(name) == nil
+	}
+	var refs func(node *rExpr) bool
+	refs = func(node *rExpr) bool {
+		if node == nil {
+			return false
+		}
+		if node.kind == reColumn && node.index < len(table.Columns) && unavailable(table.Columns[node.index].Collation) {
+			return true
+		}
+		for _, child := range rexprChildren(node) {
+			if refs(child) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, key := range rindex.Keys {
+		if key.Expr == nil {
+			if unavailable(table.Columns[key.Col].Collation) {
+				return resolvedIndex{}, IntegritySkipMissingLoadedData, nil
+			}
+			continue
+		}
+		if (key.Coll != nil && unavailable(key.Coll.Name)) || refs(key.Expr) {
+			return resolvedIndex{}, IntegritySkipMissingLoadedData, nil
+		}
+	}
+	if refs(rindex.Predicate) {
+		return resolvedIndex{}, IntegritySkipMissingLoadedData, nil
+	}
+	return rindex, "", nil
+}
+
+// ginHolds reports whether the GIN index holds the posting (term, key), found as its maintenance
+// finds it (gin.md §4.5): the first run at or after term ‖ key, decoded with the term's length. A run
+// that does not decode holds nothing (§3.4).
+func (k *integrityChecker) ginHolds(ist *tableStore, term, key []byte) (bool, error) {
+	run, err := ginRunAtOrAfter(ist, term, key)
+	if err != nil {
+		if isCorruption(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if run == nil {
+		return false, nil
+	}
+	keys, err := ginDecodeRun(len(term), run)
+	if err != nil {
+		return false, nil
+	}
+	_, ok := ginSearchKeys(keys, key)
+	return ok, nil
+}
+
+// gistHolds reports whether the GiST R-tree rooted at root holds the leaf entry (boundBytes, key):
+// it descends into every child whose bound contains the derived bound (§3.4).
+func (k *integrityChecker) gistHolds(ops []gistOpclass, root pageRef, boundBytes, key []byte) (bool, error) {
+	if root.page == 0 {
+		return false, nil
+	}
+	pos := 0
+	bound, err := readBoundTuple(ops, boundBytes, &pos)
+	if err != nil || pos != len(boundBytes) {
+		return false, nil
+	}
+	return k.gistSearch(ops, root, bound, boundBytes, key, 0)
+}
+
+func (k *integrityChecker) gistSearch(ops []gistOpclass, ref pageRef, bound []gistBound, boundBytes, key []byte, depth int) (bool, error) {
+	if depth >= integrityMaxTreeDepth {
+		return false, nil
+	}
+	pg, bad, err := k.read(ref)
+	if err != nil || bad != nil {
+		return false, err
+	}
+	items, known, bad := parseIntegrityGist(pg, k.pcap, ops)
+	if bad != nil || !known {
+		return false, nil
+	}
+	for _, it := range items {
+		if pg.pageType == pageGistLeaf {
+			if bytes.Equal(it.raw, boundBytes) && bytes.Equal(it.skey, key) {
+				return true, nil
+			}
+			continue
+		}
+		if !gistBoundContains(it.bound, bound) {
+			continue
+		}
+		ok, err := k.gistSearch(ops, it.child, bound, boundBytes, key, depth+1)
+		if err != nil || ok {
+			return ok, err
+		}
+	}
+	return false, nil
+}
+
 // integrityTree walks one B+tree depth-first in child order (format.md *Interior node*), checking
 // page verification, node types, uniform leaf depth, strict key order within a node, and that every
 // key lies in the bounds its parent's separators give it; for a table, it decodes and checks every
@@ -822,6 +1013,10 @@ type integrityTree struct {
 	badRow   bool
 	// records is the leaf records the walk read.
 	records uint64
+	// gin marks a GIN index, whose records are posting runs; postings counts them from the runs'
+	// tails (§3.2).
+	gin      bool
+	postings uint64
 }
 
 func (w *integrityTree) corrupt(page uint32, detail string) error {
@@ -889,6 +1084,17 @@ func (w *integrityTree) visit(ref pageRef, depth int, lo, hi []byte) error {
 		}
 		if err := w.checkKeys(ref.page, keys, lo, hi); err != nil {
 			return err
+		}
+		if w.gin {
+			var postings uint64
+			for _, key := range keys {
+				c, err := ginRunPostings(key)
+				if err != nil {
+					return w.corrupt(ref.page, err.Error())
+				}
+				postings += c
+			}
+			w.postings += postings
 		}
 		w.records += uint64(n)
 		if w.table == nil {
@@ -1169,16 +1375,54 @@ func (k *integrityChecker) scanRows(ref pageRef, colTypes []colType, depth int, 
 	}
 }
 
-// integrityGist walks a GiST R-tree (gist.md §4.1) for page verification, node types, and uniform leaf
-// depth. Bounding-box containment is slice I3's.
+// ginRunPostings counts a GIN posting run's storage keys from its tail, without the term's length
+// (spec/design/integrity-check.md §3.2): the body (its length in the last two bytes, after at least a
+// term byte and a `last` byte) parses exactly as varint(shared) ‖ varint(suffix length) ‖ suffix
+// triples, each varint at most three bytes, shared + suffix length > 0, the suffix within the body.
+// The count is one (the `last` key) plus the triples.
+func ginRunPostings(run []byte) (uint64, error) {
+	n := len(run)
+	if n < 4 {
+		return 0, ginRunCorrupt()
+	}
+	bodyLen := int(binary.BigEndian.Uint16(run[n-2:]))
+	if n-2-bodyLen < 2 {
+		return 0, ginRunCorrupt()
+	}
+	body := run[n-2-bodyLen : n-2]
+	count := uint64(1)
+	for at := 0; at < len(body); {
+		shared, err := ginReadVarint(body, &at)
+		if err != nil {
+			return 0, err
+		}
+		suffix, err := ginReadVarint(body, &at)
+		if err != nil {
+			return 0, err
+		}
+		if at+suffix > len(body) || shared+suffix == 0 {
+			return 0, ginRunCorrupt()
+		}
+		at += suffix
+		count++
+	}
+	return count, nil
+}
+
+// integrityGist walks a GiST R-tree (gist.md §4.1) for page verification, node types, uniform leaf
+// depth, every bound decoding under the index's opclasses, and each interior bound containing every
+// bound in the child it names (spec/design/integrity-check.md §3.2). entries counts its leaf entries.
 type integrityGist struct {
 	k         *integrityChecker
 	object    string
+	ops       []gistOpclass
 	leafDepth int
 	readable  bool
+	entries   uint64
 }
 
-func (w *integrityGist) visit(ref pageRef, depth int) error {
+// visit walks the node ref names; parent is the bound its parent's entry gives it (nil at the root).
+func (w *integrityGist) visit(ref pageRef, depth int, parent []gistBound) error {
 	ok, err := w.k.reach(w.object, ref.page)
 	if err != nil || !ok {
 		w.readable = w.readable && ok
@@ -1193,10 +1437,10 @@ func (w *integrityGist) visit(ref pageRef, depth int) error {
 	if err != nil {
 		return err
 	}
-	var children []pageRef
+	var items []integrityGistItem
 	var known bool
 	if bad == nil {
-		children, known, bad = parseIntegrityGist(pg, w.k.pcap)
+		items, known, bad = parseIntegrityGist(pg, w.k.pcap, w.ops)
 	}
 	if bad != nil {
 		w.readable = false
@@ -1206,66 +1450,113 @@ func (w *integrityGist) visit(ref pageRef, depth int) error {
 		w.readable = false
 		return w.k.add(IntegrityPageTypeWrong, w.object, integrityPage(ref.page), nil, fmt.Sprintf("page type %d in a GiST tree", pg.pageType))
 	}
-	if pg.pageType == pageGistLeaf {
+	leaf := pg.pageType == pageGistLeaf
+	if leaf {
 		if w.leafDepth < 0 {
 			w.leafDepth = depth
-			return nil
+		} else if depth != w.leafDepth {
+			if err := w.k.add(IntegrityTreeDepthUneven, w.object, integrityPage(ref.page), nil, fmt.Sprintf("leaf at depth %d, others at %d", depth, w.leafDepth)); err != nil {
+				return err
+			}
 		}
-		if depth == w.leafDepth {
-			return nil
-		}
-		return w.k.add(IntegrityTreeDepthUneven, w.object, integrityPage(ref.page), nil, fmt.Sprintf("leaf at depth %d, others at %d", depth, w.leafDepth))
 	}
-	for _, child := range children {
-		if err := w.visit(child, depth+1); err != nil {
+	if parent != nil {
+		for _, it := range items {
+			if !gistBoundContains(parent, it.bound) {
+				if err := w.k.add(IntegrityGistBoundsViolation, w.object, integrityPage(ref.page), nil, "a bound lies outside its parent's bound for this page"); err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
+	if leaf {
+		w.entries += uint64(len(items))
+		return nil
+	}
+	for _, it := range items {
+		if err := w.visit(it.child, depth+1, it.bound); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// parseIntegrityGist parses a GiST node: an interior's child pointers, nothing for a leaf (its entries
-// parsed and discarded), and known false for another page type.
-func parseIntegrityGist(pg page, pcap pageCap) ([]pageRef, bool, error) {
+// integrityGistItem is one GiST node entry: its bound's bytes and decoded form, and a leaf's storage
+// key or an interior's child.
+type integrityGistItem struct {
+	raw   []byte
+	bound []gistBound
+	skey  []byte
+	child pageRef
+}
+
+// parseIntegrityGist parses a GiST node's entries, decoding every bound under ops exactly (trailing
+// bytes are a failure); known is false for another page type.
+func parseIntegrityGist(pg page, pcap pageCap, ops []gistOpclass) ([]integrityGistItem, bool, error) {
 	payload := pg.payload
 	pos := 0
-	switch pg.pageType {
-	case pageGistLeaf:
-		for i := uint32(0); i < pg.itemCount; i++ {
-			for part := 0; part < 2; part++ { // the bound, then the storage key
-				n, err := gistReadU16(payload, &pos)
-				if err != nil {
-					return nil, true, err
-				}
-				if _, err := gistTakeBytes(payload, &pos, n); err != nil {
-					return nil, true, err
-				}
-			}
-		}
-		return nil, true, nil
-	case pageGistInterior:
+	leaf := pg.pageType == pageGistLeaf
+	switch {
+	case leaf:
+	case pg.pageType == pageGistInterior:
 		if uint64(pg.itemCount)*uint64(2+pcap.ptr()) > uint64(len(payload)) {
 			return nil, true, newError(DataCorrupted, "GiST interior item count overruns page")
 		}
-		children := make([]pageRef, 0, pg.itemCount)
-		for i := uint32(0); i < pg.itemCount; i++ {
-			n, err := gistReadU16(payload, &pos)
-			if err != nil {
-				return nil, true, err
-			}
-			if _, err := gistTakeBytes(payload, &pos, n); err != nil {
-				return nil, true, err
-			}
-			cp, err := readPageRef(payload, &pos, pcap)
-			if err != nil {
-				return nil, true, err
-			}
-			children = append(children, cp)
-		}
-		return children, true, nil
 	default:
 		return nil, false, nil
 	}
+	items := make([]integrityGistItem, 0, min(int(pg.itemCount), len(payload)/2+1))
+	for i := uint32(0); i < pg.itemCount; i++ {
+		n, err := gistReadU16(payload, &pos)
+		if err != nil {
+			return nil, true, err
+		}
+		raw, err := gistTakeBytes(payload, &pos, n)
+		if err != nil {
+			return nil, true, err
+		}
+		at := 0
+		bound, err := readBoundTuple(ops, raw, &at)
+		if err != nil {
+			return nil, true, err
+		}
+		if at != len(raw) {
+			return nil, true, newError(DataCorrupted, "GiST bound has trailing bytes")
+		}
+		it := integrityGistItem{raw: raw, bound: bound}
+		if leaf {
+			sn, err := gistReadU16(payload, &pos)
+			if err != nil {
+				return nil, true, err
+			}
+			if it.skey, err = gistTakeBytes(payload, &pos, sn); err != nil {
+				return nil, true, err
+			}
+		} else if it.child, err = readPageRef(payload, &pos, pcap); err != nil {
+			return nil, true, err
+		}
+		items = append(items, it)
+	}
+	return items, true, nil
+}
+
+// gistBoundContains reports whether tuple bound outer contains inner, per component: a range `@>`
+// (anything contains empty, empty contains only empty); a scalar's [min, max] key bytes bytewise.
+func gistBoundContains(outer, inner []gistBound) bool {
+	for i := range outer {
+		a, b := outer[i], inner[i]
+		if a.rng != nil || b.rng != nil {
+			if a.rng == nil || b.rng == nil || !rangeContains(a.rng, b.rng) {
+				return false
+			}
+			continue
+		}
+		if bytes.Compare(a.smin, b.smin) > 0 || bytes.Compare(b.smax, a.smax) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // --- space accounting (§3.3) ---------------------------------------------------------------------

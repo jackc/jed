@@ -131,6 +131,36 @@ pub(crate) fn decode_run(term_len: usize, run: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(keys)
 }
 
+/// A run key's posting count, read from its tail without the term's length (integrity-check.md
+/// §3.2): the body (its length in the last two bytes, after at least a term byte and a `last` byte)
+/// parses exactly as `varint(shared) ‖ varint(suffix length) ‖ suffix` triples, each with
+/// `shared + suffix length > 0` and the suffix within the body. The count is one plus the triples.
+/// What needs the term's length is left to [`decode_run`]. A malformed run is `XX001`.
+pub(crate) fn run_postings(run: &[u8]) -> Result<u64> {
+    let n = run.len();
+    if n < 4 {
+        return Err(corrupt());
+    }
+    let body_len = usize::from(u16::from_be_bytes([run[n - 2], run[n - 1]]));
+    let body_end = n - 2;
+    if body_end < body_len + 2 {
+        return Err(corrupt());
+    }
+    let body = &run[body_end - body_len..body_end];
+    let mut at = 0;
+    let mut count = 1u64;
+    while at < body.len() {
+        let shared = read_varint(body, &mut at)?;
+        let suffix = read_varint(body, &mut at)?;
+        if at + suffix > body.len() || shared + suffix == 0 {
+            return Err(corrupt());
+        }
+        at += suffix;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// The runs of `term` over ascending, distinct `keys`, packed greedily: a run takes each next key
 /// while its key stays within [`GIN_RUN_MAX_BYTES`] (a from-scratch build, gin.md §4.5).
 pub(crate) fn pack_runs(term: &[u8], keys: &[Vec<u8>]) -> Vec<Vec<u8>> {

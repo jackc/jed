@@ -371,7 +371,7 @@ fn timezone_index_table_db() -> Session {
 
 /// The golden host function: `geo_hash(i64) -> i64 = a * 10`, IMMUTABLE, component
 /// "com.example/geo_hash" at semantic version 1.
-fn geo_hash_golden_function() -> jed::HostFunction {
+pub(crate) fn geo_hash_golden_function() -> jed::HostFunction {
     jed::HostFunction::new(
         "geo_hash",
         vec![ScalarType::Int64],

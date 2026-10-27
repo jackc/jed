@@ -203,9 +203,12 @@ run an integrity check, jed's version of SQLite's `PRAGMA integrity_check`:
 
 It walks every page reachable from the catalog: page checksums (or authentication tags), B-tree
 shape and key order, each row's values and large-value chains, that each row is stored under its
-primary key, row counts, the free list, and the live page count. The default `full` level also checks
-that each index holds exactly the entries its table's rows produce; `quick` skips that. The check
-reads a snapshot like any reader, so it never blocks writers, and it never writes.
+primary key, row counts, GiST bounding boxes, the free list, and the live page count. The default
+`full` level also checks that each index — B-tree, expression, partial, GIN and GiST alike — holds
+exactly the entries its table's rows produce; `quick` skips that. An index the check cannot evaluate
+(its definition names a host function this environment does not register, or time-zone or collation
+data that is not loaded) is listed under `skipped` rather than reported as damage. The check reads a
+snapshot like any reader, so it never blocks writers, and it never writes.
 
 It returns a report rather than failing: a list of findings, each with a stable `kind` (such as
 `page_corrupt`, `row_count_mismatch` or `index_entry_missing`), the table or index it concerns, and

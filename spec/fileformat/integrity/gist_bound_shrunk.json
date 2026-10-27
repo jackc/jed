@@ -1,0 +1,48 @@
+{
+  "fixture": "gist_bound_shrunk.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "gist_bounds_violation",
+            "database": "main",
+            "object": "u_span_gist",
+            "page": 28,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 53,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "gist_bounds_violation",
+            "database": "main",
+            "object": "u_span_gist",
+            "page": 28,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [
+          {
+            "object": "u_span_gist",
+            "reason": "index_unreadable"
+          }
+        ],
+        "pages": 53,
+        "rows": 40
+      }
+    }
+  ]
+}

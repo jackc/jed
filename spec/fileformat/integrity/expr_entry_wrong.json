@@ -1,0 +1,42 @@
+{
+  "fixture": "expr_entry_wrong.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 53,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "index_entry_missing",
+            "database": "main",
+            "object": "u_v1_idx",
+            "page": null,
+            "key": "8000003c"
+          },
+          {
+            "kind": "index_entry_count_mismatch",
+            "database": "main",
+            "object": "u_v1_idx",
+            "page": null,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 53,
+        "rows": 40
+      }
+    }
+  ]
+}

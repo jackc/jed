@@ -153,8 +153,22 @@ func TestIntegrityFixtures(t *testing.T) {
 	}
 }
 
-// Every golden that opens checks clean at both levels, except the deliberately misordered
-// collation_skew_corrupt.jed. The goldens the existing tests reject (malformed_*, the cow_* files no
+// integrityGoldenSkips is the full-level skip list of each golden that has one under goldenEnv
+// (Unicode and time-zone data, no host functions; §3.5): geo_hash is not registered, stored text this
+// binary cannot parse, and an index ordered for a collation version other than the loaded one (its
+// agreement is skipped rather than reported as missing entries). Tables walk in name order.
+var integrityGoldenSkips = map[string][]IntegritySkip{
+	"collation_skew_corrupt.jed": {{Object: "t_name_idx", Reason: IntegritySkipMissingLoadedData}},
+	"hostfunc_index_table.jed":   {{Object: "t_geo_idx", Reason: IntegritySkipMissingHostFunction}},
+	"unparsable_definitions.jed": {
+		{Object: "e_r_excl", Reason: IntegritySkipUnparsableDefinition},
+		{Object: "p_future_idx", Reason: IntegritySkipUnparsableDefinition},
+		{Object: "x_future_idx", Reason: IntegritySkipUnparsableDefinition},
+	},
+}
+
+// Every golden that opens checks clean at both levels, skipping only what integrityGoldenSkips lists.
+// The goldens the existing tests reject (malformed_*, the cow_* files no
 // generation of which opens) fail to open here too and are skipped.
 func TestIntegrityGoldensClean(t *testing.T) {
 	dir := specPath(t, "fileformat/fixtures")
@@ -166,12 +180,8 @@ func TestIntegrityGoldensClean(t *testing.T) {
 	checked := 0
 	for _, file := range files {
 		name := filepath.Base(file)
-		// collation_skew_corrupt's index is deliberately ordered for another collation version; the
-		// malformed_* goldens are deliberately damaged (each must report a finding instead).
+		// The malformed_* goldens are deliberately damaged (each must report a finding instead).
 		damaged := strings.HasPrefix(name, "malformed_")
-		if name == "collation_skew_corrupt.jed" {
-			continue
-		}
 		var cred *Credential
 		if strings.HasPrefix(name, "encrypted_") {
 			cred = encGoldenKey()
@@ -189,8 +199,14 @@ func TestIntegrityGoldensClean(t *testing.T) {
 				if report.OK() {
 					t.Errorf("%s (level %d): a malformed golden checks clean", name, level)
 				}
-			} else if !report.OK() || len(report.Skipped) != 0 {
-				t.Errorf("%s (level %d): %+v", name, level, report.Findings)
+			} else {
+				var want []IntegritySkip
+				if level == IntegrityFull {
+					want = integrityGoldenSkips[name]
+				}
+				if !report.OK() || len(report.Skipped)+len(want) > 0 && !slices.Equal(report.Skipped, want) {
+					t.Errorf("%s (level %d): %+v skipped %+v", name, level, report.Findings, report.Skipped)
+				}
 			}
 		}
 		checked++
@@ -228,8 +244,11 @@ func TestIntegrityKindsRegistered(t *testing.T) {
 		IntegrityFreePageOutOfRange: "IntegrityFreePageOutOfRange", IntegrityFreePageDuplicate: "IntegrityFreePageDuplicate",
 		IntegrityFreePageLive: "IntegrityFreePageLive", IntegrityFreePageManifestDependency: "IntegrityFreePageManifestDependency",
 		IntegrityIndexEntryMissing: "IntegrityIndexEntryMissing", IntegrityIndexEntryCountMismatch: "IntegrityIndexEntryCountMismatch",
-		IntegrityIndexEntryError:     "IntegrityIndexEntryError",
+		IntegrityIndexEntryError: "IntegrityIndexEntryError", IntegrityGistBoundsViolation: "IntegrityGistBoundsViolation",
 		IntegritySkipTableUnreadable: "IntegritySkipTableUnreadable", IntegritySkipIndexUnreadable: "IntegritySkipIndexUnreadable",
+		IntegritySkipUnparsableDefinition: "IntegritySkipUnparsableDefinition",
+		IntegritySkipMissingHostFunction:  "IntegritySkipMissingHostFunction",
+		IntegritySkipMissingLoadedData:    "IntegritySkipMissingLoadedData",
 	}
 	for value, ident := range consts {
 		if !strings.Contains(text, ident) {
@@ -530,10 +549,96 @@ func TestIntegrityDepthCap(t *testing.T) {
 	g := &integrityGist{k: k, object: "g", leafDepth: -1, readable: true}
 	other := root
 	other.page = root.page + 1
-	if err := g.visit(other, integrityMaxTreeDepth+3); err != nil {
+	if err := g.visit(other, integrityMaxTreeDepth+3, nil); err != nil {
 		t.Fatal(err)
 	}
 	if last := k.report.Findings[len(k.report.Findings)-1]; last.Kind != IntegrityPageCorrupt || g.readable || k.reachedN != 2 {
 		t.Fatalf("GiST: got %+v readable %v reached %d", last, g.readable, k.reachedN)
+	}
+}
+
+// The environment decides the definition skips (§3.5): an index pinning a host function is skipped
+// missing_host_function when the function is not registered, and checked when it is registered at the
+// pinned component and version; an index pinning time-zone data is skipped missing_loaded_data when
+// that data is not loaded. Both goldens' tables are empty, so the skips are decided before any row.
+// (unparsable_definition is covered by integrityGoldenSkips.)
+func TestIntegrityEnvironmentSkips(t *testing.T) {
+	dir := specPath(t, "fileformat/fixtures")
+	check := func(file string, env *Environment) IntegrityReport {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), file)
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		db, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, Environment: env, Locking: LockingExclusive})
+		if err != nil {
+			t.Fatalf("open %s: %v", file, err)
+		}
+		defer db.Close()
+		report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited})
+		if err != nil {
+			t.Fatalf("check %s: %v", file, err)
+		}
+		if !report.OK() {
+			t.Fatalf("%s: findings %+v", file, report.Findings)
+		}
+		return report
+	}
+	skips := func(r IntegrityReport) []IntegritySkip { return r.Skipped }
+	if got := skips(check("hostfunc_index_table.jed", NewEnvironment())); !slices.Equal(got, []IntegritySkip{{Object: "t_geo_idx", Reason: IntegritySkipMissingHostFunction}}) {
+		t.Errorf("hostfunc without geo_hash: skipped %+v", got)
+	}
+	if got := skips(check("hostfunc_index_table.jed", envWith(t, geoHash("com.example/geo_hash", 1)))); len(got) != 0 {
+		t.Errorf("hostfunc with geo_hash: skipped %+v", got)
+	}
+	if got := skips(check("hostfunc_index_table.jed", envWith(t, geoHash("com.example/geo_hash", 2)))); !slices.Equal(got, []IntegritySkip{{Object: "t_geo_idx", Reason: IntegritySkipMissingHostFunction}}) {
+		t.Errorf("hostfunc with geo_hash at another version: skipped %+v", got)
+	}
+	if got := skips(check("timezone_index_table.jed", testEnv("unicode"))); !slices.Equal(got, []IntegritySkip{{Object: "t_zone_idx", Reason: IntegritySkipMissingLoadedData}}) {
+		t.Errorf("timezone without tz data: skipped %+v", got)
+	}
+	if got := skips(check("timezone_index_table.jed", goldenEnv())); len(got) != 0 {
+		t.Errorf("timezone with tz data: skipped %+v", got)
+	}
+}
+
+// A live database with every index kind several pages deep — expression, partial, multi-column GIN
+// over an array and a jsonb, a multi-column GiST (scalar + range) behind a partial EXCLUDE — checks
+// clean under full: each row's write-path entries are found through each index's own lookup.
+func TestIntegrityEveryIndexKindClean(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kinds.jed")
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 512, SkipFsync: true, Locking: LockingExclusive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := db.Session(SessionOptions{})
+	for _, sql := range []string{
+		"CREATE TABLE t (id i32 PRIMARY KEY, v i32, tags i32[], doc jsonb, room i32, during i32range)",
+		"CREATE INDEX t_expr ON t ((v * 2 + 1) DESC, lower('X' || v::text))",
+		"CREATE INDEX t_part ON t (v) WHERE v % 3 = 0",
+		"CREATE INDEX t_gin ON t USING gin (tags, doc)",
+		"ALTER TABLE t ADD CONSTRAINT t_excl EXCLUDE USING gist (room WITH =, during WITH &&) WHERE (v IS NOT NULL)",
+		"INSERT INTO t SELECT g, CASE WHEN g % 11 = 0 THEN NULL ELSE g % 17 END, ARRAY[g % 5, g % 7, NULL], " +
+			"jsonb_build_object('k', g % 4, 'a', jsonb_build_array(g, 'x')), g % 9, " +
+			"CASE WHEN g % 13 = 0 THEN NULL WHEN g % 10 = 0 THEN 'empty'::i32range ELSE i32range(g * 10, g * 10 + 5) END " +
+			"FROM (SELECT g::i32 AS g FROM generate_series(1, 400) g) s",
+		"DELETE FROM t WHERE id % 29 = 0",
+		"UPDATE t SET v = v + 1, tags = tags || id, during = NULL WHERE id % 7 = 0",
+	} {
+		if _, err := s.Exec(context.Background(), sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	report, err := db.IntegrityCheck(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.OK() || len(report.Skipped) != 0 {
+		t.Fatalf("findings %+v skipped %+v", report.Findings, report.Skipped)
 	}
 }

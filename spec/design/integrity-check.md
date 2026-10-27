@@ -3,7 +3,7 @@
 > A host-API operation that checks one database's storage on a live handle and returns structured
 > findings: SQLite's `PRAGMA integrity_check` / `quick_check`, and the job PostgreSQL's `amcheck`
 > (`bt_index_check … heapallindexed`) does for its B-trees. **Status: slices I1 (the reference and
-> fixtures) and I2 (the cores) landed; I3–I5 are next.** The invariants first existed as test-only
+> fixtures), I2 (the cores) and I3 (every index kind) landed; I4–I5 are next.** The invariants first existed as test-only
 > checkers in each core's simulation runner and in `spec/fileformat/verify.rb --check-image`
 > ([simulation-testing.md](simulation-testing.md) §8.3); this doc moves them into the engine, extends
 > them where they stop short, and fixes the result as a cross-core contract.
@@ -154,8 +154,21 @@ Neither page is read. Then:
   primary-key encoding ([encoding.md](encoding.md)), else `row_key_not_primary_key`;
 - after its tree, a table's persisted row count equals its leaf total (`row_count_mismatch`, format
   v28), unless the tree was unreadable (§5.2);
-- a GiST R-tree's leaves share one depth, and each interior bound contains its child's bounds
-  (`gist_bounds_violation`, [gist.md](gist.md) §4).
+- a GIN tree's records are posting runs ([gin.md](gin.md) §4.5). The walk counts each run's
+  postings from its tail, without knowing the term's length: the last two bytes give the body length,
+  at least two bytes (a term and a `last`) precede the body, and the body parses exactly to its end as
+  `varint(shared) ‖ varint(suffix length) ‖ suffix` triples (each varint at most three bytes, `shared
+  + suffix length > 0`, the suffix within the body). A run that does not parse is `page_corrupt` on
+  its leaf. The run's posting count is one plus its triples. Whatever needs the term's length (shared
+  prefixes against `last`, ascending keys) is checked by the run's decoder when agreement probes it
+  (§3.4);
+- a GiST R-tree's leaves share one depth (`tree_depth_uneven`), and every bound on every node decodes
+  under the index's opclasses ([gist.md](gist.md) §4.1, §6), else `page_corrupt`. Each interior entry's
+  bound contains every bound in the child it names, else one `gist_bounds_violation` naming the child
+  page, reported when the child is visited, after its `tree_depth_uneven`. Containment is per
+  component: a range component contains the child's (`@>`: anything contains `empty`, `empty` contains
+  only `empty`); a scalar component's `[min, max]` key bytes contain the child's
+  (`min ≤ child min`, `child max ≤ max`, bytewise).
 
 ### 3.3 Space accounting (both levels)
 
@@ -184,6 +197,21 @@ fails `open` (it reads and validates the list), so only `free_page_live` reaches
 - the index holds no other entries: if its entry count differs from the number of derived entries
   found, one `index_entry_count_mismatch`.
 
+Per kind, a row's derived entries, its "lookup", and an index's "entry count" are:
+
+| kind | derived from a row | lookup | entry count |
+|---|---|---|---|
+| B-tree (column or expression keys) | one entry key ([indexes.md](indexes.md) §3) | point `get` of the key | records |
+| GIN | one `(term, storage key)` posting per distinct term, in term order ([gin.md](gin.md) §4) | the first run at or after `term ‖ k`, decoded with the term's length; present if it holds `k` | postings, counted from run tails (§3.2) |
+| GiST | one `(bound, storage key)` leaf entry; none when an indexed column is NULL ([gist.md](gist.md) §4.1, §7) | descend into every child whose bound contains the derived bound; present if a leaf holds the encoded bound with that storage key | leaf entries |
+
+A partial index ([indexes.md](indexes.md) §9; the `EXCLUDE … WHERE` GiST index, [gist.md](gist.md)
+§7.1) derives entries only for rows whose predicate is TRUE, evaluated as a filter as at write time,
+and before GiST's NULL rule, as the write path does. A predicate or key expression that raises
+reports `index_entry_error` for the row, which then derives nothing. Each row's derivation runs with
+a fresh `max_scalar_bytes` allowance, as one write of that row would. A GIN run that the lookup cannot decode (`XX001`) leaves the posting not found, so it is
+`index_entry_missing`.
+
 Presence of every derived entry plus equal counts plus strictly ascending, storage-key-suffixed
 entries is exact equality, without materializing either side (§5.4). An index walk counts its
 entries as it checks its structure, so the count needs no second pass. This is PostgreSQL's
@@ -210,13 +238,15 @@ no longer evaluates.
 ### 3.5 Skips
 
 A requested check that cannot run on an object is a `Skip`, not a finding and not an error, so the
-rest of the check proceeds. Registered reasons:
+rest of the check proceeds. An object takes at most one skip per check: the first reason, in the
+order below, that applies. The first three are decided from the definition and the environment
+before any row is read, so an empty table's index still records them. Registered reasons:
 
 | reason | when |
 |---|---|
 | `unparsable_definition` | the object's stored text does not parse in this binary (`XX003`, [unparsable-definitions.md](unparsable-definitions.md)) |
-| `missing_host_function` | an expression names a host function the environment does not register |
-| `missing_loaded_data` | a collation or time zone the object pins is not loaded or is at another version (`XX002`, [collation.md](collation.md)) |
+| `missing_host_function` | an expression names a host function the environment does not register at the component and version the index pinned |
+| `missing_loaded_data` | a time zone the object pins, or a collation its entries depend on, is not loaded or is at another version than the catalog pins (`XX002`, [collation.md](collation.md)); for an index of any kind the collations are a bare key column's, an expression key's derived collation, and those of every column an expression key or the predicate references |
 | `table_unreadable` | the table's tree left rows unread, so its indexes' agreement and its constraints are not checked (§5.2) |
 | `index_unreadable` | the index's walk reported a finding, so its agreement is not checked (§5.2) |
 
@@ -329,11 +359,15 @@ The check is host API, so it is not in the SQL corpus. Its contract is tested wi
 - **The reference.** `spec/fileformat/integrity.rb` is a fourth voice, run as `ruby
   spec/fileformat/verify.rb --integrity-check [--quick] [--max-findings N] FILE…`. It checks a file
   as a freshly opened handle sees it, so what `open` reads (meta, manifest, catalog, free-list chain)
-  must load and anything else is a finding. It derives what it can without SQL: today every check of
-  §3.1–§3.3 except GiST bounds, and agreement for column-keyed, non-partial B-tree indexes. The rest
-  (GIN, GiST, expression and partial indexes, GiST bounds, constraints) it lists under
-  `reference_unchecked`, outside the cross-core report, until the slice that implements them
-  teaches it (§9).
+  must load and anything else is a finding. It derives what it can without SQL: every check of
+  §3.1–§3.3, and agreement for every index kind whose key expressions and predicate fall in the small
+  expression subset it evaluates (column references; integer, text and boolean literals; `+ - *` with
+  the integer overflow trap; `||`; comparisons; `AND`/`OR`/`NOT`; `IS [NOT] NULL`; `lower`/`upper`
+  over ASCII text). An index outside that subset (a host function, a time zone, non-ASCII case
+  mapping, text this binary cannot parse), and constraints until I4, are listed under
+  `reference_unchecked`, outside the cross-core report. The skips that need jed's parser or the
+  environment (`unparsable_definition`, `missing_host_function`, `missing_loaded_data`) are therefore
+  per-core unit tests over the goldens that carry them, not fixtures.
 - **Damaged fixtures.** `spec/fileformat/integrity/<name>.jed` with `<name>.json`, generated by
   `verify.rb --generate` and checked by `mise run verify`. Each starts from one from-scratch image (a
   40-row table and a column index, both several leaves deep) and applies one deterministic damage,
@@ -342,8 +376,15 @@ The check is host API, so it is not in the SQL corpus. Its contract is tested wi
   `row_key_not_primary_key`, and under `full` the index entries they no longer match), a row
   re-keyed into a gap (`row_key_not_primary_key`; `index_entry_missing`), a dropped index entry and
   an extra one (`full` only), a wrong row count, a wrong live count, a live page on the free list,
-  and a table interior naming an index leaf (`page_corrupt`, `page_reached_twice`). The `.json` holds
-  the expected report (§2 minus `detail`) for `quick` and `full`, and for one fixture a truncated run.
+  and a table interior naming an index leaf (`page_corrupt`, `page_reached_twice`). I3 adds
+  fixtures over a second table, `u`, carrying an expression index `(v + 1)`, a partial index `(v) WHERE
+  v < 50`, a GIN over an `i32[]` and a GiST over an `i32range`, each several pages deep, with damage
+  to each kind: a posting dropped from a run and one added, a run whose recorded body overruns it
+  (`page_corrupt`), a GiST leaf entry dropped, a GiST interior
+  bound shrunk (`gist_bounds_violation`), a wrong expression-index entry, a row whose `v + 1`
+  overflows (`index_entry_error`), and a partial-index entry for a row its predicate excludes. The
+  `.json` holds the expected report (§2 minus `detail`) for `quick` and `full`, and for one fixture a
+  truncated run.
   Every core must reproduce each exactly when it opens the fixture as a file (an in-memory copy has
   no persisted live count or free list, §2). Each damage leaves a file that opens: none touches what
   `open` reads.
@@ -352,7 +393,9 @@ The check is host API, so it is not in the SQL corpus. Its contract is tested wi
 - **Clean goldens.** Every golden that opens checks with no findings at both levels, in the reference
   and every core. The exceptions are deliberately damaged: the `malformed_*` goldens (some open, since
   leaves are read lazily, and must then report a finding) and `collation_skew_corrupt.jed`, whose
-  index is ordered for another collation version.
+  index is ordered for another collation version: the cores skip its agreement as
+  `missing_loaded_data`, and the reference, which has no loaded collation data, reports the
+  mismatch.
 - **Simulation.** The runners' image checker becomes a call to the engine's check on the opened copy
   (asserting no findings, plus the expected-version check that stays in the runner); the `corrupt`
   step's oracle gains "the check reports a finding naming the flipped page, or the flip was harmless".
@@ -391,7 +434,7 @@ this file sound?". Attachments are checked by opening them directly.
 |---|---|
 | **I1** ✅ | `spec/integrity/findings.toml`; the reference `spec/fileformat/integrity.rb` (`verify.rb --integrity-check`); the damaged fixtures and expected reports; the clean-golden and registry checks in `mise run verify` |
 | **I2** ✅ | Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API, with `full` agreement for the column B-tree indexes the reference covers; the simulation image checker rebuilt on it; every fixture's report reproduced and every clean golden clean in every core; the live-only kinds unit-tested |
-| **I3** | `full` for every other index kind (expression, partial, GIN, GiST) and GiST bounds, in the cores and the reference, with fixtures |
+| **I3** ✅ | `full` for every other index kind (expression, partial, GIN, GiST) and GiST bounds, in the cores and the reference, with fixtures |
 | **I4** | `constraints` option, in the cores and (except `CHECK`, which needs SQL evaluation) the reference, with fixtures |
 | **I5** | `jed check` in the CLI and cli.md; `/web` docs (each `api/` language page) |
 

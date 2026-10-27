@@ -6,9 +6,9 @@
 #
 # It checks a file as a freshly opened handle would see it: meta selection, the catalog, and the free
 # list's chain must load (as `open` requires), and everything after that is a finding, not an error.
-# It covers the checks it can evaluate without SQL. Index agreement for GIN, GiST, expression and
-# partial indexes, and GiST bounding boxes, are listed under `reference_unchecked` (not part of the
-# cross-core report) until slice I3 teaches this reference to derive them.
+# It covers the checks it can evaluate without SQL. Index agreement for an expression or partial index
+# whose text falls outside the subset expr.rb evaluates is listed under `reference_unchecked` (not part
+# of the cross-core report), as are constraints until slice I4.
 
 require "json"
 
@@ -235,38 +235,115 @@ class IntegrityCheck
   # agreement: its own lookups cannot be trusted to find what it holds (integrity-check.md §5.2).
   def check_index(t, ix, rows)
     before = @findings.size
+    entries = []
     if ix[:kind] == "gist"
-      walk = GistWalk.new(self, ix[:name])
+      walk = GistWalk.new(self, ix[:name], gist_opclasses_for(t, ix))
       readable = walk.run(ix[:root_page])
-      @unchecked << { object: ix[:name], check: "gist_bounds" }
-      entries = nil
+      entries = walk.entries
+      count = entries.size
     else
-      entries = []
-      walk = BtreeWalk.new(self, ix[:name], nil)
+      walk = BtreeWalk.new(self, ix[:name], nil, gin: ix[:kind] == "gin")
       readable = walk.run(ix[:root_page]) { |_page, key, _values| entries << key }
+      count = ix[:kind] == "gin" ? walk.postings : entries.size
     end
     @damaged ||= !readable
     return unless @level == "full"
+
     return skip(ix[:name], "table_unreadable") if rows.nil?
     return skip(ix[:name], "index_unreadable") unless readable && @findings.size == before
 
-    derivable = ix[:kind] == "btree" && ix[:predicate].nil? && ix[:cols].all?(Integer)
-    return @unchecked << { object: ix[:name], check: "index_agreement" } unless derivable
+    asts = begin
+      [ix[:predicate] && StoredExpr.parse(ix[:predicate])] +
+        ix[:cols].map { |c| c.is_a?(Hash) ? StoredExpr.parse(c[:expr]) : nil }
+    rescue StoredExpr::Unsupported
+      return @unchecked << { object: ix[:name], check: "index_agreement" }
+    end
 
-    present = entries.to_set
+    # Derive every row's entries before reporting, so an expression outside the subset leaves the
+    # index unchecked rather than half-reported.
+    derived = begin
+      rows.map do |key, row|
+        [key, derive_entries(t, ix, asts[0], key, row)]
+      rescue StoredExpr::EvalError => e
+        [key, e]
+      end
+    rescue StoredExpr::Unsupported
+      return @unchecked << { object: ix[:name], check: "index_agreement" }
+    end
     found = 0
-    rows.each do |key, row|
-      want = index_entry_key(t, ix, key, row)
-      if present.include?(want)
-        found += 1
-      else
-        add("index_entry_missing", object: ix[:name], key: key, detail: "no entry for the row")
+    derived.each do |key, want|
+      if want.is_a?(StoredExpr::EvalError)
+        add("index_entry_error", object: ix[:name], key: key, detail: "#{want.code}: #{want.message}")
+        next
+      end
+      want.each do |entry|
+        if index_holds?(ix, entries, entry)
+          found += 1
+        else
+          add("index_entry_missing", object: ix[:name], key: key, detail: "no entry for the row")
+        end
       end
     end
-    return if entries.size == found
+    return if count == found
 
     add("index_entry_count_mismatch", object: ix[:name],
-                                      detail: "index holds #{entries.size} entries, #{found} derive from rows")
+                                      detail: "index holds #{count} entries, #{found} derive from rows")
+  end
+
+  # The entries one row derives, in entry order (integrity-check.md §3.4): a B-tree's entry key, a GIN
+  # index's [term, storage key] postings in term order, a GiST index's [bound, storage key] leaf entry.
+  def derive_entries(t, ix, predicate, key, row)
+    case ix[:kind]
+    when "gin"
+      terms = []
+      ix[:cols].each_with_index do |ci, pos|
+        v = row[ci]
+        next if v.nil?
+
+        tag = ix[:cols].size > 1 ? [pos].pack("C") : "".b
+        type = t[:columns][ci][:type]
+        col_terms = if type == "jsonb"
+                      gin_jsonb_terms(v)
+                    else
+                      (v.is_a?(Hash) ? v[:elements] : v).compact.map { |e| gin_element_term(array_elem(type), e) }
+                    end
+        col_terms.map(&:b).uniq.each { |term| terms << (tag + term).b }
+      end
+      terms.sort.map { |term| [term, key] }
+    when "gist"
+      # The predicate first, as the write path evaluates it, then the NULL rule (gist.md §4.1).
+      return [] if predicate && !StoredExpr.filter?(predicate, t[:columns], row)
+      return [] if ix[:cols].any? { |ci| row[ci].nil? }
+
+      ops = gist_opclasses_for(t, ix)
+      [[gist_encode_bound(ops, gist_leaf_bound(ops, row, ix[:cols])).b, key]]
+    else
+      return [] if predicate && !StoredExpr.filter?(predicate, t[:columns], row)
+
+      [index_entry_key(t, ix, key, row)]
+    end
+  end
+
+  # Whether the index holds a derived entry, found as the core's lookup finds it: a B-tree or GiST
+  # entry by equality; a GIN posting in the first run at or after `term ‖ k`, decoded with the term's
+  # length (an undecodable run holds nothing).
+  def index_holds?(ix, entries, entry)
+    case ix[:kind]
+    when "gin"
+      term, k = entry
+      run = entries.bsearch { |r| r >= term + k }
+      return false unless run&.start_with?(term)
+
+      begin
+        gin_decode_run(term.bytesize, run).include?(k)
+      rescue StandardError
+        false
+      end
+    when "gist" then entries.include?(entry)
+    else
+      @entry_sets ||= {}
+      (@entry_sets[ix[:name]] ||= entries.to_set).include?(entry)
+    end
   end
 
   def skip(object, reason)
@@ -286,13 +363,18 @@ class IntegrityCheck
   # lies in the bounds its parent's separators give it. Yields each leaf record in key order. Returns
   # false when any part of the tree could not be read (integrity-check.md §5.2).
   class BtreeWalk
-    def initialize(check, object, columns)
+    def initialize(check, object, columns, gin: false)
       @check = check
       @object = object
       @columns = columns
+      @gin = gin
       @leaf_depth = nil
       @readable = true
+      @postings = 0
     end
+
+    # A GIN tree's postings, counted from its runs' tails (integrity-check.md §3.2).
+    attr_reader :postings
 
     def run(root, &block)
       @block = block
@@ -338,6 +420,13 @@ class IntegrityCheck
         end
         keys = keys.map(&:b)
         check_keys(page, keys, lo, hi)
+        if @gin
+          begin
+            @postings += keys.sum { |key| gin_run_postings(key) }
+          rescue StandardError => e
+            return corrupt(page, e.message)
+          end
+        end
         keys.each_with_index do |key, i|
           values = (@columns || []).each_with_index.map { |c, ci| [c[:type], raw_value(regions[ci], i)] }
           @block&.call(page, key, values)
@@ -403,24 +492,29 @@ class IntegrityCheck
     end
   end
 
-  # Walk a GiST R-tree (gist.md §4.1) for page verification, node types, and uniform leaf depth.
-  # Bounding-box containment needs each opclass's union and is left to slice I3.
+  # Walk a GiST R-tree (gist.md §4.1): page verification, node types, uniform leaf depth, every bound
+  # decoding under the index's opclasses, and each interior bound containing every bound in its child
+  # (integrity-check.md §3.2). Collects the leaf entries as [bound bytes, storage key].
   class GistWalk
-    def initialize(check, object)
+    attr_reader :entries
+
+    def initialize(check, object, ops)
       @check = check
       @object = object
+      @ops = ops
       @leaf_depth = nil
       @readable = true
+      @entries = []
     end
 
     def run(root)
-      visit(root, 0) unless root.zero?
+      visit(root, 0, nil) unless root.zero?
       @readable
     end
 
     private
 
-    def visit(page, depth)
+    def visit(page, depth, parent_bound)
       unless @check.page_ok?(@object, page)
         @readable = false
         return
@@ -431,46 +525,52 @@ class IntegrityCheck
       end
       begin
         pg = read_page(@check.image, @check.ps, page)
-        children = parse(pg)
+        items = parse(pg)
       rescue StandardError => e
         @readable = false
         return @check.finding("page_corrupt", object: @object, page: page, detail: e.message)
       end
-      if children.nil?
+      if items.nil?
         @readable = false
         return @check.finding("page_type_wrong", object: @object, page: page,
                                                  detail: "page type #{pg[:type]} in a GiST tree")
       end
-      if pg[:type] == PAGE_GIST_LEAF
+      leaf = pg[:type] == PAGE_GIST_LEAF
+      if leaf
         @leaf_depth ||= depth
-        return if depth == @leaf_depth
-
-        return @check.finding("tree_depth_uneven", object: @object, page: page,
-                                                   detail: "leaf at depth #{depth}, others at #{@leaf_depth}")
+        if depth != @leaf_depth
+          @check.finding("tree_depth_uneven", object: @object, page: page,
+                                              detail: "leaf at depth #{depth}, others at #{@leaf_depth}")
+        end
       end
-      children.each { |cp| visit(cp, depth + 1) }
+      if parent_bound && !items.all? { |bound, _, _| gist_bound_contains?(@ops, parent_bound, bound) }
+        @check.finding("gist_bounds_violation", object: @object, page: page,
+                                                detail: "a bound lies outside its parent's bound for this page")
+      end
+      if leaf
+        items.each { |_, raw, skey| @entries << [raw, skey] }
+      else
+        items.each { |bound, _, child| visit(child, depth + 1, bound) }
+      end
     end
 
-    # The child pointers of an interior, [] for a leaf (its entries parsed and discarded), nil for
-    # another page type.
+    # [decoded bound, bound bytes, storage key or child page] per entry; nil for another page type.
     def parse(pg)
       payload = pg[:payload]
       pos = 0
-      case pg[:type]
-      when PAGE_GIST_LEAF
-        pg[:item_count].times do
-          bl, pos = take(payload, pos, 2)
-          _bound, pos = take(payload, pos, bl.unpack1("n"))
+      return nil unless [PAGE_GIST_LEAF, PAGE_GIST_INTERIOR].include?(pg[:type])
+
+      (0...pg[:item_count]).map do
+        bl, pos = take(payload, pos, 2)
+        raw, pos = take(payload, pos, bl.unpack1("n"))
+        bound = gist_decode_bound(@ops, raw.b)
+        if pg[:type] == PAGE_GIST_LEAF
           sl, pos = take(payload, pos, 2)
-          _skey, pos = take(payload, pos, sl.unpack1("n"))
-        end
-        []
-      when PAGE_GIST_INTERIOR
-        (0...pg[:item_count]).map do
-          bl, pos = take(payload, pos, 2)
-          _bound, pos = take(payload, pos, bl.unpack1("n"))
+          skey, pos = take(payload, pos, sl.unpack1("n"))
+          [bound, raw.b, skey.b]
+        else
           cp, pos = read_ptr(payload, pos)
-          cp
+          [bound, raw.b, cp]
         end
       end
     end
@@ -562,6 +662,25 @@ INTEGRITY_TABLE = {
   rows: (1..40).map { |i| [i * 2, (i * 37) % 101, "row #{i}"] }
 }.freeze
 
+# The I3 table: an expression index, a partial index, a GIN over an i32[] and a GiST over an i32range,
+# each several pages deep at a 256-byte page (indexes in name order). Some rows have a NULL or empty
+# array, and some a NULL range, which derive no GIN postings or GiST entry.
+INTEGRITY_U_TABLE = {
+  name: "u",
+  columns: [col("id", "i32", pk: true), col("v", "i32"), col("tags", "i32[]"), col("span", "i32range")],
+  indexes: [{ name: "u_span_gist", cols: [3], kind: "gist" },
+            { name: "u_tags_gin", cols: [2], kind: "gin" },
+            { name: "u_v1_idx", cols: [{ expr: "v + 1" }] },
+            { name: "u_vp_idx", cols: [1], predicate: "v < 50" }],
+  rows: (1..40).map do |i|
+    tags = if (i % 11).zero? then nil
+           elsif (i % 13).zero? then []
+           else [i % 5, i % 7, i % 3]
+           end
+    [i * 2, (i * 37) % 101, tags, (i % 9).zero? ? nil : rng(i, i + 2 + (i % 4))]
+  end
+}.freeze
+
 INTEGRITY_DEFAULT_RUNS = [{ level: "quick", max_findings: 100 }, { level: "full", max_findings: 100 }].freeze
 
 INTEGRITY_FIXTURES = [
@@ -576,7 +695,16 @@ INTEGRITY_FIXTURES = [
   { name: "row_count_wrong", damage: :none, table: INTEGRITY_TABLE.merge(row_count: 41) },
   { name: "live_count_wrong", damage: :live_count_wrong },
   { name: "free_page_live", damage: :free_page_live },
-  { name: "tree_shares_page", damage: :tree_shares_page }
+  { name: "tree_shares_page", damage: :tree_shares_page },
+  { name: "u_clean", damage: nil, table: INTEGRITY_U_TABLE },
+  { name: "gin_posting_dropped", damage: :gin_posting_dropped, table: INTEGRITY_U_TABLE },
+  { name: "gin_posting_extra", damage: :gin_posting_extra, table: INTEGRITY_U_TABLE },
+  { name: "gin_run_malformed", damage: :gin_run_malformed, table: INTEGRITY_U_TABLE },
+  { name: "gist_entry_dropped", damage: :gist_entry_dropped, table: INTEGRITY_U_TABLE },
+  { name: "gist_bound_shrunk", damage: :gist_bound_shrunk, table: INTEGRITY_U_TABLE },
+  { name: "expr_entry_wrong", damage: :expr_entry_wrong, table: INTEGRITY_U_TABLE },
+  { name: "expr_overflow", damage: :expr_overflow, table: INTEGRITY_U_TABLE },
+  { name: "partial_entry_extra", damage: :partial_entry_extra, table: INTEGRITY_U_TABLE }
 ].freeze
 
 # Table and index root pages by name, from a plaintext from-scratch catalog of tables only.
@@ -622,6 +750,8 @@ def integrity_fixture_image(fx)
   ps = 256
   image = build_image([], [], [fx[:table] || INTEGRITY_TABLE], ps)
   roots = integrity_roots(image, ps)
+  return integrity_u_damage(image, ps, roots, fx[:damage]) if roots.key?("u")
+
   table_leaves = integrity_leaves(image, ps, roots["t"])
   index_leaves = integrity_leaves(image, ps, roots["t_v_idx"])
   raise "the table needs an interior root over several leaves" unless table_leaves.size >= 3 && index_leaves.size >= 2
@@ -687,6 +817,106 @@ def integrity_fixture_image(fx)
     set_page_u32(image, ps, roots["t"], PAGE_HEADER + 4, index_leaves[0])
   else
     raise "unknown integrity damage #{fx[:damage]}"
+  end
+  image
+end
+
+# The leaf pages of a plaintext GiST tree in child order, as [page, entries] with each entry the raw
+# [bound, storage key] pair.
+def integrity_gist_leaves(image, ps, root)
+  pg = read_page(image, ps, root)
+  pos = 0
+  items = (0...pg[:item_count]).map do
+    bl, pos = take(pg[:payload], pos, 2)
+    bound, pos = take(pg[:payload], pos, bl.unpack1("n"))
+    if pg[:type] == PAGE_GIST_LEAF
+      sl, pos = take(pg[:payload], pos, 2)
+      skey, pos = take(pg[:payload], pos, sl.unpack1("n"))
+      [bound.b, skey.b]
+    else
+      cp, pos = take(pg[:payload], pos, 4)
+      [bound.b, cp.unpack1("N")]
+    end
+  end
+  return [[root, items]] if pg[:type] == PAGE_GIST_LEAF
+
+  items.flat_map { |_, child| integrity_gist_leaves(image, ps, child) }
+end
+
+# The keys of a plaintext index leaf.
+def integrity_index_keys(image, ps, page)
+  pg = read_page(image, ps, page)
+  parse_pax_leaf(pg[:payload], pg[:item_count], [])[0].map(&:b)
+end
+
+def integrity_u_damage(image, ps, roots, damage)
+  table_leaves = integrity_leaves(image, ps, roots["u"])
+  gin_leaves = integrity_leaves(image, ps, roots["u_tags_gin"])
+  gist_root = read_page(image, ps, roots["u_span_gist"])
+  raise "u's trees need several pages" unless table_leaves.size >= 3 && gin_leaves.size >= 2 &&
+                                              gist_root[:type] == PAGE_GIST_INTERIOR
+  case damage
+  when nil
+    nil
+  when :gin_posting_dropped
+    # The first run of three or more storage keys in the GIN's first leaf loses its second key.
+    keys = integrity_index_keys(image, ps, gin_leaves[0])
+    at = keys.index { |run| gin_decode_run(4, run).size >= 3 }
+    postings = gin_decode_run(4, keys[at])
+    postings.delete_at(1)
+    keys[at] = gin_encode_run(keys[at].byteslice(0, 4), postings)
+    integrity_write_index_leaf(image, ps, gin_leaves[0], keys)
+  when :gin_posting_extra
+    # The first run of two or more keys in the GIN's second leaf gains an odd id no row has.
+    keys = integrity_index_keys(image, ps, gin_leaves[1])
+    at = (1...keys.size).find { |i| gin_decode_run(4, keys[i]).size >= 2 } # not the leaf's first: its key is a separator
+    postings = gin_decode_run(4, keys[at])
+    postings.insert(1, key_body("i32", decode_int(4, postings[0]) + 1))
+    keys[at] = gin_encode_run(keys[at].byteslice(0, 4), postings)
+    integrity_write_index_leaf(image, ps, gin_leaves[1], keys)
+  when :gin_run_malformed
+    # The GIN's first leaf's second run records a body longer than the run itself.
+    keys = integrity_index_keys(image, ps, gin_leaves[0])
+    keys[1] = keys[1].byteslice(0, keys[1].bytesize - 2) + u16(0xFFFF)
+    integrity_write_index_leaf(image, ps, gin_leaves[0], keys)
+  when :gist_entry_dropped
+    # The GiST's second leaf loses its second entry; every bound above it still contains the rest.
+    page, items = integrity_gist_leaves(image, ps, roots["u_span_gist"])[1]
+    items.delete_at(1)
+    payload = items.map { |bound, skey| u16(bound.bytesize) + bound + u16(skey.bytesize) + skey }.join.b
+    image[page * ps + PAGE_HEADER, ps - PAGE_HEADER] = payload + "\x00".b * (ps - PAGE_HEADER - payload.bytesize)
+    write_page(image, ps, page, PAGE_GIST_LEAF, items.size, 0, "".b)
+  when :gist_bound_shrunk
+    # The GiST root's bound for its first child starts one past the lowest lower bound beneath it.
+    # The root's first entry is u16 length, then the range body: flags, then the lower bound's i32.
+    off = roots["u_span_gist"] * ps + PAGE_HEADER + 3
+    image[off, 4] = encode_int(4, decode_int(4, image.byteslice(off, 4)) + 1)
+    refresh_body_crc(image, ps, roots["u_span_gist"])
+  when :expr_entry_wrong
+    # The expression index's largest entry (v + 1 of the row with the largest v) holds v + 2.
+    leaf = integrity_leaves(image, ps, roots["u_v1_idx"]).last
+    keys = integrity_index_keys(image, ps, leaf)
+    last = keys.last
+    keys[-1] = "\x00".b + encode_int(4, decode_int(4, last.byteslice(1, 4)) + 1) + last.byteslice(5..)
+    integrity_write_index_leaf(image, ps, leaf, keys)
+  when :expr_overflow
+    # The second row of u's second leaf holds v = 2147483647, so its v + 1 overflows.
+    page = table_leaves[1]
+    n = page_u32(image, ps, page, 4)
+    pg = read_page(image, ps, page)
+    key_end = pg[:payload].byteslice(4 * (n - 1), 4).unpack1("N")
+    dir = PAGE_HEADER + 4 * n + key_end # the column directory: u32 start per column, then the end
+    v_region = page_u32(image, ps, page, dir + 4)
+    off = page * ps + PAGE_HEADER + v_region + 1 + (n + 7) / 8 + 4 * 1
+    image[off, 4] = encode_int(4, 2**31 - 1)
+    refresh_body_crc(image, ps, page)
+  when :partial_entry_extra
+    # The partial index's last leaf gains, at its end, the entry of row id 4 (v = 74, not < 50).
+    leaf = integrity_leaves(image, ps, roots["u_vp_idx"]).last
+    keys = integrity_index_keys(image, ps, leaf)
+    integrity_write_index_leaf(image, ps, leaf, keys + ["\x00".b + key_body("i32", 74) + key_body("i32", 4)])
+  else
+    raise "unknown integrity damage #{damage}"
   end
   image
 end
@@ -762,6 +992,114 @@ def verify_integrity(goldens)
     %w[quick full].each do |level|
       report = IntegrityCheck.new(image, level: level, max_findings: 0).run
       fail!("#{fx[:file]}: #{level} integrity check reports #{report[:findings].first}") unless report[:findings].empty?
+    end
+  end
+end
+
+# --- GIN posting runs and GiST bounds (integrity-check.md §3.2, §3.4) -------------------------------
+
+def gin_read_run_varint(buf, pos)
+  v = 0
+  [0, 7, 14].each do |shift|
+    raise "a GIN posting run is malformed" if pos >= buf.bytesize
+
+    c = buf.getbyte(pos)
+    pos += 1
+    v |= (c & 0x7F) << shift
+    return [v, pos] if (c & 0x80).zero?
+  end
+  raise "a GIN posting run is malformed"
+end
+
+# A run's posting count from its tail, without the term's length: the body (its length in the last two
+# bytes, after at least a term byte and a `last` byte) parses exactly as shared/suffix triples.
+def gin_run_postings(run)
+  n = run.bytesize
+  raise "a GIN posting run is malformed" if n < 4
+
+  body_len = run.byteslice(n - 2, 2).unpack1("n")
+  raise "a GIN posting run is malformed" if n - 2 - body_len < 2
+
+  body = run.byteslice(n - 2 - body_len, body_len)
+  at = 0
+  count = 1
+  while at < body.bytesize
+    shared, at = gin_read_run_varint(body, at)
+    suffix, at = gin_read_run_varint(body, at)
+    raise "a GIN posting run is malformed" if at + suffix > body.bytesize || shared + suffix == 0
+
+    at += suffix
+    count += 1
+  end
+  count
+end
+
+# A run's storage keys, ascending, given its term's length (gin.md §4.5; the cores' run decoder).
+def gin_decode_run(term_len, run)
+  n = run.bytesize
+  raise "a GIN posting run is malformed" if n < term_len + 3
+
+  body_len = run.byteslice(n - 2, 2).unpack1("n")
+  last_end = n - 2 - body_len
+  raise "a GIN posting run is malformed" if last_end <= term_len
+
+  last = run.byteslice(term_len, last_end - term_len)
+  body = run.byteslice(last_end, body_len)
+  keys = []
+  at = 0
+  while at < body.bytesize
+    shared, at = gin_read_run_varint(body, at)
+    suffix, at = gin_read_run_varint(body, at)
+    prev = keys.last || last
+    raise "a GIN posting run is malformed" if shared > prev.bytesize || at + suffix > body.bytesize || shared + suffix == 0
+
+    key = prev.byteslice(0, shared) + body.byteslice(at, suffix)
+    at += suffix
+    raise "a GIN posting run is malformed" if keys.last && keys.last >= key
+
+    keys << key
+  end
+  raise "a GIN posting run is malformed" if keys.last && keys.last >= last
+
+  keys << last
+end
+
+# Decode a GiST tuple bound (gist.md §4.1, §6): per opclass a range body or a `[min, max]` pair of
+# length-prefixed key bytes, consuming the bytes exactly.
+def gist_decode_bound(ops, raw)
+  pos = 0
+  bound = ops.map do |op|
+    if op[:kind] == :range
+      v, pos = decode_range_body(op[:elem], raw, pos)
+      v
+    else
+      ml, pos = take(raw, pos, 2)
+      min, pos = take(raw, pos, ml.unpack1("n"))
+      xl, pos = take(raw, pos, 2)
+      max, pos = take(raw, pos, xl.unpack1("n"))
+      [min.b, max.b]
+    end
+  end
+  raise "GiST bound has trailing bytes" unless pos == raw.bytesize
+
+  bound
+end
+
+# Whether a decoded tuple bound contains another, per component: range `@>` (bounds compared through
+# their order-preserving key encodings), scalar `[min, max]` bytewise.
+def gist_bound_contains?(ops, outer, inner)
+  ops.each_index.all? do |k|
+    a = outer[k]
+    b = inner[k]
+    if ops[k][:kind] == :range
+      next true if b == :empty
+      next false if a == :empty
+
+      elem = ops[k][:elem]
+      bound = ->(v, side, lower) { encode_range_key_bound(+"".b, elem, v, side, lower) }
+      bound.(a, :lower, true) <= bound.(b, :lower, true) && bound.(b, :upper, false) <= bound.(a, :upper, false)
+    else
+      a[0] <= b[0] && b[1] <= a[1]
     end
   end
 end

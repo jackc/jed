@@ -76,32 +76,57 @@ export function ginDecodeRun(termLen: number, run: Uint8Array): Uint8Array[] {
   const last = run.subarray(termLen, lastEnd);
   const body = run.subarray(lastEnd, bodyEnd);
   const keys: Uint8Array[] = [];
-  let at = 0;
-  const read = (): number => {
-    let v = 0;
-    for (let shift = 0; shift < 21; shift += 7) {
-      if (at >= body.length) throw corrupt();
-      const c = body[at++]!;
-      v |= (c & 0x7f) << shift;
-      if ((c & 0x80) === 0) return v;
-    }
-    throw corrupt();
-  };
-  while (at < body.length) {
-    const shared = read();
-    const suffix = read();
+  const cur = { at: 0 };
+  while (cur.at < body.length) {
+    const shared = readRunVarint(body, cur);
+    const suffix = readRunVarint(body, cur);
+    const at = cur.at;
     const prev = keys.length > 0 ? keys[keys.length - 1]! : last;
     if (shared > prev.length || at + suffix > body.length || shared + suffix === 0) throw corrupt();
     const key = new Uint8Array(shared + suffix);
     key.set(prev.subarray(0, shared), 0);
     key.set(body.subarray(at, at + suffix), shared);
-    at += suffix;
+    cur.at = at + suffix;
     if (keys.length > 0 && compareBytes(keys[keys.length - 1]!, key) >= 0) throw corrupt();
     keys.push(key);
   }
   if (keys.length > 0 && compareBytes(keys[keys.length - 1]!, last) >= 0) throw corrupt();
   keys.push(last.slice());
   return keys;
+}
+
+// readRunVarint reads one run-body varint (at most three bytes) at cur.at, advancing it.
+function readRunVarint(body: Uint8Array, cur: { at: number }): number {
+  let v = 0;
+  for (let shift = 0; shift < 21; shift += 7) {
+    if (cur.at >= body.length) throw corrupt();
+    const c = body[cur.at++]!;
+    v |= (c & 0x7f) << shift;
+    if ((c & 0x80) === 0) return v;
+  }
+  throw corrupt();
+}
+
+// ginRunPostings is a run key's posting count, counted from its tail without the term's length
+// (spec/design/integrity-check.md §3.2): the body (its length in the last two bytes, after at least a
+// term byte and a `last` byte) parses exactly as shared/suffix triples, each with shared + suffix > 0
+// and the suffix within the body. One plus the triples. A run that does not parse is XX001.
+export function ginRunPostings(run: Uint8Array): number {
+  const n = run.length;
+  if (n < 4) throw corrupt();
+  const bodyLen = (run[n - 2]! << 8) | run[n - 1]!;
+  if (n - 2 - bodyLen < 2) throw corrupt();
+  const body = run.subarray(n - 2 - bodyLen, n - 2);
+  const cur = { at: 0 };
+  let count = 1;
+  while (cur.at < body.length) {
+    const shared = readRunVarint(body, cur);
+    const suffix = readRunVarint(body, cur);
+    if (cur.at + suffix > body.length || shared + suffix === 0) throw corrupt();
+    cur.at += suffix;
+    count++;
+  }
+  return count;
 }
 
 // ginPackRuns is the runs of term over ascending, distinct keys, packed greedily: a run takes each

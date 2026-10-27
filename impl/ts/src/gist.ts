@@ -56,7 +56,7 @@ type RangeVal = Value & { kind: "range" };
 // One column's bounding key: a range value (range_ops) or a [min,max] pair over the order-preserving
 // key encoding (scalar `=`). A leaf's scalar component is the degenerate [v,v]. Narrowed by `"rng" in
 // b`. A tree bound is a GistBound[] — one component per indexed column (length 1 for GX1/GX2).
-type GistBound = { rng: RangeVal } | { smin: Uint8Array; smax: Uint8Array };
+export type GistBound = { rng: RangeVal } | { smin: Uint8Array; smax: Uint8Array };
 
 // One column's search operand: a range constant (rng) for &&/@>, or a scalar equality constant's
 // order-preserving KEY bytes (skey) for =. A multi-column probe supplies one per column.
@@ -516,6 +516,43 @@ function decodeGistLeafKey(
   const cur = { pos: 0 };
   const bound = readBoundTuple(ops, key, cur);
   return { bound, skey: key.subarray(cur.pos) };
+}
+
+// gistDecodeBound decodes one stored tuple bound under ops, consuming raw exactly (integrity-check.md
+// §3.2): trailing bytes, like a short or malformed component, are data_corrupted.
+export function gistDecodeBound(ops: GistOpclass[], raw: Uint8Array): GistBound[] {
+  const cur = { pos: 0 };
+  const bound = readBoundTuple(ops, raw, cur);
+  if (cur.pos !== raw.length) throw engineError("data_corrupted", "GiST bound has trailing bytes");
+  return bound;
+}
+
+// gistSplitLeafKey splits a leaf-store key (bound ‖ storage key) into its decoded bound, the bound's
+// bytes, and the storage key.
+export function gistSplitLeafKey(
+  ops: GistOpclass[],
+  key: Uint8Array,
+): { bound: GistBound[]; boundBytes: Uint8Array; skey: Uint8Array } {
+  const cur = { pos: 0 };
+  const bound = readBoundTuple(ops, key, cur);
+  return { bound, boundBytes: key.subarray(0, cur.pos), skey: key.subarray(cur.pos) };
+}
+
+// gistBoundContains reports whether tuple bound outer contains inner, per component
+// (integrity-check.md §3.2): a range component by `@>` (anything contains empty, empty contains only
+// empty), a scalar component's [min, max] key bytes by min ≤ inner min and inner max ≤ max, bytewise.
+export function gistBoundContains(outer: GistBound[], inner: GistBound[]): boolean {
+  for (let i = 0; i < outer.length; i++) {
+    const a = outer[i]!;
+    const b = inner[i]!;
+    if ("rng" in a) {
+      if (!rangeContains(a.rng, (b as { rng: RangeVal }).rng)) return false;
+    } else {
+      const bs = b as { smin: Uint8Array; smax: Uint8Array };
+      if (cmpBytes(a.smin, bs.smin) > 0 || cmpBytes(bs.smax, a.smax) > 0) return false;
+    }
+  }
+  return true;
 }
 
 // buildGistFromLeafKeys builds the persisted R-tree from the index store's leaf keys. The keys are
