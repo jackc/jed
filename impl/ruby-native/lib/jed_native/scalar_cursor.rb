@@ -11,7 +11,7 @@ module JedNative
     # text form is safe here; bytea expression inputs still use ordinary Rows.
     FAMILIES = %w[integer decimal float boolean text bytea any anycompatible].freeze
     FUNCTIONS = FunctionCatalog::SIGNATURES.filter_map do |name, signatures|
-      next if name.start_with?('regexp_') || %w[like ilike like_escape].include?(name)
+      next if name.start_with?('regexp_') || %w[like ilike like_escape similar_to_escape].include?(name)
       next unless FunctionCatalog::VOLATILITY[name]&.all? { |_, volatility| volatility == 'immutable' }
       next unless signatures.any? { |arguments, *| !arguments.include?('bytea') }
       next unless signatures.all? { |arguments, result, *| arguments.all? { |family| FAMILIES.include?(family) } && (TYPES.key?(result) || result == 'promoted') }

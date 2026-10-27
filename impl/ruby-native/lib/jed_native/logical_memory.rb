@@ -31,7 +31,7 @@ module JedNative
     GROWTH_FUNCTIONS = %w[array_append array_prepend array_cat overlay concat json_build_array jsonb_build_array
                           json_build_object jsonb_build_object json_object jsonb_object to_json to_jsonb
                           array_to_json row_to_json json_scalar json_serialize encode quote_literal quote_ident
-                          quote_nullable like_escape to_char jsonb_set jsonb_set_lax jsonb_insert].freeze
+                          quote_nullable like_escape similar_to_escape to_char jsonb_set jsonb_set_lax jsonb_insert].freeze
 
     def constant_expression?(value)
       case value

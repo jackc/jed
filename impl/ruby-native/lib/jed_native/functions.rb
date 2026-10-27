@@ -250,6 +250,7 @@ module JedNative
         name == 'md5' ? digest.hexdigest(a) : Bytea.new(digest.digest(a))
       when 'like', 'ilike' then like(a, b, escape: c || '\\', insensitive: name == 'ilike', context: context)
       when 'like_escape' then like_escape(a, b)
+      when 'similar_to_escape' then Similar.translate(a, args.length > 1 ? b : nil)
       when /\Aregexp_/, 'regex_match', 'regex_imatch'
         raise Error.new('0A000', 'bounded regular expressions are not implemented in the Ruby experiment')
       when 'array_append'

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'regex'
+require_relative 'similar'
 
 module JedNative
   module RegexFunctions
@@ -190,14 +191,27 @@ module JedNative
     end
 
     def compile(node, columns)
-      if node[:kind] == :binary && %w[~ ~* !~ !~*].include?(node[:op])
-        args = [compile(node[:left], columns), compile(node[:right], columns)]
+      similar = node[:kind] == :binary && ['similar to', 'not similar to'].include?(node[:op])
+      if node[:kind] == :binary && (similar || %w[~ ~* !~ !~*].include?(node[:op]))
+        right = node[:right]
+        # SIMILAR TO desugars, as in PostgreSQL, to `~ similar_to_escape(p [, e])`
+        # compiled dot-all (regex.md §8f.2).
+        right = { kind: :call, name: 'similar_to_escape', args: [right, node[:escape]].compact } if similar
+        op = similar ? (node[:op].start_with?('not') ? '!~' : '~') : node[:op]
+        args = [compile(node[:left], columns), compile(right, columns)]
         raise Error.new('42804', 'regular expression operands must be text') unless args.all? { |arg| %w[text unknown null].include?(arg.type) }
-        options = node[:op].end_with?('*') ? 'i' : ''
-        if args[1].kind == :literal && args[1].value
-          program = (@regex_programs ||= {}.compare_by_identity)[node] ||= RegexProgram.new(args[1].value, insensitive: options == 'i')
+        if similar && args[1].kind == :call && args[1].args.all? { |arg| arg.kind == :literal && arg.value.is_a?(String) }
+          # A constant pattern and escape translate now, so a translation
+          # error surfaces at resolve and the pattern precompiles.
+          translated = Similar.translate(args[1].args[0].value, args[1].args[1]&.value)
+          args[1] = Expression.new(kind: :literal, type: 'text', value: translated)
         end
-        return Expression.new(kind: :regex_operator, type: 'boolean', value: node[:op], args: args, extra: { program: program, flags: options, charge_key: node })
+        options = op.end_with?('*') ? 'i' : ''
+        if args[1].kind == :literal && args[1].value
+          program = (@regex_programs ||= {}.compare_by_identity)[node] ||=
+            similar ? Similar.compile(args[1].value) : RegexProgram.new(args[1].value, insensitive: options == 'i')
+        end
+        return Expression.new(kind: :regex_operator, type: 'boolean', value: op, args: args, extra: { program: program, flags: options, charge_key: node, similar: similar })
       end
       return super unless node[:kind] == :call && (RegexFunctions::NAMES.include?(node[:name]) || node[:name] == 'substring')
       if %w[regexp_matches regexp_split_to_table].include?(node[:name]) && !@regex_source_compile
@@ -206,7 +220,23 @@ module JedNative
       expression = super
       name = node[:name]
       if name == 'substring'
-        return expression unless expression.args.length == 2 && %w[text unknown null].include?(expression.args[1].type)
+        textual = expression.args[1..].all? { |arg| %w[text unknown null].include?(arg.type) }
+        return expression unless expression.args.length.between?(2, 3) && textual
+        if expression.args.length == 3
+          # The SIMILAR substring (regex.md §8f.3): a NULL constant subject is
+          # NULL without translating; a constant pattern and escape precompile.
+          subject, pattern, escape = expression.args
+          unless subject.kind == :literal && subject.value.nil?
+            if [pattern, escape].all? { |arg| arg.kind == :literal && arg.value.is_a?(String) }
+              matcher = (@regex_programs ||= {}.compare_by_identity)[node] ||= Similar::Matcher.new(pattern.value, escape.value)
+            end
+          end
+          expression.type = 'text'
+          expression.kind = :regex_function
+          expression.value = 'substring_similar'
+          expression.extra = { matcher: matcher, charge_key: node }
+          return expression
+        end
         name = 'substring_regex'
       end
       if %w[regexp_matches regexp_split_to_table].include?(name)
@@ -227,6 +257,7 @@ module JedNative
     def evaluate(expression, row, group = nil)
       return super unless %i[regex_operator regex_function].include?(expression.kind)
       charge
+      return similar_substring(expression, row, group) if expression.value == 'substring_similar'
       args = expression.args.map { |arg| evaluate(arg, row, group) }
       return nil if args.any?(&:nil?)
       program = expression.extra[:program]
@@ -237,7 +268,7 @@ module JedNative
       end
       if expression.kind == :regex_operator
         unless program
-          program = RegexProgram.new(args[1], insensitive: expression.extra[:flags] == 'i')
+          program = expression.extra[:similar] ? Similar.compile(args[1]) : RegexProgram.new(args[1], insensitive: expression.extra[:flags] == 'i')
           charge(program.code.length)
         end
         matched = program.match?(args[0], context: self)
@@ -245,6 +276,38 @@ module JedNative
       else
         RegexFunctions.call(expression.value, args, context: self, program: program)
       end
+    end
+
+    # STRICT, but a NULL subject value does not hide a bad escape: a NULL
+    # constant argument is NULL at once, otherwise every argument is
+    # evaluated and the pattern translated before the subject's NULL check.
+    def similar_substring(expression, row, group)
+      args = []
+      expression.args.each do |arg|
+        value = evaluate(arg, row, group)
+        return nil if value.nil? && arg.kind == :literal
+        args << value
+      end
+      source, pattern, escape = args
+      return nil if pattern.nil? || escape.nil?
+      matcher = expression.extra[:matcher]
+      charge_key = expression.extra[:charge_key] || expression
+      if matcher
+        unless (@regex_charged ||= {}.compare_by_identity).key?(charge_key)
+          charge(matcher.instructions)
+          @regex_charged[charge_key] = true
+        end
+      else
+        translated = Similar.translate(pattern, escape)
+        charge(translated.bytesize)
+        consume_scalar_bytes(translated.bytesize)
+        matcher = Similar::Matcher.new(pattern, escape)
+        charge(matcher.instructions)
+      end
+      return nil if source.nil?
+      original = RegexText.new(source)
+      span = matcher.span(original, self)
+      span && original.slice(*span)
     end
 
     def source_relation(source)

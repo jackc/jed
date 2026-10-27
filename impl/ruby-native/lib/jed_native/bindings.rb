@@ -6,7 +6,7 @@ module JedNative
   # This also applies to predicates and assignments that will visit zero rows.
   class ParameterBindings
     UNKNOWN = 'unknown'
-    TEXT_OPERATORS = %w[like ilike not\ like not\ ilike ~ ~* !~ !~*].freeze
+    TEXT_OPERATORS = %w[like ilike not\ like not\ ilike similar\ to not\ similar\ to ~ ~* !~ !~*].freeze
     COMPARISONS = %w[= <> != < <= > >= is\ distinct\ from is\ not\ distinct\ from @> <@ && << >> &< &> -|-].freeze
     UNMETERED_SCALARS = %w[i16 i32 i64 boolean text bytea uuid decimal f32 f64].freeze
     METADATA_STACK_SLICE = 24
