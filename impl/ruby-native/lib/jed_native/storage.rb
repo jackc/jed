@@ -42,13 +42,22 @@ module JedNative
 
     def initialize(path:, create: false, page_size: 8192, locking: :auto,
                    file_lock_timeout_ms: 5000, fsync: true, synchronous: :on, read_only: false,
-                   max_storage_bytes: 0, cache_bytes: FileImage::DEFAULT_CACHE_BYTES, collation_key: nil, expression: nil)
+                   max_storage_bytes: 0, cache_bytes: FileImage::DEFAULT_CACHE_BYTES, collation_key: nil, expression: nil,
+                   flush_interval_ms: 1000, clock: nil)
       @codec = FileFormat.new(collation_key: collation_key, expression: expression)
       @pid = Process.pid
       @sync = fsync
       raise Error.new('22023', 'synchronous must be on or off') unless %i[on off].include?(synchronous.to_sym)
       @synchronous = synchronous.to_sym
       @durability_pending = {}
+      unless flush_interval_ms.is_a?(Integer) && flush_interval_ms >= 0
+        raise Error.new('22023', 'flush_interval_ms must be a nonnegative integer')
+      end
+      # The time-based flush (validated-cow.md §4.1): a relaxed batch pending for this long on the
+      # environment's clock is flushed by the next commit, or by the idle flusher.
+      @flush_interval_ms = flush_interval_ms
+      @clock = clock
+      @flush_deadline = nil
       @read_only = read_only
       unless cache_bytes.is_a?(Integer) && cache_bytes >= 0
         raise Error.new('22023', 'cache_bytes must be a nonnegative integer')
@@ -145,6 +154,11 @@ module JedNative
       return @service_remote.commit(snapshot) if @service_remote
       @mutex.synchronize do
         ensure_open(write: true)
+        # §4.1 rule 1: a relaxed commit reads the clock once, before planning; past the batch's
+        # deadline it flushes the batch first (rule 3) and starts the next batch with this reading.
+        reading = flush_clock_reading
+        flush_pending if reading && !@durability_pending.empty? && @flush_deadline && reading >= @flush_deadline
+        starts_batch = @durability_pending.empty?
         @durability_floor_slot ||= @meta[:slot] || (@meta[:txid] & 1)
         plan = plan_commit(snapshot)
         pages, root, live = plan.pages, plan.root, plan.live
@@ -203,6 +217,10 @@ module JedNative
           reset_durability_floor(@meta)
         else
           pages.pages.each { |page, bytes| @durability_pending[page] = @codec.crc64(bytes) if page >= 2 && bytes.getbyte(0) != 8 }
+          if reading && starts_batch && !@durability_pending.empty?
+            @flush_deadline = [reading + @flush_interval_ms * 1000, (1 << 63) - 1].min
+            start_idle_flusher
+          end
         end
         @service_owner&.publish(@meta, pages.pages.fetch(slot), pages.pages.keys.reject { |page| page < 2 })
         if @synchronous == :off && @durability_pending.length >= (@page_size - 64) / 12
@@ -221,6 +239,7 @@ module JedNative
       return if @closed
 
       ensure_pid
+      stop_idle_flusher
       begin
         flush unless @poisoned
       rescue Error => error
@@ -240,6 +259,61 @@ module JedNative
       @durability_pending = {}
       @durability_floor_free = nil
       @durability_deferred_free = nil
+      @flush_deadline = nil
+    end
+
+    def flush_clock_reading
+      return nil unless @synchronous == :off && @flush_interval_ms.positive? && @clock
+
+      @clock.now_micros
+    end
+
+    # §4.1 rule 5: the idle flusher does early only the flush the next commit would do. It wakes about
+    # when the deadline should pass, excludes commits, reads the clock, and flushes at or past the
+    # deadline; on a page-service owner it first takes the writer gate without waiting.
+    def start_idle_flusher
+      return if @idle_flusher&.alive?
+
+      @stop_idle_flusher = false
+      @idle_flusher = Thread.new do
+        loop do
+          sleep([@flush_interval_ms / 1000.0, 0.01].max)
+          done = @mutex.synchronize do
+            next true if @stop_idle_flusher || @closed || @poisoned
+            next true if @durability_pending.empty? || @flush_deadline.nil?
+
+            token = Object.new
+            next false if @service_owner && !@service_owner.try_acquire(token)
+
+            begin
+              if @clock.now_micros >= @flush_deadline
+                flush_pending
+                true
+              else
+                false
+              end
+            rescue Error
+              true
+            ensure
+              @service_owner&.release(token)
+            end
+          end
+          break if done
+        end
+      end
+      @idle_flusher.report_on_exception = false
+    end
+
+    def stop_idle_flusher
+      flusher = @idle_flusher
+      return unless flusher
+
+      @stop_idle_flusher = true
+      flusher.wakeup if flusher.alive? && flusher.stop?
+      flusher.join(5) unless flusher.equal?(Thread.current)
+      @idle_flusher = nil
+    rescue ThreadError
+      @idle_flusher = nil
     end
 
     def flush_pending(shrink: true)

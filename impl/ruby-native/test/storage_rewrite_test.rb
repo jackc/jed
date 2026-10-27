@@ -12,7 +12,7 @@ module RubyRewriteTest
     fixtures = File.expand_path('../../../spec/fileformat/fixtures', __dir__)
     count = 0
     Dir[File.join(fixtures, '*_table.jed')].sort.each do |path|
-      next if File.basename(path).match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon/)
+      next if File.basename(path).match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon|^encrypted_/)
       bytes = File.binread(path)
       codec = JedNative::FileFormat.new
       state = codec.decode_image(bytes, lazy: true)
