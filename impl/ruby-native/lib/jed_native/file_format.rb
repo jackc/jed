@@ -7,6 +7,7 @@ require_relative "page_buffer"
 require_relative "persistent_tree"
 require_relative "paged_rows"
 require_relative "stored_value"
+require_relative "crypto"
 
 module JedNative
   # Experimental v49 codec. Adapted from the independently handwritten Ruby
