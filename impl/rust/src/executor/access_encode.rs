@@ -245,10 +245,17 @@ impl KeySlot {
         if *key.get(at)? == self.order.null_tag() {
             return Some(1);
         }
-        let body = key.get(at + 1..)?;
         // `m` un-inverts a DESC body byte (`b ^ m` is the ASC byte).
         let m: u8 = if self.order.desc { 0xFF } else { 0x00 };
-        let n = match self.kind {
+        Some(1 + self.kind.body_len(key.get(at + 1..)?, m)?)
+    }
+}
+
+impl KeySlotKind {
+    /// The byte length of a key body of this kind at the start of `body`, each byte read as
+    /// `b ^ m` (`m = 0xFF` for a DESC slot's inverted body). `None` for a malformed (truncated) body.
+    pub(crate) fn body_len(self, body: &[u8], m: u8) -> Option<usize> {
+        Some(match self {
             KeySlotKind::Fixed(w) => {
                 if body.len() < w {
                     return None;
@@ -280,8 +287,67 @@ impl KeySlot {
                 }
                 i + terminated_len(body.get(i..)?, m)?
             }
-        };
-        Some(1 + n)
+        })
+    }
+}
+
+/// The byte length of the order-preserving key body of a value of resolved type `ct` at the start
+/// of `body` (encoding.md §2, the container keys §2.11/§2.14/§2.15 included), each byte read as
+/// `b ^ m` (`m = 0xFF` under `DESC`). `collated` selects a non-`C` text (or text-array element)
+/// key's sort-key form. Every key body is self-delimiting, so an index entry splits into its key
+/// slots and its storage-key suffix (the integrity check's uniqueness pass,
+/// spec/design/integrity-check.md §3.4). `None` for a malformed body or a type with no key.
+pub(crate) fn key_body_len(ct: &ColType, collated: bool, body: &[u8], m: u8) -> Option<usize> {
+    match ct {
+        ColType::Scalar(s) => KeySlot::for_scalar(*s, collated)?.kind.body_len(body, m),
+        // `0x00` the empty range; else `0x01`, then each bound: an infinite marker (`0x00` lower,
+        // `0x02` upper) or `0x01` ‖ the element key ‖ an inclusivity byte.
+        ColType::Range(elem) => {
+            if *body.first()? ^ m == 0x00 {
+                return Some(1);
+            }
+            if *body.first()? ^ m != 0x01 {
+                return None;
+            }
+            let mut at = 1;
+            for infinite in [0x00, 0x02] {
+                match *body.get(at)? ^ m {
+                    t if t == infinite => at += 1,
+                    0x01 => at += 1 + key_body_len(elem, false, body.get(at + 1..)?, m)? + 1,
+                    _ => return None,
+                }
+            }
+            Some(at)
+        }
+        // Per element `0x01` ‖ its key or `0x02` (NULL), then `0x00`, `ndim`, and per dimension a
+        // 4-byte length and a 4-byte lower bound.
+        ColType::Array(elem) => {
+            let mut at = 0;
+            loop {
+                match *body.get(at)? ^ m {
+                    0x01 => at += 1 + key_body_len(elem, collated, body.get(at + 1..)?, m)?,
+                    0x02 => at += 1,
+                    0x00 => {
+                        let ndim = (*body.get(at + 1)? ^ m) as usize;
+                        let end = at + 2 + ndim * 8;
+                        return (body.len() >= end).then_some(end);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        // Per field a §2.2 slot: `0x00` ‖ the field's key, or `0x01` (NULL).
+        ColType::Composite { fields, .. } => {
+            let mut at = 0;
+            for f in fields {
+                match *body.get(at)? ^ m {
+                    0x00 => at += 1 + key_body_len(&f.ty, false, body.get(at + 1..)?, m)?,
+                    0x01 => at += 1,
+                    _ => return None,
+                }
+            }
+            Some(at)
+        }
     }
 }
 

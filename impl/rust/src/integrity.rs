@@ -5,23 +5,32 @@
 //! then each table in name byte order (its tree, then each index's tree and, under `full`, the index's
 //! agreement with the table), then the space accounting — so every core reports the same findings in
 //! the same order. `spec/fileformat/integrity.rb` is the reference for that order and for what makes
-//! a tree unreadable (§5.2).
+//! a tree unreadable (§5.2). Under the `constraints` option a third stage, after every table's trees,
+//! re-checks each table's declared constraints against its stored rows (§3.4).
 //!
 //! Memory is bounded independent of row count (§5.4, CLAUDE.md §9): one reachability bitmap of
 //! `page_count` bits, the pending siblings of one root-to-leaf path per tree, one decoded leaf and one
 //! row's values at a time. Index agreement re-walks the table and probes the index once per derived
 //! entry through the index's own lookup, counting the index's entries during its structural walk, so
-//! neither side is materialized.
+//! neither side is materialized. The constraint stage likewise re-walks a table once per constraint,
+//! reads a unique index's entries keeping only the previous entry's key prefix, and looks each
+//! foreign key up through the referenced key's tree.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::cancel::CancellationToken;
-use crate::catalog::{ColType, IndexDef, IndexKind, Table};
+use crate::catalog::{
+    CheckConstraint, ColType, ForeignKeyConstraint, IndexDef, IndexKey, IndexKind, Table,
+};
 use crate::collation::Collation;
+use crate::encoding::KeyOrder;
 use crate::error::{EngineError, Result};
-use crate::executor::{Engine, IndexDeriveSkip, ResolvedIndex, Snapshot, encode_pk_key};
+use crate::executor::{
+    Engine, IndexDeriveSkip, ResolvedIndex, ResolvedKey, Snapshot, Typmod, encode_pk_key,
+    fk_match_full_violated, fk_probe, key_body_len, store_value,
+};
 use crate::format::{Cap, IntegrityFree, IntegrityGeneration, PageRef, TreeRead};
 use crate::gist::{DecodedBound, GistOpclass};
 use crate::integrity_kinds as kinds;
@@ -50,6 +59,10 @@ pub struct IntegrityCheckOptions {
     /// Stop after this many findings and set [`IntegrityReport::truncated`]; `0` means no limit.
     /// `100` by default.
     pub max_findings: u32,
+    /// Also re-check declared constraints against the stored rows — `NOT NULL`, column typmods,
+    /// `CHECK`, uniqueness, and foreign keys (§3.4) — as a stage after every table's trees.
+    /// Independent of `level`; `false` by default.
+    pub constraints: bool,
     /// Cancels the check (`57014`) when cancelled; polled at every page and row.
     pub cancel: Option<CancellationToken>,
 }
@@ -59,6 +72,7 @@ impl Default for IntegrityCheckOptions {
         IntegrityCheckOptions {
             level: IntegrityLevel::Full,
             max_findings: 100,
+            constraints: false,
             cancel: None,
         }
     }
@@ -199,6 +213,7 @@ struct Checker<'a> {
     first: u32,
     page_count: u32,
     full: bool,
+    constraints: bool,
     max: usize,
     cancel: Option<&'a CancellationToken>,
     report: IntegrityReport,
@@ -207,6 +222,10 @@ struct Checker<'a> {
     chain_pages: u64,
     /// Some tree was unreadable (§5.2): the live page count is not compared.
     damaged: bool,
+    /// Whether each table's tree was read whole, by name (the constraint stage's skips, §3.5).
+    tables_ok: HashMap<String, bool>,
+    /// Whether each index's structural walk reported nothing, by name (§3.5).
+    index_clean: HashMap<String, bool>,
     /// The write path's index-entry derivation, over the pinned snapshot and the handle's
     /// environment (§3.4). Maintenance evaluation is unmetered.
     engine: Engine,
@@ -232,12 +251,15 @@ pub(crate) fn run(
         first: cap.first_body(),
         page_count: generation.page_count,
         full: opts.level == IntegrityLevel::Full,
+        constraints: opts.constraints,
         max: opts.max_findings as usize,
         cancel: opts.cancel.as_ref(),
         report: IntegrityReport::default(),
         reached: RefCell::new(PageSet::new(generation.page_count)),
         chain_pages: 0,
         damaged: false,
+        tables_ok: HashMap::new(),
+        index_clean: HashMap::new(),
         engine: Engine::from_snapshot(snap.clone()),
     };
     match c.check(generation) {
@@ -329,8 +351,14 @@ impl Checker<'_> {
         }
         let gist_roots = self.check_catalog(generation.root)?;
         self.check_sequences()?;
-        for name in self.snap.table_names() {
-            self.check_table(&name, &gist_roots)?;
+        let tables = self.snap.table_names();
+        for name in &tables {
+            self.check_table(name, &gist_roots)?;
+        }
+        if self.constraints {
+            for name in &tables {
+                self.check_constraints(name)?;
+            }
         }
         self.check_free_list(&generation.free, &generation.protected)?;
         let reached = self.reached.borrow().count;
@@ -436,20 +464,7 @@ impl Checker<'_> {
             return Ok(());
         };
         let store = snap.store(name);
-        let ctx = TableCtx {
-            table,
-            col_types: Arc::new(store.col_types().to_vec()),
-            colls: table
-                .columns
-                .iter()
-                .map(|c| c.collation.as_ref().and_then(|n| snap.resolve_collation(n)))
-                .collect(),
-            pk: table
-                .pk
-                .iter()
-                .map(|&i| (i, table.columns[i].ty.clone()))
-                .collect(),
-        };
+        let ctx = table_ctx(snap, table);
         let root = store.tree_root().map_or(PageRef::NONE, |n| n.page_ref());
         let rows = Cell::new(0u64);
         let stopped = Cell::new(false);
@@ -486,6 +501,7 @@ impl Checker<'_> {
             )?;
         }
         self.damaged |= !table_ok;
+        self.tables_ok.insert(table.name.clone(), table_ok);
         let mut indexes: Vec<&IndexDef> = table.indexes.iter().collect();
         indexes.sort_by(|a, b| a.name.cmp(&b.name));
         for idx in indexes {
@@ -918,6 +934,10 @@ impl Checker<'_> {
             }
         };
         self.damaged |= !readable;
+        self.index_clean.insert(
+            idx.name.clone(),
+            readable && self.report.findings.len() == before,
+        );
         if !self.full {
             return Ok(());
         }
@@ -925,12 +945,7 @@ impl Checker<'_> {
         let rindex = match self.engine.resolve_index_for_check(ctx.table, idx)? {
             Ok(rindex) => rindex,
             Err(skip) => {
-                let reason = match skip {
-                    IndexDeriveSkip::Unparsable => kinds::SKIP_UNPARSABLE_DEFINITION,
-                    IndexDeriveSkip::HostFunction => kinds::SKIP_MISSING_HOST_FUNCTION,
-                    IndexDeriveSkip::LoadedData => kinds::SKIP_MISSING_LOADED_DATA,
-                };
-                self.skip(&idx.name, reason);
+                self.skip(&idx.name, skip_reason(skip));
                 return Ok(());
             }
         };
@@ -1094,6 +1109,301 @@ impl Checker<'_> {
         Ok(false)
     }
 
+    /// Each table row in storage-key order, decoded, for a pass after the table's tree read whole.
+    fn for_each_row(
+        &mut self,
+        ctx: &TableCtx<'_>,
+        f: &mut dyn FnMut(&mut Self, &[u8], &crate::storage::Row) -> Step<()>,
+    ) -> Step<()> {
+        let root = self
+            .snap
+            .store(&ctx.table.name)
+            .tree_root()
+            .map_or(PageRef::NONE, |n| n.page_ref());
+        self.walk_btree(
+            &ctx.table.name,
+            root,
+            &ctx.col_types,
+            false,
+            &mut |c, page, node| {
+                for i in 0..node.len() {
+                    c.poll()?;
+                    let Some(row) = c.decode_row(ctx, page, node, i, false)? else {
+                        continue;
+                    };
+                    f(c, node.key_at(i), &row)?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    /// One table's constraints (§3.4): the column pass, then each named constraint in name byte
+    /// order, ties by kind (`CHECK`, uniqueness, foreign key).
+    fn check_constraints(&mut self, name: &str) -> Step<()> {
+        let snap = self.snap;
+        let Some(table) = snap.table(name) else {
+            return Ok(());
+        };
+        let mut named: Vec<(&str, u8, Named<'_>)> = Vec::new();
+        named.extend(
+            table
+                .checks
+                .iter()
+                .map(|c| (c.name.as_str(), 0, Named::Check(c))),
+        );
+        named.extend(
+            table
+                .indexes
+                .iter()
+                .filter(|i| i.unique && i.kind == IndexKind::Btree)
+                .map(|i| (i.name.as_str(), 1, Named::Unique(i))),
+        );
+        named.extend(
+            table
+                .foreign_keys
+                .iter()
+                .map(|f| (f.name.as_str(), 2, Named::ForeignKey(f))),
+        );
+        named.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+        if !self.tables_ok.get(name).copied().unwrap_or(false) {
+            self.skip(name, kinds::SKIP_TABLE_UNREADABLE);
+            for (object, ..) in &named {
+                self.skip(object, kinds::SKIP_TABLE_UNREADABLE);
+            }
+            return Ok(());
+        }
+        let ctx = table_ctx(snap, table);
+        self.check_columns(&ctx)?;
+        for (_, _, c) in named {
+            match c {
+                Named::Check(c) => self.check_check(&ctx, c)?,
+                Named::Unique(i) => self.check_unique(&ctx, i)?,
+                Named::ForeignKey(f) => self.check_foreign_key(&ctx, f)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The column pass (§3.4): per row, per column in ordinal order, a NULL in a `NOT NULL` column,
+    /// or a value its column's write-time typmod coercion would reject or change.
+    fn check_columns(&mut self, ctx: &TableCtx<'_>) -> Step<()> {
+        let table = ctx.table;
+        self.for_each_row(ctx, &mut |c, key, row| {
+            for (ci, col) in table.columns.iter().enumerate() {
+                let v = &row[ci];
+                if matches!(v, Value::Null) {
+                    if col.not_null || col.primary_key {
+                        let detail = format!("column {} is NULL", col.name);
+                        let object = Some(table.name.as_str());
+                        c.add(kinds::NOT_NULL_VIOLATION, object, None, Some(key), detail)?;
+                    }
+                } else if !c.typmod_holds(col, &ctx.col_types[ci], v) {
+                    let detail = format!("column {} does not fit its typmod", col.name);
+                    let object = Some(table.name.as_str());
+                    c.add(kinds::TYPMOD_VIOLATION, object, None, Some(key), detail)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Whether storing `v` into `col` through the write path's typmod coercion leaves its stored
+    /// bytes unchanged (and does not fail). Top-level scalar columns only (§8).
+    fn typmod_holds(&self, col: &crate::catalog::Column, ct: &ColType, v: &Value) -> bool {
+        let tm = Typmod::of_column(col);
+        let ColType::Scalar(s) = ct else {
+            return true;
+        };
+        if tm == Typmod::NONE {
+            return true;
+        }
+        let iz = self.engine.input_zone();
+        match store_value(v.clone(), *s, tm, false, &col.name, &iz) {
+            Ok(stored) => {
+                crate::format::encode_value(ct, v) == crate::format::encode_value(ct, &stored)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// A `CHECK` (§3.4): each row evaluated as at write time; FALSE is a violation, an error a
+    /// `check_error`. Skipped when this environment cannot evaluate it (§3.5).
+    fn check_check(&mut self, ctx: &TableCtx<'_>, check: &CheckConstraint) -> Step<()> {
+        let rexpr = match self.engine.resolve_check_for_check(ctx.table, check)? {
+            Ok(rexpr) => rexpr,
+            Err(skip) => {
+                self.skip(&check.name, skip_reason(skip));
+                return Ok(());
+            }
+        };
+        let object = Some(check.name.as_str());
+        self.for_each_row(ctx, &mut |c, key, row| {
+            // Each row has a write's scalar allowance, as one INSERT would.
+            c.engine.session.scalar_bytes.set(0);
+            match c.engine.eval_check_for_check(&rexpr, row) {
+                Ok(Value::Bool(false)) => {
+                    let detail = "the row fails the check".to_string();
+                    c.add(kinds::CHECK_VIOLATION, object, None, Some(key), detail)
+                }
+                Ok(_) => Ok(()),
+                Err(e) if e.state == SqlState::QueryCanceled => Err(Halt::Error(e)),
+                Err(e) => {
+                    let detail = format!("{}: {}", e.code(), e.message);
+                    c.add(kinds::CHECK_ERROR, object, None, Some(key), detail)
+                }
+            }
+        })
+    }
+
+    /// Uniqueness (§3.4): the unique index's entries in order, an entry whose key prefix equals the
+    /// previous entry's and holds no NULL element repeating it. Only the previous prefix is kept.
+    fn check_unique(&mut self, ctx: &TableCtx<'_>, idx: &IndexDef) -> Step<()> {
+        if !self.index_clean.get(&idx.name).copied().unwrap_or(false) {
+            self.skip(&idx.name, kinds::SKIP_INDEX_UNREADABLE);
+            return Ok(());
+        }
+        // Each key element's resolved type and whether it keys by a collation's sort key; an
+        // expression element's come from resolving it.
+        let forms: Vec<(ColType, bool)> = if idx.keys.iter().any(|k| matches!(k, IndexKey::Expr(_)))
+        {
+            let rindex = match self.engine.resolve_index_for_check(ctx.table, idx)? {
+                Ok(rindex) => rindex,
+                Err(skip) => {
+                    self.skip(&idx.name, skip_reason(skip));
+                    return Ok(());
+                }
+            };
+            let mut forms = Vec::with_capacity(rindex.keys.len());
+            for k in &rindex.keys {
+                forms.push(match k {
+                    ResolvedKey::Column(ci) => (
+                        ctx.col_types[*ci].clone(),
+                        ctx.table.columns[*ci].collation.is_some(),
+                    ),
+                    ResolvedKey::Expr(_, ty, coll) => match key_col_type(ty) {
+                        Some(ct) => (ct, coll.is_some()),
+                        None => return Ok(()),
+                    },
+                });
+            }
+            forms
+        } else {
+            idx.keys
+                .iter()
+                .map(|k| match k {
+                    IndexKey::Column(ci) => (
+                        ctx.col_types[*ci].clone(),
+                        ctx.table.columns[*ci].collation.is_some(),
+                    ),
+                    IndexKey::Expr(_) => unreachable!("a column-only index"),
+                })
+                .collect()
+        };
+        let orders: Vec<KeyOrder> = (0..forms.len()).map(|i| idx.key_order(i)).collect();
+        let root = self
+            .snap
+            .index_store(&idx.name)
+            .tree_root()
+            .map_or(PageRef::NONE, |n| n.page_ref());
+        let no_columns = Arc::new(Vec::new());
+        let mut prev: Option<Vec<u8>> = None;
+        self.walk_btree(&idx.name, root, &no_columns, false, &mut |c, _, node| {
+            for i in 0..node.len() {
+                c.poll()?;
+                let entry = node.key_at(i);
+                let Some((len, has_null)) = split_index_entry(entry, &forms, &orders) else {
+                    // An entry that does not split names no key to compare.
+                    prev = None;
+                    continue;
+                };
+                let prefix = &entry[..len];
+                if !has_null && prev.as_deref() == Some(prefix) {
+                    let detail = "the key repeats the previous entry's".to_string();
+                    let object = Some(idx.name.as_str());
+                    c.add(
+                        kinds::UNIQUE_VIOLATION,
+                        object,
+                        None,
+                        Some(&entry[len..]),
+                        detail,
+                    )?;
+                }
+                prev = (!has_null).then(|| prefix.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// A foreign key (§3.4): each referencing row, unless its `MATCH` rule exempts it, is found
+    /// through the referenced key exactly as the write path's enforcement looks it up.
+    fn check_foreign_key(&mut self, ctx: &TableCtx<'_>, fk: &ForeignKeyConstraint) -> Step<()> {
+        let snap = self.snap;
+        // A referenced column whose collation is not loaded at the pinned version would encode the
+        // probe under the wrong collation (§3.5); decided before the referenced tree's skips.
+        if let Some(parent) = snap.table(&fk.ref_table)
+            && fk.ref_columns.iter().any(|&ci| {
+                parent
+                    .columns
+                    .get(ci)
+                    .is_some_and(|c| self.engine.collation_unavailable(c.collation.as_deref()))
+            })
+        {
+            self.skip(&fk.name, kinds::SKIP_MISSING_LOADED_DATA);
+            return Ok(());
+        }
+        let parent = match snap.table(&fk.ref_table) {
+            Some(parent) if self.tables_ok.get(&fk.ref_table).copied().unwrap_or(false) => parent,
+            _ => {
+                self.skip(&fk.name, kinds::SKIP_TABLE_UNREADABLE);
+                return Ok(());
+            }
+        };
+        if let Some(via) = fk_referenced_index(parent, fk)
+            && !self.index_clean.get(&via.name).copied().unwrap_or(false)
+        {
+            self.skip(&fk.name, kinds::SKIP_INDEX_UNREADABLE);
+            return Ok(());
+        }
+        let parent_colls: Vec<Option<Arc<Collation>>> = parent
+            .columns
+            .iter()
+            .map(|c| c.collation.as_ref().and_then(|n| snap.resolve_collation(n)))
+            .collect();
+        let object = Some(fk.name.as_str());
+        self.for_each_row(ctx, &mut |c, key, row| {
+            let found = if fk_match_full_violated(fk, row) {
+                Err("MATCH FULL with some but not all key columns NULL".to_string())
+            } else {
+                match fk_probe(fk, parent, &parent_colls, row, &fk.columns) {
+                    // MATCH SIMPLE: a NULL key column exempts the row.
+                    Ok(None) => Ok(()),
+                    Ok(Some(probe)) => {
+                        if c.engine.fk_probe_hits(&probe, &fk.ref_table, false)? {
+                            Ok(())
+                        } else {
+                            Err("no referenced row".to_string())
+                        }
+                    }
+                    Err(e) if e.state == SqlState::QueryCanceled => return Err(Halt::Error(e)),
+                    Err(e) => Err(format!("{}: {}", e.code(), e.message)),
+                }
+            };
+            match found {
+                Ok(()) => Ok(()),
+                Err(detail) => c.add(
+                    kinds::FOREIGN_KEY_VIOLATION,
+                    object,
+                    None,
+                    Some(key),
+                    detail,
+                ),
+            }
+        })
+    }
+
     /// The free list (§3.3): its chain pages first, then each entry in list order.
     fn check_free_list(&mut self, free: &IntegrityFree, protected: &HashSet<u32>) -> Step<()> {
         let mut chain: Vec<PageRef> = Vec::new();
@@ -1214,6 +1524,95 @@ fn gist_ops(table: &Table, idx: &IndexDef) -> Vec<GistOpclass> {
         .collect()
 }
 
+/// What one table's rows need to be checked, from the pinned snapshot.
+fn table_ctx<'t>(snap: &'t Snapshot, table: &'t Table) -> TableCtx<'t> {
+    TableCtx {
+        table,
+        col_types: Arc::new(snap.store(&table.name).col_types().to_vec()),
+        colls: table
+            .columns
+            .iter()
+            .map(|c| c.collation.as_ref().and_then(|n| snap.resolve_collation(n)))
+            .collect(),
+        pk: table
+            .pk
+            .iter()
+            .map(|&i| (i, table.columns[i].ty.clone()))
+            .collect(),
+    }
+}
+
+/// A named constraint of the constraint stage (§3.4), in its kind order.
+enum Named<'t> {
+    Check(&'t CheckConstraint),
+    Unique(&'t IndexDef),
+    ForeignKey(&'t ForeignKeyConstraint),
+}
+
+fn skip_reason(skip: IndexDeriveSkip) -> &'static str {
+    match skip {
+        IndexDeriveSkip::Unparsable => kinds::SKIP_UNPARSABLE_DEFINITION,
+        IndexDeriveSkip::HostFunction => kinds::SKIP_MISSING_HOST_FUNCTION,
+        IndexDeriveSkip::LoadedData => kinds::SKIP_MISSING_LOADED_DATA,
+    }
+}
+
+/// An expression key's result type as a resolved column type; `None` for one with no structural
+/// form (a composite result, which an expression key never has).
+fn key_col_type(ty: &Type) -> Option<ColType> {
+    Some(match ty {
+        Type::Scalar(s) => ColType::Scalar(*s),
+        Type::Array(elem) => ColType::Array(Box::new(key_col_type(elem)?)),
+        Type::Range(elem) => ColType::Range(Box::new(key_col_type(elem)?)),
+        _ => return None,
+    })
+}
+
+/// The length of an ordered index entry's key prefix (every element's §2.16 slot) and whether an
+/// element is NULL; the rest of the entry is its storage key. `None` for an entry that does not
+/// split.
+fn split_index_entry(
+    entry: &[u8],
+    forms: &[(ColType, bool)],
+    orders: &[KeyOrder],
+) -> Option<(usize, bool)> {
+    let mut at = 0;
+    let mut has_null = false;
+    for ((ct, collated), order) in forms.iter().zip(orders) {
+        let tag = *entry.get(at)?;
+        at += 1;
+        if tag == order.null_tag() {
+            has_null = true;
+            continue;
+        }
+        if tag != order.present_tag() {
+            return None;
+        }
+        let m = if order.desc { 0xFF } else { 0x00 };
+        at += key_body_len(ct, *collated, entry.get(at..)?, m)?;
+    }
+    Some((at, has_null))
+}
+
+/// The unique index a foreign key's write-path lookup goes through (constraints.md §6.8, as
+/// [`fk_probe`] chooses it), or `None` when it names the referenced table's primary key.
+fn fk_referenced_index<'t>(parent: &'t Table, fk: &ForeignKeyConstraint) -> Option<&'t IndexDef> {
+    let sorted = |cols: &[usize]| {
+        let mut v = cols.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let refs = sorted(&fk.ref_columns);
+    if !parent.pk.is_empty() && sorted(&parent.pk) == refs {
+        return None;
+    }
+    parent
+        .indexes
+        .iter()
+        .find(|i| i.unique && i.column_ordinals().is_some_and(|c| sorted(&c) == refs))
+}
+
 /// What one GiST entry names: a leaf's storage key, or an interior's child page.
 enum GistTarget {
     Leaf(Vec<u8>),
@@ -1307,6 +1706,12 @@ mod tests {
             kinds::INDEX_ENTRY_MISSING,
             kinds::INDEX_ENTRY_COUNT_MISMATCH,
             kinds::INDEX_ENTRY_ERROR,
+            kinds::NOT_NULL_VIOLATION,
+            kinds::TYPMOD_VIOLATION,
+            kinds::CHECK_VIOLATION,
+            kinds::CHECK_ERROR,
+            kinds::UNIQUE_VIOLATION,
+            kinds::FOREIGN_KEY_VIOLATION,
         ];
         for kind in emitted {
             assert!(kinds::FINDING_KINDS.contains(&kind), "{kind} unregistered");
@@ -1322,6 +1727,94 @@ mod tests {
                 kinds::SKIP_REASONS.contains(&reason),
                 "{reason} unregistered"
             );
+        }
+    }
+
+    /// An index entry splits into its key slots and its storage key for every keyable shape, under
+    /// either sort order and NULL placement: scalars, the range, array, and composite containers, and
+    /// NULL elements (the uniqueness pass, integrity-check.md §3.4).
+    #[test]
+    fn index_entries_split_at_their_storage_key() {
+        use crate::catalog::ColField;
+        use crate::types::ScalarType;
+        use crate::value::{ArrayVal, RangeVal};
+        let field = |ty: ColType| ColField {
+            name: "f".into(),
+            ty,
+            typmod: None,
+            varchar_len: None,
+            temporal: None,
+            not_null: false,
+        };
+        let int = |n: i64| Value::Int(n);
+        let range = RangeVal {
+            empty: false,
+            lower: Some(Box::new(int(3))),
+            upper: None,
+            lower_inc: true,
+            upper_inc: false,
+        };
+        let cases: Vec<(ColType, Value)> = vec![
+            (ColType::Scalar(ScalarType::Int32), int(-7)),
+            (
+                ColType::Scalar(ScalarType::Text),
+                Value::Text("a\0b".into()),
+            ),
+            (
+                ColType::Scalar(ScalarType::Decimal),
+                Value::Decimal(crate::decimal::Decimal::from_i64(-12345)),
+            ),
+            (
+                ColType::Range(Box::new(ColType::Scalar(ScalarType::Int64))),
+                Value::Range(range),
+            ),
+            (
+                ColType::Array(Box::new(ColType::Scalar(ScalarType::Text))),
+                Value::Array(ArrayVal {
+                    dims: vec![3],
+                    lbounds: vec![1],
+                    elements: vec![Value::Text("x".into()), Value::Null, Value::Text("".into())],
+                }),
+            ),
+            (
+                ColType::Composite {
+                    name: "pair".into(),
+                    fields: vec![
+                        field(ColType::Scalar(ScalarType::Int64)),
+                        field(ColType::Scalar(ScalarType::Text)),
+                    ],
+                },
+                Value::Composite(vec![int(1), Value::Null]),
+            ),
+        ];
+        let storage_key = [0x80, 0x00, 0x00, 0x2A];
+        for (ct, v) in &cases {
+            for desc in [false, true] {
+                for nulls_first in [false, true] {
+                    let order = KeyOrder { desc, nulls_first };
+                    let body = crate::executor::encode_key_ct(ct, v, None).unwrap();
+                    // Two elements: the value, then a NULL.
+                    let mut entry = Vec::new();
+                    order.push_present(&mut entry, &body);
+                    entry.push(order.null_tag());
+                    let prefix = entry.len();
+                    entry.extend_from_slice(&storage_key);
+                    let forms = [(ct.clone(), false), (ct.clone(), false)];
+                    assert_eq!(
+                        split_index_entry(&entry, &forms, &[order, order]),
+                        Some((prefix, true)),
+                        "{ct:?} {order:?}"
+                    );
+                    let one = &entry[..1 + body.len()];
+                    let mut single = one.to_vec();
+                    single.extend_from_slice(&storage_key);
+                    assert_eq!(
+                        split_index_entry(&single, &forms[..1], &[order]),
+                        Some((one.len(), false)),
+                        "{ct:?} {order:?}"
+                    );
+                }
+            }
         }
     }
 

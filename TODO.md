@@ -267,7 +267,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   and `spec/fileformat/verify.rb`; expose them through the host API and the CLI. Designed in
   [integrity-check.md](spec/design/integrity-check.md); I1 (registry, Ruby reference, damaged fixtures),
   I2 (the check + host API in all three cores) and I3 (expression, partial, GIN and GiST agreement, GiST
-  bounds) landed; I4 (constraints) and I5 (CLI) open (§9). _(size: M)_
+  bounds) and I4 (the `constraints` option) landed; I5 (CLI) open (§9). Exclusion constraints and
+  typmods inside arrays/composites are follow-ons (§8). _(size: M)_
   - [ ] _follow-on:_ an in-memory attachment's commits share one version, so the check cannot tell a
     commit racing it apart (spurious findings possible); give them distinct versions in every core
     ([integrity-check.md §8](spec/design/integrity-check.md)).

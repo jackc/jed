@@ -1,0 +1,67 @@
+{
+  "fixture": "constraints_unique_unreadable.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "constraints": true,
+      "report": {
+        "findings": [
+          {
+            "kind": "keys_unordered",
+            "database": "main",
+            "object": "p_code_key",
+            "page": 21,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [
+          {
+            "object": "c_pcode_fkey",
+            "reason": "index_unreadable"
+          },
+          {
+            "object": "p_code_key",
+            "reason": "index_unreadable"
+          }
+        ],
+        "pages": 27,
+        "rows": 60
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "constraints": true,
+      "report": {
+        "findings": [
+          {
+            "kind": "keys_unordered",
+            "database": "main",
+            "object": "p_code_key",
+            "page": 21,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [
+          {
+            "object": "p_code_key",
+            "reason": "index_unreadable"
+          },
+          {
+            "object": "c_pcode_fkey",
+            "reason": "index_unreadable"
+          },
+          {
+            "object": "p_code_key",
+            "reason": "index_unreadable"
+          }
+        ],
+        "pages": 27,
+        "rows": 60
+      }
+    }
+  ]
+}

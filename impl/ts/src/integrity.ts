@@ -6,18 +6,28 @@
 //
 // The report is a cross-core contract (§4): the same findings in the same order, the same skips and
 // counters, as spec/fileformat/integrity.rb. Finding order is the walk order: generation, then each
-// table in name byte order (its tree, then each index's structure and agreement), then space
-// accounting.
+// table in name byte order (its tree, then each index's structure and agreement), then, under
+// `constraints`, each table's column pass and named constraints, then space accounting.
 //
 // Memory is bounded independent of rows (§5.4, CLAUDE.md §9): one reachability bitmap of page_count
 // bits, one root-to-leaf path per tree being walked, and one row at a time. Index agreement re-walks
-// the table and probes the index for each derived entry; nothing materializes a table or an index.
+// the table and probes the index for each derived entry; the constraint pass re-walks each table (and
+// each unique index, keeping only the previous entry's key prefix) and probes the referenced table for
+// each foreign key; nothing materializes a table or an index.
 //
 // It is unmetered, like compaction: no session cost or memory account is charged.
 
 import { NO_TAG, capFirstBody, type Cap } from "./cap.ts";
-import type { ColType, IndexDef, Table } from "./catalog.ts";
-import { indexColumnOrdinals } from "./catalog.ts";
+import type {
+  CheckConstraint,
+  ColType,
+  Column,
+  ForeignKey,
+  HostFuncDep,
+  IndexDef,
+  Table,
+} from "./catalog.ts";
+import { indexColumnOrdinals, indexKeyOrder, resolveColType } from "./catalog.ts";
 import type { Collation } from "./collation.ts";
 import {
   type CommitMeta,
@@ -30,17 +40,29 @@ import {
 import { cancellationCheckpoint, throwIfAborted } from "./cancel.ts";
 import { EngineError, engineError } from "./errors.ts";
 import { COOPERATE, shouldCooperate, type Steps } from "./execution.ts";
+import { Meter } from "./cost.ts";
+import { type KeyOrder, keyOrderNullTag, keyOrderPresentTag } from "./encoding.ts";
+import { evalExprSteps } from "./eval.ts";
 import {
   encodePkKey,
   type Engine,
+  fkMatchFullViolated,
+  fkProbeSteps,
   gistOpclassFor,
   indexEntryKeysSteps,
+  keyBodyLen,
+  keySlotForScalar,
   type ResolvedIndex,
+  type RExpr,
+  sameSet,
+  sortedUnique,
+  uniqueProbeBound,
 } from "./executor.ts";
 import {
   catalogImagePages,
   chainPayload,
   decodeLeafValueSteps,
+  encodeValue,
   isExternalTag,
   type LeafView,
   leafValueTag,
@@ -69,7 +91,13 @@ import { compareBytes } from "./pmap.ts";
 import type { Snapshot } from "./snapshot.ts";
 import type { Row, TableStore } from "./storage.ts";
 import { indexUnparsed } from "./unparsed.ts";
-import { compareTextC } from "./value.ts";
+import {
+  adjustIntervalTypmod,
+  adjustTimestampTypmod,
+  coerceDecimal,
+  coerceVarcharStore,
+} from "./store.ts";
+import { compareTextC, decimalValue, intervalValue, textValue, type Value } from "./value.ts";
 
 export {
   IntegrityKind,
@@ -85,6 +113,12 @@ export type IntegrityLevel = "quick" | "full";
 export type IntegrityCheckOptions = {
   /** `quick` or `full` (the default). */
   level?: IntegrityLevel;
+  /**
+   * Also re-check declared constraints against the stored rows (default false): NOT NULL and column
+   * typmods, CHECK, uniqueness of every unique B-tree index, and FOREIGN KEY (§3.4). Independent of
+   * `level`; a CHECK may need host functions or loaded data the handle lacks, which it then skips.
+   */
+  constraints?: boolean;
   /** Stop after this many findings (default 100); 0 means no limit. */
   maxFindings?: number;
   /** Cancels the check with 57014; a canceled check returns no report. */
@@ -192,17 +226,24 @@ class Checker {
   private readonly paging: SharedPaging;
   private readonly target: IntegrityTarget;
   private readonly level: IntegrityLevel;
+  private readonly constraints: boolean;
   private readonly max: number;
   private readonly signal: AbortSignal | undefined;
+  // Whether each table's tree was readable, and whether each index's walk reported nothing, as the
+  // constraint stage (§3.4, after every table) needs them.
+  private readonly tableReadable = new Map<string, boolean>();
+  private readonly indexClean = new Map<string, boolean>();
 
   constructor(
     target: IntegrityTarget,
     level: IntegrityLevel,
+    constraints: boolean,
     max: number,
     signal: AbortSignal | undefined,
   ) {
     this.target = target;
     this.level = level;
+    this.constraints = constraints;
     this.max = max;
     this.signal = signal;
     const paging = target.storage.paging;
@@ -295,7 +336,9 @@ class Checker {
         yield* this.catalog(gen);
         this.sequences();
         const snap = this.target.snap;
-        for (const name of [...snap.tables.keys()].sort(compareTextC)) yield* this.table(name);
+        const names = [...snap.tables.keys()].sort(compareTextC);
+        for (const name of names) yield* this.table(name);
+        if (this.constraints) for (const name of names) yield* this.tableConstraints(name);
         yield* this.freeList(gen);
         if (!this.damaged && gen.livePages !== null && gen.livePages !== this.reachedCount) {
           this.add(
@@ -610,6 +653,7 @@ class Checker {
       }.bind(this),
     );
     const tableReadable = readable && !rowFailed;
+    this.tableReadable.set(name, tableReadable);
     const count = store.count();
     if (tableReadable && count !== null && count !== BigInt(walked)) {
       this.add(
@@ -645,6 +689,7 @@ class Checker {
         if (def.kind === "gin") entries = this.ginPostings;
       }
       if (!indexReadable) this.damaged = true;
+      this.indexClean.set(def.name, indexReadable && this.findings.length === before);
       if (this.level !== "full") continue;
       // §3.5: the definition's own skips first, decided before any row is read.
       let reason = this.definitionSkip(def);
@@ -683,18 +728,7 @@ class Checker {
   private definitionSkip(def: IndexDef): IntegritySkipReasonName | null {
     if (indexUnparsed(def)) return "unparsable_definition";
     const env = this.target.storage.environment;
-    const registered = env.hostFunctions()?.entries() ?? [];
-    for (const dep of def.hostDeps ?? []) {
-      const ok = registered.some(
-        (hf) =>
-          hf.name === dep.name &&
-          hf.argTypes.length === dep.argTypes.length &&
-          hf.argTypes.every((t, i) => t === dep.argTypes[i]) &&
-          hf.componentId === dep.componentId &&
-          hf.semanticVersion === dep.semanticVersion,
-      );
-      if (!ok) return "missing_host_function";
-    }
+    if (this.hostDepsMissing(def.hostDeps)) return "missing_host_function";
     try {
       verifyIndexTimezoneDeps(def.timezoneDeps, env);
     } catch (e) {
@@ -704,18 +738,42 @@ class Checker {
     return null;
   }
 
+  // hostDepsMissing reports whether a pinned host-function dependency is not registered by the
+  // environment at its signature, component, and version (§3.5).
+  private hostDepsMissing(deps: HostFuncDep[] | undefined): boolean {
+    const registered = this.target.storage.environment.hostFunctions()?.entries() ?? [];
+    return (deps ?? []).some(
+      (dep) =>
+        !registered.some(
+          (hf) =>
+            hf.name === dep.name &&
+            hf.argTypes.length === dep.argTypes.length &&
+            hf.argTypes.every((t, i) => t === dep.argTypes[i]) &&
+            hf.componentId === dep.componentId &&
+            hf.semanticVersion === dep.semanticVersion,
+        ),
+    );
+  }
+
+  // collationUnavailable reports whether a column collation is not loaded, or is loaded at a version
+  // other than the catalog's pin (§3.5). C (no collation) is always available.
+  private collationUnavailable(name: string | null | undefined): boolean {
+    return (
+      name !== null &&
+      name !== undefined &&
+      name !== "" &&
+      (this.target.snap.collationSkew(name) !== undefined ||
+        this.target.storage.environment.collation(name) === undefined)
+    );
+  }
+
   // collationSkip reports whether a resolved index depends on a collation the environment does not
   // load, or loads at a version other than the catalog's pin (§3.5): a bare column key's column
   // collation (any index kind), an expression key's derived collation, and the collation of every
   // column an expression key or the partial predicate reads. C (no collation) never counts.
   private collationSkip(table: Table, rindex: ResolvedIndex): boolean {
-    const snap = this.target.snap;
-    const env = this.target.storage.environment;
     const unavailable = (name: string | null | undefined): boolean =>
-      name !== null &&
-      name !== undefined &&
-      name !== "" &&
-      (snap.collationSkew(name) !== undefined || env.collation(name) === undefined);
+      this.collationUnavailable(name);
     const refs = (node: unknown): boolean =>
       rexprColumns(node).some((i) => unavailable(table.columns[i]?.collation));
     for (const key of rindex.keys) {
@@ -1164,6 +1222,261 @@ class Checker {
     return { readable, entries };
   }
 
+  // --- constraints (§3.4) ---
+
+  // tableConstraints re-checks one table's declared constraints against its stored rows (§3.4, stage
+  // 3 of §4): the column pass, then every named constraint in name byte order, ties by kind (CHECK,
+  // then unique index, then foreign key). A table whose tree was unreadable skips every one of them.
+  private *tableConstraints(name: string): Steps<void> {
+    const snap = this.target.snap;
+    const table = snap.tables.get(name)!;
+    const named: Named[] = [
+      ...table.checks.map((c): Named => ({ name: c.name, kind: 0, check: c })),
+      ...table.indexes
+        .filter((d) => d.unique && d.kind === "btree")
+        .map((d): Named => ({ name: d.name, kind: 1, index: d })),
+      ...table.fks.map((fk): Named => ({ name: fk.name, kind: 2, fk })),
+    ].sort((a, b) => compareTextC(a.name, b.name) || a.kind - b.kind);
+    if (!this.tableReadable.get(name)) {
+      this.skipped.push({ object: name, reason: "table_unreadable" });
+      for (const n of named) this.skipped.push({ object: n.name, reason: "table_unreadable" });
+      return;
+    }
+    yield* this.columnPass(table);
+    for (const n of named) {
+      if (n.kind === 0) yield* this.checkPass(table, n.check);
+      else if (n.kind === 1) yield* this.uniquePass(table, n.index);
+      else yield* this.foreignKeyPass(table, n.fk);
+    }
+  }
+
+  // tableRows re-walks a readable table's records in storage-key order, decoding the columns `want`
+  // names (every column when null) for visit.
+  private *tableRows(
+    table: Table,
+    want: number[] | null,
+    visit: (key: Uint8Array, row: Row) => Steps<void> | undefined,
+  ): Steps<void> {
+    const store = this.target.snap.stores.get(table.name)!;
+    const colTypes = store.columnTypes();
+    const tagLen = this.tagLen;
+    const paging = this.paging;
+    const fetch: PageFetch = (p, t) => paging.readBodySteps(p, t);
+    const cols = want ?? colTypes.map((_, c) => c);
+    yield* this.rewalk(
+      treeRef(store.treeRoot()),
+      colTypes,
+      function* (this: Checker, _page: number, leaf: LeafView, i: number): Steps<void> {
+        yield* this.poll();
+        const row: Row = new Array(colTypes.length);
+        for (const c of cols)
+          row[c] = yield* decodeLeafValueSteps(leaf, colTypes, i, c, fetch, tagLen);
+        const steps = visit(leaf.keys[i]!, row);
+        if (steps !== undefined) yield* steps;
+      }.bind(this),
+    );
+  }
+
+  // columnPass reports, per row and column in ordinal order, a NULL in a NOT NULL or primary-key
+  // column (not_null_violation) and a value its column's write-time typmod coercion would raise on or
+  // change (typmod_violation). Top-level scalar columns only (§8).
+  private *columnPass(table: Table): Steps<void> {
+    const colTypes = this.target.snap.stores.get(table.name)!.columnTypes();
+    const pk = new Set(table.pk);
+    yield* this.tableRows(table, null, (key, row): undefined => {
+      for (let c = 0; c < table.columns.length; c++) {
+        const col = table.columns[c]!;
+        const v = row[c]!;
+        if (v.kind === "null") {
+          if (col.notNull || col.primaryKey || pk.has(c))
+            this.add("not_null_violation", table.name, null, key, `column ${col.name} is NULL`);
+        } else if (typmodViolated(col, colTypes[c]!, v)) {
+          this.add(
+            "typmod_violation",
+            table.name,
+            null,
+            key,
+            `column ${col.name} exceeds its typmod`,
+          );
+        }
+      }
+    });
+  }
+
+  // checkPass evaluates a CHECK constraint against every row as a write does (constraints.md §4):
+  // FALSE is check_violation, an error check_error. The definition-level skips come first (§3.5).
+  private *checkPass(table: Table, c: CheckConstraint): Steps<void> {
+    let reason: IntegritySkipReasonName | null = null;
+    let node: RExpr | null = null;
+    if (c.unparsed) reason = "unparsable_definition";
+    else if (this.hostDepsMissing(c.hostDeps)) reason = "missing_host_function";
+    else {
+      try {
+        node = this.target.storage.resolveCheck(table, c);
+      } catch (e) {
+        reason = resolveSkip(e);
+      }
+      if (
+        node !== null &&
+        rexprColumns(node).some((i) => this.collationUnavailable(table.columns[i]?.collation))
+      )
+        reason = "missing_loaded_data";
+    }
+    if (reason !== null) {
+      this.skipped.push({ object: c.name, reason });
+      return;
+    }
+    const env = this.target.storage.indexMaintenanceEnv();
+    const self = this;
+    yield* this.tableRows(table, null, function* (key, row) {
+      let v: Value;
+      try {
+        // Unmetered, with a fresh scalar allowance per row.
+        v = yield* evalExprSteps(node!, row, env, new Meter());
+      } catch (e) {
+        if (evalFatal(e)) throw e;
+        self.add("check_error", c.name, null, key, message(e));
+        return;
+      }
+      if (v.kind === "bool" && !v.value)
+        self.add("check_violation", c.name, null, key, "the row fails the check");
+    });
+  }
+
+  // uniquePass reads a unique B-tree index's entries in order and reports each whose key prefix (the
+  // entry before its storage key) equals the previous entry's with no NULL element: jed's NULLs are
+  // always distinct (§3.4). It keeps one prefix, never the index.
+  private *uniquePass(table: Table, def: IndexDef): Steps<void> {
+    const elems = this.uniqueElements(table, def);
+    if (typeof elems === "string") {
+      this.skipped.push({ object: def.name, reason: elems });
+      return;
+    }
+    if (!this.indexClean.get(def.name)) {
+      this.skipped.push({ object: def.name, reason: "index_unreadable" });
+      return;
+    }
+    let prev: Uint8Array | null = null;
+    yield* this.rewalk(
+      treeRef(this.target.snap.indexStore(def.name).treeRoot()),
+      [],
+      function* (this: Checker, _page: number, leaf: LeafView, i: number): Steps<void> {
+        yield* this.poll();
+        const entry = leaf.keys[i]!;
+        const split = splitIndexEntry(entry, elems);
+        if (split === null) {
+          // Unreachable for an index whose walk was clean and whose entries derive from rows; an
+          // entry that does not split starts a new run.
+          prev = null;
+          return;
+        }
+        const prefix = entry.subarray(0, split.prefixLen);
+        if (!split.hasNull && prev !== null && compareBytes(prefix, prev) === 0) {
+          this.add(
+            "unique_violation",
+            def.name,
+            null,
+            entry.subarray(split.prefixLen),
+            "the key repeats the previous entry's",
+          );
+        }
+        prev = split.hasNull ? null : prefix.slice();
+      }.bind(this),
+    );
+  }
+
+  // uniqueElements is each key element's type, key form, and order, which split an entry into its key
+  // prefix and storage key. An expression key's type needs the index resolved; a failure to resolve is
+  // its skip reason (§3.5). A column key needs nothing evaluated, so it never skips here.
+  private uniqueElements(table: Table, def: IndexDef): KeyElem[] | IntegritySkipReasonName {
+    const snap = this.target.snap;
+    const colTypes = snap.stores.get(table.name)!.columnTypes();
+    let rindex: ResolvedIndex | null = null;
+    if (def.keys.some((k) => k.kind !== "column")) {
+      try {
+        rindex = this.target.storage.resolveIndex(table, def);
+      } catch (e) {
+        return resolveSkip(e);
+      }
+    }
+    return def.keys.map((k, i): KeyElem => {
+      const order = indexKeyOrder(def, i);
+      if (k.kind === "column")
+        return {
+          ct: colTypes[k.column]!,
+          collated: table.columns[k.column]!.collation !== null,
+          order,
+        };
+      const rk = rindex!.keys[i]!;
+      if (rk.kind === "column")
+        return {
+          ct: colTypes[rk.column]!,
+          collated: table.columns[rk.column]!.collation !== null,
+          order,
+        };
+      return { ct: resolveColType(rk.type, snap.types), collated: rk.coll !== null, order };
+    });
+  }
+
+  // foreignKeyPass looks up each referencing row's key in the referenced table as the write path's
+  // enforcement does (constraints.md §6.3–§6.4): a point lookup by primary key, or a prefix lookup in
+  // the unique index over the referenced columns. MATCH SIMPLE exempts a row with any NULL key column,
+  // MATCH FULL one with all NULL, and a MATCH FULL row with some but not all NULL is a violation.
+  private *foreignKeyPass(table: Table, fk: ForeignKey): Steps<void> {
+    const snap = this.target.snap;
+    const parent = snap.tables.get(fk.refTable);
+    // The probe encodes under the referenced columns' collations; one this handle cannot use would make
+    // every probe miss, so it skips like an index whose collation is not loaded (§3.5).
+    if (
+      parent !== undefined &&
+      fk.refColumns.some((c) => this.collationUnavailable(parent.columns[c]?.collation))
+    ) {
+      this.skipped.push({ object: fk.name, reason: "missing_loaded_data" });
+      return;
+    }
+    if (parent === undefined || !this.tableReadable.get(fk.refTable)) {
+      this.skipped.push({ object: fk.name, reason: "table_unreadable" });
+      return;
+    }
+    // The referenced key, as fkProbe chooses it: the primary key when it is exactly the referenced
+    // set, else a unique index over exactly that set.
+    const refSet = sortedUnique(fk.refColumns);
+    const viaPk = parent.pk.length > 0 && sameSet(sortedUnique(parent.pk), refSet);
+    if (!viaPk) {
+      const idx = parent.indexes.find((d) => {
+        const cols = indexColumnOrdinals(d);
+        return d.unique && cols !== null && sameSet(sortedUnique(cols), refSet);
+      });
+      // A catalog the engine writes always has the index (it cannot be dropped under the key); without
+      // one the key cannot be looked up, which is reported as that index being unreadable.
+      if (idx === undefined || !this.indexClean.get(idx.name)) {
+        this.skipped.push({ object: fk.name, reason: "index_unreadable" });
+        return;
+      }
+    }
+    const parentColls: (Collation | null)[] = parent.columns.map((c) =>
+      c.collation !== null ? (snap.resolveCollation(c.collation) ?? null) : null,
+    );
+    const parentStore = snap.stores.get(parent.name)!;
+    const self = this;
+    yield* this.tableRows(table, fk.columns, function* (key, row) {
+      let found: boolean;
+      if (fkMatchFullViolated(fk, row)) found = false;
+      else {
+        const probe = yield* fkProbeSteps(fk, parent, parentColls, row, fk.columns);
+        if (probe === null) return; // exempt under its MATCH rule
+        if (probe.kind === "absent") found = false;
+        else if (probe.kind === "pk")
+          found = (yield* parentStore.getSteps(probe.bytes)) !== undefined;
+        else
+          found =
+            (yield* snap.indexStore(probe.index).rangeEntriesSteps(uniqueProbeBound(probe.prefix)))
+              .length > 0;
+      }
+      if (!found) self.add("foreign_key_violation", fk.name, null, key, "no referenced row");
+    });
+  }
+
   // --- space accounting (§3.3) ---
 
   // freeList checks the generation's free list and returns how many chain pages it read: first the
@@ -1397,6 +1710,140 @@ function rexprColumns(root: unknown): number[] {
   return out;
 }
 
+// A named constraint object of the constraint pass (§3.4), with its kind's tie-break rank.
+type Named =
+  | { name: string; kind: 0; check: CheckConstraint }
+  | { name: string; kind: 1; index: IndexDef }
+  | { name: string; kind: 2; fk: ForeignKey };
+
+// One B-tree key element as an entry splitter reads it: its resolved type, whether a text body is a
+// collation sort key, and its sort order (encoding.md §2.16).
+type KeyElem = { ct: ColType; collated: boolean; order: KeyOrder };
+
+// splitIndexEntry finds where an ordered index entry's key prefix ends and its storage key begins,
+// reading each element's ordered slot (encoding.md §2.16), and whether an element is NULL. null for an
+// entry whose slots do not read.
+function splitIndexEntry(
+  entry: Uint8Array,
+  elems: KeyElem[],
+): { prefixLen: number; hasNull: boolean } | null {
+  let at = 0;
+  let hasNull = false;
+  for (const e of elems) {
+    if (at >= entry.length) return null;
+    const tag = entry[at]!;
+    if (tag === keyOrderNullTag(e.order)) {
+      hasNull = true;
+      at++;
+      continue;
+    }
+    if (tag !== keyOrderPresentTag(e.order)) return null;
+    const n = keyTypeBodyLen(e.ct, e.collated, entry, at + 1, e.order.desc ? 0xff : 0);
+    if (n === null) return null;
+    at += 1 + n;
+  }
+  return at <= entry.length ? { prefixLen: at, hasNull } : null;
+}
+
+// keyTypeBodyLen is the length of a key body of type ct at key[at], each byte read as b ^ m (m = 0xFF
+// under DESC): a scalar's self-delimited body, or a container's framing around its elements' bodies
+// (encoding.md §2.11 range, §2.14 array, §2.15 composite). null when it does not read.
+function keyTypeBodyLen(
+  ct: ColType,
+  collated: boolean,
+  key: Uint8Array,
+  at: number,
+  m: number,
+): number | null {
+  const scalarLen = (s: ColType, coll: boolean, pos: number): number | null => {
+    if (s.kind !== "scalar") return null;
+    const slot = keySlotForScalar(s.scalar, coll);
+    return slot === null ? null : keyBodyLen(slot, key, pos, m);
+  };
+  let pos = at;
+  const byte = (): number | null => (pos < key.length ? key[pos++]! ^ m : null);
+  switch (ct.kind) {
+    case "scalar":
+      return scalarLen(ct, collated, at);
+    case "range": {
+      const b = byte();
+      if (b === 0) return 1; // empty
+      if (b !== 1) return null;
+      for (const unbounded of [0x00, 0x02]) {
+        const marker = byte();
+        if (marker === unbounded) continue;
+        if (marker !== 1) return null;
+        const n = scalarLen(ct.elem, false, pos);
+        if (n === null) return null;
+        pos += n + 1; // the element body, then its inclusivity byte
+      }
+      return pos <= key.length ? pos - at : null;
+    }
+    case "array": {
+      for (;;) {
+        const marker = byte();
+        if (marker === 0) break;
+        if (marker === 2) continue; // a NULL element
+        if (marker !== 1) return null;
+        const n = scalarLen(ct.elem, collated, pos);
+        if (n === null) return null;
+        pos += n;
+      }
+      const ndim = byte();
+      if (ndim === null) return null;
+      pos += ndim * 8; // per dimension a u32 length and an i32 lower bound
+      return pos <= key.length ? pos - at : null;
+    }
+    case "composite": {
+      for (const f of ct.fields) {
+        const tag = byte();
+        if (tag === 1) continue; // a NULL field
+        if (tag !== 0) return null;
+        const n = keyTypeBodyLen(f.type, false, key, pos, m);
+        if (n === null) return null;
+        pos += n;
+      }
+      return pos - at;
+    }
+  }
+}
+
+// typmodViolated reports whether a stored non-NULL value of a top-level scalar column would raise, or
+// change its stored bytes, under the column's write-time typmod coercion (§3.4): varchar(n),
+// decimal(p, s), timestamp(p) / timestamptz(p), and an interval qualifier or precision. Typmods inside
+// containers are a follow-on (§8).
+function typmodViolated(col: Column, ct: ColType, v: Value): boolean {
+  if (ct.kind !== "scalar") return false;
+  let out: Value;
+  try {
+    switch (v.kind) {
+      case "text":
+        if (col.varcharLen === null) return false;
+        out = textValue(coerceVarcharStore(v.text, col.varcharLen, col.name));
+        break;
+      case "decimal":
+        if (col.decimal === null) return false;
+        out = decimalValue(coerceDecimal(v.dec, col.decimal));
+        break;
+      case "timestamp":
+      case "timestamptz":
+        if (col.temporal === null) return false;
+        out = { ...v, micros: adjustTimestampTypmod(v.micros, col.temporal) };
+        break;
+      case "interval":
+        if (col.temporal === null) return false;
+        out = intervalValue(adjustIntervalTypmod(v.iv, col.temporal));
+        break;
+      default:
+        return false;
+    }
+  } catch (e) {
+    if (evalFatal(e)) throw e;
+    return true;
+  }
+  return compareBytes(encodeValue(ct, v), encodeValue(ct, out)) !== 0;
+}
+
 // evalFatal reports whether an error deriving a row's index entries ends the check instead of being
 // the row's index_entry_error (§3.4): a cancellation, a device or connection error, or anything that
 // is not an engine error (a bug). An evaluation that raises is a finding.
@@ -1437,5 +1884,5 @@ export function* integrityCheckSteps(
   if (!Number.isSafeInteger(max) || max < 0)
     throw engineError("invalid_parameter_value", "maxFindings must be a nonnegative integer");
   throwIfAborted(opts.signal);
-  return yield* new Checker(target, level, max, opts.signal).run();
+  return yield* new Checker(target, level, opts.constraints === true, max, opts.signal).run();
 }

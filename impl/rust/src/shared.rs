@@ -3160,7 +3160,12 @@ impl Database {
     /// runs, GiST bounds); and the space accounting (free list, live page count). Under
     /// [`IntegrityLevel::Full`](crate::IntegrityLevel) it also checks that every index holds exactly
     /// the entries its table derives, evaluating expression keys and partial predicates in the
-    /// handle's environment; an index this binary or environment cannot derive is skipped.
+    /// handle's environment; an index this binary or environment cannot derive is skipped. With
+    /// [`IntegrityCheckOptions::constraints`](crate::IntegrityCheckOptions), at either level, it
+    /// then re-checks each table's declared constraints against its stored rows: `NOT NULL` and
+    /// column typmods, `CHECK` (evaluated as at write time; one this environment cannot evaluate is
+    /// skipped), uniqueness over each unique index's entries, and foreign keys under their `MATCH`
+    /// rule.
     ///
     /// The check pins the committed snapshot as a read session does and never takes the writer
     /// gate: commits proceed meanwhile and are not seen. Pages are read through the handle's pager,

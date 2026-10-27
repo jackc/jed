@@ -1,0 +1,29 @@
+{
+  "fixture": "constraints_clean.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "constraints": true,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 27,
+        "rows": 60
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "constraints": true,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 27,
+        "rows": 60
+      }
+    }
+  ]
+}

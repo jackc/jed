@@ -64,7 +64,16 @@ fn opts(level: IntegrityLevel, max_findings: u32) -> IntegrityCheckOptions {
     IntegrityCheckOptions {
         level,
         max_findings,
+        constraints: false,
         cancel: None,
+    }
+}
+
+/// [`opts`] with the `constraints` option on (integrity-check.md §3.4).
+fn with_constraints(level: IntegrityLevel, max_findings: u32) -> IntegrityCheckOptions {
+    IntegrityCheckOptions {
+        constraints: true,
+        ..opts(level, max_findings)
     }
 }
 
@@ -111,6 +120,13 @@ impl Json {
         match self {
             Json::Bool(b) => *b,
             _ => panic!("not a boolean"),
+        }
+    }
+    /// An optional boolean field: absent is `false`.
+    fn flag(&self, key: &str) -> bool {
+        match self {
+            Json::Obj(m) => m.get(key).is_some_and(Json::bool),
+            _ => panic!("not an object"),
         }
     }
 }
@@ -291,13 +307,18 @@ fn damaged_fixtures_reproduce_their_reports() {
                 other => panic!("level {other}"),
             };
             let max = run.get("max_findings").num().unwrap() as u32;
+            let constraints = run.flag("constraints");
+            let options = IntegrityCheckOptions {
+                constraints,
+                ..opts(level, max)
+            };
             let got = file
-                .integrity_check("main", &opts(level, max))
+                .integrity_check("main", &options)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
                 contract(&got),
                 expected(run.get("report")),
-                "{name}.jed {level:?} max {max}"
+                "{name}.jed {level:?} max {max} constraints {constraints}"
             );
             assert_eq!(got.ok(), got.findings.is_empty() && !got.truncated);
         }
@@ -328,8 +349,17 @@ const GOLDEN_SKIPS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-/// Every golden that opens checks with no findings at both levels, file-backed and (plaintext) in
-/// memory, skipping under `full` exactly what [`GOLDEN_SKIPS`] lists.
+/// The further skips of each golden whose `full` check with `constraints` skips a constraint
+/// (integrity-check.md §3.5), recorded after the index skips (the constraint stage runs after every
+/// table's trees, §4).
+const GOLDEN_CONSTRAINT_SKIPS: &[(&str, &[(&str, &str)])] = &[(
+    "unparsable_definitions.jed",
+    &[("c_v_check", kinds::SKIP_UNPARSABLE_DEFINITION)],
+)];
+
+/// Every golden that opens checks with no findings at both levels and at `full` with
+/// `constraints`, file-backed and (plaintext) in memory, skipping under `full` exactly what
+/// [`GOLDEN_SKIPS`] (and with `constraints`, [`GOLDEN_CONSTRAINT_SKIPS`]) lists.
 #[test]
 fn clean_goldens_check_clean() {
     let dir = spec("fileformat/fixtures");
@@ -366,31 +396,48 @@ fn clean_goldens_check_clean() {
             backings.push(("memory", memory));
         }
         for (backing, db) in &backings {
-            for level in [IntegrityLevel::Quick, IntegrityLevel::Full] {
+            let listed = |table: &[(&str, &'static [(&'static str, &'static str)])]| {
+                table
+                    .iter()
+                    .find(|(golden, _)| golden == name)
+                    .map_or(&[][..], |(_, skips)| skips)
+                    .iter()
+                    .map(|(object, reason)| (object.to_string(), *reason))
+                    .collect::<Vec<(String, &str)>>()
+            };
+            for (level, constraints) in [
+                (IntegrityLevel::Quick, false),
+                (IntegrityLevel::Full, false),
+                (IntegrityLevel::Full, true),
+            ] {
+                let options = IntegrityCheckOptions {
+                    constraints,
+                    ..opts(level, 0)
+                };
                 let report = db
-                    .integrity_check("main", &opts(level, 0))
+                    .integrity_check("main", &options)
                     .unwrap_or_else(|e| panic!("{name} ({backing}): {e}"));
                 assert!(
                     report.ok(),
-                    "{name} {level:?} ({backing}): {:#?}",
+                    "{name} {level:?} constraints {constraints} ({backing}): {:#?}",
                     report.findings
                 );
-                let want: Vec<(String, &str)> = match level {
+                let mut want = match level {
                     IntegrityLevel::Quick => Vec::new(),
-                    IntegrityLevel::Full => GOLDEN_SKIPS
-                        .iter()
-                        .find(|(golden, _)| golden == name)
-                        .map_or(&[][..], |(_, skips)| skips)
-                        .iter()
-                        .map(|(object, reason)| (object.to_string(), *reason))
-                        .collect(),
+                    IntegrityLevel::Full => listed(GOLDEN_SKIPS),
                 };
+                if constraints {
+                    want.extend(listed(GOLDEN_CONSTRAINT_SKIPS));
+                }
                 let got: Vec<(String, &str)> = report
                     .skipped
                     .iter()
                     .map(|s| (s.object.clone(), s.reason))
                     .collect();
-                assert_eq!(got, want, "{name} {level:?} ({backing}) skips");
+                assert_eq!(
+                    got, want,
+                    "{name} {level:?} constraints {constraints} ({backing}) skips"
+                );
             }
         }
         checked += 1;
@@ -724,4 +771,91 @@ fn missing_time_zone_data_is_skipped() {
     );
     let with = open_copy_in("timezone_with.jed", &image, None, environment(true, true)).unwrap();
     assert_eq!(skips(&with), []);
+}
+
+/// The skips of a `full` check of `db` with `constraints`, as `(object, reason)`.
+fn constraint_skips(db: &Database) -> Vec<(String, &'static str)> {
+    let r = db
+        .integrity_check("main", &with_constraints(IntegrityLevel::Full, 0))
+        .unwrap();
+    assert!(r.findings.is_empty(), "{:#?}", r.findings);
+    r.skipped
+        .iter()
+        .map(|s| (s.object.clone(), s.reason))
+        .collect()
+}
+
+/// A `CHECK` whose stored text this binary does not parse is skipped by the constraint stage, after
+/// every index skip (integrity-check.md §3.5, §4).
+#[test]
+fn unparsable_check_is_skipped() {
+    let image = std::fs::read(spec("fileformat/fixtures/unparsable_definitions.jed")).unwrap();
+    let db = open_copy("unparsable_check.jed", &image, None).unwrap();
+    let got = constraint_skips(&db);
+    assert_eq!(
+        got.last(),
+        Some(&("c_v_check".to_string(), kinds::SKIP_UNPARSABLE_DEFINITION)),
+        "{got:?}"
+    );
+    assert_eq!(got.iter().filter(|(o, _)| o == "c_v_check").count(), 1);
+}
+
+/// A `CHECK` calling a host function the environment does not register is skipped; with it
+/// registered at the pinned component and version, the (empty) table passes.
+#[test]
+fn check_missing_host_function_is_skipped() {
+    let image = std::fs::read(spec("fileformat/fixtures/hostfunc_check_table.jed")).unwrap();
+    let without = open_copy_in(
+        "hostfunc_check_without.jed",
+        &image,
+        None,
+        environment(true, false),
+    )
+    .expect("the file opens without its host function");
+    assert_eq!(
+        constraint_skips(&without),
+        [("t_a_check1".to_string(), kinds::SKIP_MISSING_HOST_FUNCTION)]
+    );
+    let with = open_copy_in(
+        "hostfunc_check_with.jed",
+        &image,
+        None,
+        environment(true, true),
+    )
+    .unwrap();
+    assert_eq!(constraint_skips(&with), []);
+}
+
+/// A database the engine wrote satisfies its constraints, for every key shape the uniqueness pass
+/// splits (a DESC text key, a range, an array, a composite, an expression) and every foreign key's
+/// lookup path; the pass is a no-op without the option.
+#[test]
+fn engine_written_constraints_check_clean() {
+    let db = Database::default();
+    for sql in [
+        "CREATE TYPE pair AS (a i64, b text)",
+        "CREATE TABLE p (id i32 PRIMARY KEY, code varchar(8) NOT NULL, amt decimal(6,2), \
+         ts timestamp(0), r i64range, arr i64[], pr pair, iv interval, \
+         CHECK (amt > 0), UNIQUE (code), UNIQUE (r), UNIQUE (arr), UNIQUE (pr))",
+        "CREATE UNIQUE INDEX p_code_desc ON p (code DESC NULLS FIRST, id)",
+        "CREATE UNIQUE INDEX p_lower ON p (lower(code))",
+        "CREATE TABLE c (id i32 PRIMARY KEY, pid i64 REFERENCES p, code text REFERENCES p (code), \
+         CHECK (id > 0))",
+        "INSERT INTO p SELECT g, 'c' || g, g + 0.5, '2020-01-01 00:00:00'::timestamp + g * interval '1 second', \
+         i64range(g, g + 1), ARRAY[g, g + 1], ROW(g, 'x' || g)::pair, interval '1 day' FROM generate_series(1, 120) g",
+        "INSERT INTO p (id, code) VALUES (500, 'n1'), (501, 'n2')",
+        "INSERT INTO c SELECT g, (g % 120) + 1, 'c' || ((g % 7) + 1) FROM generate_series(1, 150) g",
+        "INSERT INTO c VALUES (1000, NULL, NULL)",
+    ] {
+        run(&db, sql);
+    }
+    let r = db
+        .integrity_check("main", &with_constraints(IntegrityLevel::Quick, 0))
+        .unwrap();
+    assert!(
+        r.ok() && r.skipped.is_empty(),
+        "{:#?} {:#?}",
+        r.findings,
+        r.skipped
+    );
 }

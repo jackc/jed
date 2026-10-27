@@ -72,12 +72,21 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 	if key[at] == k.order.nullTag() {
 		return 1, true
 	}
-	body := key[at+1:]
 	// m un-inverts a DESC body byte (b^m is the ASC byte).
 	var m byte
 	if k.order.Desc {
 		m = 0xFF
 	}
+	n, ok := k.bodyLen(key[at+1:], m)
+	if !ok {
+		return 0, false
+	}
+	return 1 + n, true
+}
+
+// bodyLen is the length of the self-delimited key body at the start of body, each byte read as b^m
+// (m = 0xFF under a DESC slot's whole-key inversion). ok=false for a malformed (truncated) body.
+func (k keySlot) bodyLen(body []byte, m byte) (int, bool) {
 	var n int
 	switch k.kind {
 	case keySlotFixed:
@@ -135,7 +144,116 @@ func (k keySlot) slotLen(key []byte, at int) (int, bool) {
 		}
 		n = i + l
 	}
-	return 1 + n, true
+	return n, true
+}
+
+// colTypeKeyBodyLen is the length of the order-preserving key body of a value of resolved type ct at
+// the start of body, read through the inversion mask m — a scalar's own body, or a container key
+// recursed into (range-bounds §2.11, array-elements-terminated §2.14, composite-field-slots §2.15 of
+// spec/design/encoding.md). collated selects the sort-key form of a non-C text (or text[] element)
+// key. ok=false for a malformed body or a type with no key encoding.
+func colTypeKeyBodyLen(ct colType, collated bool, body []byte, m byte) (int, bool) {
+	at := func(i int) (byte, bool) {
+		if i >= len(body) {
+			return 0, false
+		}
+		return body[i] ^ m, true
+	}
+	switch {
+	case ct.Composite:
+		pos := 0
+		for _, f := range ct.Fields {
+			tag, ok := at(pos)
+			if !ok {
+				return 0, false
+			}
+			pos++
+			switch tag {
+			case 0x01:
+			case 0x00:
+				n, ok := colTypeKeyBodyLen(f.Type, false, body[pos:], m)
+				if !ok {
+					return 0, false
+				}
+				pos += n
+			default:
+				return 0, false
+			}
+		}
+		return pos, true
+	case ct.RangeElem != nil:
+		tag, ok := at(0)
+		if !ok {
+			return 0, false
+		}
+		if tag == 0x00 {
+			return 1, true // empty
+		}
+		if tag != 0x01 {
+			return 0, false
+		}
+		pos := 1
+		for _, infinite := range []byte{0x00, 0x02} {
+			marker, ok := at(pos)
+			if !ok {
+				return 0, false
+			}
+			pos++
+			if marker == infinite {
+				continue
+			}
+			if marker != 0x01 {
+				return 0, false
+			}
+			n, ok := colTypeKeyBodyLen(*ct.RangeElem, false, body[pos:], m)
+			if !ok {
+				return 0, false
+			}
+			pos += n + 1 // the element key, then the inclusivity byte
+		}
+		if pos > len(body) {
+			return 0, false
+		}
+		return pos, true
+	case ct.Elem != nil:
+		pos := 0
+		for {
+			marker, ok := at(pos)
+			if !ok {
+				return 0, false
+			}
+			pos++
+			if marker == 0x00 {
+				break
+			}
+			if marker == 0x02 {
+				continue
+			}
+			if marker != 0x01 {
+				return 0, false
+			}
+			n, ok := colTypeKeyBodyLen(*ct.Elem, collated, body[pos:], m)
+			if !ok {
+				return 0, false
+			}
+			pos += n
+		}
+		ndim, ok := at(pos)
+		if !ok {
+			return 0, false
+		}
+		pos += 1 + 8*int(ndim)
+		if pos > len(body) {
+			return 0, false
+		}
+		return pos, true
+	default:
+		slot, ok := keySlotForScalar(ct.Scalar, collated)
+		if !ok {
+			return 0, false
+		}
+		return slot.bodyLen(body, m)
+	}
 }
 
 // terminatedLen is the length of a *-terminated-escape body (0x00 0xFF an escaped NUL, 0x00 0x01

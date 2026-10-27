@@ -1,0 +1,261 @@
+{
+  "fixture": "constraints_broken.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "constraints": true,
+      "report": {
+        "findings": [
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_ab_fkey",
+            "page": null,
+            "key": "80000004"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_ab_fkey",
+            "page": null,
+            "key": "80000006"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pcode_fkey",
+            "page": null,
+            "key": "80000003"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pcode_fkey",
+            "page": null,
+            "key": "8000001b"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pid_fkey",
+            "page": null,
+            "key": "80000002"
+          },
+          {
+            "kind": "not_null_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000003"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000004"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000005"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000006"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000007"
+          },
+          {
+            "kind": "unique_violation",
+            "database": "main",
+            "object": "p_code_key",
+            "page": null,
+            "key": "8000000b"
+          },
+          {
+            "kind": "check_violation",
+            "database": "main",
+            "object": "p_qty_check",
+            "page": null,
+            "key": "80000008"
+          },
+          {
+            "kind": "check_violation",
+            "database": "main",
+            "object": "p_qty_next_check",
+            "page": null,
+            "key": "80000008"
+          },
+          {
+            "kind": "check_error",
+            "database": "main",
+            "object": "p_qty_next_check",
+            "page": null,
+            "key": "80000009"
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 27,
+        "rows": 60
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "constraints": true,
+      "report": {
+        "findings": [
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_ab_fkey",
+            "page": null,
+            "key": "80000004"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_ab_fkey",
+            "page": null,
+            "key": "80000006"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pcode_fkey",
+            "page": null,
+            "key": "80000003"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pcode_fkey",
+            "page": null,
+            "key": "8000001b"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pid_fkey",
+            "page": null,
+            "key": "80000002"
+          },
+          {
+            "kind": "not_null_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000003"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000004"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000005"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000006"
+          },
+          {
+            "kind": "typmod_violation",
+            "database": "main",
+            "object": "p",
+            "page": null,
+            "key": "80000007"
+          },
+          {
+            "kind": "unique_violation",
+            "database": "main",
+            "object": "p_code_key",
+            "page": null,
+            "key": "8000000b"
+          },
+          {
+            "kind": "check_violation",
+            "database": "main",
+            "object": "p_qty_check",
+            "page": null,
+            "key": "80000008"
+          },
+          {
+            "kind": "check_violation",
+            "database": "main",
+            "object": "p_qty_next_check",
+            "page": null,
+            "key": "80000008"
+          },
+          {
+            "kind": "check_error",
+            "database": "main",
+            "object": "p_qty_next_check",
+            "page": null,
+            "key": "80000009"
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 27,
+        "rows": 60
+      }
+    },
+    {
+      "level": "quick",
+      "max_findings": 3,
+      "constraints": true,
+      "report": {
+        "findings": [
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_ab_fkey",
+            "page": null,
+            "key": "80000004"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_ab_fkey",
+            "page": null,
+            "key": "80000006"
+          },
+          {
+            "kind": "foreign_key_violation",
+            "database": "main",
+            "object": "c_pcode_fkey",
+            "page": null,
+            "key": "80000003"
+          }
+        ],
+        "truncated": true,
+        "skipped": [],
+        "pages": 27,
+        "rows": 60
+      }
+    }
+  ]
+}
