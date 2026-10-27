@@ -101,6 +101,12 @@ without changing its tree shape and refuses active readers or writers. File back
 use `db.backup(path, form: :page_identical)` or `form: :compacted`; memory databases
 support the compacted form.
 
+`db.integrity_check('main', level: :full, constraints: false, max_findings: 100)`
+walks the pinned generation of `main` or an attachment and returns an
+`IntegrityReport` (`findings`, `truncated`, `skipped`, `pages`, `rows`, `ok?`),
+matching the shared integrity fixtures. Unlike the supported cores it holds a
+table's decoded rows and an index's entries in memory while it checks them.
+
 `Database#query` and `#execute` accept positional `$N` parameters; `#prepare` creates
 a reusable parsed statement. Each database convenience call uses a fresh session.
 Use `db.session` for session settings, temporary objects, or SQL transactions;
