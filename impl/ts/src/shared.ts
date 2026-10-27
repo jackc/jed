@@ -93,6 +93,11 @@ import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
 import {
+  type IntegrityCheckOptions,
+  type IntegrityReport,
+  integrityCheckSteps,
+} from "./integrity.ts";
+import {
   type JsParam,
   type Row as ErgoRow,
   type RunResult,
@@ -2364,6 +2369,62 @@ export class Database {
   // (the browser's WebCrypto, OPFS journal acquisition) is awaited. It cannot be canceled.
   *compactSteps(name: string): Steps<void> {
     yield* uncancelableSteps(this.compactAsSteps(name, name, null));
+  }
+
+  // integrityCheck checks database name — `main` or an attachment, by exact name — and returns its
+  // findings (spec/design/integrity-check.md): every page the pinned generation reaches is read and
+  // verified, the invariants between pages are checked, and under level `full` each column B-tree index
+  // is probed for every entry its table derives. A finding is a fact about the database, never an
+  // error: the call fails only with 42704 (an unknown name, or `temp`), 57014 when opts.signal or the
+  // worker's cancellation aborts it, or an I/O error. It pins the committed snapshot as a read session
+  // does and never takes the writer gate, so commits proceed and are not seen. Not metered and not
+  // reachable from SQL.
+  integrityCheck(name: string, opts: IntegrityCheckOptions = {}): IntegrityReport {
+    return runSync(this.integrityCheckSteps(name, opts));
+  }
+
+  // integrityCheckSteps is integrityCheck as a continuation (ts-runtime.md §11): page reads await an
+  // asynchronous codec or device, and the worker's cancellation is delivered at every page and row.
+  *integrityCheckSteps(name: string, opts: IntegrityCheckOptions = {}): Steps<IntegrityReport> {
+    const c = this.core;
+    c.checkPid();
+    throwIfAborted(opts.signal);
+    let snap: Snapshot;
+    let storage: Engine;
+    let release: () => void;
+    if (name === "main") {
+      const version = c.refreshAndPin();
+      const gen = c.roleGen;
+      snap = c.committed;
+      storage = c.storage;
+      release = () => c.deregister(version, gen);
+    } else {
+      const att = name === "temp" ? undefined : c.attachments.get(name);
+      if (att === undefined) {
+        throw engineError("undefined_object", `database "${name}" is not attached`);
+      }
+      if (att.svc !== null) {
+        const pin = pinServiceAttachment(att.svc as ServiceAttachment);
+        snap = pin.snap;
+        storage = (att.svc as ServiceAttachment).core.storage;
+        release = () => releaseAttachPins([pin]);
+      } else {
+        // An attachment's pages are kept by main's reader registry (a reader pins every root).
+        const version = c.refreshAndPin();
+        const gen = c.roleGen;
+        snap = c.attached.get(name)!;
+        storage = att.storage;
+        release = () => c.deregister(version, gen);
+      }
+    }
+    try {
+      return yield* integrityCheckSteps(
+        { database: name, snap, storage, durable: storage.persistHook !== null },
+        opts,
+      );
+    } finally {
+      release();
+    }
   }
 
   // rekey rewrites the file database name (`main` or a file attachment) under a NEW data key

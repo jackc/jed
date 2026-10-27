@@ -1,28 +1,18 @@
-// The deterministic-simulation integrity checkers (spec/design/simulation-testing.md §8.3), a port
-// of impl/go/sim_check_test.go.
+// The deterministic-simulation integrity checkers (spec/design/simulation-testing.md §8.3).
 //
 // The image checker opens a copy of the disk image the way a new process would — so the meta
-// selection and manifest validation of validated-cow.md §1 run first — and then walks the selected
-// generation:
-//   - the live page count at meta offset 56 equals the pages reachable from the catalog root, GiST
-//     R-tree pages included;
-//   - every reachable page lies in [2, page_count);
-//   - the free list has no duplicates and is disjoint from the reachable set and from the selected
-//     generation's manifest dependencies;
-//   - each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
-//   - each table's persisted row count equals its leaf total;
-//   - each column index holds exactly the entries derived from its table's rows;
-//   - no overflow page is named by two stored values (large-values.md §15).
+// selection and manifest validation of validated-cow.md §1 run first — checks that the selected
+// generation is the expected version, and then runs the engine's own integrity check
+// (spec/design/integrity-check.md) at level full with no finding limit: any finding fails it.
 //
 // The live checker checks the running process instead (see checkLive).
 
-import { indexColumnOrdinals } from "../catalog.ts";
-import type { Collation } from "../collation.ts";
 import { type CommitMeta, parseCommitMeta, validateCommitMeta } from "../commit_manifest.ts";
-import { type Engine, encodePkKey, indexEntryKeysColumns, type Snapshot } from "../executor.ts";
-import { capFirstBody, NO_TAG } from "../cap.ts";
+import type { Engine, Snapshot } from "../executor.ts";
+import { NO_TAG } from "../cap.ts";
 import type { Credential } from "../crypto.ts";
 import { Environment } from "../environment.ts";
+import { engineError } from "../errors.ts";
 import { ioSteps, runSync } from "../execution.ts";
 import {
   chainPages,
@@ -30,17 +20,17 @@ import {
   collectTreePages,
   loadEnginePagedAt,
   parsePage,
-  reachablePages,
   unlockPagerSteps,
 } from "../format.ts";
 import { type GistPageRead, readGistLeafKeysSteps } from "../gist.ts";
+import { integrityCheckSteps, type IntegrityReport } from "../integrity.ts";
 import { MemoryBlockStore } from "../memoryblockstore.ts";
 import { Pager } from "../pager.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../paging.ts";
 import type { Database } from "../shared.ts";
 import type { PNode } from "../pmap.ts";
 import type { Value } from "../value.ts";
-import { bytesEqual, compareBytes, compareUtf8 } from "./util.ts";
+import { compareUtf8 } from "./util.ts";
 
 // CheckError names the first violated invariant; cause is the engine error behind it, when one is, so
 // the runner can read its SQLSTATE as Go's simCode does through a wrapped error.
@@ -77,8 +67,8 @@ function selectMeta(paging: SharedPaging): { meta: CommitMeta; protectedPages: S
 }
 
 // checkImage is simIntegrity: it returns [live, pages, free] from the selected meta and the loaded
-// free list, or throws a CheckError naming the first violated invariant. credential opens an encrypted
-// image (S12).
+// free list, or throws a CheckError naming the first finding of the engine's integrity check, its
+// cause XX001 (the corruption it detected). credential opens an encrypted image (S12).
 export function checkImage(
   image: Uint8Array,
   want: bigint,
@@ -86,147 +76,37 @@ export function checkImage(
 ): [number, number, number] {
   let e: Engine;
   let paging: SharedPaging;
-  // A GiST R-tree is read whole at load (gist.md §4.1); its pages are the ones the load visits, which
-  // the reachability walk does not list.
-  const gist: number[] = [];
   try {
     const pager = Pager.fromStore(new MemoryBlockStore(image));
     const environment = new Environment();
     const codec = runSync(unlockPagerSteps(pager, credential, environment));
     paging = new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize), codec);
-    e = loadEnginePagedAt(paging, environment, { gist: (pg) => gist.push(pg) });
+    e = loadEnginePagedAt(paging, environment, {});
   } catch (err) {
     throw new CheckError("open: " + message(err), err);
   }
-  const { meta: mt, protectedPages } = selectMeta(paging);
+  const { meta: mt } = selectMeta(paging);
   if (mt.txid !== want) {
     throw new CheckError(`the image holds version ${mt.txid}, want ${want}`);
   }
-  const snap = e.committed;
-  let reached: Set<number>;
+  let report: IntegrityReport;
   try {
-    reached = reachablePages(snap, paging, mt.rootPage, mt.rootTag);
-  } catch (err) {
-    throw new CheckError("reachability walk: " + message(err), err);
-  }
-  for (const pg of gist) {
-    if (reached.has(pg)) throw new CheckError(`GiST page ${pg} is reachable twice`);
-    reached.add(pg);
-  }
-  if (reached.size !== mt.livePages) {
-    throw new CheckError(
-      `live page count ${mt.livePages}, but ${reached.size} pages are reachable`,
+    report = runSync(
+      integrityCheckSteps(
+        { database: "main", snap: e.committed, storage: e, durable: true },
+        { level: "full", maxFindings: 0 },
+      ),
     );
+  } catch (err) {
+    throw new CheckError("integrity check: " + message(err), err);
   }
-  // An encrypted file's body pages start after its key block (encrypted.md §1).
-  const first = capFirstBody(paging.cap());
-  for (const pg of reached) {
-    if (pg < first || pg >= mt.pageCount) {
-      throw new CheckError(`reachable page ${pg} outside [${first}, ${mt.pageCount})`);
-    }
-  }
-  const seen = new Set<number>();
-  for (const pg of e.freePages) {
-    if (seen.has(pg)) throw new CheckError(`free page ${pg} listed twice`);
-    if (pg < first || pg >= mt.pageCount) {
-      throw new CheckError(`free page ${pg} outside [${first}, ${mt.pageCount})`);
-    }
-    if (reached.has(pg)) throw new CheckError(`free page ${pg} is reachable`);
-    if (protectedPages.has(pg)) {
-      throw new CheckError(`free page ${pg} is a dependency of the selected generation`);
-    }
-    seen.add(pg);
-  }
-  const claimed = new Set<number>();
-  for (const name of [...snap.tables.keys()].sort(compareUtf8)) {
-    try {
-      checkTable(snap, name, paging, claimed);
-    } catch (err) {
-      throw new CheckError(
-        `table ${name}: ${message(err)}`,
-        err instanceof CheckError ? err.cause : err,
-      );
-    }
+  const f = report.findings[0];
+  if (f !== undefined) {
+    const where = [f.object, f.page === null ? null : `page ${f.page}`].filter((x) => x !== null);
+    const text = `${f.kind}${where.length > 0 ? ` (${where.join(", ")})` : ""}: ${f.detail}`;
+    throw new CheckError(text, engineError("data_corrupted", text));
   }
   return [mt.livePages, mt.pageCount, e.freePages.length];
-}
-
-// checkTable also checks chain exclusivity (large-values.md §15): every overflow page the snapshot
-// reaches is named by exactly one stored value, across all tables (claimed). A rewritten record may
-// keep an unchanged value's chain, but two records of one snapshot never share one.
-function checkTable(
-  snap: Snapshot,
-  name: string,
-  paging: SharedPaging,
-  claimed: Set<number>,
-): void {
-  const fetch = (p: number, tag: Uint8Array): Uint8Array => paging.readBody(p, tag);
-  const tagLen = paging.cap().tag;
-  const table = snap.tables.get(name)!;
-  const store = snap.stores.get(name);
-  if (store === undefined) throw new CheckError("no row store");
-  const colTypes = store.columnTypes();
-  const entries = store.entriesInKeyOrder();
-  const colls: (Collation | null)[] = table.columns.map((c) =>
-    c.collation !== null ? (snap.resolveCollation(c.collation) ?? null) : null,
-  );
-  for (let i = 0; i < entries.length; i++) {
-    for (const v of entries[i]!.row) {
-      const ext = externalRef(v);
-      if (ext === null) continue;
-      let pages: number[];
-      try {
-        pages = chainPages(ext[0], ext[1], fetch, ext[2], tagLen);
-      } catch (err) {
-        throw new CheckError(`row ${i}: an overflow chain: ${message(err)}`, err);
-      }
-      for (const pg of pages) {
-        if (claimed.has(pg)) throw new CheckError(`overflow page ${pg} is referenced twice`);
-        claimed.add(pg);
-      }
-    }
-    let row: (typeof entries)[number]["row"];
-    try {
-      row = store.resolveAll(entries[i]!.row);
-    } catch (err) {
-      throw new CheckError(`row ${i}: ${message(err)}`, err);
-    }
-    entries[i] = { key: entries[i]!.key, row };
-    if (i > 0 && compareBytes(entries[i - 1]!.key, entries[i]!.key) >= 0) {
-      throw new CheckError(`storage keys out of order at row ${i}`);
-    }
-    if (table.pk.length > 0) {
-      const want = encodePkKey(colTypes, table.pk, colls, row);
-      if (!bytesEqual(want, entries[i]!.key)) {
-        throw new CheckError(`row ${i} is stored under a key that is not its primary key`);
-      }
-    }
-  }
-  const count = store.count();
-  if (count !== null && count !== BigInt(entries.length)) {
-    throw new CheckError(`persisted row count ${count}, but the tree holds ${entries.length} rows`);
-  }
-  for (const def of table.indexes) {
-    if (indexColumnOrdinals(def) === null || def.predicate !== undefined || def.kind !== "btree") {
-      continue; // expression, partial, GIN, and GiST indexes are not generated yet
-    }
-    const want: Uint8Array[] = [];
-    for (const en of entries) {
-      want.push(...indexEntryKeysColumns(table.columns, colTypes, colls, def, en.key, en.row));
-    }
-    want.sort(compareBytes);
-    const ist = snap.indexStores.get(def.name);
-    if (ist === undefined) throw new CheckError(`index ${def.name} has no store`);
-    const got = ist.entriesInKeyOrder();
-    if (got.length !== want.length) {
-      throw new CheckError(`index ${def.name} holds ${got.length} entries, want ${want.length}`);
-    }
-    for (let i = 0; i < got.length; i++) {
-      if (!bytesEqual(got[i]!.key, want[i]!)) {
-        throw new CheckError(`index ${def.name} entry ${i} does not match its table`);
-      }
-    }
-  }
 }
 
 // The runtime-private shared core of a Database, reached for this white-box check only.

@@ -2,9 +2,9 @@
 
 > A host-API operation that checks one database's storage on a live handle and returns structured
 > findings: SQLite's `PRAGMA integrity_check` / `quick_check`, and the job PostgreSQL's `amcheck`
-> (`bt_index_check … heapallindexed`) does for its B-trees. **Status: slice I1 (the reference and
-> fixtures) landed; the cores are next (I2).** The invariants already exist as test-only checkers in
-> each core's simulation runner and in `spec/fileformat/verify.rb --check-image`
+> (`bt_index_check … heapallindexed`) does for its B-trees. **Status: slices I1 (the reference and
+> fixtures) and I2 (the cores) landed; I3–I5 are next.** The invariants first existed as test-only
+> checkers in each core's simulation runner and in `spec/fileformat/verify.rb --check-image`
 > ([simulation-testing.md](simulation-testing.md) §8.3); this doc moves them into the engine, extends
 > them where they stop short, and fixes the result as a cross-core contract.
 
@@ -48,7 +48,9 @@ AEAD tag) does not match is `XX001` ([storage.md](storage.md) §6). Detection on
 `name` is `main` or an attached database, matched exactly, as for `compact` ([api.md](api.md) §2.6).
 Both backings are supported: a file, and an in-memory database or attachment (its
 `MemoryBlockStore` has the same pages, so the same walk applies; corruption there means an engine bug,
-which is worth finding). `temp` is session-local and not a target.
+which is worth finding). An in-memory store persists no live count, manifest, or free list, so the
+check takes the catalog root, high-water, and free list from the handle's memory, and
+`live_count_mismatch` and the manifest checks do not apply. `temp` is session-local and not a target.
 
 **Options** (each core's idiomatic struct; the defaults are the zero/omitted values where the
 language allows):
@@ -97,7 +99,10 @@ fails only for:
   a statement about the bytes, so it is not a finding);
 - `08006` — a page client lost its owner mid-check (page-service.md); the host reconnects and retries;
 - the handle's own poison state (a handle poisoned by a failed commit refuses every operation, api.md
-  §3).
+  §3);
+- `55006` — the check could not capture the pinned generation's meta, high-water, and free list
+  because commits kept replacing them between its pin and its capture (a bounded retry; it should not
+  occur in practice).
 
 `XX001` raised while reading a page is **never** a call error: it becomes a finding and the walk
 continues (§5.2).
@@ -213,7 +218,7 @@ rest of the check proceeds. Registered reasons:
 | `missing_host_function` | an expression names a host function the environment does not register |
 | `missing_loaded_data` | a collation or time zone the object pins is not loaded or is at another version (`XX002`, [collation.md](collation.md)) |
 | `table_unreadable` | the table's tree left rows unread, so its indexes' agreement and its constraints are not checked (§5.2) |
-| `index_unreadable` | the index's tree left entries unread, so its agreement is not checked (§5.2) |
+| `index_unreadable` | the index's walk reported a finding, so its agreement is not checked (§5.2) |
 
 ## 4. Findings as shared data
 
@@ -254,7 +259,7 @@ pass reports in column ordinal order. A skip is recorded where its check would h
 
 `max_findings` truncates this sequence, so a truncated report is a prefix of the full one. When the
 next finding would exceed the limit the check stops, sets `truncated`, and reports `pages` and `rows`
-as counted at that moment.
+as counted at that moment: a free-list chain page counts once it is read and verified.
 
 ## 5. Execution
 
@@ -279,14 +284,20 @@ any more than a full scan would ([pager.md](pager.md)).
 A page that is out of range, already reached, fails to verify or decode, or has the wrong type is
 reported once, at the point the walk reaches it, and its subtree is not walked: its rows and
 descendants are unknown, so the walk records neither them nor the findings they would cascade into.
-Such a page, or a row that stopped at a value finding, makes its tree **unreadable**. Order and
+A page at depth 256 or deeper (the root is depth 0) is reported `page_corrupt` after it is reached
+and without being read: no valid tree over u32 page numbers comes near that depth, and the cores walk
+with bounded stacks. Such a page, or a row that stopped at a value finding, makes its tree
+**unreadable**. The pinned generation's `meta_invalid` names the meta slot it was read from; a tree
+whose root is known only from a damaged catalog page is not walked and counts as unreadable. Order and
 bounds findings (`keys_unordered`, `separator_violation`, `tree_depth_uneven`,
 `row_key_not_primary_key`) do not: every row was still read.
 
 An unreadable table skips its row count, and reports `table_unreadable` in `skipped` for each of its
 indexes' agreement (and its constraint checks), since every comparison against a partly read table
-would be noise. Its indexes are still checked structurally. An unreadable index reports
-`index_unreadable` for its agreement. Space accounting runs after damage too, but
+would be noise. Its indexes are still checked structurally. An index whose walk reported any
+finding, including an order or bounds finding that left it readable, reports `index_unreadable`
+for its agreement: agreement probes the index through its own lookup, which a misordered index can
+mislead into missing an entry it holds. Space accounting runs after damage too, but
 `live_count_mismatch` is suppressed when any tree was unreadable: pages under an unwalked subtree are
 live but unreached, and the damage was already reported. `free_page_live` is never suppressed, since a
 reached page is live whatever else is unread.
@@ -333,13 +344,15 @@ The check is host API, so it is not in the SQL corpus. Its contract is tested wi
   an extra one (`full` only), a wrong row count, a wrong live count, a live page on the free list,
   and a table interior naming an index leaf (`page_corrupt`, `page_reached_twice`). The `.json` holds
   the expected report (§2 minus `detail`) for `quick` and `full`, and for one fixture a truncated run.
-  Every core must reproduce each exactly. Each damage leaves a file that opens: none touches what
+  Every core must reproduce each exactly when it opens the fixture as a file (an in-memory copy has
+  no persisted live count or free list, §2). Each damage leaves a file that opens: none touches what
   `open` reads.
 - **The registry.** `verify.rb` checks that `findings.toml` is well-formed and that every expected
   finding has a registered, `fresh` kind setting exactly the fields its entry names.
-- **Clean goldens.** Every golden that opens checks with no findings at both levels (today in the
-  reference; in every core from I2). `collation_skew_corrupt.jed` is the one exception: its index is
-  deliberately ordered for another collation version.
+- **Clean goldens.** Every golden that opens checks with no findings at both levels, in the reference
+  and every core. The exceptions are deliberately damaged: the `malformed_*` goldens (some open, since
+  leaves are read lazily, and must then report a finding) and `collation_skew_corrupt.jed`, whose
+  index is ordered for another collation version.
 - **Simulation.** The runners' image checker becomes a call to the engine's check on the opened copy
   (asserting no findings, plus the expected-version check that stays in the runner); the `corrupt`
   step's oracle gains "the check reports a finding naming the flipped page, or the flip was harmless".
@@ -366,6 +379,9 @@ this file sound?". Attachments are checked by opening them directly.
 - exclusion-constraint re-checking (GiST probe per row);
 - a metered SQL form, if a use appears;
 - checking all attached databases in one call (today the host loops);
+- an in-memory attachment's version does not advance per commit, so a commit to one racing its check
+  cannot be detected and may produce spurious findings; giving those commits distinct versions in
+  every core closes it (in-memory main and file databases already retry);
 - an offline mode that checks every recoverable generation, not only the one recovery selects
   (`verify.rb --check-image` covers that for diagnosis).
 
@@ -374,7 +390,7 @@ this file sound?". Attachments are checked by opening them directly.
 | slice | delivers |
 |---|---|
 | **I1** ✅ | `spec/integrity/findings.toml`; the reference `spec/fileformat/integrity.rb` (`verify.rb --integrity-check`); the damaged fixtures and expected reports; the clean-golden and registry checks in `mise run verify` |
-| **I2** | Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API, with `full` agreement for the column B-tree indexes the reference covers; the simulation image checker rebuilt on it; every fixture's report reproduced and every clean golden clean in every core; the live-only kinds unit-tested |
+| **I2** ✅ | Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API, with `full` agreement for the column B-tree indexes the reference covers; the simulation image checker rebuilt on it; every fixture's report reproduced and every clean golden clean in every core; the live-only kinds unit-tested |
 | **I3** | `full` for every other index kind (expression, partial, GIN, GiST) and GiST bounds, in the cores and the reference, with fixtures |
 | **I4** | `constraints` option, in the cores and (except `CHECK`, which needs SQL evaluation) the reference, with fixtures |
 | **I5** | `jed check` in the CLI and cli.md; `/web` docs (each `api/` language page) |

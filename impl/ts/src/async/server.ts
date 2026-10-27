@@ -6,6 +6,7 @@ import { COOPERATE, runAsync, shouldCooperate, type Steps } from "../execution.t
 import { EngineError, engineError } from "../errors.ts";
 import { type Argon2Params, type Credential, DEFAULT_ARGON2_PARAMS } from "../crypto.ts";
 import type { SessionOptions } from "../executor.ts";
+import type { IntegrityCheckOptions } from "../integrity.ts";
 import { PrivilegeSet } from "../privileges.ts";
 import type { Database, Session } from "../shared.ts";
 import type { Value } from "../value.ts";
@@ -446,6 +447,16 @@ export class RuntimeServer {
         throw new TransportError("PROTOCOL", "database maintenance belongs to the database handle");
       yield* this.maintenanceSteps(db, op, args);
       return null;
+    }
+    if (op === "integrityCheck") {
+      if (sessionId !== 0)
+        throw new TransportError("PROTOCOL", "database maintenance belongs to the database handle");
+      const name = args.name;
+      if (typeof name !== "string") throw new TransportError("PROTOCOL", "a database name is text");
+      return yield* db.integrityCheckSteps(name, {
+        level: args.level as IntegrityCheckOptions["level"],
+        maxFindings: args.maxFindings as number | undefined,
+      });
     }
     const owner = this.owner(job);
     const session = owner.session;

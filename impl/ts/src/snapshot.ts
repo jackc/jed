@@ -41,6 +41,7 @@ import type { FkDependent } from "./executor.ts";
 import type { Type } from "./types.ts";
 import { resolveColType } from "./catalog.ts";
 import type { PrivilegeSet } from "./privileges.ts";
+import type { TreeRef } from "./format.ts";
 import type { ColumnStatistics } from "./statistics.ts";
 export class Snapshot {
   // txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
@@ -104,6 +105,11 @@ export class Snapshot {
   // content-deterministic, gist.md §3) at every mutating statement and on load. Never mutated in
   // place (replaced wholesale on rebuild), so clone shallow-copies it.
   gistTrees: Map<string, GistTree> = new Map();
+  // gistRoots records each GiST index's on-disk R-tree root as of the generation this snapshot was
+  // loaded from or committed as (gist.md §4.1(b): the R-tree is rewritten whole every commit, so the
+  // resident leaf store does not know it). The integrity check walks the R-tree from it and
+  // re-encodes the catalog with it (spec/design/integrity-check.md §3.1). Never serialized.
+  gistRoots: Map<string, TreeRef> = new Map();
   // storePaging is this snapshot's domain paging context — the pager a store created IN-SESSION
   // (putTableResolved / putIndexStore / putIndex) binds at creation, so it joins the post-commit
   // residency flip (demoteCleanLeaves) instead of staying a fully-resident decoded tree forever.
@@ -159,6 +165,7 @@ export class Snapshot {
     );
     // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
     c.gistTrees = new Map(this.gistTrees);
+    c.gistRoots = new Map(this.gistRoots);
     c.views = new Map(this.views);
     c.catGen = this.catGen;
     c.dataGen = this.dataGen;

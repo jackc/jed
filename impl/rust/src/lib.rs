@@ -52,6 +52,11 @@ mod gin_jsonpath;
 mod gin_runs;
 mod gist;
 mod idle_flush;
+mod integrity;
+/// The integrity check's finding kinds and skip reasons (spec/integrity/findings.toml), generated
+/// by `scripts/gen_integrity.rb`: the values of [`IntegrityFinding::kind`] and
+/// [`IntegritySkip::reason`].
+pub mod integrity_kinds;
 mod interval;
 mod json;
 mod jsonpath;
@@ -121,6 +126,10 @@ pub use environment::{Environment, EnvironmentBuilder};
 // Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions on an
 // `EnvironmentBuilder`.
 pub use extension::{HostBatchKernel, HostFunction, HostKernel, Volatility};
+// The integrity check (spec/design/integrity-check.md): `Database::integrity_check`'s options and report.
+pub use integrity::{
+    IntegrityCheckOptions, IntegrityFinding, IntegrityLevel, IntegrityReport, IntegritySkip,
+};
 // The scalar type set is on the public surface (a host names it to declare host-function signatures).
 pub use types::ScalarType;
 // The low-level single-threaded `Engine` is a purely INTERNAL concern — not the public embedding

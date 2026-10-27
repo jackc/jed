@@ -5,6 +5,7 @@ import { toValue, valueToJs, type JsParam, type Row, type RunResult } from "../e
 import type { SessionOptions, TxStatus } from "../snapshot.ts";
 import type { Argon2Params, Credential } from "../crypto.ts";
 import type { ScriptSummary } from "../split.ts";
+import type { IntegrityCheckOptions, IntegrityReport } from "../integrity.ts";
 import { decodeError, TransportError } from "./errors.ts";
 import { encodeValues, measureValues, WireBudget } from "./wire.ts";
 import { decodePackedRows } from "./packed.ts";
@@ -994,6 +995,26 @@ export class AsyncDatabase extends AsyncHandle {
    */
   async compact(name: string): Promise<void> {
     await this.call("compact", { name });
+  }
+  /**
+   * Check database `name` (`"main"` or an attachment, matched exactly) and return its findings
+   * (spec/design/integrity-check.md): every page its committed generation reaches is read and
+   * verified, and under level `full` (the default) each column B-tree index is checked against its
+   * table. A finding is a fact about the database, never an error; the call rejects only with
+   * `42704` for an unknown name, `57014` when `signal` aborts it, or an I/O error. It pins a
+   * snapshot as a read session does and never waits for the writer. Stops after `maxFindings`
+   * (default 100; 0 for no limit) and then sets `truncated`.
+   */
+  async integrityCheck(
+    name: string,
+    options: IntegrityCheckOptions = {},
+  ): Promise<IntegrityReport> {
+    const { signal, level, maxFindings } = options;
+    return (await this.call(
+      "integrityCheck",
+      { name, level, maxFindings },
+      { signal },
+    )) as IntegrityReport;
   }
   /**
    * Rewrap the data key of the encrypted file database `name` for `credential`, rewriting only the

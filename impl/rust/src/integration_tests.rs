@@ -131,6 +131,8 @@ mod identity;
 mod incremental;
 #[path = "../tests/insert.rs"]
 mod insert;
+#[path = "../tests/integrity_check.rs"]
+mod integrity_check;
 #[path = "../tests/interval.rs"]
 mod interval;
 #[path = "../tests/join_pushdown.rs"]

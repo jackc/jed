@@ -263,6 +263,84 @@ fn validate_inner(
     Ok(protected)
 }
 
+/// The integrity check's reading of a meta's manifest (spec/design/integrity-check.md §3.1): the
+/// pages the generation depends on, and those whose stored bytes no longer carry their recorded
+/// identity, in manifest order. Unlike [`validate`] it does not stop at the first problem: every
+/// listed page is read and compared. A manifest-overflow page that does not decode as one, or a
+/// chain whose digest no longer matches, is reported as that overflow page (the chain's head when no
+/// single page can be blamed), and ends the walk. Reads only pages inside `[first, physical)`.
+pub(super) fn audit(
+    meta: &[u8],
+    physical: u32,
+    mut read: impl FnMut(u32) -> Result<Vec<u8>>,
+) -> Result<(HashSet<u32>, Vec<u32>)> {
+    let encrypted = meta[6] != 0;
+    let cap = Cap::of(meta.len() as u32, encrypted);
+    let first = cap.first_body();
+    let count = u32_at(meta, 40) as usize;
+    let n = u32_at(meta, 44) as usize;
+    let head = u32_at(meta, 36);
+    let mut protected = HashSet::new();
+    let mut bad = Vec::new();
+    let entries = |bytes: &[u8],
+                   number: usize,
+                   protected: &mut HashSet<u32>,
+                   bad: &mut Vec<u32>,
+                   read: &mut dyn FnMut(u32) -> Result<Vec<u8>>|
+     -> Result<()> {
+        for e in bytes[..number * ENTRY].chunks_exact(ENTRY) {
+            let id = u32_at(e, 0);
+            protected.insert(id);
+            if id < first || id >= physical {
+                bad.push(id);
+                continue;
+            }
+            if extend(0, &read(id)?) != u64_at(e, 4) {
+                bad.push(id);
+            }
+        }
+        Ok(())
+    };
+    let (lo, hi) = inline_area(meta.len(), encrypted);
+    let inline = count.min((hi - lo) / ENTRY);
+    entries(&meta[lo..hi], inline, &mut protected, &mut bad, &mut read)?;
+    let mut remaining = count - inline;
+    let mut digest = 0;
+    let mut next = head;
+    let mut chain_ok = true;
+    for _ in 0..n {
+        if next < first || next >= physical || !protected.insert(next) {
+            bad.push(next);
+            chain_ok = false;
+            break;
+        }
+        let page = read(next)?;
+        digest = extend(extend(digest, &next.to_be_bytes()), &page);
+        let number = remaining.min((meta.len() - OVERFLOW_HEADER) / ENTRY);
+        let parsed = match parse_page(&page) {
+            Ok(p) if p.page_type == PAGE_MANIFEST && p.item_count as usize == number => p,
+            _ => {
+                bad.push(next);
+                chain_ok = false;
+                break;
+            }
+        };
+        entries(
+            &page[OVERFLOW_HEADER..],
+            number,
+            &mut protected,
+            &mut bad,
+            &mut read,
+        )?;
+        remaining -= number;
+        next = parsed.next_page;
+    }
+    if chain_ok && n > 0 && digest != u64_at(meta, 48) {
+        bad.push(head);
+    }
+    Ok((protected, bad))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
