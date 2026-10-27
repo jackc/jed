@@ -131,7 +131,7 @@ module JedNative
       if statement[:kind] == :create_view
         return statement[:temporary] || statement[:replace] && @views[statement[:name]]&.dig(:temporary)
       end
-      if %i[insert update delete alter_table alter_view create_index analyze].include?(statement[:kind])
+      if %i[insert update delete merge alter_table alter_view create_index analyze].include?(statement[:kind])
         return !!(@tables[target] || @views[target])&.dig(:temporary)
       end
       if %i[drop_table drop_view truncate].include?(statement[:kind])
@@ -282,7 +282,7 @@ module JedNative
             if local_name
               routed[name_key] = domain_key(database, local_name)
               routed[:name] = routed[name_key] if routed[:name] == local_name && name_key == :table
-              routed[:alias] ||= local_name if %i[table insert update delete].include?(kind)
+              routed[:alias] ||= local_name if %i[table insert update delete merge].include?(kind)
             end
             if kind == :create_index && routed[:name]
               routed[:native_index_name] = routed[:name]
@@ -304,7 +304,7 @@ module JedNative
 
     def validate_domain_write(statement)
       kind = statement[:kind]
-      return unless kind.to_s.start_with?('create_', 'alter_', 'drop_') || %i[insert update delete truncate analyze reindex].include?(kind)
+      return unless kind.to_s.start_with?('create_', 'alter_', 'drop_') || %i[insert update delete merge truncate analyze reindex].include?(kind)
       domain = statement[:native_database]
       # Persistence checks the actual changed domains together at commit,
       # before any file is written. Merely visiting a domain (including zero-

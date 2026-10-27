@@ -141,7 +141,7 @@ module JedNative
       # handled by mutation admission and are not interpreted by a plain read.
       return if @native_cursor && @views.empty?
       case statement[:kind]
-      when :select, :values, :set_operation, :setop, :insert, :update, :delete, :explain
+      when :select, :values, :set_operation, :setop, :insert, :update, :delete, :merge, :explain
         validate_opaque_query_tree(statement)
       when :alter_table
         return if @views.key?(statement[:name])

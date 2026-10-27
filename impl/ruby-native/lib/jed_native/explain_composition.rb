@@ -205,13 +205,13 @@ module JedNative
         columns = query_metadata(body, @outer.flat_map(&:first))[:columns]
         columns = columns.each_with_index.map { |column, ordinal| column.merge(name: cte[:columns]&.[](ordinal) || column[:name]) }
         count = cte_reference_count(main_statement, name)
-        mutation_reader = %i[insert update delete].include?(main_statement[:kind]) && count.positive?
+        mutation_reader = %i[insert update delete merge].include?(main_statement[:kind]) && count.positive?
         items.drop(index + 1).each do |later|
           uses = cte_reference_count(later[:query], name)
           count += uses
-          mutation_reader ||= %i[insert update delete].include?(later[:query][:kind]) && uses.positive?
+          mutation_reader ||= %i[insert update delete merge].include?(later[:query][:kind]) && uses.positive?
         end
-        modifying = %i[insert update delete].include?(body[:kind])
+        modifying = %i[insert update delete merge].include?(body[:kind])
         materialized = recursive || modifying || cte[:materialized] == true || cte[:materialized].nil? && count > 1
         declaration = @ctes.dup
         child = build_query_plan(body)

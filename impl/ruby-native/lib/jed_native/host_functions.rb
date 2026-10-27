@@ -337,7 +337,7 @@ module JedNative
       super
     end
     def dispatch(statement)
-      if %i[insert update delete].include?(statement[:kind]) && (stored = @tables[statement[:table]])
+      if %i[insert update delete merge].include?(statement[:kind]) && (stored = @tables[statement[:table]])
         if statement[:kind] != :delete
           stored[:constraints].sort_by { |constraint| constraint[:name].to_s.b }.each do |constraint|
             verify_host_dependencies(constraint[:host_deps], "check #{constraint[:name]}") if constraint[:kind] == :check

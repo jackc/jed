@@ -143,7 +143,11 @@ module JedNative
       query = source[:query]
       if source[:kind] == :subquery && query[:kind] == :values &&
           (query[:order_by] || []).empty? && !query[:limit] && !query[:offset] && !query[:with]
+        start = @cost
         relation = select_values(query, relation_only: true)
+        # EXPLAIN ANALYZE attributes the VALUES node a derived list skips select for.
+        plan = @explain_runtime_plans && @explain_runtime_plans[query.object_id]
+        plan.actual = (plan.actual || 0) + @cost - start if plan
         names = source[:columns] || []
         if names.length > relation.columns.length
           raise Error.new('42P10', 'too many VALUES column aliases')

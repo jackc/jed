@@ -91,7 +91,7 @@ module JedNative
     end
 
     def dispatch(stmt)
-      if stmt[:with] && %i[insert update delete].include?(stmt[:kind])
+      if stmt[:with] && %i[insert update delete merge].include?(stmt[:kind])
         previous_ctes = @ctes
         begin
           @ctes = @ctes.dup
@@ -110,6 +110,7 @@ module JedNative
       when :insert then insert(stmt)
       when :update then update(stmt)
       when :delete then delete(stmt)
+      when :merge then merge(stmt)
       when :truncate then truncate(stmt)
       when :create_index then create_index(stmt)
       when :drop_index then drop_index(stmt)
@@ -650,7 +651,7 @@ module JedNative
             rel = Relation.new(columns: rel.columns, rows: next_rows)
           end
           rel = Relation.new(columns: rel.columns, rows: all_rows)
-        elsif %i[insert update delete].include?(body[:kind])
+        elsif %i[insert update delete merge].include?(body[:kind])
           result = dispatch(body)
           rel = Relation.new(columns: result.columns.zip(result.column_types).map { |n, t| { name: n, type: t } }, rows: result.rows)
         else
