@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'jed_native/error'
+require_relative 'jed_native/crypto'
 require_relative 'jed_native/types'
 require_relative 'jed_native/functions'
 require_relative 'jed_native/jsonpath'
