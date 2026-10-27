@@ -25,10 +25,14 @@ module JedNative
           inherited = { locking: @storage.instance_variable_get(:@locking),
                         file_lock_timeout_ms: @storage.instance_variable_get(:@service_timeout) || 5000,
                         fsync: @storage.instance_variable_get(:@sync),
-                        cache_bytes: @storage.instance_variable_get(:@cache_bytes) }
+                        cache_bytes: @storage.instance_variable_get(:@cache_bytes),
+                        synchronous: @storage.instance_variable_get(:@synchronous),
+                        flush_interval_ms: @storage.instance_variable_get(:@flush_interval_ms),
+                        clock: @storage.instance_variable_get(:@clock) }
           inherited.merge!(@storage.instance_variable_get(:@service_options) || {})
           options = inherited.merge(options)
         end
+        options = { clock: (@environment ||= Environment.new).clock }.merge(options) unless source.is_a?(Storage)
         storage = source.is_a?(Storage) ? source : Storage.new(path: source, create: false, read_only: attachment[:read_only], **options)
         attachment[:storage] = storage
         import_attachment_catalog(name, attachment, storage.load)
@@ -74,7 +78,8 @@ module JedNative
     end
 
     def close
-      @attachments.each_value { |attachment| attachment[:storage]&.close }
+      # Name order, so closing flushes relaxed attachment batches in a deterministic order.
+      @attachments.sort_by { |name, _| name.b }.each { |_, attachment| attachment[:storage]&.close }
       super
     end
 

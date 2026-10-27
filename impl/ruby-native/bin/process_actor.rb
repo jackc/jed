@@ -18,7 +18,11 @@ begin
               'idle_session' => :idle_session_timeout_ms, 'max_connections' => :max_connections }
   named.each do |argument|
     key, value = argument.split('=', 2)
-    options[key == 'ownership' ? :ownership : mapping.fetch(key)] = key == 'ownership' ? value.to_sym : value.to_i
+    case key
+    when 'ownership' then options[:ownership] = value.to_sym
+    when 'synchronous' then options[:synchronous] = value.to_sym
+    else options[mapping.fetch(key)] = value.to_i
+    end
   end
   options[:read_only] = true if action == 'open-read-only'
   database = action == 'create' ? JedNative.create(path, **options) : JedNative.open(path, **options)
