@@ -298,7 +298,7 @@ module JedNative
       base_columns = table_columns(table(top[:table]), label)
       context = {
         filter: top[:predicate] && relabel_view_targets(top[:predicate], label),
-        checks: top[:checks].map { |node| compile_filter(relabel_view_targets(node, label), base_columns) }
+        checks: top[:checks].map { |node| compile_source_order_filter(relabel_view_targets(node, label), base_columns) }
       }
       [rewritten, context]
     end
@@ -422,7 +422,7 @@ module JedNative
                 else source_scope
                 end
         merge_expression_check(clause[:condition])
-        condition = compile_filter(clause[:condition], scope)
+        condition = compile_source_order_filter(clause[:condition], scope)
         plan = { match: clause[:match], action: clause[:action], condition: condition }
         case clause[:action]
         when :update
