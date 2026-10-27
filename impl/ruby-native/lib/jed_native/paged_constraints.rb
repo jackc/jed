@@ -30,7 +30,7 @@ module JedNative
         next unless index[:unique]
         elements = index[:elements] || index[:columns].map { |name| { expr: { kind: :column, name: name } } }
         expressions = elements.map { |element| compile(element[:expr], columns) }
-        predicate = compile_filter(index[:where], columns)
+        predicate = compile_source_order_filter(index[:where], columns)
         paged_unique_state(rows, primary: false) do |row|
           next if predicate && evaluate(predicate, row) != true
           expressions.map { |expression| evaluate(expression, row) }
@@ -148,7 +148,7 @@ module JedNative
     end
 
     def paged_validate_exclusion(rows, constraint, columns)
-      predicate = compile_filter(constraint[:where], columns)
+      predicate = compile_source_order_filter(constraint[:where], columns)
       elements = constraint[:elements].map { |element| [compile(element[:expr], columns), element[:op]] }
       keys = RowSpool.new(self)
       rows.each do |row|

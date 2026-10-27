@@ -17,13 +17,13 @@ module JedNative
       nodes = plan[:order].each_with_index.map do |ordinal, position|
         source = plan[:sources][ordinal]
         access = plan[:accesses][position]
-        local = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], plan[:scopes][ordinal])
+        local = source[:native_access_predicate] && plan_filter(source[:native_access_predicate], plan[:scopes][ordinal])
         node = plan_scan(@tables.fetch(source[:name]), local, statement.merge(native_scan_source: source), access)
         node.phase, node.actual = nil, 0
         node.rows, node.cost = access[:output_rows], access[:pipeline_cost]
         if source[:native_pushed_filter]
-          local = plan_compile(source[:native_pushed_filter], plan[:scopes][ordinal])
-          node.detail += @explain_options[:verbose] ? "; filter=#{plan_expression(plan_compile(source[:native_pushed_filter], plan[:scope]))}" : "; filter:conjuncts=#{conjunctions(local).length}"
+          local = plan_filter(source[:native_pushed_filter], plan[:scopes][ordinal])
+          node.detail += @explain_options[:verbose] ? "; filter=#{plan_expression(plan_filter(source[:native_pushed_filter], plan[:scope]))}" : "; filter:conjuncts=#{conjunctions(local).length}"
         end
         source[:native_scan_profile] = node
         if position.positive? && (step = plan[:steps][position - 1])[:algorithm] == :index
@@ -54,7 +54,7 @@ module JedNative
       @explain_nway_plans ||= {}
       @explain_nway_plans[statement.object_id] = plan
       if predicate
-        expression = plan_compile(predicate, plan[:scope])
+        expression = plan_filter(predicate, plan[:scope])
         detail = @explain_options[:verbose] ? "filter=#{plan_expression(expression)}" : "conjuncts=#{conjunctions(expression).length}"
         rows = [node.rows, estimate_predicate(plan[:logical], expression)].min
         node = plan_node('Filter', detail, rows, node.cost + node.rows * expression_work(expression), [node], :filter)
@@ -70,7 +70,7 @@ module JedNative
       group_nodes = resolve_group_nodes(statement, scope)
       groups = group_nodes.map { |expression| plan_compile(expression, scope) }
       calls = outputs.flat_map { |expression| expression_nodes(expression) }.select { |expression| expression.kind == :call && Functions.aggregate?(expression.value) }.uniq { |expression| [expression.value, expression.args] }
-      having = statement[:having] && plan_compile(statement[:having], scope)
+      having = statement[:having] && plan_filter(statement[:having], scope)
       if !groups.empty? || !calls.empty? || having
         rows = groups.empty? ? 1 : estimate_distinct_rows(node.rows, groups)
         cost = node.cost + node.rows * (calls.length + groups.sum { |expression| expression_work(expression) } + calls.sum { |expression| expression.args.sum { |argument| expression_work(argument) } })

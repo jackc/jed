@@ -211,6 +211,12 @@ module JedNative
       node
     end
 
+    # A WHERE, ON, HAVING, or pushed filter renders in its cost-ordered
+    # evaluation order (planner.md §3.0).
+    def plan_filter(node, columns)
+      order_filter_conjuncts(plan_compile(node, columns))
+    end
+
     def plan_compile(node, columns)
       unsupported = lambda do |value|
         case value
@@ -243,7 +249,7 @@ module JedNative
       columns = stored ? table_columns(stored, source[:alias] || source[:name]) : []
       projections = expand_stars(statement[:columns], columns)
       outputs = projections.map { |projection| plan_compile(projection[:expr], columns) }
-      predicate = statement[:where] && plan_compile(statement[:where], columns)
+      predicate = statement[:where] && plan_filter(statement[:where], columns)
       raise Error.new('42804', 'WHERE requires boolean') if predicate && !%w[boolean unknown].include?(predicate.type)
       node = stored ? plan_scan(stored, predicate, statement) : plan_node('Result', '-', 1, 0, [], :scan)
       streaming_order = node.access ? node.access[:order] : :blocking
@@ -265,7 +271,7 @@ module JedNative
       group_nodes = resolve_group_nodes(statement, columns)
       group_expressions = group_nodes.map { |expression| plan_compile(expression, columns) }
       aggregate_calls = outputs.flat_map { |expression| expression_nodes(expression) }.select { |expression| expression.kind == :call && Functions.aggregate?(expression.value) }.uniq { |expression| [expression.value, expression.args] }
-      having = statement[:having] && plan_compile(statement[:having], columns)
+      having = statement[:having] && plan_filter(statement[:having], columns)
       if !group_expressions.empty? || !aggregate_calls.empty? || having
         rows = group_expressions.empty? ? 1 : estimate_distinct_rows(node.rows, group_expressions)
         cost = node.cost + node.rows * (aggregate_calls.length + group_expressions.sum { |expression| expression_work(expression) } + aggregate_calls.sum { |expression| expression.args.sum { |argument| expression_work(argument) } })
@@ -550,7 +556,7 @@ module JedNative
         plan_node("Insert #{name}", detail, child.rows, child.cost, [child], :root)
       else
         columns = table_columns(stored, statement[:alias] || name)
-        predicate = statement[:where] && plan_compile(statement[:where], columns)
+        predicate = statement[:where] && plan_filter(statement[:where], columns)
         child = plan_scan(stored, predicate, statement)
         if predicate
           rows = [child.rows, estimate_predicate(stored[:rows].length, predicate)].min

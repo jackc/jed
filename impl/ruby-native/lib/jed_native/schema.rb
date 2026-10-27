@@ -216,7 +216,7 @@ module JedNative
           charge(1 + t[:rows].length) unless t[:rows].empty?
           columns = table_columns(t)
           expressions = (index[:elements] || []).map { |element| compile(element[:expr], columns) }
-          predicate = compile_filter(index[:where], columns)
+          predicate = compile_source_order_filter(index[:where], columns)
           t[:rows].each do |row|
             next if predicate && evaluate(predicate, row) != true
             expressions.each { |expression| evaluate(expression, row) }
@@ -234,7 +234,7 @@ module JedNative
       columns = table_columns(table)
       constraints.each do |constraint|
         if constraint[:kind] == :exclude
-          predicate = compile_filter(constraint[:where], columns)
+          predicate = compile_source_order_filter(constraint[:where], columns)
           elements = constraint[:elements].map { |element| [compile(element[:expr], columns), element[:op]] }
           keys = []
           table[:rows].each do |row|
