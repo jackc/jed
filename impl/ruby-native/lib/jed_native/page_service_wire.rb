@@ -6,16 +6,16 @@ module JedNative
   module PageServiceWire
     MAX_FRAME = 16_777_216
     MESSAGES = {
-      hello: [1, 'protocol_min:u16 protocol_max:u16 format_version:u16 flags:u8 client_name:string'],
+      hello: [1, 'protocol_min:u16 protocol_max:u16 format_version:u16 flags:u8 client_name:string credential:credential'],
       begin_read: [2, 'incarnation:id16 last_txid:u64'], read_pages: [3, 'txid:u64 indices:u32_list'],
-      end_read: [4, 'txid:u64'], begin_write: [5, 'incarnation:id16 last_txid:u64 lock_timeout_ms:u64'],
+      end_read: [4, 'txid:u64'], begin_write: [5, 'incarnation:id16 last_txid:u64 lock_timeout_ms:u64 flags:u8'],
       commit_begin: [6, 'txid:u64 meta:page manifest_pages:indexed_page_list'],
       commit_pages: [7, 'pages:indexed_page_list'], commit_end: [8, ''], abort: [9, ''],
       commit_status: [10, 'txid:u64 digest:u64'], request_ownership: [11, ''],
       hello_ok: [65, 'protocol:u16 format_version:u16 page_size:u32 connection_id:u64 flags:u8 max_read_pages:u32'],
       read_begun: [66, 'incarnation:id16 txid:u64 invalidate:u8 indices:u32_list meta:page'],
       pages: [67, 'pages:page_list'],
-      write_begun: [69, 'incarnation:id16 txid:u64 invalidate:u8 indices:u32_list reuse_grant:bool meta:page'],
+      write_begun: [69, 'incarnation:id16 txid:u64 invalidate:u8 indices:u32_list reuse_grant:bool meta:page pending:digest_list reuse:u32_list'],
       committed: [72, 'txid:u64'], commit_status_reply: [74, 'status:u8'], ownership_reply: [75, 'status:u8'],
       notice: [126, 'kind:u8 connection_id:u64'], error: [127, 'sqlstate:sqlstate message:string detail:string flags:u8']
     }.transform_values { |code, fields| [code, fields.split.map { |field| field.split(':').map(&:to_sym) }.freeze].freeze }.freeze
@@ -58,10 +58,22 @@ module JedNative
       when :page
         raise Error.new('08P01', 'invalid page extent') unless page_size.positive? && value.bytesize == page_size
         value.b
-      when :u32_list, :page_list, :indexed_page_list
+      when :credential
+        # nil (none), [:passphrase, text] or [:key, 32 bytes] (README.md §3.1).
+        if value.nil?
+          "\0".b
+        elsif value.is_a?(Array) && value[0] == :passphrase && value[1].is_a?(String)
+          "\1".b + encode_value(:string, value[1], page_size)
+        elsif value.is_a?(Array) && value[0] == :key && value[1].is_a?(String) && value[1].bytesize == 32
+          "\2".b + value[1].b
+        else
+          raise Error.new('08P01', 'invalid credential')
+        end
+      when :u32_list, :page_list, :indexed_page_list, :digest_list
         body = value.map do |item|
           case type
           when :u32_list then encode_value(:u32, item, page_size)
+          when :digest_list then encode_value(:u32, item[0], page_size) + encode_value(:u64, item[1], page_size)
           when :page_list then encode_value(:page, item, page_size)
           else encode_value(:u32, item[0], page_size) + encode_value(:page, item[1], page_size)
           end
@@ -91,13 +103,21 @@ module JedNative
       when :page
         raise Error.new('08P01', 'no connection page size') unless page_size.positive?
         reader.take(page_size)
-      when :u32_list, :page_list, :indexed_page_list
+      when :credential
+        case reader.take(1).getbyte(0)
+        when 0 then nil
+        when 1 then [:passphrase, decode_value(:string, reader, page_size)]
+        when 2 then [:key, reader.take(32)]
+        else raise Error.new('08P01', 'invalid credential kind')
+        end
+      when :u32_list, :page_list, :indexed_page_list, :digest_list
         count = decode_value(:u32, reader, page_size)
-        width = { u32_list: 4, page_list: page_size, indexed_page_list: page_size + 4 }.fetch(type)
+        width = { u32_list: 4, page_list: page_size, indexed_page_list: page_size + 4, digest_list: 12 }.fetch(type)
         raise Error.new('08P01', 'invalid list count') if width.zero? || count > reader.remaining / width
         Array.new(count) do
           case type
           when :u32_list then decode_value(:u32, reader, page_size)
+          when :digest_list then [decode_value(:u32, reader, page_size), decode_value(:u64, reader, page_size)]
           when :page_list then decode_value(:page, reader, page_size)
           else [decode_value(:u32, reader, page_size), decode_value(:page, reader, page_size)]
           end

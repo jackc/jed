@@ -23,6 +23,10 @@ module RubyPageServiceTest
     when :page then page(text, size)
     when :u32_list then text.split(',').map(&:to_i)
     when :page_list then text.split(';').map { |item| page(item, size) }
+    when :digest_list then text.split(',').map { |item| item.split('=', 2).map(&:to_i) }
+    when :credential
+      kind, data = text.split(':', 2)
+      { nil => nil, 'passphrase' => [:passphrase, data], 'key' => [:key, [data].pack('H*')] }.fetch(kind)
     when :indexed_page_list then text.split(';').map { |item| index, bytes = item.split('=', 2); [index.to_i, page(bytes, size)] }
     else text
     end
