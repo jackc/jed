@@ -3,7 +3,7 @@
 > A host-API operation that checks one database's storage on a live handle and returns structured
 > findings: SQLite's `PRAGMA integrity_check` / `quick_check`, and the job PostgreSQL's `amcheck`
 > (`bt_index_check … heapallindexed`) does for its B-trees. **Status: slices I1 (the reference and
-> fixtures), I2 (the cores) and I3 (every index kind) and I4 (constraints) landed; I5 is next.** The invariants first existed as test-only
+> fixtures), I2 (the cores) and I3 (every index kind), I4 (constraints) and I5 (`jed check`) landed.** The invariants first existed as test-only
 > checkers in each core's simulation runner and in `spec/fileformat/verify.rb --check-image`
 > ([simulation-testing.md](simulation-testing.md) §8.3); this doc moves them into the engine, extends
 > them where they stop short, and fixes the result as a cross-core contract.
@@ -463,10 +463,12 @@ jed check [--quick] [--constraints] [--max-findings N] [--format text|json] [cre
 ```
 
 It opens `DBFILE` read-only (the existing credential flags apply to an encrypted file), checks `main`,
-prints one line per finding and skip (`json`: one JSON object, the report of §2), and exits `0` with
-no findings, `1` with findings, `2` on a usage or open error. An open that fails with `XX001` prints a
-single `open_failed` pseudo-finding carrying the error and exits `1`, since that is the answer to "is
-this file sound?". Attachments are checked by opening them directly.
+prints one line per finding and skip and a summary (`json`: one JSON object, the report of §2), and
+exits as the rest of the CLI does: `0` with no findings, `1` on a usage or open error, `2` with
+findings (the CLI's code for "the operation ran and failed"). An open that fails with `XX001` prints a
+single `open_failed` pseudo-finding carrying the error and exits `2`, since that is the answer to "is
+this file sound?". Attachments are checked by opening them directly. The output format is
+[cli.md](cli.md) §3.2.
 
 ## 8. Follow-ons
 
@@ -488,6 +490,6 @@ this file sound?". Attachments are checked by opening them directly.
 | **I2** ✅ | Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API, with `full` agreement for the column B-tree indexes the reference covers; the simulation image checker rebuilt on it; every fixture's report reproduced and every clean golden clean in every core; the live-only kinds unit-tested |
 | **I3** ✅ | `full` for every other index kind (expression, partial, GIN, GiST) and GiST bounds, in the cores and the reference, with fixtures |
 | **I4** ✅ | `constraints` option, in the cores and the reference (`CHECK` within its expression subset), with fixtures |
-| **I5** | `jed check` in the CLI and cli.md; `/web` docs (each `api/` language page) |
+| **I5** ✅ | `jed check` in the CLI and cli.md; `/web` docs |
 
 I2 is the largest, and I3–I5 each depend only on it, so they can run in parallel once it lands.
