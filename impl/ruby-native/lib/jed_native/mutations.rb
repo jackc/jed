@@ -79,7 +79,7 @@ module JedNative
         arbiters = conflict_arbiters(t, conflict)
         update_scope = scope + table_columns(t, 'excluded').map { |c| c.merge(qualified_only: true) }
         assignments = resolve_assignments(t, conflict[:assignments] || [], update_scope)
-        predicate = compile_filter(conflict[:where], update_scope)
+        predicate = compile_source_order_filter(conflict[:where], update_scope)
       end
       checks = mutation_checks(t)
       paged = t[:rows].is_a?(PagedRows)
@@ -375,7 +375,7 @@ module JedNative
       end
       arbiters.map do |arbiter|
         arbiter.merge(expressions: arbiter[:elements].map { |element| compile(element[:expr], scope) },
-                      predicate: compile_filter(arbiter[:where], scope))
+                      predicate: compile_source_order_filter(arbiter[:where], scope))
       end
     end
 

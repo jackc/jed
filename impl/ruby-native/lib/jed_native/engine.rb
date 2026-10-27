@@ -422,7 +422,7 @@ module JedNative
             raise Error.new('23503', 'foreign key violation') unless matches
           end
         when :exclude
-          predicate = compile_filter(constraint[:where], cols)
+          predicate = compile_source_order_filter(constraint[:where], cols)
           elements = constraint[:elements].map { |e| [compile(e[:expr], cols), e[:op]] }
           keys = rows.filter_map do |row|
             next if predicate && evaluate(predicate, row) != true
@@ -440,7 +440,7 @@ module JedNative
         next unless index[:unique]
         elements = index[:elements] || index[:columns].map { |name| { expr: { kind: :column, name: name } } }
         expressions = elements.map { |e| compile(e[:expr], cols) }
-        predicate = compile_filter(index[:where], cols)
+        predicate = compile_source_order_filter(index[:where], cols)
         seen = {}
         rows.each do |row|
           next if predicate && evaluate(predicate, row) != true

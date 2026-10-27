@@ -434,7 +434,7 @@ module JedNative
         end
       end
       previous_checks = @view_write_checks
-      @view_write_checks = plan[:checks].map { |node| compile_filter(relabel_view_targets(node, label), table_columns(table(plan[:table]), label)) }
+      @view_write_checks = plan[:checks].map { |node| compile_source_order_filter(relabel_view_targets(node, label), table_columns(table(plan[:table]), label)) }
       yield rewritten
     ensure
       @view_write_checks = previous_checks

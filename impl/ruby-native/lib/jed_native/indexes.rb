@@ -453,7 +453,7 @@ module JedNative
         validate_index_expression(element[:expr], scope)
         compile(element[:expr], scope)
       end
-      predicate = index[:where] && (validate_index_expression(index[:where], scope); compile_filter(index[:where], scope))
+      predicate = index[:where] && (validate_index_expression(index[:where], scope); compile_source_order_filter(index[:where], scope))
       { definition: index, kind: index[:method] || 'btree', elements: elements,
         types: expressions.map(&:type), expressions: expressions, predicate: predicate,
         columns: elements.map { |element| table[:columns].index { |column| column[:name] == element[:expr][:name] } if element[:expr][:kind] == :column },

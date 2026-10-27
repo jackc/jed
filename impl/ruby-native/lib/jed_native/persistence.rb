@@ -332,7 +332,7 @@ module JedNative
       result[:host_deps] = index[:host_deps] if index[:host_deps]
       if index[:where]
         reject_stateful_index(index[:where])
-        predicate = compile_filter(index[:where], scope)
+        predicate = compile_source_order_filter(index[:where], scope)
         result[:predicate] = catalog_expression(index[:where])
         result[:where] = ->(row) { unmetered_storage_evaluate(predicate, table, row, 'boolean') == true }
       end

@@ -57,7 +57,7 @@ module JedNative
       source = sources.first
       stored = source && @tables.fetch(source[:name])
       scope = stored ? table_columns(stored, source[:alias] || source[:name]) : []
-      predicate = statement[:where] && plan_compile(statement[:where], scope)
+      predicate = statement[:where] && plan_filter(statement[:where], scope)
       node = stored ? plan_scan(stored, predicate, statement) : plan_node('Result', '-', 1, 0, [], :scan)
       if windows && stored && statement[:limit]
         limit = plan_constant(plan_compile(statement[:limit], []))
@@ -98,8 +98,8 @@ module JedNative
       end
       if source[:native_pushed_filter]
         columns = binding.columns.map { |column| column.merge(table: source[:alias] || source[:name]) }
-        filter = plan_compile(source[:native_pushed_filter], columns)
-        node.detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_compile(source[:native_pushed_filter], scope))}" : "filter:conjuncts=#{conjunctions(filter).length}"
+        filter = plan_filter(source[:native_pushed_filter], columns)
+        node.detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_filter(source[:native_pushed_filter], scope))}" : "filter:conjuncts=#{conjunctions(filter).length}"
         node.cost += node.rows * expression_work(filter)
         node.rows = estimate_predicate(node.rows, filter)
       end
@@ -262,7 +262,7 @@ module JedNative
       sets = expand_grouping_sets(group_nodes)
       groups = sets.flatten(1).uniq.map { |expression| plan_compile(expression, scope) }
       calls = projection_aggregates([statement[:columns], statement[:having], statement[:order_by], statement[:windows]]).map { |expression| plan_compile(expression, scope) }
-      having = statement[:having] && plan_compile(statement[:having], scope)
+      having = statement[:having] && plan_filter(statement[:having], scope)
       grouped = !groups.empty? || !calls.empty? || having
       validate_aggregate_scope(statement, scope, grouped)
       if grouped

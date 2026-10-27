@@ -16,8 +16,8 @@ module JedNative
       analyzer = ParameterBindings.new(self, nil)
       original_scope = analyzer.relation_columns(sources.first) + analyzer.relation_columns(edges.first[:relation])
       # This validation cannot execute subquery bodies during plain EXPLAIN.
-      plan_compile(statement[:where], original_scope) if statement[:where]
-      plan_compile(edges.first[:on], original_scope) if edges.first[:on]
+      plan_filter(statement[:where], original_scope) if statement[:where]
+      plan_filter(edges.first[:on], original_scope) if edges.first[:on]
       sources, edges, filter = rewrite_join_inputs(sources, edges, statement[:where]) || [sources, edges, statement[:where]]
       plan = if two_base_join?(sources, edges)
         two_base_join_plan(sources.first, edges.first, filter, statement)
@@ -28,7 +28,7 @@ module JedNative
       scans = inputs.each_with_index.map do |source, index|
         stored = @tables.fetch(source[:name])
         scope = analyzer.relation_columns(source)
-        predicate = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], scope)
+        predicate = source[:native_access_predicate] && plan_filter(source[:native_access_predicate], scope)
         access = index == 1 && plan[:index] ? plan[:index][:access] : plan[:scans][index]
         node = plan_scan(stored, predicate, statement.merge(native_scan_source: source), access)
         node.phase = nil
@@ -41,8 +41,8 @@ module JedNative
         end
         source[:native_scan_profile] = node
         if source[:native_pushed_filter]
-          expression = plan_compile(source[:native_pushed_filter], scope)
-          detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_compile(source[:native_pushed_filter], original_scope))}" : "filter:conjuncts=#{conjunctions(expression).length}"
+          expression = plan_filter(source[:native_pushed_filter], scope)
+          detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_filter(source[:native_pushed_filter], original_scope))}" : "filter:conjuncts=#{conjunctions(expression).length}"
           node.detail += '; ' + detail
           node.cost += node.rows * expression_work(expression)
           node.rows = access[:output_rows] * (index == 1 && plan[:index] ? plan[:scans][0][:output_rows] : 1)
@@ -57,7 +57,7 @@ module JedNative
       detail = edges.first[:kind].to_s.sub('_outer', '')
       detail += "; keys=#{plan[:keys].length}" if plan[:algorithm] == :hash
       if plan[:on]
-        detail += @explain_options[:verbose] ? "; on=#{plan_expression(plan_compile(edges.first[:on], original_scope))}" : "; on:conjuncts=#{conjunctions(plan[:on]).length}"
+        detail += @explain_options[:verbose] ? "; on=#{plan_expression(plan_filter(edges.first[:on], original_scope))}" : "; on:conjuncts=#{conjunctions(plan[:on]).length}"
       end
       detail += '; ordered: join pk ordered' if plan[:ordered]
       base_cost = plan[:cost] - plan[:output_count]
@@ -68,7 +68,7 @@ module JedNative
       @explain_join_plans[statement.object_id] = plan
       if plan[:filter]
         expression = plan[:filter]
-        detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_compile(filter, original_scope))}" : "conjuncts=#{conjunctions(expression).length}"
+        detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_filter(filter, original_scope))}" : "conjuncts=#{conjunctions(expression).length}"
         node = plan_node('Filter', detail, estimate_predicate(node.rows, expression), node.cost + node.rows * expression_work(expression), [node], :filter)
       end
       projections = expand_stars(statement[:columns], original_scope)
@@ -107,9 +107,9 @@ module JedNative
       scans = [first, second].each_with_index.map do |source, index|
         join_scan_candidates(source, scopes[index]).min_by { |access| [access[:pipeline_cost], AccessPlanning::ACCESS_RANK.fetch(access[:kind]), access[:name].to_s.b] }
       end
-      on = edge[:on] && plan_compile(edge[:on], scope)
-      gate = second[:native_original_on] ? plan_compile(second[:native_original_on], scope) : on
-      filter = where && plan_compile(where, scope)
+      on = edge[:on] && plan_filter(edge[:on], scope)
+      gate = second[:native_original_on] ? plan_filter(second[:native_original_on], scope) : on
+      filter = where && plan_filter(where, scope)
       left, right = scans.map { |scan| scan[:output_rows] }
       pairs = left * right
       rows = estimate_predicate(pairs, on)

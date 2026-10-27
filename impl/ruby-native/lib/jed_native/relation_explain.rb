@@ -70,7 +70,7 @@ module JedNative
         end
       end
       if predicate
-        expression = plan_compile(predicate, scope)
+        expression = plan_filter(predicate, scope)
         detail = @explain_options[:verbose] ? "filter=#{plan_expression(expression)}" : "conjuncts=#{conjunctions(expression).length}"
         node = plan_node('Filter', detail, estimate_predicate(node.rows, expression), node.cost + node.rows * expression_work(expression), [node], :filter)
       end
@@ -126,14 +126,14 @@ module JedNative
             plan_node("CTE Scan #{name}", '-', binding.rows.length, binding.rows.length)
           end
         else
-          predicate = source[:native_access_predicate] && plan_compile(source[:native_access_predicate], columns)
+          predicate = source[:native_access_predicate] && plan_filter(source[:native_access_predicate], columns)
           plan_scan(@tables.fetch(name), predicate, statement.merge(native_scan_source: source))
         end
       else raise Error.new('0A000', "relation #{source[:kind]} has no plan")
       end
       if source[:native_pushed_filter]
-        filter = plan_compile(source[:native_pushed_filter], columns)
-        detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_compile(source[:native_pushed_filter], scope))}" : "filter:conjuncts=#{conjunctions(filter).length}"
+        filter = plan_filter(source[:native_pushed_filter], columns)
+        detail = @explain_options[:verbose] ? "filter=#{plan_expression(plan_filter(source[:native_pushed_filter], scope))}" : "filter:conjuncts=#{conjunctions(filter).length}"
         node.detail = node.detail == '-' ? detail : node.detail + '; ' + detail
         node.cost += node.rows * expression_work(filter)
         node.rows = estimate_predicate(node.rows, filter)
@@ -148,7 +148,7 @@ module JedNative
 
     def plan_relation_join(left, right, source, edge, prefix, columns, statement)
       scope = prefix + columns
-      on = edge[:on] && plan_compile(edge[:on], scope)
+      on = edge[:on] && plan_filter(edge[:on], scope)
       original = source[:native_original_on] || edge[:on]
       gate = original && plan_compile(original, scope)
       kind = edge[:kind]
