@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -279,32 +280,36 @@ func TestBlockingSortCompactsRunsAndSpillCollisionOrder(t *testing.T) {
 		}
 		key, previous = r[0].Int, r[1].Int
 	}
-	d, err := newDiskBuckets(osSpillHost{dir: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.close()
+	// Spilled hash rows keep each hash's insertion order, interleaved with other hashes.
+	h := newHashRows(&engine{spill: osSpillHost{dir: dir}, session: newSession(NewEnvironment())})
+	h.budget = 1
 	const collision uint64 = 9
-	for i := 0; i < 30; i++ {
-		if err := d.append(collision, []byte(fmt.Sprint(i%3)), storedRow{IntValue(int64(i))}); err != nil {
+	for i := 0; i < 3000; i++ {
+		hash := collision
+		if i%3 != 0 {
+			hash = uint64(i)
+		}
+		if err := h.push(hash, storedRow{IntValue(int64(i))}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r, ok, err := d.lookup(collision, []byte("1"))
-	if err != nil || !ok || r[0].Int != 28 {
-		t.Fatalf("collision lookup %v %v %v", r, ok, err)
+	if h.disk == nil {
+		t.Fatal("hash rows did not spill")
 	}
 	var index int64
-	if err := d.bucket(collision, func(_ []byte, r storedRow) error {
+	if err := h.each(collision, func(r storedRow) error {
 		if r[0].Int != index {
 			t.Fatalf("bucket order %v want %d", r, index)
 		}
-		index++
+		index += 3
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	d.close()
+	if index != 3000 {
+		t.Fatalf("bucket visited %d rows", index/3)
+	}
+	h.close()
 	rows.close()
 	s.close()
 	assertNoBlockingScratch(t, dir)
@@ -407,4 +412,44 @@ func TestRejectedReservationsSpillInsteadOfFailing(t *testing.T) {
 	if count != 100 {
 		t.Fatalf("sorted %d rows", count)
 	}
+}
+
+// TestSpillTableMatchesMap: a spilled table keeps every key's latest value through bucket splits,
+// in-place rewrites, and values that outgrow their blocks, and its directory segments stay bounded.
+func TestSpillTableMatchesMap(t *testing.T) {
+	dir := t.TempDir()
+	d, err := newSpillTable(osSpillHost{dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]byte{}
+	const keys = 40000
+	for i := 0; i < 3*keys; i++ {
+		k := fmt.Sprint(i * 7919 % keys)
+		if i%5 == 0 {
+			k = strings.Repeat(k, 1+i%(spillInlineKey/2)) // some keys too long to read inline
+		}
+		v := []byte(strings.Repeat("v", i%97) + fmt.Sprint(i))
+		if _, _, err := d.get(k); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.set(k, v); err != nil {
+			t.Fatal(err)
+		}
+		want[k] = v
+	}
+	if d.keys != uint64(len(want)) || len(d.segments) < 2 || len(d.segments) > spillMaxSegments {
+		t.Fatalf("keys %d (want %d), segments %d", d.keys, len(want), len(d.segments))
+	}
+	for k, v := range want {
+		got, ok, err := d.get(k)
+		if err != nil || !ok || !bytes.Equal(got, v) {
+			t.Fatalf("get %.20q = %q %v %v, want %q", k, got, ok, err, v)
+		}
+	}
+	if _, ok, err := d.get("absent"); ok || err != nil {
+		t.Fatalf("absent key %v %v", ok, err)
+	}
+	d.close()
+	assertNoBlockingScratch(t, dir)
 }
