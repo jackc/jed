@@ -25,6 +25,16 @@ export { PrivilegeSet } from "../privileges.ts";
 export type { JsParam, Row, RunResult } from "../ergonomic.ts";
 export type { SessionOptions } from "../snapshot.ts";
 export type { Argon2Params, Credential } from "../crypto.ts";
+export { IntegrityKind, IntegritySkipReason } from "../integrity_kinds.ts";
+export type {
+  IntegrityCheckOptions,
+  IntegrityFinding,
+  IntegrityKindName,
+  IntegrityLevel,
+  IntegrityReport,
+  IntegritySkip,
+  IntegritySkipReasonName,
+} from "../integrity.ts";
 
 type WorkerOptions = {
   backend?: "typescript";

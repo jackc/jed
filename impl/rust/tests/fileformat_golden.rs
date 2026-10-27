@@ -48,7 +48,7 @@ fn refresh_test_page_crc(image: &mut [u8], page_start: usize) {
 /// reference entry resolves its table from a loaded bundle — collation.md §4/§9, slice 3c); the
 /// pinned `JTZ` bundle for the timezone-dependent index golden; and the `geo_hash` host function for
 /// the host-function dependency goldens.
-fn golden_env() -> jed::Environment {
+pub(crate) fn golden_env() -> jed::Environment {
     static ENV: std::sync::OnceLock<jed::Environment> = std::sync::OnceLock::new();
     ENV.get_or_init(|| {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

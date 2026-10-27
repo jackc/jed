@@ -15,6 +15,11 @@ require "json"
 INTEGRITY_DIR = File.join(__dir__, "integrity")
 INTEGRITY_REGISTRY = File.join(__dir__, "..", "integrity", "findings.toml")
 
+# A page at this depth or deeper (the root is depth 0) is page_corrupt without being read: no valid
+# tree over u32 pages comes near it, and the cores walk with bounded native stacks
+# (integrity-check.md §5.2).
+INTEGRITY_MAX_TREE_DEPTH = 256
+
 class IntegrityCheck
   # Raised by the overflow fetch when a chain names a page the walk already reached.
   class ReachedTwice < StandardError
@@ -47,6 +52,7 @@ class IntegrityCheck
     @reached = Set.new
     @rows = 0
     @damaged = false
+    @free_chain_pages = 0
   end
 
   def run
@@ -58,17 +64,16 @@ class IntegrityCheck
     unlock_image(@image, @ps, @meta) if @meta[:suite] == 1
     @first = first_body
     catalog = load_catalog
-    free_chain = []
     catch(:truncated) do
       check_sequences(catalog[:sequences])
       catalog[:tables].sort_by { |t| t[:name].b }.each { |t| check_table(t) }
-      free_chain = check_free_list
+      check_free_list
       if !@damaged && @meta[:live] != @reached.size
         add("live_count_mismatch", detail: "meta records #{@meta[:live]} live pages, #{@reached.size} are reachable")
       end
     end
     { findings: @findings, truncated: @truncated, skipped: @skipped,
-      pages: @reached.size + free_chain.size, rows: @rows, reference_unchecked: @unchecked }
+      pages: @reached.size + @free_chain_pages, rows: @rows, reference_unchecked: @unchecked }
   ensure
     $enc = nil
     $ctypes = nil
@@ -203,7 +208,12 @@ class IntegrityCheck
       end
     end
     unless t[:pk].empty?
-      want = t[:pk].map { |pi| key_body(t[:columns][pi][:type], row[pi], t[:columns][pi][:collation]) }.join.b
+      # A key column holding a value its key encoding rejects (a NULL) cannot be this row's key either.
+      want = begin
+        t[:pk].map { |pi| key_body(t[:columns][pi][:type], row[pi], t[:columns][pi][:collation]) }.join.b
+      rescue StandardError
+        nil
+      end
       unless want == key
         add("row_key_not_primary_key", object: t[:name], page: page, key: key,
                                        detail: "stored key is not the row's primary-key encoding")
@@ -221,7 +231,10 @@ class IntegrityCheck
     end
   end
 
+  # An index whose walk reported anything, even an order or bounds finding, is not checked for
+  # agreement: its own lookups cannot be trusted to find what it holds (integrity-check.md §5.2).
   def check_index(t, ix, rows)
+    before = @findings.size
     if ix[:kind] == "gist"
       walk = GistWalk.new(self, ix[:name])
       readable = walk.run(ix[:root_page])
@@ -235,7 +248,7 @@ class IntegrityCheck
     @damaged ||= !readable
     return unless @level == "full"
     return skip(ix[:name], "table_unreadable") if rows.nil?
-    return skip(ix[:name], "index_unreadable") unless readable
+    return skip(ix[:name], "index_unreadable") unless readable && @findings.size == before
 
     derivable = ix[:kind] == "btree" && ix[:predicate].nil? && ix[:cols].all?(Integer)
     return @unchecked << { object: ix[:name], check: "index_agreement" } unless derivable
@@ -294,6 +307,8 @@ class IntegrityCheck
         @readable = false
         return
       end
+      return corrupt(page, "deeper than any valid tree") if depth >= INTEGRITY_MAX_TREE_DEPTH
+
       begin
         pg = read_page(@check.image, @check.ps, page)
       rescue StandardError => e
@@ -410,6 +425,10 @@ class IntegrityCheck
         @readable = false
         return
       end
+      if depth >= INTEGRITY_MAX_TREE_DEPTH
+        @readable = false
+        return @check.finding("page_corrupt", object: @object, page: page, detail: "deeper than any valid tree")
+      end
       begin
         pg = read_page(@check.image, @check.ps, page)
         children = parse(pg)
@@ -459,8 +478,8 @@ class IntegrityCheck
 
   private
 
-  # The free list as the space-accounting check sees it (integrity-check.md §3.3). Returns the chain
-  # pages read.
+  # The free list as the space-accounting check sees it (integrity-check.md §3.3). Each chain page
+  # counts toward `pages` once it is read and verified.
   def check_free_list
     chain = []
     page = @meta[:free_head]
@@ -480,6 +499,7 @@ class IntegrityCheck
         break
       end
       chain << page
+      @free_chain_pages += 1
       entries.concat(pg[:payload].byteslice(0, pg[:item_count] * 4).unpack("N*"))
       page = pg[:next_page]
     end
@@ -552,6 +572,7 @@ INTEGRITY_FIXTURES = [
   { name: "row_rekeyed", damage: :row_rekeyed },
   { name: "index_entry_dropped", damage: :index_entry_dropped },
   { name: "index_entry_extra", damage: :index_entry_extra },
+  { name: "index_keys_swapped", damage: :index_keys_swapped },
   { name: "row_count_wrong", damage: :none, table: INTEGRITY_TABLE.merge(row_count: 41) },
   { name: "live_count_wrong", damage: :live_count_wrong },
   { name: "free_page_live", damage: :free_page_live },
@@ -640,6 +661,13 @@ def integrity_fixture_image(fx)
     keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
     extra = "\x00".b + key_body("i32", 1000) + key_body("i32", 1000)
     integrity_write_index_leaf(image, ps, index_leaves.last, keys + [extra])
+  when :index_keys_swapped
+    # The index's second leaf stores its first two entries in the wrong order: under full, its
+    # agreement is skipped (index_unreadable) rather than probed.
+    pg = read_page(image, ps, index_leaves[1])
+    keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
+    keys[0], keys[1] = keys[1], keys[0]
+    integrity_write_index_leaf(image, ps, index_leaves[1], keys)
   when :live_count_wrong
     # The selected meta records one live page fewer than the catalog root reaches.
     slot = select_meta(image, ps)[:slot]

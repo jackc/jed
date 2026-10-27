@@ -1986,6 +1986,20 @@ impl Snapshot {
         index_roots: &[Vec<PageRef>],
         cap: Cap,
     ) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .catalog_entries_split(tables, root_data_page, index_roots, cap)?
+            .0)
+    }
+
+    /// [`catalog_entries`](Self::catalog_entries), with the position of the first table entry (the
+    /// integrity check locates each table entry in the stored chain by it).
+    fn catalog_entries_split(
+        &self,
+        tables: &[(&str, &Table, &TableStore)],
+        root_data_page: &[PageRef],
+        index_roots: &[Vec<PageRef>],
+        cap: Cap,
+    ) -> Result<(Vec<Vec<u8>>, usize)> {
         let mut cat_entries: Vec<Vec<u8>> = Vec::new();
         for ct in self.composite_types_sorted() {
             let mut e = vec![1u8];
@@ -2010,6 +2024,7 @@ impl Snapshot {
             ));
             cat_entries.push(e);
         }
+        let first_table = cat_entries.len();
         for (ti, (_, t, store)) in tables.iter().enumerate() {
             let row_count = store
                 .count()
@@ -2027,7 +2042,7 @@ impl Snapshot {
         }
         cat_entries.extend(statistics_catalog_entries(self));
         cat_entries.extend(view_catalog_entries(self));
-        Ok(cat_entries)
+        Ok((cat_entries, first_table))
     }
 }
 
@@ -8136,6 +8151,329 @@ fn read_i64(buf: &[u8], pos: &mut usize) -> Result<i64> {
     Ok(i64::from_be_bytes([
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
     ]))
+}
+
+// --- the integrity check's page readers (spec/design/integrity-check.md §3) ------------------------
+
+/// `page_type` of a catalog page, for the integrity check's catalog walk.
+pub(crate) const PAGE_CATALOG_TYPE: u8 = PAGE_CATALOG;
+
+/// One B-tree page as the integrity walk reads it (integrity-check.md §3.2).
+pub(crate) enum TreeRead {
+    /// An interior node: its `N + 1` child pointers and `N` separators.
+    Interior {
+        children: Vec<PageRef>,
+        seps: Vec<Vec<u8>>,
+    },
+    /// A leaf decoded for the tree's columns (served from the pool when resident).
+    Leaf(Arc<Node>),
+    /// A leaf page whose node structure does not decode for the tree's columns.
+    LeafCorrupt(String),
+    /// A verified page of another type.
+    Other(u8),
+}
+
+/// Read the B-tree page `page` names for the integrity walk. A leaf already resident in the pool is
+/// served from it (it was verified when it was faulted); any other page is read through the pager,
+/// and a leaf is decoded and admitted to the pool as a scan's fault would. A page that fails its
+/// checksum or tag, or an interior that does not decode, is `XX001`.
+pub(crate) fn integrity_read_tree_page(
+    paging: &Arc<SharedPaging>,
+    page: PageRef,
+    col_types: &Arc<Vec<ColType>>,
+) -> Result<TreeRead> {
+    let leaf = |r: Result<Arc<Node>>| match r {
+        Ok(node) => Ok(TreeRead::Leaf(node)),
+        Err(e) if e.state == SqlState::DataCorrupted => {
+            Ok(TreeRead::LeafCorrupt(e.message.clone()))
+        }
+        Err(e) => Err(e),
+    };
+    if paging.leaf_resident(page.page) {
+        return leaf(paging.fault_leaf(page, col_types));
+    }
+    let block = paging.read_body(page)?;
+    let page_type = parse_page(&block)?.page_type;
+    match page_type {
+        PAGE_INTERIOR => {
+            let parsed = parse_page(&block)?;
+            let n = parsed.item_count as usize;
+            let payload = parsed.payload;
+            let cap = paging.cap();
+            if (cap.ptr() + 4) * n + cap.ptr() > payload.len() {
+                return Err(corrupt("B-tree interior item count overruns page"));
+            }
+            let mut pos = 0usize;
+            let mut children = Vec::with_capacity(n + 1);
+            for _ in 0..=n {
+                children.push(PageRef::read(payload, &mut pos, cap)?);
+            }
+            let seps = read_separators(payload, &mut pos, n)?;
+            Ok(TreeRead::Interior { children, seps })
+        }
+        PAGE_LEAF => leaf(paging.fault_leaf_block(page, col_types, block)),
+        t => Ok(TreeRead::Other(t)),
+    }
+}
+
+/// A verified body page as the integrity check reads it: its header, its successor (a chain page's
+/// bound successor, else the plain `next_page`), and its content — a chain page's bytes after the
+/// successor tag, any other page's payload, within the page capacity `C`.
+pub(crate) struct RawPage {
+    pub(crate) page_type: u8,
+    pub(crate) flags: u8,
+    pub(crate) item_count: u32,
+    pub(crate) next: PageRef,
+    pub(crate) content: Vec<u8>,
+}
+
+/// Read and verify the body page `page` names (checksum or tag; `XX001` otherwise).
+pub(crate) fn integrity_read_page(paging: &SharedPaging, page: PageRef) -> Result<RawPage> {
+    let block = paging.read_body(page)?;
+    let p = parse_page(&block)?;
+    let cap = paging.cap();
+    let (next, content) = if matches!(p.page_type, PAGE_CATALOG | PAGE_OVERFLOW | PAGE_FREELIST) {
+        let (next, content) = chain_content(&p, cap)?;
+        (next, &content[..content.len().min(cap.chain())])
+    } else {
+        (
+            PageRef::plain(p.next_page),
+            &p.payload[..p.payload.len().min(cap.c)],
+        )
+    };
+    Ok(RawPage {
+        page_type: p.page_type,
+        flags: p.flags,
+        item_count: p.item_count,
+        next,
+        content: content.to_vec(),
+    })
+}
+
+/// Read a bound page pointer in `cap`'s layout at `*pos` (the integrity check's GiST walk).
+pub(crate) fn integrity_read_ptr(buf: &[u8], pos: &mut usize, cap: Cap) -> Result<PageRef> {
+    PageRef::read(buf, pos, cap)
+}
+
+/// Compare the stored catalog chain `pages` (each page's index and content, in chain order) with the
+/// encoding of `snap`'s catalog (integrity-check.md §3.1). Returns the first page where they differ
+/// (`None` when the chain is byte-for-byte the encoding), and each GiST index's root as the stored
+/// table entries record it: the snapshot does not keep a GiST R-tree's page (the tree is rewritten
+/// whole every commit, gist.md §4.1), so the entry's bytes are its only record. A table entry is
+/// found by the lengths of the entries before it, which do not depend on any root's value.
+pub(crate) fn integrity_catalog(
+    snap: &Snapshot,
+    cap: Cap,
+    pages: &[(u32, RawPage)],
+) -> Result<(Option<u32>, std::collections::HashMap<String, PageRef>)> {
+    let mut gist = std::collections::HashMap::new();
+    let mut tables = snap.catalog_and_stores();
+    tables.sort_by(|a, b| a.0.cmp(b.0));
+    let roots: Vec<PageRef> = tables
+        .iter()
+        .map(|(_, _, st)| st.tree_root().map_or(PageRef::NONE, |n| n.page_ref()))
+        .collect();
+    let mut index_roots: Vec<Vec<PageRef>> = tables
+        .iter()
+        .map(|(_, t, _)| {
+            t.indexes
+                .iter()
+                .map(|idx| {
+                    if idx.kind == IndexKind::Gist {
+                        PageRef::NONE
+                    } else {
+                        snap.index_store(&idx.name)
+                            .tree_root()
+                            .map_or(PageRef::NONE, |n| n.page_ref())
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let (entries, first_table) = snap.catalog_entries_split(&tables, &roots, &index_roots, cap)?;
+    let layout = catalog_layout(&entries, cap.chain());
+    let Some(last) = pages.last() else {
+        return Ok((None, gist));
+    };
+    for (i, cp) in layout.iter().enumerate() {
+        let Some((id, raw)) = pages.get(i) else {
+            return Ok((Some(last.0), gist));
+        };
+        let len = cp.payload.len();
+        if raw.item_count != cp.item_count
+            || (raw.flags & 1 != 0) != cp.continued
+            || raw.content.len() < len
+            || raw.content[len..].iter().any(|b| *b != 0)
+        {
+            return Ok((Some(*id), gist));
+        }
+    }
+    if pages.len() > layout.len() {
+        return Ok((Some(pages[layout.len()].0), gist));
+    }
+    let mut stored = Vec::new();
+    for (cp, (_, raw)) in layout.iter().zip(pages) {
+        stored.extend_from_slice(&raw.content[..cp.payload.len()]);
+    }
+    // The chain page holding byte `at` of the entry stream.
+    let page_of = |at: usize| -> u32 {
+        let mut end = 0usize;
+        for (cp, (id, _)) in layout.iter().zip(pages) {
+            end += cp.payload.len();
+            if at < end {
+                return *id;
+            }
+        }
+        last.0
+    };
+    let mut at: usize = entries[..first_table].iter().map(Vec::len).sum();
+    for (ti, (_, t, _)) in tables.iter().enumerate() {
+        let mut pos = at + 1; // past the entry-kind byte
+        let decoded = if stored.get(at) == Some(&0) {
+            decode_table_entry(&stored, &mut pos, cap).ok()
+        } else {
+            None
+        };
+        match decoded {
+            Some((_, _, _, disk)) if disk.len() == t.indexes.len() => {
+                for (j, idx) in t.indexes.iter().enumerate() {
+                    if idx.kind == IndexKind::Gist {
+                        index_roots[ti][j] = disk[j];
+                        gist.insert(idx.name.clone(), disk[j]);
+                    }
+                }
+            }
+            _ => return Ok((Some(page_of(at)), gist)),
+        }
+        at += entries[first_table + ti].len();
+    }
+    let (entries, _) = snap.catalog_entries_split(&tables, &roots, &index_roots, cap)?;
+    let expect = entries.concat();
+    if let Some(at) = expect.iter().zip(&stored).position(|(a, b)| a != b) {
+        return Ok((Some(page_of(at)), gist));
+    }
+    if expect.len() != stored.len() {
+        return Ok((Some(page_of(expect.len().min(stored.len()))), gist));
+    }
+    Ok((None, gist))
+}
+
+/// Where the integrity check finds a generation's free list (integrity-check.md §3.3).
+pub(crate) enum IntegrityFree {
+    /// The persisted chain (meta offset 28).
+    Chain(PageRef),
+    /// The handle's in-memory list (an in-memory database's commits persist none).
+    List(Vec<u32>),
+    /// Not known: the generation's meta no longer verifies.
+    Unknown,
+}
+
+/// The generation an integrity check examines (integrity-check.md §3.1, §5.1): what its meta
+/// records, and the findings about the meta and manifest themselves.
+pub(crate) struct IntegrityGeneration {
+    pub(crate) root: PageRef,
+    pub(crate) page_count: u32,
+    /// The live page count to check (meta offset 56), or `None` when there is none to check.
+    pub(crate) live_pages: Option<u32>,
+    pub(crate) free: IntegrityFree,
+    /// The generation's manifest dependencies.
+    pub(crate) protected: HashSet<u32>,
+    /// `meta_invalid` / `manifest_page_mismatch` findings, each with its page.
+    pub(crate) findings: Vec<(&'static str, u32)>,
+}
+
+/// The generation `txid` as its meta slot records it, re-verified: the slot's checksum (and in an
+/// encrypted file its tag) and every page its manifest lists. `None` when neither slot holds `txid`
+/// any more (later commits overwrote it); a slot that still claims `txid` but no longer verifies is a
+/// `meta_invalid` finding, its fields read as stored, with no free list or live count to check.
+pub(crate) fn integrity_generation(
+    paging: &SharedPaging,
+    txid: u64,
+) -> Result<Option<IntegrityGeneration>> {
+    use crate::integrity_kinds::{MANIFEST_PAGE_MISMATCH, META_INVALID};
+    let (blocks, physical, trusts) = {
+        let mut pg = paging.pager();
+        (
+            [pg.read_block(0)?, pg.read_block(1)?],
+            pg.allocated_pages(),
+            pg.trusts_meta(),
+        )
+    };
+    let encrypted = paging.codec().is_some();
+    let first = paging.cap().first_body();
+    let claims =
+        |b: &[u8]| b.len() >= 64 && u64::from_be_bytes(b[12..20].try_into().unwrap()) == txid;
+    let mut claimed = None;
+    for (slot, b) in blocks.iter().enumerate() {
+        if !claims(b) {
+            continue;
+        }
+        let Some(m) = parse_meta(b).filter(|m| (m.suite != 0) == encrypted) else {
+            claimed.get_or_insert(slot);
+            continue;
+        };
+        let mut findings = Vec::new();
+        if let Some(codec) = paging.codec()
+            && !trusts
+        {
+            let verified = match commit_manifest::chain_pages(b, |id| paging.pager().read_block(id))
+            {
+                Ok(chain) => codec.verify_meta(slot as u32, b, &chain).is_ok(),
+                Err(e) if e.state == SqlState::DataCorrupted => false,
+                Err(e) => return Err(e),
+            };
+            if !verified {
+                findings.push((META_INVALID, slot as u32));
+            }
+        }
+        let protected = if trusts {
+            HashSet::new()
+        } else {
+            let (protected, bad) =
+                commit_manifest::audit(b, physical, |id| paging.pager().read_block(id))?;
+            findings.extend(bad.into_iter().map(|id| (MANIFEST_PAGE_MISMATCH, id)));
+            protected
+        };
+        return Ok(Some(IntegrityGeneration {
+            root: PageRef {
+                page: m.root_page,
+                tag: m.root_tag,
+            },
+            page_count: m.page_count,
+            live_pages: Some(m.live_pages),
+            free: IntegrityFree::Chain(PageRef {
+                page: m.free_list_head,
+                tag: m.free_list_tag,
+            }),
+            protected,
+            findings,
+        }));
+    }
+    let Some(slot) = claimed else {
+        return Ok(None);
+    };
+    let b = &blocks[slot];
+    let u32_at = |at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+    let mut tag = crate::crypto::NO_TAG;
+    if encrypted && b.len() >= 80 {
+        tag.copy_from_slice(&b[64..80]);
+    }
+    let pc = u32_at(24);
+    Ok(Some(IntegrityGeneration {
+        root: PageRef {
+            page: u32_at(20),
+            tag,
+        },
+        page_count: if pc > first && pc <= physical {
+            pc
+        } else {
+            physical
+        },
+        live_pages: None,
+        free: IntegrityFree::Unknown,
+        protected: HashSet::new(),
+        findings: vec![(META_INVALID, slot as u32)],
+    }))
 }
 
 #[cfg(test)]

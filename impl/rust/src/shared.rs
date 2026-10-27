@@ -378,6 +378,11 @@ pub(crate) struct Storage {
     free_gen_txid: u64,
     /// The committed-storage budget (memory.md §8): the in-memory form (Q4a) or the file form (§8.7).
     budget: StorageBudget,
+    /// The version of the commit whose catalog root, high-water and free list an in-memory domain's
+    /// accounting holds — set where a staged commit is adopted; `None` before its first commit and
+    /// after a compaction, when the meta of its image records them. The integrity check compares it
+    /// with its pinned version, so it never reads another commit's accounting.
+    adopted_txid: Option<u64>,
     /// The live-page accounting of a file-backed domain's committed state (memory.md §8.7); unused
     /// for an in-memory domain.
     live: crate::format::LiveCount,
@@ -534,6 +539,7 @@ impl Storage {
             live_at_compaction: 0,
             free_gen_txid: 0,
             budget: StorageBudget::default(),
+            adopted_txid: None,
             live: crate::format::LiveCount::default(),
             files: None,
             dir_synced: false,
@@ -548,6 +554,64 @@ impl Storage {
             service_reuse: None,
             deadline: crate::idle_flush::DeadlineFlush::default(),
         })
+    }
+
+    /// The generation `txid` of this domain as the integrity check examines it, with the domain's
+    /// paging (spec/design/integrity-check.md §3.1, §5.1); `None` when later commits overwrote its meta
+    /// slot. Called under the storage lock, so no commit is writing meanwhile. A file's generation is
+    /// what its meta slot records. An in-memory domain's commits write no free list and no live page
+    /// count, so its free list is the handle's and its live count is not checked; an in-memory
+    /// attachment's commits write no meta at all, so its catalog root is the last commit's.
+    pub(crate) fn integrity_generation(
+        &self,
+        txid: u64,
+    ) -> Result<
+        Option<(
+            crate::format::IntegrityGeneration,
+            Arc<crate::paging::SharedPaging>,
+        )>,
+    > {
+        if self.path.is_some() {
+            let found = crate::format::integrity_generation(&self.paging, txid)?;
+            return Ok(found.map(|g| (g, Arc::clone(&self.paging))));
+        }
+        // In memory (integrity-check.md §2): the catalog root, high-water and free list are the
+        // handle's, and there is no live count or manifest to check. They must be the pinned
+        // version's: a commit adopted since (or not yet adopted) means pin again.
+        let root = match self.adopted_txid {
+            Some(adopted) if adopted != txid => return Ok(None),
+            Some(_) => self.budget.last_cat_root,
+            // No commit adopted yet: the image this domain was created, opened or compacted from
+            // records the root in the meta of the pinned version (its other slot may be torn).
+            None => {
+                let mut pager = self.paging.pager();
+                let mut root = None;
+                for slot in 0..2 {
+                    let block = pager.read_block(slot)?;
+                    if let Some(m) = crate::format::parse_meta(&block)
+                        && m.txid == txid
+                    {
+                        root = Some(crate::format::PageRef {
+                            page: m.root_page,
+                            tag: m.root_tag,
+                        });
+                    }
+                }
+                match root {
+                    Some(root) => root,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let generation = crate::format::IntegrityGeneration {
+            root,
+            page_count: self.page_count,
+            live_pages: None,
+            free: crate::format::IntegrityFree::List(self.free_pages.clone()),
+            protected: HashSet::new(),
+            findings: Vec::new(),
+        };
+        Ok(Some((generation, Arc::clone(&self.paging))))
     }
 
     /// The domain's shared pager (attached to every temp store so its `OnDisk` leaves fault through the
@@ -654,6 +718,7 @@ impl Storage {
         can_reclaim: bool,
     ) -> Result<()> {
         self.page_count = staged.page_count;
+        self.adopted_txid = Some(snap.txid);
         self.budget.record(&staged);
         self.free_pages = staged.free_remaining;
         self.maybe_compact(snap, staged.root, &staged.written, can_reclaim)
@@ -1358,6 +1423,7 @@ impl Storage {
         self.live_at_compaction = engine.live_at_compaction;
         self.free_gen_txid = engine.free_gen_txid;
         self.live = engine.live;
+        self.adopted_txid = None;
         self.budget.last_cat_root = crate::format::PageRef::NONE;
         self.budget.last_written.clear();
         self.budget.last_catalog_pages = 0;
@@ -1425,6 +1491,7 @@ impl Storage {
         self.live_at_compaction = engine.live_at_compaction;
         self.free_gen_txid = engine.free_gen_txid;
         self.live = engine.live;
+        self.adopted_txid = None;
         self.budget.last_cat_root = crate::format::PageRef::NONE;
         self.budget.last_written.clear();
         self.budget.last_catalog_pages = 0;
@@ -2932,6 +2999,7 @@ impl Database {
             live_at_compaction: engine.live_at_compaction,
             free_gen_txid: engine.free_gen_txid,
             budget: StorageBudget::default(),
+            adopted_txid: None,
             live: engine.live,
             files: None,
             dir_synced: false,
@@ -3083,6 +3151,84 @@ impl Database {
     /// file open. Not metered and not reachable from SQL.
     pub fn compact(&self, name: &str) -> Result<()> {
         self.compact_named(name, name, None)
+    }
+
+    /// Check the storage of database `name` — `main` or an attachment — and report what is wrong with
+    /// it (spec/design/integrity-check.md): the pinned generation's meta, manifest, catalog and
+    /// sequences; every table's and index's tree (page verification, node types, key order and
+    /// separator bounds, leaf depth, value decoding, primary-key placement, row counts); and the space
+    /// accounting (free list, live page count). Under [`IntegrityLevel::Full`](crate::IntegrityLevel)
+    /// it also checks that each column B-tree index holds exactly the entries its table derives.
+    ///
+    /// The check pins the committed snapshot as a read session does and never takes the writer
+    /// gate: commits proceed meanwhile and are not seen. Pages are read through the handle's pager,
+    /// so a leaf already resident is not re-read. A page that fails verification is a finding, never
+    /// an error. Errors: `42704` for a name that is not attached (and for `temp`), `57014` when
+    /// `opts.cancel` is cancelled, and an I/O error from the block store. Not metered and not
+    /// reachable from SQL.
+    pub fn integrity_check(
+        &self,
+        name: &str,
+        opts: &crate::integrity::IntegrityCheckOptions,
+    ) -> Result<crate::integrity::IntegrityReport> {
+        self.integrity_check_named(name, name, opts)
+    }
+
+    /// [`integrity_check`](Self::integrity_check) of `lname` on this handle, reporting it as `name`
+    /// (a page-service attachment is checked through its inner handle, as `main`).
+    fn integrity_check_named(
+        &self,
+        lname: &str,
+        name: &str,
+        opts: &crate::integrity::IntegrityCheckOptions,
+    ) -> Result<crate::integrity::IntegrityReport> {
+        if let Some(cancel) = &opts.cancel {
+            cancel.check()?;
+        }
+        let not_attached = || {
+            EngineError::new(
+                SqlState::UndefinedObject,
+                format!("database \"{name}\" is not attached"),
+            )
+        };
+        if lname != "main" {
+            let service = match self
+                .0
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .get(lname)
+            {
+                Some(attachment) if lname != "temp" => attachment.svc.clone(),
+                _ => return Err(not_attached()),
+            };
+            if let Some(inner) = service {
+                return Database(inner).integrity_check_named("main", name, opts);
+            }
+        }
+        // Pin the committed snapshot as a read session does, then read its generation's meta under
+        // the storage lock, which a commit holds while it writes. A meta slot the pinned generation
+        // no longer holds means later commits overwrote it: pin again.
+        for _ in 0..64 {
+            let (snap, attached, version, generation) = self.0.refresh_and_pin()?;
+            let _pin = self.0.reader_pin_for(version, generation);
+            let snap = if lname == "main" {
+                snap
+            } else {
+                attached.get(lname).cloned().ok_or_else(not_attached)?
+            };
+            let found = self
+                .0
+                .with_storage(lname, |st| st.integrity_generation(snap.txid))?;
+            if let Some((generation, paging)) = found {
+                return crate::integrity::run(&snap, &paging, generation, name, opts);
+            }
+            std::thread::yield_now();
+        }
+        Err(EngineError::new(
+            SqlState::ObjectInUse,
+            format!("database \"{name}\" changed too often to pin a generation to check"),
+        ))
     }
 
     /// Change the credential of the encrypted file database `name` (`"main"` or a file attachment) to
@@ -3801,6 +3947,7 @@ impl Database {
                     limit: source.max_storage_bytes,
                     ..StorageBudget::default()
                 },
+                adopted_txid: None,
                 live: engine.live,
                 files,
                 dir_synced: false,
@@ -6707,3 +6854,59 @@ mod backup;
 #[cfg(test)]
 #[path = "cancellation_bench.rs"]
 mod cancellation_bench;
+
+#[cfg(test)]
+mod integrity_generation_tests {
+    //! The integrity check reads an in-memory domain's catalog root, high-water and free list from
+    //! the handle (spec/design/integrity-check.md §2), so they must belong to the version it pinned:
+    //! a commit adopted after the pin makes `integrity_generation` refuse, and the check pins again.
+    //! Mirrors the Go core's `stagedTxid` test. In-memory main only: an in-memory attachment's
+    //! version does not advance per commit in any core, so its commits cannot be told apart yet
+    //! (an open follow-on, spec/design/integrity-check.md §8).
+    use super::*;
+
+    fn run(db: &Database, sql: &str) {
+        db.session(SessionOptions::default())
+            .execute(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    }
+
+    fn generation_of(db: &Database, name: &str, txid: u64) -> Option<u32> {
+        db.0.with_storage(name, |st| st.integrity_generation(txid))
+            .unwrap()
+            .map(|(g, _)| g.root.page)
+    }
+
+    fn version_of(db: &Database, name: &str) -> u64 {
+        let (snap, attached, ..) = db.0.pin_latest();
+        if name == "main" {
+            snap.txid
+        } else {
+            attached[name].txid
+        }
+    }
+
+    #[test]
+    fn a_later_commit_supersedes_the_pinned_in_memory_generation() {
+        let db = Database::default();
+        for name in ["main"] {
+            let before = version_of(&db, name);
+            assert!(generation_of(&db, name, before).is_some(), "{name}: fresh");
+            run(&db, &format!("CREATE TABLE {name}.t (id i32 PRIMARY KEY)"));
+            let pinned = version_of(&db, name);
+            assert_ne!(pinned, before, "{name}: a commit advances the version");
+            let root = generation_of(&db, name, pinned).expect("the adopted version");
+            // A commit after the pin: the accounting now belongs to the next version.
+            run(&db, &format!("INSERT INTO {name}.t VALUES (1)"));
+            assert_eq!(generation_of(&db, name, pinned), None, "{name}: superseded");
+            let next = version_of(&db, name);
+            let next_root = generation_of(&db, name, next).expect("the new version");
+            assert_ne!(root, next_root, "{name}: the catalog moved");
+            let report = db
+                .integrity_check(name, &crate::IntegrityCheckOptions::default())
+                .unwrap();
+            assert!(report.ok(), "{name}: {:#?}", report.findings);
+            assert_eq!(report.rows, 1);
+        }
+    }
+}

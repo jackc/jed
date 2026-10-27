@@ -1139,6 +1139,18 @@ export type { CreateOptions, Locking, OpenOptions, ScratchEncryption } from "./f
 export { DEFAULT_ARGON2_PARAMS } from "./crypto.ts";
 export { DEFAULT_FLUSH_INTERVAL_MS } from "./idle_flush.ts";
 export type { Argon2Params, Credential } from "./crypto.ts";
+// The integrity check (spec/design/integrity-check.md): Database.integrityCheck's options and report,
+// and the registered finding kinds and skip reasons (generated from spec/integrity/findings.toml).
+export { IntegrityKind, IntegritySkipReason } from "./integrity_kinds.ts";
+export type {
+  IntegrityCheckOptions,
+  IntegrityFinding,
+  IntegrityKindName,
+  IntegrityLevel,
+  IntegrityReport,
+  IntegritySkip,
+  IntegritySkipReasonName,
+} from "./integrity.ts";
 // The Environment (spec/design/environment.md): every outside input except storage — loaded Unicode
 // and time-zone data, host functions (extensibility.md §4.2), and the random + clock sources — built
 // by an EnvironmentBuilder and handed to createDatabase/openDatabase via CreateOptions/OpenOptions.

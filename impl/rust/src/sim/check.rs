@@ -2,30 +2,20 @@
 //! of the Go reference (`impl/go/sim_check_test.go`).
 //!
 //! The image checker opens a copy of the disk image the way a new process would — so the meta
-//! selection and manifest validation of validated-cow.md §1 run first — and then walks the selected
-//! generation:
-//!
-//!   - the live page count at meta offset 56 equals the pages reachable from the catalog root, GiST
-//!     R-tree pages included;
-//!   - every reachable page lies in [2, page_count);
-//!   - the free list has no duplicates and is disjoint from the reachable set and from the selected
-//!     generation's manifest dependencies;
-//!   - each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
-//!   - each table's persisted row count equals its leaf total;
-//!   - each column index holds exactly the entries derived from its table's rows.
+//! selection and manifest validation of validated-cow.md §1 run first — checks it holds the expected
+//! version, and then runs the engine's integrity check (spec/design/integrity-check.md) at the `full`
+//! level with no finding limit over the selected generation: reachability and the live page count,
+//! page verification and node structure, key order and primary-key placement, row counts, overflow
+//! chain exclusivity, the free list against the reachable set and the manifest's dependencies, and
+//! each column index against its table. Any finding fails the image.
 
-use crate::catalog::IndexKind;
-use crate::collation::Collation;
-use crate::error::EngineError;
-use crate::executor::{Snapshot, encode_pk_key, index_entry_keys_columns};
-use crate::format::{
-    chain_pages, collect_tree_pages, reachable_pages, sim_open_with_gist, sim_selected_meta,
-};
+use crate::error::{EngineError, SqlState};
+use crate::format::{chain_pages, collect_tree_pages, sim_open_with_gist, sim_selected_meta};
+use crate::integrity::{IntegrityCheckOptions, IntegrityLevel};
+use crate::integrity_kinds as kinds;
 use crate::shared::Database;
-use crate::types::Type;
 use crate::value::{Unfetched, Value};
 use std::collections::HashSet;
-use std::sync::Arc;
 
 /// Why the image checker rejected an image: its message, and the engine error behind it, if any
 /// (a replay step needs to tell an `XX001` from a structural mismatch).
@@ -39,35 +29,12 @@ impl Fail {
         Fail { msg, engine: None }
     }
 
-    /// Wrap an engine error under `ctx` (`"ctx: error"`, or the bare error for an empty `ctx`).
+    /// Wrap an engine error under `ctx` (`"ctx: error"`).
     fn engine(ctx: &str) -> impl Fn(EngineError) -> Fail + '_ {
         move |e| Fail {
-            msg: if ctx.is_empty() {
-                e.to_string()
-            } else {
-                format!("{ctx}: {e}")
-            },
+            msg: format!("{ctx}: {e}"),
             engine: Some(e),
         }
-    }
-
-    fn context(self, ctx: &str) -> Fail {
-        Fail {
-            msg: format!("{ctx}: {}", self.msg),
-            engine: self.engine,
-        }
-    }
-}
-
-impl From<String> for Fail {
-    fn from(msg: String) -> Fail {
-        Fail::msg(msg)
-    }
-}
-
-impl From<&str> for Fail {
-    fn from(msg: &str) -> Fail {
-        Fail::msg(msg.to_string())
     }
 }
 
@@ -102,9 +69,7 @@ fn integrity_checked(
     want: u64,
     credential: Option<&crate::crypto::Credential>,
 ) -> Result<(u32, u32, u32), Fail> {
-    // A GiST R-tree is read whole at load (gist.md §4.1); its pages are the ones the load visits,
-    // which the reachability walk does not list.
-    let (engine, paging, gist) =
+    let (engine, paging, _) =
         sim_open_with_gist(image, credential).map_err(Fail::engine("open"))?;
     let mt = sim_selected_meta(&paging).map_err(Fail::engine("meta"))?;
     if mt.txid != want {
@@ -113,162 +78,46 @@ fn integrity_checked(
             mt.txid, want
         )));
     }
-    let snap = &engine.committed;
-
-    let root = crate::format::PageRef {
-        page: mt.root_page,
-        tag: mt.root_tag,
+    let generation = crate::format::integrity_generation(&paging, mt.txid)
+        .map_err(Fail::engine("meta"))?
+        .ok_or_else(|| Fail::msg("the selected meta slot does not hold its version".into()))?;
+    let opts = IntegrityCheckOptions {
+        level: IntegrityLevel::Full,
+        max_findings: 0,
+        cancel: None,
     };
-    let mut reached =
-        reachable_pages(snap, &paging, root).map_err(Fail::engine("reachability walk"))?;
-    for pg in gist {
-        if !reached.insert(pg) {
-            return Err(format!("GiST page {pg} is reachable twice").into());
+    let report = crate::integrity::run(&engine.committed, &paging, generation, "main", &opts)
+        .map_err(Fail::engine("integrity check"))?;
+    if let Some(f) = report.findings.first() {
+        let msg = format!(
+            "{}{}{}: {}",
+            f.kind,
+            f.object
+                .as_ref()
+                .map_or(String::new(), |o| format!(" in {o}")),
+            f.page.map_or(String::new(), |p| format!(" at page {p}")),
+            f.detail
+        );
+        // A page that does not verify or decode is what an engine read reports as XX001; the
+        // structural findings are not engine errors.
+        let unreadable = [
+            kinds::META_INVALID,
+            kinds::MANIFEST_PAGE_MISMATCH,
+            kinds::CATALOG_PAGE_CORRUPT,
+            kinds::PAGE_CORRUPT,
+            kinds::VALUE_UNDECODABLE,
+            kinds::OVERFLOW_CHAIN_CORRUPT,
+            kinds::FREE_LIST_CORRUPT,
+        ];
+        if unreadable.contains(&f.kind) {
+            return Err(Fail::engine("integrity check")(EngineError::new(
+                SqlState::DataCorrupted,
+                msg,
+            )));
         }
-    }
-    if reached.len() as u32 != mt.live_pages {
-        return Err(format!(
-            "live page count {}, but {} pages are reachable",
-            mt.live_pages,
-            reached.len()
-        )
-        .into());
-    }
-    let mut sorted: Vec<u32> = reached.iter().copied().collect();
-    sorted.sort();
-    // An encrypted file's body pages start after its key block (encrypted.md §1).
-    let first = paging.cap().first_body();
-    for pg in sorted {
-        if pg < first || pg >= mt.page_count {
-            return Err(format!("reachable page {pg} outside [{first}, {})", mt.page_count).into());
-        }
-    }
-    let mut seen: HashSet<u32> = HashSet::new();
-    for &pg in &engine.free_pages {
-        if seen.contains(&pg) {
-            return Err(format!("free page {pg} listed twice").into());
-        }
-        if pg < first || pg >= mt.page_count {
-            return Err(format!("free page {pg} outside [{first}, {})", mt.page_count).into());
-        }
-        if reached.contains(&pg) {
-            return Err(format!("free page {pg} is reachable").into());
-        }
-        if mt.protected.contains(&pg) {
-            return Err(
-                format!("free page {pg} is a dependency of the selected generation").into(),
-            );
-        }
-        seen.insert(pg);
-    }
-
-    let mut claimed: HashSet<u32> = HashSet::new();
-    for name in snap.table_names() {
-        check_table(snap, &name, &paging, &mut claimed)
-            .map_err(|f| f.context(&format!("table {name}")))?;
+        return Err(Fail::msg(msg));
     }
     Ok((mt.live_pages, mt.page_count, engine.free_pages.len() as u32))
-}
-
-/// Also checks chain exclusivity (large-values.md §15): every overflow page the snapshot reaches is
-/// named by exactly one stored value, across all tables (`claimed`). A rewritten record may keep an
-/// unchanged value's chain, but two records of one snapshot never share one.
-fn check_table(
-    snap: &Snapshot,
-    name: &str,
-    paging: &crate::paging::SharedPaging,
-    claimed: &mut HashSet<u32>,
-) -> Result<(), Fail> {
-    let fetch = |p: crate::format::PageRef| paging.read_body(p);
-    let table = snap.table(name).ok_or("no table definition")?;
-    let store = snap.sim_store(name).ok_or("no row store")?;
-    let mut entries = store.iter_entries().map_err(Fail::engine(""))?;
-    let colls: Vec<Option<Arc<Collation>>> = table
-        .columns
-        .iter()
-        .map(|c| c.collation.as_ref().and_then(|n| snap.resolve_collation(n)))
-        .collect();
-    let pk: Vec<(usize, Type)> = table
-        .pk
-        .iter()
-        .map(|&i| (i, table.columns[i].ty.clone()))
-        .collect();
-    let col_types = store.col_types();
-    for i in 0..entries.len() {
-        for v in &entries[i].1 {
-            if let Some((first, len)) = external_ref(v) {
-                let ctx = format!("row {i}: an overflow chain");
-                let pages = chain_pages(first, len as usize, &fetch, paging.cap())
-                    .map_err(Fail::engine(&ctx))?;
-                for pg in pages {
-                    if !claimed.insert(pg) {
-                        return Err(format!("overflow page {pg} is referenced twice").into());
-                    }
-                }
-            }
-        }
-        let ctx = format!("row {i}");
-        store
-            .resolve_all(&mut entries[i].1)
-            .map_err(Fail::engine(&ctx))?;
-        if i > 0 && entries[i - 1].0 >= entries[i].0 {
-            return Err(format!("storage keys out of order at row {i}").into());
-        }
-        if !pk.is_empty() {
-            let want =
-                encode_pk_key(&pk, col_types, &colls, &entries[i].1).map_err(Fail::engine(""))?;
-            if want != entries[i].0 {
-                return Err(
-                    format!("row {i} is stored under a key that is not its primary key").into(),
-                );
-            }
-        }
-    }
-    if let Some(count) = store.count()
-        && count != entries.len() as i64
-    {
-        return Err(format!(
-            "persisted row count {count}, but the tree holds {} rows",
-            entries.len()
-        )
-        .into());
-    }
-    for def in &table.indexes {
-        if def.column_ordinals().is_none()
-            || def.predicate.is_some()
-            || def.kind != IndexKind::Btree
-        {
-            continue; // expression, partial, GIN, and GiST indexes are not generated yet
-        }
-        let mut want: Vec<Vec<u8>> = Vec::new();
-        for (key, row) in &entries {
-            let keys = index_entry_keys_columns(&table.columns, col_types, &colls, def, key, row)
-                .map_err(Fail::engine(""))?;
-            want.extend(keys);
-        }
-        want.sort();
-        let ist = snap
-            .sim_index_store(&def.name)
-            .ok_or_else(|| format!("index {} has no store", def.name))?;
-        let got = ist.iter_entries().map_err(Fail::engine(""))?;
-        if got.len() != want.len() {
-            return Err(format!(
-                "index {} holds {} entries, want {}",
-                def.name,
-                got.len(),
-                want.len()
-            )
-            .into());
-        }
-        for (i, (k, _)) in got.iter().enumerate() {
-            if *k != want[i] {
-                return Err(
-                    format!("index {} entry {i} does not match its table", def.name).into(),
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Check the LIVE process, not a fresh open of its image: every page its committed in-memory trees

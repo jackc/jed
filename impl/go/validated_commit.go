@@ -247,6 +247,20 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 // bounded by the physical file, ids strictly increase, and chain ordinals prevent
 // cycles without a file-sized visited set.
 func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
+	protected, _, valid, err := commitManifestDependencies(m, raw, p.pageSize, p.readBlock)
+	if valid && err == nil {
+		p.manifestProtected = protected
+	}
+	return valid, err
+}
+
+// commitManifestDependencies validates the commit manifest of meta m (raw is its slot's bytes) by
+// reading every page it lists and every manifest-overflow page through read, and returns the pages the
+// generation depends on (its listed pages and manifest pages). When the manifest does not validate it
+// also returns the page whose identity failed — a listed page or a manifest-overflow page — or 0 when
+// the failure is the manifest's own shape (counts, chain digest). It changes no pager state, so the
+// integrity check (spec/design/integrity-check.md §3.1) re-validates a live handle's generation with it.
+func commitManifestDependencies(m meta, raw []byte, pageSize uint32, read func(uint32) ([]byte, error)) (map[uint32]bool, uint32, bool, error) {
 	// An encrypted meta: body pages start past the key block, the inline manifest after the tags, and
 	// a listed page is ciphertext, so only its digest is checked (encrypted.md §6).
 	pcap := capOf(uint32(len(raw)), m.suite != 0)
@@ -255,70 +269,67 @@ func (p *pager) validateCommitManifest(m meta, raw []byte) (bool, error) {
 	last := first - 1
 	seen := uint32(0)
 	rootSeen, freeHeadSeen := false, m.freeListHead == 0
-	validate := func(entries []byte, count uint32) (bool, error) {
+	validate := func(entries []byte, count uint32) (uint32, bool, error) {
 		for i := uint32(0); i < count; i++ {
 			e := entries[int(i)*12:]
 			id := binary.BigEndian.Uint32(e)
 			if id <= last || id >= m.pageCount {
-				return false, nil
+				return id, false, nil
 			}
 			last = id
 			protected[id] = true
 			rootSeen = rootSeen || id == m.rootPage
 			freeHeadSeen = freeHeadSeen || id == m.freeListHead
-			block, err := p.readBlock(id)
+			block, err := read(id)
 			if err != nil {
-				return false, err
+				return 0, false, err
 			}
-			if len(block) != int(p.pageSize) || commitCRC64(0, block) != binary.BigEndian.Uint64(e[4:]) {
-				return false, nil
+			if len(block) != int(pageSize) || commitCRC64(0, block) != binary.BigEndian.Uint64(e[4:]) {
+				return id, false, nil
 			}
 			if !pcap.encrypted() && (block[0] < 1 || block[0] > 7 || pageCRC(block) != binary.BigEndian.Uint32(block[12:16])) {
-				return false, nil
+				return id, false, nil
 			}
 			seen++
 		}
-		return true, nil
+		return 0, true, nil
 	}
 	lo, _ := manifestInlineArea(len(raw), pcap)
 	inline := min(m.dirtyCount, uint32(manifestInlineCapacity(len(raw), pcap)))
-	if ok, err := validate(raw[lo:], inline); !ok || err != nil {
-		return ok, err
+	if bad, ok, err := validate(raw[lo:], inline); !ok || err != nil {
+		return protected, bad, ok, err
 	}
 	id := m.manifestHead
 	chainCRC := uint64(0)
 	for ordinal := uint32(0); ordinal < m.manifestPages; ordinal++ {
 		if id < first || id >= m.pageCount {
-			return false, nil
+			return protected, id, false, nil
 		}
 		protected[id] = true
-		block, err := p.readBlock(id)
+		block, err := read(id)
 		if err != nil {
-			return false, err
+			return protected, 0, false, err
 		}
 		pg, err := parsePage(block)
 		if err != nil {
-			return false, nil
+			return protected, id, false, nil
 		}
 		count := min(m.dirtyCount-seen, uint32(manifestOverflowCapacity(len(block))))
 		if pg.pageType != pageManifest || !zeroBytes(block[1:4]) || pg.itemCount != count ||
 			binary.BigEndian.Uint64(block[16:24]) != m.txid || binary.BigEndian.Uint32(block[24:28]) != ordinal || !zeroBytes(block[28:32]) || !zeroBytes(block[32+12*int(count):]) {
-			return false, nil
+			return protected, id, false, nil
 		}
 		var index [4]byte
 		binary.BigEndian.PutUint32(index[:], id)
 		chainCRC = commitCRC64(chainCRC, index[:])
 		chainCRC = commitCRC64(chainCRC, block)
-		if ok, err := validate(block[32:], count); !ok || err != nil {
-			return ok, err
+		if bad, ok, err := validate(block[32:], count); !ok || err != nil {
+			return protected, bad, ok, err
 		}
 		id = pg.nextPage
 	}
 	valid := id == 0 && seen == m.dirtyCount && chainCRC == m.manifestCRC && (m.dirtyCount == 0 || (rootSeen && freeHeadSeen))
-	if valid {
-		p.manifestProtected = protected
-	}
-	return valid, nil
+	return protected, 0, valid, nil
 }
 
 // manifestChain is the manifest-overflow chain a valid meta names, in chain order — what an encrypted

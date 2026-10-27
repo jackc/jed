@@ -192,6 +192,28 @@ another, the compacted copy is written to a `<name>.jedcompact` file beside the 
 copied over it; if the page closes part way, the next open finishes the copy, so the database is
 never left half-compacted.
 
+## Checking a database (integrity check)
+
+jed verifies every page it reads, so damage surfaces as `XX001` when a query touches it. To check a
+whole database up front — after a crash, a copy or a restore, or before shipping a prebuilt file —
+run an integrity check, jed's version of SQLite's `PRAGMA integrity_check`:
+`db.integrity_check("main", &IntegrityCheckOptions::default())` (Rust),
+`db.IntegrityCheck(ctx, "main", jed.IntegrityCheckOptions{})` (Go) or
+`await db.integrityCheck("main")` (TypeScript). Pass an attachment's name to check that database.
+
+It walks every page reachable from the catalog: page checksums (or authentication tags), B-tree
+shape and key order, each row's values and large-value chains, that each row is stored under its
+primary key, row counts, the free list, and the live page count. The default `full` level also checks
+that each index holds exactly the entries its table's rows produce; `quick` skips that. The check
+reads a snapshot like any reader, so it never blocks writers, and it never writes.
+
+It returns a report rather than failing: a list of findings, each with a stable `kind` (such as
+`page_corrupt`, `row_count_mismatch` or `index_entry_missing`), the table or index it concerns, and
+the page or row key where there is one. An empty list means nothing was found. The check stops after
+100 findings by default (`max_findings` / `MaxFindings` / `maxFindings`) and marks the report
+truncated. It fails only for an unknown database name (`42704`), cancellation (`57014`), or an I/O
+error.
+
 ## Encrypting a database
 
 A file database can be created **encrypted**. Every page except the small header pages is sealed

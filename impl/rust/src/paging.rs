@@ -144,6 +144,41 @@ impl SharedPaging {
         Ok(node)
     }
 
+    /// Whether the leaf at `page` is resident in the pool (the integrity check serves a resident
+    /// leaf from the pool rather than re-reading it, spec/design/integrity-check.md §5.1).
+    pub(crate) fn leaf_resident(&self, page: u32) -> bool {
+        self.pool.contains(page)
+    }
+
+    /// [`fault_leaf`](Self::fault_leaf) for a leaf whose page `block` the caller has already read
+    /// and found to be a leaf: decoded and admitted to the pool as a fault would, without a second
+    /// read.
+    pub(crate) fn fault_leaf_block(
+        self: &Arc<Self>,
+        page: PageRef,
+        col_types: &Arc<Vec<ColType>>,
+        block: Vec<u8>,
+    ) -> Result<Arc<Node>> {
+        let node = self.pool.get_or_load(page.page, move || {
+            crate::format::decode_leaf_node(
+                block,
+                page,
+                Arc::clone(col_types),
+                Arc::downgrade(self),
+                self.cap,
+            )
+        })?;
+        if let Some(packed) = &node.packed
+            && !crate::format::same_leaf_shape(packed.col_types(), col_types)
+        {
+            return Err(crate::error::EngineError::new(
+                crate::error::SqlState::DataCorrupted,
+                "leaf page belongs to a different tree",
+            ));
+        }
+        Ok(node)
+    }
+
     /// Whether scans over this paging read ahead (spec/design/page-service.md §5.3).
     pub(crate) fn batches_reads(&self) -> bool {
         self.batches

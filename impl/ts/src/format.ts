@@ -3744,6 +3744,7 @@ function serializeIncremental(
             cap.tag,
           );
         }
+        snap.gistRoots.set(idx.name, ir);
       } else {
         const iroot = snap.indexStore(idx.name).treeRoot();
         if (iroot !== null) {
@@ -4885,6 +4886,7 @@ function* loadAtMetaSteps(
           );
           for (const key of out) istore.insert(key, []);
           snap.indexStores.set(table.indexes[k]!.name, istore);
+          snap.gistRoots.set(table.indexes[k]!.name, iroot);
           continue;
         }
         istore.attachPaging(paging);
@@ -6758,4 +6760,110 @@ function readHostDeps(buf: Uint8Array, cur: Cursor): HostFuncDep[] {
     deps.push({ name, argTypes, result, componentId, semanticVersion });
   }
   return deps;
+}
+
+// --- integrity-check readers (spec/design/integrity-check.md; integrity.ts) ---
+// The check walks the stored bytes itself, page by page, so it reuses the node codecs below without
+// the resident-tree machinery: each reader throws data_corrupted (XX001) on bytes it cannot decode.
+
+export const PAGE_TYPE_CATALOG = PAGE_CATALOG;
+export const PAGE_TYPE_LEAF = PAGE_LEAF;
+export const PAGE_TYPE_INTERIOR = PAGE_INTERIOR;
+
+// LeafView is a parsed B+tree leaf for the integrity check: its keys (views into the page) and its
+// column regions, from which each value is decoded on demand (decodeLeafValueSteps).
+export type LeafView = { n: number; keys: Uint8Array[]; payload: Uint8Array; dirs: PaxDirs };
+
+// parseLeafView parses a leaf page's payload of n records for colTypes (an index leaf has none).
+export function parseLeafView(payload: Uint8Array, n: number, colTypes: ColType[]): LeafView {
+  const dirs = parsePaxLeaf(payload, n, colTypes);
+  const keys: Uint8Array[] = [];
+  for (let i = 0; i < n; i++) keys.push(paxKey(payload, dirs, i));
+  return { n, keys, payload, dirs };
+}
+
+// leafValueTag reports a stored value's form: null for NULL, "fixed" for an untagged fixed-width slot,
+// else its presence tag byte (TAG_EXTERNAL / TAG_EXTERNAL_COMP name an overflow chain).
+export function leafValueTag(
+  leaf: LeafView,
+  colTypes: ColType[],
+  i: number,
+  c: number,
+): number | "fixed" | null {
+  if (paxIsNull(leaf.payload, leaf.dirs, c, i)) return null;
+  if (fixedValueWidth(colTypes[c]!) !== null) return "fixed";
+  return leaf.payload[paxValueOff(leaf.payload, leaf.dirs, c, i)] ?? null;
+}
+
+// isExternalTag reports whether a presence tag names an overflow chain.
+export function isExternalTag(tag: number | "fixed" | null): boolean {
+  return tag === TAG_EXTERNAL || tag === TAG_EXTERNAL_COMP;
+}
+
+// decodeLeafValueSteps fully decodes record i's column c: an out-of-line value's chain is gathered
+// through fetch (tagLen its chain pages' successor-tag width) and decompressed, and every body is
+// constructed, as a query touching the value would.
+export function* decodeLeafValueSteps(
+  leaf: LeafView,
+  colTypes: ColType[],
+  i: number,
+  c: number,
+  fetch: PageFetch,
+  tagLen: number,
+): Steps<Value> {
+  if (paxIsNull(leaf.payload, leaf.dirs, c, i)) return nullValue();
+  const ty = colTypes[c]!;
+  const cur = { pos: paxValueOff(leaf.payload, leaf.dirs, c, i) };
+  if (fixedValueWidth(ty) !== null) return readInlineBody(ty, leaf.payload, cur, "construct");
+  const v = readValueLazy({ cols: colTypes, idx: c }, leaf.payload, cur, null, tagLen);
+  if (v.kind !== "unfetched") return v;
+  return yield* resolveUnfetchedSteps(ty, v.ref, fetch, tagLen);
+}
+
+// parseInterior parses a B+tree interior page's payload of n separators: its n+1 child pointers and
+// its separator keys (format.md *Interior node*).
+export function parseInterior(
+  payload: Uint8Array,
+  n: number,
+  tagLen: number,
+): { children: TreeRef[]; seps: Uint8Array[] } {
+  const ptr = 4 + tagLen;
+  if ((ptr + 4) * n + ptr > payload.length)
+    throw engineError("data_corrupted", "B-tree interior item count overruns page");
+  const cur = { pos: 0 };
+  const children: TreeRef[] = [];
+  for (let i = 0; i < n + 1; i++) children.push(readPointer(payload, cur, tagLen));
+  return { children, seps: readSeparators(payload, cur, n) };
+}
+
+// chainPayload is a chain page's (catalog, free-list) successor and content (encrypted.md §2).
+export function chainPayload(
+  pg: Page,
+  tagLen: number,
+): { next: number; nextTag: Uint8Array; content: Uint8Array } {
+  return chainContent(pg, tagLen);
+}
+
+// CatalogImagePage is one page of the catalog chain a snapshot encodes to.
+export type CatalogImagePage = CatalogPage;
+
+// catalogImagePages is the catalog chain snap encodes to (format.md *Catalog*) with its trees at the
+// pages the snapshot's committed stores name: each table and B-tree index store's root, and each GiST
+// index's root as the snapshot recorded it (Snapshot.gistRoots). It is the chain the commit that
+// published snap wrote, so the integrity check compares the stored chain against it.
+export function catalogImagePages(snap: Snapshot, cap: Cap): CatalogImagePage[] {
+  const keys = [...snap.tables.keys()].sort(compareTextC);
+  const ref = (n: PNode | null): TreeRef =>
+    n === null || n.page === 0 ? NO_TREE : { page: n.page, tag: n.tag ?? NO_TAG };
+  const rootDataPage = keys.map((k) => ref(snap.stores.get(k)!.treeRoot()));
+  const indexRoots = keys.map((k) =>
+    snap.tables
+      .get(k)!
+      .indexes.map((idx) =>
+        idx.kind === "gist"
+          ? (snap.gistRoots.get(idx.name) ?? NO_TREE)
+          : ref(snap.indexStore(idx.name).treeRoot()),
+      ),
+  );
+  return catalogLayout(catalogEntries(snap, keys, rootDataPage, indexRoots, cap), capChain(cap));
 }

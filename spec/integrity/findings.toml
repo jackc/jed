@@ -270,4 +270,4 @@ description = "The table's tree had a finding that left rows unread, so its inde
 
 [[skip]]
 reason = "index_unreadable"
-description = "The index's tree had a finding that left entries unread, so its agreement is not checked."
+description = "The index's walk reported a finding (even one that left it readable), so its agreement is not checked."

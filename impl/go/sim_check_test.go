@@ -2,21 +2,17 @@ package jed
 
 // The deterministic-simulation integrity checker (spec/design/simulation-testing.md §8.3). It opens
 // a copy of the disk image the way a new process would — so the meta selection and manifest
-// validation of validated-cow.md §1 run first — and then walks the selected generation:
-//
-//   - the live page count at meta offset 56 equals the pages reachable from the catalog root, GiST
-//     R-tree pages included;
-//   - every reachable page lies in [2, page_count);
-//   - the free list has no duplicates and is disjoint from the reachable set and from the selected
-//     generation's manifest dependencies;
-//   - each table's storage keys ascend strictly and equal the primary-key encoding of their rows;
-//   - each table's persisted row count equals its leaf total;
-//   - each column index holds exactly the entries derived from its table's rows.
+// validation of validated-cow.md §1 run first — checks that the selected generation is the expected
+// version, and runs the engine's integrity check (spec/design/integrity-check.md) over it at the full
+// level with no finding limit: page verification, tree shape, key order and primary keys, row counts,
+// overflow chains (one record per chain, large-values.md §15), index agreement, the free list, and the
+// live page count. Any finding fails the step with XX001.
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, free uint32, err error) {
@@ -28,11 +24,7 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 	if err := unlockPager(p, cred, env); err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
-	// A GiST R-tree is read whole at load (gist.md §4.1); its pages are the ones the load visits, which
-	// the reachability walk does not list.
-	var gist []uint32
-	e, err := loadEngineSharedPagingAt(newSharedPaging(p, cacheLeaves(defaultCacheBytes, p.pageSize)), env,
-		loadAt{gist: func(pg uint32) { gist = append(gist, pg) }})
+	e, err := loadEngineSharedPaging(newSharedPaging(p, cacheLeaves(defaultCacheBytes, p.pageSize)), env)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("open: %w", err)
 	}
@@ -43,146 +35,30 @@ func simIntegrity(image []byte, want uint64, cred *Credential) (live, pages, fre
 	if mt.txid != want {
 		return 0, 0, 0, fmt.Errorf("the image holds version %d, want %d", mt.txid, want)
 	}
-	snap := e.committed
-
-	reached, err := snap.reachablePages(e.paging, pageRef{page: mt.rootPage, tag: mt.rootTag})
+	gen := integrityGeneration{meta: mt, file: true, protected: p.manifestProtected}
+	k := newIntegrityChecker(context.Background(), "main", IntegrityCheckOptions{MaxFindings: IntegrityUnlimited}, e.committed, e.paging, gen)
+	report, err := k.run(nil)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("reachability walk: %w", err)
+		return 0, 0, 0, fmt.Errorf("integrity check: %w", err)
 	}
-	for _, pg := range gist {
-		if reached[pg] {
-			return 0, 0, 0, fmt.Errorf("GiST page %d is reachable twice", pg)
+	if !report.OK() {
+		var lines []string
+		for _, f := range report.Findings {
+			line := f.Kind
+			if f.Object != "" {
+				line += " " + f.Object
+			}
+			if f.Page != nil {
+				line += fmt.Sprintf(" page %d", *f.Page)
+			}
+			if f.Key != nil {
+				line += fmt.Sprintf(" key %x", f.Key)
+			}
+			lines = append(lines, line+": "+f.Detail)
 		}
-		reached[pg] = true
-	}
-	if uint32(len(reached)) != mt.livePages {
-		return 0, 0, 0, fmt.Errorf("live page count %d, but %d pages are reachable", mt.livePages, len(reached))
-	}
-	// An encrypted file's body pages start after its key block (encrypted.md §1).
-	first := e.paging.cap().firstBody()
-	for pg := range reached {
-		if pg < first || pg >= mt.pageCount {
-			return 0, 0, 0, fmt.Errorf("reachable page %d outside [%d, %d)", pg, first, mt.pageCount)
-		}
-	}
-	seen := make(map[uint32]bool, len(e.freePages))
-	for _, pg := range e.freePages {
-		switch {
-		case seen[pg]:
-			return 0, 0, 0, fmt.Errorf("free page %d listed twice", pg)
-		case pg < first || pg >= mt.pageCount:
-			return 0, 0, 0, fmt.Errorf("free page %d outside [%d, %d)", pg, first, mt.pageCount)
-		case reached[pg]:
-			return 0, 0, 0, fmt.Errorf("free page %d is reachable", pg)
-		case p.manifestProtected[pg]:
-			return 0, 0, 0, fmt.Errorf("free page %d is a dependency of the selected generation", pg)
-		}
-		seen[pg] = true
-	}
-
-	names := make([]string, 0, len(snap.tables))
-	for name := range snap.tables {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	claimed := map[uint32]bool{}
-	for _, name := range names {
-		if err := simCheckTable(snap, name, e.paging, claimed); err != nil {
-			return 0, 0, 0, fmt.Errorf("table %s: %w", name, err)
-		}
+		return 0, 0, 0, newError(DataCorrupted, "integrity check: "+strings.Join(lines, "; "))
 	}
 	return mt.livePages, mt.pageCount, uint32(len(e.freePages)), nil
-}
-
-// simCheckTable also checks chain exclusivity (large-values.md §15): every overflow page the snapshot
-// reaches is named by exactly one stored value, across all tables (claimed). A rewritten record may
-// keep an unchanged value's chain, but two records of one snapshot never share one.
-func simCheckTable(snap *snapshot, name string, paging *sharedPaging, claimed map[uint32]bool) error {
-	fetch := paging.readBody
-	table := snap.tables[name]
-	store := snap.stores[name]
-	if store == nil {
-		return fmt.Errorf("no row store")
-	}
-	entries, err := store.EntriesInKeyOrder()
-	if err != nil {
-		return err
-	}
-	colls := make([]*Collation, len(table.Columns))
-	for i, c := range table.Columns {
-		if c.Collation != "" {
-			colls[i] = snap.resolveCollation(c.Collation)
-		}
-	}
-	for i := range entries {
-		for _, v := range entries[i].Row {
-			first, length, ok := simExternalRef(v)
-			if !ok {
-				continue
-			}
-			pages, err := chainPages(first, length, fetch, paging.cap())
-			if err != nil {
-				return fmt.Errorf("row %d: an overflow chain: %w", i, err)
-			}
-			for _, pg := range pages {
-				if claimed[pg] {
-					return fmt.Errorf("overflow page %d is referenced twice", pg)
-				}
-				claimed[pg] = true
-			}
-		}
-		row, err := store.resolveAll(entries[i].Row)
-		if err != nil {
-			return fmt.Errorf("row %d: %w", i, err)
-		}
-		entries[i].Row = row
-		if i > 0 && bytes.Compare(entries[i-1].Key, entries[i].Key) >= 0 {
-			return fmt.Errorf("storage keys out of order at row %d", i)
-		}
-		if len(table.PK) > 0 {
-			want, err := encodePkKey(store.colTypes, table.PK, colls, row)
-			if err != nil {
-				return err
-			}
-			if !bytes.Equal(want, entries[i].Key) {
-				return fmt.Errorf("row %d is stored under a key that is not its primary key", i)
-			}
-		}
-	}
-	if count, known := store.Count(); known && count != int64(len(entries)) {
-		return fmt.Errorf("persisted row count %d, but the tree holds %d rows", count, len(entries))
-	}
-	for _, def := range table.Indexes {
-		if def.columnOrdinals() == nil || def.Predicate != nil || def.Kind != indexBtree {
-			continue // expression, partial, GIN, and GiST indexes are not generated yet
-		}
-		var want [][]byte
-		for _, e := range entries {
-			keys, err := indexEntryKeysColumns(table.Columns, store.colTypes, colls, def, e.Key, e.Row)
-			if err != nil {
-				return err
-			}
-			want = append(want, keys...)
-		}
-		sort.Slice(want, func(a, b int) bool { return bytes.Compare(want[a], want[b]) < 0 })
-		ist := snap.indexStores[def.Name]
-		if ist == nil {
-			return fmt.Errorf("index %s has no store", def.Name)
-		}
-		got, err := ist.EntriesInKeyOrder()
-		if err != nil {
-			return err
-		}
-		if len(got) != len(want) {
-			return fmt.Errorf("index %s holds %d entries, want %d", def.Name, len(got), len(want))
-		}
-		for i := range got {
-			if !bytes.Equal(got[i].Key, want[i]) {
-				return fmt.Errorf("index %s entry %d does not match its table", def.Name, i)
-			}
-		}
-	}
-	return nil
 }
 
 // simCheckLive checks the LIVE process, not a fresh open of its image: every page its committed

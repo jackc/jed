@@ -303,6 +303,10 @@ type storage struct {
 	// live is the live-page accounting of a file-backed domain's committed state (memory.md §8.7);
 	// unused for an in-memory domain.
 	live liveCount
+	// stagedTxid is the version of the last in-memory commit this domain adopted (adoptStagedLocked),
+	// whose catalog root budget.lastCatRoot records: the integrity check matches its pinned snapshot to
+	// that root (spec/design/integrity-check.md §3.1). Unused for a file, whose meta carries both.
+	stagedTxid uint64
 	// spilled is whether this temp domain has migrated from its in-RAM store to a scratch file in the
 	// host spill directory (temp-tables.md §6). Once spilled it stays spilled; its pool is then bounded
 	// by tempBuffers instead of pinned. Always false for a main or attached domain.
@@ -1436,6 +1440,7 @@ func (st *storage) stageInMemoryLocked(snap *snapshot, budget *budgetCtx, name s
 func (st *storage) adoptStagedLocked(snap *snapshot, staged stagedCommit, canReclaim bool) error {
 	st.pageCount = staged.pageCount
 	st.budget.record(staged)
+	st.stagedTxid = snap.txid
 	st.freePages = staged.freeRemaining
 	return st.maybeCompact(snap, staged.root, staged.written, canReclaim)
 }
