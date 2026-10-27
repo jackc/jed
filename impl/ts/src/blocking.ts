@@ -16,29 +16,131 @@ import { hashRowBytes, keyBytes, rowBytes } from "./memsize.ts";
 import { decodeSpillRow, encodeSpillRow, type SpillScratch, type SpillSink } from "./spill.ts";
 import type { Row } from "./storage.ts";
 
-function u64(value: number): Uint8Array {
+// Appended scratch bytes gather in a buffer, written once it fills; the buffer starts small and doubles
+// to this fixed bound, so a structure holds one bounded I/O buffer however much it spills.
+const TAIL_BYTES = 64 * 1024;
+// A sequential reader takes scratch in chunks of this many bytes.
+const READ_CHUNK = 64 * 1024;
+
+// BufferedScratch is a spilled structure's scratch file with its appends buffered. Reads and rewrites
+// see buffered bytes as if written.
+class BufferedScratch {
+  private file: SpillScratch;
+  // File bytes [tailStart, tailStart + tailLength) are still in tail, unwritten.
+  private tail = new Uint8Array(4096);
+  private tailStart = 0;
+  private tailLength = 0;
+  constructor(file: SpillScratch) {
+    this.file = file;
+  }
+  get end(): number {
+    return this.tailStart + this.tailLength;
+  }
+  private flush(): void {
+    if (this.tailLength === 0) return;
+    this.file.write(this.tailStart, this.tail.subarray(0, this.tailLength));
+    this.tailStart += this.tailLength;
+    this.tailLength = 0;
+  }
+  // read is a copy of bytes [at, at + length), all before end.
+  read(at: number, length: number): Uint8Array {
+    if (at >= this.tailStart)
+      return this.tail.slice(at - this.tailStart, at - this.tailStart + length);
+    if (at + length > this.tailStart) this.flush();
+    return this.file.read(at, length);
+  }
+  // overwrite replaces bytes already written.
+  overwrite(at: number, bytes: Uint8Array): void {
+    if (at >= this.tailStart) {
+      this.tail.set(bytes, at - this.tailStart);
+      return;
+    }
+    if (at + bytes.length > this.tailStart) this.flush();
+    this.file.write(at, bytes);
+  }
+  // append adds bytes at the end and returns their offset.
+  append(bytes: Uint8Array): number {
+    const at = this.end;
+    const need = this.tailLength + bytes.length;
+    if (need > this.tail.length && this.tail.length < TAIL_BYTES) {
+      const grown = new Uint8Array(Math.min(TAIL_BYTES, Math.max(need, this.tail.length * 2)));
+      grown.set(this.tail.subarray(0, this.tailLength));
+      this.tail = grown;
+    }
+    if (need > this.tail.length) {
+      this.flush();
+      if (bytes.length > this.tail.length) {
+        this.file.write(at, bytes);
+        this.tailStart += bytes.length;
+        return at;
+      }
+    }
+    this.tail.set(bytes, this.tailLength);
+    this.tailLength += bytes.length;
+    return at;
+  }
+  // reserve adds `length` zero bytes at the end and returns their offset. Writing the last eight
+  // extends the file over them; the rest read as zeros.
+  reserve(length: number): number {
+    this.flush();
+    const at = this.tailStart;
+    this.file.write(at + length - 8, new Uint8Array(8));
+    this.tailStart += length;
+    return at;
+  }
+  close(): void {
+    this.tail = new Uint8Array(0);
+    this.tailLength = 0;
+    this.file.close();
+  }
+}
+
+// ChunkReader reads a scratch region front to back a chunk at a time. A view it returns is valid until
+// the next call.
+class ChunkReader {
+  private scratch: BufferedScratch;
+  private limit: number;
+  private chunk: Uint8Array = new Uint8Array(0);
+  private chunkStart = 0;
+  constructor(scratch: BufferedScratch, limit: number) {
+    this.scratch = scratch;
+    this.limit = limit;
+  }
+  bytes(at: number, length: number): Uint8Array {
+    const from = at - this.chunkStart;
+    if (from < 0 || from + length > this.chunk.length) {
+      this.chunkStart = at;
+      this.chunk = this.scratch.read(at, Math.max(length, Math.min(READ_CHUNK, this.limit - at)));
+      return this.chunk.subarray(0, length);
+    }
+    return this.chunk.subarray(from, from + length);
+  }
+}
+
+function u32At(bytes: Uint8Array, at: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.length).getUint32(at, true);
+}
+function f64At(bytes: Uint8Array, at: number): number {
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.length).getFloat64(at, true);
+}
+function f64(value: number): Uint8Array {
   const out = new Uint8Array(8);
-  new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
+  new DataView(out.buffer).setFloat64(0, value, true);
   return out;
 }
-function numberAt(file: SpillScratch, at: number): number {
-  const bytes = file.read(at, 8);
-  return Number(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true));
-}
-function writeRecord(file: SpillScratch, row: Row): number {
+// A record is a u32 length and an encoded row, after `prefix` bytes the caller fills.
+function record(row: Row, prefix = 0): Uint8Array {
   const bytes = encodeSpillRow(row);
-  const at = file.size;
-  file.write(at, u64(bytes.length));
-  file.write(at + 8, bytes);
-  return at;
+  const out = new Uint8Array(prefix + 4 + bytes.length);
+  new DataView(out.buffer).setUint32(prefix, bytes.length, true);
+  out.set(bytes, prefix + 4);
+  return out;
 }
-function readRecord(file: SpillScratch, at: number): Row {
-  return decodeSpillRow(file.read(at + 8, numberAt(file, at)));
-}
+
 export class RowSpool implements Iterable<Row> {
   private rows: Row[] = [];
   private bytes = 0;
-  private file: SpillScratch | null = null;
+  private file: BufferedScratch | null = null;
   private budget: number;
   private sink: SpillSink;
   // The resident rows' query-memory charge: row_bytes per resident row, returned when the spool spills,
@@ -53,7 +155,7 @@ export class RowSpool implements Iterable<Row> {
   push(row: Row): void {
     if (this.file !== null) {
       this.length++;
-      writeRecord(this.file, row);
+      this.file.append(record(row));
       return;
     }
     // The spool spills when its residency exceeds work_mem or when the account rejects the row — the
@@ -64,8 +166,8 @@ export class RowSpool implements Iterable<Row> {
     this.rows.push(row);
     this.bytes += bytes;
     if (rejected || this.bytes > this.budget) {
-      this.file = this.sink.createScratch!();
-      for (const buffered of this.rows) writeRecord(this.file, buffered);
+      this.file = new BufferedScratch(this.sink.createScratch!());
+      for (const buffered of this.rows) this.file.append(record(buffered));
       this.rows = [];
       this.bytes = 0;
       // The rows left memory: the spool's whole resident charge goes with them.
@@ -77,11 +179,12 @@ export class RowSpool implements Iterable<Row> {
       yield* this.rows;
       return;
     }
-    const size = this.file.size;
+    const size = this.file.end;
+    const reader = new ChunkReader(this.file, size);
     for (let at = 0; at < size; ) {
-      const length = numberAt(this.file, at);
-      yield decodeSpillRow(this.file.read(at + 8, length));
-      at += 8 + length;
+      const length = u32At(reader.bytes(at, 4), 0);
+      yield decodeSpillRow(reader.bytes(at + 4, length));
+      at += 4 + length;
     }
   }
   // release returns the resident charge now — the spool (or its reader) is discarded at this stage
@@ -97,7 +200,6 @@ export class RowSpool implements Iterable<Row> {
   }
 }
 
-const PARTITIONS = 4096;
 const textEncoder = new TextEncoder();
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -114,22 +216,76 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-// A key's place in a spilled SpillMap's directory: its encoded bytes, hash, bucket offset, and node
-// offset (0 while absent).
-type Located = { key: string; bytes: Uint8Array; hash: number; bucket: number; node: number };
+// A spilled SpillMap's scratch is a linear-hashing table. Placement is private: lookups compare the
+// complete canonical key, and callers keep their own visitation order.
+//   directory: bucket heads (f64 node offsets, 0 = empty) in segments. Segment 0 holds
+//     INITIAL_BUCKETS heads at offset 0; segment k ≥ 1 holds INITIAL_BUCKETS·2^(k-1) heads and is
+//     reserved at the end of the file when a split first needs it. Only the segment offsets are
+//     resident, at most MAX_SEGMENTS of them, so the metadata stays fixed however many keys spill.
+//   node: next f64 | value block offset f64 | value capacity u32 | key length u32 | hash u32 | 0 u32 |
+//     key bytes | its first value block
+//   value block: length u32 | encoded row, in a reserved capacity a replacement reuses when it fits.
+// Each new key may split one bucket, so chains average at most MAX_LOAD nodes and a lookup reads one
+// head and about one node. A skewed bucket (one hash for every key) still streams one node at a time.
+const INITIAL_BUCKETS = 4096;
+// 4096·2^20 = 2^32 buckets: every 32-bit hash has its own, so splitting stops there.
+const MAX_SEGMENTS = 21;
+const MAX_LOAD = 1;
+const NODE_HEADER = 32;
+// A node read also takes this many bytes past the key, so a small first value block arrives with it.
+const PEEK = 64;
+// Keys up to this many bytes are read with their node's header.
+const INLINE_KEY = 4096;
 
-// The disk directory is fixed-size; its chains stream one record at a time even if every key
-// hashes to one partition. Existing keys replace a value pointer, so repeated updates never grow
-// a resident directory or a chain of stale versions. A single value can exceed work_mem.
+// valueBlock is a value block holding `encoded` in `capacity` bytes.
+function valueBlock(encoded: Uint8Array, capacity: number): Uint8Array {
+  const block = new Uint8Array(4 + capacity);
+  new DataView(block.buffer).setUint32(0, encoded.length, true);
+  block.set(encoded, 4);
+  return block;
+}
+// mix32 avalanches keyHash's bits, so linear hashing's low-bit bucket addresses spread evenly.
+function mix32(hash: number): number {
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x85ebca6b);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 0xc2b2ae35);
+  hash ^= hash >>> 16;
+  return hash >>> 0;
+}
+
+// A key's place in a spilled SpillMap: its encoded bytes, hash, bucket and that bucket's head, and its
+// node (0 while absent) with the node's value block offset, capacity, and encoded value once read.
+type Located = {
+  key: string;
+  bytes: Uint8Array;
+  hash: number;
+  bucket: number;
+  head: number;
+  node: number;
+  valueAt: number;
+  capacity: number;
+  value: Uint8Array | null;
+};
+
+// Existing keys rewrite their value block in place, or move it when it outgrows its capacity, so
+// repeated updates never grow a resident directory or a chain of stale versions. A single value can
+// exceed work_mem.
 export class SpillMap {
   // Each resident entry keeps its measured key and value bytes, so a replacement charges the growth.
   private memory = new KeyMap<{ value: Row; keyLen: number; valueLen: number }>();
   private bytes = 0;
-  private file: SpillScratch | null = null;
+  private file: BufferedScratch | null = null;
   private sink: SpillSink;
   private budget: number;
   // The resident entries' query-memory charge, returned on spill or discard.
   private charge: StateCharge;
+  // The spilled table has base + split buckets; each bucket below split has been split into itself
+  // and itself + base. keys counts the spilled keys.
+  private base = INITIAL_BUCKETS;
+  private split = 0;
+  private keys = 0;
+  private segments: number[] = [];
   // The last disk lookup, so a get then set of one key (a GROUP BY state update, an insert) encodes,
   // hashes, and walks its chain once.
   private located: Located | null = null;
@@ -138,31 +294,80 @@ export class SpillMap {
     this.sink = sink;
     this.charge = charge;
   }
+  private headAt(bucket: number): number {
+    if (bucket < INITIAL_BUCKETS) return bucket * 8;
+    const segment = 32 - Math.clz32(Math.floor(bucket / INITIAL_BUCKETS));
+    return this.segments[segment]! + (bucket - INITIAL_BUCKETS * 2 ** (segment - 1)) * 8;
+  }
+  private head(bucket: number): number {
+    return f64At(this.file!.read(this.headAt(bucket), 8), 0);
+  }
+  private address(hash: number): number {
+    const bucket = hash % this.base;
+    return bucket < this.split ? hash % (this.base * 2) : bucket;
+  }
   private locate(key: string): Located {
     const last = this.located;
     if (last !== null && last.key === key) return last;
     const file = this.file!;
     const bytes = textEncoder.encode(key);
-    const hash = keyHash(key) >>> 0;
-    const bucket = (hash % PARTITIONS) * 8;
-    let node = numberAt(file, bucket);
-    while (node !== 0) {
-      const keyLength = numberAt(file, node + 16);
+    const hash = mix32(keyHash(key));
+    const bucket = this.address(hash);
+    const head = this.head(bucket);
+    const loc: Located = {
+      key,
+      bytes,
+      hash,
+      bucket,
+      head,
+      node: 0,
+      valueAt: 0,
+      capacity: 0,
+      value: null,
+    };
+    const end = file.end;
+    // A short key's node read takes the header, a key of this length, and often the first value
+    // block; a long key is read only when the hash and length match.
+    const inline = bytes.length <= INLINE_KEY;
+    for (let node = head; node !== 0; ) {
+      const want = inline ? NODE_HEADER + bytes.length + PEEK : NODE_HEADER;
+      const found = file.read(node, Math.min(want, end - node));
+      const view = new DataView(found.buffer, found.byteOffset, found.length);
       if (
-        numberAt(file, node + 24) === hash &&
-        keyLength === bytes.length &&
-        equalBytes(file.read(node + 32, keyLength), bytes)
-      )
+        view.getUint32(24, true) === hash &&
+        view.getUint32(20, true) === bytes.length &&
+        equalBytes(
+          inline
+            ? found.subarray(NODE_HEADER, NODE_HEADER + bytes.length)
+            : file.read(node + NODE_HEADER, bytes.length),
+          bytes,
+        )
+      ) {
+        loc.node = node;
+        loc.valueAt = view.getFloat64(8, true);
+        loc.capacity = view.getUint32(16, true);
+        const within = loc.valueAt - node;
+        if (within + 4 <= found.length) {
+          const length = view.getUint32(within, true);
+          if (within + 4 + length <= found.length)
+            loc.value = found.subarray(within + 4, within + 4 + length);
+        }
         break;
-      node = numberAt(file, node);
+      }
+      node = view.getFloat64(0, true);
     }
-    this.located = { key, bytes, hash, bucket, node };
-    return this.located;
+    this.located = loc;
+    return loc;
   }
   get(key: string): Row | undefined {
     if (this.file === null) return this.memory.get(key)?.value;
-    const { node } = this.locate(key);
-    return node === 0 ? undefined : readRecord(this.file, numberAt(this.file, node + 8));
+    const loc = this.locate(key);
+    if (loc.node === 0) return undefined;
+    if (loc.value === null) {
+      const block = this.file.read(loc.valueAt, 4 + loc.capacity);
+      loc.value = block.subarray(4, 4 + u32At(block, 0));
+    }
+    return decodeSpillRow(loc.value);
   }
   // set stores `value` under the canonical `key`. keyLen is key_bytes of the logical key row and
   // valueLen key_bytes of the logical value (memory.md §6.6): a new entry is resident as ENTRY + keyLen
@@ -178,8 +383,8 @@ export class SpillMap {
       this.memory.set(key, { value, keyLen: old?.keyLen ?? keyLen, valueLen });
       this.bytes += delta;
       if (!rejected && this.bytes <= this.budget) return;
-      this.file = this.sink.createScratch!();
-      this.file.write(0, new Uint8Array(PARTITIONS * 8));
+      this.file = new BufferedScratch(this.sink.createScratch!());
+      this.segments.push(this.file.reserve(INITIAL_BUCKETS * 8));
       // The entries left memory: the map's whole resident charge goes with them.
       this.charge.releaseAll();
       for (const [k, v] of this.memory) this.write(k, v.value);
@@ -198,19 +403,78 @@ export class SpillMap {
   private write(key: string, value: Row): void {
     const file = this.file!;
     const loc = this.locate(key);
-    const record = writeRecord(file, value);
+    const encoded = encodeSpillRow(value);
+    loc.value = encoded;
     if (loc.node !== 0) {
-      file.write(loc.node + 8, u64(record));
+      if (encoded.length <= loc.capacity) {
+        file.overwrite(loc.valueAt, valueBlock(encoded, encoded.length));
+        return;
+      }
+      // The value outgrew its block: move it to a new one with room to grow.
+      loc.capacity = encoded.length + (encoded.length >>> 1);
+      loc.valueAt = file.append(valueBlock(encoded, loc.capacity));
+      const pointer = new Uint8Array(12);
+      const view = new DataView(pointer.buffer);
+      view.setFloat64(0, loc.valueAt, true);
+      view.setUint32(8, loc.capacity, true);
+      file.overwrite(loc.node + 8, pointer);
       return;
     }
-    const at = file.size;
-    file.write(at, u64(numberAt(file, loc.bucket)));
-    file.write(at + 8, u64(record));
-    file.write(at + 16, u64(loc.bytes.length));
-    file.write(at + 24, u64(loc.hash));
-    file.write(at + 32, loc.bytes);
-    file.write(loc.bucket, u64(at));
-    loc.node = at;
+    const keyLength = loc.bytes.length;
+    const node = new Uint8Array(NODE_HEADER + keyLength + 4 + encoded.length);
+    const view = new DataView(node.buffer);
+    const at = file.end;
+    view.setFloat64(0, loc.head, true);
+    view.setFloat64(8, at + NODE_HEADER + keyLength, true);
+    view.setUint32(16, encoded.length, true);
+    view.setUint32(20, keyLength, true);
+    view.setUint32(24, loc.hash, true);
+    node.set(loc.bytes, NODE_HEADER);
+    view.setUint32(NODE_HEADER + keyLength, encoded.length, true);
+    node.set(encoded, NODE_HEADER + keyLength + 4);
+    file.append(node);
+    file.overwrite(this.headAt(loc.bucket), f64(at));
+    loc.head = loc.node = at;
+    loc.valueAt = at + NODE_HEADER + keyLength;
+    loc.capacity = encoded.length;
+    if (++this.keys > MAX_LOAD * (this.base + this.split)) this.splitBucket();
+  }
+  // splitBucket divides bucket `split` between itself and split + base by the next hash bit, keeping
+  // each node's relative order and rewriting only the links that change.
+  private splitBucket(): void {
+    const file = this.file!;
+    const from = this.split;
+    const to = this.base + from;
+    if (to === INITIAL_BUCKETS * 2 ** (this.segments.length - 1)) {
+      if (this.segments.length === MAX_SEGMENTS) return;
+      this.segments.push(file.reserve(to * 8));
+    }
+    const original = this.head(from);
+    // Each list's first node, last node, and that last node's link as written.
+    const lists = [
+      { first: 0, last: 0, link: 0 },
+      { first: 0, last: 0, link: 0 },
+    ];
+    for (let node = original; node !== 0; ) {
+      const header = file.read(node, NODE_HEADER);
+      const next = f64At(header, 0);
+      const list = lists[u32At(header, 24) % (this.base * 2) === from ? 0 : 1]!;
+      if (list.last === 0) list.first = node;
+      else if (list.link !== node) file.overwrite(list.last, f64(node));
+      list.last = node;
+      list.link = next;
+      node = next;
+    }
+    for (const list of lists)
+      if (list.last !== 0 && list.link !== 0) file.overwrite(list.last, f64(0));
+    if (lists[0]!.first !== original) file.overwrite(this.headAt(from), f64(lists[0]!.first));
+    if (lists[1]!.first !== 0) file.overwrite(this.headAt(to), f64(lists[1]!.first));
+    if (++this.split === this.base) {
+      this.base *= 2;
+      this.split = 0;
+    }
+    // Bucket addresses moved.
+    this.located = null;
   }
   // release returns the resident charge now — the map is discarded at this stage boundary.
   release(): void {
@@ -230,7 +494,7 @@ export class SpillMap {
 export class SpillMultiMap {
   // The disk-chain index (used only once spilled): uncharged, since a spilled table reserves nothing.
   private index: SpillMap;
-  private file: SpillScratch | null = null;
+  private file: BufferedScratch | null = null;
   private memory = new KeyMap<Row[]>();
   private bytes = 0;
   private budget: number;
@@ -254,8 +518,9 @@ export class SpillMultiMap {
       else rows.push(row);
       this.bytes += bytes;
       if (!rejected && this.bytes <= this.budget) return;
-      this.file = this.sink.createScratch!();
-      this.file.write(0, u64(0));
+      this.file = new BufferedScratch(this.sink.createScratch!());
+      // Offset 0 ends a chain, so no row record starts there.
+      this.file.append(new Uint8Array(8));
       // The rows left memory: the table's whole resident charge goes with them.
       this.charge.releaseAll();
       for (const [k, bucket] of this.memory) for (const r of bucket) this.appendDisk(k, r);
@@ -265,14 +530,14 @@ export class SpillMultiMap {
     }
     this.appendDisk(key, row);
   }
+  // Each chained row is a next-row link (f64, 0 at the end) and a record.
   private appendDisk(key: string, row: Row): void {
     const file = this.file!;
     const previous = this.index.get(key);
-    const at = file.size;
-    file.write(at, u64(0));
-    writeRecord(file, row);
+    const at = file.append(record(row, 8));
     const first = previous === undefined ? at : Number((previous[0]! as { int: bigint }).int);
-    if (previous !== undefined) file.write(Number((previous[1]! as { int: bigint }).int), u64(at));
+    if (previous !== undefined)
+      file.overwrite(Number((previous[1]! as { int: bigint }).int), f64(at));
     this.index.set(key, [
       { kind: "int", int: BigInt(first) },
       { kind: "int", int: BigInt(at) },
@@ -287,9 +552,9 @@ export class SpillMultiMap {
     if (bounds === undefined) return;
     let at = Number((bounds[0]! as { int: bigint }).int);
     while (at !== 0) {
-      const next = numberAt(this.file, at);
-      yield readRecord(this.file, at + 8);
-      at = next;
+      const header = this.file.read(at, 12);
+      yield decodeSpillRow(this.file.read(at + 12, u32At(header, 8)));
+      at = f64At(header, 0);
     }
   }
   // release returns the resident charge now — the table is discarded at this stage boundary.

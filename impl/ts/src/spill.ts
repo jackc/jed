@@ -362,8 +362,13 @@ class RunSource implements MergeSource {
 
 // ByteWriter is a growable little-endian byte buffer for serializing one run.
 class ByteWriter {
-  private buf = new Uint8Array(1024);
+  private buf: Uint8Array;
+  private view: DataView;
   private len = 0;
+  constructor(capacity = 1024) {
+    this.buf = new Uint8Array(capacity);
+    this.view = new DataView(this.buf.buffer);
+  }
   private ensure(n: number): void {
     if (this.len + n <= this.buf.length) return;
     let cap = this.buf.length * 2;
@@ -371,6 +376,7 @@ class ByteWriter {
     const nb = new Uint8Array(cap);
     nb.set(this.buf.subarray(0, this.len));
     this.buf = nb;
+    this.view = new DataView(nb.buffer);
   }
   u8(b: number): void {
     this.ensure(1);
@@ -383,16 +389,14 @@ class ByteWriter {
     this.u8(n >>> 24);
   }
   u64(n: bigint): void {
-    let x = BigInt.asUintN(64, n);
-    for (let i = 0; i < 8; i++) {
-      this.u8(Number(x & 0xffn));
-      x >>= 8n;
-    }
+    this.ensure(8);
+    this.view.setBigUint64(this.len, BigInt.asUintN(64, n), true);
+    this.len += 8;
   }
   f64(n: number): void {
-    const dv = new DataView(new ArrayBuffer(8));
-    dv.setFloat64(0, n, true); // little-endian, matching this format's u32/u64
-    this.raw(new Uint8Array(dv.buffer));
+    this.ensure(8);
+    this.view.setFloat64(this.len, n, true); // little-endian, matching this format's u32/u64
+    this.len += 8;
   }
   f32(n: number): void {
     const dv = new DataView(new ArrayBuffer(4));
@@ -748,7 +752,8 @@ function readValue(r: SpillByteReader): Value {
 
 // The same internal value codec serves repeatable operator spools.
 export function encodeSpillRow(row: Row): Uint8Array {
-  const writer = new ByteWriter();
+  // Most spooled rows are small; one is encoded per spilled row.
+  const writer = new ByteWriter(64);
   writeRow(writer, row);
   return writer.result();
 }

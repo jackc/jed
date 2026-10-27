@@ -202,6 +202,84 @@ test("spool and skewed bucket replay stay streaming with bounded descriptors", (
   }
 });
 
+test("a spilled map keeps lookups short as keys grow, and values replace in place or move", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-blocking-map-"));
+  const sink = new CountedSink(dir);
+  const map = new SpillMap(64, sink);
+  const keys = 20000;
+  const long = (i: number) => `long:${i}:${"y".repeat(5000)}`;
+  try {
+    for (let i = 0; i < keys; i++) map.set(`key:${i}`, [intValue(BigInt(i))]);
+    for (let i = 0; i < 20; i++) map.set(long(i), [textValue(`v${i}`)]);
+    // White-box: the directory grew past its first segment by splitting, so chains stay about one
+    // node long instead of keys / 4096.
+    const shape = map as unknown as { segments: number[]; base: number; split: number };
+    assert.ok(shape.segments.length > 2, `segments ${shape.segments.length}`);
+    assert.ok(keys + 20 <= shape.base + shape.split);
+    // Same-size values rewrite in place; longer ones move to a larger block; shorter ones reuse it.
+    for (let i = 0; i < keys; i += 3) map.set(`key:${i}`, [intValue(BigInt(-i))]);
+    for (let i = 1; i < keys; i += 3) map.set(`key:${i}`, [textValue("w".repeat(i % 200))]);
+    for (let i = 1; i < keys; i += 9) map.set(`key:${i}`, [textValue("s")]);
+    const end = () => (map as unknown as { file: { end: number } }).file.end;
+    const before = end();
+    for (let i = 0; i < keys; i += 3) map.set(`key:${i}`, [intValue(BigInt(i * 7))]);
+    assert.equal(end(), before, "same-size replacement should not append");
+    for (let i = 0; i < keys; i++) {
+      const want =
+        i % 3 === 0
+          ? String(i * 7)
+          : i % 9 === 1
+            ? "s"
+            : i % 3 === 1
+              ? "w".repeat(i % 200)
+              : String(i);
+      assert.equal(render(map.get(`key:${i}`)![0]!), want, `key:${i}`);
+    }
+    for (let i = 0; i < 20; i++) assert.equal(render(map.get(long(i))![0]!), `v${i}`);
+    assert.equal(map.get("key:-1"), undefined);
+    assert.equal(map.get(long(20)), undefined);
+    assert.equal(map.insert("key:5", 0), false);
+    assert.equal(map.insert("key:fresh", 0), true);
+    assert.equal(map.insert("key:fresh", 0), false);
+    assert.equal(sink.peak, 1);
+  } finally {
+    map.close();
+    assert.equal(sink.live, 0);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a spilled spool replays rows larger than its buffers, repeatedly and while growing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-blocking-spool-"));
+  const sink = new CountedSink(dir);
+  const spool = new RowSpool(64, sink);
+  const width = (i: number) => (i % 50 === 7 ? 200_000 : i % 13);
+  try {
+    for (let i = 0; i < 400; i++)
+      spool.push([intValue(BigInt(i)), textValue("z".repeat(width(i)))]);
+    const check = (count: number) => {
+      let n = 0;
+      for (const row of spool) {
+        assert.equal(render(row[0]!), String(n));
+        assert.equal((row[1] as { text: string }).text.length, width(n));
+        n++;
+      }
+      assert.equal(n, count);
+    };
+    check(400);
+    check(400);
+    // A replay sees the rows present when it began, even if more arrive meanwhile.
+    let n = 0;
+    for (const _ of spool) if (n++ < 5) spool.push([intValue(BigInt(400 + n - 1)), textValue("")]);
+    assert.equal(n, 400);
+    assert.equal(spool.length, 405);
+  } finally {
+    spool.close();
+    assert.equal(sink.live, 0);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("scratch codec preserves signed values and empty recursive arrays", () => {
   const row = [intValue(-123n), arrayValue([]), arrayValue([intValue(-1n)])];
   assert.deepEqual(decodeSpillRow(encodeSpillRow(row)), row);
