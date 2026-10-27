@@ -236,7 +236,7 @@ materializing host API's collected rows to the query-memory account
 - Every spool, partition, and output sort has a bounded resident buffer. Metadata and
   open descriptors must not grow once per row or run: use a fixed partition directory
   (or a directory kept in scratch that grows with its keys behind fixed resident metadata,
-  as the TS and Go cores' linear-hashing state maps do, so chains stay short)
+  as every core's linear-hashing state map does, so chains stay short)
   and bounded merge fan-in. The working bound allows a current record and fixed I/O
   buffers in addition to `work_mem`; one large value is not split by this threshold.
 - Scratch uses the existing host target and private exclusive creation. All normal,
