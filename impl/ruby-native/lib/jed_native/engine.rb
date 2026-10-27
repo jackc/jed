@@ -1394,7 +1394,7 @@ module JedNative
         contextual_binary(op, left, right) if respond_to?(:contextual_binary)
         comparison = %w[= <> != < <= > >= and or like ilike not\ like not\ ilike ~ ~* !~ !~* is\ distinct\ from is\ not\ distinct\ from @> <@ && ? ?| ?&].include?(op)
         type = respond_to?(:binary_type) ? binary_type(op, left.type, right.type) : (comparison ? 'boolean' : common_type(left.type, right.type))
-        if %w[and or].include?(op) && [left.type, right.type].any? { |t| !%w[boolean unknown].include?(t) }
+        if %w[and or].include?(op) && [left.type, right.type].any? { |t| !%w[boolean unknown null].include?(t) }
           raise Error.new('42804', 'boolean operands required')
         end
         Expression.new(kind: kind, type: type, value: op, args: [left, right])
