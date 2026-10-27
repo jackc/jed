@@ -757,6 +757,9 @@ module JedNative
         prepare_window_values(stmt, rel.columns, contexts) if respond_to?(:prepare_window_values)
         profile_checkpoint(:window) if @explain_profile_frames
         defer_projection = !stmt[:distinct] && (cursor_output? || !grouped && !contains_window?(stmt[:columns]))
+        # A DISTINCT query sorts before it dedups, so its sort receives every
+        # row (cost.md §3 "sort_key / hash_key").
+        distinct_sort = distinct_sort_keys(stmt, projections, columns, rel.columns) if stmt[:distinct]
         if defer_projection
           output_owner = query_memory_owner if @query_memory && query_memory_collect_result?
           results = contexts.map { |row, group| [nil, row, group, {}] }
@@ -767,6 +770,8 @@ module JedNative
           results = contexts.filter_map do |row, group|
             values = compiled.map { |e| evaluate(e, row, group) }
             if seen
+              distinct_sort&.each { |slot, expression| charge_sort_key(slot ? values[slot] : evaluate(expression, row, group)) }
+              charge_hash_keys(values)
               next if seen.key?(values)
               query_memory_add(distinct_owner, MemorySchedule::ENTRY + query_memory_key_bytes(values, compiled.map(&:type)))
               seen[values] = true
@@ -780,7 +785,13 @@ module JedNative
           results = contexts.map do |row, group|
             [compiled.map { |e| evaluate(e, row, group) }, row, group]
           end
-          results = results.uniq { |entry| entry[0] } if stmt[:distinct]
+          if stmt[:distinct]
+            results.each do |entry|
+              distinct_sort&.each { |slot, expression| charge_sort_key(slot ? entry[0][slot] : evaluate(expression, entry[1], entry[2])) }
+              charge_hash_keys(entry[0])
+            end
+            results = results.uniq { |entry| entry[0] }
+          end
         end
         profile_checkpoint(:distinct) if @explain_profile_frames
         orders = stmt[:order_by] || []
@@ -812,6 +823,7 @@ module JedNative
             query_memory_add(sort_memory_owner, query_memory_collation_bytes(keys, sort_memory_owner)) if @query_memory
             [entry, keys]
           end
+          keyed.each { |_, keys| charge_sort_keys(keys) } unless distinct_sort
           keyed.sort! do |a, b|
             comparison = 0
             order_exprs.each_with_index do |(_, _, order), i|
@@ -874,6 +886,21 @@ module JedNative
       ensure
         @ctes = old_ctes
         @window_values = old_windows
+      end
+    end
+
+    def distinct_sort_keys(stmt, projections, columns, input_columns)
+      orders = stmt[:order_by] || []
+      return nil if orders.empty?
+      orders.map do |order|
+        node = order[:expr] || order
+        slot = if node[:kind] == :literal && node[:value].is_a?(Integer)
+          node[:value] - 1 if (node[:value] - 1).between?(0, columns.length - 1)
+        elsif node[:kind] == :column && !node[:table]
+          columns.index { |column| column[:name] == node[:name] }
+        end
+        slot ||= projections.index { |projection| projection[:expr] == node }
+        [slot, slot ? nil : compile(node, input_columns)]
       end
     end
 

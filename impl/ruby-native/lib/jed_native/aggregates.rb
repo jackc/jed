@@ -181,6 +181,7 @@ module JedNative
         owners = {} if @query_memory
         relation.rows.each_with_index do |row, index|
           key = slots.empty? ? empty_key : slots.map { |slot| key_values[index][slot] }
+          charge_hash_keys(key)
           if @query_memory && !groups.key?(key)
             owners[key] = query_memory_owner
             query_memory_add(owners[key], MemorySchedule::ENTRY + query_memory_key_bytes(key))
@@ -480,7 +481,11 @@ module JedNative
         charge
         values = argument_kernel ? argument_kernel.call(self, row, @params) : expression.args.map { |arg| arg.kind == :star ? 1 : evaluate(arg, row) }
         charge if extra_charge
-        keys = orderings.map { |compiled, _| evaluate(compiled, row) } if ordered
+        if ordered
+          keys = orderings.map { |compiled, _| evaluate(compiled, row) }
+          charge_sort_keys(keys)
+        end
+        charge_hash_key(values.first) if distinct
         if owner
           if ordered
             query_memory_add_row(owner, keys + values)
@@ -560,6 +565,11 @@ module JedNative
         next if expression.extra[:filter_expr] && evaluate(expression.extra[:filter_expr], row) != true
         charge
         values = orders.map { |compiled, _| evaluate(compiled, row) }
+        if HYPOTHETICAL.include?(expression.value)
+          charge_sort_keys(values)
+        elsif !(expression.value == 'percentile_cont' && !values.first.is_a?(IntervalValue))
+          charge_sort_key(values.first)
+        end
         if @query_memory && @query_memory_aggregate_owner
           bytes = HYPOTHETICAL.include?(expression.value) ? query_memory_row_bytes(values) : values.first.nil? ? 0 : LogicalMemory.value_bytes(values.first, orders.first.first.type)
           query_memory_add(@query_memory_aggregate_owner, bytes)

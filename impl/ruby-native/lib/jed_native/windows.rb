@@ -121,6 +121,7 @@ module JedNative
         end
       end
       shared = {}
+      charged = {}
       nodes.uniq(&:object_id).each do |node|
         spec = resolve_window_spec(node[:over], definitions)
         (spec[:partition_by] + spec[:order_by].map { |item| item[:expr] }).each do |key|
@@ -135,7 +136,11 @@ module JedNative
         # Compound keys have independent materialization slots for each window
         # expression under the shared cost contract.
         cache_key << node.object_id unless (partition_exprs + order_exprs).all? { |key| key.kind == :column }
-        partitions = shared[cache_key] ||= window_partitions(contexts, partition_exprs, order_exprs, spec[:order_by])
+        # Per-row keys are charged once per identical partition/sort definition
+        # (window.md §8), even where compound keys keep per-node slots.
+        charge_keys = !charged.key?([spec[:partition_by], spec[:order_by]])
+        charged[[spec[:partition_by], spec[:order_by]]] = true
+        partitions = shared[cache_key] ||= window_partitions(contexts, partition_exprs, order_exprs, spec[:order_by], charge_keys: charge_keys)
         partitions.each do |partition|
           evaluate_window_partition(node, expression, spec, frame, partition)
         end
@@ -249,8 +254,9 @@ module JedNative
       result
     end
 
-    def window_partitions(contexts, partition_exprs, order_exprs, orders)
+    def window_partitions(contexts, partition_exprs, order_exprs, orders, charge_keys: true)
       partitions = {}
+      entries = [] if charge_keys
       contexts.each_with_index do |(row, group), ordinal|
         key = partition_exprs.map { |expression| evaluate(expression, row, group) }
         order = order_exprs.map { |expression| evaluate(expression, row, group) }
@@ -259,6 +265,11 @@ module JedNative
           query_memory_add(@query_memory_window_partition_owner, query_memory_collation_bytes(order, @query_memory_window_partition_owner))
         end
         (partitions[key] ||= []) << { row: row, group: group, order: order, ordinal: ordinal }
+        entries << [key, order] if charge_keys
+      end
+      if charge_keys
+        entries.each { |key, _| charge_hash_keys(key) }
+        entries.each { |_, order| charge_sort_keys(order) } unless orders.empty?
       end
       partitions.each_value do |partition|
         unless orders.empty?
