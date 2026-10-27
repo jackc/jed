@@ -95,7 +95,9 @@ module JedNative
                projections = (node[:columns] || node[:projections]).map do |item|
                  expression(item[:expr]) + (item[:alias] ? " as #{identifier(item[:alias])}" : '')
                end
-               sql = "select #{node[:distinct] ? 'distinct ' : ''}#{projections.join(' , ')}"
+               distinct = node[:distinct] ? 'distinct ' : ''
+               distinct += "on ( #{node[:distinct_on].map { |key| expression(key) }.join(' , ')} ) " if node[:distinct_on]
+               sql = "select #{distinct}#{projections.join(' , ')}"
                sources = node[:from] || []
                sources = [sources] unless sources.is_a?(Array)
                sql += " from #{sources.map { |source| relation(source) }.join(' , ')}" unless sources.empty?

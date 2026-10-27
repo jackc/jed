@@ -82,16 +82,20 @@ module JedNative
         end
         node = plan_node('Aggregate', detail, rows, cost, [node], :aggregate)
       end
-      node = plan_node('Distinct', '-', estimate_distinct_rows(node.rows, outputs), node.cost, [node], :distinct) if statement[:distinct]
+      distinct_on = statement[:distinct_on] && plan_distinct_on_keys(statement, projections, outputs, scope)
+      ordered = false if distinct_on
+      node = plan_node('Distinct', '-', estimate_distinct_rows(node.rows, outputs), node.cost, [node], :distinct) if statement[:distinct] && !distinct_on
       orders = statement[:order_by] || []
-      unless orders.empty? || ordered
+      unless (orders.empty? && !distinct_on) || ordered
         work = orders.sum do |order|
           expression = order[:expr]
           output = expression[:kind] == :literal && expression[:value].is_a?(Integer) || expression[:kind] == :column && !expression[:table] && projections.any? { |projection| (projection[:alias] || expression_name(projection[:expr])) == expression[:name] }
           output ? 0 : expression_work(plan_compile(expression, scope))
         end
-        node = plan_node('Sort', "keys=#{orders.length}", node.rows, node.cost + node.rows * work, [node], :sort)
+        work += distinct_on[:work] if distinct_on
+        node = plan_node('Sort', "keys=#{orders.length + (distinct_on ? distinct_on[:appended] : 0)}", node.rows, node.cost + node.rows * work, [node], :sort)
       end
+      node = plan_node('Distinct', "on=#{distinct_on[:keys].length}", estimate_distinct_rows(node.rows, distinct_on[:keys]), node.cost, [node], :distinct) if distinct_on
       if statement[:limit] || statement[:offset]
         limit = statement[:limit] && plan_constant(plan_compile(statement[:limit], []))
         offset = statement[:offset] ? plan_constant(plan_compile(statement[:offset], [])) || 0 : 0

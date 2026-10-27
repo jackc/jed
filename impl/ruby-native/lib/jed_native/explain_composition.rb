@@ -296,18 +296,21 @@ module JedNative
         node = plan_node('Window', "funcs=#{windows.length}", node.rows, node.cost + node.rows * windows.length, [node], :window)
       end
       projection_work = outputs.sum { |expression| expression_work(expression) }
-      if statement[:distinct]
+      distinct_on = statement[:distinct_on] && plan_distinct_on_keys(statement, projections, outputs, scope)
+      ordered = false if distinct_on
+      if statement[:distinct] && !distinct_on
         node = plan_node('Distinct', '-', estimate_distinct_rows(node.rows, outputs), node.cost + node.rows * projection_work, [node], :distinct)
         projection_work = 0
       end
       orders = statement[:order_by] || []
-      unless orders.empty? || ordered
+      unless (orders.empty? && !distinct_on) || ordered
         work = orders.sum do |order|
           expression = order[:expr]
           output = expression[:kind] == :literal && expression[:value].is_a?(Integer) || expression[:kind] == :column && !expression[:table] && projections.any? { |projection| (projection[:alias] || expression_name(projection[:expr])) == expression[:name] }
           output ? 0 : expression_work(plan_compile(expression, scope))
         end
-        detail = "keys=#{orders.length}"
+        work += distinct_on[:work] if distinct_on
+        detail = "keys=#{orders.length + (distinct_on ? distinct_on[:appended] : 0)}"
         if statement[:limit] && !grouped && windows.empty? && !statement[:distinct]
           limit = plan_constant(plan_compile(statement[:limit], []))
           offset = statement[:offset] ? plan_constant(plan_compile(statement[:offset], [])) || 0 : 0
@@ -315,6 +318,7 @@ module JedNative
         end
         node = plan_node('Sort', detail, node.rows, node.cost + node.rows * work, [node], :sort)
       end
+      node = plan_node('Distinct', "on=#{distinct_on[:keys].length}", estimate_distinct_rows(node.rows, distinct_on[:keys]), node.cost, [node], :distinct) if distinct_on
       node = plan_composition_tail(node, statement.merge(order_by: []))
       node.cost += node.rows * (1 + projection_work)
       if @explain_options[:verbose]

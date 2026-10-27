@@ -391,7 +391,11 @@ module JedNative
       expect('select')
       distinct = at?('distinct') && !at?('from', 1) && token(1).kind != :eof && accept('distinct')
       distinct_on = nil
-      distinct_on = parenthesized_expressions if distinct && accept('on')
+      if distinct && at?('on') && at?('(', 1)
+        accept('on')
+        distinct_on = parenthesized_expressions
+        raise Error.new('42601', 'DISTINCT ON requires at least one expression') if distinct_on.empty?
+      end
       accept('all') unless distinct
       result = { kind: :select, columns: select_items, from: [], joins: [], distinct: distinct,
                  group_by: [], order_by: [], windows: {} }
