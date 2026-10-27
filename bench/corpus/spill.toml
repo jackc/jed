@@ -10,6 +10,8 @@ hash_join = "SELECT a.k, b.s FROM wide a JOIN wide b ON a.k = b.k ORDER BY a.k"
 aggregate = "SELECT s, count(*), sum(v) FROM wide GROUP BY s ORDER BY s"
 distinct = "SELECT DISTINCT s FROM wide ORDER BY s"
 ordered_set = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s) FROM wide"
+# A spilled group state map holding far more keys than a disk hash directory's initial buckets.
+aggregate_many_groups = "SELECT count(*) FROM (SELECT g, count(*) FROM generate_series(1, 200000) g GROUP BY 1) q"
 
 # Session-local temp-table spill (spec/design/temp-tables.md §6): each worker process fills a temp
 # table from `wide` in autocommit batches, then queries it, once fully resident (temp_buffers = 0) and
