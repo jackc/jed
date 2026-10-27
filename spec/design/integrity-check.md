@@ -2,11 +2,11 @@
 
 > A host-API operation that checks one database's storage on a live handle and returns structured
 > findings: SQLite's `PRAGMA integrity_check` / `quick_check`, and the job PostgreSQL's `amcheck`
-> (`bt_index_check … heapallindexed`) does for its B-trees. **Status: designed, not built.** The
-> invariants already exist as test-only checkers in each core's simulation runner and in
-> `spec/fileformat/verify.rb --check-image` ([simulation-testing.md](simulation-testing.md) §8.3); this
-> doc moves them into the engine, extends them where they stop short, and fixes the result as a
-> cross-core contract.
+> (`bt_index_check … heapallindexed`) does for its B-trees. **Status: slice I1 (the reference and
+> fixtures) landed; the cores are next (I2).** The invariants already exist as test-only checkers in
+> each core's simulation runner and in `spec/fileformat/verify.rb --check-image`
+> ([simulation-testing.md](simulation-testing.md) §8.3); this doc moves them into the engine, extends
+> them where they stop short, and fixes the result as a cross-core contract.
 
 ## 1. Why, and what it is not
 
@@ -70,8 +70,8 @@ IntegrityReport {
   findings:  [Finding]     // in the contract order of §4; empty means the check found nothing
   truncated: bool          // max_findings was reached; more findings may exist
   skipped:   [Skip]        // objects a requested check could not cover, and why (§3.5)
-  pages:     u64           // distinct pages the walk read and verified
-  rows:      u64           // table rows decoded
+  pages:     u64           // distinct pages the walk reached, plus the free-list pages it read
+  rows:      u64           // records visited in table leaves (decoded or not)
 }
 
 Finding {
@@ -124,45 +124,64 @@ the generation that snapshot reads:
 
 ### 3.2 Trees and pages (both levels)
 
-For each table (in the order of §4) and then each of its indexes:
+For each table (in the order of §4) and then each of its indexes, the walk marks every page it
+reaches in one reachability bitmap (§5.4), catalog pages first. Before reading a page:
 
-- every page of the tree verifies and decodes as its declared page type ([format.md](../fileformat/format.md));
-- B+tree shape: every leaf is at the same depth; within a node keys ascend strictly; every key lies
-  within the separator bounds its parent gives the child (the check the simulation leaves to its
-  digest, simulation-testing.md §8.3);
-- table rows: storage keys ascend strictly across the whole tree, and for a table with a primary key
-  each key equals the primary-key encoding of its row ([encoding.md](encoding.md)); every value
-  decodes as its column's type, collation, and typmod-independent form;
-- the table's persisted row count equals its leaf total (format v28);
-- overflow chains: every out-of-line value's chain verifies, decodes (including LZ4,
-  [../fileformat/lz4.md](../fileformat/lz4.md)) to the recorded length, and no overflow page is named
-  by two stored values ([large-values.md](large-values.md) §15);
-- index trees: entry keys ascend strictly; a GiST R-tree's node bounding boxes contain their
-  children's ([gist.md](gist.md) §4).
+- it lies in the body range (`[2, page_count)`, `[4, page_count)` in an encrypted file), else
+  `page_out_of_range`;
+- no earlier pointer reached it, else `page_reached_twice`, reported by the object whose walk reached
+  it second (two trees sharing a node, a chain inside a tree, two values sharing a chain:
+  [large-values.md](large-values.md) §15).
+
+Neither page is read. Then:
+
+- every page verifies (checksum or tag) and decodes as a node of its tree's kind
+  ([format.md](../fileformat/format.md)): `page_corrupt`, `page_type_wrong`;
+- B+tree shape: every leaf lies at the depth of the tree's first leaf (`tree_depth_uneven`); within a
+  node keys or separators ascend strictly (`keys_unordered`); every key lies within the bounds its
+  parent's separators give it (`separator_violation`: child `i` holds `[sep[i−1], sep[i])`). These
+  three together imply key order across the whole tree; the simulation leaves them to its digest
+  (simulation-testing.md §8.3). The last two are reported at most once per page;
+- table rows, in leaf order: each value decodes as its column's type (`value_undecodable`), and an
+  out-of-line value's chain verifies, ends at its recorded length, and decompresses
+  ([../fileformat/lz4.md](../fileformat/lz4.md)) and decodes (`overflow_chain_corrupt`). A row stops
+  at its first such finding. A row that decodes, in a table with a primary key, is stored under its
+  primary-key encoding ([encoding.md](encoding.md)), else `row_key_not_primary_key`;
+- after its tree, a table's persisted row count equals its leaf total (`row_count_mismatch`, format
+  v28), unless the tree was unreadable (§5.2);
+- a GiST R-tree's leaves share one depth, and each interior bound contains its child's bounds
+  (`gist_bounds_violation`, [gist.md](gist.md) §4).
 
 ### 3.3 Space accounting (both levels)
 
-One reachability bitmap is filled during §3.1–§3.2 (§5.4). At the end:
+After every tree:
 
-- no page was reached twice (two trees sharing a node, a chain inside a tree);
-- every reached page lies in the body range (`[2, page_count)`, `[4, page_count)` in an encrypted file);
-- the live page count at meta offset 56 equals the number of reached pages (format v34);
-- the free list (meta offset 28) verifies and decodes, has no duplicates, lies in the body range, and
-  is disjoint from the reached pages and from the generation's manifest dependencies.
+- the free list (meta offset 28): its chain pages are walked first, each in the body range, not
+  revisited, and verifying as a free-list page (else `free_list_corrupt`, ending the chain), and not
+  reachable (`free_page_live`); then each entry in list order is, by the first rule it breaks, in the
+  body range (`free_page_out_of_range`), not listed before (`free_page_duplicate`), not reachable
+  (`free_page_live`), and not one of the generation's manifest dependencies
+  (`free_page_manifest_dependency`);
+- the live page count at meta offset 56 equals the number of reached pages (`live_count_mismatch`,
+  format v34), unless any tree was unreadable (§5.2).
 
-Free pages themselves are not read: their contents are dead by definition.
+Free pages themselves are not read: their contents are dead by definition. Most free-list damage
+fails `open` (it reads and validates the list), so only `free_page_live` reaches a fresh handle.
 
 ### 3.4 Index agreement (`full`) and constraints (`constraints`)
 
 **`full`** adds that every index holds exactly the entries its table derives:
 
-- for each table row, every entry the index definition derives from it (column keys, expression keys,
-  the partial predicate's filter, GIN terms, GiST keys; [indexes.md](indexes.md), [gin.md](gin.md),
-  [gist.md](gist.md)) is present in the index, found through the index's own lookup;
-- the index holds no other entries: its entry count equals the total derived.
+- for each table row in storage-key order, every entry the index definition derives from it (column
+  keys, expression keys, the partial predicate's filter, GIN terms, GiST keys;
+  [indexes.md](indexes.md), [gin.md](gin.md), [gist.md](gist.md)), in entry order, is present in the
+  index, found through the index's own lookup; else `index_entry_missing`, keyed by the row;
+- the index holds no other entries: if its entry count differs from the number of derived entries
+  found, one `index_entry_count_mismatch`.
 
 Presence of every derived entry plus equal counts plus strictly ascending, storage-key-suffixed
-entries is exact equality, without materializing either side (§5.4). This is PostgreSQL's
+entries is exact equality, without materializing either side (§5.4). An index walk counts its
+entries as it checks its structure, so the count needs no second pass. This is PostgreSQL's
 `heapallindexed` and SQLite's per-row index probe. It covers every index kind, not only the column
 B-tree indexes the simulation checker covers today.
 
@@ -193,22 +212,28 @@ rest of the check proceeds. Registered reasons:
 | `unparsable_definition` | the object's stored text does not parse in this binary (`XX003`, [unparsable-definitions.md](unparsable-definitions.md)) |
 | `missing_host_function` | an expression names a host function the environment does not register |
 | `missing_loaded_data` | a collation or time zone the object pins is not loaded or is at another version (`XX002`, [collation.md](collation.md)) |
-| `table_unreadable` | the table's tree had a finding, so index agreement and constraints for it are not checked (§5.2) |
+| `table_unreadable` | the table's tree left rows unread, so its indexes' agreement and its constraints are not checked (§5.2) |
+| `index_unreadable` | the index's tree left entries unread, so its agreement is not checked (§5.2) |
 
 ## 4. Findings as shared data
 
 Finding kinds and skip reasons are a registry, `spec/integrity/findings.toml`, authored once (CLAUDE.md
 §5) and cross-checked by a unit test in each core, as the error registry is. Each entry gives the
-kind, the check (§3.x) it belongs to, which of `object` / `page` / `key` it sets, and a description.
-The initial kinds, by check:
+kind, the check (§3.x) it belongs to, which of `object` / `page` / `key` it sets, whether it can arise
+on a freshly opened handle (`fresh`), and a description. The kinds, by check:
 
 | check | kinds |
 |---|---|
 | generation | `meta_invalid`, `manifest_page_mismatch`, `catalog_page_corrupt`, `catalog_mismatch`, `sequence_out_of_range` |
-| trees and pages | `page_corrupt`, `page_type_wrong`, `tree_depth_uneven`, `node_keys_unordered`, `separator_violation`, `row_keys_unordered`, `row_key_not_primary_key`, `value_undecodable`, `row_count_mismatch`, `overflow_chain_corrupt`, `overflow_length_mismatch`, `overflow_page_shared`, `index_keys_unordered`, `gist_bbox_violation` |
-| space accounting | `page_reached_twice`, `page_out_of_range`, `live_count_mismatch`, `free_list_corrupt`, `free_page_duplicate`, `free_page_out_of_range`, `free_page_live`, `free_page_manifest_dependency` |
+| trees and pages | `page_out_of_range`, `page_reached_twice`, `page_corrupt`, `page_type_wrong`, `tree_depth_uneven`, `keys_unordered`, `separator_violation`, `row_key_not_primary_key`, `value_undecodable`, `overflow_chain_corrupt`, `row_count_mismatch`, `gist_bounds_violation` |
+| space accounting | `live_count_mismatch`, `free_list_corrupt`, `free_page_out_of_range`, `free_page_duplicate`, `free_page_live`, `free_page_manifest_dependency` |
 | index agreement | `index_entry_missing`, `index_entry_count_mismatch`, `index_entry_error` |
 | constraints | `not_null_violation`, `typmod_violation`, `check_violation`, `check_error`, `unique_violation`, `foreign_key_violation` |
+
+A `fresh = false` kind needs damage that happened after the handle opened: on a fresh open the same
+damage fails `open` with `XX001` (the meta, manifest, catalog, and free list are all read and
+validated there) or makes recovery select the other meta slot. These are what a long-lived handle
+adds over the CLI, and are unit-tested per core rather than by the shared fixtures.
 
 **The contract.** For the same file bytes, credential, environment, and options, every core returns
 the same `findings` (kind, database, object, page, key — everything but `detail`), in the same order,
@@ -223,8 +248,13 @@ walks the same bytes with the same rules in the same order:
 3. space accounting (§3.3).
 
 Within a tree, findings follow a depth-first walk in child order, so page and row findings come in
-key order. Per row, a constraint pass reports in column ordinal order. `max_findings` truncates this
-sequence, so a truncated report is a prefix of the full one.
+key order. On one page the order is `tree_depth_uneven`, `keys_unordered`, `separator_violation`,
+then its rows; on one row, its value finding, then `row_key_not_primary_key`. Per row, a constraint
+pass reports in column ordinal order. A skip is recorded where its check would have run.
+
+`max_findings` truncates this sequence, so a truncated report is a prefix of the full one. When the
+next finding would exceed the limit the check stops, sets `truncated`, and reports `pages` and `rows`
+as counted at that moment.
 
 ## 5. Execution
 
@@ -246,14 +276,20 @@ any more than a full scan would ([pager.md](pager.md)).
 
 ### 5.2 Containment
 
-A page that fails to verify or decode is reported once, at the point the walk reaches it, and its
-subtree is not walked: its rows and descendants are unknown, so the walk records neither them nor
-the findings they would cascade into. A table with any §3.2 finding is reported with
-`table_unreadable` in `skipped` for its index-agreement and constraint checks, since every derived
-comparison against a partly read table would be noise. Its indexes are still checked structurally.
-Space accounting runs after a damaged walk too, but `live_count_mismatch` and `free_page_live` are
-then suppressed, because pages under an unwalked subtree are live but unreached; damaged subtrees
-were already reported.
+A page that is out of range, already reached, fails to verify or decode, or has the wrong type is
+reported once, at the point the walk reaches it, and its subtree is not walked: its rows and
+descendants are unknown, so the walk records neither them nor the findings they would cascade into.
+Such a page, or a row that stopped at a value finding, makes its tree **unreadable**. Order and
+bounds findings (`keys_unordered`, `separator_violation`, `tree_depth_uneven`,
+`row_key_not_primary_key`) do not: every row was still read.
+
+An unreadable table skips its row count, and reports `table_unreadable` in `skipped` for each of its
+indexes' agreement (and its constraint checks), since every comparison against a partly read table
+would be noise. Its indexes are still checked structurally. An unreadable index reports
+`index_unreadable` for its agreement. Space accounting runs after damage too, but
+`live_count_mismatch` is suppressed when any tree was unreadable: pages under an unwalked subtree are
+live but unreached, and the damage was already reported. `free_page_live` is never suppressed, since a
+reached page is live whatever else is unread.
 
 ### 5.3 Cancellation
 
@@ -279,17 +315,31 @@ CLAUDE.md §9: nothing in the check requires a table to fit in memory.
 
 The check is host API, so it is not in the SQL corpus. Its contract is tested with:
 
-- **Damaged fixtures.** `spec/fileformat/verify.rb` gains `--integrity-check FILE…`, a fourth
-  voice that prints the report (§2 minus `detail`) as JSON, and a generator of damaged images under
-  `spec/fileformat/integrity/`. Each fixture starts from a golden and applies one deterministic damage
-  with its checksums *recomputed* where the damage is semantic, so the logical checks are what catch
-  it: a bit flip in a leaf (`page_corrupt`), two rows' keys swapped (`row_keys_unordered`), a row
-  re-keyed (`row_key_not_primary_key`), a dropped index entry (`index_entry_missing`), an extra one
-  (`index_entry_count_mismatch`), a wrong row count, a wrong live count, a live page on the free list,
-  a shared overflow page, a constraint-violating row. Each fixture carries its expected report; every
-  core must reproduce it exactly, and so must `verify.rb`.
-- **Clean goldens.** Every existing golden file and encrypted golden checks with no findings at both
-  levels with `constraints`.
+- **The reference.** `spec/fileformat/integrity.rb` is a fourth voice, run as `ruby
+  spec/fileformat/verify.rb --integrity-check [--quick] [--max-findings N] FILE…`. It checks a file
+  as a freshly opened handle sees it, so what `open` reads (meta, manifest, catalog, free-list chain)
+  must load and anything else is a finding. It derives what it can without SQL: today every check of
+  §3.1–§3.3 except GiST bounds, and agreement for column-keyed, non-partial B-tree indexes. The rest
+  (GIN, GiST, expression and partial indexes, GiST bounds, constraints) it lists under
+  `reference_unchecked`, outside the cross-core report, until the slice that implements them
+  teaches it (§9).
+- **Damaged fixtures.** `spec/fileformat/integrity/<name>.jed` with `<name>.json`, generated by
+  `verify.rb --generate` and checked by `mise run verify`. Each starts from one from-scratch image (a
+  40-row table and a column index, both several leaves deep) and applies one deterministic damage,
+  recomputing checksums where the damage is semantic so the logical checks are what catch it: a
+  flipped leaf byte (`page_corrupt`), two rows' keys swapped (`keys_unordered`,
+  `row_key_not_primary_key`, and under `full` the index entries they no longer match), a row
+  re-keyed into a gap (`row_key_not_primary_key`; `index_entry_missing`), a dropped index entry and
+  an extra one (`full` only), a wrong row count, a wrong live count, a live page on the free list,
+  and a table interior naming an index leaf (`page_corrupt`, `page_reached_twice`). The `.json` holds
+  the expected report (§2 minus `detail`) for `quick` and `full`, and for one fixture a truncated run.
+  Every core must reproduce each exactly. Each damage leaves a file that opens: none touches what
+  `open` reads.
+- **The registry.** `verify.rb` checks that `findings.toml` is well-formed and that every expected
+  finding has a registered, `fresh` kind setting exactly the fields its entry names.
+- **Clean goldens.** Every golden that opens checks with no findings at both levels (today in the
+  reference; in every core from I2). `collation_skew_corrupt.jed` is the one exception: its index is
+  deliberately ordered for another collation version.
 - **Simulation.** The runners' image checker becomes a call to the engine's check on the opened copy
   (asserting no findings, plus the expected-version check that stays in the runner); the `corrupt`
   step's oracle gains "the check reports a finding naming the flipped page, or the flip was harmless".
@@ -323,10 +373,10 @@ this file sound?". Attachments are checked by opening them directly.
 
 | slice | delivers |
 |---|---|
-| **I1** | `spec/integrity/findings.toml`; `verify.rb --integrity-check`; the damaged-fixture generator and expected reports |
-| **I2** | `quick` level in Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API; the simulation image checker rebuilt on it; fixtures for `quick` pass in every core |
-| **I3** | `full` level: index agreement for every index kind (column, expression, partial, GIN, GiST) |
-| **I4** | `constraints` option |
+| **I1** ✅ | `spec/integrity/findings.toml`; the reference `spec/fileformat/integrity.rb` (`verify.rb --integrity-check`); the damaged fixtures and expected reports; the clean-golden and registry checks in `mise run verify` |
+| **I2** | Rust, Go, and TS (§3.1–§3.3, §5): the sim checkers' logic moved into the engine, extended with separator, depth, overflow-decoding, and catalog checks; the host API in all cores and the TS async API, with `full` agreement for the column B-tree indexes the reference covers; the simulation image checker rebuilt on it; every fixture's report reproduced and every clean golden clean in every core; the live-only kinds unit-tested |
+| **I3** | `full` for every other index kind (expression, partial, GIN, GiST) and GiST bounds, in the cores and the reference, with fixtures |
+| **I4** | `constraints` option, in the cores and (except `CHECK`, which needs SQL evaluation) the reference, with fixtures |
 | **I5** | `jed check` in the CLI and cli.md; `/web` docs (each `api/` language page) |
 
 I2 is the largest, and I3–I5 each depend only on it, so they can run in parallel once it lands.

@@ -265,7 +265,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   checksums, tree invariants, free-list and live-count accounting, and index ↔ table agreement on a
   live database, returning structured findings. The checkers already exist in the simulation runners
   and `spec/fileformat/verify.rb`; expose them through the host API and the CLI. Designed in
-  [integrity-check.md](spec/design/integrity-check.md); slices I1–I5 (§9). _(size: M)_
+  [integrity-check.md](spec/design/integrity-check.md); I1 (registry, Ruby reference, damaged fixtures) landed, I2–I5 open (§9). _(size: M)_
 - [ ] **Change notifications** — host callbacks after a commit (tables touched, `txid`), plus a cheap
   "has anything committed since" counter (SQLite's update/commit hooks and `PRAGMA data_version`), for
   reactive embedded apps and cache invalidation. Must cover commits from other page-service

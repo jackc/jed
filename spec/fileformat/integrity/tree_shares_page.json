@@ -1,0 +1,62 @@
+{
+  "fixture": "tree_shares_page.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "page_corrupt",
+            "database": "main",
+            "object": "t",
+            "page": 9,
+            "key": null
+          },
+          {
+            "kind": "page_reached_twice",
+            "database": "main",
+            "object": "t_v_idx",
+            "page": 9,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 11,
+        "rows": 33
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "page_corrupt",
+            "database": "main",
+            "object": "t",
+            "page": 9,
+            "key": null
+          },
+          {
+            "kind": "page_reached_twice",
+            "database": "main",
+            "object": "t_v_idx",
+            "page": 9,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [
+          {
+            "object": "t_v_idx",
+            "reason": "table_unreadable"
+          }
+        ],
+        "pages": 11,
+        "rows": 33
+      }
+    }
+  ]
+}

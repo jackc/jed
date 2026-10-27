@@ -2094,8 +2094,10 @@ FIXTURES = ([
     collations: COLLATION_PK_TABLE[:collations], tables: COLLATION_PK_TABLE[:tables] },
   { file: "collation_array_table.jed", page_size: 256,
     collations: COLLATION_ARRAY_TABLE[:collations], tables: COLLATION_ARRAY_TABLE[:tables] },
+  # Its index is deliberately ordered for another collation version, so an integrity check against
+  # the frozen collation finds it (a core with the version loaded skips it as missing_loaded_data).
   { file: "collation_skew_corrupt.jed", page_size: 256,
-    collations: COLLATION_SKEW_CORRUPT_TABLE[:collations], tables: COLLATION_SKEW_CORRUPT_TABLE[:tables] },
+    collations: COLLATION_SKEW_CORRUPT_TABLE[:collations], tables: COLLATION_SKEW_CORRUPT_TABLE[:tables], integrity_clean: false },
   { file: "unparsable_definitions.jed", page_size: 256,
     tables: UNPARSABLE_DEFINITIONS[:tables], views: UNPARSABLE_DEFINITIONS[:views] },
   { file: "collation_skew_twin.jed", page_size: 256,
@@ -5877,6 +5879,8 @@ def generate
   end
   File.write(lz4_vectors_path, lz4_vectors_toml)
   File.write(encryption_vectors_path, encryption_vectors_toml)
+  require_relative "integrity"
+  generate_integrity_fixtures
   puts "wrote encryption_vectors.toml"
   puts "wrote lz4_vectors.toml (#{LZ4_VECTORS.size} vectors)"
   puts "Generated #{FIXTURES.size} fixtures in #{dir}"
@@ -5963,14 +5967,19 @@ def verify
 
   verify_lz4_vectors
   verify_encryption_vectors
+  require_relative "integrity"
+  verify_integrity(FIXTURES.reject { |fx| fx[:reject] || fx[:malformed] || fx[:expected_open_error] || fx[:integrity_clean] == false })
   puts "OK: #{FIXTURES.size} file-format fixtures verified (byte-exact + independent decode); " \
-       "#{LZ4_VECTORS.size} LZ4 vectors and the encryption vectors verified"
+       "#{LZ4_VECTORS.size} LZ4 vectors, the encryption vectors, and #{INTEGRITY_FIXTURES.size} integrity fixtures verified"
 end
 
 if ARGV.include?("--generate")
   generate
 elsif ARGV.first == "--check-image"
   check_images(ARGV.drop(1))
+elsif ARGV.first == "--integrity-check"
+  require_relative "integrity"
+  integrity_check_files(ARGV.drop(1))
 else
   verify
 end

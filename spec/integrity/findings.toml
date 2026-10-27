@@ -1,0 +1,273 @@
+# Integrity-check finding registry — CANONICAL DATA (CLAUDE.md §5; spec/design/integrity-check.md §4).
+#
+# Every finding an integrity check reports has a `kind` from this list, and every skip a `reason`.
+# Each core cross-checks its constants against this file; spec/fileformat/integrity.rb is the
+# reference that produces the expected reports of spec/fileformat/integrity/.
+#
+# kind      stable snake_case identity, the machine-legible part of a finding.
+# check     the §3 group it belongs to: generation, trees, space, agreement, constraints.
+# fields    which of object / page / key the finding sets (database is always set).
+# fresh     whether the finding can arise on a freshly opened handle. A "live" finding needs damage
+#           that happened after open: on a fresh open the same damage fails `open` with XX001, or
+#           recovery selects the other meta slot. Live findings are unit-tested per core, not by
+#           the shared fixtures.
+#
+# A finding's `detail` text is informational and never part of the contract.
+
+schema_version = 1
+
+# --- generation (integrity-check.md §3.1) -----------------------------------
+
+[[finding]]
+kind = "meta_invalid"
+check = "generation"
+fields = ["page"]
+fresh = false
+description = "The pinned generation's meta slot no longer verifies: a later open would select the other slot."
+
+[[finding]]
+kind = "manifest_page_mismatch"
+check = "generation"
+fields = ["page"]
+fresh = false
+description = "A page the generation's commit manifest lists, or a manifest-overflow page, no longer carries its recorded identity."
+
+[[finding]]
+kind = "catalog_page_corrupt"
+check = "generation"
+fields = ["page"]
+fresh = false
+description = "A catalog page fails verification or does not decode."
+
+[[finding]]
+kind = "catalog_mismatch"
+check = "generation"
+fields = ["page"]
+fresh = false
+description = "The stored catalog chain is not the encoding of the snapshot's catalog."
+
+[[finding]]
+kind = "sequence_out_of_range"
+check = "generation"
+fields = ["object"]
+fresh = true
+description = "A sequence's current value lies outside its minimum and maximum."
+
+# --- trees and pages (§3.2) --------------------------------------------------
+
+[[finding]]
+kind = "page_out_of_range"
+check = "trees"
+fields = ["object", "page", "key?"]
+fresh = true
+description = "A pointer names a page outside the body range [first body page, page_count). key is set when an overflow pointer of a row names it."
+
+[[finding]]
+kind = "page_reached_twice"
+check = "trees"
+fields = ["object", "page", "key?"]
+fresh = true
+description = "A pointer names a page the walk already reached: two trees, two nodes, or two overflow values share a page. key is set when an overflow pointer of a row names it."
+
+[[finding]]
+kind = "page_corrupt"
+check = "trees"
+fields = ["object", "page"]
+fresh = true
+description = "A tree page fails its checksum or authentication tag, or its node structure does not decode."
+
+[[finding]]
+kind = "page_type_wrong"
+check = "trees"
+fields = ["object", "page"]
+fresh = true
+description = "A tree pointer names a page of another type."
+
+[[finding]]
+kind = "tree_depth_uneven"
+check = "trees"
+fields = ["object", "page"]
+fresh = true
+description = "A leaf lies at a different depth from the tree's first leaf."
+
+[[finding]]
+kind = "keys_unordered"
+check = "trees"
+fields = ["object", "page"]
+fresh = true
+description = "A node's keys or separators do not ascend strictly. Reported at most once per page."
+
+[[finding]]
+kind = "separator_violation"
+check = "trees"
+fields = ["object", "page"]
+fresh = true
+description = "A node holds a key outside the bounds its parent's separators give it. Reported at most once per page."
+
+[[finding]]
+kind = "row_key_not_primary_key"
+check = "trees"
+fields = ["object", "page", "key"]
+fresh = true
+description = "A row is stored under a key that is not the primary-key encoding of its values."
+
+[[finding]]
+kind = "value_undecodable"
+check = "trees"
+fields = ["object", "page", "key"]
+fresh = true
+description = "A stored inline value does not decode as its column's type."
+
+[[finding]]
+kind = "overflow_chain_corrupt"
+check = "trees"
+fields = ["object", "page", "key"]
+fresh = true
+description = "An out-of-line value's chain fails verification, ends early, revisits a page, or does not decompress or decode to its column's type. page is the row's leaf."
+
+[[finding]]
+kind = "row_count_mismatch"
+check = "trees"
+fields = ["object"]
+fresh = true
+description = "The table's persisted row count differs from the rows its tree holds."
+
+[[finding]]
+kind = "gist_bounds_violation"
+check = "trees"
+fields = ["object", "page"]
+fresh = true
+description = "A GiST interior's bound for a child does not contain every bound in that child."
+
+# --- space accounting (§3.3) -------------------------------------------------
+
+[[finding]]
+kind = "live_count_mismatch"
+check = "space"
+fields = []
+fresh = true
+description = "The live page count in the meta differs from the pages reachable from the catalog root. Not reported when any tree was unreadable."
+
+[[finding]]
+kind = "free_list_corrupt"
+check = "space"
+fields = ["page"]
+fresh = false
+description = "A free-list page fails verification or does not decode, or the chain leaves the body range or revisits a page."
+
+[[finding]]
+kind = "free_page_out_of_range"
+check = "space"
+fields = ["page"]
+fresh = false
+description = "The free list names a page outside the body range."
+
+[[finding]]
+kind = "free_page_duplicate"
+check = "space"
+fields = ["page"]
+fresh = false
+description = "The free list names a page twice."
+
+[[finding]]
+kind = "free_page_live"
+check = "space"
+fields = ["page"]
+fresh = true
+description = "The free list names a reachable page, or a free-list page is itself reachable."
+
+[[finding]]
+kind = "free_page_manifest_dependency"
+check = "space"
+fields = ["page"]
+fresh = false
+description = "The free list names a page the generation's commit manifest depends on."
+
+# --- index agreement (§3.4, level full) --------------------------------------
+
+[[finding]]
+kind = "index_entry_missing"
+check = "agreement"
+fields = ["object", "key"]
+fresh = true
+description = "A row derives an index entry the index does not hold. key is the row's storage key."
+
+[[finding]]
+kind = "index_entry_count_mismatch"
+check = "agreement"
+fields = ["object"]
+fresh = true
+description = "The index holds entries no row derives."
+
+[[finding]]
+kind = "index_entry_error"
+check = "agreement"
+fields = ["object", "key"]
+fresh = true
+description = "Deriving a row's index entry raised an error, where the write that stored it succeeded."
+
+# --- constraints (§3.4, option constraints) ----------------------------------
+
+[[finding]]
+kind = "not_null_violation"
+check = "constraints"
+fields = ["object", "key"]
+fresh = true
+description = "A NOT NULL column holds NULL. object is the table."
+
+[[finding]]
+kind = "typmod_violation"
+check = "constraints"
+fields = ["object", "key"]
+fresh = true
+description = "A value exceeds its column's typmod (varchar length, numeric precision or scale, temporal precision). object is the table."
+
+[[finding]]
+kind = "check_violation"
+check = "constraints"
+fields = ["object", "key"]
+fresh = true
+description = "A row does not satisfy a CHECK constraint. object is the constraint."
+
+[[finding]]
+kind = "check_error"
+check = "constraints"
+fields = ["object", "key"]
+fresh = true
+description = "Evaluating a CHECK constraint on a row raised an error. object is the constraint."
+
+[[finding]]
+kind = "unique_violation"
+check = "constraints"
+fields = ["object", "key"]
+fresh = true
+description = "Two rows share a key a UNIQUE index or primary key forbids. object is the index; key is the second row's storage key."
+
+[[finding]]
+kind = "foreign_key_violation"
+check = "constraints"
+fields = ["object", "key"]
+fresh = true
+description = "A referencing row's key has no referenced row. object is the constraint."
+
+# --- skip reasons (§3.5) -----------------------------------------------------
+
+[[skip]]
+reason = "unparsable_definition"
+description = "The object's stored text does not parse in this binary (XX003)."
+
+[[skip]]
+reason = "missing_host_function"
+description = "An expression names a host function the environment does not register."
+
+[[skip]]
+reason = "missing_loaded_data"
+description = "A collation or time zone the object pins is not loaded, or is loaded at another version (XX002)."
+
+[[skip]]
+reason = "table_unreadable"
+description = "The table's tree had a finding that left rows unread, so its indexes' agreement and its constraints are not checked."
+
+[[skip]]
+reason = "index_unreadable"
+description = "The index's tree had a finding that left entries unread, so its agreement is not checked."

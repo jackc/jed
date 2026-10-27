@@ -1,0 +1,57 @@
+{
+  "fixture": "row_rekeyed.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "row_key_not_primary_key",
+            "database": "main",
+            "object": "t",
+            "page": 3,
+            "key": "80000013"
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [
+          {
+            "kind": "row_key_not_primary_key",
+            "database": "main",
+            "object": "t",
+            "page": 3,
+            "key": "80000013"
+          },
+          {
+            "kind": "index_entry_missing",
+            "database": "main",
+            "object": "t_v_idx",
+            "page": null,
+            "key": "80000013"
+          },
+          {
+            "kind": "index_entry_count_mismatch",
+            "database": "main",
+            "object": "t_v_idx",
+            "page": null,
+            "key": null
+          }
+        ],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    }
+  ]
+}

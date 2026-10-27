@@ -1,0 +1,27 @@
+{
+  "fixture": "clean.jed",
+  "runs": [
+    {
+      "level": "quick",
+      "max_findings": 100,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    },
+    {
+      "level": "full",
+      "max_findings": 100,
+      "report": {
+        "findings": [],
+        "truncated": false,
+        "skipped": [],
+        "pages": 12,
+        "rows": 40
+      }
+    }
+  ]
+}
