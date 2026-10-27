@@ -80,6 +80,7 @@ module JedNative
           columns[ordinal][:default] = identity_default(stmt[:new_name])
           @tables[table_name] = t.merge(columns: columns)
         end
+        rename_sequence_defaults(stmt[:name], stmt[:new_name])
       else
         options = stmt[:options] || {}
         raise Error.new('42601', 'ALTER SEQUENCE needs an action') if options.empty?
@@ -96,6 +97,12 @@ module JedNative
         next if !sequence && stmt[:if_exists]
         raise Error.new('42P01', 'sequence does not exist') unless sequence
         raise Error.new(stmt[:cascade] ? '0A000' : '2BP01', 'owned sequence depends on its column') if sequence[:owned_by]
+        # A column DEFAULT naming the sequence in a constant nextval / currval / setval argument depends
+        # on it (sequences.md §1): 2BP01, as in PostgreSQL; its CASCADE is not supported.
+        if (dependent = sequence_default_dependent(name))
+          raise Error.new('0A000', "DROP SEQUENCE ... CASCADE of a sequence a column default uses is not supported: #{dependent}") if stmt[:cascade]
+          raise Error.new('2BP01', "cannot drop sequence #{name} because other objects depend on it: #{dependent} depends on sequence #{name}")
+        end
         @sequences.delete(name)
       end
       @dirty = true
@@ -133,6 +140,86 @@ module JedNative
         @dirty = true
         value
       end
+    end
+
+    # The first table (then view) column whose DEFAULT names sequence `name` in a constant
+    # nextval / currval / setval first argument, in name byte order then column ordinal order.
+    def sequence_default_dependent(name)
+      @tables.values.sort_by { |table| table[:name].b }.each do |table|
+        table[:columns].each do |column|
+          return "default value for column #{column[:name]} of table #{table[:name]}" if default_names_sequence?(column[:default], name)
+        end
+      end
+      (@views || {}).sort_by { |view_name, _| view_name.b }.each do |view_name, view|
+        (view[:defaults] || {}).each do |column, node|
+          return "default value for column #{column} of view #{view_name}" if default_names_sequence?(node, name)
+        end
+      end
+      nil
+    end
+
+    def default_names_sequence?(node, name)
+      return false unless node.is_a?(Hash) || node.is_a?(Array)
+      if node.is_a?(Hash) && node[:kind] == :opaque_definition
+        tokens = Lexer.new(node[:text]).tokens rescue (return false)
+        return tokens.each_cons(4).any? do |call, open, literal, close|
+          call.kind == :word && %w[nextval currval setval].include?(call.value) && open.value == '(' &&
+            literal.kind == :string && [')', ','].include?(close.value) && sequence_literal_names?(literal.value, name)
+        end
+      end
+      found = false
+      each_sequence_argument(node) { |literal| found ||= sequence_literal_names?(literal[:value], name) }
+      found
+    end
+
+    # Yields each lone string-literal first argument of a nextval / currval / setval call.
+    def each_sequence_argument(node, &block)
+      case node
+      when Array then node.each { |child| each_sequence_argument(child, &block) }
+      when Hash
+        if node[:kind] == :call && %w[nextval currval setval].include?(node[:name])
+          first = node[:args]&.first
+          yield first if first.is_a?(Hash) && first[:kind] == :literal && first[:untyped] && first[:value].is_a?(String)
+        end
+        node.each_value { |child| each_sequence_argument(child, &block) if child.is_a?(Hash) || child.is_a?(Array) }
+      end
+    end
+
+    def sequence_literal_names?(text, name)
+      sequence_name(text) == name
+    rescue Error
+      false
+    end
+
+    # ALTER SEQUENCE … RENAME rewrites every table and view column DEFAULT naming the sequence
+    # (sequences.md §15.3), as PostgreSQL's regclass constant follows it.
+    def rename_sequence_defaults(old_name, new_name)
+      @tables.each do |table_name, table|
+        next unless table[:columns].any? { |column| default_names_sequence?(column[:default], old_name) }
+
+        columns = table[:columns].map do |column|
+          next column unless default_names_sequence?(column[:default], old_name)
+
+          column.merge(default: rewrite_sequence_default(column[:default], old_name, new_name))
+        end
+        @tables[table_name] = table.merge(columns: columns)
+      end
+      (@views || {}).each do |view_name, view|
+        defaults = view[:defaults] || {}
+        next unless defaults.values.any? { |node| default_names_sequence?(node, old_name) }
+
+        @views[view_name] = view.merge(defaults: defaults.transform_values { |node| default_names_sequence?(node, old_name) ? rewrite_sequence_default(node, old_name, new_name) : node })
+      end
+    end
+
+    def rewrite_sequence_default(node, old_name, new_name)
+      return node unless node.is_a?(Hash) && node[:kind] != :opaque_definition
+
+      copy = Marshal.load(Marshal.dump(node))
+      each_sequence_argument(copy) do |literal|
+        literal[:value] = new_name.match?(/\A[a-z_][a-z0-9_$]*\z/) ? new_name : %("#{new_name.gsub('"', '""')}") if sequence_literal_names?(literal[:value], old_name)
+      end
+      copy
     end
 
     def sequence_name(value)
