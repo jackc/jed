@@ -296,7 +296,9 @@ module JedNative
     def current_key_block
       return nil unless @codec.encrypted?
 
-      KeyBlock.select(*[2, 3].map { |page| @image.byteslice(page * @page_size, @page_size) })
+      return KeyBlock.select(*@service_remote.read_pages([2, 3])) if @service_remote
+
+      KeyBlock.select(*[2, 3].map { |page| @file.pread(@page_size, page * @page_size) })
     end
 
     def compact_file

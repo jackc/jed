@@ -294,6 +294,21 @@ records raw timings and checksums, and distinguishes interpreter/YJIT/ZJIT; an
 unavailable JIT is reported, never silently measured as interpreter Ruby.
 
 The approved OpenSSL and Zlib extensions are required for digests and CRC32.
+
+**Encryption at rest** (spec/fileformat/encrypted.md) uses the same OpenSSL binding
+for AES-256, AES-256-GCM and HKDF-SHA-256 and `SecureRandom` for key material; only
+XAES-256-GCM's derivation glue is written here, checked against the C2SP vectors.
+Passphrase credentials stretch with Argon2id from the approved `argon2-kdf` gem
+(`gem install argon2-kdf`), loaded only when a passphrase is used, so plaintext and
+host-key databases need nothing beyond the standard library. A credential is passed
+as `credential: JedNative::Credential.key(bytes)` or `.passphrase(text)` to
+`create`, `open` and file `attach`; `change_credential(name, credential, kdf)`,
+`rekey(name, credential, kdf)` and `scratch_encryption: :auto | :on` follow
+spec/design/api.md. The corpus's encrypted mode is
+`JED_NATIVE_STORAGE=disk JED_NATIVE_ENCRYPTED=1` (or `JED_CONFORMANCE_ENCRYPTED=1`),
+writing its cost transcript to `JED_CONFORMANCE_TRANSCRIPT`. A rekey rebuilds the
+trees in memory rather than in a sealed, spillable scratch domain.
+
 `tools/generate_catalog.rb` snapshots only
 mechanical function metadata from shared spec data using the existing development
 TOML parser; normal codegen never runs it. Parser, resolver, executor, codecs, and
