@@ -58,7 +58,12 @@ import {
   zoneRenderCount,
 } from "./value.ts";
 import { parseNameText } from "./parser.ts";
-import { adjustIntervalTypmod, adjustTimestampTypmod } from "./store.ts";
+import {
+  adjustIntervalTypmod,
+  adjustTimestampTypmod,
+  floatInputOutOfRange,
+  floatUnderflow,
+} from "./store.ts";
 import { COSTS } from "./costs.ts";
 import { makeDate } from "./date.ts";
 import {
@@ -154,6 +159,7 @@ import {
   isInteger,
   isInterval,
   isJson,
+  isJsonPath,
   isJsonb,
   isText,
   isTimestamp,
@@ -174,6 +180,8 @@ import {
   parseInterval,
   tsDiff,
   tsShift,
+  tsShiftZoned,
+  tsShiftZoneConsults,
 } from "./interval.ts";
 import { Decimal, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
 import type { Interval } from "./interval.ts";
@@ -184,8 +192,10 @@ import {
   type PassingVar,
   type Vars as JsonPathVars,
   checkVarsObject,
+  compileCastMetered as jsonPathCompileCastMetered,
   compileMetered as jsonPathCompileMetered,
   evalPath as jsonPathEval,
+  render as jsonPathRender,
   passingVars,
 } from "./jsonpath.ts";
 import { not3, or3, valueCmp } from "./window.ts";
@@ -204,6 +214,7 @@ import {
   nullValueRaised as jsonNullValueRaised,
   getField,
   getIndex,
+  getRootIndex,
   getPath,
   pathStepIndex,
   verbatimGet,
@@ -251,6 +262,7 @@ import {
   localToInstantMicros,
   offsetAtRef,
   renderTimestamptzIn,
+  resolveMakeTimestamptzZone,
   resolveZone,
 } from "./timezone.ts";
 import {
@@ -838,6 +850,14 @@ function evalCastNode(e: Of<"cast">, row: Row, env: EvalEnv, m: Meter): EvalResu
 
 function applyCast(e: Of<"cast">, v: Value, env: EvalEnv, m: Meter): Value {
   if (v.kind === "null") return nullValue();
+  // text → jsonpath (casts.toml): the per-row text compiles through the literal's own parser (42601
+  // malformed) and yields the canonical path text, as PostgreSQL's jsonpath_in; the compile is
+  // metered like every evaluation-time compile (jsonpath.md §7).
+  if (v.kind === "text" && isJsonPath(e.target)) {
+    return jsonPathValue(
+      jsonPathRender(jsonPathCompileCastMetered(v.text, m, env.environment.property())),
+    );
+  }
   // Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in the
   // session zone.
   const out = isText(e.target)
@@ -1052,8 +1072,20 @@ function applyArith(e: Of<"arith">, a: Value, b: Value, _env: EvalEnv, m: Meter)
       instant = (a as { micros: bigint }).micros;
       iv = (b as { iv: Interval }).iv;
     }
-    const r = tsShift(instant, iv, e.op === "sub");
-    return isTimestamptz(e.result) ? timestamptzValue(r) : timestampValue(r);
+    if (isTimestamptz(e.result)) {
+      // A timestamptz shifts in the SESSION zone (PG timestamptz_pl_interval; interval.md §5): its
+      // months/days steps each consult the zone, charged one timezone unit apiece before the shift
+      // runs (cost.md, the AT TIME ZONE unit).
+      const n = tsShiftZoneConsults(instant, iv);
+      if (n !== 0n) {
+        m.charge(n * COSTS.timezone);
+        m.guard();
+      }
+      return timestamptzValue(
+        tsShiftZoned(instant, iv, e.op === "sub", _env.exec.session.timeZone),
+      );
+    }
+    return timestampValue(tsShift(instant, iv, e.op === "sub"));
   }
   if (isDecimal(e.result)) {
     // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -1162,6 +1194,7 @@ function applyCompare(e: Of<"compare">, a: Value, b: Value, _env: EvalEnv, m: Me
 }
 
 function evalBooleanNode(e: Of<"and" | "or">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
+  if (e.kind === "or" && e.lhs.kind === "or") return evalOrChain(e, row, env, m);
   m.charge(operatorCost(e.kind));
   const left = evalExprMaybeSteps(e.lhs, row, env, m);
   return isPendingEval(left)
@@ -1191,6 +1224,72 @@ function evalBooleanRight(
   return evalBinaryRight(e, left, e.rhs, row, env, m, applyBoolean);
 }
 
+// evalOrChain evaluates a left-deep OR chain — `a OR b OR c`, or an IN list's desugar (grammar.md
+// §20) — iteratively down its left spine instead of recursing into each lhs, so the V8 stack it uses
+// does not grow with the chain (cost.md §7). The charges and the short-circuit are exactly the
+// recursive form's: every OR node on the spine is charged first (the recursion charges each on entry
+// before descending into its lhs), then the operands are evaluated left to right, folding with the
+// Kleene OR and stopping at the first TRUE, which is returned as is. A pending operand retains the
+// fold as a continuation (resumeOrChain), like every other operator. Called for a node whose lhs is
+// itself an OR; a plain `a OR b` keeps evalBooleanNode's form.
+function evalOrChain(e: Of<"or">, row: Row, env: EvalEnv, m: Meter): EvalResult<Value> {
+  const spine: Of<"or">[] = []; // root first
+  let node: RExpr = e;
+  while (node.kind === "or") {
+    m.charge(operatorCost("or"));
+    spine.push(node);
+    node = node.lhs;
+  }
+  const left = evalExprMaybeSteps(node, row, env, m);
+  return isPendingEval(left)
+    ? resumeOrChain(spine, spine.length - 1, left, row, env, m)
+    : foldOrChain(spine, spine.length - 1, left, row, env, m);
+}
+
+// foldOrChain folds acc (the value of everything left of spine[i].rhs) through the spine's rhs
+// operands from i down to the root.
+function foldOrChain(
+  spine: Of<"or">[],
+  i: number,
+  acc: Value,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): EvalResult<Value> {
+  for (; i >= 0; i--) {
+    if (acc.kind === "bool" && acc.value === true) return acc;
+    const right = evalExprMaybeSteps(spine[i]!.rhs, row, env, m);
+    if (isPendingEval(right)) return resumeOrChainRight(spine, i, acc, right, row, env, m);
+    acc = boolOr(acc, right);
+  }
+  return acc;
+}
+
+function* resumeOrChain(
+  spine: Of<"or">[],
+  i: number,
+  left: Steps<Value>,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Steps<Value> {
+  const result = foldOrChain(spine, i, yield* left, row, env, m);
+  return isPendingEval(result) ? yield* result : result;
+}
+
+function* resumeOrChainRight(
+  spine: Of<"or">[],
+  i: number,
+  acc: Value,
+  right: Steps<Value>,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): Steps<Value> {
+  const result = foldOrChain(spine, i - 1, boolOr(acc, yield* right), row, env, m);
+  return isPendingEval(result) ? yield* result : result;
+}
+
 function applyBoolean(e: Of<"and" | "or">, left: Value, right: Value): Value {
   return e.kind === "and" ? boolAnd(left, right) : boolOr(left, right);
 }
@@ -1215,7 +1314,7 @@ function* evalJsonGetNodeSteps(e: Of<"jsonGet">, row: Row, env: EvalEnv, m: Mete
     if (av.kind === "text") {
       accessed = getField(node, av.text);
     } else if (av.kind === "int") {
-      accessed = getIndex(node, av.int);
+      accessed = getRootIndex(node, av.int); // a top-level scalar is its own element 0 (PG)
     } else {
       throw new Error("resolver guarantees a text/int arg for -> / ->>");
     }
@@ -1700,7 +1799,10 @@ function* evalRegexFuncNodeSteps(
       // whole match (regex.md §8e).
       if (e.func === "substring" && prog.ngroups > 0) subexpr = 1;
       // `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
-      // or a non-participating group (-1) → NULL / 0.
+      // or a non-participating group (-1) → NULL / 0. A pattern with NO capture group has one
+      // "subexpression" — the whole match — so subexpr 1 selects it there (PG setup_regexp_matches
+      // falls back to npatterns = 1; regex.md §8b).
+      if (prog.ngroups === 0 && subexpr === 1) subexpr = 0;
       if (subexpr > prog.ngroups) return noMatch();
       const si = 2 * subexpr;
       const s2 = regexSlot(prog, caps, si);
@@ -2050,10 +2152,7 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
     m.guard();
     if (vals.length === 7) {
       const zoneStr = (vals[6] as { text: string }).text;
-      const z = resolveZone(zoneStr, env.environment);
-      if (z === undefined) {
-        throw engineError("invalid_parameter_value", `time zone "${zoneStr}" not recognized`);
-      }
+      const z = resolveMakeTimestamptzZone(env.environment, zoneStr);
       return timestamptzValue(localToInstantMicros(z, wall));
     }
     return timestamptzValue(localToInstantMicros(env.exec.session.timeZone, wall));
@@ -2188,9 +2287,18 @@ function applyScalarFunc(e: Of<"scalarFunc">, vals: Value[], env: EvalEnv, m: Me
   if (e.func === "uuidv7") {
     const clock = env.rng.statementClockMicros(env.environment);
     // The optional interval arg shifts the embedded instant via the existing calendar-aware
-    // timestamptz arithmetic (entropy.md §4).
-    const shifted =
-      vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
+    // timestamptz arithmetic — in the session zone, as PG's timestamptz_pl_interval does, each
+    // calendar step charging one timezone unit (entropy.md §4, interval.md §5).
+    let shifted = clock;
+    if (vals.length === 1) {
+      const iv = (vals[0] as { iv: Interval }).iv;
+      const n = tsShiftZoneConsults(clock, iv);
+      if (n !== 0n) {
+        m.charge(n * COSTS.timezone);
+        m.guard();
+      }
+      shifted = tsShiftZoned(clock, iv, false, env.exec.session.timeZone);
+    }
     return uuidValue(env.rng.uuidV7(env.environment, shifted));
   }
   // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
@@ -3084,20 +3192,41 @@ function* evalJsonObjectFromArraysNodeSteps(
   m.charge(COSTS.operatorEval);
   // STRICT: a NULL whole-array argument → SQL NULL.
   const arrays: (string | null)[][] = [];
+  const dims: number[][] = []; // each argument's shape — the pairing rules depend on it (below)
   for (const a of e.args) {
     const v = yield* evalExprSteps(a, row, env, m);
     if (v.kind === "null") return nullValue();
+    if (v.kind === "array") dims.push(v.dims);
     arrays.push(valueToOptTextArray(v));
   }
-  // Pair up keys/values: one array of alternating k/v (even length), or two equal-length arrays.
+  // Pair up keys/values: one array of alternating k/v (even length), or two equal-length arrays. The
+  // shape rules are PostgreSQL's (json-sql-functions.md §2): the one-array form takes a 1-D array
+  // (even length) or a 2-D array of pairs (`{{k,v},…}`, else "array must have two columns"); the
+  // two-array form takes two 1-D arrays of one length; anything deeper is 2202E "wrong number of
+  // array subscripts". An empty (0-D) array builds `{}`.
   const pairs: [string | null, string | null][] = [];
   if (arrays.length === 1) {
     const flat = arrays[0]!;
-    if (flat.length % 2 !== 0) {
-      throw engineError("array_subscript_error", "array must have even number of elements");
+    switch (dims[0]!.length) {
+      case 0:
+      case 1:
+        if (flat.length % 2 !== 0) {
+          throw engineError("array_subscript_error", "array must have even number of elements");
+        }
+        break;
+      case 2:
+        if (dims[0]![1] !== 2) {
+          throw engineError("array_subscript_error", "array must have two columns");
+        }
+        break;
+      default:
+        throw engineError("array_subscript_error", "wrong number of array subscripts");
     }
     for (let i = 0; i < flat.length; i += 2) pairs.push([flat[i]!, flat[i + 1]!]);
   } else {
+    if (dims[0]!.length > 1 || dims[0]!.length !== dims[1]!.length) {
+      throw engineError("array_subscript_error", "wrong number of array subscripts");
+    }
     if (arrays[0]!.length !== arrays[1]!.length) {
       throw engineError("array_subscript_error", "mismatched array dimensions");
     }
@@ -3710,7 +3839,19 @@ export function evalFloatArith(op: BinaryOp, x: number, y: number, result: Scala
   // A finite-operand op that produced a non-finite result overflowed the (binary32 after fround, or
   // binary64) range → trap 22003. An Inf/NaN that came FROM an operand propagates and is NOT a trap.
   if (finiteInputs && !Number.isFinite(r)) throw overflow(result);
+  // Underflow (PG float8_mul / float8_div, float.md §3): a product of two non-zero operands, or a
+  // quotient of a non-zero dividend by a finite divisor, that rounds to exactly zero (at the result
+  // width — after the fround) traps 22003 rather than yielding 0. +, - and % never underflow.
+  if (r === 0 && floatUnderflowed(op, x, y)) throw floatUnderflow();
   return f32 ? float32Value(r) : float64Value(r);
+}
+
+// floatUnderflowed reports whether a zero result of op is PG's underflow: x * y with both operands
+// non-zero, or x / y with a non-zero dividend and a finite divisor (1 / Infinity is a legitimate 0).
+function floatUnderflowed(op: BinaryOp, x: number, y: number): boolean {
+  if (op === "mul") return x !== 0 && y !== 0;
+  if (op === "div") return x !== 0 && Number.isFinite(y);
+  return false;
 }
 
 // evalFloatFunc evaluates a unary float scalar function (float.md §8) over a float value `x`,
@@ -3750,53 +3891,60 @@ export function evalFloatFunc(
     case "round":
       return out(roundFloatHalfAway(x, places));
     case "sqrt":
-      // sqrt(neg) is a DOMAIN error → 22003 (NaN stays input-only). sqrt(NaN)=NaN, sqrt(+Inf)=+Inf,
-      // sqrt(-0)=-0 all propagate. IEEE mandates sqrt correctly-rounded, so it is in-contract.
+      // sqrt(neg) is a DOMAIN error → 2201F (PG dsqrt; NaN stays input-only). sqrt(NaN)=NaN,
+      // sqrt(+Inf)=+Inf, sqrt(-0)=-0 all propagate. IEEE mandates sqrt correctly-rounded, so it is
+      // in-contract.
       if (x < 0)
         throw engineError(
-          "numeric_value_out_of_range",
+          "invalid_argument_for_power_function",
           "cannot take square root of a negative number",
         );
       return out(Math.sqrt(x));
     case "exp": {
-      // exp overflow (e.g. exp(710)) → 22003. A NaN/±Inf operand propagates (exp(+Inf)=+Inf,
-      // exp(-Inf)=0, exp(NaN)=NaN). Transcendental — exempted (R tag).
+      // exp overflow (e.g. exp(710)) → 22003; an exact result that rounds to 0 (exp(-746)) is the
+      // underflow trap (PG dexp). A NaN/±Inf operand propagates (exp(+Inf)=+Inf, exp(-Inf)=0,
+      // exp(NaN)=NaN). Transcendental — exempted (R tag).
       const r = Math.exp(x);
-      if (Number.isFinite(x) && !Number.isFinite(r)) throw overflow(result);
+      if (Number.isFinite(x)) {
+        if (!Number.isFinite(r)) throw overflow(result);
+        if (r === 0) throw floatUnderflow();
+      }
       return out(r);
     }
     case "ln":
-      // ln(0) → 22003; ln(neg) → 22003 (domain). ln(+Inf)=+Inf, ln(NaN)=NaN propagate.
-      if (x === 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of zero");
+      // ln(0) → 2201E; ln(neg) → 2201E (PG dlog1). ln(+Inf)=+Inf, ln(NaN)=NaN propagate.
+      if (x === 0) throw engineError("invalid_argument_for_log", "cannot take logarithm of zero");
       if (x < 0)
-        throw engineError(
-          "numeric_value_out_of_range",
-          "cannot take logarithm of a negative number",
-        );
+        throw engineError("invalid_argument_for_log", "cannot take logarithm of a negative number");
       return out(Math.log(x));
     case "log10":
-      if (x === 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of zero");
+      if (x === 0) throw engineError("invalid_argument_for_log", "cannot take logarithm of zero");
       if (x < 0)
-        throw engineError(
-          "numeric_value_out_of_range",
-          "cannot take logarithm of a negative number",
-        );
+        throw engineError("invalid_argument_for_log", "cannot take logarithm of a negative number");
       return out(Math.log10(x));
     case "sin":
-      return out(Math.sin(x));
     case "cos":
-      return out(Math.cos(x));
     case "tan":
-      return out(Math.tan(x));
+    case "cot":
+      // The circular functions are undefined at ±Infinity: PG raises 22003 "input is out of
+      // range" (dsin/dcos/dtan/dcot) rather than returning NaN; a NaN operand propagates.
+      if (!Number.isFinite(x) && !Number.isNaN(x)) throw floatInputOutOfRange();
+      if (func === "sin") return out(Math.sin(x));
+      if (func === "cos") return out(Math.cos(x));
+      if (func === "tan") return out(Math.tan(x));
+      // cot(x) = 1/tan(x) (no Math.cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
+      return out(1 / Math.tan(x));
     case "cbrt":
       // cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
       return out(Math.cbrt(x));
     case "radians":
       // radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
-      // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
-      return out(x * RADIANS_PER_DEGREE);
+      // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract). They are
+      // PG's float8_mul / float8_div, so they carry the §3/§5 overflow and underflow traps:
+      // degrees(1e308) overflows, radians(5e-324) underflows to 0 — both 22003.
+      return evalFloatArith("mul", x, RADIANS_PER_DEGREE, "f64");
     case "degrees":
-      return out(x / RADIANS_PER_DEGREE);
+      return evalFloatArith("div", x, RADIANS_PER_DEGREE, "f64");
     case "asin":
       // asin domain is [-1, 1]: a finite |x| > 1 (and ±Inf, magnitude > 1) is out of range →
       // 22003, exactly PG; a NaN operand propagates (no trap).
@@ -3811,9 +3959,6 @@ export function evalFloatFunc(
     case "atan":
       // atan is defined on all of ℝ (no domain trap); atan(±Inf) = ±π/2, atan(NaN) = NaN.
       return out(Math.atan(x));
-    case "cot":
-      // cot(x) = 1/tan(x) (no Math.cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
-      return out(1 / Math.tan(x));
     case "sinh":
       // sinh/cosh overflow to ±Inf with NO trap (PG-faithful, unlike exp/pow). NaN propagates.
       return out(Math.sinh(x));
@@ -3846,9 +3991,55 @@ export function evalFloatFunc(
 // exempted), trapping 22003 on a finite-input overflow to ±Inf (e.g. pow(10, 400)); a NaN/±Inf
 // operand propagates per IEEE. result is f64 (the catalog), so no fround.
 export function evalFloatPow(x: number, y: number, result: ScalarType): Value {
-  const r = x ** y;
-  if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r)) throw overflow(result);
+  const r = floatPow(x, y, result);
   return result === "f32" ? float32Value(Math.fround(r)) : float64Value(r);
+}
+
+// floatPow is PostgreSQL's dpow (float.c) over binary64 (float.md §8): the POSIX NaN rules first
+// (NaN^0 = 1, 1^NaN = 1, every other NaN input yields NaN), then the SQL-standard domain errors
+// 2201F (0^negative; negative^non-integer), then the infinite cases resolved explicitly per POSIX
+// (never trapped), and finally the native pow with the finite overflow (±Inf → 22003) and underflow
+// (a non-zero base whose power rounds to 0 → 22003) traps.
+function floatPow(x: number, y: number, result: ScalarType): number {
+  if (Number.isNaN(x)) return Number.isNaN(y) || y !== 0 ? NaN : 1;
+  if (Number.isNaN(y)) return x !== 1 ? NaN : 1;
+  if (x === 0 && y < 0)
+    throw engineError(
+      "invalid_argument_for_power_function",
+      "zero raised to a negative power is undefined",
+    );
+  if (x < 0 && Math.floor(y) !== y)
+    throw engineError(
+      "invalid_argument_for_power_function",
+      "a negative number raised to a non-integer power yields a complex result",
+    );
+  if (!Number.isFinite(y)) {
+    const absx = Math.abs(x);
+    if (absx === 1) return 1;
+    if (y > 0) return absx > 1 ? y : 0;
+    return absx > 1 ? 0 : -y;
+  }
+  if (!Number.isFinite(x)) {
+    if (y === 0) return 1;
+    if (x > 0) return y > 0 ? x : 0;
+    // x = -Inf: y is an integer (the domain check above); the sign follows its parity.
+    const yOdd = Math.floor(y / 2) !== y / 2;
+    if (y > 0) return yOdd ? x : -x;
+    return yOdd ? -0 : 0;
+  }
+  const r = x ** y;
+  if (Number.isNaN(r)) {
+    // Every domain error was handled above, so a NaN can only be a libm quirk for a huge |y| (PG's
+    // glibc-bug branch): resolve it as PG does.
+    const absx = Math.abs(x);
+    if (x === 0) return 0;
+    if (absx === 1) return 1;
+    if (y >= 0 === absx > 1) throw overflow(result);
+    throw floatUnderflow();
+  }
+  if (!Number.isFinite(r)) throw overflow(result);
+  if (r === 0 && x !== 0) throw floatUnderflow();
+  return r;
 }
 
 // roundFloatHalfAway rounds a float to `places` decimal places, HALF AWAY FROM ZERO (jed's one
@@ -3979,7 +4170,10 @@ export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | n
     if (isFloat(target)) {
       const d = Number(v.dec.render());
       if (!Number.isFinite(d)) throw overflow(target);
-      return makeFloat(target, d);
+      const f = makeFloat(target, d);
+      // A non-zero decimal that rounds to 0 at the width underflowed → 22003 (float.md §6).
+      if ((f as { value: number }).value === 0 && !v.dec.isZero()) throw floatUnderflow();
+      return f;
     }
     const n = v.dec.toBigIntRound();
     if (n === null || !inRange(target, n)) throw overflow(target);
@@ -4030,6 +4224,8 @@ export function makeFloatCast(ty: ScalarType, n: number): Value {
   const r = Math.fround(n);
   // A finite double beyond binary32 range frounds to ±Inf → trap; a NaN/±Inf source stays as-is.
   if (Number.isFinite(n) && !Number.isFinite(r)) throw overflow(ty);
+  // A non-zero double that frounds to 0 underflowed binary32 → 22003 (PG float84, float.md §6).
+  if (r === 0 && n !== 0) throw floatUnderflow();
   return float32Value(r);
 }
 

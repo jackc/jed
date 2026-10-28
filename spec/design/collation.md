@@ -1238,8 +1238,11 @@ and Unicode casing is the optional ICU extension — and it is what lets a `C`/A
   (identifier folding is ASCII-only, [grammar.md §3](grammar.md)). So the bare binary's casing
   is **always available** and makes **no Unicode-version promise**.
 - **Full Unicode casing (the loaded property section).** When a bundle's **property section** is
-  loaded (§9/§13), `upper`/`lower`/`initcap` fold via the Unicode simple case mappings + SpecialCasing
-  (e.g. `ß`→`SS`), under the bundle's single `(unicode_version)`. Like collation, this is jed's **own
+  loaded (§9/§13), `upper`/`lower` fold via the Unicode simple case mappings + SpecialCasing
+  (e.g. `ß`→`SS`), under the bundle's single `(unicode_version)`. (`initcap` stays on the ASCII
+  baseline even with a property section loaded — the section carries case mappings only, and
+  `initcap` also needs an alphanumeric classification for its word boundaries; it is the deferred
+  follow-on noted above, [string-functions.md §3](string-functions.md).) Like collation, this is jed's **own
   pinned data**, byte-identical cross-core, deterministic-given-the-bytes — **not** a host read and
   **not** a determinism-ledger exception (§11).
 - **One version axis, one bundle.** The property tables share the **`(unicode_version)`** axis with

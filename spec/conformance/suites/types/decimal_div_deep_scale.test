@@ -1,0 +1,67 @@
+# Decimal division when the dividend's scale exceeds select_div_scale's 1000-digit display clamp
+# (spec/design/decimal.md §4): the rescale shift E = rscale + s2 − s1 is then NEGATIVE, so the
+# shift moves to the divisor (N = |C1|, D = |C2|·10^−E) instead of widening the dividend — the
+# result is the quotient rounded half away from zero to 1000 fractional digits, exactly
+# PostgreSQL's (oracle-confirmed: 1e-16383 / 1 is 0 at scale 1000, and 5e-1001 / 1 rounds up to
+# 1e-1000). The work is the divisor-widened group product q(d1) · q(d2 − E) (cost.md §3), so
+# the cost is identical across cores. The former wrapped shift built a 2^32-digit numerator and
+# returned a wrong non-zero result at the wrong cost.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.aggregates, cast.operator, types.i32, types.decimal, expr.decimal_arithmetic, resource.cost_metering
+
+# 1e-1001 / 1: rscale clamps to 1000, E = -1, 1 / 10 rounds to 0 at scale 1000 (1002 characters)
+# cost: 7
+query IT nosort
+SELECT length(('1e-1001'::numeric / 1)::text), left(('1e-1001'::numeric / 1)::text, 5)
+----
+1002
+0.000
+
+# the max-scale dividend: E = -15383, the divisor widens by 15383 digits (q(1) · q(15384) = 3846)
+# cost: 7945
+query BI nosort
+SELECT (1e-16383 / 1) = 0, length((1e-16383 / 1)::text)
+----
+true
+1002
+
+# half away from zero: 5e-1001 / 1 is 5 / 10 → rounds up to 1e-1000; 4e-1001 / 1 rounds to 0
+# cost: 254
+query BB nosort
+SELECT ('5e-1001'::numeric / 1) = 1e-1000, ('4e-1001'::numeric / 1) = 0
+----
+true
+true
+
+# a deep-scale divisor too: 1e-1500 / 1e-1001 (s1 = 1500, s2 = 1001, E = 501) is 1e-499
+# cost: 381
+query BI nosort
+SELECT ('1e-1500'::numeric / 1e-1001) = 1e-499, length(('1e-1500'::numeric / 1e-1001)::text)
+----
+true
+1002
+
+# a non-zero quotient past the clamp: 1.5e-1001 / 1e-1001 = 1.5 at scale 1000
+# cost: 756
+query BI nosort
+SELECT ('1.5e-1001'::numeric / 1e-1001) = 1.5, length(('1.5e-1001'::numeric / 1e-1001)::text)
+----
+true
+1002
+
+# the division-by-zero trap still precedes the work
+statement error 22012
+SELECT '1e-1001'::numeric / 0
+
+# AVG over such a value divides the sum by the count through the same path
+statement ok
+CREATE TABLE deep (id i32 PRIMARY KEY, x decimal)
+
+statement ok
+INSERT INTO deep VALUES (1, '1e-1001'::numeric)
+
+# cost: 757
+query BI nosort
+SELECT avg(x) = 0, length(avg(x)::text) FROM deep
+----
+true
+1002

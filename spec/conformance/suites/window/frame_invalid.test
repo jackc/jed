@@ -1,0 +1,113 @@
+# Window functions — reversed / impossible frame extents are 42P20 (window.md §6).
+#
+# PostgreSQL rejects a frame whose extent can never be well-formed at parse time (gram.y
+# frame_extent), before any bound offset is validated, in every mode (ROWS/RANGE/GROUPS):
+# - the start may not be UNBOUNDED FOLLOWING;
+# - the end may not be UNBOUNDED PRECEDING;
+# - a CURRENT ROW start may not end with n PRECEDING;
+# - an n FOLLOWING start may not end with n PRECEDING or CURRENT ROW (so the single-bound form
+#   `ROWS n FOLLOWING`, whose end defaults to CURRENT ROW, is rejected too).
+# A frame that is merely empty (`1 FOLLOWING AND 0 FOLLOWING`, `3 PRECEDING AND 2 PRECEDING`) is
+# legal and yields the empty-frame result. Every record is oracle-checked against PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_aggregate, query.window_frame, query.window_frame_range, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+
+# frame start cannot be UNBOUNDED FOLLOWING
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS UNBOUNDED FOLLOWING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED FOLLOWING AND UNBOUNDED FOLLOWING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k GROUPS UNBOUNDED FOLLOWING) FROM t
+
+# frame end cannot be UNBOUNDED PRECEDING
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND UNBOUNDED PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k GROUPS BETWEEN CURRENT ROW AND UNBOUNDED PRECEDING) FROM t
+
+# frame starting from current row cannot have preceding rows
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k GROUPS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t
+
+# frame starting from following row cannot have preceding rows / cannot end with current row
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS 1 FOLLOWING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k RANGE 1 FOLLOWING) FROM t
+
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k GROUPS BETWEEN 2 FOLLOWING AND 1 PRECEDING) FROM t
+
+# The extent check precedes offset validation: a negative FOLLOWING start before CURRENT ROW is
+# 42P20, not 22013.
+statement error 42P20
+SELECT sum(id) OVER (ORDER BY k ROWS BETWEEN -1 FOLLOWING AND CURRENT ROW) FROM t
+
+# It also precedes the mode checks: GROUPS without ORDER BY, or a RANGE offset with no key, is still
+# rejected for its extent first (42P20 either way).
+statement error 42P20
+SELECT sum(id) OVER (GROUPS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t
+
+# The same shape in a named WINDOW definition.
+statement error 42P20
+SELECT sum(id) OVER w FROM t WINDOW w AS (ORDER BY k ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW)
+
+# Merely empty frames are legal: 1 FOLLOWING .. 0 FOLLOWING frames nothing (sum NULL), 3 PRECEDING ..
+# 2 PRECEDING frames keys in [k-3, k-2] (only id3 sees {1}), 2 FOLLOWING .. 1 FOLLOWING is empty (count 0).
+# names: id, a, b, c
+# cost: 17
+query IIII nosort
+SELECT id, sum(id) OVER (ORDER BY k ROWS BETWEEN 1 FOLLOWING AND 0 FOLLOWING) AS a, sum(id) OVER (ORDER BY k RANGE BETWEEN 3 PRECEDING AND 2 PRECEDING) AS b, count(*) OVER (ORDER BY k GROUPS BETWEEN 2 FOLLOWING AND 1 FOLLOWING) AS c FROM t ORDER BY id
+----
+1
+NULL
+NULL
+0
+2
+NULL
+NULL
+0
+3
+NULL
+1
+0

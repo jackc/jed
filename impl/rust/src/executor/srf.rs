@@ -42,6 +42,7 @@ impl Engine {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -449,8 +450,10 @@ impl Engine {
         if args.len() != 2 {
             return Err(no_func_overload(name));
         }
-        // The base argument's COMPOSITE type fixes the columns (its value is unused — usually NULL).
-        let (_base, bt) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
+        // The base argument's COMPOSITE type fixes the columns, and its VALUE is the row the JSON
+        // members overwrite (json-table.md §2): a member missing from the document keeps the base
+        // field (NULL when the base is NULL, the usual `NULL::type` call).
+        let (base, bt) = resolve(arg_scope, &args[0], None, &mut AggCtx::Forbidden, ptypes)?;
         let ctype = match &bt {
             ResolvedType::Composite(r) => {
                 // A named composite supplies the columns; an anonymous `record` base is `0A000`.
@@ -519,8 +522,9 @@ impl Engine {
             on_commit: crate::catalog::OnCommit::PreserveRows,
             scalar_func: false,
         });
-        // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
-        Ok((table, vec![doc], SrfKind::JsonRecord { jsonb, set }))
+        // The SRF args are the json DOCUMENT then the BASE row (the R1 `_to_record` forms have only
+        // the document); the R1 row generator fills the base row's fields from the document.
+        Ok((table, vec![doc, base], SrfKind::JsonRecord { jsonb, set }))
     }
 
     /// Resolve a `JSON_TABLE(ctx, path COLUMNS (…))` source (T1, json-table.md §3) → its synthetic
@@ -549,6 +553,7 @@ impl Engine {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -605,6 +610,9 @@ impl Engine {
         // The PASSING values (json-sql-functions.md §5.4) follow the context in the SRF's args.
         let (passing, passing_names) =
             resolve_json_passing(&arg_scope, &jt.passing, &mut AggCtx::Forbidden, ptypes)?;
+        // Every column name across the whole COLUMNS tree is unique (42712, PostgreSQL's
+        // CheckDuplicateColumnOrPathNames, checked before the columns themselves resolve).
+        check_jt_duplicate_names(&jt.columns, &mut std::collections::HashSet::new())?;
         let mut out_columns: Vec<Column> = Vec::new();
         let mut defaults: Vec<RExpr> = Vec::new();
         let columns = self.resolve_jt_columns(
@@ -655,9 +663,17 @@ impl Engine {
         defaults: &mut Vec<RExpr>,
     ) -> Result<Vec<JtCol>> {
         let mut resolved = Vec::with_capacity(cols.len());
+        let mut ordinality_found = false; // at most one FOR ORDINALITY column per COLUMNS level (PG)
         for col in cols {
             match col {
                 JtColumn::Ordinality { name } => {
+                    if ordinality_found {
+                        return Err(EngineError::new(
+                            SqlState::SyntaxError,
+                            "only one FOR ORDINALITY column is allowed",
+                        ));
+                    }
+                    ordinality_found = true;
                     let idx = out_columns.len();
                     out_columns.push(jt_column(name, ScalarType::Int32, None));
                     resolved.push(JtCol::Ordinality { idx });
@@ -790,9 +806,10 @@ impl Engine {
         if matches!(ctx, Value::Null) {
             return Ok(Vec::new());
         }
-        // A `json` context is converted to `jsonb`, as PostgreSQL casts it (jsonpath.md §5).
+        // A `json` context is converted to `jsonb`, as PostgreSQL casts it (jsonpath.md §5); a
+        // `text` context is parsed the same way (malformed → 22P02, outside ON ERROR — json.md §4.2).
         let node = match &ctx {
-            Value::Json(s) => json::jsonb_in(s)?,
+            Value::Json(s) | Value::Text(s) => json::jsonb_in(s)?,
             other => json_arg_node(other)?,
         };
         // The root path → the sequence of row items (a structural error here yields no rows).
@@ -1637,7 +1654,26 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<Vec<Row>> {
         let arg = srf.args[0].eval(&[], env, meter)?;
+        // json[b]_populate_record(set) (R2) carries its base row as the second arg: a NULL base is
+        // an all-NULL row of the composite's shape. The `_to_record` forms have no base (None).
+        let base: Option<Row> = match srf.kind {
+            SrfKind::JsonRecord { .. } if srf.args.len() == 2 => {
+                Some(match srf.args[1].eval(&[], env, meter)? {
+                    Value::Composite(fields) => fields,
+                    _ => vec![Value::Null; srf.record_cols.len()],
+                })
+            }
+            _ => None,
+        };
         if matches!(arg, Value::Null) {
+            // A NULL document: populate_record returns the base row unchanged (PostgreSQL returns
+            // the record argument as is — one row, all NULL for a NULL base); every other form
+            // yields no rows.
+            if let (SrfKind::JsonRecord { set: false, .. }, Some(b)) = (srf.kind, &base) {
+                meter.checkpoint()?;
+                meter.charge(COSTS.generated_row);
+                return Ok(vec![b.clone()]);
+            }
             return Ok(Vec::new());
         }
         // The json array_elements / each variants walk the verbatim text (json.md §4) instead of
@@ -1666,7 +1702,7 @@ impl Engine {
                     .trim_start_matches(json::is_json_ws_char)
                     .starts_with('[')
                 {
-                    return json_recordset_rows_verbatim(srf, text, env, meter);
+                    return json_recordset_rows_verbatim(srf, text, base.as_ref(), env, meter);
                 }
                 json::parse_preserving_unless_root(text, b'{')?
             }
@@ -1790,12 +1826,24 @@ impl Engine {
                     for e in elems {
                         meter.checkpoint()?;
                         meter.charge(COSTS.generated_row);
-                        out.push(json_record_row(e, &srf.record_cols, env, meter)?);
+                        out.push(json_record_row(
+                            e,
+                            &srf.record_cols,
+                            base.as_ref(),
+                            env,
+                            meter,
+                        )?);
                     }
                 } else {
                     meter.checkpoint()?;
                     meter.charge(COSTS.generated_row);
-                    out.push(json_record_row(&node, &srf.record_cols, env, meter)?);
+                    out.push(json_record_row(
+                        &node,
+                        &srf.record_cols,
+                        base.as_ref(),
+                        env,
+                        meter,
+                    )?);
                 }
             }
             _ => unreachable!("json_srf_rows only handles the json SRF kinds"),
@@ -1857,9 +1905,36 @@ impl Engine {
 /// `\u0000` / unpaired surrogate raises) and its row built — so an earlier element's conversion
 /// error precedes a later element's escape error — while a non-object element raises its kind error
 /// at its opening bracket (an array, unlexed) or after its token (a scalar, lexed first).
+/// Walk a `JSON_TABLE` COLUMNS tree (every nesting level shares one namespace, as in PostgreSQL)
+/// and report the first column name seen twice as 42712 (json-table.md §3.1).
+fn check_jt_duplicate_names(
+    cols: &[JtColumn],
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    for col in cols {
+        let name = match col {
+            JtColumn::Ordinality { name } => name,
+            JtColumn::Regular { name, .. } => name,
+            JtColumn::Exists { name, .. } => name,
+            JtColumn::Nested { columns, .. } => {
+                check_jt_duplicate_names(columns, seen)?;
+                continue;
+            }
+        };
+        if !seen.insert(name.clone()) {
+            return Err(EngineError::new(
+                SqlState::DuplicateAlias,
+                format!("duplicate JSON_TABLE column or path name: {name}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn json_recordset_rows_verbatim(
     srf: &SrfPlan,
     text: &str,
+    base: Option<&Row>,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Vec<Row>> {
@@ -1868,7 +1943,7 @@ fn json_recordset_rows_verbatim(
         let e = json::parse_preserving_unless_root(sub, b'[')?;
         meter.checkpoint()?;
         meter.charge(COSTS.generated_row);
-        out.push(json_record_row(&e, &srf.record_cols, env, meter)?);
+        out.push(json_record_row(&e, &srf.record_cols, base, env, meter)?);
     }
     Ok(out)
 }

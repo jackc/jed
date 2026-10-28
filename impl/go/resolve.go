@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -154,6 +155,16 @@ type scope struct {
 	// mergeAction is the flat slot merge_action() reads: set only on a MERGE's RETURNING scope
 	// (spec/design/merge.md §7). Elsewhere (nil) the function is 42601.
 	mergeAction *int
+	// grouped marks this scope as GROUPED for the subqueries planned under it, with groupKeys the
+	// flat input indices of its grouping keys in group-row slot order (the planner's master list,
+	// functionally dependent columns included — aggregates.md §4). Set only while a collecting
+	// aggCtx plans a subquery (planSubquery): the projection, HAVING, ORDER BY and window keys of a
+	// grouped query evaluate over the GROUP row (keys, then aggregates), so a correlated reference
+	// into this scope from such a subquery must name a grouping column — else 42803, as in
+	// PostgreSQL — and reads that key's slot (resolveColumnRef). A subquery in WHERE or an aggregate
+	// argument sees the flat input row (grouped is false there).
+	grouped   bool
+	groupKeys []int
 }
 
 // lateralFence is the fence a parenthesized join's body is planned against (spec/design/grammar.md
@@ -603,6 +614,17 @@ func (s *scope) traceFlat(idx int) {
 	}
 }
 
+// hasSubRel reports whether label is an inner label of an unaliased parenthesized join of this
+// scope (grammar.md §15).
+func (s *scope) hasSubRel(label string) bool {
+	for _, sr := range s.subRels {
+		if sr.label == label {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveQualified resolves a qualified rel.col against THIS scope, then outward. A qualifier
 // naming a relation here binds — a missing column is then 42703 (no fall-through). Only an
 // unknown qualifier walks outward (42P01 if no ancestor has it).
@@ -616,6 +638,12 @@ func (s *scope) resolveQualified(qualifier, name string) (resolved, error) {
 		if r.label == q {
 			labeled++
 		}
+	}
+	// A relation label that is also an inner label of a joined source (a MERGE target aliased like
+	// one of its source join's relations — merge.md §2) is likewise ambiguous: PostgreSQL's 42P09,
+	// never a silent bind to the target.
+	if labeled == 1 && s.hasSubRel(q) {
+		labeled++
 	}
 	if labeled > 1 {
 		return resolved{}, newError(AmbiguousAlias, "table reference "+qualifier+" is ambiguous")
@@ -946,12 +974,15 @@ func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz
 	for i, ty := range types {
 		var v Value
 		var err error
+		if err := checkHostParam(supplied[i]); err != nil {
+			return nil, err
+		}
 		if ty.isScalar() {
 			// A text value bound to a timestamptz parameter reads an offset-less string in the session
 			// zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
-			v, err = storeValue(supplied[i], ty.Scalar, typmod{}, false, labels[i], iz)
+			v, err = storeValue(hostTimeParam(supplied[i], &ty.Scalar), ty.Scalar, typmod{}, false, labels[i], iz)
 		} else {
-			v, err = bindContainerParam(supplied[i], ty, labels[i], iz)
+			v, err = bindContainerParam(hostTimeArrayParam(supplied[i], ty), ty, labels[i], iz)
 		}
 		if err != nil {
 			return nil, err
@@ -959,6 +990,43 @@ func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz
 		bound[i] = v
 	}
 	return bound, nil
+}
+
+// checkHostParam checks a supplied text parameter as PostgreSQL checks a text-format parameter's
+// encoding: a text value with an invalid UTF-8 sequence or a NUL byte is 22021 (types.md §11), so no
+// such value is ever compared, stored, or rendered. The ergonomic binder (toValue) checks a Go string
+// the same way; this covers a Value a host builds itself.
+func checkHostParam(v Value) error {
+	if v.Kind != ValText {
+		return nil
+	}
+	_, err := decodeUTF8Text(v.str())
+	return err
+}
+
+// hostTimeArrayParam is hostTimeParam for a container parameter: a one-dimensional array bound from
+// a Go []time.Time (every element a host time) re-coerces each element to the array's scalar element
+// type; any other value is returned as is.
+func hostTimeArrayParam(v Value, ty colType) Value {
+	if v.Kind != ValArray || ty.Elem == nil || !ty.Elem.isScalar() {
+		return v
+	}
+	elems := v.arrayVal().Elements
+	converted := false
+	for _, e := range elems {
+		if _, ok := e.ref.(time.Time); ok {
+			converted = true
+			break
+		}
+	}
+	if !converted {
+		return v
+	}
+	out := make([]Value, len(elems))
+	for i, e := range elems {
+		out[i] = hostTimeParam(e, &ty.Elem.Scalar)
+	}
+	return ArrayValue(out)
 }
 
 // bindContainerParam coerces a host value to an array, range, or composite parameter type
@@ -1165,7 +1233,14 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 		}
 		for k, idx := range star {
 			c := starCols[k]
-			ps = append(ps, &rExpr{kind: reColumn, index: idx})
+			// Each expanded column obeys the grouping rule exactly as a written reference would
+			// (aggregates.md §4): in a grouped projection it must be a grouping column (else 42803)
+			// and reads its group-row slot, never the flat input index.
+			node, _, err := collectColumn(s, ag, idx, c.Name)
+			if err != nil {
+				return nil, nil, nil, nil, nil, err
+			}
+			ps = append(ps, node)
 			names = append(names, c.Name)
 			types = append(types, resolvedTypeOfCol(c.Type, s.catalog.readSnap()))
 			derivs = append(derivs, catColumnDeriv(c))
@@ -1224,17 +1299,28 @@ func resolveProjections(s *scope, items selectItems, ag *aggCtx, params *paramTy
 					break
 				}
 			}
-			// An inner label of an unaliased parenthesized join expands to its own columns (§15).
+			// An inner label of an unaliased parenthesized join expands to its own columns (§15). A
+			// label naming both a relation and an inner join relation is ambiguous (42P09), as for a
+			// qualified column (resolveQualified).
 			for i := range s.subRels {
-				if table == nil && s.subRels[i].label == want {
-					table, slots = s.subRels[i].table, s.subRels[i].slots
+				if s.subRels[i].label != want {
+					continue
 				}
+				if table != nil {
+					return nil, nil, nil, nil, nil, newError(AmbiguousAlias, "table reference "+want+" is ambiguous")
+				}
+				table, slots = s.subRels[i].table, s.subRels[i].slots
 			}
 			if table == nil {
 				return nil, nil, nil, nil, nil, newError(UndefinedTable, "missing FROM-clause entry for table "+it.Expr.Qualifier)
 			}
 			for i := range slots {
-				ps = append(ps, &rExpr{kind: reColumn, index: slots[i]})
+				// The grouping rule applies per expanded column, as for bare `*` (aggregates.md §4).
+				node, _, err := collectColumn(s, ag, slots[i], table.Columns[i].Name)
+				if err != nil {
+					return nil, nil, nil, nil, nil, err
+				}
+				ps = append(ps, node)
 				names = append(names, table.Columns[i].Name)
 				types = append(types, resolvedTypeOfCol(table.Columns[i].Type, s.catalog.readSnap()))
 				derivs = append(derivs, catColumnDeriv(&table.Columns[i]))
@@ -1469,6 +1555,19 @@ func hasCorrelatedSubquery(e *rExpr) bool {
 	if e.kind == reSubquery && e.subPlan != nil && queryPlanReferencesOuter(e.subPlan, 0) {
 		return true
 	}
+	if (e.kind == reAnd || e.kind == reOr) && e.lhs.kind == e.kind {
+		// A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its
+		// left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+		// the chain (cost.md §7f).
+		node := e
+		for node.kind == e.kind {
+			if hasCorrelatedSubquery(node.rhs) {
+				return true
+			}
+			node = node.lhs
+		}
+		return hasCorrelatedSubquery(node)
+	}
 	for _, child := range rexprChildren(e) {
 		if hasCorrelatedSubquery(child) {
 			return true
@@ -1488,14 +1587,31 @@ func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, re
 	if r.level == 0 {
 		return collectColumn(s, ag, r.index, name)
 	}
-	// An enclosing-query column that is itself a GROUP BY key of this query reads the group's key
-	// slot (query.group_by_correlated) — so a ROLLUP grand-total row sees it NULL, as in PostgreSQL.
-	if ag != nil && ag.collecting {
-		if slot, ty, ok := matchGroupOuter(ag, r.level, r.index); ok {
-			return &rExpr{kind: reColumn, index: slot}, ty, nil
+	return outerColumnRef(s, ag, r.level, r.index, resolvedTypeOfCol(s.columnOf(r).Type, s.catalog.readSnap()), name)
+}
+
+// outerColumnRef builds the correlated reference to flat column idx of the scope `level` hops out
+// (§26). An ancestor that is GROUPED (scope.grouped — its projection / HAVING / ORDER BY planned this
+// subquery) hands the subquery its GROUP row, so the column must be one of its grouping keys (else
+// 42803, PostgreSQL's "subquery uses ungrouped column") and the node reads that key's slot; an
+// ungrouped ancestor hands its input row, read at the flat index. The index is thus always a slot of
+// the row the evaluator finds `level` frames out. An enclosing-query column that is itself a GROUP
+// BY key of THIS query reads this query's group slot instead (query.group_by_correlated) — so a
+// ROLLUP grand-total row sees it NULL, as in PostgreSQL.
+func outerColumnRef(s *scope, ag *aggCtx, level, idx int, ty resolvedType, name string) (*rExpr, resolvedType, error) {
+	slot := idx
+	if anc := s.ancestor(level); anc.grouped {
+		slot = slices.Index(anc.groupKeys, idx)
+		if slot < 0 {
+			return nil, resolvedType{}, newError(GroupingError, "subquery uses ungrouped column "+name+" from outer query")
 		}
 	}
-	return &rExpr{kind: reOuterColumn, level: r.level, index: r.index}, resolvedTypeOfCol(s.columnOf(r).Type, s.catalog.readSnap()), nil
+	if ag != nil && ag.collecting {
+		if gslot, gty, ok := matchGroupOuter(ag, level, slot); ok {
+			return &rExpr{kind: reColumn, index: gslot}, gty, nil
+		}
+	}
+	return &rExpr{kind: reOuterColumn, level: level, index: slot}, ty, nil
 }
 
 // planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT
@@ -1506,7 +1622,7 @@ func resolveColumnRef(s *scope, ag *aggCtx, r resolved, name string) (*rExpr, re
 // documented divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The
 // inner query is resolved ONCE, with `s` as its parent, so correlated references become
 // reOuterColumn and errors fire even over an empty outer.
-func planSubquery(s *scope, inner queryExpr, params *paramTypes) (queryPlan, error) {
+func planSubquery(s *scope, inner queryExpr, ag *aggCtx, params *paramTypes) (queryPlan, error) {
 	if !s.allowSubquery {
 		return queryPlan{}, newError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
 	}
@@ -1515,6 +1631,14 @@ func planSubquery(s *scope, inner queryExpr, params *paramTypes) (queryPlan, err
 	// bound params (foldUncorrelatedInSelect), so a reused plan would carry another execution's
 	// folded constants. Every subquery form (scalar/EXISTS/IN/quantified) funnels through here.
 	params.uncacheable = true
+	// The inner query sees whether THIS level evaluates its row grouped (scope.grouped): a
+	// collecting context plans the subquery over the group row, any other over the input row.
+	savedGrouped, savedKeys := s.grouped, s.groupKeys
+	s.grouped, s.groupKeys = ag != nil && ag.collecting, nil
+	if s.grouped {
+		s.groupKeys = ag.groupKeys
+	}
+	defer func() { s.grouped, s.groupKeys = savedGrouped, savedKeys }()
 	// A subquery inherits the enclosing scope's CTE bindings directly (cte.md §2): a CTE is
 	// visible inside a nested subquery without counting as a correlation level.
 	return s.catalog.planQuery(inner, s, s.ctes, params)
@@ -1524,8 +1648,8 @@ func planSubquery(s *scope, inner queryExpr, params *paramTypes) (queryPlan, err
 // constructor of `arity` fields: the body must yield exactly `arity` columns (fewer / more is 42601,
 // PostgreSQL's "subquery has too few / too many columns"). Returns the plan and the anonymous
 // composite type its rows take (fields f1…fN over the column types, like a ROW(…) constructor).
-func planRowSubquery(s *scope, inner queryExpr, arity int, params *paramTypes) (queryPlan, resolvedType, error) {
-	plan, err := planSubquery(s, inner, params)
+func planRowSubquery(s *scope, inner queryExpr, arity int, ag *aggCtx, params *paramTypes) (queryPlan, resolvedType, error) {
+	plan, err := planSubquery(s, inner, ag, params)
 	if err != nil {
 		return queryPlan{}, resolvedType{}, err
 	}
@@ -1548,15 +1672,15 @@ func planRowSubquery(s *scope, inner queryExpr, arity int, params *paramTypes) (
 // element type each body row contributes, and whether it is ROW-VALUED. A row-constructor `lhs`
 // makes it row-valued (planRowSubquery); any other `lhs` needs exactly one body column (42601
 // otherwise).
-func planMembershipSubquery(s *scope, lhs exprNode, inner queryExpr, params *paramTypes) (queryPlan, resolvedType, bool, error) {
+func planMembershipSubquery(s *scope, lhs exprNode, inner queryExpr, ag *aggCtx, params *paramTypes) (queryPlan, resolvedType, bool, error) {
 	if lhs.Kind == exprRow {
-		plan, ty, err := planRowSubquery(s, inner, len(lhs.RowItems), params)
+		plan, ty, err := planRowSubquery(s, inner, len(lhs.RowItems), ag, params)
 		if err != nil {
 			return queryPlan{}, resolvedType{}, false, err
 		}
 		return plan, ty, true, nil
 	}
-	plan, err := planSubquery(s, inner, params)
+	plan, err := planSubquery(s, inner, ag, params)
 	if err != nil {
 		return queryPlan{}, resolvedType{}, false, err
 	}
@@ -2427,7 +2551,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		// its column-count / type errors fire even over an empty outer. planSubquery rejects a
 		// non-SELECT context and a $N inside (both 0A000). The fold pass folds an uncorrelated one
 		// to a constant; a correlated one is re-executed per outer row by the evaluator.
-		plan, err := planSubquery(s, *e.Subquery, params)
+		plan, err := planSubquery(s, *e.Subquery, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2440,7 +2564,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 	case exprExists:
 		// EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
 		// EXISTS parses as the unary NOT wrapping this, so negated here is always false.
-		plan, err := planSubquery(s, *e.Subquery, params)
+		plan, err := planSubquery(s, *e.Subquery, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2455,7 +2579,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		plan, elem, rowValued, err := planMembershipSubquery(s, is.Lhs, is.Query, params)
+		plan, elem, rowValued, err := planMembershipSubquery(s, is.Lhs, is.Query, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2616,6 +2740,17 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				elemCol := scalarColType(elementScalar(desc))
 				ct := colType{RangeElem: &elemCol}
 				return resolveParamNode(s, e.Cast.Inner, &ct, resolvedType{kind: rtRange, elem: &elemRT}, params)
+			}
+			// A runtime operand: a range of the SAME element type is the identity (no node — the array
+			// branch's rule, so `ROW(int4range(1,3), 1)::rr` casts its field), and a non-literal NULL
+			// adapts; every other source stays the documented 0A000 narrowing.
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			resultRT := resolvedType{kind: rtRange, elem: &elemRT}
+			if ity.kind == rtNull || (ity.kind == rtRange && resolvedTypeEqual(*ity.elem, elemRT)) {
+				return rinner, resultRT, nil
 			}
 			return nil, resolvedType{}, newError(FeatureNotSupported,
 				"casting to a range type is only supported from a string literal this slice")
@@ -2823,6 +2958,33 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 				return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to uuid")
 			}
 		}
+		// A jsonpath TARGET (casts.toml, jsonpath.md §1): a runtime text expression compiles per row
+		// through the literal's own parser (42601 malformed; jsonpath_compile charged per byte, §7) and
+		// yields the canonical path text, as PostgreSQL's jsonpath_in. A string LITERAL was coerced
+		// above; `$1::jsonpath` declares the param as jsonpath; a NULL adapts; a jsonpath operand is the
+		// identity. Any other source is 42846 (cannot_coerce, as PostgreSQL).
+		if target.IsJsonPath() {
+			if e.Cast.Inner.Kind == exprParam {
+				t := scalarJsonPath
+				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return pinner, resolvedType{kind: rtJsonPath}, nil
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch ity.kind {
+			case rtNull, rtJsonPath:
+				return rinner, resolvedType{kind: rtJsonPath}, nil
+			case rtText:
+				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtJsonPath}, nil
+			default:
+				return nil, resolvedType{}, newError(CannotCoerce, "cannot cast type "+rtName(ity)+" to jsonpath")
+			}
+		}
 		// Datetime casts (timezones.md §9.3, types.md §5): a timestamp/timestamptz/date TARGET from
 		// another datetime family or from runtime text. A same-family cast is the identity; a
 		// cross-family or text cast becomes a reDateConvert node (the zone-crossing ones read the
@@ -2982,7 +3144,7 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		}
 		// Casting FROM json/jsonb (json↔jsonb, json[b]→text, text→json[b]) lands in J3
 		// (spec/design/json.md §6); deferred this slice.
-		if ity.kind == rtJson || ity.kind == rtJsonb {
+		if ity.kind == rtJson || ity.kind == rtJsonb || ity.kind == rtJsonPath {
 			return nil, resolvedType{}, newError(FeatureNotSupported, "casting a json value is not supported yet")
 		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
@@ -3093,24 +3255,30 @@ func resolveNode(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *para
 		}
 		// Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
 		// `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
-		// non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses
-		// the `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics, per-element
-		// operand typing (a too-wide literal → 22003, a cross-family element → 42804), and cost
-		// all fall out. The LHS is evaluated once per element (the OR-chain model — a documented
-		// cost consequence, cost.md §3).
-		var folded exprNode
-		for i, elem := range e.In.List {
-			eq := newBinaryExpr(opEq, e.In.Lhs, elem, e.Pos)
-			if i == 0 {
+		// non-empty (the parser rejects `IN ()` → 42601). Each `x = elem` is resolved by the `=`
+		// machinery verbatim, so the per-element operand typing (a too-wide literal → 22003, a
+		// cross-family element → 42804) falls out; the OR / NOT nodes are built here exactly as
+		// resolveBinary / the NOT arm build them (both operands bool — an `=` always is), so the
+		// three-valued NULL semantics and cost fall out too. The chain is assembled in a loop,
+		// not resolved as one tree: it is as deep as the list is long, and resolving it
+		// recursively would use native stack per element (cost.md §7). The LHS is evaluated once
+		// per element (the OR-chain model — a documented cost consequence, cost.md §3).
+		var folded *rExpr
+		for _, elem := range e.In.List {
+			eq, _, err := resolve(s, newBinaryExpr(opEq, e.In.Lhs, elem, e.Pos), nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if folded == nil {
 				folded = eq
 			} else {
-				folded = newBinaryExpr(opOr, folded, eq, e.Pos)
+				folded = &rExpr{kind: reOr, lhs: folded, rhs: eq}
 			}
 		}
 		if e.In.Negated {
-			folded = exprNode{Kind: exprUnary, Unary: &unaryExpr{Op: opNot, Operand: folded}, Pos: e.Pos}
+			folded = &rExpr{kind: reNot, operand: folded}
 		}
-		return resolve(s, folded, ctx, ag, params)
+		return folded, resolvedType{kind: rtBool}, nil
 	case exprBetween:
 		// Desugar to `lhs >= lo AND lhs <= hi` (grammar.md §21). The Kleene AND gives the PG
 		// result for a NULL bound: `5 BETWEEN 10 AND NULL` is `FALSE AND NULL` = FALSE (a FALSE
@@ -4121,6 +4289,47 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 				peekL, peekT = rl, lt
 			}
 		}
+		// `timestamp[tz] + 'lit'` and `'lit' + timestamp[tz]` (types.md §6): the only `+` over a
+		// timestamp takes an interval, so the string literal adapts to INTERVAL, as PostgreSQL
+		// resolves the unknown literal (`-` keeps the sibling's type: `ts - '2023-01-01'` is a
+		// timestamp difference). The non-literal side resolves first, once: a non-timestamp LHS is
+		// reused as the pair's peeked LHS; a non-timestamp RHS is paired with the literal here.
+		var preRl, preRr *rExpr
+		var preLt, preRt resolvedType
+		if b.Op == opAdd && isStringLiteral(b.Lhs) != isStringLiteral(b.Rhs) {
+			litIsLhs := isStringLiteral(b.Lhs)
+			lit, other := b.Lhs, b.Rhs
+			if !litIsLhs {
+				lit, other = b.Rhs, b.Lhs
+			}
+			if !isAdaptableOperand(other) {
+				ro, ot, err := resolve(s, other, nil, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				switch {
+				case ot.kind == rtTimestamp || ot.kind == rtTimestamptz:
+					ivT := scalarInterval
+					rlit, litT, err := resolve(s, lit, &ivT, ag, params)
+					if err != nil {
+						return nil, resolvedType{}, err
+					}
+					if litIsLhs {
+						preRl, preLt, preRr, preRt = rlit, litT, ro, ot
+					} else {
+						preRl, preLt, preRr, preRt = ro, ot, rlit, litT
+					}
+				case !litIsLhs:
+					peekL, peekT = ro, ot
+				default:
+					rlit, litT, err := resolve(s, lit, ctxOf(ot), ag, params)
+					if err != nil {
+						return nil, resolvedType{}, err
+					}
+					preRl, preLt, preRr, preRt = rlit, litT, ro, ot
+				}
+			}
+		}
 		// Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
 		// integer literal adapts to an integer sibling), then pick the family: both integer →
 		// integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
@@ -4128,7 +4337,9 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		var rl, rr *rExpr
 		var lt, rt resolvedType
 		var err error
-		if peekL != nil {
+		if preRl != nil {
+			rl, lt, rr, rt = preRl, preLt, preRr, preRt
+		} else if peekL != nil {
 			rl, lt, rr, rt, err = resolveOperandPairWithLhs(s, peekL, peekT, b.Rhs, ag, params)
 		} else {
 			rl, lt, rr, rt, err = resolveOperandPair(s, b.Lhs, b.Rhs, ag, params)
@@ -4168,6 +4379,12 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if st, isTemporal, terr := temporalArithResult(b.Op, lt.kind, rt.kind); isTemporal {
 			if terr != nil {
 				return nil, resolvedType{}, terr
+			}
+			// timestamptz ± interval shifts in the session zone (interval.md §5), so it depends on
+			// the session zone — nonimmutable (42P17 in an index expression) — unless the interval
+			// is a constant pure time-of-day span (index-dependencies.md).
+			if st == scalarTimestamptz && !zonelessIntervalShift(rl, rr) {
+				params.nonimmutable = true
 			}
 			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
 		}
@@ -4226,7 +4443,7 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			plan, ty, perr := planRowSubquery(s, *b.Rhs.Subquery, len(b.Lhs.RowItems), params)
+			plan, ty, perr := planRowSubquery(s, *b.Rhs.Subquery, len(b.Lhs.RowItems), ag, params)
 			if perr != nil {
 				return nil, resolvedType{}, perr
 			}

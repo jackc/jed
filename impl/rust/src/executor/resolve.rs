@@ -127,14 +127,42 @@ fn resolve_arith(
             peeked = Some((rl, lt));
         }
     }
+    // `timestamp[tz] + 'lit'` and `'lit' + timestamp[tz]` (types.md §6): the only `+` over a
+    // timestamp takes an interval, so the string literal adapts to INTERVAL, as PostgreSQL
+    // resolves the unknown literal (`-` keeps the sibling's type: `ts - '2023-01-01'` is a
+    // timestamp difference). The non-literal side resolves first, once: a non-timestamp LHS is
+    // reused as the pair's peeked LHS; a non-timestamp RHS is paired with the literal here.
+    let mut pre = None;
+    let is_str = |e: &Expr| matches!(e, Expr::Literal(Literal::Text(_), _));
+    if matches!(op, BinaryOp::Add) && is_str(lhs) != is_str(rhs) {
+        let lit_is_lhs = is_str(lhs);
+        let (lit, other) = if lit_is_lhs { (lhs, rhs) } else { (rhs, lhs) };
+        if !is_adaptable_operand(other) {
+            let (ro, ot) = resolve(scope, other, None, agg, params)?;
+            if matches!(ot, ResolvedType::Timestamp | ResolvedType::Timestamptz) {
+                let (rlit, lit_t) = resolve(scope, lit, Some(ScalarType::Interval), agg, params)?;
+                pre = Some(if lit_is_lhs {
+                    (rlit, lit_t, ro, ot)
+                } else {
+                    (ro, ot, rlit, lit_t)
+                });
+            } else if !lit_is_lhs {
+                peeked = Some((ro, ot));
+            } else {
+                let (rlit, lit_t) = resolve(scope, lit, ctx_of(&ot), agg, params)?;
+                pre = Some((rlit, lit_t, ro, ot));
+            }
+        }
+    }
     // Arithmetic is overloaded across integer and decimal. Resolve the operand pair
     // (an integer literal adapts to an integer sibling), then pick the family: both
     // integer → integer arithmetic (promotion tower); at least one decimal → decimal
     // arithmetic (the integer operand widens at eval); a text/boolean operand is a
     // 42804 (spec/design/decimal.md §4).
-    let (rl, lt, rr, rt) = match peeked {
-        Some(l) => resolve_operand_pair_with_lhs(scope, l, rhs, agg, params)?,
-        None => resolve_operand_pair(scope, lhs, rhs, agg, params)?,
+    let (rl, lt, rr, rt) = match (pre, peeked) {
+        (Some(p), _) => p,
+        (None, Some(l)) => resolve_operand_pair_with_lhs(scope, l, rhs, agg, params)?,
+        (None, None) => resolve_operand_pair(scope, lhs, rhs, agg, params)?,
     };
     // The rest of the arm runs in its own frame, off the recursive path (cost.md §7.1).
     outline(|| {
@@ -196,6 +224,12 @@ fn resolve_arith(
         // operand in any other combination is a 42804.
         if let Some(res) = temporal_arith_result(op, &lt, &rt) {
             let result = res?;
+            // timestamptz ± interval shifts in the session zone (interval.md §5), so it depends
+            // on the session zone — nonimmutable (42P17 in an index expression) — unless the
+            // interval is a constant pure time-of-day span (index-dependencies.md).
+            if matches!(result, ScalarType::Timestamptz) && !zoneless_interval_shift(&rl, &rr) {
+                params.nonimmutable = true;
+            }
             let aop = if matches!(op, BinaryOp::Add) {
                 ArithOp::Add
             } else {
@@ -295,7 +329,7 @@ fn resolve_comparison(
     let (rl, lt, rr, rt) = match (lhs, rhs) {
         (Expr::Row(items, _), Expr::ScalarSubquery(q, _)) => outline(|| {
             let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
-            let (plan, rt) = plan_row_subquery(scope, q, items.len(), params)?;
+            let (plan, rt) = plan_row_subquery(scope, q, items.len(), agg, params)?;
             let rr = RExpr::Subquery {
                 plan: Box::new(plan),
                 kind: SubqueryKind::Scalar,
@@ -1229,11 +1263,14 @@ pub(crate) fn jsonpath_operands<'v>(
     casing: Option<&crate::collation::PropertyTable>,
     m: &mut Meter,
 ) -> Result<Option<(Cow<'v, JsonNode>, crate::jsonpath::JsonPath)>> {
+    // A `text` context item (admitted with or without FORMAT JSON — json-sql-functions.md §5.1) is
+    // parsed as jsonb like a `json` one: malformed text is 22P02, raised by the context's
+    // conversion, outside ON ERROR (json.md §4.2), as in PostgreSQL.
     let node = match ctx {
         Value::Null => return Ok(None),
         Value::Jsonb(n) => Cow::Borrowed(n),
-        Value::Json(s) => Cow::Owned(json::jsonb_in(s)?),
-        _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
+        Value::Json(s) | Value::Text(s) => Cow::Owned(json::jsonb_in(s)?),
+        _ => unreachable!("resolver restricts a jsonpath context item to json/jsonb/text"),
     };
     let text = match path {
         Value::Null => return Ok(None),
@@ -1981,20 +2018,34 @@ pub(crate) fn width_bucket_float(op: f64, low: f64, high: f64, count: i64) -> Re
         return Err(width_bucket_err("lower bound cannot equal upper bound"));
     }
     let cf = count as f64;
+    // The interior bucket (PG width_bucket_float8): floor(fraction · count) + 1, where the
+    // fraction is (op − lo) / (hi − lo) for the near bound lo. When hi − lo overflows to ±Infinity
+    // (bounds of opposite sign near the f64 limit) the halves are used instead — (op/2 − lo/2) /
+    // (hi/2 − lo/2) — which cannot overflow; and a fraction that rounds up to 1.0 is clamped back
+    // to `count` (it would otherwise claim the past-the-end bucket for an operand inside the range).
+    let interior = |lo: f64, hi: f64| -> i64 {
+        let frac = if (hi - lo).is_infinite() {
+            (op / 2.0 - lo / 2.0) / (hi / 2.0 - lo / 2.0)
+        } else {
+            (op - lo) / (hi - lo)
+        };
+        let r = ((frac * cf).floor() as i64).saturating_add(1);
+        r.min(count)
+    };
     let idx = if low < high {
         if op < low {
             0
         } else if op >= high {
             count.saturating_add(1)
         } else {
-            (((op - low) / (high - low) * cf).floor() as i64).saturating_add(1)
+            interior(low, high)
         }
     } else if op > low {
         0
     } else if op <= high {
         count.saturating_add(1)
     } else {
-        (((low - op) / (low - high) * cf).floor() as i64).saturating_add(1)
+        interior(low, high)
     };
     Ok(idx)
 }
@@ -2172,6 +2223,17 @@ pub(crate) fn temporal_arith_result(
         }
     };
     Some(Ok(st))
+}
+
+/// Whether a `timestamptz ± interval` pair (either order) never consults the session zone: its
+/// interval operand is a constant with zero months and days (a pure microsecond shift on the
+/// instant), so the expression depends on its arguments only (index-dependencies.md). A constant
+/// with a calendar field, or any non-constant interval, consults the session zone at eval
+/// (interval.md §5).
+pub(crate) fn zoneless_interval_shift(rl: &RExpr, rr: &RExpr) -> bool {
+    [rl, rr]
+        .iter()
+        .any(|e| matches!(e, RExpr::ConstInterval(iv) if iv.months == 0 && iv.days == 0))
 }
 
 /// The result type of a `date` arithmetic operator (spec/design/date.md §6): `date ± integer →

@@ -208,6 +208,22 @@ Let `pc` be the next free index. Targets written `→Lk` are resolved by the ord
   L3:
   ```
   **lazy `sub*?`:** swap the `Split` arms → `Split →L3, →L2`.
+  **Nullable body — `sub*` where `sub` can match the empty string** (RE2's rule, `Compiler::Star`):
+  emit **`Quest(Plus(sub))`** instead, i.e. `emit((sub+)?)` with the same greediness on both. The
+  plain loop's `Jmp →L1` re-enters a pc the epsilon closure has already visited, so the thread that
+  took the body's *empty* iteration dies and a capture inside it stays unset — `(a*)*` on `''` would
+  give `{NULL}`; `(sub+)?` enters the body first and loops from its end, so the empty iteration is
+  recorded: `regexp_match('', '(a*)*')` = `{""}`, as PostgreSQL, RE2, and PCRE all answer. The
+  instruction count is unchanged (`|sub| + 2` either way), so `regex_compile` is unaffected; the
+  listing and `regex_step` differ, and both are pinned per core like every other lowering.
+  *Nullable* is RE2's flag: `Empty`, the anchors, `Star`, `Quest` are nullable; `Char`/`Any`/`Class`
+  are not; `Concat` iff every child, `Alt` iff either arm, `Group`/`Plus` iff the body, `{n,m}` iff
+  `n = 0` or the body. (The `{n,}` unroll's trailing `Star` takes the same rule.) Two neighbours
+  stay RE2-flavored where PostgreSQL's own engine differs, both ledgered in `oracle_overrides.toml`
+  and pinned in `expr/regexp_template_subexpr.test`: the **lazy** `(a*)*?` is `(sub+?)??`, whose
+  exit arm has priority, so on `''` the group is unset (`{NULL}`; PG `{""}`); and a **plus** over a
+  nullable body, `(a*)+b` on `ab`, keeps the last non-empty iteration (`{a}`; PG `{""}`) because
+  the loop's empty re-entry at the same position is a duplicate thread in the Pike VM (§4.2).
 - **Plus `sub+` (greedy):**
   ```
   L1: emit(sub)
@@ -445,8 +461,14 @@ them):
 - **`regexp_replace(source, pattern, replacement [, flags])` → text.** Replace the **first** match
   (or **all** with the `g` flag) of `pattern` in `source` by `replacement`. The replacement is a
   *template*: `\1`…`\9` splice in capture group 1…9, `\&` the whole match, `\\` a literal backslash.
-  (These are template back-references *into the replacement string* — NOT regex backreferences, so
-  they do not compromise the RE2 linearity.) No match → `source` unchanged. A NULL arg → NULL.
+  Those are the **only** special sequences (PostgreSQL `appendStringInfoRegexpSubstr`): any other
+  `\<c>` — `\0` included — keeps **both** characters literally (the backslash is copied and `<c>` is
+  read again as plain template text), and a trailing lone `\` is a literal backslash:
+  `regexp_replace('abc', '(b)', '\0')` = `a\0c`, `regexp_replace('abc', 'b', '\x')` = `a\xc`. A
+  reference to a group the pattern does not have, or one that did not participate, expands to
+  nothing. (These are template back-references *into the replacement string* — NOT regex
+  backreferences, so they do not compromise the RE2 linearity.) No match → `source` unchanged. A NULL
+  arg → NULL.
 - **`regexp_match(source, pattern [, flags])` → text[].** The capture array of the **first** match:
   element `i` is group `i`'s captured substring (group 0 omitted when there is ≥1 group, matching
   PG: the array is groups 1..n; a pattern with no group returns a 1-element array of the whole
@@ -495,8 +517,11 @@ exhaustion; `regexp_substr`/`regexp_instr` stop at the **N-th** match.
 - **`regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])` → text.** The substring
   matched by the **N-th** match (1-based `N`, default 1) at or after `start`. `subexpr` (default 0)
   selects a parenthesized capture group within that match — 0 = the whole match, *k* = group *k*.
-  No N-th match, an out-of-range `subexpr` (> the pattern's group count), or a group that did not
-  participate → **NULL**.
+  A pattern with **no** capture group has one "subexpression", the whole match, so `subexpr = 1`
+  selects it there (`regexp_substr('abc', 'b', 1, 1, '', 1)` = `b`; PostgreSQL's
+  `setup_regexp_matches` falls back to `npatterns = 1`) — `subexpr = 2` on it is still out of range.
+  No N-th match, an out-of-range `subexpr` (> the pattern's group count, or > 1 for a group-less
+  pattern), or a group that did not participate → **NULL**.
 - **`regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]])` → integer.**
   The 1-based position of the **N-th** match's `subexpr` span. `endoption` (default 0) picks **0** =
   the position of the first character of the span, **1** = the position *following* the last

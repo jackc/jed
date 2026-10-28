@@ -1,0 +1,43 @@
+# power(numeric, numeric) with a NEGATIVE base and an integer exponent outside int32 (spec/design/
+# decimal.md §8, PostgreSQL's power_var): an exponent that fits int32 takes power_var_int; a larger
+# integral exponent goes through exp(exp · ln|base|), and the result's sign is the exponent's
+# parity (odd → negative), exactly as PostgreSQL — never the complex-result error, which is kept
+# for a genuinely non-integral exponent. A huge |result| overflows 22003; a tiny one is 0 at the
+# display scale (1000). The results are exact decimals, byte-identical across cores and oracle-
+# clean, like the rest of the numeric transcendentals.
+# requires: query.select, query.select_no_from, types.decimal, expr.numeric_transcendental, func.arg_coercion, resource.cost_metering
+
+# even / odd exponents just past int32: 1 and -1 at 16 significant digits
+# cost: 14956
+query DDDDD nosort
+SELECT power(-1.0, 2147483648.0), power(-1.0, 2147483649), power(-1.0, 1e10), power(-1.0, -2147483649), power(-1.0, 2147483648)
+----
+1.0000000000000000
+-1.0000000000000000
+1.0000000000000000
+-1.0000000000000000
+1.0000000000000000
+
+# |base| < 1: the power underflows to 0 at the display scale (1000 fractional digits), positive
+# whatever the exponent's parity (no negative zero)
+# cost: 184101
+query IBI nosort
+SELECT length(power(-0.5, 2147483648.0)::text), power(-0.5, 2147483648.0) = 0, length(power(-0.5, 2147483649.0)::text)
+----
+1002
+true
+1002
+
+# |base| > 1 overflows the numeric format
+statement error 22003
+SELECT power(-2.0, 2147483648.0)
+
+statement error 22003
+SELECT power(-1.5, 1e10)
+
+# a non-integral exponent is still the complex-result error (2201F)
+statement error 2201F
+SELECT power(-1.0, 2147483648.5)
+
+statement error 2201F
+SELECT power(-2.0, 0.5)

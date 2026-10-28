@@ -169,27 +169,31 @@ func parsePosixAbbr(b []byte, i *int) (string, bool) {
 }
 
 // parsePosixOffset parses [+|-]hh[:mm[:ss]] → seconds (POSIX raw, west-positive). Caller negates.
+// The fields are bounded exactly as tzcode's getsecs (which PostgreSQL's pg_tzset uses for a numeric
+// zone — timezones.md §3.2): hours 0..167 (a week less an hour), minutes 0..59, seconds 0..60 (a
+// leap second). A digit run exceeding its bound, however long, is not an offset (so `'+168'`,
+// `'+1000000'` and `'+4294967296'` are all "not recognized", never a wrapped or clamped value).
 func parsePosixOffset(b []byte, i *int) (int32, bool) {
 	neg := false
 	if *i < len(b) && (b[*i] == '+' || b[*i] == '-') {
 		neg = b[*i] == '-'
 		*i++
 	}
-	hh, ok := parseUint(b, i)
+	hh, ok := parseUintMax(b, i, 167)
 	if !ok {
 		return 0, false
 	}
 	secs := int32(hh) * 3600
 	if *i < len(b) && b[*i] == ':' {
 		*i++
-		mm, ok := parseUint(b, i)
+		mm, ok := parseUintMax(b, i, 59)
 		if !ok {
 			return 0, false
 		}
 		secs += int32(mm) * 60
 		if *i < len(b) && b[*i] == ':' {
 			*i++
-			ss, ok := parseUint(b, i)
+			ss, ok := parseUintMax(b, i, 60)
 			if !ok {
 				return 0, false
 			}
@@ -211,17 +215,17 @@ func parsePosixRule(b []byte, i *int) (posixRule, int32, error) {
 		return posixRule{}, 0, fmt.Errorf("posix: Jn/n julian-day transition rules are not yet supported")
 	}
 	*i++
-	m, ok := parseUint(b, i)
+	m, ok := parseUintMax(b, i, 12)
 	if !ok || *i >= len(b) || b[*i] != '.' {
 		return posixRule{}, 0, fmt.Errorf("posix: bad month")
 	}
 	*i++
-	w, ok := parseUint(b, i)
+	w, ok := parseUintMax(b, i, 5)
 	if !ok || *i >= len(b) || b[*i] != '.' {
 		return posixRule{}, 0, fmt.Errorf("posix: bad week")
 	}
 	*i++
-	d, ok := parseUint(b, i)
+	d, ok := parseUintMax(b, i, 6)
 	if !ok {
 		return posixRule{}, 0, fmt.Errorf("posix: bad day")
 	}
@@ -240,11 +244,16 @@ func parsePosixRule(b []byte, i *int) (posixRule, int32, error) {
 	return posixRule{M: uint8(m), W: uint8(w), D: uint8(d)}, time, nil
 }
 
-func parseUint(b []byte, i *int) (uint32, bool) {
+// parseUintMax reads a digit run whose value may not exceed max — tzcode's getnum: the running
+// value is checked after every digit, so an over-long run fails instead of overflowing.
+func parseUintMax(b []byte, i *int, max uint32) (uint32, bool) {
 	start := *i
 	var v uint32
 	for *i < len(b) && b[*i] >= '0' && b[*i] <= '9' {
 		v = v*10 + uint32(b[*i]-'0')
+		if v > max {
+			return 0, false
+		}
 		*i++
 	}
 	return v, *i != start
@@ -691,7 +700,7 @@ func openTzBundle(data []byte) (*tzBundle, error) {
 // builtinZone resolves a built-in zone name — UTC or a fixed ±HH[:MM[:SS]] offset (§3.2) — with no
 // loaded data. Named zones come from the handle's Environment (Environment.resolveZone).
 func builtinZone(name string) (ZoneRef, bool) {
-	if name == "UTC" {
+	if foldZoneName(name) == "utc" {
 		return ZoneRef{Fixed: true, Off: 0}, true
 	}
 	if off, ok := parseFixedOffset(name); ok {
@@ -795,6 +804,135 @@ func parseFixedOffset(name string) (int32, bool) {
 		return 0, false
 	}
 	return -posix, true
+}
+
+// foldZoneName is the case fold a zone-name lookup applies (timezones.md §3.2): ASCII letters are
+// lowercased, every other byte kept — PostgreSQL's downcase_truncate_identifier, so `'utc'` and
+// `'america/new_york'` resolve like PG (a non-ASCII letter keeps its case).
+func foldZoneName(name string) string {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c >= 'A' && c <= 'Z' {
+			b := []byte(name)
+			for j := i; j < len(b); j++ {
+				if b[j] >= 'A' && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return name
+}
+
+// numericZoneStatus classifies decodeNumericZone's reading of a zone string.
+type numericZoneStatus uint8
+
+const (
+	numericZoneOK        numericZoneStatus = iota // a well-formed ISO offset within ±15:59:59
+	numericZoneBadFormat                          // not an ISO numeric offset: try it as a zone name
+	numericZoneOverflow                           // numeric, but a field is out of range
+)
+
+// decodeNumericZone reads a zone string as PostgreSQL's DecodeTimezone does for make_timestamptz
+// (parse_sane_timezone; functions.md §11): `[+|-]HH`, `[+|-]HH:MM[:SS]`, or the run-together
+// `[+|-]HHMM` (four or more characters), with the ISO / timestamp-literal sign — `+05:30` is
+// UTC+5:30, east-positive — bounded by PG's MAX_TZDISP_HOUR (hours 0..15, minutes and seconds
+// 0..59; out of range is numericZoneOverflow). A string that does not start with a sign, or that
+// has trailing text after a well-formed offset, is numericZoneBadFormat. Like C strtoint, a field's
+// digit run may be empty (reads 0), may follow spaces, and may carry its own sign. The east-positive
+// offset is returned in seconds.
+func decodeNumericZone(name string) (int32, numericZoneStatus) {
+	b := []byte(name)
+	if len(b) == 0 || (b[0] != '+' && b[0] != '-') {
+		return 0, numericZoneBadFormat
+	}
+	i := 1
+	hr, ok := readStrtoint(b, &i)
+	if !ok {
+		return 0, numericZoneOverflow
+	}
+	var min, sec int64
+	if i < len(b) && b[i] == ':' {
+		i++
+		if min, ok = readStrtoint(b, &i); !ok {
+			return 0, numericZoneOverflow
+		}
+		if i < len(b) && b[i] == ':' {
+			i++
+			if sec, ok = readStrtoint(b, &i); !ok {
+				return 0, numericZoneOverflow
+			}
+		}
+	} else if i == len(b) && len(b) > 3 {
+		// run-together HHMM
+		min = hr % 100
+		hr = hr / 100
+	}
+	if hr < 0 || hr > 15 || min < 0 || min > 59 || sec < 0 || sec > 59 {
+		return 0, numericZoneOverflow
+	}
+	if i != len(b) {
+		return 0, numericZoneBadFormat
+	}
+	tz := (hr*60+min)*60 + sec
+	if b[0] == '-' {
+		tz = -tz
+	}
+	return int32(tz), numericZoneOK
+}
+
+// resolveMakeTimestamptzZone resolves make_timestamptz's explicit timezone argument as PostgreSQL's
+// parse_sane_timezone does (functions.md §11): a leading digit is 22023 "invalid input syntax for
+// type numeric time zone"; a sign-led string is first read as an ISO numeric offset
+// (decodeNumericZone — `+05:30` is UTC+5:30, the timestamp-literal sign, NOT AT TIME ZONE's POSIX
+// sign), out of range being 22023 "numeric time zone … out of range"; anything else resolves as a
+// zone name through env (22023 "not recognized" when unknown).
+func resolveMakeTimestamptzZone(env *Environment, name string) (ZoneRef, error) {
+	if len(name) > 0 && name[0] >= '0' && name[0] <= '9' {
+		return ZoneRef{}, newError(InvalidParameterValue,
+			fmt.Sprintf("invalid input syntax for type numeric time zone: %q", name))
+	}
+	switch off, status := decodeNumericZone(name); status {
+	case numericZoneOK:
+		return ZoneRef{Fixed: true, Off: off}, nil
+	case numericZoneOverflow:
+		return ZoneRef{}, newError(InvalidParameterValue,
+			fmt.Sprintf("numeric time zone %q out of range", name))
+	}
+	zr, ok := env.resolveZone(name)
+	if !ok {
+		return ZoneRef{}, newError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", name))
+	}
+	return zr, nil
+}
+
+// readStrtoint reads an int as C strtoint does at b[*i]: optional spaces, an optional sign, then
+// digits (none reads 0 and consumes nothing but the spaces/sign). ok = false is ERANGE: a value
+// past the C int range.
+func readStrtoint(b []byte, i *int) (int64, bool) {
+	for *i < len(b) && isWS(b[*i]) {
+		*i++
+	}
+	neg := false
+	if *i < len(b) && (b[*i] == '+' || b[*i] == '-') {
+		neg = b[*i] == '-'
+		*i++
+	}
+	var v int64
+	for *i < len(b) && b[*i] >= '0' && b[*i] <= '9' {
+		v = v*10 + int64(b[*i]-'0')
+		if v > 2147483648 {
+			return 0, false
+		}
+		*i++
+	}
+	if neg {
+		v = -v
+	}
+	if v > 2147483647 {
+		return 0, false
+	}
+	return v, true
 }
 
 func fixedAbbrev(utoff int32) string {

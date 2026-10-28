@@ -1619,9 +1619,50 @@ impl Engine {
                 self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(rhs, bound, ctes, cost)
             }
-            RExpr::And(l, r) | RExpr::Or(l, r) => {
-                self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
-                self.fold_uncorrelated_in_rexpr(r, bound, ctes, cost)
+            RExpr::And(..) | RExpr::Or(..) => {
+                // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is folded
+                // along its left spine iteratively, not by recursing into each lhs, so the stack
+                // does not grow with the chain (cost.md §7f). The order is the recursive one's —
+                // the deepest lhs, then each rhs from the deepest node up — so subqueries run,
+                // and errors surface, in list order.
+                // The chain is taken apart into its owned pieces (the borrow checker cannot
+                // hold every level's rhs mutably while descending), folded, and put back together
+                // in its original shape — on an error too, so the plan is intact either way.
+                let is_and = matches!(e, RExpr::And(..));
+                let mut rhss: Vec<RExpr> = Vec::new(); // the root's rhs first
+                let mut node = std::mem::replace(e, RExpr::ConstNull);
+                let mut leaf = loop {
+                    match node {
+                        RExpr::And(l, r) if is_and => {
+                            rhss.push(*r);
+                            node = *l;
+                        }
+                        RExpr::Or(l, r) if !is_and => {
+                            rhss.push(*r);
+                            node = *l;
+                        }
+                        other => break other,
+                    }
+                };
+                let mut result = self.fold_uncorrelated_in_rexpr(&mut leaf, bound, ctes, cost);
+                if result.is_ok() {
+                    for r in rhss.iter_mut().rev() {
+                        result = self.fold_uncorrelated_in_rexpr(r, bound, ctes, cost);
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let mut chain = leaf;
+                for r in rhss.into_iter().rev() {
+                    chain = if is_and {
+                        RExpr::And(Box::new(chain), Box::new(r))
+                    } else {
+                        RExpr::Or(Box::new(chain), Box::new(r))
+                    };
+                }
+                *e = chain;
+                result
             }
             RExpr::JsonGet { base, arg, .. }
             | RExpr::JsonHasKey { base, arg, .. }

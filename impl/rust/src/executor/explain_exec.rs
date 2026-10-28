@@ -364,19 +364,11 @@ impl Engine {
         };
         for cte in &wq.ctes {
             if cte.body.is_data_modifying() {
-                for binding in &bindings {
-                    binding
-                        .refs
-                        .set(binding.refs.get() + count_cte_refs_dml(&cte.body, &binding.name));
-                }
+                add_dml_cte_refs(&bindings, &cte.body);
             }
         }
         if wq.body.is_data_modifying() {
-            for binding in &bindings {
-                binding
-                    .refs
-                    .set(binding.refs.get() + count_cte_refs_dml(&wq.body, &binding.name));
-            }
+            add_dml_cte_refs(&bindings, &wq.body);
         }
         let modes = cte_modes(&bindings);
         Ok((bindings, modes, primary))

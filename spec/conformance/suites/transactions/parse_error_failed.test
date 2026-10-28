@@ -1,0 +1,78 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# Parse-stage errors poison an explicit block too (spec/design/transactions.md §6). PostgreSQL aborts
+# a transaction block on ANY statement error — a syntax error (42601) raised before the statement is
+# ever planned included — so after one, every later statement but ROLLBACK / COMMIT is 25P02
+# (in_failed_sql_transaction). In a failed block BEGIN is refused with 25P02 as well (not the clean
+# block's 25001 — PostgreSQL), and so is SAVEPOINT. ROLLBACK clears the failed state, and a syntax
+# error in autocommit poisons nothing (the contrast that makes this a property of the block).
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: txn.failed_state, txn.explicit, txn.savepoint, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (2)
+
+# a syntax error — the parse stage, before any planning or execution
+statement error 42601
+SELECT 1 FROM
+
+# the block is failed: a valid read, a write, a nested BEGIN, and SAVEPOINT are all 25P02
+statement error 25P02
+SELECT id FROM t
+
+statement error 25P02
+INSERT INTO t VALUES (3)
+
+statement error 25P02
+BEGIN
+
+statement error 25P02
+SAVEPOINT a
+
+statement ok
+ROLLBACK
+
+# ROLLBACK cleared the failed state; the INSERT that preceded the syntax error was discarded with the block
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+
+# COMMIT of a block failed by a syntax error acts as ROLLBACK
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (2)
+
+statement error 42601
+INSERT INTO t VALUES (
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+
+# in autocommit a syntax error poisons nothing: the next statement runs normally
+statement error 42601
+SELECT 1 FROM
+
+statement ok
+INSERT INTO t VALUES (2)
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2

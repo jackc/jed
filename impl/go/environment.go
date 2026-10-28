@@ -28,6 +28,9 @@ type Environment struct {
 	// zones is the loaded zone set (and link aliases) keyed by exact name. UTC and fixed offsets are
 	// built in and never here.
 	zones map[string]*zone
+	// zonesFolded indexes zones by ASCII-folded name for the case-insensitive lookup (timezones.md
+	// §3.2); built once by Build.
+	zonesFolded map[string]*zone
 	// hosts is the frozen host function registry (extensibility.md §7). Never nil.
 	hosts  *hostRegistry
 	random RandomSource
@@ -182,16 +185,31 @@ func (b *EnvironmentBuilder) Build() *Environment {
 	for k, v := range b.zones {
 		zones[k] = v
 	}
+	// The ASCII-case-folded index for case-insensitive lookup (resolveZone): when two loaded names
+	// fold to one key the byte-smaller canonical name wins, so the choice is deterministic.
+	names := make([]string, 0, len(zones))
+	for k := range zones {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	zonesFolded := make(map[string]*zone, len(zones))
+	for _, k := range names {
+		f := foldZoneName(k)
+		if _, taken := zonesFolded[f]; !taken {
+			zonesFolded[f] = zones[k]
+		}
+	}
 	functions := make([]hostFuncEntry, len(b.functions))
 	copy(functions, b.functions)
 	return &Environment{
-		collations: collations,
-		property:   b.property,
-		zones:      zones,
-		hosts:      &hostRegistry{functions: functions},
-		random:     b.random,
-		clock:      b.clock,
-		keySeed:    b.keySeed,
+		collations:  collations,
+		property:    b.property,
+		zones:       zones,
+		zonesFolded: zonesFolded,
+		hosts:       &hostRegistry{functions: functions},
+		random:      b.random,
+		clock:       b.clock,
+		keySeed:     b.keySeed,
 	}
 }
 
@@ -296,6 +314,12 @@ func (e *Environment) resolveZone(name string) (ZoneRef, bool) {
 		return zr, true
 	}
 	if z := e.zones[name]; z != nil {
+		return ZoneRef{zone: z}, true
+	}
+	// Case-insensitive like PostgreSQL's pg_tzset (timezones.md §3.2): an exact name wins, else the
+	// ASCII-folded name. The resolved zone keeps its canonical name (the one an index dependency
+	// records).
+	if z := e.zonesFolded[foldZoneName(name)]; z != nil {
 		return ZoneRef{zone: z}, true
 	}
 	return ZoneRef{}, false

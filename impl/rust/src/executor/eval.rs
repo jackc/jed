@@ -207,6 +207,16 @@ impl RExpr {
                             Ok(Value::Int(i64::from(b)))
                         }
                     }
+                    // text → jsonpath (casts.toml): the per-row text compiles through the literal's
+                    // own parser (42601 malformed) and yields the canonical path text, as
+                    // PostgreSQL's jsonpath_in; the compile is metered like every evaluation-time
+                    // compile (jsonpath.md §7).
+                    Value::Text(s) if *target == ScalarType::JsonPath => {
+                        let casing = env.exec.session.env.property();
+                        Ok(Value::JsonPath(
+                            crate::jsonpath::compile_cast_metered(&s, casing, m)?.render(),
+                        ))
+                    }
                     // text → json/jsonb (spec/design/json.md §6.1): json validates + stores
                     // verbatim (22P02 on malformed); jsonb parses + canonicalizes.
                     Value::Text(s) if target.is_json() => {
@@ -555,12 +565,28 @@ impl RExpr {
                         (Value::Interval(iv), Value::Timestamptz(t)) => (t, iv, true),
                         _ => unreachable!("resolver guarantees a timestamp ± interval pair here"),
                     };
-                    let r = crate::interval::ts_shift(t, &iv, subtract)?;
-                    Ok(if is_tz {
-                        Value::Timestamptz(r)
+                    if is_tz {
+                        // A timestamptz shifts in the SESSION zone (PG timestamptz_pl_interval;
+                        // interval.md §5): its months/days steps each consult the zone, charged
+                        // one timezone unit apiece before the shift runs (cost.md, the AT TIME
+                        // ZONE unit).
+                        let n = crate::interval::ts_shift_zone_consults(t, &iv);
+                        if n != 0 {
+                            m.charge(n * COSTS.timezone);
+                            m.guard()?;
+                        }
+                        let r = crate::interval::ts_shift_zoned(
+                            t,
+                            &iv,
+                            subtract,
+                            &env.exec.session.time_zone,
+                        )?;
+                        Ok(Value::Timestamptz(r))
                     } else {
-                        Value::Timestamp(r)
-                    })
+                        Ok(Value::Timestamp(crate::interval::ts_shift(
+                            t, &iv, subtract,
+                        )?))
+                    }
                 } else if result.is_decimal() {
                     // Decimal arithmetic: widen any integer operand to decimal, then apply the
                     // op with PG's scale rules (spec/design/decimal.md §4). The size-scaled
@@ -683,7 +709,8 @@ impl RExpr {
                 let accessed: Option<&JsonNode> = match op {
                     JsonGetOp::Arrow | JsonGetOp::ArrowText => match &av {
                         Value::Text(k) => json::get_field(node, k),
-                        Value::Int(i) => json::get_index(node, *i),
+                        // A top-level scalar is its own element 0 (PG's raw-scalar pseudo-array).
+                        Value::Int(i) => json::get_root_index(node, *i),
                         _ => unreachable!("resolver guarantees a text/int arg for -> / ->>"),
                     },
                     JsonGetOp::HashArrow | JsonGetOp::HashArrowText => match &av {
@@ -905,28 +932,62 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 // STRICT: a NULL whole-array argument → SQL NULL.
                 let mut arrays = Vec::with_capacity(args.len());
+                // Each argument's shape: (ndim, dims) — the pairing rules depend on it (below).
+                let mut dims: Vec<Vec<usize>> = Vec::with_capacity(args.len());
                 for a in args {
                     let v = a.eval(row, env, m)?;
                     if matches!(v, Value::Null) {
                         return Ok(Value::Null);
+                    }
+                    if let Value::Array(arr) = &v {
+                        dims.push(arr.dims.clone());
                     }
                     arrays.push(
                         value_to_opt_text_array(&v).expect("resolver guarantees a text[] arg"),
                     );
                 }
                 // Pair up keys/values: one array of alternating k/v (even length), or two arrays.
+                // The shape rules are PostgreSQL's (json-sql-functions.md §2): the one-array form
+                // takes a 1-D array (even length) or a 2-D array of pairs (`{{k,v},…}`, else "array
+                // must have two columns"); the two-array form takes two 1-D arrays of one length;
+                // anything deeper is 2202E "wrong number of array subscripts". An empty (0-D) array
+                // builds `{}`.
                 let pairs: Vec<(Option<String>, Option<String>)> = if arrays.len() == 1 {
                     let flat = &arrays[0];
-                    if flat.len() % 2 != 0 {
-                        return Err(EngineError::new(
-                            SqlState::ArraySubscriptError,
-                            "array must have even number of elements",
-                        ));
+                    match dims[0].len() {
+                        0 | 1 => {
+                            if flat.len() % 2 != 0 {
+                                return Err(EngineError::new(
+                                    SqlState::ArraySubscriptError,
+                                    "array must have even number of elements",
+                                ));
+                            }
+                        }
+                        2 => {
+                            if dims[0][1] != 2 {
+                                return Err(EngineError::new(
+                                    SqlState::ArraySubscriptError,
+                                    "array must have two columns",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(EngineError::new(
+                                SqlState::ArraySubscriptError,
+                                "wrong number of array subscripts",
+                            ));
+                        }
                     }
                     flat.chunks_exact(2)
                         .map(|c| (c[0].clone(), c[1].clone()))
                         .collect()
                 } else {
+                    if dims[0].len() > 1 || dims[0].len() != dims[1].len() {
+                        return Err(EngineError::new(
+                            SqlState::ArraySubscriptError,
+                            "wrong number of array subscripts",
+                        ));
+                    }
                     if arrays[0].len() != arrays[1].len() {
                         return Err(EngineError::new(
                             SqlState::ArraySubscriptError,
@@ -1138,6 +1199,9 @@ impl RExpr {
                 Ok(and3(&lv, &rv))
             }),
             RExpr::Or(l, r) => outline(|| {
+                if matches!(**l, RExpr::Or(..)) {
+                    return eval_or_chain(self, row, env, m);
+                }
                 m.charge(operator_cost("or"));
                 let lv = l.eval(row, env, m)?;
                 if matches!(lv, Value::Bool(true)) {
@@ -1591,7 +1655,15 @@ impl RExpr {
                                     subexpr
                                 };
                                 // `subexpr` selects the whole match (0) or a capture group; out of range
-                                // (> group count) or a non-participating group (-1) → NULL.
+                                // (> group count) or a non-participating group (-1) → NULL. A pattern
+                                // with NO capture group has one "subexpression" — the whole match — so
+                                // subexpr 1 selects it there (PG setup_regexp_matches falls back to
+                                // npatterns = 1; regex.md §8b).
+                                let subexpr = if prog.ngroups == 0 && subexpr == 1 {
+                                    0
+                                } else {
+                                    subexpr
+                                };
                                 if subexpr > prog.ngroups as i64 {
                                     return Ok(Value::Null);
                                 }
@@ -1612,6 +1684,12 @@ impl RExpr {
                     RegexFunc::Instr => match prog.nth_match(&match_chars, start0, nth, m)? {
                         None => Ok(Value::Int(0)),
                         Some(caps) => {
+                            // As for regexp_substr: a group-less pattern's subexpr 1 is the whole match.
+                            let subexpr = if prog.ngroups == 0 && subexpr == 1 {
+                                0
+                            } else {
+                                subexpr
+                            };
                             if subexpr > prog.ngroups as i64 {
                                 return Ok(Value::Int(0));
                             }
@@ -2413,12 +2491,10 @@ impl RExpr {
                                 Value::Text(s) => s.as_str(),
                                 _ => unreachable!("resolver restricts the timezone arg to text"),
                             };
-                            env.exec.session.env.resolve_zone(zone_str).ok_or_else(|| {
-                                EngineError::new(
-                                    SqlState::InvalidParameterValue,
-                                    format!("time zone \"{zone_str}\" not recognized"),
-                                )
-                            })?
+                            crate::timezone::resolve_make_timestamptz_zone(
+                                &env.exec.session.env,
+                                zone_str,
+                            )?
                         } else {
                             env.exec.session.time_zone.clone()
                         };
@@ -2636,10 +2712,22 @@ impl RExpr {
                         let mut r = env.rng.get();
                         let clock = r.statement_clock_micros(&env.exec.session.env);
                         // The optional interval arg shifts the embedded instant via the existing
-                        // calendar-aware timestamptz arithmetic (entropy.md §4).
+                        // calendar-aware timestamptz arithmetic — in the session zone, as PG's
+                        // timestamptz_pl_interval does, each calendar step charging one timezone
+                        // unit (entropy.md §4, interval.md §5).
                         let shifted = match vals.first() {
                             Some(Value::Interval(iv)) => {
-                                crate::interval::ts_shift(clock, iv, false)?
+                                let n = crate::interval::ts_shift_zone_consults(clock, iv);
+                                if n != 0 {
+                                    m.charge(n * COSTS.timezone);
+                                    m.guard()?;
+                                }
+                                crate::interval::ts_shift_zoned(
+                                    clock,
+                                    iv,
+                                    false,
+                                    &env.exec.session.time_zone,
+                                )?
                             }
                             Some(_) => {
                                 unreachable!("resolver restricts uuidv7's arg to an interval")
@@ -3697,4 +3785,47 @@ fn eval_formatting(
         },
         _ => unreachable!("eval_formatting called for a non-formatting function"),
     }
+}
+
+/// Evaluate a left-deep OR chain — `a OR b OR c`, or an IN list's desugar (grammar.md §20) —
+/// iteratively down its left spine instead of recursing into each lhs, so the native stack it uses
+/// does not grow with the chain (cost.md §7). The charges and the short-circuit are exactly the
+/// recursive form's: every OR node on the spine is charged first (the recursion charges each on
+/// entry before descending into its lhs), then the operands are evaluated left to right, folding
+/// with the Kleene OR and stopping at the first TRUE, which is returned as is. Called for a node
+/// whose lhs is itself an OR; a plain `a OR b` keeps the inline form.
+fn eval_or_chain(e: &RExpr, row: &[Value], env: &EvalEnv, m: &mut Meter) -> Result<Value> {
+    // The spine, root first. A chain of a few elements stays in the inline buffer; only a long IN
+    // list spills to the heap.
+    const INLINE: usize = 16;
+    let mut inline: [&RExpr; INLINE] = [e; INLINE];
+    let mut heap: Vec<&RExpr> = Vec::new();
+    let mut len = 0usize;
+    let mut node = e;
+    while let RExpr::Or(l, _) = node {
+        m.charge(operator_cost("or"));
+        if len < INLINE {
+            inline[len] = node;
+        } else {
+            if len == INLINE {
+                heap.extend_from_slice(&inline);
+            }
+            heap.push(node);
+        }
+        len += 1;
+        node = l;
+    }
+    let spine: &[&RExpr] = if len <= INLINE { &inline[..len] } else { &heap };
+    let mut acc = node.eval(row, env, m)?;
+    for or in spine.iter().rev() {
+        if matches!(acc, Value::Bool(true)) {
+            return Ok(acc);
+        }
+        let RExpr::Or(_, r) = or else {
+            unreachable!("the spine holds OR nodes only")
+        };
+        let rv = r.eval(row, env, m)?;
+        acc = or3(&acc, &rv);
+    }
+    Ok(acc)
 }

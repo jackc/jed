@@ -146,7 +146,7 @@ func evalArrayFunc(fn arrayFunc, vals []Value, m *costMeter) (Value, error) {
 		case afLower:
 			return IntValue(int64(a.Lbounds[d])), nil
 		default: // afUpper
-			return IntValue(int64(a.Ubound(d))), nil
+			return IntValue(a.Ubound(d)), nil
 		}
 	case afAppend:
 		return arrayExtend(vals[0], vals[1], true)
@@ -545,6 +545,23 @@ func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
 	if a.Ndim() != 1 {
 		return Value{}, newError(DataException, "argument must be empty or one-dimensional array")
 	}
+	// The new element's subscript must fit in an i32 (PG array_append/array_prepend: 22003 — for a
+	// prepend that is `lb - 1`, even though PG then readjusts the lower bound back to the input's).
+	// An append must also keep the grown dimension's `lb + len` within an i32 (checkArrayBounds:
+	// 54000); a prepend keeps its lower bound, and PG runs no bounds check after readjusting it, so
+	// `array_prepend(0, '[2147483645:2147483646]={1,2}')` is `[2147483645:2147483647]={0,1,2}` there
+	// and here (array-functions.md §3.2).
+	lb, n := int64(a.Lbounds[0]), int64(a.Dims[0])
+	if atEnd && lb+n > math.MaxInt32 || !atEnd && lb-1 < math.MinInt32 {
+		return Value{}, newError(NumericValueOutOfRange, "value out of range for type i32").withDataType("i32")
+	}
+	lbounds := cloneI32(a.Lbounds)
+	dims := []int{a.Dims[0] + 1}
+	if atEnd {
+		if err := checkArrayBounds(dims, lbounds); err != nil {
+			return Value{}, err
+		}
+	}
 	elements := make([]Value, 0, len(a.Elements)+1)
 	if atEnd {
 		elements = append(elements, a.Elements...)
@@ -553,14 +570,17 @@ func arrayExtend(arr, elem Value, atEnd bool) (Value, error) {
 		elements = append(elements, elem)
 		elements = append(elements, a.Elements...)
 	}
-	return arrayValueOf(&ArrayVal{Dims: []int{a.Dims[0] + 1}, Lbounds: cloneI32(a.Lbounds), Elements: elements}), nil
+	return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
 }
 
 // arrayCatValues is array_cat (array-functions.md §3.2): identity-aware concatenation along the
 // outer dimension. NULL/empty is the identity (both NULL → NULL). Same dimensionality concatenates
-// if the inner dims match; an off-by-one dimensionality appends/prepends the lower one as an outer
-// slice; any other pairing — or an inner-dim mismatch — is 2202E. The flattened element list is
-// always a ++ b (row-major, outer-first); the result lower bounds come from the higher-dim operand.
+// if the inner dims AND inner lower bounds match (PG array_cat compares both); an off-by-one
+// dimensionality appends/prepends the lower one as an outer slice when its dims and lower bounds
+// equal the other's inner ones; any other pairing — or an inner mismatch — is 2202E. The flattened
+// element list is always a ++ b (row-major, outer-first); the result lower bounds come from the
+// higher-dim operand (the outer lower bound of the lower-dim operand is irrelevant). The grown
+// outer dimension must keep `lb + len` within an i32 (checkArrayBounds: 54000).
 func arrayCatValues(a, b Value) (Value, error) {
 	if a.Kind == ValNull && b.Kind == ValNull {
 		return NullValue(), nil
@@ -583,31 +603,34 @@ func arrayCatValues(a, b Value) (Value, error) {
 	elements = append(elements, av.Elements...)
 	elements = append(elements, bv.Elements...)
 	na, nb := av.Ndim(), bv.Ndim()
+	var dims []int
+	var lbounds []int32
 	switch {
 	case na == nb:
-		if !equalInts(av.Dims[1:], bv.Dims[1:]) {
+		if !equalInts(av.Dims[1:], bv.Dims[1:]) || !int32SliceEqual(av.Lbounds[1:], bv.Lbounds[1:]) {
 			return Value{}, mismatch()
 		}
-		dims := cloneInts(av.Dims)
+		dims, lbounds = cloneInts(av.Dims), cloneI32(av.Lbounds)
 		dims[0] = av.Dims[0] + bv.Dims[0]
-		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
 	case na == nb+1:
-		if !equalInts(av.Dims[1:], bv.Dims) {
+		if !equalInts(av.Dims[1:], bv.Dims) || !int32SliceEqual(av.Lbounds[1:], bv.Lbounds) {
 			return Value{}, mismatch()
 		}
-		dims := cloneInts(av.Dims)
+		dims, lbounds = cloneInts(av.Dims), cloneI32(av.Lbounds)
 		dims[0] = av.Dims[0] + 1
-		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(av.Lbounds), Elements: elements}), nil
 	case nb == na+1:
-		if !equalInts(bv.Dims[1:], av.Dims) {
+		if !equalInts(bv.Dims[1:], av.Dims) || !int32SliceEqual(bv.Lbounds[1:], av.Lbounds) {
 			return Value{}, mismatch()
 		}
-		dims := cloneInts(bv.Dims)
+		dims, lbounds = cloneInts(bv.Dims), cloneI32(bv.Lbounds)
 		dims[0] = bv.Dims[0] + 1
-		return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: cloneI32(bv.Lbounds), Elements: elements}), nil
 	default:
 		return Value{}, mismatch()
 	}
+	if err := checkArrayBounds(dims, lbounds); err != nil {
+		return Value{}, err
+	}
+	return arrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
 }
 
 // cloneInts / cloneI32 / equalInts are small slice helpers for the array builders.
@@ -732,7 +755,7 @@ func arrayGetElement(a *ArrayVal, idxs []int64) Value {
 	stride := 1
 	for d := a.Ndim() - 1; d >= 0; d-- {
 		lb := int64(a.Lbounds[d])
-		ub := int64(a.Ubound(d))
+		ub := a.Ubound(d)
 		if idxs[d] < lb || idxs[d] > ub {
 			return NullValue()
 		}
@@ -756,7 +779,7 @@ func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 	starts := make([]int, ndim) // source 0-based start per dimension
 	for d := 0; d < ndim; d++ {
 		lb := int64(a.Lbounds[d])
-		ub := int64(a.Ubound(d))
+		ub := a.Ubound(d)
 		reqLo, reqHi := lb, ub
 		if d < len(los) {
 			if los[d] != nil {
@@ -1474,6 +1497,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		if v.Kind == ValNull {
 			return NullValue(), nil
 		}
+		if e.result.IsJsonPath() {
+			// text → jsonpath (casts.toml): the per-row text compiles through the literal's own parser
+			// (42601 malformed) and yields the canonical path text, as PostgreSQL's jsonpath_in; the
+			// compile is metered like every evaluation-time compile (jsonpath.md §7).
+			jp, err := compileCastMetered(v.str(), m, env.exec.inputZone().prop)
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonPathValue(jp.Render()), nil
+		}
 		var out Value
 		if e.result.IsText() {
 			// Any scalar → text (casts.toml, types.md §5): the type's own output form, timestamptz in
@@ -1737,12 +1770,25 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			} else {
 				instant, iv = a.Int, b.interval()
 			}
+			if e.result.IsTimestamptz() {
+				// A timestamptz shifts in the SESSION zone (PG timestamptz_pl_interval; interval.md
+				// §5): its months/days steps each consult the zone, charged one timezone unit apiece
+				// before the shift runs (cost.md, the AT TIME ZONE unit).
+				if n := tsShiftZoneConsults(instant, iv); n != 0 {
+					m.Charge(n * costs.Timezone)
+					if err := m.Guard(); err != nil {
+						return Value{}, err
+					}
+				}
+				r, terr := tsShiftZoned(instant, iv, e.op == opSub, env.exec.session.timeZone)
+				if terr != nil {
+					return Value{}, terr
+				}
+				return TimestamptzValue(r), nil
+			}
 			r, terr := tsShift(instant, iv, e.op == opSub)
 			if terr != nil {
 				return Value{}, terr
-			}
-			if e.result.IsTimestamptz() {
-				return TimestamptzValue(r), nil
 			}
 			return TimestampValue(r), nil
 		}
@@ -1882,7 +1928,7 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if av.Kind == ValText {
 				accessed = jsonGetField(node, av.str())
 			} else { // ValInt — resolver guarantees a text/int arg for -> / ->>
-				accessed = jsonGetIndex(node, av.Int)
+				accessed = jsonGetRootIndex(node, av.Int) // a top-level scalar is its own element 0 (PG)
 			}
 		default: // jgHashArrow, jgHashArrowText — a text[] path
 			arr := av.arrayVal()
@@ -2078,6 +2124,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		}
 		return boolAnd(a, b), nil
 	case reOr:
+		if e.lhs.kind == reOr {
+			return evalOrChain(e, row, env, m)
+		}
 		m.Charge(operatorCost("or"))
 		a, err := e.lhs.eval(row, env, m)
 		if err != nil {
@@ -2485,7 +2534,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				subexpr = 1
 			}
 			// `subexpr` selects the whole match (0) or a capture group; out of range (> group count)
-			// or a non-participating group (-1) → NULL / 0.
+			// or a non-participating group (-1) → NULL / 0. A pattern with NO capture group has one
+			// "subexpression" — the whole match — so subexpr 1 selects it there (PG
+			// setup_regexp_matches falls back to npatterns = 1; regex.md §8b).
+			if prog.ngroups == 0 && subexpr == 1 {
+				subexpr = 0
+			}
 			if subexpr > int64(prog.ngroups) {
 				return noMatch(), nil
 			}
@@ -2973,10 +3027,9 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			var zr ZoneRef
 			if len(vals) == 7 {
-				z, ok := env.exec.session.env.resolveZone(vals[6].str())
-				if !ok {
-					return Value{}, newError(InvalidParameterValue,
-						fmt.Sprintf("time zone %q not recognized", vals[6].str()))
+				z, err := resolveMakeTimestamptzZone(env.exec.session.env, vals[6].str())
+				if err != nil {
+					return Value{}, err
 				}
 				zr = z
 			} else {
@@ -3168,8 +3221,16 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			shifted := clock
 			if len(vals) == 1 {
 				// The optional interval arg shifts the embedded instant via the existing
-				// calendar-aware timestamptz arithmetic (entropy.md §4).
-				s, err := tsShift(clock, vals[0].interval(), false)
+				// calendar-aware timestamptz arithmetic — in the session zone, as PG's
+				// timestamptz_pl_interval does, each calendar step charging one timezone unit
+				// (entropy.md §4, interval.md §5).
+				if n := tsShiftZoneConsults(clock, vals[0].interval()); n != 0 {
+					m.Charge(n * costs.Timezone)
+					if err := m.Guard(); err != nil {
+						return Value{}, err
+					}
+				}
+				s, err := tsShiftZoned(clock, vals[0].interval(), false, env.exec.session.timeZone)
 				if err != nil {
 					return Value{}, err
 				}
@@ -4122,6 +4183,8 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		m.Charge(costs.OperatorEval)
 		// STRICT: a NULL whole-array argument → SQL NULL.
 		arrays := make([][]*string, 0, len(e.sargs))
+		vals := make([]Value, 0, len(e.sargs))
+		dims := make([]int, 0, len(e.sargs)) // each argument's dimensionality (ndim)
 		for _, a := range e.sargs {
 			v, err := a.eval(row, env, m)
 			if err != nil {
@@ -4131,20 +4194,38 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				return NullValue(), nil
 			}
 			arrays = append(arrays, valueToOptTextArray(v))
+			vals = append(vals, v)
+			dims = append(dims, len(v.arrayVal().Dims))
 		}
-		// Pair up keys/values: one array of alternating k/v (even length), or two arrays.
+		// Pair up keys/values: one array of alternating k/v (even length), or two arrays. The
+		// shape rules are PostgreSQL's (json-sql-functions.md §2): the one-array form takes a 1-D
+		// array (even length) or a 2-D array of pairs (`{{k,v},…}`, else "array must have two
+		// columns"); the two-array form takes two 1-D arrays of one length; anything deeper is
+		// 2202E "wrong number of array subscripts". An empty (0-D) array builds `{}`.
 		type kvPair struct{ key, val *string }
 		var pairs []kvPair
 		if len(arrays) == 1 {
 			flat := arrays[0]
-			if len(flat)%2 != 0 {
-				return Value{}, newError(ArraySubscriptError, "array must have even number of elements")
+			switch dims[0] {
+			case 0, 1:
+				if len(flat)%2 != 0 {
+					return Value{}, newError(ArraySubscriptError, "array must have even number of elements")
+				}
+			case 2:
+				if vals[0].arrayVal().Dims[1] != 2 {
+					return Value{}, newError(ArraySubscriptError, "array must have two columns")
+				}
+			default:
+				return Value{}, newError(ArraySubscriptError, "wrong number of array subscripts")
 			}
 			pairs = make([]kvPair, 0, len(flat)/2)
 			for i := 0; i < len(flat); i += 2 {
 				pairs = append(pairs, kvPair{flat[i], flat[i+1]})
 			}
 		} else {
+			if dims[0] > 1 || dims[0] != dims[1] {
+				return Value{}, newError(ArraySubscriptError, "wrong number of array subscripts")
+			}
 			if len(arrays[0]) != len(arrays[1]) {
 				return Value{}, newError(ArraySubscriptError, "mismatched array dimensions")
 			}
@@ -5252,4 +5333,39 @@ func jsonGetVerbatim(op jsonGetOp, text string, arg Value) (Value, error) {
 		}
 		return TextValue(s), nil
 	}
+}
+
+// evalOrChain evaluates a left-deep OR chain — `a OR b OR c`, or an IN list's desugar (grammar.md
+// §20) — iteratively down its left spine instead of recursing into each lhs, so the native stack it
+// uses does not grow with the chain (cost.md §7). The charges and the short-circuit are exactly the
+// recursive form's: every OR node on the spine is charged first (the recursion charges each on entry
+// before descending into its lhs), then the operands are evaluated left to right, folding with the
+// Kleene OR and stopping at the first TRUE, which is returned as is. Called for a node whose lhs is
+// itself an OR; a plain `a OR b` keeps the inline form.
+func evalOrChain(e *rExpr, row storedRow, env *evalEnv, m *costMeter) (Value, error) {
+	// The spine, root first. A chain of a few elements stays in the stack buffer; only a long IN
+	// list spills to the heap.
+	var buf [16]*rExpr
+	spine := buf[:0]
+	node := e
+	for node.kind == reOr {
+		m.Charge(operatorCost("or"))
+		spine = append(spine, node)
+		node = node.lhs
+	}
+	acc, err := node.eval(row, env, m)
+	if err != nil {
+		return Value{}, err
+	}
+	for i := len(spine) - 1; i >= 0; i-- {
+		if to3(acc) == True {
+			return acc, nil
+		}
+		b, err := spine[i].rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		acc = boolOr(acc, b)
+	}
+	return acc, nil
 }

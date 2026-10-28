@@ -1613,6 +1613,21 @@ export function compileMetered(src: string, m: Meter, prop: PropertyTable | unde
   return path;
 }
 
+// compileCastMetered compiles the per-row text of a runtime text → jsonpath cast (casts.toml): the
+// full resolve-time compile (the canonical text must compile too — §8), metered as compileMetered.
+export function compileCastMetered(
+  src: string,
+  m: Meter,
+  prop: PropertyTable | undefined,
+): JsonPath {
+  m.charge(COSTS.jsonpathCompile * BigInt(utf8Length(src)));
+  m.guard();
+  const path = compile(src, prop);
+  m.charge(COSTS.regexCompile * BigInt(path.regexInsts));
+  m.guard();
+  return path;
+}
+
 // evalPath evaluates a compiled path over a jsonb context item → the ordered SQL/JSON sequence
 // (jsonpath.md §3). Generated items (method results, .keyvalue() objects, literals) are built; any
 // error propagates. Metered by jsonpath_step (§7). Port of impl/rust/src/jsonpath.rs `eval`.

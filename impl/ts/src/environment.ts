@@ -38,7 +38,7 @@ import {
   seededRandomSource,
   wallClock,
 } from "./seam.ts";
-import { type TimeZoneInfo, timeZoneBundleZones, type Zone } from "./timezone.ts";
+import { foldZoneName, type TimeZoneInfo, timeZoneBundleZones, type Zone } from "./timezone.ts";
 
 // The contents an Environment is built from. Internal: build() hands the builder's copies over.
 type Contents = {
@@ -80,6 +80,7 @@ export class Environment {
   private readonly collationSet: ReadonlyMap<string, Collation>;
   private readonly propertyTable: PropertyTable | undefined;
   private readonly zoneSet: ReadonlyMap<string, Zone>;
+  private readonly zoneSetFolded: ReadonlyMap<string, Zone>;
   // null when no host function is registered — the built-in-only fast path.
   private readonly hostFunctionSet: HostFunctions | null;
   private readonly random: RandomSource;
@@ -93,6 +94,12 @@ export class Environment {
     this.collationSet = c.collations;
     this.propertyTable = c.property;
     this.zoneSet = c.zones;
+    const folded = new Map<string, Zone>();
+    for (const name of [...c.zones.keys()].sort(compareNames)) {
+      const key = foldZoneName(name);
+      if (!folded.has(key)) folded.set(key, c.zones.get(name)!);
+    }
+    this.zoneSetFolded = folded;
     this.hostFunctionSet = c.functions.length > 0 ? new HostFunctions(c.functions) : null;
     this.random = c.random;
     this.clock = c.clock;
@@ -183,7 +190,9 @@ export class Environment {
 
   // zone looks up a loaded named zone (or alias) by exact name; undefined ⇒ not loaded.
   zone(name: string): Zone | undefined {
-    return this.zoneSet.get(name);
+    // Case-insensitive like PostgreSQL's pg_tzset (timezones.md §3.2): an exact name wins, else the
+    // ASCII-folded name; when two loaded names fold to one key the byte-smaller canonical name wins.
+    return this.zoneSet.get(name) ?? this.zoneSetFolded.get(foldZoneName(name));
   }
 
   // zones returns every loaded zone (aliases included), ascending by name.

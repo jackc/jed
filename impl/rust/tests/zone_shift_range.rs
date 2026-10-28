@@ -66,7 +66,8 @@ fn shift_past_i64_max_traps_22008() {
     traps(
         &mut db,
         "UTC",
-        "make_timestamptz(294247, 1, 10, 4, 0, 0, '+05:00')",
+        // make_timestamptz reads its explicit zone with the ISO sign (functions.md §11): '-05:00' is UTC-5.
+        "make_timestamptz(294247, 1, 10, 4, 0, 0, '-05:00')",
         1,
     );
     // An instant rendered in a UTC+5 zone moves +5h.

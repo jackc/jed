@@ -344,7 +344,7 @@ count after the lower-scale coefficient is multiplied up). Then:
 | compare (`=` `<>` `<` `<=` `>` `>=`, `IS [NOT] DISTINCT FROM`, one `IN`-list element) | `max(q(a1), q(a2))` |
 | `+` `−` | `max(q(a1), q(a2))` |
 | `*` | `q(d1) · q(d2)` |
-| `/` | `q(d1 + E) · q(d2)` with `E = rscale + s2 − s1` (`rscale` per `select_div_scale`, decimal.md §4) |
+| `/` | `q(d1 + E) · q(d2)` when `E ≥ 0`, else `q(d1) · q(d2 − E)`, with `E = rscale + s2 − s1` (`rscale` per `select_div_scale`, decimal.md §4 — `E < 0` only when `s1` exceeds the 1000-digit clamp, and the shift then widens the divisor, exactly the operands the division uses) |
 | `%` | `q(a1) · q(a2)` |
 | `SUM`/`AVG` fold | the `+` formula, accumulator vs. input |
 
@@ -2052,9 +2052,10 @@ Why enforce in the **parser** and not the evaluator: the parser is the *first* p
 *producer* of the tree. Bounding the depth there means **no `Expr`/`RExpr` taller than the
 limit is ever constructed**, so every downstream walk (resolve, eval, fold, the structural
 `CHECK`/`DEFAULT` validators, the touched-column collector) is transitively safe with **zero
-extra guard sites** — one mechanism, one place. (`IN (list)`, `BETWEEN`, `LIKE`, `CASE` are
-flat `RExpr` nodes, not desugared into deep nesting, so bounding source-AST depth bounds the
-resolved tree to within a constant — the bound is tight.)
+extra guard sites** — one mechanism, one place. (`BETWEEN`, `LIKE`, `CASE` resolve to a bounded
+number of nodes per source level, so bounding source-AST depth bounds the resolved tree to within
+a constant — the bound is tight. The one exception is `IN (list)`, which is parsed flat but
+resolves to an OR chain as deep as the list is long; it has its own element cap, §7f.)
 
 **Why `256`, and why a fixed number rather than PG's probe.** PostgreSQL raises this same
 `54001` from `check_stack_depth()`, which compares the *actual* stack pointer against
@@ -2340,6 +2341,55 @@ statement's planning work is bounded by its text and the catalog it reads. A det
 cross-core constant (§8), pinned by
 [../conformance/suites/resource/view_expansion_limit.test](../conformance/suites/resource/view_expansion_limit.test)
 (gated by `resource.view_expansion_limit`; jed-specific, **not** oracle-checked).
+
+## 7f. IN-list element limit (landed)
+
+`x IN (v1, v2, …)` is parsed **flat** — the parser collects the elements in a loop, one nesting
+level for the whole list — so the §7 counter never sees it. But the engine desugars the list at
+resolve into the left-deep OR chain PostgreSQL defines `IN` as, `x = v1 OR x = v2 OR …`
+([grammar.md §20](grammar.md)), which is **as deep as the list is long**: the one place a
+statement's resolved depth is not bounded by its written nesting. The walks below the parser —
+resolve, the uncorrelated-subquery fold, the estimator, evaluation — recurse down that chain, so
+before this gate a 50 000-element list overflowed the native stack in every core (a crash, not an
+engine error, even at `max_cost = 1`).
+
+**The gate: `MAX_IN_LIST_ELEMENTS = 1000`, checked in the parser.** A list with more elements
+aborts with **`54001` `statement_too_complex`** at parse time, with no position (a program limit,
+not a mistake at a place — [error-fields.md §10.2](error-fields.md)), identically in every core.
+The constant is deliberately generous for real queries (ORM-generated membership lists run to a
+few hundred elements) and deliberately **not** a change of representation: the chain, its costs
+(`n−1` `or` nodes always, `=` nodes up to the first TRUE — grammar.md §20), its EXPLAIN rendering,
+and the planner's OR-chain point-lookup extraction are untouched. The `IN (subquery)` form is a
+separate shape and is not capped; `x = ANY(ARRAY[…])` is a flat node and needs no cap.
+
+**The chain's recursion is trimmed where it is deepest, in the same way in every core.** The cap
+alone did not fit the §7.1 budgets — a 1 000-element list used ~1 MiB of Rust stack and ~800 KB of
+V8 stack — so the passes that recursed once per element now walk a left-deep `AND`/`OR` spine
+iteratively, with the recursive form's order and charges: the resolver builds the chain in a loop
+from per-element `x = v` resolutions; the evaluator charges every spine node first, then folds the
+operands left to right with the Kleene OR, stopping at the first TRUE (an inline buffer keeps a
+short chain allocation-free); the uncorrelated-subquery fold, the estimator's node count and
+subquery accounting, and the correlated-subquery test iterate the spine. Measured at the cap on
+x86_64: Rust needs ~768 KiB of a 1 MiB thread (every statement shape, before trimming ~1 MiB),
+TS ~320 KB of its 512 KB budget (before ~800 KB), Go ~2 MB of its 1 GB default. The remaining
+margin is below the ×4 the depth limit enjoys; a flat N-ary `IN` node (one `RExpr`, no chain at
+all) is the follow-on that would remove the cap's reason, and must reproduce the chain's costs,
+plan extraction, and rendering exactly.
+
+**Conformance.** [../conformance/suites/resource/in_list_limit.test](../conformance/suites/resource/in_list_limit.test)
+pins the boundary cross-core (a 1 000-element list runs with the chain's costs; 1 001 elements is
+`statement error 54001` in every clause), gated by `resource.in_list_limit`. jed-specific (PG
+bounds this only by its runtime stack probe), so not oracle-checked.
+
+## 7g. Bind-parameter index limit (landed)
+
+A statement's parameter table is sized by the **largest** index it names, so `SELECT $4294967295`
+allocated four billion slots before any cost was metered — a fatal out-of-memory, not an engine
+error. The lexer bounds the index at **`MAX_PARAM_INDEX = 65535`** (PostgreSQL's wire-protocol
+limit on the parameters of one statement); a larger index is `42601` ([api.md §5](api.md),
+[grammar.md §5](grammar.md)). Pinned cross-core by
+[../conformance/suites/resource/param_index_limit.test](../conformance/suites/resource/param_index_limit.test)
+(`resource.param_index_limit`); jed-specific in its trigger, so not oracle-checked.
 
 ## 8. Result-amplifying scalars and decimal transcendental work
 

@@ -249,7 +249,7 @@ column_constraint ::= "PRIMARY" "KEY"
  * DML through the action closure. The optional MATCH clause precedes the actions: MATCH SIMPLE (the
  * default) exempts a referencing tuple with any NULL; MATCH FULL exempts only an all-NULL tuple and
  * rejects a partly-NULL one (23503); MATCH PARTIAL is 0A000 (PostgreSQL: not yet implemented). */
-references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
+references_clause  ::= "REFERENCES" qualified_table ("(" identifier ("," identifier)* ")")?
                        ("MATCH" ("FULL" | "SIMPLE" | "PARTIAL"))?
                        ("ON" ("DELETE" | "UPDATE") referential_action)*
 referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"

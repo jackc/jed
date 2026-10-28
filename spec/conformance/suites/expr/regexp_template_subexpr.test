@@ -1,0 +1,250 @@
+# Three regex edges (spec/design/regex.md §8, §8b, §3.3):
+#   - regexp_replace's template: only \1..\9, \& and \\ are special; any other \<c> — \0 included —
+#     keeps both characters literally, and a trailing lone \ is literal (PG
+#     appendStringInfoRegexpSubstr).
+#   - regexp_substr / regexp_instr with subexpr = 1 on a pattern WITHOUT a capture group select the
+#     whole match (PG setup_regexp_matches falls back to npatterns = 1); subexpr 2 is still out of
+#     range there, as it is on a one-group pattern.
+#   - A star over a NULLABLE body is compiled as (sub+)? (RE2's rule), so the empty iteration's
+#     capture is recorded: regexp_match('', '(a*)*') is {""}, as PostgreSQL, RE2 and PCRE agree.
+#     Two ledgered flavor divergences ride along: the LAZY form `(a*)*?` and a plus over a nullable
+#     body `(a*)+b` follow RE2 (an unset / the last non-empty iteration) where PostgreSQL's engine
+#     reports the empty iteration — see oracle_overrides.toml.
+# Oracle-pinned vs postgres:18 except the two ledgered rows. Format: ../../../design/conformance.md.
+# requires: query.select, func.regexp_replace, func.regexp_match, func.regexp_substr, func.regexp_instr, func.regexp_count, func.regexp_split_to_array, expr.regex_match, types.text, types.i32, types.boolean, types.array, null.three_valued, resource.cost_metering
+
+# --- regexp_replace template escapes ---
+
+# \0 is not a back-reference: both characters are literal.
+# cost: 37
+query T nosort
+SELECT regexp_replace('abc', '(b)', '\0')
+----
+a\0c
+
+# cost: 31
+query T nosort
+SELECT regexp_replace('abc', 'b', '\x')
+----
+a\xc
+
+# \0 literal, \1 group 1, \& the whole match, \\ one backslash, \x literal.
+# cost: 54
+query T nosort
+SELECT regexp_replace('abc', '(b)', '[\0\1\&\\\x]')
+----
+a[\0bb\\x]c
+
+# A trailing lone backslash is literal.
+# cost: 29
+query T nosort
+SELECT regexp_replace('abc', 'b', '\')
+----
+a\c
+
+# \\1 is a literal backslash followed by the character 1.
+# cost: 32
+query T nosort
+SELECT regexp_replace('abc', 'b', '\\1')
+----
+a\1c
+
+# \\ then \1 (group 1 does not exist → nothing).
+# cost: 32
+query T nosort
+SELECT regexp_replace('abc', 'b', '\\\1')
+----
+a\c
+
+# Global: the literal \0 and the absent group 2 per match.
+# cost: 92
+query T nosort
+SELECT regexp_replace('abcabc', '(b)', '<\0\2>', 'g')
+----
+a<\0>ca<\0>c
+
+# --- regexp_substr / regexp_instr: subexpr on a group-less pattern ---
+
+# cost: 25
+query T nosort
+SELECT regexp_substr('abc', 'b', 1, 1, '', 1)
+----
+b
+
+# cost: 25
+query T nosort
+SELECT regexp_substr('abc', 'b', 1, 1, '', 2)
+----
+NULL
+
+# cost: 31
+query T nosort
+SELECT regexp_substr('abc', '(b)', 1, 1, '', 2)
+----
+NULL
+
+# A non-capturing group does not count.
+# cost: 32
+query T nosort
+SELECT regexp_substr('abc', '(?:b)c', 1, 1, '', 1)
+----
+bc
+
+# cost: 39
+query T nosort
+SELECT regexp_substr('abc', '(b)c', 1, 1, '', 1)
+----
+b
+
+# cost: 25
+query I nosort
+SELECT regexp_instr('abc', 'b', 1, 1, 0, '', 1)
+----
+2
+
+# cost: 25
+query I nosort
+SELECT regexp_instr('abc', 'b', 1, 1, 1, '', 1)
+----
+3
+
+# cost: 25
+query I nosort
+SELECT regexp_instr('abc', 'b', 1, 1, 0, '', 2)
+----
+0
+
+# cost: 31
+query I nosort
+SELECT regexp_instr('abc', '(b)', 1, 1, 0, '', 2)
+----
+0
+
+# cost: 32
+query I nosort
+SELECT regexp_instr('abc', '(?:b)c', 1, 1, 0, '', 1)
+----
+2
+
+# --- a star over a nullable body records the empty iteration's capture ---
+
+# cost: 74
+query T nosort
+SELECT regexp_match('', '(a*)*')
+----
+{""}
+
+# cost: 74
+query T nosort
+SELECT regexp_match('b', '(a*)*')
+----
+{""}
+
+# cost: 69
+query T nosort
+SELECT regexp_match('', '()*')
+----
+{""}
+
+# cost: 75
+query T nosort
+SELECT regexp_match('', '(|a)*')
+----
+{""}
+
+# cost: 74
+query T nosort
+SELECT regexp_match('', '(.*)*')
+----
+{""}
+
+# A non-empty iteration is captured as before.
+# cost: 92
+query T nosort
+SELECT regexp_match('aa', '(a*)*')
+----
+{aa}
+
+# cost: 100
+query T nosort
+SELECT regexp_match('ab', '(a*)*b')
+----
+{a}
+
+# cost: 95
+query T nosort
+SELECT regexp_match('aaa', '(a?)*')
+----
+{a}
+
+# cost: 96
+query T nosort
+SELECT regexp_match('x', '(a*|b)*x')
+----
+{""}
+
+# The {n,} unroll's trailing star takes the same rule.
+# cost: 157
+query T nosort
+SELECT regexp_match('aab', '(a*){2,}b')
+----
+{""}
+
+# cost: 81
+query T nosort
+SELECT regexp_match('b', '(^)*b')
+----
+{""}
+
+# cost: 169
+query T nosort
+SELECT regexp_match('abab', '((a|b)*)*')
+----
+{abab,b}
+
+# RE2 flavor (ledgered): the lazy form exits first, so the group stays unset.
+# cost: 74
+query T nosort
+SELECT regexp_match('', '(a*)*?')
+----
+{NULL}
+
+# RE2 flavor (ledgered): a plus over a nullable body keeps the last non-empty iteration.
+# cost: 96
+query T nosort
+SELECT regexp_match('ab', '(a*)+b')
+----
+{a}
+
+# cost: 100
+query T nosort
+SELECT regexp_match('ab', '(a*)*?b')
+----
+{a}
+
+# The global replace, split and count see the same matches as before (an empty match per gap).
+# cost: 76
+query T nosort
+SELECT regexp_replace('ab', '(a*)*', '[\1]', 'g')
+----
+[a][]b[]
+
+# cost: 75
+query T nosort
+SELECT regexp_split_to_array('aba', '(a*)*')
+----
+{"",b,""}
+
+# cost: 75
+query I nosort
+SELECT regexp_count('aba', '(a*)*')
+----
+4
+
+# cost: 115
+query BBB nosort
+SELECT 'aa' ~ '^(a*)*$', '' ~ '^(a*)*$', 'b' ~ '^(a*)*$'
+----
+true
+true
+false

@@ -302,11 +302,20 @@ func (d Decimal) Div(o Decimal) (Decimal, error) {
 	if d.IsZero() {
 		return decimalZero(rscale), nil
 	}
-	e := int64(rscale) + int64(o.Scale) - int64(d.Scale) // >= 0 since rscale >= s1
-	numer := magMulPow10(d.Limbs, uint32(e))
-	q, r := magDivMod(numer, o.Limbs)
+	// E = rscale + s2 − s1. It is negative when the dividend's scale exceeds select_div_scale's
+	// 1000-digit display clamp (s1 > 1000): the quotient then has FEWER fractional digits than
+	// the dividend, so the shift moves to the divisor instead (N = |C1|, D = |C2|·10^−E) — never
+	// a wrapped uint32 shift (decimal.md §4).
+	e := int64(rscale) + int64(o.Scale) - int64(d.Scale)
+	numer, denom := d.Limbs, o.Limbs
+	if e >= 0 {
+		numer = magMulPow10(d.Limbs, uint32(e))
+	} else {
+		denom = magMulPow10(o.Limbs, uint32(-e))
+	}
+	q, r := magDivMod(numer, denom)
 	// Round half away from zero: if 2*r >= |divisor|, round the magnitude up.
-	if magCmp(magAdd(r, r), o.Limbs) >= 0 {
+	if magCmp(magAdd(r, r), denom) >= 0 {
 		q = magAdd(q, []uint32{1})
 	}
 	return newDecimal(d.Neg != o.Neg, rscale, q).CheckCap()
@@ -677,16 +686,20 @@ func workMul(a, b Decimal) int64 {
 	return decGroups(a.Precision()) * decGroups(b.Precision())
 }
 
-// WorkDiv is W for div: numerator groups (dividend digits + the rescale shift E) × divisor
-// groups, E = rscale + s2 − s1 with the same selectDivScale as the result. A zero divisor
-// returns 1 — the operation traps 22012 before any work (cost.md §3).
+// WorkDiv is W for div: numerator groups × divisor groups, where the rescale shift
+// E = rscale + s2 − s1 (the same selectDivScale as the result) widens the dividend when E ≥ 0 and
+// the divisor when E < 0 (s1 > 1000, past the display clamp) — the operands Div actually divides
+// (cost.md §3). A zero divisor returns 1 — the operation traps 22012 before any work.
 func workDiv(a, b Decimal) int64 {
 	if b.IsZero() {
 		return 1
 	}
 	rscale := selectDivScale(a, b)
-	e := int64(rscale) + int64(b.Scale) - int64(a.Scale) // >= 0 since rscale >= s1
-	return decGroups(a.Precision()+uint32(e)) * decGroups(b.Precision())
+	e := int64(rscale) + int64(b.Scale) - int64(a.Scale)
+	if e >= 0 {
+		return decGroups(a.Precision()+uint32(e)) * decGroups(b.Precision())
+	}
+	return decGroups(a.Precision()) * decGroups(b.Precision()+uint32(-e))
 }
 
 // WorkMod is W for mod: the aligned divmod — the product of the aligned group counts. A zero
@@ -1225,9 +1238,20 @@ func powerVar(base, exp Decimal, m *costMeter) (Decimal, error) {
 	if base.IsZero() {
 		return decimalZero(uint32(minSigDigits)), nil
 	}
+	// A negative base insists on an integer exponent (PG power_var): an integer exponent outside
+	// power_var_int's int32 gate still arrives here, so integrality is tested by value, not by
+	// the gate. The result's sign is the exponent's parity (odd → negative) and its magnitude is
+	// computed over |base| (decimal.md §8).
+	resNeg := false
 	if base.Neg {
-		return Decimal{}, newError(InvalidArgumentForPowerFunction,
-			"a negative number raised to a non-integer power yields a complex result")
+		intExp := exp.TruncToScale(0)
+		if intExp.CmpValue(exp) != 0 {
+			return Decimal{}, newError(InvalidArgumentForPowerFunction,
+				"a negative number raised to a non-integer power yields a complex result")
+		}
+		// Limbs are little-endian base 10^9 (even), so the units digit's parity is limb 0's.
+		resNeg = len(intExp.Limbs) > 0 && intExp.Limbs[0]%2 == 1
+		base = base.Abs()
 	}
 	lnDweight, err := base.estimateLnDweight(m)
 	if err != nil {
@@ -1260,6 +1284,9 @@ func powerVar(base, exp Decimal, m *costMeter) (Decimal, error) {
 	r, err := lnNum.expVar(rscale, m)
 	if err != nil {
 		return Decimal{}, err
+	}
+	if resNeg && !r.IsZero() {
+		r = r.Negate() // a zero result stays positive (no negative zero)
 	}
 	return r.CheckCap()
 }

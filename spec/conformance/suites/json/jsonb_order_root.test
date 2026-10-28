@@ -1,0 +1,158 @@
+# jsonb ordering details PostgreSQL's compareJsonbContainers fixes (spec/design/json.md §5): (1) an
+# object's members are stored in canonical length-first key order, but the KEYS themselves compare
+# bytewise, so `{"b":1}` > `{"aa":1}`; (2) a top-level scalar is stored as a one-element raw-scalar
+# pseudo-array whose element count is checked after the raw-scalar flag, so a scalar sorts after
+# the empty array and before every non-empty array — `[]` sorts first of all, then the scalars by
+# type rank, then non-empty arrays, then objects; inside a container the ordinary rank applies.
+# (3) The same pseudo-array makes `'"x"'::jsonb -> 0` (and `-> -1`) the scalar itself
+# (json-sql-functions.md §1); `#>` and the json overloads do not see it. Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.comparison_order, query.order_by, query.values, query.derived_table, types.jsonb, types.json, types.jsonb_compare, func.jsonb_access, resource.cost_metering
+
+# Object keys compare bytewise ("aa" < "b"), not length-first.
+# cost: 4
+query BBB nosort
+SELECT '{"b":1}'::jsonb < '{"aa":1}'::jsonb, '{"aa":1}'::jsonb < '{"b":1}'::jsonb, '{"b":1}'::jsonb = '{"aa":1}'::jsonb
+----
+false
+true
+false
+
+# The pairwise walk is in storage order: {"b":1,"c":2} vs {"b":1,"aa":2} compares "c" vs "aa" second;
+# a nested object's keys compare the same way.
+# cost: 4
+query BBB nosort
+SELECT '{"b":1,"c":2}'::jsonb < '{"b":1,"aa":2}'::jsonb, '{"ab":1}'::jsonb < '{"b":{"x":1}}'::jsonb, '{"a":{"b":1}}'::jsonb < '{"a":{"aa":1}}'::jsonb
+----
+false
+true
+false
+
+# A top-level scalar vs an array: after the empty array, before a non-empty one.
+# cost: 8
+query BBBBBBB nosort
+SELECT 'true'::jsonb < '[]'::jsonb, '[]'::jsonb < 'null'::jsonb, '"a"'::jsonb < '[]'::jsonb, '1'::jsonb > '[]'::jsonb, 'null'::jsonb < '[1]'::jsonb, '{}'::jsonb > '[]'::jsonb, '[]'::jsonb = '[]'::jsonb
+----
+false
+true
+false
+true
+true
+true
+true
+
+# Inside a container the type rank applies: a scalar element sorts before an array element.
+# cost: 5
+query BBBB nosort
+SELECT '[null]'::jsonb < '[[]]'::jsonb, '[true]'::jsonb < '[[1]]'::jsonb, '{"a":1}'::jsonb < '{"a":[]}'::jsonb, '[[], 1]'::jsonb < '[1, []]'::jsonb
+----
+true
+true
+true
+false
+
+# The whole order: [] first, scalars by rank, non-empty arrays by count, objects (keys bytewise).
+# cost: 241
+query T nosort
+SELECT x FROM (VALUES ('[]'::jsonb),('null'::jsonb),('"a"'::jsonb),('1'::jsonb),('true'::jsonb),('[1]'::jsonb),('{}'::jsonb),('[[]]'::jsonb),('[null]'::jsonb),('{"a":1}'::jsonb),('{"b":1}'::jsonb),('{"aa":1}'::jsonb)) v(x) ORDER BY x
+----
+[]
+null
+"a"
+1
+true
+[null]
+[1]
+[[]]
+{}
+{"a": 1}
+{"aa": 1}
+{"b": 1}
+
+# cost: 83
+query T nosort
+SELECT x FROM (VALUES ('{"b":1}'::jsonb),('{"aa":1}'::jsonb),('[]'::jsonb),('false'::jsonb)) v(x) ORDER BY x DESC
+----
+{"b": 1}
+{"aa": 1}
+false
+[]
+
+# `-> int` on a top-level scalar: index 0 / -1 is the scalar itself (->> renders it as text).
+# cost: 7
+query TTTTTT nosort
+SELECT '"x"'::jsonb -> 0, '"x"'::jsonb ->> 0, '"x"'::jsonb -> -1, '1'::jsonb -> 0, 'null'::jsonb -> 0, 'true'::jsonb ->> 0
+----
+"x"
+x
+"x"
+1
+null
+true
+
+# Any other index, a `#>` path, a key, or an object root → NULL.
+# cost: 7
+query TTTTTT nosort
+SELECT '"x"'::jsonb -> 1, '"x"'::jsonb -> -2, '"x"'::jsonb #> '{0}', '"x"'::jsonb #>> '{0}', '"x"'::jsonb -> 'a', '{"a":1}'::jsonb -> 0
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# The json overloads walk the verbatim text: a scalar root is not an array.
+# cost: 4
+query TTT nosort
+SELECT '"x"'::json -> 0, '"x"'::json ->> 0, '[["y"]]'::jsonb #> '{0,0,0}'
+----
+NULL
+NULL
+NULL
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"b":1}'), (2, '{"aa":1}'), (3, '[]'), (4, 'null'), (5, '[1]'), (6, '"s"')
+
+# cost: 125
+query I nosort
+SELECT id FROM t ORDER BY b, id
+----
+3
+4
+6
+5
+2
+1
+
+# Nothing sorts before the empty array.
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE b < '[]' ORDER BY id
+----
+
+# cost: 14
+query I nosort
+SELECT id FROM t WHERE b > '{"aa":1}' ORDER BY id
+----
+1
+
+# cost: 19
+query IT nosort
+SELECT id, b -> 0 FROM t ORDER BY id
+----
+1
+NULL
+2
+NULL
+3
+NULL
+4
+null
+5
+1
+6
+"s"

@@ -1,0 +1,56 @@
+# ln / log10 of a SUBNORMAL f64 (spec/design/float.md §8): a subnormal (below 2^-1022 ≈ 2.2e-308)
+# is a first-class finite operand whose logarithm is a finite normal result — ln(1e-320) ≈ -736.8,
+# not ln(2^-1022) ≈ -708.4. A libm that reads the exponent field directly (Go's amd64 log
+# assembly) mishandles the zero field; every core pre-normalizes, so the values agree with
+# PostgreSQL within the transcendental `R` tolerance. The boundary 2^-1022 itself is normal.
+# requires: query.select, query.select_no_from, cast.operator, types.f64, resource.cost_metering
+
+# cost: 3
+query R nosort
+SELECT ln(1e-320::float8)
+----
+-736.8272408909739
+
+# cost: 3
+query R nosort
+SELECT log10(1e-320::float8)
+----
+-320.000004834948
+
+# the smallest subnormal, 2^-1074
+# cost: 3
+query R nosort
+SELECT ln(5e-324::float8)
+----
+-744.4400719213812
+
+# cost: 3
+query R nosort
+SELECT log10(5e-324::float8)
+----
+-323.3062153431158
+
+# cost: 3
+query R nosort
+SELECT ln(1e-310::float8)
+----
+-713.8013788281542
+
+# cost: 3
+query R nosort
+SELECT log10(1e-310::float8)
+----
+-310
+
+# the smallest NORMAL value, 2^-1022: unchanged by the guard
+# cost: 3
+query R nosort
+SELECT ln(2.2250738585072014e-308::float8)
+----
+-708.3964185322641
+
+# cost: 3
+query R nosort
+SELECT log10(2.2250738585072014e-308::float8)
+----
+-307.6526555685888

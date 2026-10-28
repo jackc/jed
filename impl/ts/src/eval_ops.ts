@@ -18,6 +18,7 @@ import {
   arrayUbound,
   arrayValue,
   boolValue,
+  checkArrayBounds,
   decimalValue,
   emptyArray,
   float64Value,
@@ -495,20 +496,34 @@ export function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
   if (arr.dims.length !== 1) {
     throw engineError("data_exception", "argument must be empty or one-dimensional array");
   }
+  // The new element's subscript must fit in an i32 (PG array_append/array_prepend: 22003 — for a
+  // prepend that is `lb - 1`, even though PG then readjusts the lower bound back to the input's). An
+  // append must also keep the grown dimension's `lb + len` within an i32 (checkArrayBounds: 54000);
+  // a prepend keeps its lower bound, and PG runs no bounds check after readjusting it, so
+  // `array_prepend(0, '[2147483645:2147483646]={1,2}')` is `[2147483645:2147483647]={0,1,2}` there
+  // and here (array-functions.md §3.2).
+  const lb = arr.lbounds[0]!;
+  const n = arr.dims[0]!;
+  if ((atEnd && lb + n > 2147483647) || (!atEnd && lb - 1 < -2147483648)) {
+    throw engineError("numeric_value_out_of_range", "value out of range for type i32").withDataType(
+      "i32",
+    );
+  }
+  const lbounds = [...arr.lbounds];
+  const dims = [n + 1];
+  if (atEnd) checkArrayBounds(dims, lbounds);
   const elements = atEnd ? [...arr.elements, elem] : [elem, ...arr.elements];
-  return {
-    kind: "array",
-    dims: [arr.dims[0]! + 1],
-    lbounds: [...arr.lbounds],
-    elements,
-  };
+  return { kind: "array", dims, lbounds, elements };
 }
 
 // arrayCatValues is array_cat (array-functions.md §3.2): identity-aware concatenation along the outer
 // dimension. NULL/empty is the identity (both NULL → NULL). Same dimensionality concatenates if the
-// inner dims match; an off-by-one dimensionality appends/prepends the lower one as an outer slice; any
-// other pairing — or an inner-dim mismatch — is 2202E. The flattened element list is always a ++ b
-// (row-major, outer-first); the result lower bounds come from the higher-dim operand.
+// inner dims AND inner lower bounds match (PG array_cat compares both); an off-by-one dimensionality
+// appends/prepends the lower one as an outer slice when its dims and lower bounds equal the other's
+// inner ones; any other pairing — or an inner mismatch — is 2202E. The flattened element list is
+// always a ++ b (row-major, outer-first); the result lower bounds come from the higher-dim operand
+// (the outer lower bound of the lower-dim operand is irrelevant). The grown outer dimension must keep
+// `lb + len` within an i32 (checkArrayBounds: 54000).
 export function arrayCatValues(a: Value, b: Value): Value {
   if (a.kind === "null" && b.kind === "null") return nullValue();
   if (a.kind === "null") return b;
@@ -523,25 +538,34 @@ export function arrayCatValues(a: Value, b: Value): Value {
   const elements = [...a.elements, ...b.elements];
   const na = a.dims.length;
   const nb = b.dims.length;
+  let dims: number[];
+  let lbounds: number[];
   if (na === nb) {
-    if (!eqInts(a.dims.slice(1), b.dims.slice(1))) throw mismatch();
-    const dims = [...a.dims];
+    if (
+      !eqInts(a.dims.slice(1), b.dims.slice(1)) ||
+      !eqInts(a.lbounds.slice(1), b.lbounds.slice(1))
+    )
+      throw mismatch();
+    dims = [...a.dims];
+    lbounds = [...a.lbounds];
     dims[0] = a.dims[0]! + b.dims[0]!;
-    return { kind: "array", dims, lbounds: [...a.lbounds], elements };
-  }
-  if (na === nb + 1) {
-    if (!eqInts(a.dims.slice(1), b.dims)) throw mismatch();
-    const dims = [...a.dims];
+  } else if (na === nb + 1) {
+    if (!eqInts(a.dims.slice(1), b.dims) || !eqInts(a.lbounds.slice(1), b.lbounds))
+      throw mismatch();
+    dims = [...a.dims];
+    lbounds = [...a.lbounds];
     dims[0] = a.dims[0]! + 1;
-    return { kind: "array", dims, lbounds: [...a.lbounds], elements };
-  }
-  if (nb === na + 1) {
-    if (!eqInts(b.dims.slice(1), a.dims)) throw mismatch();
-    const dims = [...b.dims];
+  } else if (nb === na + 1) {
+    if (!eqInts(b.dims.slice(1), a.dims) || !eqInts(b.lbounds.slice(1), a.lbounds))
+      throw mismatch();
+    dims = [...b.dims];
+    lbounds = [...b.lbounds];
     dims[0] = b.dims[0]! + 1;
-    return { kind: "array", dims, lbounds: [...b.lbounds], elements };
+  } else {
+    throw mismatch();
   }
-  throw mismatch();
+  checkArrayBounds(dims, lbounds);
+  return { kind: "array", dims, lbounds, elements };
 }
 
 // buildNestedArray stacks the evaluated elements of a nested ARRAY[...] constructor into a value of

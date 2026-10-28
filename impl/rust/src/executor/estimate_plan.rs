@@ -184,6 +184,33 @@ impl Engine {
             }
             return;
         }
+        if let RExpr::And(..) | RExpr::Or(..) = expr {
+            // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along
+            // its left spine iteratively, not by recursing into each lhs, so the stack does not
+            // grow with the chain (cost.md §7f); the order — the deepest lhs, then each rhs from
+            // the deepest node up — is the recursive one's.
+            let is_and = matches!(expr, RExpr::And(..));
+            let mut rhss: Vec<&RExpr> = Vec::new();
+            let mut node: &RExpr = expr;
+            loop {
+                match node {
+                    RExpr::And(l, r) if is_and => {
+                        rhss.push(r);
+                        node = l;
+                    }
+                    RExpr::Or(l, r) if !is_and => {
+                        rhss.push(r);
+                        node = l;
+                    }
+                    _ => break,
+                }
+            }
+            self.add_expression_subqueries(dst, Some(node), invocations, ctx);
+            for r in rhss.into_iter().rev() {
+                self.add_expression_subqueries(dst, Some(r), invocations, ctx);
+            }
+            return;
+        }
         for child in estimator_expression_children(expr) {
             self.add_expression_subqueries(dst, Some(child), invocations, ctx);
         }

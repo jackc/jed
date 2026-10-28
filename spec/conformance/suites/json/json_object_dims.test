@@ -1,0 +1,47 @@
+# json_object / jsonb_object array shapes (spec/design/json-sql-functions.md §2): the one-array form
+# takes a 1-D array of alternating keys and values (an odd length is 2202E "array must have even
+# number of elements") or a 2-D array of two-element rows (another inner length is 2202E "array
+# must have two columns"); the two-array form takes two 1-D arrays of one length ("mismatched array
+# dimensions"); any other dimensionality is 2202E "wrong number of array subscripts"; an empty
+# array builds `{}`. PostgreSQL's rules. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonb, types.json, types.array, func.json_object, resource.cost_metering
+
+# cost: 7
+query TT nosort
+SELECT jsonb_object('{a, 1, b, 2}'::text[]), json_object('{{a, 1}, {b, 2}}'::text[])
+----
+{"a": "1", "b": "2"}
+{"a" : "1", "b" : "2"}
+
+# cost: 6
+query TTT nosort
+SELECT jsonb_object('{a, b}'::text[], '{1, 2}'::text[]), jsonb_object('{}'::text[]), jsonb_object('{}'::text[], '{}'::text[])
+----
+{"a": "1", "b": "2"}
+{}
+{}
+
+# A 3-D array, in either form.
+statement error 2202E
+SELECT jsonb_object('{{{a, 1}}}'::text[])
+
+statement error 2202E
+SELECT json_object('{{{a, 1}}}'::text[])
+
+# A 2-D array whose rows are not pairs.
+statement error 2202E
+SELECT jsonb_object('{{a, 1, b}}'::text[])
+
+statement error 2202E
+SELECT jsonb_object('{a, 1, b}'::text[])
+
+# The two-array form takes 1-D arrays only.
+statement error 2202E
+SELECT jsonb_object('{{a}}'::text[], '{{1}}'::text[])
+
+statement error 2202E
+SELECT jsonb_object('{a}'::text[], '{{1}}'::text[])
+
+statement error 2202E
+SELECT json_object('{a}'::text[], '{1, 2}'::text[])

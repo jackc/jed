@@ -380,9 +380,10 @@ pub(crate) const BASE64_ALPHABET: &[u8; 64] =
 /// `encode(bytes, format)` (string-functions.md §3): render binary as text. `hex` = two lowercase
 /// hex digits per byte; `base64` = RFC 4648, wrapped at 76 chars with `\n` (PostgreSQL's style);
 /// `escape` = printable bytes verbatim, `0x00` → `\000`, backslash doubled, high-bit bytes → `\nnn`
-/// octal. An unrecognized format traps `22023`.
+/// octal. The format name is matched ASCII-case-insensitively (PG `pg_strcasecmp`: `'BASE64'` =
+/// `'base64'`); an unrecognized format traps `22023`.
 pub(crate) fn encode_bytea(bytes: &[u8], format: &str) -> Result<String> {
-    match format {
+    match format.to_ascii_lowercase().as_str() {
         "hex" => Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
         "escape" => {
             let mut out = String::with_capacity(bytes.len());
@@ -427,34 +428,34 @@ pub(crate) fn sha2_digest(func: ScalarFunc, bytes: &[u8]) -> Vec<u8> {
     }
 }
 
-/// RFC 4648 base64 of `bytes`, wrapped at 76 characters with `\n` between chunks (no trailing
-/// newline) — PostgreSQL's `encode(…, 'base64')` layout.
+/// RFC 4648 base64 of `bytes` in PostgreSQL's `pg_base64_encode` layout: a `\n` after every 76
+/// characters of FULL 3-byte groups — including after the last one when the full groups end
+/// exactly on a 76-character line (57·k input bytes), the newline PG's encoder emits inside its
+/// loop — and then the padded partial group, which never takes a newline (string-functions.md §3).
 pub(crate) fn base64_encode_wrapped(bytes: &[u8]) -> String {
-    let mut b64: Vec<u8> = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        b64.push(BASE64_ALPHABET[((n >> 18) & 63) as usize]);
-        b64.push(BASE64_ALPHABET[((n >> 12) & 63) as usize]);
-        b64.push(if chunk.len() > 1 {
-            BASE64_ALPHABET[((n >> 6) & 63) as usize]
-        } else {
-            b'='
-        });
-        b64.push(if chunk.len() > 2 {
-            BASE64_ALPHABET[(n & 63) as usize]
-        } else {
-            b'='
-        });
-    }
-    let mut out = String::with_capacity(b64.len() + b64.len() / 76);
-    for (i, &c) in b64.iter().enumerate() {
-        if i > 0 && i % 76 == 0 {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4 + bytes.len() / 57 + 1);
+    let full = bytes.len() / 3 * 3;
+    for (g, chunk) in bytes[..full].chunks_exact(3).enumerate() {
+        let n = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | chunk[2] as u32;
+        out.push(BASE64_ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 6) & 63) as usize] as char);
+        out.push(BASE64_ALPHABET[(n & 63) as usize] as char);
+        if (g + 1) * 4 % 76 == 0 {
             out.push('\n');
         }
-        out.push(c as char);
+    }
+    let rest = &bytes[full..];
+    if !rest.is_empty() {
+        let n = (rest[0] as u32) << 16 | (*rest.get(1).unwrap_or(&0) as u32) << 8;
+        out.push(BASE64_ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if rest.len() == 2 {
+            BASE64_ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push('=');
     }
     out
 }
@@ -563,12 +564,13 @@ pub(crate) fn quote_ident_text(s: &str) -> String {
 
 /// `decode(s, format)` (string-functions.md §3): the inverse of `encode`. `hex` and `base64` skip a
 /// space, tab, newline, or carriage return (`hex` only between digit pairs); a malformed hex/base64
-/// string traps `22023`; a malformed `escape` sequence traps `22P02` (PostgreSQL's split). An
-/// unrecognized format traps `22023`.
+/// string traps `22023`; a malformed `escape` sequence traps `22P02` (PostgreSQL's split). The
+/// format name is matched ASCII-case-insensitively (as `encode`); an unrecognized format traps
+/// `22023`.
 pub(crate) fn decode_text(s: &str, format: &str) -> Result<Vec<u8>> {
-    match format {
+    match format.to_ascii_lowercase().as_str() {
         "hex" => decode_hex(s.as_bytes()),
-        "base64" => decode_base64(s.as_bytes()),
+        "base64" => decode_base64(s),
         "escape" => decode_escape(s.as_bytes()),
         _ => Err(EngineError::new(
             SqlState::InvalidParameterValue,
@@ -585,46 +587,72 @@ pub(crate) fn decode_hex(bytes: &[u8]) -> Result<Vec<u8>> {
         .map_err(|msg| EngineError::new(SqlState::InvalidParameterValue, msg))
 }
 
-/// Decode `base64` (RFC 4648); a space, tab, newline, or carriage return is ignored (PostgreSQL's
-/// `pg_base64_decode` set); an out-of-alphabet byte (or data after the `=` padding) traps `22023`.
-/// Bit-accumulation: each 6-bit symbol feeds a buffer that emits a byte per full 8 bits (the
-/// trailing <8 bits implied by padding are discarded).
-pub(crate) fn decode_base64(bytes: &[u8]) -> Result<Vec<u8>> {
-    let bad = || {
-        EngineError::new(
+/// Decode `base64`: PostgreSQL's `pg_base64_decode` (encode.c), a 4-symbol-group state machine
+/// over the input's code points (string-functions.md §3). A space, tab, newline, or carriage return
+/// is skipped; every other symbol — an alphabet character or `=` — fills a group of four, and each
+/// complete group emits its 3 bytes, less one per `=` the FIRST padded group carried. A `=` is
+/// legal only at group position 2 or 3 the first time (`unexpected "="` otherwise, `22023`); once
+/// padding has begun, later symbols — more `=` or even alphabet characters — are accepted as
+/// zero-valued filler (`YW=j` → `\x61`, `YQ==YQ==` → `\x6161`, exactly as PG). A symbol outside
+/// the alphabet is `invalid symbol "<c>"` (`22023`, quoting the whole code point); an input that
+/// ends mid-group (`YQ`, `YWJ`, `YQ=`) is `invalid base64 end sequence` (`22023`).
+pub(crate) fn decode_base64(s: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut pos = 0;
+    let mut end = 0;
+    for c in s.chars() {
+        let b: u32 = match c {
+            ' ' | '\t' | '\n' | '\r' => continue,
+            '=' => {
+                if end == 0 {
+                    end = match pos {
+                        2 => 1,
+                        3 => 2,
+                        _ => {
+                            return Err(EngineError::new(
+                                SqlState::InvalidParameterValue,
+                                "unexpected \"=\" while decoding base64 sequence",
+                            ));
+                        }
+                    };
+                }
+                0
+            }
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::InvalidParameterValue,
+                    format!("invalid symbol \"{c}\" found while decoding base64 sequence"),
+                ));
+            }
+        };
+        buf = (buf << 6) | b;
+        pos += 1;
+        if pos == 4 {
+            out.push((buf >> 16) as u8);
+            if end == 0 || end > 1 {
+                out.push((buf >> 8) as u8);
+            }
+            if end == 0 || end > 2 {
+                out.push(buf as u8);
+            }
+            buf = 0;
+            pos = 0;
+        }
+    }
+    if pos != 0 {
+        return Err(EngineError::new(
             SqlState::InvalidParameterValue,
             "invalid base64 end sequence",
         )
-    };
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut nbits = 0;
-    let mut padded = false;
-    for &b in bytes {
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
-            continue;
-        }
-        if b == b'=' {
-            padded = true;
-            continue;
-        }
-        if padded {
-            return Err(bad()); // a data symbol after padding
-        }
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return Err(bad()),
-        };
-        acc = (acc << 6) | v as u32;
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
+        .with_hint(Some(
+            "Input data is missing padding, is truncated, or is otherwise corrupted.".to_string(),
+        )));
     }
     Ok(out)
 }

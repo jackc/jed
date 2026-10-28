@@ -213,21 +213,35 @@ handles `NULL` itself (PG; oracle-pinned). This is the surface's one genuinely n
   **`22000`** (PG *"argument must be empty or one-dimensional array"*). Otherwise the result is
   `a`'s elements followed by `e`, the lower bound **preserved** and the upper bound grown by one
   (`'[2:4]={7,8,9}'` ∥ `10` → `'[2:5]={7,8,9,10}'`). A `NULL` element `e` is appended as a real
-  NULL element (`{1,2}` ∥ `NULL` → `{1,2,NULL}`).
+  NULL element (`{1,2}` ∥ `NULL` → `{1,2,NULL}`). The new element's subscript must fit in an i32
+  (`lb + len > 2147483647` → **`22003`**, PG's "integer out of range" — jed's "value out of range
+  for type i32"), and the grown array must keep `lb + len ≤ 2147483647` (PG `ArrayCheckBounds`,
+  array.md §7) — `array_append('[2147483645:2147483646]={1,2}', 3)` is **`54000`** *"array lower
+  bound is too large: 2147483645"*.
 - `array_prepend(e, a)`: the mirror — `e` is placed first, the lower bound **preserved**, upper
   grown by one (`array_prepend(0, '{1,2,3}')` → `'{0,1,2,3}'` lb 1; `array_prepend(6,
-  '[2:4]={7,8,9}')` → `'[2:5]={6,7,8,9}'`). Multidimensional `a` → `22000`.
+  '[2:4]={7,8,9}')` → `'[2:5]={6,7,8,9}'`). Multidimensional `a` → `22000`. The prepended element's
+  provisional subscript `lb − 1` must fit in an i32 (`lb = -2147483648` → **`22003`**) — PG computes
+  it before readjusting the lower bound back to the input's — but, as in PG, no `ArrayCheckBounds`
+  runs after that readjustment, so a prepend may legitimately produce an upper bound of exactly
+  `2147483647` (`array_prepend(0, '[2147483645:2147483646]={1,2}')` → `[2147483645:2147483647]=
+  {0,1,2}`, oracle-pinned); an `array_append` to such a value is then `22003`.
 - `array_cat(a, b)`: identity-aware concatenation. `NULL`/empty acts as the identity (`a` NULL →
   `b`; `b` NULL → `a`; **both NULL → `NULL`**; `a` empty → `b`; `b` empty → `a`). Otherwise it
   concatenates along the **outer** dimension, matching PG `array_cat`'s three cases on
   `(ndims_a, ndims_b)`:
-  - **equal** `N == N`: outer length = `a.dim[0] + b.dim[0]`; the **inner** dims `dims[1..]` must
-    be equal or it is **`2202E`** (PG *"cannot concatenate incompatible arrays"*); result lower
-    bounds = `a`'s.
+  - **equal** `N == N`: outer length = `a.dim[0] + b.dim[0]`; the **inner** dims `dims[1..]` **and
+    inner lower bounds** `lbounds[1..]` must both be equal or it is **`2202E`** (PG *"cannot
+    concatenate incompatible arrays"* — PG `array_cat` compares `dims` and `lbs` alike:
+    `'[0:0][5:6]={{1,2}}' ∥ '[0:0][1:2]={{3,4}}'` is `2202E`); result lower bounds = `a`'s (the
+    outer lower bounds may differ freely).
   - **off-by-one** `N == M+1`: the `(M)`-D operand is one outer slice of the `(N)`-D one; its dims
-    must equal the other's `dims[1..]` (`2202E` otherwise); the outer length grows by one; result
-    lower bounds = the **higher-dimensional** operand's.
+    **and lower bounds** must equal the other's `dims[1..]` / `lbounds[1..]` (`2202E` otherwise:
+    `'[0:0][5:6]={{1,2}}' ∥ '[1:2]={3,4}'` is `2202E`, `∥ '[5:6]={3,4}'` is `[0:1][5:6]={{1,2},{3,4}}`);
+    the outer length grows by one; result lower bounds = the **higher-dimensional** operand's.
   - **otherwise** (`|N−M| > 1`): `2202E`.
+  - In every case the result must keep `lb + len ≤ 2147483647` on the outer dimension (PG
+    `ArrayCheckBounds`, array.md §7) — else **`54000`** *"array lower bound is too large: <lb>"*.
 
   In every case the flattened element list is simply `a.elements ++ b.elements` (row-major,
   outer-first), so a 2×2 ∥ 1-D-of-2 appends a row.

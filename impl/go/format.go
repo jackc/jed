@@ -1505,9 +1505,12 @@ func adoptHeldCodec(pgr *pager, codec *pageCodec) error {
 			return err
 		}
 	}
-	suite, err := fileSuite(pages[0], pages[1])
+	suite, found, err := fileSuite(pages[0], pages[1])
 	if err != nil {
 		return err
+	}
+	if !found {
+		return newError(DataCorrupted, "no complete valid meta page")
 	}
 	if suite == 0 {
 		return newError(StaleKey, "the database is no longer encrypted; reopen it")
@@ -1549,11 +1552,15 @@ func unlockPager(pgr *pager, cred *Credential, env *Environment) error {
 	if err != nil {
 		return err
 	}
-	suite, err := fileSuite(slot0, slot1)
+	suite, found, err := fileSuite(slot0, slot1)
 	if err != nil {
 		return err
 	}
 	switch {
+	case !found:
+		// Neither slot is CRC-valid: the file declares no variant, so the credential is neither
+		// applicable nor inapplicable. Slot selection reports the corruption (XX001).
+		return nil
 	case suite == 0 && cred == nil:
 		return nil
 	case suite == 0:

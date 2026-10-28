@@ -21,6 +21,7 @@ import {
   adjustTimestampTypmod,
   assignmentError,
   coerceStringToArray,
+  floatUnderflow,
   overflow,
   rexprConstToValue,
   truncateToChars,
@@ -84,14 +85,26 @@ export function widthBucketFloat(op: number, low: number, high: number, count: b
     throw widthBucketErr("lower and upper bounds must be finite");
   if (low === high) throw widthBucketErr("lower bound cannot equal upper bound");
   const cf = Number(count);
+  // The interior bucket (PG width_bucket_float8): floor(fraction · count) + 1, where the fraction
+  // is (op − lo) / (hi − lo) for the near bound lo. When hi − lo overflows to ±Infinity (bounds of
+  // opposite sign near the f64 limit) the halves are used instead — (op/2 − lo/2) / (hi/2 − lo/2)
+  // — which cannot overflow; and a fraction that rounds up to 1.0 is clamped back to `count` (it
+  // would otherwise claim the past-the-end bucket for an operand inside the range).
+  const interior = (lo: number, hi: number): bigint => {
+    const frac = Number.isFinite(hi - lo)
+      ? (op - lo) / (hi - lo)
+      : (op / 2 - lo / 2) / (hi / 2 - lo / 2);
+    const r = BigInt(Math.floor(frac * cf)) + 1n;
+    return r > count ? count : r;
+  };
   if (low < high) {
     if (op < low) return 0n;
     if (op >= high) return count + 1n;
-    return BigInt(Math.floor(((op - low) / (high - low)) * cf)) + 1n;
+    return interior(low, high);
   }
   if (op > low) return 0n;
   if (op <= high) return count + 1n;
-  return BigInt(Math.floor(((low - op) / (low - high)) * cf)) + 1n;
+  return interior(low, high);
 }
 
 // resolveTextOperandPair resolves the operand pair of a text-only operator (LIKE/ILIKE, the regex
@@ -461,6 +474,8 @@ export function floatFromDecimalLiteral(
   if (!Number.isFinite(exact)) throw overflow(ty);
   const n = roundToWidth(ty, exact);
   if (!Number.isFinite(n)) throw overflow(ty); // f32 rounding pushed a finite double to ±Inf
+  // A non-zero literal that rounds to 0 at the width underflowed → 22003 (float.md §6).
+  if (n === 0 && !d.isZero()) throw floatUnderflow();
   return {
     node: { kind: "constFloat", ty, value: n },
     type: { kind: "float", ty },
@@ -1056,7 +1071,7 @@ export function parseDecimalLiteral(s: string): Decimal {
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for
 // BOOLEAN 'true' / CAST('t' AS boolean) (grammar.md §36). Matches PostgreSQL's boolin: trimmed
 // ASCII whitespace, case-insensitive; t/tr/tru/true, y/ye/yes, on, 1 → true and f/fa/fal/fals/
-// false, n/no, off, 0 → false; anything else 22P02.
+// false, n/no, of/off, 0 → false (every unambiguous prefix of a word); anything else 22P02.
 export function parseBoolLiteral(s: string): boolean {
   switch (trimLit(s).toLowerCase()) {
     case "t":
@@ -1076,6 +1091,7 @@ export function parseBoolLiteral(s: string): boolean {
     case "false":
     case "n":
     case "no":
+    case "of": // `off`'s unambiguous prefix (PG parse_bool); `o` alone is ambiguous → 22P02
     case "off":
     case "0":
       return false;
@@ -1139,7 +1155,22 @@ export function parseFloatLiteral(s: string, ty: ScalarType): number {
   if (!Number.isFinite(d)) throw overflow(ty);
   const n = ty === "f32" ? Math.fround(d) : d;
   if (!Number.isFinite(n)) throw overflow(ty); // finite double beyond binary32 range
+  // A non-zero literal that rounded to 0 at the width underflowed: out of range (22003), as PG's
+  // float8in / float4in (Number() does not report underflow — float.md §4).
+  if (n === 0 && floatTextHasNonzeroDigit(t)) throw overflow(ty);
   return n;
+}
+
+// floatTextHasNonzeroDigit reports whether a finite float literal's mantissa (the text before any
+// e/E) holds a non-zero digit — i.e. the literal names a non-zero value, so a parse to 0 is an
+// underflow rather than a spelled zero (`0e-400`, `0.000`).
+function floatTextHasNonzeroDigit(t: string): boolean {
+  for (let i = 0; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c === 101 || c === 69) return false; // e / E
+    if (c >= 49 && c <= 57) return true; // 1-9
+  }
+  return false;
 }
 
 // FLOAT_GRAMMAR_OK tests the finite-decimal grammar (a named wrapper so the regex's role is legible).
@@ -1221,6 +1252,18 @@ export function factorToFraction(v: Value): [bigint, bigint] {
   if (v.kind === "int") return [v.int, 1n];
   if (v.kind === "decimal") return parseFactorDecimal(v.dec.render());
   throw typeError("internal: non-numeric interval-scale factor");
+}
+
+// zonelessIntervalShift reports whether a timestamptz ± interval pair (either order) never consults
+// the session zone: its interval operand is a constant with zero months and days (a pure microsecond
+// shift on the instant), so the expression depends on its arguments only (index-dependencies.md). A
+// constant with a calendar field, or any non-constant interval, consults the session zone at eval
+// (interval.md §5).
+export function zonelessIntervalShift(rl: RExpr, rr: RExpr): boolean {
+  for (const e of [rl, rr]) {
+    if (e.kind === "constInterval" && e.value.months === 0 && e.value.days === 0) return true;
+  }
+  return false;
 }
 
 export function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {

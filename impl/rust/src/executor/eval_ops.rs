@@ -67,7 +67,7 @@ pub(crate) fn eval_array_func(func: &ArrayFunc, vals: &[Value], m: &mut Meter) -
             let v = match func {
                 ArrayFunc::ArrayLength => a.dims[d] as i64,
                 ArrayFunc::ArrayLower => a.lbounds[d] as i64,
-                ArrayFunc::ArrayUpper => a.ubound(d) as i64,
+                ArrayFunc::ArrayUpper => a.ubound(d),
                 _ => unreachable!(),
             };
             Ok(Value::Int(v))
@@ -457,6 +457,26 @@ pub(crate) fn array_extend(arr: &Value, elem: &Value, append: bool) -> Result<Va
         None => Ok(Value::Array(ArrayVal::one_dim(vec![elem.clone()]))),
         Some(a) if a.ndim() == 0 => Ok(Value::Array(ArrayVal::one_dim(vec![elem.clone()]))),
         Some(a) if a.ndim() == 1 => {
+            // The new element's subscript must fit in an i32 (PG array_append/array_prepend: 22003
+            // — for a prepend that is `lb - 1`, even though PG then readjusts the lower bound back
+            // to the input's). An append must also keep the grown dimension's `lb + len` within an
+            // i32 (`check_array_bounds`: 54000); a prepend keeps its lower bound, and PG runs no
+            // bounds check after readjusting it, so `array_prepend(0, '[2147483645:2147483646]=
+            // {1,2}')` is `[2147483645:2147483647]={0,1,2}` there and here (array-functions.md
+            // §3.2).
+            let (lb, n) = (a.lbounds[0] as i64, a.dims[0] as i64);
+            if (append && lb + n > i32::MAX as i64) || (!append && lb - 1 < i32::MIN as i64) {
+                return Err(EngineError::new(
+                    SqlState::NumericValueOutOfRange,
+                    "value out of range for type i32".to_string(),
+                )
+                .with_data_type("i32"));
+            }
+            let lbounds = a.lbounds.clone();
+            let dims = vec![a.dims[0] + 1];
+            if append {
+                crate::value::check_array_bounds(&dims, &lbounds)?;
+            }
             let mut elements = a.elements.clone();
             if append {
                 elements.push(elem.clone());
@@ -464,8 +484,8 @@ pub(crate) fn array_extend(arr: &Value, elem: &Value, append: bool) -> Result<Va
                 elements.insert(0, elem.clone());
             }
             Ok(Value::Array(ArrayVal {
-                dims: vec![a.dims[0] + 1],
-                lbounds: a.lbounds.clone(),
+                dims,
+                lbounds,
                 elements,
             }))
         }
@@ -478,9 +498,12 @@ pub(crate) fn array_extend(arr: &Value, elem: &Value, append: bool) -> Result<Va
 
 /// array_cat (array-functions.md §3.2): identity-aware concatenation along the outer dimension.
 /// NULL/empty is the identity (both NULL → NULL). Same dimensionality concatenates if the inner
-/// dims match; an off-by-one dimensionality appends/prepends the lower one as an outer slice; any
-/// other pairing — or an inner-dim mismatch — is `2202E`. The flattened element list is always
-/// `a ++ b` (row-major, outer-first); the result lower bounds come from the higher-dim operand.
+/// dims AND inner lower bounds match (PG `array_cat` compares both); an off-by-one dimensionality
+/// appends/prepends the lower one as an outer slice when its dims and lower bounds equal the
+/// other's inner ones; any other pairing — or an inner mismatch — is `2202E`. The flattened element
+/// list is always `a ++ b` (row-major, outer-first); the result lower bounds come from the
+/// higher-dim operand (the outer lower bound of the lower-dim operand is irrelevant). The grown
+/// outer dimension must keep `lb + len` within an i32 (`check_array_bounds`: 54000).
 pub(crate) fn array_cat_values(a: &Value, b: &Value) -> Result<Value> {
     match (a, b) {
         (Value::Null, Value::Null) => return Ok(Value::Null),
@@ -511,42 +534,35 @@ pub(crate) fn array_cat_values(a: &Value, b: &Value) -> Result<Value> {
     let mut elements = av.elements.clone();
     elements.extend(bv.elements.iter().cloned());
     let (na, nb) = (av.ndim(), bv.ndim());
-    if na == nb {
-        if av.dims[1..] != bv.dims[1..] {
+    let (mut dims, lbounds) = if na == nb {
+        if av.dims[1..] != bv.dims[1..] || av.lbounds[1..] != bv.lbounds[1..] {
             return Err(mismatch());
         }
         let mut dims = av.dims.clone();
         dims[0] = av.dims[0] + bv.dims[0];
-        Ok(Value::Array(ArrayVal {
-            dims,
-            lbounds: av.lbounds.clone(),
-            elements,
-        }))
+        (dims, av.lbounds.clone())
     } else if na == nb + 1 {
-        if av.dims[1..] != bv.dims[..] {
+        if av.dims[1..] != bv.dims[..] || av.lbounds[1..] != bv.lbounds[..] {
             return Err(mismatch());
         }
-        let mut dims = av.dims.clone();
-        dims[0] = av.dims[0] + 1;
-        Ok(Value::Array(ArrayVal {
-            dims,
-            lbounds: av.lbounds.clone(),
-            elements,
-        }))
+        (av.dims.clone(), av.lbounds.clone())
     } else if nb == na + 1 {
-        if bv.dims[1..] != av.dims[..] {
+        if bv.dims[1..] != av.dims[..] || bv.lbounds[1..] != av.lbounds[..] {
             return Err(mismatch());
         }
-        let mut dims = bv.dims.clone();
-        dims[0] = bv.dims[0] + 1;
-        Ok(Value::Array(ArrayVal {
-            dims,
-            lbounds: bv.lbounds.clone(),
-            elements,
-        }))
+        (bv.dims.clone(), bv.lbounds.clone())
     } else {
-        Err(mismatch())
+        return Err(mismatch());
+    };
+    if na != nb {
+        dims[0] += 1;
     }
+    crate::value::check_array_bounds(&dims, &lbounds)?;
+    Ok(Value::Array(ArrayVal {
+        dims,
+        lbounds,
+        elements,
+    }))
 }
 
 /// Evaluate an array subscript `base[..][..]` (spec/design/array.md §6) — the body of
@@ -633,7 +649,7 @@ pub(crate) fn array_get_element(a: &ArrayVal, idxs: &[i64]) -> Value {
     let mut stride = 1usize;
     for d in (0..a.ndim()).rev() {
         let lb = a.lbounds[d] as i64;
-        let ub = a.ubound(d) as i64;
+        let ub = a.ubound(d);
         if idxs[d] < lb || idxs[d] > ub {
             return Value::Null;
         }
@@ -657,7 +673,7 @@ pub(crate) fn array_get_slice(a: &ArrayVal, bounds: &[(Option<i64>, Option<i64>)
     let mut starts = Vec::with_capacity(ndim); // source 0-based start per dimension
     for d in 0..ndim {
         let lb = a.lbounds[d] as i64;
-        let ub = a.ubound(d) as i64;
+        let ub = a.ubound(d);
         let (req_lo, req_hi) = if d < bounds.len() {
             (bounds[d].0.unwrap_or(lb), bounds[d].1.unwrap_or(ub))
         } else {
@@ -1872,13 +1888,31 @@ pub(crate) fn parse_f64_literal(s: &str) -> Result<f64> {
     // but also `inf`/`nan` spellings — already handled above, so reject any non-finite result that
     // sneaks through (defensive) and any parse failure.
     let v: f64 = t.parse().map_err(|_| invalid())?;
-    if v.is_finite() {
-        Ok(v)
-    } else {
+    if !v.is_finite() {
         // A finite-looking literal that overflows binary64 parses to ±Inf — that is 22003, not a
         // first-class infinity (only the special words above produce ±Inf).
-        Err(overflow(ScalarType::Float64))
+        return Err(overflow(ScalarType::Float64));
     }
+    if v == 0.0 && float_text_has_nonzero_digit(t) {
+        // A non-zero literal that rounded to 0 underflowed: out of range (22003), as PG's
+        // float8in (Rust's parser does not report underflow — float.md §4).
+        return Err(overflow(ScalarType::Float64));
+    }
+    Ok(v)
+}
+
+/// Does a finite float literal's mantissa (the text before any `e`/`E`) hold a non-zero digit —
+/// i.e. does it name a non-zero value, so a parse to 0 is an underflow rather than a spelled zero
+/// (`0e-400`, `0.000`)?
+fn float_text_has_nonzero_digit(t: &str) -> bool {
+    for c in t.bytes() {
+        match c {
+            b'e' | b'E' => return false,
+            b'1'..=b'9' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// As [`parse_f64_literal`], for `f32` (binary32). A finite value beyond the binary32 range
@@ -1895,11 +1929,13 @@ pub(crate) fn parse_f32_literal(s: &str) -> Result<f32> {
         return Ok(v);
     }
     let v: f32 = t.parse().map_err(|_| invalid())?;
-    if v.is_finite() {
-        Ok(v)
-    } else {
-        Err(overflow(ScalarType::Float32))
+    if !v.is_finite() {
+        return Err(overflow(ScalarType::Float32));
     }
+    if v == 0.0 && float_text_has_nonzero_digit(t) {
+        return Err(overflow(ScalarType::Float32)); // underflow at binary32 (as parse_f64_literal)
+    }
+    Ok(v)
 }
 
 /// Recognize PG's special float spellings (case-insensitive): `infinity`/`inf` (± optional sign),
@@ -2170,14 +2206,16 @@ pub(crate) fn parse_decimal_literal(s: &str) -> Result<Decimal> {
 /// Parse a string literal's content as a boolean — the text→boolean coercion for `BOOLEAN 'true'`
 /// / `CAST('t' AS boolean)` (grammar.md §36). Matches PostgreSQL's `boolin`: trimmed ASCII
 /// whitespace, case-insensitive; `t`/`tr`/`tru`/`true`, `y`/`ye`/`yes`, `on`, `1` → true and
-/// `f`/`fa`/`fal`/`fals`/`false`, `n`/`no`, `off`, `0` → false; anything else `22P02`.
+/// `f`/`fa`/`fal`/`fals`/`false`, `n`/`no`, `of`/`off`, `0` → false (every unambiguous prefix of
+/// a word); anything else `22P02`.
 pub(crate) fn parse_bool_literal(s: &str) -> Result<bool> {
     let t = s
         .trim_matches(|c: char| c.is_ascii_whitespace())
         .to_ascii_lowercase();
     match t.as_str() {
         "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" | "1" => Ok(true),
-        "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "off" | "0" => Ok(false),
+        // `of` is `off`'s unambiguous prefix (PG parse_bool); `o` alone is ambiguous → 22P02.
+        "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" | "0" => Ok(false),
         _ => Err(EngineError::new(
             SqlState::InvalidTextRepresentation,
             format!("invalid input syntax for type boolean: \"{s}\""),

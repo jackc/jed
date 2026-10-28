@@ -176,6 +176,12 @@ fn scan_number(sql: &str, start: usize) -> Result<(Token, usize)> {
 ///
 /// This is the stored-text entry point (a view body, a CHECK expression, a rename rewrite), so an
 /// error carries no position: it would point into text the host never wrote (§10.1).
+/// The largest bind-parameter index a statement may name (`$65535`, spec/design/api.md §5):
+/// PostgreSQL's wire-protocol limit on the parameters of one statement. A fixed, cross-core-identical
+/// bound, like `MAX_EXPR_DEPTH` — the parameter table a statement allocates is sized by its largest
+/// index, so the bound is what keeps `SELECT $4294967295` from allocating four billion slots.
+pub const MAX_PARAM_INDEX: u64 = 65535;
+
 pub fn lex(sql: &str) -> Result<Vec<Token>> {
     lex_with_positions(sql)
         .map(|(tokens, _)| tokens)
@@ -190,6 +196,13 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
 /// one past the last character — PostgreSQL's "at end of input". An error carries the position of
 /// the lexeme being scanned (spec/design/error-fields.md §10.2).
 pub fn lex_with_positions(sql: &str) -> Result<(Vec<Token>, Vec<u32>)> {
+    // The text is checked as a whole before it is scanned, as PostgreSQL verifies a query string's
+    // encoding before parsing it (pg_verifymbstr). A `&str` is valid UTF-8 by construction, so the
+    // one check left is the NUL byte: a text value never holds one (spec/design/types.md §11), and
+    // the scan copies literal and identifier bytes raw — so a NUL anywhere in the text is 22021,
+    // with no position, exactly as the Go core reports it; a host text parameter is checked the
+    // same way at bind (api.md §5).
+    check_text_encoding(sql)?;
     let mut starts = Vec::new();
     let mut tok_start = 0;
     match lex_raw(sql, &mut starts, &mut tok_start) {
@@ -199,6 +212,19 @@ pub fn lex_with_positions(sql: &str) -> Result<(Vec<Token>, Vec<u32>)> {
             Err(e.with_position(pos))
         }
     }
+}
+
+/// Check text the engine receives from outside — SQL text, a host text parameter — as PostgreSQL's
+/// `pg_verifymbstr` does: a NUL byte is `22021`, naming the byte as PostgreSQL's
+/// `report_invalid_encoding` does (an invalid UTF-8 sequence cannot reach a `&str`).
+pub(crate) fn check_text_encoding(text: &str) -> Result<()> {
+    if text.as_bytes().contains(&0) {
+        return Err(EngineError::new(
+            SqlState::CharacterNotInRepertoire,
+            "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Convert ascending byte offsets into `sql` to 1-based character positions in one pass. A
@@ -581,7 +607,9 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
             b'$' => {
                 // A bind parameter `$N` — `$` then a 1-based decimal index (spec/design/api.md
                 // §5, grammar.md §5). `$` with no following digit, `$0`, and a leading zero
-                // (`$01`) are all 42601; an index overflowing u32 is too.
+                // (`$01`) are all 42601; so is an index above MAX_PARAM_INDEX: the parameter table
+                // is sized by the largest index a statement names, so an unbounded index would be
+                // an unbounded allocation (CLAUDE.md §13).
                 i += 1; // consume '$'
                 let digit_start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -596,9 +624,14 @@ fn lex_raw(sql: &str, starts: &mut Vec<usize>, tok_start: &mut usize) -> Result<
                         "invalid parameter number ${digits}: parameters are 1-based with no leading zero"
                     )));
                 }
-                let n: u32 = digits
-                    .parse()
-                    .map_err(|_| syntax(format!("parameter number out of range: ${digits}")))?;
+                let n: u32 = match digits.parse::<u64>() {
+                    Ok(n) if n <= MAX_PARAM_INDEX => n as u32,
+                    _ => {
+                        return Err(syntax(format!(
+                            "parameter number out of range: ${digits} (the maximum is ${MAX_PARAM_INDEX})"
+                        )));
+                    }
+                };
                 tokens.push(Token::Param(n));
             }
             _ if c.is_ascii_alphabetic() || c == b'_' => {
@@ -828,4 +861,75 @@ fn name_too_long() -> EngineError {
 
 fn syntax(msg: String) -> EngineError {
     EngineError::new(SqlState::SyntaxError, msg)
+}
+
+#[cfg(test)]
+mod text_encoding_tests {
+    //! Host-API behavior the corpus cannot express (CLAUDE.md §10): a NUL byte in SQL text or in a
+    //! text parameter — the one encoding fault a `&str` can carry — is 22021 with PostgreSQL's
+    //! message (spec/design/types.md §11), the same report the Go core gives for the same bytes.
+
+    use super::*;
+    use crate::{CreateOptions, Database, Session, SessionOptions, Value};
+
+    fn session() -> Session {
+        Database::create(CreateOptions::default())
+            .unwrap()
+            .session(SessionOptions::default())
+    }
+
+    #[test]
+    fn nul_in_sql_text_is_22021_without_position() {
+        for sql in ["SELECT 'a\0b'", "SELECT \"a\0b\"", "SELECT 1 -- \0"] {
+            let err = lex_with_positions(sql).unwrap_err();
+            assert_eq!(err.code(), "22021", "{sql:?}");
+            assert_eq!(
+                err.message,
+                "invalid byte sequence for encoding \"UTF8\": 0x00"
+            );
+            assert_eq!(err.position, None);
+        }
+        // The stored-text entry point rejects it the same way.
+        assert_eq!(lex("SELECT 'a\0b'").unwrap_err().code(), "22021");
+    }
+
+    #[test]
+    fn nul_in_text_parameter_is_22021() {
+        let mut db = session();
+        db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v text)", &[])
+            .unwrap();
+        let err = db
+            .query_outcome(
+                "INSERT INTO t VALUES (1, $1)",
+                &[Value::Text("a\0b".to_string())],
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), "22021");
+        assert_eq!(
+            err.message,
+            "invalid byte sequence for encoding \"UTF8\": 0x00"
+        );
+        // Nothing was stored; ordinary non-ASCII text still binds.
+        db.query_outcome(
+            "INSERT INTO t VALUES (1, $1)",
+            &[Value::Text("h\u{e9}\u{1F600}".to_string())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parameter_index_is_capped() {
+        assert!(lex("SELECT $65535").is_ok());
+        let err = lex("SELECT $65536").unwrap_err();
+        assert_eq!(err.code(), "42601");
+        assert_eq!(
+            err.message,
+            "parameter number out of range: $65536 (the maximum is $65535)"
+        );
+        assert_eq!(lex("SELECT $4294967295").unwrap_err().code(), "42601");
+        assert_eq!(
+            lex("SELECT $99999999999999999999999").unwrap_err().code(),
+            "42601"
+        );
+    }
 }

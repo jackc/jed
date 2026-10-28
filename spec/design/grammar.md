@@ -301,7 +301,9 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   contrast, *has* landed — `--` line and nesting `/* */` block comments, §33).
 - **Parameter placeholders (`$N`) are parsed, but bound by the host API, not the corpus.**
   The lexer accepts `$` followed by ≥1 ASCII digits as a 1-based bind parameter (`$1`,
-  `$2`, …); `$0`, a leading zero (`$01`), and `$` not followed by a digit are `42601`. A
+  `$2`, …); `$0`, a leading zero (`$01`), `$` not followed by a digit, and an index above
+  `65535` (`MAX_PARAM_INDEX` — PostgreSQL's wire-protocol limit; the parameter table is sized by
+  the largest index named, [cost.md §7g](cost.md)) are `42601`. A
   `$N` is a primary expression usable anywhere an expression is (WHERE / HAVING / ON /
   select list / UPDATE SET RHS / arithmetic / `CAST` inner / `IN` / `BETWEEN` / `LIKE` /
   `CASE`) and as an `INSERT` value slot — but **not** in LIMIT/OFFSET, GROUP BY, or a type
@@ -1603,6 +1605,12 @@ FROM`. `NOT IN` is the negation. The whole form is the first of the Phase-2 pred
 - **The list is non-empty.** `x IN ()` is a **42601** syntax error (the parser requires at
   least one element; PostgreSQL rejects the empty list too). The `IN (subquery)` form is a
   separate, later feature (Phase 4 subqueries) — this slice is the value-list form only.
+- **The list has at most 1000 elements** (`MAX_IN_LIST_ELEMENTS`, [cost.md §7f](cost.md)): a
+  longer list is **54001** `statement_too_complex` at parse time. The list is parsed flat, so the
+  nesting-depth gate never counts it, but it resolves to the OR chain above — as deep as the list
+  is long — which the walks below the parser descend; the cap is what keeps that depth bounded
+  (a documented PG divergence: PostgreSQL bounds it only by its runtime stack probe). The
+  `IN (subquery)` form is not capped.
 - **Precedence narrowing.** PostgreSQL binds `IN` slightly tighter than the comparison
   operators; the engine collapses it into the single non-associative comparison level. This is
   unobservable here because chaining comparisons (`a = b IN (…)`) is already a 42601 syntax
@@ -2307,6 +2315,15 @@ real cause (the type can't be determined) and is consistent with its strict, no-
   subquery by an enclosing-query column (a per-outer-row constant) is `query.group_by_correlated` /
   `query.order_by_correlated` (above). A correlated window `PARTITION BY` / `ORDER BY` key stays
   `0A000`.
+- **A correlated reference into a GROUPED enclosing query** — landed: a subquery in a grouped
+  query's select list, `HAVING`, `ORDER BY` or window keys runs once per group over the group row,
+  so an enclosing-query column it reads must be one of that query's grouping columns (or
+  functionally dependent on its grouped primary key — aggregates.md §16) and reads the group's
+  value; any other is `42803` (PostgreSQL's *subquery uses ungrouped column*). A subquery in
+  `WHERE` or inside an aggregate's argument still sees the input row. **Narrowing:** an aggregate
+  written inside the subquery over an enclosing column — PostgreSQL's outer-level aggregate,
+  `SELECT a, (SELECT max(b)) FROM t GROUP BY a` — is `42803` (PostgreSQL computes it at the outer
+  level); relaxable.
 - **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) landed as its own
   slice; see §42.
 - **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)` landed (the subquery spelling of `IN`);
@@ -2861,7 +2878,7 @@ just "coerce the string `x` to that type, with the type named explicitly." The p
 | `text` | identity (the string itself) | — |
 | `i16` / `i32` / `i64` | optional sign + decimal digits, surrounding whitespace trimmed | `22P02` malformed / `22003` out of range |
 | `decimal` / `numeric` | jed's decimal-literal grammar (sign, digits, one `.`, an optional `e`-notation exponent — §14), whitespace trimmed; capped | `22P02` malformed / `22003` over cap |
-| `boolean` | PG's `boolin`: `t`/`tr`/`tru`/`true`, `f`/`fa`/`fal`/`fals`/`false`, `y`/`ye`/`yes`, `n`/`no`, `on`/`off`, `1`, `0` (case-insensitive, trimmed) | `22P02` malformed |
+| `boolean` | PG's `boolin`: `t`/`tr`/`tru`/`true`, `f`/`fa`/`fal`/`fals`/`false`, `y`/`ye`/`yes`, `n`/`no`, `on`/`of`/`off`, `1`, `0` (case-insensitive, trimmed — every unambiguous prefix; `of` is `off`'s, a lone `o` is ambiguous) | `22P02` malformed |
 
 The native-syntax types (`integer`/`decimal`/`boolean`) are where `type 'string'` is a genuine
 **cast from text** — coercing a *string* to a number/bool. The literal form folds the coercion at
@@ -3249,7 +3266,7 @@ Both constraint positions gain the referential form ([constraints.md §6](constr
 column being defined):
 
 ```
-references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
+references_clause  ::= "REFERENCES" qualified_table ("(" identifier ("," identifier)* ")")?
                        ("MATCH" ("FULL" | "SIMPLE" | "PARTIAL"))?
                        ("ON" ("DELETE" | "UPDATE") referential_action)*
 referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
@@ -3257,8 +3274,11 @@ referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "
 
 and a `table_constraint` may be
 `["CONSTRAINT" identifier] "FOREIGN" "KEY" "(" identifier ("," identifier)* ")" references_clause`
-(the local-column list reuses the `PRIMARY KEY` list shape — bare names, non-empty). The
-referenced-column list is optional and defaults to the parent's primary key. The optional match
+(the local-column list reuses the `PRIMARY KEY` list shape — bare names, non-empty). The parent is
+a `qualified_table` (`main.` / `temp.` pin the implicit scope; an attachment qualifier is a
+cross-database FK, `0A000`; an unknown one `42P01` — [attached-databases.md](attached-databases.md)
+§4, [constraints.md](constraints.md) §6.2 step 2). The referenced-column list is optional and
+defaults to the parent's primary key. The optional match
 type follows it and precedes the actions, at most once (PostgreSQL's `key_match`): `MATCH SIMPLE`
 (the default) or `MATCH FULL` ([constraints.md §6.3](constraints.md)); `MATCH PARTIAL` parses but is
 rejected `0A000` (`MATCH PARTIAL not yet implemented`, PostgreSQL's parse-time error). A `MATCH`

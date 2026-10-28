@@ -585,14 +585,19 @@ mirroring the §2.11 range-bounds container recursion:
 
 1. A leading **type-rank discriminator byte** encoding the §5 order `Null < String < Number <
    Boolean < Array < Object` (one byte, ascending, so the rank dominates the sort exactly as the
-   range empty/±∞ markers dominate §2.11).
+   range empty/±∞ markers dominate §2.11) — with the root-level raw-scalar rule folded in: the
+   **empty array** takes its own, lowest rank value (it sorts before every scalar — json.md §5
+   rule 0), and a non-empty array the ordinary array rank above the scalars. Nested nodes use the
+   plain rank.
 2. Then the per-kind body, each in its **own order-preserving, self-delimiting** form:
    `null`/`false`/`true` carry no body (the rank byte suffices, with `false`/`true` split into
    two rank values); a **string** uses the `text-terminated-escape` rule (§2.4); a **number**
    uses `decimal-order-preserving` (§2.5); an **array** frames its element count then each
    element body recursively; an **object** frames its member count then, in canonical key order
    ([json.md §2.3](json.md)), each key (`text-terminated-escape`) then value body recursively.
-   Count-first framing reproduces the §5 "fewer elements/members sort first" rule.
+   Count-first framing reproduces the §5 "fewer elements/members sort first" rule, and the
+   terminated-escape key bytes compare bytewise — exactly the §5 key comparison (keys walked in
+   storage order, compared bytewise), so no extra transform is needed.
 
 This composes with the §2.2 nullable slot and §2.3 descending inversion unchanged. **Status —
 AUTHORED, UNEXERCISED.** It is written but not yet a live key — the way the float (§2.8) and range

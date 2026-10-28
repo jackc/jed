@@ -1,0 +1,127 @@
+# DROP INDEX of a bare unique index a FOREIGN KEY depends on (spec/design/constraints.md §5.5,
+# §6.2 step 4). A FOREIGN KEY's referenced columns must be the parent's PRIMARY KEY or the column
+# set of a unique index — a bare `CREATE UNIQUE INDEX` qualifies, as in PostgreSQL. The FK's
+# existence probe walks that key, so dropping the LAST unique key covering the referenced set is
+# refused with 2BP01 (dependent_objects_still_exist), exactly as dropping the parent table is; the
+# constraint must go first (ALTER TABLE … DROP CONSTRAINT). jed resolves the referenced set against
+# ANY covering unique key, so while another unique index or the primary key still covers the set the
+# drop is allowed — the records below drop the LATER-created twin, which PostgreSQL (which binds the
+# FK to the first matching index) also allows, so every record agrees with PostgreSQL 18
+# (oracle-checked; PostgreSQL's DETAIL line is not compared). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.foreign_key, ddl.alter_table, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.where_eq, query.order_by, types.i32, resource.cost_metering
+
+# --- the last covering unique index cannot be dropped ---------------------------------------------
+
+statement ok
+CREATE TABLE p (id i32, v i32)
+
+statement ok
+CREATE UNIQUE INDEX p_id ON p (id)
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p (id) ON DELETE CASCADE)
+
+statement ok
+INSERT INTO p VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO c VALUES (1, 1), (2, 2)
+
+# The FK's probe walks p_id: dropping it would leave c_pid_fkey unenforceable.
+statement error 2BP01
+DROP INDEX p_id
+
+# The parent table is protected the same way.
+statement error 2BP01
+DROP TABLE p
+
+# The refused drop changed nothing: the FK still enforces on both sides.
+# cost: 7
+statement ok
+DELETE FROM p WHERE id = 1
+
+# cost: 3
+query II nosort
+SELECT id, pid FROM c ORDER BY id
+----
+2
+2
+
+# cost: 0
+statement error 23503
+INSERT INTO c VALUES (3, 9)
+
+# Drop the constraint first; the index is then an ordinary one.
+statement ok
+ALTER TABLE c DROP CONSTRAINT c_pid_fkey
+
+statement ok
+DROP INDEX p_id
+
+# --- a twin unique key keeps the drop legal ------------------------------------------------------
+
+statement ok
+CREATE TABLE p2 (a i32, b i32)
+
+statement ok
+CREATE UNIQUE INDEX p2_ab ON p2 (a, b)
+
+statement ok
+CREATE UNIQUE INDEX p2_ba ON p2 (b, a)
+
+# The referenced SET is what matters, not the key order.
+statement ok
+CREATE TABLE c2 (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (y, x) REFERENCES p2 (b, a))
+
+# The later twin can go while p2_ab still covers {a, b} ...
+statement ok
+DROP INDEX p2_ba
+
+# ... but the last one cannot.
+statement error 2BP01
+DROP INDEX p2_ab
+
+# A unique index on a different column set is unrelated to the FK.
+statement ok
+CREATE UNIQUE INDEX p2_a ON p2 (a)
+
+statement ok
+DROP INDEX p2_a
+
+# --- the primary key counts as a cover --------------------------------------------------------------
+
+statement ok
+CREATE TABLE p3 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE UNIQUE INDEX p3_id ON p3 (id)
+
+statement ok
+CREATE TABLE c3 (id i32 PRIMARY KEY, pid i32 REFERENCES p3 (id))
+
+# The primary key still covers {id}: the redundant unique index is droppable.
+statement ok
+DROP INDEX p3_id
+
+# --- ALTER TABLE … ADD FOREIGN KEY binds the same way --------------------------------------------
+
+statement ok
+CREATE TABLE p4 (id i32)
+
+statement ok
+CREATE UNIQUE INDEX p4_id ON p4 (id)
+
+statement ok
+CREATE TABLE c4 (id i32 PRIMARY KEY, pid i32)
+
+statement ok
+ALTER TABLE c4 ADD CONSTRAINT c4_fk FOREIGN KEY (pid) REFERENCES p4 (id)
+
+statement error 2BP01
+DROP INDEX p4_id
+
+statement ok
+ALTER TABLE c4 DROP CONSTRAINT c4_fk
+
+statement ok
+DROP INDEX p4_id

@@ -18,8 +18,8 @@ type StatementSpan struct {
 }
 
 // SplitStatements returns a lazy iterator over the statements in sql (spec/design/session.md §4.1),
-// splitting on top-level `;` while respecting string literals, dollar-quoted strings, and
-// line/block comments — a `;` inside any of those is never a boundary. It is pure and total (no
+// splitting on top-level `;` while respecting string literals, quoted identifiers, dollar-quoted
+// strings, and line/block comments — a `;` inside any of those is never a boundary. It is pure and total (no
 // Session/Engine, never an error: a lone `!` is just a byte to the splitter — the parse error is
 // the host's when it runs the span). Empty spans (a leading/standalone `;`, or whitespace/comment-
 // only text between separators) are skipped, so every yielded span has significant content; the
@@ -70,16 +70,19 @@ func SplitStatements(sql string) iter.Seq[StatementSpan] {
 						i++
 					}
 				}
-			case c == '\'':
-				// Single-quoted string literal; `''` is an embedded quote. An unterminated literal
-				// runs to EOF (the parse error is the host's).
+			case c == '\'' || c == '"':
+				// Single-quoted string literal (`''` an embedded quote) or double-quoted identifier
+				// (`""` an embedded quote — grammar.md §3); a `U&` prefix is ordinary bytes before
+				// the quote, so `U&'…'` / `U&"…"` take this case too. An unterminated literal or
+				// identifier runs to EOF (the parse error is the host's).
+				quote := c
 				if start < 0 {
 					start = i
 				}
 				i++
 				for i < n {
-					if b[i] == '\'' {
-						if i+1 < n && b[i+1] == '\'' {
+					if b[i] == quote {
+						if i+1 < n && b[i+1] == quote {
 							i += 2
 						} else {
 							i++

@@ -45,7 +45,10 @@ program and run per row, never re-parsed per row.
   `jsonpath '$.a'`) at resolve time, routed through `JsonPath::compile`; a malformed path is
   a **`42601`** (syntax error) at resolve, matching PG's syntax-error class for a bad path
   literal. The path *body* needs no new lexer tokens — it is scanned as a string and handed
-  to the compiler. New punctuation tokens are needed only for the **operators** `@?`/`@@` (§6).
+  to the compiler. A **runtime `text → jsonpath` cast** (a text expression `::jsonpath`,
+  casts.toml) compiles the per-row text the same way at evaluation — `42601` per malformed row —
+  and yields the canonical text, as PostgreSQL's `jsonpath_in`; a `jsonpath` operand is the
+  identity, a `NULL` adapts, and any other source type is `42846` (cannot_coerce, as PostgreSQL). New punctuation tokens are needed only for the **operators** `@?`/`@@` (§6).
 
 ---
 
@@ -684,7 +687,8 @@ before each compile. For a `jsonpath` value that is its stored canonical text (`
 as `$."a"`, 5 bytes); for a `JSON_TABLE` path it is the path literal as written. Every evaluation compiles its path, and the evaluators keep no cache. So a
 long stored path joined against many rows pays for every pair, the way `varlen_compare` does.
 A `'…'::jsonpath` literal is compiled at resolve, which is unmetered (cost.md §3); evaluating
-it compiles it again and charges.
+it compiles it again and charges. A runtime `text → jsonpath` cast compiles the per-row text and
+charges per byte of that text, after the cast's `operator_eval`.
 
 **`jsonpath_step`: path-evaluation work,** each charge guarded as it accrues:
 

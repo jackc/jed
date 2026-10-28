@@ -373,6 +373,13 @@ function classifyOrderKey(
 // Exceeding it throws 54001 statement_too_complex.
 export const MAX_EXPR_DEPTH = 256;
 
+// MAX_IN_LIST_ELEMENTS is the maximum number of elements in an `IN (…)` value list (spec/design/
+// cost.md §7f, grammar.md §20). The list is parsed flat, so MAX_EXPR_DEPTH never counts it, but it
+// resolves to a left-deep OR chain of as many levels — the one place a statement's resolved depth is
+// not bounded by its written nesting — and the walks below the parser recurse down that chain. The
+// cap bounds it at 54001, like the depth limit: a fixed, cross-core-identical constant.
+export const MAX_IN_LIST_ELEMENTS = 1000;
+
 // MAX_IDENTIFIER_LENGTH is enforced in the lexer (the identifier-token producer); re-exported here
 // so the two parser-level limits sit together (spec/design/cost.md §7; CLAUDE.md §13).
 export { MAX_IDENTIFIER_LENGTH } from "./lexer.ts";
@@ -1550,7 +1557,10 @@ class Parser {
   // returned definition carries no name and no local columns; the caller fills them in.
   private parseReferencesClause(): ForeignKeyDef {
     this.expectKeyword("references");
-    const refTable = this.expectIdentifier();
+    // The parent is a qualified_table (attached-databases.md §4): an optional database qualifier
+    // (`main.` / `temp.` pin the implicit scope; an attachment is a cross-database FK, 0A000 at
+    // resolution; unknown → 42P01) before the table name.
+    const [refDb, refTable] = this.parseQualifiedTableName();
     const refColumns = this.peek().kind === "lparen" ? this.parsePkColumnList() : null;
     let matchFull = false;
     if (this.peekKeyword() === "match") {
@@ -1586,7 +1596,16 @@ class Parser {
         throw engineError("syntax_error", "expected DELETE or UPDATE after ON");
       }
     }
-    return { name: null, columns: [], refTable, refColumns, matchFull, onDelete, onUpdate };
+    return {
+      name: null,
+      columns: [],
+      refDb: refDb ?? null,
+      refTable,
+      refColumns,
+      matchFull,
+      onDelete,
+      onUpdate,
+    };
   }
 
   // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
@@ -5223,6 +5242,16 @@ class Parser {
     while (this.peek().kind === "comma") {
       this.advance();
       list.push(this.parseConcat());
+      // The list is parsed flat, so the nesting counter never sees it — but it resolves to an OR
+      // chain as deep as the list is long (grammar.md §20), which the recursive walks below the
+      // parser descend. The element cap bounds that depth the way MAX_EXPR_DEPTH bounds written
+      // nesting (spec/design/cost.md §7f): 54001, no position.
+      if (list.length > MAX_IN_LIST_ELEMENTS) {
+        throw engineError(
+          "statement_too_complex",
+          `statement too complex: IN list exceeds the maximum of ${MAX_IN_LIST_ELEMENTS} elements`,
+        );
+      }
     }
     this.expect("rparen");
     return { kind: "in", lhs, list, negated: predNegated, loc: opLoc };
@@ -6463,8 +6492,18 @@ class Parser {
       this.expectKeyword("and");
       end = this.parseFrameBound();
     } else {
-      // A single bound is the frame START; the END defaults to CURRENT ROW.
+      // A single bound is the frame START; the END defaults to CURRENT ROW. PostgreSQL rejects the
+      // two impossible single-bound forms here, with their own messages (window.md §6, 42P20).
       start = this.parseFrameBound();
+      if (start.kind === "unboundedFollowing") {
+        throw engineError("windowing_error", "frame start cannot be UNBOUNDED FOLLOWING");
+      }
+      if (start.kind === "following") {
+        throw engineError(
+          "windowing_error",
+          "frame starting from following row cannot end with current row",
+        );
+      }
       end = { kind: "currentRow" };
     }
     const exclude = this.parseFrameExclusion();

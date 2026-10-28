@@ -1,0 +1,112 @@
+# encode / decode base64 exactly as PostgreSQL (spec/design/string-functions.md §3):
+#   the format name is ASCII-case-insensitive ('BASE64', 'Hex', 'ESCAPE'), an unknown one 22023;
+#   encode wraps at 76 characters and emits the newline after a line of full 3-byte groups even
+#   when it is the last (57 input bytes → 77 characters), never after the padded partial group;
+#   decode is pg_base64_decode's 4-symbol-group state machine: input ending mid-group ('YQ', 'YWJ',
+#   'YQ=', 'Y') is 22023 "invalid base64 end sequence"; '=' is legal only at position 2 or 3 of
+#   the first padded group ("unexpected =" otherwise: '=', 'YWJj=', 'YQ==='); once padding has
+#   begun, further symbols are zero-valued filler ('YW=j' → \x61, 'YQ==YQ==' → \x6161); a symbol
+#   outside the alphabet is 22023 "invalid symbol" (a form feed included); a space, tab, newline,
+#   or carriage return is skipped anywhere; dangling low bits are dropped ('AB==' → \x00).
+# requires: query.select, query.select_no_from, cast.operator, types.i32, types.text, types.bytea, resource.cost_metering
+
+# --- the format name folds ASCII case ----------------------------------------------------
+# cost: 6
+query TTTTT nosort
+SELECT encode('abc'::bytea, 'BASE64'), encode('a'::bytea, 'bAsE64'), encode('\x00'::bytea, 'ESCAPE'), decode('616263', 'HEX'), decode('YWJj', 'Base64')
+----
+YWJj
+YQ==
+\000
+\x616263
+\x616263
+
+statement error 22023
+SELECT encode('a'::bytea, 'base65')
+
+statement error 22023
+SELECT decode('a', 'BASE65')
+
+# --- encode's line wrap: 57·k input bytes end with a newline ------------------------------
+# 56 bytes: 18 full groups + a padded group = 76 chars, no newline; 57: 76 + '\n'; 58: 76 + '\n' +
+# 'YQ=='; 60: 81 (the former pin); 114: two full lines, each newline-terminated; 115: 154 + 4
+# cost: 493
+query IIIIIII nosort
+SELECT length(encode(repeat('a', 56)::bytea, 'base64')), length(encode(repeat('a', 57)::bytea, 'base64')), length(encode(repeat('a', 58)::bytea, 'base64')), length(encode(repeat('a', 60)::bytea, 'base64')), length(encode(repeat('a', 114)::bytea, 'base64')), length(encode(repeat('a', 115)::bytea, 'base64')), length(encode(''::bytea, 'base64'))
+----
+76
+77
+81
+81
+154
+158
+0
+
+# the wrapped output round-trips (decode skips the newlines)
+# cost: 354
+query B nosort
+SELECT decode(encode(repeat('a', 115)::bytea, 'base64'), 'base64') = repeat('a', 115)::bytea
+----
+true
+
+# --- decode: padding as PostgreSQL accepts it ---------------------------------------------
+# cost: 9
+query TTTTTTTT nosort
+SELECT decode('YW=j', 'base64'), decode('YQ==YQ==', 'base64'), decode('YQ=A', 'base64'), decode('Y Q = =', 'base64'), decode('AB==', 'base64'), decode('AAB=', 'base64'), decode('', 'base64'), decode('AA==', 'base64')
+----
+\x61
+\x6161
+\x61
+\x61
+\x00
+\x0000
+\x
+\x00
+
+# --- decode: input ending mid-group ------------------------------------------------------
+statement error 22023
+SELECT decode('YWJ', 'base64')
+
+statement error 22023
+SELECT decode('YQ', 'base64')
+
+statement error 22023
+SELECT decode('YQ=', 'base64')
+
+statement error 22023
+SELECT decode('Y', 'base64')
+
+statement error 22023
+SELECT decode('YQ===', 'base64')
+
+statement error 22023
+SELECT decode('YQ==YQ', 'base64')
+
+statement error 22023
+SELECT decode('YWJjYQ', 'base64')
+
+# --- decode: a misplaced '=' -------------------------------------------------------------
+statement error 22023
+SELECT decode('=', 'base64')
+
+statement error 22023
+SELECT decode('YWJj=', 'base64')
+
+statement error 22023
+SELECT decode('A===', 'base64')
+
+statement error 22023
+SELECT decode('====', 'base64')
+
+# --- decode: a symbol outside the alphabet ------------------------------------------------
+statement error 22023
+SELECT decode('Y!', 'base64')
+
+statement error 22023
+SELECT decode('YWJj!', 'base64')
+
+statement error 22023
+SELECT decode('é', 'base64')
+
+statement error 22023
+SELECT decode('YQ=' || chr(12) || '=', 'base64')

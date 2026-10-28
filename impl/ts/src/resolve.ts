@@ -123,6 +123,7 @@ import {
   resolveRowToComposite,
   resolveTextOperandPair,
   temporalArithResult,
+  zonelessIntervalShift,
   unifyArrayElementTypes,
   widenFloatTo,
 } from "./kernels.ts";
@@ -210,7 +211,10 @@ export function resolveProjections(
     if (scope.star !== null) {
       for (const idx of scope.star) {
         const c = scope.columnAt(idx);
-        nodes.push({ kind: "column", index: idx });
+        // Each expanded column obeys the grouping rule exactly as a written reference would
+        // (aggregates.md §4): in a grouped projection it must be a grouping column (else 42803) and
+        // reads its group-row slot, never the flat input index.
+        nodes.push(collectColumn(scope, ag, idx, c.name).node);
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
@@ -244,7 +248,8 @@ export function resolveProjections(
       r.table.columns.forEach((c, i) => {
         const idx = r.offset + i;
         if (i >= shown || scope.hidden.includes(idx)) return;
-        nodes.push({ kind: "column", index: idx });
+        // The grouping rule applies per expanded column (aggregates.md §4).
+        nodes.push(collectColumn(scope, ag, idx, c.name).node);
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
@@ -278,9 +283,15 @@ export function resolveProjections(
         table = rel.table;
         const shown = rel.table.columns.length - starHiddenCount(rel, scope.ctes);
         slots = rel.table.columns.slice(0, shown).map((_c, i) => rel.offset + i);
-      } else {
-        // An inner label of an unaliased parenthesized join expands to its own columns (§15).
-        const sub = scope.subRels.find((sr) => sr.label === want);
+      }
+      // An inner label of an unaliased parenthesized join expands to its own columns (§15). A label
+      // naming both a relation and an inner join relation is ambiguous (42P09), as for a qualified
+      // column (resolveQualified).
+      const sub = scope.subRels.find((sr) => sr.label === want);
+      if (rel !== undefined && sub !== undefined) {
+        throw engineError("ambiguous_alias", `table reference ${want} is ambiguous`);
+      }
+      if (rel === undefined) {
         if (sub !== undefined) {
           table = sub.table;
           slots = sub.slots;
@@ -293,7 +304,8 @@ export function resolveProjections(
         );
       }
       table.columns.slice(0, slots.length).forEach((c, i) => {
-        nodes.push({ kind: "column", index: slots[i]! });
+        // The grouping rule applies per expanded column, as for bare `*` (aggregates.md §4).
+        nodes.push(collectColumn(scope, ag, slots[i]!, c.name).node);
         names.push(c.name);
         types.push(resolvedTypeOfCol(c.type, scope.catalog));
         derivs.push(catColumnDeriv(c));
@@ -439,16 +451,48 @@ export function resolveColumnRef(
 ): { node: RExpr; type: ResolvedType } {
   if (r.layer !== undefined) return resolveLayerRef(scope, ag, r, name);
   if (r.level === 0) return collectColumn(scope, ag, r.index, name);
-  // An enclosing-query column that is itself a GROUP BY key of this query reads the group's key slot
-  // (query.group_by_correlated) — so a ROLLUP grand-total row sees it NULL, as in PostgreSQL.
+  return outerColumnRef(
+    scope,
+    ag,
+    r.level,
+    r.index,
+    resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog),
+    name,
+  );
+}
+
+// outerColumnRef builds the correlated reference to flat column idx of the scope `level` hops out
+// (§26). An ancestor that is GROUPED (scope.groupKeys — its projection / HAVING / ORDER BY planned
+// this subquery) hands the subquery its GROUP row, so the column must be one of its grouping keys
+// (else 42803, PostgreSQL's "subquery uses ungrouped column") and the node reads that key's slot; an
+// ungrouped ancestor hands its input row, read at the flat index. The index is thus always a slot of
+// the row the evaluator finds `level` frames out. An enclosing-query column that is itself a GROUP
+// BY key of THIS query reads this query's group slot instead (query.group_by_correlated) — so a
+// ROLLUP grand-total row sees it NULL, as in PostgreSQL.
+export function outerColumnRef(
+  scope: Scope,
+  ag: AggCtx,
+  level: number,
+  idx: number,
+  type: ResolvedType,
+  name: string,
+): { node: RExpr; type: ResolvedType } {
+  let slot = idx;
+  const keys = scope.ancestor(level).groupKeys;
+  if (keys !== null) {
+    slot = keys.indexOf(idx);
+    if (slot < 0) {
+      throw engineError(
+        "grouping_error",
+        "subquery uses ungrouped column " + name + " from outer query",
+      );
+    }
+  }
   if (ag.collecting) {
-    const m = matchGroupOuter(ag, r.level, r.index);
+    const m = matchGroupOuter(ag, level, slot);
     if (m !== null) return { node: { kind: "column", index: m.slot }, type: m.ty };
   }
-  return {
-    node: { kind: "outerColumn", level: r.level, index: r.index },
-    type: resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog),
-  };
+  return { node: { kind: "outerColumn", level, index: slot }, type };
 }
 
 // resolveLayerRef resolves a reference to a column of a layered relation (a write through a view,
@@ -539,7 +583,12 @@ export function resolveFieldOf(
 // divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The inner query is
 // resolved ONCE, with `scope` as its parent, so correlated references become outerColumn and errors
 // fire even over an empty outer.
-export function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
+export function planSubquery(
+  scope: Scope,
+  inner: QueryExpr,
+  ag: AggCtx,
+  params: ParamTypes,
+): QueryPlan {
   if (!scope.allowSubquery) {
     throw engineError(
       "feature_not_supported",
@@ -551,9 +600,17 @@ export function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes)
   // bound params, so a reused plan would carry another execution's folded constants. Every subquery
   // form (scalar / EXISTS / IN / quantified) funnels through here.
   params.uncacheable = true;
-  // The subquery inherits the enclosing scope's CTE bindings directly (cte.md §2) — visible at any
-  // nesting depth without counting as a correlation level.
-  return scope.catalog.planQuery(inner, scope, scope.ctes, params);
+  // The inner query sees whether THIS level evaluates its row grouped (scope.groupKeys): a
+  // collecting context plans the subquery over the group row, any other over the input row.
+  const savedKeys = scope.groupKeys;
+  scope.groupKeys = ag.collecting ? ag.groupKeys : null;
+  try {
+    // The subquery inherits the enclosing scope's CTE bindings directly (cte.md §2) — visible at
+    // any nesting depth without counting as a correlation level.
+    return scope.catalog.planQuery(inner, scope, scope.ctes, params);
+  } finally {
+    scope.groupKeys = savedKeys;
+  }
 }
 
 // planRowSubquery plans a ROW-VALUED subquery (grammar.md §26) whose left operand is a row
@@ -564,9 +621,10 @@ export function planRowSubquery(
   scope: Scope,
   inner: QueryExpr,
   arity: number,
+  ag: AggCtx,
   params: ParamTypes,
 ): { plan: QueryPlan; type: ResolvedType } {
-  const plan = planSubquery(scope, inner, params);
+  const plan = planSubquery(scope, inner, ag, params);
   const n = plan.columnTypes.length;
   if (n !== arity) {
     const which = n < arity ? "few" : "many";
@@ -584,13 +642,14 @@ function planMembershipSubquery(
   scope: Scope,
   lhs: Expr,
   inner: QueryExpr,
+  ag: AggCtx,
   params: ParamTypes,
 ): { plan: QueryPlan; elem: ResolvedType; rowValued: boolean } {
   if (lhs.kind === "row") {
-    const r = planRowSubquery(scope, inner, lhs.fields.length, params);
+    const r = planRowSubquery(scope, inner, lhs.fields.length, ag, params);
     return { plan: r.plan, elem: r.type, rowValued: true };
   }
-  const plan = planSubquery(scope, inner, params);
+  const plan = planSubquery(scope, inner, ag, params);
   if (plan.columnTypes.length !== 1) {
     throw engineError("syntax_error", "subquery has too many columns");
   }
@@ -1006,9 +1065,9 @@ function resolveNode(
     case "literal":
       return resolveLiteralExpr(scope, e, ctx, params);
     case "scalarSubquery":
-      return resolveScalarSubqueryExpr(scope, e, params);
+      return resolveScalarSubqueryExpr(scope, e, ag, params);
     case "exists":
-      return resolveExistsExpr(scope, e, params);
+      return resolveExistsExpr(scope, e, ag, params);
     case "inSubquery":
       return resolveInSubqueryExpr(scope, e, ag, params);
     case "quantifiedSubquery":
@@ -1523,13 +1582,14 @@ function resolveLiteralExpr(
 function resolveScalarSubqueryExpr(
   scope: Scope,
   e: Of<"scalarSubquery">,
+  ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   // A subquery in expression position (§26): PLANNED ONCE against the scope chain here, so its
   // column-count / type errors fire even over an empty outer. planSubquery rejects a non-SELECT
   // context and a $N inside (both 0A000). The fold pass folds an uncorrelated one to a constant;
   // a correlated one is re-executed per outer row by the evaluator.
-  const plan = planSubquery(scope, e.query, params);
+  const plan = planSubquery(scope, e.query, ag, params);
   if (plan.columnTypes.length !== 1) {
     throw engineError("syntax_error", "subquery must return only one column");
   }
@@ -1555,11 +1615,12 @@ function resolveScalarSubqueryExpr(
 function resolveExistsExpr(
   scope: Scope,
   e: Of<"exists">,
+  ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT EXISTS
   // parses as the unary NOT wrapping this, so negated here is always false.
-  const plan = planSubquery(scope, e.query, params);
+  const plan = planSubquery(scope, e.query, ag, params);
   return {
     node: {
       kind: "subquery",
@@ -1584,7 +1645,7 @@ function resolveInSubqueryExpr(
   // comparable (42804), exactly like a literal IN. A row-constructor LHS makes it ROW-VALUED: N
   // body columns, each row one anonymous composite element.
   const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
-  const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
+  const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, ag, params);
   classifyComparable(lt, elem);
   // = ignores the collation at eval (byte identity, collation.md §7), but a conflict between
   // the operand and the body column is still 42P22 (PostgreSQL's texteq demands one).
@@ -1615,7 +1676,7 @@ function resolveQuantifiedSubqueryExpr(
   // column (42601), and require comparability — reporting operator-not-found (42883) the way the
   // array quantifier does (§11.3), not the plain 42804. No 21000 cardinality limit.
   const { node: lhs, type: lt } = resolve(scope, e.lhs, null, ag, params);
-  const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, params);
+  const { plan, elem, rowValued } = planMembershipSubquery(scope, e.lhs, e.query, ag, params);
   try {
     classifyComparable(lt, elem);
   } catch {
@@ -1861,6 +1922,17 @@ function resolveCastExpr(
           params,
         );
       }
+      // A runtime operand: a range of the SAME element type is the identity (no node — the array
+      // branch's rule, so `ROW(int4range(1,3), 1)::rr` casts its field), and a non-literal NULL
+      // adapts; every other source stays the documented 0A000 narrowing.
+      const inner = resolve(scope, e.inner, null, ag, params);
+      const resultType: ResolvedType = { kind: "range", elem: elemRt };
+      if (
+        inner.type.kind === "null" ||
+        (inner.type.kind === "range" && resolvedTypeEqual(inner.type.elem, elemRt))
+      ) {
+        return { node: inner.node, type: resultType };
+      }
       throw engineError(
         "feature_not_supported",
         "casting to a range type is only supported from a string literal this slice",
@@ -2002,6 +2074,36 @@ function resolveCastExpr(
       };
     }
     throw typeError("cannot cast " + rtName(inner.type) + " to bytea");
+  }
+  // A jsonpath TARGET (casts.toml, jsonpath.md §1): a runtime text expression compiles per row
+  // through the literal's own parser (42601 malformed; jsonpath_compile charged per byte, §7) and
+  // yields the canonical path text, as PostgreSQL's jsonpath_in. A string LITERAL was coerced above;
+  // `$1::jsonpath` declares the param as jsonpath; a NULL adapts; a jsonpath operand is the identity.
+  // Any other source is 42846 (cannot_coerce, as PostgreSQL).
+  if (isJsonPath(target)) {
+    if (e.inner.kind === "param") {
+      const pinner = resolve(scope, e.inner, "jsonpath", ag, params);
+      return { node: pinner.node, type: { kind: "jsonpath" } };
+    }
+    const inner = resolve(scope, e.inner, null, ag, params);
+    const ik = inner.type.kind;
+    if (ik === "null" || ik === "jsonpath") {
+      return { node: inner.node, type: { kind: "jsonpath" } };
+    }
+    if (ik === "text") {
+      return {
+        node: {
+          kind: "cast",
+          target,
+          typmod,
+          varcharLen: null,
+          temporal: null,
+          operand: inner.node,
+        },
+        type: { kind: "jsonpath" },
+      };
+    }
+    throw engineError("cannot_coerce", `cannot cast type ${rtName(inner.type)} to jsonpath`);
   }
   // The uuid cast slice (spec/types/casts.toml, types.md §14): a uuid TARGET from a runtime text
   // or bytea expression. text → uuid runs uuid_in at eval (22P02 on malformed); bytea → uuid takes
@@ -2452,23 +2554,25 @@ function resolveInExpr(
   }
   // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
   // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
-  // non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree reuses the
-  // `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics, per-element operand
-  // typing (a too-wide literal → 22003, a cross-family element → 42804), and cost all fall
-  // out. The LHS is evaluated once per element (the OR-chain model — a documented cost
-  // consequence, cost.md §3).
-  let folded: Expr | null = null;
+  // non-empty (the parser rejects `IN ()` → 42601). Each `x = elem` is resolved by the `=`
+  // machinery verbatim, so the per-element operand typing (a too-wide literal → 22003, a
+  // cross-family element → 42804) falls out; the OR / NOT nodes are built here exactly as
+  // resolveBinary / resolveUnaryExpr build them (both operands bool — an `=` always is), so the
+  // three-valued NULL semantics and cost fall out too. The chain is assembled in a loop, not
+  // resolved as one tree: it is as deep as the list is long, and resolving it recursively would
+  // use native stack per element (cost.md §7). The LHS is evaluated once per element (the
+  // OR-chain model — a documented cost consequence, cost.md §3).
+  let folded: RExpr | null = null;
   for (const elem of e.list) {
     // The desugared comparisons carry the IN's operator position (PostgreSQL's).
     const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem, loc: e.loc };
-    folded = folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq, loc: e.loc };
+    const { node } = resolve(scope, eq, null, ag, params);
+    folded = folded === null ? node : { kind: "or", lhs: folded, rhs: node };
   }
   // folded is non-null: the parser guarantees a non-empty list.
-  let desugared = folded as Expr;
-  if (e.negated) {
-    desugared = { kind: "unary", op: "not", operand: desugared, loc: e.loc };
-  }
-  return resolve(scope, desugared, ctx, ag, params);
+  let node = folded as RExpr;
+  if (e.negated) node = { kind: "not", operand: node };
+  return { node, type: { kind: "bool" } };
 }
 
 function resolveBetweenExpr(
@@ -3321,14 +3425,42 @@ export function resolveBinary(
         }
         if (!isAdaptableOperand(lhs)) peeked = peek;
       }
+      // `timestamp[tz] + 'lit'` and `'lit' + timestamp[tz]` (types.md §6): the only `+` over a
+      // timestamp takes an interval, so the string literal adapts to INTERVAL, as PostgreSQL
+      // resolves the unknown literal (`-` keeps the sibling's type: `ts - '2023-01-01'` is a
+      // timestamp difference). The non-literal side resolves first, once: a non-timestamp LHS is
+      // reused as the pair's peeked LHS; a non-timestamp RHS is paired with the literal here.
+      let pre: { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType } | null = null;
+      const isStr = (e: Expr) => e.kind === "literal" && e.literal.kind === "text";
+      if (op === "add" && isStr(lhs) !== isStr(rhs)) {
+        const litIsLhs = isStr(lhs);
+        const lit = litIsLhs ? lhs : rhs;
+        const other = litIsLhs ? rhs : lhs;
+        if (!isAdaptableOperand(other)) {
+          const o = resolve(scope, other, null, ag, params);
+          if (o.type.kind === "timestamp" || o.type.kind === "timestamptz") {
+            const l = resolve(scope, lit, "interval", ag, params);
+            pre = litIsLhs
+              ? { rl: l.node, lt: l.type, rr: o.node, rt: o.type }
+              : { rl: o.node, lt: o.type, rr: l.node, rt: l.type };
+          } else if (!litIsLhs) {
+            peeked = o;
+          } else {
+            const l = resolve(scope, lit, ctxOf(o.type), ag, params);
+            pre = { rl: l.node, lt: l.type, rr: o.node, rt: o.type };
+          }
+        }
+      }
       // Arithmetic is overloaded across integer and decimal. Resolve the operand pair (an
       // integer literal adapts to an integer sibling), then pick the family: both integer →
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
       const p =
-        peeked !== null
-          ? resolveOperandPairWithLhs(scope, peeked, rhs, ag, params)
-          : resolveOperandPair(scope, lhs, rhs, ag, params);
+        pre !== null
+          ? pre
+          : peeked !== null
+            ? resolveOperandPairWithLhs(scope, peeked, rhs, ag, params)
+            : resolveOperandPair(scope, lhs, rhs, ag, params);
       // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-` difference, `*`
       // intersection over two ranges. A range operand in any of these three is the set-op axis — both
       // operands must be ranges of a common element type, else 42883 (matching PG's "operator does not
@@ -3367,6 +3499,12 @@ export function resolveBinary(
       // any other combination is a 42804.
       const temporal = temporalArithResult(op, p.lt.kind, p.rt.kind);
       if (temporal !== undefined) {
+        // timestamptz ± interval shifts in the session zone (interval.md §5), so it depends on the
+        // session zone — nonimmutable (42P17 in an index expression) — unless the interval is a
+        // constant pure time-of-day span (index-dependencies.md).
+        if (temporal === "timestamptz" && !zonelessIntervalShift(p.rl, p.rr)) {
+          params.nonimmutable = true;
+        }
         return {
           node: { kind: "arith", op, result: temporal, lhs: p.rl, rhs: p.rr },
           type: resolvedTypeOf(temporal),
@@ -3422,7 +3560,7 @@ export function resolveBinary(
       let p: { rl: RExpr; lt: ResolvedType; rr: RExpr; rt: ResolvedType };
       if (lhs.kind === "row" && rhs.kind === "scalarSubquery") {
         const l = resolve(scope, lhs, null, ag, params);
-        const r = planRowSubquery(scope, rhs.query, lhs.fields.length, params);
+        const r = planRowSubquery(scope, rhs.query, lhs.fields.length, ag, params);
         const rr: RExpr = {
           kind: "subquery",
           plan: r.plan,
@@ -3879,9 +4017,12 @@ export function jsonArgShape(v: Value): JsonNode {
 }
 
 // jsonpathContextNode is a jsonpath query's context item: a jsonb value as is, a json value
-// converted to jsonb (PostgreSQL casts it: keys canonical, duplicates last-wins — jsonpath.md §5).
+// converted to jsonb (PostgreSQL casts it: keys canonical, duplicates last-wins — jsonpath.md §5),
+// and a text value (the SQL/JSON query functions and JSON_TABLE admit a `text` context item, with
+// or without FORMAT JSON — json-sql-functions.md §5.1) parsed as jsonb: malformed text is 22P02,
+// raised by the context's conversion, outside ON ERROR (json.md §4.2), as in PostgreSQL.
 export function jsonpathContextNode(v: Value): JsonNode {
-  return v.kind === "json" ? jsonbIn(v.text) : jsonArgNode(v);
+  return v.kind === "json" || v.kind === "text" ? jsonbIn(v.text) : jsonArgNode(v);
 }
 
 // evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a json/jsonb

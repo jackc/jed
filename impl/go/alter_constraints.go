@@ -376,20 +376,18 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 		// The parent takes the temp-first resolution walk and must be of the table's own kind (42P16,
 		// temp-tables.md §8).
 		var parent *catTable
-		if d.RefTable == t.Name {
+		tempScope := snap == db.tempSnap()
+		if d.RefTable == t.Name && fkQualifierInScope(d.RefDB, tempScope) {
 			parent = t
-		} else if p, ok := db.tempSnap().table(d.RefTable); ok {
-			if err := checkFkPersistence(snap == db.tempSnap(), true); err != nil {
-				return err
-			}
-			parent = p
-		} else if p, ok := db.readSnap().table(d.RefTable); ok {
-			if err := checkFkPersistence(snap == db.tempSnap(), false); err != nil {
-				return err
-			}
-			parent = p
 		} else {
-			return fkParentMissing(db.readSnap(), d.RefTable)
+			p, parentTemp, err := db.lkpFkParent(d.RefDB, d.RefTable)
+			if err != nil {
+				return err
+			}
+			if err := checkFkPersistence(tempScope, parentTemp); err != nil {
+				return err
+			}
+			parent = p
 		}
 		var refs []int
 		if d.RefColumns == nil {

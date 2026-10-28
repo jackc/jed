@@ -70,7 +70,11 @@ source is visible, a `USING`/`NATURAL` column is one merged column (bare `k`; `*
 its source query is `SELECT *` over the join. The first `ON` after the join belongs to the join, the
 next to `MERGE` (PostgreSQL's grammar). An **aliased** parenthesized join is an ordinary derived
 table: only its alias qualifies (`a.x` is `42P01`). The target's label is checked only against the
-source's own label (`42712`), never against a join's inner labels — PostgreSQL's rule. Which relation each part
+source's own label (`42712`), never against a join's inner labels — PostgreSQL's rule. A target
+aliased like one of the join's inner relations is accepted, but a qualified reference to that
+label names two relations and is **`42P09`** (*table reference "a" is ambiguous*), never a silent
+bind to the target — raised at the reference in the `MERGE`'s own clauses (`ON`, `WHEN`, `SET`,
+`RETURNING`, a `t.*`); see §11 for the join's own `ON`. Which relation each part
 of the statement sees is PostgreSQL's:
 
 | Part | Target | Source |
@@ -290,6 +294,11 @@ expression's sublinks and functions need.
   condition and accepts, for example, `ON 1`.
 - **`SELECT` on the target is always required** (§10); PostgreSQL requires it only for the target
   columns a condition or expression reads.
+- **A target alias colliding with a joined source's inner label** is `42P09` at any qualified
+  reference in the `MERGE`'s own clauses (§2), as in PostgreSQL. PostgreSQL also raises it for
+  such a reference inside the join's own `ON` condition (its target is in scope when the join is
+  analyzed); jed plans the joined source before the target exists, so a reference there binds the
+  inner relation.
 - **Deterministic order.** PostgreSQL's action order is whatever its join plan produces; jed's is §3's
   (source order, then each source row's matches in probe order, then not-matched-by-source rows in
   storage-key order). It is observable only through which error is reported first and through the

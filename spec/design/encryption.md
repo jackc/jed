@@ -218,6 +218,7 @@ fail-closed:
 | Wrong or tampered credential (unwrap fails) | `28P01 invalid_password` |
 | Encrypted file, no credential | `28P02 credential_required` |
 | Plaintext file, credential offered | `28P03 credential_not_applicable` (otherwise a file swap would silently drop encryption) |
+| Neither meta slot CRC-valid, with or without a credential | `XX001 data_corrupted` — the file declares no variant; a damaged encrypted header is corruption, never a plaintext file (`28P03` would misreport the damage as the host's mistake) |
 | A connected client whose held DEK no longer authenticates the meta slot (a rotation happened) | `28P04 stale_key` — reopen |
 | Credential for an in-memory database | `55000` — nothing is at rest |
 

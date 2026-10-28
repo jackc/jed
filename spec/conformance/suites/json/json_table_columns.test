@@ -1,0 +1,78 @@
+# JSON_TABLE column names (spec/design/json-table.md §3.1): a regular / EXISTS column with no PATH
+# reads the member named exactly like the column — the default path is `$."<name>"`, a QUOTED
+# jsonpath member name, so a column named `a.b`, `a b`, `1`, `$a` or one containing a quote reads
+# that member rather than navigating a dotted path (PostgreSQL builds the same path). Every column
+# name across the whole COLUMNS tree (NESTED levels included) must be unique (42712), and each
+# COLUMNS level allows at most one FOR ORDINALITY column (42601). Output matches the postgres:18
+# oracle. Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table, resource.cost_metering
+
+# A dotted column name is one member name, not a two-step path.
+# cost: 19
+query I nosort
+SELECT * FROM JSON_TABLE('[{"a.b": 2, "a": {"b": 7}}]', '$[*]' COLUMNS ("a.b" int))
+----
+2
+
+# cost: 27
+query II nosort
+SELECT * FROM JSON_TABLE('[{"a b": 2, "a": 1}]', '$[*]' COLUMNS ("a b" int, a int))
+----
+2
+1
+
+# cost: 16
+query I nosort
+SELECT * FROM JSON_TABLE('[{"1": 2}]', '$[*]' COLUMNS ("1" int))
+----
+2
+
+# A quote in the name is JSON-escaped in the path.
+# cost: 19
+query I nosort
+SELECT * FROM JSON_TABLE('[{"a\"b": 2}]', '$[*]' COLUMNS ("a""b" int))
+----
+2
+
+# An unquoted identifier folds to lower case; the default path reads the folded name (for an
+# EXISTS column too).
+# cost: 25
+query II nosort
+SELECT * FROM JSON_TABLE('[{"A": 2, "a": 3}]', '$[*]' COLUMNS (A int, "A" int EXISTS))
+----
+3
+1
+
+# cost: 17
+query I nosort
+SELECT * FROM JSON_TABLE('[{"$a": 1}]', '$[*]' COLUMNS ("$a" int))
+----
+1
+
+# Duplicate column names: at one level, across a NESTED level, between an EXISTS and a regular
+# column two levels apart, and between FOR ORDINALITY and a regular column.
+statement error 42712
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a int, a text))
+
+statement error 42712
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a int, NESTED PATH '$' COLUMNS (a text PATH '$.a')))
+
+statement error 42712
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a int, NESTED PATH '$' COLUMNS (b int EXISTS, NESTED PATH '$' COLUMNS (b int))))
+
+statement error 42712
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (n FOR ORDINALITY, n int))
+
+# One FOR ORDINALITY per COLUMNS level: a NESTED level has its own.
+statement error 42601
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a FOR ORDINALITY, b FOR ORDINALITY))
+
+# cost: 9
+query II nosort
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a FOR ORDINALITY, NESTED PATH '$' COLUMNS (b FOR ORDINALITY)))
+----
+1
+1
+
+statement error 42601
+SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (a FOR ORDINALITY, NESTED PATH '$' COLUMNS (b FOR ORDINALITY, c FOR ORDINALITY)))

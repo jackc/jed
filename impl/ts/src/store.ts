@@ -4,6 +4,7 @@
 // a decimal column coerces to the typmod (rounds, precision-checks → 22003); a boolean into a
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
 import type { ArrayInResult, Value } from "./value.ts";
+import { arrayInError } from "./value.ts";
 import type { DecimalTypmod, ScalarType, TemporalTypmod } from "./types.ts";
 import { EngineError, engineError, notNullViolation } from "./errors.ts";
 import { ASSIGNMENT_MISMATCH } from "./error_hint.ts";
@@ -551,11 +552,7 @@ export function materializeInsertValue(
 // NULL token → NULL element). A malformed literal is 22P02.
 export function coerceStringToArray(s: string, elem: ColType, iz: InputZone): Value {
   const parsed: ArrayInResult = parseArrayLiteral(s);
-  if (!parsed.ok) {
-    if (parsed.err === "boundflip")
-      throw arraySubscriptErr("upper bound cannot be less than lower bound");
-    throw engineError("invalid_text_representation", "malformed array literal");
-  }
+  if (!parsed.ok) throw arrayInError(parsed.err);
   const vals = parsed.value.tokens.map((tok) => {
     if (tok === null) return nullValue();
     // Coerce the token to the element type (a scalar via the string-literal coercion, a composite
@@ -672,6 +669,18 @@ export function overflow(ty: ScalarType): Error {
     "numeric_value_out_of_range",
     "value out of range for type " + canonicalName(ty),
   ).withDataType(canonicalName(ty));
+}
+
+// floatUnderflow is the 22003 a float operation traps when a non-zero exact result rounds to zero
+// (PG's float_underflow_error — float.md §3).
+export function floatUnderflow(): Error {
+  return engineError("numeric_value_out_of_range", "value out of range: underflow");
+}
+
+// floatInputOutOfRange is the 22003 PG raises for a function input outside its domain
+// (asin/acos/acosh/atanh out of range, sin/cos/tan/cot of ±Infinity).
+export function floatInputOutOfRange(): Error {
+  return engineError("numeric_value_out_of_range", "input is out of range");
 }
 
 export function typeError(msg: string): EngineError {

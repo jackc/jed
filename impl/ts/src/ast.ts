@@ -686,6 +686,7 @@ export type RefAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDe
 export type ForeignKeyDef = {
   name: string | null;
   columns: string[];
+  refDb: string | null; // the optional database qualifier on the parent (attached-databases.md §4)
   refTable: string;
   refColumns: string[] | null;
   matchFull: boolean;

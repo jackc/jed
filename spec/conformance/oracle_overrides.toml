@@ -522,25 +522,8 @@ file = "expr/float_math.test"
 sql = "SELECT round(x, 1) FROM f WHERE id = 6"
 reason = "jed extension: a 2-argument round() over f64 (catalog round/2, result f64). PostgreSQL's 2-arg round is numeric-only (no round(double precision, integer)), so PG has no such overload. jed returns 1.5."
 
-# --- float domain-error codes: jed has a single numeric range/domain trap, 22003 (the registry
-# defines no granular 2201E/2201F), so every float math domain error collapses to 22003 — the
-# same engine-wide simplification float.test already uses. PostgreSQL distinguishes 2201E
-# (invalid_argument_for_logarithm) and 2201F (invalid_argument_for_power_function). The message
-# differs; the trap and its determinism are identical.
-[[override]]
-file = "expr/float_math.test"
-sql = "SELECT sqrt(x) FROM f WHERE id = 7"
-reason = "jed: sqrt of a negative traps 22003 (jed's single numeric range/domain code — no granular 2201F in the registry). PostgreSQL raises 2201F (invalid_argument_for_power_function). Engine-wide collapse to 22003 (errors/registry.toml), as in float.test."
-
-[[override]]
-file = "expr/float_math.test"
-sql = "SELECT ln(x) FROM f WHERE id = 3"
-reason = "jed: ln of zero traps 22003 (jed's single numeric range/domain code — no granular 2201E in the registry). PostgreSQL raises 2201E (invalid_argument_for_logarithm). Engine-wide collapse to 22003."
-
-[[override]]
-file = "expr/float_math.test"
-sql = "SELECT log10(x) FROM f WHERE id = 3"
-reason = "jed: log10 of zero traps 22003 (jed's single numeric range/domain code — no granular 2201E in the registry). PostgreSQL raises 2201E (invalid_argument_for_logarithm). Engine-wide collapse to 22003."
+# (The float domain-error codes — sqrt of a negative 2201F, ln/log10 of <= 0 2201E — now match
+# PostgreSQL exactly, as the decimal kernels always did; their former overrides were removed.)
 
 # (Derived tables: a nested WITH in a derived-table body — spec/design/cte.md §7 — and a
 # parenthesized-join FROM — grammar.md §15 — have both landed, so jed now accepts them like
@@ -2013,3 +1996,36 @@ reason = "jed: with no ORDER BY, DISTINCT ON sorts by its keys with the primary-
 file = "query/distinct_on.test"
 sql = "SELECT DISTINCT ON (cust) cust, 100 / (total - 7) FROM o ORDER BY cust, id"
 reason = "jed: a DISTINCT ON query projects only the rows it emits (grammar.md §11.1, cost.md §3), so the dropped row with total = 7 never evaluates 100 / 0. PostgreSQL computes a cheap select item below its sort, over every row, and traps 22012."
+
+[[override]]
+file = "transactions/parse_error_failed.test"
+sql = "BEGIN"
+reason = "Not a divergence — an oracle-harness artifact. PostgreSQL does raise 25P02 for BEGIN in an aborted block (exec_simple_query refuses every statement but COMMIT/ROLLBACK/PREPARE there; verified interactively), and jed matches. The importer replays each record inside its own wrapping transaction, where the nested BEGIN is PostgreSQL's 'there is already a transaction in progress' WARNING rather than an ERROR, so the probe sees no error code to compare."
+
+# --- Regex flavor (regex.md §3.3): a star over a NULLABLE body compiles as `(sub+)?` (RE2's rule),
+# which makes `(a*)*` agree with PostgreSQL ({""}). Two neighbours stay RE2-flavored where PostgreSQL's
+# own engine differs: the LAZY `(a*)*?` takes the exit arm first, leaving the group unset ({NULL}); a
+# PLUS over a nullable body `(a*)+b` reports the last non-empty iteration ({a}) because the empty
+# re-entry at the same position is a duplicate thread in the Pike VM. PostgreSQL reports the empty
+# iteration ({""}) in both. jed's stated flavor is RE2, which gives jed's answers; pinned cross-core.
+[[override]]
+file = "expr/regexp_template_subexpr.test"
+sql = "SELECT regexp_match('', '(a*)*?')"
+reason = "RE2 flavor (regex.md §3.3): a lazy star over a nullable body is `(sub+?)??`, whose exit arm has priority, so the capture is unset → {NULL}. PostgreSQL's engine reports the empty iteration → {\"\"}. A documented flavor divergence; the greedy `(a*)*` agrees with PostgreSQL."
+[[override]]
+file = "expr/regexp_template_subexpr.test"
+sql = "SELECT regexp_match('ab', '(a*)+b')"
+reason = "RE2 flavor (regex.md §3.3): in the Pike VM the plus loop's empty re-entry at the same input position is a duplicate thread and dies, so the capture keeps the last NON-EMPTY iteration → {a}. PostgreSQL's engine reports the trailing empty iteration → {\"\"}. A documented flavor divergence pinned cross-core."
+
+# --- timestamptz ± a CONSTANT pure time-of-day interval in an index expression: jed admits it
+# (index-dependencies.md — the shift never consults the session zone, so it depends on its arguments
+# only), PostgreSQL rejects timestamptz_pl_interval wholesale as STABLE (42P17). The first record
+# carries the divergence; the second replays inside PG's aborted transaction (25P02).
+[[override]]
+file = "expr/timestamptz_interval_zone.test"
+sql = "CREATE INDEX ev_hour ON ev ((at + interval '1 hour'))"
+reason = "jed: timestamptz ± a constant interval with zero months and days is a pure microsecond shift on the instant — no session-zone dependency, so the index is admitted (index-dependencies.md, interval.md §5). PostgreSQL marks timestamptz + interval STABLE and rejects it (42P17). A documented compositional refinement; a calendar-field interval is 42P17 in both."
+[[override]]
+file = "expr/timestamptz_interval_zone.test"
+sql = "CREATE INDEX ev_hour2 ON ev ((interval '90 minutes' + at))"
+reason = "Same refinement as ev_hour (the commuted form); in the oracle replay it runs inside the transaction ev_hour aborted (25P02)."

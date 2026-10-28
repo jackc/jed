@@ -326,6 +326,7 @@ const (
 type foreignKeyDef struct {
 	Name       string
 	Columns    []string
+	RefDB      *string // optional database qualifier on the parent (attached-databases.md §4)
 	RefTable   string
 	RefColumns []string // nil = default to the parent's primary key
 	MatchFull  bool

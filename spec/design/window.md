@@ -262,7 +262,8 @@ catalog array (S0+) and reused `[[aggregate]]` rows (S3):
   with the `f64` type landed, returning `float8` removes the divergence at no determinism cost.)
 - **Value functions** (`lag`/`lead`/`first_value`/`last_value`/`nth_value`) → **the value
   expression's type** (the `same_as_input` reserved id, [functions.md](functions.md) §8). `lag`'s
-  `default` argument, if present, must be assignable to that type (`42804` otherwise).
+  `default` argument, if present, must be assignable to that type (`42804` otherwise — stricter
+  than PG, which promotes `lag(i32_col, 1, 1.5)` to `numeric`; recorded in §6).
 - **Aggregate windows** inherit every aggregate widening *and divergence* unchanged: `SUM(i16|i32)`
   → `i64`, `SUM(i64)` → `decimal`, `AVG` → `decimal`, the order-independent canonical float fold
   for `SUM(float) OVER` ([float.md](float.md) §7), and the empty-frame → `NULL` rule
@@ -493,7 +494,15 @@ folds over, *per current row*. The frame is `{ROWS | RANGE | GROUPS} frame_exten
   PG float total order, so it is bit-identical cross-core and to PG; the total order gives PG's
   `in_range` NaN/±Infinity rule for free (a NaN current key → a NaN bound, NaN sorts after every
   non-NaN). A **NULL** current key frames only its NULL peers for offset/`CURRENT ROW` bounds, while
-  `UNBOUNDED` bounds still reach the partition edge (matching PG). Integer bound arithmetic is exact
+  `UNBOUNDED` bounds still reach the partition edge (matching PG). For a **non-NULL** current key a
+  NULL row never satisfies the value test; its position is fixed by **NULL placement** instead,
+  exactly as PG's `update_frameheadpos`/`update_frametailpos` (nodeWindowAgg.c): with `NULLS LAST`
+  (the `ASC` default) the trailing NULLs sort *after* every bound — a start bound that overshoots
+  every non-NULL key stops **at the first NULL row**, not the partition end, so an `UNBOUNDED
+  FOLLOWING` end then still frames the NULLs while an offset end never reaches them; with `NULLS
+  FIRST` (the `DESC` default) the leading NULLs sort *before* every bound — an `UNBOUNDED PRECEDING`
+  start includes them under any offset end, and an offset start skips them
+  (`window/frame_range_nulls.test`, oracle-checked). Integer bound arithmetic is exact
   (i128 / bigint, so it never
   overflows — matching PG's saturating frame edge).
 - **`GROUPS`** — peer-group offsets (`GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`). A bound `g
@@ -513,6 +522,26 @@ value-based `RANGE` offsets (integer/decimal keys); **S7** added `EXCLUDE`; a la
 `0A000` (the deferred D4 follow-on). A frame bound that contains a window function, an aggregate, a
 column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22013` as appropriate,
 matching PG); a malformed `EXCLUDE` is `42601`.
+
+**Frame-extent errors (`42P20`, PG's parse-time checks, in PG's order and with PG's messages).** A
+reversed or impossible extent is rejected before any bound offset is validated and in every mode,
+so it precedes the mode checks above and the `22013`/`0A000` offset checks
+(`window/frame_invalid.test`):
+
+| Extent | Message |
+|---|---|
+| start `UNBOUNDED FOLLOWING` | `frame start cannot be UNBOUNDED FOLLOWING` |
+| end `UNBOUNDED PRECEDING` | `frame end cannot be UNBOUNDED PRECEDING` |
+| start `CURRENT ROW`, end `n PRECEDING` | `frame starting from current row cannot have preceding rows` |
+| start `n FOLLOWING`, end `n PRECEDING` or `CURRENT ROW` (`BETWEEN` form) | `frame starting from following row cannot have preceding rows` |
+| single-bound `n FOLLOWING` (its end defaults to `CURRENT ROW`) | `frame starting from following row cannot end with current row` |
+
+A merely *empty* extent (`1 FOLLOWING AND 0 FOLLOWING`, `3 PRECEDING AND 2 PRECEDING`) is legal and
+yields the empty-frame result, as in PG. Two deliberately **stricter** jed rules, recorded here
+(not divergences in results, only in what is accepted): a `ROWS`/`GROUPS` offset must be a
+non-negative **integer literal** — PG casts a non-integer offset (`ROWS BETWEEN 1.5 PRECEDING …` →
+`2`), jed raises `0A000`; and `lag`/`lead`'s `default` must be assignable to the value type — PG
+promotes the pair to a common type (`lag(i32_col, 1, 1.5)` → `numeric`), jed raises `42804` (§4).
 
 Frame evaluation **slides** for a no-`EXCLUDE` aggregate (§5.2/§8): the sorted partition makes the
 frame bounds `[lo, hi)` monotonic non-decreasing, so the accumulator is carried across rows — an

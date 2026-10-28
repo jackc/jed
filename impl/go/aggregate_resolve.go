@@ -1033,6 +1033,9 @@ func resolveWindowDef(s *scope, wd *windowDef, keyCtx *aggCtx, windowKeys *[]*rE
 // decimal, or float type (a timestamp/date key is the deferred D4 follow-on, any other type is
 // 0A000). A negative offset is 22013. Mirrors Rust's resolve_frame.
 func resolveFrame(f *windowFrame, order []orderSlot, orderTypes []dataType) (*resolvedFrame, error) {
+	if err := checkFrameExtent(f); err != nil {
+		return nil, err
+	}
 	isOffset := func(b frameBound) bool { return b.Kind == framePreceding || b.Kind == frameFollowing }
 	hasOffset := isOffset(f.Start) || isOffset(f.End)
 	switch f.Mode {
@@ -1093,6 +1096,26 @@ func resolveFrame(f *windowFrame, order []orderSlot, orderTypes []dataType) (*re
 		}
 		return &resolvedFrame{mode: frameRange, start: start, end: end, exclude: f.Exclude}, nil
 	}
+}
+
+// checkFrameExtent rejects a reversed or impossible frame extent (42P20) before any bound is
+// resolved — PostgreSQL's parse-time checks (gram.y frame_extent), in PG's order and with PG's
+// messages (spec/design/window.md §6). They apply to every mode (ROWS/RANGE/GROUPS) alike; the
+// single-bound form (`ROWS n FOLLOWING`) is caught with its own message by the parser.
+func checkFrameExtent(f *windowFrame) error {
+	if f.Start.Kind == frameUnboundedFollowing {
+		return newError(WindowingError, "frame start cannot be UNBOUNDED FOLLOWING")
+	}
+	if f.End.Kind == frameUnboundedPreceding {
+		return newError(WindowingError, "frame end cannot be UNBOUNDED PRECEDING")
+	}
+	if f.Start.Kind == frameCurrentRow && f.End.Kind == framePreceding {
+		return newError(WindowingError, "frame starting from current row cannot have preceding rows")
+	}
+	if f.Start.Kind == frameFollowing && (f.End.Kind == framePreceding || f.End.Kind == frameCurrentRow) {
+		return newError(WindowingError, "frame starting from following row cannot have preceding rows")
+	}
+	return nil
 }
 
 // resolveIntBound resolves a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must

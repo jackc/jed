@@ -1,0 +1,169 @@
+# json[b]_populate_record(set): the base row and duplicate keys (spec/design/json-table.md §2). The
+# first argument is not only the composite SHAPE: its VALUE is the row the document's members
+# overwrite — a member missing from the document keeps the base field (NULL when the base is NULL),
+# a JSON null member sets SQL NULL. A NULL document returns the base row unchanged from
+# _populate_record (one row; all NULL for a NULL base) and no rows from _populate_recordset. A
+# `json` document keeps duplicate keys and the LAST one wins (PostgreSQL hashes the object), for
+# the _to_record(set) forms too; the winning member is the one coerced, so an earlier bad spelling
+# is ignored and a later one is 22P02. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.aggregates, query.cross_join, types.jsonb, types.json, types.composite, func.coldeflist, func.json_record, func.json_populate, resource.cost_metering
+
+statement ok
+CREATE TYPE pt AS (x i32, y text)
+
+# A missing member keeps the base field.
+# cost: 4
+query IT nosort
+SELECT * FROM jsonb_populate_record(ROW(5, 'q')::pt, '{"x": 1}')
+----
+1
+q
+
+# cost: 4
+query IT nosort
+SELECT * FROM jsonb_populate_record(ROW(5, 'q')::pt, '{"y": "r"}')
+----
+5
+r
+
+# A JSON null member overrides the base field with SQL NULL.
+# cost: 4
+query IT nosort
+SELECT * FROM jsonb_populate_record(ROW(5, 'q')::pt, '{"x": null}')
+----
+NULL
+q
+
+# cost: 4
+query IT nosort
+SELECT * FROM jsonb_populate_record(ROW(5, 'q')::pt, '{}')
+----
+5
+q
+
+# A NULL document returns the base row as is.
+# cost: 4
+query IT nosort
+SELECT * FROM jsonb_populate_record(ROW(5, 'q')::pt, NULL)
+----
+5
+q
+
+# cost: 2
+query IT nosort
+SELECT * FROM jsonb_populate_record(NULL::pt, NULL)
+----
+NULL
+NULL
+
+# cost: 2
+query IT nosort
+SELECT * FROM jsonb_populate_record(NULL::pt, '{"x": 1}')
+----
+1
+NULL
+
+# _recordset: every element starts from the base row.
+# cost: 8
+query IT nosort
+SELECT * FROM jsonb_populate_recordset(ROW(9, 'z')::pt, '[{"x": 1}, {"y": "b"}, {}]')
+----
+1
+z
+9
+b
+9
+z
+
+# A NULL document → no rows from _recordset.
+# cost: 4
+query I nosort
+SELECT count(*)::i32 FROM jsonb_populate_recordset(ROW(9, 'z')::pt, NULL)
+----
+0
+
+# A json document's duplicate keys: the last wins.
+# cost: 4
+query IT nosort
+SELECT * FROM json_populate_record(ROW(5, 'q')::pt, '{"x": 1, "x": null}')
+----
+NULL
+q
+
+# cost: 4
+query IT nosort
+SELECT * FROM json_populate_record(ROW(5, 'q')::pt, '{"x": 1, "x": 2}')
+----
+2
+q
+
+# cost: 6
+query IT nosort
+SELECT * FROM json_populate_recordset(ROW(5, 'q')::pt, '[{"x": 1, "x": 3}, {"y": "k", "y": "m"}]')
+----
+3
+q
+5
+m
+
+# Only the winning member is coerced.
+# cost: 4
+query IT nosort
+SELECT * FROM json_populate_record(ROW(5, 'q')::pt, '{"x": "bad", "x": 2}')
+----
+2
+q
+
+statement error 22P02
+SELECT * FROM json_populate_record(ROW(5, 'q')::pt, '{"x": 2, "x": "bad"}')
+
+# The _to_record(set) forms: last wins too.
+# cost: 2
+query II nosort
+SELECT * FROM json_to_record('{"a": 1, "b": 5, "a": null}') AS r(a i32, b i32)
+----
+NULL
+5
+
+statement error 22P02
+SELECT * FROM json_to_record('{"a": 1, "b": 5, "a": "x"}') AS r(a i32, b i32)
+
+# cost: 4
+query I nosort
+SELECT * FROM json_to_recordset('[{"a": 1, "a": 3}, {"a": 4}]') AS r(a i32)
+----
+3
+4
+
+# A jsonb document is already canonical (last wins at parse).
+# cost: 2
+query II nosort
+SELECT * FROM jsonb_to_record('{"a": 1, "b": 5, "a": null}') AS r(a i32, b i32)
+----
+NULL
+5
+
+# A stored composite column as the base, per row.
+statement ok
+CREATE TABLE rows_ (id i32 PRIMARY KEY, base pt, doc jsonb)
+
+statement ok
+INSERT INTO rows_ VALUES (1, ROW(1, 'one'), '{"y": "uno"}'), (2, ROW(2, 'two'), '{"x": 22}'), (3, NULL, '{"x": 3}'), (4, ROW(4, 'four'), NULL)
+
+# cost: 13
+query IIT nosort
+SELECT r.id, p.x, p.y FROM rows_ r CROSS JOIN jsonb_populate_record(r.base, r.doc) AS p ORDER BY r.id
+----
+1
+1
+uno
+2
+22
+two
+3
+3
+NULL
+4
+4
+four

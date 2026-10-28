@@ -1,0 +1,147 @@
+# daterange with the date ±infinity sentinels (spec/design/ranges.md §4, date.md §6). A daterange is
+# discrete and canonicalizes to `[)` by stepping a bound one day — but PG daterange_canonical skips
+# a NON-FINITE date: the 'infinity'/'-infinity' sentinel is not stepped and KEEPS the inclusivity it
+# was given, so `(-infinity,2020-01-01)` stays exclusive-lower, `[2020-01-01,infinity]` stays
+# inclusive-upper (neither is 22003), and `[-infinity,infinity]` is a legal value. The sentinel is a
+# finite BOUND (lower_inf/upper_inf are false; `(,)` is the unbounded range), compares as the
+# largest/smallest date, and `@>` of the sentinel date follows the kept inclusivity. The values
+# store and reload, and ORDER BY / the stored order agree. Oracle-pinned vs postgres:18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.range, types.date, types.i32, func.range_constructors, func.range_accessors, func.range_operators, func.range_set_operators, resource.cost_metering
+
+# --- text input keeps the sentinel's inclusivity; a finite bound next to it still canonicalizes ---
+
+# cost: 1
+query T nosort
+SELECT '(-infinity,2020-01-01)'::daterange
+----
+(-infinity,2020-01-01)
+
+# cost: 1
+query T nosort
+SELECT '[-infinity,2020-01-01)'::daterange
+----
+[-infinity,2020-01-01)
+
+# cost: 1
+query T nosort
+SELECT '[2020-01-01,infinity]'::daterange
+----
+[2020-01-01,infinity]
+
+# cost: 1
+query T nosort
+SELECT '[2020-01-01,infinity)'::daterange
+----
+[2020-01-01,infinity)
+
+# The finite lower steps to inclusive; the sentinel upper keeps its `]`.
+# cost: 1
+query T nosort
+SELECT '(2020-01-01,infinity]'::daterange
+----
+[2020-01-02,infinity]
+
+# --- the constructor ---
+
+# cost: 2
+query T nosort
+SELECT daterange('-infinity','infinity','[]')
+----
+[-infinity,infinity]
+
+# cost: 2
+query T nosort
+SELECT daterange('-infinity','infinity','()')
+----
+(-infinity,infinity)
+
+# Equal sentinel bounds: not-both-inclusive is empty (the usual empty normalization); `[]` is the
+# one-day range at the sentinel.
+# cost: 2
+query T nosort
+SELECT daterange('infinity','infinity','[)')
+----
+empty
+
+# cost: 2
+query T nosort
+SELECT daterange('infinity','infinity','[]')
+----
+[infinity,infinity]
+
+# cost: 2
+query T nosort
+SELECT daterange('-infinity','-infinity','(]')
+----
+empty
+
+# --- accessors and containment: the sentinel is a finite bound ---
+
+# cost: 5
+query BBBB nosort
+SELECT lower_inc('[-infinity,2020-01-01)'::daterange), lower_inf('[-infinity,2020-01-01)'::daterange), upper_inc('[2020-01-01,infinity]'::daterange), upper_inf('[2020-01-01,infinity]'::daterange)
+----
+true
+false
+true
+false
+
+# cost: 5
+query BBBB nosort
+SELECT '[2020-01-01,infinity]'::daterange @> 'infinity'::date, '[2020-01-01,infinity)'::daterange @> 'infinity'::date, '(-infinity,2020-01-01)'::daterange @> '-infinity'::date, '[-infinity,2020-01-01)'::daterange @> '-infinity'::date
+----
+true
+false
+false
+true
+
+# `]` and `)` at the sentinel are distinct values; the inclusive upper sorts after.
+# cost: 3
+query BB nosort
+SELECT '[2020-01-01,infinity]'::daterange = '[2020-01-01,infinity)'::daterange, '[2020-01-01,infinity]'::daterange > '[2020-01-01,infinity)'::daterange
+----
+false
+true
+
+# cost: 3
+query BB nosort
+SELECT '[2020-01-01,infinity)'::daterange && '[infinity,infinity]'::daterange, '[2020-01-01,infinity]'::daterange && '[infinity,infinity]'::daterange
+----
+false
+true
+
+# Difference at the sentinel: removing the one-day sentinel range leaves `(,infinity)` either way.
+# cost: 3
+query TT nosort
+SELECT '(,infinity)'::daterange - '[infinity,infinity]'::daterange, '(,infinity]'::daterange - '[infinity,infinity]'::daterange
+----
+(,infinity)
+(,infinity)
+
+# --- storage round trip and order ---
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, r daterange)
+
+statement ok
+INSERT INTO d VALUES (1, '[2020-01-01,infinity)'), (2, '[2020-01-01,infinity]'), (3, '(,)'), (4, '[-infinity,2020-01-01)'), (5, '(-infinity,2020-01-01)'), (6, '(,2020-01-01)'), (7, '[2020-01-01,)')
+
+# An unbounded lower sorts before the -infinity sentinel; an unbounded upper after the +infinity one.
+query IT nosort
+SELECT id, r FROM d ORDER BY r
+----
+6
+(,2020-01-01)
+3
+(,)
+4
+[-infinity,2020-01-01)
+5
+(-infinity,2020-01-01)
+1
+[2020-01-01,infinity)
+2
+[2020-01-01,infinity]
+7
+[2020-01-01,)

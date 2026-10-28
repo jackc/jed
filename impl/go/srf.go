@@ -227,8 +227,10 @@ func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*expr
 		return nil, nil, noFuncOverload(name)
 	}
 	forbidden := &aggCtx{}
-	// The base argument's COMPOSITE type fixes the columns (its value is unused — usually NULL).
-	_, bt, err := resolve(argScope, *args[0], nil, forbidden, ptypes)
+	// The base argument's COMPOSITE type fixes the columns, and its VALUE is the row the JSON
+	// members overwrite (json-table.md §2): a member missing from the document keeps the base
+	// field (NULL when the base is NULL, the usual `NULL::type` call).
+	base, bt, err := resolve(argScope, *args[0], nil, forbidden, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -270,8 +272,9 @@ func (db *engine) resolveJSONPopulate(name string, jsonb, set bool, args []*expr
 	if set {
 		kind = srfJSONRecordset
 	}
-	// The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
-	return table, &srfPlan{kind: kind, args: []*rExpr{r}, recordCols: columns}, nil
+	// The SRF args are the json DOCUMENT then the BASE row (the R1 `_to_record` forms have only the
+	// document); the R1 row generator fills the base row's fields from the document's members.
+	return table, &srfPlan{kind: kind, args: []*rExpr{r, base}, recordCols: columns}, nil
 }
 
 // resolveJSONTable resolves a JSON_TABLE(ctx, path COLUMNS (…)) source (T1, json-table.md §3) → its
@@ -314,6 +317,11 @@ func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, 
 	if err != nil {
 		return nil, nil, err
 	}
+	// Every column name across the whole COLUMNS tree is unique (42712, PostgreSQL's
+	// CheckDuplicateColumnOrPathNames, checked before the columns themselves resolve).
+	if err := checkJtDuplicateNames(jt.Columns, map[string]bool{}); err != nil {
+		return nil, nil, err
+	}
 	var outColumns []catColumn
 	columns, err := db.resolveJtColumns(jt.Columns, &outColumns, argScope, ptypes)
 	if err != nil {
@@ -336,9 +344,14 @@ func (db *engine) resolveJSONTable(jt *jsonTable, alias *string, parent *scope, 
 // EMPTY / ON ERROR `DEFAULT expr` resolves in argScope (json-sql-functions.md §5.3).
 func (db *engine) resolveJtColumns(cols []jtColumn, outColumns *[]catColumn, argScope *scope, ptypes *paramTypes) ([]jtCol, error) {
 	resolved := make([]jtCol, 0, len(cols))
+	ordinalityFound := false // at most one FOR ORDINALITY column per COLUMNS level (PG)
 	for _, col := range cols {
 		switch c := col.(type) {
 		case *jtColumnOrdinality:
+			if ordinalityFound {
+				return nil, newError(SyntaxError, "only one FOR ORDINALITY column is allowed")
+			}
+			ordinalityFound = true
 			idx := len(*outColumns)
 			*outColumns = append(*outColumns, newJtColumn(c.Name, scalarInt32, nil))
 			resolved = append(resolved, &jtColOrdinality{idx: idx})
@@ -1552,7 +1565,32 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	if err != nil {
 		return nil, err
 	}
+	// json[b]_populate_record(set) (R2) carries its base row as the second arg: a NULL base is an
+	// all-NULL row of the composite's shape. The `_to_record` forms have no base (nil).
+	var base storedRow
+	if (sp.kind == srfJSONRecord || sp.kind == srfJSONRecordset) && len(sp.args) == 2 {
+		bv, err := sp.args[1].eval(nil, env, m)
+		if err != nil {
+			return nil, err
+		}
+		base = make(storedRow, len(sp.recordCols))
+		for i := range base {
+			base[i] = NullValue()
+		}
+		if bv.Kind != ValNull {
+			copy(base, *bv.composite())
+		}
+	}
 	if arg.Kind == ValNull {
+		// A NULL document: populate_record returns the base row unchanged (PostgreSQL returns the
+		// record argument as is — one row, all NULL for a NULL base); every other form yields no rows.
+		if sp.kind == srfJSONRecord && base != nil {
+			if err := m.Step(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			return []storedRow{base}, nil
+		}
 		return nil, nil
 	}
 	// The json array_elements / each variants walk the verbatim text (json.md §4) instead of a parsed
@@ -1570,7 +1608,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	case arg.Kind == ValJson && sp.kind == srfJSONRecordset:
 		text := arg.str()
 		if start := skipJSONWS(text, 0); start < len(text) && text[start] == '[' {
-			return jsonRecordsetRowsVerbatim(sp, text, env, m)
+			return jsonRecordsetRowsVerbatim(sp, text, base, env, m)
 		}
 		node, err = parsePreservingJSONUnlessRoot(text, '{')
 	default:
@@ -1655,7 +1693,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
-		row, err := jsonRecordRow(&node, sp.recordCols, env, m)
+		row, err := jsonRecordRow(&node, sp.recordCols, base, env, m)
 		if err != nil {
 			return nil, err
 		}
@@ -1671,7 +1709,7 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
-			row, err := jsonRecordRow(&node.Arr[i], sp.recordCols, env, m)
+			row, err := jsonRecordRow(&node.Arr[i], sp.recordCols, base, env, m)
 			if err != nil {
 				return nil, err
 			}
@@ -1729,10 +1767,13 @@ func (db *engine) jsonSrfRows(sp *srfPlan, env *evalEnv, m *costMeter) ([]stored
 	return out, nil
 }
 
-// jsonRecordRow builds one output row for json[b]_to_record(set) (R1): map each declared column to
-// the JSON object's member of that name, coercing it to the column type. A missing member or a JSON
-// null → SQL NULL; a non-object node → 22023. (json-table.md §2)
-func jsonRecordRow(node *JsonNode, cols []catColumn, env *evalEnv, m *costMeter) (storedRow, error) {
+// jsonRecordRow builds one output row for json[b]_to_record(set) (R1) and json[b]_populate_record(set)
+// (R2): map each declared column to the JSON object's member of that name, coercing it to the column
+// type. A JSON null member → SQL NULL; a missing member → the base row's field (`base`, the populate
+// forms) or SQL NULL (`base` nil, the `_to_record` forms); a non-object node → 22023. A `json`
+// document keeps duplicate keys, and the LAST one wins, as PostgreSQL's hash of the object does
+// (json-table.md §2). The base row is never modified.
+func jsonRecordRow(node *JsonNode, cols []catColumn, base storedRow, env *evalEnv, m *costMeter) (storedRow, error) {
 	if node.Kind != JObject {
 		return nil, newError(InvalidParameterValue, "argument of json_to_record must be a JSON object")
 	}
@@ -1742,12 +1783,19 @@ func jsonRecordRow(node *JsonNode, cols []catColumn, env *evalEnv, m *costMeter)
 		var member *JsonNode
 		for mi := range node.Obj {
 			if node.Obj[mi].Key == col.Name {
-				member = &node.Obj[mi].Val
-				break
+				member = &node.Obj[mi].Val // last wins
 			}
 		}
-		// A missing member or a JSON null member → SQL NULL.
-		if member == nil || member.Kind == JNull {
+		if member == nil {
+			if base != nil {
+				row = append(row, base[ci])
+			} else {
+				row = append(row, NullValue())
+			}
+			continue
+		}
+		// A JSON null member → SQL NULL (it overrides a base field).
+		if member.Kind == JNull {
 			row = append(row, NullValue())
 			continue
 		}
@@ -2028,6 +2076,32 @@ func jtBehavior(b *jsonOnBehavior, def jsonOnBehavior) jsonOnBehavior {
 	return def
 }
 
+// checkJtDuplicateNames walks a JSON_TABLE COLUMNS tree (every nesting level shares one namespace,
+// as in PostgreSQL) and reports the first column name seen twice as 42712 (json-table.md §3.1).
+func checkJtDuplicateNames(cols []jtColumn, seen map[string]bool) error {
+	for _, col := range cols {
+		var name string
+		switch c := col.(type) {
+		case *jtColumnOrdinality:
+			name = c.Name
+		case *jtColumnRegular:
+			name = c.Name
+		case *jtColumnExists:
+			name = c.Name
+		case *jtColumnNested:
+			if err := checkJtDuplicateNames(c.Columns, seen); err != nil {
+				return err
+			}
+			continue
+		}
+		if seen[name] {
+			return newError(DuplicateAlias, "duplicate JSON_TABLE column or path name: "+name)
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
 // jtScalarType resolves a JSON_TABLE column type name → its scalar type + decimal typmod (a composite
 // → 0A000, an unknown name → 42704).
 func jtScalarType(db *engine, typeName string) (scalarType, *decimalTypmod, error) {
@@ -2041,11 +2115,18 @@ func jtScalarType(db *engine, typeName string) (scalarType, *decimalTypmod, erro
 }
 
 // jtCompilePath compiles a JSON_TABLE column path — the explicit `PATH p`, or the default
-// `$.<column_name>` — to its canonical rendered form (validating; malformed → 42601).
+// `$."<column_name>"` — to its canonical rendered form (validating; malformed → 42601). The default
+// member name is a QUOTED jsonpath string (JSON-escaped), as PostgreSQL builds it, so a column named
+// `a.b`, `a b`, or `1` reads the member of exactly that name (json-table.md §3.1).
 func jtCompilePath(path *string, name string, prop *propertyTable) (string, error) {
-	src := "$." + name
+	var src string
 	if path != nil {
 		src = *path
+	} else {
+		var b strings.Builder
+		b.WriteString("$.")
+		writeJSONString(name, &b)
+		src = b.String()
 	}
 	compiled, err := compile(src, prop)
 	if err != nil {
@@ -2318,7 +2399,7 @@ func (db *engine) unnestRecordRows(sp *srfPlan, env *evalEnv, m *costMeter, mask
 // element's conversion error precedes a later element's escape error — while a non-object element
 // raises its kind error at its opening bracket (an array, unlexed) or after its token (a scalar,
 // lexed first).
-func jsonRecordsetRowsVerbatim(sp *srfPlan, text string, env *evalEnv, m *costMeter) ([]storedRow, error) {
+func jsonRecordsetRowsVerbatim(sp *srfPlan, text string, base storedRow, env *evalEnv, m *costMeter) ([]storedRow, error) {
 	elems, err := verbatimArrayElements(text, "json_to_recordset", false)
 	if err != nil {
 		return nil, err
@@ -2333,7 +2414,7 @@ func jsonRecordsetRowsVerbatim(sp *srfPlan, text string, env *evalEnv, m *costMe
 			return nil, err
 		}
 		m.Charge(costs.GeneratedRow)
-		row, err := jsonRecordRow(&e, sp.recordCols, env, m)
+		row, err := jsonRecordRow(&e, sp.recordCols, base, env, m)
 		if err != nil {
 			return nil, err
 		}

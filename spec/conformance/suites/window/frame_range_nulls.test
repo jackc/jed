@@ -1,0 +1,451 @@
+# Window functions — RANGE value offsets over NULL ordering keys (window.md §6).
+#
+# A NULL key never satisfies a RANGE value test; its frame position is fixed by NULL placement
+# instead, exactly as PostgreSQL's update_frameheadpos/update_frametailpos (nodeWindowAgg.c):
+# - NULLS LAST (the ASC default): the trailing NULLs sort AFTER every bound. A start bound that
+#   overshoots every non-NULL key stops AT the first NULL row — not the partition end — so an
+#   UNBOUNDED FOLLOWING end then still frames the NULLs, while an offset end never reaches them.
+# - NULLS FIRST (the DESC default): the leading NULLs sort BEFORE every bound, so an UNBOUNDED
+#   PRECEDING start includes them under any offset end, and an offset start skips them.
+# - A NULL current row frames exactly its NULL peer group for offset / CURRENT ROW bounds, while its
+#   UNBOUNDED bounds still reach the partition edge.
+# The sliding accumulator (window.md §6) carries across these frames unchanged — the bounds stay
+# monotone — so every record also pins the metered cost. GROUPS mode is included for contrast.
+# Every record is oracle-checked against PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_aggregate, query.window_frame, query.window_frame_range, query.window_frame_exclude, query.window_aggregate_filter, query.order_by, types.i32, types.decimal, types.array, func.array_agg, resource.cost_metering
+
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO w VALUES (1, 1), (2, 2), (3, 3), (4, NULL), (5, NULL)
+
+statement ok
+CREATE TABLE wd (id i32 PRIMARY KEY, d decimal(10,1))
+
+statement ok
+INSERT INTO wd VALUES (1, 1.0), (2, 2.0), (3, 3.5), (4, NULL)
+
+statement ok
+CREATE TABLE wp (id i32 PRIMARY KEY, p i32, k i32)
+
+statement ok
+INSERT INTO wp VALUES (1, 1, 1), (2, 1, 2), (3, 1, NULL), (4, 2, 5), (5, 2, NULL), (6, 2, 6)
+
+# A FOLLOWING start that overshoots every non-NULL key stops at the first NULL row (NULLS LAST): id3 (k=3)
+# frames nothing, while the NULL rows frame their peer group {4,5}.
+# names: id, s
+# cost: 21
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+5
+2
+3
+3
+NULL
+4
+9
+5
+9
+
+# array_agg over the same frame: an empty frame is NULL, the NULL rows see {4,5}.
+# names: id, a
+# cost: 44
+query IT nosort
+SELECT id, array_agg(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING)::text AS a FROM w ORDER BY id
+----
+1
+{2,3}
+2
+{3}
+3
+NULL
+4
+{4,5}
+5
+{4,5}
+
+# With an UNBOUNDED FOLLOWING end the overshot start still frames the trailing NULLs: id3 sees {4,5}.
+# names: id, s
+# cost: 25
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+14
+2
+12
+3
+9
+4
+9
+5
+9
+
+# count(*) and count(k) over the same frame: the NULL keys are framed but not counted by count(k).
+# names: id, c, ck
+# cost: 33
+query III nosort
+SELECT id, count(*) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS c, count(k) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS ck FROM w ORDER BY id
+----
+1
+4
+2
+2
+3
+1
+3
+2
+0
+4
+2
+0
+5
+2
+0
+
+# first_value picks the first NULL row (id4) once the start overshoots.
+# names: id, f
+# cost: 16
+query II nosort
+SELECT id, first_value(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS f FROM w ORDER BY id
+----
+1
+2
+2
+3
+3
+4
+4
+4
+5
+4
+
+# min/max over the overshooting frame.
+# names: id, mn, mx
+# cost: 39
+query III nosort
+SELECT id, min(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS mn, max(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS mx FROM w ORDER BY id
+----
+1
+2
+5
+2
+3
+5
+3
+4
+5
+4
+4
+5
+5
+4
+5
+
+# NULLS FIRST: the leading NULLs sort before every bound, so an UNBOUNDED PRECEDING start with an offset
+# end includes them for every non-NULL row (id1 sees {4,5,1,2}=12); the NULL rows frame their peers.
+# names: id, s
+# cost: 21
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+12
+2
+15
+3
+15
+4
+9
+5
+9
+
+# last_value / nth_value over the NULLS FIRST expanding frame.
+# names: id, l, n
+# cost: 21
+query III nosort
+SELECT id, last_value(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS l, nth_value(id, 2) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS n FROM w ORDER BY id
+----
+1
+2
+5
+2
+3
+5
+3
+3
+5
+4
+5
+5
+5
+5
+5
+
+# NULLS FIRST with offsets on both sides: the leading NULLs are skipped by the start bound.
+# names: id, s
+# cost: 23
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+3
+2
+6
+3
+5
+4
+9
+5
+9
+
+# NULLS FIRST, PRECEDING .. CURRENT ROW and CURRENT ROW .. FOLLOWING.
+# names: id, a, b
+# cost: 34
+query III nosort
+SELECT id, sum(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS a, sum(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS b FROM w ORDER BY id
+----
+1
+1
+3
+2
+3
+5
+3
+5
+3
+4
+9
+9
+5
+9
+9
+
+# NULLS FIRST, both bounds PRECEDING: the start skips the NULLs, the end stops before the current key.
+# names: id, mn, mx
+# cost: 29
+query III nosort
+SELECT id, min(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING) AS mn, max(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING) AS mx FROM w ORDER BY id
+----
+1
+NULL
+NULL
+2
+1
+1
+3
+1
+2
+4
+4
+5
+5
+4
+5
+
+# DESC (NULLS FIRST by default): the leading NULLs are inside every UNBOUNDED PRECEDING frame — id1 (k=1)
+# sees {4,5,3,2}=14 under 1 PRECEDING, i.e. keys >= 2.
+# names: id, s
+# cost: 20
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k DESC RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS s FROM w ORDER BY id
+----
+1
+14
+2
+12
+3
+9
+4
+9
+5
+9
+
+# DESC NULLS LAST with an UNBOUNDED FOLLOWING end: every non-NULL row reaches the trailing NULLs.
+# names: id, s
+# cost: 27
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k DESC NULLS LAST RANGE BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+12
+2
+15
+3
+15
+4
+9
+5
+9
+
+# DESC NULLS LAST, FOLLOWING .. FOLLOWING (keys below the current one): id1's start overshoots to the NULLs.
+# names: id, a
+# cost: 44
+query IT nosort
+SELECT id, array_agg(id) OVER (ORDER BY k DESC NULLS LAST RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING)::text AS a FROM w ORDER BY id
+----
+1
+NULL
+2
+{1}
+3
+{2,1}
+4
+{4,5}
+5
+{4,5}
+
+# ASC NULLS LAST, both bounds PRECEDING and PRECEDING .. FOLLOWING: the trailing NULLs are never reached by
+# an offset end.
+# names: id, a, b
+# cost: 32
+query III nosort
+SELECT id, sum(id) OVER (ORDER BY k RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING) AS a, sum(id) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b FROM w ORDER BY id
+----
+1
+NULL
+3
+2
+1
+6
+3
+3
+5
+4
+9
+9
+5
+9
+9
+
+# GROUPS mode for contrast: offsets count peer groups, so the NULL peer group is the group after k=3 and
+# id3 sees {4,5}=9 under 1 FOLLOWING .. 2 FOLLOWING; the NULL rows have no following group.
+# names: id, s
+# cost: 23
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+5
+2
+12
+3
+9
+4
+NULL
+5
+NULL
+
+# EXCLUDE TIES drops the NULL row's peer (id4 keeps itself), EXCLUDE GROUP empties the NULL rows' frame.
+# names: id, t, g
+# cost: 29
+query III nosort
+SELECT id, sum(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING EXCLUDE TIES) AS t, sum(id) OVER (ORDER BY k RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING EXCLUDE GROUP) AS g FROM w ORDER BY id
+----
+1
+5
+NULL
+2
+3
+1
+3
+NULL
+3
+4
+4
+NULL
+5
+5
+NULL
+
+# EXCLUDE CURRENT ROW over the overshooting frame: id3's frame (the NULLs) never held it, the NULL rows lose
+# themselves.
+# names: id, s
+# cost: 27
+query II nosort
+SELECT id, sum(id) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS s FROM w ORDER BY id
+----
+1
+14
+2
+12
+3
+9
+4
+5
+5
+4
+
+# FILTER over the overshooting frame.
+# names: id, s
+# cost: 42
+query II nosort
+SELECT id, sum(id) FILTER (WHERE id <> 2) OVER (ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM w ORDER BY id
+----
+1
+12
+2
+12
+3
+9
+4
+9
+5
+9
+
+# A decimal key: the NULL placement rule is type-independent (id3 at 3.5 overshoots to the NULLs).
+# names: id, s
+# cost: 31
+query ID nosort
+SELECT id, sum(d) OVER (ORDER BY d RANGE BETWEEN 0.5 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM wd ORDER BY id
+----
+1
+5.5
+2
+3.5
+3
+NULL
+4
+NULL
+
+# Partitions: each partition's NULLs sit at its own edge (NULLS LAST here), so an overshot start stops at the
+# partition's first NULL row and never crosses into the next partition.
+# names: id, s
+# cost: 25
+query II nosort
+SELECT id, sum(id) OVER (PARTITION BY p ORDER BY k RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS s FROM wp ORDER BY id
+----
+1
+5
+2
+3
+3
+3
+4
+11
+5
+5
+6
+5
+
+# Partitions, NULLS FIRST, expanding frame with an offset end.
+# names: id, s
+# cost: 25
+query II nosort
+SELECT id, sum(id) OVER (PARTITION BY p ORDER BY k NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS s FROM wp ORDER BY id
+----
+1
+6
+2
+6
+3
+3
+4
+15
+5
+5
+6
+15

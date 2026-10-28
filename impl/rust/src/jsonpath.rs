@@ -681,6 +681,21 @@ pub fn compile_metered(
     Ok(path)
 }
 
+/// Compile the per-row text of a runtime text → jsonpath cast (casts.toml): the full resolve-time
+/// compile (the canonical text must compile too — §8), metered as [`compile_metered`].
+pub fn compile_cast_metered(
+    src: &str,
+    casing: Option<&PropertyTable>,
+    m: &mut Meter,
+) -> Result<JsonPath> {
+    m.charge(COSTS.jsonpath_compile * src.len() as i64);
+    m.checkpoint()?;
+    let path = JsonPath::compile(src, casing)?;
+    m.charge(COSTS.regex_compile * path.regex_insts);
+    m.checkpoint()?;
+    Ok(path)
+}
+
 /// Evaluate a compiled path over a jsonb context item → the ordered SQL/JSON sequence
 /// (jsonpath.md §3). Items borrowed from the document stay borrowed; generated items (method
 /// results, `.keyvalue()` objects, literals) are owned. Any error propagates.

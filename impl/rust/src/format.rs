@@ -3278,7 +3278,12 @@ pub(crate) fn unlock_pager(
     }
     let slot0 = pager.read_block(0)?;
     let slot1 = pager.read_block(1)?;
-    let suite = crate::crypto::file_suite(&slot0, &slot1)?;
+    let suite = match crate::crypto::file_suite(&slot0, &slot1)? {
+        Some(suite) => suite,
+        // Neither slot is CRC-valid: the file declares no variant, so the credential is neither
+        // applicable nor inapplicable. Slot selection reports the corruption (XX001).
+        None => return Ok(None),
+    };
     match (suite, credential) {
         (0, None) => Ok(None),
         (0, Some(_)) => Err(EngineError::new(
@@ -3315,11 +3320,15 @@ pub(crate) fn adopt_held_codec(pager: &mut Pager, codec: &crate::crypto::PageCod
     }
     let slot0 = pager.read_block(0)?;
     let slot1 = pager.read_block(1)?;
-    if crate::crypto::file_suite(&slot0, &slot1)? == 0 {
-        return Err(EngineError::new(
-            SqlState::StaleKey,
-            "the database is no longer encrypted; reopen it",
-        ));
+    match crate::crypto::file_suite(&slot0, &slot1)? {
+        None => return Err(corrupt("no complete valid meta page")),
+        Some(0) => {
+            return Err(EngineError::new(
+                SqlState::StaleKey,
+                "the database is no longer encrypted; reopen it",
+            ));
+        }
+        Some(_) => {}
     }
     if pager.allocated_pages() < crate::crypto::FIRST_BODY_PAGE {
         return Err(corrupt("encrypted file too small for its key block"));

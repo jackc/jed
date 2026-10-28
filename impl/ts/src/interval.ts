@@ -15,6 +15,7 @@ import {
   NEG_INFINITY,
   POS_INFINITY,
 } from "./timestamp.ts";
+import { instantToLocalMicros, localToInstantMicros, type ZoneRef } from "./timezone.ts";
 import { INTERVAL_QUALIFIERS, type IntervalQualifier } from "./datetime_units_gen.ts";
 import type { TemporalTypmod } from "./types.ts";
 
@@ -26,8 +27,13 @@ export const DAYS_PER_MONTH = 30n;
 const MONTHS_PER_YEAR = 12n;
 // The digit bounds of an `interval × / number` factor (spec/design/interval.md §5), so the exact
 // cascade stays well-defined; over-long → 22008.
+// An interval × / number factor's digit bounds (spec/design/interval.md §6): integer digits, and
+// significant fractional digits (trailing zeros stripped first) — the bound that keeps the Rust
+// i128 cascade exact, so all cores trap at the same factor size.
 const MAX_INT_DIGITS = 18;
-const MAX_FRAC_DIGITS = 9;
+const MAX_FRAC_DIGITS = 18;
+// TSROUND's 1e-6 quantum, applied to the fractional-month days (micro-days).
+const MICRO_DAYS_PER_DAY = 1_000_000n;
 const I32_MIN = -2147483648n;
 const I32_MAX = 2147483647n;
 
@@ -219,14 +225,16 @@ function bigGcd(a: bigint, b: bigint): bigint {
 }
 
 // parseFactorDecimal parses a canonical decimal string `[-]int[.frac]` into an exact fraction
-// [num, den] with den = 10^len(frac) (value = num/den). Caps the digit counts (matching the Rust
-// i128 cascade's bound) so all cores trap at the same factor size; over-long → 22008.
+// [num, den] with den = 10^len(frac) (value = num/den). Trailing fractional zeros are stripped
+// first (`1.0000000000` is the factor `1`, as it is for PG's double), then the digit counts are
+// capped (matching the Rust i128 cascade's bound) so all cores trap at the same factor size;
+// over-long → 22008.
 export function parseFactorDecimal(s: string): [bigint, bigint] {
   const neg = s.startsWith("-");
   const body = neg ? s.slice(1) : s;
   const dot = body.indexOf(".");
   const intPart = dot >= 0 ? body.slice(0, dot) : body;
-  const fracPart = dot >= 0 ? body.slice(dot + 1) : "";
+  const fracPart = dot >= 0 ? body.slice(dot + 1).replace(/0+$/, "") : "";
   if (intPart.length > MAX_INT_DIGITS || fracPart.length > MAX_FRAC_DIGITS) {
     throw intervalFieldOverflow("interval factor has too many digits");
   }
@@ -236,9 +244,14 @@ export function parseFactorDecimal(s: string): [bigint, bigint] {
   return [num, den];
 }
 
-// mulByFraction is the exact ×÷ cascade (spec/design/interval.md §5): scale each field by
-// fnum/fden (fden > 0), cascading the fractional part months→days→micros, µs rounded half away
-// from zero. EXACT (bigint; mirrors Rust's i128). A field beyond i32/i64 traps 22008.
+// mulByFraction is the ×÷ cascade (spec/design/interval.md §5): scale each field by fnum/fden
+// (fden > 0), truncating the whole months/days like PostgreSQL's `(int32)` casts and cascading the
+// fractional part months→days→micros exactly as PG's interval_mul / interval_div do — including the
+// two TSROUND quantizations (the fractional-month days to 1e-6 day, the seconds remainder to 1 µs,
+// both rounded half to even like C rint) and the move of whole days out of a seconds remainder of
+// 24 h or more. The arithmetic is EXACT rational math over bigint (PG's is double), so the cores
+// agree byte-for-byte and differ from PG only where its double lands on the other side of a quantum
+// boundary. A field beyond i32/i64 traps 22008.
 export function mulByFraction(iv: Interval, fnum: bigint, fden: bigint): Interval {
   let g = bigGcd(fnum, fden);
   if (g === 0n) g = 1n;
@@ -248,20 +261,32 @@ export function mulByFraction(iv: Interval, fnum: bigint, fden: bigint): Interva
   const d = BigInt(iv.days);
   const u = iv.micros;
 
+  // result.month = trunc(m × factor); the fractional months cascade to days.
   const mTotal = m * fn;
   const rMonth = mTotal / fd; // trunc toward zero
-  const fracMonth = mTotal - rMonth * fd;
-  const mrd = fracMonth * DAYS_PER_MONTH;
-  const mrdWhole = mrd / fd;
-  const mrdFrac = mrd - mrdWhole * fd;
+  const fracMonth = mTotal - rMonth * fd; // over fd
+  // month_remainder_days = TSROUND(fracMonth/fd × 30): quantized to micro-days, half to even.
+  const mrdQ = roundHalfEvenDivBig(fracMonth * DAYS_PER_MONTH * MICRO_DAYS_PER_DAY, fd);
+  const mrdWhole = mrdQ / MICRO_DAYS_PER_DAY;
+  const mrdFrac = mrdQ - mrdWhole * MICRO_DAYS_PER_DAY; // micro-days
 
+  // result.day = trunc(d × factor); its fraction (over fd) joins the month remainder's fraction.
   const dTotal = d * fn;
-  const rDayPart = dTotal / fd;
-  const dayFrac = dTotal - rDayPart * fd;
-  const rDay = rDayPart + mrdWhole;
+  let rDay = dTotal / fd;
+  const dayFrac = dTotal - rDay * fd; // over fd
+  // sec_remainder = TSROUND((dayFrac/fd + mrdFrac/1e6) × 86 400): quantized to µs, half to even.
+  let secRem = roundHalfEvenDivBig(dayFrac * MICROS_PER_DAY + mrdFrac * 86_400n * fd, fd); // µs
+  // A remainder of 24 h or more (rounding, or the month cascade on top of the day fraction) moves
+  // its whole days up into the days field.
+  if ((secRem < 0n ? -secRem : secRem) >= MICROS_PER_DAY) {
+    const whole = secRem / MICROS_PER_DAY;
+    rDay += whole;
+    secRem -= whole * MICROS_PER_DAY;
+  }
+  rDay += mrdWhole;
 
-  const timeNum = u * fn + (dayFrac + mrdFrac) * MICROS_PER_DAY;
-  const rTime = roundDivBig(timeNum, fd);
+  // result.time = rint(u × factor + sec_remainder).
+  const rTime = roundHalfEvenDivBig(u * fn + secRem * fd, fd);
 
   if (
     rMonth < I32_MIN ||
@@ -276,6 +301,16 @@ export function mulByFraction(iv: Interval, fnum: bigint, fden: bigint): Interva
   return { months: Number(rMonth), days: Number(rDay), micros: rTime };
 }
 
+// roundHalfEvenDivBig rounds num/den (den > 0) to the nearest integer, ties to even — C rint under
+// the default rounding mode, which PostgreSQL's interval_mul/interval_div and TSROUND use.
+function roundHalfEvenDivBig(num: bigint, den: bigint): bigint {
+  const q = num / den; // truncates toward zero
+  const r = num - q * den;
+  const twice = (r < 0n ? -r : r) * 2n;
+  if (twice > den || (twice === den && q % 2n !== 0n)) return num >= 0n ? q + 1n : q - 1n;
+  return q;
+}
+
 function floorDivB(a: bigint, b: bigint): bigint {
   let q = a / b;
   if (a % b !== 0n && a < 0n !== b < 0n) q -= 1n;
@@ -287,30 +322,72 @@ function floorModB(a: bigint, b: bigint): bigint {
   return m;
 }
 
-// tsShift computes ts + iv (or ts - iv with subtract) — the calendar-aware datetime arithmetic
-// (spec/design/interval.md §5). Months added first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1 month
-// -> Feb 28/29), then days (24 h each), then micros. ±infinity stays ±infinity; a result onto a
-// sentinel or beyond the i64-µs range traps 22008.
+// tsShift computes ts + iv (or ts - iv with subtract) for a ZONELESS operand — a timestamp, or a
+// date widened to midnight (spec/design/interval.md §5). Months added first WITH DAY-OF-MONTH
+// CLAMPING (Jan 31 + 1 month -> Feb 28/29), then days (24 h each), then micros. ±infinity stays
+// ±infinity; a result onto a sentinel or beyond the i64-µs range traps 22008. A timestamptz operand
+// takes tsShiftZoned instead.
 export function tsShift(ts: bigint, iv: Interval, subtract: boolean): bigint {
   if (ts === NEG_INFINITY || ts === POS_INFINITY) return ts;
   const sign = subtract ? -1n : 1n;
   let t = ts;
   const months = sign * BigInt(iv.months);
-  if (months !== 0n) {
-    const [y, mo, d, h, mi, s, us] = civilFromMicros(t);
-    const total = y * 12n + (mo - 1n) + months;
-    const ny = floorDivB(total, 12n);
-    const nmo = floorModB(total, 12n) + 1n;
-    const maxd = daysInMonth(ny, nmo);
-    const nd = d > maxd ? maxd : d;
-    const days = daysFromCivil(ny, nmo, nd);
-    t = (days * 86_400n + h * 3600n + mi * 60n + s) * MICROS_PER_SEC + us;
-  }
+  if (months !== 0n) t = addMonthsClamped(t, months);
   t = t + sign * BigInt(iv.days) * MICROS_PER_DAY;
-  t = subtract ? t - iv.micros : t + iv.micros;
+  return addShiftMicros(t, iv.micros, subtract);
+}
+
+// tsShiftZoned computes ts ± iv for a TIMESTAMPTZ operand in the session zone zr — PostgreSQL's
+// timestamptz_pl_interval (spec/design/interval.md §5, timezones.md §6): the months step converts
+// the instant to its wall clock in the zone, adds the months with day-of-month clamping, and
+// re-resolves the wall clock through the zone (a DST gap/overlap as for input); the days step does
+// the same with calendar days (so `+ 1 day` across a DST change keeps the wall-clock time, unlike
+// `+ 24 hours`); the micros are then added on the instant. Each step performs a zone consult only
+// when its field is nonzero (tsShiftZoneConsults counts them for the cost meter). ±infinity is
+// unchanged; a wall clock or instant leaving the finite range traps 22008.
+export function tsShiftZoned(ts: bigint, iv: Interval, subtract: boolean, zr: ZoneRef): bigint {
+  if (ts === NEG_INFINITY || ts === POS_INFINITY) return ts;
+  const sign = subtract ? -1n : 1n;
+  let t = ts;
+  const months = sign * BigInt(iv.months);
+  if (months !== 0n) {
+    const local = addMonthsClamped(instantToLocalMicros(zr, t), months);
+    t = localToInstantMicros(zr, local);
+  }
+  const days = sign * BigInt(iv.days);
+  if (days !== 0n) {
+    const local = instantToLocalMicros(zr, t) + days * MICROS_PER_DAY;
+    t = localToInstantMicros(zr, local);
+  }
+  return addShiftMicros(t, iv.micros, subtract);
+}
+
+// tsShiftZoneConsults is the number of zone consults tsShiftZoned performs for ts ± iv — one per
+// nonzero calendar field (months, days) of a finite operand — each charged one `timezone` cost unit
+// (spec/design/cost.md, the AT TIME ZONE unit) before the shift runs.
+export function tsShiftZoneConsults(ts: bigint, iv: Interval): bigint {
+  if (ts === NEG_INFINITY || ts === POS_INFINITY) return 0n;
+  return (iv.months !== 0 ? 1n : 0n) + (iv.days !== 0 ? 1n : 0n);
+}
+
+// addMonthsClamped adds months to a wall clock / zoneless instant t with day-of-month clamping.
+function addMonthsClamped(t: bigint, months: bigint): bigint {
+  const [y, mo, d, h, mi, s, us] = civilFromMicros(t);
+  const total = y * 12n + (mo - 1n) + months;
+  const ny = floorDivB(total, 12n);
+  const nmo = floorModB(total, 12n) + 1n;
+  const maxd = daysInMonth(ny, nmo);
+  const nd = d > maxd ? maxd : d;
+  const days = daysFromCivil(ny, nmo, nd);
+  return (days * 86_400n + h * 3600n + mi * 60n + s) * MICROS_PER_SEC + us;
+}
+
+// addShiftMicros is the final micros step of a shift: t ± micros, never onto a ±infinity sentinel.
+function addShiftMicros(t: bigint, micros: bigint, subtract: boolean): bigint {
+  const r = subtract ? t - micros : t + micros;
   // A finite instant must lie strictly between the ±infinity sentinels (= i64::MIN/MAX).
-  if (t <= NEG_INFINITY || t >= POS_INFINITY) throw intervalFieldOverflow("timestamp out of range");
-  return t;
+  if (r <= NEG_INFINITY || r >= POS_INFINITY) throw intervalFieldOverflow("timestamp out of range");
+  return r;
 }
 
 // tsDiff computes a - b of two timestamps (or timestamptz) → an interval, justified into days +

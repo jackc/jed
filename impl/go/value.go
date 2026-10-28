@@ -245,8 +245,29 @@ type ArrayVal struct {
 // Ndim is the dimension count (0 = the empty array).
 func (a *ArrayVal) Ndim() int { return len(a.Dims) }
 
-// Ubound is the upper bound of dimension d (lb + len - 1).
-func (a *ArrayVal) Ubound(d int) int32 { return a.Lbounds[d] + int32(a.Dims[d]) - 1 }
+// Ubound is the upper bound of dimension d (lb + len - 1), computed in int64 so an array whose
+// bounds were never validated cannot wrap (every value the engine builds satisfies
+// checkArrayBounds, so the result is always within the i32 domain).
+func (a *ArrayVal) Ubound(d int) int64 { return int64(a.Lbounds[d]) + int64(a.Dims[d]) - 1 }
+
+// arrayMaxSize is PostgreSQL's MaxArraySize (MaxAllocSize / sizeof(Datum) = 134217727): the number
+// quoted by the "array size exceeds the maximum allowed" message when a declared dimension's length
+// overflows (spec/design/array.md §7).
+const arrayMaxSize = 134217727
+
+// checkArrayBounds is PostgreSQL's ArrayCheckBounds (spec/design/array.md §4): every dimension's
+// `lb + len` must fit in an i32, so an array's last subscript is at most i32::MAX − 1 and subscript
+// arithmetic can never overflow. Every value-producing path that can grow a dimension or set a lower
+// bound (array_in, array_append/array_prepend, array_cat) runs it; a violation is 54000 "array lower
+// bound is too large: <lb>" (PG's message, the offending lower bound).
+func checkArrayBounds(dims []int, lbounds []int32) error {
+	for d := range dims {
+		if int64(lbounds[d])+int64(dims[d]) > math.MaxInt32 {
+			return newError(ProgramLimitExceeded, "array lower bound is too large: "+strconv.FormatInt(int64(lbounds[d]), 10))
+		}
+	}
+	return nil
+}
 
 // EmptyArray is the empty array `{}` (ndim 0). Elements is a non-nil empty slice (matching the
 // store path's make([]Value, 0)) so an empty array read from disk is reflect.DeepEqual to one built
@@ -1389,7 +1410,7 @@ func arrayOutZoned(a *ArrayVal, zone *ZoneRef) (string, error) {
 			b.WriteByte('[')
 			b.WriteString(strconv.FormatInt(int64(a.Lbounds[d]), 10))
 			b.WriteByte(':')
-			b.WriteString(strconv.FormatInt(int64(a.Ubound(d)), 10))
+			b.WriteString(strconv.FormatInt(a.Ubound(d), 10))
 			b.WriteByte(']')
 		}
 		b.WriteByte('=')
@@ -1467,10 +1488,32 @@ func arrayElemNeedsQuote(s string) bool {
 type arrayInErr int
 
 const (
-	arrayOK        arrayInErr = iota // parsed cleanly
-	arrayMalformed                   // a malformed literal or mismatched declared dims → 22P02
-	arrayBoundFlip                   // a declared [l:u] with u<l → 2202E
+	arrayOK            arrayInErr = iota // parsed cleanly
+	arrayMalformed                       // a malformed literal or mismatched declared dims → 22P02
+	arrayBoundFlip                       // a declared [l:u] with u<l → 2202E
+	arrayBoundOutOfInt                   // a declared bound outside the i32 domain → 54000 "array bound is out of integer range"
+	arrayUpperBoundMax                   // a declared upper bound of exactly i32::MAX → 54000 "array upper bound is too large: 2147483647"
+	arraySizeOverflow                    // a declared dimension's length u−l+1 overflows an i32 → 54000 "array size exceeds the maximum allowed (134217727)"
 )
+
+// arrayInError maps a parseArrayLiteral failure to its error (nil for arrayOK): a malformed literal
+// is 22P02, an inverted bound 2202E, and the three PG dimension-limit failures 54000 with PG's
+// messages (spec/design/array.md §7).
+func arrayInError(kind arrayInErr) error {
+	switch kind {
+	case arrayMalformed:
+		return newError(InvalidTextRepresentation, "malformed array literal")
+	case arrayBoundFlip:
+		return arraySubscriptErr("upper bound cannot be less than lower bound")
+	case arrayBoundOutOfInt:
+		return newError(ProgramLimitExceeded, "array bound is out of integer range")
+	case arrayUpperBoundMax:
+		return newError(ProgramLimitExceeded, "array upper bound is too large: "+strconv.FormatInt(math.MaxInt32, 10))
+	case arraySizeOverflow:
+		return newError(ProgramLimitExceeded, "array size exceeds the maximum allowed ("+strconv.Itoa(arrayMaxSize)+")")
+	}
+	return nil
+}
 
 // parsedArray is the structured result of parseArrayLiteral: the shape and the flattened row-major
 // element tokens (nil = a NULL element).
@@ -1511,24 +1554,33 @@ func parseArrayLiteral(input string) (*parsedArray, arrayInErr) {
 				break
 			}
 			p.i++ // [
-			lb, ok := p.parseInt()
-			if !ok {
-				return nil, arrayMalformed
+			lb, errKind := p.parseInt()
+			if errKind != arrayOK {
+				return nil, errKind
 			}
 			if c, ok := p.peek(); !ok || c != ':' {
 				return nil, arrayMalformed
 			}
 			p.i++ // :
-			ub, ok := p.parseInt()
-			if !ok {
-				return nil, arrayMalformed
+			ub, errKind := p.parseInt()
+			if errKind != arrayOK {
+				return nil, errKind
 			}
 			if c, ok := p.peek(); !ok || c != ']' {
 				return nil, arrayMalformed
 			}
 			p.i++ // ]
+			// PG ReadArrayDimensions, in its order: an inverted bound, an upper bound of exactly
+			// i32::MAX (disallowed so `lb + len` stays computable — checkArrayBounds), then a
+			// dimension length that overflows an i32.
 			if ub < lb {
 				return nil, arrayBoundFlip
+			}
+			if ub == math.MaxInt32 {
+				return nil, arrayUpperBoundMax
+			}
+			if ub-lb+1 > math.MaxInt32 {
+				return nil, arraySizeOverflow
 			}
 			prefixLb = append(prefixLb, int32(lb))
 			prefixDims = append(prefixDims, int(ub-lb+1))
@@ -1601,12 +1653,13 @@ func (p *arrParser) skipSpace() {
 }
 
 // parseInt parses a signed decimal integer (a dimension bound).
-func (p *arrParser) parseInt() (int64, bool) {
+func (p *arrParser) parseInt() (int64, arrayInErr) {
 	var b strings.Builder
 	if c, ok := p.peek(); ok && c == '-' {
 		b.WriteByte('-')
 		p.i++
 	}
+	digits := 0
 	for {
 		c, ok := p.peek()
 		if !ok || c < '0' || c > '9' {
@@ -1614,12 +1667,18 @@ func (p *arrParser) parseInt() (int64, bool) {
 		}
 		b.WriteRune(c)
 		p.i++
+		digits++
 	}
+	if digits == 0 {
+		return 0, arrayMalformed
+	}
+	// A dimension bound must lie in the i32 domain (PG ReadDimensionInt): a digit string too long
+	// for an int64 is the same out-of-range bound, not a malformed literal.
 	n, err := strconv.ParseInt(b.String(), 10, 64)
-	if err != nil {
-		return 0, false
+	if err != nil || n < math.MinInt32 || n > math.MaxInt32 {
+		return 0, arrayBoundOutOfInt
 	}
-	return n, true
+	return n, arrayOK
 }
 
 // parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf). depth is

@@ -434,13 +434,19 @@ impl Decimal {
             return Ok(Decimal::zero(rscale));
         }
         let rscale = select_div_scale(self, other);
-        // numerator = |C1| * 10^E, E = rscale + s2 - s1 (>= 0 since rscale >= s1).
+        // E = rscale + s2 - s1. It is negative when the dividend's scale exceeds
+        // select_div_scale's 1000-digit display clamp (s1 > 1000): the quotient then has FEWER
+        // fractional digits than the dividend, so the shift moves to the divisor instead
+        // (N = |C1|, D = |C2|·10^−E) — never a wrapped `as u32` shift (decimal.md §4).
         let e = rscale as i64 + other.scale as i64 - self.scale as i64;
-        debug_assert!(e >= 0);
-        let numer = mag_mul_pow10(&self.limbs, e as u32);
-        let (mut q, r) = mag_divmod(&numer, &other.limbs);
+        let (numer, denom) = if e >= 0 {
+            (mag_mul_pow10(&self.limbs, e as u32), other.limbs.clone())
+        } else {
+            (self.limbs.clone(), mag_mul_pow10(&other.limbs, (-e) as u32))
+        };
+        let (mut q, r) = mag_divmod(&numer, &denom);
         // Round half away from zero: if 2*r >= |divisor|, round the magnitude up.
-        if mag_cmp(&mag_add(&r, &r), &other.limbs) != std::cmp::Ordering::Less {
+        if mag_cmp(&mag_add(&r, &r), &denom) != std::cmp::Ordering::Less {
             q = mag_add(&q, &[1]);
         }
         Decimal::from_parts(self.neg ^ other.neg, rscale, q).check_cap()
@@ -1185,14 +1191,27 @@ impl Decimal {
         if base.is_zero() {
             return Ok(Decimal::zero(MIN_SIG_DIGITS as u32));
         }
-        // A negative base demands an integer exponent (which routed above), so a non-integer
-        // exponent here is the complex-result error.
-        if base.neg {
-            return Err(EngineError::new(
-                SqlState::InvalidArgumentForPowerFunction,
-                "a negative number raised to a non-integer power yields a complex result",
-            ));
-        }
+        // A negative base insists on an integer exponent (PG power_var): an integer exponent
+        // outside power_var_int's int32 gate still arrives here, so integrality is tested by
+        // value, not by the gate. The result's sign is the exponent's parity (odd → negative)
+        // and its magnitude is computed over |base| (decimal.md §8).
+        let abs_base;
+        let mut res_neg = false;
+        let base = if base.neg {
+            let int_exp = exp.trunc_to_scale(0);
+            if int_exp.cmp_value(exp) != std::cmp::Ordering::Equal {
+                return Err(EngineError::new(
+                    SqlState::InvalidArgumentForPowerFunction,
+                    "a negative number raised to a non-integer power yields a complex result",
+                ));
+            }
+            // Limbs are little-endian base 10^9 (even), so the units digit's parity is limb 0's.
+            res_neg = int_exp.limbs.first().is_some_and(|l| l % 2 == 1);
+            abs_base = base.abs();
+            &abs_base
+        } else {
+            base
+        };
         let ln_dweight = base.estimate_ln_dweight(m.as_deref_mut())?;
         // Low-precision exp·ln(base) to estimate the result weight (and a crude overflow exit).
         let mut local_rscale = (8 - ln_dweight).max(0);
@@ -1217,7 +1236,11 @@ impl Decimal {
         local_rscale = (sig_digits - ln_dweight + 8).max(0);
         ln_base = base.ln_var(local_rscale, m.as_deref_mut())?;
         ln_num = ln_base.mul_var(exp, local_rscale);
-        ln_num.exp_var(rscale, m.as_deref_mut())?.check_cap()
+        let mut r = ln_num.exp_var(rscale, m.as_deref_mut())?;
+        if res_neg && !r.is_zero() {
+            r = r.neg(); // a zero result stays positive (no negative zero)
+        }
+        r.check_cap()
     }
 
     /// `power(base, exp)` over numeric (PG `numeric_power`, finite path): the domain checks plus
@@ -1379,16 +1402,21 @@ pub fn work_mul(a: &Decimal, b: &Decimal) -> u64 {
     groups(a.precision()) * groups(b.precision())
 }
 
-/// W for div: numerator groups (dividend digits + the rescale shift `E`) × divisor groups,
-/// `E = rscale + s2 − s1` with the same `select_div_scale` as the result. A zero divisor
-/// returns 1 — the operation traps 22012 before any work (cost.md §3).
+/// W for div: numerator groups × divisor groups, where the rescale shift `E = rscale + s2 − s1`
+/// (the same `select_div_scale` as the result) widens the dividend when `E ≥ 0` and the divisor
+/// when `E < 0` (s1 > 1000, past the display clamp) — the operands `div` actually divides
+/// (cost.md §3). A zero divisor returns 1 — the operation traps 22012 before any work.
 pub fn work_div(a: &Decimal, b: &Decimal) -> u64 {
     if b.is_zero() {
         return 1;
     }
     let rscale = select_div_scale(a, b);
-    let e = rscale as i64 + b.scale as i64 - a.scale as i64; // >= 0 since rscale >= s1
-    groups(a.precision() + e as u32) * groups(b.precision())
+    let e = rscale as i64 + b.scale as i64 - a.scale as i64;
+    if e >= 0 {
+        groups(a.precision() + e as u32) * groups(b.precision())
+    } else {
+        groups(a.precision()) * groups(b.precision() + (-e) as u32)
+    }
 }
 
 /// W for mod: the aligned divmod — the product of the aligned group counts. Zero divisor → 1.

@@ -600,6 +600,14 @@ so `hour = 24` / `sec = 60` are accepted within a day, exactly PG's `make_timest
 `make_timestamptz` is **overloaded on arity**: the 6-arg form interprets the assembled wall clock in
 the **session** zone, the 7-arg form in an explicit `timezone` text (an unrecognized zone is
 `22023`); both charge one `timezone` unit beyond the call's `operator_eval`, like `AT TIME ZONE`.
+The explicit `timezone` text is read as PostgreSQL's `parse_sane_timezone` reads it — **not** as
+`AT TIME ZONE` reads its zone: a sign-led string is first an ISO numeric offset with the
+**timestamp-literal sign** (`'+05:30'` is UTC+5:30, east-positive — the opposite of `AT TIME ZONE
+'+05:30'`'s POSIX west-positive reading), in the forms `±HH`, `±HH:MM[:SS]` and the run-together
+`±HHMM`, bounded by PG's `MAX_TZDISP_HOUR` (`±15:59:59`; beyond is `22023` "numeric time zone … out
+of range"); a leading digit is `22023` "invalid input syntax for type numeric time zone"; anything
+else resolves as a zone name (case-insensitively, [timezones.md §3.2](timezones.md)), `22023` when
+unknown. So `make_timestamptz(2024, 1, 1, 0, 0, 0, '+05:30')` is `2023-12-31 18:30:00+00`.
 The 6-arg form's session-zone dependence makes it `stable` (PG's class); `make_timestamp` is
 `immutable`. (`make_timestamptz`'s overload-on-arity is the first time `normalize_named_args` runs
 against an arity-selected catalog row — the 7th positional argument or a named `timezone` selects

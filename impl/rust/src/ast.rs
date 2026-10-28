@@ -281,6 +281,8 @@ pub enum RefAction {
 pub struct ForeignKeyDef {
     pub name: Option<String>,
     pub columns: Vec<String>,
+    /// The optional database qualifier on the parent (attached-databases.md §4).
+    pub ref_db: Option<String>,
     pub ref_table: String,
     pub ref_columns: Option<Vec<String>>,
     pub match_full: bool,

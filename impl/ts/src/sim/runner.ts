@@ -711,7 +711,7 @@ export class SimRunner {
     if (image === null || image.length < 2 * ps) return false;
     let suite: number;
     try {
-      suite = fileSuite(image.subarray(0, ps), image.subarray(ps, 2 * ps));
+      suite = fileSuite(image.subarray(0, ps), image.subarray(ps, 2 * ps)) ?? 0;
     } catch {
       return false;
     }

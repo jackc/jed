@@ -1,0 +1,75 @@
+# AT TIME ZONE with a built-in fixed numeric offset — its bounds and the zone-name case fold
+# (spec/design/timezones.md §3.2). A fixed offset `±HH[:MM[:SS]]` is read as PostgreSQL's pg_tzset
+# reads a numeric POSIX zone: hours 0..167, minutes 0..59, seconds 0..60, each digit run checked as
+# it accumulates, so an over-long run (`+1000000`, `+4294967296`) is "not recognized" (22023), never
+# a wrapped or truncated offset. Zone names fold ASCII case like PG (`utc`, `america/new_york`).
+# Oracle-checked against postgres:18.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, expr.at_time_zone, resource.cost_metering
+
+# load-timezone: America/New_York
+
+# the largest POSIX hour: 167 (a week less an hour); POSIX sign, so +HH is west of UTC
+# cost: 3
+query T nosort
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+167:59:59'
+----
+2024-01-07 23:59:59+00
+
+# cost: 3
+query T nosort
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+100'
+----
+2024-01-05 04:00:00+00
+
+# a leap second (60) is accepted in the seconds field
+# cost: 3
+query T nosort
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+05:07:60'
+----
+2024-01-01 05:08:00+00
+
+# cost: 3
+query T nosort
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '-05:30'
+----
+2023-12-31 18:30:00+00
+
+statement error 22023
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+168'
+
+statement error 22023
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '-168:00:00'
+
+statement error 22023
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+05:60'
+
+statement error 22023
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+1000000'
+
+# a run that would overflow a 32-bit accumulator
+statement error 22023
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE '+4294967296'
+
+statement error 22023
+SELECT timestamptz '2024-01-01 00:00:00+00' AT TIME ZONE '+99999999999999999999'
+
+# zone names are case-insensitive (ASCII fold)
+# cost: 3
+query T nosort
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE 'utc'
+----
+2024-01-01 00:00:00+00
+
+# cost: 3
+query T nosort
+SELECT timestamp '2024-01-01 00:00:00' AT TIME ZONE 'america/new_york'
+----
+2024-01-01 05:00:00+00
+
+# cost: 3
+query T nosort
+SELECT timestamptz '2024-07-15 12:00:00+00' AT TIME ZONE 'AMERICA/NEW_YORK'
+----
+2024-07-15 08:00:00

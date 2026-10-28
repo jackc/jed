@@ -38,6 +38,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 ## Core query / DML completeness
 
 - [x] **Predicate forms** (`IN`/`BETWEEN`/`LIKE`/`ILIKE`/`CASE`, regex operators, `SIMILAR TO`). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
+  - [ ] _follow-on:_ a flat N-ary `IN (list)` node in place of the resolve-time OR-chain desugar (cost.md §7f) — the chain is as deep as the list is long, so the list is capped at 1000 elements (`54001`) and the deepest walks iterate its spine; a flat node would lift the cap and must reproduce the chain's costs (`n−1` `or` nodes, `=` nodes up to the first TRUE), EXPLAIN rendering, and the planner's point-lookup extraction exactly, in all three cores.
 - [x] **Left-to-right short-circuit `AND` / `OR`** (PostgreSQL's qual-list NULL rule in filters, whose conjuncts are cost-ordered like PostgreSQL's). → [cost.md §3](spec/design/cost.md), [planner.md §3.0](spec/design/planner.md), `expr/short_circuit.test`, `expr/filter_conjunct_order.test`
 - [x] **Scalar functions**, with implicit argument coercion. → [functions.md §9](spec/design/functions.md), [arg-coercion.md](spec/design/arg-coercion.md)
   - [ ] _follow-on:_ have the `div`/`gcd`/`lcm`/`width_bucket` resolvers read their numeric reconciliation from the argument-coercion table (a no-behavior-change cleanup, [arg-coercion.md §9](spec/design/arg-coercion.md) slice 5).

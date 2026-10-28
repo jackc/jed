@@ -38,6 +38,13 @@ use crate::token::Token;
 /// 1 MiB native stack in an optimized build (spec/design/cost.md §7.1).
 pub const MAX_EXPR_DEPTH: usize = 256;
 
+/// The maximum number of elements in an `IN (…)` value list (spec/design/cost.md §7f, grammar.md
+/// §20). The list is parsed flat, so `MAX_EXPR_DEPTH` never counts it, but it resolves to a
+/// left-deep OR chain of as many levels — the one place a statement's resolved depth is not bounded
+/// by its written nesting — and the walks below the parser recurse down that chain. The cap bounds
+/// it at 54001, like the depth limit: a fixed, cross-core-identical constant.
+pub const MAX_IN_LIST_ELEMENTS: usize = 1000;
+
 /// Maximum length, in **bytes**, of a single identifier — table / column / type / alias /
 /// function name (spec/design/cost.md §7; CLAUDE.md §13). The §13 identifier-hardening gate for
 /// untrusted input: an unbounded identifier would otherwise consume O(input) memory and land
@@ -1484,7 +1491,10 @@ impl Parser {
     /// The returned definition carries no name and no local columns; the caller fills them in.
     fn parse_references_clause(&mut self) -> Result<ForeignKeyDef> {
         self.expect_keyword("references")?;
-        let ref_table = self.expect_identifier()?;
+        // The parent is a qualified_table (attached-databases.md §4): an optional database qualifier
+        // (`main.` / `temp.` pin the implicit scope; an attachment is a cross-database FK, 0A000 at
+        // resolution; unknown → 42P01) before the table name.
+        let (ref_db, ref_table) = self.parse_qualified_table_name()?;
         let ref_columns = if matches!(self.peek(), Token::LParen) {
             Some(self.parse_pk_column_list()?)
         } else {
@@ -1535,6 +1545,7 @@ impl Parser {
         Ok(ForeignKeyDef {
             name: None,
             columns: Vec::new(),
+            ref_db,
             ref_table,
             ref_columns,
             match_full,
@@ -6075,6 +6086,19 @@ impl Parser {
                 while matches!(self.peek(), Token::Comma) {
                     self.advance();
                     list.push(self.parse_concat()?);
+                    // The list is parsed flat, so the nesting counter never sees it — but it
+                    // resolves to an OR chain as deep as the list is long (grammar.md §20), which
+                    // the recursive walks below the parser descend. The element cap bounds that
+                    // depth the way MAX_EXPR_DEPTH bounds written nesting (spec/design/cost.md
+                    // §7f): 54001, no position.
+                    if list.len() > MAX_IN_LIST_ELEMENTS {
+                        return Err(EngineError::new(
+                            SqlState::StatementTooComplex,
+                            format!(
+                                "statement too complex: IN list exceeds the maximum of {MAX_IN_LIST_ELEMENTS} elements"
+                            ),
+                        ));
+                    }
                 }
                 self.expect(&Token::RParen)?;
                 return Ok(Expr::In {
@@ -7546,8 +7570,23 @@ impl Parser {
             let e = self.parse_frame_bound()?;
             (s, e)
         } else {
-            // A single bound is the frame START; the END defaults to CURRENT ROW.
-            (self.parse_frame_bound()?, FrameBound::CurrentRow)
+            // A single bound is the frame START; the END defaults to CURRENT ROW. PostgreSQL
+            // rejects the two impossible single-bound forms here, with their own messages
+            // (window.md §6, 42P20).
+            let s = self.parse_frame_bound()?;
+            if matches!(s, FrameBound::UnboundedFollowing) {
+                return Err(EngineError::new(
+                    SqlState::WindowingError,
+                    "frame start cannot be UNBOUNDED FOLLOWING",
+                ));
+            }
+            if matches!(s, FrameBound::Following(_)) {
+                return Err(EngineError::new(
+                    SqlState::WindowingError,
+                    "frame starting from following row cannot end with current row",
+                ));
+            }
+            (s, FrameBound::CurrentRow)
         };
         let exclude = self.parse_frame_exclusion()?;
         Ok(Some(WindowFrame {

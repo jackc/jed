@@ -327,7 +327,11 @@ keeps a literal from silently forcing a width, and makes `WHERE small = 100000` 
   `i64`. The result type is then the promotion of the operand types (§3, §4), and a
   *computed* result outside that type still traps `22003` at run time (`30000 + 30000` over
   `i16`). The unary-minus fold (`-lit`) is one negative literal, range-checked against its
-  context like any literal.
+  context like any literal. A **string literal** beside a `timestamp`/`timestamptz` operand
+  adapts to the sibling's type (`ts - '2023-01-01'` is a timestamp difference) **except under
+  `+`**, where it adapts to **`interval`** (`ts + '1 day'`, `'1 day' + ts`) — the only `+` over a
+  timestamp takes an interval, which is how PostgreSQL resolves the unknown-typed literal
+  ([interval.md §5](interval.md)); a non-interval string is then the interval parser's `22007`.
 
 **Why this, not "smallest fitting" or "always i64".** Smallest-fitting makes ordinary
 arithmetic overflow surprisingly (`30000 + 30000` would be `i16 + i16`). Always-i64
@@ -538,6 +542,16 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
 `text` (aliases `varchar`, `character varying`, `string`) is a **variable-width UTF-8 string**
 and the first storable non-integer scalar. The empty string `''` is a distinct, non-NULL value
 (a zero-length string), separate from `NULL`.
+
+**A text value is valid UTF-8 and never holds the NUL character** (PostgreSQL's rule: `chr(0)` is
+`54000` *"null character not permitted"*, string-functions.md §4; a JSON `\u0000` has no text
+value, json.md §4.2). The engine enforces this where text enters from outside, as PostgreSQL's
+`pg_verifymbstr` does: the whole SQL text is checked before it is lexed (a string literal, a quoted
+identifier, even a comment), and every host-supplied text parameter at bind ([api.md §5](api.md)).
+An invalid sequence or a NUL byte is **`22021` `character_not_in_repertoire`** with PostgreSQL's
+exact message naming the first bad sequence's bytes, up to its expected length — `invalid byte
+sequence for encoding "UTF8": 0xe2 0x82 0x27` — and no position. So a stored text value is valid
+UTF-8 by construction, and a file's text that is not is corruption (`XX001`), never input.
 
 **One collation: `C` (byte / code-point order over UTF-8).** A *collation* is the rule for
 ordering and equating text, layered on the *encoding* (which maps characters to bytes — the

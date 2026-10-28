@@ -445,17 +445,14 @@ func (db *engine) planExplainWithDml(wq *withQuery) (*explainWithPlan, error) {
 		}
 		primary = &plan
 	}
+	byName := cteBindingsByName(bindings)
 	for i := range wq.Ctes {
 		if wq.Ctes[i].Body.IsDataModifying() {
-			for _, binding := range bindings {
-				binding.refs += countCteRefsDml(&wq.Ctes[i].Body, binding.name)
-			}
+			addDmlCteRefs(byName, &wq.Ctes[i].Body)
 		}
 	}
 	if wq.Body.IsDataModifying() {
-		for _, binding := range bindings {
-			binding.refs += countCteRefsDml(&wq.Body, binding.name)
-		}
+		addDmlCteRefs(byName, &wq.Body)
 	}
 	return &explainWithPlan{bindings: bindings, modes: cteModes(bindings), primary: primary, body: wq.Body}, nil
 }

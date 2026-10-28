@@ -461,10 +461,11 @@ func sha2Digest(f scalarFunc, b []byte) []byte {
 
 // encodeBytea is encode(bytes, format) (string-functions.md §3): render binary as text. hex = two
 // lowercase hex digits per byte; base64 = RFC 4648 wrapped at 76 chars with \n (PostgreSQL's style);
-// escape = printable bytes verbatim, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal. An
+// escape = printable bytes verbatim, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal. The
+// format name is matched ASCII-case-insensitively (PG pg_strcasecmp: 'BASE64' = 'base64'); an
 // unrecognized format traps 22023.
 func encodeBytea(bytes []byte, format string) (string, error) {
-	switch format {
+	switch toLowerASCII(format) {
 	case "hex":
 		var b strings.Builder
 		for _, c := range bytes {
@@ -493,38 +494,36 @@ func encodeBytea(bytes []byte, format string) (string, error) {
 	}
 }
 
-// base64EncodeWrapped is RFC 4648 base64 wrapped at 76 chars with \n (no trailing newline).
+// base64EncodeWrapped is RFC 4648 base64 in PostgreSQL's pg_base64_encode layout: a `\n` after
+// every 76 characters of FULL 3-byte groups — including after the last one when the full groups
+// end exactly on a 76-character line (57·k input bytes), the newline PG's encoder emits inside its
+// loop — and then the padded partial group, which never takes a newline (string-functions.md §3).
 func base64EncodeWrapped(bytes []byte) string {
-	var b64 []byte
-	for i := 0; i < len(bytes); i += 3 {
-		n := uint32(bytes[i]) << 16
-		l := 1
-		if i+1 < len(bytes) {
-			n |= uint32(bytes[i+1]) << 8
-			l = 2
-		}
-		if i+2 < len(bytes) {
-			n |= uint32(bytes[i+2])
-			l = 3
-		}
-		b64 = append(b64, base64Alphabet[(n>>18)&63], base64Alphabet[(n>>12)&63])
-		if l > 1 {
-			b64 = append(b64, base64Alphabet[(n>>6)&63])
-		} else {
-			b64 = append(b64, '=')
-		}
-		if l > 2 {
-			b64 = append(b64, base64Alphabet[n&63])
-		} else {
-			b64 = append(b64, '=')
-		}
-	}
 	var out strings.Builder
-	for i, c := range b64 {
-		if i > 0 && i%76 == 0 {
+	full := len(bytes) / 3 * 3
+	for i := 0; i < full; i += 3 {
+		n := uint32(bytes[i])<<16 | uint32(bytes[i+1])<<8 | uint32(bytes[i+2])
+		out.WriteByte(base64Alphabet[(n>>18)&63])
+		out.WriteByte(base64Alphabet[(n>>12)&63])
+		out.WriteByte(base64Alphabet[(n>>6)&63])
+		out.WriteByte(base64Alphabet[n&63])
+		if (i/3+1)*4%76 == 0 {
 			out.WriteByte('\n')
 		}
-		out.WriteByte(c)
+	}
+	if rest := len(bytes) - full; rest > 0 {
+		n := uint32(bytes[full]) << 16
+		if rest == 2 {
+			n |= uint32(bytes[full+1]) << 8
+		}
+		out.WriteByte(base64Alphabet[(n>>18)&63])
+		out.WriteByte(base64Alphabet[(n>>12)&63])
+		if rest == 2 {
+			out.WriteByte(base64Alphabet[(n>>6)&63])
+		} else {
+			out.WriteByte('=')
+		}
+		out.WriteByte('=')
 	}
 	return out.String()
 }
@@ -632,14 +631,14 @@ func quoteIdentText(s string) string {
 
 // decodeText is decode(s, format) (string-functions.md §3): the inverse of encode. hex and base64
 // skip a space, tab, newline, or carriage return (hex only between digit pairs); a malformed
-// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split). An
-// unrecognized format traps 22023.
+// hex/base64 string traps 22023; a malformed escape sequence traps 22P02 (PostgreSQL's split). The
+// format name is matched ASCII-case-insensitively (as encode); an unrecognized format traps 22023.
 func decodeText(s, format string) ([]byte, error) {
-	switch format {
+	switch toLowerASCII(format) {
 	case "hex":
 		return decodeHex([]byte(s))
 	case "base64":
-		return decodeBase64([]byte(s))
+		return decodeBase64(s)
 	case "escape":
 		return decodeEscape([]byte(s))
 	default:
@@ -658,47 +657,65 @@ func decodeHex(bytes []byte) ([]byte, error) {
 	return b, nil
 }
 
-// decodeBase64 (RFC 4648); a space, tab, newline, or carriage return is ignored (PostgreSQL's
-// pg_base64_decode set); an out-of-alphabet byte (or data after the =
-// padding) traps 22023. Bit-accumulation emits a byte per full 8 bits.
-func decodeBase64(bytes []byte) ([]byte, error) {
-	bad := func() error { return newError(InvalidParameterValue, "invalid base64 end sequence") }
+// decodeBase64 is PostgreSQL's pg_base64_decode (encode.c), a 4-symbol-group state machine over
+// the input's code points (string-functions.md §3): a space, tab, newline, or carriage return is
+// skipped; every other symbol — an alphabet character or `=` — fills a group of four, and each
+// complete group emits its 3 bytes, less one per `=` the FIRST padded group carried. A `=` is legal
+// only at group position 2 or 3 the first time (`unexpected "="` otherwise, 22023); once padding
+// has begun, later symbols — more `=` or even alphabet characters — are accepted as zero-valued
+// filler (`YW=j` → \x61, `YQ==YQ==` → \x6161, exactly as PG). A symbol outside the alphabet is
+// `invalid symbol "<c>"` (22023, quoting the whole code point); an input that ends mid-group
+// (`YQ`, `YWJ`, `YQ=`) is `invalid base64 end sequence` (22023).
+func decodeBase64(s string) ([]byte, error) {
 	var out []byte
-	var acc uint32
-	nbits := 0
-	padded := false
-	for _, b := range bytes {
-		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
-			continue
-		}
-		if b == '=' {
-			padded = true
-			continue
-		}
-		if padded {
-			return nil, bad()
-		}
-		var v byte
+	var buf uint32
+	pos, end := 0, 0
+	for _, c := range s {
+		var b uint32
 		switch {
-		case b >= 'A' && b <= 'Z':
-			v = b - 'A'
-		case b >= 'a' && b <= 'z':
-			v = b - 'a' + 26
-		case b >= '0' && b <= '9':
-			v = b - '0' + 52
-		case b == '+':
-			v = 62
-		case b == '/':
-			v = 63
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			continue
+		case c == '=':
+			if end == 0 {
+				switch pos {
+				case 2:
+					end = 1
+				case 3:
+					end = 2
+				default:
+					return nil, newError(InvalidParameterValue, `unexpected "=" while decoding base64 sequence`)
+				}
+			}
+		case c >= 'A' && c <= 'Z':
+			b = uint32(c - 'A')
+		case c >= 'a' && c <= 'z':
+			b = uint32(c-'a') + 26
+		case c >= '0' && c <= '9':
+			b = uint32(c-'0') + 52
+		case c == '+':
+			b = 62
+		case c == '/':
+			b = 63
 		default:
-			return nil, bad()
+			return nil, newError(InvalidParameterValue,
+				`invalid symbol "`+string(c)+`" found while decoding base64 sequence`)
 		}
-		acc = acc<<6 | uint32(v)
-		nbits += 6
-		if nbits >= 8 {
-			nbits -= 8
-			out = append(out, byte(acc>>uint(nbits)))
+		buf = buf<<6 | b
+		pos++
+		if pos == 4 {
+			out = append(out, byte(buf>>16))
+			if end == 0 || end > 1 {
+				out = append(out, byte(buf>>8))
+			}
+			if end == 0 || end > 2 {
+				out = append(out, byte(buf))
+			}
+			buf, pos = 0, 0
 		}
+	}
+	if pos != 0 {
+		return nil, newError(InvalidParameterValue, "invalid base64 end sequence").
+			withHint("Input data is missing padding, is truncated, or is otherwise corrupted.")
 	}
 	return out, nil
 }
@@ -1121,6 +1138,24 @@ func widthBucketFloat(op, low, high float64, count int64) (int64, error) {
 		return 0, widthBucketErr("lower bound cannot equal upper bound")
 	}
 	cf := float64(count)
+	// The interior bucket (PG width_bucket_float8): floor(fraction · count) + 1, where the fraction
+	// is (op − lo) / (hi − lo) for the near bound lo. When hi − lo overflows to ±Infinity (bounds
+	// of opposite sign near the f64 limit) the halves are used instead — (op/2 − lo/2) / (hi/2 −
+	// lo/2) — which cannot overflow; and a fraction that rounds up to 1.0 is clamped back to
+	// `count` (it would otherwise claim the past-the-end bucket for an operand inside the range).
+	interior := func(lo, hi float64) (int64, error) {
+		var frac float64
+		if math.IsInf(hi-lo, 0) {
+			frac = (op/2 - lo/2) / (hi/2 - lo/2)
+		} else {
+			frac = (op - lo) / (hi - lo)
+		}
+		r := int64(math.Floor(frac*cf)) + 1
+		if r > count {
+			r = count
+		}
+		return r, nil
+	}
 	if low < high {
 		if op < low {
 			return 0, nil
@@ -1128,7 +1163,7 @@ func widthBucketFloat(op, low, high float64, count int64) (int64, error) {
 		if op >= high {
 			return satAdd1(count), nil
 		}
-		return int64(math.Floor((op-low)/(high-low)*cf)) + 1, nil
+		return interior(low, high)
 	}
 	if op > low {
 		return 0, nil
@@ -1136,7 +1171,7 @@ func widthBucketFloat(op, low, high float64, count int64) (int64, error) {
 	if op <= high {
 		return satAdd1(count), nil
 	}
-	return int64(math.Floor((low-op)/(low-high)*cf)) + 1, nil
+	return interior(low, high)
 }
 
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
@@ -1184,6 +1219,20 @@ func factorToFraction(v Value) (*big.Int, *big.Int, error) {
 		return big.NewInt(v.Int), big.NewInt(1), nil
 	}
 	return parseFactorDecimal(v.decimal().Render())
+}
+
+// zonelessIntervalShift reports whether a timestamptz ± interval pair (either order) never consults
+// the session zone: its interval operand is a constant with zero months and days (a pure
+// microsecond shift on the instant), so the expression depends on its arguments only
+// (index-dependencies.md). A constant with a calendar field, or any non-constant interval, consults
+// the session zone at eval (interval.md §5).
+func zonelessIntervalShift(rl, rr *rExpr) bool {
+	for _, e := range []*rExpr{rl, rr} {
+		if e.kind == reConstInterval && e.cIv.Months == 0 && e.cIv.Days == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // temporalArithResult gives the result type of a temporal +/- (spec/design/interval.md §5).
@@ -2076,10 +2125,30 @@ func parseFloatLiteral(s string, ty scalarType) (float64, error) {
 		// A finite numeric that rounded to ±Inf is out of range (22003), not a literal Infinity.
 		return 0, overflowErr(ty)
 	}
+	if f == 0 && floatTextHasNonzeroDigit(t) {
+		// A non-zero numeric that rounded to 0 at the width underflowed: out of range (22003), as
+		// PG's float8in / float4in (strconv does not report ERANGE on underflow — float.md §4).
+		return 0, overflowErr(ty)
+	}
 	if bits == 32 {
 		return float64(float32(f)), nil
 	}
 	return f, nil
+}
+
+// floatTextHasNonzeroDigit reports whether a validFloatNumeric mantissa (the text before any
+// e/E) holds a non-zero digit — i.e. the literal names a non-zero value, so a parse to 0 is an
+// underflow rather than a spelled zero (`0e-400`, `0.000`).
+func floatTextHasNonzeroDigit(t string) bool {
+	for i := 0; i < len(t); i++ {
+		switch c := t[i]; {
+		case c == 'e' || c == 'E':
+			return false
+		case c >= '1' && c <= '9':
+			return true
+		}
+	}
+	return false
 }
 
 // validFloatNumeric reports whether t is a well-formed FINITE float numeric: an optional sign,
@@ -2262,12 +2331,13 @@ func parseDecimalLiteral(s string) (Decimal, error) {
 // parseBoolLiteral parses a string literal's content as a boolean — the text→boolean coercion for
 // BOOLEAN 'true' / CAST('t' AS boolean) (grammar.md §36). Matches PostgreSQL's boolin: trimmed
 // ASCII whitespace, case-insensitive; t/tr/tru/true, y/ye/yes, on, 1 → true and f/fa/fal/fals/
-// false, n/no, off, 0 → false; anything else 22P02.
+// false, n/no, of/off, 0 → false (every unambiguous prefix of a word — `of` is `off`'s; `o` alone
+// is ambiguous); anything else 22P02.
 func parseBoolLiteral(s string) (bool, error) {
 	switch toLowerASCII(strings.Trim(s, litWhitespace)) {
 	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
 		return true, nil
-	case "f", "fa", "fal", "fals", "false", "n", "no", "off", "0":
+	case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
 		return false, nil
 	default:
 		return false, newError(InvalidTextRepresentation,

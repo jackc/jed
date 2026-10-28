@@ -1421,6 +1421,18 @@ func estimatorOperatorNodes(expr *rExpr) int64 {
 	case reInValues:
 		total = satEstimateAdd(total, int64(len(expr.list)))
 	}
+	if (expr.kind == reAnd || expr.kind == reOr) && expr.lhs.kind == expr.kind {
+		// A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is summed along its
+		// left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+		// the chain (cost.md §7f); the saturating sum is the same.
+		total = satEstimateAdd(total, estimatorOperatorNodes(expr.rhs))
+		spine := expr.lhs
+		for spine.kind == expr.kind {
+			total = satEstimateAdd(total, satEstimateAdd(1, estimatorOperatorNodes(spine.rhs)))
+			spine = spine.lhs
+		}
+		return satEstimateAdd(total, estimatorOperatorNodes(spine))
+	}
 	total = satEstimateAdd(total, estimatorOperatorNodes(expr.operand))
 	total = satEstimateAdd(total, estimatorOperatorNodes(expr.lhs))
 	total = satEstimateAdd(total, estimatorOperatorNodes(expr.rhs))
@@ -1670,6 +1682,23 @@ func (db *engine) addExpressionSubqueries(dst *planEstimate, expr *rExpr, invoca
 			}
 			subplan := db.estimateQueryPlan(*expr.subPlan, ctx)
 			addPlanEstimateUnits(dst, repeatPlanEstimate(subplan.root, count))
+		}
+		return
+	}
+	if (expr.kind == reAnd || expr.kind == reOr) && expr.lhs.kind == expr.kind {
+		// A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its
+		// left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+		// the chain (cost.md §7f); the order — the deepest lhs, then each rhs from the deepest
+		// node up — is the recursive one's.
+		var spine []*rExpr
+		node := expr
+		for node.kind == expr.kind {
+			spine = append(spine, node)
+			node = node.lhs
+		}
+		db.addExpressionSubqueries(dst, node, invocations, ctx)
+		for i := len(spine) - 1; i >= 0; i-- {
+			db.addExpressionSubqueries(dst, spine[i].rhs, invocations, ctx)
 		}
 		return
 	}

@@ -192,8 +192,14 @@ dispatch) + `resolve_range_op` (the range axis); a `RangeOp` node carrying the o
 range's element scalar (for the element overloads' eval coercion); the eight boolean kernels in
 `range.rs` (`range_contains`/`range_contains_elem`/`range_overlaps`/`range_before`/`range_after`/
 `range_overleft`/`range_overright`/`range_adjacent`) over a general `cmp_bounds` (PG
-`range_cmp_bounds` generalized to compare a lower against an upper). No on-disk change (RF3 is a
-query surface only).
+`range_cmp_bounds` generalized to compare a lower against an upper). For equal bound *values* the
+tie-break is PG's exactly — an exclusive bound sits just inside its own side, so on **different**
+sides a lower and an upper of the same inclusivity are not equal: both exclusive → the lower sorts
+**after** the upper (`(5` is "> 5", `5)` is "< 5": `numrange(1,5,'[)') && numrange(5,8,'(]')` is
+false, `<<` true, `+` is `22000`, `-` leaves `[1,5)`), both inclusive → the lower sorts **before**
+(`[5` and `5]` meet at 5). The same-side total order (`range_cmp`, ranges.md §6, and the §2.11 key
+encoding) is untouched by this: it only ever compares a lower against a lower and an upper against an
+upper. No on-disk change (RF3 is a query surface only).
 
 ## 4. Set operators (RF4)
 

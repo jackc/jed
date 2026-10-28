@@ -284,11 +284,14 @@ fully deterministic and cross-core-identical. Full Unicode alphanumeric classifi
 because the three cores' runtimes carry different Unicode versions (`char::is_alphanumeric` in Rust
 std vs Go's `unicode` vs Node's `\p{}`), which would reintroduce the cross-core Unicode-version
 divergence the collation work fought (CLAUDE.md §8; the ICU trap). The consequence: a **non-ASCII
-letter is treated as a word boundary** rather than a word character, so `initcap('école')` is
-`'école'` (jed leaves the leading `é` lowercase) where PostgreSQL gives `'École'`. PostgreSQL agrees
-for **ASCII** input, which the oracle corpus exercises; the non-ASCII titlecasing (full Unicode word
-classification + a loaded-bundle case fold, like `lower`/`upper`) is a deferred refinement. NULL
-propagates.
+letter is treated as a word boundary** rather than a word character — it passes through unchanged
+and the ASCII letter after it starts a new word — so `initcap('école')` is `'éCole'` (the `é` is
+left alone and the `c` is uppercased as a word start) where PostgreSQL gives `'École'`. PostgreSQL
+agrees for **ASCII** input, which the oracle corpus exercises; the non-ASCII titlecasing (full
+Unicode word classification + a loaded-bundle case fold, like `lower`/`upper`) is a deferred
+refinement — `initcap` does **not** consult the loaded property section today, even when one is
+loaded, because the bundle carries case mappings only and no alphanumeric classification
+([collation.md §16](collation.md)). NULL propagates.
 
 ### `to_hex(int) → text`
 
@@ -309,8 +312,9 @@ NULL propagates.
 ### `encode(bytea, format) → text` and `decode(text, format) → bytea`
 
 The inverse pair that converts between `bytea` and `text` in one of three formats — `hex`, `base64`,
-`escape` — matching PostgreSQL. An **unrecognized format** traps **`22023`** (*"unrecognized
-encoding"*). NULL args propagate. These are dependency-free, hand-written codecs (§14: base64 is
+`escape` — matching PostgreSQL. The format name is matched **ASCII-case-insensitively**
+(`'BASE64'`, `'Hex'` — PostgreSQL's `pg_strcasecmp`); an **unrecognized format** traps **`22023`**
+(*"unrecognized encoding"*, quoting the name as written). NULL args propagate. These are dependency-free, hand-written codecs (§14: base64 is
 RFC-4648-standardized so it agrees byte-for-byte across cores; jed hand-writes it rather than taking
 three different library deps).
 
@@ -320,11 +324,22 @@ three different library deps).
   hex input — [types.md](types.md) §13), erroring `22023` on an odd digit count (*"invalid
   hexadecimal data: odd number of digits"*) or an invalid digit — whitespace inside a pair or any
   other character (*"invalid hexadecimal digit: "<c>""*).
-- **`base64`** — RFC 4648, and on *encode* PostgreSQL wraps the output at **76 characters** with a
-  `\n` between chunks (no trailing newline); *decode* ignores a space, tab, newline, or carriage
-  return (PostgreSQL's set — a form feed or vertical tab is an invalid symbol). `encode('\x616263'::bytea,
+- **`base64`** — RFC 4648, and on *encode* PostgreSQL's `pg_base64_encode` layout: a `\n` after
+  every **76 characters** of full 3-byte groups — **including after the last full line** when the
+  full groups end exactly on one (57·k input bytes: `encode(repeat('a', 57)::bytea, 'base64')` is
+  77 characters) — and then the padded partial group, which never takes a newline; *decode* is
+  PostgreSQL's `pg_base64_decode` state machine over 4-symbol groups: a space, tab, newline, or
+  carriage return is skipped anywhere (PostgreSQL's set — a form feed or vertical tab is an
+  invalid symbol); an input ending mid-group (`'YQ'`, `'YWJ'`, `'YQ='`) is `22023` *"invalid base64
+  end sequence"*; `=` is legal only at position 2 or 3 of the first padded group (`22023`
+  *"unexpected "=" while decoding base64 sequence"* otherwise: `'='`, `'YWJj='`, `'YQ==='`), and
+  once padding has begun any further symbol — more `=` or even an alphabet character — is
+  zero-valued filler (`'YW=j'` → `\x61`, `'YQ==YQ=='` → `\x6161`, as PostgreSQL); a symbol outside
+  the alphabet is `22023` *"invalid symbol "<c>" found while decoding base64 sequence"* (the whole
+  code point); dangling low bits are dropped (`'AB=='` → `\x00`). `encode('\x616263'::bytea,
   'base64') = 'YWJj'`. (The corpus pins short values directly and the 76-char wrap via `length`,
-  since the harness cannot carry an embedded newline in an expected row.)
+  since the harness cannot carry an embedded newline in an expected row;
+  `suites/expr/bytea_base64_strict.test`.)
 - **`escape`** — a printable byte (`0x01`–`0x7f`) is emitted **verbatim** (including control bytes
   like tab/newline), a **backslash** (`0x5c`) is doubled, a **NUL** (`0x00`) becomes `\000`, and a
   **high-bit byte** (`0x80`–`0xff`) becomes `\` + a 3-digit **octal**. `encode('\x00ff41'::bytea,

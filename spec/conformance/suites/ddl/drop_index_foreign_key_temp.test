@@ -1,0 +1,27 @@
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# DROP INDEX of a bare unique index a FOREIGN KEY depends on, in the session-local temp domain
+# (spec/design/constraints.md §5.5; the persistent half is drop_index_foreign_key.test). An FK never
+# crosses domains (temp-tables.md §8), so the dependency scan runs over the index's own domain: a temp
+# child's FK protects its temp parent's last covering unique index with 2BP01. Oracle-checked against
+# PostgreSQL 18 (PostgreSQL's DETAIL line is not compared).
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.foreign_key, ddl.drop_table, ddl.temp_table, types.i32, session.allow_temp_ddl
+
+# --- session-local temporary tables ---------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE tp (id i32)
+
+statement ok
+CREATE UNIQUE INDEX tp_id ON tp (id)
+
+statement ok
+CREATE TEMP TABLE tc (id i32 PRIMARY KEY, pid i32 REFERENCES tp (id))
+
+statement error 2BP01
+DROP INDEX tp_id
+
+statement ok
+DROP TABLE tc
+
+statement ok
+DROP INDEX tp_id

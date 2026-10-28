@@ -1673,6 +1673,27 @@ func (db *engine) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, 
 	}
 	// Recurse into the children of every other node (a subquery may nest anywhere). The fields
 	// are only set for the relevant node kinds, so this is exhaustive without a per-kind switch.
+	if (e.kind == reAnd || e.kind == reOr) && e.lhs.kind == e.kind {
+		// A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is folded along its
+		// left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+		// the chain (cost.md §7f). The order is the recursive one's — the deepest lhs, then each
+		// rhs from the deepest node up — so subqueries run, and errors surface, in list order.
+		var spine []*rExpr
+		node := e
+		for node.kind == e.kind {
+			spine = append(spine, node)
+			node = node.lhs
+		}
+		if err := db.foldUncorrelatedInRExpr(node, bound, ctes, cost); err != nil {
+			return err
+		}
+		for i := len(spine) - 1; i >= 0; i-- {
+			if err := db.foldUncorrelatedInRExpr(spine[i].rhs, bound, ctes, cost); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if e.operand != nil {
 		if err := db.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost); err != nil {
 			return err
@@ -2822,14 +2843,12 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte(':')
 			b.WriteString(v.str())
 		case ValJsonb:
-			// jsonb keys on its CANONICAL text under a distinct 'B' tag (the canonical form makes
-			// structural equality the value equality, §5; jsonbOut is byte-identical for equal trees,
-			// so equal jsonb values share a DISTINCT/GROUP BY bucket). Length-prefixed.
-			s := jsonbOut(v.jsonb())
+			// jsonb keys STRUCTURALLY under a distinct 'B' tag (json.go writeJsonbDistinctKey): the
+			// walk emits each number's value-canonical decimal string, so Cmp-equal documents share
+			// one DISTINCT/GROUP BY bucket (`{"a":1}` and `{"a":1.0}` are equal — json.md §5; the
+			// canonical text render keeps the scale and would split them).
 			b.WriteByte('B')
-			b.WriteString(strconv.Itoa(len(s)))
-			b.WriteByte(':')
-			b.WriteString(s)
+			writeJsonbDistinctKey(&b, v.jsonb())
 		}
 	}
 	return b.String()

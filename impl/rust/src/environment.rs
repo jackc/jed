@@ -49,6 +49,9 @@ struct Contents {
     /// Loaded named zones and link aliases by exact name; first-wins. `UTC` and fixed offsets are
     /// never here (built in, timezones.md §3.2).
     zones: Arc<BTreeMap<String, Arc<Zone>>>,
+    /// `zones` indexed by ASCII-folded name for the case-insensitive lookup (timezones.md §3.2);
+    /// when two names fold to one key the byte-smaller canonical name wins.
+    zones_folded: Arc<BTreeMap<String, Arc<Zone>>>,
     /// The host scalar functions (extensibility.md §4.2).
     functions: Arc<ExtensionRegistry>,
     random: Arc<dyn RandomSource>,
@@ -80,6 +83,7 @@ impl Default for EnvironmentBuilder {
                 collations: Arc::new(BTreeMap::new()),
                 property: None,
                 zones: Arc::new(BTreeMap::new()),
+                zones_folded: Arc::new(BTreeMap::new()),
                 functions: Arc::new(ExtensionRegistry::default()),
                 random: crate::seam::os_random_source(),
                 clock: crate::seam::wall_clock(),
@@ -118,6 +122,13 @@ impl EnvironmentBuilder {
         for z in zones {
             set.entry(z.name.clone()).or_insert(z);
         }
+        let mut folded = BTreeMap::new();
+        for (name, z) in set.iter() {
+            folded
+                .entry(crate::timezone::fold_zone_name(name))
+                .or_insert_with(|| z.clone());
+        }
+        self.contents.zones_folded = Arc::new(folded);
         Ok(self)
     }
 
@@ -247,8 +258,18 @@ impl Environment {
     /// Resolve a zone name to a built-in fixed offset (`UTC` / `±HH[:MM[:SS]]`) or a loaded named
     /// zone (timezones.md §3.2). `None` ⇒ unknown (the caller raises `22023`).
     pub(crate) fn resolve_zone(&self, name: &str) -> Option<ZoneRef> {
+        // Case-insensitive like PostgreSQL's pg_tzset (timezones.md §3.2): an exact name wins, else
+        // the ASCII-folded name. The resolved zone keeps its canonical name (the one an index
+        // dependency records).
         crate::timezone::builtin_zone(name)
             .or_else(|| self.0.zones.get(name).cloned().map(ZoneRef::Zone))
+            .or_else(|| {
+                self.0
+                    .zones_folded
+                    .get(&crate::timezone::fold_zone_name(name))
+                    .cloned()
+                    .map(ZoneRef::Zone)
+            })
     }
 
     /// The loaded zones as persisted index dependencies, ascending by exact UTF-8 name

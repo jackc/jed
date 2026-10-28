@@ -76,15 +76,18 @@ func (db *engine) executeWith(wq *withQuery, params []Value) (outcome, error) {
 // reference expansion off, so a chain of such CTEs plans each body a bounded number of times.
 func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBinding, parent *scope, ptypes *paramTypes, primary ctePrimary) ([]*cteBinding, error) {
 	bindings := make([]*cteBinding, 0, len(ctes))
+	// The static reference counts behind the inline-candidate decision, one walk per part.
+	refs := newCteRefTally(ctes, primary)
+	// Duplicate names are rejected as they are met, so a name indexes at most one binding.
+	seen := make(map[string]struct{}, len(ctes))
 	for i := range ctes {
 		cte := &ctes[i]
 		lname := cte.Name
-		for _, b := range bindings {
-			if b.name == lname {
-				return nil, newError(DuplicateAlias,
-					"WITH query name "+lname+" specified more than once")
-			}
+		if _, dup := seen[lname]; dup {
+			return nil, newError(DuplicateAlias,
+				"WITH query name "+lname+" specified more than once")
 		}
+		seen[lname] = struct{}{}
 		searchCycle := cte.Search != nil || cte.Cycle != nil
 		isRecursive, unionAll := false, false
 		if recursive {
@@ -183,7 +186,7 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 			// its reference (planner.md §3.4). Its definition then expands no reference of its own; an
 			// uncorrelated candidate keeps that definition, a correlated one is planned again with
 			// expansion on (it stays an ordinary CTE).
-			candidate := cteReferenceCandidate(ctes, i, primary)
+			candidate := refs.candidate(ctes, i)
 			var plan queryPlan
 			planDefinition := func() error {
 				p, perr := db.planQuery(*q, parent, visible, ptypes)
@@ -257,42 +260,6 @@ func notRecursiveError(c *cte) error {
 type ctePrimary struct {
 	body  *cteBody
 	query *queryExpr
-}
-
-// refs returns the static (syntactic) references to CTE name in the primary, as (query,
-// data-modifying).
-func (p ctePrimary) refs(name string) (int, int) {
-	if p.body != nil {
-		return staticCteRefs(p.body, name)
-	}
-	return countSelfRefsQuery(*p.query, name), 0
-}
-
-// staticCteRefs returns the static references to CTE name in one part of a WITH statement, as
-// (query, data-modifying): a data-modifying part's references are counted apart, because such a part
-// is planned only when it runs, so a CTE it names is never inlined at its reference (planner.md
-// §3.4).
-func staticCteRefs(body *cteBody, name string) (int, int) {
-	n := countCteRefsDml(body, name)
-	if body.IsDataModifying() {
-		return 0, n
-	}
-	return n, 0
-}
-
-// cteReferenceCandidate reports whether the CTE at ci in a WITH list may be inlined at its reference
-// (planner.md §3.4): not MATERIALIZED, and named exactly once by the later CTE bodies and the
-// primary, by a query part.
-func cteReferenceCandidate(ctes []cte, ci int, primary ctePrimary) bool {
-	name := ctes[ci].Name
-	query, dml := primary.refs(name)
-	for k := ci + 1; k < len(ctes); k++ {
-		q, d := staticCteRefs(&ctes[k].Body, name)
-		query += q
-		dml += d
-	}
-	materialized := ctes[ci].Materialized != nil && *ctes[ci].Materialized
-	return query == 1 && dml == 0 && !materialized
 }
 
 func hasCteBinding(bindings []*cteBinding, name string) bool {
@@ -780,17 +747,14 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	//      data-modifying primary) contributes to each binding, so the inline-vs-materialize decision
 	//      is correct for a query CTE referenced only by a data-modifying part (§3). Query bodies / a
 	//      query primary were already plan-counted in (1)/(2).
+	byName := cteBindingsByName(bindings)
 	for i := range wq.Ctes {
 		if wq.Ctes[i].Body.IsDataModifying() {
-			for _, b := range bindings {
-				b.refs += countCteRefsDml(&wq.Ctes[i].Body, b.name)
-			}
+			addDmlCteRefs(byName, &wq.Ctes[i].Body)
 		}
 	}
 	if wq.Body.IsDataModifying() {
-		for _, b := range bindings {
-			b.refs += countCteRefsDml(&wq.Body, b.name)
-		}
+		addDmlCteRefs(byName, &wq.Body)
 	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
@@ -1039,188 +1003,312 @@ func validateRecursiveTerm(name string, sel *selectStmt) error {
 	return nil
 }
 
+// cteRefVisitor is what the cteRefs* walkers do at each plain relation reference they reach: it
+// receives the referenced name and returns that reference's contribution to the walk's count. Two
+// visitors exist — matchCteName counts one name (the countSelfRefs* / countCteRefsDml wrappers), and
+// cteRefCounts tallies every name in one pass (the cteRefTally the WITH planner uses so a list of n
+// CTEs is counted in O(total size), not O(n × size) — one walk per body, not one per (body, name)).
+type cteRefVisitor func(name string) int
+
+// matchCteName is the single-name visitor: +1 per reference to name.
+func matchCteName(name string) cteRefVisitor {
+	return func(ref string) int {
+		if ref == name {
+			return 1
+		}
+		return 0
+	}
+}
+
+// shadow masks name for the rest of a walk: a nested WITH that declares an inner CTE of that name
+// shadows the outer binding for its later bodies and its main query (cte.md §7), so a reference to
+// the name there is not a reference to the outer CTE.
+func (v cteRefVisitor) shadow(name string) cteRefVisitor {
+	return func(ref string) int {
+		if ref == name {
+			return 0
+		}
+		return v(ref)
+	}
+}
+
+// cteRefCounts tallies every plain relation reference a walk reaches, by name (the multi-name
+// visitor behind cteRefTally).
+type cteRefCounts map[string]int
+
+func (c cteRefCounts) visit(name string) int {
+	c[name]++
+	return 0
+}
+
 // countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
 // relations at every nesting level plus expression sublinks).
 func countSelfRefsQuery(qe queryExpr, name string) int {
+	return cteRefsQuery(qe, matchCteName(name))
+}
+
+// countCteRefsDml counts references to CTE name reachable through a cte_body's inner queries (the
+// writable-CTE analogue of countSelfRefsQuery, spec/design/writable-cte.md §3).
+func countCteRefsDml(body *cteBody, name string) int {
+	return cteRefsDml(body, matchCteName(name))
+}
+
+// cteRefTally is the static reference count of every CTE in one WITH list, computed in one walk per
+// part (planner.md §3.4). cteReferenceCandidate asks, for the CTE at ci, how often the LATER bodies
+// and the primary name it; answering that with a per-name walk over the remaining list is O(n²) in
+// the number of CTEs (20 000 CTEs took a minute of unmetered planning). The tally walks each body
+// once, keeping its per-name counts, and answers in cursor order: before CTE ci is asked, the counts
+// of bodies 0..ci are subtracted from the running totals, which then hold exactly the later bodies'
+// and the primary's references — the same figures as the per-name walks, in O(total size).
+type cteRefTally struct {
+	query  cteRefCounts   // references by query parts after the cursor + a query primary
+	dml    cteRefCounts   // references by data-modifying parts after the cursor + a data-modifying primary
+	bodies []cteRefCounts // per CTE body, its references by name
+	next   int            // the first body not yet subtracted
+}
+
+// newCteRefTally walks every CTE body and the primary once.
+func newCteRefTally(ctes []cte, primary ctePrimary) *cteRefTally {
+	t := &cteRefTally{query: cteRefCounts{}, dml: cteRefCounts{}, bodies: make([]cteRefCounts, len(ctes))}
+	for i := range ctes {
+		counts := cteRefCounts{}
+		cteRefsDml(&ctes[i].Body, counts.visit)
+		t.bodies[i] = counts
+		t.add(counts, ctes[i].Body.IsDataModifying(), 1)
+	}
+	counts := cteRefCounts{}
+	isDml := false
+	if primary.body != nil {
+		cteRefsDml(primary.body, counts.visit)
+		isDml = primary.body.IsDataModifying()
+	} else {
+		cteRefsQuery(*primary.query, counts.visit)
+	}
+	t.add(counts, isDml, 1)
+	return t
+}
+
+// add folds counts into the running totals (sign +1) or out of them (sign -1): a data-modifying
+// part's references count apart, because such a part is planned only when it runs, so a CTE it names
+// is never inlined at its reference (planner.md §3.4).
+func (t *cteRefTally) add(counts cteRefCounts, isDml bool, sign int) {
+	into := t.query
+	if isDml {
+		into = t.dml
+	}
+	for name, n := range counts {
+		into[name] += sign * n
+	}
+}
+
+// candidate reports whether the CTE at ci may be inlined at its reference (planner.md §3.4): not
+// MATERIALIZED, and named exactly once by the later CTE bodies and the primary, by a query part. The
+// WITH planner asks in list order, so the cursor only ever moves forward.
+func (t *cteRefTally) candidate(ctes []cte, ci int) bool {
+	for t.next <= ci {
+		t.add(t.bodies[t.next], ctes[t.next].Body.IsDataModifying(), -1)
+		t.next++
+	}
+	name := ctes[ci].Name
+	materialized := ctes[ci].Materialized != nil && *ctes[ci].Materialized
+	return t.query[name] == 1 && t.dml[name] == 0 && !materialized
+}
+
+// addDmlCteRefs adds the references one NON-planned data-modifying part (a data-modifying CTE body,
+// or a data-modifying primary) contributes to each binding it names (writable-cte.md §3), in one walk
+// of the part: byName indexes the bindings (the WITH planner rejects a duplicate name).
+func addDmlCteRefs(byName map[string]*cteBinding, body *cteBody) {
+	counts := cteRefCounts{}
+	cteRefsDml(body, counts.visit)
+	for name, n := range counts {
+		if b := byName[name]; b != nil {
+			b.refs += n
+		}
+	}
+}
+
+// cteBindingsByName indexes bindings by name for addDmlCteRefs.
+func cteBindingsByName(bindings []*cteBinding) map[string]*cteBinding {
+	byName := make(map[string]*cteBinding, len(bindings))
+	for _, b := range bindings {
+		byName[b.name] = b
+	}
+	return byName
+}
+
+// cteRefsQuery walks the self-references anywhere in a query expression (deep — FROM relations at
+// every nesting level plus expression sublinks), summing what visit returns for each.
+func cteRefsQuery(qe queryExpr, visit cteRefVisitor) int {
 	if qe.Select != nil {
-		return countSelfRefsSelect(qe.Select, name)
+		return cteRefsSelect(qe.Select, visit)
 	}
 	if qe.SetOp != nil {
-		return countSelfRefsQuery(qe.SetOp.Lhs, name) + countSelfRefsQuery(qe.SetOp.Rhs, name)
+		return cteRefsQuery(qe.SetOp.Lhs, visit) + cteRefsQuery(qe.SetOp.Rhs, visit)
 	}
 	// A nested WITH inherits this binding until an inner same-named CTE is declared. That inner
 	// binding shadows the outer one for later bodies and the main query, but its own non-recursive
 	// body still sees the outer binding (cte.md §7).
 	n := 0
-	shadowed := false
+	inner := visit
 	for i := range qe.With.Ctes {
-		if !shadowed {
-			n += countCteRefsDml(&qe.With.Ctes[i].Body, name)
-		}
-		if qe.With.Ctes[i].Name == name {
-			shadowed = true
-		}
+		n += cteRefsDml(&qe.With.Ctes[i].Body, inner)
+		inner = inner.shadow(qe.With.Ctes[i].Name)
 	}
-	if !shadowed {
-		n += countSelfRefsQuery(*qe.With.Body, name)
-	}
+	n += cteRefsQuery(*qe.With.Body, inner)
 	return n
 }
 
-// countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
+// cteRefsSelect walks the self-references in a SELECT: its FROM relations (deep) plus all of its
 // expressions' sublinks.
-func countSelfRefsSelect(s *selectStmt, name string) int {
+func cteRefsSelect(s *selectStmt, visit cteRefVisitor) int {
 	n := 0
 	for _, tref := range fromRelations(s) {
-		n += countSelfRefsTableref(tref, name)
+		n += cteRefsTableref(tref, visit)
 	}
 	for _, e := range selectExprs(s) {
-		n += countSelfRefsExpr(e, name)
+		n += cteRefsExpr(e, visit)
 	}
 	return n
 }
 
-// countSelfRefsTableref counts self-references reachable through one FROM relation: a plain table
-// reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
-// / VALUES' argument exprs.
-func countSelfRefsTableref(tref *tableRef, name string) int {
+// cteRefsTableref walks the self-references reachable through one FROM relation: a plain table
+// reference (visited by name), a derived-table subquery (recurse), or a table-function's / VALUES'
+// argument exprs.
+func cteRefsTableref(tref *tableRef, visit cteRefVisitor) int {
 	if isPlainRelation(tref) {
-		if tref.Name == name {
-			return 1
-		}
-		return 0
+		return visit(tref.Name)
 	}
 	n := 0
 	if tref.Subquery != nil {
-		n += countSelfRefsQuery(*tref.Subquery, name)
+		n += cteRefsQuery(*tref.Subquery, visit)
 	}
 	for _, a := range tref.Args {
-		n += countSelfRefsExpr(*a, name)
+		n += cteRefsExpr(*a, visit)
 	}
 	for _, row := range tref.Values {
 		for _, e := range row {
-			n += countSelfRefsExpr(*e, name)
+			n += cteRefsExpr(*e, visit)
 		}
 	}
 	return n
 }
 
-// countSelfRefsExpr counts self-references inside an expression — only reachable through a sublink
-// (a subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
+// cteRefsExpr walks the self-references inside an expression — only reachable through a sublink (a
+// subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
 // (like exprHasAggregate).
-func countSelfRefsExpr(e exprNode, name string) int {
+func cteRefsExpr(e exprNode, visit cteRefVisitor) int {
 	switch e.Kind {
 	case exprScalarSubquery, exprExists:
-		return countSelfRefsQuery(*e.Subquery, name)
+		return cteRefsQuery(*e.Subquery, visit)
 	case exprInSubquery:
-		return countSelfRefsExpr(e.InSubquery.Lhs, name) + countSelfRefsQuery(e.InSubquery.Query, name)
+		return cteRefsExpr(e.InSubquery.Lhs, visit) + cteRefsQuery(e.InSubquery.Query, visit)
 	case exprQuantifiedSubquery:
-		return countSelfRefsExpr(e.QuantifiedSubquery.Lhs, name) + countSelfRefsQuery(e.QuantifiedSubquery.Query, name)
+		return cteRefsExpr(e.QuantifiedSubquery.Lhs, visit) + cteRefsQuery(e.QuantifiedSubquery.Query, visit)
 	case exprCast:
-		return countSelfRefsExpr(e.Cast.Inner, name)
+		return cteRefsExpr(e.Cast.Inner, visit)
 	case exprExtract:
-		return countSelfRefsExpr(e.Extract.Source, name)
+		return cteRefsExpr(e.Extract.Source, visit)
 	case exprCollate:
-		return countSelfRefsExpr(e.Collate.Inner, name)
+		return cteRefsExpr(e.Collate.Inner, visit)
 	case exprUnary:
-		return countSelfRefsExpr(e.Unary.Operand, name)
+		return cteRefsExpr(e.Unary.Operand, visit)
 	case exprIsNull:
-		return countSelfRefsExpr(e.IsNullOf.Operand, name)
+		return cteRefsExpr(e.IsNullOf.Operand, visit)
 	case exprIsJson:
-		return countSelfRefsExpr(e.IsJsonOf.Operand, name)
+		return cteRefsExpr(e.IsJsonOf.Operand, visit)
 	case exprJsonCtor:
-		return countSelfRefsExpr(e.JsonCtorOf.Operand, name)
+		return cteRefsExpr(e.JsonCtorOf.Operand, visit)
 	case exprJsonExists:
-		n := countSelfRefsExpr(e.JsonExists.Ctx, name) + countSelfRefsExpr(e.JsonExists.Path, name)
+		n := cteRefsExpr(e.JsonExists.Ctx, visit) + cteRefsExpr(e.JsonExists.Path, visit)
 		for _, p := range e.JsonExists.Passing {
-			n += countSelfRefsExpr(p.Expr, name)
+			n += cteRefsExpr(p.Expr, visit)
 		}
 		return n
 	case exprJsonValue:
-		n := countSelfRefsExpr(e.JsonValue.Ctx, name) + countSelfRefsExpr(e.JsonValue.Path, name)
+		n := cteRefsExpr(e.JsonValue.Ctx, visit) + cteRefsExpr(e.JsonValue.Path, visit)
 		for _, p := range e.JsonValue.Passing {
-			n += countSelfRefsExpr(p.Expr, name)
+			n += cteRefsExpr(p.Expr, visit)
 		}
 		return n
 	case exprJsonQuery:
-		n := countSelfRefsExpr(e.JsonQuery.Ctx, name) + countSelfRefsExpr(e.JsonQuery.Path, name)
+		n := cteRefsExpr(e.JsonQuery.Ctx, visit) + cteRefsExpr(e.JsonQuery.Path, visit)
 		for _, p := range e.JsonQuery.Passing {
-			n += countSelfRefsExpr(p.Expr, name)
+			n += cteRefsExpr(p.Expr, visit)
 		}
 		return n
 	case exprBinary:
-		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
+		return cteRefsExpr(e.Binary.Lhs, visit) + cteRefsExpr(e.Binary.Rhs, visit)
 	case exprIsDistinct:
-		return countSelfRefsExpr(e.IsDistinct.Lhs, name) + countSelfRefsExpr(e.IsDistinct.Rhs, name)
+		return cteRefsExpr(e.IsDistinct.Lhs, visit) + cteRefsExpr(e.IsDistinct.Rhs, visit)
 	case exprIn:
-		n := countSelfRefsExpr(e.In.Lhs, name)
+		n := cteRefsExpr(e.In.Lhs, visit)
 		for _, x := range e.In.List {
-			n += countSelfRefsExpr(x, name)
+			n += cteRefsExpr(x, visit)
 		}
 		return n
 	case exprBetween:
-		return countSelfRefsExpr(e.Between.Lhs, name) + countSelfRefsExpr(e.Between.Lo, name) + countSelfRefsExpr(e.Between.Hi, name)
+		return cteRefsExpr(e.Between.Lhs, visit) + cteRefsExpr(e.Between.Lo, visit) + cteRefsExpr(e.Between.Hi, visit)
 	case exprLike:
-		return countSelfRefsExpr(e.Like.Lhs, name) + countSelfRefsExpr(e.Like.Rhs, name)
+		return cteRefsExpr(e.Like.Lhs, visit) + cteRefsExpr(e.Like.Rhs, visit)
 	case exprRegex:
-		return countSelfRefsExpr(e.Regex.Lhs, name) + countSelfRefsExpr(e.Regex.Rhs, name)
+		return cteRefsExpr(e.Regex.Lhs, visit) + cteRefsExpr(e.Regex.Rhs, visit)
 	case exprCase:
 		n := 0
 		if e.Case.Operand != nil {
-			n += countSelfRefsExpr(*e.Case.Operand, name)
+			n += cteRefsExpr(*e.Case.Operand, visit)
 		}
 		for _, w := range e.Case.Whens {
-			n += countSelfRefsExpr(w.Cond, name) + countSelfRefsExpr(w.Result, name)
+			n += cteRefsExpr(w.Cond, visit) + cteRefsExpr(w.Result, visit)
 		}
 		if e.Case.Els != nil {
-			n += countSelfRefsExpr(*e.Case.Els, name)
+			n += cteRefsExpr(*e.Case.Els, visit)
 		}
 		return n
 	case exprCoalesce:
 		n := 0
 		for _, a := range e.Coalesce {
-			n += countSelfRefsExpr(a, name)
+			n += cteRefsExpr(a, visit)
 		}
 		return n
 	case exprGreatestLeast:
 		n := 0
 		for _, a := range e.GreatestLeast {
-			n += countSelfRefsExpr(a, name)
+			n += cteRefsExpr(a, visit)
 		}
 		return n
 	case exprNullIf:
 		n := 0
 		for _, a := range e.NullIf {
-			n += countSelfRefsExpr(a, name)
+			n += cteRefsExpr(a, visit)
 		}
 		return n
 	case exprFuncCall:
 		n := 0
 		for _, a := range e.FuncCall.Args {
-			n += countSelfRefsExpr(*a, name)
+			n += cteRefsExpr(*a, visit)
 		}
 		return n
 	case exprFieldAccess, exprFieldStar:
-		return countSelfRefsExpr(*e.Base, name)
+		return cteRefsExpr(*e.Base, visit)
 	case exprQualifiedStar:
 		return 0 // a leaf relation reference — no sublink to recurse into
 
 	case exprSubscript:
-		n := countSelfRefsExpr(*e.Base, name)
+		n := cteRefsExpr(*e.Base, visit)
 		for _, sp := range e.Subscripts {
 			for _, x := range subscriptSpecExprs(sp) {
-				n += countSelfRefsExpr(*x, name)
+				n += cteRefsExpr(*x, visit)
 			}
 		}
 		return n
 	case exprRow, exprArray:
 		n := 0
 		for _, it := range e.RowItems {
-			n += countSelfRefsExpr(it, name)
+			n += cteRefsExpr(it, visit)
 		}
 		return n
 	case exprQuantified:
-		return countSelfRefsExpr(e.Quantified.Lhs, name) + countSelfRefsExpr(e.Quantified.Array, name)
+		return cteRefsExpr(e.Quantified.Lhs, visit) + cteRefsExpr(e.Quantified.Array, visit)
 	default:
 		return 0
 	}
@@ -1276,85 +1364,85 @@ func addOutcomeCost(outcome outcome, extra int64) outcome {
 	return outcome
 }
 
-// countCteRefsDml counts references to CTE name reachable through a cte_body's inner queries — the
-// writable-CTE analogue of countSelfRefsQuery (spec/design/writable-cte.md §3). A query body
-// delegates to the query counter; a data-modifying body counts the references in its source query /
+// cteRefsDml walks the references reachable through a cte_body's inner queries — the writable-CTE
+// analogue of cteRefsQuery (spec/design/writable-cte.md §3). A query body
+// delegates to the query walker; a data-modifying body walks the references in its source query /
 // WHERE / SET RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the
 // references a NON-planned data-modifying part contributes to the inline-vs-materialize decision.
-func countCteRefsDml(body *cteBody, name string) int {
+func cteRefsDml(body *cteBody, visit cteRefVisitor) int {
 	switch {
 	case body.Query != nil:
-		return countSelfRefsQuery(*body.Query, name)
+		return cteRefsQuery(*body.Query, visit)
 	case body.Insert != nil:
 		ins := body.Insert
 		n := 0
 		if ins.Query != nil {
-			n += countSelfRefsQuery(*ins.Query, name)
+			n += cteRefsQuery(*ins.Query, visit)
 		}
 		// A VALUES expression slot may hold a sublink (grammar.md §16).
 		for _, values := range ins.Rows {
 			for _, v := range values {
 				if v.IsExpr {
-					n += countSelfRefsExpr(*v.Expr, name)
+					n += cteRefsExpr(*v.Expr, visit)
 				}
 			}
 		}
 		if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
 			for i := range ins.OnConflict.Assignments {
-				n += countSelfRefsExpr(ins.OnConflict.Assignments[i].Value, name)
+				n += cteRefsExpr(ins.OnConflict.Assignments[i].Value, visit)
 			}
 			if ins.OnConflict.Filter != nil {
-				n += countSelfRefsExpr(*ins.OnConflict.Filter, name)
+				n += cteRefsExpr(*ins.OnConflict.Filter, visit)
 			}
 		}
-		return n + countReturningRefs(ins.Returning, name)
+		return n + cteRefsReturning(ins.Returning, visit)
 	case body.Update != nil:
 		upd := body.Update
 		n := 0
 		for i := range upd.Assignments {
-			n += countSelfRefsExpr(upd.Assignments[i].Value, name)
+			n += cteRefsExpr(upd.Assignments[i].Value, visit)
 		}
 		if upd.Filter != nil {
-			n += countSelfRefsExpr(*upd.Filter, name)
+			n += cteRefsExpr(*upd.Filter, visit)
 		}
-		return n + countReturningRefs(upd.Returning, name)
+		return n + cteRefsReturning(upd.Returning, visit)
 	case body.Merge != nil:
 		m := body.Merge
-		n := countSelfRefsQuery(m.Source, name) + countSelfRefsExpr(m.On, name)
+		n := cteRefsQuery(m.Source, visit) + cteRefsExpr(m.On, visit)
 		for ci := range m.Clauses {
 			c := &m.Clauses[ci]
 			if c.Condition != nil {
-				n += countSelfRefsExpr(*c.Condition, name)
+				n += cteRefsExpr(*c.Condition, visit)
 			}
 			for i := range c.Assignments {
-				n += countSelfRefsExpr(c.Assignments[i].Value, name)
+				n += cteRefsExpr(c.Assignments[i].Value, visit)
 			}
 			for i := range c.Values {
 				if !c.Values[i].IsDefault {
-					n += countSelfRefsExpr(c.Values[i].Expr, name)
+					n += cteRefsExpr(c.Values[i].Expr, visit)
 				}
 			}
 		}
-		return n + countReturningRefs(m.Returning, name)
+		return n + cteRefsReturning(m.Returning, visit)
 	default:
 		del := body.Delete
 		n := 0
 		if del.Filter != nil {
-			n += countSelfRefsExpr(*del.Filter, name)
+			n += cteRefsExpr(*del.Filter, visit)
 		}
-		return n + countReturningRefs(del.Returning, name)
+		return n + cteRefsReturning(del.Returning, visit)
 	}
 }
 
-// countReturningRefs counts references to CTE name in a RETURNING item list's sublinks (the star
-// form RETURNING * has no expressions, so it contributes none).
-func countReturningRefs(returning *returningClause, name string) int {
+// cteRefsReturning walks the references in a RETURNING item list's sublinks (the star form
+// RETURNING * has no expressions, so it contributes none).
+func cteRefsReturning(returning *returningClause, visit cteRefVisitor) int {
 	if returning == nil || returning.Items.All {
 		return 0
 	}
 	n := 0
 	for i := range returning.Items.Items {
-		n += countSelfRefsExpr(returning.Items.Items[i].Expr, name)
+		n += cteRefsExpr(returning.Items.Items[i].Expr, visit)
 	}
 	return n
 }
@@ -1377,7 +1465,7 @@ func countFromSubquerySelfRefs(s *selectStmt, name string) int {
 	n := 0
 	for _, tref := range fromRelations(s) {
 		if !isPlainRelation(tref) {
-			n += countSelfRefsTableref(tref, name)
+			n += cteRefsTableref(tref, matchCteName(name))
 		}
 	}
 	return n
@@ -1388,7 +1476,7 @@ func countFromSubquerySelfRefs(s *selectStmt, name string) int {
 func countSublinkSelfRefs(s *selectStmt, name string) int {
 	n := 0
 	for _, e := range selectExprs(s) {
-		n += countSelfRefsExpr(e, name)
+		n += cteRefsExpr(e, matchCteName(name))
 	}
 	return n
 }

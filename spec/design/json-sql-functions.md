@@ -27,7 +27,7 @@ recorded as data, not branchy code — except where PG observably differs, §3).
 
 | op | signature | result | slice | notes |
 |---|---|---|---|---|
-| `->` | `jsonb -> text` / `jsonb -> i32` | `jsonb` | J4 | field by key / element by index; out-of-range/absent → SQL NULL |
+| `->` | `jsonb -> text` / `jsonb -> i32` | `jsonb` | J4 | field by key / element by index; out-of-range/absent → SQL NULL. A **top-level scalar** is PostgreSQL's one-element raw-scalar pseudo-array, so `'"x"'::jsonb -> 0` and `-> -1` are `"x"` ([json.md §5](json.md)); only the operator's root sees this (`#>` and the `json` overload do not) |
 | `->>` | `jsonb ->> text` / `jsonb ->> i32` | `text` | J4 | same, rendered as text |
 | `#>` | `jsonb #> text[]` | `jsonb` | J4 | get at path |
 | `#>>` | `jsonb #>> text[]` | `text` | J4 | get at path as text |
@@ -108,7 +108,7 @@ rows, because the conversion needs the argument's static type (§2.2).
 | `to_json(anyelement)` / `to_jsonb(anyelement)` | any value | `json` / `jsonb` | any jed value → its JSON image (§2.2) |
 | `json_build_array(VARIADIC "any")` / `jsonb_build_array` | variadic | `json`/`jsonb` | array from heterogeneous args (existing `variadic` facility) |
 | `json_build_object(VARIADIC "any")` / `jsonb_build_object` | variadic key/value pairs | `json`/`jsonb` | odd arg count → `22023`; keys and values per §2.2 |
-| `json_object(text[])` / `json_object(text[], text[])` / `jsonb_object(…)` | text array(s) | `json`/`jsonb` | the one-array (k,v,…) and two-array (keys, values) forms |
+| `json_object(text[])` / `json_object(text[], text[])` / `jsonb_object(…)` | text array(s) | `json`/`jsonb` | the one-array (k,v,…) and two-array (keys, values) forms. PostgreSQL's shape rules: the one-array form takes a 1-D array (odd length → `2202E` *array must have even number of elements*) or a 2-D array of pairs (`{{k,v},…}`; another inner length → `2202E` *array must have two columns*); the two-array form takes two 1-D arrays of one length (`2202E` *mismatched array dimensions*); any other dimensionality → `2202E` *wrong number of array subscripts*; an empty array → `{}` |
 | `json_array_length(json)` / `jsonb_array_length(jsonb)` | array | `i32` | `22023` on non-array |
 | `json_typeof(json)` / `jsonb_typeof(jsonb)` | any | `text` | `object`/`array`/`string`/`number`/`boolean`/`null` (SQL NULL → SQL NULL) |
 | `json_strip_nulls(json[, bool])` / `jsonb_strip_nulls(jsonb[, bool])` | any | `json`/`jsonb` | remove object members whose value is JSON null |
@@ -390,7 +390,10 @@ dispatch** (the same parse site as `IS NULL` / `IS DISTINCT FROM`).
 
 All three query functions compile `path` to a `jsonpath` program, evaluate it to a sequence
 over the context item ([jsonpath.md §3](jsonpath.md)) — a `json` context is first converted to
-`jsonb`, as PostgreSQL casts it ([jsonpath.md §5](jsonpath.md)) — then:
+`jsonb`, as PostgreSQL casts it ([jsonpath.md §5](jsonpath.md)), and a **`text`** context (with
+or without `FORMAT JSON`; a `::text` expression or a text column — a bare string literal adapts
+to `jsonb` instead) is parsed as `jsonb` the same way, malformed text raising `22P02` from the
+context's conversion, which `ON ERROR` does not catch ([json.md §4.2](json.md)) — then:
 
 - **`JSON_EXISTS`** — non-empty → true (a lax path stops at its first item, jsonpath.md §5);
   errors honor `ON ERROR` (PG default `FALSE`).

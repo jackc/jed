@@ -44,12 +44,44 @@ fn type_rank(n: &JsonNode) -> u8 {
 }
 
 impl JsonNode {
-    /// The PG `jsonb` total btree order (spec/design/json.md §5). A definite ordering (no SQL
-    /// NULLs inside a document), driving both `<` and `ORDER BY` from one comparator so they
-    /// agree by construction. Type rank first; within a type: booleans false<true, numbers by
-    /// `Decimal` value, strings by collation-`C` UTF-8 byte order, arrays/objects by element/
-    /// member COUNT first (PG compares container length before contents) then element-wise.
+    /// Whether the node is a JSON scalar (null, boolean, number, string).
+    pub fn is_scalar(&self) -> bool {
+        !matches!(self, JsonNode::Array(_) | JsonNode::Object(_))
+    }
+
+    /// The PG `jsonb` total btree order (spec/design/json.md §5) of two WHOLE documents. A definite
+    /// ordering (no SQL NULLs inside a document), driving both `<` and `ORDER BY` from one
+    /// comparator so they agree by construction. It is [`JsonNode::cmp_nested`] plus PostgreSQL's
+    /// one root-level quirk: a top-level scalar is stored as a one-element "raw scalar"
+    /// pseudo-array, and `compareJsonbContainers` checks the element count AFTER the raw-scalar
+    /// flag, so a scalar sorts after the empty array and before every non-empty array
+    /// (`[]` < null < "a" < 1 < true < [1] < {}). Inside a container the ordinary type rank
+    /// applies (`[null]` < `[[]]`).
     pub fn cmp(&self, other: &JsonNode) -> Ordering {
+        if let (true, JsonNode::Array(b)) = (self.is_scalar(), other) {
+            return if b.is_empty() {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        if let (JsonNode::Array(a), true) = (self, other.is_scalar()) {
+            return if a.is_empty() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        self.cmp_nested(other)
+    }
+
+    /// The PG `jsonb` order of two nodes BELOW the document root (json.md §5). Type rank first;
+    /// within a type: booleans false<true, numbers by `Decimal` value, strings by collation-`C`
+    /// UTF-8 byte order, arrays/objects by element/member COUNT first (PG compares container
+    /// length before contents) then element-wise — an object's members pairwise in stored
+    /// canonical key order, each key compared BYTEWISE (PG compares the key strings under the
+    /// collation, not length-first: `{"b":1}` > `{"aa":1}`).
+    fn cmp_nested(&self, other: &JsonNode) -> Ordering {
         let (ra, rb) = (type_rank(self), type_rank(other));
         if ra != rb {
             return ra.cmp(&rb);
@@ -61,7 +93,7 @@ impl JsonNode {
             (JsonNode::String(a), JsonNode::String(b)) => a.as_bytes().cmp(b.as_bytes()),
             (JsonNode::Array(a), JsonNode::Array(b)) => a.len().cmp(&b.len()).then_with(|| {
                 for (x, y) in a.iter().zip(b.iter()) {
-                    let o = x.cmp(y);
+                    let o = x.cmp_nested(y);
                     if o != Ordering::Equal {
                         return o;
                     }
@@ -69,13 +101,15 @@ impl JsonNode {
                 Ordering::Equal
             }),
             (JsonNode::Object(a), JsonNode::Object(b)) => a.len().cmp(&b.len()).then_with(|| {
-                // Members are in canonical key order in both; compare keys then values pairwise.
+                // Members are in canonical (length-first) key order in both; compare keys BYTEWISE
+                // then values, pairwise (the storage order and the key comparison deliberately
+                // differ, as in PostgreSQL — json.md §5).
                 for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
-                    let ko = key_cmp(ka, kb);
+                    let ko = ka.as_bytes().cmp(kb.as_bytes());
                     if ko != Ordering::Equal {
                         return ko;
                     }
-                    let vo = va.cmp(vb);
+                    let vo = va.cmp_nested(vb);
                     if vo != Ordering::Equal {
                         return vo;
                     }
@@ -87,9 +121,9 @@ impl JsonNode {
     }
 }
 
-/// Canonical object-key order (spec/design/json.md §2.3): shorter key first, ties broken
-/// bytewise — PostgreSQL's jsonb key order. The canonicalizer sorts by this and the comparator
-/// compares keys by this.
+/// Canonical object-key STORAGE order (spec/design/json.md §2.3): shorter key first, ties broken
+/// bytewise — PostgreSQL's jsonb key order. The canonicalizer sorts by this; the comparator walks
+/// members in this order but compares the keys themselves bytewise (§5).
 pub fn key_cmp(a: &str, b: &str) -> Ordering {
     a.len()
         .cmp(&b.len())
@@ -815,6 +849,22 @@ pub fn get_field<'a>(node: &'a JsonNode, key: &str) -> Option<&'a JsonNode> {
         JsonNode::Object(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
         _ => None,
     }
+}
+
+/// `jsonb -> int` applied to a WHOLE document (json-sql-functions.md §1): an array element by
+/// index, or — PostgreSQL's raw-scalar quirk — the document itself when it is a top-level scalar
+/// and the index names its single pseudo-array element (0 or -1): `'"x"'::jsonb -> 0` is `"x"`. An
+/// object, or any other index, → `None` (SQL NULL). Only the operator's root sees the pseudo-array;
+/// a `#>` path step over a nested scalar is a miss ([`get_index`]).
+pub fn get_root_index(node: &JsonNode, idx: i64) -> Option<&JsonNode> {
+    if node.is_scalar() {
+        return if idx == 0 || idx == -1 {
+            Some(node)
+        } else {
+            None
+        };
+    }
+    get_index(node, idx)
 }
 
 /// `jsonb -> int`: an array element by index (a negative index counts from the end). `None`

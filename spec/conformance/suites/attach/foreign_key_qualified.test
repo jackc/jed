@@ -1,0 +1,111 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen (a fresh
+# Database handle is opened from the file, and an in-memory attachment lives only on the old handle;
+# spec/design/conformance.md §3, attached-databases.md §5).
+# A qualified FOREIGN KEY parent — `REFERENCES db.t (cols)` in the column-level and table-level forms
+# and in ALTER TABLE … ADD (spec/design/attached-databases.md §4, constraints.md §6.2 step 2). The
+# parent is a qualified_table: `main.` / `temp.` pin the implicit scope, so the name is looked up
+# there alone (a validation gate — preclude-overlaps keeps a name in one scope) and the persistence
+# rule (42P16, temp-tables.md §8) then applies as for a bare name; an attachment qualifier is a
+# cross-database foreign key, which §8 forbids (0A000); an unknown qualifier is 42P01 "not attached".
+# The `# attach:` directive attaches a fresh in-memory database `o`. jed-specific (PostgreSQL has no
+# embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# attach: o
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.primary_key, ddl.foreign_key, ddl.temp_table, ddl.alter_table, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, session.allow_temp_ddl, resource.cost_metering
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p VALUES (1), (2)
+
+statement ok
+CREATE TABLE o.t (id i32 PRIMARY KEY)
+
+# --- the qualifier is validated before the table name ------------------------------------------
+
+statement error 42P01
+CREATE TABLE f (x i32 REFERENCES nope.p (id))
+
+statement error 42P01
+CREATE TABLE f (x i32, FOREIGN KEY (x) REFERENCES nope.p (id))
+
+# A cross-database foreign key is refused (§8) — in both constraint forms.
+statement error 0A000
+CREATE TABLE f (x i32 REFERENCES o.t (id))
+
+statement error 0A000
+CREATE TABLE f (x i32, CONSTRAINT f_fk FOREIGN KEY (x) REFERENCES o.t (id))
+
+# A table in the attachment cannot carry a foreign key at all this slice, even to its own database.
+statement error 0A000
+CREATE TABLE o.f (x i32 REFERENCES o.t (id))
+
+# `temp.` looks in the session-local domain alone: p is persistent, so it is not found there.
+statement error 42P01
+CREATE TABLE f (x i32 REFERENCES temp.p (id))
+
+# --- the implicit scopes resolve ----------------------------------------------------------------
+
+statement ok
+CREATE TABLE f (x i32 REFERENCES main.p (id))
+
+# The constraint is enforced exactly as a bare REFERENCES p (id).
+statement ok
+INSERT INTO f VALUES (1)
+
+# cost: 0
+statement error 23503
+INSERT INTO f VALUES (9)
+
+# A self-reference may spell its own table with the qualifier.
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, parent i32 REFERENCES main.s (id))
+
+statement ok
+INSERT INTO s VALUES (1, NULL), (2, 1)
+
+# ALTER TABLE … ADD takes the same qualified parent and the same validation.
+statement ok
+CREATE TABLE g (x i32)
+
+statement error 42P01
+ALTER TABLE g ADD FOREIGN KEY (x) REFERENCES nope.p (id)
+
+statement error 0A000
+ALTER TABLE g ADD FOREIGN KEY (x) REFERENCES o.t (id)
+
+statement error 42P01
+ALTER TABLE g ADD FOREIGN KEY (x) REFERENCES temp.p (id)
+
+statement ok
+ALTER TABLE g ADD CONSTRAINT g_fk FOREIGN KEY (x) REFERENCES main.p (id)
+
+# cost: 0
+statement error 23503
+INSERT INTO g VALUES (9)
+
+# --- temp tables through `temp.` ------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE tp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE tf (x i32 REFERENCES temp.tp (id))
+
+# `main.` on a temp parent finds nothing in main.
+statement error 42P01
+CREATE TEMP TABLE tf2 (x i32 REFERENCES main.tp (id))
+
+# The persistence rule still applies once the parent is found: a persistent child may not reference
+# a temp parent, however it is spelled.
+statement error 42P16
+CREATE TABLE h (x i32 REFERENCES temp.tp (id))
+
+statement error 42P16
+CREATE TEMP TABLE th (x i32 REFERENCES main.p (id))
+
+query I nosort
+SELECT id FROM p ORDER BY id
+----
+1
+2

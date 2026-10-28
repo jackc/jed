@@ -246,7 +246,8 @@ subsequent statements run within it until it ends:
 - **`BEGIN` while already in an explicit block** has no defined action (nesting is
   `SAVEPOINT`'s job — §11) → **`25001 active_sql_transaction`**. PostgreSQL only warns here;
   jed has no warning channel, and silently ignoring the statement would hide a nesting bug, so
-  it errors without aborting the block.
+  it errors without aborting the block. In a **failed** block (§6) it is the block's `25P02`
+  instead, as in PostgreSQL.
 - **`COMMIT`/`ROLLBACK` in autocommit mode** (no open block) → a **lenient no-op success**.
   PostgreSQL warns ("there is no transaction in progress"); jed has no warning channel
   (CLAUDE.md §4), so it silently succeeds rather than raising — a documented, deliberate
@@ -328,9 +329,12 @@ top of it and **depends on the mode**, faithfully mirroring PostgreSQL:
 - **Explicit block** (§4.2): a statement error **aborts the transaction** — it enters the
   **failed** state. Every subsequent statement except `ROLLBACK` (and `COMMIT`, treated as
   `ROLLBACK`) and `ROLLBACK TO` a savepoint is rejected with **`25P02
-  in_failed_sql_transaction`** until the block ends. `ROLLBACK` clears the failed state, and so
+  in_failed_sql_transaction`** until the block ends — `BEGIN` and `SAVEPOINT` included. `ROLLBACK` clears the failed state, and so
   does `ROLLBACK TO` an existing savepoint, which returns the block to that savepoint's state (§11). This matches PostgreSQL's "current transaction is aborted,
-  commands ignored until end of transaction block."
+  commands ignored until end of transaction block." **Any** error counts, whatever stage raises
+  it: a parse error (`42601`), the `54000` input-size limit, a host-API parameter-conversion
+  error, a `prepare` that fails to parse, and a pre-execution `57014` abort the block exactly like
+  an execution error — PostgreSQL aborts on an error in the parse/bind stages too.
 
 New error codes (class 25, *invalid transaction state*), in
 [../errors/registry.toml](../errors/registry.toml):
@@ -341,6 +345,7 @@ New error codes (class 25, *invalid transaction state*), in
 | `25006` | `read_only_sql_transaction` | a write statement issued in a READ ONLY transaction (§4.3) |
 | `25P01` | `no_active_sql_transaction` | `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` with no open block (§11) |
 | `25P02` | `in_failed_sql_transaction` | any statement but `ROLLBACK`/`COMMIT`/`ROLLBACK TO` in a failed block (§6) |
+| `2D000` | `invalid_transaction_termination` | `COMMIT`/`ROLLBACK` (SQL or the handle's methods) inside a `view`/`update` closure ([api.md §2.2](api.md)) |
 | `3B001` | `invalid_savepoint_specification` | `RELEASE` / `ROLLBACK TO` naming no savepoint of the block (§11) |
 
 A `COMMIT`/`ROLLBACK` with no open block is a no-op success, **not** an error (§4.2); `25P01` is

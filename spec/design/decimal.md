@@ -176,9 +176,14 @@ make `1/3 → rscale 20` (f1=1 ≤ f2=3 ⇒ qweight −1 ⇒ 16+4) and `10.0/4.0
 (f1=10 > f2=4 ⇒ qweight 0, then max with s=1). This is the single hardest function to keep
 byte-identical — it is pinned with division fixtures (`1/3, 2/3, 1/7, 10/4, 1/8, 100/7`).
 
-**Division itself** (`value1 / value2`, value2 ≠ 0): with `E = rscale + s2 − s1` (always `≥ 0`,
-since `rscale ≥ s1`), form `N = |C1| · 10^E`; then `q = N div |C2|`, `r = N mod |C2|`, and
-**`if 2·r ≥ |C2|: q += 1`** (half away, §3). Result = `(neg1 XOR neg2, q, rscale)`, normalized.
+**Division itself** (`value1 / value2`, value2 ≠ 0): with `E = rscale + s2 − s1`, form the
+integer pair `N`, `D`: when `E ≥ 0` (the usual case, `rscale ≥ s1`) `N = |C1| · 10^E` and
+`D = |C2|`; when `E < 0` — only possible when `s1` exceeds the 1000-digit clamp above, so the
+quotient has *fewer* fractional digits than the dividend — `N = |C1|` and `D = |C2| · 10^−E`
+(the shift moves to the divisor; it is never a wrapped unsigned shift). Then `q = N div D`,
+`r = N mod D`, and **`if 2·r ≥ D: q += 1`** (half away, §3) — so `5e-1001 / 1` rounds up to
+`1e-1000` and `4e-1001 / 1` to `0`, as PostgreSQL. Result = `(neg1 XOR neg2, q, rscale)`,
+normalized.
 Division/modulo by zero traps **`22012`** (the integer trap, reused).
 
 **Overflow.** A constrained result (a `numeric(p,s)` column/CAST target) traps `22003` by the
@@ -286,7 +291,12 @@ Newton `isqrt` over the limb magnitude — jed's own routine, not PG's Karatsuba
 sum, then re-square). `ln_var` reduces `x` into (0.9, 1.1) by repeated `sqrt`, then sums the
 `atanh` series `2·(z + z³/3 + z⁵/5 + …)` with `z = (x−1)/(x+1)`. `log_var(base, num)` is
 `ln(num)/ln(base)`; one-arg `log`/`log10` is `log(10, x)`. `power_var` routes an integer exponent
-to `power_var_int` (binary exponentiation) and a non-integer to `exp(exp·ln(base))`.
+that fits `int32` to `power_var_int` (binary exponentiation) and everything else to
+`exp(exp·ln(base))` — a **negative base** there insists on an exponent that is integral *by
+value* (the integers past the `int32` gate still arrive here: `power(-1.0, 2147483649)` is
+`-1.0000000000000000`, never the complex-result error), computes over `|base|`, and takes the
+sign from the exponent's parity (odd → negative; a zero result stays positive), exactly PG's
+`power_var` (`suites/expr/decimal_power_negative_base.test`).
 
 **Result scale.** As in PG, the result targets at least **`NUMERIC_MIN_SIG_DIGITS` = 16**
 significant digits and never falls below the input's display scale, clamped to

@@ -121,13 +121,15 @@ counters. This is deterministic under an injected random source + clock and cros
 
 ## 4. The `uuidv7(shift interval)` overload
 
-PostgreSQL offsets the embedded timestamp by an `interval` before generating. jed reuses its
-existing **calendar-aware** `timestamptz + interval` arithmetic (`interval::ts_shift`,
-[interval.md](interval.md) §5) — months land on calendar months — so the shift is PG-faithful and
-there is no second interval model: `shifted = ts_shift(stmt_clock_micros, interval)`, then
-`unix_ms = floor(shifted / 1000)` (§3). Overflow in the add traps the same `22008` the shift
-arithmetic already raises. A NULL interval propagates (the catalog `null = "propagates"` — the call
-returns NULL).
+PostgreSQL offsets the embedded timestamp by an `interval` before generating (its
+`timestamptz_pl_interval`, in the session zone). jed reuses its existing **calendar-aware**
+`timestamptz + interval` arithmetic (`interval::ts_shift_zoned` with the session zone,
+[interval.md](interval.md) §5) — months land on calendar months and days on calendar days of the
+session zone's wall clock — so the shift is PG-faithful and there is no second interval model:
+`shifted = ts_shift_zoned(stmt_clock_micros, interval, session_zone)`, then
+`unix_ms = floor(shifted / 1000)` (§3), charging one `timezone` unit per calendar step like the
+operator. Overflow in the add traps the same `22008` the shift arithmetic already raises. A NULL
+interval propagates (the catalog `null = "propagates"` — the call returns NULL).
 
 ## 5. The seam in the cores
 

@@ -1291,9 +1291,12 @@ function* rebalanceChildSteps(
 // nothing comes down); an INTERIOR merge PULLS the separator DOWN between the two key lists (the
 // merged children need a routing key between them). If M fits, it replaces the pair (the parent
 // loses one key); if it overflows, it is split 2-way by the balanced rule and the halves + the new
-// separator replace the pair (the parent's key count is unchanged). An INTERIOR M that overflows
-// but admits no valid split (near-cap separators) ABANDONS the merge — the parent is returned
-// unchanged (format.md "Delete", the deterministic abandon rule).
+// separator replace the pair (the parent's key count is unchanged). The merge is ABANDONED — the
+// parent is returned unchanged, the underfull child tolerated — in two deterministic cases
+// (format.md "Delete", the abandon rules): an INTERIOR M that overflows but admits no valid split
+// (near-cap separators), and a split whose new separator is longer than the parent separator it
+// would replace by enough to overflow the PARENT (the key count is unchanged, the byte size is not;
+// nothing on the delete path splits an interior, so an over-cap parent would be unserializable).
 function* mergeAtSteps(
   n: PNode,
   j: number,
@@ -1323,6 +1326,15 @@ function* mergeAtSteps(
     // the parent separator stay exactly as they were (underfull tolerated).
     if (out === null) return n;
     merged = out;
+  }
+
+  if (
+    merged.whole === null &&
+    interiorPayload(cap, n.keys) - n.keys[j]!.length + merged.sep.length > cap.c
+  ) {
+    // The replacement separator would overflow the parent: abandon the merge — the two children and
+    // the parent separator stay exactly as they were (underfull tolerated).
+    return n;
   }
 
   const keys = n.keys.slice();

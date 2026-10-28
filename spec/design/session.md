@@ -121,7 +121,7 @@ There is **one** state machine with **three entry points** — this is what remo
 |---|---|
 | SQL `BEGIN` / `COMMIT` / `ROLLBACK` | the open-ended / interactive spelling; `Idle ⇄ Open` |
 | `session.begin(writable)` / `commit()` / `rollback()` | the **same** transitions, from the host API |
-| `session.view(fn)` / `session.update(fn)` | **scoped sugar**: require `Idle`, open → run `fn` → commit/rollback → `Idle`; panic-safe |
+| `session.view(fn)` / `session.update(fn)` | **scoped sugar**: require `Idle`, open → run `fn` → commit/rollback → `Idle`; panic-safe. `fn` may not end the block itself: `COMMIT`/`ROLLBACK` through its `tx` is `2D000` ([api.md §2.2](api.md)) |
 
 `session.begin` and SQL `BEGIN` are two spellings of one transition; the closures are the bounded,
 guaranteed-to-close wrapper. Consequently the separate **`Transaction` object** the first
@@ -434,7 +434,13 @@ default-off + per-function `grant`"; a *deny-list* is "default-on + per-function
   in its `WHERE` / assignment RHS / `RETURNING`. An `INSERT` reads its target when it has an `ON
   CONFLICT` conflict target (the arbiter columns — a column list or `ON CONSTRAINT`) or a
   `RETURNING` that references a column (`*` included); a target-less `ON CONFLICT DO NOTHING` and a
-  column-free `RETURNING 1` read nothing. These are PostgreSQL's rules, at table granularity.
+  column-free `RETURNING 1` read nothing. An `UPDATE`/`DELETE` follows the same column rule: a
+  `WHERE true`, a `RETURNING 1`, or a constant-only `SET` reads nothing, so the write privilege
+  alone suffices; a column reference in any of those positions needs `SELECT`. These are
+  PostgreSQL's rules, at table granularity. One **conservative narrowing**: a subquery in a
+  `WHERE` / `RETURNING` / assignment RHS is taken as a read of the target whether or not it is
+  correlated (the preflight walks the unresolved tree), so `DELETE FROM t WHERE (SELECT 1) = 1`
+  needs `SELECT` on `t` where PostgreSQL does not; the subquery's own tables need `SELECT` as usual.
 - **`INSERT` / `UPDATE` / `DELETE`** on the statement's **write target**. A statement that both
   reads and writes a table needs both privileges: `UPDATE t SET … WHERE …` requires `UPDATE` *and*
   `SELECT` on `t`; a bare `INSERT INTO t VALUES …` (no read) requires only `INSERT`. `INSERT … ON

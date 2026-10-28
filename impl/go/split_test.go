@@ -121,3 +121,25 @@ func TestSplitNoTrailingSemicolonStillYieldsLast(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+func TestSplitSemicolonInQuotedIdentifierIsNotABoundary(t *testing.T) {
+	t.Parallel()
+	// A double-quoted identifier is opaque to the splitter, like a string literal (grammar.md §3).
+	if got := splitTexts(`CREATE TABLE "a;b" (x i32); INSERT INTO "a;b" VALUES (1)`); !reflect.DeepEqual(
+		got, []string{`CREATE TABLE "a;b" (x i32)`, `INSERT INTO "a;b" VALUES (1)`},
+	) {
+		t.Fatalf("got %v", got)
+	}
+	// An embedded `""` quote, with a `;` between the two quotes; and a `'` inside the identifier.
+	if got := splitTexts(`SELECT "it"";s"; SELECT "a'b;c"`); !reflect.DeepEqual(
+		got, []string{`SELECT "it"";s"`, `SELECT "a'b;c"`},
+	) {
+		t.Fatalf("got %v", got)
+	}
+	// A Unicode-escape identifier / literal: `U&` is ordinary text before the quote.
+	if got := splitTexts(`SELECT U&"a;b", U&'c;d'; SELECT 2`); !reflect.DeepEqual(
+		got, []string{`SELECT U&"a;b", U&'c;d'`, "SELECT 2"},
+	) {
+		t.Fatalf("got %v", got)
+	}
+}

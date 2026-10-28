@@ -73,11 +73,16 @@ After C0. These are the canonical col-def-list consumers; they are strictly simp
 
 The kernel maps JSON object members → declared columns **by name**, coercing each member to
 the column type (the `JSON_VALUE` scalar-coercion path,
-[json-sql-functions.md §5.2](json-sql-functions.md)); a missing member → SQL NULL; an
-extra member is ignored. The `_to_*` forms take the shape from the C0 `AS (…)` list; the
-`populate_*` forms take it from the composite type of the (typically NULL-valued) first
-argument — leaning on the existing `Type::Composite(catalog-ref)` facility rather than the
-col-def list. **Sequencing:** `_to_record(set)` first (R1, exercises C0), then `populate_*`
+[json-sql-functions.md §5.2](json-sql-functions.md)); a JSON `null` member → SQL NULL; an
+extra member is ignored. A `json` document keeps duplicate keys and the **last** one wins
+(PostgreSQL hashes the object; `jsonb` is already canonical), and only the winning member is
+coerced. The `_to_*` forms take the shape from the C0 `AS (…)` list, and a missing member →
+SQL NULL. The `populate_*` forms take the shape from the composite type of the first argument —
+leaning on the existing `Type::Composite(catalog-ref)` facility rather than the col-def list —
+and its **value is the base row**, as in PostgreSQL: a missing member keeps the base field
+(SQL NULL when the base is NULL, the usual `NULL::type` call); a NULL document returns the base
+row unchanged from `_populate_record` (one row, all NULL for a NULL base) and no rows from
+`_populate_recordset`. **Sequencing:** `_to_record(set)` first (R1, exercises C0), then `populate_*`
 (R2, adds composite-shape extraction). Capabilities `func.json_record` (R1) /
 `func.json_populate` (R2).
 
@@ -103,9 +108,14 @@ jt_column  ::= identifier "FOR" "ORDINALITY"
 
 `ctx` / `path` / `json_passing` / `wrapper_clause` / `quotes_clause` / `on_clause` /
 `behavior` are the same productions as the SQL/JSON query functions
-([json-sql-functions.md §5.1](json-sql-functions.md)). A regular column with **no explicit
-`PATH`** defaults to `$.<column_name>` (PG). `JSON_TABLE` is recognized in `table_ref` as a
-new alternative beside `table_function`.
+([json-sql-functions.md §5.1](json-sql-functions.md)). A regular or `EXISTS` column with **no
+explicit `PATH`** defaults to `$."<column_name>"` — the name as a **quoted, JSON-escaped jsonpath
+member name** (PG builds the same), so a column named `a.b`, `a b`, or `1` reads the member of
+exactly that name. Every column name across the whole `COLUMNS` tree (`NESTED` levels included)
+must be unique — a repeat is `42712` *duplicate JSON_TABLE column or path name* — and each
+`COLUMNS` level allows **at most one `FOR ORDINALITY`** column (`42601` *only one FOR ORDINALITY
+column is allowed*; a `NESTED` level may have its own), both as PostgreSQL. `JSON_TABLE` is
+recognized in `table_ref` as a new alternative beside `table_function`.
 
 ### 3.2 As a FROM-clause table source
 

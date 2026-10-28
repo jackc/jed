@@ -1,0 +1,56 @@
+# Casting a range value to its own type is the identity (spec/design/ranges.md §5): a runtime
+# operand whose element type matches the target yields the operand unchanged, so a composite
+# field of a range type accepts a ROW(…) constructor's range through the field-by-field cast
+# (composite.md §8), and a non-literal NULL adapts. Results verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, cast.explicit, cast.composite, types.composite, types.composite_range_field, types.composite_bare_row, types.range, func.range_constructors, types.i32, resource.cost_metering
+
+statement ok
+CREATE TYPE rr AS (r int4range, n int)
+
+# cost: 4
+query T nosort
+SELECT ROW(int4range(1, 3), 1)::rr
+----
+("[1,3)",1)
+
+# cost: 2
+query T nosort
+SELECT int4range(1, 3)::int4range
+----
+[1,3)
+
+# cost: 2
+query T nosort
+SELECT CAST(numrange(1.5, 2) AS numrange)
+----
+[1.5,2)
+
+# cost: 1
+query T nosort
+SELECT (NULL::int4range)::int4range
+----
+NULL
+
+statement ok
+CREATE TABLE rt (id i32 PRIMARY KEY, r int4range)
+
+statement ok
+INSERT INTO rt VALUES (1, int4range(1, 3)), (2, NULL)
+
+# cost: 5
+query IT nosort
+SELECT id, r::int4range FROM rt ORDER BY id
+----
+1
+[1,3)
+2
+NULL
+
+# cost: 9
+query IT nosort
+SELECT id, ROW(r, id)::rr FROM rt ORDER BY id
+----
+1
+("[1,3)",1)
+2
+(,2)

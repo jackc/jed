@@ -1,0 +1,223 @@
+# Range bound tie-breaks across sides (spec/design/range-functions.md §3, ranges.md §6): the boolean
+# and set operators compare a LOWER bound against an UPPER bound (PG range_cmp_bounds), and for
+# equal bound values the exclusive side decides — both exclusive on different sides means the lower
+# sorts AFTER the upper (`(5` is "> 5", `5)` is "< 5"), both inclusive means the lower sorts BEFORE
+# (`[5` and `5]` meet at 5). So [1,5) and (5,8] do not overlap, are strictly left/right of each
+# other, are not adjacent, their union is 22000 and their difference leaves the operand whole. The
+# same-side total order (ORDER BY, the key encoding) is unaffected: it compares lower vs lower and
+# upper vs upper only, and the PRIMARY KEY walk below agrees with the sort. Oracle-pinned vs
+# postgres:18. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.range, types.i32, types.decimal, types.timestamp, func.range_constructors, func.range_operators, func.range_set_operators, resource.cost_metering
+
+# --- [1,5) vs (5,8]: both bounds exclusive at 5, on different sides — the ranges share no point ---
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') && numrange(5,8,'(]')
+----
+false
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') << numrange(5,8,'(]')
+----
+true
+
+# cost: 4
+query B nosort
+SELECT numrange(5,8,'(]') >> numrange(1,5,'[)')
+----
+true
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') -|- numrange(5,8,'(]')
+----
+false
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') &< numrange(5,8,'(]')
+----
+true
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') &> numrange(5,8,'(]')
+----
+false
+
+# The union would leave a gap at 5.
+statement error 22000
+SELECT numrange(1,5,'[)') + numrange(5,8,'(]')
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[)') - numrange(5,8,'(]')
+----
+[1,5)
+
+# cost: 4
+query T nosort
+SELECT numrange(5,8,'()') - numrange(1,5,'()')
+----
+(5,8)
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[)') * numrange(5,8,'(]')
+----
+empty
+
+# range_merge spans the gap (it never errors).
+# cost: 4
+query T nosort
+SELECT range_merge(numrange(1,5,'[)'), numrange(5,8,'(]'))
+----
+[1,8]
+
+# --- [1,5] vs [5,8]: both bounds inclusive at 5 — the ranges share the point 5 ---
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[]') && numrange(5,8,'[]')
+----
+true
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[]') << numrange(5,8,'[]')
+----
+false
+
+# Overlapping ranges are not adjacent; a range ending at 5) is adjacent to one starting at [5, and
+# one ending at 5] to one starting at (5.
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[]') -|- numrange(5,8,'[]')
+----
+false
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') -|- numrange(5,8,'[]')
+----
+true
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[]') -|- numrange(5,8,'(]')
+----
+true
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[]') + numrange(5,8,'(]')
+----
+[1,8]
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[]') + numrange(5,8,'[]')
+----
+[1,8]
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[]') - numrange(5,8,'[]')
+----
+[1,5)
+
+# cost: 4
+query T nosort
+SELECT numrange(5,8,'[]') - numrange(1,5,'[]')
+----
+(5,8]
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[]') * numrange(5,8,'[]')
+----
+[5,5]
+
+# cost: 4
+query T nosort
+SELECT numrange(1,5,'[]') * numrange(5,8,'(]')
+----
+empty
+
+# --- containment at the shared endpoint ---
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[]') @> numrange(5,5,'[]')
+----
+true
+
+# cost: 4
+query B nosort
+SELECT numrange(1,5,'[)') @> numrange(5,5,'[]')
+----
+false
+
+# cost: 4
+query B nosort
+SELECT numrange(5,8,'()') @> numrange(5,6,'[)')
+----
+false
+
+# --- the same tie on a timestamp range and on a discrete (canonical [)) range ---
+
+# cost: 4
+query B nosort
+SELECT tsrange('2020-01-01','2020-01-02','[)') && tsrange('2020-01-02','2020-01-03','(]')
+----
+false
+
+# cost: 4
+query B nosort
+SELECT tsrange('2020-01-01','2020-01-02','[)') << tsrange('2020-01-02','2020-01-03','(]')
+----
+true
+
+# cost: 4
+query T nosort
+SELECT tsrange('2020-01-01','2020-01-02','[)') - tsrange('2020-01-02','2020-01-03','(]')
+----
+["2020-01-01 00:00:00","2020-01-02 00:00:00")
+
+statement error 22000
+SELECT tsrange('2020-01-01','2020-01-02','[)') + tsrange('2020-01-02','2020-01-03','(]')
+
+# [1,5) and [5,8) touch (an inclusive lower meets an exclusive upper): no overlap, a contiguous union.
+# cost: 4
+query B nosort
+SELECT int4range(1,5) && int4range(5,8)
+----
+false
+
+# cost: 4
+query T nosort
+SELECT int4range(1,5) + int4range(5,8)
+----
+[1,8)
+
+# --- the same-side total order is untouched: ORDER BY and a range PRIMARY KEY walk agree ---
+
+statement ok
+CREATE TABLE spans (r numrange PRIMARY KEY)
+
+statement ok
+INSERT INTO spans VALUES (numrange(5,8,'()')), (numrange(5,8,'[)')), (numrange(5,8,'(]')), (numrange(5,8,'[]')), (numrange(1,5,'[)')), (numrange(1,5,'[]'))
+
+# For equal lower values an inclusive lower sorts first; for equal upper values an exclusive upper
+# sorts first (ranges.md §6).
+query T nosort
+SELECT r FROM spans ORDER BY r
+----
+[1,5)
+[1,5]
+[5,8)
+[5,8]
+(5,8)
+(5,8]

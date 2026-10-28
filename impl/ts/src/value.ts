@@ -15,6 +15,7 @@ import { Decimal, floatShortestExact } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { NEG_INFINITY, POS_INFINITY, renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 import { renderDate } from "./date.ts";
+import { engineError } from "./errors.ts";
 import { rangeOut, rangeOutZoned, rangeTotalCmp } from "./range.ts";
 import { type ZoneRef, renderTimestamptzIn } from "./timezone.ts";
 import { type JsonNode, jsonNodeCmp, jsonbOut } from "./json.ts";
@@ -349,9 +350,49 @@ export function arrayNdim(a: { dims: number[] }): number {
   return a.dims.length;
 }
 
-// arrayUbound is the upper bound of dimension d (lb + len - 1).
+// arrayUbound is the upper bound of dimension d (lb + len - 1). JS numbers do not wrap, and every
+// value the engine builds satisfies checkArrayBounds, so the result is always within the i32 domain.
 export function arrayUbound(a: { dims: number[]; lbounds: number[] }, d: number): number {
   return a.lbounds[d] + a.dims[d] - 1;
+}
+
+// ARRAY_MAX_SIZE is PostgreSQL's MaxArraySize (MaxAllocSize / sizeof(Datum) = 134217727): the number
+// quoted by the "array size exceeds the maximum allowed" message when a declared dimension's length
+// overflows (spec/design/array.md §7).
+export const ARRAY_MAX_SIZE = 134217727;
+
+// checkArrayBounds is PostgreSQL's ArrayCheckBounds (spec/design/array.md §4): every dimension's
+// `lb + len` must fit in an i32, so an array's last subscript is at most i32::MAX − 1 and subscript
+// arithmetic can never overflow. Every value-producing path that can grow a dimension or set a lower
+// bound (array_in, array_append/array_prepend, array_cat) runs it; a violation is 54000 "array lower
+// bound is too large: <lb>" (PG's message, the offending lower bound).
+export function checkArrayBounds(dims: number[], lbounds: number[]): void {
+  for (let d = 0; d < dims.length; d++) {
+    if (lbounds[d]! + dims[d]! > 2147483647) {
+      throw engineError("program_limit_exceeded", `array lower bound is too large: ${lbounds[d]}`);
+    }
+  }
+}
+
+// arrayInError maps a parseArrayLiteral failure to its error: a malformed literal is 22P02, an
+// inverted bound 2202E, and the three PG dimension-limit failures 54000 with PG's messages
+// (spec/design/array.md §7).
+export function arrayInError(err: ArrayInErr): Error {
+  switch (err) {
+    case "malformed":
+      return engineError("invalid_text_representation", "malformed array literal");
+    case "boundflip":
+      return engineError("array_subscript_error", "upper bound cannot be less than lower bound");
+    case "boundoutofint":
+      return engineError("program_limit_exceeded", "array bound is out of integer range");
+    case "uppermax":
+      return engineError("program_limit_exceeded", "array upper bound is too large: 2147483647");
+    case "sizeoverflow":
+      return engineError(
+        "program_limit_exceeded",
+        `array size exceeds the maximum allowed (${ARRAY_MAX_SIZE})`,
+      );
+  }
 }
 
 // compareBytea compares two byte strings by UNSIGNED byte order (Uint8Array elements are
@@ -860,11 +901,14 @@ export interface ParsedArray {
   tokens: (string | null)[];
 }
 
-// ArrayInResult is parseArrayLiteral's result: a parsed array, or a classified failure —
-// "malformed" (→ 22P02) or "boundflip" (a declared [l:u] with u<l → 2202E).
-export type ArrayInResult =
-  | { ok: true; value: ParsedArray }
-  | { ok: false; err: "malformed" | "boundflip" };
+// ArrayInErr classifies why an array literal failed to parse (mapped to a SQLSTATE by arrayInError):
+// "malformed" (→ 22P02), "boundflip" (a declared [l:u] with u<l → 2202E), "boundoutofint" (a declared
+// bound outside the i32 domain → 54000), "uppermax" (a declared upper bound of exactly i32::MAX →
+// 54000), "sizeoverflow" (a declared dimension's length u−l+1 overflows an i32 → 54000).
+export type ArrayInErr = "malformed" | "boundflip" | "boundoutofint" | "uppermax" | "sizeoverflow";
+
+// ArrayInResult is parseArrayLiteral's result: a parsed array, or a classified failure.
+export type ArrayInResult = { ok: true; value: ParsedArray } | { ok: false; err: ArrayInErr };
 
 // ArrNode is a parsed brace node: a leaf scalar token (leaf, null = the NULL token) or a braced level.
 type ArrNode = { leaf: string | null; isLeaf: true } | { children: ArrNode[]; isLeaf: false };
@@ -888,14 +932,19 @@ export function parseArrayLiteral(input: string): ArrayInResult {
     while (p.peek() === "[") {
       p.bump(); // [
       const lb = p.parseInt();
-      if (lb === null) return malformed;
+      if (typeof lb === "string") return { ok: false, err: lb };
       if (p.peek() !== ":") return malformed;
       p.bump(); // :
       const ub = p.parseInt();
-      if (ub === null) return malformed;
+      if (typeof ub === "string") return { ok: false, err: ub };
       if (p.peek() !== "]") return malformed;
       p.bump(); // ]
+      // PG ReadArrayDimensions, in its order: an inverted bound, an upper bound of exactly i32::MAX
+      // (disallowed so `lb + len` stays computable — checkArrayBounds), then a dimension length that
+      // overflows an i32.
       if (ub < lb) return { ok: false, err: "boundflip" };
+      if (ub === 2147483647) return { ok: false, err: "uppermax" };
+      if (ub - lb + 1 > 2147483647) return { ok: false, err: "sizeoverflow" };
       prefixLb.push(lb);
       prefixDims.push(ub - lb + 1);
     }
@@ -952,8 +1001,10 @@ class ArrParser {
   skipWs(): void {
     while (this.i < this.s.length && isArrWs(this.s[this.i]!)) this.i++;
   }
-  // parseInt parses a signed decimal integer (a dimension bound); null on no digits / bad number.
-  parseInt(): number | null {
+  // parseInt parses a signed decimal integer (a dimension bound): "malformed" on no digits, and
+  // "boundoutofint" when the value lies outside the i32 domain (PG ReadDimensionInt — a digit string
+  // of any length is the same out-of-range bound, not a malformed literal).
+  parseInt(): number | ArrayInErr {
     let buf = "";
     if (this.peek() === "-") {
       buf += "-";
@@ -963,9 +1014,10 @@ class ArrParser {
       buf += this.s[this.i]!;
       this.bump();
     }
-    if (buf === "" || buf === "-") return null;
+    if (buf === "" || buf === "-") return "malformed";
     const n = Number(buf);
-    return Number.isInteger(n) ? n : null;
+    if (!Number.isFinite(n) || n < -2147483648 || n > 2147483647) return "boundoutofint";
+    return n;
   }
   // parseNode parses one element: a nested `{…}` (a braced level) or a scalar token (a leaf).
   // `depth` is the number of enclosing braces: a brace past ARRAY_MAXDIM is rejected as it is read —

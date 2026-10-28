@@ -3904,7 +3904,11 @@ export function loadEngine(
 export function* adoptHeldCodecSteps(pager: Pager, codec: PageCodec): Steps<void> {
   const slot0 = yield* pager.readPageSteps(0);
   const slot1 = yield* pager.readPageSteps(1);
-  if (fileSuite(slot0, slot1) === 0) {
+  const held = fileSuite(slot0, slot1);
+  if (held === null) {
+    throw engineError("data_corrupted", "no complete valid meta page");
+  }
+  if (held === 0) {
     throw engineError("stale_key", "the database is no longer encrypted; reopen it");
   }
   if (pager.pageSize < ENCRYPTED_MIN_PAGE_SIZE || pager.physicalPages() < FIRST_BODY_ENCRYPTED) {
@@ -3954,7 +3958,11 @@ export function* unlockPagerSteps(
   }
   const slot0 = yield* pager.readPageSteps(0);
   const slot1 = yield* pager.readPageSteps(1);
-  if (fileSuite(slot0, slot1) === 0) {
+  const suite = fileSuite(slot0, slot1);
+  // Neither slot is CRC-valid: the file declares no variant, so the credential is neither applicable
+  // nor inapplicable. Slot selection reports the corruption (XX001).
+  if (suite === null) return null;
+  if (suite === 0) {
     if (credential !== undefined) {
       throw engineError(
         "credential_not_applicable",

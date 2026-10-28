@@ -440,7 +440,28 @@ func float64Op(op binaryOp, x, y float64) (float64, error) {
 	if (math.IsInf(r, 0) || math.IsNaN(r)) && isFinite(x) && isFinite(y) {
 		return 0, overflowFloatErr()
 	}
+	// Underflow (PG float8_mul / float8_div, float.md §3): a product of two non-zero operands, or
+	// a quotient of a non-zero dividend by a finite divisor, that rounds to exactly zero traps
+	// 22003 rather than yielding 0. `+`, `-` and `%` never underflow (their exact results are
+	// representable or already zero).
+	if r == 0 && floatUnderflowed(op, x, y) {
+		return 0, underflowFloatErr()
+	}
 	return r, nil
+}
+
+// floatUnderflowed reports whether a zero result of op is PG's underflow: `x * y` with both
+// operands non-zero, or `x / y` with a non-zero dividend and a finite divisor (`1 / Infinity`
+// is a legitimate 0). Shared by the f64 and f32 kernels.
+func floatUnderflowed(op binaryOp, x, y float64) bool {
+	switch op {
+	case opMul:
+		return x != 0 && y != 0
+	case opDiv:
+		return x != 0 && !math.IsInf(y, 0)
+	default:
+		return false
+	}
 }
 
 // float32Op is float64Op at binary32 width — every op rounds to binary32 (Go f32 arithmetic),
@@ -470,6 +491,9 @@ func float32Op(op binaryOp, x, y float32) (float32, error) {
 	if (math.IsInf(float64(r), 0) || math.IsNaN(float64(r))) && isFinite32(x) && isFinite32(y) {
 		return 0, overflowFloatErr()
 	}
+	if r == 0 && floatUnderflowed(op, float64(x), float64(y)) {
+		return 0, underflowFloatErr() // the binary32 underflow (PG float4_mul / float4_div)
+	}
 	return r, nil
 }
 
@@ -488,6 +512,18 @@ func isFinite32(f float32) bool { return isFinite(float64(f)) }
 // overflowFloatErr is the 22003 a finite float operation traps on overflow to ±Inf (§3).
 func overflowFloatErr() error {
 	return newError(NumericValueOutOfRange, "value out of range: overflow")
+}
+
+// underflowFloatErr is the 22003 a float operation traps when a non-zero exact result rounds to
+// zero (PG's float_underflow_error — float.md §3).
+func underflowFloatErr() error {
+	return newError(NumericValueOutOfRange, "value out of range: underflow")
+}
+
+// floatInputOutOfRangeErr is the 22003 PG raises for a function input outside its domain
+// (asin/acos/acosh/atanh out of range, sin/cos/tan/cot of ±Infinity).
+func floatInputOutOfRangeErr() error {
+	return newError(NumericValueOutOfRange, "input is out of range")
 }
 
 // --- casts (spec/design/float.md §6, ../types/casts.toml) ---------------------------------
@@ -631,11 +667,15 @@ func decimalFromFloatSigDigits(f float64, sig uint32) Decimal {
 
 // decimalToFloat64 converts a decimal to the nearest binary64, round-ties-to-even via Go's
 // correctly-rounded strconv.ParseFloat over the decimal's canonical string. A finite decimal
-// whose magnitude overflows binary64 traps 22003 (the §3 finite-overflow rule — NOT ±Inf).
+// whose magnitude overflows binary64 traps 22003 (the §3 finite-overflow rule — NOT ±Inf); a
+// non-zero decimal that rounds to zero traps 22003 underflow (§6, as PG's numeric → float8).
 func decimalToFloat64(d Decimal) (float64, error) {
 	f, err := strconv.ParseFloat(d.Render(), 64)
 	if err != nil || math.IsInf(f, 0) {
 		return 0, overflowFloatErr()
+	}
+	if f == 0 && !d.IsZero() {
+		return 0, underflowFloatErr()
 	}
 	return f, nil
 }
@@ -646,15 +686,22 @@ func decimalToFloat32(d Decimal) (float32, error) {
 	if err != nil || math.IsInf(f, 0) {
 		return 0, overflowFloatErr()
 	}
+	if f == 0 && !d.IsZero() {
+		return 0, underflowFloatErr()
+	}
 	return float32(f), nil
 }
 
 // float64ToFloat32 narrows a f64 to f32, round-ties-to-even. A finite f64 beyond the
-// binary32 range traps 22003 (the §3 finite-overflow rule). NaN/±Inf convert unchanged (no trap).
+// binary32 range traps 22003 (the §3 finite-overflow rule); a non-zero f64 that rounds to zero
+// at binary32 traps 22003 underflow (PG's float84 check). NaN/±Inf convert unchanged (no trap).
 func float64ToFloat32(f float64) (float32, error) {
 	r := float32(f)
 	if math.IsInf(float64(r), 0) && isFinite(f) {
 		return 0, overflowFloatErr()
+	}
+	if r == 0 && f != 0 {
+		return 0, underflowFloatErr()
 	}
 	return r, nil
 }
@@ -781,8 +828,10 @@ func (a *floatSumAcc) avgF32() (float32, bool, error) {
 // EXACT / correctly-rounded (in-contract): abs, ceil, floor, trunc, round (half away, 1- & 2-arg),
 // sqrt. TRANSCENDENTAL (exempted, native math pkg): exp, ln, log10, pow, sin, cos, tan. Result
 // width is the call's `result` (Float32 only for abs over a f32 arg; f64 for the rest, per
-// the catalog). Domain errors follow PG: ln(0) → 22003, sqrt/ln of a negative → 22003, exp/pow
-// overflow → 22003 — keeping NaN an INPUT-ONLY value (a finite call never RETURNS NaN/±Inf).
+// the catalog). Domain errors follow PG: ln/log10 of zero or a negative → 2201E, sqrt of a negative
+// and pow's 0^negative / negative^non-integer → 2201F, exp/pow overflow and underflow → 22003,
+// sin/cos/tan/cot of ±Infinity → 22003 — keeping NaN an INPUT-ONLY value (a finite call never
+// RETURNS NaN/±Inf).
 
 // evalFloatFunc evaluates a float scalar function over its already-evaluated, non-NULL args. fn is
 // the float scalar function; result is the call's width (Float32/Float64). vals[0] is the float
@@ -812,55 +861,82 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result scalarType) (Value, error
 		}
 		return Float64Value(roundFloatPlaces(x, places)), nil
 	case sfSqrt:
-		// sqrt is IEEE-correctly-rounded (in-contract). Negative → 22003 (NaN is input-only).
+		// sqrt is IEEE-correctly-rounded (in-contract). Negative → 2201F (PG dsqrt; NaN is
+		// input-only).
 		if x < 0 {
-			return Value{}, newError(NumericValueOutOfRange, "cannot take square root of a negative number")
+			return Value{}, newError(InvalidArgumentForPowerFunction, "cannot take square root of a negative number")
 		}
 		return Float64Value(math.Sqrt(x)), nil
 	case sfExp:
 		r := math.Exp(x)
-		if math.IsInf(r, 0) && isFinite(x) {
-			return Value{}, overflowFloatErr() // exp(710) overflows → 22003
+		if isFinite(x) {
+			if math.IsInf(r, 0) {
+				return Value{}, overflowFloatErr() // exp(710) overflows → 22003
+			}
+			if r == 0 {
+				return Value{}, underflowFloatErr() // exp(-746) underflows to 0 → 22003 (PG dexp)
+			}
 		}
 		return Float64Value(r), nil
 	case sfLn:
+		// ln(0) / ln(negative) → 2201E (PG dlog1); the subnormal-safe log (see logF64).
 		if x == 0 {
-			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of zero")
+			return Value{}, newError(InvalidArgumentForLog, "cannot take logarithm of zero")
 		}
 		if x < 0 {
-			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of a negative number")
+			return Value{}, newError(InvalidArgumentForLog, "cannot take logarithm of a negative number")
 		}
-		return Float64Value(math.Log(x)), nil
+		return Float64Value(logF64(x)), nil
 	case sfLog10:
 		if x == 0 {
-			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of zero")
+			return Value{}, newError(InvalidArgumentForLog, "cannot take logarithm of zero")
 		}
 		if x < 0 {
-			return Value{}, newError(NumericValueOutOfRange, "cannot take logarithm of a negative number")
+			return Value{}, newError(InvalidArgumentForLog, "cannot take logarithm of a negative number")
 		}
-		return Float64Value(math.Log10(x)), nil
+		return Float64Value(log10F64(x)), nil
 	case sfPow:
-		y := vals[1].asF64()
-		r := math.Pow(x, y)
-		if math.IsInf(r, 0) && isFinite(x) && isFinite(y) {
-			return Value{}, overflowFloatErr() // finite^finite overflow → 22003
+		r, err := floatPow(x, vals[1].asF64())
+		if err != nil {
+			return Value{}, err
 		}
 		return Float64Value(r), nil
-	case sfSin:
-		return Float64Value(math.Sin(x)), nil
-	case sfCos:
-		return Float64Value(math.Cos(x)), nil
-	case sfTan:
-		return Float64Value(math.Tan(x)), nil
+	case sfSin, sfCos, sfTan, sfCot:
+		// The circular functions are undefined at ±Infinity: PG raises 22003 "input is out of
+		// range" (dsin/dcos/dtan/dcot) rather than returning NaN; a NaN operand propagates.
+		if math.IsInf(x, 0) {
+			return Value{}, floatInputOutOfRangeErr()
+		}
+		switch fn {
+		case sfSin:
+			return Float64Value(math.Sin(x)), nil
+		case sfCos:
+			return Float64Value(math.Cos(x)), nil
+		case sfTan:
+			return Float64Value(math.Tan(x)), nil
+		default:
+			// cot(x) = 1/tan(x) (no math.Cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
+			return Float64Value(1.0 / math.Tan(x)), nil
+		}
 	case sfCbrt:
 		// cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
 		return Float64Value(math.Cbrt(x)), nil
 	case sfRadians:
 		// radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
-		// RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
-		return Float64Value(x * radiansPerDegree), nil
+		// RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract). They
+		// are PG's float8_mul / float8_div, so they carry the §3/§5 overflow and underflow traps:
+		// degrees(1e308) overflows, radians(5e-324) underflows to 0 — both 22003.
+		r, err := float64Op(opMul, x, radiansPerDegree)
+		if err != nil {
+			return Value{}, err
+		}
+		return Float64Value(r), nil
 	case sfDegrees:
-		return Float64Value(x / radiansPerDegree), nil
+		r, err := float64Op(opDiv, x, radiansPerDegree)
+		if err != nil {
+			return Value{}, err
+		}
+		return Float64Value(r), nil
 	case sfAsin:
 		// asin domain is [-1, 1]: a finite |x| > 1 (and ±Inf, magnitude > 1) is out of range →
 		// 22003, exactly PG; a NaN operand propagates (no trap).
@@ -880,9 +956,6 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result scalarType) (Value, error
 	case sfAtan2:
 		// atan2(y, x): y is vals[0] (x here), x is vals[1]. Quadrant-aware; no domain trap.
 		return Float64Value(math.Atan2(x, vals[1].asF64())), nil
-	case sfCot:
-		// cot(x) = 1/tan(x) (no math.Cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
-		return Float64Value(1.0 / math.Tan(x)), nil
 	case sfSinh:
 		// sinh/cosh overflow to ±Inf with NO trap (PG-faithful, unlike exp/pow). NaN propagates.
 		return Float64Value(math.Sinh(x)), nil
@@ -907,6 +980,116 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result scalarType) (Value, error
 	default:
 		panic("BUG: evalFloatFunc on a non-float scalar function")
 	}
+}
+
+// logF64 is math.Log with a subnormal operand pre-normalized: Go's amd64 assembly log reads the
+// exponent field directly and mishandles a zero field (ln(1e-320) came out as ln(2^-1022)), so a
+// subnormal is scaled by 2^54 into the normal range and the exact 54·ln 2 subtracted back out.
+// Every architecture then agrees with PG within the R-tag tolerance (float.md §8).
+func logF64(x float64) float64 {
+	if x > 0 && x < 0x1p-1022 {
+		return math.Log(x*0x1p54) - 54*math.Ln2
+	}
+	return math.Log(x)
+}
+
+// log10F64 is math.Log10 with the same subnormal guard as logF64: math.Log10 is built on the
+// amd64 log, so a subnormal takes the Frexp-based log2 (subnormal-safe) scaled by log10(2).
+func log10F64(x float64) float64 {
+	if x > 0 && x < 0x1p-1022 {
+		return math.Log2(x) * (math.Ln2 / math.Ln10)
+	}
+	return math.Log10(x)
+}
+
+// floatPow is PostgreSQL's dpow (float.c) over binary64 (float.md §8): the POSIX NaN rules first
+// (NaN^0 = 1, 1^NaN = 1, every other NaN input yields NaN), then the SQL-standard domain errors
+// 2201F (0^negative; negative^non-integer), then the infinite cases resolved explicitly per POSIX
+// (never trapped), and finally the libm pow with the finite overflow (±Inf → 22003) and underflow
+// (a non-zero base whose power rounds to 0 → 22003) traps.
+func floatPow(x, y float64) (float64, error) {
+	if math.IsNaN(x) {
+		if math.IsNaN(y) || y != 0 {
+			return canonicalNaN64(), nil
+		}
+		return 1, nil
+	}
+	if math.IsNaN(y) {
+		if x != 1 {
+			return canonicalNaN64(), nil
+		}
+		return 1, nil
+	}
+	if x == 0 && y < 0 {
+		return 0, newError(InvalidArgumentForPowerFunction, "zero raised to a negative power is undefined")
+	}
+	if x < 0 && math.Floor(y) != y {
+		return 0, newError(InvalidArgumentForPowerFunction,
+			"a negative number raised to a non-integer power yields a complex result")
+	}
+	if math.IsInf(y, 0) {
+		absx := math.Abs(x)
+		switch {
+		case absx == 1:
+			return 1, nil
+		case y > 0: // y = +Inf
+			if absx > 1 {
+				return y, nil
+			}
+			return 0, nil
+		default: // y = -Inf
+			if absx > 1 {
+				return 0, nil
+			}
+			return -y, nil
+		}
+	}
+	if math.IsInf(x, 0) {
+		switch {
+		case y == 0:
+			return 1, nil
+		case x > 0: // x = +Inf
+			if y > 0 {
+				return x, nil
+			}
+			return 0, nil
+		default: // x = -Inf: y is an integer (the domain check above); the sign follows its parity.
+			yOdd := math.Floor(y/2) != y/2
+			if y > 0 {
+				if yOdd {
+					return x, nil
+				}
+				return -x, nil
+			}
+			if yOdd {
+				return math.Copysign(0, -1), nil
+			}
+			return 0, nil
+		}
+	}
+	r := math.Pow(x, y)
+	if math.IsNaN(r) {
+		// Every domain error was handled above, so a NaN can only be a libm quirk for a huge
+		// |y| (PG's glibc-bug branch): resolve it as PG does.
+		absx := math.Abs(x)
+		switch {
+		case x == 0:
+			return 0, nil
+		case absx == 1:
+			return 1, nil
+		case (y >= 0) == (absx > 1):
+			return 0, overflowFloatErr()
+		default:
+			return 0, underflowFloatErr()
+		}
+	}
+	if math.IsInf(r, 0) {
+		return 0, overflowFloatErr()
+	}
+	if r == 0 && x != 0 {
+		return 0, underflowFloatErr()
+	}
+	return r, nil
 }
 
 // roundFloatPlaces rounds f to n decimal places, HALF AWAY FROM ZERO (jed's one rounding mode —

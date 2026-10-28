@@ -153,6 +153,14 @@ decimal types:
 
 - a finite operation whose true result overflows the binary64 range traps **`22003`**
   (`numeric_value_out_of_range`) — e.g. `1e308 * 10`;
+- a non-zero exact result that **underflows** to exactly `0` traps **`22003`** too (PG's
+  `float_underflow_error`, message *"value out of range: underflow"*): `x * y` with both
+  operands non-zero, `x / y` with a non-zero dividend and a *finite* divisor (`1 / Infinity`
+  is a legitimate `0`), `exp(-746)`, `pow(2, -1075)`, `radians(5e-324)`, and the casts of a
+  non-zero value too small for the width (§6). `+`, `-` and `%` never underflow — their exact
+  results are representable or already zero (`1e-323 - 1e-323 = 0`). Subnormal *values* are
+  ordinary finite values (`5e-324 * 1 = 5e-324`); only a result that rounds to zero traps.
+  (`suites/expr/float_underflow.test`.)
 - `x / 0` (and `x % 0`) traps **`22012`** (`division_by_zero`) for **every numerator except
   `NaN`**: `1/0`, `Inf/0`, and `0/0` all trap; **only `NaN / 0` escapes the trap and
   propagates** (`NaN / 0 = NaN`). This matches PostgreSQL exactly — PG raises *division by
@@ -220,8 +228,10 @@ existing literal machinery — types.md §6, grammar.md §36):
 `f64 ⊕ f64 → f64` for `+ − * /` and unary `−` (and `%`/`mod`, IEEE `fmod`, exact).
 Each is the IEEE 754 correctly-rounded operation (round-ties-to-even), evaluated **one
 operator per expression node** in the tree-walking evaluator. Division by zero traps `22012`;
-a finite result that overflows binary64 traps `22003` (§3). Operands that are already Inf/NaN
-propagate (no trap) per IEEE.
+a finite result that overflows binary64 traps `22003`, and a `*` or `/` result that underflows
+to zero from non-zero operands traps `22003` (§3) — at the result width, so `f32` arithmetic
+underflows at the binary32 range (`1e-45::float4 / 2::float4`). Operands that are already
+Inf/NaN propagate (no trap) per IEEE.
 
 **Cross-core determinism of the kernel (in-contract — the easy win).** IEEE mandates these
 operations are correctly rounded, so they are **bit-identical across Rust/Go/TS** provided no
@@ -259,10 +269,11 @@ one is lossy or representation-changing:
 | from → to | mode | rule |
 |---|---|---|
 | `int{16,32,64} → f64` | explicit | nearest binary64, round-ties-to-even (exact ≤ 2^53; larger i64 may round). Never traps. |
-| `decimal → f64` | explicit | nearest binary64 to the exact decimal value, round-ties-to-even. Never traps (a huge decimal → ±Inf? **traps `22003`** rather than yielding Inf, matching the finite-overflow rule §3). |
+| `decimal → f64` | explicit | nearest binary64 to the exact decimal value, round-ties-to-even. A huge decimal → ±Inf? **traps `22003`** rather than yielding Inf, matching the finite-overflow rule §3; a non-zero decimal that rounds to `0` at the width (`1e-400::numeric::float8`, `1e-46::numeric::float4`) **traps `22003`** underflow (§3), as PG's `numeric → float8/float4`. The same rules bind a numeric literal adapting to a float context (§4). |
+| `f64 → f32` | explicit | nearest binary32, round-ties-to-even. A finite f64 beyond the binary32 range **traps `22003`**; a non-zero f64 that rounds to `0` at binary32 (`7e-46::float8::float4`) **traps `22003`** underflow (PG's `float84`); NaN/±Inf narrow unchanged. |
 | `f64 → int{16,32,64}` | explicit | round **half away from zero** to an integer (jed's one rounding mode — decimal.md §3), then range-check (`22003`). NaN/±Inf → `22003`. **Documented divergence from PG**, which rounds half-to-even (`rint`); jed keeps one engine-wide mode. |
 | `f64 → decimal` | explicit | the exact decimal of the binary64 value, then the target typmod's scale coercion (decimal.md §3). NaN/±Inf → `22003` (decimal is finite). |
-| `text ⇄ f64` | explicit | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` parses per row (the runtime-text-cast slice), and `CAST(float_expr AS text)` renders PostgreSQL's `float8out` / `float4out` text (§9, types.md §5), the same in every core, so it can be compared, stored, and keyed. |
+| `text ⇄ f64` | explicit | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` parses per row (the runtime-text-cast slice), and `CAST(float_expr AS text)` renders PostgreSQL's `float8out` / `float4out` text (§9, types.md §5), the same in every core, so it can be compared, stored, and keyed. A finite numeric text beyond the width's range is `22003`, and so is one naming a non-zero value that rounds to `0` at the width (`'1e-400'::float8`, `'1e-46'::float4` — PG's `float8in`/`float4in` underflow; a spelled zero like `'0e-400'` is `0`). |
 
 `int`/`decimal` → `f64` is explicit (not implicit like `int → decimal`) precisely because
 it is **lossy** — the whole point of the strict matrix.
@@ -339,11 +350,24 @@ across cores and from PG. These share one **`determinism_exceptions.toml` entry*
 (`float-transcendental`, class **A**, drops G2/G3, blast radius = the result column, promoting
 only via float-gated control flow §1), are compared by the `R` tag's tolerant rule (§9), and are
 **PG-oracle-only** in the corpus (an `oracle_overrides.toml` note where PG's ULP differs). Domain
-errors follow PG exactly: `ln(0)` / `ln(-1)` / `sqrt(-1)` → `22003`; `asin`/`acos` outside
-[-1, 1] and `acosh`/`atanh` outside their domains (and ±Inf) → `22003` — rather than returning
-NaN, keeping NaN an *input-only* value (§3) — while `cot(0)` and `atanh(±1)` return `±Infinity`
-(PG-faithful, admissible since the result is in the exempted column), and a NaN *operand*
-propagates. `sinh`/`cosh` overflow to `±Infinity` with NO trap (a PG quirk, unlike `exp`/`pow`).
+errors follow PG exactly, with PG's granular codes (the same ones the decimal kernels raise):
+`ln(0)` / `ln(-1)` / `log10(0)` → **`2201E`** (`invalid_argument_for_log`); `sqrt(-1)` →
+**`2201F`** (`invalid_argument_for_power_function`); `pow(0, negative)` → `2201F` *"zero raised
+to a negative power is undefined"* and `pow(negative, non-integer)` → `2201F` *"a negative number
+raised to a non-integer power yields a complex result"* (PG's `dpow`, which first applies the
+POSIX NaN rules — `NaN^0 = 1`, `1^NaN = 1`, any other NaN input is NaN — and resolves an infinite
+base or exponent explicitly, never trapping: `pow(-1, ±Inf) = 1`, `pow(-8, Inf) = Inf`,
+`pow(Inf, -1) = 0`, `pow(-Inf, -3) = -0`); `asin`/`acos` outside [-1, 1] and `acosh`/`atanh`
+outside their domains (and ±Inf) → `22003` *"input is out of range"*, and so are
+`sin`/`cos`/`tan`/`cot` of **±Infinity** — rather than returning NaN, keeping NaN an
+*input-only* value (§3) — while `cot(0)` and `atanh(±1)` return `±Infinity` (PG-faithful,
+admissible since the result is in the exempted column), and a NaN *operand* propagates.
+`exp`/`pow` trap `22003` on overflow *and* on a result that underflows to zero from a non-zero
+base (§3); `degrees`/`radians` are the §5 divide/multiply and carry its overflow/underflow traps
+(`degrees(1e308)`, `radians(5e-324)`). `sinh`/`cosh` overflow to `±Infinity` with NO trap (a PG
+quirk, unlike `exp`/`pow`). `ln`/`log10` of a **subnormal** are ordinary finite results
+(`ln(1e-320) ≈ -736.8`); a core whose libm reads the exponent field directly pre-normalizes
+the operand (`suites/expr/float_subnormal_log.test`, `float_pow_domain.test`).
 
 **Numeric transcendentals have LANDED** ([decimal.md §8](decimal.md)). PostgreSQL also offers
 `sqrt`/`ln`/`exp`/`power(numeric,numeric)`/`log(numeric)`/`log(b, x)` over `numeric` (PG has no

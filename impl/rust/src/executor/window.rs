@@ -315,7 +315,7 @@ impl<'a> FrameCtx<'a> {
             return Ok((lo, hi.max(lo)));
         }
         // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
-        let (col, desc, _, _) = self.order[0];
+        let (col, desc, nulls_first, _) = self.order[0];
         let cur = &self.rows[self.ordered[pos]][col];
         if matches!(cur, Value::Null) {
             let lo = match &f.start {
@@ -331,22 +331,35 @@ impl<'a> FrameCtx<'a> {
         let lo = match &f.start {
             ResolvedBound::UnboundedPreceding => 0,
             ResolvedBound::CurrentRow => self.peer_start[pos],
-            ResolvedBound::Preceding(off) => self.range_start(col, cur, off, true, desc)?,
-            ResolvedBound::Following(off) => self.range_start(col, cur, off, false, desc)?,
+            ResolvedBound::Preceding(off) => {
+                self.range_start(col, cur, off, true, desc, nulls_first)?
+            }
+            ResolvedBound::Following(off) => {
+                self.range_start(col, cur, off, false, desc, nulls_first)?
+            }
             ResolvedBound::UnboundedFollowing => np,
         };
         let hi = match &f.end {
             ResolvedBound::UnboundedFollowing => np,
             ResolvedBound::CurrentRow => self.peer_end[pos],
-            ResolvedBound::Preceding(off) => self.range_end(col, cur, off, true, desc, lo)?,
-            ResolvedBound::Following(off) => self.range_end(col, cur, off, false, desc, lo)?,
+            ResolvedBound::Preceding(off) => {
+                self.range_end(col, cur, off, true, desc, nulls_first, lo)?
+            }
+            ResolvedBound::Following(off) => {
+                self.range_end(col, cur, off, false, desc, nulls_first, lo)?
+            }
             ResolvedBound::UnboundedPreceding => 0,
         };
         Ok((lo, hi.max(lo)))
     }
 
-    /// The first sorted position whose key satisfies a RANGE start bound (NULL keys never qualify
-    /// for a non-NULL current row). `subtract = is_preceding XOR descending` chooses the bound side.
+    /// The first sorted position whose key satisfies a RANGE start bound for a non-NULL current
+    /// row — PostgreSQL's `update_frameheadpos` (nodeWindowAgg.c), window.md §6. A NULL key never
+    /// satisfies the value test; its position is fixed by NULL placement instead: with NULLS FIRST
+    /// the leading NULLs sort BEFORE every bound (the head skips them), with NULLS LAST the trailing
+    /// NULLs sort AFTER every bound, so a start that overshoots every non-NULL key stops AT the
+    /// first NULL row (not the partition end — an UNBOUNDED FOLLOWING end then still frames the
+    /// NULLs). `subtract = is_preceding XOR descending` chooses the bound side.
     pub(crate) fn range_start(
         &self,
         col: usize,
@@ -354,12 +367,16 @@ impl<'a> FrameCtx<'a> {
         off: &Value,
         is_preceding: bool,
         desc: bool,
+        nulls_first: bool,
     ) -> Result<usize> {
         let subtract = is_preceding != desc;
         for i in 0..self.np {
             let v = &self.rows[self.ordered[i]][col];
             if matches!(v, Value::Null) {
-                continue;
+                if nulls_first {
+                    continue;
+                }
+                return Ok(i);
             }
             let ord = range_v_vs_bound(v, cur, off, subtract)?;
             // ascending frame: v ≥ bound; descending frame: v ≤ bound.
@@ -375,8 +392,11 @@ impl<'a> FrameCtx<'a> {
         Ok(self.np)
     }
 
-    /// The exclusive end of a RANGE end bound, scanning forward from `lo` while the key stays in
-    /// frame (the in-frame keys form a contiguous run over the sorted partition).
+    /// The exclusive end of a RANGE end bound for a non-NULL current row, scanning forward from
+    /// `lo` while the key stays in frame (the in-frame keys form a contiguous run over the sorted
+    /// partition) — PostgreSQL's `update_frametailpos`. NULL placement decides a NULL key: leading
+    /// NULLs (NULLS FIRST) are within every end bound, trailing NULLs (NULLS LAST) are beyond every
+    /// one.
     pub(crate) fn range_end(
         &self,
         col: usize,
@@ -384,6 +404,7 @@ impl<'a> FrameCtx<'a> {
         off: &Value,
         is_preceding: bool,
         desc: bool,
+        nulls_first: bool,
         lo: usize,
     ) -> Result<usize> {
         let subtract = is_preceding != desc;
@@ -391,6 +412,10 @@ impl<'a> FrameCtx<'a> {
         for i in lo..self.np {
             let v = &self.rows[self.ordered[i]][col];
             if matches!(v, Value::Null) {
+                if nulls_first {
+                    hi = i + 1;
+                    continue;
+                }
                 break;
             }
             let ord = range_v_vs_bound(v, cur, off, subtract)?;
@@ -864,8 +889,11 @@ pub(crate) fn apply_window_stage(
                             let mut cur_hi = 0usize;
                             for pos in 0..np {
                                 let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
-                                if !removable && lo > cur_lo {
+                                if (!removable && lo > cur_lo) || lo < cur_lo || hi < cur_hi {
                                     // Left edge advanced over a non-invertible aggregate ⇒ rebuild.
+                                    // The carry assumes monotone bounds (window.md §6); a frame
+                                    // that moved backwards on either edge is rebuilt rather than
+                                    // carried, so a stale accumulator can never leak into a result.
                                     acc = Acc::with_context(
                                         aggplan,
                                         spec.agg_collation.clone(),

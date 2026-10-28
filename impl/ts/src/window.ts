@@ -267,6 +267,7 @@ export class FrameCtx {
     // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
     const col = this.order[0]!.idx;
     const desc = this.order[0]!.descending;
+    const nullsFirst = this.order[0]!.nullsFirst;
     const cur = this.rows[this.ordered[pos]!]![col]!;
     if (cur.kind === "null") {
       const lo = f.start.kind === "unboundedPreceding" ? 0 : this.peerStart[pos]!;
@@ -282,10 +283,10 @@ export class FrameCtx {
         lo = this.peerStart[pos]!;
         break;
       case "preceding":
-        lo = this.rangeStart(col, cur, f.start.offset, true, desc);
+        lo = this.rangeStart(col, cur, f.start.offset, true, desc, nullsFirst);
         break;
       case "following":
-        lo = this.rangeStart(col, cur, f.start.offset, false, desc);
+        lo = this.rangeStart(col, cur, f.start.offset, false, desc, nullsFirst);
         break;
       case "unboundedFollowing":
         lo = np;
@@ -300,10 +301,10 @@ export class FrameCtx {
         hi = this.peerEnd[pos]!;
         break;
       case "preceding":
-        hi = this.rangeEnd(col, cur, f.end.offset, true, desc, lo);
+        hi = this.rangeEnd(col, cur, f.end.offset, true, desc, nullsFirst, lo);
         break;
       case "following":
-        hi = this.rangeEnd(col, cur, f.end.offset, false, desc, lo);
+        hi = this.rangeEnd(col, cur, f.end.offset, false, desc, nullsFirst, lo);
         break;
       case "unboundedPreceding":
         hi = 0;
@@ -312,19 +313,28 @@ export class FrameCtx {
     return [lo, Math.max(hi, lo)];
   }
 
-  // The first sorted position whose key satisfies a RANGE start bound (NULL keys never qualify for a
-  // non-NULL current row). subtract = isPreceding XOR descending chooses the bound side.
+  // The first sorted position whose key satisfies a RANGE start bound for a non-NULL current row —
+  // PostgreSQL's update_frameheadpos (nodeWindowAgg.c), window.md §6. A NULL key never satisfies the
+  // value test; its position is fixed by NULL placement instead: with NULLS FIRST the leading NULLs
+  // sort BEFORE every bound (the head skips them), with NULLS LAST the trailing NULLs sort AFTER
+  // every bound, so a start that overshoots every non-NULL key stops AT the first NULL row (not the
+  // partition end — an UNBOUNDED FOLLOWING end then still frames the NULLs).
+  // subtract = isPreceding XOR descending chooses the bound side.
   private rangeStart(
     col: number,
     cur: Value,
     off: Value,
     isPreceding: boolean,
     desc: boolean,
+    nullsFirst: boolean,
   ): number {
     const subtract = isPreceding !== desc;
     for (let i = 0; i < this.np; i++) {
       const v = this.rows[this.ordered[i]!]![col]!;
-      if (v.kind === "null") continue;
+      if (v.kind === "null") {
+        if (nullsFirst) continue;
+        return i;
+      }
       const ord = rangeVVsBound(v, cur, off, subtract);
       // ascending frame: v >= bound; descending frame: v <= bound.
       const include = desc ? ord <= 0 : ord >= 0;
@@ -333,21 +343,30 @@ export class FrameCtx {
     return this.np;
   }
 
-  // The exclusive end of a RANGE end bound, scanning forward from lo while the key stays in frame
-  // (the in-frame keys form a contiguous run over the sorted partition).
+  // The exclusive end of a RANGE end bound for a non-NULL current row, scanning forward from lo
+  // while the key stays in frame (the in-frame keys form a contiguous run over the sorted
+  // partition) — PostgreSQL's update_frametailpos. NULL placement decides a NULL key: leading NULLs
+  // (NULLS FIRST) are within every end bound, trailing NULLs (NULLS LAST) are beyond every one.
   private rangeEnd(
     col: number,
     cur: Value,
     off: Value,
     isPreceding: boolean,
     desc: boolean,
+    nullsFirst: boolean,
     lo: number,
   ): number {
     const subtract = isPreceding !== desc;
     let hi = lo;
     for (let i = lo; i < this.np; i++) {
       const v = this.rows[this.ordered[i]!]![col]!;
-      if (v.kind === "null") break;
+      if (v.kind === "null") {
+        if (nullsFirst) {
+          hi = i + 1;
+          continue;
+        }
+        break;
+      }
       const ord = rangeVVsBound(v, cur, off, subtract);
       // ascending frame: v <= bound; descending frame: v >= bound.
       const include = desc ? ord >= 0 : ord <= 0;
@@ -793,8 +812,11 @@ export function* applyWindowStageSteps(
               let curHi = 0;
               for (let pos = 0; pos < np; pos++) {
                 const [lo, hi] = ctx.bounds(pos, spec.frame);
-                if (!removable && lo > curLo) {
+                if ((!removable && lo > curLo) || lo < curLo || hi < curHi) {
                   // Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
+                  // The carry assumes monotone bounds (window.md §6); a frame that moved backwards
+                  // on either edge is rebuilt rather than carried, so a stale accumulator can never
+                  // leak into a result.
                   acc = windowAcc(spec, env.exec.session.timeZone);
                   meter.releaseQuery(accCharge);
                   accCharge = 0;

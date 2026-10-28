@@ -2163,6 +2163,25 @@ impl Shared {
         true
     }
 
+    /// Claim the in-process writer gate only if it is free right now (no gates — the attach/detach
+    /// scope of [`acquire_writer_scoped`](Self::acquire_writer_scoped)), else fail `55006` with
+    /// `busy` as the message. A host-API act never waits for the writer gate (api.md §2.3): the gate
+    /// may be held by a session on this very thread (an open BEGIN / `update` block), which waiting
+    /// would deadlock, so like compaction it reports object_in_use and the host ends the transaction
+    /// first. Released by [`release_writer`](Self::release_writer).
+    fn try_acquire_writer_local(&self, busy: String) -> Result<()> {
+        if !self.try_acquire_local_writer() {
+            return Err(EngineError::new(SqlState::ObjectInUse, busy));
+        }
+        if !self.under_page_service()
+            && let Err(error) = self.check_coordinator_pids()
+        {
+            self.release_local_writer();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Compact database `lname` (`main` or an attachment) under the local writer barrier the caller
     /// holds (spec/design/api.md §2.6): require a drained reader watermark, then rewrite the storage at the next version and publish the reloaded root while
     /// still holding the watermark lock, so no reader pins in between.
@@ -4060,7 +4079,9 @@ impl Database {
                 let _ = Database(inner).close();
             }
         };
-        if let Err(error) = self.0.acquire_writer_scoped(0, false) {
+        if let Err(error) = self.0.try_acquire_writer_local(format!(
+            "cannot attach database \"{name}\" while a write transaction is open"
+        )) {
             release_service(service);
             return Err(error);
         }
@@ -4150,7 +4171,9 @@ impl Database {
     /// released, under the writer gate.
     pub fn detach(&self, name: &str) -> Result<()> {
         let lname = name.to_string();
-        self.0.acquire_writer_scoped(0, false)?;
+        self.0.try_acquire_writer_local(format!(
+            "cannot detach database \"{name}\" while a write transaction is open"
+        ))?;
         let mut removed: Option<Attachment> = None;
         let result = (|| {
             {
@@ -4461,7 +4484,13 @@ impl Session {
         if let Some(error) = &self.pending_error {
             return Err(error.clone());
         }
-        let ast = self.engine.parse(sql)?;
+        // A parse error (42601 / the 54000 input-size limit) is a statement error: inside an open
+        // block it aborts the block like an execution error (transactions.md §6 — PostgreSQL aborts
+        // on ANY error).
+        let ast = self
+            .engine
+            .parse(sql)
+            .map_err(|e| self.engine.poison_on_lane_err(e))?;
         self.query_ast(ast, params)
     }
 
@@ -5010,11 +5039,24 @@ impl Session {
         f: impl FnOnce(&mut Transaction) -> Result<R>,
     ) -> Result<R> {
         self.begin_block(writable)?;
+        // A scoped handle: this session ends the block (publishing through the shared core / releasing
+        // the gate), so the handle's own commit/rollback — and SQL COMMIT/ROLLBACK through it — are
+        // 2D000 (api.md §2.2): the closure's writes are never discarded by ending the block early.
         let r = {
             let mut tx = Transaction::borrow(&mut self.engine);
             f(&mut tx)
         };
         match r {
+            Ok(_) if self.engine.tx_failed() => {
+                // The closure swallowed a statement error: the block is failed, so "commit" would be
+                // a silent ROLLBACK (transactions.md §6). A closure API reports that — its writes
+                // are never discarded behind an Ok return.
+                let _ = self.end_block(false);
+                Err(EngineError::new(
+                    SqlState::InFailedSqlTransaction,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                ))
+            }
             Ok(v) => {
                 self.end_block(true)?;
                 Ok(v)
@@ -5706,13 +5748,25 @@ impl Database {
     }
 
     /// Release this handle (spec/design/api.md §2.3). The bare convenience methods autocommit, so
-    /// there is never uncommitted work to discard; another clone of the shared core may still be
-    /// live, so the backing file is released when the last handle drops. Idempotent.
+    /// there is never uncommitted work to discard; a session's open write transaction is the
+    /// session's to end (session.md §2.3), so `close` never waits for the writer gate — it would
+    /// deadlock against a block open on this very thread — and fails `55006` while one is held,
+    /// without ending the block. The refusal still consumes this handle (Rust ownership): the
+    /// session's own clone of the shared core keeps the file open until its block ends, and a host
+    /// that wants to retry closes a clone. Another clone of the shared core may still be live, so the
+    /// backing file is released when the last handle drops. Idempotent.
     ///
     /// Under the page service, closing ends the handle's role for every clone: a serving owner drains
     /// its clients for its shutdown grace and releases ownership; a client closes its connection
     /// (spec/pageservice/README.md §6.5).
     pub fn close(self) -> Result<()> {
+        if !self.0.try_acquire_local_writer() {
+            return Err(EngineError::new(
+                SqlState::ObjectInUse,
+                "cannot close the database while a write transaction is open",
+            ));
+        }
+        self.0.release_local_writer();
         #[cfg(unix)]
         self.0.end_service(true);
         // Each file attachment under the page service ends its own role too (README.md §6.6).

@@ -233,7 +233,11 @@ func (st *storage) integrityCapture(snap *snapshot) (*integrityPin, bool, error)
 	pin := &integrityPin{snap: snap, paging: paging}
 	if st.path == "" {
 		// In memory: the last adopted commit's catalog root, or, before any commit (and after a
-		// compaction), the store's own meta.
+		// compaction), the store's own meta — the slot holding the PINNED version (integrity-check.md
+		// §2). An image deserialized after a crash can carry a newer slot whose generation the loader
+		// rejected (its manifest invalid — validated-cow.md §1) and fell back from; that slot parses,
+		// but it is not the snapshot the check pinned, and preferring it would make every pin look
+		// stale and the check spin to 55006.
 		var m meta
 		if st.budget.lastCatRoot.page != 0 {
 			m = meta{txid: st.stagedTxid, rootPage: st.budget.lastCatRoot.page, rootTag: st.budget.lastCatRoot.tag}
@@ -244,12 +248,14 @@ func (st *storage) integrityCapture(snap *snapshot) (*integrityPin, bool, error)
 				if err != nil {
 					return nil, false, err
 				}
-				if pm, ok := parseMeta(raw); ok && (!found || pm.txid > m.txid) {
+				if pm, ok := parseMeta(raw); ok && pm.txid == snap.txid {
 					m, found = pm, true
 				}
 			}
 			if !found {
-				return nil, false, newError(DataCorrupted, "no valid meta page")
+				// No slot names the pinned version: the storage has moved past it, or (never with a
+				// loaded image) no slot parses. The caller pins again.
+				return nil, false, nil
 			}
 		}
 		if m.txid != snap.txid {

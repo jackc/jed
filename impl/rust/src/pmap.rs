@@ -586,6 +586,45 @@ fn split_point(
     Some(m_balanced.min(m_max).max(m_min))
 }
 
+/// The leaf split decision from the record weights alone (format.md "Leaf split"): `Some(m)` when a
+/// leaf of these records overflows `cap` and splits at `m`, `None` when it fits (or has a single
+/// record — defensively left whole, the oversize surfacing as `0A000` at serialize). Shared by
+/// [`build_leaf`] and the delete path's merge pre-check, so both see the same separator.
+fn leaf_split_point(
+    weights: &[u32],
+    cap: Cap,
+    shape: LeafShape,
+    edited: Option<usize>,
+) -> Option<usize> {
+    let n = weights.len();
+    let payload: usize =
+        weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
+    if payload <= cap.c || n < 2 {
+        return None;
+    }
+    let prefix: Vec<usize> = std::iter::once(0)
+        .chain(weights.iter().scan(0usize, |acc, &w| {
+            *acc += w as usize;
+            Some(*acc)
+        }))
+        .collect();
+    let total = prefix[n];
+    let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape);
+    let rightpayload = |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape);
+    let right_edge = edited == Some(n - 1);
+    // `None` is unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md
+    // "Why the record cap").
+    split_point(
+        1,
+        n - 1,
+        payload,
+        cap.c,
+        right_edge,
+        leftpayload,
+        rightpayload,
+    )
+}
+
 /// Build a leaf from its parts; if its payload overflows `cap`, split it 2-way **copy-up**
 /// (format.md "Leaf split"): the left leaf keeps records `[0, m)`, the right leaf `[m, N)`, and
 /// the separator handed up is a **copy of `keys[m]`** (the right leaf's first key). `edited` is
@@ -600,35 +639,8 @@ fn build_leaf(
     shape: LeafShape,
     edited: Option<usize>,
 ) -> Ins {
-    let n = keys.len();
-    let payload: usize =
-        weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
-    if payload <= cap.c || n < 2 {
+    let Some(m) = leaf_split_point(&weights, cap, shape, edited) else {
         return Ins::Whole(Node::new_leaf(keys, vals, weights));
-    }
-    let prefix: Vec<usize> = std::iter::once(0)
-        .chain(weights.iter().scan(0usize, |acc, &w| {
-            *acc += w as usize;
-            Some(*acc)
-        }))
-        .collect();
-    let total = prefix[n];
-    let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape);
-    let rightpayload = |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape);
-    let right_edge = edited == Some(n - 1);
-    let m = match split_point(
-        1,
-        n - 1,
-        payload,
-        cap.c,
-        right_edge,
-        leftpayload,
-        rightpayload,
-    ) {
-        Some(m) => m,
-        // Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why
-        // the record cap"); defensively leave the node whole (0A000 at serialize).
-        None => return Ins::Whole(Node::new_leaf(keys, vals, weights)),
     };
 
     let mut keys = keys;
@@ -1657,9 +1669,12 @@ fn into_parts(slot: &mut Child, parts: LeafParts) -> (Vec<Vec<u8>>, Vec<Row>, Ve
 /// the two key lists (the merged children need a routing key between them). If `M` fits, it
 /// replaces the pair (the parent loses one key); if it overflows, it is split 2-way by the
 /// balanced rule and the halves + the new separator replace the pair (the parent's key count is
-/// unchanged). An **interior** `M` that overflows but admits no valid split (near-cap separators)
-/// **abandons the merge** — the parent is left unchanged (format.md "Delete", the deterministic
-/// abandon rule).
+/// unchanged). The merge is **abandoned** — the parent is left unchanged, the underfull child
+/// tolerated — in two deterministic cases (format.md "Delete", the abandon rules): an **interior**
+/// `M` that overflows but admits no valid split (near-cap separators), and a split whose new
+/// separator is longer than the parent separator it would replace by enough to overflow the
+/// **parent** (the key count is unchanged, the byte size is not; nothing on the delete path splits
+/// an interior, so an over-cap parent would be unserializable).
 ///
 /// The parent is edited in place. A merged leaf takes a uniquely owned dirty operand's vectors
 /// instead of copying them; every fallible step (faulting, decoding) runs before any vector moves,
@@ -1692,7 +1707,45 @@ fn merge_at(
         (Child::OnDisk(_), _) => true,
     };
 
+    // The parent payload the merge's replacement separator `sep` would leave (the parent keeps its
+    // key count; separator `j` is replaced), against which the second abandon rule tests.
+    let parent_with =
+        |sep_len: usize| interior_payload(cap, &node.keys) - node.keys[j].len() + sep_len;
+
     let merged = if left_is_leaf {
+        // The pre-check: a leaf merge takes a dirty operand's vectors, so decide before any move.
+        {
+            let operand = |slot: &Child, loaded: &Option<Arc<Node>>| -> Arc<Node> {
+                match (slot, loaded) {
+                    (Child::Resident(n), _) => Arc::clone(n),
+                    (Child::OnDisk(_), Some(n)) => Arc::clone(n),
+                    (Child::OnDisk(p), None) => {
+                        unreachable!("OnDisk merge operand {} was not faulted", p.page)
+                    }
+                }
+            };
+            let lnode = operand(&node.children[j], &lloaded);
+            let rnode = operand(&node.children[j + 1], &rloaded);
+            let mut weights: Vec<u32> = Vec::with_capacity(lnode.len() + rnode.len());
+            for i in 0..lnode.len() {
+                weights.push(lnode.weight_at(i));
+            }
+            for i in 0..rnode.len() {
+                weights.push(rnode.weight_at(i));
+            }
+            if let Some(m) = leaf_split_point(&weights, cap, shape, None) {
+                let sep_len = if m < lnode.len() {
+                    lnode.key_at(m).len()
+                } else {
+                    rnode.key_at(m - lnode.len()).len()
+                };
+                if parent_with(sep_len) > cap.c {
+                    // The replacement separator would overflow the parent: abandon the merge — the
+                    // two children and the parent separator stay exactly as they were.
+                    return Ok(());
+                }
+            }
+        }
         let (lslot, rslot) = node.children.split_at_mut(j + 1);
         let (lslot, rslot) = (&mut lslot[j], &mut rslot[0]);
         let lparts = leaf_parts(lslot, lloaded.as_ref())?;
@@ -1714,6 +1767,9 @@ fn merge_at(
         let mut mchildren = left.children.clone();
         mchildren.extend(right.children.iter().cloned());
         match build_interior(mkeys, mchildren, cap, None) {
+            // The pushed-up median would overflow the parent: abandon the merge (the interior
+            // operands were only copied, so nothing is left to restore).
+            Some(Ins::Split { ref sep, .. }) if parent_with(sep.len()) > cap.c => return Ok(()),
             Some(ins) => ins,
             // No valid 2-way split point (near-cap separators): abandon the merge — the two
             // children and the parent separator stay exactly as they were (underfull tolerated).

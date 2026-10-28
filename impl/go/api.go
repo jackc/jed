@@ -11,14 +11,45 @@ package jed
 type Transaction struct {
 	db   *engine
 	done bool
+	// scoped marks a Transaction handed to a View/Update closure (Session.withBlock): the closure IS the
+	// block's lifetime, so ending it from inside — SQL COMMIT/ROLLBACK or this handle's Commit/Rollback —
+	// is 2D000 invalid_transaction_termination (spec/design/api.md §2.2), never a silent discard of
+	// the closure's writes.
+	scoped bool
 }
 
 // queryValues is the unexported raw (sql, []Value) -> *Rows seam the ergonomic Query/Exec/QueryRow
 // (ergonomic.go) build on within this transaction. Total: a non-query statement (a write in a READ
 // ONLY transaction is 25006; a statement error aborts the block, every later statement but
-// commit/rollback then 25P02) returns a no-column cursor carrying the command tag.
+// commit/rollback then 25P02) returns a no-column cursor carrying the command tag. A parse error
+// (42601 / the 54000 input-size limit) is a statement error too, so it aborts the block
+// (transactions.md §6 — PostgreSQL aborts on ANY error, the parse stage included).
 func (tx *Transaction) queryValues(sql string, params []Value) (*Rows, error) {
-	return tx.db.queryValues(sql, params)
+	stmt, err := tx.db.parse(sql)
+	if err != nil {
+		tx.db.failOpenBlock()
+		return nil, err
+	}
+	return tx.queryStmt(stmt, params, nil, nil)
+}
+
+// queryStmt routes a parsed statement through the engine's lazy lanes after the closure-scope gate:
+// inside a View/Update closure SQL COMMIT/ROLLBACK is 2D000 and aborts the block (api.md §2.2 — the
+// PostgreSQL rule for COMMIT inside a procedure called within a transaction block; the Transaction's
+// later statements would otherwise run outside the block the wrapper is about to end, and their
+// writes be discarded). A nested BEGIN stays the engine's 25001 / 25P02 (transactions.md §4.2), and
+// the SAVEPOINT family runs on the open block as api.md §2.2 specifies.
+func (tx *Transaction) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *insertStmtCache) (*Rows, error) {
+	if tx.scoped && (stmt.Commit != nil || stmt.Rollback != nil) {
+		tx.db.failOpenBlock()
+		return nil, errInvalidTransactionTermination()
+	}
+	return tx.db.queryStmt(stmt, params, sc, ic)
+}
+
+// errInvalidTransactionTermination is 2D000: a View/Update closure may not end its own block.
+func errInvalidTransactionTermination() error {
+	return newError(InvalidTransactionTermination, "invalid transaction termination")
 }
 
 // Render renders v in the owning session's current time zone — Session.Render
@@ -30,6 +61,9 @@ func (tx *Transaction) Render(v Value) (string, error) {
 // Commit publishes the transaction durably (per synchronous). Idempotent after the transaction
 // has ended.
 func (tx *Transaction) Commit() error {
+	if tx.scoped {
+		return errInvalidTransactionTermination() // the closure ends the block (api.md §2.2)
+	}
 	if tx.done {
 		return nil
 	}
@@ -40,6 +74,9 @@ func (tx *Transaction) Commit() error {
 // Rollback discards the transaction's working set. Idempotent after the transaction has ended, so
 // a `defer tx.Rollback()` after a Commit is a safe no-op (the View/Update wrappers rely on this).
 func (tx *Transaction) Rollback() error {
+	if tx.scoped {
+		return errInvalidTransactionTermination() // the closure ends the block (api.md §2.2)
+	}
 	if tx.done {
 		return nil
 	}

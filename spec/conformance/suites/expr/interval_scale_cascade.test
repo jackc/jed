@@ -1,0 +1,142 @@
+# interval × / number — PostgreSQL's interval_mul / interval_div cascade (spec/design/interval.md
+# §5). The whole months and days are truncated like PG's (int32) casts; the fractional months cascade
+# into days and the fractional days into the time, with PG's two TSROUND quantizations (the
+# fractional-month days to 1e-6 day, the seconds remainder to 1 µs, half to even like C rint) and a
+# seconds remainder of 24 h or more moving its whole days up into the days field. jed computes the
+# cascade in exact rational arithmetic (PG: double), so it agrees with PG except where PG's double
+# lands on the other side of a quantum boundary (interval.md §5); the records here avoid those ties.
+# Oracle-checked against postgres:18.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.interval, expr.interval_scale, resource.cost_metering
+
+# The day fraction (0.75 day) and the fractional-month days (0.75 mon = 22.5 days) sum to 1 day 6 h:
+# the whole day moves into the days field (PG: 23 days 06:00:00, never 22 days 30:00:00).
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month 1 day' * 0.75
+----
+23 days 06:00:00
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '3 months 3 days' / 4
+----
+23 days 06:00:00
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month 1 day' * 1.75
+----
+1 mon 24 days 06:00:00
+
+# a negative factor: the whole-day move and the cascade carry the sign
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month 1 day' * -0.75
+----
+-23 days -06:00:00
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month 1 day 1 hour' * -1.5
+----
+-1 mons -16 days -13:30:00
+
+# TSROUND: the fractional-month days (5/7 mon = 21.428571428… days) are quantized to 1e-6 day
+# BEFORE cascading, so the time is 0.428571 day = 10:17:08.5344, not the exact 10:17:08.571429.
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 year' / 7
+----
+1 mon 21 days 10:17:08.5344
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 year' * 0.123456789
+----
+1 mon 14 days 10:39:59.9616
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '7 months' / 3
+----
+2 mons 10 days
+
+# the quantized fractional-month days cascade into the time: 0.0000005 mon = 15e-6 day = 1.296 s
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month' * 0.0000005
+----
+00:00:01.296
+
+# 4.5e-6 day rounds half to even to 4e-6 day = 0.3456 s (C rint)
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month' * 0.00000015
+----
+00:00:00.3456
+
+# below half a micro-day: nothing survives the quantization
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 month' * 0.000000016
+----
+00:00:00
+
+# the µs result rounds half to even (rint): 0.5 µs → 0, 1.5 µs → 2, 2.5 µs → 2
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 microsecond' * 0.5
+----
+00:00:00
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '3 microseconds' / 2
+----
+00:00:00.000002
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '5 microseconds' * 0.5
+----
+00:00:00.000002
+
+# A factor's trailing fractional zeros do not count against the digit cap (interval.md §6): a
+# numeric(p, 10) factor of 1.0000000000 is the factor 1.
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 day' * 1.0000000000
+----
+1 day
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '100 days' * 100.0000000000
+----
+10000 days
+
+# ten significant fractional digits: 1e-10 day = 8.64 µs → rint → 9 µs
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 day' * 1.0000000001
+----
+1 day 00:00:00.000009
+
+# cost: 2
+query T nosort
+SELECT INTERVAL '1 day' * 1.00000000005
+----
+1 day 00:00:00.000004
+
+# the zero interval scales to zero whatever the factor's magnitude
+# cost: 2
+query T nosort
+SELECT INTERVAL '0' * 1000000000000000000
+----
+00:00:00
+
+# a factor whose product overflows the days field is 22008 (PG: interval out of range)
+statement error 22008
+SELECT INTERVAL '1 day' * 123456789012345678.123456789

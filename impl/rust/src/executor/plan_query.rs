@@ -108,9 +108,13 @@ impl Engine {
         primary: CtePrimary<'_>,
     ) -> Result<Vec<CteBinding>> {
         let mut bindings: Vec<CteBinding> = Vec::new();
+        // The static reference counts behind the inline-candidate decision, one walk per part.
+        let mut refs = CteRefTally::new(ctes, primary);
+        // Duplicate names are rejected as they are met, so a name indexes at most one binding.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(ctes.len());
         for (ci, cte) in ctes.iter().enumerate() {
             let lname = cte.name.to_string();
-            if bindings.iter().any(|b| b.name == lname) {
+            if !seen.insert(cte.name.as_str()) {
                 return Err(EngineError::new(
                     SqlState::DuplicateAlias,
                     format!("WITH query name {lname} specified more than once"),
@@ -235,7 +239,7 @@ impl Engine {
                         // expands no reference of its own; an uncorrelated candidate keeps that
                         // definition, a correlated one is planned again with expansion on (it
                         // stays an ordinary CTE).
-                        let candidate = cte_reference_candidate(ctes, ci, primary);
+                        let candidate = refs.candidate(ctes, ci);
                         let mut plan = if candidate {
                             self.without_cte_expansion(|| {
                                 self.plan_query(q, parent, &visible, ptypes)
@@ -819,17 +823,11 @@ impl Engine {
         //      Query bodies / a query primary were already plan-counted in (1)/(2).
         for cte in &ctes {
             if cte.body.is_data_modifying() {
-                for b in &bindings {
-                    b.refs
-                        .set(b.refs.get() + count_cte_refs_dml(&cte.body, &b.name));
-                }
+                add_dml_cte_refs(&bindings, &cte.body);
             }
         }
         if body.is_data_modifying() {
-            for b in &bindings {
-                b.refs
-                    .set(b.refs.get() + count_cte_refs_dml(&body, &b.name));
-            }
+            add_dml_cte_refs(&bindings, &body);
         }
         let bound = bind_params(params, &ptypes.finalize()?, &self.input_zone())?;
         if planning.bind(&bound) {
@@ -1301,6 +1299,7 @@ impl Engine {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,

@@ -121,6 +121,16 @@ time zones have a table-free built-in baseline:
 
 - **`UTC`** (the session default) and **fixed numeric offsets** `±HH`, `±HH:MM`, `±HH:MM:SS` are
   **built-in and require no loaded data** — a fixed offset is pure integer arithmetic on the instant.
+  A fixed offset is read as PostgreSQL's `pg_tzset` reads a numeric POSIX zone (the POSIX sign: `+05`
+  is *west* of UTC): hours `0..167`, minutes `0..59`, seconds `0..60`, each digit run checked as it
+  accumulates (tzcode's `getnum`), so an over-long run — `'+168'`, `'+1000000'`, `'+4294967296'` — is
+  `22023` "not recognized", never a wrapped, clamped, or silently-UTC offset. (`make_timestamptz`'s
+  explicit zone argument reads a numeric offset with the **ISO** sign and PG's `±15:59:59` bound
+  instead — [functions.md §11](functions.md).)
+- **Names are matched case-insensitively**, as PostgreSQL's `pg_tzset` does: the lookup folds ASCII
+  letters (`downcase_truncate_identifier`), so `'utc'`, `'america/new_york'` and `'AMERICA/NEW_YORK'`
+  all resolve; an exact name wins over a folded match, and the resolved zone keeps its canonical
+  loaded name (the one an index dependency records). A non-ASCII letter keeps its case.
 - **Every *named* IANA zone** (`America/New_York`, and notably the `Etc/*` zones, whose POSIX sign
   convention is a foot-gun) requires a **loaded bundle**; naming one no loaded bundle provides is
   **`22023`** (`invalid_parameter_value`, PG's "time zone not recognized"; §6).
@@ -258,7 +268,15 @@ Details:
   as `±infinity`) traps `22008` "timestamp out of range" — PostgreSQL's code for an out-of-range
   timestamp. `±infinity` inputs pass through unshifted and never reach the kernels. Every zone-shift
   consumer inherits the guard: `AT TIME ZONE`, the cross-family casts (§9.3), `date_trunc` (§9.1) and
-  `EXTRACT`/`date_part` (§9.2) in a zone, `make_timestamptz`, and the session-zone text render (§9.5).
+  `EXTRACT`/`date_part` (§9.2) in a zone, `make_timestamptz`, `timestamptz ± interval` (below), and
+  the session-zone text render (§9.5).
+- **`timestamptz ± interval` is a zone consumer too** — PostgreSQL's `timestamptz_pl_interval`
+  ([interval.md §5](interval.md)): the months and days of the interval are added on the **session
+  zone's wall clock** (each step re-resolving the wall clock through the zone with exactly the
+  gap/overlap rules above), the micros on the instant. So `+ interval '1 day'` keeps the wall-clock
+  time across a DST change (the instant moves 23 or 25 h) while `+ interval '24 hours'` moves it
+  exactly 24 h. One `timezone` unit per calendar step performed (§10). A zoneless `timestamp` or
+  `date` never consults a zone.
   These extremes lie far outside PostgreSQL's range, so they are not oracle-checkable; each core pins
   them in its `zone_shift_range` test.
 - **Purity.** `AT TIME ZONE` is a pure function of `(instant, loaded TZif bytes)` — no host reach, no
@@ -639,9 +657,11 @@ Identical posture to collation ([collation.md §11](collation.md)):
   analogue, [collation.md §8](collation.md)), charged **once per zone lookup** at the evaluation site —
   the deterministic, cross-core-identical metering point. `AT TIME ZONE` charges it per conversion; the
   Slice-2 consumers charge it exactly when they consult a zone (`date_trunc(timestamptz)` / its 3-arg
-  form, an `EXTRACT` of a `timestamptz` that decomposes it in the session zone, and a `timestamptz`-
-  crossing cast) and **not** for the zone-free forms (`date_trunc(timestamp)`, `EXTRACT(epoch FROM
-  timestamptz)`, `EXTRACT` of a `timestamp`/`date`/`interval`, the zone-free casts). A TZif lookup is a
+  form, an `EXTRACT` of a `timestamptz` that decomposes it in the session zone, a `timestamptz`-
+  crossing cast, and `timestamptz ± interval` — one unit per calendar step, months and days, a finite
+  operand performs; `uuidv7(shift)` the same) and **not** for the zone-free forms (`date_trunc(timestamp)`,
+  `EXTRACT(epoch FROM timestamptz)`, `EXTRACT` of a `timestamp`/`date`/`interval`, the zone-free casts,
+  a pure time-of-day interval). A TZif lookup is a
   bounded binary search (+ a bounded footer evaluation), so a query converting a large input is cost-
   ceilinged like any other work ([cost.md](cost.md)). The unit is registered in
   [../cost/schedule.toml](../cost/schedule.toml) (`timezone`, landed with Slice 1).

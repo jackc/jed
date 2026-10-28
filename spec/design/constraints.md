@@ -512,6 +512,17 @@ the flag decides only which is a *constraint*, as PostgreSQL's `pg_constraint` r
 - `ALTER TABLE … DROP CONSTRAINT`, `RENAME CONSTRAINT` and `ON CONFLICT ON CONSTRAINT` naming a
   bare unique index are **`42704`**, and `jed_constraints` does not list one. A bare unique index is
   still a FOREIGN KEY target and an `ON CONFLICT` column-list arbiter, as in PostgreSQL.
+- `DROP INDEX` of a bare unique index that is the **last unique key covering a FOREIGN KEY's
+  referenced column set** (the parent's primary key or another unique index on the same set counts
+  as a cover) is **`2BP01`** (*cannot drop index … because other objects depend on it: constraint
+  … on table …*, the `DROP TABLE` shape of §6.10): the FK's existence probe (§6.4) walks that key,
+  so removing it would leave the constraint unenforceable. Drop the constraint first. The dependency
+  scan runs over the index's own domain only (an FK never crosses the temp/persistent line,
+  [temp-tables.md](temp-tables.md) §8). **Divergence:** PostgreSQL binds the FK to one specific index
+  at `CREATE` and refuses to drop *that* one even when a twin unique index remains; jed resolves the
+  referenced set against any covering unique key (§6.2 step 4), so only the last cover is protected.
+  A catalog that nonetheless holds an FK with no covering unique key (a malformed file) fails the
+  probe closed with `XX001` rather than crashing.
 
 A reloaded database enforces exactly as the creating session did. The byte fixture is the
 `unique_table.jed` golden (`t_v_key` and `wv` are constraints, `uq` is not).
@@ -560,7 +571,14 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    takes the temp-first resolution walk, and the parent must be of the child's kind — a session-local
    temp table references only temp tables, a persistent table only persistent ones, else **`42P16`**
    (PostgreSQL's persistence rule; [temp-tables.md](temp-tables.md) §8). Every later step and all
-   enforcement then stay within that one domain.
+   enforcement then stay within that one domain. The parent is a `qualified_table`
+   ([attached-databases.md](attached-databases.md) §4): a `main.` / `temp.` qualifier pins the
+   implicit scope, so the name is looked up there alone (a validation gate — preclude-overlaps keeps
+   a name in one scope; a self-reference may spell its own table with its own scope's qualifier) and
+   the persistence rule then applies as for a bare name; an attachment qualifier is a
+   **cross-database foreign key**, which attached-databases.md §8 forbids — **`0A000`** (*a foreign
+   key may not reference a table in another database*); an unknown qualifier is **`42P01`**
+   (*database "x" is not attached*). The same resolution serves `ALTER TABLE … ADD FOREIGN KEY`.
 3. **Referenced columns.** An omitted `(refcol …)` list defaults to the **parent's primary key**
    (in PK key order); a parent with no primary key is **`42704`**
    (`there is no primary key for referenced table <parent>`) — PG's code for the omitted-list case

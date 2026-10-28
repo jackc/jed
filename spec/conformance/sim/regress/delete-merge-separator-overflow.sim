@@ -1,0 +1,235 @@
+# Delete rebalance at page size 256 over text keys of random length (seed 7 of a scratch generator):
+# a merge-overflow split whose new separator would overflow the parent is abandoned, leaving the
+# underfull leaf (format.md "Delete", the second abandon rule). Before that rule the commit of w10
+# failed 0A000 (the over-capacity interior reached serialize) and the row stayed undeletable. The
+# check after every batch pins the image hash, so every core must abandon the same merges.
+# format: simulation
+# seed: 7
+# page_size: 256
+# clock: 1700000000000000
+open w1 write
+on w1 CREATE TABLE t (k text PRIMARY KEY)
+commit w1
+open w2 write
+on w2 INSERT INTO t VALUES ('z2dtxNC5')
+on w2 INSERT INTO t VALUES ('xizUQAiNMeWhSal36g')
+on w2 INSERT INTO t VALUES ('8Sf4y31W79aI4joMeUjxJdi')
+on w2 INSERT INTO t VALUES ('Wbaq2FDSC8hxkPJa9hxC3Gv')
+on w2 INSERT INTO t VALUES ('JHd7BHtBetH7E5LjDrFctYsv3dl6VqmDRPjmdUo8')
+on w2 INSERT INTO t VALUES ('18p7JWeRiA62RVxnYNdDmmpD')
+on w2 INSERT INTO t VALUES ('2M1gvSBhrQVf')
+on w2 INSERT INTO t VALUES ('0PPDAa8wImgOI7QU0XDMQrfpX2mPOC2VLjxveBmP')
+on w2 INSERT INTO t VALUES ('g4HvvERC4Z335mm')
+on w2 INSERT INTO t VALUES ('hv6PMpR7sCqfJnG1xFHTO0BoTPQGIFW3MsjjnvRb')
+on w2 INSERT INTO t VALUES ('oqWzXUHvtsan6k06BCi3HKzSZ2QChXpasNS')
+on w2 INSERT INTO t VALUES ('SjU4')
+on w2 INSERT INTO t VALUES ('WRfvqPlQGOKfCRDX9UQ0WFhCV6YWoVntPnydhX')
+on w2 INSERT INTO t VALUES ('GHlBeMF97X9EoSRmqX6AG8RHi0EHpw41ImeS3uRXs4vY5w')
+on w2 INSERT INTO t VALUES ('fN3ffgFDqQ2UeUMncm2y9B')
+commit w2
+open w3 write
+on w3 INSERT INTO t VALUES ('U8fODjS3NogcLwXUjJpu')
+on w3 INSERT INTO t VALUES ('JvguauHvclVlKiTR9h1hvtNwTYJrHi0pksB7')
+on w3 INSERT INTO t VALUES ('ANainymXId8GArlbLL2Wj')
+on w3 INSERT INTO t VALUES ('tRYucVi6u5WkG6Tcw8dPC1p0TMjPPKO')
+on w3 INSERT INTO t VALUES ('IKwf7pdLYwUoKtYS')
+on w3 INSERT INTO t VALUES ('5UxfylA1IqPtIYkedeOhQ6WcN4kiDea0Xxu8D5FWX')
+on w3 INSERT INTO t VALUES ('wEYaIupurkaaIJ32CPJvMTy8wxCZl4l1wCKcDNP2Q6iMAr')
+on w3 INSERT INTO t VALUES ('h241eUdWxUCSKFWO6v7a')
+on w3 INSERT INTO t VALUES ('hRAfmbvz0Xz26vMR4LzeDwGwIknJHMNW')
+on w3 INSERT INTO t VALUES ('exasjgrcoUcFinCPANsu')
+on w3 INSERT INTO t VALUES ('3CC75pTHabyN6KQVwRbuixUZ9BJ')
+on w3 INSERT INTO t VALUES ('w0z193zUEQm5UTxM54')
+on w3 INSERT INTO t VALUES ('wBcYsRLr0rezDlLF6dEnf4NaQS4p')
+on w3 INSERT INTO t VALUES ('SnG036G2lRbGNgWdM3EeBOEAU3P2ZABzcvSukXHL')
+on w3 INSERT INTO t VALUES ('Tr3UrIi2nVfwOZsbT1G0Zh')
+commit w3
+open w4 write
+on w4 INSERT INTO t VALUES ('DmKaLcVv')
+on w4 INSERT INTO t VALUES ('jEw31xR0kil3N4dVZhWqghnq8c')
+on w4 INSERT INTO t VALUES ('ecDLnyavJRVADpevUBS4kBavzTdfaTrkNxNctwm0ych')
+on w4 INSERT INTO t VALUES ('Lh7Y8PJGYzPu6Zf28JpOeBibucURnivl')
+on w4 INSERT INTO t VALUES ('kP4X')
+on w4 INSERT INTO t VALUES ('BFlFKHjDocjl255bIrfV7MFYo24rwqWfXN8u8')
+on w4 INSERT INTO t VALUES ('weUHNZ')
+on w4 INSERT INTO t VALUES ('yX2kqPG3ZR6tsSs5a5mTvqUB8spQ6CtkV1SR')
+on w4 INSERT INTO t VALUES ('ayGNWoL6NoBZXWc2r4bUcYVEjxWeT')
+on w4 INSERT INTO t VALUES ('Eqf0NTbAGV6nlNlHL2yAuGM5ZCsWbSkkWOcFNFXp')
+on w4 INSERT INTO t VALUES ('5uwirFhQjB')
+on w4 INSERT INTO t VALUES ('9F6iMXUaFxGha7EBJ6Wua7O2cgIWXnT2Ce5VurNws')
+on w4 INSERT INTO t VALUES ('xoqrh9hYJWavDEj5T4WjbuqpUQA5JctfncG')
+on w4 INSERT INTO t VALUES ('MFlwavRbos3JkI6XgkU5A1UohDEQTySi44zFPQyo5Jpk')
+on w4 INSERT INTO t VALUES ('kQWBSXDFiRW5ixK0qfFQmStdmMX9Xm1IWfqJe')
+commit w4
+open w5 write
+on w5 INSERT INTO t VALUES ('TrZOvesHdodXgwD32hbn1tMe5qKlti')
+on w5 INSERT INTO t VALUES ('8p8OAd9zCcHPREwz0PwRhyF9kp6VFzwKwFEef3')
+on w5 INSERT INTO t VALUES ('KpqTvcvDeUv8TXhuuuUocVihwMnnyoqg')
+on w5 INSERT INTO t VALUES ('YM4eVUN4QdtlEKq9ckiTOcRFfgiGNtNy')
+on w5 INSERT INTO t VALUES ('L8vW207HDk64tzvBuUxdAPwMDAEvjBcNx2lJUsFGp8SQKEp')
+on w5 INSERT INTO t VALUES ('ljJqXGmolDJsqTv4ZzI')
+on w5 INSERT INTO t VALUES ('B51rhwMV8Bdnjz')
+on w5 INSERT INTO t VALUES ('nPiOMuENuOqGzdvf3H')
+on w5 INSERT INTO t VALUES ('DnV4UWNRWMDH')
+on w5 INSERT INTO t VALUES ('5O4lbvBPCHbmzgVJ')
+on w5 INSERT INTO t VALUES ('2Tz9twrWM2D7G8')
+on w5 INSERT INTO t VALUES ('58q4nobErI')
+on w5 INSERT INTO t VALUES ('7ZatQCfutOb6Tpp1rjzHc5MaCai9gCWCGrvHh')
+on w5 INSERT INTO t VALUES ('f8VLEXD0')
+on w5 INSERT INTO t VALUES ('fy9aNqq4mwduegLo0ghgVL0HUlyW669pTRpp1')
+commit w5
+open w6 write
+on w6 INSERT INTO t VALUES ('hH5DA')
+on w6 INSERT INTO t VALUES ('VU0odBq27Omq1hWLhWWnl6sjSjcHecE')
+on w6 INSERT INTO t VALUES ('fcXicy9yXUM06kzhxtcjLRv1ViF9')
+on w6 INSERT INTO t VALUES ('cvyd2wDPJzEiw3gf9xGRTF8Qe6qcfV3')
+on w6 INSERT INTO t VALUES ('DyuuWsbo697yfPGeuFWSUGDk7X')
+on w6 INSERT INTO t VALUES ('xk43rOvMikd5E3c2aXLMKvHxftOcA9f')
+on w6 INSERT INTO t VALUES ('9VMHUud4e9gxpWD')
+on w6 INSERT INTO t VALUES ('hVMTRg8lfWyDk9DZYQKX02z4kwqqIqmdYAC90LzJ')
+on w6 INSERT INTO t VALUES ('ibFPUEC8eJ4WBK5XNAjADYQ0te')
+on w6 INSERT INTO t VALUES ('CPpCpUyD5b6tPUGXsdGy1JXa54pyIkxIu30dSnAGp')
+on w6 INSERT INTO t VALUES ('bGbw9bvPKoiCtdjA3xRbVx3BUT4Q7sBkF4ud0ONA2G1N2nh')
+on w6 INSERT INTO t VALUES ('7U9yBWrDDvlI3Vgfj4kn2bJfelYWsj')
+on w6 INSERT INTO t VALUES ('B9WzcNPq')
+on w6 INSERT INTO t VALUES ('SI1Ef')
+on w6 INSERT INTO t VALUES ('Al6d6H66y0XYo0X2rGZbKWyzu0vv152oAn1C1alXbL')
+commit w6
+open w7 write
+on w7 INSERT INTO t VALUES ('PYJzkyGfkeas')
+on w7 INSERT INTO t VALUES ('5Z5Maa9zjWLAS2Z19Ijt0Lq7vER3')
+on w7 INSERT INTO t VALUES ('BM3fndtSj')
+on w7 INSERT INTO t VALUES ('RMzKh8ScCN47mq')
+on w7 INSERT INTO t VALUES ('AYisIqxxdVv6XCYrXu95PTfZtGIV6NYTJC')
+on w7 INSERT INTO t VALUES ('kehP49azcrCCrAzAsN')
+on w7 INSERT INTO t VALUES ('Ra2QY8')
+on w7 INSERT INTO t VALUES ('R92aysqSag5WEtLh2Q8C')
+on w7 INSERT INTO t VALUES ('plFMzJwrdzggg2m8WD2Wwv29kkdrKvF')
+on w7 INSERT INTO t VALUES ('6znjqVjtnHErkvXaiJH2AIP6OLsstRKyF3aLpMIfOOTD')
+on w7 INSERT INTO t VALUES ('DKETEkdTZTAfXr')
+on w7 INSERT INTO t VALUES ('CeDawU5MrcbObZL8eJJuFybRYRhzgUPYeaEYsal0uNBVHcE')
+on w7 INSERT INTO t VALUES ('FeitbZEegEhRBAjXCOQMiKkEZvFzfETRF2Ct4I6')
+on w7 INSERT INTO t VALUES ('8xxxPcsngiqg7A9yLmVbiiMPfTGyvkGTs')
+on w7 INSERT INTO t VALUES ('zk9txgq3in0hYOrcaf5jKZpHT0UWZ54SSpXsa1h1p6')
+commit w7
+check
+open w8 write
+on w8 DELETE FROM t WHERE k = 'CeDawU5MrcbObZL8eJJuFybRYRhzgUPYeaEYsal0uNBVHcE'
+on w8 DELETE FROM t WHERE k = 'BFlFKHjDocjl255bIrfV7MFYo24rwqWfXN8u8'
+on w8 DELETE FROM t WHERE k = 'DyuuWsbo697yfPGeuFWSUGDk7X'
+on w8 DELETE FROM t WHERE k = 'plFMzJwrdzggg2m8WD2Wwv29kkdrKvF'
+on w8 DELETE FROM t WHERE k = 'f8VLEXD0'
+on w8 DELETE FROM t WHERE k = 'SI1Ef'
+on w8 DELETE FROM t WHERE k = 'h241eUdWxUCSKFWO6v7a'
+on w8 DELETE FROM t WHERE k = 'Wbaq2FDSC8hxkPJa9hxC3Gv'
+on w8 DELETE FROM t WHERE k = 'fy9aNqq4mwduegLo0ghgVL0HUlyW669pTRpp1'
+commit w8
+check
+open w9 write
+on w9 DELETE FROM t WHERE k = '8Sf4y31W79aI4joMeUjxJdi'
+on w9 DELETE FROM t WHERE k = 'Tr3UrIi2nVfwOZsbT1G0Zh'
+on w9 DELETE FROM t WHERE k = 'tRYucVi6u5WkG6Tcw8dPC1p0TMjPPKO'
+on w9 DELETE FROM t WHERE k = 'DKETEkdTZTAfXr'
+on w9 DELETE FROM t WHERE k = 'SnG036G2lRbGNgWdM3EeBOEAU3P2ZABzcvSukXHL'
+on w9 DELETE FROM t WHERE k = 'g4HvvERC4Z335mm'
+on w9 DELETE FROM t WHERE k = '5uwirFhQjB'
+on w9 DELETE FROM t WHERE k = 'bGbw9bvPKoiCtdjA3xRbVx3BUT4Q7sBkF4ud0ONA2G1N2nh'
+on w9 DELETE FROM t WHERE k = 'Ra2QY8'
+commit w9
+check
+open w10 write
+on w10 DELETE FROM t WHERE k = 'FeitbZEegEhRBAjXCOQMiKkEZvFzfETRF2Ct4I6'
+on w10 DELETE FROM t WHERE k = 'xoqrh9hYJWavDEj5T4WjbuqpUQA5JctfncG'
+on w10 DELETE FROM t WHERE k = '2M1gvSBhrQVf'
+on w10 DELETE FROM t WHERE k = 'PYJzkyGfkeas'
+on w10 DELETE FROM t WHERE k = 'hH5DA'
+on w10 DELETE FROM t WHERE k = 'cvyd2wDPJzEiw3gf9xGRTF8Qe6qcfV3'
+on w10 DELETE FROM t WHERE k = 'B51rhwMV8Bdnjz'
+on w10 DELETE FROM t WHERE k = 'ljJqXGmolDJsqTv4ZzI'
+on w10 DELETE FROM t WHERE k = 'U8fODjS3NogcLwXUjJpu'
+commit w10
+check
+open w11 write
+on w11 DELETE FROM t WHERE k = 'nPiOMuENuOqGzdvf3H'
+on w11 DELETE FROM t WHERE k = '18p7JWeRiA62RVxnYNdDmmpD'
+on w11 DELETE FROM t WHERE k = 'ibFPUEC8eJ4WBK5XNAjADYQ0te'
+on w11 DELETE FROM t WHERE k = 'hRAfmbvz0Xz26vMR4LzeDwGwIknJHMNW'
+on w11 DELETE FROM t WHERE k = 'SjU4'
+on w11 DELETE FROM t WHERE k = 'exasjgrcoUcFinCPANsu'
+on w11 DELETE FROM t WHERE k = 'w0z193zUEQm5UTxM54'
+on w11 DELETE FROM t WHERE k = 'weUHNZ'
+on w11 DELETE FROM t WHERE k = 'wEYaIupurkaaIJ32CPJvMTy8wxCZl4l1wCKcDNP2Q6iMAr'
+commit w11
+check
+open w12 write
+on w12 DELETE FROM t WHERE k = 'DmKaLcVv'
+on w12 DELETE FROM t WHERE k = '3CC75pTHabyN6KQVwRbuixUZ9BJ'
+on w12 DELETE FROM t WHERE k = 'TrZOvesHdodXgwD32hbn1tMe5qKlti'
+on w12 DELETE FROM t WHERE k = 'fcXicy9yXUM06kzhxtcjLRv1ViF9'
+on w12 DELETE FROM t WHERE k = 'R92aysqSag5WEtLh2Q8C'
+on w12 DELETE FROM t WHERE k = 'kQWBSXDFiRW5ixK0qfFQmStdmMX9Xm1IWfqJe'
+on w12 DELETE FROM t WHERE k = 'Lh7Y8PJGYzPu6Zf28JpOeBibucURnivl'
+on w12 DELETE FROM t WHERE k = 'zk9txgq3in0hYOrcaf5jKZpHT0UWZ54SSpXsa1h1p6'
+on w12 DELETE FROM t WHERE k = 'wBcYsRLr0rezDlLF6dEnf4NaQS4p'
+commit w12
+check
+open w13 write
+on w13 DELETE FROM t WHERE k = 'yX2kqPG3ZR6tsSs5a5mTvqUB8spQ6CtkV1SR'
+on w13 DELETE FROM t WHERE k = 'YM4eVUN4QdtlEKq9ckiTOcRFfgiGNtNy'
+on w13 DELETE FROM t WHERE k = 'oqWzXUHvtsan6k06BCi3HKzSZ2QChXpasNS'
+on w13 DELETE FROM t WHERE k = '5Z5Maa9zjWLAS2Z19Ijt0Lq7vER3'
+on w13 DELETE FROM t WHERE k = 'VU0odBq27Omq1hWLhWWnl6sjSjcHecE'
+on w13 DELETE FROM t WHERE k = 'z2dtxNC5'
+on w13 DELETE FROM t WHERE k = 'WRfvqPlQGOKfCRDX9UQ0WFhCV6YWoVntPnydhX'
+on w13 DELETE FROM t WHERE k = 'B9WzcNPq'
+on w13 DELETE FROM t WHERE k = 'L8vW207HDk64tzvBuUxdAPwMDAEvjBcNx2lJUsFGp8SQKEp'
+commit w13
+check
+open w14 write
+on w14 DELETE FROM t WHERE k = '8xxxPcsngiqg7A9yLmVbiiMPfTGyvkGTs'
+on w14 DELETE FROM t WHERE k = '8p8OAd9zCcHPREwz0PwRhyF9kp6VFzwKwFEef3'
+on w14 DELETE FROM t WHERE k = 'hv6PMpR7sCqfJnG1xFHTO0BoTPQGIFW3MsjjnvRb'
+on w14 DELETE FROM t WHERE k = 'DnV4UWNRWMDH'
+on w14 DELETE FROM t WHERE k = 'JHd7BHtBetH7E5LjDrFctYsv3dl6VqmDRPjmdUo8'
+on w14 DELETE FROM t WHERE k = 'ANainymXId8GArlbLL2Wj'
+on w14 DELETE FROM t WHERE k = 'kP4X'
+on w14 DELETE FROM t WHERE k = 'xk43rOvMikd5E3c2aXLMKvHxftOcA9f'
+on w14 DELETE FROM t WHERE k = '58q4nobErI'
+commit w14
+check
+open w15 write
+on w15 DELETE FROM t WHERE k = 'Al6d6H66y0XYo0X2rGZbKWyzu0vv152oAn1C1alXbL'
+on w15 DELETE FROM t WHERE k = '7ZatQCfutOb6Tpp1rjzHc5MaCai9gCWCGrvHh'
+on w15 DELETE FROM t WHERE k = 'ecDLnyavJRVADpevUBS4kBavzTdfaTrkNxNctwm0ych'
+on w15 DELETE FROM t WHERE k = 'KpqTvcvDeUv8TXhuuuUocVihwMnnyoqg'
+on w15 DELETE FROM t WHERE k = '0PPDAa8wImgOI7QU0XDMQrfpX2mPOC2VLjxveBmP'
+on w15 DELETE FROM t WHERE k = 'JvguauHvclVlKiTR9h1hvtNwTYJrHi0pksB7'
+on w15 DELETE FROM t WHERE k = 'ayGNWoL6NoBZXWc2r4bUcYVEjxWeT'
+on w15 DELETE FROM t WHERE k = 'kehP49azcrCCrAzAsN'
+on w15 DELETE FROM t WHERE k = 'IKwf7pdLYwUoKtYS'
+commit w15
+check
+open w16 write
+on w16 DELETE FROM t WHERE k = 'fN3ffgFDqQ2UeUMncm2y9B'
+on w16 DELETE FROM t WHERE k = 'AYisIqxxdVv6XCYrXu95PTfZtGIV6NYTJC'
+on w16 DELETE FROM t WHERE k = 'Eqf0NTbAGV6nlNlHL2yAuGM5ZCsWbSkkWOcFNFXp'
+on w16 DELETE FROM t WHERE k = '6znjqVjtnHErkvXaiJH2AIP6OLsstRKyF3aLpMIfOOTD'
+on w16 DELETE FROM t WHERE k = 'CPpCpUyD5b6tPUGXsdGy1JXa54pyIkxIu30dSnAGp'
+on w16 DELETE FROM t WHERE k = 'GHlBeMF97X9EoSRmqX6AG8RHi0EHpw41ImeS3uRXs4vY5w'
+on w16 DELETE FROM t WHERE k = '7U9yBWrDDvlI3Vgfj4kn2bJfelYWsj'
+on w16 DELETE FROM t WHERE k = 'hVMTRg8lfWyDk9DZYQKX02z4kwqqIqmdYAC90LzJ'
+on w16 DELETE FROM t WHERE k = 'MFlwavRbos3JkI6XgkU5A1UohDEQTySi44zFPQyo5Jpk'
+commit w16
+check
+open w17 write
+on w17 DELETE FROM t WHERE k = 'jEw31xR0kil3N4dVZhWqghnq8c'
+on w17 DELETE FROM t WHERE k = 'BM3fndtSj'
+on w17 DELETE FROM t WHERE k = 'RMzKh8ScCN47mq'
+on w17 DELETE FROM t WHERE k = '5UxfylA1IqPtIYkedeOhQ6WcN4kiDea0Xxu8D5FWX'
+on w17 DELETE FROM t WHERE k = '5O4lbvBPCHbmzgVJ'
+on w17 DELETE FROM t WHERE k = '2Tz9twrWM2D7G8'
+on w17 DELETE FROM t WHERE k = 'xizUQAiNMeWhSal36g'
+on w17 DELETE FROM t WHERE k = '9F6iMXUaFxGha7EBJ6Wua7O2cgIWXnT2Ce5VurNws'
+on w17 DELETE FROM t WHERE k = '9VMHUud4e9gxpWD'
+commit w17
+check
