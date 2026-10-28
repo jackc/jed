@@ -3072,6 +3072,87 @@ impl Database {
         snap.to_image(page_size, txid)
     }
 
+    /// Build a new **in-memory** database whose initial state is the database image `bytes`
+    /// (spec/design/api.md §2.8; SQLite's `sqlite3_deserialize`): the bytes of a jed database file,
+    /// or what [`serialize`](Database::serialize) returned. The bytes are copied — the caller keeps
+    /// its buffer — and the image is opened as a file is, from its newer valid meta slot, at the
+    /// image's own page size and version. Later commits change only the in-memory copy; serialize
+    /// again to get them back as bytes. A malformed image is `XX001`; an encrypted one is `55000`
+    /// (an in-memory database cannot be encrypted).
+    pub fn deserialize(bytes: &[u8], opts: crate::file::DeserializeOptions) -> Result<Database> {
+        let engine = match Engine::from_image_in(bytes, &opts.environment) {
+            Ok(engine) => engine,
+            Err(e) if e.code() == SqlState::CredentialRequired.code() => {
+                return Err(credential_without_file());
+            }
+            Err(e) => return Err(e),
+        };
+        let db = Database::from_engine(engine);
+        db.0.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .budget
+            .limit = opts.max_storage_bytes;
+        Ok(db)
+    }
+
+    /// Export database `name` — `main` or an attachment — as bytes (spec/design/api.md §2.8; SQLite's
+    /// `sqlite3_serialize`): the clean from-scratch image of its committed state, at its page size and
+    /// committed version, which [`deserialize`](Database::deserialize) loads and which is also a
+    /// valid database file. The image holds no dead pages and is byte-identical in every core for the
+    /// same committed state. The export pins the committed snapshot as a read session does and never
+    /// takes the writer gate: commits proceed meanwhile and are not included; an open transaction's
+    /// uncommitted changes are never included. Errors: `42704` for a name that is not attached (and
+    /// for `temp`), `0A000` for an encrypted database (the export would be plaintext). Not metered and
+    /// not reachable from SQL.
+    pub fn serialize(&self, name: &str) -> Result<Vec<u8>> {
+        self.serialize_named(name, name)
+    }
+
+    /// [`serialize`](Self::serialize) of `lname` on this handle, reporting it as `name` (a page-service
+    /// attachment is exported through its inner handle, as `main`).
+    fn serialize_named(&self, lname: &str, name: &str) -> Result<Vec<u8>> {
+        let not_attached = || {
+            EngineError::new(
+                SqlState::UndefinedObject,
+                format!("database \"{name}\" is not attached"),
+            )
+        };
+        if lname != "main" {
+            let service = match self
+                .0
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .get(lname)
+            {
+                Some(attachment) if lname != "temp" => attachment.svc.clone(),
+                _ => return Err(not_attached()),
+            };
+            if let Some(inner) = service {
+                return Database(inner).serialize_named("main", name);
+            }
+        }
+        let (snap, attached, version, generation) = self.0.refresh_and_pin()?;
+        // The pin keeps the snapshot's pages from reuse while the image reads them.
+        let _pin = self.0.reader_pin_for(version, generation);
+        let snap = if lname == "main" {
+            snap
+        } else {
+            attached.get(lname).cloned().ok_or_else(not_attached)?
+        };
+        let (page_size, encrypted) = self
+            .0
+            .with_storage(lname, |st| Ok((st.page_size, st.paging.codec().is_some())))?;
+        if encrypted {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                format!("cannot serialize encrypted database \"{name}\""),
+            ));
+        }
+        snap.to_image(page_size, snap.txid)
+    }
+
     /// The canonical name of every persistent table in the latest committed snapshot, sorted
     /// ascending by exact name (the catalog's standing order — no map-iteration order may leak,
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6). Reads a pinned

@@ -61,6 +61,11 @@ export type BrowserDatabaseOptions = {
   workerFactory?: () => Worker;
 };
 
+export type BrowserDeserializeOptions = Pick<
+  BrowserDatabaseOptions,
+  "backend" | "maxStorageBytes" | "unicodeData" | "timeZoneData" | "runtime" | "workerFactory"
+>;
+
 export type BrowserOpenOptions = Omit<BrowserDatabaseOptions, "path" | "pageSize"> & {
   readOnly?: boolean;
   cacheBytes?: number;
@@ -95,8 +100,11 @@ function browserTransport(worker: Worker): RuntimeTransport {
 }
 
 async function connect(
-  mode: "create" | "open",
-  options: BrowserDatabaseOptions | (BrowserOpenOptions & { path: string }),
+  mode: "create" | "open" | "deserialize",
+  options:
+    | BrowserDatabaseOptions
+    | (BrowserOpenOptions & { path: string })
+    | (BrowserDeserializeOptions & { image: Uint8Array }),
 ): Promise<AsyncDatabase> {
   if (options.backend !== undefined && options.backend !== "typescript") {
     throw new TransportError("UNSUPPORTED", "this package provides the typescript backend");
@@ -168,4 +176,17 @@ export function openDatabase(
   options: BrowserOpenOptions = {},
 ): Promise<AsyncDatabase> {
   return connect("open", { ...options, path });
+}
+
+/**
+ * Build an in-memory database from the bytes of a database image (spec/design/api.md §2.8): a jed
+ * database file's bytes, or what `serialize` returned. The bytes are copied to the worker and count
+ * against `runtime.maxQueuedBytes`. Later commits change only the in-memory copy. A malformed image
+ * is `XX001`; an encrypted one is `55000`.
+ */
+export function deserializeDatabase(
+  image: Uint8Array,
+  options: BrowserDeserializeOptions = {},
+): Promise<AsyncDatabase> {
+  return connect("deserialize", { ...options, image });
 }

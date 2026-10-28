@@ -46,6 +46,7 @@ type WorkerOptions = {
 };
 export type AsyncCreateOptions = Omit<CreateOptions, "environment"> & WorkerOptions;
 export type AsyncOpenOptions = Omit<OpenOptions, "environment"> & WorkerOptions;
+export type AsyncDeserializeOptions = { maxStorageBytes?: bigint } & WorkerOptions;
 
 function nodeTransport(worker: Worker): RuntimeTransport {
   return {
@@ -65,9 +66,10 @@ function nodeTransport(worker: Worker): RuntimeTransport {
 }
 
 async function connect(
-  mode: "create" | "open" | "remote",
+  mode: "create" | "open" | "remote" | "deserialize",
   options:
     | AsyncCreateOptions
+    | (AsyncDeserializeOptions & { image: Uint8Array })
     | (AsyncOpenOptions & { path: string })
     | (AsyncOpenOptions & { command: string[]; name: string }),
 ): Promise<AsyncDatabase> {
@@ -106,6 +108,19 @@ export function createDatabase(options: AsyncCreateOptions = {}): Promise<AsyncD
 }
 export function openDatabase(path: string, options: AsyncOpenOptions = {}): Promise<AsyncDatabase> {
   return connect("open", { ...options, path });
+}
+
+/**
+ * Build an in-memory database from the bytes of a database image (spec/design/api.md §2.8): a jed
+ * database file's bytes, or what `serialize` returned. The bytes are copied to the execution worker
+ * and count against `runtime.maxQueuedBytes`. Later commits change only the in-memory copy. A
+ * malformed image is `XX001`; an encrypted one is `55000`.
+ */
+export function deserializeDatabase(
+  image: Uint8Array,
+  options: AsyncDeserializeOptions = {},
+): Promise<AsyncDatabase> {
+  return connect("deserialize", { ...options, image });
 }
 
 /**

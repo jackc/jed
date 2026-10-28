@@ -997,6 +997,16 @@ export class AsyncDatabase extends AsyncHandle {
     await this.call("compact", { name });
   }
   /**
+   * Export database `name` (`"main"` or an attachment, matched exactly) as bytes (spec/design/api.md
+   * §2.8): the clean from-scratch image of its committed state, which `deserializeDatabase` loads and
+   * which is also a valid database file. It pins a snapshot as a read session does and never waits
+   * for the writer; uncommitted changes are not included. `42704` for an unknown name, `0A000` for an
+   * encrypted database; an image larger than `runtime.maxResultBytes` fails `RESULT_TOO_LARGE`.
+   */
+  async serialize(name: string): Promise<Uint8Array> {
+    return (await this.call("serialize", { name })) as Uint8Array;
+  }
+  /**
    * Check database `name` (`"main"` or an attachment, matched exactly) and return its findings
    * (spec/design/integrity-check.md): every page its committed generation reaches is read and
    * verified, and under level `full` (the default) every index is checked against its

@@ -276,9 +276,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   "has anything committed since" counter (SQLite's update/commit hooks and `PRAGMA data_version`), for
   reactive embedded apps and cache invalidation. Must cover commits from other page-service
   clients. _(size: M)_
-- [ ] **Database ↔ bytes** — open a database from a byte buffer and export one to bytes (SQLite's
-  `sqlite3_serialize` / `sqlite3_deserialize`), over the in-memory `MemoryBlockStore`; useful for
-  browsers, tests, and shipping prebuilt databases. _(size: S)_
+- [x] **Database ↔ bytes** — open a database from a byte buffer and export one to bytes (SQLite's
+  `sqlite3_serialize` / `sqlite3_deserialize`), over the in-memory `MemoryBlockStore`, in all three
+  cores and the TS async API. → [api.md §2.8](spec/design/api.md)
+  - [ ] _follow-on:_ encrypted databases (both directions fail closed today): an export sealed under
+    the database's own keys, and an import that takes the credential.
+  - [ ] _follow-on:_ attach a database from bytes (`AttachSource::bytes`), and a chunked transfer of
+    images larger than the TS worker transport's message limits.
 - [ ] **OPFS disk-spill** — the browser host has no spill target, so sort/hash spill and temp-table
   spill stay resident there. → [hosts.md §3/§5/§7](spec/design/hosts.md)
 - [x] **TS async application runtime.** → [ts-runtime.md](spec/design/ts-runtime.md)

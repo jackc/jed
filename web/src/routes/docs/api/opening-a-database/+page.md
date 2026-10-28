@@ -315,6 +315,34 @@ browser — the same engine, no file. Create one by calling the unified create c
 `Database::create(CreateOptions::default())` (Rust), `jed.CreateDatabase(jed.CreateOptions{})` (Go), or
 `await createDatabase({})` (TypeScript).
 
+## A database as bytes
+
+A database can be exported to a byte buffer and loaded back from one, jed's version of SQLite's
+`sqlite3_serialize` / `sqlite3_deserialize`. Use it to ship a prebuilt database inside an app or a
+web page, to save a browser's in-memory database somewhere of your choosing, or to give each test
+its own copy of a fixture.
+
+`db.serialize("main")` (Rust, TypeScript) or `db.Serialize("main")` (Go) returns the committed state
+as the bytes of a clean database file: it holds no free pages, and the same committed data gives the
+same bytes in every language. Write them to disk and you have a file `open` accepts. Pass an
+attachment's name to export that database instead. The export reads a snapshot like any reader, so it
+never waits for or blocks a writer, and it never includes uncommitted changes.
+
+`Database::deserialize(&bytes, DeserializeOptions::default())` (Rust),
+`jed.DeserializeDatabase(data, jed.DeserializeOptions{})` (Go), `Database.deserialize(bytes)` (the
+TypeScript core) or `await deserializeDatabase(bytes)` (`jed-ts` and `jed-ts/browser`) builds a new
+**in-memory** database from the bytes of a database file or an export. The bytes are copied, so your
+buffer is never changed, and later commits change only the in-memory copy; serialize again to get
+them back. The options take an environment and `max_storage_bytes`. In TypeScript, an image crosses
+the worker boundary in one message, so `runtime.maxQueuedBytes` bounds what `deserializeDatabase`
+accepts (8 MiB by default) and `runtime.maxResultBytes` bounds what `serialize` returns (2 MiB by
+default; larger images fail with a `RESULT_TOO_LARGE` `TransportError`). Raise them for bigger
+databases.
+
+Bytes that are not a jed database fail with `XX001`. Encrypted databases are not supported yet:
+exporting one fails with `0A000` (the export would be plaintext), and loading an encrypted file's
+bytes fails with `55000`, since an in-memory database cannot be encrypted.
+
 ## The environment
 
 Everything a database takes from outside the engine, except its storage, arrives in one immutable

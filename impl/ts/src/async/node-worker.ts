@@ -1,6 +1,7 @@
 // Node-only execution adapter. All engine and synchronous storage work runs in this worker;
 // the application thread owns only typed transport proxies.
 import { parentPort } from "node:worker_threads";
+import { Database } from "../shared.ts";
 import {
   createDatabase,
   type CreateOptions,
@@ -47,6 +48,16 @@ const server = new RuntimeServer({
     }
     const configured = { ...options, environment: builder.build() };
     if (args.mode === "create") return createDatabase(configured as CreateOptions);
+    if (args.mode === "deserialize") {
+      const { image, maxStorageBytes, environment } = configured as Record<string, unknown>;
+      if (!(image instanceof Uint8Array)) {
+        throw new TransportError("PROTOCOL", "deserializing a database requires image bytes");
+      }
+      return Database.deserialize(image, {
+        environment: environment as Environment,
+        maxStorageBytes: maxStorageBytes as bigint | undefined,
+      });
+    }
     if (args.mode === "remote") {
       const { command, name, ...rest } = configured as Record<string, unknown>;
       if (

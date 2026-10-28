@@ -448,6 +448,20 @@ export class RuntimeServer {
       yield* this.maintenanceSteps(db, op, args);
       return null;
     }
+    if (op === "serialize") {
+      if (sessionId !== 0)
+        throw new TransportError("PROTOCOL", "database maintenance belongs to the database handle");
+      const name = args.name;
+      if (typeof name !== "string") throw new TransportError("PROTOCOL", "a database name is text");
+      const image = yield* db.serializeSteps(name);
+      if (image.byteLength > this.limits.maxResultBytes) {
+        throw new TransportError(
+          "RESULT_TOO_LARGE",
+          `the image of database "${name}" is ${image.byteLength} bytes, over maxResultBytes`,
+        );
+      }
+      return image;
+    }
     if (op === "integrityCheck") {
       if (sessionId !== 0)
         throw new TransportError("PROTOCOL", "database maintenance belongs to the database handle");
@@ -711,7 +725,11 @@ export class RuntimeServer {
       this.reply(
         job.request.id,
         result,
-        job.request.op === "fetch" ? [(result as FetchReply).rows.data] : undefined,
+        job.request.op === "fetch"
+          ? [(result as FetchReply).rows.data]
+          : job.request.op === "serialize"
+            ? [(result as Uint8Array).buffer as ArrayBuffer]
+            : undefined,
       );
   }
 

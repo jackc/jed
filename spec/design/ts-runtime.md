@@ -416,6 +416,10 @@ exactly as an in-process session would. A credential change runs as a continuati
 cancellation can stop it before the writer gate is taken, never during the key-block write.
 Compaction and rekey are continuations too: a rekey's KDF can be canceled, the rewrite cannot. On
 OPFS they write the image to a journal file and copy it over the database (hosts.md §5.1).
+`await db.serialize(name)` exports a database as bytes and `deserializeDatabase(bytes, options)`
+(both entry points) builds an in-memory database from them (api.md §2.8). The image travels in one
+message each way: the import counts against `maxQueuedBytes`, and an export over `maxResultBytes`
+fails `RESULT_TOO_LARGE`; its buffer is transferred.
 
 `query(sql, Value[], {signal})` and prepared `query(Value[], {signal})` return async,
 single-pass rows. Column names/types and command count are returned at open; cost is final

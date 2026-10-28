@@ -1125,7 +1125,7 @@ export { Database, Session } from "./shared.ts";
 // Host-attached databases (spec/design/attached-databases.md §4): Database.attach/detach + the memory|
 // file source builders. A file source is reserved for Slice 2 (throws 0A000).
 export { attachFile, attachMemory } from "./shared.ts";
-export type { AttachSource } from "./shared.ts";
+export type { AttachSource, DeserializeOptions } from "./shared.ts";
 export { PreparedStatement, Rows, Transaction } from "./api.ts";
 // The better-sqlite3-style ergonomic layer (spec/design/api.md §11): db.prepare(sql) → a Statement
 // with run/get/all/iterate over native JS params + rows-as-objects. Additive — the raw Value[] path
