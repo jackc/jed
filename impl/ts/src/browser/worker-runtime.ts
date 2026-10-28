@@ -58,7 +58,7 @@ export function startDatabaseWorker(options: BrowserWorkerOptions = {}): void {
     },
     async open(args) {
       const settings = args.options as Omit<
-        BrowserDatabaseOptions & BrowserOpenOptions,
+        BrowserDatabaseOptions & BrowserOpenOptions & { image?: Uint8Array },
         "workerFactory" | "runtime"
       >;
       if (settings.backend !== undefined && settings.backend !== "typescript") {
@@ -72,6 +72,18 @@ export function startDatabaseWorker(options: BrowserWorkerOptions = {}): void {
       if (settings.timeZoneData !== undefined) builder.loadTimeZoneData(settings.timeZoneData);
       if (configure) await configure(builder);
       const environment = builder.build();
+      if (args.mode === "deserialize") {
+        if (!(settings.image instanceof Uint8Array)) {
+          throw engineError(
+            "invalid_parameter_value",
+            "deserializing a database requires image bytes",
+          );
+        }
+        return Database.deserialize(settings.image, {
+          environment,
+          maxStorageBytes: settings.maxStorageBytes,
+        });
+      }
       if (settings.path === undefined) {
         if (args.mode !== "create")
           throw engineError("undefined_file", "opening OPFS requires a path");

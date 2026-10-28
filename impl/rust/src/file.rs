@@ -107,6 +107,19 @@ impl Default for DatabaseOptions {
     }
 }
 
+/// Settings for [`Database::deserialize`](crate::Database::deserialize) (spec/design/api.md §2.8):
+/// the handle settings of an in-memory database built from bytes. Its page size and contents come
+/// from the image. The default is a fresh empty environment and no storage limit.
+#[derive(Clone, Debug, Default)]
+pub struct DeserializeOptions {
+    /// The environment the database runs in (spec/design/environment.md), as for
+    /// [`CreateOptions::environment`]; the image's collation references resolve against it.
+    pub environment: Environment,
+    /// The committed-storage limit in bytes (spec/design/memory.md §8), as for
+    /// [`CreateOptions::max_storage_bytes`]. Zero or negative is unlimited (the default).
+    pub max_storage_bytes: i64,
+}
+
 /// Settings for creating a fresh database (spec/design/api.md §2.1). `path` selects the backing:
 /// `None` builds an **in-memory** database (never touches the filesystem); `Some(p)` builds a
 /// **single-file** database at `p` (`58P02` if it already exists). `page_size` (`0` →

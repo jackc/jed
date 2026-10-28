@@ -189,6 +189,8 @@ mod select;
 mod select_no_from;
 #[path = "../tests/sequence.rs"]
 mod sequence;
+#[path = "../tests/serialize.rs"]
+mod serialize;
 #[path = "../tests/session.rs"]
 mod session;
 #[path = "../tests/shared.rs"]

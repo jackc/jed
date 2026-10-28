@@ -2963,6 +2963,91 @@ export class Database {
     return Database.fromEngine(loadEngine(image, environment));
   }
 
+  // deserialize builds a new in-memory database whose initial state is the database image bytes
+  // (spec/design/api.md §2.8; SQLite's sqlite3_deserialize): the bytes of a jed database file, or
+  // what serialize returned. The bytes are copied — the caller keeps its buffer — and the image is
+  // opened as a file is, from its newer valid meta slot, at the image's own page size and version.
+  // Later commits change only the in-memory copy; serialize again to get them back as bytes. A
+  // malformed image is XX001; an encrypted one is 55000 (an in-memory database cannot be encrypted).
+  static deserialize(bytes: Uint8Array, options: DeserializeOptions = {}): Database {
+    let engine: Engine;
+    try {
+      engine = loadEngine(bytes, options.environment ?? new Environment());
+    } catch (error) {
+      if (error instanceof EngineError && error.code() === "28P02") {
+        throw engineError(
+          "object_not_in_prerequisite_state",
+          "an in-memory database cannot be encrypted",
+        );
+      }
+      throw error;
+    }
+    engine.storageBudget.limit = options.maxStorageBytes ?? 0n;
+    return Database.fromEngine(engine);
+  }
+
+  // serialize exports database name — `main` or an attachment, exact name — as bytes
+  // (spec/design/api.md §2.8; SQLite's sqlite3_serialize): the clean from-scratch image of its
+  // committed state, at its page size and committed version, which deserialize loads and which is
+  // also a valid database file. The image holds no dead pages and is byte-identical in every core for
+  // the same committed state. The export pins the committed snapshot as a read session does and never
+  // takes the writer gate: commits proceed meanwhile and are not included, and an open transaction's
+  // uncommitted changes never are. Errors: 42704 for a name that is not attached (and for temp),
+  // 0A000 for an encrypted database (the export would be plaintext). Not metered and not reachable
+  // from SQL.
+  serialize(name: string): Uint8Array {
+    return runSync(this.serializeSteps(name));
+  }
+
+  // serializeSteps is serialize as a continuation (ts-runtime.md §11): under an asynchronous device
+  // the snapshot's pages are read ahead through the awaitable read before the synchronous serializer
+  // runs.
+  *serializeSteps(name: string): Steps<Uint8Array> {
+    const c = this.core;
+    c.checkPid();
+    let snap: Snapshot;
+    let storage: Engine;
+    let release: () => void;
+    if (name === "main") {
+      const version = c.refreshAndPin();
+      const gen = c.roleGen;
+      snap = c.committed;
+      storage = c.storage;
+      release = () => c.deregister(version, gen);
+    } else {
+      const att = name === "temp" ? undefined : c.attachments.get(name);
+      if (att === undefined) {
+        throw engineError("undefined_object", `database "${name}" is not attached`);
+      }
+      if (att.svc !== null) {
+        const pin = pinServiceAttachment(att.svc as ServiceAttachment);
+        snap = pin.snap;
+        storage = (att.svc as ServiceAttachment).core.storage;
+        release = () => releaseAttachPins([pin]);
+      } else {
+        // An attachment's pages are kept by main's reader registry (a reader pins every root).
+        const version = c.refreshAndPin();
+        const gen = c.roleGen;
+        snap = c.attached.get(name)!;
+        storage = att.storage;
+        release = () => c.deregister(version, gen);
+      }
+    }
+    try {
+      const paging = storage.paging;
+      if (paging === null) throw engineError("io_error", "database storage is closed");
+      if (paging.codec() !== null) {
+        throw engineError("feature_not_supported", `cannot serialize encrypted database "${name}"`);
+      }
+      // biome-ignore lint/correctness/useYield: the serializer reads synchronously once prefetched.
+      return yield* withPrefetchSteps(paging, snap, function* () {
+        return toImageBytes(snap, storage.pageSize, snap.txid);
+      });
+    } finally {
+      release();
+    }
+  }
+
   // --- Catalog / storage introspection (spec/design/api.md §6): reads the latest committed snapshot.
   // Not the embedding API — hosts introspect through SQL (the jed_ catalog relations,
   // introspection.md). table()/compositeType()/rowsInKeyOrder() return the doc-hidden introspection
@@ -3079,6 +3164,17 @@ export class Database {
 // paged open over a memory store). txid 0 is the pre-first-commit version (the same committed version
 // an in-memory core always started at); the first commit publishes txid 1 into the alternate meta slot.
 // maxStorageBytes is the database's committed-storage limit (memory.md §8.1); <= 0n is unlimited.
+// DeserializeOptions are the handle settings of an in-memory database built from bytes
+// (Database.deserialize, spec/design/api.md §2.8). Its page size and contents come from the image.
+export type DeserializeOptions = {
+  // The handle's Environment, as for CreateOptions.environment; the image's collation references
+  // resolve against it. Absent ⇒ a fresh empty environment.
+  environment?: Environment;
+  // The committed-storage limit in bytes (spec/design/memory.md §8), as for
+  // CreateOptions.maxStorageBytes. Zero, negative, or absent is unlimited (the default).
+  maxStorageBytes?: bigint;
+};
+
 export function buildInMemory(
   pageSize: number,
   environment: Environment = new Environment(),

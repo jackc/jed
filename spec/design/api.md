@@ -615,6 +615,52 @@ accounting, index ↔ table agreement, and optionally constraints — and get st
 SQLite's `PRAGMA integrity_check`. The call, its options, its report, and the cross-core finding
 contract are in [integrity-check.md](integrity-check.md) (designed, not built).
 
+### 2.8 Database ↔ bytes (`serialize` / `deserialize`)
+
+A host may export a database to a byte buffer and build a database from one — SQLite's
+`sqlite3_serialize` / `sqlite3_deserialize`. The uses are shipping a prebuilt database (an app bundle,
+a web page), persisting a browser's in-memory database wherever the host chooses, and per-test copies
+of a fixture. Both are host-API acts: not metered, not reachable from SQL.
+
+| | Rust | Go | TS (core) | TS (async, Node and browser) |
+|---|---|---|---|---|
+| export | `db.serialize(name) -> Result<Vec<u8>>` | `db.Serialize(name) ([]byte, error)` | `db.serialize(name): Uint8Array` | `await db.serialize(name)` |
+| import | `Database::deserialize(&bytes, DeserializeOptions)` | `DeserializeDatabase(data, DeserializeOptions)` | `Database.deserialize(bytes, options?)` | `await deserializeDatabase(bytes, options?)` |
+
+**Export.** `serialize(name)` returns the from-scratch image (format.md) of database `name` — `main`
+or an attachment, matched exactly — at its page size, with its **committed version** as the txid in
+both meta slots. It is the image compaction would write (§2.6), except that compaction writes the
+next version: it holds no free or orphan pages, its free list is empty, and it is byte-identical in
+every core for the same committed state (the golden fixtures pin the serializer). It is also a valid
+database file: a host may write it to disk and `open` it. The export pins the committed snapshot as a
+read session does (its pages are protected from reuse while it reads them) and never takes the writer
+gate, so it never waits: commits proceed meanwhile and are not included, and an open transaction's
+uncommitted changes never are. Under the page service it pins as any reader does, on owner and page
+client alike; a file attachment under the page service is exported through its own handle. Errors:
+`42704` for a name that is not attached, and for `temp` (a session's temp domain is not a database
+that can be exported); `0A000` for an encrypted database, because the image would be plaintext. An
+encrypted export (the image sealed under the database's own keys, loadable with its credential) is a
+follow-on.
+
+**Import.** `deserialize(bytes, options)` builds a new **in-memory** database whose byte store
+(hosts.md, `MemoryBlockStore`) starts as a copy of `bytes` — the caller keeps its buffer, and later
+changes to it are not seen. Any image a file-backed open accepts is accepted: an export, or the raw
+bytes of a database file, including its free pages, preallocated tail, and two meta generations. It
+is opened through the same path as a file (validated-cow.md §3): the newer valid meta slot whose
+commit validates, the persisted free list, the image's own page size. The handle's version is the
+image's txid, so a round trip preserves `version()`. Commits then write into the in-memory store as
+for any in-memory database (§2.1.1); nothing is persisted, and the host serializes again to get the
+changed state back. `options` carries the handle's `environment` (the image's collation references
+resolve against it, environment.md) and `max_storage_bytes` (memory.md §8, measured as for any
+in-memory database); the page size, contents, and version come from the image. Errors: `XX001` for
+bytes that are not a valid image; `55000` for an encrypted image (an in-memory database cannot be
+encrypted, encryption.md §5). Rows, plans, and costs over the result equal those over the source.
+
+**TypeScript worker transport.** The async API carries the image in one worker message each way. The
+import's bytes count against `runtime.maxQueuedBytes`, as `unicodeData` does; an export larger than
+`runtime.maxResultBytes` fails `RESULT_TOO_LARGE` (ts-runtime.md §10), and its buffer is transferred,
+not copied. A host with larger databases raises those limits; a chunked transfer is a follow-on.
+
 ## 3. Persistence & durability
 
 The on-disk model is the **page-backed copy-on-write B-tree** with **incremental commit**
@@ -819,6 +865,7 @@ the values unknown.
 | attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(name, source, readOnly) error` | `db.attach(name, source, readOnly): void` |
 | detach a database | `db.detach(name) -> Result<()>` | `db.Detach(name) error` | `db.detach(name): void` |
 | attach source | `AttachSource::memory()` / `AttachSource::file(path, opts)` | `AttachMemory()` / `AttachFile(path, opts)` | `attachMemory()` / `attachFile(path, opts)` |
+| export / import bytes (§2.8) | `db.serialize(name)` / `Database::deserialize(&b, opts)` | `db.Serialize(name)` / `DeserializeDatabase(b, opts)` | `db.serialize(name)` / `Database.deserialize(b, opts)` |
 | table lookup (catalog — doc-hidden tooling, §6) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*catTable, bool)` | `db.table(name): Table \| undefined` |
 
 **Per-language divergences, deliberate and documented:**
