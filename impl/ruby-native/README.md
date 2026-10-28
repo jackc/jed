@@ -72,6 +72,8 @@ The [ordering follow-up](ORDERING_FOLLOWUP.md) specializes typed ORDER BY
 comparators and measures whole-query gains with interpreter/YJIT/ZJIT controls.
 [Runtime instructions](../../bench/ruby-native/RUNTIMES.md)
 describe the separate opt-in build; the repository's normal Ruby version is unchanged.
+The [parity update](PARITY_UPDATE.md) brought the surface level with source revision
+`1c5a8961`, including encryption at rest, and lists the remaining omissions.
 Future features do not update this directory unless explicitly requested.
 
 ```ruby
