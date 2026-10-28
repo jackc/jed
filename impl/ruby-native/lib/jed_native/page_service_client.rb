@@ -127,8 +127,55 @@ module JedNative
       end
     end
 
+    # The variant of a served meta against the key this handle holds (encrypted.md §14). A first open
+    # of an encrypted database unlocks with the handle's credential from the key-block pages read
+    # through the service; a later connection keeps the data key it holds and adopts the selected
+    # key-block copy. A plaintext meta where a key is held, or one the held key cannot authenticate, is
+    # 28P04 (a rekey since); an encrypted meta where none is held is 28P02.
+    def check_variant(bytes)
+      encrypted = bytes.getbyte(6).to_i != 0
+      crypto = @codec.crypto
+      opened = !@storage.meta.nil?
+      if crypto
+        raise Error.new('28P04', 'the database was rekeyed since this handle opened it; reopen it') unless encrypted
+        unless @key_block_read
+          crypto.key_block = KeyBlock.select(*read_pages([2, 3]))
+          @key_block_read = true
+        end
+      elsif encrypted
+        credential = @storage.send(:service_credential)
+        if opened || credential.nil?
+          raise Error.new('28P02', 'the database is encrypted; a credential is required')
+        end
+        @codec.crypto = PageCodec.unlock(*read_pages([2, 3]), credential, @storage.send(:service_key_random))
+        @key_block_read = true
+      elsif !opened && @storage.send(:service_credential)
+        raise Error.new('28P03', 'a credential was given for a database that is not encrypted')
+      end
+    end
+
+    # The served meta must authenticate under the held key for one of the two slots (it carries no
+    # slot), its manifest-overflow chain read through the service; its pointers' tags are recorded.
+    def authenticate_served(bytes, meta)
+      head, _, chain_count = bytes.byteslice(36, 12).unpack('N3')
+      chain = []
+      page = head
+      chain_count.times do
+        break if page.zero? || chain.length >= 4096
+        block = read_pages([page]).first
+        chain << [page, block]
+        page = block.byteslice(8, 4).unpack1('N')
+      end
+      unless [0, 1].any? { |slot| @codec.crypto.meta_authentic?(slot, bytes, chain) }
+        raise Error.new('28P04', 'the database was rekeyed since this handle opened it; reopen it')
+      end
+      @codec.crypto.note(meta[:root_page], meta[:root_tag])
+      @codec.crypto.note(meta[:free_head], meta[:free_tag])
+    end
+
     def adopt(reply)
       bytes = reply[:meta]
+      check_variant(bytes)
       high = bytes.byteslice(24, 4).unpack1('N')
       image = PageBuffer.new(@page_size, high)
       image[0, @page_size] = bytes
@@ -136,10 +183,11 @@ module JedNative
       raise Error.new('08P01', 'invalid owner meta') unless meta && meta[:txid] == reply[:txid]
       changed = reply[:invalidate] == 1 || @txid != reply[:txid] || @incarnation != reply[:incarnation]
       @image.adopt(bytes, high, reply[:invalidate] == 1 ? nil : reply[:indices])
+      authenticate_served(bytes, meta) if @codec.encrypted?
       @incarnation, @txid = reply.values_at(:incarnation, :txid)
       return unless changed
       meta[:slot] = meta[:txid] & 1
-      reader = FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key))
+      reader = @codec.reader
       snapshot = reader.decode_image(@image, page_size: @page_size, lazy: true, meta: meta)
       @storage.instance_variable_set(:@meta, meta)
       @storage.instance_variable_set(:@snapshot, snapshot)
@@ -170,7 +218,8 @@ module JedNative
       meta_bytes = pages.pages.fetch(slot)
       overlay = PageOverlay.new(@image, pages)
       prepared = @storage.send(:published_snapshot, snapshot, plan, overlay)
-      chain = pages.pages.select { |page, bytes| page >= 2 && bytes.getbyte(0) == 8 }
+      manifest_ids = free_plan.manifest_ids.to_set
+      chain = pages.pages.select { |page, _| manifest_ids.include?(page) }
       ordered_chain = []
       page = meta_bytes.byteslice(36, 4).unpack1('N')
       until page.zero?
@@ -181,7 +230,7 @@ module JedNative
       # Check the complete first frame before sending any part of a delta.
       PageServiceWire.encode(:commit_begin, 1, { txid: txid, meta: meta_bytes, manifest_pages: ordered_chain }, @page_size)
       @connection.request(:commit_begin, { txid: txid, meta: meta_bytes, manifest_pages: ordered_chain }, reply: false)
-      body = pages.pages.keys.select { |index| index >= 2 && pages.pages.fetch(index).getbyte(0) != 8 }.sort
+      body = pages.pages.keys.select { |index| index >= 2 && !manifest_ids.include?(index) }.sort
       batch = (PageServiceWire::MAX_FRAME - 9) / (@page_size + 4)
       body.each_slice(batch) do |indices|
         entries = indices.map { |index| [index, pages.pages.fetch(index)] }
@@ -195,7 +244,7 @@ module JedNative
           raise
         end
         raise unless error.sqlstate == '08006'
-        return @storage.send(:resolve_service_commit, txid, @codec.crc64(meta_bytes), @write_token)
+        return @storage.send(:resolve_service_commit, txid, @codec.resolution_digest(meta_bytes), @write_token)
       end
       raise Error.new('08P01', 'invalid commit acknowledgement') unless name == :committed && reply[:txid] == txid
       meta = { txid: txid, slot: slot, root_page: plan.root, page_count: pages.page_count, free_head: free_plan.head,

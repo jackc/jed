@@ -16,11 +16,11 @@ module JedNative
       @window_start = storage.meta[:txid]
       @meta_bytes = storage.instance_variable_get(:@image).byteslice(storage.meta[:slot] * @page_size, @page_size)
       @meta = storage.meta
-      @resolution[@meta[:txid]] = @codec.crc64(@meta_bytes)
+      @resolution[@meta[:txid]] = @codec.resolution_digest(@meta_bytes)
       image = storage.instance_variable_get(:@image)
       previous_slot = @meta[:slot] ^ 1
       previous = @codec.read_meta(image, @page_size, previous_slot)
-      @resolution[previous[:txid]] = @codec.crc64(image.byteslice(previous_slot * @page_size, @page_size)) if previous && previous[:txid] + 1 == @meta[:txid]
+      @resolution[previous[:txid]] = @codec.resolution_digest(image.byteslice(previous_slot * @page_size, @page_size)) if previous && previous[:txid] + 1 == @meta[:txid]
       @endpoint = endpoint_path
     end
 
@@ -158,7 +158,7 @@ module JedNative
         @meta, @meta_bytes = meta, bytes
         @window = []
         @window_start = meta[:txid]
-        @resolution[meta[:txid]] = @codec.crc64(bytes)
+        @resolution[meta[:txid]] = @codec.resolution_digest(bytes)
         @resolution.shift while @resolution.length > 256
       end
     end
@@ -167,7 +167,7 @@ module JedNative
         @meta, @meta_bytes = meta, bytes
         @window << [meta[:txid], indices.sort.uniq]
         @window_start = @window.shift[0] while @window.length > 256
-        @resolution[meta[:txid]] = @codec.crc64(bytes)
+        @resolution[meta[:txid]] = @codec.resolution_digest(bytes)
         @resolution.shift while @resolution.length > 256
       end
     end
@@ -420,7 +420,7 @@ module JedNative
         @waiter.report_on_exception = false
       end
       def legal_page?(page, high)
-        page >= 2 && page < high && (page >= @base[:page_count] || @granted_pages.include?(page))
+        page >= @codec.first_body && page < high && (page >= @base[:page_count] || @granted_pages.include?(page))
       end
       def begin_commit(fields)
         return if @revoked
@@ -440,7 +440,13 @@ module JedNative
         meta = @codec.read_meta(image, @page_size, 0, validate_body: false)
         raise Error.new('08P01', 'invalid commit manifest') unless meta && meta[:txid] == txid && !meta[:manifest].empty? && meta[:manifest_pages] == manifest.map(&:first)
         raise Error.new('08P01', 'body page is not reusable') unless meta[:manifest].all? { |page, _| legal_page?(page, high) }
-        @delta.merge!(meta: meta, bytes: meta_bytes, expected: meta[:manifest].to_h, manifest: manifest.map(&:first))
+        # An encrypted client cannot know the slot the owner writes: its meta must authenticate under
+        # either slot index before any page is written (encrypted.md §14).
+        if @codec.encrypted? && [0, 1].none? { |slot| @codec.crypto.meta_authentic?(slot, meta_bytes, manifest) }
+          raise Error.new('08P01', 'the meta does not authenticate under the database key')
+        end
+        @delta.merge!(meta: meta, bytes: meta_bytes, expected: meta[:manifest].to_h, manifest: manifest.map(&:first),
+                      manifest_pages: manifest)
         manifest.each { |page, bytes| @storage.send(:write_at, @storage.instance_variable_get(:@file), bytes, page * @page_size) }
       rescue Error, ArgumentError, RuntimeError => error
         @delta[:error] = Error.new('08P01', error.message)
@@ -452,7 +458,9 @@ module JedNative
         raise Error.new('08P01', 'body without commit_begin') unless @delta
         pages.each do |page, bytes|
           expected = @delta[:expected][page]
-          unless expected && @delta[:received].add?(page) && bytes.getbyte(0).between?(1, 7) && @codec.page_crc(bytes) == bytes.byteslice(12, 4).unpack1('N') && @codec.crc64(bytes) == expected
+          # An encrypted body page is ciphertext, checked by its manifest identity alone.
+          plain_ok = @codec.encrypted? || bytes.getbyte(0).between?(1, 7) && @codec.page_crc(bytes) == bytes.byteslice(12, 4).unpack1('N')
+          unless expected && @delta[:received].add?(page) && bytes.bytesize == @page_size && plain_ok && @codec.crc64(bytes) == expected
             raise Error.new('08P01', 'commit page identity mismatch')
           end
           @storage.send(:write_at, @storage.instance_variable_get(:@file), bytes, page * @page_size)

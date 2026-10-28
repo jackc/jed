@@ -4,6 +4,12 @@
 require File.join(ENV.fetch('RUBY_NATIVE_SOURCE', File.expand_path('..', __dir__)), 'lib/jed_native')
 STDOUT.sync = true
 
+# A 32-byte host-key credential from 64 hex digits (spec/design/encryption.md §8).
+def host_key(text)
+  raise ArgumentError, 'a 64-hex-digit key' unless text.match?(/\A\h{64}\z/)
+  JedNative::Credential.key([text].pack('H*'))
+end
+
 def reply_error(error)
   puts "ERR\t#{error.respond_to?(:sqlstate) ? error.sqlstate : 'XX000'}\t#{error.message.unpack1('H*')}"
 end
@@ -21,6 +27,7 @@ begin
     case key
     when 'ownership' then options[:ownership] = value.to_sym
     when 'synchronous' then options[:synchronous] = value.to_sym
+    when 'key' then options[:credential] = host_key(value)
     else options[mapping.fetch(key)] = value.to_i
     end
   end
@@ -52,6 +59,9 @@ begin
         name, read_only, source = argument.split("\t", 3)
         database.attach(name, source, read_only == '1' ? :read_only : :read_write, locking: :auto)
       when 'DETACH' then database.detach(argument)
+      # An encrypted database's credential change and rekey: CHANGE_KEY <hex>, REKEY <hex> (empty: decrypt).
+      when 'CHANGE_KEY' then database.change_credential('main', host_key(argument))
+      when 'REKEY' then database.rekey('main', argument.empty? ? nil : host_key(argument))
       when 'ROLE'
         storage = argument.empty? ? database.engine.instance_variable_get(:@storage) : database.engine.instance_variable_get(:@attachments).fetch(argument)[:storage]
         value = storage.service_role.to_s

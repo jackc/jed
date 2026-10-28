@@ -72,7 +72,7 @@ module JedNative
       if @foreign_snapshot
         @mutex.synchronize do
           if @foreign_snapshot
-            reader = FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key))
+            reader = @codec.reader
             @snapshot = reader.decode_image(@image, page_size: @page_size, lazy: true, meta: @meta)
             @foreign_snapshot = false
           end
@@ -144,6 +144,7 @@ module JedNative
           else
             @file = File.open(@path, @read_only ? 'rb' : 'r+b')
             @file.close_on_exec = true
+            promote_with_held_key
             @snapshot = decode_file
             @meta, @free_pages = @snapshot.values_at(:meta, :free_pages)
             reset_durability_floor(@meta)
@@ -157,6 +158,7 @@ module JedNative
         end
       rescue Error => error
         @service_reselect = true
+        raise if %w[28P02 28P04].include?(error.sqlstate)
         raise Error.new('08006', "could not re-elect page-service owner: #{error.message}")
       end
     end
@@ -177,6 +179,33 @@ module JedNative
       service_ensure_role
     rescue Error
       @service_reselect = true
+    end
+
+    def service_credential = @credential
+    def service_key_random = @key_random
+
+    # A client that promotes itself opens the file with the data key it holds, not its credential
+    # (encrypted.md §14): it adopts the file's selected key-block copy, leaves a differing pair
+    # unrepaired, and fails 28P04 when the held key authenticates neither meta slot (a rekey since).
+    def promote_with_held_key
+      slots = [0, 1].map { |slot| @file.pread(@page_size, slot * @page_size) }
+      suite = JedNative.file_suite(*slots)
+      crypto = @codec.crypto
+      unless crypto
+        raise Error.new('28P02', 'the database was encrypted since this handle opened it') unless suite.zero?
+        return
+      end
+      raise Error.new('28P04', 'the database was decrypted since this handle opened it; reopen it') if suite.zero?
+      crypto.key_block = KeyBlock.select(*[2, 3].map { |page| @file.pread(@page_size, page * @page_size) })
+      image = FileImage.new(@file, @page_size)
+      candidates = [0, 1].filter_map { |slot| @codec.read_meta(image, @page_size, slot) }
+      selected = candidates.max_by { |meta| meta[:txid] }
+      return unless selected
+      stored = image.byteslice(selected[:slot_index] * @page_size, @page_size)
+      manifest = (selected[:manifest_pages] || []).map { |page| [page, image.byteslice(page * @page_size, @page_size)] }
+      unless crypto.meta_authentic?(selected[:slot_index], stored, manifest)
+        raise Error.new('28P04', 'the database was rekeyed since this handle opened it; reopen it')
+      end
     end
 
     def initialize_service_owner
@@ -205,8 +234,14 @@ module JedNative
         # Check the linked free inventory before the publication point. The body
         # is already on disk, but remains unreachable from committed meta.
         @image.invalidate(indices)
-        free = @codec.validate_free_list!(@image, @page_size, meta)
         slot = (@meta[:slot] || @meta[:txid] & 1) ^ 1
+        if @codec.encrypted?
+          # The client's meta authenticated under the database key; reseal it for the slot written.
+          bytes = @codec.crypto.seal_meta(slot, bytes.dup, delta[:manifest_pages])
+          @codec.crypto.note(meta[:root_page], meta[:root_tag])
+          @codec.crypto.note(meta[:free_head], meta[:free_tag])
+        end
+        free = @codec.validate_free_list!(@image, @page_size, meta)
         write_at(@file, bytes, slot * @page_size)
         durable_sync(@file)
         @meta = meta.merge(slot: slot)

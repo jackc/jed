@@ -2073,6 +2073,18 @@ module JedNative
     def manifest_offset = encrypted? ? 96 : 64
     def inline_manifest_capacity(ps) = encrypted? ? (ps - 96 - Crypto::RESERVE) / 12 : (ps - 64) / 12
 
+    # A commit's resolution digest (spec/pageservice/README.md §3.5): the CRC-64 of its meta page, with
+    # the CRC field and the reserve zeroed in the encrypted variant, so the meta a client sent and the
+    # one its owner resealed for the slot it wrote resolve alike (encrypted.md §14).
+    def resolution_digest(meta)
+      return crc64(meta) if meta.getbyte(6).to_i.zero?
+
+      zeroed = meta.dup
+      zeroed[32, 4] = "\0" * 4
+      zeroed[zeroed.bytesize - Crypto::RESERVE, Crypto::RESERVE] = "\0" * Crypto::RESERVE
+      crc64(zeroed)
+    end
+
     # Record the free-list head (with its tag) in meta slot `slot`.
     def write_meta_free_head(image, ps, slot, head)
       image[slot * ps + 28, 4] = u32(head)
