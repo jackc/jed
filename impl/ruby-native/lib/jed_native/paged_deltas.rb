@@ -15,7 +15,7 @@ module JedNative
       pending = table[:rows]
       base = pending.base_table
       codec = statistics_codec
-      capacity = storage_page_size(table) - FileFormat::PAGE_HEADER
+      capacity = storage_capacity(table)
       cost, lifetime, maximum, lifetime_maximum = @cost, @lifetime_cost, @max_cost, @lifetime_max_cost
       @max_cost = @lifetime_max_cost = 0
       changes = pending.each_change.map do |before, after, rowid|

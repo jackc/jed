@@ -171,7 +171,8 @@ module JedNative
         value = record[:row][column]
         length = value.is_a?(StoredValue) ? value.payload_length : @codec.value_payload(@columns[column][:type], value).bytesize
         stored = form == :external_comp ? record[:comps][column].bytesize : length
-        pages += (stored + @capacity - 1) / @capacity if %i[external external_comp].include?(form)
+        slab = @codec.chain_capacity(@capacity)
+        pages += (stored + slab - 1) / slab if %i[external external_comp].include?(form)
         slabs += (length + @capacity - 1) / @capacity if %i[inline_comp external_comp].include?(form)
       end
       [pages, slabs]
@@ -184,7 +185,7 @@ module JedNative
     def initialize(pool, page, columns, records)
       super(pool, page, columns)
       @records = records
-      @resident = RecordLeaf.new({ keys: records.map { |record| record[:key] }, recs: records, children: [] }, columns, pool.codec, pool.page_size - FileFormat::PAGE_HEADER)
+      @resident = RecordLeaf.new({ keys: records.map { |record| record[:key] }, recs: records, children: [] }, columns, pool.codec, pool.codec.payload_capacity(pool.page_size))
     end
     def [](key) = %i[keys recs].include?(key) ? @resident[key] : super
     def records = @records

@@ -30,39 +30,52 @@ module RubyStorageTest
     { tables: [{ name: 't', columns: [codec.col('id', 'i32', pk: true), codec.col('v', 'text')], rows: rows }] }
   end
 
+  # An encrypted golden's codec: unlocked from its key block with the goldens' host key.
+  def self.golden_codec(name, image)
+    return JedNative::FileFormat.new unless name.start_with?('encrypted_')
+
+    key = JedNative::Credential.key("\x4A".b * 32)
+    JedNative::FileFormat.new(crypto: JedNative::PageCodec.unlock(image.byteslice(2048, 1024), image.byteslice(3072, 1024), key, nil))
+  end
+
   def self.golden_decode
-    codec = JedNative::FileFormat.new
     accepted = 0
     Dir[File.join(FIXTURES, '*.jed')].sort.each do |path|
       name = File.basename(path)
-      # The encrypted file variant (spec/fileformat/encrypted.md) is not built in this core yet.
-      next if name.start_with?('encrypted_')
-
       begin
-        codec.decode_image(File.binread(path))
+        image = File.binread(path)
+        golden_codec(name, image).decode_image(image)
         raise "accepted corrupt #{name}" if REJECTED.include?(name)
         accepted += 1
       rescue StandardError => exception
         raise "#{name}: #{exception.message}" unless REJECTED.include?(name)
       end
     end
-    assert(accepted == 97, "expected 97 readable fixtures, got #{accepted}")
+    assert(accepted == 103, "expected 103 readable fixtures, got #{accepted}")
   end
 
   def self.golden_encode
-    codec = JedNative::FileFormat.new
     count = 0
     Dir[File.join(FIXTURES, '*_table.jed')].sort.each do |path|
-      next if File.basename(path).match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon|^encrypted_/)
+      name = File.basename(path)
+      next if name.match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon|rekey/)
 
       expected = File.binread(path)
-      state = codec.decode_image(expected)
-      actual = codec.build_image(state[:types], state[:sequences], state[:tables], 256,
+      state = golden_codec(name, expected).decode_image(expected)
+      # An encrypted golden re-encodes under a fresh key block from the goldens' seeded stream.
+      codec = if name.start_with?('encrypted_')
+                key = JedNative::Credential.key("\x4A".b * 32)
+                JedNative::FileFormat.new(crypto: JedNative::PageCodec.create(key, nil, JedNative::SeededRandom.new(0x4A454442)))
+              else
+                JedNative::FileFormat.new
+              end
+      page_size = name.start_with?('encrypted_') ? 1024 : 256
+      actual = codec.build_image(state[:types], state[:sequences], state[:tables], page_size,
                                  state[:collations], views: state[:views])
       assert(expected == actual, "encoded bytes differ from #{File.basename(path)}")
       count += 1
     end
-    assert(count == 65, "expected 65 byte comparisons, got #{count}")
+    assert(count == 68, "expected 68 byte comparisons, got #{count}")
   end
 
   def self.durable_recovery
@@ -317,7 +330,7 @@ module RubyStorageTest
       public_send(name)
       puts "ruby-native storage: #{name} passed"
     end
-    puts "ruby-native storage: #{tests.length} tests passed (106 shared images, 65 byte-exact encodes)"
+    puts "ruby-native storage: #{tests.length} tests passed (103 shared images, 68 byte-exact encodes)"
   end
 
   def self.temporal_containers_reopen

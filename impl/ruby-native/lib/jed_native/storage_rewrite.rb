@@ -3,15 +3,23 @@
 module JedNative
   # Rewrites existing nodes without rebalancing them. The sink owns each page
   # immediately, so a file rewrite never buffers the complete database image.
+  # In an encrypted file the codec seals each page as it is emitted — post-order,
+  # chains last page first — with fresh nonces; the reader `source` codec opens
+  # the source image's pages (encrypted.md §7, §13).
   class PhysicalImage
-    def initialize(codec, page_size, source_image: nil)
-      @codec, @page_size, @source_image = codec, page_size, source_image
-      @capacity, @next_page = page_size - FileFormat::PAGE_HEADER, 2
+    def initialize(codec, page_size, source_image: nil, source_codec: codec)
+      @codec, @page_size, @source_image, @source_codec = codec, page_size, source_image, source_codec
+      @capacity, @next_page = codec.payload_capacity(page_size), codec.first_body
     end
 
     def write(snapshot, txid, &sink)
       raise Error.new('54000', 'transaction id overflow') unless txid.between?(0, 0xFFFF_FFFF_FFFF_FFFF)
       @sink = sink
+      if @codec.encrypted?
+        block = @codec.crypto.key_block_page(@page_size)
+        @sink.call(2, block)
+        @sink.call(3, block)
+      end
       @codec.instance_variable_set(:@ctypes, snapshot.fetch(:types, []).to_h { |type| [type[:name], type[:fields]] })
       entries = []
       snapshot.fetch(:types, []).sort_by { |type| type[:name].b }.each { |type| entries << "\x01".b + @codec.composite_type_entry_bytes(type) }
@@ -36,32 +44,32 @@ module JedNative
       end
       tables.each { |table| entries.concat(@codec.statistics_entries(table)) }
       snapshot.fetch(:views, []).sort_by { |view| view[:name].b }.each { |view| entries << "\x05".b + @codec.view_entry_bytes(view) }
-      catalog = @codec.catalog_layout(entries, @capacity)
+      catalog = @codec.catalog_layout(entries, @codec.chain_capacity(@capacity))
       root = @next_page
-      catalog.each_with_index do |page, index|
-        id = allocate
-        emit(id, FileFormat::PAGE_CATALOG, page[:count], page[:payload], index + 1 < catalog.length ? id + 1 : 0, flags: page[:continued] ? 1 : 0)
-      end
-      meta = { txid: txid, root_page: root, page_count: @next_page, live: @next_page - 2, free_head: 0, protected: [], slot: txid & 1 }
+      ids = catalog.map { allocate }
+      @codec.catalog_out(self, @page_size, ids, catalog)
+      meta = { txid: txid, root_page: root, page_count: @next_page, live: @next_page - @codec.first_body, free_head: 0, protected: [], slot: txid & 1 }
       self.class.meta_pages(@codec, @page_size, meta).each { |page, bytes| @sink.call(page, bytes) }
       meta
     end
 
+    # Both meta slots of a bootstrap meta (no manifest), each sealed for its own slot when encrypted.
     def self.meta_pages(codec, page_size, meta)
-      buffer = PageBuffer.new(page_size, [3, meta[:page_count]].max)
+      buffer = PageBuffer.new(page_size, [codec.first_body + 1, meta[:page_count]].max)
       2.times do |slot|
-        codec.write_meta(buffer, page_size, slot, page_size, meta[:txid], meta[:root_page], meta[:page_count], meta[:live])
-        bytes = buffer.pages.fetch(slot)
-        bytes[28, 4] = [meta[:free_head] || 0].pack('N')
-        bytes[32, 4] = [codec.meta_crc(bytes)].pack('N')
+        codec.write_meta(buffer, page_size, slot, page_size, meta[:txid], meta[:root_page], meta[:page_count], meta[:live], seal: false)
+        codec.write_meta_free_head(buffer, page_size, slot, meta[:free_head] || 0)
+        codec.finish_meta(buffer, page_size, slot)
       end
       buffer.pages
     end
 
-    # FileFormat's overflow encoder uses an indexed page sink.
+    # FileFormat's page emitters use an indexed page sink: a descriptor, or sealed bytes.
     def []=(page, descriptor)
-      kind, count, payload, following = descriptor
-      emit(page, kind, count, payload, following || 0)
+      return @sink.call(page, descriptor) if descriptor.is_a?(String)
+
+      kind, count, payload, following, flags = descriptor
+      emit(page, kind, count, payload, following || 0, flags: flags || 0)
     end
 
     private
@@ -74,7 +82,7 @@ module JedNative
     end
 
     def emit(page, kind, count, payload, following = 0, flags: 0)
-      buffer = PageBuffer.new(@page_size, [3, page + 1].max)
+      buffer = PageBuffer.new(@page_size, [@codec.first_body + 1, page + 1].max)
       @codec.write_page(buffer, @page_size, page, kind, count, following, payload, flags: flags)
       @sink.call(page, buffer.pages.fetch(page))
     end
@@ -111,18 +119,25 @@ module JedNative
           finish = payload.byteslice(start + 1 + 4 * row, 4).unpack1('N')
           next if previous == finish
           offset = start + 1 + 4 * count + previous
-          next unless [FileFormat::TAG_EXTERNAL, FileFormat::TAG_EXTERNAL_COMP].include?(payload.getbyte(offset))
+          tag = payload.getbyte(offset)
+          next unless [FileFormat::TAG_EXTERNAL, FileFormat::TAG_EXTERNAL_COMP].include?(tag)
+          @source_codec.note_external(payload.byteslice(offset, finish - previous))
           original = payload.byteslice(offset + 1, 4).unpack1('N')
           length = payload.byteslice(offset + 5, 4).unpack1('N')
-          payload[offset + 1, 4] = [copy_overflow(pool, original, length)].pack('N')
+          first = copy_overflow(pool, original, length)
+          payload[offset + 1, 4] = [first].pack('N')
+          if @codec.encrypted?
+            width = tag == FileFormat::TAG_EXTERNAL ? FileFormat::EXTERNAL_PTR_LEN : FileFormat::EXTERNAL_COMP_PTR_LEN
+            payload[offset + width, Crypto::TAG] = @codec.tag_of(first)
+          end
         end
       end
       payload
     end
 
     def copy_overflow(pool, original, remaining)
-      first = @next_page
       seen = Set.new
+      slabs = []
       until original.zero?
         raise Error.new('XX001', 'overflow chain cycle') unless seen.add?(original)
         raw = pool.page(original)
@@ -133,12 +148,16 @@ module JedNative
         remaining -= count
         following = raw[:next_page]
         raise Error.new('XX001', 'overflow length mismatch') unless following.zero? == remaining.zero?
-        page = allocate
-        emit(page, FileFormat::PAGE_OVERFLOW, count, raw[:payload].byteslice(0, count), following.zero? ? 0 : @next_page)
+        slabs << raw[:payload].byteslice(0, count)
         original = following
       end
       raise Error.new('XX001', 'overflow length mismatch') unless remaining.zero?
-      first
+      ids = slabs.map { allocate }
+      # Last page first: an encrypted chain page binds its successor's tag.
+      (slabs.length - 1).downto(0) do |index|
+        emit(ids[index], FileFormat::PAGE_OVERFLOW, slabs[index].bytesize, slabs[index], ids[index + 1] || 0)
+      end
+      ids.first
     end
 
     def write_gist(node, operations)
@@ -146,16 +165,17 @@ module JedNative
       children = node[:leaf] ? [] : node[:children].map { |_, child| write_gist(child, operations) }
       page = allocate
       if @source_image && node[:page]
-        raw = @codec.read_page(@source_image, @page_size, node[:page])
+        raw = @source_codec.read_page(@source_image, @page_size, node[:page])
         payload = raw[:payload].dup
         unless node[:leaf]
+          rebuilt = +''.b
           offset = 0
           children.each do |child|
             length = payload.byteslice(offset, 2).unpack1('n')
-            offset += 2 + length
-            payload[offset, 4] = [child].pack('N')
-            offset += 4
+            rebuilt << payload.byteslice(offset, 2 + length) << @codec.pointer(child)
+            offset += 2 + length + 4
           end
+          payload = rebuilt
         end
         emit(page, raw[:type], raw[:item_count], payload)
       else
@@ -164,7 +184,7 @@ module JedNative
         values.each_with_index do |(bound, key), index|
           bytes = @codec.gist_encode_bound(operations, bound)
           payload << [bytes.bytesize].pack('n') << bytes
-          payload << (node[:leaf] ? [key.bytesize].pack('n') + key : [children[index]].pack('N'))
+          payload << (node[:leaf] ? [key.bytesize].pack('n') + key : @codec.pointer(children[index]))
         end
         emit(page, node[:leaf] ? FileFormat::PAGE_GIST_LEAF : FileFormat::PAGE_GIST_INTERIOR, values.length, payload)
       end

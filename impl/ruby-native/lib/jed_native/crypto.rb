@@ -385,6 +385,12 @@ module JedNative
     end
   end
 
+  class PageCodec
+    # A keyless stand-in that only selects the encrypted layout: a meta slot's fields can be read and
+    # its manifest checked before the key block is unlocked (slot selection is keyless, §6).
+    LAYOUT = new("\0".b * 32, nil, ''.b)
+  end
+
   # The production key-entropy source: the OS CSPRNG (never the seeded SQL random source).
   class OSKeyRandom
     def bytes(length) = SecureRandom.random_bytes(length)

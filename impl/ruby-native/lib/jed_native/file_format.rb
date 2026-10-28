@@ -340,10 +340,112 @@ module JedNative
     # image by `build_image` (encode) and `decode_image` (decode) before any value is coded, so the
     # recursive composite codec can resolve a column's / field's composite type by name. `{}` when no
     # composite types are defined (every existing fixture).
-    def initialize(collation_key: nil, expression: nil)
+    def initialize(collation_key: nil, expression: nil, crypto: nil)
       @ctypes = {}
       @collation_key = collation_key
       @expression = expression
+      @crypto = crypto
+    end
+
+    # --- the encrypted variant's layout (spec/fileformat/encrypted.md §1–§2) ----------------------
+    #
+    # @crypto is the PageCodec of the encrypted database whose pages this codec reads and writes (nil:
+    # plaintext). Sealing records each written page's tag in it, and reading a pointer records the tag
+    # it binds, so every pointer a writer emits and every page a reader follows is checked against it.
+    attr_accessor :crypto
+
+    def encrypted? = !@crypto.nil?
+
+    # A codec for the same database with the same collation and expression hooks.
+    def reader(crypto: @crypto)
+      FileFormat.new(collation_key: @collation_key, expression: @expression, crypto: crypto)
+    end
+
+    # The payload capacity C of a body page at page size ps in this codec's variant.
+    def payload_capacity(ps) = ps - PAGE_HEADER - (encrypted? ? Crypto::RESERVE : 0)
+    def first_body = encrypted? ? Crypto::FIRST_BODY : ROOT_PAGE
+
+    # A capacity names its variant: C is page_size − 16 in a plaintext page and page_size − 56 in an
+    # encrypted one, and page sizes are powers of two, so the two never coincide. The tree and record
+    # rules that take only C (split points, record dispositions, chain slabs) read the pointer width
+    # from it, so an in-memory tree edit planned for an encrypted database splits as its pages will.
+    def cap_tag(cap)
+      full = cap + PAGE_HEADER + Crypto::RESERVE
+      full >= Crypto::MIN_PAGE_SIZE && (full & (full - 1)).zero? ? Crypto::TAG : 0
+    end
+
+    def chain_capacity(cap) = cap - cap_tag(cap)
+    def external_ptr_len(cap) = EXTERNAL_PTR_LEN + cap_tag(cap)
+    def external_comp_ptr_len(cap) = EXTERNAL_COMP_PTR_LEN + cap_tag(cap)
+    def page_size_of(cap) = cap + PAGE_HEADER + (cap_tag(cap).zero? ? 0 : Crypto::RESERVE)
+
+    # The tag a pointer to page binds (empty in a plaintext file; zero for page 0).
+    def tag_of(page)
+      return "".b unless @crypto
+      tag = @crypto.tag(page)
+      raise Error.new("XX001", "no tag is known for page #{page}") unless tag
+      tag
+    end
+
+    # A page pointer in this codec's layout: u32 index, then its tag when encrypted.
+    def pointer(page) = u32(page) + tag_of(page)
+
+    # Read the tag that ends a pointer at pos and record it for page.
+    def read_pointer_tag(buf, pos, page)
+      return pos unless @crypto
+      tag, pos = take(buf, pos, Crypto::TAG)
+      if page.zero?
+        raise "a pointer to no page carries a tag" unless tag == Crypto::ZERO_TAG
+      else
+        @crypto.note(page, tag)
+      end
+      pos
+    end
+
+    # Record the overflow-chain tag of a leaf value's external pointer (its stored span).
+    def note_external(span)
+      return unless @crypto
+      case span.getbyte(0)
+      when TAG_EXTERNAL then @crypto.note(span.byteslice(1, 4).unpack1("N"), span.byteslice(EXTERNAL_PTR_LEN, Crypto::TAG))
+      when TAG_EXTERNAL_COMP then @crypto.note(span.byteslice(1, 4).unpack1("N"), span.byteslice(EXTERNAL_COMP_PTR_LEN, Crypto::TAG))
+      end
+    end
+
+    CHAIN_TYPES = [1, 4, 7].freeze
+
+    # A body page's stored bytes in the encrypted layout (encrypted.md §4): header with a zero CRC,
+    # a chain page's successor tag leading the payload, zero fill, sealed under the page key.
+    def seal_page(ps, index, type, item_count, next_page, payload, flags: 0)
+      lead = CHAIN_TYPES.include?(type) ? tag_of(next_page) : "".b
+      if lead.bytesize + payload.bytesize > payload_capacity(ps)
+        raise Error.new("0A000", "page payload exceeds page capacity")
+      end
+      plain = [type, flags, 0, item_count, next_page, 0].pack("CCnNNN") + lead + payload
+      @crypto.seal_body(index, plain.ljust(ps - Crypto::RESERVE, "\0"))
+    end
+
+    # Emit a body page into a page sink: a descriptor a later write_descriptor writes in a plaintext
+    # file, or the sealed bytes at once in an encrypted one — sealing happens in emission order, which
+    # is the seal order of encrypted.md §7 (every child before the page that points at it).
+    def page_out(pages, ps, index, type, item_count, payload, next_page = 0, flags = 0)
+      pages[index] = @crypto ? seal_page(ps, index, type, item_count, next_page, payload, flags: flags) : [type, item_count, payload, next_page, flags]
+    end
+
+    def write_descriptor(image, ps, index, descriptor)
+      if descriptor.is_a?(String)
+        image[index * ps, ps] = descriptor
+      else
+        type, count, payload, following, flags = descriptor
+        write_page(image, ps, index, type, count, following || 0, payload, flags: flags || 0)
+      end
+    end
+
+    # Sealed catalog pages for layout at ids, last page first (each needs its successor's tag).
+    def catalog_out(pages, ps, ids, layout)
+      (layout.length - 1).downto(0) do |index|
+        page = layout[index]
+        page_out(pages, ps, ids[index], PAGE_CATALOG, page[:count], page[:payload], ids[index + 1] || 0, page[:continued] ? 1 : 0)
+      end
     end
     
     # The field list of the composite type named `type` (case-insensitive), or nil for a scalar type.
@@ -785,7 +887,7 @@ module JedNative
     
         # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
         out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
-        out << u32(index_roots[k])
+        out << pointer(index_roots[k])
         # v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
         out << length16(ix[:predicate]) << ix[:predicate].b if ix[:predicate]
         # v31: the host-function dependency list (extensibility.md §8.1) after the predicate — only when
@@ -832,7 +934,7 @@ module JedNative
           out << u16(col) << [{ "&&" => 0, "=" => 1 }.fetch(op)].pack("C")
         end
       end
-      out << u32(root_data_page)
+      out << pointer(root_data_page)
       raise "row_count must fit nonnegative i64" unless row_count.between?(0, (1 << 63) - 1)
       raise "root_data_page/row_count invariant violated" unless root_data_page.zero? == row_count.zero?
     
@@ -1576,7 +1678,7 @@ module JedNative
         end
         index = next_index
         next_index += 1
-        pages[index] = [PAGE_GIST_LEAF, node[:entries].size, payload, 0]
+        page_out(pages, @gist_page_size, index, PAGE_GIST_LEAF, node[:entries].size, payload)
         [index, next_index]
       else
         child_indices = node[:children].map do |_, c|
@@ -1586,11 +1688,11 @@ module JedNative
         payload = +"".b
         node[:children].each_with_index do |(u, _), i|
           b = gist_encode_bound(ops, u)
-          payload << length16(b) << b << u32(child_indices[i])
+          payload << length16(b) << b << pointer(child_indices[i])
         end
         index = next_index
         next_index += 1
-        pages[index] = [PAGE_GIST_INTERIOR, node[:children].size, payload, 0]
+        page_out(pages, @gist_page_size, index, PAGE_GIST_INTERIOR, node[:children].size, payload)
         [index, next_index]
       end
     end
@@ -1755,13 +1857,13 @@ module JedNative
       # Pass 2 — externalize: anything whose current encoded size beats its pointer, largest first.
       cand = (0...cols.size).select do |i|
         spillable?(cols[i][:type]) &&
-          cur[i] > (forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN)
+          cur[i] > (forms[i] == :inline_comp ? external_comp_ptr_len(cap) : external_ptr_len(cap))
       end
       cand.sort_by! { |i| [-cur[i], i] }
       cand.each do |i|
         break if size <= max
     
-        ptr = forms[i] == :inline_comp ? EXTERNAL_COMP_PTR_LEN : EXTERNAL_PTR_LEN
+        ptr = forms[i] == :inline_comp ? external_comp_ptr_len(cap) : external_ptr_len(cap)
         forms[i] = forms[i] == :inline_comp ? :external_comp : :external
         size += ptr - cur[i]
         cur[i] = ptr
@@ -1783,12 +1885,14 @@ module JedNative
     # Write a payload across a chain of overflow pages (cap-byte slabs, in order), allocating each via
     # `alloc` and linking with next_page (0 terminates). Returns the first page index for the pointer.
     def write_overflow_chain(payload, cap, alloc, pages)
-      n = (payload.bytesize + cap - 1) / cap
+      slab_size = chain_capacity(cap)
+      n = (payload.bytesize + slab_size - 1) / slab_size
       indices = Array.new(n) { alloc.call }
-      n.times do |j|
-        slab = payload.byteslice(j * cap, cap)
+      # Last page first: an encrypted chain page binds its successor's tag (encrypted.md §7).
+      (n - 1).downto(0) do |j|
+        slab = payload.byteslice(j * slab_size, slab_size)
         nxt = j + 1 < n ? indices[j + 1] : 0
-        pages[indices[j]] = [PAGE_OVERFLOW, slab.bytesize, slab, nxt]
+        page_out(pages, page_size_of(cap), indices[j], PAGE_OVERFLOW, slab.bytesize, slab, nxt)
       end
       indices[0]
     end
@@ -1810,6 +1914,7 @@ module JedNative
           first = write_overflow_chain(v.stored_payload, cap, alloc, pages)
           bytes = v.stored_bytes.dup
           bytes[1, 4] = u32(first)
+          bytes[form == :external ? EXTERNAL_PTR_LEN : EXTERNAL_COMP_PTR_LEN, Crypto::TAG] = tag_of(first) if @crypto
           return bytes
         end
         v = v.resolve
@@ -1819,14 +1924,14 @@ module JedNative
       when :external
         payload = value_payload(c[:type], v)
         first = write_overflow_chain(payload, cap, alloc, pages)
-        [TAG_EXTERNAL].pack("C") + u32(first) + u32(payload.bytesize)
+        [TAG_EXTERNAL].pack("C") + u32(first) + u32(payload.bytesize) + tag_of(first)
       when :inline_comp
         payload = value_payload(c[:type], v)
         [TAG_INLINE_COMP].pack("C") + u32(payload.bytesize) + length16(comp) + comp
       when :external_comp
         payload = value_payload(c[:type], v)
         first = write_overflow_chain(comp, cap, alloc, pages) # the chain carries the COMPRESSED block
-        [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize)
+        [TAG_EXTERNAL_COMP].pack("C") + u32(first) + u32(comp.bytesize) + u32(payload.bytesize) + tag_of(first)
       else
         encode_value(c[:type], v)
       end
@@ -1836,7 +1941,7 @@ module JedNative
     # end-offset separator directory, then the separator key blob. Record-free.
     def emit_interior(sep_keys, child_pages)
       out = +"".b
-      child_pages.each { |cp| out << u32(cp) }
+      child_pages.each { |cp| out << pointer(cp) }
       off = 0
       sep_keys.each { |k| off += k.bytesize; out << u32(off) }
       sep_keys.each { |k| out << k }
@@ -1945,20 +2050,49 @@ module JedNative
     end
     
     # `live` defaults to every body page: a from-scratch image has no free list and no manifest.
-    def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_count - 2)
+    def write_meta(image, ps, slot, page_size, txid, root, page_count, live = page_count - first_body, seal: true)
       off = slot * ps
       image[off, ps] = "\x00".b * ps
       image[off, 4] = MAGIC
       image[off + 4, 2] = u16(VERSION)
+      image[off + 6, 2] = [Crypto::SUITE, Crypto::RESERVE].pack("CC") if @crypto
       image[off + 8, 4] = u32(page_size)
       image[off + 12, 8] = u64(txid)
       image[off + 20, 4] = u32(root)
       image[off + 24, 4] = u32(page_count)
       image[off + 56, 4] = u32(live) # v34: the exact live page count
-      image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
+      image[off + 64, Crypto::TAG] = tag_of(root) if @crypto
+      if seal
+        finish_meta(image, ps, slot)
+      else
+        image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
+      end
+    end
+
+    # The inline manifest's offset and capacity in a meta page (encrypted.md §6).
+    def manifest_offset = encrypted? ? 96 : 64
+    def inline_manifest_capacity(ps) = encrypted? ? (ps - 96 - Crypto::RESERVE) / 12 : (ps - 64) / 12
+
+    # Record the free-list head (with its tag) in meta slot `slot`.
+    def write_meta_free_head(image, ps, slot, head)
+      image[slot * ps + 28, 4] = u32(head)
+      image[slot * ps + 80, Crypto::TAG] = tag_of(head) if @crypto
+    end
+
+    # Close meta slot `slot` once every field is written: its CRC, or in an encrypted file its seal
+    # over the manifest-overflow pages (id, stored bytes) in chain order, then its CRC.
+    def finish_meta(image, ps, slot, manifest = [])
+      off = slot * ps
+      if @crypto
+        bytes = image.byteslice(off, ps).dup
+        image[off, ps] = @crypto.seal_meta(slot, bytes, manifest)
+      else
+        image[off + 32, 4] = u32(meta_crc(image.byteslice(off, ps)))
+      end
     end
     
     def write_page(image, ps, index, type, item_count, next_page, payload, flags: 0)
+      return image[index * ps, ps] = seal_page(ps, index, type, item_count, next_page, payload, flags: flags) if @crypto
       raise Error.new('0A000', 'page payload exceeds page capacity') if payload.bytesize > ps - PAGE_HEADER
       off = index * ps
       image[off, 1] = [type].pack("C")
@@ -1985,11 +2119,12 @@ module JedNative
     # size: } whose `size` is the on-disk (post-spill) record size (large-values.md §12). The tree
     # splits on `size`; the actual pointer bytes (with allocated overflow pages) are emitted later by
     # serialize_tree. An INTERIOR node has no recs (v24) — its payload is the separators themselves.
-    def node_payload(node)
+    def node_payload(node, cap = nil)
       if node_leaf?(node)
         node[:recs].sum { |r| r[:size] } + leaf_overhead(node[:keys].size, leaf_cols(node))
       else
-        8 * node[:keys].size + 4 + node[:keys].sum(&:bytesize)
+        ptr = 4 + (cap ? cap_tag(cap) : 0)
+        (ptr + 4) * node[:keys].size + ptr + node[:keys].sum(&:bytesize)
       end
     end
     
@@ -2018,7 +2153,7 @@ module JedNative
     # in ascending key order (build_tree), so right_edge is always true here — the balanced arm is
     # implemented so the reference states the whole contract.
     def split_node(node, cap, right_edge)
-      payload = node_payload(node)
+      payload = node_payload(node, cap)
       return [:whole, node] if payload <= cap
     
       n = node[:keys].size
@@ -2042,8 +2177,9 @@ module JedNative
             else
               prefix = [0]
               node[:keys].each { |k| prefix << prefix.last + k.bytesize }
-              leftp = ->(mm) { 8 * mm + 4 + prefix[mm] }
-              rightp = ->(mm) { 8 * (n - 1 - mm) + 4 + (prefix[n] - prefix[mm + 1]) }
+              ptr = 4 + cap_tag(cap)
+              leftp = ->(mm) { (ptr + 4) * mm + ptr + prefix[mm] }
+              rightp = ->(mm) { (ptr + 4) * (n - 1 - mm) + ptr + (prefix[n] - prefix[mm + 1]) }
               mm = pick_split_m(1..(n - 2), payload, cap, right_edge, leftp, rightp)
               raise "unsplittable interior on the insert path" if mm.nil?
     
@@ -2123,21 +2259,24 @@ module JedNative
         i
       end
       n = root[:keys].size
-      pages[index] = if node_leaf?(root)
-                       [PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages), 0] # column-major (v24)
-                     else
-                       [PAGE_INTERIOR, n, emit_interior(root[:keys], child_pages), 0] # record-free (v24)
-                     end
+      if node_leaf?(root)
+        page_out(pages, page_size_of(cap), index, PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages)) # column-major (v24)
+      else
+        page_out(pages, page_size_of(cap), index, PAGE_INTERIOR, n, emit_interior(root[:keys], child_pages)) # record-free (v24)
+      end
       [index, next_index]
     end
     
     # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
     # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
     # catalog chain, then both meta slots at txid 1.
-    def build_pages(types, sequences, tables, page_size, collations = [], start_page: ROOT_PAGE, views: [])
+    def build_pages(types, sequences, tables, page_size, collations = [], start_page: nil, views: [], txid: TXID)
       raise ArgumentError, "invalid page size" unless valid_page_size?(page_size)
+      raise Error.new("0A000", "an encrypted database needs a page size of at least 1024") if @crypto && page_size < Crypto::MIN_PAGE_SIZE
       ps = page_size
-      cap = ps - PAGE_HEADER
+      start_page ||= first_body
+      cap = payload_capacity(ps)
+      @gist_page_size = ps
       # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
       @ctypes = types.to_h { |t| [t[:name], t[:fields]] }
       sorted = tables.sort_by { |t| t[:name] }
@@ -2194,21 +2333,19 @@ module JedNative
       sorted.each { |t| cat_entries.concat(statistics_entries(t)) }
       # View entries (kind 5, v38) come last, in view-name byte order (format.md *View entry*).
       views.sort_by { |v| v[:name] }.each { |v| cat_entries << ("\x05".b + view_entry_bytes(v)) }
-      cat_layout = catalog_layout(cat_entries, cap)
+      cat_layout = catalog_layout(cat_entries, chain_capacity(cap))
       page_count = cat_root + cat_layout.size
-    
+      catalog_out(data_pages, ps, (cat_root...page_count).to_a, cat_layout)
+
       image = PageBuffer.new(ps, page_count)
-      write_meta(image, ps, 0, page_size, TXID, cat_root, page_count, page_count - start_page)
-      write_meta(image, ps, 1, page_size, TXID, cat_root, page_count, page_count - start_page)
-    
-      data_pages.each { |index, (type, count, payload, nxt)| write_page(image, ps, index, type, count, nxt || 0, payload) }
-    
-      cat_layout.each_with_index do |cp, gi|
-        index = cat_root + gi
-        nxt = gi + 1 < cat_layout.size ? index + 1 : 0
-        write_page(image, ps, index, PAGE_CATALOG, cp[:count], nxt, cp[:payload], flags: cp[:continued] ? 1 : 0)
+      if @crypto
+        block = @crypto.key_block_page(ps)
+        image[2 * ps, ps] = block
+        image[3 * ps, ps] = block
       end
-    
+      data_pages.each { |index, descriptor| write_descriptor(image, ps, index, descriptor) }
+      write_meta(image, ps, 0, page_size, txid, cat_root, page_count, page_count - start_page)
+      write_meta(image, ps, 1, page_size, txid, cat_root, page_count, page_count - start_page)
       image
     end
     
@@ -2271,17 +2408,24 @@ module JedNative
       m = image.byteslice(off, ps)
       return nil unless m.byteslice(0, 4) == MAGIC
       return nil unless m.byteslice(4, 2).unpack1("n") == VERSION
-      return nil unless m.getbyte(6).zero? && m.getbyte(7).zero?
+      return nil unless [m.getbyte(6), m.getbyte(7)] == (@crypto ? [Crypto::SUITE, Crypto::RESERVE] : [0, 0])
       return nil unless m.byteslice(8, 4).unpack1("N") == ps
       return nil unless meta_crc(m) == m.byteslice(32, 4).unpack1("N")
     
       meta = { txid: m.byteslice(12, 8).unpack1("Q>"), root_page: m.byteslice(20, 4).unpack1("N"),
                page_count: m.byteslice(24, 4).unpack1("N"), free_head: m.byteslice(28, 4).unpack1("N"),
                live: m.byteslice(56, 4).unpack1("N") }
-      return nil unless meta[:page_count] >= 3 && meta[:page_count] <= image.bytesize / ps
-      return nil unless (2...meta[:page_count]).cover?(meta[:root_page])
-      return nil unless meta[:live] <= meta[:page_count] - 2
-      return nil unless meta[:free_head].zero? || (2...meta[:page_count]).cover?(meta[:free_head])
+      first = first_body
+      return nil unless meta[:page_count] >= first + 1 && meta[:page_count] <= image.bytesize / ps
+      return nil unless (first...meta[:page_count]).cover?(meta[:root_page])
+      return nil unless meta[:live] <= meta[:page_count] - first
+      return nil unless meta[:free_head].zero? || (first...meta[:page_count]).cover?(meta[:free_head])
+      if @crypto
+        meta[:root_tag] = m.byteslice(64, Crypto::TAG)
+        meta[:free_tag] = m.byteslice(80, Crypto::TAG)
+        return nil if meta[:free_head].zero? && meta[:free_tag] != Crypto::ZERO_TAG
+      end
+      meta[:slot_index] = slot
       if manifest
         return nil unless valid_manifest?(image, ps, m, meta, validate_body: validate_body)
       else
@@ -2294,21 +2438,24 @@ module JedNative
     def valid_manifest?(image, ps, m, meta, validate_body: true)
       head, count, chain_count = m.byteslice(36, 12).unpack("N3")
       digest = m.byteslice(48, 8).unpack1("Q>")
+      first = first_body
       return false unless m.byteslice(60, 4) == "\x00".b * 4
-      return false if count + chain_count > meta[:page_count] - 2
+      return false if count + chain_count > meta[:page_count] - first
       return false unless (chain_count.zero? && head.zero? && digest.zero?) ||
-                          (chain_count.positive? && head >= 2 && head < meta[:page_count])
+                          (chain_count.positive? && head >= first && head < meta[:page_count])
       return false if count.zero? && (!chain_count.zero? || !head.zero? || !digest.zero?)
-    
-      inline = [count, (ps - 64) / 12].min
-      refs = m.byteslice(64, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
-      return false unless m.byteslice(64 + inline * 12, ps - 64 - inline * 12).bytes.all?(&:zero?)
+
+      base = manifest_offset
+      limit = ps - (@crypto ? Crypto::RESERVE : 0)
+      inline = [count, inline_manifest_capacity(ps)].min
+      refs = m.byteslice(base, inline * 12).unpack("NQ>" * inline).each_slice(2).to_a
+      return false unless m.byteslice(base + inline * 12, limit - base - inline * 12).bytes.all?(&:zero?)
       chain = []
       chain_digest = 0
       remaining = count - inline
       page = head
       chain_count.times do |ordinal|
-        return false unless page >= 2 && page < meta[:page_count] && !chain.include?(page)
+        return false unless page >= first && page < meta[:page_count] && !chain.include?(page)
         block = image.byteslice(page * ps, ps)
         return false unless block.getbyte(0) == 8 && block.byteslice(1, 3) == "\x00".b * 3
         return false unless page_crc(block) == block.byteslice(12, 4).unpack1("N")
@@ -2330,9 +2477,11 @@ module JedNative
       return false if count.positive? && !ids.include?(meta[:root_page])
       return false if count.positive? && meta[:free_head].positive? && !ids.include?(meta[:free_head])
       return false unless refs.all? do |index, expected|
-        next false unless index >= 2 && index < meta[:page_count]
+        next false unless index >= first && index < meta[:page_count]
         next true unless validate_body
         block = image.byteslice(index * ps, ps)
+        # An encrypted body page is ciphertext: its manifest identity alone checks it (encrypted.md §6).
+        next crc64(block) == expected if @crypto
         (1..7).cover?(block.getbyte(0)) && page_crc(block) == block.byteslice(12, 4).unpack1("N") &&
           crc64(block) == expected
       end
@@ -2349,16 +2498,18 @@ module JedNative
       free_pages = []
       page = meta[:free_head]
       until page.zero?
-        raise "invalid free-list chain" unless page >= 2 && page < meta[:page_count] && !seen.include?(page)
-        block = image.byteslice(page * ps, ps)
-        raise "invalid free-list page" unless block.getbyte(0) == 7 && page_crc(block) == block.byteslice(12, 4).unpack1("N")
-        entries = block.byteslice(4, 4).unpack1("N")
-        raise "invalid free-list count" if entries > (ps - 16) / 4
-        free_pages.concat(block.byteslice(16, entries * 4).unpack("N*"))
+        raise "invalid free-list chain" unless page >= first_body && page < meta[:page_count] && !seen.include?(page)
+        reached, @reached = @reached, nil
+        pg = read_page(image, ps, page)
+        @reached = reached
+        raise "invalid free-list page" unless pg[:type] == 7
+        entries = pg[:item_count]
+        raise "invalid free-list count" if entries * 4 > pg[:payload].bytesize
+        free_pages.concat(pg[:payload].byteslice(0, entries * 4).unpack("N*"))
         seen << page
-        page = block.byteslice(8, 4).unpack1("N")
+        page = pg[:next_page]
       end
-      unless free_pages == free_pages.sort.uniq && free_pages.all? { |id| id >= 2 && id < meta[:page_count] } &&
+      unless free_pages == free_pages.sort.uniq && free_pages.all? { |id| id >= first_body && id < meta[:page_count] } &&
              (free_pages & (meta[:protected] + seen)).empty?
         raise "invalid free-list entry"
       end
@@ -2368,17 +2519,31 @@ module JedNative
     def select_meta(image, ps)
       a = read_meta(image, ps, 0)
       b = read_meta(image, ps, 1)
-      return (b && b[:txid] > a[:txid] ? b : a) if a && b
-      return a if a
-      return b if b
-    
-      raise "no valid meta page"
+      selected = a && b ? (b[:txid] > a[:txid] ? b : a) : a || b
+      raise "no valid meta page" unless selected
+
+      authenticate_meta(image, ps, selected)
+    end
+
+    # The selected meta of an encrypted file must authenticate under the held key — never a fallback
+    # to the other slot (encrypted.md §6) — and its root and free-list tags become the pointers' tags.
+    def authenticate_meta(image, ps, meta, slots: [meta[:slot_index]])
+      return meta unless @crypto
+      stored = image.byteslice(meta[:slot_index] * ps, ps)
+      manifest = (meta[:manifest_pages] || []).map { |page| [page, image.byteslice(page * ps, ps)] }
+      unless slots.any? { |slot| @crypto.meta_authentic?(slot, stored, manifest) }
+        raise Error.new("XX001", "meta page fails authentication")
+      end
+      @crypto.note(meta[:root_page], meta[:root_tag])
+      @crypto.note(meta[:free_head], meta[:free_tag])
+      meta
     end
     
     def read_page(image, ps, index)
       off = index * ps
       raise "page index out of range" if off + ps > image.bytesize
-    
+      return read_sealed_page(image.byteslice(off, ps), ps, index) if @crypto
+
       p = image.byteslice(off, ps)
       # Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
       raise "page checksum mismatch (corrupted page)" unless page_crc(p) == p.byteslice(12, 4).unpack1("N")
@@ -2387,6 +2552,42 @@ module JedNative
         next_page: p.byteslice(8, 4).unpack1("N"), payload: p.byteslice(PAGE_HEADER, ps - PAGE_HEADER) }
     end
     
+    # An encrypted body page, checked against the tag its pointer bound and opened, returned in the
+    # plaintext page's shape: a chain page without its successor's tag, an interior's and a GiST
+    # interior's child pointers without theirs — each tag recorded as the pointer's (encrypted.md §2).
+    def read_sealed_page(stored, ps, index)
+      raise "page index below the first body page" if index < Crypto::FIRST_BODY
+      plain = @crypto.open_body(index, stored, @crypto.tag(index))
+      type, flags, reserved, item_count, next_page = plain.unpack("CCnNN")
+      raise "reserved page header bytes are nonzero" unless reserved.zero?
+      payload = plain.byteslice(PAGE_HEADER, ps - PAGE_HEADER - Crypto::RESERVE)
+      if CHAIN_TYPES.include?(type)
+        payload = payload.byteslice(read_pointer_tag(payload, 0, next_page)..)
+      elsif type == PAGE_INTERIOR
+        pos = 0
+        children = Array.new(item_count + 1) do
+          child, pos = take(payload, pos, 4)
+          child = child.unpack1("N")
+          pos = read_pointer_tag(payload, pos, child)
+          child
+        end
+        payload = children.pack("N*") + payload.byteslice(pos..)
+      elsif type == PAGE_GIST_INTERIOR
+        pos = 0
+        out = +"".b
+        item_count.times do
+          bl, pos = take(payload, pos, 2)
+          bound, pos = take(payload, pos, bl.unpack1("n"))
+          child, pos = take(payload, pos, 4)
+          pos = read_pointer_tag(payload, pos, child.unpack1("N"))
+          out << bl << bound << child
+        end
+        payload = out + payload.byteslice(pos..)
+      end
+      @reached << index if @reached
+      { type: type, flags: flags, item_count: item_count, next_page: next_page, payload: payload }
+    end
+
     # Decode a composite-type catalog entry's body (inverse of composite_type_entry_bytes); the caller
     # has consumed the entry_kind byte. A nested-composite field stores the referenced type's NAME.
     def decode_composite_type_entry(buf, pos)
@@ -2609,6 +2810,8 @@ module JedNative
         has_host_deps = (fb.getbyte(0) & 0b100) != 0
         raise "a non-btree index cannot have host-function dependencies (v31)" if has_host_deps && kb.getbyte(0) != 0 && !(kb.getbyte(0) == 2 && has_predicate)
         rb, pos = take(buf, pos, 4)
+        index_root = rb.unpack1("N")
+        pos = read_pointer_tag(buf, pos, index_root)
         # v27: the partial-index predicate canonical text follows index_root_page when bit1 is set.
         predicate = nil
         if has_predicate
@@ -2650,7 +2853,7 @@ module JedNative
         end
         indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, constraint: (fb.getbyte(0) & 0b10_0000) != 0, orders: orders,
                      kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
-                     root_page: rb.unpack1("N"), predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
+                     root_page: index_root, predicate: predicate, host_deps: host_deps, timezone_deps: timezone_deps }
       end
       # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
       # actions byte, in name order. An FK owns no B-tree (no root page).
@@ -2696,6 +2899,7 @@ module JedNative
         exclusions << { name: ename, index: iname, elements: elements }
       end
       root, pos = take(buf, pos, 4)
+      pos = read_pointer_tag(buf, pos, root.unpack1("N"))
       count_raw, pos = take(buf, pos, 8)
       row_count = count_raw.unpack1("q>")
       raise "negative table row_count" if row_count.negative?
@@ -2779,6 +2983,7 @@ module JedNative
       if t == TAG_EXTERNAL
         fpb, pos = take(buf, pos, 4)
         lnb, pos = take(buf, pos, 4)
+        pos = read_pointer_tag(buf, pos, fpb.unpack1("N"))
         raise "external value with no overflow reader" if fetch.nil?
     
         return [value_from_payload(type, read_overflow_chain(fpb.unpack1("N"), lnb.unpack1("N"), fetch)), pos]
@@ -2793,6 +2998,7 @@ module JedNative
         fpb, pos = take(buf, pos, 4)
         slb, pos = take(buf, pos, 4)
         rlb, pos = take(buf, pos, 4)
+        pos = read_pointer_tag(buf, pos, fpb.unpack1("N"))
         raise "external value with no overflow reader" if fetch.nil?
     
         comp = read_overflow_chain(fpb.unpack1("N"), slb.unpack1("N"), fetch)
@@ -3150,11 +3356,12 @@ module JedNative
                 length = region[:ends][i] - lo
                 next if length.zero?
                 bytes = region[:body].byteslice(lo, length)
-                capacity = ps - PAGE_HEADER
+                capacity = payload_capacity(ps)
+                slab = chain_capacity(capacity)
                 pages, slabs = case bytes.getbyte(0)
-                               when TAG_EXTERNAL then [(bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity, 0]
+                               when TAG_EXTERNAL then [(bytes.byteslice(5, 4).unpack1('N') + slab - 1) / slab, 0]
                                when TAG_INLINE_COMP then [0, (bytes.byteslice(1, 4).unpack1('N') + capacity - 1) / capacity]
-                               when TAG_EXTERNAL_COMP then [(bytes.byteslice(5, 4).unpack1('N') + capacity - 1) / capacity,
+                               when TAG_EXTERNAL_COMP then [(bytes.byteslice(5, 4).unpack1('N') + slab - 1) / slab,
                                                             (bytes.byteslice(9, 4).unpack1('N') + capacity - 1) / capacity]
                                else [0, 0]
                                end

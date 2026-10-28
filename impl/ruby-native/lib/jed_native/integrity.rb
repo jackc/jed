@@ -79,7 +79,7 @@ module JedNative
     # keeps them in RAM: memory_free is its free list). engine: the pinned session's engine, which
     # evaluates expression keys, predicates and CHECKs.
     def initialize(database:, image:, page_size:, meta:, engine:, catalog_engine:, durable:, memory_free: nil,
-                   level: :full, constraints: false, max_findings: 100)
+                   level: :full, constraints: false, max_findings: 100, crypto: nil)
       level = level.to_s
       raise Error.new('22023', "unknown integrity check level #{level}") unless %w[quick full].include?(level)
       raise Error.new('22023', 'max_findings must be a nonnegative integer') unless max_findings.is_a?(Integer) && max_findings >= 0
@@ -91,7 +91,7 @@ module JedNative
       @codec = FileFormat.new(collation_key: lambda { |name, value|
         collation = engine.resolve_collation(name)
         collation ? collation.sort_key(value) : value.b
-      })
+      }, crypto: crypto)
       @findings, @skipped = [], []
       @truncated = false
       @reached = Set.new
@@ -101,7 +101,7 @@ module JedNative
       @tables = {}
       @index_clean = {}
       @index_entries = {}
-      @first = 2
+      @first = @codec.first_body
     end
 
     def run
@@ -152,6 +152,11 @@ module JedNative
       if slot && (reread.nil? || reread[:txid] != @meta[:txid])
         add('meta_invalid', page: slot, detail: "meta slot #{slot} no longer verifies")
       end
+      if slot && reread && @codec.encrypted?
+        stored = @image.byteslice(slot * @ps, @ps)
+        manifest = (@meta[:manifest_pages] || []).map { |page| [page, @image.byteslice(page * @ps, @ps)] }
+        add('meta_invalid', page: slot, detail: "meta slot #{slot} fails authentication") unless @codec.crypto.meta_authentic?(slot, stored, manifest)
+      end
       (@meta[:manifest_pages] || []).each do |page|
         block = @image.byteslice(page * @ps, @ps)
         next if block.getbyte(0) == 8 && @codec.page_crc(block) == block.byteslice(12, 4).unpack1('N') &&
@@ -165,8 +170,9 @@ module JedNative
           next
         end
         block = @image.byteslice(index * @ps, @ps)
-        next if @codec.crc64(block) == expected && (1..7).cover?(block.getbyte(0)) &&
-                @codec.page_crc(block) == block.byteslice(12, 4).unpack1('N')
+        # An encrypted body page is ciphertext: its manifest identity alone checks it.
+        next if @codec.crc64(block) == expected && (@codec.encrypted? || (1..7).cover?(block.getbyte(0)) &&
+                @codec.page_crc(block) == block.byteslice(12, 4).unpack1('N'))
 
         add('manifest_page_mismatch', page: index, detail: "page #{index} no longer carries its recorded identity")
       end
@@ -1121,7 +1127,7 @@ module JedNative
                    image = storage.instance_variable_get(:@image)
                    reread = meta[:slot] && storage.instance_variable_get(:@codec).read_meta(image, storage.page_size, meta[:slot], validate_body: false)
                    meta = meta.merge(reread.slice(:manifest, :manifest_pages, :protected)) if reread && reread[:txid] == meta[:txid]
-                   { image: image, page_size: storage.page_size, meta: meta, durable: true }
+                   { image: image, page_size: storage.page_size, meta: meta, durable: true, crypto: storage.crypto }
                  else
                    memory_integrity_target(name)
                  end

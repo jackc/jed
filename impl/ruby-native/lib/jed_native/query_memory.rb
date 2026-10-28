@@ -436,7 +436,7 @@ module JedNative
 
     def query_memory_storage_records(table, row, rowid, codec, meter: false)
       key = query_memory_storage_key(table, row, rowid, codec)
-      values, forms, compressed, bytes = storage_record_plan(table, key, row, codec, storage_page_size(table) - FileFormat::PAGE_HEADER, meter: meter)
+      values, forms, compressed, bytes = storage_record_plan(table, key, row, codec, storage_capacity(table), meter: meter)
       forms.each_with_index do |form, index|
         if form == :external
           value = values[index]

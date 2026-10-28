@@ -35,6 +35,7 @@ module JedNative
       @pool, @type, @stored_bytes = pool, type, bytes.b.freeze
       @first_page = 0
       @compressed_length = nil
+      tag = pool.codec.encrypted? ? Crypto::TAG : 0
       header = %w[text bytea json].include?(type) ? 3 : 1
       case @stored_bytes.getbyte(0)
       when 0
@@ -44,7 +45,7 @@ module JedNative
         @stored_length = @payload_length
         @compression_outcome = :unknown
       when FileFormat::TAG_EXTERNAL
-        check_span_length(FileFormat::EXTERNAL_PTR_LEN)
+        check_span_length(FileFormat::EXTERNAL_PTR_LEN + tag)
         @form = :external
         @first_page, @payload_length = @stored_bytes.byteslice(1, 8).unpack('N2')
         @stored_length = @payload_length
@@ -57,7 +58,7 @@ module JedNative
         @stored_length = @compressed_length
         @compression_outcome = :accepted
       when FileFormat::TAG_EXTERNAL_COMP
-        check_span_length(FileFormat::EXTERNAL_COMP_PTR_LEN)
+        check_span_length(FileFormat::EXTERNAL_COMP_PTR_LEN + tag)
         @form = :external_comp
         @first_page, @compressed_length, @payload_length = @stored_bytes.byteslice(1, 12).unpack('N3')
         @stored_length = @compressed_length
@@ -69,6 +70,7 @@ module JedNative
         raise Error.new('XX001', 'invalid stored overflow pointer')
       end
       @plain_size = @payload_length + header
+      pool.codec.note_external(@stored_bytes) if external?
       freeze
     end
 
@@ -76,7 +78,7 @@ module JedNative
     def external? = @form == :external || @form == :external_comp
     def large? = @form != :inline
     def compressed? = @compression_outcome == :accepted
-    def overflow_count(capacity = @pool.page_size - FileFormat::PAGE_HEADER)
+    def overflow_count(capacity = chain_capacity)
       external? ? (@stored_length + capacity - 1) / capacity : 0
     end
 
@@ -129,6 +131,11 @@ module JedNative
 
     private
 
+    def chain_capacity
+      codec = @pool.codec
+      codec.chain_capacity(codec.payload_capacity(@pool.page_size))
+    end
+
     def check_span_length(expected)
       raise Error.new('XX001', 'stored value span length mismatch') unless @stored_bytes.bytesize == expected
     end
@@ -137,7 +144,7 @@ module JedNative
       return unless external?
       index, remaining = @first_page, @stored_length
       seen = Set.new
-      capacity = @pool.page_size - FileFormat::PAGE_HEADER
+      capacity = chain_capacity
       until index.zero?
         raise Error.new('XX001', 'overflow chain cycle') unless seen.add?(index)
         page = @pool.page(index)

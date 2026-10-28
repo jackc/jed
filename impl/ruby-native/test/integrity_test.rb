@@ -85,7 +85,7 @@ module RubyIntegrityTest
     count
   end
 
-  NOT_CLEAN = ->(name) { name.start_with?('malformed_', 'encrypted_') || %w[cow_invalid_free_list.jed collation_skew_corrupt.jed].include?(name) }
+  NOT_CLEAN = ->(name) { name.start_with?('malformed_') || %w[cow_invalid_free_list.jed collation_skew_corrupt.jed].include?(name) }
 
   def self.clean_goldens
     environment = golden_environment
@@ -97,7 +97,8 @@ module RubyIntegrityTest
         next if NOT_CLEAN.call(name)
 
         begin
-          with_copy(path, dir, environment: environment) do |database|
+          credential = name.start_with?('encrypted_') ? JedNative::Credential.key("\x4A".b * 32) : nil
+          with_copy(path, dir, environment: environment, credential: credential) do |database|
             %i[quick full].each do |level|
               report = database.integrity_check(level: level, max_findings: 0)
               assert(report.findings.empty?, "#{name} #{level}: #{contract(report)['findings']}")

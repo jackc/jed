@@ -114,17 +114,20 @@ module JedNative
         length = region[:ends][slot] - low
         next if length.zero?
         body = region[:body]
-        capacity = @pool.page_size - FileFormat::PAGE_HEADER
+        # Overflow pages hold a chain slab (C less a successor tag when encrypted); decompression
+        # units count C-sized slabs (cost.md §3).
+        capacity = @pool.codec.payload_capacity(@pool.page_size)
+        slab = @pool.codec.chain_capacity(capacity)
         case body.getbyte(low)
         when FileFormat::TAG_EXTERNAL
           raise Error.new('XX001', 'short external value span') if length < 9
-          pages += (body.unpack1('N', offset: low + 5) + capacity - 1) / capacity
+          pages += (body.unpack1('N', offset: low + 5) + slab - 1) / slab
         when FileFormat::TAG_INLINE_COMP
           raise Error.new('XX001', 'short compressed value span') if length < 5
           slabs += (body.unpack1('N', offset: low + 1) + capacity - 1) / capacity
         when FileFormat::TAG_EXTERNAL_COMP
           raise Error.new('XX001', 'short compressed external value span') if length < 13
-          pages += (body.unpack1('N', offset: low + 5) + capacity - 1) / capacity
+          pages += (body.unpack1('N', offset: low + 5) + slab - 1) / slab
           slabs += (body.unpack1('N', offset: low + 9) + capacity - 1) / capacity
         end
       end
@@ -144,6 +147,7 @@ module JedNative
           bytes = region[:body].byteslice(previous, finish - previous)
           previous = finish
           next unless [FileFormat::TAG_EXTERNAL, FileFormat::TAG_EXTERNAL_COMP].include?(bytes.getbyte(0))
+          @pool.codec.note_external(bytes)
           page = bytes.byteslice(1, 4).unpack1('N')
           until page.zero?
             raise Error.new('XX001', 'overflow page reached twice') unless pages.add?(page)
@@ -394,7 +398,7 @@ module JedNative
       return [nil, 0] unless node
       seen.add(node.object_id)
       if node[:children].empty?
-        leaf = node.is_a?(PagedLeaf) || node.is_a?(RecordLeaf) ? node : RecordLeaf.new(node, @columns, @pool.codec, @pool.page_size - FileFormat::PAGE_HEADER)
+        leaf = node.is_a?(PagedLeaf) || node.is_a?(RecordLeaf) ? node : RecordLeaf.new(node, @columns, @pool.codec, @pool.codec.payload_capacity(@pool.page_size))
         @leaves << leaf
         return [leaf, 1]
       end
