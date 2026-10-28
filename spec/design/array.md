@@ -349,7 +349,14 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   coerces each token to the element type — an **unquoted** `NULL` (any case) is a NULL element,
   `"NULL"` is the 4-char text string, `\x`→`x` un-escapes. It is the inverse of `array_out` (values
   round-trip). A multidim literal must be **rectangular**, and a declared prefix's dimensions must
-  match the contents (else `22P02`); a prefix with `u < l` is `2202E`. A malformed literal is
+  match the contents (else `22P02`); a prefix with `u < l` is `2202E`. The declared bounds follow PG
+  `ReadArrayDimensions`: a bound outside the i32 domain is **`54000`** *"array bound is out of
+  integer range"*, an upper bound of exactly `2147483647` is **`54000`** *"array upper bound is too
+  large: 2147483647"* (so `lb + len` stays computable — PG `ArrayCheckBounds`, which `array_in`,
+  `array_append` and `array_cat` apply, so their results keep `lb + len ≤ 2³¹−1`, i.e. a last
+  subscript of at most `2147483646`; `array_prepend` is PG's one exception, array-functions.md
+  §3.2 — every subscript is computed in 64 bits either way), and a dimension length `u − l + 1` that overflows an i32 is **`54000`** *"array
+  size exceeds the maximum allowed (134217727)"*. A malformed literal is
   `22P02`; a bad element value surfaces that element's own parse error.
 - An array literal is `'{1,2,3}'::i32[]` or `i32[] '{1,2,3}'` — the cast / typed-literal
   machinery routes the **string-literal → array** coercion through `array_in`, the same

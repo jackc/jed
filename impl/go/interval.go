@@ -17,11 +17,12 @@ import (
 // integer math matches Rust's i128 and TS's BigInt within the digit caps below.
 
 const (
-	microsPerDay  = int64(86_400) * microsPerSec // canonical "1 day = 24 h" span weight
-	daysPerMonth  = int64(30)                    // canonical "1 month = 30 days"
-	monthsPerYear = int64(12)
-	maxIntDigits  = 18 // an interval × / number factor's digit bounds (spec/design/interval.md §5)
-	maxFracDigits = 9
+	microsPerDay    = int64(86_400) * microsPerSec // canonical "1 day = 24 h" span weight
+	daysPerMonth    = int64(30)                    // canonical "1 month = 30 days"
+	monthsPerYear   = int64(12)
+	maxIntDigits    = 18               // an interval × / number factor's digit bounds (spec/design/interval.md §6)
+	maxFracDigits   = 18               // significant fractional digits (trailing zeros stripped first)
+	microDaysPerDay = int64(1_000_000) // TSROUND's 1e-6 quantum, applied to the fractional-month days
 )
 
 // Interval is a span of time — three independent fields. Comparison/ordering/dedup go through the
@@ -129,8 +130,10 @@ func (iv Interval) Neg() (Interval, error) {
 }
 
 // ParseFactorDecimal parses a canonical decimal string `[-]int[.frac]` into an exact fraction
-// (num, den) with den = 10^len(frac) (value = num/den). Caps the digit counts (matching the
-// Rust i128 cascade's bound) so all cores trap at the same factor size; over-long → 22008.
+// (num, den) with den = 10^len(frac) (value = num/den). Trailing fractional zeros are stripped
+// first (`1.0000000000` is the factor `1`, as it is for PostgreSQL's double), then the digit counts
+// are capped (spec/design/interval.md §6 — the bound that keeps the Rust i128 cascade exact) so all
+// cores trap at the same factor size; over-long → 22008.
 func parseFactorDecimal(s string) (*big.Int, *big.Int, error) {
 	neg := strings.HasPrefix(s, "-")
 	body := strings.TrimPrefix(s, "-")
@@ -138,6 +141,7 @@ func parseFactorDecimal(s string) (*big.Int, *big.Int, error) {
 	if i := strings.IndexByte(body, '.'); i >= 0 {
 		intPart, fracPart = body[:i], body[i+1:]
 	}
+	fracPart = strings.TrimRight(fracPart, "0")
 	if len(intPart) > maxIntDigits || len(fracPart) > maxFracDigits {
 		return nil, nil, intervalFieldOverflow("interval factor has too many digits")
 	}
@@ -152,9 +156,14 @@ func parseFactorDecimal(s string) (*big.Int, *big.Int, error) {
 	return num, den, nil
 }
 
-// MulByFraction is the exact ×÷ cascade (spec/design/interval.md §5): scale each field by
-// fnum/fden (fden > 0), cascading the fractional part months→days→micros, µs rounded half away
-// from zero. EXACT (big.Int; mirrors Rust's i128). A field beyond i32/i64 traps 22008.
+// MulByFraction is the ×÷ cascade (spec/design/interval.md §5): scale each field by fnum/fden
+// (fden > 0), truncating the whole months/days like PostgreSQL's `(int32)` casts and cascading the
+// fractional part months→days→micros exactly as PG's interval_mul / interval_div do — including the
+// two TSROUND quantizations (the fractional-month days to 1e-6 day, the seconds remainder to 1 µs,
+// both rounded half to even like C rint) and the move of whole days out of a seconds remainder of
+// 24 h or more. The arithmetic is EXACT rational math over big.Int (PG's is double), so the cores
+// agree byte-for-byte and differ from PG only where its double lands on the other side of a
+// quantum boundary. A field beyond i32/i64 traps 22008.
 func mulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
 	g := new(big.Int).GCD(nil, nil, new(big.Int).Abs(fnum), new(big.Int).Abs(fden))
 	if g.Sign() == 0 {
@@ -167,22 +176,36 @@ func mulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
 	u := big.NewInt(iv.Micros)
 	of := func() error { return intervalFieldOverflow("interval out of range") }
 
+	// result.month = trunc(m × factor); the fractional months cascade to days.
 	mTotal := new(big.Int).Mul(m, fn)
 	rMonth := new(big.Int).Quo(mTotal, fd)
-	fracMonth := new(big.Int).Sub(mTotal, new(big.Int).Mul(rMonth, fd))
-	mrd := new(big.Int).Mul(fracMonth, big.NewInt(daysPerMonth))
-	mrdWhole := new(big.Int).Quo(mrd, fd)
-	mrdFrac := new(big.Int).Sub(mrd, new(big.Int).Mul(mrdWhole, fd))
+	fracMonth := new(big.Int).Sub(mTotal, new(big.Int).Mul(rMonth, fd)) // over fd
+	// month_remainder_days = TSROUND(fracMonth/fd × 30): quantized to micro-days, half to even.
+	mrdQ := roundHalfEvenDivBig(new(big.Int).Mul(fracMonth, big.NewInt(daysPerMonth*microDaysPerDay)), fd)
+	mrdWhole := new(big.Int).Quo(mrdQ, big.NewInt(microDaysPerDay))
+	mrdFrac := new(big.Int).Sub(mrdQ, new(big.Int).Mul(mrdWhole, big.NewInt(microDaysPerDay))) // micro-days
 
+	// result.day = trunc(d × factor); its fraction (over fd) joins the month remainder's fraction.
 	dTotal := new(big.Int).Mul(d, fn)
-	rDayPart := new(big.Int).Quo(dTotal, fd)
-	dayFrac := new(big.Int).Sub(dTotal, new(big.Int).Mul(rDayPart, fd))
-	rDay := new(big.Int).Add(rDayPart, mrdWhole)
+	rDay := new(big.Int).Quo(dTotal, fd)
+	dayFrac := new(big.Int).Sub(dTotal, new(big.Int).Mul(rDay, fd)) // over fd
+	// sec_remainder = TSROUND((dayFrac/fd + mrdFrac/1e6) × 86 400): quantized to µs, half to even.
+	secNum := new(big.Int).Mul(dayFrac, big.NewInt(microsPerDay))
+	secNum.Add(secNum, new(big.Int).Mul(new(big.Int).Mul(mrdFrac, big.NewInt(secsPerDay)), fd))
+	secRem := roundHalfEvenDivBig(secNum, fd) // µs
+	// A remainder of 24 h or more (rounding, or the month cascade on top of the day fraction) moves
+	// its whole days up into the days field.
+	if new(big.Int).Abs(secRem).Cmp(big.NewInt(microsPerDay)) >= 0 {
+		whole := new(big.Int).Quo(secRem, big.NewInt(microsPerDay))
+		rDay.Add(rDay, whole)
+		secRem.Sub(secRem, new(big.Int).Mul(whole, big.NewInt(microsPerDay)))
+	}
+	rDay.Add(rDay, mrdWhole)
 
+	// result.time = rint(u × factor + sec_remainder).
 	timeNum := new(big.Int).Mul(u, fn)
-	fracSum := new(big.Int).Add(dayFrac, mrdFrac)
-	timeNum.Add(timeNum, new(big.Int).Mul(fracSum, big.NewInt(microsPerDay)))
-	rTime := roundDivBig(timeNum, fd)
+	timeNum.Add(timeNum, new(big.Int).Mul(secRem, fd))
+	rTime := roundHalfEvenDivBig(timeNum, fd)
 
 	if !rMonth.IsInt64() || !rDay.IsInt64() || !rTime.IsInt64() {
 		return Interval{}, of()
@@ -194,10 +217,30 @@ func mulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
 	return Interval{Months: int32(mi), Days: int32(di), Micros: ti}, nil
 }
 
-// TsShift computes ts + iv (or ts - iv with subtract) — the calendar-aware datetime arithmetic
-// (spec/design/interval.md §5). Months are added first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1
-// month -> Feb 28/29), then days (24 h each), then micros. Adding to ±infinity stays ±infinity; a
-// finite result onto a sentinel or beyond the i64-µs range traps 22008.
+// roundHalfEvenDivBig rounds num/den (den > 0) to the nearest integer, ties to even — C `rint`
+// under the default rounding mode, which PostgreSQL's interval_mul/interval_div and TSROUND use.
+func roundHalfEvenDivBig(num, den *big.Int) *big.Int {
+	q := new(big.Int)
+	r := new(big.Int)
+	q.QuoRem(num, den, r) // q truncated toward zero, r has the sign of num
+	twice := new(big.Int).Abs(r)
+	twice.Lsh(twice, 1) // 2*|r|
+	c := twice.Cmp(den)
+	if c > 0 || (c == 0 && q.Bit(0) == 1) {
+		if num.Sign() >= 0 {
+			q.Add(q, big.NewInt(1))
+		} else {
+			q.Sub(q, big.NewInt(1))
+		}
+	}
+	return q
+}
+
+// TsShift computes ts + iv (or ts - iv with subtract) for a ZONELESS operand — timestamp, or a date
+// widened to midnight (spec/design/interval.md §5). Months are added first WITH DAY-OF-MONTH
+// CLAMPING (Jan 31 + 1 month -> Feb 28/29), then days (24 h each), then micros. Adding to ±infinity
+// stays ±infinity; a finite result onto a sentinel or beyond the i64-µs range traps 22008. A
+// timestamptz operand takes tsShiftZoned instead.
 func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 	if ts == negInfinity || ts == posInfinity {
 		return ts, nil
@@ -207,24 +250,10 @@ func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 		sign = -1
 	}
 	t := ts
-	months := sign * int64(iv.Months)
-	if months != 0 {
-		y, mo, d, h, mi, s, us := civilFromMicros(t)
-		total := y*12 + (mo - 1) + months
-		ny := floorDiv(total, 12)
-		nmo := floorMod(total, 12) + 1
-		nd := d
-		if maxd := daysInMonth(ny, nmo); nd > maxd {
-			nd = maxd
-		}
-		days := daysFromCivil(ny, nmo, nd)
-		secs, ok := mulAdd(days, secsPerDay, h*3600+mi*60+s)
-		if !ok {
-			return 0, intervalFieldOverflow("timestamp out of range")
-		}
-		t, ok = mulAdd(secs, microsPerSec, us)
-		if !ok {
-			return 0, intervalFieldOverflow("timestamp out of range")
+	if months := sign * int64(iv.Months); months != 0 {
+		var err error
+		if t, err = addMonthsClamped(t, months); err != nil {
+			return 0, err
 		}
 	}
 	dayUS, ok := mul64(sign*int64(iv.Days), microsPerDay)
@@ -235,15 +264,107 @@ func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 	if !ok {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
-	if subtract {
-		t, ok = sub64(t, iv.Micros)
-	} else {
-		t, ok = add64(t, iv.Micros)
+	return addShiftMicros(t, iv.Micros, subtract)
+}
+
+// TsShiftZoned computes ts ± iv for a TIMESTAMPTZ operand in the session zone zr — PostgreSQL's
+// timestamptz_pl_interval (spec/design/interval.md §5, timezones.md §6): the months step converts
+// the instant to its wall clock in the zone, adds the months with day-of-month clamping, and
+// re-resolves the wall clock through the zone (a DST gap/overlap as for input); the days step does
+// the same with calendar days (so `+ 1 day` across a DST change keeps the wall-clock time, unlike
+// `+ 24 hours`); the micros are then added on the instant. Each step performs a zone consult only
+// when its field is nonzero (tsShiftZoneConsults counts them for the cost meter). ±infinity is
+// unchanged; a wall clock or instant leaving the finite range traps 22008.
+func tsShiftZoned(ts int64, iv Interval, subtract bool, zr ZoneRef) (int64, error) {
+	if ts == negInfinity || ts == posInfinity {
+		return ts, nil
 	}
+	sign := int64(1)
+	if subtract {
+		sign = -1
+	}
+	t := ts
+	if months := sign * int64(iv.Months); months != 0 {
+		local, ok := instantToLocalMicros(zr, t)
+		if !ok {
+			return 0, errZoneShiftOutOfRange()
+		}
+		var err error
+		if local, err = addMonthsClamped(local, months); err != nil {
+			return 0, err
+		}
+		if t, ok = localToInstantMicros(zr, local); !ok {
+			return 0, errZoneShiftOutOfRange()
+		}
+	}
+	if days := sign * int64(iv.Days); days != 0 {
+		local, ok := instantToLocalMicros(zr, t)
+		if !ok {
+			return 0, errZoneShiftOutOfRange()
+		}
+		dayUS, ok := mul64(days, microsPerDay)
+		if !ok {
+			return 0, intervalFieldOverflow("timestamp out of range")
+		}
+		if local, ok = add64(local, dayUS); !ok {
+			return 0, intervalFieldOverflow("timestamp out of range")
+		}
+		if t, ok = localToInstantMicros(zr, local); !ok {
+			return 0, errZoneShiftOutOfRange()
+		}
+	}
+	return addShiftMicros(t, iv.Micros, subtract)
+}
+
+// TsShiftZoneConsults is the number of zone consults tsShiftZoned performs for ts ± iv — one per
+// nonzero calendar field (months, days) of a finite operand — each charged one `timezone` cost unit
+// (spec/design/cost.md, the AT TIME ZONE unit) before the shift runs.
+func tsShiftZoneConsults(ts int64, iv Interval) int64 {
+	if ts == negInfinity || ts == posInfinity {
+		return 0
+	}
+	n := int64(0)
+	if iv.Months != 0 {
+		n++
+	}
+	if iv.Days != 0 {
+		n++
+	}
+	return n
+}
+
+// addMonthsClamped adds months to a wall clock / zoneless instant t with day-of-month clamping.
+func addMonthsClamped(t int64, months int64) (int64, error) {
+	y, mo, d, h, mi, s, us := civilFromMicros(t)
+	total := y*12 + (mo - 1) + months
+	ny := floorDiv(total, 12)
+	nmo := floorMod(total, 12) + 1
+	nd := d
+	if maxd := daysInMonth(ny, nmo); nd > maxd {
+		nd = maxd
+	}
+	days := daysFromCivil(ny, nmo, nd)
+	secs, ok := mulAdd(days, secsPerDay, h*3600+mi*60+s)
 	if !ok {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
-	if t == negInfinity || t == posInfinity {
+	r, ok := mulAdd(secs, microsPerSec, us)
+	if !ok {
+		return 0, intervalFieldOverflow("timestamp out of range")
+	}
+	return r, nil
+}
+
+// addShiftMicros is the final micros step of a shift: t ± micros, checked, and never onto a
+// ±infinity sentinel.
+func addShiftMicros(t int64, micros int64, subtract bool) (int64, error) {
+	var ok bool
+	if subtract {
+		t, ok = sub64(t, micros)
+	} else {
+		t, ok = add64(t, micros)
+	}
+	if !ok || t == negInfinity || t == posInfinity {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
 	return t, nil

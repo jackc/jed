@@ -804,7 +804,15 @@ impl Engine {
     /// (read-your-snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.rs) and the
     /// catalog is a shallow copy. `committed` is untouched until commit.
     pub(crate) fn begin_tx(&mut self, writable: Option<bool>) -> Result<Outcome> {
-        if self.session.tx.is_some() {
+        if let Some(tx) = self.session.tx.as_ref() {
+            if tx.is_failed() {
+                // In a failed block even BEGIN is refused with the block's 25P02 (PostgreSQL — only
+                // ROLLBACK/COMMIT/ROLLBACK TO are accepted there, transactions.md §6).
+                return Err(EngineError::new(
+                    SqlState::InFailedSqlTransaction,
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                ));
+            }
             return Err(EngineError::new(
                 SqlState::ActiveSqlTransaction,
                 "there is already a transaction in progress",

@@ -64,7 +64,8 @@ test("a zone shift past i64 max traps 22008", () => {
   ]) {
     traps(db, "+05:00", expr, 1);
   }
-  traps(db, "UTC", "make_timestamptz(294247, 1, 10, 4, 0, 0, '+05:00')", 1);
+  // make_timestamptz reads its explicit zone with the ISO sign (functions.md §11): '-05:00' is UTC-5.
+  traps(db, "UTC", "make_timestamptz(294247, 1, 10, 4, 0, 0, '-05:00')", 1);
   // An instant rendered in a UTC+5 zone moves +5h.
   for (const expr of [
     "tz :: timestamp",

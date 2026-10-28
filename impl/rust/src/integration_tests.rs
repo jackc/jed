@@ -53,6 +53,8 @@ mod chain_sharing;
 mod check_constraint;
 #[path = "../tests/checksum.rs"]
 mod checksum;
+#[path = "../tests/closure_txn.rs"]
+mod closure_txn;
 #[path = "../tests/collation.rs"]
 mod collation;
 #[path = "../tests/collation_host.rs"]

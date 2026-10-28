@@ -849,16 +849,7 @@ pub(crate) fn scalar_pair_castable(from: ScalarType, to: ScalarType) -> bool {
 }
 
 pub(crate) fn coerce_string_to_array(s: &str, elem: &ColType, iz: &InputZone) -> Result<Value> {
-    let parsed = crate::value::parse_array_literal(s).map_err(|e| match e {
-        crate::value::ArrayInError::Malformed => EngineError::new(
-            SqlState::InvalidTextRepresentation,
-            "malformed array literal".to_string(),
-        ),
-        // An inverted [l:u] bound (`u < l`) — PG `2202E`.
-        crate::value::ArrayInError::BoundFlip => {
-            array_subscript_err("upper bound cannot be less than lower bound")
-        }
-    })?;
+    let parsed = crate::value::parse_array_literal(s).map_err(crate::value::array_in_error)?;
     let mut elements = Vec::with_capacity(parsed.tokens.len());
     for tok in parsed.tokens {
         match tok {
@@ -1588,7 +1579,120 @@ pub(crate) fn eval_float64_arith(op: ArithOp, x: f64, y: f64) -> Result<Value> {
     if r.is_infinite() && x.is_finite() && y.is_finite() {
         return Err(overflow(ScalarType::Float64));
     }
+    // Underflow (PG float8_mul / float8_div, float.md §3): a product of two non-zero operands, or
+    // a quotient of a non-zero dividend by a finite divisor, that rounds to exactly zero traps
+    // 22003 rather than yielding 0. `+`, `-` and `%` never underflow.
+    if r == 0.0 && float_underflowed(op, x, y) {
+        return Err(float_underflow());
+    }
     Ok(Value::Float64(r))
+}
+
+/// Is a zero result of `op` PG's underflow: `x * y` with both operands non-zero, or `x / y` with a
+/// non-zero dividend and a finite divisor (`1 / Infinity` is a legitimate 0)? Shared by the f64
+/// and f32 kernels.
+fn float_underflowed(op: ArithOp, x: f64, y: f64) -> bool {
+    match op {
+        ArithOp::Mul => x != 0.0 && y != 0.0,
+        ArithOp::Div => x != 0.0 && !y.is_infinite(),
+        _ => false,
+    }
+}
+
+/// The 22003 a float operation traps when a non-zero exact result rounds to zero (PG's
+/// `float_underflow_error` — float.md §3).
+pub(crate) fn float_underflow() -> EngineError {
+    EngineError::new(
+        SqlState::NumericValueOutOfRange,
+        "value out of range: underflow",
+    )
+}
+
+/// The 22003 PG raises for a function input outside its domain (asin/acos/acosh/atanh out of
+/// range, sin/cos/tan/cot of ±Infinity).
+fn float_input_out_of_range() -> EngineError {
+    EngineError::new(SqlState::NumericValueOutOfRange, "input is out of range")
+}
+
+/// PostgreSQL's `dpow` (float.c) over binary64 (float.md §8): the POSIX NaN rules first (NaN^0 =
+/// 1, 1^NaN = 1, every other NaN input yields NaN), then the SQL-standard domain errors 2201F
+/// (0^negative; negative^non-integer), then the infinite cases resolved explicitly per POSIX
+/// (never trapped), and finally the libm pow with the finite overflow (±Inf → 22003) and underflow
+/// (a non-zero base whose power rounds to 0 → 22003) traps.
+fn float_pow(x: f64, y: f64) -> Result<f64> {
+    if x.is_nan() {
+        return Ok(if y.is_nan() || y != 0.0 {
+            f64::NAN
+        } else {
+            1.0
+        });
+    }
+    if y.is_nan() {
+        return Ok(if x != 1.0 { f64::NAN } else { 1.0 });
+    }
+    if x == 0.0 && y < 0.0 {
+        return Err(EngineError::new(
+            SqlState::InvalidArgumentForPowerFunction,
+            "zero raised to a negative power is undefined",
+        ));
+    }
+    if x < 0.0 && y.floor() != y {
+        return Err(EngineError::new(
+            SqlState::InvalidArgumentForPowerFunction,
+            "a negative number raised to a non-integer power yields a complex result",
+        ));
+    }
+    if y.is_infinite() {
+        let absx = x.abs();
+        return Ok(if absx == 1.0 {
+            1.0
+        } else if y > 0.0 {
+            if absx > 1.0 { y } else { 0.0 }
+        } else if absx > 1.0 {
+            0.0
+        } else {
+            -y
+        });
+    }
+    if x.is_infinite() {
+        return Ok(if y == 0.0 {
+            1.0
+        } else if x > 0.0 {
+            if y > 0.0 { x } else { 0.0 }
+        } else {
+            // x = -Inf: y is an integer (the domain check above); the sign follows its parity.
+            let y_odd = (y / 2.0).floor() != y / 2.0;
+            if y > 0.0 {
+                if y_odd { x } else { -x }
+            } else if y_odd {
+                -0.0
+            } else {
+                0.0
+            }
+        });
+    }
+    let r = x.powf(y);
+    if r.is_nan() {
+        // Every domain error was handled above, so a NaN can only be a libm quirk for a huge |y|
+        // (PG's glibc-bug branch): resolve it as PG does.
+        let absx = x.abs();
+        return if x == 0.0 {
+            Ok(0.0)
+        } else if absx == 1.0 {
+            Ok(1.0)
+        } else if (y >= 0.0) == (absx > 1.0) {
+            Err(overflow(ScalarType::Float64))
+        } else {
+            Err(float_underflow())
+        };
+    }
+    if r.is_infinite() {
+        return Err(overflow(ScalarType::Float64));
+    }
+    if r == 0.0 && x != 0.0 {
+        return Err(float_underflow());
+    }
+    Ok(r)
 }
 
 /// As [`eval_float64_arith`], at binary32 (`f32`). Each op rounds to binary32 (native `f32`
@@ -1610,6 +1714,9 @@ pub(crate) fn eval_float32_arith(op: ArithOp, x: f32, y: f32) -> Result<Value> {
     };
     if r.is_infinite() && x.is_finite() && y.is_finite() {
         return Err(overflow(ScalarType::Float32));
+    }
+    if r == 0.0 && float_underflowed(op, x as f64, y as f64) {
+        return Err(float_underflow()); // the binary32 underflow (PG float4_mul / float4_div)
     }
     Ok(Value::Float32(r))
 }
@@ -1640,21 +1747,27 @@ pub(crate) fn int_to_const_float(n: i64, target: ScalarType) -> RExpr {
 pub(crate) fn decimal_to_float(d: &Decimal, target: ScalarType) -> Result<Value> {
     // The decimal's canonical string parses to the nearest binary value (Rust's float parser is
     // correctly rounded). A huge decimal parses to ±Inf, which is the overflow case.
+    // A non-zero decimal that parses to 0 underflowed the width: 22003 (PG numeric → float8/float4,
+    // float.md §6).
     let s = d.render();
     if target.is_float32() {
         let f: f32 = s.parse().map_err(|_| overflow(ScalarType::Float32))?;
-        if f.is_finite() {
-            Ok(Value::Float32(f))
-        } else {
-            Err(overflow(ScalarType::Float32))
+        if !f.is_finite() {
+            return Err(overflow(ScalarType::Float32));
         }
+        if f == 0.0 && !d.is_zero() {
+            return Err(float_underflow());
+        }
+        Ok(Value::Float32(f))
     } else {
         let f: f64 = s.parse().map_err(|_| overflow(ScalarType::Float64))?;
-        if f.is_finite() {
-            Ok(Value::Float64(f))
-        } else {
-            Err(overflow(ScalarType::Float64))
+        if !f.is_finite() {
+            return Err(overflow(ScalarType::Float64));
         }
+        if f == 0.0 && !d.is_zero() {
+            return Err(float_underflow());
+        }
+        Ok(Value::Float64(f))
     }
 }
 
@@ -1677,6 +1790,9 @@ pub(crate) fn cast_from_float(
         let n = f as f32;
         if n.is_infinite() && f.is_finite() {
             return Err(overflow(ScalarType::Float32));
+        }
+        if n == 0.0 && f != 0.0 {
+            return Err(float_underflow()); // a non-zero f64 that rounds to 0 at binary32 (PG float84)
         }
         return Ok(Value::Float32(n));
     }
@@ -1798,7 +1914,9 @@ pub(crate) fn round_f64_places(f: f64, places: i64) -> f64 {
 /// Evaluate a float scalar function over a finite/non-finite f64 (spec/design/float.md §8). The
 /// EXACT set (ceil/floor/trunc/sqrt) is correctly-rounded (in-contract); the TRANSCENDENTAL set
 /// (exp/ln/log10/pow/sin/cos/tan) calls Rust's libm (exempted, may differ by an ULP cross-core).
-/// Domain/overflow errors trap 22003, keeping NaN/Inf input-only (a NaN/Inf *operand* propagates).
+/// Domain errors follow PG: ln/log10 of zero or a negative → 2201E, sqrt of a negative and pow's
+/// 0^negative / negative^non-integer → 2201F, exp/pow overflow and underflow → 22003, sin/cos/
+/// tan/cot of ±Infinity → 22003 — keeping NaN/Inf input-only (a NaN/Inf *operand* propagates).
 pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Value> {
     // PG's exact RADIANS_PER_DEGREE literal (float.c) — shared by radians/degrees so the single
     // IEEE multiply/divide is byte-identical cross-core and matches PG.
@@ -1808,11 +1926,11 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         ScalarFunc::Floor => x.floor(),
         ScalarFunc::Trunc => x.trunc(),
         ScalarFunc::Sqrt => {
-            // sqrt of a NEGATIVE finite value is a domain error → 22003 (NaN stays input-only).
-            // A NaN/±Inf operand propagates (sqrt(Inf) = Inf, sqrt(NaN) = NaN).
-            if x.is_finite() && x < 0.0 {
+            // sqrt of a NEGATIVE value is a domain error → 2201F (PG dsqrt; NaN stays input-only).
+            // A NaN/±Inf operand propagates (sqrt(Inf) = Inf, sqrt(NaN) = NaN); -Inf is negative.
+            if x < 0.0 {
                 return Err(EngineError::new(
-                    SqlState::NumericValueOutOfRange,
+                    SqlState::InvalidArgumentForPowerFunction,
                     "cannot take square root of a negative number",
                 ));
             }
@@ -1820,44 +1938,46 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         }
         ScalarFunc::Exp => {
             let v = x.exp();
-            // exp overflow (e.g. exp(710)) → ±Inf from a finite operand traps 22003.
-            if v.is_infinite() && x.is_finite() {
-                return Err(overflow(ScalarType::Float64));
+            if x.is_finite() {
+                // exp overflow (e.g. exp(710)) → ±Inf from a finite operand traps 22003; an exact
+                // result that rounds to 0 (exp(-746)) is the underflow trap (PG dexp).
+                if v.is_infinite() {
+                    return Err(overflow(ScalarType::Float64));
+                }
+                if v == 0.0 {
+                    return Err(float_underflow());
+                }
             }
             v
         }
         ScalarFunc::Ln => {
-            // ln(0) → 22003; ln(neg) → 22003 (domain). NaN/Inf operands propagate.
-            if x.is_finite() {
-                if x == 0.0 {
-                    return Err(EngineError::new(
-                        SqlState::NumericValueOutOfRange,
-                        "cannot take logarithm of zero",
-                    ));
-                }
-                if x < 0.0 {
-                    return Err(EngineError::new(
-                        SqlState::NumericValueOutOfRange,
-                        "cannot take logarithm of a negative number",
-                    ));
-                }
+            // ln(0) → 2201E; ln(neg) → 2201E (PG dlog1). NaN/+Inf operands propagate.
+            if x == 0.0 {
+                return Err(EngineError::new(
+                    SqlState::InvalidArgumentForLog,
+                    "cannot take logarithm of zero",
+                ));
+            }
+            if x < 0.0 {
+                return Err(EngineError::new(
+                    SqlState::InvalidArgumentForLog,
+                    "cannot take logarithm of a negative number",
+                ));
             }
             x.ln()
         }
         ScalarFunc::Log10 => {
-            if x.is_finite() {
-                if x == 0.0 {
-                    return Err(EngineError::new(
-                        SqlState::NumericValueOutOfRange,
-                        "cannot take logarithm of zero",
-                    ));
-                }
-                if x < 0.0 {
-                    return Err(EngineError::new(
-                        SqlState::NumericValueOutOfRange,
-                        "cannot take logarithm of a negative number",
-                    ));
-                }
+            if x == 0.0 {
+                return Err(EngineError::new(
+                    SqlState::InvalidArgumentForLog,
+                    "cannot take logarithm of zero",
+                ));
+            }
+            if x < 0.0 {
+                return Err(EngineError::new(
+                    SqlState::InvalidArgumentForLog,
+                    "cannot take logarithm of a negative number",
+                ));
             }
             x.log10()
         }
@@ -1866,22 +1986,36 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
                 Some(Value::Float64(y)) => *y,
                 _ => unreachable!("pow's second arg is a widened f64"),
             };
-            let v = x.powf(y);
-            // pow overflow from finite operands → 22003.
-            if v.is_infinite() && x.is_finite() && y.is_finite() {
-                return Err(overflow(ScalarType::Float64));
-            }
-            v
+            float_pow(x, y)?
         }
-        ScalarFunc::Sin => x.sin(),
-        ScalarFunc::Cos => x.cos(),
-        ScalarFunc::Tan => x.tan(),
+        // The circular functions are undefined at ±Infinity: PG raises 22003 "input is out of
+        // range" (dsin/dcos/dtan/dcot) rather than returning NaN; a NaN operand propagates.
+        ScalarFunc::Sin | ScalarFunc::Cos | ScalarFunc::Tan | ScalarFunc::Cot => {
+            if x.is_infinite() {
+                return Err(float_input_out_of_range());
+            }
+            match func {
+                ScalarFunc::Sin => x.sin(),
+                ScalarFunc::Cos => x.cos(),
+                ScalarFunc::Tan => x.tan(),
+                // cot(x) = 1/tan(x) (no libm cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
+                _ => 1.0 / x.tan(),
+            }
+        }
         // cbrt has no domain restriction: cbrt(-8) = -2, cbrt(±Inf) = ±Inf, cbrt(NaN) = NaN.
         ScalarFunc::Cbrt => x.cbrt(),
         // radians/degrees — a single correctly-rounded IEEE op (multiply/divide) by PG's exact
-        // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract).
-        ScalarFunc::Radians => x * RADIANS_PER_DEGREE,
-        ScalarFunc::Degrees => x / RADIANS_PER_DEGREE,
+        // RADIANS_PER_DEGREE literal (float.c), so byte-identical cross-core (in-contract). They
+        // are PG's float8_mul / float8_div, so they carry the §3/§5 overflow and underflow traps:
+        // degrees(1e308) overflows, radians(5e-324) underflows to 0 — both 22003.
+        ScalarFunc::Radians => match eval_float64_arith(ArithOp::Mul, x, RADIANS_PER_DEGREE)? {
+            Value::Float64(v) => v,
+            _ => unreachable!("eval_float64_arith yields a Float64"),
+        },
+        ScalarFunc::Degrees => match eval_float64_arith(ArithOp::Div, x, RADIANS_PER_DEGREE)? {
+            Value::Float64(v) => v,
+            _ => unreachable!("eval_float64_arith yields a Float64"),
+        },
         // asin domain is [-1, 1]: a finite |x| > 1 (and ±Inf, magnitude > 1) is out of range →
         // 22003, exactly PG; a NaN operand propagates (no trap).
         ScalarFunc::Asin => {
@@ -1914,8 +2048,6 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
             };
             x.atan2(x2)
         }
-        // cot(x) = 1/tan(x) (no libm cot; 1/tan bit-matches PG). cot(0) = +Inf (no trap).
-        ScalarFunc::Cot => 1.0 / x.tan(),
         // Hyperbolics: sinh/cosh overflow to ±Inf with NO trap (PG-faithful, unlike exp/pow);
         // tanh/asinh are total. acosh traps below 1; atanh traps outside [-1, 1] (atanh(±1) =
         // ±Inf is admissible). A NaN operand propagates through every one.

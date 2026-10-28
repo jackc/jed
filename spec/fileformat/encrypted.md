@@ -252,6 +252,7 @@ setting, so it reaches no SQL surface or error message.
 | Unwrap fails (wrong credential, wrong kind, tampered copy that kept its CRC) | `28P01 invalid_password` |
 | Encrypted file, no credential | `28P02 credential_required` |
 | Plaintext file, credential offered | `28P03 credential_not_applicable` |
+| Neither meta slot CRC-valid, with or without a credential | `XX001 data_corrupted` — the file declares no variant, so a credential is neither applicable nor inapplicable; slot selection reports the damage (never `28P03`) |
 | In-memory database with a credential | `55000 object_not_in_prerequisite_state` |
 | `create` with a credential and `page_size < 1024` | `0A000` |
 

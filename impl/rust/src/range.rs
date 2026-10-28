@@ -225,6 +225,16 @@ fn increment(v: &Value, elem: ScalarType) -> Result<Value> {
     }
 }
 
+/// Whether a discrete bound value is the date ±infinity sentinel. PG's `daterange_canonical` skips
+/// such a bound: it keeps the inclusivity it was given rather than stepping the sentinel
+/// (ranges.md §4).
+fn is_infinite_date_bound(v: &Value, elem: ScalarType) -> bool {
+    matches!(
+        (v, elem),
+        (Value::Date(d), ScalarType::Date) if *d == crate::date::NEG_INFINITY || *d == crate::date::POS_INFINITY
+    )
+}
+
 /// Build a CANONICAL [`RangeVal`] from coerced bound values (spec/design/ranges.md §4): the order
 /// check (`lower > upper` → `22000`), discrete canonicalization to `[)` (trapping `22003` on a step
 /// past the domain), and empty normalization (`lower == upper` not-both-inclusive → `empty`).
@@ -252,7 +262,7 @@ pub fn finalize(
         // Canonical `[)`: an exclusive finite lower steps up to inclusive; an inclusive finite upper
         // steps up to exclusive. Infinite bounds stay exclusive (their inclusivity is meaningless).
         match &lower {
-            Some(lo) if !lower_inc => {
+            Some(lo) if !lower_inc && !is_infinite_date_bound(lo, elem) => {
                 lower = Some(increment(lo, elem)?);
                 lower_inc = true;
             }
@@ -260,7 +270,7 @@ pub fn finalize(
             _ => {}
         }
         match &upper {
-            Some(hi) if upper_inc => {
+            Some(hi) if upper_inc && !is_infinite_date_bound(hi, elem) => {
                 upper = Some(increment(hi, elem)?);
                 upper_inc = false;
             }
@@ -402,14 +412,20 @@ fn cmp_bounds(
             if c != Ordering::Equal {
                 return c;
             }
-            // Equal values: only a differing inclusivity breaks the tie (PG range_cmp_bounds). The
-            // exclusive side decides — an exclusive lower sorts after, an exclusive upper before.
+            // Equal values: the tie-break is PG range_cmp_bounds exactly. An exclusive bound sits
+            // just inside its own side (an exclusive lower starts later, an exclusive upper ends
+            // earlier), so two bounds of the same inclusivity on the SAME side are equal, while on
+            // DIFFERENT sides the lower bound sorts after the upper when both are exclusive (`(5` is
+            // "> 5", `5)` is "< 5") and before it when both are inclusive (`[5` and `5]` meet at 5).
+            // range-functions.md §3.
             match (inc1, inc2) {
-                (true, false) => {
-                    if lower2 {
-                        Ordering::Less
-                    } else {
+                (false, false) => {
+                    if lower1 == lower2 {
+                        Ordering::Equal
+                    } else if lower1 {
                         Ordering::Greater
+                    } else {
+                        Ordering::Less
                     }
                 }
                 (false, true) => {
@@ -419,7 +435,22 @@ fn cmp_bounds(
                         Ordering::Less
                     }
                 }
-                _ => Ordering::Equal,
+                (true, false) => {
+                    if lower2 {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (true, true) => {
+                    if lower1 == lower2 {
+                        Ordering::Equal
+                    } else if lower1 {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
             }
         }
     }

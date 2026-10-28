@@ -188,7 +188,49 @@ function scanNumber(sql: string, start: number): [Token, number] {
 // error carries no position: it would point into text the host never wrote
 // (spec/design/error-fields.md §10.1). lexRaw never sets one; only lexWithPositions stamps it.
 export function lex(sql: string): Token[] {
+  checkTextEncoding(sql);
   return lexRaw(sql, { starts: [], tokStart: 0 });
+}
+
+// MAX_PARAM_INDEX is the largest bind-parameter index a statement may name ($65535, spec/design/api.md
+// §5): PostgreSQL's wire-protocol limit on the parameters of one statement. A fixed, cross-core-
+// identical bound, like MAX_EXPR_DEPTH — the parameter table a statement allocates is sized by its
+// largest index, so the bound is what keeps `SELECT $4294967295` from allocating four billion slots.
+export const MAX_PARAM_INDEX = 65535;
+
+// checkTextEncoding checks text the engine receives from outside — SQL text, a host text parameter —
+// as PostgreSQL's pg_verifymbstr checks a query string or a text-format parameter: the text must be
+// valid UTF-8 without NUL (spec/design/types.md §11). A JS string is UTF-16, so the two ways it can
+// fail are a NUL and a lone surrogate (not valid Unicode, so it has no UTF-8 form — its naive
+// three-byte encoding is what PostgreSQL would name). Either is 22021, naming the bytes as
+// report_invalid_encoding does, with no position; the Rust and Go cores report the same.
+export function checkTextEncoding(text: string): void {
+  for (let i = 0; i < text.length; i++) {
+    const u = text.charCodeAt(i);
+    if (u === 0) {
+      throw engineError(
+        "character_not_in_repertoire",
+        'invalid byte sequence for encoding "UTF8": 0x00',
+      );
+    }
+    if (u >= 0xd800 && u <= 0xdfff) {
+      if (u <= 0xdbff) {
+        const next = text.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          i++; // a surrogate pair: one code point
+          continue;
+        }
+      }
+      const hex = (b: number) => "0x" + b.toString(16).padStart(2, "0");
+      const b1 = 0xe0 | (u >> 12);
+      const b2 = 0x80 | ((u >> 6) & 0x3f);
+      const b3 = 0x80 | (u & 0x3f);
+      throw engineError(
+        "character_not_in_repertoire",
+        `invalid byte sequence for encoding "UTF8": ${hex(b1)} ${hex(b2)} ${hex(b3)}`,
+      );
+    }
+  }
 }
 
 // lexWithPositions is lex, also returning each token's 1-based CHARACTER position in sql
@@ -196,6 +238,10 @@ export function lex(sql: string): Token[] {
 // one past the last character — PostgreSQL's "at end of input". An error carries the position of
 // the lexeme being scanned (spec/design/error-fields.md §10.2).
 export function lexWithPositions(sql: string): { tokens: Token[]; positions: number[] } {
+  // The text is checked as a whole before it is scanned (checkTextEncoding): a NUL or a lone
+  // surrogate anywhere — in a literal, a quoted identifier, or between tokens — is 22021 with no
+  // position, and the scan below never has to re-check what it copies raw.
+  checkTextEncoding(sql);
   const st: LexState = { starts: [], tokStart: 0 };
   let tokens: Token[];
   try {
@@ -574,8 +620,9 @@ function lexRaw(sql: string, st: LexState): Token[] {
       }
     } else if (c === "$") {
       // A bind parameter $N — "$" then a 1-based decimal index (spec/design/api.md §5,
-      // grammar.md §5). "$" with no following digit, $0, and a leading zero ($01) are 42601;
-      // an index overflowing a 32-bit range is too.
+      // grammar.md §5). "$" with no following digit, $0, and a leading zero ($01) are 42601; so
+      // is an index above MAX_PARAM_INDEX: the parameter table is sized by the largest index a
+      // statement names, so an unbounded index would be an unbounded allocation (CLAUDE.md §13).
       i++; // consume "$"
       const digitStart = i;
       while (i < n && isDigit(sql[i]!)) {
@@ -593,8 +640,11 @@ function lexRaw(sql: string, st: LexState): Token[] {
         );
       }
       const idx = Number(digits);
-      if (!Number.isSafeInteger(idx) || idx > 0xffffffff) {
-        throw engineError("syntax_error", `parameter number out of range: $${digits}`);
+      if (!Number.isSafeInteger(idx) || idx > MAX_PARAM_INDEX) {
+        throw engineError(
+          "syntax_error",
+          `parameter number out of range: $${digits} (the maximum is $${MAX_PARAM_INDEX})`,
+        );
       }
       tokens.push({ kind: "param", paramIndex: idx });
     } else if (isAlpha(c)) {

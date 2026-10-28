@@ -1,0 +1,94 @@
+# make_timestamptz's explicit timezone argument (spec/design/functions.md §11) is read as
+# PostgreSQL's parse_sane_timezone reads it: a sign-led string is an ISO numeric offset with the
+# timestamp-literal sign (`+05:30` is UTC+5:30 — NOT AT TIME ZONE's POSIX sign), in the forms
+# `±HH`, `±HH:MM[:SS]`, and the run-together `±HHMM`, bounded by MAX_TZDISP_HOUR (±15:59:59; beyond
+# is 22023 "numeric time zone … out of range"); a leading digit is 22023 "invalid input syntax for
+# type numeric time zone"; anything else is a zone name, matched case-insensitively (22023 when
+# unknown). Oracle-checked against postgres:18.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.i32, types.timestamptz, func.make_timestamp, resource.cost_metering
+
+# load-timezone: America/New_York
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+05:30')
+----
+2023-12-31 18:30:00+00
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '-08')
+----
+2024-01-01 08:00:00+00
+
+# run-together HHMM
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+0530')
+----
+2023-12-31 18:30:00+00
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+530')
+----
+2023-12-31 18:30:00+00
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+5')
+----
+2023-12-31 19:00:00+00
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+05:30:15')
+----
+2023-12-31 18:29:45+00
+
+# the largest numeric offset
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+15:59:59')
+----
+2023-12-31 08:00:01+00
+
+statement error 22023
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+16')
+
+statement error 22023
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '-16:00')
+
+statement error 22023
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+15:60')
+
+statement error 22023
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '+99999999999999999999')
+
+# a numeric zone must start with its sign
+statement error 22023
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, '05:30')
+
+# zone names, case-insensitively
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, 'UTC')
+----
+2024-01-01 00:00:00+00
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, 'utc')
+----
+2024-01-01 00:00:00+00
+
+# cost: 3
+query T nosort
+SELECT make_timestamptz(2024, 7, 1, 0, 0, 0, 'america/new_york')
+----
+2024-07-01 04:00:00+00
+
+statement error 22023
+SELECT make_timestamptz(2024, 1, 1, 0, 0, 0, 'XYZ')

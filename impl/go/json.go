@@ -77,12 +77,39 @@ func jsonTypeRank(n *JsonNode) int {
 	}
 }
 
-// Cmp is the PG jsonb total btree order (spec/design/json.md §5). A definite ordering (no SQL NULLs
-// inside a document), driving both `<` and `ORDER BY` from one comparator so they agree by
-// construction. Type rank first; within a type: booleans false<true, numbers by Decimal value,
-// strings by collation-`C` UTF-8 byte order, arrays/objects by element/member COUNT first (PG
-// compares container length before contents) then element-wise.
+// Cmp is the PG jsonb total btree order (spec/design/json.md §5) of two WHOLE documents. A definite
+// ordering (no SQL NULLs inside a document), driving both `<` and `ORDER BY` from one comparator so
+// they agree by construction. It is cmpNested plus PostgreSQL's one root-level quirk: a top-level
+// scalar is stored as a one-element "raw scalar" pseudo-array, and compareJsonbContainers checks
+// the element count AFTER the raw-scalar flag, so a scalar sorts after the empty array and before
+// every non-empty array (`[]` < null < "a" < 1 < true < [1] < {}). Inside a container the ordinary
+// type rank applies (`[null]` < `[[]]`).
 func (n *JsonNode) Cmp(other *JsonNode) int {
+	ns, os := jsonIsScalar(n), jsonIsScalar(other)
+	if ns && other.Kind == JArray {
+		if len(other.Arr) == 0 {
+			return 1
+		}
+		return -1
+	}
+	if os && n.Kind == JArray {
+		if len(n.Arr) == 0 {
+			return -1
+		}
+		return 1
+	}
+	return n.cmpNested(other)
+}
+
+// jsonIsScalar reports whether a node is a JSON scalar (null, boolean, number, string).
+func jsonIsScalar(n *JsonNode) bool { return n.Kind != JArray && n.Kind != JObject }
+
+// cmpNested is the PG jsonb order of two nodes BELOW the document root (json.md §5). Type rank
+// first; within a type: booleans false<true, numbers by Decimal value, strings by collation-`C`
+// UTF-8 byte order, arrays/objects by element/member COUNT first (PG compares container length
+// before contents) then element-wise — an object's members pairwise in stored canonical key order,
+// each key compared BYTEWISE (PG compares the key strings under the collation, not length-first).
+func (n *JsonNode) cmpNested(other *JsonNode) int {
 	ra, rb := jsonTypeRank(n), jsonTypeRank(other)
 	if ra != rb {
 		return cmpInt(ra, rb)
@@ -102,7 +129,7 @@ func (n *JsonNode) Cmp(other *JsonNode) int {
 			return c
 		}
 		for i := range n.Arr {
-			if c := n.Arr[i].Cmp(&other.Arr[i]); c != 0 {
+			if c := n.Arr[i].cmpNested(&other.Arr[i]); c != 0 {
 				return c
 			}
 		}
@@ -111,16 +138,63 @@ func (n *JsonNode) Cmp(other *JsonNode) int {
 		if c := cmpInt(len(n.Obj), len(other.Obj)); c != 0 {
 			return c
 		}
-		// Members are in canonical key order in both; compare keys then values pairwise.
+		// Members are in canonical (length-first) key order in both; compare keys BYTEWISE then
+		// values, pairwise. The storage order and the key comparison deliberately differ, as in
+		// PostgreSQL: `{"b":1}` > `{"aa":1}` because "aa" < "b" bytewise (json.md §5).
 		for i := range n.Obj {
-			if c := jsonKeyCmp(n.Obj[i].Key, other.Obj[i].Key); c != 0 {
+			if c := strings.Compare(n.Obj[i].Key, other.Obj[i].Key); c != 0 {
 				return c
 			}
-			if c := n.Obj[i].Val.Cmp(&other.Obj[i].Val); c != 0 {
+			if c := n.Obj[i].Val.cmpNested(&other.Obj[i].Val); c != 0 {
 				return c
 			}
 		}
 		return 0
+	}
+}
+
+// writeJsonbDistinctKey appends a collision-free STRUCTURAL key of a jsonb node to a DISTINCT /
+// GROUP BY / set-operation row key (exec_emit.go distinctRowKey): two nodes produce the same key iff
+// Cmp == 0. A number keys on its value-canonical decimal string, exactly as a `decimal` column does
+// (spec/design/decimal.md §5), so `1`, `1.0`, `1.00` and `1e0` share one bucket — the canonical
+// render (jsonbOut) preserves scale and would split them. Strings are length-prefixed; containers
+// frame their count and recurse; keys are length-prefixed in canonical order (json.md §2.3).
+func writeJsonbDistinctKey(b *strings.Builder, n *JsonNode) {
+	switch n.Kind {
+	case JNull:
+		b.WriteByte('n')
+	case JBool:
+		if n.B {
+			b.WriteByte('t')
+		} else {
+			b.WriteByte('f')
+		}
+	case JNumber:
+		b.WriteByte('d')
+		b.WriteString(n.Num.CanonicalString())
+		b.WriteByte(';')
+	case JString:
+		b.WriteByte('s')
+		b.WriteString(strconv.Itoa(len(n.S)))
+		b.WriteByte(':')
+		b.WriteString(n.S)
+	case JArray:
+		b.WriteByte('a')
+		b.WriteString(strconv.Itoa(len(n.Arr)))
+		b.WriteByte(':')
+		for i := range n.Arr {
+			writeJsonbDistinctKey(b, &n.Arr[i])
+		}
+	default: // JObject
+		b.WriteByte('o')
+		b.WriteString(strconv.Itoa(len(n.Obj)))
+		b.WriteByte(':')
+		for i := range n.Obj {
+			b.WriteString(strconv.Itoa(len(n.Obj[i].Key)))
+			b.WriteByte(':')
+			b.WriteString(n.Obj[i].Key)
+			writeJsonbDistinctKey(b, &n.Obj[i].Val)
+		}
 	}
 }
 
@@ -131,9 +205,9 @@ func boolRank(b bool) int {
 	return 0
 }
 
-// jsonKeyCmp is the canonical object-key order (spec/design/json.md §2.3): shorter key first, ties
-// broken bytewise — PostgreSQL's jsonb key order. The canonicalizer sorts by this and the comparator
-// compares keys by this.
+// jsonKeyCmp is the canonical object-key STORAGE order (spec/design/json.md §2.3): shorter key
+// first, ties broken bytewise — PostgreSQL's jsonb key order. The canonicalizer sorts by this; the
+// comparator walks members in this order but compares the keys themselves bytewise (§5).
 func jsonKeyCmp(a, b string) int {
 	if c := cmpInt(len(a), len(b)); c != 0 {
 		return c
@@ -1034,6 +1108,21 @@ func jsonGetIndex(node *JsonNode, idx int64) *JsonNode {
 		return &node.Arr[i]
 	}
 	return nil
+}
+
+// jsonGetRootIndex is `jsonb -> int` applied to a WHOLE document (json-sql-functions.md §1): an
+// array element by index, or — PostgreSQL's raw-scalar quirk — the document itself when it is a
+// top-level scalar and the index names its single pseudo-array element (0 or -1): `'"x"'::jsonb -> 0`
+// is `"x"`. An object, or any other index, → nil (SQL NULL). Only the operator's root sees the
+// pseudo-array; a `#>` path step over a nested scalar is a miss (jsonGetIndex).
+func jsonGetRootIndex(node *JsonNode, idx int64) *JsonNode {
+	if jsonIsScalar(node) {
+		if idx == 0 || idx == -1 {
+			return node
+		}
+		return nil
+	}
+	return jsonGetIndex(node, idx)
 }
 
 // jsonGetPath is `jsonb #> text[]`: navigate a path of text steps. At each step an object uses the

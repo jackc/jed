@@ -1,0 +1,144 @@
+# Float pow / power domain and special-value rules (spec/design/float.md §8, PostgreSQL's dpow),
+# the float domain-error codes, and the degrees / radians range traps.
+#   pow: NaN^0 = 1 and 1^NaN = 1, every other NaN input yields NaN (no error); 0^negative is 2201F
+#   "zero raised to a negative power is undefined"; negative^non-integer is 2201F "a negative
+#   number raised to a non-integer power yields a complex result"; an infinite base or exponent
+#   resolves per POSIX with no trap (pow(-1, ±Inf) = 1, pow(-8, Inf) = Inf, pow(Inf, -1) = 0,
+#   pow(-Inf, 3) = -Inf, pow(-Inf, -3) = -0); a finite result that overflows is 22003, a non-zero
+#   base whose power rounds to 0 is 22003 underflow.
+#   ln / log10 of zero or a negative are 2201E (invalid_argument_for_log); sqrt of a negative is
+#   2201F (invalid_argument_for_power_function) — PostgreSQL's granular codes, not 22003.
+#   degrees(x) = x / RADIANS_PER_DEGREE and radians(x) = x · RADIANS_PER_DEGREE carry the §3/§5
+#   float overflow and underflow traps: degrees(1e308) is 22003, radians(5e-324) is 22003.
+# requires: query.select, query.select_no_from, cast.operator, cast.string_literal, types.f64, resource.cost_metering
+
+# --- NaN rules (no error) ---------------------------------------------------------------
+# cost: 10
+query RRRR nosort
+SELECT pow('NaN'::float8, 0::float8), pow(1::float8, 'NaN'::float8), pow(-8.0::float8, 'NaN'::float8), pow(0::float8, 'NaN'::float8)
+----
+1
+1
+NaN
+NaN
+
+# --- the 2201F domain errors -------------------------------------------------------------
+statement error 2201F
+SELECT pow(0.0::float8, -1.0::float8)
+
+statement error 2201F
+SELECT pow(0.0::float8, '-Infinity'::float8)
+
+statement error 2201F
+SELECT pow((-0.0)::float8, -3.0::float8)
+
+statement error 2201F
+SELECT pow(-8.0::float8, 0.5::float8)
+
+statement error 2201F
+SELECT power(-1.0::float8, 0.5::float8)
+
+# --- infinite operands resolve per POSIX, never trap --------------------------------------
+# cost: 13
+query RRRR nosort
+SELECT pow(-1.0::float8, 'Infinity'::float8), pow(-1.0::float8, '-Infinity'::float8), pow(-8.0::float8, 'Infinity'::float8), pow(-8.0::float8, '-Infinity'::float8)
+----
+1
+1
+Infinity
+0
+
+# cost: 7
+query RRR nosort
+SELECT pow(0.5::float8, 'Infinity'::float8), pow(2::float8, '-Infinity'::float8), pow(0::float8, 'Infinity'::float8)
+----
+0
+0
+0
+
+# cost: 15
+query RRRRRR nosort
+SELECT pow('Infinity'::float8, -1::float8), pow('Infinity'::float8, 1::float8), pow('-Infinity'::float8, 3::float8), pow('-Infinity'::float8, 2::float8), pow('-Infinity'::float8, -3::float8), pow('-Infinity'::float8, 0::float8)
+----
+0
+Infinity
+-Infinity
+Infinity
+-0
+1
+
+# --- the finite cases --------------------------------------------------------------------
+# cost: 29
+query RRRRRRRR nosort
+SELECT pow((-0.0)::float8, 3::float8), pow((-0.0)::float8, 2::float8), pow((-0.0)::float8, 0.5::float8), pow(-8.0::float8, 3.0::float8), pow(-8.0::float8, -3.0::float8), pow(0::float8, 0::float8), pow(0::float8, 2.5::float8), pow(2.0::float8, -1074.0::float8)
+----
+0
+0
+0
+-512
+-0.001953125
+1
+0
+5e-324
+
+# a huge integral exponent on a negative base: the parity decides the sign, -1 never overflows
+# cost: 14
+query RRR nosort
+SELECT pow(-1::float8, 2e9::float8), pow(-1::float8, 2e9::float8 + 1), pow(-1::float8, 1e19::float8)
+----
+1
+-1
+1
+
+# overflow and underflow traps
+statement error 22003
+SELECT pow(2.0::float8, 1024.0::float8)
+
+statement error 22003
+SELECT pow(2::float8, 1e19::float8)
+
+statement error 22003
+SELECT pow(2.0::float8, -1075.0::float8)
+
+statement error 22003
+SELECT pow(-0.5::float8, 2e9::float8)
+
+statement error 22003
+SELECT pow(1e-200::float8, 2::float8)
+
+# --- ln / log10 / sqrt domain codes ------------------------------------------------------
+statement error 2201E
+SELECT ln(0::float8)
+
+statement error 2201E
+SELECT ln(-1::float8)
+
+statement error 2201E
+SELECT log10(0::float8)
+
+statement error 2201E
+SELECT log10(-1::float8)
+
+statement error 2201F
+SELECT sqrt(-1::float8)
+
+# --- degrees / radians range traps -------------------------------------------------------
+statement error 22003
+SELECT degrees(1e308::float8)
+
+statement error 22003
+SELECT degrees(-1e308::float8)
+
+statement error 22003
+SELECT radians(5e-324::float8)
+
+# in range, including a subnormal result and an infinite operand (propagates)
+# cost: 9
+query RRRRR nosort
+SELECT degrees(1e-320::float8), radians(1e-320::float8), radians(1e308::float8), degrees('Infinity'::float8), degrees('NaN'::float8)
+----
+5.72953e-319
+1.73e-322
+1.7453292519943295e+306
+Infinity
+NaN

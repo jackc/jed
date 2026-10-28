@@ -1322,16 +1322,16 @@ func (db *engine) createTableWithColumns(ct *createTable, prebuilt []catColumn) 
 		// name takes the temp-first resolution walk, and the parent must be of the child's own kind
 		// (42P16, PostgreSQL's ATAddForeignKeyConstraint): an FK never crosses from the session-local
 		// temp domain to the main database or back (temp-tables.md §8).
-		selfRef := fk.RefTable == table.Name
+		selfRef := fk.RefTable == table.Name && fkQualifierInScope(fk.RefDB, targetTemp)
 		var parent *catTable
 		if selfRef {
 			parent = table
 		} else {
-			p, ok := db.lkpTable(fk.RefTable)
-			if !ok {
-				return outcome{}, fkParentMissing(db.readSnap(), fk.RefTable)
+			p, parentTemp, err := db.lkpFkParent(fk.RefDB, fk.RefTable)
+			if err != nil {
+				return outcome{}, err
 			}
-			if err := checkFkPersistence(targetTemp, db.isTempTable(fk.RefTable)); err != nil {
+			if err := checkFkPersistence(targetTemp, parentTemp); err != nil {
 				return outcome{}, err
 			}
 			parent = p
@@ -3773,6 +3773,56 @@ func checkFkPersistence(childTemp, parentTemp bool) error {
 	return nil
 }
 
+// lkpFkParent resolves a FOREIGN KEY parent name (constraints.md §6.2 step 2). A bare name takes
+// the temp-first resolution walk; a `main.` / `temp.` qualifier pins the implicit scope, so the name
+// is looked up in that one scope alone (attached-databases.md §4 — a validation gate, since
+// preclude-overlaps keeps a name in one scope); an attachment qualifier is a cross-database foreign
+// key, which §8 forbids (0A000); any other qualifier is 42P01 "not attached". A found parent reports
+// its domain for the caller's 42P16 persistence check; a missing one is fkParentMissing against the
+// queried scope (a view there is 42809).
+func (db *engine) lkpFkParent(q *string, name string) (parent *catTable, isTemp bool, err error) {
+	if q == nil {
+		if t, ok := db.tempSnap().table(name); ok {
+			return t, true, nil
+		}
+		if t, ok := db.readSnap().table(name); ok {
+			return t, false, nil
+		}
+		return nil, false, fkParentMissing(db.readSnap(), name)
+	}
+	switch *q {
+	case "temp":
+		if t, ok := db.tempSnap().table(name); ok {
+			return t, true, nil
+		}
+		return nil, false, fkParentMissing(db.tempSnap(), name)
+	case "main":
+		if t, ok := db.readSnap().table(name); ok {
+			return t, false, nil
+		}
+		return nil, false, fkParentMissing(db.readSnap(), name)
+	default:
+		if db.attachReadSnap(*q) == nil {
+			return nil, false, newError(UndefinedTable, `database "`+*q+`" is not attached`)
+		}
+		return nil, false, newError(FeatureNotSupported,
+			"a foreign key may not reference a table in another database")
+	}
+}
+
+// fkQualifierInScope reports whether a REFERENCES database qualifier names the child's own domain —
+// the condition under which a parent spelled with the child's name is a self-reference (bare, or
+// `temp.` for a temp child, `main.` for a persistent one; an attachment never is).
+func fkQualifierInScope(q *string, childTemp bool) bool {
+	if q == nil {
+		return true
+	}
+	if childTemp {
+		return *q == "temp"
+	}
+	return *q == "main"
+}
+
 // fkParentMissing is the error for a FOREIGN KEY parent that is not a table of the parent's
 // database: a view is the wrong object kind (42809, views.md §2); any other name is missing (42P01).
 func fkParentMissing(snap *snapshot, name string) error {
@@ -4495,11 +4545,60 @@ func (db *engine) checkIndexOwner(tableKey string, def *indexDef) error {
 		}
 	}
 	if owner == "" {
-		return nil
+		return db.checkIndexFkDependents(tableKey, t, def)
 	}
 	return newError(DependentObjectsStillExist,
 		"cannot drop index "+def.Name+" because constraint "+owner+" on table "+t.Name+" requires it").
 		hinted(dropOwnerInsteadHint(owner, t.Name))
+}
+
+// checkIndexFkDependents refuses a DROP INDEX of a bare unique index that is the LAST unique key
+// covering a FOREIGN KEY's referenced column set (constraints.md §5.5 / §6.2 step 4): the FK's
+// existence probe walks that key, so dropping it would leave the constraint unenforceable (the
+// buildFkProbe invariant). 2BP01 in the DROP TABLE message shape, naming the first dependent FK in
+// table-key byte order then definition order. jed resolves the referenced set against ANY unique
+// key of the parent, so the drop is refused only when neither the primary key nor another unique
+// index still covers the same set — a documented divergence from PostgreSQL, which binds the FK to
+// one index and refuses dropping that one even when a twin exists (§5.5). An FK never crosses
+// domains (temp-tables.md §8), so only the index's own domain is scanned.
+func (db *engine) checkIndexFkDependents(tableKey string, t *catTable, def *indexDef) error {
+	cols := def.columnOrdinals()
+	if !def.Unique || cols == nil {
+		return nil
+	}
+	set := sortedUnique(cols)
+	if len(t.PK) > 0 && slices.Equal(sortedUnique(t.PK), set) {
+		return nil
+	}
+	for i := range t.Indexes {
+		ix := &t.Indexes[i]
+		if ix.Name == def.Name || !ix.Unique {
+			continue
+		}
+		if c := ix.columnOrdinals(); c != nil && slices.Equal(sortedUnique(c), set) {
+			return nil
+		}
+	}
+	snap := db.readSnap()
+	if db.isTempTable(tableKey) {
+		snap = db.tempSnap()
+	}
+	tableKeys := make([]string, 0, len(snap.tables))
+	for k := range snap.tables {
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	for _, tk := range tableKeys {
+		child := snap.tables[tk]
+		for _, fk := range child.ForeignKeys {
+			if fk.RefTable == t.Name && slices.Equal(sortedUnique(fk.RefColumns), set) {
+				return newError(DependentObjectsStillExist,
+					"cannot drop index "+def.Name+" because other objects depend on it: constraint "+
+						fk.Name+" on table "+child.Name)
+			}
+		}
+	}
+	return nil
 }
 
 // executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a duplicate

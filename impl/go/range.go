@@ -214,6 +214,13 @@ func elemMaxFinite(elem scalarType) int64 {
 	}
 }
 
+// isInfiniteDateBound reports whether a discrete bound value is the date ±infinity sentinel
+// (dateNegInfinity / datePosInfinity). PG's daterange_canonical skips such a bound: it keeps the
+// inclusivity it was given rather than stepping the sentinel (ranges.md §4).
+func isInfiniteDateBound(v Value, elem scalarType) bool {
+	return elem == scalarDate && (v.Int == int64(dateNegInfinity) || v.Int == int64(datePosInfinity))
+}
+
 // incrementDiscrete steps a discrete bound value up by one unit (the canonicalization +1): an
 // integer +1 or a date +1 day. A step past the element domain traps 22003.
 func incrementDiscrete(v Value, elem scalarType) (Value, error) {
@@ -242,7 +249,7 @@ func finalizeRange(desc rangeDesc, lower, upper *Value, lowerInc, upperInc bool)
 		// Canonical `[)`: an exclusive finite lower steps up to inclusive; an inclusive finite upper
 		// steps up to exclusive. Infinite bounds stay exclusive.
 		switch {
-		case lower != nil && !lowerInc:
+		case lower != nil && !lowerInc && !isInfiniteDateBound(*lower, elem):
 			nv, err := incrementDiscrete(*lower, elem)
 			if err != nil {
 				return nil, err
@@ -253,7 +260,7 @@ func finalizeRange(desc rangeDesc, lower, upper *Value, lowerInc, upperInc bool)
 			lowerInc = false
 		}
 		switch {
-		case upper != nil && upperInc:
+		case upper != nil && upperInc && !isInfiniteDateBound(*upper, elem):
 			nv, err := incrementDiscrete(*upper, elem)
 			if err != nil {
 				return nil, err
@@ -361,21 +368,38 @@ func cmpBounds(v1 *Value, inc1 bool, lower1 bool, v2 *Value, inc2 bool, lower2 b
 	if c := rangeElemCmp(*v1, *v2); c != 0 {
 		return c
 	}
-	// Equal values: only a differing inclusivity breaks the tie (PG range_cmp_bounds). The exclusive
-	// side decides — an exclusive lower sorts after, an exclusive upper before.
+	// Equal values: the tie-break is PG range_cmp_bounds exactly. An exclusive bound sits just inside
+	// its own side (an exclusive lower starts later, an exclusive upper ends earlier), so two bounds
+	// of the same inclusivity on the SAME side are equal, while on DIFFERENT sides the lower bound
+	// sorts after the upper when both are exclusive (`(5` is "> 5", `5)` is "< 5") and before it when
+	// both are inclusive (`[5` and `5]` meet at 5). range-functions.md §3.
 	switch {
-	case inc1 && !inc2:
-		if lower2 {
-			return -1
+	case !inc1 && !inc2:
+		if lower1 == lower2 {
+			return 0
 		}
-		return 1
-	case !inc1 && inc2:
 		if lower1 {
 			return 1
 		}
 		return -1
+	case !inc1:
+		if lower1 {
+			return 1
+		}
+		return -1
+	case !inc2:
+		if lower2 {
+			return -1
+		}
+		return 1
 	default:
-		return 0
+		if lower1 == lower2 {
+			return 0
+		}
+		if lower1 {
+			return -1
+		}
+		return 1
 	}
 }
 

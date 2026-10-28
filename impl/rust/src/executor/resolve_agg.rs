@@ -3119,6 +3119,7 @@ pub(crate) fn resolve_frame(
     order_types: &[Type],
 ) -> Result<ResolvedFrame> {
     use crate::ast::{FrameBound, FrameMode};
+    check_frame_extent(f)?;
     let is_offset =
         |b: &FrameBound| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_));
     let has_offset = is_offset(&f.start) || is_offset(&f.end);
@@ -3176,6 +3177,30 @@ pub(crate) fn resolve_frame(
             exclude: f.exclude,
         }),
     }
+}
+
+/// Reject a reversed or impossible frame extent (`42P20`) before any bound is resolved —
+/// PostgreSQL's parse-time checks (gram.y `frame_extent`), in PG's order and with PG's messages
+/// (spec/design/window.md §6). They apply to every mode (ROWS/RANGE/GROUPS) alike; the
+/// single-bound form (`ROWS n FOLLOWING`) is caught with its own message by the parser.
+pub(crate) fn check_frame_extent(f: &crate::ast::WindowFrame) -> Result<()> {
+    use crate::ast::FrameBound;
+    let err = |msg: &str| Err(EngineError::new(SqlState::WindowingError, msg));
+    if matches!(f.start, FrameBound::UnboundedFollowing) {
+        return err("frame start cannot be UNBOUNDED FOLLOWING");
+    }
+    if matches!(f.end, FrameBound::UnboundedPreceding) {
+        return err("frame end cannot be UNBOUNDED PRECEDING");
+    }
+    if matches!(f.start, FrameBound::CurrentRow) && matches!(f.end, FrameBound::Preceding(_)) {
+        return err("frame starting from current row cannot have preceding rows");
+    }
+    if matches!(f.start, FrameBound::Following(_))
+        && matches!(f.end, FrameBound::Preceding(_) | FrameBound::CurrentRow)
+    {
+        return err("frame starting from following row cannot have preceding rows");
+    }
+    Ok(())
 }
 
 /// Resolve a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must be a

@@ -566,6 +566,7 @@ import {
   checkDepth as jsonCheckDepth,
   checkTextDepth as jsonCheckTextDepth,
   jsonCompactOut,
+  jsonbDistinctKey,
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
@@ -741,12 +742,13 @@ import {
   collectQueryPrivs,
   collectStmtPrivs,
   conjunctCount,
-  countCteRefsDml,
+  addDmlCteRefs,
+  cteBindingsByName,
+  CteRefTally,
   countTrue,
   cteDetail,
   explainActualCosts,
   cteModes,
-  cteReferenceCandidate,
   cteSyntheticTable,
   cteSyntheticTableCols,
   dmlOutcome,
@@ -1351,6 +1353,14 @@ function checkFkPersistence(childTemp: boolean, parentTemp: boolean): void {
 
 // fkParentMissing is the error for a FOREIGN KEY parent that is not a table of the parent's
 // database: a view is the wrong object kind (42809, views.md §2); any other name is missing (42P01).
+// fkQualifierInScope reports whether a REFERENCES database qualifier names the child's own domain —
+// the condition under which a parent spelled with the child's name is a self-reference (bare, or
+// `temp.` for a temp child, `main.` for a persistent one; an attachment never is).
+function fkQualifierInScope(q: string | null, childTemp: boolean): boolean {
+  if (q === null) return true;
+  return q === (childTemp ? "temp" : "main");
+}
+
 function fkParentMissing(snap: Snapshot, name: string): EngineError {
   if (snap.view(name) !== undefined) {
     return engineError("wrong_object_type", `referenced relation "${name}" is not a table`);
@@ -1633,14 +1643,16 @@ export const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 // encodeBytea is encode(bytes, format) (string-functions.md §3): render binary as text. hex = two
 // lowercase hex digits per byte; base64 = RFC 4648 wrapped at 76 chars with \n (PostgreSQL's style);
 // escape = printable bytes verbatim, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal. An
+// format name is matched ASCII-case-insensitively (PG pg_strcasecmp: 'BASE64' = 'base64'); an
 // unrecognized format traps 22023.
 export function encodeBytea(bytes: Uint8Array, format: string): string {
-  if (format === "hex") {
+  const fmt = asciiLowerFormat(format);
+  if (fmt === "hex") {
     let out = "";
     for (const b of bytes) out += b.toString(16).padStart(2, "0");
     return out;
   }
-  if (format === "escape") {
+  if (fmt === "escape") {
     let out = "";
     for (const b of bytes) {
       if (b === 0x00) out += "\\000";
@@ -1650,26 +1662,39 @@ export function encodeBytea(bytes: Uint8Array, format: string): string {
     }
     return out;
   }
-  if (format === "base64") return base64EncodeWrapped(bytes);
+  if (fmt === "base64") return base64EncodeWrapped(bytes);
   throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
 }
 
-// base64EncodeWrapped is RFC 4648 base64 wrapped at 76 chars with \n (no trailing newline).
+// asciiLowerFormat folds an encode/decode format name's ASCII letters to lower case (PG
+// pg_strcasecmp — ASCII only, never a Unicode case mapping); the original spelling is kept for
+// the "unrecognized encoding" message.
+function asciiLowerFormat(format: string): string {
+  return format.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+// base64EncodeWrapped is RFC 4648 base64 in PostgreSQL's pg_base64_encode layout: a "\n" after
+// every 76 characters of FULL 3-byte groups — including after the last one when the full groups
+// end exactly on a 76-character line (57·k input bytes), the newline PG's encoder emits inside its
+// loop — and then the padded partial group, which never takes a newline (string-functions.md §3).
 export function base64EncodeWrapped(bytes: Uint8Array): string {
-  let b64 = "";
-  for (let i = 0; i < bytes.length; i += 3) {
-    const has1 = i + 1 < bytes.length;
-    const has2 = i + 2 < bytes.length;
-    const n = (bytes[i]! << 16) | ((has1 ? bytes[i + 1]! : 0) << 8) | (has2 ? bytes[i + 2]! : 0);
-    b64 += BASE64_ALPHABET[(n >> 18) & 63];
-    b64 += BASE64_ALPHABET[(n >> 12) & 63];
-    b64 += has1 ? BASE64_ALPHABET[(n >> 6) & 63] : "=";
-    b64 += has2 ? BASE64_ALPHABET[n & 63] : "=";
-  }
   let out = "";
-  for (let i = 0; i < b64.length; i++) {
-    if (i > 0 && i % 76 === 0) out += "\n";
-    out += b64[i];
+  const full = Math.floor(bytes.length / 3) * 3;
+  for (let i = 0; i < full; i += 3) {
+    const n = (bytes[i]! << 16) | (bytes[i + 1]! << 8) | bytes[i + 2]!;
+    out += BASE64_ALPHABET[(n >> 18) & 63];
+    out += BASE64_ALPHABET[(n >> 12) & 63];
+    out += BASE64_ALPHABET[(n >> 6) & 63];
+    out += BASE64_ALPHABET[n & 63];
+    if (((i / 3 + 1) * 4) % 76 === 0) out += "\n";
+  }
+  const rest = bytes.length - full;
+  if (rest > 0) {
+    const n = (bytes[full]! << 16) | ((rest === 2 ? bytes[full + 1]! : 0) << 8);
+    out += BASE64_ALPHABET[(n >> 18) & 63];
+    out += BASE64_ALPHABET[(n >> 12) & 63];
+    out += rest === 2 ? BASE64_ALPHABET[(n >> 6) & 63] : "=";
+    out += "=";
   }
   return out;
 }
@@ -1742,14 +1767,14 @@ export function quoteIdentText(s: string): string {
 // An unrecognized format traps 22023. The hex success path reads ASCII directly; other paths
 // operate on the input's UTF-8 bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
 export function decodeText(s: string, format: string): Uint8Array {
-  if (format === "hex") {
+  const fmt = asciiLowerFormat(format); // matched ASCII-case-insensitively, as encode
+  if (fmt === "hex") {
     const r = decodeHexString(s);
     if ("error" in r) throw engineError("invalid_parameter_value", r.error);
     return r.bytes;
   }
-  const bytes = SQL_BYTE_ENCODER.encode(s);
-  if (format === "base64") return decodeBase64(bytes);
-  if (format === "escape") return decodeEscape(bytes);
+  if (fmt === "base64") return decodeBase64(s);
+  if (fmt === "escape") return decodeEscape(SQL_BYTE_ENCODER.encode(s));
   throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
 }
 
@@ -1762,39 +1787,66 @@ export function decodeHex(bytes: Uint8Array): Uint8Array {
   return r.bytes;
 }
 
-// decodeBase64 (RFC 4648); a space, tab, newline, or carriage return is ignored (PostgreSQL's
-// pg_base64_decode set); out-of-alphabet / data-after-pad → 22023.
-export function decodeBase64(bytes: Uint8Array): Uint8Array {
+// decodeBase64 is PostgreSQL's pg_base64_decode (encode.c), a 4-symbol-group state machine over
+// the input's code points (string-functions.md §3): a space, tab, newline, or carriage return is
+// skipped; every other symbol — an alphabet character or '=' — fills a group of four, and each
+// complete group emits its 3 bytes, less one per '=' the FIRST padded group carried. A '=' is legal
+// only at group position 2 or 3 the first time (`unexpected "="` otherwise, 22023); once padding
+// has begun, later symbols — more '=' or even alphabet characters — are accepted as zero-valued
+// filler ('YW=j' → \x61, 'YQ==YQ==' → \x6161, exactly as PG). A symbol outside the alphabet is
+// `invalid symbol "<c>"` (22023, quoting the whole code point); an input that ends mid-group
+// ('YQ', 'YWJ', 'YQ=') is `invalid base64 end sequence` (22023).
+export function decodeBase64(s: string): Uint8Array {
   const out: number[] = [];
-  let acc = 0;
-  let nbits = 0;
-  let padded = false;
-  for (const b of bytes) {
-    if (b === 32 || b === 9 || b === 10 || b === 13) continue; // ' ' '\t' '\n' '\r'
-    if (b === 61) {
-      padded = true;
-      continue;
-    } // '='
-    if (padded) throw engineError("invalid_parameter_value", "invalid base64 end sequence");
-    let v: number;
-    if (b >= 65 && b <= 90)
-      v = b - 65; // A-Z
-    else if (b >= 97 && b <= 122)
-      v = b - 97 + 26; // a-z
-    else if (b >= 48 && b <= 57)
-      v = b - 48 + 52; // 0-9
-    else if (b === 43)
-      v = 62; // +
-    else if (b === 47)
-      v = 63; // /
-    else throw engineError("invalid_parameter_value", "invalid base64 end sequence");
-    acc = (acc << 6) | v;
-    nbits += 6;
-    if (nbits >= 8) {
-      nbits -= 8;
-      out.push((acc >> nbits) & 0xff);
+  let buf = 0;
+  let pos = 0;
+  let end = 0;
+  for (const c of s) {
+    let b: number;
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") continue;
+    if (c === "=") {
+      if (end === 0) {
+        if (pos === 2) end = 1;
+        else if (pos === 3) end = 2;
+        else
+          throw engineError(
+            "invalid_parameter_value",
+            'unexpected "=" while decoding base64 sequence',
+          );
+      }
+      b = 0;
+    } else {
+      const code = c.length === 1 ? c.charCodeAt(0) : -1;
+      if (code >= 65 && code <= 90)
+        b = code - 65; // A-Z
+      else if (code >= 97 && code <= 122)
+        b = code - 97 + 26; // a-z
+      else if (code >= 48 && code <= 57)
+        b = code - 48 + 52; // 0-9
+      else if (code === 43)
+        b = 62; // +
+      else if (code === 47)
+        b = 63; // /
+      else
+        throw engineError(
+          "invalid_parameter_value",
+          `invalid symbol "${c}" found while decoding base64 sequence`,
+        );
+    }
+    buf = (buf << 6) | b;
+    pos++;
+    if (pos === 4) {
+      out.push((buf >> 16) & 0xff);
+      if (end === 0 || end > 1) out.push((buf >> 8) & 0xff);
+      if (end === 0 || end > 2) out.push(buf & 0xff);
+      buf = 0;
+      pos = 0;
     }
   }
+  if (pos !== 0)
+    throw engineError("invalid_parameter_value", "invalid base64 end sequence").withHint(
+      "Input data is missing padding, is truncated, or is otherwise corrupted.",
+    );
   return Uint8Array.from(out);
 }
 
@@ -2992,6 +3044,40 @@ export class Engine {
     return this.tempSnap().table(name) ?? this.readSnap().table(name);
   }
 
+  // lkpFkParent resolves a FOREIGN KEY parent name (constraints.md §6.2 step 2). A bare name takes
+  // the temp-first resolution walk; a `main.` / `temp.` qualifier pins the implicit scope, so the
+  // name is looked up in that one scope alone (attached-databases.md §4 — a validation gate, since
+  // preclude-overlaps keeps a name in one scope); an attachment qualifier is a cross-database foreign
+  // key, which §8 forbids (0A000); any other qualifier is 42P01 "not attached". A found parent
+  // reports its domain for the caller's 42P16 persistence check; a missing one is fkParentMissing
+  // against the queried scope (a view there is 42809).
+  private lkpFkParent(q: string | null, name: string): [Table, boolean] {
+    if (q === null) {
+      const temp = this.tempSnap().table(name);
+      if (temp !== undefined) return [temp, true];
+      const main = this.readSnap().table(name);
+      if (main !== undefined) return [main, false];
+      throw fkParentMissing(this.readSnap(), name);
+    }
+    if (q === "temp") {
+      const temp = this.tempSnap().table(name);
+      if (temp !== undefined) return [temp, true];
+      throw fkParentMissing(this.tempSnap(), name);
+    }
+    if (q === "main") {
+      const main = this.readSnap().table(name);
+      if (main !== undefined) return [main, false];
+      throw fkParentMissing(this.readSnap(), name);
+    }
+    if (this.attachReadSnap(q) === undefined) {
+      throw engineError("undefined_table", `database "${q}" is not attached`);
+    }
+    throw engineError(
+      "feature_not_supported",
+      "a foreign key may not reference a table in another database",
+    );
+  }
+
   // lkpStore returns a table's store for READS, routing by the resolution walk (session-local temp →
   // visible main snapshot — temp-tables.md §2). No dirty flag — reads never persist.
   private lkpStore(name: string): TableStore {
@@ -3894,6 +3980,14 @@ export class Engine {
   // until commit.
   beginTx(writable: boolean | null): Outcome {
     if (this.session.tx !== null) {
+      if (this.session.tx.failed) {
+        // In a failed block even BEGIN is refused with the block's 25P02 (PostgreSQL — only
+        // ROLLBACK/COMMIT/ROLLBACK TO are accepted there, transactions.md §6).
+        throw engineError(
+          "in_failed_sql_transaction",
+          "current transaction is aborted, commands ignored until end of transaction block",
+        );
+      }
       throw engineError("active_sql_transaction", "there is already a transaction in progress");
     }
     if (writable === true && this.readOnly) {
@@ -4898,10 +4992,24 @@ export class Engine {
       case "jsonCtor":
         add(expr.operand);
         return;
+      case "and":
+      case "or": {
+        // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its
+        // left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+        // the chain (cost.md §7f); the order — the deepest lhs, then each rhs from the deepest
+        // node up — is the recursive one's.
+        const spine: Extract<RExpr, { kind: "and" | "or" }>[] = [];
+        let node: RExpr = expr;
+        while ((node.kind === "and" || node.kind === "or") && node.kind === expr.kind) {
+          spine.push(node);
+          node = node.lhs;
+        }
+        add(node);
+        for (let i = spine.length - 1; i >= 0; i--) add(spine[i]!.rhs);
+        return;
+      }
       case "arith":
       case "compare":
-      case "and":
-      case "or":
       case "distinct":
       case "like":
       case "regex":
@@ -6643,13 +6751,11 @@ export class Engine {
     const bindings = this.planCteBindings(wq.ctes, wq.recursive, [], null, ptypes, wq.body);
     const query = cteBodyAsQuery(wq.body);
     const primary = query === null ? null : this.planQuery(query, null, bindings, ptypes);
+    const byName = cteBindingsByName(bindings);
     for (const cte of wq.ctes) {
-      if (!cteBodyIsDataModifying(cte.body)) continue;
-      for (const binding of bindings) binding.refs += countCteRefsDml(cte.body, binding.name);
+      if (cteBodyIsDataModifying(cte.body)) addDmlCteRefs(byName, cte.body);
     }
-    if (cteBodyIsDataModifying(wq.body)) {
-      for (const binding of bindings) binding.refs += countCteRefsDml(wq.body, binding.name);
-    }
+    if (cteBodyIsDataModifying(wq.body)) addDmlCteRefs(byName, wq.body);
     return { bindings, modes: cteModes(bindings), primary, body: wq.body };
   }
 
@@ -8068,14 +8174,13 @@ export class Engine {
       // name takes the temp-first resolution walk, and the parent must be of the child's own kind
       // (42P16, PostgreSQL's ATAddForeignKeyConstraint): an FK never crosses from the session-local
       // temp domain to the main database or back (temp-tables.md §8).
-      const selfRef = fk.refTable === table.name;
+      const selfRef = fk.refTable === table.name && fkQualifierInScope(fk.refDb, targetTemp);
       let parent: Table;
       if (selfRef) {
         parent = table;
       } else {
-        const found = this.lkpTable(fk.refTable);
-        if (found === undefined) throw fkParentMissing(this.readSnap(), fk.refTable);
-        checkFkPersistence(targetTemp, this.isTempTable(fk.refTable));
+        const [found, parentTemp] = this.lkpFkParent(fk.refDb, fk.refTable);
+        checkFkPersistence(targetTemp, parentTemp);
         parent = found;
       }
       // 3. Referenced columns into the parent (default to the parent's primary key).
@@ -9666,13 +9771,14 @@ export class Engine {
               }
               // The parent takes the temp-first resolution walk and must be of the table's own kind
               // (42P16, temp-tables.md §8).
-              let parent: Table | undefined;
-              if (d.refTable === table.name) parent = table;
-              else if ((parent = this.tempSnap().table(d.refTable)) !== undefined)
-                checkFkPersistence(tempScope, true);
-              else if ((parent = this.readSnap().table(d.refTable)) !== undefined)
-                checkFkPersistence(tempScope, false);
-              else throw fkParentMissing(this.readSnap(), d.refTable);
+              let parent: Table;
+              if (d.refTable === table.name && fkQualifierInScope(d.refDb, tempScope)) {
+                parent = table;
+              } else {
+                const [found, parentTemp] = this.lkpFkParent(d.refDb, d.refTable);
+                checkFkPersistence(tempScope, parentTemp);
+                parent = found;
+              }
               let refs: number[];
               if (d.refColumns === null) refs = [...parent.pk];
               else {
@@ -11679,7 +11785,10 @@ export class Engine {
     for (const e of t.exclusions) {
       if (e.index === def.name) owner = e.name;
     }
-    if (owner === "") return;
+    if (owner === "") {
+      this.checkIndexFkDependents(tableKey, t, def);
+      return;
+    }
     throw engineError(
       "dependent_objects_still_exist",
       "cannot drop index " +
@@ -11690,6 +11799,45 @@ export class Engine {
         t.name +
         " requires it",
     ).hinted(dropOwnerInstead(owner, t.name));
+  }
+
+  // checkIndexFkDependents refuses a DROP INDEX of a bare unique index that is the LAST unique key
+  // covering a FOREIGN KEY's referenced column set (constraints.md §5.5 / §6.2 step 4): the FK's
+  // existence probe walks that key, so dropping it would leave the constraint unenforceable (the
+  // fkProbeSteps invariant). 2BP01 in the DROP TABLE message shape, naming the first dependent FK in
+  // table-key byte order then definition order. jed resolves the referenced set against ANY unique
+  // key of the parent, so the drop is refused only when neither the primary key nor another unique
+  // index still covers the same set — a documented divergence from PostgreSQL, which binds the FK to
+  // one index and refuses dropping that one even when a twin exists (§5.5). An FK never crosses
+  // domains (temp-tables.md §8), so only the index's own domain is scanned.
+  private checkIndexFkDependents(tableKey: string, t: Table, def: IndexDef): void {
+    const cols = indexColumnOrdinals(def);
+    if (!def.unique || cols === null) return;
+    const set = sortedUnique(cols);
+    if (t.pk.length > 0 && sameSet(sortedUnique(t.pk), set)) return;
+    for (const ix of t.indexes) {
+      if (ix.name === def.name || !ix.unique) continue;
+      const c = indexColumnOrdinals(ix);
+      if (c !== null && sameSet(sortedUnique(c), set)) return;
+    }
+    const snap = this.isTempTable(tableKey) ? this.tempSnap() : this.readSnap();
+    const tableKeys = [...snap.tables.keys()].sort(compareTextC);
+    for (const tk of tableKeys) {
+      const child = snap.tables.get(tk)!;
+      for (const fk of child.fks) {
+        if (fk.refTable === t.name && sameSet(sortedUnique(fk.refColumns), set)) {
+          throw engineError(
+            "dependent_objects_still_exist",
+            "cannot drop index " +
+              def.name +
+              " because other objects depend on it: constraint " +
+              fk.name +
+              " on table " +
+              child.name,
+          );
+        }
+      }
+    }
   }
 
   // executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a
@@ -18084,12 +18232,17 @@ export class Engine {
     primary: CteBody,
   ): CteBinding[] {
     const bindings: CteBinding[] = [];
+    // The static reference counts behind the inline-candidate decision, one walk per part.
+    const refs = new CteRefTally(ctes, primary);
+    // Duplicate names are rejected as they are met, so a name indexes at most one binding.
+    const seen = new Set<string>();
     for (let ci = 0; ci < ctes.length; ci++) {
       const cte = ctes[ci]!;
       const lname = cte.name;
-      if (bindings.some((b) => b.name === lname)) {
+      if (seen.has(lname)) {
         throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
       }
+      seen.add(lname);
       const bodyQuery = cteBodyAsQuery(cte.body);
       const searchCycle = cte.search !== null || cte.cycle !== null;
       const shape =
@@ -18153,7 +18306,7 @@ export class Engine {
         // its reference (planner.md §3.4). Its definition then expands no reference of its own; an
         // uncorrelated candidate keeps that definition, a correlated one is planned again with
         // expansion on (it stays an ordinary CTE).
-        const candidate = cteReferenceCandidate(ctes, ci, primary);
+        const candidate = refs.candidate(ci);
         let plan = candidate
           ? this.withoutCteExpansion(() => this.planQuery(bodyQuery, parent, visible, ptypes))
           : this.planQuery(bodyQuery, parent, visible, ptypes);
@@ -18706,24 +18859,13 @@ export class Engine {
     //      data-modifying primary) contributes to each binding, so the inline-vs-materialize decision
     //      is correct for a query CTE referenced only by a data-modifying part (§3). Query bodies / a
     //      query primary were already plan-counted in (1)/(2).
+    const byName = cteBindingsByName(bindings);
     for (const cte of ctes) {
       if (shouldCooperate()) yield COOPERATE;
 
-      if (cteBodyIsDataModifying(cte.body)) {
-        for (const b of bindings) {
-          if (shouldCooperate()) yield COOPERATE;
-
-          b.refs += countCteRefsDml(cte.body, b.name);
-        }
-      }
+      if (cteBodyIsDataModifying(cte.body)) addDmlCteRefs(byName, cte.body);
     }
-    if (cteBodyIsDataModifying(body)) {
-      for (const b of bindings) {
-        if (shouldCooperate()) yield COOPERATE;
-
-        b.refs += countCteRefsDml(body, b.name);
-      }
-    }
+    if (cteBodyIsDataModifying(body)) addDmlCteRefs(byName, body);
     const bound = bindParams(params, ptypes.finalize(), this.inputZone());
     if (planning.bind(bound))
       return yield* restartPlanningSteps(bound, () => this.runWithDmlSteps(wq, params));
@@ -22859,8 +23001,10 @@ export class Engine {
   ): { table: Table; srf: SrfPlan } {
     if (args.length !== 2) throw noFuncOverload(name);
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
-    // The base argument's COMPOSITE type fixes the columns (its value is unused — usually NULL).
-    const { type: bt } = resolve(argScope, args[0]!, null, forbidden, ptypes);
+    // The base argument's COMPOSITE type fixes the columns, and its VALUE is the row the JSON
+    // members overwrite (json-table.md §2): a member missing from the document keeps the base
+    // field (NULL when the base is NULL, the usual `NULL::type` call).
+    const { node: base, type: bt } = resolve(argScope, args[0]!, null, forbidden, ptypes);
     if (bt.kind !== "composite") {
       throw engineError(
         "datatype_mismatch",
@@ -22908,10 +23052,11 @@ export class Engine {
       fks: [],
       exclusions: [],
     };
-    // The SRF arg is the json DOCUMENT (the base value is unused); reuse the R1 row generator.
+    // The SRF args are the json DOCUMENT then the BASE row (the R1 `_to_record` forms have only the
+    // document); the R1 row generator fills the base row's fields from the document's members.
     return {
       table,
-      srf: { kind: "json_record", args: [doc], recordSet: set, recordCols: columns },
+      srf: { kind: "json_record", args: [doc, base], recordSet: set, recordCols: columns },
     };
   }
 
@@ -22958,6 +23103,9 @@ export class Engine {
     // The PASSING values (json-sql-functions.md §5.4) follow the context in the SRF's args.
     const passing = resolveJsonPassing(argScope, jt.passing, forbidden, ptypes);
     const outColumns: Column[] = [];
+    // Every column name across the whole COLUMNS tree is unique (42712, PostgreSQL's
+    // CheckDuplicateColumnOrPathNames, checked before the columns themselves resolve).
+    checkJtDuplicateNames(jt.columns, new Set());
     const columns = this.resolveJtColumns(jt.columns, outColumns, argScope, ptypes);
     const width = outColumns.length;
     const table: Table = {
@@ -22989,9 +23137,14 @@ export class Engine {
     ptypes: ParamTypes,
   ): JtCol[] {
     const resolved: JtCol[] = [];
+    let ordinalityFound = false; // at most one FOR ORDINALITY column per COLUMNS level (PG)
     for (const col of cols) {
       switch (col.kind) {
         case "ordinality": {
+          if (ordinalityFound) {
+            throw engineError("syntax_error", "only one FOR ORDINALITY column is allowed");
+          }
+          ordinalityFound = true;
           const idx = outColumns.length;
           outColumns.push(jtColumn(col.name, "i32", null));
           resolved.push({ kind: "ordinality", idx });
@@ -23842,8 +23995,27 @@ export class Engine {
 
   private *jsonSrfRowsSteps(srf: SrfPlan, env: EvalEnv, meter: Meter): Steps<Row[]> {
     const arg = yield* evalExprSteps(srf.args[0]!, [], env, meter);
-    // A NULL argument → zero rows (PG; the empty_on_null discipline).
-    if (arg.kind === "null") return [];
+    // json[b]_populate_record(set) (R2) carries its base row as the second arg: a NULL base is an
+    // all-NULL row of the composite's shape. The `_to_record` forms have no base (null).
+    let base: Row | null = null;
+    if (srf.kind === "json_record" && srf.args.length === 2) {
+      const bv = yield* evalExprSteps(srf.args[1]!, [], env, meter);
+      base =
+        bv.kind === "composite"
+          ? bv.fields
+          : (srf.recordCols ?? []).map(() => nullValue() as Value);
+    }
+    if (arg.kind === "null") {
+      // A NULL document: populate_record returns the base row unchanged (PostgreSQL returns the
+      // record argument as is — one row, all NULL for a NULL base); every other form yields no rows
+      // (PG; the empty_on_null discipline).
+      if (srf.kind === "json_record" && srf.recordSet !== true && base !== null) {
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        return [base];
+      }
+      return [];
+    }
     // The json array_elements / each variants walk the verbatim text (json.md §4) instead of a
     // parsed node tree, returning each element / member value as its exact sub-text.
     switch (srf.kind) {
@@ -23864,7 +24036,7 @@ export class Engine {
       node = parsePreservingJsonUnlessRoot(arg.text, "[");
     } else if (arg.kind === "json" && srf.kind === "json_record") {
       if (arg.text[skipJsonWs(arg.text, 0)] === "[") {
-        return jsonRecordsetRowsVerbatim(srf, arg.text, env, meter);
+        return jsonRecordsetRowsVerbatim(srf, arg.text, base, env, meter);
       }
       node = parsePreservingJsonUnlessRoot(arg.text, "{");
     } else {
@@ -23948,12 +24120,12 @@ export class Engine {
             if (shouldCooperate()) yield COOPERATE;
             meter.guard();
             meter.charge(COSTS.generatedRow);
-            out.push(jsonRecordRow(e, cols, env, meter));
+            out.push(jsonRecordRow(e, cols, base, env, meter));
           }
         } else {
           meter.guard();
           meter.charge(COSTS.generatedRow);
-          out.push(jsonRecordRow(node, cols, env, meter));
+          out.push(jsonRecordRow(node, cols, base, env, meter));
         }
         break;
       }
@@ -28728,10 +28900,28 @@ export class Engine {
       case "jsonCtor":
         e.operand = yield* this.foldUncorrelatedInRExprSteps(e.operand, bound, ctes, cost);
         return e;
+      case "and":
+      case "or": {
+        // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is folded along its
+        // left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+        // the chain (cost.md §7f). The order is the recursive one's — the deepest lhs, then each
+        // rhs from the deepest node up — so subqueries run, and errors surface, in list order.
+        const spine: Extract<RExpr, { kind: "and" | "or" }>[] = [];
+        let node: RExpr = e;
+        while ((node.kind === "and" || node.kind === "or") && node.kind === e.kind) {
+          spine.push(node);
+          node = node.lhs;
+        }
+        const deepest = spine[spine.length - 1]!;
+        deepest.lhs = yield* this.foldUncorrelatedInRExprSteps(deepest.lhs, bound, ctes, cost);
+        for (let i = spine.length - 1; i >= 0; i--) {
+          const n = spine[i]!;
+          n.rhs = yield* this.foldUncorrelatedInRExprSteps(n.rhs, bound, ctes, cost);
+        }
+        return e;
+      }
       case "arith":
       case "compare":
-      case "and":
-      case "or":
       case "distinct":
       case "like":
       case "regex":
@@ -31811,10 +32001,22 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
     case "jsonCtor":
       children = sum(expr.operand);
       break;
+    case "and":
+    case "or": {
+      // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is summed along its left
+      // spine iteratively, not by recursing into each lhs, so the stack does not grow with the
+      // chain (cost.md §7f); the saturating sum is the same.
+      children = sum(expr.rhs);
+      let spine: RExpr = expr.lhs;
+      while (spine.kind === expr.kind) {
+        children = saturatingEstimateAdd(children, saturatingEstimateAdd(1n, sum(spine.rhs)));
+        spine = spine.lhs;
+      }
+      children = saturatingEstimateAdd(children, sum(spine));
+      break;
+    }
     case "arith":
     case "compare":
-    case "and":
-    case "or":
     case "distinct":
     case "like":
     case "regex":
@@ -32011,6 +32213,17 @@ export function orderFilterConjuncts(e: RExpr): RExpr {
 // references this query level or an enclosing one, so the uncorrelated fold leaves it in place).
 function hasCorrelatedSubquery(e: RExpr): boolean {
   if (e.kind === "subquery" && queryPlanReferencesOuter(e.plan, 0)) return true;
+  if (e.kind === "and" || e.kind === "or") {
+    // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its left
+    // spine iteratively, not by recursing into each lhs, so the stack does not grow with the chain
+    // (cost.md §7f).
+    let node: RExpr = e;
+    while ((node.kind === "and" || node.kind === "or") && node.kind === e.kind) {
+      if (hasCorrelatedSubquery(node.rhs)) return true;
+      node = node.lhs;
+    }
+    return hasCorrelatedSubquery(node);
+  }
   return estimatorExpressionChildren(e).some(hasCorrelatedSubquery);
 }
 
@@ -35568,7 +35781,17 @@ export function* fkProbeSteps(
   const idx = parent.indexes.find((i) => {
     const cols = indexColumnOrdinals(i);
     return i.unique && cols !== null && sameSet(sortedUnique(cols), refSet);
-  })!;
+  });
+  if (idx === undefined) {
+    // Unreachable through the catalog: CREATE TABLE / ALTER TABLE ADD resolved the referenced set
+    // to a unique key (§6.2 step 4) and DROP INDEX / DROP CONSTRAINT / DROP COLUMN refuse to remove
+    // the last one (2BP01, §5.5). A file whose catalog breaks that invariant is malformed data, not
+    // a crash: XX001, failing closed like any other self-disagreeing persisted state.
+    throw engineError(
+      "data_corrupted",
+      "foreign key " + fk.name + " references no unique key of table " + parent.name,
+    );
+  }
   const idxCols = indexColumnOrdinals(idx)!; // an FK target is a plain-column unique index
   const parts: Uint8Array[] = [];
   for (let i = 0; i < idxCols.length; i++) {
@@ -38223,10 +38446,15 @@ export function distinctValueKey(v: Value): string {
       // json keys verbatim under a distinct 'j' tag (json is not SQL-comparable, but a value-level
       // dedup key keeps a DISTINCT over a json literal collision-free — spec/design/json.md §4).
       return "j" + v.text.length.toString() + ":" + v.text;
-    case "jsonb":
-      // jsonb keys by its canonical render under a distinct 'J' tag — the canonical form makes the
-      // text a pure function of the value, so jsonNodeCmp-equal values share a key (§5).
-      return "J" + jsonbOut(v.node);
+    case "jsonb": {
+      // jsonb keys STRUCTURALLY under a distinct 'J' tag (json.ts jsonbDistinctKey): the walk emits
+      // each number's value-canonical decimal string, so jsonNodeCmp-equal documents share one
+      // DISTINCT/GROUP BY bucket (`{"a":1}` and `{"a":1.0}` are equal — json.md §5; the canonical
+      // text render keeps the scale and would split them).
+      const parts: string[] = ["J"];
+      jsonbDistinctKey(v.node, parts);
+      return parts.join("");
+    }
     case "jsonpath":
       // jsonpath is not SQL-comparable (42883 at resolve), but a value-level dedup key under a
       // distinct 'p' tag keeps it collision-free (mirrors the Rust Hash impl — spec/design/jsonpath.md).
@@ -39697,10 +39925,19 @@ export function srfTableCols(
   };
 }
 
-// jsonRecordRow builds one output row for `json[b]_to_record(set)` (R1): map each declared column to
-// the JSON object's member of that name, coercing it to the column type. A missing member or a JSON
-// null → SQL NULL; a non-object node → 22023. (json-table.md §2)
-export function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, meter: Meter): Row {
+// jsonRecordRow builds one output row for `json[b]_to_record(set)` (R1) and
+// `json[b]_populate_record(set)` (R2): map each declared column to the JSON object's member of that
+// name, coercing it to the column type. A JSON null member → SQL NULL; a missing member → the base
+// row's field (`base`, the populate forms) or SQL NULL (`base` null, the `_to_record` forms); a
+// non-object node → 22023. A `json` document keeps duplicate keys, and the LAST one wins, as
+// PostgreSQL's hash of the object does (json-table.md §2). The base row is never modified.
+export function jsonRecordRow(
+  node: JsonNode,
+  cols: Column[],
+  base: Row | null,
+  env: EvalEnv,
+  meter: Meter,
+): Row {
   if (node.kind !== "object") {
     throw engineError(
       "invalid_parameter_value",
@@ -39708,14 +39945,16 @@ export function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, mete
     );
   }
   const row: Value[] = [];
-  for (const col of cols) {
-    const member = node.members.find((m) => m.key === col.name)?.value;
-    if (member === undefined || member.kind === "null") {
-      row.push(nullValue()); // missing / JSON null → SQL NULL
+  cols.forEach((col, ci) => {
+    const member = node.members.findLast((m) => m.key === col.name)?.value; // last wins
+    if (member === undefined) {
+      row.push(base === null ? nullValue() : base[ci]!);
+    } else if (member.kind === "null") {
+      row.push(nullValue()); // a JSON null overrides a base field
     } else {
       row.push(coerceJsonMember(member, col.type, typmodOfColumn(col), env, meter));
     }
-  }
+  });
   return row;
 }
 
@@ -40040,11 +40279,35 @@ export function jtScalarType(db: Engine, typeName: string): ScalarType {
   throw engineError("undefined_object", `type "${typeName}" does not exist`);
 }
 
+// checkJtDuplicateNames walks a JSON_TABLE COLUMNS tree (every nesting level shares one namespace,
+// as in PostgreSQL) and reports the first column name seen twice as 42712 (json-table.md §3.1).
+function checkJtDuplicateNames(cols: JtColumn[], seen: Set<string>): void {
+  for (const col of cols) {
+    if (col.kind === "nested") {
+      checkJtDuplicateNames(col.columns, seen);
+      continue;
+    }
+    if (seen.has(col.name)) {
+      throw engineError("duplicate_alias", "duplicate JSON_TABLE column or path name: " + col.name);
+    }
+    seen.add(col.name);
+  }
+}
+
 // jtCompilePath compiles a `JSON_TABLE` column path — the explicit `PATH p`, or the default
 // `$.<column_name>` — to its canonical rendered form (validating; malformed → 42601). Port of
 // impl/rust/src/executor.rs `jt_compile_path`.
 export function jtCompilePath(path: string | null, name: string): string {
-  const src = path ?? `$.${name}`;
+  // The default member name is a QUOTED jsonpath string (JSON-escaped), as PostgreSQL builds it, so
+  // a column named `a.b`, `a b`, or `1` reads the member of exactly that name (json-table.md §3.1).
+  let src: string;
+  if (path !== null) {
+    src = path;
+  } else {
+    const out: string[] = ["$."];
+    writeJsonString(name, out);
+    src = out.join("");
+  }
   // Canonical text only — a like_regex fold never changes it, so no casing table is needed.
   return jsonPathRender(jsonPathCompile(src, undefined));
 }
@@ -44412,6 +44675,7 @@ export function resolveFrame(
   order: OrderSlot[],
   orderTypes: Type[],
 ): ResolvedFrame {
+  checkFrameExtent(f);
   const isOffset = (b: FrameBound): boolean => b.kind === "preceding" || b.kind === "following";
   const hasOffset = isOffset(f.start) || isOffset(f.end);
   switch (f.mode) {
@@ -44462,6 +44726,31 @@ export function resolveFrame(
         end: resolveIntBound(f.end),
         exclude: f.exclude,
       };
+  }
+}
+
+// checkFrameExtent rejects a reversed or impossible frame extent (42P20) before any bound is
+// resolved — PostgreSQL's parse-time checks (gram.y frame_extent), in PG's order and with PG's
+// messages (spec/design/window.md §6). They apply to every mode (ROWS/RANGE/GROUPS) alike; the
+// single-bound form (`ROWS n FOLLOWING`) is caught with its own message by the parser.
+export function checkFrameExtent(f: WindowFrame): void {
+  if (f.start.kind === "unboundedFollowing") {
+    throw engineError("windowing_error", "frame start cannot be UNBOUNDED FOLLOWING");
+  }
+  if (f.end.kind === "unboundedPreceding") {
+    throw engineError("windowing_error", "frame end cannot be UNBOUNDED PRECEDING");
+  }
+  if (f.start.kind === "currentRow" && f.end.kind === "preceding") {
+    throw engineError(
+      "windowing_error",
+      "frame starting from current row cannot have preceding rows",
+    );
+  }
+  if (f.start.kind === "following" && (f.end.kind === "preceding" || f.end.kind === "currentRow")) {
+    throw engineError(
+      "windowing_error",
+      "frame starting from following row cannot have preceding rows",
+    );
   }
 }
 
@@ -47419,14 +47708,20 @@ function insertDefaultNeeds(
 // element's conversion error precedes a later element's escape error — while a non-object element
 // raises its kind error at its opening bracket (an array, unlexed) or after its token (a scalar,
 // lexed first).
-function jsonRecordsetRowsVerbatim(srf: SrfPlan, text: string, env: EvalEnv, meter: Meter): Row[] {
+function jsonRecordsetRowsVerbatim(
+  srf: SrfPlan,
+  text: string,
+  base: Row | null,
+  env: EvalEnv,
+  meter: Meter,
+): Row[] {
   const cols = srf.recordCols ?? [];
   const out: Row[] = [];
   for (const sub of verbatimArrayElements(text, "json_to_recordset", false)) {
     const e = parsePreservingJsonUnlessRoot(sub, "[");
     meter.guard();
     meter.charge(COSTS.generatedRow);
-    out.push(jsonRecordRow(e, cols, env, meter));
+    out.push(jsonRecordRow(e, cols, base, env, meter));
   }
   return out;
 }

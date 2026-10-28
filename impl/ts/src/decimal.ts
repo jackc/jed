@@ -331,12 +331,17 @@ export class Decimal {
     if (o.isZero()) throw divByZero();
     const rscale = selectDivScale(this, o);
     if (this.isZero()) return Decimal.zero(rscale);
-    const e = rscale + o.scale - this.scale; // >= 0 since rscale >= s1
-    const numer = magMulPow10(this.limbs, e);
-    const [q, r] = magDivMod(numer, o.limbs);
+    // E = rscale + s2 − s1. It is negative when the dividend's scale exceeds select_div_scale's
+    // 1000-digit display clamp (s1 > 1000): the quotient then has FEWER fractional digits than the
+    // dividend, so the shift moves to the divisor instead (N = |C1|, D = |C2|·10^−E) — never a
+    // negative array length (decimal.md §4).
+    const e = rscale + o.scale - this.scale;
+    const numer = e >= 0 ? magMulPow10(this.limbs, e) : this.limbs;
+    const denom = e >= 0 ? o.limbs : magMulPow10(o.limbs, -e);
+    const [q, r] = magDivMod(numer, denom);
     // Round half away from zero: if 2*r >= |divisor|, round the magnitude up.
     let quo = q;
-    if (magCmp(magAdd(r, r), o.limbs) >= 0) quo = magAdd(quo, [1]);
+    if (magCmp(magAdd(r, r), denom) >= 0) quo = magAdd(quo, [1]);
     return Decimal.fromParts(this.neg !== o.neg, rscale, quo).checkCap();
   }
 
@@ -814,11 +819,22 @@ export class Decimal {
     const iexp = exp.toI32IfInteger();
     if (iexp !== null) return Decimal.powerVarInt(base, iexp, exp.scale, m);
     if (base.isZero()) return Decimal.zero(MIN_SIG_DIGITS);
-    if (base.neg)
-      throw engineError(
-        "invalid_argument_for_power_function",
-        "a negative number raised to a non-integer power yields a complex result",
-      );
+    // A negative base insists on an integer exponent (PG power_var): an integer exponent outside
+    // power_var_int's int32 gate still arrives here, so integrality is tested by value, not by the
+    // gate. The result's sign is the exponent's parity (odd → negative) and its magnitude is
+    // computed over |base| (decimal.md §8).
+    let resNeg = false;
+    if (base.neg) {
+      const intExp = exp.truncToScale(0);
+      if (intExp.cmpValue(exp) !== 0)
+        throw engineError(
+          "invalid_argument_for_power_function",
+          "a negative number raised to a non-integer power yields a complex result",
+        );
+      // Limbs are little-endian base 10^4 (even), so the units digit's parity is limb 0's.
+      resNeg = intExp.limbs.length > 0 && intExp.limbs[0]! % 2 === 1;
+      base = base.abs();
+    }
     const lnDweight = base.estimateLnDweight(m);
     let localRscale = Math.max(8 - lnDweight, 0);
     let lnBase = base.lnVar(localRscale, m);
@@ -840,7 +856,9 @@ export class Decimal {
     localRscale = Math.max(sigDigits - lnDweight + 8, 0);
     lnBase = base.lnVar(localRscale, m);
     lnNum = lnBase.mulVar(exp, localRscale);
-    return lnNum.expVar(rscale, m).checkCap();
+    let r = lnNum.expVar(rscale, m);
+    if (resNeg && !r.isZero()) r = r.negate(); // a zero result stays positive (no negative zero)
+    return r.checkCap();
   }
 
   // decPower is power(base, exp) over numeric (PG numeric_power, finite path). 0 ^ negative → 2201F.
@@ -975,14 +993,16 @@ export function workMul(a: Decimal, b: Decimal): number {
   return decGroups(a.precision()) * decGroups(b.precision());
 }
 
-// W for div: numerator groups (dividend digits + the rescale shift E) × divisor groups,
-// E = rscale + s2 − s1 with the same selectDivScale as the result. A zero divisor returns 1 —
-// the operation traps 22012 before any work (cost.md §3).
+// W for div: numerator groups × divisor groups, where the rescale shift E = rscale + s2 − s1 (the
+// same selectDivScale as the result) widens the dividend when E ≥ 0 and the divisor when E < 0
+// (s1 > 1000, past the display clamp) — the operands div actually divides (cost.md §3). A zero
+// divisor returns 1 — the operation traps 22012 before any work.
 export function workDiv(a: Decimal, b: Decimal): number {
   if (b.isZero()) return 1;
   const rscale = selectDivScale(a, b);
-  const e = rscale + b.scale - a.scale; // >= 0 since rscale >= s1
-  return decGroups(a.precision() + e) * decGroups(b.precision());
+  const e = rscale + b.scale - a.scale;
+  if (e >= 0) return decGroups(a.precision() + e) * decGroups(b.precision());
+  return decGroups(a.precision()) * decGroups(b.precision() - e);
 }
 
 // W for mod: the aligned divmod — the product of the aligned group counts. A zero divisor

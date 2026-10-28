@@ -985,9 +985,10 @@ func collectInsertPrivs(ins *insert, req *privReq, locals map[string]bool) {
 
 func collectUpdatePrivs(upd *update, req *privReq, locals map[string]bool) {
 	req.needTable(upd.Table, PrivUpdate)
-	// SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
-	// referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
-	reads := upd.Filter != nil || upd.Returning != nil
+	// SELECT on the target if it reads any column (session.md §5.3, PostgreSQL's rule at table
+	// granularity): a column/subquery-referencing WHERE, RETURNING, or assignment RHS. A constant-only
+	// `SET a = 1`, `WHERE true`, or `RETURNING 1` reads nothing, so UPDATE alone suffices.
+	reads := (upd.Filter != nil && exprReadsColumns(upd.Filter)) || returningReadsColumns(upd.Returning)
 	for i := range upd.Assignments {
 		if exprReadsColumns(&upd.Assignments[i].Value) {
 			reads = true
@@ -1007,8 +1008,9 @@ func collectUpdatePrivs(upd *update, req *privReq, locals map[string]bool) {
 
 func collectDeletePrivs(del *deleteStmt, req *privReq, locals map[string]bool) {
 	req.needTable(del.Table, PrivDelete)
-	// DELETE reads the target's columns through a WHERE or a RETURNING.
-	if del.Filter != nil || del.Returning != nil {
+	// DELETE reads the target's columns through a column/subquery-referencing WHERE or RETURNING
+	// (session.md §5.3); `WHERE true` / `RETURNING 1` read nothing, so DELETE alone suffices.
+	if (del.Filter != nil && exprReadsColumns(del.Filter)) || returningReadsColumns(del.Returning) {
 		req.needTable(del.Table, PrivSelect)
 	}
 	if del.Filter != nil {

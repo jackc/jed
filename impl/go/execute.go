@@ -142,7 +142,13 @@ func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *in
 // snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
 // committed is untouched until commit.
 func (db *engine) beginTx(writable, modeSet bool) (outcome, error) {
-	if db.session.tx != nil {
+	if tx := db.session.tx; tx != nil {
+		if tx.failed {
+			// In a failed block even BEGIN is refused with the block's 25P02 (PostgreSQL — only
+			// ROLLBACK/COMMIT/ROLLBACK TO are accepted there, transactions.md §6).
+			return outcome{}, newError(InFailedSqlTransaction,
+				"current transaction is aborted, commands ignored until end of transaction block")
+		}
 		return outcome{}, newError(ActiveSqlTransaction, "there is already a transaction in progress")
 	}
 	if modeSet && writable && db.readOnly {

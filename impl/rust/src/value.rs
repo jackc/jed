@@ -356,9 +356,62 @@ impl ArrayVal {
         self.dims.len()
     }
 
-    /// The per-dimension upper bound `lb + len - 1` for dimension `d`.
-    pub fn ubound(&self, d: usize) -> i32 {
-        (self.lbounds[d] as i64 + self.dims[d] as i64 - 1) as i32
+    /// The per-dimension upper bound `lb + len - 1` for dimension `d`, computed in i64 so an array
+    /// whose bounds were never validated cannot wrap (every value the engine builds satisfies
+    /// [`check_array_bounds`], so the result is always within the i32 domain).
+    pub fn ubound(&self, d: usize) -> i64 {
+        self.lbounds[d] as i64 + self.dims[d] as i64 - 1
+    }
+}
+
+/// PostgreSQL's `MaxArraySize` (`MaxAllocSize / sizeof(Datum)` = 134217727): the number quoted by
+/// the "array size exceeds the maximum allowed" message when a declared dimension's length
+/// overflows (spec/design/array.md §7).
+pub const ARRAY_MAX_SIZE: i64 = 134_217_727;
+
+/// PostgreSQL's `ArrayCheckBounds` (spec/design/array.md §4): every dimension's `lb + len` must fit
+/// in an i32, so an array's last subscript is at most `i32::MAX - 1` and subscript arithmetic can
+/// never overflow. Every value-producing path that can grow a dimension or set a lower bound
+/// (`array_in`, `array_append`/`array_prepend`, `array_cat`) runs it; a violation is `54000`
+/// "array lower bound is too large: <lb>" (PG's message, the offending lower bound).
+pub fn check_array_bounds(dims: &[usize], lbounds: &[i32]) -> EngineResult<()> {
+    for (d, len) in dims.iter().enumerate() {
+        if lbounds[d] as i64 + *len as i64 > i32::MAX as i64 {
+            return Err(crate::error::EngineError::new(
+                crate::error::SqlState::ProgramLimitExceeded,
+                format!("array lower bound is too large: {}", lbounds[d]),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Map a [`parse_array_literal`] failure to its error: a malformed literal is `22P02`, an inverted
+/// bound `2202E`, and the three PG dimension-limit failures `54000` with PG's messages
+/// (spec/design/array.md §7).
+pub fn array_in_error(e: ArrayInError) -> crate::error::EngineError {
+    use crate::error::{EngineError, SqlState};
+    match e {
+        ArrayInError::Malformed => EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            "malformed array literal".to_string(),
+        ),
+        ArrayInError::BoundFlip => EngineError::new(
+            SqlState::ArraySubscriptError,
+            "upper bound cannot be less than lower bound".to_string(),
+        ),
+        ArrayInError::BoundOutOfInt => EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            "array bound is out of integer range".to_string(),
+        ),
+        ArrayInError::UpperBoundMax => EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            format!("array upper bound is too large: {}", i32::MAX),
+        ),
+        ArrayInError::SizeOverflow => EngineError::new(
+            SqlState::ProgramLimitExceeded,
+            format!("array size exceeds the maximum allowed ({ARRAY_MAX_SIZE})"),
+        ),
     }
 }
 
@@ -1302,6 +1355,13 @@ pub enum ArrayInError {
     Malformed,
     /// A declared `[l:u]` bound with `u < l` → `2202E`.
     BoundFlip,
+    /// A declared bound outside the i32 domain → `54000` "array bound is out of integer range".
+    BoundOutOfInt,
+    /// A declared upper bound of exactly `i32::MAX` → `54000` "array upper bound is too large".
+    UpperBoundMax,
+    /// A declared dimension's length `u - l + 1` overflows an i32 → `54000` "array size exceeds
+    /// the maximum allowed (134217727)".
+    SizeOverflow,
 }
 
 /// The PostgreSQL maximum array dimensionality (`MAXDIM`).
@@ -1342,8 +1402,17 @@ pub fn parse_array_literal(input: &str) -> Result<ParsedArray, ArrayInError> {
                 return Err(ArrayInError::Malformed);
             }
             p.bump(); // ]
+            // PG ReadArrayDimensions, in its order: an inverted bound, an upper bound of exactly
+            // i32::MAX (disallowed so `lb + len` stays computable — `check_array_bounds`), then a
+            // dimension length that overflows an i32.
             if ub < lb {
                 return Err(ArrayInError::BoundFlip);
+            }
+            if ub == i32::MAX as i64 {
+                return Err(ArrayInError::UpperBoundMax);
+            }
+            if ub - lb + 1 > i32::MAX as i64 {
+                return Err(ArrayInError::SizeOverflow);
             }
             prefix_lbounds.push(lb as i32);
             prefix_dims.push((ub - lb + 1) as usize);
@@ -1432,11 +1501,21 @@ impl ArrParser<'_> {
             s.push('-');
             self.bump();
         }
+        let mut digits = 0usize;
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             s.push(self.peek().unwrap());
             self.bump();
+            digits += 1;
         }
-        s.parse::<i64>().map_err(|_| ArrayInError::Malformed)
+        if digits == 0 {
+            return Err(ArrayInError::Malformed);
+        }
+        // A dimension bound must lie in the i32 domain (PG ReadDimensionInt): a digit string too
+        // long for an i64 is the same out-of-range bound, not a malformed literal.
+        match s.parse::<i64>() {
+            Ok(n) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => Ok(n),
+            _ => Err(ArrayInError::BoundOutOfInt),
+        }
     }
 
     /// Parse one element: a nested `{…}` (→ `Node::Arr`) or a scalar token (→ `Node::Leaf`).

@@ -630,6 +630,16 @@ class RegexCompiler {
         return;
       }
       case "star": {
+        if (nullable(n.sub)) {
+          // A star over a NULLABLE body is lowered as `(sub+)?` (RE2's rule, regex.md §3.3): the
+          // plain loop's `jmp L1` re-enters a pc the epsilon closure already visited, so the thread
+          // that took the body's empty iteration dies and a capture inside it stays unset (`(a*)*`
+          // on '' → {NULL}); `(sub+)?` enters the body first and loops from its end, so the empty
+          // iteration is recorded ({""}, as PostgreSQL/RE2/PCRE).
+          const plus: Node = { kind: "plus", sub: n.sub, greedy: n.greedy };
+          this.emit({ kind: "quest", sub: plus, greedy: n.greedy });
+          return;
+        }
         // L1: split L2,L3 (greedy) / split L3,L2 (lazy) ; L2: <sub>; jmp L1 ; L3:
         const l1 = this.pushInst({ op: "split", x: 0, y: 0, ch: 0 });
         const l2 = this.insts.length;
@@ -698,6 +708,29 @@ class RegexCompiler {
     for (let i = 0; i < n.max - n.min; i++) {
       this.emit({ kind: "quest", sub: n.sub, greedy: n.greedy });
     }
+  }
+}
+
+// nullable reports whether a node can match the empty string (RE2's `nullable` flag): the star
+// lowering branches on it (regex.md §3.3). Zero-width assertions are nullable; a repeat with min 0 is
+// nullable, otherwise it is as nullable as its body.
+function nullable(n: Node): boolean {
+  switch (n.kind) {
+    case "char":
+    case "any":
+    case "class":
+      return false;
+    case "concat":
+      return n.subs.every(nullable);
+    case "alt":
+      return nullable(n.left) || nullable(n.right);
+    case "plus":
+    case "group":
+      return nullable(n.sub);
+    case "repeat":
+      return n.min === 0 || nullable(n.sub);
+    default: // empty, star, quest, the anchors
+      return true;
   }
 }
 
@@ -1241,9 +1274,11 @@ function cpSlice(orig: number[], start: number, end: number): string {
 // original input.
 type PieceFn = (cp: number, lo: number, hi: number) => void;
 
-// forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), \\
-// (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
-// or absent group expands to nothing. Sizing and building share this walk so they cannot disagree.
+// forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), and
+// \\ (literal backslash) — the only special sequences (regex.md §8, PG appendStringInfoRegexpSubstr).
+// Any other \<other> (including \0) keeps BOTH characters literally: the backslash is copied and
+// <other> is read again as ordinary template text. A trailing lone \ is literal, and an unset or
+// absent group expands to nothing. Sizing and building share this walk so they cannot disagree.
 function forEachPiece(p: RegexProgram, repl: number[], caps: CapNode, f: PieceFn): void {
   const span = (start: number, end: number): void => {
     if (start >= 0 && end >= 0) f(0, start, end);
@@ -1252,13 +1287,18 @@ function forEachPiece(p: RegexProgram, repl: number[], caps: CapNode, f: PieceFn
     const c = repl[i];
     if (c === 0x5c /* \ */ && i + 1 < repl.length) {
       const n = repl[i + 1];
-      if (n >= 0x30 && n <= 0x39 /* 0-9 */) {
+      if (n >= 0x31 && n <= 0x39 /* 1-9 */) {
         const g = n - 0x30;
         if (g <= p.ngroups) span(regexSlot(p, caps, 2 * g), regexSlot(p, caps, 2 * g + 1));
       } else if (n === 0x26 /* & */) {
         span(regexSlot(p, caps, 0), regexSlot(p, caps, 1));
+      } else if (n === 0x5c /* \ */) {
+        f(n, -1, -1); // \\ -> \
       } else {
-        f(n, -1, -1); // \\ -> \, and \<other> -> <other>
+        // Not a special sequence: the backslash is literal and <other> is re-read as plain text
+        // (so `\0` is `\0`, not the whole match).
+        f(c, -1, -1);
+        continue;
       }
       i++;
     } else {

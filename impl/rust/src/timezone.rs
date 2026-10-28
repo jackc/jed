@@ -194,6 +194,10 @@ fn parse_posix_abbr(b: &[u8], i: &mut usize) -> Option<String> {
 }
 
 /// Parse `[+|-]hh[:mm[:ss]]` → seconds (POSIX raw value, west-positive). Caller negates to east.
+/// The fields are bounded exactly as tzcode's `getsecs` (which PostgreSQL's `pg_tzset` uses for a
+/// numeric zone — timezones.md §3.2): hours 0..167 (a week less an hour), minutes 0..59, seconds
+/// 0..60 (a leap second). A digit run exceeding its bound, however long, is not an offset (so
+/// `'+168'`, `'+1000000'` and `'+4294967296'` are all "not recognized", never a wrapped value).
 fn parse_posix_offset(b: &[u8], i: &mut usize) -> Option<i32> {
     let neg = match b.get(*i) {
         Some(b'-') => {
@@ -206,14 +210,14 @@ fn parse_posix_offset(b: &[u8], i: &mut usize) -> Option<i32> {
         }
         _ => false,
     };
-    let hh = parse_uint(b, i)?;
+    let hh = parse_uint_max(b, i, 167)?;
     let mut secs = hh as i32 * 3600;
     if b.get(*i) == Some(&b':') {
         *i += 1;
-        secs += parse_uint(b, i)? as i32 * 60;
+        secs += parse_uint_max(b, i, 59)? as i32 * 60;
         if b.get(*i) == Some(&b':') {
             *i += 1;
-            secs += parse_uint(b, i)? as i32;
+            secs += parse_uint_max(b, i, 60)? as i32;
         }
     }
     Some(if neg { -secs } else { secs })
@@ -225,17 +229,17 @@ fn parse_posix_rule(b: &[u8], i: &mut usize) -> std::result::Result<(PosixRule, 
     match b.get(*i) {
         Some(b'M') => {
             *i += 1;
-            let m = parse_uint(b, i).ok_or("posix: bad month")? as u8;
+            let m = parse_uint_max(b, i, 12).ok_or("posix: bad month")? as u8;
             if b.get(*i) != Some(&b'.') {
                 return Err("posix: expected '.' after month".into());
             }
             *i += 1;
-            let w = parse_uint(b, i).ok_or("posix: bad week")? as u8;
+            let w = parse_uint_max(b, i, 5).ok_or("posix: bad week")? as u8;
             if b.get(*i) != Some(&b'.') {
                 return Err("posix: expected '.' after week".into());
             }
             *i += 1;
-            let d = parse_uint(b, i).ok_or("posix: bad day")? as u8;
+            let d = parse_uint_max(b, i, 6).ok_or("posix: bad day")? as u8;
             if !(1..=12).contains(&m) || !(1..=5).contains(&w) || d > 6 {
                 return Err("posix: Mm.w.d out of range".into());
             }
@@ -254,11 +258,16 @@ fn parse_posix_rule(b: &[u8], i: &mut usize) -> std::result::Result<(PosixRule, 
     }
 }
 
-fn parse_uint(b: &[u8], i: &mut usize) -> Option<u32> {
+/// A digit run whose value may not exceed `max` — tzcode's `getnum`: the running value is checked
+/// after every digit, so an over-long run fails instead of overflowing.
+fn parse_uint_max(b: &[u8], i: &mut usize, max: u32) -> Option<u32> {
     let start = *i;
     let mut v: u32 = 0;
     while *i < b.len() && b[*i].is_ascii_digit() {
-        v = v.checked_mul(10)?.checked_add((b[*i] - b'0') as u32)?;
+        v = v * 10 + (b[*i] - b'0') as u32;
+        if v > max {
+            return None;
+        }
         *i += 1;
     }
     if *i == start { None } else { Some(v) }
@@ -719,10 +728,136 @@ pub(crate) fn parse_zone_bundle(bytes: &[u8]) -> Result<Vec<Arc<Zone>>> {
 /// Resolve a zone name to a built-in fixed offset (`UTC` / `±HH[:MM[:SS]]`, §3.2), which needs no
 /// loaded data. `None` ⇒ not built in (an environment then looks the name up among its loaded zones).
 pub(crate) fn builtin_zone(name: &str) -> Option<ZoneRef> {
-    if name == "UTC" {
+    if fold_zone_name(name) == "utc" {
         return Some(ZoneRef::Fixed(0));
     }
     parse_fixed_offset(name).map(ZoneRef::Fixed)
+}
+
+/// The case fold a zone-name lookup applies (timezones.md §3.2): ASCII letters are lowercased,
+/// every other character kept — PostgreSQL's `downcase_truncate_identifier`, so `'utc'` and
+/// `'america/new_york'` resolve like PG (a non-ASCII letter keeps its case).
+pub(crate) fn fold_zone_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// How [`decode_numeric_zone`] read a zone string.
+pub(crate) enum NumericZone {
+    /// A well-formed ISO offset within ±15:59:59 — east-positive seconds.
+    Offset(i32),
+    /// Not an ISO numeric offset: try it as a zone name.
+    BadFormat,
+    /// Numeric, but a field is out of range.
+    Overflow,
+}
+
+/// Read a zone string as PostgreSQL's `DecodeTimezone` does for `make_timestamptz`
+/// (`parse_sane_timezone`; functions.md §11): `[+|-]HH`, `[+|-]HH:MM[:SS]`, or the run-together
+/// `[+|-]HHMM` (four or more characters), with the ISO / timestamp-literal sign — `+05:30` is
+/// UTC+5:30, east-positive — bounded by PG's `MAX_TZDISP_HOUR` (hours 0..15, minutes and seconds
+/// 0..59; out of range is `Overflow`). A string that does not start with a sign, or has trailing
+/// text after a well-formed offset, is `BadFormat`. Like C `strtoint`, a field's digit run may be
+/// empty (reads 0), may follow spaces, and may carry its own sign.
+pub(crate) fn decode_numeric_zone(name: &str) -> NumericZone {
+    let b = name.as_bytes();
+    if b.is_empty() || (b[0] != b'+' && b[0] != b'-') {
+        return NumericZone::BadFormat;
+    }
+    let mut i = 1usize;
+    let Some(mut hr) = read_strtoint(b, &mut i) else {
+        return NumericZone::Overflow;
+    };
+    let mut min = 0i64;
+    let mut sec = 0i64;
+    if b.get(i) == Some(&b':') {
+        i += 1;
+        let Some(m) = read_strtoint(b, &mut i) else {
+            return NumericZone::Overflow;
+        };
+        min = m;
+        if b.get(i) == Some(&b':') {
+            i += 1;
+            let Some(s) = read_strtoint(b, &mut i) else {
+                return NumericZone::Overflow;
+            };
+            sec = s;
+        }
+    } else if i == b.len() && b.len() > 3 {
+        // run-together HHMM
+        min = hr % 100;
+        hr /= 100;
+    }
+    if !(0..=15).contains(&hr) || !(0..=59).contains(&min) || !(0..=59).contains(&sec) {
+        return NumericZone::Overflow;
+    }
+    if i != b.len() {
+        return NumericZone::BadFormat;
+    }
+    let tz = (hr * 60 + min) * 60 + sec;
+    NumericZone::Offset(if b[0] == b'-' { -tz } else { tz } as i32)
+}
+
+/// Read an int as C `strtoint` does at `b[*i]`: optional spaces, an optional sign, then digits
+/// (none reads 0 and consumes nothing but the spaces/sign). `None` is ERANGE: past the C int range.
+fn read_strtoint(b: &[u8], i: &mut usize) -> Option<i64> {
+    while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        *i += 1;
+    }
+    let neg = match b.get(*i) {
+        Some(b'-') => {
+            *i += 1;
+            true
+        }
+        Some(b'+') => {
+            *i += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut v: i64 = 0;
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        v = v * 10 + (b[*i] - b'0') as i64;
+        if v > 2_147_483_648 {
+            return None;
+        }
+        *i += 1;
+    }
+    let v = if neg { -v } else { v };
+    if v > 2_147_483_647 { None } else { Some(v) }
+}
+
+/// Resolve `make_timestamptz`'s explicit timezone argument as PostgreSQL's `parse_sane_timezone`
+/// does (functions.md §11): a leading digit is 22023 "invalid input syntax for type numeric time
+/// zone"; a sign-led string is first read as an ISO numeric offset ([`decode_numeric_zone`] —
+/// `+05:30` is UTC+5:30, the timestamp-literal sign, NOT AT TIME ZONE's POSIX sign), out of range
+/// being 22023 "numeric time zone … out of range"; anything else resolves as a zone name through
+/// `env` (22023 "not recognized" when unknown).
+pub(crate) fn resolve_make_timestamptz_zone(
+    env: &crate::environment::Environment,
+    name: &str,
+) -> Result<ZoneRef> {
+    if name.as_bytes().first().is_some_and(|c| c.is_ascii_digit()) {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("invalid input syntax for type numeric time zone: \"{name}\""),
+        ));
+    }
+    match decode_numeric_zone(name) {
+        NumericZone::Offset(off) => return Ok(ZoneRef::Fixed(off)),
+        NumericZone::Overflow => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("numeric time zone \"{name}\" out of range"),
+            ));
+        }
+        NumericZone::BadFormat => {}
+    }
+    env.resolve_zone(name).ok_or_else(|| {
+        EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("time zone \"{name}\" not recognized"),
+        )
+    })
 }
 
 /// The offset in effect at `instant_secs` for a resolved zone reference.

@@ -431,6 +431,19 @@ name = "dependent_objects_still_exist"
 class = "dependent objects still exist"
 template = "cannot drop type {name} because other objects depend on it: {detail}"
 
+# --- invalid transaction termination (class 2D) -----------------------------
+# Raised by SQL COMMIT / ROLLBACK (and the Transaction handle's own commit/rollback) issued
+# inside a view/update closure (spec/design/api.md §2.2): the closure IS the transaction's
+# lifetime, so ending it from inside has no defined action — and silently running the
+# closure's later statements outside the block would discard them. PostgreSQL's code for
+# COMMIT/ROLLBACK inside a procedure called within a transaction block. Like any statement
+# error inside a block, the SQL form aborts the block (25P02 thereafter).
+[[error]]
+code = "2D000"
+name = "invalid_transaction_termination"
+class = "invalid transaction termination"
+template = "invalid transaction termination"
+
 # --- invalid authorization specification (class 28) -------------------------
 # The credential of an encrypted database (../design/encryption.md §5, ../fileformat/encrypted.md
 # §9). The credential is a host-API argument of create/open/attach, never SQL, so the shared corpus

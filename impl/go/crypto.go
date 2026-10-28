@@ -584,10 +584,11 @@ func unlockCodec(page2, page3 []byte, cred *Credential, rng RandomSource) (*page
 
 // fileSuite is the suite a file's meta slots declare (offset 6, with the reserve byte at 7 —
 // encrypted.md §6), read from the CRC-valid slots before any key is available: 0 plaintext, suiteXAES
-// encrypted. Slots that disagree, or an unknown suite, are XX001.
-func fileSuite(slot0, slot1 []byte) (byte, error) {
-	found := false
-	var suite byte
+// encrypted. Slots that disagree, or an unknown suite, are XX001. found is false when NEITHER slot is
+// CRC-valid: the file declares nothing, so the caller must not read suite 0 as "plaintext" (a damaged
+// encrypted header opened with its credential is XX001, never 28P03) — slot selection reports the
+// corruption.
+func fileSuite(slot0, slot1 []byte) (suite byte, found bool, err error) {
 	for _, m := range [][]byte{slot0, slot1} {
 		if len(m) < 64 || binary.BigEndian.Uint32(m[32:36]) != metaCRC(m) {
 			continue
@@ -599,15 +600,14 @@ func fileSuite(slot0, slot1 []byte) (byte, error) {
 		case m[6] == suiteXAES && int(m[7]) == cryptoReserve:
 			s = suiteXAES
 		default:
-			return 0, cryptoCorrupt("unknown encryption suite")
+			return 0, false, cryptoCorrupt("unknown encryption suite")
 		}
 		if found && s != suite {
-			return 0, cryptoCorrupt("meta slots disagree on encryption")
+			return 0, false, cryptoCorrupt("meta slots disagree on encryption")
 		}
 		found, suite = true, s
 	}
-	// Neither slot is valid: slot selection reports the corruption.
-	return suite, nil
+	return suite, found, nil
 }
 
 // --- scratch encryption (spec/design/encryption.md §6, spec/fileformat/encrypted.md §11) ---------

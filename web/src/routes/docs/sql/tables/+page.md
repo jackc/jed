@@ -84,6 +84,13 @@ scans the whole child table, and each action scans it once per statement. Create
 starts with the foreign-key columns (or make them the leading primary-key columns), and each check
 or action becomes one index lookup per parent row. This work counts toward a session's `max_cost`.
 
+The referenced columns must be the parent's primary key or the columns of a unique index (else
+error `42830`), and the parent keeps that key for as long as the foreign key needs it: dropping the
+last unique index covering the referenced columns is error `2BP01`, like dropping the parent table —
+drop the constraint first. The parent may be written `main.account` or `temp.account` to pin the
+scope; a table in an attached database cannot be referenced (`0A000`), and an unknown qualifier is
+error `42P01`.
+
 A multi-column foreign key with a `NULL` in any referencing column is not checked: that row
 references nothing (`MATCH SIMPLE`, the default). Write `MATCH FULL` after the referenced columns to
 allow only all-`NULL` or all-non-`NULL` keys; a row that mixes them is error `23503`.

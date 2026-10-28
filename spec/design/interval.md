@@ -27,8 +27,10 @@ They are kept **separate on purpose**, because months and days are not fixed-len
 
 - A month is 28–31 days, so `timestamp + interval '1 month'` is a **calendar** add (Jan 31 + 1
   month → Feb 28/29, day clamped to the target month) — genuinely different from `+ '30 days'`.
-- A day is 24 h here (jed has no time zones; under DST PG's day can be 23/25 h, but that is a
-  zone concern jed does not have).
+- A day is a **calendar day for a `timestamptz`** — `timestamptz + interval '1 day'` keeps the
+  wall-clock time in the session zone, so across a DST change the instant moves by 23 or 25 h,
+  exactly as PostgreSQL's `timestamptz_pl_interval` (§5; [timezones.md §6](timezones.md)) — and a
+  fixed 24 h for a zoneless `timestamp` or `date`. `interval '24 hours'` is always 24 h.
 
 `micros` is microsecond resolution like the rest of the engine; the time-of-day part of an
 interval is **not** justified into days (`INTERVAL '100 hours'` keeps `micros = 100 h`, `days = 0`,
@@ -270,7 +272,8 @@ surface):
 | interval | `+` / `-` | interval | interval (field-wise; **no** justification — PG keeps fields independent; overflow `22008`) |
 | `-` (unary) | | interval | interval (negate all three fields) |
 | interval | `*` / `/` | integer/decimal | interval (and `number * interval` commutes) |
-| timestamp[tz] | `+` / `-` | interval | timestamp[tz] (months with day-clamping, then days as 24 h, then micros; overflow `22008`) |
+| timestamp | `+` / `-` | interval | timestamp (months with day-clamping, then days as 24 h, then micros; overflow `22008`) |
+| timestamptz | `+` / `-` | interval | timestamptz (**in the session zone**, PG `timestamptz_pl_interval`: months with day-clamping and days are added on the zone's wall clock, each step re-resolving the wall clock through the zone as input does at a DST gap/overlap; then micros on the instant; overflow `22008`. One `timezone` cost unit per calendar step performed — §6) |
 | interval | `+` | timestamp[tz] | timestamp[tz] (commutes) |
 | timestamp | `-` | timestamp | interval (`micros = a − b`, `months = 0`, then `justify_hours`) |
 | timestamptz | `-` | timestamptz | interval (same) |
@@ -278,11 +281,32 @@ surface):
 `timestamp − timestamp` produces a **justified** interval: the difference in µs is computed, then
 whole 24 h chunks move into `days` (PG `timestamp_mi` → `interval_justify_hours`), `months = 0`.
 
-**`interval × / number` is a documented PG divergence.** PostgreSQL multiplies/divides the fields
-through `double` and cascades the fraction months→days→micros; jed does the **same cascade with
-exact integer/decimal math** (no float in the value path — CLAUDE.md §8), rounding the µs result
-half away from zero. The two agree on all "nice" factors and differ only on sub-unit ties (the same
-class as the half-away-vs-half-even timestamp-fraction divergence). Recorded in the override ledger.
+**`timestamptz ± interval` reads the session zone.** The months step converts the instant to its
+wall clock in the session zone, adds the months with day-of-month clamping, and re-resolves the wall
+clock through the zone (the input rules at a DST gap/overlap, [timezones.md §6](timezones.md)); the
+days step does the same with calendar days; the micros are then added on the instant. So
+`+ interval '1 day'` across a DST change keeps the wall-clock time where `+ interval '24 hours'`
+moves the instant by exactly 24 h — PostgreSQL's behavior, verbatim. A zoneless `timestamp` (or a
+`date`, which widens to a midnight timestamp) never consults a zone: a day is 24 h. Because the
+result depends on the session zone, an index expression over `timestamptz ± interval` is
+nonimmutable (`42P17`) unless the interval is a constant with zero months and days — a pure
+microsecond shift ([index-dependencies.md](index-dependencies.md)). `uuidv7(shift)` takes the same
+zoned shift ([entropy.md §4](entropy.md)).
+
+**`interval × / number` is PostgreSQL's cascade in exact arithmetic.** PostgreSQL's `interval_mul` /
+`interval_div` truncate the whole months and days (`(int32)` casts), then cascade the fractional
+months into days and the fractional days into the time — with two **TSROUND** quantizations: the
+fractional-month days are rounded to **1e-6 day** and the seconds remainder to **1 µs**, both ties to
+even (C `rint`); a seconds remainder of **24 h or more** moves its whole days up into the days field;
+the final time is `rint(time × factor + remainder)`. jed reproduces every step **in exact rational
+arithmetic** (no float in the value path — CLAUDE.md §8; `i128` / big integers) with the same
+quantization points and the same half-to-even rounding, so `interval '1 year' / 7` is PG's
+`1 mon 21 days 10:17:08.5344` (the quantized `0.428571 day`, not the exact `10:17:08.571429`) and
+`interval '1 month 1 day' * 0.75` is `23 days 06:00:00`. The one residual divergence is PG's
+`double`: where its rounding error lands the value on the other side of a quantum boundary (an exact
+tie such as `1 month * 1.00000005` = 1.5 micro-days, which jed rounds to even and PG's double may
+not), the two differ by one quantum. Such ties are kept out of the oracle corpus; nothing else
+diverges.
 
 **Construction — `make_interval(years, months, weeks, days, hours, mins, secs)`.** The interval
 *constructor* is jed's first **named + defaulted** function (every parameter named, DEFAULT 0;
@@ -401,10 +425,20 @@ one-argument form one for the current day and, for `timestamptz`, one for its mi
   length prefix.
 - **Cost** ([cost.md](cost.md)): every interval/temporal arithmetic node — compare, `±`, unary
   minus, `timestamp ± interval`, `timestamp − timestamp`, and the `×÷ number` cascade — charges
-  **one** uniform `operator_eval`, like integer/timestamp. The cascade is **bounded fixed-width
-  work** (the factor is digit-capped, the math is `i128` / a fixed bignum, not unbounded decimal
-  limbs), so no size-scaled `decimal_work` is needed; an untrusted query's cascade is already
-  bounded. No new cost unit.
+  **one** uniform `operator_eval`, like integer/timestamp. `timestamptz ± interval` additionally
+  charges one **`timezone`** unit (the AT TIME ZONE unit) per calendar step a finite operand
+  performs — one for a nonzero months field, one for a nonzero days field — before the shift runs; a
+  pure time-of-day interval, an ±infinity operand, or a zoneless `timestamp`/`date` charges none. The
+  cascade is **bounded fixed-width work** (the factor is digit-capped, the math is `i128` / a fixed
+  bignum, not unbounded decimal limbs), so no size-scaled `decimal_work` is needed; an untrusted
+  query's cascade is already bounded. No new cost unit.
+- **The factor digit cap.** An `interval × / number` factor is read as an exact fraction from the
+  decimal's canonical text: at most **18 integer digits** and **18 significant fractional digits**
+  (trailing fractional zeros stripped first, so a `numeric(p, 10)` column value such as
+  `1.0000000000` is the factor `1`); beyond either bound is `22008` "interval factor has too many
+  digits". The bound keeps the Rust `i128` cascade exact — every intermediate overflow it could still
+  reach implies an `i32`/`i64` field overflow, so all three cores trap the same `22008` — and lies far
+  past the ~16 significant digits PostgreSQL's `double` factor carries.
 
 ### 6.1 Field qualifiers and precision — the interval typmod
 
@@ -486,10 +520,11 @@ suites/introspection/temporal_typmod.test.
 
 ## 7. Determinism traps (the cross-core checklist)
 
-1. **The fractional-unit cascade** (parse AND `× / number`) — exact integer/decimal math, µs
-   rounded half away from zero (a year fraction's months half to even, as PG's `rint`), identical
-   months/days/micros and identical render across cores. The #1 divergence risk; pinned by
-   [intervals.toml](../encoding/intervals.toml) and oracle-diffed vs PG.
+1. **The fractional-unit cascade** (parse AND `× / number`) — exact integer/decimal math: the
+   parser rounds µs half away from zero (a year fraction's months half to even, as PG's `rint`);
+   the `× / number` cascade is PG's step for step with its two TSROUND quantizations and half-to-even
+   rounding (§5). Identical months/days/micros and identical render across cores. The #1 divergence
+   risk; pinned by [intervals.toml](../encoding/intervals.toml) and oracle-diffed vs PG.
 2. **The parser is a port, not a grammar.** PG's field splitting, right-to-left positional reading,
    field masks, and ISO fallback (§3) are mirrored step for step in every core — including PG's
    quirks (a time replaces earlier µs; `at`/`on` reset the positional unit; 10-letter unit

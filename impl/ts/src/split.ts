@@ -4,8 +4,8 @@
 // database is opened. It yields one statement's source text at a time, lazily (a generator),
 // buffering nothing across statements (an O(n) scan, no parse tree).
 //
-// It scans so a `;` inside a string literal, a dollar-quoted string, or a line/block comment is
-// never a statement boundary. It does NOT validate tokens (a lone `!` is just a character to the
+// It scans so a `;` inside a string literal, a quoted identifier, a dollar-quoted string, or a
+// line/block comment is never a statement boundary. It does NOT validate tokens (a lone `!` is just a character to the
 // splitter — the error surfaces when the host feeds the span to parse), so it never throws. Empty
 // spans — a leading/standalone `;`, or whitespace/comment-only text between separators — are
 // skipped, so every yielded span has significant content. Offsets are UTF-16 code-unit indices
@@ -28,8 +28,8 @@ export type ScriptSummary = {
 };
 
 // splitStatements lazily yields the top-level statements in sql (spec/design/session.md §4.1),
-// splitting on top-level `;` while respecting string literals, dollar-quoted strings, and
-// line/block comments.
+// splitting on top-level `;` while respecting string literals, quoted identifiers, dollar-quoted
+// strings, and line/block comments.
 export function* splitStatements(sql: string): Generator<StatementSpan> {
   const n = sql.length;
   let i = 0;
@@ -69,13 +69,16 @@ export function* splitStatements(sql: string): Generator<StatementSpan> {
           i++;
         }
       }
-    } else if (ch === "'") {
-      // Single-quoted string literal; `''` is an embedded quote. An unterminated literal runs to EOF.
+    } else if (ch === "'" || ch === '"') {
+      // Single-quoted string literal (`''` an embedded quote) or double-quoted identifier (`""` an
+      // embedded quote — grammar.md §3); a `U&` prefix is ordinary characters before the quote, so
+      // `U&'…'` / `U&"…"` take this branch too. An unterminated literal or identifier runs to EOF.
+      const quote = ch;
       if (start < 0) start = i;
       i++;
       while (i < n) {
-        if (sql[i] === "'") {
-          if (sql[i + 1] === "'") {
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
             i += 2;
           } else {
             i++;

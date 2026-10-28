@@ -4,8 +4,8 @@
 //! callable before any database is opened. It yields one statement's source text at a time, lazily,
 //! buffering nothing across statements (an O(n) scan, no parse tree).
 //!
-//! It scans at the lexer level so a `;` inside a **string literal**, a **dollar-quoted string**, or
-//! a **line/block comment** is never a statement boundary. It does *not* validate tokens (a lone `!`
+//! It scans at the lexer level so a `;` inside a **string literal**, a **quoted identifier**, a
+//! **dollar-quoted string**, or a **line/block comment** is never a statement boundary. It does *not* validate tokens (a lone `!`
 //! is just a byte to the splitter — the error surfaces when the host feeds the span to `parse`), so
 //! it never fails: the boundary scan is total. Empty spans — a leading/standalone `;`, or
 //! whitespace/comment-only text between separators — are skipped, so every yielded span has
@@ -45,7 +45,7 @@ pub struct SplitStatements<'a> {
 
 /// Split `sql` into its top-level statements, lazily (spec/design/session.md §4.1). The returned
 /// iterator yields one [`StatementSpan`] per non-empty statement, splitting on top-level `;` while
-/// respecting string literals, dollar-quoted strings, and line/block comments. Pure and total — no
+/// respecting string literals, quoted identifiers, dollar-quoted strings, and line/block comments. Pure and total — no
 /// `Session`/`Engine`, never an error.
 pub fn split_statements(sql: &str) -> SplitStatements<'_> {
     SplitStatements {
@@ -106,16 +106,20 @@ impl Iterator for SplitStatements<'_> {
                         }
                     }
                 }
-                b'\'' => {
-                    // Single-quoted string literal; `''` is an embedded quote. A `;` inside is not a
-                    // boundary. An unterminated literal runs to EOF (the parse error is the host's).
+                b'\'' | b'"' => {
+                    // Single-quoted string literal (`''` an embedded quote) or double-quoted
+                    // identifier (`""` an embedded quote — grammar.md §3); a `U&` prefix is ordinary
+                    // bytes before the quote, so `U&'…'` / `U&"…"` take this arm too. A `;` inside is
+                    // not a boundary. An unterminated literal or identifier runs to EOF (the parse
+                    // error is the host's).
+                    let quote = c;
                     if start.is_none() {
                         start = Some(i);
                     }
                     i += 1;
                     while i < n {
-                        if bytes[i] == b'\'' {
-                            if bytes.get(i + 1) == Some(&b'\'') {
+                        if bytes[i] == quote {
+                            if bytes.get(i + 1) == Some(&quote) {
                                 i += 2;
                             } else {
                                 i += 1;
@@ -251,6 +255,29 @@ mod tests {
         );
         // Embedded `''` quote, with a `;` between the two quotes.
         assert_eq!(texts("SELECT 'it''s; ok'"), vec!["SELECT 'it''s; ok'"]);
+    }
+
+    #[test]
+    fn semicolon_in_quoted_identifier_is_not_a_boundary() {
+        // A double-quoted identifier is opaque to the splitter, like a string literal
+        // (grammar.md §3).
+        assert_eq!(
+            texts(r#"CREATE TABLE "a;b" (x i32); INSERT INTO "a;b" VALUES (1)"#),
+            vec![
+                r#"CREATE TABLE "a;b" (x i32)"#,
+                r#"INSERT INTO "a;b" VALUES (1)"#
+            ],
+        );
+        // An embedded `""` quote, with a `;` between the two quotes; a `'` inside the identifier.
+        assert_eq!(
+            texts(r#"SELECT "it"";s"; SELECT "a'b;c""#),
+            vec![r#"SELECT "it"";s""#, r#"SELECT "a'b;c""#],
+        );
+        // A Unicode-escape identifier / literal: `U&` is ordinary text before the quote.
+        assert_eq!(
+            texts(r#"SELECT U&"a;b", U&'c;d'; SELECT 2"#),
+            vec![r#"SELECT U&"a;b", U&'c;d'"#, "SELECT 2"],
+        );
     }
 
     #[test]

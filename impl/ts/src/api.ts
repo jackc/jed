@@ -7,6 +7,7 @@ import type { Statement } from "./ast.ts";
 import type { SessionState } from "./session.ts";
 import { throwIfAborted } from "./cancel.ts";
 import { Cursor } from "./cursor.ts";
+import { type EngineError, engineError } from "./errors.ts";
 import { runSync, type Steps } from "./execution.ts";
 import {
   type JsParam,
@@ -341,23 +342,19 @@ export const querySql = query;
 // Transaction is an open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4).
 // Statements run through execute/query; commit/rollback end it. JS has no destructor, so a raw
 // `begin` caller must end it explicitly — `view`/`update` do that automatically (and are preferred).
-// TxEnd lets a Transaction route commit/rollback through a host (a Session) that does more than the
-// raw Engine swap — e.g. publishing the working set to the shared core and releasing the writer gate.
-// When absent, commit/rollback fall back to the bare Engine swap (the one-handle Engine API).
-export interface TxEnd {
-  commit(): void;
-  rollback(): void;
-}
-
+// A scoped Transaction is one lent to a Session's view/update closure: the closure IS the block's
+// lifetime, so ending it from inside — SQL COMMIT/ROLLBACK or this handle's commit/rollback — is 2D000
+// invalid_transaction_termination (spec/design/api.md §2.2), never a silent discard of the closure's
+// writes (the session ends the block: publishing through the shared core and releasing the gate).
 export class Transaction {
   private readonly db: Engine;
   private done: boolean;
-  private readonly end?: TxEnd;
+  private readonly scoped: boolean;
 
-  constructor(db: Engine, end?: TxEnd) {
+  constructor(db: Engine, scoped = false) {
     this.db = db;
     this.done = false;
-    this.end = end;
+    this.scoped = scoped;
   }
 
   // execute runs a (possibly mutating) statement within this transaction, binding params, and returns
@@ -382,8 +379,35 @@ export class Transaction {
     return runSync(this.querySteps(sql, params));
   }
 
+  // A parse error (42601 / the 54000 input-size limit) is a statement error too, so it aborts the
+  // block (transactions.md §6 — PostgreSQL aborts on ANY error, the parse stage included).
   *querySteps(sql: string, params: Value[] = []): Steps<Rows> {
-    const outcome = yield* this.db.executeStmtParamsSteps(this.db.parse(sql), params);
+    let stmt: Statement;
+    try {
+      stmt = this.db.parse(sql);
+    } catch (e) {
+      this.db.failOpenBlock();
+      throw e;
+    }
+    return yield* this.queryStmtSteps(stmt, params, null);
+  }
+
+  // queryStmtSteps runs a parsed statement after the closure-scope gate: inside a view/update closure
+  // SQL COMMIT/ROLLBACK is 2D000 and aborts the block (api.md §2.2 — PostgreSQL's rule for COMMIT
+  // inside a procedure called within a transaction block; the handle's later statements would
+  // otherwise run outside the block the wrapper is about to end, and their writes be discarded —
+  // and the session's writer gate would never be released). A nested BEGIN stays the engine's
+  // 25001 / 25P02 (transactions.md §4.2); the SAVEPOINT family runs on the open block (api.md §2.2).
+  private *queryStmtSteps(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null,
+  ): Steps<Rows> {
+    if (this.scoped && (stmt.kind === "commit" || stmt.kind === "rollback")) {
+      this.db.failOpenBlock();
+      throw invalidTransactionTermination();
+    }
+    const outcome = yield* this.db.executeStmtParamsSteps(stmt, params, insertHolder);
     return rowsFromOutcome(outcome, this.db.session);
   }
 
@@ -398,7 +422,12 @@ export class Transaction {
   // over this database. (Named prepareStatement because prepare() is the better-sqlite3-style
   // ergonomic Statement, api.md §11 — a TS-only naming divergence, api.md §6.)
   prepareStatement(sql: string): PreparedStatement {
-    return new PreparedStatement(this.db.parse(sql));
+    try {
+      return new PreparedStatement(this.db.parse(sql));
+    } catch (e) {
+      this.db.failOpenBlock(); // a parse error inside an open block aborts it (transactions.md §6)
+      throw e;
+    }
   }
 
   // executePrepared runs a prepared statement within this transaction, binding params, and returns
@@ -416,8 +445,7 @@ export class Transaction {
   }
 
   *queryPreparedSteps(stmt: PreparedStatement, params: Value[] = []): Steps<Rows> {
-    const outcome = yield* this.db.executeStmtParamsSteps(stmt.ast, params, stmt.icHolder);
-    return rowsFromOutcome(outcome, this.db.session);
+    return yield* this.queryStmtSteps(stmt.ast, params, stmt.icHolder);
   }
 
   // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/
@@ -457,22 +485,27 @@ export class Transaction {
   }
 
   // commit publishes the transaction durably (per synchronous). Idempotent after the transaction
-  // has ended.
+  // has ended. Inside a view/update closure it is 2D000: the closure ends the block (api.md §2.2).
   commit(): void {
+    if (this.scoped) throw invalidTransactionTermination();
     if (this.done) return;
     this.done = true;
-    if (this.end) this.end.commit();
-    else this.db.commitTx();
+    this.db.commitTx();
   }
 
-  // rollback discards the transaction's working set. Idempotent after the transaction has ended, so
-  // the view/update wrappers can roll back in a catch even after a commit.
+  // rollback discards the transaction's working set. Idempotent after the transaction has ended.
+  // Inside a view/update closure it is 2D000: the closure ends the block (api.md §2.2).
   rollback(): void {
+    if (this.scoped) throw invalidTransactionTermination();
     if (this.done) return;
     this.done = true;
-    if (this.end) this.end.rollback();
-    else this.db.rollbackTx();
+    this.db.rollbackTx();
   }
+}
+
+// invalidTransactionTermination is 2D000: a view/update closure may not end its own block.
+export function invalidTransactionTermination(): EngineError {
+  return engineError("invalid_transaction_termination", "invalid transaction termination");
 }
 
 // begin opens an explicit transaction (spec/design/api.md §2.2). writable false is READ ONLY (a

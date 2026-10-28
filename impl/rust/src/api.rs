@@ -272,6 +272,11 @@ impl Iterator for Rows {
 pub struct Transaction<'a> {
     db: &'a mut Engine,
     done: bool,
+    /// A handle lent to a `view`/`update` closure ([`Session`](crate::Session)-driven): the closure
+    /// IS the block's lifetime, so ending it from inside — SQL `COMMIT`/`ROLLBACK` or this handle's
+    /// `commit`/`rollback` — is `2D000` invalid_transaction_termination (spec/design/api.md §2.2),
+    /// never a silent discard of the closure's writes.
+    scoped: bool,
 }
 
 impl<'a> Transaction<'a> {
@@ -280,8 +285,20 @@ impl<'a> Transaction<'a> {
     /// roll back — the owning `Session` ends the block (committing through the shared core / releasing
     /// the writer gate / publishing). The closure runs only `execute`/`query` against it.
     pub(crate) fn borrow(db: &'a mut Engine) -> Transaction<'a> {
-        Transaction { db, done: true }
+        Transaction {
+            db,
+            done: true,
+            scoped: true,
+        }
     }
+}
+
+/// `2D000`: a `view`/`update` closure may not end its own block (spec/design/api.md §2.2).
+pub(crate) fn invalid_transaction_termination() -> EngineError {
+    EngineError::new(
+        SqlState::InvalidTransactionTermination,
+        "invalid transaction termination",
+    )
 }
 
 impl Transaction<'_> {
@@ -289,12 +306,38 @@ impl Transaction<'_> {
     /// a READ ONLY transaction is `25006`; a statement error aborts the block (every later
     /// statement but commit/rollback is then `25P02`).
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
-        self.db.execute(sql, params)
+        drain_affected(self.query(sql, params)?)
     }
 
-    /// Run a query within this transaction, returning a row cursor.
+    /// Run a query within this transaction, returning a row cursor. A parse error (`42601` / the
+    /// `54000` input-size limit) is a statement error too, so it aborts the block (transactions.md
+    /// §6 — PostgreSQL aborts on ANY error, the parse stage included).
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
-        self.db.query(sql, params)
+        let ast = match self.db.parse(sql) {
+            Ok(ast) => ast,
+            Err(e) => return Err(self.db.poison_on_lane_err(e)),
+        };
+        self.query_ast(&ast, params, None, None)
+    }
+
+    /// Route a parsed statement through the engine's lazy lanes after the closure-scope gate: inside
+    /// a `view`/`update` closure SQL `COMMIT`/`ROLLBACK` is `2D000` and aborts the block (api.md
+    /// §2.2 — PostgreSQL's rule for `COMMIT` inside a procedure called within a transaction block;
+    /// the handle's later statements would otherwise run outside the block the wrapper is about to
+    /// end, and their writes be discarded). A nested `BEGIN` stays the engine's `25001`/`25P02`
+    /// (transactions.md §4.2), and the `SAVEPOINT` family runs on the open block (api.md §2.2).
+    fn query_ast(
+        &mut self,
+        ast: &Statement,
+        params: &[Value],
+        cache: Option<&RefCell<Option<CachedPlan>>>,
+        insert_cache: Option<&RefCell<Option<CachedInsert>>>,
+    ) -> Result<Rows> {
+        if self.scoped && matches!(ast, Statement::Commit | Statement::Rollback) {
+            self.db.fail_open_block();
+            return Err(invalid_transaction_termination());
+        }
+        self.db.query_ast_cached(ast, params, cache, insert_cache)
     }
 
     /// Render `v` in the owning session's current time zone — [`Session::render`](crate::Session::render)
@@ -314,7 +357,7 @@ impl Transaction<'_> {
     /// cursor — the prepared analogue of [`query`](Transaction::query). Reuses the statement's cached
     /// plan when this database + committed catalog still match it (spec/design/api.md §2.4).
     pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
-        self.db.query_ast_cached(
+        self.query_ast(
             stmt.ast(),
             params,
             Some(stmt.cache()),
@@ -334,7 +377,7 @@ impl Transaction<'_> {
     ) -> Result<u64> {
         cancel.check()?;
         let prev = self.db.session.cancel.replace(cancel.clone());
-        let r = self.db.execute(sql, params);
+        let r = self.execute(sql, params);
         self.db.session.cancel = prev;
         r
     }
@@ -349,19 +392,27 @@ impl Transaction<'_> {
     ) -> Result<Rows> {
         cancel.check()?;
         let prev = self.db.session.cancel.replace(cancel.clone());
-        let r = self.db.query(sql, params);
+        let r = self.query(sql, params);
         self.db.session.cancel = prev;
         r
     }
 
     /// Commit the transaction — publish + make durable (per `synchronous`). Consumes the handle.
+    /// Inside a `view`/`update` closure it is `2D000`: the closure ends the block (api.md §2.2).
     pub fn commit(mut self) -> Result<()> {
+        if self.scoped {
+            return Err(invalid_transaction_termination());
+        }
         self.done = true;
         self.db.commit()
     }
 
-    /// Roll back the transaction — discard its working set. Consumes the handle.
+    /// Roll back the transaction — discard its working set. Consumes the handle. Inside a
+    /// `view`/`update` closure it is `2D000`: the closure ends the block (api.md §2.2).
     pub fn rollback(mut self) -> Result<()> {
+        if self.scoped {
+            return Err(invalid_transaction_termination());
+        }
         self.done = true;
         self.db.rollback()
     }
@@ -386,6 +437,7 @@ impl Engine {
         Ok(Transaction {
             db: self,
             done: false,
+            scoped: false,
         })
     }
 
@@ -442,8 +494,10 @@ impl Engine {
     /// Parse `sql` once into a reusable prepared statement (spec/design/api.md §2.4). Parse
     /// errors (`42601`, …) and the `54000` input-size limit surface here.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        // A parse error inside an open block aborts it (transactions.md §6).
+        let ast = self.parse(sql).map_err(|e| self.poison_on_lane_err(e))?;
         Ok(PreparedStatement {
-            ast: self.parse(sql)?,
+            ast,
             cache: RefCell::new(None),
             insert_cache: RefCell::new(None),
         })
@@ -466,7 +520,8 @@ impl Engine {
     /// time. (This is the bare single-handle [`Engine`]; the watermark pin lives on the shared-core
     /// [`Session`](crate::Session) path.)
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
-        let ast = self.parse(sql)?;
+        // A parse error inside an open block aborts it (transactions.md §6).
+        let ast = self.parse(sql).map_err(|e| self.poison_on_lane_err(e))?;
         self.query_ast(ast, params)
     }
 

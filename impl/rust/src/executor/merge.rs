@@ -155,6 +155,7 @@ fn merge_scope<'a>(
         subquery_derivs: Default::default(),
         lateral_view: None,
         lateral_hit: Default::default(),
+        grouped_keys: Default::default(),
         lateral_refused: false,
         shares_parent_level: false,
         hints: Default::default(),

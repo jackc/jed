@@ -725,6 +725,21 @@ class SharedCore {
     return true;
   }
 
+  // tryAcquireWriterLocal claims the in-process writer flag only if it is free right now (no gates —
+  // the attach/detach scope of acquireWriterScoped), else throws 55006 with busy as the message. A
+  // host-API act never waits for the writer gate (api.md §2.3): the gate may be held by a session's
+  // open BEGIN / update block, so like compaction it reports object_in_use and the host ends the
+  // transaction first (Go/Rust, which could block, refuse identically). Released by releaseWriter.
+  tryAcquireWriterLocal(busy: string): void {
+    if (!this.tryAcquireLocalWriter()) throw engineError("object_in_use", busy);
+    try {
+      this.checkPid();
+    } catch (error) {
+      this.releaseWriter();
+      throw error;
+    }
+  }
+
   // releaseWriter releases the writer's read-only attachment pins, then its gates in reverse order
   // (main's included; compaction's gate too), then the in-process writer flag.
   releaseWriter(): void {
@@ -2225,7 +2240,9 @@ export class Database {
         inner.storage.storageBudget.limit = source.maxStorageBytes ?? 0n;
         svc = new ServiceAttachment(lname, readOnly, opened.service, inner, opened.realPath);
         try {
-          c.acquireWriterScoped(0, false);
+          c.tryAcquireWriterLocal(
+            `cannot attach database "${name}" while a write transaction is open`,
+          );
         } catch (error) {
           opened.service.close();
           throw error;
@@ -2290,7 +2307,7 @@ export class Database {
       root = empty;
     }
     try {
-      c.acquireWriterScoped(0, false);
+      c.tryAcquireWriterLocal(`cannot attach database "${name}" while a write transaction is open`);
     } catch (error) {
       storage.paging?.close();
       coordinator?.close();
@@ -2316,7 +2333,7 @@ export class Database {
   detach(name: string): void {
     const lname = name;
     const c = this.core;
-    c.acquireWriterScoped(0, false);
+    c.tryAcquireWriterLocal(`cannot detach database "${name}" while a write transaction is open`);
     let att: Attachment;
     try {
       if (lname === "main" || lname === "temp" || !c.attachments.has(lname)) {
@@ -2873,10 +2890,20 @@ export class Database {
   // convenience methods autocommit, so there is never uncommitted work to discard. Idempotent.
   close(): void {
     const handoff = this.core.handoff;
+    if (handoff !== null && this.core.handoffClosed) return;
+    if (this.core.writerActive) {
+      // A session's open write transaction is the session's to end (session.md §2.3): close never
+      // ends it behind the session's back, and reports the held gate without any partial close, so
+      // the host can end the transaction and close again (api.md §2.3; Go/Rust refuse identically
+      // rather than wait on a gate the same thread may hold).
+      throw engineError(
+        "object_in_use",
+        "cannot close the database while a write transaction is open",
+      );
+    }
     if (handoff !== null) {
       // A serving owner drains its clients and stops serving while presence EX is still held; a client
       // closes its connection (page-service.md §4.1; README §6.5). The path claim goes last.
-      if (this.core.handoffClosed) return;
       this.core.closeService();
       try {
         this.closeStorage();
@@ -3280,7 +3307,17 @@ export class Session {
   }
 
   *querySteps(sql: string, params: Value[] = []): Steps<Rows> {
-    return yield* this.queryStmtSteps(this.engine.parse(sql), params, null, null);
+    let stmt: Statement;
+    try {
+      stmt = this.engine.parse(sql);
+    } catch (e) {
+      // A parse error (42601 / the 54000 input-size limit) is a statement error: inside an open block
+      // it aborts the block like an execution error (transactions.md §6 — PostgreSQL aborts on ANY
+      // error).
+      this.engine.failOpenBlock();
+      throw e;
+    }
+    return yield* this.queryStmtSteps(stmt, params, null, null);
   }
 
   // queryStmt routes an already-parsed query AST through the session's lazy lanes — the autocommit
@@ -3432,7 +3469,12 @@ export class Session {
   // (Named prepareStatement because prepare() is the better-sqlite3-style ergonomic Statement below —
   // a TS-only naming divergence, api.md §6.)
   prepareStatement(sql: string): PreparedStatement {
-    return new PreparedStatement(this.engine.parse(sql));
+    try {
+      return new PreparedStatement(this.engine.parse(sql));
+    } catch (e) {
+      this.engine.failOpenBlock(); // a parse error inside an open block aborts it (transactions.md §6)
+      throw e;
+    }
   }
 
   // The async worker scheduler parks a statement BEFORE its first execution when another local
@@ -3550,6 +3592,10 @@ export class Session {
   // latest committed; a READ ONLY block pins its snapshot and registers it in the watermark (like a
   // read session) without the gate.
   private beginBlock(writable: boolean | null): Outcome {
+    // A nested BEGIN (a block is already open) must NOT re-take the writer gate / re-pin — defer to
+    // the executor, which rejects it against the open transaction: 25001, or the block's 25P02 when
+    // it is failed (transactions.md §4.2/§6; the Go/Rust cores carry the identical guard).
+    if (this.engine.session.tx !== null) return this.engine.beginTx(writable);
     const rw = writable ?? true;
     if (rw) {
       this.acquireGate();
@@ -3772,25 +3818,29 @@ export class Session {
 
   private withBlock<R>(writable: boolean, fn: (tx: Transaction) => R): R {
     this.beginBlock(writable);
-    // The Transaction's commit/rollback route through this session (publish + gate release), not the
-    // bare Engine swap, and are idempotent — so the wrapper's trailing commit/rollback is a no-op when
-    // the closure already ended the block.
-    const tx = new Transaction(this.engine, {
-      commit: () => {
-        if (this.engine.session.tx !== null) this.endBlock(true);
-      },
-      rollback: () => {
-        if (this.engine.session.tx !== null) this.endBlock(false);
-      },
-    });
+    // A scoped handle: this session ends the block (publish + gate release), so the handle's own
+    // commit/rollback — and SQL COMMIT/ROLLBACK through it — are 2D000 (api.md §2.2): the closure's
+    // writes are never discarded by ending the block early, and the gate is always released here.
+    const tx = new Transaction(this.engine, true);
+    let result: R;
     try {
-      const result = fn(tx);
-      tx.commit();
-      return result;
+      result = fn(tx);
     } catch (e) {
-      tx.rollback();
+      this.endBlock(false);
       throw e;
     }
+    if (this.engine.session.tx?.failed) {
+      // The closure swallowed a statement error: the block is failed, so "commit" would be a silent
+      // ROLLBACK (transactions.md §6). A closure API reports that — its writes are never discarded
+      // behind a normal return.
+      this.endBlock(false);
+      throw engineError(
+        "in_failed_sql_transaction",
+        "current transaction is aborted, commands ignored until end of transaction block",
+      );
+    }
+    this.endBlock(true);
+    return result;
   }
 
   // executeScript runs a multi-statement script on this session (spec/design/session.md §4.2): split

@@ -121,6 +121,8 @@ const (
 	IdleInTransactionSessionTimeout
 	// DependentObjectsStillExist is 2BP01 — cannot drop type {name} because other objects depend on it: {detail}.
 	DependentObjectsStillExist
+	// InvalidTransactionTermination is 2D000 — invalid transaction termination.
+	InvalidTransactionTermination
 	// InvalidPassword is 28P01 — {detail}.
 	InvalidPassword
 	// CredentialRequired is 28P02 — {detail}.
@@ -352,6 +354,8 @@ func (s SqlState) Code() string {
 		return "25P03"
 	case DependentObjectsStillExist:
 		return "2BP01"
+	case InvalidTransactionTermination:
+		return "2D000"
 	case InvalidPassword:
 		return "28P01"
 	case CredentialRequired:
@@ -541,6 +545,7 @@ var errorDescs = []errorDesc{
 	{Code: "25P02", Name: "in_failed_sql_transaction", Class: "invalid transaction state"},
 	{Code: "25P03", Name: "idle_in_transaction_session_timeout", Class: "invalid transaction state"},
 	{Code: "2BP01", Name: "dependent_objects_still_exist", Class: "dependent objects still exist"},
+	{Code: "2D000", Name: "invalid_transaction_termination", Class: "invalid transaction termination"},
 	{Code: "28P01", Name: "invalid_password", Class: "invalid authorization specification"},
 	{Code: "28P02", Name: "credential_required", Class: "invalid authorization specification"},
 	{Code: "28P03", Name: "credential_not_applicable", Class: "invalid authorization specification"},

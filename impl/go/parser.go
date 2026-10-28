@@ -52,6 +52,13 @@ func newBinaryExpr(op binaryOp, lhs, rhs exprNode, pos srcPos) exprNode {
 // any realistic query. Exceeding it aborts with 54001 statement_too_complex.
 const maxExprDepth = 256
 
+// maxInListElements is the maximum number of elements in an `IN (…)` value list (spec/design/cost.md
+// §7f, grammar.md §20). The list is parsed flat, so maxExprDepth never counts it, but it resolves to
+// a left-deep OR chain of as many levels — the one place a statement's resolved depth is not bounded
+// by its written nesting — and the walks below the parser recurse down that chain. The cap bounds it
+// at 54001, like the depth limit: a fixed, cross-core-identical constant.
+const maxInListElements = 1000
+
 // maxIdentifierLength is the maximum length, in bytes, of a single identifier — table / column /
 // type / alias / function name (spec/design/cost.md §7; CLAUDE.md §13). The §13 identifier
 // hardening gate for untrusted input: an unbounded identifier would otherwise consume O(input)
@@ -1650,7 +1657,10 @@ func (p *parser) parseReferencesClause() (foreignKeyDef, error) {
 	if err := p.expectKeyword("references"); err != nil {
 		return foreignKeyDef{}, err
 	}
-	refTable, err := p.expectIdentifier()
+	// The parent is a qualified_table (attached-databases.md §4): an optional database qualifier
+	// (`main.` / `temp.` pin the implicit scope; an attachment is a cross-database FK, 0A000 at
+	// resolution; unknown → 42P01) before the table name.
+	refDB, refTable, err := p.parseQualifiedTableName()
 	if err != nil {
 		return foreignKeyDef{}, err
 	}
@@ -1707,6 +1717,7 @@ func (p *parser) parseReferencesClause() (foreignKeyDef, error) {
 		}
 	}
 	return foreignKeyDef{
+		RefDB:      refDB,
 		RefTable:   refTable,
 		RefColumns: refColumns,
 		MatchFull:  matchFull,
@@ -6727,6 +6738,15 @@ func (p *parser) parseComparison() (exprNode, error) {
 				return exprNode{}, err
 			}
 			list = append(list, elem)
+			// The list is parsed flat, so the nesting counter never sees it — but it resolves to an
+			// OR chain as deep as the list is long (grammar.md §20), which the recursive walks
+			// below the parser descend. The element cap bounds that depth the way maxExprDepth
+			// bounds written nesting (spec/design/cost.md §7f): 54001, no position.
+			if len(list) > maxInListElements {
+				return exprNode{}, newError(StatementTooComplex, fmt.Sprintf(
+					"statement too complex: IN list exceeds the maximum of %d elements", maxInListElements,
+				))
+			}
 		}
 		if err := p.expect(tokRParen); err != nil {
 			return exprNode{}, err
@@ -8038,10 +8058,17 @@ func (p *parser) parseWindowFrame() (*windowFrame, error) {
 		}
 		start, end = s, e
 	} else {
-		// A single bound is the frame START; the END defaults to CURRENT ROW.
+		// A single bound is the frame START; the END defaults to CURRENT ROW. PostgreSQL rejects the
+		// two impossible single-bound forms here, with their own messages (window.md §6, 42P20).
 		s, err := p.parseFrameBound()
 		if err != nil {
 			return nil, err
+		}
+		if s.Kind == frameUnboundedFollowing {
+			return nil, newError(WindowingError, "frame start cannot be UNBOUNDED FOLLOWING")
+		}
+		if s.Kind == frameFollowing {
+			return nil, newError(WindowingError, "frame starting from following row cannot end with current row")
 		}
 		start, end = s, frameBound{Kind: frameCurrentRow}
 	}

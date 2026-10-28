@@ -228,7 +228,12 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   a bare/qualified **column**, a select-list **ordinal**, an output **alias**, or a general
   **expression** (§15) — emitting one row per distinct key
   combination. The **grouping-error rule** ([grammar.md](grammar.md) §18): every
-  non-aggregated column in the select list (and `ORDER BY`) must be a grouping key, else `42803`. `NULL` forms its own
+  non-aggregated column in the select list (and `ORDER BY`) must be a grouping key, else `42803`. A
+  `*` / `t.*` expands into one item per column and each obeys the rule (reading its key's group
+  value, whatever order the keys were written in); a correlated subquery in the select list /
+  `HAVING` / `ORDER BY` / window keys runs over the group row, so an enclosing column it reads must
+  be a grouping key too (`42803`, PostgreSQL's *subquery uses ungrouped column* —
+  [grammar.md](grammar.md) §26). `NULL` forms its own
   group; decimal keys bucket value-canonically (the displayed key is the first occurrence's
   value). `GROUP BY` over an empty table → zero rows. **`ORDER BY` over the grouped output**
   resolves each key against the grouping keys — a grouping column sorts the group rows

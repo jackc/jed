@@ -1,0 +1,56 @@
+# width_bucket(f64, f64, f64, i32) with bounds so far apart that high − low overflows to ±Infinity
+# (spec/functions/catalog.toml, PostgreSQL 16+'s width_bucket_float8): the interior bucket is then
+# computed over the halves, (op/2 − low/2) / (high/2 − low/2) · count, which cannot overflow, so an
+# operand inside [-1e308, 1e308) lands in its true bucket instead of bucket 1 (or 0). Reversed
+# bounds use the same halving; the outside-the-range answers (0 / count + 1) are unchanged, and a
+# fraction that rounds up to 1.0 is clamped to count.
+# requires: query.select, query.select_no_from, cast.operator, types.i32, types.f64, resource.cost_metering
+
+# cost: 6
+query I nosort
+SELECT width_bucket(0::float8, -1e308::float8, 1e308::float8, 10)
+----
+6
+
+# cost: 6
+query I nosort
+SELECT width_bucket(5e307::float8, -1e308::float8, 1e308::float8, 10)
+----
+8
+
+# reversed bounds
+# cost: 6
+query I nosort
+SELECT width_bucket(0::float8, 1e308::float8, -1e308::float8, 10)
+----
+6
+
+# a large count: the halved fraction scales exactly like the direct one
+# cost: 6
+query I nosort
+SELECT width_bucket(1e307::float8, -1e308::float8, 1e308::float8, 2147483647)
+----
+1181116006
+
+# cost: 6
+query I nosort
+SELECT width_bucket(5e307::float8, -1e308::float8, 1e308::float8, 2147483647)
+----
+1610612736
+
+# the bounds themselves and the outside answers are unchanged
+# cost: 23
+query IIII nosort
+SELECT width_bucket(-1e308::float8, -1e308::float8, 1e308::float8, 10), width_bucket(1e308::float8, -1e308::float8, 1e308::float8, 10), width_bucket(1.7e308::float8, -1e308::float8, 1e308::float8, 10), width_bucket(-1.7e308::float8, -1e308::float8, 1e308::float8, 10)
+----
+1
+11
+11
+0
+
+# cost: 12
+query II nosort
+SELECT width_bucket(1e308::float8, -1e308::float8, 1.5e308::float8, 3), width_bucket(-1e308::float8, 1e308::float8, -1.5e308::float8, 3)
+----
+3
+3

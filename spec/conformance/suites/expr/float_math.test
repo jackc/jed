@@ -2,8 +2,8 @@
 # ceil / floor / trunc / round(1) / round(2), sqrt, exp, ln, log10, pow, sin / cos / tan.
 # Each takes the float family and returns f64 (the `R` render tag — compared by parsed
 # value at tolerance, conformance.md §1), charges one operator_eval per call, and propagates
-# NULL. The transcendental/root kernels trap 22003 (sqrt of a negative, ln/log10 of <=0, an
-# exp/pow result out of f64 range). Argument resolution is `none`: a bare integer/decimal
+# NULL. The transcendental/root kernels trap on a domain error (sqrt of a negative 2201F, ln/log10
+# of <=0 2201E) and 22003 on an exp/pow result out of f64 range. Argument resolution is `none`: a bare integer/decimal
 # literal does NOT promote to float (an explicit f64 value is required) — so these
 # functions are exercised through f64 columns. round over f64 is half-away-from-zero
 # (round(2.5) = 3), matching jed's decimal round (decimal.md §3). PostgreSQL-oracle-checkable.
@@ -130,14 +130,15 @@ SELECT sqrt(x) FROM p
 3
 4
 
-# --- traps: sqrt of a negative, ln/log10 of <= 0, an out-of-range exp/pow → 22003 -----
-statement error 22003
+# --- traps: sqrt of a negative → 2201F, ln/log10 of <= 0 → 2201E (PostgreSQL's granular -----
+# --- codes), an out-of-range exp/pow → 22003 ---------------------------------------------
+statement error 2201F
 SELECT sqrt(x) FROM f WHERE id = 7
 
-statement error 22003
+statement error 2201E
 SELECT ln(x) FROM f WHERE id = 3
 
-statement error 22003
+statement error 2201E
 SELECT log10(x) FROM f WHERE id = 3
 
 # exp(710) overflows f64

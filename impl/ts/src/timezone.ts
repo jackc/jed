@@ -147,23 +147,27 @@ function parsePosixAbbr(c: Cur): string | undefined {
 }
 
 // parsePosixOffset parses [+|-]hh[:mm[:ss]] → seconds (POSIX raw, west-positive). Caller negates.
+// The fields are bounded exactly as tzcode's getsecs (which PostgreSQL's pg_tzset uses for a numeric
+// zone — timezones.md §3.2): hours 0..167 (a week less an hour), minutes 0..59, seconds 0..60 (a
+// leap second). A digit run exceeding its bound, however long, is not an offset (so `'+168'`,
+// `'+1000000'` and `'+4294967296'` are all "not recognized", never a wrapped or clamped value).
 function parsePosixOffset(c: Cur): number | undefined {
   let neg = false;
   if (c.i < c.s.length && (c.s[c.i] === "+" || c.s[c.i] === "-")) {
     neg = c.s[c.i] === "-";
     c.i++;
   }
-  const hh = parseUint(c);
+  const hh = parseUintMax(c, 167);
   if (hh === undefined) return undefined;
   let secs = hh * 3600;
   if (c.i < c.s.length && c.s[c.i] === ":") {
     c.i++;
-    const mm = parseUint(c);
+    const mm = parseUintMax(c, 59);
     if (mm === undefined) return undefined;
     secs += mm * 60;
     if (c.i < c.s.length && c.s[c.i] === ":") {
       c.i++;
-      const ss = parseUint(c);
+      const ss = parseUintMax(c, 60);
       if (ss === undefined) return undefined;
       secs += ss;
     }
@@ -178,13 +182,13 @@ function parsePosixRule(c: Cur): [PosixRule, number] {
     throw corruptErr("posix: Jn/n julian-day transition rules are not yet supported");
   }
   c.i++;
-  const m = parseUint(c);
+  const m = parseUintMax(c, 12);
   if (m === undefined || c.s[c.i] !== ".") throw corruptErr("posix: bad month");
   c.i++;
-  const w = parseUint(c);
+  const w = parseUintMax(c, 5);
   if (w === undefined || c.s[c.i] !== ".") throw corruptErr("posix: bad week");
   c.i++;
-  const d = parseUint(c);
+  const d = parseUintMax(c, 6);
   if (d === undefined) throw corruptErr("posix: bad day");
   if (m < 1 || m > 12 || w < 1 || w > 5 || d > 6) throw corruptErr("posix: Mm.w.d out of range");
   let time = 7200;
@@ -197,11 +201,14 @@ function parsePosixRule(c: Cur): [PosixRule, number] {
   return [{ m, w, d }, time];
 }
 
-function parseUint(c: Cur): number | undefined {
+// parseUintMax reads a digit run whose value may not exceed max — tzcode's getnum: the running value
+// is checked after every digit, so an over-long run fails instead of overflowing.
+function parseUintMax(c: Cur, max: number): number | undefined {
   const start = c.i;
   let v = 0;
   while (c.i < c.s.length && c.s.charCodeAt(c.i) >= 48 && c.s.charCodeAt(c.i) <= 57) {
     v = v * 10 + (c.s.charCodeAt(c.i) - 48);
+    if (v > max) return undefined;
     c.i++;
   }
   return c.i === start ? undefined : v;
@@ -601,11 +608,105 @@ export function timeZoneBundleZones(data: Uint8Array): Zone[] {
 // resolveZone resolves a zone name to a built-in fixed offset (UTC / ±HH[:MM[:SS]], §3.2) or a named
 // zone the environment loaded. undefined ⇒ unknown (the caller raises 22023).
 export function resolveZone(name: string, env: Environment): ZoneRef | undefined {
-  if (name === "UTC") return { fixed: true, off: 0 };
+  if (foldZoneName(name) === "utc") return { fixed: true, off: 0 };
   const off = parseFixedOffset(name);
   if (off !== undefined) return { fixed: true, off };
+  // Case-insensitive like PostgreSQL's pg_tzset (timezones.md §3.2): an exact name wins, else the
+  // ASCII-folded name (Environment.zone). The resolved zone keeps its canonical name (the one an
+  // index dependency records).
   const z = env.zone(name);
   return z !== undefined ? { fixed: false, zone: z } : undefined;
+}
+
+// foldZoneName is the case fold a zone-name lookup applies (timezones.md §3.2): ASCII letters are
+// lowercased, every other character kept — PostgreSQL's downcase_truncate_identifier, so 'utc' and
+// 'america/new_york' resolve like PG (a non-ASCII letter keeps its case).
+export function foldZoneName(name: string): string {
+  return name.replace(/[A-Z]+/g, (s) => s.toLowerCase());
+}
+
+// decodeNumericZone reads a zone string as PostgreSQL's DecodeTimezone does for make_timestamptz
+// (parse_sane_timezone; functions.md §11): `[+|-]HH`, `[+|-]HH:MM[:SS]`, or the run-together
+// `[+|-]HHMM` (four or more characters), with the ISO / timestamp-literal sign — `+05:30` is
+// UTC+5:30, east-positive — bounded by PG's MAX_TZDISP_HOUR (hours 0..15, minutes and seconds 0..59;
+// out of range is "overflow"). A string that does not start with a sign, or that has trailing text
+// after a well-formed offset, is "bad_format". Like C strtoint, a field's digit run may be empty
+// (reads 0), may follow spaces, and may carry its own sign. The offset is east-positive seconds.
+export function decodeNumericZone(
+  name: string,
+): { status: "ok"; off: number } | { status: "bad_format" } | { status: "overflow" } {
+  if (name.length === 0 || (name[0] !== "+" && name[0] !== "-")) return { status: "bad_format" };
+  const c: Cur = { s: name, i: 1 };
+  let hr = readStrtoint(c);
+  if (hr === undefined) return { status: "overflow" };
+  let min = 0;
+  let sec = 0;
+  if (c.i < name.length && name[c.i] === ":") {
+    c.i++;
+    const m = readStrtoint(c);
+    if (m === undefined) return { status: "overflow" };
+    min = m;
+    if (c.i < name.length && name[c.i] === ":") {
+      c.i++;
+      const s = readStrtoint(c);
+      if (s === undefined) return { status: "overflow" };
+      sec = s;
+    }
+  } else if (c.i === name.length && name.length > 3) {
+    // run-together HHMM
+    min = hr % 100;
+    hr = Math.trunc(hr / 100);
+  }
+  if (hr < 0 || hr > 15 || min < 0 || min > 59 || sec < 0 || sec > 59)
+    return { status: "overflow" };
+  if (c.i !== name.length) return { status: "bad_format" };
+  const tz = (hr * 60 + min) * 60 + sec;
+  return { status: "ok", off: name[0] === "-" ? -tz : tz };
+}
+
+// readStrtoint reads an int as C strtoint does at c.i: optional spaces, an optional sign, then
+// digits (none reads 0 and consumes nothing but the spaces/sign). undefined is ERANGE: a value past
+// the C int range.
+function readStrtoint(c: Cur): number | undefined {
+  while (c.i < c.s.length && " \t\n\r\v\f".includes(c.s[c.i]!)) c.i++;
+  let neg = false;
+  if (c.i < c.s.length && (c.s[c.i] === "+" || c.s[c.i] === "-")) {
+    neg = c.s[c.i] === "-";
+    c.i++;
+  }
+  let v = 0;
+  while (c.i < c.s.length && c.s.charCodeAt(c.i) >= 48 && c.s.charCodeAt(c.i) <= 57) {
+    v = v * 10 + (c.s.charCodeAt(c.i) - 48);
+    if (v > 2147483648) return undefined;
+    c.i++;
+  }
+  if (neg) v = -v;
+  return v > 2147483647 ? undefined : v;
+}
+
+// resolveMakeTimestamptzZone resolves make_timestamptz's explicit timezone argument as PostgreSQL's
+// parse_sane_timezone does (functions.md §11): a leading digit is 22023 "invalid input syntax for
+// type numeric time zone"; a sign-led string is first read as an ISO numeric offset
+// (decodeNumericZone — `+05:30` is UTC+5:30, the timestamp-literal sign, NOT AT TIME ZONE's POSIX
+// sign), out of range being 22023 "numeric time zone … out of range"; anything else resolves as a
+// zone name through env (22023 "not recognized" when unknown).
+export function resolveMakeTimestamptzZone(env: Environment, name: string): ZoneRef {
+  if (name.length > 0 && name.charCodeAt(0) >= 48 && name.charCodeAt(0) <= 57) {
+    throw engineError(
+      "invalid_parameter_value",
+      `invalid input syntax for type numeric time zone: "${name}"`,
+    );
+  }
+  const n = decodeNumericZone(name);
+  if (n.status === "ok") return { fixed: true, off: n.off };
+  if (n.status === "overflow") {
+    throw engineError("invalid_parameter_value", `numeric time zone "${name}" out of range`);
+  }
+  const z = resolveZone(name, env);
+  if (z === undefined) {
+    throw engineError("invalid_parameter_value", `time zone "${name}" not recognized`);
+  }
+  return z;
 }
 
 // offsetAtRef is the offset in effect at instantSecs for a resolved zone reference.

@@ -81,6 +81,26 @@ function typeRank(n: JsonNode): number {
 // strings by collation-`C` UTF-8 byte order, arrays/objects by element/member COUNT first (PG
 // compares container length before contents) then element-wise. Returns <0, 0, >0.
 export function jsonNodeCmp(a: JsonNode, b: JsonNode): number {
+  // jsonNodeCmp compares two WHOLE documents: jsonNodeCmpNested plus PostgreSQL's one root-level
+  // quirk — a top-level scalar is stored as a one-element "raw scalar" pseudo-array, and
+  // compareJsonbContainers checks the element count AFTER the raw-scalar flag, so a scalar sorts
+  // after the empty array and before every non-empty array (`[]` < null < "a" < 1 < true < [1] <
+  // {}). Inside a container the ordinary type rank applies (`[null]` < `[[]]`). (json.md §5)
+  if (isScalar(a) && b.kind === "array") return b.elements.length === 0 ? 1 : -1;
+  if (a.kind === "array" && isScalar(b)) return a.elements.length === 0 ? -1 : 1;
+  return jsonNodeCmpNested(a, b);
+}
+
+// isScalar reports whether a node is a JSON scalar (null, boolean, number, string).
+export function isScalar(n: JsonNode): boolean {
+  return n.kind !== "array" && n.kind !== "object";
+}
+
+// jsonNodeCmpNested is the PG jsonb order of two nodes BELOW the document root (json.md §5): type
+// rank first; within a type as above — an object's members pairwise in stored canonical key order,
+// each key compared BYTEWISE (PG compares the key strings under the collation, not length-first:
+// `{"b":1}` > `{"aa":1}`).
+function jsonNodeCmpNested(a: JsonNode, b: JsonNode): number {
   const ra = typeRank(a);
   const rb = typeRank(b);
   if (ra !== rb) return ra < rb ? -1 : 1;
@@ -100,7 +120,7 @@ export function jsonNodeCmp(a: JsonNode, b: JsonNode): number {
       const be = (b as { kind: "array"; elements: JsonNode[] }).elements;
       if (a.elements.length !== be.length) return a.elements.length < be.length ? -1 : 1;
       for (let i = 0; i < a.elements.length; i++) {
-        const c = jsonNodeCmp(a.elements[i]!, be[i]!);
+        const c = jsonNodeCmpNested(a.elements[i]!, be[i]!);
         if (c !== 0) return c;
       }
       return 0;
@@ -108,11 +128,13 @@ export function jsonNodeCmp(a: JsonNode, b: JsonNode): number {
     case "object": {
       const bm = (b as { kind: "object"; members: JsonMember[] }).members;
       if (a.members.length !== bm.length) return a.members.length < bm.length ? -1 : 1;
-      // Members are in canonical key order in both; compare keys then values pairwise.
+      // Members are in canonical (length-first) key order in both; compare keys BYTEWISE then
+      // values, pairwise (the storage order and the key comparison deliberately differ, as in
+      // PostgreSQL — json.md §5).
       for (let i = 0; i < a.members.length; i++) {
-        const kc = keyCmp(a.members[i]!.key, bm[i]!.key);
+        const kc = byteCmp(utf8Bytes(a.members[i]!.key), utf8Bytes(bm[i]!.key));
         if (kc !== 0) return kc;
-        const vc = jsonNodeCmp(a.members[i]!.value, bm[i]!.value);
+        const vc = jsonNodeCmpNested(a.members[i]!.value, bm[i]!.value);
         if (vc !== 0) return vc;
       }
       return 0;
@@ -120,9 +142,44 @@ export function jsonNodeCmp(a: JsonNode, b: JsonNode): number {
   }
 }
 
-// keyCmp is the canonical object-key order (spec/design/json.md §2.3): shorter key first, ties broken
-// bytewise (over UTF-8 BYTES) — PostgreSQL's jsonb key order. The canonicalizer sorts by this and the
-// comparator compares keys by this.
+// jsonbDistinctKey appends a collision-free STRUCTURAL key of a jsonb node to a DISTINCT / GROUP BY
+// / set-operation value key (executor.ts distinctValueKey): two nodes produce the same key iff
+// jsonNodeCmp === 0. A number keys on its value-canonical decimal string, exactly as a `decimal`
+// column does (spec/design/decimal.md §5), so `1`, `1.0`, `1.00` and `1e0` share one bucket — the
+// canonical render (jsonbOut) preserves scale and would split them. Strings are length-prefixed
+// (UTF-8 byte length, the Go/Rust key's unit); containers frame their count and recurse; keys are
+// length-prefixed in canonical order (json.md §2.3).
+export function jsonbDistinctKey(n: JsonNode, out: string[]): void {
+  switch (n.kind) {
+    case "null":
+      out.push("n");
+      break;
+    case "bool":
+      out.push(n.value ? "t" : "f");
+      break;
+    case "number":
+      out.push("d", n.dec.canonicalString(), ";");
+      break;
+    case "string":
+      out.push("s", utf8Bytes(n.value).length.toString(), ":", n.value);
+      break;
+    case "array":
+      out.push("a", n.elements.length.toString(), ":");
+      for (const e of n.elements) jsonbDistinctKey(e, out);
+      break;
+    case "object":
+      out.push("o", n.members.length.toString(), ":");
+      for (const m of n.members) {
+        out.push(utf8Bytes(m.key).length.toString(), ":", m.key);
+        jsonbDistinctKey(m.value, out);
+      }
+      break;
+  }
+}
+
+// keyCmp is the canonical object-key STORAGE order (spec/design/json.md §2.3): shorter key first, ties
+// broken bytewise (over UTF-8 BYTES) — PostgreSQL's jsonb key order. The canonicalizer sorts by this;
+// the comparator walks members in this order but compares the keys themselves bytewise (§5).
 export function keyCmp(a: string, b: string): number {
   const ba = utf8Bytes(a);
   const bb = utf8Bytes(b);
@@ -879,6 +936,16 @@ export function getField(node: JsonNode, key: string): JsonNode | null {
 // getIndex is `jsonb -> int`: an array element by index (a negative index counts from the end). null
 // (→ SQL NULL) if the node is not an array or the index is out of range. `idx` is a bigint (the TS
 // core's integer representation — CLAUDE.md §2).
+// getRootIndex is `jsonb -> int` applied to a WHOLE document (json-sql-functions.md §1): an array
+// element by index, or — PostgreSQL's raw-scalar quirk — the document itself when it is a top-level
+// scalar and the index names its single pseudo-array element (0 or -1): `'"x"'::jsonb -> 0` is `"x"`.
+// An object, or any other index, → null (SQL NULL). Only the operator's root sees the pseudo-array;
+// a `#>` path step over a nested scalar is a miss (getIndex).
+export function getRootIndex(node: JsonNode, idx: bigint): JsonNode | null {
+  if (isScalar(node)) return idx === 0n || idx === -1n ? node : null;
+  return getIndex(node, idx);
+}
+
 export function getIndex(node: JsonNode, idx: bigint): JsonNode | null {
   if (node.kind !== "array") return null;
   const len = BigInt(node.elements.length);

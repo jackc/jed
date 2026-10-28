@@ -329,6 +329,21 @@ transactions.md §1). The commit boundary and durability are **decoupled** (tran
   `RELEASE a`, and `ROLLBACK TO a` run on the open transaction ([transactions.md](transactions.md)
   §11), so the host API adds no savepoint methods; a `ROLLBACK TO` that recovers a failed block
   returns the session's status to `Open`.
+- **A closure may not end its own block.** The transaction's lifetime *is* `fn` (session.md §2.2),
+  so inside `view`/`update` SQL `COMMIT`/`ROLLBACK` through the closure's `tx` — and `tx.commit()`
+  / `tx.rollback()` themselves — are **`2D000 invalid_transaction_termination`**, PostgreSQL's code
+  for `COMMIT` inside a procedure called within a transaction block. The SQL form is a statement
+  error and so **aborts the block** (`25P02` thereafter, transactions.md §6); the handle methods
+  only refuse. The alternative — ending the block early and running the closure's later statements
+  in autocommit — would silently discard them, and ending it twice is undefined; `BEGIN` inside stays
+  the nested `25001` (`25P02` once failed), and the `SAVEPOINT` family works as above. A closure
+  that returns success while its block is **failed** (it swallowed a statement error) gets
+  **`25P02`** from `view`/`update` rather than a success that committed nothing: a failed block
+  commits as a `ROLLBACK` (PostgreSQL), and a closure API reports that instead of hiding it.
+  (The TS **async** runtime's `update`/`view` drive the session's own `begin`/`commit` through the
+  worker ([ts-runtime.md](ts-runtime.md)) and do not yet enforce the `2D000` gate: a `COMMIT` there
+  ends the block through the session itself — its writes are published and the gate released —
+  and the closure's later statements autocommit.)
 - **`commit` / `rollback` are uniform across modes.** **In-memory** → commit **packs the dirty
   pages into the database's `MemoryBlockStore`** (bplus-reshape.md B3 — structurally the file
   commit minus `fsync`, whose memory-host `sync` is a no-op); the observable result is the same
@@ -355,6 +370,17 @@ every prior statement is already committed and durable (per `synchronous`, §2.2
 the original surprising rule — `close` does **not** drop committed work; durability is never
 hidden in a destructor (error-prone in the GC'd Go/TS cores), it is the explicit result of each
 commit. `close` is idempotent.
+
+Since [session.md §2.3](session.md), the open transaction a `close` rolls back is a **session's**
+(`session.close()`); the `Database` handle's `close` ends no session's transaction behind its back.
+**It never waits for the writer gate either:** while a session holds a write transaction open (an
+explicit `BEGIN` / `update` block, or a TS `writeSession`), `db.close()` — like `attach`, `detach`,
+and `compact` — fails **`55006 object_in_use`** without closing anything, so the host ends the
+transaction and closes again. A blocking wait would deadlock the common case, a block open on the
+very thread that calls `close`, and silently ending the block would discard its work. (Rust's
+`close(self)` consumes the handle even when it refuses: the backing file is released only when the
+last clone of the handle drops, so the session holding the block keeps it open until the block ends;
+a host that wants to retry closes a clone.)
 
 ### 2.4 Prepare / execute / query
 
@@ -755,7 +781,10 @@ the materialized `rows`, and `cost`.
 ## 5. Parameters (`$N`)
 
 A bind parameter is `$` followed by a 1-based decimal index (`$1`, `$2`, …; grammar.md §5,
-[../grammar/grammar.ebnf](../grammar/grammar.ebnf)). Parameters are an **API construct**:
+[../grammar/grammar.ebnf](../grammar/grammar.ebnf)), at most `$65535` (`MAX_PARAM_INDEX`,
+PostgreSQL's wire-protocol limit on the parameters of one statement; a larger index is `42601` at
+the lexer — the parameter table is sized by the largest index a statement names, so the bound is a
+§13 resource gate, [cost.md §7g](cost.md)). Parameters are an **API construct**:
 the corpus binds them through the `# params:` directive ([conformance.md](conformance.md) §1.2),
 and the parser accepts `$N` anywhere a
 primary expression is accepted and as an `INSERT` value slot. DDL takes none (`42601`), except the
@@ -810,7 +839,12 @@ An anonymous record (a `ROW(…)` expression) does not type a parameter (`42P18`
 **Binding is two-phase / all-or-nothing**, like `INSERT`/`UPDATE`: every supplied value is
 coerced to its inferred type up front (out-of-range → `22003`, wrong family → `42804`, NULL
 into a NOT NULL target → `23502`, bad `bytea`/`uuid` text → `22P02`) **before any row is
-touched**, so a bad binding fails deterministically with no partial work. Supplying the
+touched**, so a bad binding fails deterministically with no partial work. A supplied **text**
+value is first checked as PostgreSQL checks a text-format parameter's encoding: it must be valid
+UTF-8 without a NUL byte ([types.md §11](types.md)), else `22021` naming the first bad sequence
+(`invalid byte sequence for encoding "UTF8": 0xff`), so no such value is ever compared, stored, or
+rendered. (A `&str` / JS string cannot carry an invalid sequence, so there the check is the NUL; a
+Go `string` is checked whole.) Supplying the
 wrong number of values is `42601` (a malformed invocation — PG's `08P01` is wire-protocol
 only and the engine has no wire protocol).
 
@@ -1141,8 +1175,14 @@ a JS array; in Rust the `Array(vec![…])` newtype, because a bare `Vec<T>` is a
 `Vec<u8>` is `bytea`); a bare `Value` passes through, which is how a host binds a range or composite
 value. **The one impedance point is temporal**: Go's single `time.Time` (and the
 equivalents) maps to three jed types — it is bound as `timestamptz` and the §5 binder re-coerces to
-the inferred column type (`timestamp`/`date`); a host that needs an exact target casts (`$1 ::
-date`) or passes a `Value`.
+the inferred parameter type: **`timestamptz` takes the instant; `timestamp` and `date` take the
+time's calendar fields in its own `Location`** (year, month, day, hour, minute, second,
+microsecond — what the same time formatted without a zone would read as), so a date built at UTC
+midnight binds as that date whatever the session time zone, and a `[]time.Time` binds each element
+the same way for a `timestamp[]`/`date[]` parameter. A cast is context enough (`$1 :: date`
+binds the date); a host that needs another rule passes a `Value`. A non-temporal target rejects a
+`time.Time` as a family mismatch (`42804`), like a literal. A Go `string` is checked for valid UTF-8
+without NUL at conversion (`22021`, §5).
 
 **Scan (`Value` → native `*T`).** The mirror, an **inline type switch with explicit cases for the
 common destinations** (`*i64/i32/i16/int`, `*string`, `*bool`, `*f64/f32`, `*[]byte`, the temporal
@@ -1154,6 +1194,11 @@ per-type case — and `*any` (→ the language's null). A `Scanner`/`ScanJed` ho
 
 `Values()` returns a whole row as native values (pgx's `Values` — for callers that don't know the
 schema), disambiguating `timestamp`/`timestamptz`/`date` via the column type (§4 `ColumnTypes`).
+**An infinite `timestamp`/`timestamptz`/`date` has no `time.Time` form** (`time.Time` is finite,
+and the `±infinity` sentinels are the extreme instants, which would otherwise read as real dates
+in the year ±292 277): `Scan` into a `*time.Time` is an error naming the infinite value, and
+`Values()` hands the cell back as its raw `Value` (`Value.Kind` + the sentinel), never a bogus
+finite instant.
 Rich container types (composite/array/range/json) map to the engine value type for now; a richer
 native mapping is a follow-on.
 

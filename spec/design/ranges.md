@@ -167,6 +167,13 @@ upper bound body   present ONLY if !RANGE_EMPTY && !UB_INF: the element value-co
      - A step past the element domain (e.g. `int4range(1, 2147483647, '[]')` → upper 2³¹) →
        **`22003`** "integer out of range" (oracle-pinned, "integer out of range" message).
      - Infinite bounds are not stepped (they stay `LB_INF`/`UB_INF`).
+     - A finite `date` bound that is the **±infinity sentinel** (`'infinity'`/`'-infinity'`, the
+       reserved extreme day counts — date.md §6) is **not stepped either** and **keeps the
+       inclusivity it was given** (PG `daterange_canonical` skips a non-finite date):
+       `'(-infinity,2020-01-01)'::daterange` stays `(-infinity,2020-01-01)`,
+       `'[2020-01-01,infinity]'::daterange` stays `[2020-01-01,infinity]`, and
+       `daterange('-infinity','infinity','[]')` is `[-infinity,infinity]`. Only a finite day next to
+       a sentinel traps `22003` on the step.
      Continuous subtypes (`numrange`/`tsrange`/`tstzrange`; `discrete = false`) keep their
      bounds and inclusivity **verbatim** — `numrange(1.0,2.0,'[]')` stays `[1.0,2.0]`.
 
@@ -219,6 +226,13 @@ column's range type, or an untyped `NULL`, is stored through `store_range`; a di
   quoted timestamp). A malformed range literal (bad brackets, missing comma, element-parse
   failure) is **`22P02`** invalid_text_representation. After parsing, the canonicalization /
   order-check / empty rules of §4 apply.
+
+**Casting to a range type** (`…::i32range`, `CAST(… AS int4range)`): a string literal parses through
+`range_in` (above), a bare `NULL` adapts, `$1::i32range` types the parameter, and a runtime operand
+of the **same** range type is the identity (the operand itself — so a composite field of a range type
+takes a `ROW(…)` constructor's range through the field-by-field cast, composite.md §8, and a
+non-literal `NULL` adapts). Every other runtime source — a text expression, a range of another
+element type — stays the documented `0A000` narrowing (§10).
 
 ## 6. Comparison & ordering — `range_cmp`
 

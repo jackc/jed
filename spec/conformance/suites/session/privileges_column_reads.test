@@ -1,0 +1,115 @@
+# Session authorization — UPDATE / DELETE need SELECT on their target only when they READ one of
+# its columns (spec/design/session.md §5.3, PostgreSQL's rule at table granularity): a WHERE, a
+# RETURNING, or an assignment RHS that references a column or holds a subquery. `WHERE true`,
+# `RETURNING 1`, and a constant-only SET read nothing, so the write privilege alone suffices — the
+# rule INSERT ... RETURNING already follows. A subquery anywhere in those positions is taken as a
+# read of the target (it may be correlated), a deliberate conservative narrowing recorded in §5.3.
+# jed-specific (the envelope is host-configured), so CROSS-CORE-checked, NOT oracle-checked; the
+# directive grammar is privileges.test's.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.order_by, query.subquery_scalar, query.aggregates, types.i32, session.privileges, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE o (k i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO o VALUES (1)
+
+# --- DELETE ----------------------------------------------------------------------------------------
+
+# A WHERE that reads a column needs SELECT ...
+# default_privileges: DELETE
+statement error 42501
+DELETE FROM t WHERE id = 3
+
+# ... a column-free WHERE does not (nothing is read, every row is deleted — restored below).
+# default_privileges: DELETE
+# cost: 4
+statement ok
+DELETE FROM t WHERE true
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# RETURNING follows INSERT's rule: a column reference (or *) reads, a constant does not.
+# default_privileges: DELETE
+statement error 42501
+DELETE FROM t WHERE false RETURNING id
+
+# default_privileges: DELETE
+statement error 42501
+DELETE FROM t WHERE false RETURNING *
+
+# default_privileges: DELETE
+# cost: 0
+query I nosort
+DELETE FROM t WHERE false RETURNING 1
+----
+
+# A subquery in the WHERE is taken as a read of the target even when it names only another table
+# (the conservative rule), and that other table needs SELECT of its own.
+# default_privileges: DELETE
+statement error 42501
+DELETE FROM t WHERE 1 = (SELECT min(k) FROM o)
+
+# default_privileges: DELETE
+# grant: SELECT ON o
+statement error 42501
+DELETE FROM t WHERE 1 = (SELECT min(k) FROM o)
+
+# default_privileges: DELETE, SELECT
+# cost: 9
+statement ok
+DELETE FROM t WHERE 1 = (SELECT min(k) FROM o) AND id = 3
+
+# --- UPDATE ----------------------------------------------------------------------------------------
+
+# A column-reading WHERE or RHS needs SELECT ...
+# default_privileges: UPDATE
+statement error 42501
+UPDATE t SET v = 0 WHERE id = 1
+
+# default_privileges: UPDATE
+statement error 42501
+UPDATE t SET v = v + 1
+
+# default_privileges: UPDATE
+statement error 42501
+UPDATE t SET v = 0 RETURNING v
+
+# ... a column-free WHERE / RETURNING does not.
+# default_privileges: UPDATE
+# cost: 5
+query I nosort
+UPDATE t SET v = 5 WHERE true RETURNING 1
+----
+1
+1
+
+# default_privileges: UPDATE
+# cost: 0
+query I nosort
+UPDATE t SET v = 6 WHERE false RETURNING 1
+----
+
+# With both privileges the column-reading forms succeed.
+# default_privileges: SELECT, UPDATE
+# cost: 5
+query II nosort
+UPDATE t SET v = v + 1 WHERE id = 1 RETURNING id, v
+----
+1
+6
+
+query II nosort
+SELECT id, v FROM t ORDER BY id
+----
+1
+6
+2
+5

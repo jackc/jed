@@ -1,0 +1,33 @@
+# The text → boolean input (grammar.md §36, PostgreSQL's parse_bool): every unambiguous prefix of
+# true / false / yes / no / on / off, plus 1 / 0, case-insensitively and trimmed. `of` is `off`'s
+# prefix and is accepted (false); a lone `o` is ambiguous between `on` and `off` and is 22P02,
+# as is anything else.
+# requires: query.select, query.select_no_from, cast.operator, cast.string_literal, types.boolean
+
+query BBB nosort
+SELECT 'of'::boolean, 'OF'::boolean, ' of '::boolean
+----
+false
+false
+false
+
+query BBBBBBBB nosort
+SELECT 't'::boolean, 'tr'::boolean, 'ye'::boolean, 'on'::boolean, 'fa'::boolean, 'n'::boolean, 'off'::boolean, '0'::boolean
+----
+true
+true
+true
+true
+false
+false
+false
+false
+
+statement error 22P02
+SELECT 'o'::boolean
+
+statement error 22P02
+SELECT 'offf'::boolean
+
+statement error 22P02
+SELECT 'oof'::boolean

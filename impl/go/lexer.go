@@ -214,6 +214,12 @@ func scanNumber(sql string, b []byte, start int) (token, int, error) {
 	return token{Kind: tokDecimal, Word: digits, Int: uint64(scale)}, end, nil
 }
 
+// maxParamIndex is the largest bind-parameter index a statement may name (`$65535`, spec/design/api.md
+// §5): PostgreSQL's wire-protocol limit on the parameters of one statement. A fixed, cross-core-
+// identical bound, like maxExprDepth — the parameter table a statement allocates is sized by its
+// largest index, so the bound is what keeps `SELECT $4294967295` from allocating four billion slots.
+const maxParamIndex = 65535
+
 // Lex tokenizes sql into tokens terminated by TokEof (CLAUDE.md §5: parsers are
 // per-language, not codegen'd). Integer literals may carry a leading '-'. Errors are
 // structured (SQLSTATE 42601 syntax error).
@@ -238,6 +244,15 @@ func lex(sql string) ([]token, error) {
 // the last character — PostgreSQL's "at end of input". An error carries the position of the lexeme
 // being scanned (spec/design/error-fields.md §10.2).
 func lexWithPositions(sql string) ([]token, []int32, error) {
+	// The text is checked as a whole before it is scanned, as PostgreSQL verifies a query string's
+	// encoding before parsing it (pg_verifymbstr): an invalid UTF-8 sequence or a NUL byte anywhere —
+	// in a string literal, a quoted identifier, or between tokens — is 22021, naming the first bad
+	// sequence's bytes, with no position (spec/design/types.md §11). The scan below copies literal
+	// and identifier bytes raw, so this is what keeps every text value and name the engine stores
+	// valid UTF-8 without NUL; a host string parameter is checked the same way at bind (api.md §5).
+	if _, err := decodeUTF8Text(sql); err != nil {
+		return nil, nil, err
+	}
 	var starts []int
 	tokStart := 0
 	tokens, err := lexRaw(sql, &starts, &tokStart)
@@ -619,7 +634,8 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 		case c == '$':
 			// A bind parameter $N — '$' then a 1-based decimal index (spec/design/api.md §5,
 			// grammar.md §5). '$' with no following digit, $0, and a leading zero ($01) are 42601;
-			// an index overflowing uint32 is too.
+			// so is an index above maxParamIndex: the parameter table is sized by the largest index a
+			// statement names, so an unbounded index would be an unbounded allocation (CLAUDE.md §13).
 			i++ // consume '$'
 			digitStart := i
 			for i < len(b) && isDigit(b[i]) {
@@ -634,9 +650,11 @@ func lexRaw(sql string, starts *[]int, tokStart *int) ([]token, error) {
 					"invalid parameter number $%s: parameters are 1-based with no leading zero", digits,
 				))
 			}
-			n, err := strconv.ParseUint(digits, 10, 32)
-			if err != nil {
-				return nil, newError(SyntaxError, fmt.Sprintf("parameter number out of range: $%s", digits))
+			n, err := strconv.ParseUint(digits, 10, 64)
+			if err != nil || n > maxParamIndex {
+				return nil, newError(SyntaxError, fmt.Sprintf(
+					"parameter number out of range: $%s (the maximum is $%d)", digits, maxParamIndex,
+				))
 			}
 			tokens = append(tokens, token{Kind: tokParam, Int: n})
 		case isAlpha(c):

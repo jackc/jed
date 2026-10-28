@@ -1575,7 +1575,10 @@ pub(crate) fn resolve_projections(
             if let Some(star) = &scope.star {
                 for &idx in star {
                     let c = scope.column_at(idx);
-                    nodes.push(RExpr::Column(idx));
+                    // Each expanded column obeys the grouping rule exactly as a written reference
+                    // would (aggregates.md §4): in a grouped projection it must be a grouping column
+                    // (else 42803) and reads its group-row slot, never the flat input index.
+                    nodes.push(collect_column(scope, agg, idx, &c.name)?.0);
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
                     derivs.push(cat_column_deriv(c));
@@ -1622,7 +1625,8 @@ pub(crate) fn resolve_projections(
                     if scope.hidden.contains(&idx) {
                         continue;
                     }
-                    nodes.push(RExpr::Column(idx));
+                    // The grouping rule applies per expanded column (aggregates.md §4).
+                    nodes.push(collect_column(scope, agg, idx, &c.name)?.0);
                     names.push(c.name.clone());
                     types.push(resolved_type_of_col(&c.ty, scope.catalog));
                     derivs.push(cat_column_deriv(c));
@@ -1662,6 +1666,16 @@ pub(crate) fn resolve_projections(
                         )?;
                         continue;
                     }
+                    // A label naming both a relation and an inner join relation is ambiguous
+                    // (42P09), as for a qualified column (resolve_qualified).
+                    if scope.rels.iter().any(|r| r.label == want)
+                        && scope.sub_rels.iter().any(|sr| sr.label == want)
+                    {
+                        return Err(EngineError::new(
+                            SqlState::AmbiguousAlias,
+                            format!("table reference {want} is ambiguous"),
+                        ));
+                    }
                     let (table, slots): (&Table, Vec<usize>) =
                         match scope.rels.iter().find(|r| r.label == want) {
                             Some(rel) => (
@@ -1682,7 +1696,9 @@ pub(crate) fn resolve_projections(
                             }
                         };
                     for (i, c) in table.columns.iter().enumerate().take(slots.len()) {
-                        nodes.push(RExpr::Column(slots[i]));
+                        // The grouping rule applies per expanded column, as for bare `*`
+                        // (aggregates.md §4).
+                        nodes.push(collect_column(scope, agg, slots[i], &c.name)?.0);
                         names.push(c.name.clone());
                         types.push(resolved_type_of_col(&c.ty, scope.catalog));
                         derivs.push(cat_column_deriv(c));
@@ -1971,6 +1987,30 @@ fn has_correlated_subquery(e: &RExpr) -> bool {
             return true;
         }
     }
+    if let RExpr::And(..) | RExpr::Or(..) = e {
+        // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is walked along its
+        // left spine iteratively, not by recursing into each lhs, so the stack does not grow with
+        // the chain (cost.md §7f).
+        let is_and = matches!(e, RExpr::And(..));
+        let mut node: &RExpr = e;
+        loop {
+            match node {
+                RExpr::And(l, r) if is_and => {
+                    if has_correlated_subquery(r) {
+                        return true;
+                    }
+                    node = l;
+                }
+                RExpr::Or(l, r) if !is_and => {
+                    if has_correlated_subquery(r) {
+                        return true;
+                    }
+                    node = l;
+                }
+                _ => return has_correlated_subquery(node),
+            }
+        }
+    }
     estimator_expression_children(e)
         .into_iter()
         .any(has_correlated_subquery)
@@ -2210,6 +2250,11 @@ pub(crate) fn bind_params_with_labels(
     }
     let mut bound = Vec::with_capacity(types.len());
     for (i, (v, ty)) in supplied.iter().zip(types).enumerate() {
+        // A host text value is checked as PostgreSQL checks a text-format parameter's encoding: a
+        // NUL byte is 22021 (types.md §11), so no such value is ever compared, stored, or rendered.
+        if let Value::Text(s) = v {
+            crate::lexer::check_text_encoding(s)?;
+        }
         // A bound parameter is coerced exactly like a literal in that position: typmod is
         // unconstrained (a comparison/insert against a column re-applies the column typmod),
         // not_null is false (NULL is a legal bound value; a NOT NULL target re-checks at store).
@@ -3790,10 +3835,11 @@ pub(crate) fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &Has
 
 pub(crate) fn collect_update_privs(upd: &Update, req: &mut PrivReq, locals: &HashSet<String>) {
     req.need_table(&upd.table, Privilege::Update);
-    // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
-    // referencing assignment RHS (a constant-only `SET a = 1` with no WHERE/RETURNING reads nothing).
-    let reads = upd.filter.is_some()
-        || upd.returning.is_some()
+    // SELECT on the target if it reads any column (session.md §5.3, PostgreSQL's rule at table
+    // granularity): a column/subquery-referencing WHERE, RETURNING, or assignment RHS. A constant-only
+    // `SET a = 1`, `WHERE true`, or `RETURNING 1` reads nothing, so UPDATE alone suffices.
+    let reads = upd.filter.as_ref().is_some_and(expr_reads_columns)
+        || returning_reads_columns(&upd.returning)
         || upd.assignments.iter().any(|a| expr_reads_columns(&a.value));
     if reads {
         req.need_table(&upd.table, Privilege::Select);
@@ -3809,8 +3855,11 @@ pub(crate) fn collect_update_privs(upd: &Update, req: &mut PrivReq, locals: &Has
 
 pub(crate) fn collect_delete_privs(del: &Delete, req: &mut PrivReq, locals: &HashSet<String>) {
     req.need_table(&del.table, Privilege::Delete);
-    // DELETE reads the target's columns through a WHERE or a RETURNING.
-    if del.filter.is_some() || del.returning.is_some() {
+    // DELETE reads the target's columns through a column/subquery-referencing WHERE or RETURNING
+    // (session.md §5.3); `WHERE true` / `RETURNING 1` read nothing, so DELETE alone suffices.
+    if del.filter.as_ref().is_some_and(expr_reads_columns)
+        || returning_reads_columns(&del.returning)
+    {
         req.need_table(&del.table, Privilege::Select);
     }
     if let Some(f) = &del.filter {
@@ -4370,17 +4419,45 @@ pub(crate) fn resolve_column_ref(
     match r {
         Resolved::Local(idx) => collect_column(scope, agg, idx, name),
         Resolved::Outer { level, index } => {
-            // An enclosing-query column that is itself a GROUP BY key of this query reads the
-            // group's key slot (query.group_by_correlated) — so a ROLLUP grand-total row sees it
-            // NULL, as in PostgreSQL.
-            if let Some((slot, ty)) = match_group_outer(agg, level, index) {
-                return Ok((RExpr::Column(slot), ty));
-            }
             let ty = resolved_type_of_col(&scope.column_of(r).ty, scope.catalog);
-            Ok((RExpr::OuterColumn { level, index }, ty))
+            outer_column_ref(scope, agg, level, index, ty, name)
         }
         Resolved::Layer { level, rel, col } => resolve_layer_ref(scope, agg, level, rel, col, name),
     }
+}
+
+/// Build the correlated reference to flat column `idx` of the scope `level` hops out (§26). An
+/// ancestor that is GROUPED (`Scope::grouped_keys` — its projection / HAVING / ORDER BY planned this
+/// subquery) hands the subquery its GROUP row, so the column must be one of its grouping keys (else
+/// 42803, PostgreSQL's "subquery uses ungrouped column") and the node reads that key's slot; an
+/// ungrouped ancestor hands its input row, read at the flat index. The index is thus always a slot
+/// of the row the evaluator finds `level` frames out. An enclosing-query column that is itself a
+/// GROUP BY key of THIS query reads this query's group slot instead (query.group_by_correlated) — so
+/// a ROLLUP grand-total row sees it NULL, as in PostgreSQL.
+pub(crate) fn outer_column_ref(
+    scope: &Scope,
+    agg: &AggCtx,
+    level: usize,
+    idx: usize,
+    ty: ResolvedType,
+    name: &str,
+) -> Result<(RExpr, ResolvedType)> {
+    let slot = match scope.ancestor(level).grouped_keys.borrow().as_deref() {
+        Some(keys) => match keys.iter().position(|&k| k == idx) {
+            Some(slot) => slot,
+            None => {
+                return Err(EngineError::new(
+                    SqlState::GroupingError,
+                    format!("subquery uses ungrouped column {name} from outer query"),
+                ));
+            }
+        },
+        None => idx,
+    };
+    if let Some((gslot, gty)) = match_group_outer(agg, level, slot) {
+        return Ok((RExpr::Column(gslot), gty));
+    }
+    Ok((RExpr::OuterColumn { level, index: slot }, ty))
 }
 
 /// Resolve a composite field selection `base.field` (spec/design/composite.md §S4) given the
@@ -4437,9 +4514,10 @@ pub(crate) fn plan_row_subquery(
     scope: &Scope,
     inner: &QueryExpr,
     arity: usize,
+    agg: &AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(QueryPlan, ResolvedType)> {
-    let plan = plan_subquery(scope, inner, params)?;
+    let plan = plan_subquery(scope, inner, agg, params)?;
     let n = plan.column_types().len();
     if n != arity {
         let which = if n < arity { "few" } else { "many" };
@@ -4486,13 +4564,14 @@ fn plan_membership_subquery(
     scope: &Scope,
     lhs: &Expr,
     inner: &QueryExpr,
+    agg: &AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(QueryPlan, ResolvedType, bool)> {
     if let Expr::Row(items, _) = lhs {
-        let (plan, ty) = plan_row_subquery(scope, inner, items.len(), params)?;
+        let (plan, ty) = plan_row_subquery(scope, inner, items.len(), agg, params)?;
         return Ok((plan, ty, true));
     }
-    let plan = plan_subquery(scope, inner, params)?;
+    let plan = plan_subquery(scope, inner, agg, params)?;
     if plan.column_types().len() != 1 {
         return Err(EngineError::new(
             SqlState::SyntaxError,
@@ -4506,6 +4585,7 @@ fn plan_membership_subquery(
 pub(crate) fn plan_subquery(
     scope: &Scope,
     inner: &QueryExpr,
+    agg: &AggCtx,
     params: &mut ParamTypes,
 ) -> Result<QueryPlan> {
     if !scope.allow_subquery {
@@ -4519,9 +4599,25 @@ pub(crate) fn plan_subquery(
     // bound params, so a reused plan would carry another execution's folded constants. Every subquery
     // form (scalar / EXISTS / IN / quantified) funnels through here.
     params.uncacheable = true;
-    scope
+    // The inner query sees whether THIS level evaluates its row grouped (`Scope::grouped_keys`): a
+    // collecting context plans the subquery over the group row, any other over the input row.
+    let saved = scope.grouped_keys.replace(grouped_keys_of(agg));
+    let plan = scope
         .catalog
-        .plan_query(inner, Some(scope), scope.ctes, params)
+        .plan_query(inner, Some(scope), scope.ctes, params);
+    scope.grouped_keys.replace(saved);
+    plan
+}
+
+/// The grouping keys a collecting context evaluates over (the group-row slot order), or `None` for a
+/// context that reads the input row.
+fn grouped_keys_of(agg: &AggCtx) -> Option<Vec<usize>> {
+    match agg {
+        AggCtx::Collect { group_keys, .. } | AggCtx::GroupedWindow { group_keys, .. } => {
+            Some(group_keys.clone())
+        }
+        AggCtx::Forbidden | AggCtx::Window { .. } => None,
+    }
 }
 
 /// Resolve one array-subscript bound to an integer `RExpr` (a literal adapts to int4; a non-integer
@@ -5408,7 +5504,7 @@ fn resolve_node(
         // pass folds an uncorrelated one to a constant; a correlated one (an OuterColumn in its
         // plan) is re-executed per outer row by the evaluator.
         Expr::ScalarSubquery(inner, _) => outline(|| {
-            let plan = plan_subquery(scope, inner, params)?;
+            let plan = plan_subquery(scope, inner, agg, params)?;
             if plan.column_types().len() != 1 {
                 return Err(EngineError::new(
                     SqlState::SyntaxError,
@@ -5437,7 +5533,7 @@ fn resolve_node(
         Expr::Exists(inner, _) => outline(|| {
             // EXISTS ignores the select list entirely; the result is boolean, never NULL. A NOT
             // EXISTS parses as the unary `NOT` wrapping this, so `negated` here is always false.
-            let plan = plan_subquery(scope, inner, params)?;
+            let plan = plan_subquery(scope, inner, agg, params)?;
             Ok((
                 RExpr::Subquery {
                     plan: Box::new(plan),
@@ -5461,7 +5557,8 @@ fn resolve_node(
             // pair must be comparable (42804), exactly like a literal IN. A row-constructor LHS
             // makes it ROW-VALUED: N body columns, each row one anonymous composite element.
             let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
-            let (plan, elem, row_valued) = plan_membership_subquery(scope, lhs, query, params)?;
+            let (plan, elem, row_valued) =
+                plan_membership_subquery(scope, lhs, query, agg, params)?;
             classify_comparable(&lt, &elem)?;
             // `=` ignores the collation at eval (byte identity, collation.md §7), but a conflict
             // between the operand and the body column is still 42P22 (PostgreSQL's texteq demands
@@ -5681,6 +5778,18 @@ fn resolve_node(
                         ResolvedType::Range(Box::new(elem_rt)),
                         params,
                     );
+                }
+                // A runtime operand: a range of the SAME element type is the identity (no node — the
+                // array branch's rule, so `ROW(int4range(1,3), 1)::rr` casts its field), and a
+                // non-literal NULL adapts; every other source stays the documented 0A000 narrowing.
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                let result_rt = ResolvedType::Range(Box::new(elem_rt.clone()));
+                match ity {
+                    ResolvedType::Null => return Ok((rinner, result_rt)),
+                    ResolvedType::Range(ref src_elem) if **src_elem == elem_rt => {
+                        return Ok((rinner, result_rt));
+                    }
+                    _ => {}
                 }
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -5968,6 +6077,40 @@ fn resolve_node(
                         "cannot cast {} to uuid",
                         ity.type_name()
                     ))),
+                };
+            }
+            // A jsonpath TARGET (casts.toml, jsonpath.md §1): a runtime text expression compiles per
+            // row through the literal's own parser (42601 malformed; `jsonpath_compile` charged per
+            // byte, §7) and yields the canonical path text, as PostgreSQL's jsonpath_in. A string
+            // LITERAL was coerced above; `$1::jsonpath` declares the param as jsonpath; a NULL adapts;
+            // a jsonpath operand is the identity. Any other source is 42846 (cannot_coerce, as
+            // PostgreSQL).
+            if target == ScalarType::JsonPath {
+                if matches!(inner.as_ref(), Expr::Param(_, _)) {
+                    let (rinner, _) =
+                        resolve(scope, inner, Some(ScalarType::JsonPath), agg, params)?;
+                    return Ok((rinner, ResolvedType::JsonPath));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                return match ity {
+                    ResolvedType::Null | ResolvedType::JsonPath => {
+                        Ok((rinner, ResolvedType::JsonPath))
+                    }
+                    ResolvedType::Text => Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod: None,
+                            varchar_len: None,
+                            trap: TrapClass::May,
+                            temporal: None,
+                        },
+                        ResolvedType::JsonPath,
+                    )),
+                    _ => Err(EngineError::new(
+                        SqlState::CannotCoerce,
+                        format!("cannot cast type {} to jsonpath", ity.type_name()),
+                    )),
                 };
             }
             // An interval TARGET (interval.md §6, types.md §5): runtime text → interval parses the
@@ -6395,7 +6538,8 @@ fn resolve_node(
             // operator-not-found (42883) the way the array quantifier does (§11.3), not the plain
             // 42804. No 21000 cardinality limit (any row count is a list).
             let (rlhs, lt) = resolve(scope, lhs, None, agg, params)?;
-            let (plan, elem, row_valued) = plan_membership_subquery(scope, lhs, query, params)?;
+            let (plan, elem, row_valued) =
+                plan_membership_subquery(scope, lhs, query, agg, params)?;
             classify_comparable(&lt, &elem).map_err(|_| {
                 EngineError::new(
                     SqlState::UndefinedFunction,
@@ -6453,28 +6597,29 @@ fn resolve_node(
             }
             // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` ≡
             // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list
-            // is non-empty (the parser rejects `IN ()` → 42601). Resolving the desugared tree
-            // reuses the `=`/OR/NOT machinery verbatim, so the three-valued NULL semantics,
-            // per-element operand typing (a too-wide literal → 22003, a cross-family element →
-            // 42804), and cost all fall out. The LHS is evaluated once per element (the
-            // OR-chain model — a documented cost consequence, cost.md §3).
-            let mut folded: Option<Expr> = None;
+            // is non-empty (the parser rejects `IN ()` → 42601). Each `x = elem` is resolved by
+            // the `=` machinery verbatim, so the per-element operand typing (a too-wide literal
+            // → 22003, a cross-family element → 42804) falls out; the OR / NOT nodes are built
+            // here exactly as resolve_and_or / the NOT arm build them (both operands bool — an
+            // `=` always is), so the three-valued NULL semantics and cost fall out too. The chain
+            // is assembled in a loop, not resolved as one tree: it is as deep as the list is
+            // long, and resolving it recursively would use native stack per element (cost.md
+            // §7). The LHS is evaluated once per element (the OR-chain model — a documented cost
+            // consequence, cost.md §3).
+            let mut folded: Option<RExpr> = None;
             for elem in list {
                 let eq = binary_expr(BinaryOp::Eq, (**lhs).clone(), elem.clone(), *pos);
+                let (req, _) = resolve(scope, &eq, None, agg, params)?;
                 folded = Some(match folded {
-                    None => eq,
-                    Some(acc) => binary_expr(BinaryOp::Or, acc, eq, *pos),
+                    None => req,
+                    Some(acc) => RExpr::Or(Box::new(acc), Box::new(req)),
                 });
             }
-            let mut desugared = folded.expect("IN list is non-empty (parser guarantees ≥1)");
+            let mut node = folded.expect("IN list is non-empty (parser guarantees ≥1)");
             if *negated {
-                desugared = Expr::Unary {
-                    op: UnaryOp::Not,
-                    operand: Box::new(desugared),
-                    pos: *pos,
-                };
+                node = RExpr::Not(Box::new(node));
             }
-            resolve(scope, &desugared, ctx, agg, params)
+            Ok((node, ResolvedType::Bool))
         }),
         Expr::Between {
             lhs,

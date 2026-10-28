@@ -39,6 +39,24 @@ test("semicolon in a string is not a boundary", () => {
   assert.deepStrictEqual(texts("SELECT 'it''s; ok'"), ["SELECT 'it''s; ok'"]);
 });
 
+test("semicolon in a quoted identifier is not a boundary", () => {
+  // A double-quoted identifier is opaque to the splitter, like a string literal (grammar.md §3).
+  assert.deepStrictEqual(texts(`CREATE TABLE "a;b" (x i32); INSERT INTO "a;b" VALUES (1)`), [
+    `CREATE TABLE "a;b" (x i32)`,
+    `INSERT INTO "a;b" VALUES (1)`,
+  ]);
+  // An embedded `""` quote, with a `;` between the two quotes; a `'` inside the identifier.
+  assert.deepStrictEqual(texts(`SELECT "it"";s"; SELECT "a'b;c"`), [
+    `SELECT "it"";s"`,
+    `SELECT "a'b;c"`,
+  ]);
+  // A Unicode-escape identifier / literal: `U&` is ordinary text before the quote.
+  assert.deepStrictEqual(texts(`SELECT U&"a;b", U&'c;d'; SELECT 2`), [
+    `SELECT U&"a;b", U&'c;d'`,
+    "SELECT 2",
+  ]);
+});
+
 test("semicolon in a comment is not a boundary", () => {
   assert.deepStrictEqual(texts("SELECT 1 -- a; b\n; SELECT 2"), ["SELECT 1", "SELECT 2"]);
   assert.deepStrictEqual(texts("SELECT /* a; b */ 1; SELECT 2"), [

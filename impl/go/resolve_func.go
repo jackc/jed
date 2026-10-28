@@ -2139,7 +2139,7 @@ func resolveQuantifiedSubquery(s *scope, q *quantifiedSubqueryExpr, ag *aggCtx, 
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	plan, elem, rowValued, err := planMembershipSubquery(s, q.Lhs, q.Query, params)
+	plan, elem, rowValued, err := planMembershipSubquery(s, q.Lhs, q.Query, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -2967,9 +2967,12 @@ func resolveJsonpathArgs(s *scope, name string, args []*exprNode, argNames []*st
 }
 
 // jsonpathContextNode is a jsonpath query's context item: a jsonb value as is, a json value converted
-// to jsonb (PostgreSQL casts it: keys canonical, duplicates last-wins — jsonpath.md §5).
+// to jsonb (PostgreSQL casts it: keys canonical, duplicates last-wins — jsonpath.md §5), and a text
+// value (the SQL/JSON query functions and JSON_TABLE admit a `text` context item, with or without
+// FORMAT JSON — json-sql-functions.md §5.1) parsed as jsonb: malformed text is 22P02, raised by
+// the context's conversion, outside ON ERROR (json.md §4.2), as in PostgreSQL.
 func jsonpathContextNode(v Value) (JsonNode, error) {
-	if v.Kind == ValJson {
+	if v.Kind == ValJson || v.Kind == ValText {
 		return jsonbIn(v.str())
 	}
 	return jsonArgNode(v)

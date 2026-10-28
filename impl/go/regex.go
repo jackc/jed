@@ -742,6 +742,15 @@ func (c *regexCompiler) emit(n *regexNode) error {
 		c.insts[jmp].x = lend
 		return nil
 	case nStar:
+		if regexNullable(n.subs[0]) {
+			// A star over a NULLABLE body is lowered as `(sub+)?` (RE2's rule, regex.md §3.3): the
+			// plain loop's `Jmp L1` re-enters a pc the epsilon closure already visited, so the
+			// thread that took the body's empty iteration dies and a capture inside it stays
+			// unset (`(a*)*` on '' → {NULL}); `(sub+)?` enters the body first and loops from its
+			// end, so the empty iteration is recorded ({""}, as PostgreSQL/RE2/PCRE).
+			plus := &regexNode{kind: nPlus, subs: n.subs, greedy: n.greedy}
+			return c.emit(&regexNode{kind: nQuest, subs: []*regexNode{plus}, greedy: n.greedy})
+		}
 		// L1: Split L2,L3 (greedy) / Split L3,L2 (lazy) ; L2: <sub>; Jmp L1 ; L3:
 		l1, err := c.push(regexInst{op: opSplit})
 		if err != nil {
@@ -823,6 +832,31 @@ func (c *regexCompiler) emit(n *regexNode) error {
 		return err
 	}
 	return nil
+}
+
+// regexNullable reports whether a node can match the empty string (RE2's `nullable` flag): the
+// Star lowering branches on it (regex.md §3.3). Zero-width assertions are nullable; a Repeat with
+// min 0 is nullable, otherwise it is as nullable as its body.
+func regexNullable(n *regexNode) bool {
+	switch n.kind {
+	case nChar, nAny, nClass:
+		return false
+	case nConcat:
+		for _, sub := range n.subs {
+			if !regexNullable(sub) {
+				return false
+			}
+		}
+		return true
+	case nAlt:
+		return regexNullable(n.subs[0]) || regexNullable(n.subs[1])
+	case nPlus, nGroup:
+		return regexNullable(n.subs[0])
+	case nRepeat:
+		return n.repMin == 0 || regexNullable(n.subs[0])
+	default: // nEmpty, nStar, nQuest, the anchors
+		return true
+	}
 }
 
 // emitRepeat unrolls `{min,max}` -> min mandatory copies, then a Star ({min,}) or (max-min)
@@ -1510,10 +1544,12 @@ func sliceGroup(orig []rune, start, end int64) *string {
 	return &s
 }
 
-// forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), \\
-// (literal backslash), and \<other> (the literal <other>). A trailing lone \ is literal, and an unset
-// or absent group expands to nothing. Each piece is a literal rune (lo < 0) or the [lo, hi) span of
-// the original input. Sizing and building share this walk so they cannot disagree.
+// forEachPiece walks a replacement template, expanding \1..\9 (capture group), \& (whole match), and
+// \\ (literal backslash) — the only special sequences (regex.md §8, PG appendStringInfoRegexpSubstr).
+// Any other \<other> (including \0) keeps BOTH characters literally: the backslash is copied and
+// <other> is read again as ordinary template text. A trailing lone \ is literal, and an unset or
+// absent group expands to nothing. Each piece is a literal rune (lo < 0) or the [lo, hi) span of the
+// original input. Sizing and building share this walk so they cannot disagree.
 func (p *regexProgram) forEachPiece(repl []rune, caps regexCaps, f func(r rune, lo, hi int)) {
 	span := func(start, end int64) {
 		if start >= 0 && end >= 0 {
@@ -1525,15 +1561,20 @@ func (p *regexProgram) forEachPiece(repl []rune, caps regexCaps, f func(r rune, 
 		if c == '\\' && i+1 < len(repl) {
 			n := repl[i+1]
 			switch {
-			case n >= '0' && n <= '9':
+			case n >= '1' && n <= '9':
 				g := int(n - '0')
 				if g <= p.ngroups {
 					span(p.slot(caps, 2*g), p.slot(caps, 2*g+1))
 				}
 			case n == '&':
 				span(p.slot(caps, 0), p.slot(caps, 1))
+			case n == '\\':
+				f(n, -1, -1) // \\ -> \
 			default:
-				f(n, -1, -1) // \\ -> \, and \<other> -> <other>
+				// Not a special sequence: the backslash is literal and <other> is re-read as plain
+				// text (so `\0` is `\0`, not the whole match).
+				f(c, -1, -1)
+				continue
 			}
 			i++
 		} else {

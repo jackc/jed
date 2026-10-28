@@ -182,6 +182,24 @@ func (c *sharedCore) releaseWriter() {
 	c.writeMu.Unlock()
 }
 
+// tryAcquireWriterLocal claims the in-process writer lock only if it is free right now (no gates —
+// the Attach/Detach scope of acquireWriterScoped), else fails 55006 with busy as the message. A
+// host-API act never waits for the writer gate (api.md §2.3): the gate may be held by a session on
+// this very goroutine (an open BEGIN / Update block), which waiting would deadlock, so like Compact
+// it reports object_in_use and the host ends the transaction first. Released by releaseWriter.
+func (c *sharedCore) tryAcquireWriterLocal(busy string) error {
+	if !c.writeMu.TryLock() {
+		return newError(ObjectInUse, busy)
+	}
+	if c.handoff == nil {
+		if err := c.checkCoordinatorPIDs(); err != nil {
+			c.writeMu.Unlock()
+			return err
+		}
+	}
+	return nil
+}
+
 // hasSharedCoordinator reports whether other processes may commit to this database or one of its
 // attachments, so a read session refreshes at its first read: true under the page service.
 func (c *sharedCore) hasSharedCoordinator() bool {
@@ -2036,7 +2054,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			coordinator.close()
 		}
 	}
-	if err := c.acquireWriterScoped(0, false); err != nil {
+	if err := c.tryAcquireWriterLocal(`cannot attach database "` + name + `" while a write transaction is open`); err != nil {
 		release()
 		return err
 	}
@@ -2091,7 +2109,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 func (db *Database) Detach(name string) error {
 	lname := name
 	c := db.core
-	if err := c.acquireWriterScoped(0, false); err != nil {
+	if err := c.tryAcquireWriterLocal(`cannot detach database "` + name + `" while a write transaction is open`); err != nil {
 		return err
 	}
 	c.attachmentsMu.Lock()
@@ -2607,15 +2625,24 @@ func (db *Database) UpgradeCollations() (int, error) {
 }
 
 // Close closes the backing store (an in-memory store's close is a no-op). The bare convenience
-// methods autocommit, so there is never uncommitted work to discard. Idempotent.
+// methods autocommit, so there is never uncommitted work to discard; a session's open write
+// transaction is the session's to end (session.md §2.3), so Close never waits for the writer gate —
+// it would deadlock against a block open on this very goroutine — and fails 55006 while one is held
+// (api.md §2.3). Idempotent.
 func (db *Database) Close() error {
 	c := db.core
+	if c.handoff != nil && c.handoff.closed.Load() {
+		return nil
+	}
+	// Probe the gate before touching the service: a held gate is reported without any partial close, so
+	// the host can end the transaction and Close again.
+	if !c.writeMu.TryLock() {
+		return newError(ObjectInUse, "cannot close the database while a write transaction is open")
+	}
+	c.writeMu.Unlock()
 	if c.handoff != nil {
 		// A serving owner drains its clients and stops serving while presence EX is still held; a client
 		// closes its connection (page-service.md §4.1; README.md §6.5).
-		if c.handoff.closed.Load() {
-			return nil
-		}
 		c.closeService()
 	}
 	c.writeMu.Lock()
@@ -2723,6 +2750,9 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 	}
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
+		// A parse error (42601 / the 54000 input-size limit) is a statement error: inside an open block it
+		// aborts the block like an execution error (transactions.md §6 — PostgreSQL aborts on ANY error).
+		s.engine.failOpenBlock()
 		return nil, err
 	}
 	return s.queryStmt(stmt, params, nil, nil) // one-shot: no cross-call plan cache (still plans once)
@@ -2890,6 +2920,7 @@ func (s *Session) refreshInitialRead() error {
 func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
+		s.engine.failOpenBlock() // a parse error inside an open block aborts it (transactions.md §6)
 		return nil, err
 	}
 	return &PreparedStatement{ast: stmt}, nil
@@ -3221,12 +3252,21 @@ func (s *Session) withBlock(writable, modeSet bool, fn func(tx *Transaction) err
 	if _, err := s.beginBlock(writable, modeSet); err != nil {
 		return err
 	}
-	// done:true so the Transaction's own Rollback is a no-op — the session ends the block (publishing
-	// through the shared core / releasing the gate). The closure runs only Execute/Query against it.
-	tx := &Transaction{db: s.engine, done: true}
+	// scoped: the session ends the block (publishing through the shared core / releasing the gate), so
+	// the Transaction's own Commit/Rollback — and SQL COMMIT/ROLLBACK through it — are 2D000 (api.md
+	// §2.2): the closure's writes are never discarded by ending the block early.
+	tx := &Transaction{db: s.engine, done: true, scoped: true}
 	if err := fn(tx); err != nil {
 		_, _ = s.endBlock(false)
 		return err
+	}
+	if cur := s.engine.session.tx; cur != nil && cur.failed {
+		// The closure swallowed a statement error: the block is failed, so "commit" would be a silent
+		// ROLLBACK (transactions.md §6). A closure API reports that — its writes are never discarded
+		// behind a nil return.
+		_, _ = s.endBlock(false)
+		return newError(InFailedSqlTransaction,
+			"current transaction is aborted, commands ignored until end of transaction block")
 	}
 	_, err := s.endBlock(true)
 	return err

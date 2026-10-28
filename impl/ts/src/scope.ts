@@ -120,6 +120,7 @@ import { finalizeRange, rangeForElement } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 import { type ColType, colTypeScalar } from "./catalog.ts";
 import { quoteIdentifier } from "./parser.ts";
+import { checkTextEncoding } from "./lexer.ts";
 import type { Privilege } from "./privileges.ts";
 import type { TableStore } from "./storage.ts";
 import type { ViewWrite, WriteLayer } from "./view_write.ts";
@@ -264,6 +265,14 @@ export class Scope {
   // The flat slot merge_action() reads: set only on a MERGE's RETURNING scope
   // (spec/design/merge.md §7). Elsewhere the function is 42601.
   mergeAction: number | null = null;
+  // groupKeys marks this scope as GROUPED for the subqueries planned under it: the flat input indices
+  // of its grouping keys in group-row slot order (the planner's master list, functionally dependent
+  // columns included — aggregates.md §4). Set only while a collecting AggCtx plans a subquery
+  // (planSubquery): the projection, HAVING, ORDER BY and window keys of a grouped query evaluate over
+  // the GROUP row (keys, then aggregates), so a correlated reference into this scope from such a
+  // subquery must name a grouping column — else 42803, as in PostgreSQL — and reads that key's slot
+  // (resolveColumnRef). A subquery in WHERE or an aggregate argument sees the flat input row (null).
+  groupKeys: number[] | null = null;
   constructor(
     rels: ScopeRel[],
     catalog: Engine,
@@ -659,7 +668,13 @@ export class Scope {
     // Two relations under one label at this level — only the DO UPDATE scope of a target labeled
     // `excluded` builds one (every FROM rejects a duplicate label up front, 42712): PostgreSQL's
     // 42P09 (upsert.md §5).
-    if (this.rels.filter((r) => r.label === q).length > 1) {
+    // A relation label that is also an inner label of a joined source (a MERGE target aliased like
+    // one of its source join's relations — merge.md §2) is likewise ambiguous: PostgreSQL's 42P09,
+    // never a silent bind to the target.
+    const labeled =
+      this.rels.filter((r) => r.label === q).length +
+      (this.subRels.some((sr) => sr.label === q) ? 1 : 0);
+    if (labeled > 1) {
       throw engineError("ambiguous_alias", `table reference ${qualifier} is ambiguous`);
     }
     for (let ri = 0; ri < this.rels.length; ri++) {
@@ -1176,27 +1191,115 @@ export function cteModes(bindings: CteBinding[]): CteMode[] {
   });
 }
 
-// staticCteRefs counts the static references to CTE `name` in one part of a WITH statement, as
-// [query, data-modifying]: a data-modifying part's references are counted apart, because such a part
-// is planned only when it runs, so a CTE it names is never inlined at its reference (planner.md
-// §3.4). A query expression is a CteBody too, so it also serves the primary of a nested WITH.
-function staticCteRefs(body: CteBody, name: string): [number, number] {
-  const n = countCteRefsDml(body, name);
-  return cteBodyIsDataModifying(body) ? [0, n] : [n, 0];
+// CteRefVisitor is what the cteRefs* walkers do at each plain relation reference they reach: it
+// receives the referenced name and returns that reference's contribution to the walk's count. Two
+// visitors exist — matchCteName counts one name (the countSelfRefs* / countCteRefsDml wrappers), and
+// CteRefCounts tallies every name in one pass (the CteRefTally the WITH planner uses so a list of n
+// CTEs is counted in O(total size), not O(n × size) — one walk per body, not one per (body, name)).
+type CteRefVisitor = (name: string) => number;
+
+// matchCteName is the single-name visitor: +1 per reference to name.
+function matchCteName(name: string): CteRefVisitor {
+  return (ref) => (ref === name ? 1 : 0);
 }
 
-// cteReferenceCandidate reports whether the CTE at ci in a WITH list may be inlined at its reference
-// (planner.md §3.4): not MATERIALIZED, and named exactly once by the later CTE bodies and `primary`
-// (the query that owns the list), by a query part.
-export function cteReferenceCandidate(ctes: Cte[], ci: number, primary: CteBody): boolean {
-  const name = ctes[ci]!.name;
-  let [query, dml] = staticCteRefs(primary, name);
-  for (const later of ctes.slice(ci + 1)) {
-    const [q, d] = staticCteRefs(later.body, name);
-    query += q;
-    dml += d;
+// shadowCteName masks name for the rest of a walk: a nested WITH that declares an inner CTE of that
+// name shadows the outer binding for its later bodies and its main query (cte.md §7), so a reference
+// to the name there is not a reference to the outer CTE.
+function shadowCteName(visit: CteRefVisitor, name: string): CteRefVisitor {
+  return (ref) => (ref === name ? 0 : visit(ref));
+}
+
+// CteRefCounts tallies every plain relation reference a walk reaches, by name (the multi-name
+// visitor behind CteRefTally).
+type CteRefCounts = Map<string, number>;
+
+function tallyInto(counts: CteRefCounts): CteRefVisitor {
+  return (ref) => {
+    counts.set(ref, (counts.get(ref) ?? 0) + 1);
+    return 0;
+  };
+}
+
+// countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
+// relations at every nesting level plus expression sublinks).
+export function countSelfRefsQuery(qe: QueryExpr, name: string): number {
+  return cteRefsQuery(qe, matchCteName(name));
+}
+
+// countCteRefsDml counts references to CTE `name` reachable through a cte_body's inner queries (the
+// writable-CTE analogue of countSelfRefsQuery, spec/design/writable-cte.md §3).
+export function countCteRefsDml(body: CteBody, name: string): number {
+  return cteRefsDml(body, matchCteName(name));
+}
+
+// CteRefTally is the static reference count of every CTE in one WITH list, computed in one walk per
+// part (planner.md §3.4). The candidate question — for the CTE at ci, how often do the LATER bodies
+// and the primary name it — answered with a per-name walk over the remaining list is O(n²) in the
+// number of CTEs (20 000 CTEs took a minute of unmetered planning). The tally walks each body once,
+// keeping its per-name counts, and answers in cursor order: before CTE ci is asked, the counts of
+// bodies 0..ci are subtracted from the running totals, which then hold exactly the later bodies' and
+// the primary's references — the same figures as the per-name walks, in O(total size). A
+// data-modifying part's references count apart, because such a part is planned only when it runs,
+// so a CTE it names is never inlined at its reference.
+export class CteRefTally {
+  private readonly query: CteRefCounts = new Map(); // by query parts after the cursor + a query primary
+  private readonly dml: CteRefCounts = new Map(); // by data-modifying parts after the cursor + a data-modifying primary
+  private readonly bodies: CteRefCounts[] = []; // per CTE body, its references by name
+  private next = 0; // the first body not yet subtracted
+  private readonly ctes: Cte[];
+
+  // Walks every CTE body and the primary (the query that owns the list) once.
+  constructor(ctes: Cte[], primary: CteBody) {
+    this.ctes = ctes;
+    for (const cte of ctes) {
+      const counts: CteRefCounts = new Map();
+      cteRefsDml(cte.body, tallyInto(counts));
+      this.bodies.push(counts);
+      this.add(counts, cteBodyIsDataModifying(cte.body), 1);
+    }
+    const counts: CteRefCounts = new Map();
+    cteRefsDml(primary, tallyInto(counts));
+    this.add(counts, cteBodyIsDataModifying(primary), 1);
   }
-  return query === 1 && dml === 0 && ctes[ci]!.materialized !== true;
+
+  private add(counts: CteRefCounts, isDml: boolean, sign: number): void {
+    const into = isDml ? this.dml : this.query;
+    for (const [name, n] of counts) into.set(name, (into.get(name) ?? 0) + sign * n);
+  }
+
+  // candidate reports whether the CTE at ci may be inlined at its reference (planner.md §3.4): not
+  // MATERIALIZED, and named exactly once by the later CTE bodies and the primary, by a query part.
+  // The WITH planner asks in list order, so the cursor only ever moves forward.
+  candidate(ci: number): boolean {
+    for (; this.next <= ci; this.next++) {
+      const cte = this.ctes[this.next]!;
+      this.add(this.bodies[this.next]!, cteBodyIsDataModifying(cte.body), -1);
+    }
+    const cte = this.ctes[ci]!;
+    return (
+      (this.query.get(cte.name) ?? 0) === 1 &&
+      (this.dml.get(cte.name) ?? 0) === 0 &&
+      cte.materialized !== true
+    );
+  }
+}
+
+// addDmlCteRefs adds the references one NON-planned data-modifying part (a data-modifying CTE body,
+// or a data-modifying primary) contributes to each binding it names (writable-cte.md §3), in one walk
+// of the part: byName indexes the bindings (the WITH planner rejects a duplicate name).
+export function addDmlCteRefs(byName: Map<string, CteBinding>, body: CteBody): void {
+  const counts: CteRefCounts = new Map();
+  cteRefsDml(body, tallyInto(counts));
+  for (const [name, n] of counts) {
+    const b = byName.get(name);
+    if (b !== undefined) b.refs += n;
+  }
+}
+
+// cteBindingsByName indexes bindings by name for addDmlCteRefs.
+export function cteBindingsByName(bindings: CteBinding[]): Map<string, CteBinding> {
+  return new Map(bindings.map((b) => [b.name, b]));
 }
 
 // addOutcomeCost adds extra cost to an outcome (the writable-CTE orchestrator folds the
@@ -1206,181 +1309,171 @@ export function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
   return { ...outcome, cost: outcome.cost + extra };
 }
 
-// countCteRefsDml counts references to CTE `name` reachable through a cte_body's inner queries — the
-// writable-CTE analogue of countSelfRefsQuery (spec/design/writable-cte.md §3). A query body delegates
-// to the query counter; a data-modifying body counts the references in its source query / WHERE / SET
-// RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the references a
-// NON-planned data-modifying part contributes to the inline-vs-materialize decision.
-export function countCteRefsDml(body: CteBody, name: string): number {
+// cteRefsDml walks the references reachable through a cte_body's inner queries — the writable-CTE
+// analogue of cteRefsQuery (spec/design/writable-cte.md §3). A query body delegates to the query
+// walker; a data-modifying body walks the references in its source query / WHERE / SET RHSs / ON
+// CONFLICT / RETURNING sublinks.
+function cteRefsDml(body: CteBody, visit: CteRefVisitor): number {
   if (body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr") {
-    return countSelfRefsQuery(body, name);
+    return cteRefsQuery(body, visit);
   }
   if (body.kind === "insert") {
     let n = 0;
     if (body.source.kind === "query") {
-      n = countSelfRefsQuery(body.source.query, name);
+      n = cteRefsQuery(body.source.query, visit);
     } else {
       // A VALUES expression slot may hold a sublink (grammar.md §16).
       for (const values of body.source.rows) {
-        for (const v of values) if (v.kind === "expr") n += countSelfRefsExpr(v.expr, name);
+        for (const v of values) if (v.kind === "expr") n += cteRefsExpr(v.expr, visit);
       }
     }
     if (body.onConflict?.doUpdate) {
-      for (const a of body.onConflict.assignments) n += countSelfRefsExpr(a.value, name);
-      if (body.onConflict.filter !== null) n += countSelfRefsExpr(body.onConflict.filter, name);
+      for (const a of body.onConflict.assignments) n += cteRefsExpr(a.value, visit);
+      if (body.onConflict.filter !== null) n += cteRefsExpr(body.onConflict.filter, visit);
     }
-    return n + countReturningRefs(body.returning, name);
+    return n + cteRefsReturning(body.returning, visit);
   }
   if (body.kind === "update") {
     let n = 0;
-    for (const a of body.assignments) n += countSelfRefsExpr(a.value, name);
-    if (body.filter !== null) n += countSelfRefsExpr(body.filter, name);
-    return n + countReturningRefs(body.returning, name);
+    for (const a of body.assignments) n += cteRefsExpr(a.value, visit);
+    if (body.filter !== null) n += cteRefsExpr(body.filter, visit);
+    return n + cteRefsReturning(body.returning, visit);
   }
   if (body.kind === "merge") {
-    let n = countSelfRefsQuery(body.source, name) + countSelfRefsExpr(body.on, name);
+    let n = cteRefsQuery(body.source, visit) + cteRefsExpr(body.on, visit);
     for (const c of body.clauses) {
-      if (c.condition !== null) n += countSelfRefsExpr(c.condition, name);
+      if (c.condition !== null) n += cteRefsExpr(c.condition, visit);
       if (c.action.kind === "update") {
-        for (const a of c.action.assignments) n += countSelfRefsExpr(a.value, name);
+        for (const a of c.action.assignments) n += cteRefsExpr(a.value, visit);
       } else if (c.action.kind === "insert") {
-        for (const v of c.action.values) if (v !== null) n += countSelfRefsExpr(v, name);
+        for (const v of c.action.values) if (v !== null) n += cteRefsExpr(v, visit);
       }
     }
-    return n + countReturningRefs(body.returning, name);
+    return n + cteRefsReturning(body.returning, visit);
   }
   // delete
   let n = 0;
-  if (body.filter !== null) n += countSelfRefsExpr(body.filter, name);
-  return n + countReturningRefs(body.returning, name);
+  if (body.filter !== null) n += cteRefsExpr(body.filter, visit);
+  return n + cteRefsReturning(body.returning, visit);
 }
 
-// countReturningRefs counts references to CTE `name` in a RETURNING item list's sublinks.
-export function countReturningRefs(returning: ReturningClause | null, name: string): number {
+// cteRefsReturning walks the references in a RETURNING item list's sublinks.
+function cteRefsReturning(returning: ReturningClause | null, visit: CteRefVisitor): number {
   if (returning === null || returning.items.kind !== "list") return 0;
-  return returning.items.items.reduce((a, it) => a + countSelfRefsExpr(it.expr, name), 0);
+  return returning.items.items.reduce((a, it) => a + cteRefsExpr(it.expr, visit), 0);
 }
 
-// countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
-// relations at every nesting level plus expression sublinks).
-export function countSelfRefsQuery(qe: QueryExpr, name: string): number {
-  if (qe.kind === "select") return countSelfRefsSelect(qe, name);
+// cteRefsQuery walks the self-references anywhere in a query expression (deep — FROM relations at
+// every nesting level plus expression sublinks), summing what visit returns for each.
+function cteRefsQuery(qe: QueryExpr, visit: CteRefVisitor): number {
+  if (qe.kind === "select") return cteRefsSelect(qe, visit);
   if (qe.kind === "withExpr") {
     // A nested WITH inherits this binding until an inner same-named CTE is declared. That inner
     // binding shadows it for later bodies and the main query, but its own non-recursive body still
     // sees the inherited binding (cte.md §7).
     let n = 0;
-    let shadowed = false;
+    let inner = visit;
     for (const cte of qe.ctes) {
-      if (!shadowed) n += countCteRefsDml(cte.body, name);
-      if (cte.name === name) shadowed = true;
+      n += cteRefsDml(cte.body, inner);
+      inner = shadowCteName(inner, cte.name);
     }
-    if (!shadowed) n += countSelfRefsQuery(qe.body, name);
+    n += cteRefsQuery(qe.body, inner);
     return n;
   }
-  return countSelfRefsQuery(qe.lhs, name) + countSelfRefsQuery(qe.rhs, name);
+  return cteRefsQuery(qe.lhs, visit) + cteRefsQuery(qe.rhs, visit);
 }
 
-// countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
+// cteRefsSelect walks the self-references in a SELECT: its FROM relations (deep) plus all of its
 // expressions' sublinks.
-export function countSelfRefsSelect(s: Select, name: string): number {
+function cteRefsSelect(s: Select, visit: CteRefVisitor): number {
   let n = 0;
-  for (const tref of fromRelations(s)) n += countSelfRefsTableref(tref, name);
-  for (const e of selectExprs(s)) n += countSelfRefsExpr(e, name);
+  for (const tref of fromRelations(s)) n += cteRefsTableref(tref, visit);
+  for (const e of selectExprs(s)) n += cteRefsExpr(e, visit);
   return n;
 }
 
-// countSelfRefsTableref counts self-references reachable through one FROM relation: a plain table
-// reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
-// / VALUES' argument exprs.
-export function countSelfRefsTableref(tref: TableRef, name: string): number {
-  if (isPlainRelation(tref)) return tref.name === name ? 1 : 0;
+// cteRefsTableref walks the self-references reachable through one FROM relation: a plain table
+// reference (visited by name), a derived-table subquery (recurse), or a table-function's / VALUES'
+// argument exprs.
+function cteRefsTableref(tref: TableRef, visit: CteRefVisitor): number {
+  if (isPlainRelation(tref)) return visit(tref.name);
   let n = 0;
-  if (tref.subquery !== undefined) n += countSelfRefsQuery(tref.subquery, name);
+  if (tref.subquery !== undefined) n += cteRefsQuery(tref.subquery, visit);
   if (tref.args !== null && tref.args !== undefined) {
-    for (const a of tref.args) n += countSelfRefsExpr(a, name);
+    for (const a of tref.args) n += cteRefsExpr(a, visit);
   }
   if (tref.values !== undefined) {
-    for (const row of tref.values) for (const e of row) n += countSelfRefsExpr(e, name);
+    for (const row of tref.values) for (const e of row) n += cteRefsExpr(e, visit);
   }
   return n;
 }
 
-// countSelfRefsExpr counts self-references inside an expression — only reachable through a sublink
-// (a subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
+// cteRefsExpr walks the self-references inside an expression — only reachable through a sublink (a
+// subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
 // (like exprHasAggregate).
-export function countSelfRefsExpr(e: Expr, name: string): number {
+function cteRefsExpr(e: Expr, visit: CteRefVisitor): number {
   switch (e.kind) {
     case "scalarSubquery":
     case "exists":
-      return countSelfRefsQuery(e.query, name);
+      return cteRefsQuery(e.query, visit);
     case "inSubquery":
     case "quantifiedSubquery":
-      return countSelfRefsExpr(e.lhs, name) + countSelfRefsQuery(e.query, name);
+      return cteRefsExpr(e.lhs, visit) + cteRefsQuery(e.query, visit);
     case "cast":
     case "collate":
-      return countSelfRefsExpr(e.inner, name);
+      return cteRefsExpr(e.inner, visit);
     case "extract":
-      return countSelfRefsExpr(e.source, name);
+      return cteRefsExpr(e.source, visit);
     case "unary":
     case "isNull":
     case "isJson":
     case "jsonCtor":
-      return countSelfRefsExpr(e.operand, name);
+      return cteRefsExpr(e.operand, visit);
     case "jsonExists":
     case "jsonValue":
     case "jsonQuery":
       return (
-        countSelfRefsExpr(e.ctx, name) +
-        countSelfRefsExpr(e.path, name) +
-        e.passing.reduce((n, p) => n + countSelfRefsExpr(p.expr, name), 0)
+        cteRefsExpr(e.ctx, visit) +
+        cteRefsExpr(e.path, visit) +
+        e.passing.reduce((n, p) => n + cteRefsExpr(p.expr, visit), 0)
       );
     case "binary":
     case "isDistinct":
     case "like":
     case "regex":
-      return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.rhs, name);
+      return cteRefsExpr(e.lhs, visit) + cteRefsExpr(e.rhs, visit);
     case "in":
-      return (
-        countSelfRefsExpr(e.lhs, name) + e.list.reduce((a, x) => a + countSelfRefsExpr(x, name), 0)
-      );
+      return cteRefsExpr(e.lhs, visit) + e.list.reduce((a, x) => a + cteRefsExpr(x, visit), 0);
     case "between":
-      return (
-        countSelfRefsExpr(e.lhs, name) +
-        countSelfRefsExpr(e.lo, name) +
-        countSelfRefsExpr(e.hi, name)
-      );
+      return cteRefsExpr(e.lhs, visit) + cteRefsExpr(e.lo, visit) + cteRefsExpr(e.hi, visit);
     case "case":
       return (
-        (e.operand !== null ? countSelfRefsExpr(e.operand, name) : 0) +
-        e.whens.reduce(
-          (a, w) => a + countSelfRefsExpr(w.cond, name) + countSelfRefsExpr(w.result, name),
-          0,
-        ) +
-        (e.els !== null ? countSelfRefsExpr(e.els, name) : 0)
+        (e.operand !== null ? cteRefsExpr(e.operand, visit) : 0) +
+        e.whens.reduce((a, w) => a + cteRefsExpr(w.cond, visit) + cteRefsExpr(w.result, visit), 0) +
+        (e.els !== null ? cteRefsExpr(e.els, visit) : 0)
       );
     case "coalesce":
     case "greatestLeast":
     case "nullIf":
-      return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+      return e.args.reduce((a, x) => a + cteRefsExpr(x, visit), 0);
     case "funcCall":
-      return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+      return e.args.reduce((a, x) => a + cteRefsExpr(x, visit), 0);
     case "row":
-      return e.fields.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+      return e.fields.reduce((a, x) => a + cteRefsExpr(x, visit), 0);
     case "array":
-      return e.elements.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+      return e.elements.reduce((a, x) => a + cteRefsExpr(x, visit), 0);
     case "fieldAccess":
     case "fieldStar":
-      return countSelfRefsExpr(e.base, name);
+      return cteRefsExpr(e.base, visit);
     case "qualifiedStar":
       return 0; // a leaf relation reference — no sublink to recurse into
     case "subscript":
       return (
-        countSelfRefsExpr(e.base, name) +
-        astSubscriptExprs(e.subscripts).reduce((a, x) => a + countSelfRefsExpr(x, name), 0)
+        cteRefsExpr(e.base, visit) +
+        astSubscriptExprs(e.subscripts).reduce((a, x) => a + cteRefsExpr(x, visit), 0)
       );
     case "quantified":
-      return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.array, name);
+      return cteRefsExpr(e.lhs, visit) + cteRefsExpr(e.array, visit);
     default:
       return 0;
   }
@@ -1401,7 +1494,7 @@ export function countDirectFromSelfRefs(s: Select, name: string): number {
 export function countFromSubquerySelfRefs(s: Select, name: string): number {
   let n = 0;
   for (const tref of fromRelations(s)) {
-    if (!isPlainRelation(tref)) n += countSelfRefsTableref(tref, name);
+    if (!isPlainRelation(tref)) n += cteRefsTableref(tref, matchCteName(name));
   }
   return n;
 }
@@ -1410,7 +1503,7 @@ export function countFromSubquerySelfRefs(s: Select, name: string): number {
 // SELECT's top-level expressions — the `within a subquery` position.
 export function countSublinkSelfRefs(s: Select, name: string): number {
   let n = 0;
-  for (const e of selectExprs(s)) n += countSelfRefsExpr(e, name);
+  for (const e of selectExprs(s)) n += cteRefsExpr(e, matchCteName(name));
   return n;
 }
 
@@ -1819,6 +1912,9 @@ export function bindParams(
       `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
     );
   }
+  // A host text value is checked as PostgreSQL checks a text-format parameter's encoding: a NUL or
+  // a lone surrogate is 22021 (types.md §11), so no such value is ever compared, stored, or rendered.
+  for (const v of supplied) if (v.kind === "text") checkTextEncoding(v.text);
   // A text value bound to a timestamptz parameter reads an offset-less string in the session zone,
   // as PostgreSQL's text-format parameter input does (timezones.md §9.3).
   return types.map((ty, i) =>
@@ -2448,11 +2544,12 @@ export function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string
 
 export function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
   req.tables.push({ name: upd.table, priv: "update" });
-  // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
-  // referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
+  // SELECT on the target if it reads any column (session.md §5.3, PostgreSQL's rule at table
+  // granularity): a column/subquery-referencing WHERE, RETURNING, or assignment RHS. A constant-only
+  // `SET a = 1`, `WHERE true`, or `RETURNING 1` reads nothing, so UPDATE alone suffices.
   const reads =
-    upd.filter !== null ||
-    upd.returning !== null ||
+    (upd.filter !== null && exprReadsColumns(upd.filter)) ||
+    returningReadsColumns(upd.returning) ||
     upd.assignments.some((a) => exprReadsColumns(a.value));
   if (reads) req.tables.push({ name: upd.table, priv: "select" });
   for (const a of upd.assignments) collectExprPrivs(a.value, req, locals);
@@ -2462,8 +2559,12 @@ export function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string
 
 export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
   req.tables.push({ name: del.table, priv: "delete" });
-  // DELETE reads the target's columns through a WHERE or a RETURNING.
-  if (del.filter !== null || del.returning !== null) {
+  // DELETE reads the target's columns through a column/subquery-referencing WHERE or RETURNING
+  // (session.md §5.3); `WHERE true` / `RETURNING 1` read nothing, so DELETE alone suffices.
+  if (
+    (del.filter !== null && exprReadsColumns(del.filter)) ||
+    returningReadsColumns(del.returning)
+  ) {
     req.tables.push({ name: del.table, priv: "select" });
   }
   if (del.filter !== null) collectExprPrivs(del.filter, req, locals);

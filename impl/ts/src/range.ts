@@ -10,6 +10,7 @@ import { type RangeDesc, RANGES } from "./ranges_gen.ts";
 import { canonicalName, scalarTypeFromName, type ScalarType } from "./types.ts";
 import { emptyRangeValue, rangeValue, render, renderIn, type Value } from "./value.ts";
 import type { ZoneRef } from "./timezone.ts";
+import { DATE_NEG_INFINITY, DATE_POS_INFINITY } from "./date.ts";
 import { engineError } from "./errors.ts";
 
 // rangeByName looks up a range type by name (exact name), matching the canonical id or any
@@ -175,6 +176,17 @@ function incrementDiscrete(v: Value, elem: ScalarType): Value {
   return { kind: "int", int: cur + 1n };
 }
 
+// isInfiniteDateBound reports whether a discrete bound value is the date ±infinity sentinel. PG's
+// daterange_canonical skips such a bound: it keeps the inclusivity it was given rather than stepping
+// the sentinel (ranges.md §4).
+function isInfiniteDateBound(v: Value, elem: ScalarType): boolean {
+  return (
+    elem === "date" &&
+    v.kind === "date" &&
+    (v.days === DATE_NEG_INFINITY || v.days === DATE_POS_INFINITY)
+  );
+}
+
 // finalizeRange builds a CANONICAL range Value from coerced bound values (spec/design/ranges.md §4):
 // the order check (lower > upper → 22000), discrete canonicalization to `[)` (throwing 22003 on a
 // step past the domain), and empty normalization (lower == upper not-both-inclusive → empty). A null
@@ -197,13 +209,13 @@ export function finalizeRange(
   if (desc.discrete) {
     // Canonical `[)`: an exclusive finite lower steps up to inclusive; an inclusive finite upper
     // steps up to exclusive. Infinite bounds stay exclusive.
-    if (lower !== null && !lowerInc) {
+    if (lower !== null && !lowerInc && !isInfiniteDateBound(lower, elem)) {
       lower = incrementDiscrete(lower, elem);
       lowerInc = true;
     } else if (lower === null) {
       lowerInc = false;
     }
-    if (upper !== null && upperInc) {
+    if (upper !== null && upperInc && !isInfiniteDateBound(upper, elem)) {
       upper = incrementDiscrete(upper, elem);
       upperInc = false;
     } else if (upper === null) {
@@ -309,11 +321,15 @@ function cmpBounds(
   if (v2 === null) return lower2 ? 1 : -1;
   const c = rangeElemCmp(v1, v2);
   if (c !== 0) return c;
-  // Equal values: only a differing inclusivity breaks the tie (PG range_cmp_bounds). The exclusive
-  // side decides — an exclusive lower sorts after, an exclusive upper before.
-  if (inc1 && !inc2) return lower2 ? -1 : 1;
-  if (!inc1 && inc2) return lower1 ? 1 : -1;
-  return 0;
+  // Equal values: the tie-break is PG range_cmp_bounds exactly. An exclusive bound sits just inside
+  // its own side (an exclusive lower starts later, an exclusive upper ends earlier), so two bounds of
+  // the same inclusivity on the SAME side are equal, while on DIFFERENT sides the lower bound sorts
+  // after the upper when both are exclusive (`(5` is "> 5", `5)` is "< 5") and before it when both
+  // are inclusive (`[5` and `5]` meet at 5). range-functions.md §3.
+  if (!inc1 && !inc2) return lower1 === lower2 ? 0 : lower1 ? 1 : -1;
+  if (!inc1) return lower1 ? 1 : -1;
+  if (!inc2) return lower2 ? -1 : 1;
+  return lower1 === lower2 ? 0 : lower1 ? -1 : 1;
 }
 
 // --- key encoding (spec/design/encoding.md §2.11) --------------------------

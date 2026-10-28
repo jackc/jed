@@ -687,3 +687,15 @@ mode = "explicit"
 from = "jsonpath"
 to = "text"
 mode = "explicit"
+
+# text -> jsonpath: the RUNTIME cast on a non-literal text expression — the per-row text compiles
+# through the same parser the '…'::jsonpath literal uses (jsonpath.md §1) and yields the canonical
+# path text, as PostgreSQL's jsonpath_in; a malformed path traps 42601 per row (PG's syntax-error
+# class for a bad path, as for the literal). The compile is metered per byte (jsonpath.md §7).
+# Any other source -> jsonpath is a forbidden pair, reported as 42846 (cannot_coerce) like PG.
+[[cast]]
+from = "text"
+to = "jsonpath"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "42601"

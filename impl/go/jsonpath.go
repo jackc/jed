@@ -704,6 +704,24 @@ func checkVarsObject(vars *JsonNode) error {
 		withDetail(`Jsonpath parameters should be encoded as key-value pairs of "vars" object.`)
 }
 
+// compileCastMetered compiles the per-row text of a runtime text → jsonpath cast (casts.toml): the
+// full resolve-time compile (the canonical text must compile too — §8), metered as compileMetered.
+func compileCastMetered(src string, m *costMeter, prop *propertyTable) (jsonPath, error) {
+	m.Charge(costs.JsonpathCompile * int64(len(src)))
+	if err := m.Step(); err != nil {
+		return jsonPath{}, err
+	}
+	jp, err := compile(src, prop)
+	if err != nil {
+		return jsonPath{}, err
+	}
+	m.Charge(costs.RegexCompile * jp.regexInsts)
+	if err := m.Step(); err != nil {
+		return jsonPath{}, err
+	}
+	return jp, nil
+}
+
 // compileMetered compiles a path for evaluation, charging jsonpath_compile for each byte of the text
 // first (jsonpath.md §7). Every evaluation compiles its path; there is no cache. prop is as for
 // compile.

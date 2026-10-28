@@ -118,6 +118,8 @@ pub enum SqlState {
     IdleInTransactionSessionTimeout,
     /// 2BP01 — cannot drop type {name} because other objects depend on it: {detail}
     DependentObjectsStillExist,
+    /// 2D000 — invalid transaction termination
+    InvalidTransactionTermination,
     /// 28P01 — {detail}
     InvalidPassword,
     /// 28P02 — {detail}
@@ -297,6 +299,7 @@ impl SqlState {
             SqlState::InFailedSqlTransaction => "25P02",
             SqlState::IdleInTransactionSessionTimeout => "25P03",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InvalidTransactionTermination => "2D000",
             SqlState::InvalidPassword => "28P01",
             SqlState::CredentialRequired => "28P02",
             SqlState::CredentialNotApplicable => "28P03",
@@ -418,6 +421,7 @@ impl SqlState {
             "25P02" => Some(SqlState::InFailedSqlTransaction),
             "25P03" => Some(SqlState::IdleInTransactionSessionTimeout),
             "2BP01" => Some(SqlState::DependentObjectsStillExist),
+            "2D000" => Some(SqlState::InvalidTransactionTermination),
             "28P01" => Some(SqlState::InvalidPassword),
             "28P02" => Some(SqlState::CredentialRequired),
             "28P03" => Some(SqlState::CredentialNotApplicable),
@@ -548,6 +552,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "25P02", name: "in_failed_sql_transaction", class: "invalid transaction state" },
     ErrorDesc { code: "25P03", name: "idle_in_transaction_session_timeout", class: "invalid transaction state" },
     ErrorDesc { code: "2BP01", name: "dependent_objects_still_exist", class: "dependent objects still exist" },
+    ErrorDesc { code: "2D000", name: "invalid_transaction_termination", class: "invalid transaction termination" },
     ErrorDesc { code: "28P01", name: "invalid_password", class: "invalid authorization specification" },
     ErrorDesc { code: "28P02", name: "credential_required", class: "invalid authorization specification" },
     ErrorDesc { code: "28P03", name: "credential_not_applicable", class: "invalid authorization specification" },

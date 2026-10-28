@@ -379,15 +379,17 @@ class Checker {
       // A never-reopened in-memory store keeps its generation's facts in RAM: the last commit's catalog
       // root and the high-water (an in-memory attachment's commit writes no meta at all — persist.ts
       // stageInMemory), and its free list. Before any commit, and after compaction, the meta of its
-      // from-scratch image names the root.
+      // from-scratch image names the root — the slot holding the PINNED version, not the newest that
+      // parses: an image deserialized after a crash can carry a newer slot whose generation the loader
+      // rejected (its manifest invalid — validated-cow.md §1) and fell back from, and walking that
+      // root would check a version the pin never saw.
       let root = st.storageBudget.lastCatRoot;
       if (root === 0) {
-        const metas = [0, 1]
+        const pinned = [0, 1]
           .map((s) => parseCommitMeta(blocks[s]!, ps, paging.physicalPages()))
-          .filter((m): m is CommitMeta => m !== null)
-          .sort((a, b) => (a.txid > b.txid ? -1 : a.txid < b.txid ? 1 : 0));
-        if (metas.length === 0) return null;
-        root = metas[0]!.rootPage;
+          .find((m): m is CommitMeta => m !== null && m.txid === txid);
+        if (pinned === undefined) return null;
+        root = pinned.rootPage;
       }
       return {
         rootPage: root,

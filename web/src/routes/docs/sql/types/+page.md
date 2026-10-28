@@ -535,7 +535,10 @@ the `json` accessors and set-returning functions above, and the SQL/JSON query f
 `\u0000` fails with `22P05`, an unpaired surrogate with `22P02`. These functions check the whole
 document, not just the part they return. `json` input only checks syntax, so it stores either escape
 unchanged, and `json_typeof`, `json_array_length`, `json_array_elements`, and `IS JSON` read such a
-value without error. jsonpath string literals reject the same two escapes.
+value without error. jsonpath string literals reject the same two escapes. A runtime `text`
+value casts to `jsonpath` the way the literal does: `('$' || '.a')::jsonpath` compiles the text per
+row and yields its canonical form (`$."a"`); a malformed path raises `42601`, and a non-text
+source is `42846`.
 
 A `jsonpath` (`jsonb_path_query`, `@?`, `JSON_VALUE`, and the rest) can end a step in an item method:
 `.type()`, `.size()`, `.abs()`, `.floor()`, `.ceiling()`, `.double()`, `.bigint()`, `.integer()`,
@@ -673,6 +676,12 @@ Named IANA zones (`America/New_York`, `Europe/Paris`, …) come from a time-zone
 already-loaded zone (an unknown zone raises `22023`). This is the same host-loaded-data model jed
 uses for Unicode collation; see the design notes for the `JTZ` bundle and the environment's `loadTimeZoneData`
 host call.
+
+Arithmetic follows PostgreSQL too: `timestamptz + interval '1 day'` (or `'1 month'`) adds a
+calendar day (month) on the **session zone's wall clock**, so across a DST change the instant moves
+by 23 or 25 hours and the wall-clock time is kept, while `+ interval '24 hours'` moves the instant
+by exactly 24 hours; a zoneless `timestamp` always adds 24-hour days. `make_timestamptz(…, '+05:30')`
+reads its explicit zone with the ISO sign (UTC+5:30), unlike `AT TIME ZONE`'s POSIX reading.
 
 ### Rendering in the session time zone
 

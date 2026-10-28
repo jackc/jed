@@ -693,6 +693,15 @@ impl Compiler {
                 self.insts[jmp] = Inst::Jmp(lend);
                 Ok(())
             }
+            Node::Star(sub, greedy) if nullable(sub) => {
+                // A star over a NULLABLE body is lowered as `(sub+)?` (RE2's rule, regex.md §3.3):
+                // the plain loop's `Jmp L1` re-enters a pc the epsilon closure already visited, so
+                // the thread that took the body's empty iteration dies and a capture inside it
+                // stays unset (`(a*)*` on '' → {NULL}); `(sub+)?` enters the body first and loops
+                // from its end, so the empty iteration is recorded ({""}, as PostgreSQL/RE2/PCRE).
+                let plus = Node::Plus(Box::new(clone_node(sub)), *greedy);
+                self.emit(&Node::Quest(Box::new(plus), *greedy))
+            }
             Node::Star(sub, greedy) => {
                 // L1: Split L2,L3 (greedy) / Split L3,L2 (lazy) ; L2: <sub>; Jmp L1 ; L3:
                 let l1 = self.push(Inst::Split(0, 0))?;
@@ -785,6 +794,26 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+}
+
+/// Whether a node can match the empty string (RE2's `nullable` flag): the `Star` lowering branches
+/// on it (regex.md §3.3). Zero-width assertions are nullable; a `Repeat` with min 0 is nullable,
+/// otherwise it is as nullable as its body.
+fn nullable(n: &Node) -> bool {
+    match n {
+        Node::Char(_) | Node::Any | Node::Class(_) => false,
+        Node::Concat(subs) => subs.iter().all(nullable),
+        Node::Alt(a, b) => nullable(a) || nullable(b),
+        Node::Plus(sub, _) | Node::Group(sub, _) => nullable(sub),
+        Node::Repeat(sub, min, _, _) => *min == 0 || nullable(sub),
+        Node::Empty
+        | Node::Star(..)
+        | Node::Quest(..)
+        | Node::AnchorStart
+        | Node::AnchorEnd
+        | Node::LineStart
+        | Node::LineEnd => true,
     }
 }
 
@@ -1511,10 +1540,12 @@ impl Program {
         })
     }
 
-    /// Walk a replacement template, expanding `\1`..`\9` (capture group), `\&` (whole match), `\\`
-    /// (literal backslash), and `\<other>` (the literal `<other>`). A trailing lone `\` is literal,
-    /// and an unset or absent group expands to nothing. Sizing and building share this walk so they
-    /// cannot disagree.
+    /// Walk a replacement template, expanding `\1`..`\9` (capture group), `\&` (whole match), and
+    /// `\\` (literal backslash) — the only special sequences (regex.md §8, PG
+    /// `appendStringInfoRegexpSubstr`). Any other `\<other>` (including `\0`) keeps BOTH characters
+    /// literally: the backslash is copied and `<other>` is read again as ordinary template text. A
+    /// trailing lone `\` is literal, and an unset or absent group expands to nothing. Sizing and
+    /// building share this walk so they cannot disagree.
     fn for_each_piece(&self, repl: &[char], caps: &Captures, mut f: impl FnMut(Piece)) {
         // An unset (`-1`) group expands to nothing.
         let span = |start: i64, end: i64| {
@@ -1525,7 +1556,7 @@ impl Program {
             let c = repl[i];
             if c == '\\' && i + 1 < repl.len() {
                 let n = repl[i + 1];
-                if let Some(d) = n.to_digit(10) {
+                if let Some(d) = n.to_digit(10).filter(|d| *d >= 1) {
                     let g = d as usize;
                     if g <= self.ngroups {
                         if let Some(p) = span(self.slot(caps, 2 * g), self.slot(caps, 2 * g + 1)) {
@@ -1536,8 +1567,14 @@ impl Program {
                     if let Some(p) = span(self.slot(caps, 0), self.slot(caps, 1)) {
                         f(p);
                     }
-                } else {
+                } else if n == '\\' {
                     f(Piece::Char(n));
+                } else {
+                    // Not a special sequence: the backslash is literal and `<other>` is re-read as
+                    // plain text (so `\0` is `\0`, not the whole match).
+                    f(Piece::Char(c));
+                    i += 1;
+                    continue;
                 }
                 i += 2;
             } else {

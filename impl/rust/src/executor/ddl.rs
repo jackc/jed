@@ -218,6 +218,59 @@ fn check_fk_persistence(child_temp: bool, parent_temp: bool) -> Result<()> {
 
 /// The error for a FOREIGN KEY parent that is not a table of the parent's database: a view is the
 /// wrong object kind (42809, views.md §2); any other name is missing (42P01).
+/// Whether a REFERENCES database qualifier names the child's own domain — the condition under
+/// which a parent spelled with the child's name is a self-reference (bare, or `temp.` for a temp
+/// child, `main.` for a persistent one; an attachment never is).
+fn fk_qualifier_in_scope(q: Option<&str>, child_temp: bool) -> bool {
+    match q {
+        None => true,
+        Some(q) => q == if child_temp { "temp" } else { "main" },
+    }
+}
+
+impl Engine {
+    /// Resolve a FOREIGN KEY parent name (constraints.md §6.2 step 2). A bare name takes the
+    /// temp-first resolution walk; a `main.` / `temp.` qualifier pins the implicit scope, so the
+    /// name is looked up in that one scope alone (attached-databases.md §4 — a validation gate,
+    /// since preclude-overlaps keeps a name in one scope); an attachment qualifier is a
+    /// cross-database foreign key, which §8 forbids (0A000); any other qualifier is 42P01 "not
+    /// attached". A found parent reports its domain for the caller's 42P16 persistence check; a
+    /// missing one is `fk_parent_missing` against the queried scope (a view there is 42809).
+    pub(crate) fn lkp_fk_parent(&self, q: Option<&str>, name: &str) -> Result<(&Table, bool)> {
+        match q {
+            None => {
+                if let Some(t) = self.temp_read_snap().table(name) {
+                    return Ok((t, true));
+                }
+                if let Some(t) = self.read_snap().table(name) {
+                    return Ok((t, false));
+                }
+                Err(fk_parent_missing(self.read_snap(), name))
+            }
+            Some("temp") => match self.temp_read_snap().table(name) {
+                Some(t) => Ok((t, true)),
+                None => Err(fk_parent_missing(self.temp_read_snap(), name)),
+            },
+            Some("main") => match self.read_snap().table(name) {
+                Some(t) => Ok((t, false)),
+                None => Err(fk_parent_missing(self.read_snap(), name)),
+            },
+            Some(q) => {
+                if self.attach_read_snap(q).is_none() {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("database \"{q}\" is not attached"),
+                    ));
+                }
+                Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a foreign key may not reference a table in another database",
+                ))
+            }
+        }
+    }
+}
+
 fn fk_parent_missing(snap: &Snapshot, name: &str) -> EngineError {
     if snap.view(name).is_some() {
         return EngineError::new(
@@ -1682,14 +1735,14 @@ impl Engine {
             // any other name takes the temp-first resolution walk, and the parent must be of the
             // child's own kind (42P16, PostgreSQL's ATAddForeignKeyConstraint): an FK never crosses
             // from the session-local temp domain to the main database or back (temp-tables.md §8).
-            let self_ref = fk.ref_table == table.name;
+            let self_ref = fk.ref_table == table.name
+                && fk_qualifier_in_scope(fk.ref_db.as_deref(), target_temp);
             let parent: &Table = if self_ref {
                 &table
             } else {
-                let parent = self
-                    .table(&fk.ref_table)
-                    .ok_or_else(|| fk_parent_missing(self.read_snap(), &fk.ref_table))?;
-                check_fk_persistence(target_temp, self.is_temp_table(&fk.ref_table))?;
+                let (parent, parent_temp) =
+                    self.lkp_fk_parent(fk.ref_db.as_deref(), &fk.ref_table)?;
+                check_fk_persistence(target_temp, parent_temp)?;
                 parent
             };
             // 3. Referenced columns into the parent (default to the parent's primary key).
@@ -2967,16 +3020,15 @@ impl Engine {
                                 }
                                 // The parent takes the temp-first resolution walk and must be of
                                 // the table's own kind (42P16, temp-tables.md §8).
-                                let parent = if d.ref_table == table.name {
+                                let parent = if d.ref_table == table.name
+                                    && fk_qualifier_in_scope(d.ref_db.as_deref(), temp_scope)
+                                {
                                     table.clone()
-                                } else if let Some(p) = temp_namespace.table(&d.ref_table) {
-                                    check_fk_persistence(temp_scope, true)?;
-                                    p.clone()
-                                } else if let Some(p) = main_namespace.table(&d.ref_table) {
-                                    check_fk_persistence(temp_scope, false)?;
-                                    p.clone()
                                 } else {
-                                    return Err(fk_parent_missing(&main_namespace, &d.ref_table));
+                                    let (p, parent_temp) =
+                                        self.lkp_fk_parent(d.ref_db.as_deref(), &d.ref_table)?;
+                                    check_fk_persistence(temp_scope, parent_temp)?;
+                                    p.clone()
                                 };
                                 let refs = if let Some(ns) = d.ref_columns {
                                     let mut r = Vec::new();
@@ -6050,7 +6102,7 @@ impl Engine {
             }
         }
         let Some(owner) = owner else {
-            return Ok(());
+            return self.check_index_fk_dependents(table_key, t, def);
         };
         Err(EngineError::new(
             SqlState::DependentObjectsStillExist,
@@ -6060,6 +6112,62 @@ impl Engine {
             ),
         )
         .hinted(&error_hint::drop_owner_instead(owner, &t.name)))
+    }
+
+    /// Refuse a `DROP INDEX` of a bare unique index that is the LAST unique key covering a
+    /// FOREIGN KEY's referenced column set (constraints.md §5.5 / §6.2 step 4): the FK's existence
+    /// probe walks that key, so dropping it would leave the constraint unenforceable (the
+    /// `fk_probe` invariant). 2BP01 in the DROP TABLE message shape, naming the first dependent FK
+    /// in table-key byte order then definition order. jed resolves the referenced set against ANY
+    /// unique key of the parent, so the drop is refused only when neither the primary key nor
+    /// another unique index still covers the same set — a documented divergence from PostgreSQL,
+    /// which binds the FK to one index and refuses dropping that one even when a twin exists
+    /// (§5.5). An FK never crosses domains (temp-tables.md §8), so only the index's own domain is
+    /// scanned.
+    fn check_index_fk_dependents(&self, table_key: &str, t: &Table, def: &IndexDef) -> Result<()> {
+        let Some(cols) = def.column_ordinals() else {
+            return Ok(());
+        };
+        if !def.unique {
+            return Ok(());
+        }
+        let set = sorted_unique(&cols);
+        if !t.pk.is_empty() && sorted_unique(&t.pk) == set {
+            return Ok(());
+        }
+        for ix in &t.indexes {
+            if ix.name == def.name || !ix.unique {
+                continue;
+            }
+            if ix
+                .column_ordinals()
+                .is_some_and(|c| sorted_unique(&c) == set)
+            {
+                return Ok(());
+            }
+        }
+        let snap = if self.is_temp_table(table_key) {
+            self.temp_read_snap()
+        } else {
+            self.read_snap()
+        };
+        let mut tkeys: Vec<&String> = snap.tables.keys().collect();
+        tkeys.sort();
+        for tk in tkeys {
+            let child = &snap.tables[tk];
+            for fk in &child.foreign_keys {
+                if fk.ref_table == t.name && sorted_unique(&fk.ref_columns) == set {
+                    return Err(EngineError::new(
+                        SqlState::DependentObjectsStillExist,
+                        format!(
+                            "cannot drop index {} because other objects depend on it: constraint {} on table {}",
+                            def.name, fk.name, child.name
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Analyze and run a CREATE TYPE (spec/design/composite.md): reject a duplicate type name

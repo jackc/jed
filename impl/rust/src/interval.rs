@@ -130,20 +130,24 @@ fn igcd(mut a: i128, mut b: i128) -> i128 {
     a
 }
 
-/// The maximum integer and fractional digits of an `interval × / number` factor — bounds chosen so
-/// the exact i128 cascade math cannot overflow (and Go big.Int / TS BigInt agree).
+/// The maximum integer and significant fractional digits of an `interval × / number` factor
+/// (spec/design/interval.md §6) — bounds chosen so every i128 overflow in the cascade below implies
+/// an `i32`/`i64` field overflow (so Go big.Int / TS BigInt, which never overflow, trap identically).
 const MAX_INT_DIGITS: usize = 18;
-const MAX_FRAC_DIGITS: usize = 9;
+const MAX_FRAC_DIGITS: usize = 18;
+/// TSROUND's 1e-6 quantum, applied to the fractional-month days (micro-days).
+const MICRO_DAYS_PER_DAY: i128 = 1_000_000;
 
 /// Parse a canonical decimal string `[-]int[.frac]` into an exact fraction `(num, den)` with
-/// `den = 10^len(frac) > 0` (the value = num/den). Caps the digit counts so the i128 cascade
-/// stays well-defined; an over-long factor traps `22008` (a documented bound — beyond any real
-/// interval factor, and far beyond what PG's `double` represents).
+/// `den = 10^len(frac) > 0` (the value = num/den). Trailing fractional zeros are stripped first
+/// (`1.0000000000` is the factor `1`, as it is for PG's double), then the digit counts are capped
+/// so the i128 cascade stays well-defined; an over-long factor traps `22008` (a documented bound —
+/// spec/design/interval.md §6 — beyond what PG's `double` represents).
 pub fn parse_factor_decimal(s: &str) -> Result<(i128, i128)> {
     let neg = s.starts_with('-');
     let body = s.strip_prefix('-').unwrap_or(s);
     let (int_part, frac_part) = match body.split_once('.') {
-        Some((i, f)) => (i, f),
+        Some((i, f)) => (i, f.trim_end_matches('0')),
         None => (body, ""),
     };
     if int_part.len() > MAX_INT_DIGITS || frac_part.len() > MAX_FRAC_DIGITS {
@@ -158,12 +162,15 @@ pub fn parse_factor_decimal(s: &str) -> Result<(i128, i128)> {
     Ok((num, den))
 }
 
-/// The exact `×÷` cascade (spec/design/interval.md §5): multiply each field by `fnum/fden`
-/// (`fden > 0`), cascading the fractional part months→days→micros (1 month = 30 days, 1 day =
-/// 24 h) with the µs result rounded **half away from zero**. This mirrors PG `interval_mul` /
-/// `interval_div` structurally but is EXACT (no float) — a documented PG divergence only on
-/// sub-unit ties. All i128 (gcd-reduced first); a field beyond `i32`/`i64`, or an i128 overflow,
-/// traps `22008`.
+/// The `×÷` cascade (spec/design/interval.md §5): multiply each field by `fnum/fden` (`fden > 0`),
+/// truncating the whole months/days like PostgreSQL's `(int32)` casts and cascading the fractional
+/// part months→days→micros exactly as PG's `interval_mul` / `interval_div` do — including the two
+/// TSROUND quantizations (the fractional-month days to 1e-6 day, the seconds remainder to 1 µs,
+/// both rounded half to even like C `rint`) and the move of whole days out of a seconds remainder
+/// of 24 h or more. The arithmetic is EXACT rational math in i128 (PG's is `double`), so the cores
+/// agree byte-for-byte and differ from PG only where its double lands on the other side of a
+/// quantum boundary. A field beyond `i32`/`i64` — or an i128 overflow, which the factor digit cap
+/// makes imply one — traps `22008`.
 pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval> {
     let g = igcd(fnum, fden).max(1);
     let fnum = fnum / g;
@@ -174,32 +181,50 @@ pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval
     let d = iv.days as i128;
     let u = iv.micros as i128;
 
-    // result.month = trunc(m * fnum / fden); the fractional months cascade to days.
+    // result.month = trunc(m × factor); the fractional months cascade to days.
     let m_total = m.checked_mul(fnum).ok_or_else(of)?;
     let r_month = m_total / fden;
-    let frac_month = m_total - r_month * fden; // remainder over fden
-    let mrd = frac_month
-        .checked_mul(DAYS_PER_MONTH as i128)
-        .ok_or_else(of)?; // days·fden
-    let mrd_whole = mrd / fden;
-    let mrd_frac = mrd - mrd_whole * fden;
+    let frac_month = m_total - r_month * fden; // over fden
+    // month_remainder_days = TSROUND(frac_month/fden × 30): quantized to micro-days, half to even.
+    let mrd_q = round_half_even_div(
+        frac_month
+            .checked_mul(DAYS_PER_MONTH as i128 * MICRO_DAYS_PER_DAY)
+            .ok_or_else(of)?,
+        fden,
+    );
+    let mrd_whole = mrd_q / MICRO_DAYS_PER_DAY;
+    let mrd_frac = mrd_q - mrd_whole * MICRO_DAYS_PER_DAY; // micro-days
 
-    // result.day = trunc(d * fnum / fden) + whole days from the month remainder.
+    // result.day = trunc(d × factor); its fraction (over fden) joins the month remainder's.
     let d_total = d.checked_mul(fnum).ok_or_else(of)?;
-    let r_day_part = d_total / fden;
-    let day_frac = d_total - r_day_part * fden;
-    let r_day = r_day_part.checked_add(mrd_whole).ok_or_else(of)?;
-
-    // result.time = round( (u·fnum + (day_frac + mrd_frac)·MICROS_PER_DAY) / fden ), half away.
-    let time_num = u
-        .checked_mul(fnum)
+    let mut r_day = d_total / fden;
+    let day_frac = d_total - r_day * fden; // over fden
+    // sec_remainder = TSROUND((day_frac/fden + mrd_frac/1e6) × 86 400): quantized to µs, half to
+    // even. mrd_frac × 86 400 is that part in whole µs; it is scaled by fden to share the divisor.
+    let sec_num = day_frac
+        .checked_mul(MICROS_PER_DAY as i128)
         .and_then(|x| {
-            (day_frac + mrd_frac)
-                .checked_mul(MICROS_PER_DAY as i128)
+            (mrd_frac * 86_400)
+                .checked_mul(fden)
                 .and_then(|y| x.checked_add(y))
         })
         .ok_or_else(of)?;
-    let r_time = round_div(time_num, fden);
+    let mut sec_rem = round_half_even_div(sec_num, fden); // µs
+    // A remainder of 24 h or more (rounding, or the month cascade on top of the day fraction)
+    // moves its whole days up into the days field.
+    if sec_rem.abs() >= MICROS_PER_DAY as i128 {
+        let whole = sec_rem / MICROS_PER_DAY as i128;
+        r_day = r_day.checked_add(whole).ok_or_else(of)?;
+        sec_rem -= whole * MICROS_PER_DAY as i128;
+    }
+    r_day = r_day.checked_add(mrd_whole).ok_or_else(of)?;
+
+    // result.time = rint(u × factor + sec_remainder).
+    let time_num = u
+        .checked_mul(fnum)
+        .and_then(|x| sec_rem.checked_mul(fden).and_then(|y| x.checked_add(y)))
+        .ok_or_else(of)?;
+    let r_time = round_half_even_div(time_num, fden);
 
     Ok(Interval {
         months: i32::try_from(r_month).map_err(|_| field_overflow("interval out of range"))?,
@@ -208,52 +233,121 @@ pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval
     })
 }
 
-/// `ts + iv` (or `ts - iv` with `subtract`) — the calendar-aware datetime arithmetic
-/// (spec/design/interval.md §5, the engine's first timestamp arithmetic). Months are added
-/// first **with day-of-month clamping** (Jan 31 + 1 month → Feb 28/29), then days (24 h each —
-/// jed has no zones), then microseconds. Adding to ±infinity stays ±infinity (PG); a finite
-/// result onto a sentinel or beyond the `i64`-µs range traps `22008`.
+/// Round `num / den` (`den > 0`) to the nearest integer, ties to even — C `rint` under the
+/// default rounding mode, which PostgreSQL's `interval_mul`/`interval_div` and TSROUND use.
+fn round_half_even_div(num: i128, den: i128) -> i128 {
+    let q = num / den;
+    let r = num - q * den;
+    let twice = r.abs() * 2;
+    if twice > den || (twice == den && q % 2 != 0) {
+        if num >= 0 { q + 1 } else { q - 1 }
+    } else {
+        q
+    }
+}
+
+/// `ts + iv` (or `ts - iv` with `subtract`) for a ZONELESS operand — a `timestamp`, or a date
+/// widened to midnight (spec/design/interval.md §5). Months are added first **with day-of-month
+/// clamping** (Jan 31 + 1 month → Feb 28/29), then days (24 h each), then microseconds. Adding to
+/// ±infinity stays ±infinity (PG); a finite result onto a sentinel or beyond the `i64`-µs range
+/// traps `22008`. A `timestamptz` operand takes [`ts_shift_zoned`] instead.
 pub fn ts_shift(ts: i64, iv: &Interval, subtract: bool) -> Result<i64> {
     if ts == timestamp::NEG_INFINITY || ts == timestamp::POS_INFINITY {
         return Ok(ts); // ±infinity ± any finite interval is unchanged
     }
     let sign: i64 = if subtract { -1 } else { 1 };
     let mut t = ts;
-
     let months = sign * iv.months as i64;
     if months != 0 {
-        let (y, mo, d, h, mi, s, us) = timestamp::civil_from_micros(t);
-        // months since (astronomical) year 0, month 0 — floor div/mod handle pre-epoch years.
-        let total = y * 12 + (mo as i64 - 1) + months;
-        let ny = total.div_euclid(12);
-        let nmo = total.rem_euclid(12) as u32 + 1;
-        let nd = d.min(timestamp::days_in_month(ny, nmo)); // clamp to the new month's length
-        let days = timestamp::days_from_civil(ny, nmo as i64, nd as i64);
-        t = days
-            .checked_mul(86_400)
-            .and_then(|x| x.checked_add(h as i64 * 3600 + mi as i64 * 60 + s as i64))
-            .and_then(|secs| secs.checked_mul(MICROS_PER_SEC))
-            .and_then(|m| m.checked_add(us as i64))
-            .ok_or_else(|| field_overflow("timestamp out of range"))?;
+        t = add_months_clamped(t, months)?;
     }
-
     let day_us = (sign * iv.days as i64)
         .checked_mul(MICROS_PER_DAY)
         .ok_or_else(|| field_overflow("timestamp out of range"))?;
     t = t
         .checked_add(day_us)
         .ok_or_else(|| field_overflow("timestamp out of range"))?;
-    t = if subtract {
-        t.checked_sub(iv.micros)
+    add_shift_micros(t, iv.micros, subtract)
+}
+
+/// `ts ± iv` for a TIMESTAMPTZ operand in the session zone `zr` — PostgreSQL's
+/// `timestamptz_pl_interval` (spec/design/interval.md §5, timezones.md §6): the months step
+/// converts the instant to its wall clock in the zone, adds the months with day-of-month clamping,
+/// and re-resolves the wall clock through the zone (a DST gap/overlap as for input); the days step
+/// does the same with calendar days (so `+ 1 day` across a DST change keeps the wall-clock time,
+/// unlike `+ 24 hours`); the micros are then added on the instant. Each step performs a zone
+/// consult only when its field is nonzero ([`ts_shift_zone_consults`] counts them for the cost
+/// meter). ±infinity is unchanged; a wall clock or instant leaving the finite range traps `22008`.
+pub fn ts_shift_zoned(
+    ts: i64,
+    iv: &Interval,
+    subtract: bool,
+    zr: &crate::timezone::ZoneRef,
+) -> Result<i64> {
+    use crate::timezone::{instant_to_local_micros, local_to_instant_micros};
+    if ts == timestamp::NEG_INFINITY || ts == timestamp::POS_INFINITY {
+        return Ok(ts);
+    }
+    let sign: i64 = if subtract { -1 } else { 1 };
+    let mut t = ts;
+    let months = sign * iv.months as i64;
+    if months != 0 {
+        let local =
+            instant_to_local_micros(zr, t).ok_or_else(timestamp::zone_shift_out_of_range)?;
+        let local = add_months_clamped(local, months)?;
+        t = local_to_instant_micros(zr, local).ok_or_else(timestamp::zone_shift_out_of_range)?;
+    }
+    let days = sign * iv.days as i64;
+    if days != 0 {
+        let local =
+            instant_to_local_micros(zr, t).ok_or_else(timestamp::zone_shift_out_of_range)?;
+        let local = days
+            .checked_mul(MICROS_PER_DAY)
+            .and_then(|d| local.checked_add(d))
+            .ok_or_else(|| field_overflow("timestamp out of range"))?;
+        t = local_to_instant_micros(zr, local).ok_or_else(timestamp::zone_shift_out_of_range)?;
+    }
+    add_shift_micros(t, iv.micros, subtract)
+}
+
+/// The number of zone consults [`ts_shift_zoned`] performs for `ts ± iv` — one per nonzero
+/// calendar field (months, days) of a finite operand — each charged one `timezone` cost unit
+/// (spec/design/cost.md, the AT TIME ZONE unit) before the shift runs.
+pub fn ts_shift_zone_consults(ts: i64, iv: &Interval) -> i64 {
+    if ts == timestamp::NEG_INFINITY || ts == timestamp::POS_INFINITY {
+        return 0;
+    }
+    (iv.months != 0) as i64 + (iv.days != 0) as i64
+}
+
+/// Add `months` to a wall clock / zoneless instant `t` with day-of-month clamping.
+fn add_months_clamped(t: i64, months: i64) -> Result<i64> {
+    let (y, mo, d, h, mi, s, us) = timestamp::civil_from_micros(t);
+    // months since (astronomical) year 0, month 0 — floor div/mod handle pre-epoch years.
+    let total = y * 12 + (mo as i64 - 1) + months;
+    let ny = total.div_euclid(12);
+    let nmo = total.rem_euclid(12) as u32 + 1;
+    let nd = d.min(timestamp::days_in_month(ny, nmo)); // clamp to the new month's length
+    let days = timestamp::days_from_civil(ny, nmo as i64, nd as i64);
+    days.checked_mul(86_400)
+        .and_then(|x| x.checked_add(h as i64 * 3600 + mi as i64 * 60 + s as i64))
+        .and_then(|secs| secs.checked_mul(MICROS_PER_SEC))
+        .and_then(|m| m.checked_add(us as i64))
+        .ok_or_else(|| field_overflow("timestamp out of range"))
+}
+
+/// The final micros step of a shift: `t ± micros`, checked, and never onto a ±infinity sentinel.
+fn add_shift_micros(t: i64, micros: i64, subtract: bool) -> Result<i64> {
+    let r = if subtract {
+        t.checked_sub(micros)
     } else {
-        t.checked_add(iv.micros)
+        t.checked_add(micros)
     }
     .ok_or_else(|| field_overflow("timestamp out of range"))?;
-
-    if t == timestamp::NEG_INFINITY || t == timestamp::POS_INFINITY {
+    if r == timestamp::NEG_INFINITY || r == timestamp::POS_INFINITY {
         return Err(field_overflow("timestamp out of range")); // reserved for the sentinels
     }
-    Ok(t)
+    Ok(r)
 }
 
 /// `a - b` of two timestamps (or two timestamptz) → an interval, justified into days + time with

@@ -1506,6 +1506,17 @@ rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes
     the two children and the parent separator stay exactly as they were (an underfull interior is
     tolerated; correctness is unaffected, only compactness). The abandon rule is deterministic
     and part of this byte contract.
+  - **Parent overflow — the second abandon rule.** The parent's key count is unchanged by a
+    merge-overflow split, but its **byte size is not**: the new separator (a leaf `M`'s `key[m]`,
+    an interior `M`'s pushed-up `sep[m]`) replaces separator `j` and may be longer than it. Nothing
+    on the delete path splits an interior node, so a parent that no longer fits would be
+    unserializable. Therefore, when `payload(parent) − sep_len(j) + len(new separator) > C`, the
+    merge is likewise **abandoned** — the two children and the parent separator stay exactly as
+    they were, the underfull child tolerated. The test is made against the parent as it is when
+    the merge is attempted, with the separator the split would hand up (the same `m` the split
+    rule selects), before any node is replaced; both abandon rules are part of this byte
+    contract. (A merge whose `M` fits only removes a separator, so it can never overflow the
+    parent.)
 - **Root collapse:** a leaf root that drains to `N = 0` empties the table
   (`root_data_page = 0`); an interior root that drains to `N = 0` is replaced by its single
   child (height − 1).
@@ -1521,8 +1532,8 @@ lands in `[1, N−1]` with both halves non-empty and fitting. Without the cap, a
 on its **last**, oversized record, forcing an empty sibling or a multi-way spill — both of which
 complicate the byte contract across four implementations. Interior nodes carry no records, so the
 cap does not bind them; their guarantee is the **minimum-fanout invariant** (one separator + two
-pointers always fit — *Interior node* above) plus the pinned `N = 2` degenerate split and the
-merge-abandon guard, which together make every interior operation total. The cap buys an
+pointers always fit — *Interior node* above) plus the pinned `N = 2` degenerate split and the two
+merge-abandon guards, which together make every interior operation total. The cap buys an
 all-2-way scheme at the cost of a tighter (and later-liftable) oversized-row limit.
 
 ### Value codec

@@ -1723,6 +1723,7 @@ fn build_prefix_scope<'s>(
         subquery_derivs: Default::default(),
         lateral_view: None,
         lateral_hit: Default::default(),
+        grouped_keys: Default::default(),
         lateral_refused,
         shares_parent_level,
         merge_action: None,
@@ -1772,6 +1773,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -1823,40 +1825,137 @@ pub(crate) enum CtePrimary<'q> {
     Query(&'q QueryExpr),
 }
 
-impl CtePrimary<'_> {
-    /// The static (syntactic) references to CTE `name` in the primary: `(query, data-modifying)`.
-    fn refs(self, name: &str) -> (usize, usize) {
-        match self {
-            CtePrimary::Body(b) => static_cte_refs(b, name),
-            CtePrimary::Query(q) => (count_self_refs_query(q, name), 0),
+/// What the `cte_refs_*` walkers do at each plain relation reference they reach: it receives the
+/// referenced name and returns that reference's contribution to the walk's count. Two visitors
+/// exist — the single-name counter behind [`count_self_refs_query`] / [`count_cte_refs_dml`], and
+/// the per-name tally behind [`CteRefTally`], which the WITH planner uses so a list of n CTEs is
+/// counted in O(total size), not O(n × size) — one walk per body, not one per (body, name). The
+/// `shadowed` slice carries the names a nested WITH's inner CTEs shadow for its later bodies and its
+/// main query (cte.md §7): a reference to such a name there is not a reference to the outer CTE.
+type CteRefVisitor<'a> = dyn FnMut(&str) -> usize + 'a;
+
+/// Total self-references to `name` anywhere in a query expression (deep — FROM relations at every
+/// nesting level plus expression sublinks).
+fn count_self_refs_query(qe: &QueryExpr, name: &str) -> usize {
+    cte_refs_query(qe, &[], &mut |r| usize::from(r == name))
+}
+
+/// References to CTE `name` reachable through a `cte_body`'s inner queries — the writable-CTE
+/// analogue of [`count_self_refs_query`] (spec/design/writable-cte.md §3).
+fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
+    cte_refs_dml(body, &[], &mut |r| usize::from(r == name))
+}
+
+/// Every plain relation reference a walk reaches, tallied by name.
+type CteRefCounts = HashMap<String, usize>;
+
+fn tally_cte_refs(body: &CteBody) -> CteRefCounts {
+    let mut counts = CteRefCounts::new();
+    cte_refs_dml(body, &[], &mut |r| {
+        *counts.entry(r.to_string()).or_insert(0) += 1;
+        0
+    });
+    counts
+}
+
+/// The static reference count of every CTE in one `WITH` list, computed in one walk per part
+/// (planner.md §3.4). The candidate question — for the CTE at `ci`, how often do the LATER bodies
+/// and the primary name it — answered with a per-name walk over the remaining list is O(n²) in the
+/// number of CTEs (20 000 CTEs took a minute of unmetered planning). The tally walks each body once,
+/// keeping its per-name counts, and answers in cursor order: before CTE `ci` is asked, the counts of
+/// bodies `0..=ci` are subtracted from the running totals, which then hold exactly the later bodies'
+/// and the primary's references — the same figures as the per-name walks, in O(total size). A
+/// data-modifying part's references count apart, because such a part is planned only when it runs,
+/// so a CTE it names is never inlined at its reference.
+pub(crate) struct CteRefTally {
+    /// References by query parts after the cursor + a query primary.
+    query: CteRefCounts,
+    /// References by data-modifying parts after the cursor + a data-modifying primary.
+    dml: CteRefCounts,
+    /// Per CTE body, its references by name.
+    bodies: Vec<CteRefCounts>,
+    /// The first body not yet subtracted.
+    next: usize,
+}
+
+impl CteRefTally {
+    /// Walks every CTE body and the primary (the query that owns the list) once.
+    pub(crate) fn new(ctes: &[Cte], primary: CtePrimary<'_>) -> CteRefTally {
+        let mut t = CteRefTally {
+            query: CteRefCounts::new(),
+            dml: CteRefCounts::new(),
+            bodies: Vec::with_capacity(ctes.len()),
+            next: 0,
+        };
+        for cte in ctes {
+            let counts = tally_cte_refs(&cte.body);
+            t.add(&counts, cte.body.is_data_modifying(), false);
+            t.bodies.push(counts);
+        }
+        let (counts, is_dml) = match primary {
+            CtePrimary::Body(b) => (tally_cte_refs(b), b.is_data_modifying()),
+            CtePrimary::Query(q) => {
+                let mut counts = CteRefCounts::new();
+                cte_refs_query(q, &[], &mut |r| {
+                    *counts.entry(r.to_string()).or_insert(0) += 1;
+                    0
+                });
+                (counts, false)
+            }
+        };
+        t.add(&counts, is_dml, false);
+        t
+    }
+
+    /// Fold `counts` into (or, `subtract`, out of) the running totals.
+    fn add(&mut self, counts: &CteRefCounts, is_dml: bool, subtract: bool) {
+        let into = if is_dml {
+            &mut self.dml
+        } else {
+            &mut self.query
+        };
+        for (name, n) in counts {
+            let slot = into.entry(name.clone()).or_insert(0);
+            if subtract {
+                *slot -= n;
+            } else {
+                *slot += n;
+            }
         }
     }
-}
 
-/// The static references to CTE `name` in one part of a `WITH` statement, as `(query,
-/// data-modifying)`: a data-modifying part's references are counted apart, because such a part is
-/// planned only when it runs, so a CTE it names is never inlined at its reference (planner.md
-/// §3.4).
-fn static_cte_refs(body: &CteBody, name: &str) -> (usize, usize) {
-    let n = count_cte_refs_dml(body, name);
-    if body.is_data_modifying() {
-        (0, n)
-    } else {
-        (n, 0)
+    /// Whether the CTE at `ci` may be inlined at its reference (planner.md §3.4): not
+    /// `MATERIALIZED`, and named exactly once by the later CTE bodies and the primary, by a query
+    /// part. The WITH planner asks in list order, so the cursor only ever moves forward.
+    pub(crate) fn candidate(&mut self, ctes: &[Cte], ci: usize) -> bool {
+        while self.next <= ci {
+            let counts = std::mem::take(&mut self.bodies[self.next]);
+            self.add(&counts, ctes[self.next].body.is_data_modifying(), true);
+            self.bodies[self.next] = counts;
+            self.next += 1;
+        }
+        let name = ctes[ci].name.as_str();
+        self.query.get(name).copied().unwrap_or(0) == 1
+            && self.dml.get(name).copied().unwrap_or(0) == 0
+            && ctes[ci].materialized != Some(true)
     }
 }
 
-/// Whether the CTE at `ci` in a `WITH` list may be inlined at its reference (planner.md §3.4): not
-/// `MATERIALIZED`, and named exactly once by the later CTE bodies and the primary, by a query part.
-fn cte_reference_candidate(ctes: &[Cte], ci: usize, primary: CtePrimary<'_>) -> bool {
-    let name = ctes[ci].name.as_str();
-    let (mut query, mut dml) = primary.refs(name);
-    for later in &ctes[ci + 1..] {
-        let (q, d) = static_cte_refs(&later.body, name);
-        query += q;
-        dml += d;
+/// Add the references one NON-planned data-modifying part (a data-modifying CTE body, or a
+/// data-modifying primary) contributes to each binding it names (writable-cte.md §3), in one walk
+/// of the part (the WITH planner rejects a duplicate name, so a name has at most one binding).
+pub(crate) fn add_dml_cte_refs(bindings: &[CteBinding], body: &CteBody) {
+    let counts = tally_cte_refs(body);
+    if counts.is_empty() {
+        return;
     }
-    query == 1 && dml == 0 && ctes[ci].materialized != Some(true)
+    let by_name: HashMap<&str, &CteBinding> =
+        bindings.iter().map(|b| (b.name.as_str(), b)).collect();
+    for (name, n) in &counts {
+        if let Some(b) = by_name.get(name.as_str()) {
+            b.refs.set(b.refs.get() + n);
+        }
+    }
 }
 
 /// What a CTE binding evaluates to (spec/design/cte.md, writable-cte.md). A plain CTE holds a
@@ -1983,6 +2082,15 @@ pub(crate) struct Scope<'a> {
     /// parenthesized join's lateral prefix to learn whether the join's body correlates to the
     /// relations on its left (grammar.md §15).
     lateral_hit: std::cell::Cell<bool>,
+    /// `Some(keys)` marks this scope as GROUPED for the subqueries planned under it: the flat input
+    /// indices of its grouping keys in group-row slot order (the planner's master list,
+    /// functionally dependent columns included — aggregates.md §4). Set only while a collecting
+    /// `AggCtx` plans a subquery (`plan_subquery`): the projection, HAVING, ORDER BY and window keys
+    /// of a grouped query evaluate over the GROUP row (keys, then aggregates), so a correlated
+    /// reference into this scope from such a subquery must name a grouping column — else 42803, as
+    /// in PostgreSQL — and reads that key's slot (`resolve_column_ref`). A subquery in WHERE or an
+    /// aggregate argument sees the flat input row (`None` there).
+    grouped_keys: std::cell::RefCell<Option<Vec<usize>>>,
     /// Set on a LATERAL prefix whose relations are the left side of a `RIGHT` or `FULL` join
     /// (PostgreSQL's `p_lateral_ok = false`, spec/design/grammar.md §44): a reference that resolves
     /// to one of them is `42P10`. A reference that passes them to an outer level is unaffected.
@@ -2131,6 +2239,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -2217,6 +2326,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -2305,6 +2415,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -2382,6 +2493,7 @@ impl<'a> Scope<'a> {
             subquery_derivs: Default::default(),
             lateral_view: None,
             lateral_hit: Default::default(),
+            grouped_keys: Default::default(),
             lateral_refused: false,
             shares_parent_level: false,
             merge_action: None,
@@ -2637,7 +2749,12 @@ impl<'a> Scope<'a> {
         // Two relations under one label at this level — only the DO UPDATE scope of a target
         // labeled `excluded` builds one (every FROM rejects a duplicate label up front, 42712):
         // PostgreSQL's 42P09 (upsert.md §5).
-        if self.rels.iter().filter(|r| r.label == q).count() > 1 {
+        // A relation label that is also an inner label of a joined source (a MERGE target aliased
+        // like one of its source join's relations — merge.md §2) is likewise ambiguous: PostgreSQL's
+        // 42P09, never a silent bind to the target.
+        let labeled = self.rels.iter().filter(|r| r.label == q).count()
+            + usize::from(self.sub_rels.iter().any(|sr| sr.label == q));
+        if labeled > 1 {
             return Err(EngineError::new(
                 SqlState::AmbiguousAlias,
                 format!("table reference {qualifier} is ambiguous"),
@@ -4660,7 +4777,7 @@ fn validate_recursive_term(name: &str, sel: &Select) -> Result<()> {
 fn count_sublink_self_refs(s: &Select, name: &str) -> usize {
     select_exprs(s)
         .iter()
-        .map(|e| count_self_refs_expr(e, name))
+        .map(|e| cte_refs_expr(e, &[], &mut |r| usize::from(r == name)))
         .sum()
 }
 
@@ -4775,65 +4892,62 @@ fn collation_identity(d: &Deriv) -> &str {
 
 /// Total self-references to `name` anywhere in a query expression (deep — FROM relations at every
 /// nesting level plus expression sublinks).
-fn count_self_refs_query(qe: &QueryExpr, name: &str) -> usize {
+fn cte_refs_query(qe: &QueryExpr, shadowed: &[&str], visit: &mut CteRefVisitor) -> usize {
     match qe {
-        QueryExpr::Select(s) => count_self_refs_select(s, name),
+        QueryExpr::Select(s) => cte_refs_select(s, shadowed, visit),
         QueryExpr::SetOp(so) => {
-            count_self_refs_query(&so.lhs, name) + count_self_refs_query(&so.rhs, name)
+            cte_refs_query(&so.lhs, shadowed, visit) + cte_refs_query(&so.rhs, shadowed, visit)
         }
         QueryExpr::With(we) => {
             // A nested WITH inherits this binding until an inner same-named CTE is declared. That
             // inner binding shadows it for later bodies and the main query, but its own
             // non-recursive body still sees the inherited binding (cte.md §7).
             let mut n = 0;
-            let mut shadowed = false;
+            let mut inner: Vec<&str> = shadowed.to_vec();
             for cte in &we.ctes {
-                if !shadowed {
-                    n += count_cte_refs_dml(&cte.body, name);
-                }
-                if cte.name == name {
-                    shadowed = true;
-                }
+                n += cte_refs_dml(&cte.body, &inner, visit);
+                inner.push(cte.name.as_str());
             }
-            if !shadowed {
-                n += count_self_refs_query(&we.body, name);
-            }
+            n += cte_refs_query(&we.body, &inner, visit);
             n
         }
     }
 }
 
 /// Total self-references in a SELECT: its FROM relations (deep) plus all of its expressions' sublinks.
-fn count_self_refs_select(s: &Select, name: &str) -> usize {
+fn cte_refs_select(s: &Select, shadowed: &[&str], visit: &mut CteRefVisitor) -> usize {
     let mut n = 0;
     for tref in from_relations(s) {
-        n += count_self_refs_tableref(tref, name);
+        n += cte_refs_tableref(tref, shadowed, visit);
     }
     for e in select_exprs(s) {
-        n += count_self_refs_expr(e, name);
+        n += cte_refs_expr(e, shadowed, visit);
     }
     n
 }
 
 /// Self-references reachable through one FROM relation: a plain table reference with the matching
 /// name (+1), a derived-table subquery (recurse), or a table-function's / VALUES' argument exprs.
-fn count_self_refs_tableref(tref: &TableRef, name: &str) -> usize {
+fn cte_refs_tableref(tref: &TableRef, shadowed: &[&str], visit: &mut CteRefVisitor) -> usize {
     if is_plain_relation(tref) {
-        return usize::from(tref.name == name);
+        if shadowed.contains(&tref.name.as_str()) {
+            return 0;
+        }
+        return visit(&tref.name);
     }
     let mut n = 0;
     if let Some(sub) = &tref.subquery {
-        n += count_self_refs_query(sub, name);
+        n += cte_refs_query(sub, shadowed, visit);
     }
     if let Some(args) = &tref.args {
         for a in args {
-            n += count_self_refs_expr(a, name);
+            n += cte_refs_expr(a, shadowed, visit);
         }
     }
     if let Some(rows) = &tref.values {
         for row in rows {
             for e in row {
-                n += count_self_refs_expr(e, name);
+                n += cte_refs_expr(e, shadowed, visit);
             }
         }
     }
@@ -4844,19 +4958,19 @@ fn count_self_refs_tableref(tref: &TableRef, name: &str) -> usize {
 /// independent query whose own FROM may reference the CTE). Walks every Expr variant to find the
 /// sublinks, then recurses into each sublink's query. The walk is exhaustive (like
 /// `expr_has_aggregate`) so a new Expr variant is a compile error here, not a silent miss.
-fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
-    let sub = |x: &Expr| count_self_refs_expr(x, name);
+fn cte_refs_expr(e: &Expr, shadowed: &[&str], visit: &mut CteRefVisitor) -> usize {
+    let mut sub = |x: &Expr| cte_refs_expr(x, shadowed, visit);
     match e {
-        Expr::ScalarSubquery(q, _) | Expr::Exists(q, _) => count_self_refs_query(q, name),
+        Expr::ScalarSubquery(q, _) | Expr::Exists(q, _) => cte_refs_query(q, shadowed, visit),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
-            sub(lhs) + count_self_refs_query(query, name)
+            sub(lhs) + cte_refs_query(query, shadowed, visit)
         }
         Expr::Column(_, _)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_, _)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_, _) => 0,
-        Expr::Row(items, _) | Expr::Array(items, _) => items.iter().map(sub).sum(),
+        Expr::Row(items, _) | Expr::Array(items, _) => items.iter().map(&mut sub).sum(),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => sub(base),
         // `t.*` is a leaf (a relation name, no sub-expression) — no sublink to recurse into.
         Expr::QualifiedStar { .. } => 0,
@@ -4865,7 +4979,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                 + subscripts
                     .iter()
                     .flat_map(subscript_spec_exprs)
-                    .map(sub)
+                    .map(&mut sub)
                     .sum::<usize>()
         }
         Expr::Cast { inner, .. }
@@ -4888,7 +5002,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
         | Expr::Regex { lhs, rhs, .. } => sub(lhs) + sub(rhs),
-        Expr::In { lhs, list, .. } => sub(lhs) + list.iter().map(sub).sum::<usize>(),
+        Expr::In { lhs, list, .. } => sub(lhs) + list.iter().map(&mut sub).sum::<usize>(),
         Expr::Quantified { lhs, array, .. } => sub(lhs) + sub(array),
         Expr::Between { lhs, lo, hi, .. } => sub(lhs) + sub(lo) + sub(hi),
         Expr::Case {
@@ -4897,13 +5011,15 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
             els,
             ..
         } => {
-            operand.as_deref().map_or(0, sub)
+            operand.as_deref().map_or(0, &mut sub)
                 + whens.iter().map(|(c, r)| sub(c) + sub(r)).sum::<usize>()
-                + els.as_deref().map_or(0, sub)
+                + els.as_deref().map_or(0, &mut sub)
         }
-        Expr::Coalesce(args, _) => args.iter().map(sub).sum(),
-        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => args.iter().map(sub).sum(),
-        Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
+        Expr::Coalesce(args, _) => args.iter().map(&mut sub).sum(),
+        Expr::GreatestLeast { args, .. } | Expr::NullIf { args, .. } => {
+            args.iter().map(&mut sub).sum()
+        }
+        Expr::FuncCall { args, .. } => args.iter().map(&mut sub).sum(),
     }
 }
 
@@ -4970,18 +5086,18 @@ fn add_outcome_cost(outcome: Outcome, extra: i64) -> Outcome {
 /// the query counter; a data-modifying body counts the references in its source query / `WHERE` /
 /// `SET` RHSs / `ON CONFLICT` / `RETURNING` sublinks. Used by the orchestrator to count the
 /// references a NON-planned data-modifying part contributes to the inline-vs-materialize decision.
-fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
+fn cte_refs_dml(body: &CteBody, shadowed: &[&str], visit: &mut CteRefVisitor) -> usize {
     match body {
-        CteBody::Query(q) => count_self_refs_query(q, name),
+        CteBody::Query(q) => cte_refs_query(q, shadowed, visit),
         CteBody::Insert(ins) => {
             let mut n = match &ins.source {
-                InsertSource::Query(q) => count_self_refs_query(q, name),
+                InsertSource::Query(q) => cte_refs_query(q, shadowed, visit),
                 // A VALUES expression slot may hold a sublink (grammar.md §16).
                 InsertSource::Values(rows) => rows
                     .iter()
                     .flatten()
                     .map(|v| match v {
-                        InsertValue::Expr(e) => count_self_refs_expr(e, name),
+                        InsertValue::Expr(e) => cte_refs_expr(e, shadowed, visit),
                         _ => 0,
                     })
                     .sum(),
@@ -4993,69 +5109,74 @@ fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
                 } = &oc.action
                 {
                     for a in assignments {
-                        n += count_self_refs_expr(&a.value, name);
+                        n += cte_refs_expr(&a.value, shadowed, visit);
                     }
                     if let Some(f) = filter {
-                        n += count_self_refs_expr(f, name);
+                        n += cte_refs_expr(f, shadowed, visit);
                     }
                 }
             }
-            n + count_returning_refs(&ins.returning, name)
+            n + cte_refs_returning(&ins.returning, shadowed, visit)
         }
         CteBody::Update(upd) => {
             let mut n = 0;
             for a in &upd.assignments {
-                n += count_self_refs_expr(&a.value, name);
+                n += cte_refs_expr(&a.value, shadowed, visit);
             }
             if let Some(f) = &upd.filter {
-                n += count_self_refs_expr(f, name);
+                n += cte_refs_expr(f, shadowed, visit);
             }
-            n + count_returning_refs(&upd.returning, name)
+            n + cte_refs_returning(&upd.returning, shadowed, visit)
         }
         CteBody::Delete(del) => {
             let mut n = 0;
             if let Some(f) = &del.filter {
-                n += count_self_refs_expr(f, name);
+                n += cte_refs_expr(f, shadowed, visit);
             }
-            n + count_returning_refs(&del.returning, name)
+            n + cte_refs_returning(&del.returning, shadowed, visit)
         }
         CteBody::Merge(m) => {
             use crate::ast::{MergeAction, MergeValue};
-            let mut n = count_self_refs_query(&m.source, name) + count_self_refs_expr(&m.on, name);
+            let mut n =
+                cte_refs_query(&m.source, shadowed, visit) + cte_refs_expr(&m.on, shadowed, visit);
             for c in &m.clauses {
                 if let Some(cond) = &c.condition {
-                    n += count_self_refs_expr(cond, name);
+                    n += cte_refs_expr(cond, shadowed, visit);
                 }
                 match &c.action {
                     MergeAction::Update(assigns) => {
                         for a in assigns {
-                            n += count_self_refs_expr(&a.value, name);
+                            n += cte_refs_expr(&a.value, shadowed, visit);
                         }
                     }
                     MergeAction::Insert { values, .. } => {
                         for v in values {
                             if let MergeValue::Expr(e) = v {
-                                n += count_self_refs_expr(e, name);
+                                n += cte_refs_expr(e, shadowed, visit);
                             }
                         }
                     }
                     MergeAction::Delete | MergeAction::DoNothing => {}
                 }
             }
-            n + count_returning_refs(&m.returning, name)
+            n + cte_refs_returning(&m.returning, shadowed, visit)
         }
     }
 }
 
 /// References to CTE `name` in a `RETURNING` item list's sublinks.
-fn count_returning_refs(returning: &Option<ReturningClause>, name: &str) -> usize {
+fn cte_refs_returning(
+    returning: &Option<ReturningClause>,
+    shadowed: &[&str],
+    visit: &mut CteRefVisitor,
+) -> usize {
     match returning {
         Some(ReturningClause {
             items: SelectItems::Items(items),
             ..
         }) => items
             .iter()
-            .map(|it| count_self_refs_expr(&it.expr, name))
+            .map(|it| cte_refs_expr(&it.expr, shadowed, visit))
             .sum(),
         _ => 0,
     }
@@ -5074,7 +5195,7 @@ fn count_direct_from_self_refs(s: &Select, name: &str) -> usize {
 fn count_from_subquery_self_refs(s: &Select, name: &str) -> usize {
     from_relations(s)
         .filter(|tref| !is_plain_relation(tref))
-        .map(|tref| count_self_refs_tableref(tref, name))
+        .map(|tref| cte_refs_tableref(tref, &[], &mut |r| usize::from(r == name)))
         .sum()
 }
 
@@ -5946,12 +6067,16 @@ fn apply_srf_column_aliases(
     Ok(())
 }
 
-/// Build one output row for `json[b]_to_record(set)` (R1): map each declared column to the JSON
-/// object's member of that name, coercing it to the column type. A missing member or a JSON null →
-/// SQL NULL; a non-object node → `22023`. (json-table.md §2)
+/// Build one output row for `json[b]_to_record(set)` (R1) and `json[b]_populate_record(set)` (R2):
+/// map each declared column to the JSON object's member of that name, coercing it to the column
+/// type. A JSON null member → SQL NULL; a missing member → the base row's field (`base`, the
+/// populate forms) or SQL NULL (`None`, the `_to_record` forms); a non-object node → `22023`. A
+/// `json` document keeps duplicate keys, and the LAST one wins, as PostgreSQL's hash of the object
+/// does (json-table.md §2). The base row is never modified.
 fn json_record_row(
     node: &JsonNode,
     cols: &[Column],
+    base: Option<&Row>,
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<Row> {
@@ -5965,10 +6090,18 @@ fn json_record_row(
         }
     };
     let mut row = Vec::with_capacity(cols.len());
-    for col in cols {
-        let member = members.iter().find(|(k, _)| k == &col.name).map(|(_, v)| v);
+    for (ci, col) in cols.iter().enumerate() {
+        let member = members
+            .iter()
+            .rev() // last wins
+            .find(|(k, _)| k == &col.name)
+            .map(|(_, v)| v);
         let val = match member {
-            None | Some(JsonNode::Null) => Value::Null, // missing / JSON null → SQL NULL
+            None => match base {
+                Some(b) => b[ci].clone(),
+                None => Value::Null,
+            },
+            Some(JsonNode::Null) => Value::Null, // a JSON null overrides a base field
             Some(v) => coerce_json_member(v, &col.ty, Typmod::of_column(col), env, meter)?,
         };
         row.push(val);
@@ -6638,8 +6771,10 @@ fn jt_scalar_type(db: &Engine, type_name: &str) -> Result<ScalarType> {
     }
 }
 
-/// Compile a `JSON_TABLE` column path — the explicit `PATH p`, or the default `$.<column_name>` —
-/// to its canonical rendered form (validating; malformed → 42601).
+/// Compile a `JSON_TABLE` column path — the explicit `PATH p`, or the default `$."<column_name>"` —
+/// to its canonical rendered form (validating; malformed → 42601). The default member name is a
+/// QUOTED jsonpath string (JSON-escaped), as PostgreSQL builds it, so a column named `a.b`, `a b`,
+/// or `1` reads the member of exactly that name (json-table.md §3.1).
 fn jt_compile_path(
     path: Option<&str>,
     name: &str,
@@ -6647,7 +6782,11 @@ fn jt_compile_path(
 ) -> Result<String> {
     let src = match path {
         Some(p) => p.to_string(),
-        None => format!("$.{name}"),
+        None => {
+            let mut s = String::from("$.");
+            json::write_json_string(name, &mut s);
+            s
+        }
     };
     Ok(crate::jsonpath::JsonPath::compile(&src, casing)?.render())
 }

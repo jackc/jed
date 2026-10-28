@@ -205,8 +205,11 @@ while the untrusted-scratch pattern is `allow_ddl = off` (no persistent DDL) **+
 `allow_temp_ddl = on`** — private scratch tables only, everything else denied. This keeps the §5.3
 default-deny posture intact (an untrusted `{SELECT}`-only session has `allow_ddl = off`, so temp DDL is
 off too until the host deliberately opts in) and relaxes the documented "one boolean" `allow_ddl`
-narrowing (session.md §5.3) only for temp tables. The gate is configured per record by the directives
-`# allow_ddl:` / `# allow_temp_ddl:` (§13).
+narrowing (session.md §5.3) only for temp tables. The inheritance is decided **when the session is
+configured**: a later runtime `SetAllowDDL(false)` / `set_allow_ddl(false)` / `setAllowDdl(false)`
+changes only `allow_ddl`, and a host that tightens a live session must set `allow_temp_ddl` itself
+(resetting the privilege envelope restores both defaults). The gate is configured per record by the
+directives `# allow_ddl:` / `# allow_temp_ddl:` (§13).
 
 ### 5.1 `ON COMMIT` — end-of-transaction actions
 

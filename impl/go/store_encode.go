@@ -654,11 +654,8 @@ func materializeInsertValue(iv insertValue, ty colType, bound []Value, iz *input
 // token → NULL element). A malformed literal is 22P02.
 func coerceStringToArray(s string, elem colType, iz *inputZone) (Value, error) {
 	parsed, errKind := parseArrayLiteral(s)
-	switch errKind {
-	case arrayMalformed:
-		return Value{}, newError(InvalidTextRepresentation, "malformed array literal")
-	case arrayBoundFlip:
-		return Value{}, arraySubscriptErr("upper bound cannot be less than lower bound")
+	if err := arrayInError(errKind); err != nil {
+		return Value{}, err
 	}
 	vals := make([]Value, len(parsed.Tokens))
 	for i, tok := range parsed.Tokens {
@@ -1218,7 +1215,12 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 		}
 	}
 	if idx == nil {
-		panic("referenced columns matched a unique key at CREATE TABLE §6.2")
+		// Unreachable through the catalog: CREATE TABLE / ALTER TABLE ADD resolved the referenced set
+		// to a unique key (§6.2 step 4) and DROP INDEX / DROP CONSTRAINT / DROP COLUMN refuse to remove
+		// the last one (2BP01, §5.5). A file whose catalog breaks that invariant is malformed data,
+		// not a crash: XX001, failing closed like any other self-disagreeing persisted state.
+		return fkProbe{}, false, newError(DataCorrupted,
+			"foreign key "+fk.Name+" references no unique key of table "+parent.Name)
 	}
 	var prefix []byte
 	for i, pcol := range idxCols {

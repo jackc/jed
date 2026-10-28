@@ -301,7 +301,8 @@ func (c *frameCtx) groupsBounds(pos int, f *resolvedFrame) (int, int) {
 // offset (UNBOUNDED / CURRENT ROW) is peer/edge based and needs no key arithmetic. With a value
 // offset, the frame spans the rows whose key is within the offset of the current key; a NULL
 // current key has only its NULL peers (offset/CURRENT bounds collapse to the peer group, the PG
-// rule), while UNBOUNDED bounds still reach the partition edge.
+// rule), while UNBOUNDED bounds still reach the partition edge. For a non-NULL current key the
+// NULL rows sit on the side NULL placement puts them (rangeStart/rangeEnd).
 func (c *frameCtx) rangeBounds(pos int, f *resolvedFrame) (int, int, error) {
 	np := c.np
 	startOff := f.start.kind == boundPreceding || f.start.kind == boundFollowing
@@ -323,6 +324,7 @@ func (c *frameCtx) rangeBounds(pos int, f *resolvedFrame) (int, int, error) {
 	// Offset present ⇒ exactly one ORDER BY key (validated at resolve).
 	col := c.order[0].idx
 	desc := c.order[0].descending
+	nullsFirst := c.order[0].nullsFirst
 	cur := c.rows[c.ordered[pos]][col]
 	if cur.IsNull() {
 		lo := 0
@@ -348,9 +350,9 @@ func (c *frameCtx) rangeBounds(pos int, f *resolvedFrame) (int, int, error) {
 	case boundCurrentRow:
 		lo = c.peerStart[pos]
 	case boundPreceding:
-		lo, err = c.rangeStart(col, cur, f.start.offVal, true, desc)
+		lo, err = c.rangeStart(col, cur, f.start.offVal, true, desc, nullsFirst)
 	case boundFollowing:
-		lo, err = c.rangeStart(col, cur, f.start.offVal, false, desc)
+		lo, err = c.rangeStart(col, cur, f.start.offVal, false, desc, nullsFirst)
 	case boundUnboundedFollowing:
 		lo = np
 	}
@@ -364,9 +366,9 @@ func (c *frameCtx) rangeBounds(pos int, f *resolvedFrame) (int, int, error) {
 	case boundCurrentRow:
 		hi = c.peerEnd[pos]
 	case boundPreceding:
-		hi, err = c.rangeEnd(col, cur, f.end.offVal, true, desc, lo)
+		hi, err = c.rangeEnd(col, cur, f.end.offVal, true, desc, nullsFirst, lo)
 	case boundFollowing:
-		hi, err = c.rangeEnd(col, cur, f.end.offVal, false, desc, lo)
+		hi, err = c.rangeEnd(col, cur, f.end.offVal, false, desc, nullsFirst, lo)
 	case boundUnboundedPreceding:
 		hi = 0
 	}
@@ -379,14 +381,22 @@ func (c *frameCtx) rangeBounds(pos int, f *resolvedFrame) (int, int, error) {
 	return lo, hi, nil
 }
 
-// rangeStart is the first sorted position whose key satisfies a RANGE start bound (NULL keys never
-// qualify for a non-NULL current row). subtract = isPreceding XOR descending chooses the bound side.
-func (c *frameCtx) rangeStart(col int, cur, off Value, isPreceding, desc bool) (int, error) {
+// rangeStart is the first sorted position whose key satisfies a RANGE start bound for a non-NULL
+// current row — PostgreSQL's update_frameheadpos (nodeWindowAgg.c), window.md §6. A NULL key never
+// satisfies the value test; its position is fixed by NULL placement instead: with NULLS FIRST the
+// leading NULLs sort BEFORE every bound (the head skips them), with NULLS LAST the trailing NULLs
+// sort AFTER every bound, so a start that overshoots every non-NULL key stops AT the first NULL row
+// (not the partition end — an UNBOUNDED FOLLOWING end then still frames the NULLs).
+// subtract = isPreceding XOR descending chooses the bound side.
+func (c *frameCtx) rangeStart(col int, cur, off Value, isPreceding, desc, nullsFirst bool) (int, error) {
 	subtract := isPreceding != desc
 	for i := 0; i < c.np; i++ {
 		v := c.rows[c.ordered[i]][col]
 		if v.IsNull() {
-			continue
+			if nullsFirst {
+				continue
+			}
+			return i, nil
 		}
 		ord, err := rangeVVsBound(v, cur, off, subtract)
 		if err != nil {
@@ -404,14 +414,20 @@ func (c *frameCtx) rangeStart(col int, cur, off Value, isPreceding, desc bool) (
 	return c.np, nil
 }
 
-// rangeEnd is the exclusive end of a RANGE end bound, scanning forward from lo while the key stays
-// in frame (the in-frame keys form a contiguous run over the sorted partition).
-func (c *frameCtx) rangeEnd(col int, cur, off Value, isPreceding, desc bool, lo int) (int, error) {
+// rangeEnd is the exclusive end of a RANGE end bound for a non-NULL current row, scanning forward
+// from lo while the key stays in frame (the in-frame keys form a contiguous run over the sorted
+// partition) — PostgreSQL's update_frametailpos. NULL placement decides a NULL key: leading NULLs
+// (NULLS FIRST) are within every end bound, trailing NULLs (NULLS LAST) are beyond every one.
+func (c *frameCtx) rangeEnd(col int, cur, off Value, isPreceding, desc, nullsFirst bool, lo int) (int, error) {
 	subtract := isPreceding != desc
 	hi := lo
 	for i := lo; i < c.np; i++ {
 		v := c.rows[c.ordered[i]][col]
 		if v.IsNull() {
+			if nullsFirst {
+				hi = i + 1
+				continue
+			}
 			break
 		}
 		ord, err := rangeVVsBound(v, cur, off, subtract)
@@ -930,8 +946,11 @@ func applyWindowStage(rows []storedRow, specs []windowSpec, windowKeys []*rExpr,
 							if err != nil {
 								return err
 							}
-							if !removable && lo > curLo {
+							if (!removable && lo > curLo) || lo < curLo || hi < curHi {
 								// Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
+								// The carry assumes monotone bounds (window.md §6); a frame that moved
+								// backwards on either edge is rebuilt rather than carried, so a stale
+								// accumulator can never leak into a result.
 								a = newAccWithContext(spec.aggPlan, spec.aggCollation, spec.aggJSONTypes, env.exec.session.timeZone)
 								meter.releaseQuery(accCharge)
 								accCharge = 0

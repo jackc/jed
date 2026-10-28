@@ -2197,10 +2197,24 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
             estimator_operator_nodes(Some(lhs)),
             estimator_operator_nodes(Some(array)),
         ),
-        RExpr::And(lhs, rhs) | RExpr::Or(lhs, rhs) => sat_add(
-            estimator_operator_nodes(Some(lhs)),
-            estimator_operator_nodes(Some(rhs)),
-        ),
+        RExpr::And(lhs, rhs) | RExpr::Or(lhs, rhs) => {
+            // A left-deep AND / OR chain (an IN list's desugar, grammar.md §20) is summed along
+            // its left spine iteratively, not by recursing into each lhs, so the stack does not
+            // grow with the chain (cost.md §7f); the saturating sum is the same.
+            let is_and = matches!(expr, RExpr::And(..));
+            let mut total = estimator_operator_nodes(Some(rhs));
+            let mut spine: &RExpr = lhs;
+            loop {
+                let (l, r) = match spine {
+                    RExpr::And(l, r) if is_and => (l, r),
+                    RExpr::Or(l, r) if !is_and => (l, r),
+                    _ => break,
+                };
+                total = sat_add(total, sat_add(1, estimator_operator_nodes(Some(r))));
+                spine = l;
+            }
+            sat_add(total, estimator_operator_nodes(Some(spine)))
+        }
         RExpr::Cast { inner, .. }
         | RExpr::ArrayCast { inner, .. }
         | RExpr::CompositeCast { inner, .. }
@@ -5681,15 +5695,20 @@ pub(crate) fn fk_probe(
         }
         Ok(Some(FkProbe::Pk(k)))
     } else {
-        let idx = parent
-            .indexes
-            .iter()
-            .find(|i| {
-                i.unique
-                    && i.column_ordinals()
-                        .is_some_and(|c| sorted_unique(&c) == ref_set)
-            })
-            .expect("referenced columns matched a unique key at CREATE TABLE §6.2");
+        // Unreachable through the catalog: CREATE TABLE / ALTER TABLE ADD resolved the referenced
+        // set to a unique key (§6.2 step 4) and DROP INDEX / DROP CONSTRAINT / DROP COLUMN refuse to
+        // remove the last one (2BP01, §5.5). A file whose catalog breaks that invariant is malformed
+        // data, not a crash: XX001, failing closed like any other self-disagreeing persisted state.
+        let Some(idx) = parent.indexes.iter().find(|i| {
+            i.unique
+                && i.column_ordinals()
+                    .is_some_and(|c| sorted_unique(&c) == ref_set)
+        }) else {
+            return Err(EngineError::data_corrupted(format!(
+                "foreign key {} references no unique key of table {}",
+                fk.name, parent.name
+            )));
+        };
         let idx_cols = idx
             .column_ordinals()
             .expect("FK target is a plain-column unique index");

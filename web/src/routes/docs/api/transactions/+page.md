@@ -21,6 +21,14 @@ calls. In TypeScript, await each operation: `await db.update(async (tx) => { ...
 `await db.session(...)`, and `await session.begin()`. Use the transaction proxy returned by
 `begin()` throughout the block; it retains ownership across application awaits.
 
+The closure owns the transaction's lifetime: issuing `COMMIT` or `ROLLBACK` from inside it (as SQL,
+or by calling `tx.commit()` / `tx.rollback()`) is refused with `2D000`, and the SQL form fails the
+block like any other error. If your closure swallows a statement error and returns normally,
+`update` reports `25P02` instead of pretending to commit — a failed transaction commits nothing.
+Savepoints (below) work inside the closure as usual. (The async TypeScript runtime drives the block
+through the session and does not yet enforce this: a `COMMIT` inside its closure commits through the
+session, and later statements autocommit.)
+
 A writable transaction that makes no persistent changes commits without rewriting the database or
 issuing an fsync. This includes empty transactions, SELECT-only work, and zero-row writes without
 other effects. Temporary-only changes stay in the session; attachment-only changes persist only the

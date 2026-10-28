@@ -1078,6 +1078,7 @@ impl<'a> Runner<'a> {
         let Ok(suite) = crate::crypto::file_suite(&image[..ps], &image[ps..2 * ps]) else {
             return false;
         };
+        let suite = suite.unwrap_or(0);
         if k < 0 || suite == 0 {
             return k < 0 && suite == 0;
         }

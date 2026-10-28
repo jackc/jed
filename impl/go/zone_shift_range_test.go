@@ -63,7 +63,8 @@ func TestZoneShiftPastMaxInt64Traps(t *testing.T) {
 	} {
 		zoneShiftTraps(t, db, "+05:00", expr, 1)
 	}
-	zoneShiftTraps(t, db, "UTC", "make_timestamptz(294247, 1, 10, 4, 0, 0, '+05:00')", 1)
+	// make_timestamptz reads its explicit zone with the ISO sign (functions.md §11): '-05:00' is UTC-5.
+	zoneShiftTraps(t, db, "UTC", "make_timestamptz(294247, 1, 10, 4, 0, 0, '-05:00')", 1)
 	// An instant rendered in a UTC+5 zone moves +5h.
 	for _, expr := range []string{
 		"tz :: timestamp",

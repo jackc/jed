@@ -1,0 +1,120 @@
+# jsonb equality is value equality (spec/design/json.md §5): a number compares by its exact decimal
+# VALUE, so `{"a": 1}`, `{"a": 1.0}`, `{"a": 1.00}` and `{"a": 1e0}` are one value, and every
+# equality-keyed operation — DISTINCT, GROUP BY, UNION / EXCEPT / INTERSECT, count(DISTINCT),
+# array_agg(DISTINCT), a window PARTITION BY, and a jsonb nested in a ROW(…) or ARRAY[…] — buckets
+# them together (the dedup key walks the document structurally, keying each number on its canonical
+# decimal, never on the scale-preserving canonical text). The representative of a bucket is the
+# first occurrence in scan order (its scale is preserved in the output). Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.distinct, query.aggregates, query.aggregate_distinct, query.group_by, query.union, query.except, query.intersect, query.window, query.derived_table, types.jsonb, types.jsonb_compare, types.composite, types.array, func.array_agg, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"a":1}'), (2, '{"a":1.0}'), (3, '{"a":1.00}'), (4, '{"a":1e0}'), (5, '[1, 2.50]'), (6, '[1.0, 2.5]'), (7, '7'), (8, '7.000'), (9, '{"a":2}')
+
+# DISTINCT: four spellings of {"a": 1} are one value (the first occurrence is kept).
+# cost: 688
+query T nosort
+SELECT DISTINCT b FROM t ORDER BY b
+----
+7
+[1, 2.50]
+{"a": 1}
+{"a": 2}
+
+# GROUP BY buckets by value.
+# cost: 514
+query TI nosort
+SELECT b, count(*)::i32 FROM t GROUP BY b ORDER BY b
+----
+7
+2
+[1, 2.50]
+2
+{"a": 1}
+4
+{"a": 2}
+1
+
+# count(DISTINCT).
+# cost: 358
+query I nosort
+SELECT count(DISTINCT b)::i32 FROM t
+----
+4
+
+# UNION dedups across the arms by value.
+# cost: 276
+query T nosort
+SELECT b FROM t WHERE id <= 4 UNION SELECT b FROM t WHERE id = 9 ORDER BY b
+----
+{"a": 1}
+{"a": 2}
+
+# EXCEPT: every left row has a value-equal right row.
+# cost: 268
+query T nosort
+SELECT b FROM t WHERE id IN (1, 5, 7) EXCEPT SELECT b FROM t WHERE id IN (2, 6, 8) ORDER BY b
+----
+
+# INTERSECT keeps the value-equal pairs (the left arm's spelling).
+# cost: 410
+query T nosort
+SELECT b FROM t WHERE id IN (1, 5, 9) INTERSECT SELECT b FROM t WHERE id IN (2, 6, 8) ORDER BY b
+----
+[1, 2.50]
+{"a": 1}
+
+# A window PARTITION BY partitions by value.
+# cost: 383
+query II nosort
+SELECT id, count(*) OVER (PARTITION BY b)::i32 FROM t ORDER BY id
+----
+1
+4
+2
+4
+3
+4
+4
+4
+5
+2
+6
+2
+7
+2
+8
+2
+9
+1
+
+# array_agg(DISTINCT …) dedups by value.
+# cost: 694
+query T nosort
+SELECT array_agg(DISTINCT b ORDER BY b) FROM t
+----
+{7,"[1, 2.50]","{\"a\": 1}","{\"a\": 2}"}
+
+# A jsonb nested in a composite or an array dedups by the same structural key.
+# cost: 714
+query T nosort
+SELECT DISTINCT ROW(b, 1) FROM t WHERE id IN (1, 2, 7, 8) ORDER BY 1
+----
+(7,1)
+("{""a"": 1}",1)
+
+# cost: 1134
+query T nosort
+SELECT DISTINCT ARRAY[b] FROM t WHERE id IN (1, 2, 7, 8) ORDER BY 1
+----
+{7}
+{"{\"a\": 1}"}
+
+# cost: 357
+query I nosort
+SELECT count(*)::i32 FROM (SELECT DISTINCT b FROM t) d
+----
+4

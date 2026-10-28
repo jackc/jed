@@ -78,10 +78,12 @@ var (
 func ergoQuery(ctx context.Context, eng *engine, args []any, raw func([]Value) (*Rows, error)) (*Rows, error) {
 	params, err := toValues(args)
 	if err != nil {
+		eng.failOpenBlock() // an arg-conversion error is a statement error: it aborts an open block (transactions.md §6)
 		return nil, err
 	}
 	done := contextDone(ctx)
 	if err := doneErr(done); err != nil {
+		eng.failOpenBlock() // so is a pre-execution 57014 (api.md §11.4)
 		return nil, err
 	}
 	defer eng.restoreCancel(eng.armCancel(done))
@@ -202,12 +204,12 @@ func (s *Session) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement,
 
 // QueryPrepared runs a prepared query within this transaction (against its working set).
 func (tx *Transaction) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
-	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
+	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // ExecPrepared runs a prepared statement within this transaction and returns its command tag.
 func (tx *Transaction) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
-	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
+	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
@@ -610,6 +612,11 @@ func toValue(a any) (Value, error) {
 	case float64:
 		return Float64Value(v), nil
 	case string:
+		// A Go string is arbitrary bytes; a jed text value is valid UTF-8 without NUL (types.md §11),
+		// so the string is checked here as PostgreSQL checks a text-format parameter (22021).
+		if _, err := decodeUTF8Text(v); err != nil {
+			return Value{}, err
+		}
 		return TextValue(v), nil
 	case []byte:
 		return ByteaValue(v), nil
@@ -618,9 +625,12 @@ func toValue(a any) (Value, error) {
 	case Interval:
 		return IntervalValue(v), nil
 	case time.Time:
-		// time.Time binds as timestamptz here; the binder re-coerces to the inferred temporal
-		// column type (timestamp / date) — the one Go↔jed temporal impedance point (api.md §11).
-		return TimestamptzValue(v.UnixMicro()), nil
+		// time.Time binds as timestamptz here, carrying the time itself in ref so the §5 binder can
+		// re-coerce it to the inferred temporal type (timestamp / date) by its calendar fields in its
+		// own Location — the one Go↔jed temporal impedance point (api.md §11.2, hostTimeParam).
+		tv := TimestamptzValue(v.UnixMicro())
+		tv.ref = v
+		return tv, nil
 	default:
 		// Any other slice binds as a one-dimensional array of its converted elements, for an array
 		// parameter (`id = ANY($1)` — api.md §5); a nil slice is NULL.
@@ -771,10 +781,12 @@ func valueToAny(v Value) any {
 		return v.F32()
 	case ValFloat64:
 		return v.F64()
-	case ValTimestamp, ValTimestamptz:
-		return time.UnixMicro(v.Int).UTC()
-	case ValDate:
-		return time.Unix(int64(int32(v.Int))*86400, 0).UTC()
+	case ValTimestamp, ValTimestamptz, ValDate:
+		// An infinite value has no time.Time form (asTime): it stays the raw Value.
+		if t, err := asTime(v); err == nil {
+			return t
+		}
+		return v
 	default:
 		// composite / array / range / json: the raw Value for now (richer mapping is a follow-up).
 		return v
@@ -801,7 +813,14 @@ func asFloat(v Value) (float64, error) {
 	}
 }
 
+// asTime converts a finite timestamp / timestamptz / date to a time.Time in UTC (api.md §11.2). An
+// infinite value has no time.Time form — time.Time is finite — so it is an error, never a bogus
+// instant (the ±infinity sentinels are the extreme i64/i32, which UnixMicro would render as a real
+// date in the year ±292 277): Values() returns such a cell as its raw Value instead (valueToAny).
 func asTime(v Value) (time.Time, error) {
+	if isInfiniteTemporal(v) {
+		return time.Time{}, fmt.Errorf("cannot scan an infinite %s into time.Time", kindName(v.Kind))
+	}
 	switch v.Kind {
 	case ValTimestamp, ValTimestamptz:
 		return time.UnixMicro(v.Int).UTC(), nil
@@ -810,6 +829,44 @@ func asTime(v Value) (time.Time, error) {
 	default:
 		return time.Time{}, typeErr(v, "time.Time")
 	}
+}
+
+// isInfiniteTemporal reports whether v is a ±infinity timestamp, timestamptz, or date.
+func isInfiniteTemporal(v Value) bool {
+	switch v.Kind {
+	case ValTimestamp, ValTimestamptz:
+		return v.Int == negInfinity || v.Int == posInfinity
+	case ValDate:
+		return int32(v.Int) == dateNegInfinity || int32(v.Int) == datePosInfinity
+	default:
+		return false
+	}
+}
+
+// hostTimeParam re-coerces a host time.Time bound as a timestamptz Value (toValue) to the parameter
+// type the statement inferred (api.md §5/§11.2): the instant for timestamptz; for timestamp and date
+// the time's calendar fields in its own Location — what a text literal of the time formatted without
+// a zone would read as — so a date built at UTC midnight binds as that date whatever the session
+// time zone. The result is a clean Value (no ref), and any other target keeps the timestamptz value,
+// whose family mismatch the binder then reports as a literal's (42804). A nil ty is "no inferred
+// scalar" (a container target): the value stays timestamptz.
+func hostTimeParam(v Value, ty *scalarType) Value {
+	t, ok := v.ref.(time.Time)
+	if !ok {
+		return v
+	}
+	if ty != nil {
+		switch {
+		case ty.IsTimestamp():
+			y, mo, d := t.Date()
+			h, mi, sec := t.Clock()
+			return TimestampValue(time.Date(y, mo, d, h, mi, sec, t.Nanosecond(), time.UTC).UnixMicro())
+		case ty.IsDate():
+			y, mo, d := t.Date()
+			return DateValue(int32(time.Date(y, mo, d, 0, 0, 0, 0, time.UTC).Unix() / 86400))
+		}
+	}
+	return TimestamptzValue(v.Int)
 }
 
 func typeErr(v Value, want string) error {

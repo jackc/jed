@@ -1,0 +1,117 @@
+# Float UNDERFLOW traps (spec/design/float.md §3/§5/§6/§8, PostgreSQL's float_underflow_error):
+# a non-zero exact result that rounds to exactly 0 at the result width is 22003 "value out of
+# range: underflow", the mirror of the finite-overflow trap — never a silent 0.
+#   * and /: a product of two non-zero operands, or a quotient of a non-zero dividend by a FINITE
+#   divisor (1 / Infinity is a legitimate 0); + and - never underflow (their exact results are
+#   representable or already zero), at both f64 and f32.
+#   exp(x) whose result rounds to 0; pow(x, y) with a non-zero base (float_pow_domain.test).
+#   The casts: a text or decimal literal naming a non-zero value that rounds to 0 at the width
+#   ("1e-400" at f64, "1e-46" at f32), and f64 → f32 of a non-zero f64 too small for binary32.
+#   sin / cos / tan / cot of ±Infinity are 22003 "input is out of range" (a NaN propagates).
+# A spelled zero ('0e-400', '0.000', -0) is never an underflow.
+# requires: query.select, query.select_no_from, cast.operator, cast.explicit, cast.string_literal, expr.arithmetic, types.f64, types.f32, error.overflow_trap, resource.cost_metering
+
+# --- arithmetic ---------------------------------------------------------------------------
+statement error 22003
+SELECT 5e-324::float8 / 2
+
+statement error 22003
+SELECT 5e-324::float8 * 0.1::float8
+
+statement error 22003
+SELECT 1e-200::float8 * 1e-200::float8
+
+statement error 22003
+SELECT 1e-300::float8 / 1e300::float8
+
+statement error 22003
+SELECT (-5e-324)::float8 / 2
+
+# f32: binary32 underflow (1e-45 is the smallest f32 subnormal; half of it rounds to 0)
+statement error 22003
+SELECT 1e-45::float4 / 2::float4
+
+statement error 22003
+SELECT 1e-40::float4 * 1e-40::float4
+
+# a zero result that is NOT an underflow: a zero operand, an infinite divisor, subtraction
+# cost: 15
+query RRRRR nosort
+SELECT 0::float8 * 1e-300::float8, 1::float8 / 'Infinity'::float8, 1e-323::float8 - 1e-323::float8, 5e-324::float8 * 1::float8, 1e-45::float4 * 1::float4
+----
+0
+0
+0
+5e-324
+1e-45
+
+# --- exp -----------------------------------------------------------------------------------
+statement error 22003
+SELECT exp(-746.0::float8)
+
+# exp(-745) is the smallest subnormal; exp(-Infinity) is a legitimate 0
+# cost: 8
+query RRR nosort
+SELECT exp(-745.0::float8), exp(-744.0::float8), exp('-Infinity'::float8)
+----
+5e-324
+1e-323
+0
+
+# --- the casts ----------------------------------------------------------------------------
+statement error 22003
+SELECT '1e-400'::float8
+
+statement error 22003
+SELECT '-1e-400'::float8
+
+statement error 22003
+SELECT '1e-46'::float4
+
+statement error 22003
+SELECT CAST('1e-400' AS f64)
+
+statement error 22003
+SELECT 1e-400::numeric::float8
+
+statement error 22003
+SELECT 1e-46::numeric::float4
+
+statement error 22003
+SELECT 1e-46::float8::float4
+
+statement error 22003
+SELECT 7e-46::float8::float4
+
+# a spelled zero never underflows; the smallest f32 subnormal survives the narrowing
+# cost: 5
+query RRRRR nosort
+SELECT '0e-400'::float8, '0.000'::float8, '-0'::float8, 0.0::numeric::float8, 1e-45::float8::float4
+----
+0
+0
+-0
+0
+1e-45
+
+# --- the circular functions at ±Infinity --------------------------------------------------
+statement error 22003
+SELECT sin('Infinity'::float8)
+
+statement error 22003
+SELECT cos('-Infinity'::float8)
+
+statement error 22003
+SELECT tan('Infinity'::float8)
+
+statement error 22003
+SELECT cot('-Infinity'::float8)
+
+# cost: 5
+query RRRR nosort
+SELECT sin('NaN'::float8), cos('NaN'::float8), tan('NaN'::float8), cot('NaN'::float8)
+----
+NaN
+NaN
+NaN
+NaN

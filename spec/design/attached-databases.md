@@ -463,7 +463,8 @@ Sequenced to put the durability-risky part last:
     change; the store lookup is untouched. Corpus-tested (qualified reads/joins/DML over `main`/`temp`,
     unknown-database `42P01`); no new error code, no `format_version` change. `CREATE INDEX ON` /
     `REFERENCES` / `CREATE TABLE` qualifiers stay bare this sub-slice (they matter once real
-    attachments exist — 1b).
+    attachments exist — 1b). The `REFERENCES` qualifier has since landed (constraints.md §6.2 step
+    2): `main.` / `temp.` pin the scope, an attachment is the §8 cross-database FK `0A000`.
   - **1b — the registry + host-API in-memory attach + N-root commit + the DDL qualifier. LANDED (all
     three cores).** A per-attachment `(storage, published-root)` struct keyed by name
     lives on the shared core; `db.attach(name, memory(), read_only)` / `db.detach(name)` add/remove

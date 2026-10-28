@@ -1287,8 +1287,11 @@ export function unlockCodec(
 
 // fileSuite is the suite a file's meta slots declare (offset 6, with the reserve byte at 7 —
 // encrypted.md §6), read from the CRC-valid slots before any key is available: 0 plaintext,
-// SUITE_XAES encrypted. Slots that disagree, or an unknown suite, are XX001.
-export function fileSuite(slot0: Uint8Array, slot1: Uint8Array): number {
+// SUITE_XAES encrypted. Slots that disagree, or an unknown suite, are XX001. null when NEITHER slot
+// is CRC-valid: the file declares nothing, so the caller must not read it as plaintext (a damaged
+// encrypted header opened with its credential is XX001, never 28P03) — slot selection reports the
+// corruption.
+export function fileSuite(slot0: Uint8Array, slot1: Uint8Array): number | null {
   let suite: number | null = null;
   for (const m of [slot0, slot1]) {
     if (m.length < 64 || u32At(m, 32) !== metaChecksum(m)) continue;
@@ -1299,8 +1302,7 @@ export function fileSuite(slot0: Uint8Array, slot1: Uint8Array): number {
     if (suite !== null && suite !== s) throw corrupt("meta slots disagree on encryption");
     suite = s;
   }
-  // Neither slot is valid: slot selection reports the corruption.
-  return suite ?? 0;
+  return suite;
 }
 
 // ---- scratch encryption (spec/fileformat/encrypted.md §11) ----------------------------------------

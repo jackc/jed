@@ -301,9 +301,18 @@ with jsonpath's own escape set ([jsonpath.md](jsonpath.md) §2.1).
   array/range/composite (the catalog cannot express "recurse over a JSON tree"; CLAUDE.md §5
   forbids codegenning it). It yields a **definite boolean** — btree semantics like array/range,
   **not** composite's 3VL — because there are no SQL NULLs *inside* a document (JSON `null`
-  is a concrete `NTAG_NULL` node, not SQL NULL). The order (PG's):
+  is a concrete `NTAG_NULL` node, not SQL NULL). The order (PG's `compareJsonbContainers`,
+  quirks included):
 
-  1. **Type rank** (the outermost discriminator):
+  0. **At the document root only — the raw-scalar rule.** PostgreSQL stores a top-level scalar
+     as a one-element "raw scalar" pseudo-array, and compares two roots as containers: when one
+     is a raw scalar and the other a real array, the raw-scalar flag says "scalar first" but the
+     element-count check that follows overrides it, so a **scalar sorts after the empty array and
+     before every non-empty array**. The whole order is therefore `[]` < every scalar (by the
+     rank below) < non-empty arrays < objects: `'true'::jsonb < '[]'::jsonb` is false,
+     `'[]'::jsonb < 'null'::jsonb` is true. The rule applies to the two documents being compared,
+     never to nested nodes (`'[null]'::jsonb < '[[]]'::jsonb` is true, by rank).
+  1. **Type rank** (the outermost discriminator below the root):
      `Object > Array > Boolean > Number > String > Null`.
   2. Within the same type:
      - **Null:** all equal.
@@ -315,13 +324,19 @@ with jsonpath's own escape set ([jsonpath.md](jsonpath.md) §2.1).
        length before contents), then element-wise recursively; the first differing element
        decides.
      - **Object:** by **member count first** (fewer members first — PG), then by comparing
-       members pairwise in **stored canonical key order** (§2.3): compare keys
-       (length-then-bytewise), then values recursively; the first differing key-or-value
-       decides.
+       members pairwise in **stored canonical key order** (§2.3): compare the two keys
+       **bytewise** (collation-`C` byte order — *not* the length-first storage order; PostgreSQL
+       compares the key strings under the collation while walking the pairs in storage order),
+       then values recursively; the first differing key-or-value decides. So
+       `'{"b":1}'::jsonb < '{"aa":1}'::jsonb` is **false** ("aa" < "b" bytewise).
 
   A single comparator drives both `<` and `ORDER BY`, so they agree by construction (the
   §8 consistency requirement; jed sidesteps PG's own abbreviated-key inconsistency by having
-  one comparator).
+  one comparator). Equality is unaffected by the root rule and the key rule (both only reorder
+  unequal documents), so the DISTINCT / GROUP BY / set-operation **dedup key** stays the
+  structural walk — each number keyed on its value-canonical decimal, so `{"a":1}` and
+  `{"a":1.0}` share one bucket — and the GIN `jsonb_ops` terms (containment/existence, never
+  order) are untouched.
 
 - **`jsonb`-as-key deferred `0A000` initially.** Comparison/ordering/grouping ship via the
   in-memory comparator — **no key bytes needed** (the array precedent: values are fully
@@ -566,7 +581,7 @@ kernels in [json-sql-functions.md](json-sql-functions.md)):
 
 | op | meaning | result | slice |
 |---|---|---|---|
-| `->` | get field (by key) / element (by int index) | `json`/`jsonb` | J4 |
+| `->` | get field (by key) / element (by int index; a top-level scalar is its own element 0 / -1 — the raw-scalar rule, §5) | `json`/`jsonb` | J4 |
 | `->>` | get field/element as text | `text` | J4 |
 | `#>` | get at path (`text[]`) | `json`/`jsonb` | J4 |
 | `#>>` | get at path as text | `text` | J4 |

@@ -302,8 +302,11 @@ event  = "one AT TIME ZONE conversion (an RFC 8536 reader lookup)"
 # per conversion at the operator's evaluation site (the deterministic, cross-core-identical metering
 # point — like `collate`), so an AT TIME ZONE over many rows stays cost-proportional and a max_cost
 # ceiling aborts it (54P01). A built-in `UTC`/fixed-offset conversion still charges the unit (one
-# lookup's worth) so cost does not depend on whether a bundle is loaded. Charged at the identical
-# point in every core, so cost stays cross-core identical (§8/§13).
+# lookup's worth) so cost does not depend on whether a bundle is loaded. `timestamptz ± interval`
+# (and `uuidv7(shift)`) charges it once per calendar step — a nonzero months field, a nonzero days
+# field — a finite operand performs on the session zone's wall clock (../design/interval.md §5/§6);
+# a pure time-of-day interval charges none. Charged at the identical point in every core, so cost
+# stays cross-core identical (§8/§13).
 
 [[unit]]
 id     = "regex_compile"

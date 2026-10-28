@@ -593,7 +593,7 @@ func (r *simRunner) simUnlocks(image []byte, k int) bool {
 	if len(image) < 2*ps {
 		return false
 	}
-	suite, err := fileSuite(image[:ps], image[ps:2*ps])
+	suite, _, err := fileSuite(image[:ps], image[ps:2*ps])
 	if err != nil {
 		return false
 	}

@@ -794,6 +794,11 @@ var SupportedCapabilities = []string{
 	// Nesting-depth limit — a fixed maxExprDepth checked in the parser aborts deeply-nested input
 	// with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
 	"resource.depth_limit",
+	// Bind-parameter index limit — $N is at most $65535 (maxParamIndex), else 42601 at the lexer;
+	// IN-list element limit — at most 1000 elements (maxInListElements), else 54001 at the parser
+	// (CLAUDE.md §13; api.md §5, cost.md §7f).
+	"resource.param_index_limit",
+	"resource.in_list_limit",
 	// Input-size limit — a per-handle maxSQLLength (default 1 MiB, 0 = unlimited) aborts an
 	// over-long statement with 54000 at parse entry, before lexing; the `# max_sql_length:`
 	// directive runs a record under a small cap (CLAUDE.md §13; cost.md §7, api.md §8).
