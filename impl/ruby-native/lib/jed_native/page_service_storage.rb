@@ -192,6 +192,9 @@ module JedNative
       suite = JedNative.file_suite(*slots)
       crypto = @codec.crypto
       unless crypto
+        # An open that becomes the owner before it ever unlocked (the owner yielded during the open)
+        # unlocks with its credential like a local open.
+        return unlock_file if @credential && @meta.nil?
         raise Error.new('28P02', 'the database was encrypted since this handle opened it') unless suite.zero?
         return
       end
