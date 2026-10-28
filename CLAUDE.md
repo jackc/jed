@@ -148,6 +148,9 @@ experiment, and promotion requires a separate decision. See
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.
+For encryption at rest (the 2026-10-27 parity update) it also approved OpenSSL's
+AES-256, AES-256-GCM and HKDF, and the `argon2-kdf` gem for Argon2id passphrases,
+loaded only when a passphrase is used.
 A well-supported native checksum gem is also permitted if profiling justifies
 it, with the standard library preferred. SQL parsing, planning, other evaluation,
 and storage algorithms remain handwritten Ruby; these utility exceptions do not

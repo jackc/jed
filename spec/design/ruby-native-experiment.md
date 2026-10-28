@@ -11,7 +11,10 @@ no FFI, native engine extension, embedded interpreter for another core, or SQL s
 Ruby's built-in arbitrary-precision integers are permitted for exact arithmetic.
 The maintainer explicitly approved Ruby's OpenSSL binding for vetted cryptographic
 digest primitives, stdlib Zlib for byte-identical CRC32 checksums, and a well-supported
-native checksum gem if profiling justifies it (prefer the standard library). These
+native checksum gem if profiling justifies it (prefer the standard library). For
+encryption at rest it also approved OpenSSL's AES-256, AES-256-GCM and HKDF, and the
+`argon2-kdf` gem (a Fiddle binding to libargon2) for Argon2id passphrase credentials,
+loaded only when a passphrase is used. These
 utility exceptions do not authorize a native engine component; parser, planner,
 remaining evaluation, and storage algorithms stay handwritten Ruby. Other new
 third-party dependencies still require explicit confirmation.
@@ -27,6 +30,11 @@ feature work does not update it, its frozen catalog data, or its benchmark resul
 unless the maintainer explicitly requests that work. Promotion to a supported core
 requires a separate decision. An experiment need not pass a later expanded corpus;
 its report must identify the revision it tested and retain failures and omissions.
+The maintainer-requested [parity update](../../impl/ruby-native/PARITY_UPDATE.md)
+brought the surface level with source revision `1c5a8961` (from `d4a01ebd`),
+including MERGE, DISTINCT ON, SIMILAR TO, per-row key metering, format v50, the
+integrity check and encryption at rest; it lists the remaining omissions and does not
+change the frozen status or refresh benchmark results.
 
 The cleaned integration history retains the implementation, opt-in tooling and
 readable reports. Generated evidence and run-specific drivers remain on the
