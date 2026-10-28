@@ -32,7 +32,7 @@ module JedNative
       @page_ids, @next_page_ids = page_ids, {}.compare_by_identity
       @old_overflow_ids, @overflow_ids = overflow_ids, {}.compare_by_identity
       @live_pages = Set.new
-      @capacity = page_size - FileFormat::PAGE_HEADER
+      @capacity = codec.payload_capacity(page_size)
       @body, @assignments, @live = {}, [], 0
       @codec.instance_variable_set(:@ctypes, snapshot.fetch(:types, []).to_h { |type| [type[:name], type[:fields]] })
       entries = []
@@ -62,18 +62,14 @@ module JedNative
       end
       tables.each { |table| entries.concat(@codec.statistics_entries(table)) }
       snapshot.fetch(:views, []).sort_by { |view| view[:name].b }.each { |view| entries << "\x05".b + @codec.view_entry_bytes(view) }
-      catalog = @codec.catalog_layout(entries, @capacity)
+      catalog = @codec.catalog_layout(entries, @codec.chain_capacity(@capacity))
       ids = catalog.map { @allocator.allocate }
       @root = ids.first
-      catalog.each_with_index do |page, index|
-        @body[ids[index]] = [FileFormat::PAGE_CATALOG, page[:count], ids[index + 1] || 0, page[:payload], page[:continued] ? 1 : 0]
-        @live_pages.add(ids[index])
-      end
+      @codec.catalog_out(@body, @page_size, ids, catalog)
+      @live_pages.merge(ids)
       @live += catalog.length
       @pages = PageBuffer.new(page_size, @allocator.high_water, compact: true)
-      @body.each do |page, (kind, count, following, payload, flags)|
-        @codec.write_page(@pages, @page_size, page, kind, count, following, payload, flags: flags || 0)
-      end
+      @body.each { |page, descriptor| @codec.write_descriptor(@pages, @page_size, page, descriptor) }
     end
 
     def adopt
@@ -142,8 +138,8 @@ module JedNative
           end
         end
         payload = @codec.emit_leaf_pax(node[:recs], @capacity, -> { @allocator.allocate }, overflow, retain: retain)
-        overflow.each do |id, (kind, count, bytes, following)|
-          @body[id] = [kind, count, following || 0, bytes]
+        overflow.each do |id, descriptor|
+          @body[id] = descriptor
           @live_pages.add(id)
         end
         @overflow_ids[node] = (kept + overflow.keys).freeze
@@ -162,7 +158,7 @@ module JedNative
       @overflow_ids[page] = @overflow_ids[node] if children.empty?
       @live_pages.add(page)
       @live += 1
-      @body[page] = [kind, node[:keys].length, 0, payload]
+      @codec.page_out(@body, @page_size, page, kind, node[:keys].length, payload)
       page
     end
 
@@ -183,7 +179,7 @@ module JedNative
         node[:children].each do |bound, child|
           child_page = write_gist(child, operations)
           bytes = @codec.gist_encode_bound(operations, bound)
-          payload << [bytes.bytesize].pack('n') << bytes << [child_page].pack('N')
+          payload << [bytes.bytesize].pack('n') << bytes << @codec.pointer(child_page)
         end
         kind, count = FileFormat::PAGE_GIST_INTERIOR, node[:children].length
       end
@@ -192,7 +188,7 @@ module JedNative
       @assignments << [node, page]
       @next_page_ids[node] = page
       @live_pages.add(page)
-      @body[page] = [kind, count, 0, payload]
+      @codec.page_out(@body, @page_size, page, kind, count, payload)
       @live += 1
       page
     end

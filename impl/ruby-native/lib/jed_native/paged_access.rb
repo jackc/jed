@@ -211,7 +211,7 @@ module JedNative
       raise Error.new('XX001', 'persisted row count does not match tree') unless rows.actual_count == rows.length
       codec = statistics_codec
       stored = { columns: table[:columns], rows: rows.raw || rows }
-      capacity = storage_page_size(table) - FileFormat::PAGE_HEADER
+      capacity = storage_capacity(table)
       definitions = table[:indexes].to_h { |index| [index[:name], export_index(table, index)] }
       indexes = table[:indexes].map do |index|
         next index if index[:unparsed]

@@ -19,6 +19,9 @@ module JedNative
       mode = options.delete(:mode) || mode
       raise Error.new('22023', 'invalid attachment mode') unless %i[read_only read_write].include?(mode)
       attachment = { read_only: mode == :read_only }
+      if (source.nil? || source == :memory) && options[:credential]
+        raise Error.new('55000', 'an in-memory database cannot be encrypted')
+      end
       unless source.nil? || source == :memory
         require_relative 'persistence'
         if @storage && !source.is_a?(Storage)
@@ -32,9 +35,14 @@ module JedNative
           inherited.merge!(@storage.instance_variable_get(:@service_options) || {})
           options = inherited.merge(options)
         end
-        options = { clock: (@environment ||= Environment.new).clock }.merge(options) unless source.is_a?(Storage)
+        options = { clock: (@environment ||= Environment.new).clock, key_random: @environment.key_stream }.merge(options) unless source.is_a?(Storage)
         storage = source.is_a?(Storage) ? source : Storage.new(path: source, create: false, read_only: attachment[:read_only], **options)
         attachment[:storage] = storage
+        # An encrypted attachment must not spill plaintext through a plaintext handle's scratch
+        # files (spec/fileformat/encrypted.md §11).
+        if storage.encrypted? && !scratch_sealed?
+          raise Error.new('55000', 'an encrypted attachment needs scratch_encryption = on')
+        end
         import_attachment_catalog(name, attachment, storage.load)
       end
       @attachments[name] = attachment

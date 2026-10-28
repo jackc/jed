@@ -31,6 +31,8 @@ module JedNative
     attr_reader :path, :page_size, :meta
     attr_writer :reader_watermark_provider
     def read_only? = @read_only
+    def encrypted? = @codec.encrypted?
+    def crypto = @codec.crypto
     def max_storage_bytes=(bytes)
       raise Error.new('22023', 'max_storage_bytes must be an integer') unless bytes.is_a?(Integer)
       @max_storage_bytes = [bytes, 0].max
@@ -43,8 +45,14 @@ module JedNative
     def initialize(path:, create: false, page_size: 8192, locking: :auto,
                    file_lock_timeout_ms: 5000, fsync: true, synchronous: :on, read_only: false,
                    max_storage_bytes: 0, cache_bytes: FileImage::DEFAULT_CACHE_BYTES, collation_key: nil, expression: nil,
-                   flush_interval_ms: 1000, clock: nil)
+                   flush_interval_ms: 1000, clock: nil, credential: nil, kdf: nil, key_random: nil)
       @codec = FileFormat.new(collation_key: collation_key, expression: expression)
+      unless credential.nil? || credential.is_a?(Credential)
+        raise Error.new('22023', 'a credential must be a JedNative::Credential')
+      end
+      # The credential unlocks the file; only the data key it unwraps is kept (encrypted.md §9).
+      @credential = credential
+      @key_random = key_random || OSKeyRandom.new
       @pid = Process.pid
       @sync = fsync
       raise Error.new('22023', 'synchronous must be on or off') unless %i[on off].include?(synchronous.to_sym)
@@ -97,6 +105,10 @@ module JedNative
         raise Error.new("58P02", "database file already exists") if File.exist?(@path)
 
         @page_size = page_size
+        if @credential
+          raise Error.new('0A000', 'an encrypted database needs a page size of at least 1024') if @page_size < Crypto::MIN_PAGE_SIZE
+          @codec.crypto = PageCodec.create(@credential, kdf, @key_random)
+        end
         if @max_storage_bytes.positive? && @page_size > @max_storage_bytes
           raise Error.new("54P06", "database storage limit exceeded")
         end
@@ -108,6 +120,8 @@ module JedNative
         raise Error.new("55006", "coordinated access rejects hard-linked database files")
       end
       @page_size ||= discover_page_size
+      unlock_file unless create
+      @credential = nil
       @snapshot = decode_file
       @meta = @snapshot.fetch(:meta)
       @free_generation = @meta[:txid]
@@ -216,14 +230,15 @@ module JedNative
         if @synchronous == :on
           reset_durability_floor(@meta)
         else
-          pages.pages.each { |page, bytes| @durability_pending[page] = @codec.crc64(bytes) if page >= 2 && bytes.getbyte(0) != 8 }
+          manifest = free_plan.manifest_ids.to_set
+          pages.pages.each { |page, bytes| @durability_pending[page] = @codec.crc64(bytes) if page >= 2 && !manifest.include?(page) }
           if reading && starts_batch && !@durability_pending.empty?
             @flush_deadline = [reading + @flush_interval_ms * 1000, (1 << 63) - 1].min
             start_idle_flusher
           end
         end
         @service_owner&.publish(@meta, pages.pages.fetch(slot), pages.pages.keys.reject { |page| page < 2 })
-        if @synchronous == :off && @durability_pending.length >= (@page_size - 64) / 12
+        if @synchronous == :off && @durability_pending.length >= @codec.inline_manifest_capacity(@page_size)
           begin
             flush_pending
           rescue Error
@@ -330,7 +345,7 @@ module JedNative
     # Adopt the already validated commit roots directly. The owner foreground
     # path neither rereads meta pages nor reparses SQL after its own publication.
     def published_snapshot(snapshot, plan, image)
-      reader = FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key), expression: @codec.instance_variable_get(:@expression))
+      reader = @codec.reader
       reader.instance_variable_set(:@ctypes, snapshot.fetch(:types, []).to_h { |type| [type[:name], type[:fields]] })
       pool = LeafPool.new(reader, image, @page_size, image.cache_pages)
       previous = @snapshot.fetch(:tables, []).to_h { |table| [table[:name], table] }
@@ -413,16 +428,48 @@ module JedNative
         next if @file.size < size * 3
 
         image = FileImage.new(@file, size)
-        next unless @codec.read_meta(image, size, 0) || @codec.read_meta(image, size, 1)
+        next unless [0, 1].any? do |slot|
+          @codec.read_meta(image, size, slot, manifest: false) ||
+            size >= Crypto::MIN_PAGE_SIZE && @codec.reader(crypto: PageCodec::LAYOUT).read_meta(image, size, slot, manifest: false)
+        end
 
         return size
       end
       raise Error.new("XX001", "no valid meta page")
     end
 
+    # Learn the variant from the meta slots and unlock an encrypted file with the credential
+    # (encrypted.md §9): 28P02 without one, 28P03 for a plaintext file, 28P01 when it does not unwrap.
+    def unlock_file
+      slots = [0, 1].map { |slot| @file.pread(@page_size, slot * @page_size) }
+      suite = JedNative.file_suite(*slots)
+      if suite.zero?
+        raise Error.new('28P03', 'a credential was given for a database that is not encrypted') if @credential
+        return
+      end
+      raise Error.new('28P02', 'the database is encrypted; a credential is required') unless @credential
+      if @page_size < Crypto::MIN_PAGE_SIZE || @file.size < Crypto::FIRST_BODY * @page_size
+        raise Error.new('XX001', 'encrypted file too small for its key block')
+      end
+      pages = [2, 3].map { |page| @file.pread(@page_size, page * @page_size) }
+      @codec.crypto = PageCodec.unlock(*pages, @credential, @key_random)
+      repair_key_block(pages)
+    end
+
+    # A writable open whose key-block pages differ writes the selected copy over the other between
+    # two barriers (encrypted.md §5).
+    def repair_key_block(pages)
+      return if @read_only
+      selected = @codec.crypto.key_block_page(@page_size)
+      return if pages.all?(selected)
+      durable_sync(@file) if @sync
+      [2, 3].each_with_index { |page, index| write_at(@file, selected, page * @page_size) unless pages[index] == selected }
+      durable_sync(@file) if @sync
+    end
+
     def decode_file
       image = @image = FileImage.new(@file, @page_size, cache_bytes: @cache_bytes)
-      reader = FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key), expression: @codec.instance_variable_get(:@expression))
+      reader = @codec.reader
       snapshot = reader.decode_image(image, page_size: @page_size, lazy: true)
       a = @codec.read_meta(image, @page_size, 0)
       b = @codec.read_meta(image, @page_size, 1)

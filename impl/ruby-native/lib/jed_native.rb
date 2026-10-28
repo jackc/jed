@@ -302,7 +302,7 @@ module JedNative
 
   def self.file_database(path, create, options)
     require_relative 'jed_native/persistence'
-    engine_options = options.select { |key, _| %i[environment max_cost max_scalar_bytes max_sql_length lifetime_max_cost allow_ddl allow_temp_ddl default_privileges max_query_memory_bytes work_mem max_temp_storage_bytes].include?(key) }
+    engine_options = options.select { |key, _| %i[environment max_cost max_scalar_bytes max_sql_length lifetime_max_cost allow_ddl allow_temp_ddl default_privileges max_query_memory_bytes work_mem max_temp_storage_bytes scratch_encryption].include?(key) }
     storage_options = options.reject { |key, _| engine_options.key?(key) }
     db = Database.new(**engine_options)
     db.engine.attach_storage(path: path, create: create, **storage_options)
@@ -345,3 +345,4 @@ require_relative 'jed_native/prepared_joins'
 require_relative 'jed_native/query_walks'
 require_relative 'jed_native/expression_walks'
 require_relative 'jed_native/merge'
+require_relative 'jed_native/encryption_operations'

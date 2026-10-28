@@ -14,6 +14,17 @@ module JedNative
       @storage&.page_size || @native_page_size || 8192
     end
 
+    # The payload capacity C of the table's database's pages: an encrypted file's pages hold 40 bytes
+    # less (spec/fileformat/encrypted.md §1), and the capacity carries the variant into the tree rules.
+    def storage_capacity(table = nil)
+      page_size = storage_page_size(table)
+      storage = if table && table[:temporary] then nil
+                elsif table && table[:database] then @attachments&.dig(table[:database], :storage)
+                else @storage
+                end
+      page_size - FileFormat::PAGE_HEADER - (storage&.encrypted? ? Crypto::RESERVE : 0)
+    end
+
     def refresh_primary_indexes
       super
       refresh_primary_pages
@@ -72,7 +83,7 @@ module JedNative
     def refresh_primary_pages
       @tables.each do |name, stored|
         page_size = storage_page_size(stored)
-        signature = [stored[:rows].object_id, stored[:columns].object_id, stored[:constraints].object_id, page_size]
+        signature = [stored[:rows].object_id, stored[:columns].object_id, stored[:constraints].object_id, page_size, storage_capacity(stored)]
         next if stored[:native_page_signature] == signature
         codec = statistics_codec
         names = stored[:constraints].find { |constraint| constraint[:kind] == :primary_key }&.dig(:columns) || []
@@ -86,7 +97,8 @@ module JedNative
         end
         entries = rows.map { |key, row| [key.freeze, row_positions.fetch(row.object_id)].freeze }.freeze
         shape = { columns: stored[:columns] }
-        cap = page_size - FileFormat::PAGE_HEADER
+        cap = storage_capacity(stored)
+        slab = codec.chain_capacity(cap)
         scan_units = {}
         pairs = rows.map do |key, row|
             values = row.each_with_index.map { |value, index| statistics_value(stored[:columns][index][:type], value) }
@@ -96,8 +108,8 @@ module JedNative
               next if form == :inline
               payload = codec.value_payload(stored[:columns][index][:type], values[index])
               pages = case form
-                      when :external then (payload.bytesize + cap - 1) / cap
-                      when :external_comp then (comps[index].bytesize + cap - 1) / cap
+                      when :external then (payload.bytesize + slab - 1) / slab
+                      when :external_comp then (comps[index].bytesize + slab - 1) / slab
                       else 0
                       end
               slabs = %i[inline_comp external_comp].include?(form) ? (payload.bytesize + cap - 1) / cap : 0
@@ -370,7 +382,7 @@ module JedNative
             tree = previous_metadata[:physical_tree]
             runs = previous_metadata[:runs].transform_values(&:dup)
             old = previous_metadata[:row_terms]
-            capacity = storage_page_size(table) - FileFormat::PAGE_HEADER
+            capacity = storage_capacity(table)
             old.sort_by(&:first).each do |key, terms|
               (terms - (row_terms[key] || [])).each do |term|
                 tree = codec.gin_edit_posting(tree, runs[term] ||= [], term, key, false, capacity)
@@ -473,7 +485,7 @@ module JedNative
         [key, { key: key, row: [], table: columns, forms: [], comps: [], size: key.bytesize }]
       end
       page_size = storage_page_size(table)
-      tree = imported ? codec.tree_from_profile(imported, pairs) : codec.patch_tree(previous, pairs, page_size - FileFormat::PAGE_HEADER)
+      tree = imported ? codec.tree_from_profile(imported, pairs) : codec.patch_tree(previous, pairs, storage_capacity(table))
       compact_tree_profile(tree).merge(physical_tree: tree)
     end
 

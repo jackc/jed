@@ -53,16 +53,27 @@ module JedNative
   end
 
   class Environment
-    attr_reader :clock, :random, :timezones, :collations, :unicode_properties, :functions
-    def initialize(clock: WallClock.new, random: OSRandom.new, timezones: {}, collations: {}, unicode_properties: nil, functions: [])
+    attr_reader :clock, :random, :timezones, :collations, :unicode_properties, :functions, :key_seed
+    def initialize(clock: WallClock.new, random: OSRandom.new, timezones: {}, collations: {}, unicode_properties: nil, functions: [], key_seed: nil)
       @clock, @random, @timezones = clock, random, timezones.dup.freeze
       @collations, @unicode_properties = collations.dup.freeze, unicode_properties
       @functions = functions.dup.freeze
+      raise Error.new('22023', 'key_seed must be an integer') unless key_seed.nil? || key_seed.is_a?(Integer)
+      @key_seed = key_seed
       freeze
     end
-    def with(clock: @clock, random: @random, timezones: @timezones, collations: @collations, unicode_properties: @unicode_properties, functions: @functions)
-      self.class.new(clock: clock, random: random, timezones: timezones, collations: collations, unicode_properties: unicode_properties, functions: functions)
+    def with(clock: @clock, random: @random, timezones: @timezones, collations: @collations, unicode_properties: @unicode_properties, functions: @functions, key_seed: @key_seed)
+      self.class.new(clock: clock, random: random, timezones: timezones, collations: collations, unicode_properties: unicode_properties, functions: functions, key_seed: key_seed)
     end
+
+    # Encrypted databases draw key material and nonces from an INSECURE splitmix64 stream seeded with
+    # seed instead of the OS CSPRNG (spec/fileformat/encrypted.md §8) — for tests and fixtures only.
+    # Separate from the SQL random source, so seeding uuidv4 never seeds a key.
+    def insecure_seeded_key_entropy(seed) = with(key_seed: seed)
+
+    # A fresh key-entropy stream for one encrypted database: each database opened or created through
+    # the environment starts its own stream.
+    def key_stream = @key_seed ? SeededRandom.new(@key_seed) : OSKeyRandom.new
     def load_time_zone_data(bytes)
       require_relative 'timezone_data'
       loaded = TimeZoneData.new(bytes).zones

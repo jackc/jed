@@ -128,8 +128,18 @@ class NativeCorpus
   DIRECTIVES = %w[requires names types cost max_cost format fixture params clock clock_advance seed timezone collation unicode attach lifetime_max_cost max_query_memory_bytes max_scalar_bytes max_sql_length max_storage_bytes max_temp_storage_bytes work_mem allow_ddl allow_temp_ddl default_privileges grant revoke set load-collation load-timezone upgrade-collations].freeze
   attr_reader :summary
 
+  # The corpus's encrypted mode (spec/design/conformance.md §3; JED_CONFORMANCE_ENCRYPTED=1 or
+  # JED_NATIVE_ENCRYPTED=1 with the disk mode): every database file is encrypted under a fixed host
+  # key. Rows and errors must be as written; each `# cost:` record's cost and each EXPLAIN's rows
+  # follow the variant's page capacity, so they go to a transcript (JED_CONFORMANCE_TRANSCRIPT) that
+  # must agree with the supported cores' instead.
+  ENCRYPTED = ENV['JED_CONFORMANCE_ENCRYPTED'] == '1' || ENV['JED_NATIVE_ENCRYPTED'] == '1'
+  CREDENTIAL = ENCRYPTED ? JedNative::Credential.key("\x4A".b * 32) : nil
+
   def initialize(filter: '', mode: 'memory', output: nil)
     @filter, @mode, @output = filter, mode, output
+    abort 'the encrypted mode runs with the disk mode' if ENCRYPTED && mode != 'disk'
+    @encrypted = ENCRYPTED
     @query_api = ENV.fetch('JED_NATIVE_QUERY_API', 'execute')
     raise 'JED_NATIVE_QUERY_API must be execute or query' unless %w[execute query].include?(@query_api)
     if ENV.key?('JED_NATIVE_QUERY_MEMORY_API') && ENV['JED_NATIVE_QUERY_MEMORY_API'] != @query_api
@@ -148,6 +158,16 @@ class NativeCorpus
     @summary[:compiled_like_kernels] = 0
     @summary[:query_api_records] = @summary[:execute_api_records] = 0
     @summary[:materialized_memory_records] = 0
+    @summary[:encrypted] = true if @encrypted
+    @summary[:transcript] = [] if @encrypted
+  end
+
+  def credential_options = @encrypted ? { credential: CREDENTIAL } : {}
+
+  def transcribe(path, kind, sql, actual)
+    escapes = { '\\' => '\\\\', "\n" => '\\n', "\t" => '\\t' }
+    flat = ->(text) { text.gsub(/[\\\n\t]/) { |c| escapes[c] } }
+    @summary[:transcript] << [relative(path).delete_prefix('spec/conformance/suites/'), kind, flat.(sql), flat.(actual)].join("\t")
   end
 
   def run
@@ -210,7 +230,10 @@ class NativeCorpus
     end
     @summary[:finished_at], @summary[:final_source_sha256] = Time.now.utc.iso8601, source_digest
     write_report
-    puts JSON.generate(@summary.reject { |key, _| key == :failures })
+    if @encrypted && (target = ENV['JED_CONFORMANCE_TRANSCRIPT'])
+      File.write(target, @summary[:transcript].map { |line| "#{line}\n" }.join)
+    end
+    puts JSON.generate(@summary.reject { |key, _| %i[failures transcript].include?(key) })
     @summary[:failed].zero? && @summary[:unsupported_files].zero?
   end
 
@@ -218,7 +241,7 @@ class NativeCorpus
     @summary[:files] += 1
     worker_progress(path, 0, nil)
     contents = File.read(path)
-    if contents.match?(/^#\s*skip:\s*#{@mode}\b/)
+    if contents.match?(/^#\s*skip:\s*#{@mode}\b/) || @encrypted && contents.match?(/^#\s*skip:\s*encrypted\b/)
       @summary[:skipped_files] += 1
       return
     end
@@ -254,7 +277,7 @@ class NativeCorpus
       end
       raise "expected fixture open error #{expected_error}, got success" if expected_error
     else
-      db = file ? JedNative.create(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym) : JedNative.memory(environment: environment)
+      db = file ? JedNative.create(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym, **credential_options) : JedNative.memory(environment: environment)
     end
     contents.scan(/^#\s*attach:\s*(.+)$/).flatten.each { |name| db.attach(name.strip) }
     core = db
@@ -362,7 +385,9 @@ class NativeCorpus
             actual = result.rows.flat_map { |row| row.each_with_index.map { |v, index| db.render(v, result.column_types[index]) } }
             actual = actual.each_slice(width).to_a.sort.flatten if sort == 'rowsort'
             actual.sort! if sort == 'valuesort'
-            if expected.length == 1 && (hash = /\A(\d+) values hashing to ([0-9a-f]+)\z/.match(expected.first))
+            if @encrypted && sql.join("\n").lstrip.match?(/\Aexplain/i)
+              transcribe(path, 'rows', sql.join("\n"), actual.join(' '))
+            elsif expected.length == 1 && (hash = /\A(\d+) values hashing to ([0-9a-f]+)\z/.match(expected.first))
               raise 'hash mismatch' unless actual.length == hash[1].to_i && Digest::MD5.hexdigest(actual.join("\n") + "\n") == hash[2]
             else
               expected = expected.each_slice(width).to_a.sort.flatten if sort == 'rowsort'
@@ -376,7 +401,9 @@ class NativeCorpus
               raise "#{key}: expected #{pending[key]}, got #{actual_names.join(', ')}" unless pending[key].split(',').map(&:strip) == actual_names
             end
           end
-          if pending['cost'] && result.cost != pending['cost'].to_i
+          if pending['cost'] && @encrypted
+            transcribe(path, 'cost', sql.join("\n"), result.cost.to_s)
+          elsif pending['cost'] && result.cost != pending['cost'].to_i
             raise "cost expected #{pending['cost']}, got #{result.cost}"
           end
         end
@@ -389,7 +416,7 @@ class NativeCorpus
         if file && !db.engine.transaction_open?
           db.close
           core.close
-          core = JedNative.open(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym)
+          core = JedNative.open(file, environment: environment, locking: ENV.fetch('JED_NATIVE_LOCKING', 'auto').to_sym, **(fixture ? {} : credential_options))
           db = core.session
           storage_limits.each { |name, bytes| db.set_max_storage_bytes(bytes, name) }
         end
@@ -431,6 +458,8 @@ class NativeCorpus
       name = key.to_sym
       if name == :failures
         count.each { |record| append_failure(record.transform_keys(&:to_sym)) }
+      elsif name == :transcript
+        @summary[:transcript].concat(count)
       elsif @summary[name].is_a?(Numeric)
         @summary[name] += count
       end
@@ -439,7 +468,7 @@ class NativeCorpus
   def write_report
     return unless @output
     temporary = "#{@output}.tmp.#{Process.pid}"
-    File.write(temporary, JSON.pretty_generate(@summary) + "\n")
+    File.write(temporary, JSON.pretty_generate(@summary.reject { |key, _| key == :transcript }) + "\n")
     File.rename(temporary, @output)
   end
   def source_digest

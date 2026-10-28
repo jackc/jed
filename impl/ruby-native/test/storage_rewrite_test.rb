@@ -12,13 +12,28 @@ module RubyRewriteTest
     fixtures = File.expand_path('../../../spec/fileformat/fixtures', __dir__)
     count = 0
     Dir[File.join(fixtures, '*_table.jed')].sort.each do |path|
-      next if File.basename(path).match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon|^encrypted_/)
+      name = File.basename(path)
+      next if name.match?(/collation|expr_index|partial_index|timezone_index|hostfunc_index|exclude_followon|rekey/)
       bytes = File.binread(path)
+      page_size = 256
       codec = JedNative::FileFormat.new
+      if name.start_with?('encrypted_')
+        # The golden is its own from-scratch image: rewriting it node for node under a fresh stream
+        # from the goldens' seed (after their key-block draws) reproduces it (encrypted.md §7–§8).
+        page_size = 1024
+        key = JedNative::Credential.key("\x4A".b * 32)
+        random = JedNative::SeededRandom.new(0x4A454442)
+        random.bytes(32)
+        random.bytes(32)
+        random.bytes(12)
+        unlocked = JedNative::PageCodec.unlock(bytes.byteslice(2048, 1024), bytes.byteslice(3072, 1024), key, random)
+        codec = JedNative::FileFormat.new(crypto: unlocked)
+      end
       state = codec.decode_image(bytes, lazy: true)
-      output = JedNative::PageBuffer.new(256, bytes.bytesize / 256)
-      JedNative::PhysicalImage.new(codec, 256, source_image: bytes).write(state, state[:meta][:txid]) do |page, block|
-        output[page * 256, 256] = block
+      writer = codec.encrypted? ? codec.reader(crypto: codec.crypto.fork) : codec
+      output = JedNative::PageBuffer.new(page_size, bytes.bytesize / page_size)
+      JedNative::PhysicalImage.new(writer, page_size, source_image: bytes, source_codec: codec).write(state, state[:meta][:txid]) do |page, block|
+        output[page * page_size, page_size] = block
       end
       assert(bytes == output.to_s, "physical rewrite differs from shared fixture #{File.basename(path)}")
       count += 1

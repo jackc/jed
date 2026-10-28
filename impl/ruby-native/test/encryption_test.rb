@@ -85,8 +85,37 @@ module RubyEncryptionTest
     assert(new_block == hex(rewrap['block_hex']), 'rewrap block')
   end
 
+  def self.unlock(image, ps = GOLDEN_PAGE)
+    JedNative::PageCodec.unlock(image.byteslice(2 * ps, ps), image.byteslice(3 * ps, ps), golden_key, nil)
+  end
+
+  # Each encrypted golden decodes under the goldens' key, and its logical database re-encodes, under a
+  # fresh key block drawn from the seeded stream, to exactly its bytes (encrypted.md §7, §8).
+  def self.golden_roundtrip
+    count = 0
+    Dir[File.join(GOLDENS, 'encrypted_*.jed')].sort.each do |path|
+      next if File.basename(path).include?('rekey')
+      image = File.binread(path)
+      state = JedNative::FileFormat.new(crypto: unlock(image)).decode_image(image)
+      writer = JedNative::FileFormat.new(crypto: JedNative::PageCodec.create(golden_key, nil, JedNative::SeededRandom.new(GOLDEN_SEED)))
+      actual = writer.build_image(state[:types], state[:sequences], state[:tables], GOLDEN_PAGE, state[:collations], views: state[:views])
+      unless actual == image
+        at = (0...[actual.bytesize, image.bytesize].min).find { |i| actual.getbyte(i) != image.getbyte(i) }
+        raise "#{File.basename(path)}: re-encoded bytes differ (#{actual.bytesize} vs #{image.bytesize}, first at page #{at && at / GOLDEN_PAGE})"
+      end
+      keyless = begin
+        JedNative::FileFormat.new.decode_image(image)
+      rescue StandardError
+        nil
+      end
+      assert(keyless.nil?, "#{File.basename(path)} decoded without a key")
+      count += 1
+    end
+    assert(count == 5, "expected 5 encrypted goldens, got #{count}")
+  end
+
   def self.run
-    tests = %i[vector_xaes vector_keys]
+    tests = %i[vector_xaes vector_keys golden_roundtrip]
     tests.each do |name|
       public_send(name)
       puts "ruby-native encryption: #{name} passed"

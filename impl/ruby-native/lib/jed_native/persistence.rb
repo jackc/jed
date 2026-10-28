@@ -27,6 +27,7 @@ module JedNative
     def attach_storage(storage = nil, **options)
       options[:collation_key] ||= ->(name, value) { resolve_collation(name).sort_key(value) }
       options[:clock] ||= (@environment ||= Environment.new).clock
+      options[:key_random] ||= @environment.key_stream
       storage ||= Storage.new(**options)
       storage.collation_key = options[:collation_key]
       @storage = storage
