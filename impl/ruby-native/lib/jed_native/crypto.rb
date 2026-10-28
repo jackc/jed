@@ -391,6 +391,100 @@ module JedNative
     LAYOUT = new("\0".b * 32, nil, ''.b)
   end
 
+  # A sealed scratch file (spec/fileformat/encrypted.md §11): a random key and file id from the
+  # handle's scratch stream, never persisted; logical bytes in 4096-byte blocks, block i stored at
+  # i·4136 as its XAES-256-GCM ciphertext, nonce and tag, its associated data binding the file id, the
+  # ordinal and the block's in-memory write counter (never reset), so a replayed older version, a
+  # moved block or an altered byte fails to open (58030). The block last written stays in plaintext
+  # until another is written. Exposes the IO subset the scratch spools use: seek/pos/read/write/close!.
+  class SealedScratchIO
+    BLOCK = 4096
+    STORED = BLOCK + Crypto::RESERVE
+
+    def initialize(file, stream)
+      @file, @stream = file, stream
+      @key = XaesKey.new(KeyBlock.draw(stream, 32))
+      @id = KeyBlock.draw(stream, 16)
+      @size = @pos = 0
+      @counters, @live = [], []
+      @cached_at, @cached = nil, nil
+    end
+
+    def pos = @pos
+    alias tell pos
+
+    def seek(offset, whence = IO::SEEK_SET)
+      @pos = whence == IO::SEEK_END ? @size + offset : whence == IO::SEEK_CUR ? @pos + offset : offset
+      0
+    end
+
+    def read(length)
+      return nil if @pos >= @size && length.positive?
+      count = [length, @size - @pos].min
+      out = +''.b
+      while out.bytesize < count
+        ordinal, within = (@pos + out.bytesize).divmod(BLOCK)
+        take = [BLOCK - within, count - out.bytesize].min
+        out << load(ordinal).byteslice(within, take)
+      end
+      @pos += count
+      out
+    end
+
+    def write(bytes)
+      bytes = bytes.b
+      done = 0
+      while done < bytes.bytesize
+        ordinal, within = (@pos + done).divmod(BLOCK)
+        take = [BLOCK - within, bytes.bytesize - done].min
+        unless @cached_at == ordinal
+          block = take == BLOCK ? ("\0".b * BLOCK) : load(ordinal).dup
+          flush_cached
+          @cached_at, @cached = ordinal, block
+        end
+        @cached[within, take] = bytes.byteslice(done, take)
+        done += take
+      end
+      @pos += bytes.bytesize
+      @size = [@size, @pos].max
+      bytes.bytesize
+    end
+
+    def close!
+      @cached_at = @cached = nil
+      @file.close!
+    end
+
+    private
+
+    def ad(ordinal, counter) = 'JEDB'.b + [Crypto::SUITE, Crypto::ROLE_SCRATCH].pack('CC') + @id + [ordinal, counter].pack('Q>Q>')
+
+    def load(ordinal)
+      return @cached if @cached_at == ordinal
+      return "\0".b * BLOCK unless @live[ordinal]
+      @file.seek(ordinal * STORED)
+      stored = @file.read(STORED)
+      raise Error.new('58030', 'truncated scratch block') unless stored && stored.bytesize == STORED
+      plain = @key.open(stored.byteslice(BLOCK, Crypto::NONCE), stored.byteslice(0, BLOCK),
+                        stored.byteslice(BLOCK + Crypto::NONCE, Crypto::TAG), ad(ordinal, @counters[ordinal]))
+      raise Error.new('58030', 'a scratch block fails authentication') unless plain
+      plain
+    end
+
+    def flush_cached
+      return unless @cached_at
+      ordinal, block = @cached_at, @cached
+      @cached_at = @cached = nil
+      counter = (@counters[ordinal] || 0) + 1
+      nonce = KeyBlock.draw(@stream, Crypto::NONCE)
+      sealed, tag = @key.seal(nonce, block, ad(ordinal, counter))
+      @file.seek(ordinal * STORED)
+      @file.write(sealed + nonce + tag)
+      @counters[ordinal] = counter
+      @live[ordinal] = true
+    end
+  end
+
   # The production key-entropy source: the OS CSPRNG (never the seeded SQL random source).
   class OSKeyRandom
     def bytes(length) = SecureRandom.random_bytes(length)

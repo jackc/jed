@@ -7,9 +7,11 @@ module JedNative
   # this process to its exclusively created file, never on database or host input.
   class ScratchFile
     attr_reader :count
-    def initialize
+    # sealed: the handle's scratch stream when scratch encryption is on (encrypted.md §11).
+    def initialize(sealed: nil)
       @file = Tempfile.new(['jed-ruby-', '.scratch'])
       @file.binmode
+      @file = SealedScratchIO.new(@file, sealed) if sealed
       @count = 0
     rescue SystemCallError, IOError => error
       raise Error.new('58030', error.message)
@@ -59,9 +61,10 @@ module JedNative
   # Forward links preserve insertion order; reverse links find the newest state.
   class ScratchBuckets
     PARTITIONS = 4096
-    def initialize
+    def initialize(sealed: nil)
       @file = Tempfile.new(['jed-ruby-', '.buckets'])
       @file.binmode
+      @file = SealedScratchIO.new(@file, sealed) if sealed
       @heads, @tails = Array.new(PARTITIONS), Array.new(PARTITIONS)
     rescue SystemCallError, IOError => error
       raise Error.new('58030', error.message)
@@ -150,6 +153,11 @@ module JedNative
       @account&.release(@charged)
       @charged = @resident_bytes = 0
     end
+
+    # The scratch stream to seal this owner's scratch files with, or nil for plaintext scratch.
+    def scratch_seal
+      @engine.respond_to?(:scratch_sealed?) && @engine.scratch_sealed? ? @engine.scratch_stream : nil
+    end
   end
 
   class RowSpool < SpillOwner
@@ -163,7 +171,7 @@ module JedNative
     def push(row)
       unless @file
         unless reserve(LogicalMemory.row_bytes(row))
-          @file = ScratchFile.new
+          @file = ScratchFile.new(sealed: scratch_seal)
           @rows.each { |old| @file.append(old) }
           @rows = nil
           release
@@ -202,7 +210,7 @@ module JedNative
       delta += MemorySchedule::ENTRY + key.sum { |item| LogicalMemory.value_bytes(item) } unless had
       @entries[key] = value
       unless reserve(delta)
-        @disk = ScratchBuckets.new
+        @disk = ScratchBuckets.new(sealed: scratch_seal)
         @entries.each { |entry_key, entry_value| @disk.append(entry_key, entry_value) }
         @entries = nil
         release
@@ -229,7 +237,7 @@ module JedNative
       return @disk.append(key, row) if @disk
       (@rows[key] ||= []) << row
       unless reserve(MemorySchedule::ENTRY + LogicalMemory.row_bytes(row))
-        @disk = ScratchBuckets.new
+        @disk = ScratchBuckets.new(sealed: scratch_seal)
         @rows.each { |stored_key, rows| rows.each { |stored_row| @disk.append(stored_key, stored_row) } }
         @rows = nil
         release
@@ -269,7 +277,7 @@ module JedNative
 
     def flush
       return if @rows.empty?
-      run = ScratchFile.new
+      run = ScratchFile.new(sealed: scratch_seal)
       @rows.sort!(&@compare)
       @rows.each { |row| run.append(row) }
       @rows = []
@@ -278,7 +286,7 @@ module JedNative
       while @runs[level]
         older = @runs[level]
         @runs[level] = nil
-        merged = ScratchFile.new
+        merged = ScratchFile.new(sealed: scratch_seal)
         merge([older, run]) { |row| merged.append(row) }
         older.close
         run.close

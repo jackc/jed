@@ -193,8 +193,11 @@ module JedNative
   end
 
   module StorageRewrite
-    def physical_scratch(snapshot = @snapshot, txid = @meta[:txid] + 1, &sink)
-      PhysicalImage.new(rewrite_codec, @page_size, source_image: @image).write(snapshot, txid, &sink)
+    # A node-preserving image of snapshot into a new file. An encrypted one keeps the data key and the
+    # selected key-block copy and draws fresh nonces from the database's stream; its pointer tags are
+    # the new file's (writer.crypto, adopted when the file replaces this one).
+    def physical_scratch(snapshot = @snapshot, txid = @meta[:txid] + 1, writer: image_writer, &sink)
+      PhysicalImage.new(writer, @page_size, source_image: @image, source_codec: @codec).write(snapshot, txid, &sink)
     end
 
     def compact
@@ -218,7 +221,7 @@ module JedNative
         break if captured.first
       end
       snapshot, selected_meta, source_image = captured
-      codec = rewrite_codec
+      codec = @codec.reader
       destination = File.join(File.realpath(File.dirname(destination)), File.basename(destination))
       raise Error.new('58P02', 'backup destination exists') if File.exist?(destination) || File.symlink?(destination)
       temporary = "#{destination}.jedtmp"
@@ -227,7 +230,7 @@ module JedNative
         flags = File::WRONLY | File::CREAT | File::TRUNC | File::NOFOLLOW
         File.open(temporary, flags, 0o600) do |output|
           if form == :compacted
-            meta = PhysicalImage.new(codec, @page_size, source_image: source_image).write(snapshot, selected_meta[:txid] + 1) do |page, bytes|
+            meta = PhysicalImage.new(image_writer(current_key_block), @page_size, source_image: source_image, source_codec: codec).write(snapshot, selected_meta[:txid] + 1) do |page, bytes|
               write_at(output, bytes, page * @page_size)
             end
           else
@@ -242,7 +245,13 @@ module JedNative
               page = raw[:next_page]
             end
             zero = "\0".b * @page_size
-            (2...meta[:page_count]).each do |id|
+            if codec.encrypted?
+              # Both key-block pages receive the selected copy (encrypted.md §13).
+              block = current_key_block.ljust(@page_size, "\0")
+              write_at(output, block, 2 * @page_size)
+              write_at(output, block, 3 * @page_size)
+            end
+            (codec.first_body...meta[:page_count]).each do |id|
               codec.read_page(source_image, @page_size, id) if reached.include?(id)
               bytes = reached.include?(id) ? source_image.byteslice(id * @page_size, @page_size) : zero
               write_at(output, bytes, id * @page_size)
@@ -273,18 +282,32 @@ module JedNative
 
     private
 
-    def rewrite_codec
-      FileFormat.new(collation_key: @codec.instance_variable_get(:@collation_key), expression: @codec.instance_variable_get(:@expression))
+    def rewrite_codec = @codec.reader(crypto: nil)
+
+    # The codec that writes a new file of this database: the same keys with a fresh pointer namespace.
+    def image_writer(key_block = nil)
+      return rewrite_codec unless @codec.encrypted?
+
+      @codec.reader(crypto: @codec.crypto.fork(key_block || @codec.crypto.key_block))
+    end
+
+    # The file's selected key-block copy, read from pages 2 and 3 (a page client that unlocked before
+    # a credential change copies the current pair — encrypted.md §13).
+    def current_key_block
+      return nil unless @codec.encrypted?
+
+      KeyBlock.select(*[2, 3].map { |page| @image.byteslice(page * @page_size, @page_size) })
     end
 
     def compact_file
       temporary = "#{@path}.jedtmp"
       renamed = false
+      writer = image_writer
       begin
         mode = @file.stat.mode & 0o7777
         File.open(temporary, File::WRONLY | File::CREAT | File::TRUNC | File::NOFOLLOW, mode) do |output|
           output.chmod(mode)
-          meta = physical_scratch { |page, bytes| write_at(output, bytes, page * @page_size) }
+          meta = physical_scratch(writer: writer) { |page, bytes| write_at(output, bytes, page * @page_size) }
           output.truncate(meta[:page_count] * @page_size)
           durable_sync(output) if @sync
         end
@@ -294,6 +317,7 @@ module JedNative
         @file = File.open(@path, 'r+b')
         @file.close_on_exec = true
         sync_directory if @sync
+        @codec.crypto = writer.crypto if writer.encrypted?
         @snapshot = decode_file
         @meta = @snapshot.fetch(:meta)
         @page_ids, @overflow_ids = {}.compare_by_identity, {}.compare_by_identity
