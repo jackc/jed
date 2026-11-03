@@ -5,6 +5,7 @@ package jed
 // belong in per-core tests, alongside zone_shift_range_test.go.
 
 import (
+	"fmt"
 	"math"
 	"testing"
 )
@@ -36,4 +37,25 @@ func TestTimestampFiniteBoundaryConstruction(t *testing.T) {
 	} {
 		wantErr(t, db, sql, "22008")
 	}
+}
+
+func TestDateTruncFiniteBoundary(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t)
+	for _, typ := range []string{"timestamp", "timestamptz"} {
+		for _, unit := range []string{"milliseconds", "second", "minute", "hour", "day", "week", "month", "quarter", "year", "decade", "century", "millennium"} {
+			sql := fmt.Sprintf("SELECT date_trunc('%s', %s '290309-12-21 19:59:05.224193 BC')", unit, typ)
+			wantErr(t, db, sql, "22008")
+		}
+		// The midnight product itself is out of range on this day, but the
+		// completed sub-day timestamp remains valid and must not be rejected.
+		for _, unit := range []string{"microseconds", "milliseconds", "second"} {
+			sql := fmt.Sprintf("SELECT date_trunc('%s', %s '290309-12-21 19:59:06 BC')", unit, typ)
+			rows := query(t, db, sql)
+			if got := rows[0][0].Int; got != math.MinInt64+775808 {
+				t.Errorf("%s: got %d", sql, got)
+			}
+		}
+	}
+	wantErr(t, db, "SELECT date_trunc('day', timestamptz '290309-12-21 19:59:06 BC', 'UTC')", "22008")
 }

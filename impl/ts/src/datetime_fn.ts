@@ -17,6 +17,7 @@ import {
   civilFromDays,
   civilFromMicros,
   daysFromCivil,
+  finiteInstant,
   NEG_INFINITY,
   POS_INFINITY,
 } from "./timestamp.ts";
@@ -191,11 +192,13 @@ export function dateTruncMicros(unit: string, micros: bigint, tz: boolean): bigi
     s: bigint,
     us: bigint,
   ): bigint =>
-    daysFromCivil(y, mo, d) * MICROS_PER_DAY +
-    h * MICROS_PER_HOUR +
-    mi * MICROS_PER_MIN +
-    s * MICROS_PER_SEC +
-    us;
+    finiteInstant(
+      daysFromCivil(y, mo, d) * MICROS_PER_DAY +
+        h * MICROS_PER_HOUR +
+        mi * MICROS_PER_MIN +
+        s * MICROS_PER_SEC +
+        us,
+    );
   switch (u) {
     case "microseconds":
       return micros;
@@ -212,7 +215,7 @@ export function dateTruncMicros(unit: string, micros: bigint, tz: boolean): bigi
     case "week": {
       const days = daysFromCivil(y, mo, d);
       const monday0 = floorMod(days + 3n, 7n);
-      return (days - monday0) * MICROS_PER_DAY;
+      return finiteInstant((days - monday0) * MICROS_PER_DAY);
     }
     case "month":
       return rebuild(y, mo, 1n, 0n, 0n, 0n, 0n);
