@@ -737,6 +737,10 @@ explicit zone:
 
 <LiveSql demo="convDemo" query={convDemo} rows={1} />
 
+Finite timestamps use signed 64-bit microseconds since 1970, with the two endpoints reserved
+for infinities. This range differs from PostgreSQL's. Parsing and construction accept every
+finite microsecond in that range.
+
 Over an `interval`, `EXTRACT` reads its separate fields, each keeping its sign: `year`/`month`/`quarter`
 from the months, `day`/`week` from the days, `hour`/`minute`/`second` from the time, and `epoch` counts
 a year as 365.25 days and a month as 30.
