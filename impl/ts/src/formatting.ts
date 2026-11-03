@@ -128,7 +128,8 @@ import { renderFloatPg } from "./value.ts";
 // --- byte strings ------------------------------------------------------------------------------
 
 const UTF8_ENC = new TextEncoder();
-const UTF8_DEC = new TextDecoder();
+// Rendered bytes are SQL text: preserve a leading U+FEFF literal from the template.
+const UTF8_DEC = new TextDecoder("utf-8", { ignoreBOM: true });
 
 // toBytes is s's UTF-8 encoding as a byte string (one char per byte).
 export function toBytes(s: string): string {
