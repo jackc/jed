@@ -244,6 +244,7 @@ import {
   compileRegex,
   compileSimilar,
   compileSimilarMatcher,
+  cpSlice,
   foldRegexPattern,
   regexIsMatch,
   regexNinst,
@@ -1638,9 +1639,7 @@ function similarSubstring(e: Of<"regexFunc">, vals: Value[], m: Meter): Value {
   if (subject.kind !== "text") return nullValue();
   const cps = Array.from(subject.text, (c) => c.codePointAt(0) as number);
   const span = similarSubstringSpan(sm, cps, m);
-  return span === null
-    ? nullValue()
-    : textValue(String.fromCodePoint(...cps.slice(span[0], span[1])));
+  return span === null ? nullValue() : textValue(cpSlice(cps, span[0], span[1]));
 }
 
 function* evalRegexFuncNodeSteps(
@@ -1809,7 +1808,7 @@ function* evalRegexFuncNodeSteps(
       const e2 = regexSlot(prog, caps, si + 1);
       if (s2 < 0 || e2 < 0) return noMatch();
       if (e.func !== "instr") {
-        return { kind: "text", text: String.fromCodePoint(...origCps.slice(s2, e2)) };
+        return { kind: "text", text: cpSlice(origCps, s2, e2) };
       }
       // endoption 0 → first-char position, 1 → after-last-char (1-based).
       return intValue(BigInt(endoption === 0 ? s2 + 1 : e2 + 1));
