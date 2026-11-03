@@ -15,9 +15,20 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { makeTimestamp, parseTimestamp } from "../src/timestamp.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
-test("datetime constructors reject extreme years", () => {
+test("timestamp construction preserves the full finite i64 range", () => {
+  const minimum = -(1n << 63n) + 1n;
+  assert.equal(parseTimestamp("290309-12-21 19:59:05.224193 BC"), minimum);
+  assert.equal(makeTimestamp(-290309n, 12n, 21n, 19n, 59n, 5.224193), minimum);
+  for (const text of ["290309-12-21 19:59:05.224192 BC", "290309-12-21 19:59:05.224191 BC"]) {
+    assert.equal(
+      errCode(() => parseTimestamp(text)),
+      "22008",
+      text,
+    );
+  }
   const db = dbWith([]);
   for (const sql of [
     "SELECT make_date('-9223372036854775808'::bigint, 1, 1)",

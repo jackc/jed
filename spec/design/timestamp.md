@@ -121,6 +121,9 @@ Per core: Rust `i64::div_euclid`/`rem_euclid`; Go a small floor-div/mod helper; 
 math in `bigint`** (`number` loses precision past 2⁵³, and JS `%` truncates), with a `bigint`
 floor helper. `micros_from_civil` uses **checked** multiply/add and traps `22008` on `i64`
 overflow for extreme years or if a finite result would equal a reserved sentinel.
+The range check applies to the **complete** microsecond value: intermediate products may
+fall below `i64::MIN` even when adding the positive time-of-day or fractional second brings
+the result back into range. Use wider intermediates or an equivalent checked decomposition.
 
 ## 3. Parsing — a text literal adapting in a timestamp context
 

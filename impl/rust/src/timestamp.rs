@@ -327,7 +327,8 @@ fn parse_wall(input: &str, type_name: &str) -> Result<Wall> {
     }
     let hour_part = if extra_day { 0 } else { hour };
 
-    // Compose the instant in checked i64 arithmetic; any overflow is a range error.
+    // The beginning of the earliest finite second is outside i64 even when its fractional
+    // microseconds bring the final instant into range. Check only the complete sum.
     let mut days = days_from_civil(astro, month, day);
     if extra_day {
         days = days
@@ -338,10 +339,8 @@ fn parse_wall(input: &str, type_name: &str) -> Result<Wall> {
         .checked_mul(SECS_PER_DAY)
         .and_then(|s| s.checked_add(hour_part * 3600 + minute * 60 + second))
         .ok_or_else(|| field_overflow("value out of range"))?;
-    let micros = secs
-        .checked_mul(MICROS_PER_SEC)
-        .and_then(|m| m.checked_add(micro))
-        .ok_or_else(|| field_overflow("value out of range"))?;
+    let micros = i64::try_from(secs as i128 * MICROS_PER_SEC as i128 + micro as i128)
+        .map_err(|_| field_overflow("value out of range"))?;
     Ok(Wall::Finite(micros, offset_secs))
 }
 
@@ -504,11 +503,13 @@ pub fn make_timestamp(
     if tod_micros > SECS_PER_DAY * MICROS_PER_SEC {
         return Err(field_overflow("time field value out of range"));
     }
-    // Compose the instant in checked i64 arithmetic; any overflow is a range error.
-    let micros = days_from_civil(astro, month, day)
-        .checked_mul(SECS_PER_DAY * MICROS_PER_SEC)
-        .and_then(|d| d.checked_add(tod_micros))
-        .ok_or_else(|| field_overflow("timestamp out of range"))?;
+    // Midnight of the earliest finite day is outside i64; its time of day can restore a
+    // representable instant. Use a wide intermediate and validate the complete sum.
+    let micros = i64::try_from(
+        days_from_civil(astro, month, day) as i128 * (SECS_PER_DAY * MICROS_PER_SEC) as i128
+            + tod_micros as i128,
+    )
+    .map_err(|_| field_overflow("timestamp out of range"))?;
     if micros == NEG_INFINITY || micros == POS_INFINITY {
         return Err(field_overflow("timestamp out of range")); // reserved for ±infinity
     }

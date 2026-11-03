@@ -491,11 +491,25 @@ func parseDatetimeWall(input string, typeName string) (datetimeWall, error) {
 	if !ok {
 		return datetimeWall{}, datetimeFieldOverflow("value out of range")
 	}
-	micros, ok = mulAdd(micros, microsPerSec, micro)
+	micros, ok = timestampMulAdd(micros, microsPerSec, micro)
 	if !ok {
 		return datetimeWall{}, datetimeFieldOverflow("value out of range")
 	}
 	return datetimeWall{micros: micros, offsetSecs: offsetSecs, hasOffset: hasOffset}, nil
+}
+
+// timestampMulAdd checks the composed timestamp, allowing the positive time-of-day
+// remainder to bring an intermediate product below MinInt64 back into range.
+func timestampMulAdd(a, b, c int64) (int64, bool) {
+	if out, ok := mulAdd(a, b, c); ok {
+		return out, true
+	}
+	out := new(big.Int).Mul(big.NewInt(a), big.NewInt(b))
+	out.Add(out, big.NewInt(c))
+	if !out.IsInt64() {
+		return 0, false
+	}
+	return out.Int64(), true
 }
 
 // mulAdd computes a*b + c with i64 overflow detection.
@@ -628,7 +642,7 @@ func makeTimestamp(year, month, day, hour, minute int64, sec float64) (int64, er
 		return 0, datetimeFieldOverflow("time field value out of range")
 	}
 	// Compose the instant in checked i64 arithmetic; any overflow is a range error.
-	micros, ok := mulAdd(daysFromCivil(astro, month, day), secsPerDay*microsPerSec, todMicros)
+	micros, ok := timestampMulAdd(daysFromCivil(astro, month, day), secsPerDay*microsPerSec, todMicros)
 	if !ok {
 		return 0, datetimeFieldOverflow("timestamp out of range")
 	}
