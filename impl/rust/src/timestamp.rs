@@ -478,14 +478,11 @@ pub fn make_timestamp(
     sec: f64,
 ) -> Result<i64> {
     // Date fields (22008). A negative year is BC; year 0 has no AD/BC representation.
-    if year == 0 {
+    if year == 0 || !(-999_999..=999_999).contains(&year) {
         return Err(field_overflow("date field value out of range"));
     }
     let bc = year < 0;
-    let mag = year.unsigned_abs() as i64; // |year|; the displayed magnitude
-    if mag > 999_999 {
-        return Err(field_overflow("date field value out of range"));
-    }
+    let mag = year.abs(); // Range-checked before negation, including i64::MIN.
     if !(1..=12).contains(&month) {
         return Err(field_overflow("date field value out of range"));
     }

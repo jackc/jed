@@ -55,16 +55,11 @@ pub fn date_clock_is_relative(input: &str) -> bool {
 /// two cannot drift.
 pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32> {
     let err = || field_overflow("date field value out of range");
-    if year == 0 {
+    if year == 0 || !(-9_999_999..=9_999_999).contains(&year) {
         return Err(err());
     }
     let bc = year < 0;
     let mag = year.abs();
-    if mag > 9_999_999 {
-        // Only an i64-overflow guard for `days_from_civil` (like parse_date's year cap); the real
-        // bound is the finite-i32 day-range check below.
-        return Err(err());
-    }
     if !(1..=12).contains(&month) {
         return Err(err());
     }
