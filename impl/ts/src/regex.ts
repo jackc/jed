@@ -1262,7 +1262,7 @@ function sliceGroup(orig: number[], start: number, end: number): string | null {
 
 // cpSlice converts the code points orig[start..end] to a string in bounded chunks: spreading a large
 // array into String.fromCodePoint overflows the stack (the replaceBuild precedent).
-function cpSlice(orig: number[], start: number, end: number): string {
+export function cpSlice(orig: number[], start: number, end: number): string {
   const parts: string[] = [];
   for (let i = start; i < end; i += 8192) {
     parts.push(String.fromCodePoint(...orig.slice(i, Math.min(i + 8192, end))));

@@ -36,7 +36,8 @@ ORDER BY id;`;
 
 	const substringRegex = `SELECT substring('order-1234' FROM '[0-9]+')       AS digits,
        substring('key=value' FROM '=(.*)')          AS after_eq,
-       substring('nothing here' FROM '[0-9]+')      AS no_match;`;
+       substring('nothing here' FROM '[0-9]+')      AS no_match,
+       length(substring(repeat('a', 150000) FROM 'a+')) AS long_capture_length;`;
 
 	const matches = `SELECT m[1] AS key, m[2] AS value
 FROM regexp_matches('host=db1 port=5432 user=app', '(\\w+)=(\\w+)', 'g') AS m;`;
@@ -156,6 +157,8 @@ Reordering with capture groups:
 text of the first match: the first capture group when the pattern has one, otherwise the whole
 match, and `NULL` when nothing matches. A quoted second argument is a pattern, as in PostgreSQL, so
 `substring('hello' FROM '2')` searches for `2`; pass an integer (`FROM 2`) for the position form.
+Large captures work the same way: the example returns all 150,000 characters and reports their
+length. Configured query resource limits still apply.
 
 <LiveSql query={substringRegex} rows={1} />
 

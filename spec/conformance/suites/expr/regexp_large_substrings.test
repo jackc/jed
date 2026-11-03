@@ -1,0 +1,23 @@
+# Regex substring results must not depend on the host's function-argument limit.
+# Include an astral character so bounded conversion preserves complete code points.
+# requires: query.select_no_from, func.regexp_substr, func.substring_regex, func.substring_similar, types.text
+
+query I nosort
+SELECT length(regexp_substr(repeat('a', 150000), 'a+'))
+----
+150000
+
+query I nosort
+SELECT length(substring(repeat('😀', 150000) FROM '(😀+)'))
+----
+150000
+
+query I nosort
+SELECT length(substring(repeat('a', 150000), '%', '#'))
+----
+150000
+
+query I nosort
+SELECT length(substring('x' || repeat('😀', 150000) || 'y', 'x#"%#"y', '#'))
+----
+150000
