@@ -330,7 +330,7 @@ pub enum ExtractSrc {
 /// microseconds into that day.
 fn julian_parts(micros: i64) -> (i64, i64) {
     let days = micros.div_euclid(MICROS_PER_DAY);
-    (days + UNIX_EPOCH_JD, micros - days * MICROS_PER_DAY)
+    (days + UNIX_EPOCH_JD, micros.rem_euclid(MICROS_PER_DAY))
 }
 
 /// `EXTRACT(julian FROM timestamp)` over finite wall-clock micros: the Julian Day number plus the
