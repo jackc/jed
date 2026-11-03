@@ -23,6 +23,22 @@ fn err_code(db: &mut Session, sql: &str) -> String {
     }
 }
 
+/// These boundaries use jed's full i64 range and integer-family constructor overloads,
+/// both deliberate PostgreSQL differences, so they cannot use the oracle corpus.
+#[test]
+fn datetime_boundary_regressions() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for sql in [
+        "SELECT make_date('-9223372036854775808'::bigint, 1, 1)",
+        "SELECT make_timestamp('-9223372036854775808'::bigint, 1, 1, 0, 0, 0.0::f64)",
+        "SELECT make_timestamptz('-9223372036854775808'::bigint, 1, 1, 0, 0, 0.0::f64)",
+    ] {
+        assert_eq!(err_code(&mut db, sql), "22008", "{sql}");
+    }
+}
+
 /// EXTRACT of a monotonic field over an infinite timestamp/timestamptz/date traps 22003 (jed's
 /// decimal is finite-only); PG returns numeric ±Infinity.
 #[test]

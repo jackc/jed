@@ -15,7 +15,22 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dbWith, errCode } from "./util.ts";
+import { dbWith, errCode, query } from "./util.ts";
+
+test("datetime constructors reject extreme years", () => {
+  const db = dbWith([]);
+  for (const sql of [
+    "SELECT make_date('-9223372036854775808'::bigint, 1, 1)",
+    "SELECT make_timestamp('-9223372036854775808'::bigint, 1, 1, 0, 0, 0.0::f64)",
+    "SELECT make_timestamptz('-9223372036854775808'::bigint, 1, 1, 0, 0, 0.0::f64)",
+  ]) {
+    assert.equal(
+      errCode(() => query(db, sql)),
+      "22008",
+      sql,
+    );
+  }
+});
 
 test("EXTRACT of a monotonic field over an infinite datetime traps (22003 — jed decimal is finite)", () => {
   const db = dbWith([]);
