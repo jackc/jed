@@ -129,6 +129,10 @@ RETURNING body, raw;`;
   '{"a" : [1,  2], "a": {"b" :  1.50}}'::jsonb -> 'a'      AS jsonb_member,
   '{"a" : [1,  2], "a": {"b" :  1.50}}'::json #>> '{a,b}'  AS b_text;`;
 
+	const jsonUnicodeDemo = `SELECT
+  length(('"a' || chr(65279) || 'b"')::jsonb #>> '{}') AS characters,
+  ('"' || chr(65279) || '"')::jsonb = to_jsonb(chr(65279)) AS preserved;`;
+
 	const rowToJsonDemo = `CREATE TYPE addr AS (street text, zip i32);
 SELECT
   row_to_json('(Main,90210)'::addr)                     AS named,
@@ -528,6 +532,11 @@ functions `json_array_elements[_text]` and `json_each[_text]` work the same way,
 lists every member in input order, duplicates included:
 
 <LiveSql demo="jsonReadDemo" query={jsonReadDemo} rows={1} />
+
+JSON strings and keys preserve Unicode characters, including the invisible U+FEFF character.
+It counts as one character and remains distinct from an empty string:
+
+<LiveSql demo="jsonUnicodeDemo" query={jsonUnicodeDemo} rows={1} />
 
 Text cannot hold the escape `\u0000` or a UTF-16 surrogate escape that is not half of a pair, so, as
 in PostgreSQL, a function that decodes JSON strings rejects them: `jsonb` input, a cast to `jsonb`,

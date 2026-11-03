@@ -1,0 +1,20 @@
+# U+FEFF is an ordinary character inside JSON strings and object keys, whether
+# written literally or escaped. Build it with chr to keep this fixture visible.
+# requires: query.select_no_from, types.json, types.jsonb
+
+query II nosort
+SELECT length(('"a' || chr(65279) || 'b"')::jsonb #>> '{}'), length(('"a' || chr(65279) || 'b"')::json #>> '{}')
+----
+3
+3
+
+query B nosort
+SELECT ('"' || chr(65279) || '"')::jsonb = '"\uFEFF"'::jsonb
+----
+true
+
+query BB nosort
+SELECT ('{"ab":1,"a' || chr(65279) || 'b":2}')::jsonb ->> 'ab' = '1', ('{"ab":1,"a' || chr(65279) || 'b":2}')::jsonb ->> ('a' || chr(65279) || 'b') = '2'
+----
+true
+true

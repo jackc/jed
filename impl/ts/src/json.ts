@@ -355,7 +355,8 @@ function utf8Len(lead: number): number {
   return 1;
 }
 
-const ASCII_DECODER = new TextDecoder("utf-8", { fatal: true });
+// Each decode is one string code point, so U+FEFF is content, never a stream BOM.
+const ASCII_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 class JsonParser {
   private buf: Uint8Array;
