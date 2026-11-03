@@ -27,7 +27,7 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 /// both deliberate PostgreSQL differences, so they cannot use the oracle corpus.
 #[test]
 fn datetime_boundary_regressions() {
-    use jed::datetime_fn::date_trunc_micros;
+    use jed::datetime_fn::{date_part_julian, date_trunc_micros};
     use jed::timestamp::{make_timestamp, parse_timestamp};
 
     let minimum = i64::MIN + 1;
@@ -78,6 +78,11 @@ fn datetime_boundary_regressions() {
             .code(),
         "22008"
     );
+    assert_eq!(
+        date_part_julian(near_minimum),
+        -104311404.0 + 71946.0 / 86400.0
+    );
+
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
@@ -88,6 +93,11 @@ fn datetime_boundary_regressions() {
     ] {
         assert_eq!(err_code(&mut db, sql), "22008", "{sql}");
     }
+    db.query_outcome(
+        "SELECT EXTRACT(julian FROM timestamp '290309-12-21 19:59:06 BC')",
+        &[],
+    )
+    .unwrap();
 }
 
 /// EXTRACT of a monotonic field over an infinite timestamp/timestamptz/date traps 22003 (jed's
