@@ -43,6 +43,41 @@ test("timestamp construction preserves the full finite i64 range", () => {
   }
 });
 
+test("date_trunc rejects results below jed's finite i64 timestamp range", () => {
+  // jed's BC range extends past PostgreSQL's, so this belongs outside the oracle corpus.
+  const db = dbWith([]);
+  const lowest = "290309-12-21 19:59:05.224193 BC";
+  for (const type of ["timestamp", "timestamptz"]) {
+    for (const unit of [
+      "millisecond",
+      "second",
+      "minute",
+      "hour",
+      "day",
+      "week",
+      "month",
+      "quarter",
+      "year",
+      "decade",
+      "century",
+      "millennium",
+    ]) {
+      const sql = `SELECT date_trunc('${unit}', ${type} '${lowest}')`;
+      assert.equal(
+        errCode(() => query(db, sql)),
+        "22008",
+        sql,
+      );
+    }
+  }
+  assert.deepEqual(query(db, `SELECT date_trunc('microseconds', timestamp '${lowest}')`), [
+    [lowest],
+  ]);
+  assert.deepEqual(query(db, "SELECT date_trunc('second', timestamp '290309-12-21 19:59:06 BC')"), [
+    ["290309-12-21 19:59:06 BC"],
+  ]);
+});
+
 test("EXTRACT of a monotonic field over an infinite datetime traps (22003 — jed decimal is finite)", () => {
   const db = dbWith([]);
   for (const field of ["year", "decade", "century", "millennium", "julian", "isoyear", "epoch"]) {

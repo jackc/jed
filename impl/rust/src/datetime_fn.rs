@@ -201,15 +201,15 @@ pub fn date_trunc_micros(unit: &str, micros: i64, tz: bool) -> Result<i64> {
     }
     let (y, mo, d, h, mi, s, us) = civil_from_micros(micros);
     // Recompose a wall-clock instant from civil fields (floor-consistent with civil_from_micros).
-    let rebuild = |y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32, us: u32| -> i64 {
-        days_from_civil(y, mo as i64, d as i64) * MICROS_PER_DAY
-            + h as i64 * MICROS_PER_HOUR
-            + mi as i64 * MICROS_PER_MIN
-            + s as i64 * MICROS_PER_SEC
-            + us as i64
+    let rebuild = |y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32, us: u32| -> i128 {
+        days_from_civil(y, mo as i64, d as i64) as i128 * MICROS_PER_DAY as i128
+            + h as i128 * MICROS_PER_HOUR as i128
+            + mi as i128 * MICROS_PER_MIN as i128
+            + s as i128 * MICROS_PER_SEC as i128
+            + us as i128
     };
     let out = match u {
-        "microseconds" => micros,
+        "microseconds" => micros as i128,
         "milliseconds" => rebuild(y, mo, d, h, mi, s, (us / 1000) * 1000),
         "second" => rebuild(y, mo, d, h, mi, s, 0),
         "minute" => rebuild(y, mo, d, h, mi, 0, 0),
@@ -219,7 +219,7 @@ pub fn date_trunc_micros(unit: &str, micros: i64, tz: bool) -> Result<i64> {
             // Back to Monday, time zeroed. monday0 = days since the most recent Monday.
             let days = days_from_civil(y, mo as i64, d as i64);
             let monday0 = (days + 3).rem_euclid(7); // Mon=0..Sun=6
-            (days - monday0) * MICROS_PER_DAY
+            (days - monday0) as i128 * MICROS_PER_DAY as i128
         }
         "month" => rebuild(y, mo, 1, 0, 0, 0, 0),
         "quarter" => rebuild(y, ((mo - 1) / 3) * 3 + 1, 1, 0, 0, 0, 0),
@@ -241,7 +241,9 @@ pub fn date_trunc_micros(unit: &str, micros: i64, tz: bool) -> Result<i64> {
         }
         _ => return Err(not_supported(&name, timestamp_type_name(tz))),
     };
-    Ok(out)
+    let out = i64::try_from(out)
+        .map_err(|_| crate::timestamp::field_overflow("timestamp out of range"))?;
+    crate::timestamp::finite_instant(out)
 }
 
 /// `date_trunc(unit, interval)` — truncate an interval's fields down to `unit`. `week` and the

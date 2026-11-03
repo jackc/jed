@@ -236,54 +236,58 @@ func dateTruncMicros(unit string, micros int64, tz bool) (int64, error) {
 		return micros, nil
 	}
 	y, mo, d, h, mi, s, us := civilFromMicros(micros)
-	rebuild := func(y, mo, d, h, mi, s, us int64) int64 {
-		return daysFromCivil(y, mo, d)*microsPerDayDT +
-			h*microsPerHourDT + mi*microsPerMinDT + s*microsPerSecDT + us
+	rebuild := func(y, mo, d, h, mi, s, us int64) (int64, error) {
+		out, ok := timestampMulAdd(daysFromCivil(y, mo, d), microsPerDayDT,
+			h*microsPerHourDT+mi*microsPerMinDT+s*microsPerSecDT+us)
+		if !ok {
+			return 0, datetimeFieldOverflow("timestamp out of range")
+		}
+		return finiteInstant(out)
 	}
 	switch u {
 	case "microseconds":
 		return micros, nil
 	case "milliseconds":
-		return rebuild(y, mo, d, h, mi, s, (us/1000)*1000), nil
+		return rebuild(y, mo, d, h, mi, s, (us/1000)*1000)
 	case "second":
-		return rebuild(y, mo, d, h, mi, s, 0), nil
+		return rebuild(y, mo, d, h, mi, s, 0)
 	case "minute":
-		return rebuild(y, mo, d, h, mi, 0, 0), nil
+		return rebuild(y, mo, d, h, mi, 0, 0)
 	case "hour":
-		return rebuild(y, mo, d, h, 0, 0, 0), nil
+		return rebuild(y, mo, d, h, 0, 0, 0)
 	case "day":
-		return rebuild(y, mo, d, 0, 0, 0, 0), nil
+		return rebuild(y, mo, d, 0, 0, 0, 0)
 	case "week":
 		days := daysFromCivil(y, mo, d)
 		monday0 := floorMod(days+3, 7)
-		return (days - monday0) * microsPerDayDT, nil
+		return rebuild(y, mo, d-monday0, 0, 0, 0, 0)
 	case "month":
-		return rebuild(y, mo, 1, 0, 0, 0, 0), nil
+		return rebuild(y, mo, 1, 0, 0, 0, 0)
 	case "quarter":
-		return rebuild(y, ((mo-1)/3)*3+1, 1, 0, 0, 0, 0), nil
+		return rebuild(y, ((mo-1)/3)*3+1, 1, 0, 0, 0, 0)
 	case "year":
-		return rebuild(y, 1, 1, 0, 0, 0, 0), nil
+		return rebuild(y, 1, 1, 0, 0, 0, 0)
 	case "decade":
 		d10 := extractDecade(toPgYear(y))
 		startTm := d10 * 10
 		if d10 < 1 {
 			startTm = d10*10 - 1
 		}
-		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0), nil
+		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0)
 	case "century":
 		c := extractCentury(toPgYear(y))
 		startTm := (c-1)*100 + 1
 		if c < 1 {
 			startTm = c * 100
 		}
-		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0), nil
+		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0)
 	case "millennium":
 		m := extractMillennium(toPgYear(y))
 		startTm := (m-1)*1000 + 1
 		if m < 1 {
 			startTm = m * 1000
 		}
-		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0), nil
+		return rebuild(fromPgYear(startTm), 1, 1, 0, 0, 0, 0)
 	default:
 		return 0, unitNotSupported(name, timestampTypeName(tz))
 	}

@@ -27,6 +27,7 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 /// both deliberate PostgreSQL differences, so they cannot use the oracle corpus.
 #[test]
 fn datetime_boundary_regressions() {
+    use jed::datetime_fn::date_trunc_micros;
     use jed::timestamp::{make_timestamp, parse_timestamp};
 
     let minimum = i64::MIN + 1;
@@ -44,6 +45,39 @@ fn datetime_boundary_regressions() {
     ] {
         assert_eq!(parse_timestamp(text).unwrap_err().code(), "22008");
     }
+    let near_minimum = parse_timestamp("290309-12-21 19:59:06 BC").unwrap();
+    for unit in [
+        "minute",
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year",
+        "decade",
+        "century",
+        "millennium",
+    ] {
+        assert_eq!(
+            date_trunc_micros(unit, near_minimum, false)
+                .unwrap_err()
+                .code(),
+            "22008",
+            "{unit}"
+        );
+    }
+    for unit in ["microseconds", "milliseconds", "second"] {
+        assert_eq!(
+            date_trunc_micros(unit, near_minimum, false).unwrap(),
+            near_minimum
+        );
+    }
+    assert_eq!(
+        date_trunc_micros("milliseconds", minimum, false)
+            .unwrap_err()
+            .code(),
+        "22008"
+    );
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());

@@ -124,6 +124,8 @@ overflow for extreme years or if a finite result would equal a reserved sentinel
 The range check applies to the **complete** microsecond value: intermediate products may
 fall below `i64::MIN` even when adding the positive time-of-day or fractional second brings
 the result back into range. Use wider intermediates or an equivalent checked decomposition.
+Calendar reconstruction for `date_trunc` obeys the same rule; truncating a finite instant
+past the lower bound is `22008`, never a wrapped positive instant.
 
 ## 3. Parsing — a text literal adapting in a timestamp context
 
