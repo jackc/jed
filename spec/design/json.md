@@ -243,6 +243,10 @@ upsert limitations are unaffected by this scalar rule.
 
 ### 4.2 `\u` escapes: lexed vs. decoded
 
+Literal Unicode code points in strings and object keys are preserved. In particular, U+FEFF
+inside a JSON string is content, even at the start of the string; it must agree with its
+`\uFEFF` escape and must not be consumed as a byte-order mark by a UTF-8 decoder.
+
 Text cannot hold the NUL character, and a string is a sequence of code points, so two `\u` escapes
 have no text value: `\u0000`, and a UTF-16 surrogate that is not one half of a high-then-low pair.
 jed follows PostgreSQL's lexer (`json_lex_string` in `src/common/jsonapi.c`), which checks them only
