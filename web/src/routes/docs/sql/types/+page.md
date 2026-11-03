@@ -231,6 +231,9 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   to_char(-42.5, '999.9PR')                                                         AS bracketed,
   to_char(1987::i32, 'RN')                                                          AS roman;`;
 
+	const formatUnicodeDemo = `SELECT
+  length(to_char(timestamp '2024-01-01', chr(65279) || 'YYYY')) AS characters;`;
+
 	const parseDemo = `SELECT
   to_timestamp('05 Mar 2024 13:04', 'DD Mon YYYY HH24:MI')      AS ts,
   to_timestamp('2024-03-05 13:04 +05:30', 'YYYY-MM-DD HH24:MI OF') AS with_offset,
@@ -809,6 +812,11 @@ padding, `TH` adds an ordinal suffix, and double-quoted text is copied through. 
 shown in the session time zone, with its abbreviation under `TZ`:
 
 <LiveSql demo="toCharDemo" query={toCharDemo} rows={1} />
+
+Literal Unicode text is preserved even at the beginning of the output. For example, an
+invisible U+FEFF before a four-digit year makes a five-character result:
+
+<LiveSql demo="formatUnicodeDemo" query={formatUnicodeDemo} rows={1} />
 
 `to_timestamp(text, template)` and `to_date(text, template)` read text back with the same
 patterns; a reading without a `TZH`/`TZM`/`OF` offset is a wall clock in the session time zone.

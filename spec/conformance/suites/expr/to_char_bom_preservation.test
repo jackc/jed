@@ -1,0 +1,18 @@
+# A leading U+FEFF in a formatting template is literal output, not a byte-order
+# marker to consume while decoding the internally rendered UTF-8.
+# requires: query.select_no_from, func.to_char, types.timestamp, types.text
+
+query I nosort
+SELECT length(to_char(timestamp '2024-01-01', chr(65279) || 'YYYY'))
+----
+5
+
+query I nosort
+SELECT ascii(to_char(timestamp '2024-01-01', chr(65279) || 'YYYY'))
+----
+65279
+
+query I nosort
+SELECT length(to_char(42, '"' || chr(65279) || '"999'))
+----
+5

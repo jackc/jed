@@ -71,6 +71,8 @@ Templates and inputs are processed as **UTF-8 bytes**, exactly as `formatting.c`
 encodes its UTF-16 strings first — so a multibyte character is one literal node, a byte-level prefix
 search never splits a pattern, and the three cores agree byte for byte. PostgreSQL caches parsed
 templates; jed parses per call (the template may be a column).
+Literal U+FEFF is preserved in templates and output, including at the beginning of the
+formatted text. It is content, not a byte-order mark to strip while decoding output bytes.
 
 Because the processing is byte-wise, an error message that quotes a slice of the input (`invalid
 value "…" for "YYYY"`, which takes exactly the field's width in bytes) can end, or start, inside a
