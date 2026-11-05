@@ -222,6 +222,13 @@ The v23 rule — *"payload > C → 2-way median-**record**-promote"* ([transacti
   underfull threshold + the merge-then-maybe-split shape mirror the current rebalance, restated
   for the two node kinds.
 
+  A last-row delete below a zero-key interior instead propagates its empty unary
+  subtree to the first branching ancestor, which removes that child and its
+  adjacent separator. This preserves the nonempty-leaf invariant even when a
+  degenerate interior merge would split again. Root collapse repeats through
+  unary roots. The exact removal rule is in format.md *Delete*; ordinary leaf
+  merges and both merge-abandon rules remain unchanged.
+
 The split point, fan-out determination (page-fit, not a tuning constant), and the single-record
 cap are re-derived for the two-layout world and **pinned with golden fixtures** — this is a §8
 cross-core byte contract, so all four implementations (Rust/Go/TS + the Ruby reference) must

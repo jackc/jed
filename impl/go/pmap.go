@@ -528,9 +528,9 @@ func (m *pMap) Remove(key []byte, cap pageCap, shape leafShape, src leafSource) 
 	// The root may have drained to zero keys: an empty leaf becomes the empty map; a 0-key interior
 	// root (one child) hands the root down a level (height shrinks). The root is exempt from the
 	// underfull rule, so no rebalance here.
-	if len(newRoot.keys) == 0 {
+	for newRoot != nil && newRoot.keyLen() == 0 {
 		if newRoot.isLeaf() {
-			m.root = nil
+			newRoot = nil
 		} else {
 			// The lone surviving child becomes the new root — fault it if it is an OnDisk leaf (a
 			// tree of height 2 can collapse to its single bottom child).
@@ -538,11 +538,10 @@ func (m *pMap) Remove(key []byte, cap pageCap, shape leafShape, src leafSource) 
 			if err != nil {
 				return nil, false, err
 			}
-			m.root = child
+			newRoot = child
 		}
-	} else {
-		m.root = newRoot
 	}
+	m.root = newRoot
 	if !m.lengthUnknown {
 		m.length--
 	}
@@ -1438,11 +1437,33 @@ func rebalanceChild(n *pnode, i int, generation *mutationGeneration, src leafSou
 		// with — its own parent merges IT away; the root case collapses in pMap.Remove.
 		return n, nil
 	}
+	if !childNode.isLeaf() && emptyUnarySubtree(childNode) {
+		parent := n
+		if !ownedBy(n, generation) {
+			parent = &pnode{keys: cloneKeys(n.keys), children: cloneChildren(n.children), owner: generation}
+		}
+		parent.keys = removeKeyAtMutable(parent.keys, min(i, len(parent.keys)-1))
+		parent.children = removeChildAtMutable(parent.children, i)
+		return parent, nil
+	}
 	j := i
 	if i+1 >= len(n.children) {
 		j = i - 1
 	}
 	return mergeAt(n, j, generation, src, cap, shape)
+}
+
+// A last-row delete below zero-key interiors cannot rebalance at the leaf's
+// parent. Carry that empty unary subtree to the nearest branching ancestor;
+// merging it as an ordinary interior would retain an empty descendant leaf.
+func emptyUnarySubtree(n *pnode) bool {
+	for len(n.children) == 1 && len(n.keys) == 0 {
+		if n.children[0].node == nil {
+			return false
+		}
+		n = n.children[0].node
+	}
+	return n.isLeaf() && n.keyLen() == 0
 }
 
 // mergeAt merges children[j] and children[j+1] into one node M (format.md "Delete"): a LEAF merge

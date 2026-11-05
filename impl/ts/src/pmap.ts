@@ -557,17 +557,16 @@ export class PMap {
     if (this.root === null) return undefined;
     const res = yield* nodeRemoveSteps(this.root, key, src, cap, shape);
     if (!res.ok) return undefined;
-    const newRoot = res.node;
+    let newRoot: PNode | null = res.node;
     // The root may have drained: an empty leaf becomes the empty map; a 0-key interior root hands
     // the root down a level (height shrinks). The root is exempt from the underfull rule, so no
     // rebalance here.
-    if (nodeLen(newRoot) === 0) {
+    while (newRoot !== null && nodeLen(newRoot) === 0) {
       // The lone surviving child becomes the new root — fault it if it is an OnDisk leaf (a tree of
       // height 2 can collapse to its single bottom child).
-      this.root = isLeaf(newRoot) ? null : yield* resolveChildSteps(newRoot.children[0], src);
-    } else {
-      this.root = newRoot;
+      newRoot = isLeaf(newRoot) ? null : yield* resolveChildSteps(newRoot.children[0], src);
     }
+    this.root = newRoot;
     if (this.rowCount !== null) this.rowCount -= 1n;
     return res.removed;
   }
@@ -1276,14 +1275,30 @@ function* rebalanceChildSteps(
   shape: LeafShape,
 ): Steps<PNode> {
   // children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
-  if (payload(yield* resolveChildSteps(n.children[i], src), cap, shape) >= cap.c / 2) return n;
+  const child = yield* resolveChildSteps(n.children[i], src);
+  if (payload(child, cap, shape) >= cap.c / 2) return n;
   if (n.children.length < 2) {
     // A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
     // with — its own parent merges IT away; the root case collapses in PMap.remove.
     return n;
   }
+  if (!isLeaf(child) && emptyUnarySubtree(child)) {
+    return newInterior(removeAt(n.keys, Math.min(i, n.keys.length - 1)), removeAt(n.children, i));
+  }
   const j = i + 1 < n.children.length ? i : i - 1;
   return yield* mergeAtSteps(n, j, src, cap, shape);
+}
+
+// An empty leaf below zero-key interiors has no same-parent sibling. Its first
+// branching ancestor removes the empty unary subtree; an ordinary interior
+// merge could split again and preserve the empty descendant leaf.
+function emptyUnarySubtree(node: PNode): boolean {
+  while (node.children.length === 1 && node.keys.length === 0) {
+    const child = node.children[0].node;
+    if (child === null) return false;
+    node = child;
+  }
+  return isLeaf(node) && nodeLen(node) === 0;
 }
 
 // mergeAt merges children[j] and children[j+1] into one node M (format.md "Delete"): a LEAF merge

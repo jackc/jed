@@ -386,11 +386,11 @@ func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 	t.Parallel()
 	// Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240−12)/2 = 114;
-	// keys of 110 bytes keep records under the cap while two separators (2·110 + 20) overflow an
+	// keys of 112 bytes keep records under the cap while two separators (2·112 + 20) overflow an
 	// interior.
 	shape := leafShape{}
 	bigKey := func(n uint64) []byte {
-		k := make([]byte, 110)
+		k := make([]byte, 112)
 		for i := range k {
 			k[i] = 0xAB
 		}
@@ -400,7 +400,7 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 	var pm pMap
 	ref := map[string]bool{}
 	for _, k := range pmShuffled(60) {
-		pm.Insert(bigKey(k), storedRow{}, 110, pmCap, shape, nil)
+		pm.Insert(bigKey(k), storedRow{}, 112, pmCap, shape, nil)
 		ref[string(bigKey(k))] = true
 	}
 	if pmLen(t, &pm) != len(ref) {
@@ -409,6 +409,9 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 	// Structure: fits + routing correctness (0-key interiors allowed).
 	var walk func(n *pnode)
 	walk = func(n *pnode) {
+		if n.isLeaf() && n.keyLen() == 0 {
+			t.Fatal("empty non-root leaf")
+		}
 		if n.payload(pmCap, shape) > pmCap.c {
 			t.Fatalf("node payload %d overflows its page", n.payload(pmCap, shape))
 		}
@@ -440,6 +443,9 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 	for _, k := range pmShuffled(60) {
 		if _, ok, _ := pm.Remove(bigKey(k), pmCap, shape, nil); !ok {
 			t.Fatalf("remove miss at %d", k)
+		}
+		if pm.root != nil {
+			walk(pm.root)
 		}
 	}
 	if pmLen(t, &pm) != 0 {

@@ -1488,6 +1488,13 @@ is never deleted or replaced; separators may go stale), remove the record, then 
 rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes it):
 
 - A non-root child is **underfull** when its `payload < C/2`.
+- **Empty unary subtree.** If deleting a leaf's last record leaves it below one
+  or more zero-key interiors, it has no sibling at its immediate parent. Carry
+  that empty unary subtree upward. The first parent with another child removes
+  the empty child pointer and separator `min(child_index, N−1)`; its own parent
+  then applies the ordinary underfull rule. Do not merge the empty interior as an
+  ordinary sibling: a subsequent degenerate split could retain its empty leaf.
+  An ordinary empty leaf with a sibling still uses the leaf merge below.
 - When a child is underfull, **merge** it with an adjacent sibling — prefer the **right**
   sibling (`child[i+1]`) if it exists, else the **left** (`child[i-1]`):
   - **Leaf merge:** concatenate the two leaves' records into one leaf `M`; the parent **removes**
@@ -1520,7 +1527,9 @@ rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes
     parent.)
 - **Root collapse:** a leaf root that drains to `N = 0` empties the table
   (`root_data_page = 0`); an interior root that drains to `N = 0` is replaced by its single
-  child (height − 1).
+  child (height − 1), repeating through zero-key interior roots until reaching a
+  nonempty leaf or an interior with a separator; an empty leaf then empties the
+  table. No committed leaf is empty, including below a degenerate interior.
 
 **Why the record cap.** Capping a **leaf** record at `RECORD_MAX(K) = (C − max(12, 12+16·K))/2`
 makes a two-record leaf never exceed `C`, for every column mix: the worst case is all-variable

@@ -307,24 +307,25 @@ test("pmap: wide values keep nodes valid", () => {
 // (a looser invariant check — 0-key interiors are legal here).
 test("pmap: near-cap keys force degenerate interior nodes", () => {
   // Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240-12)/2 = 114;
-  // keys of 110 bytes keep records under the cap while two separators (2·110 + 20) overflow an
+  // keys of 112 bytes keep records under the cap while two separators (2·112 + 20) overflow an
   // interior.
   const shape: LeafShape = { fixed: 0, var: 0 };
   const bigKey = (n: number): Uint8Array => {
-    const k = new Uint8Array(110).fill(0xab);
+    const k = new Uint8Array(112).fill(0xab);
     new DataView(k.buffer).setBigUint64(0, BigInt(n));
     return k;
   };
   const pm = new PMap();
   const ref = new Map<string, Row>();
   for (const k of shuffled(60)) {
-    pm.insert(bigKey(k), [], 110, CAP, shape, null);
+    pm.insert(bigKey(k), [], 112, CAP, shape, null);
     ref.set(keyStr(bigKey(k)), []);
   }
   assert.equal(pmCount(pm), ref.size);
   // Structure: fits + routing correctness (0-key interiors allowed).
   const walk = (n: PNode): void => {
     assert.ok(nodePayload(n, shape) <= CAP.c, "node overflows its page");
+    if (n.children.length === 0) assert.ok(n.keys.length > 0, "empty non-root leaf");
     if (n.children.length > 0) {
       assert.equal(n.children.length, n.keys.length + 1);
       for (const c of n.children) {
@@ -347,6 +348,8 @@ test("pmap: near-cap keys force degenerate interior nodes", () => {
   }
   for (const k of shuffled(60)) {
     assert.deepEqual(pm.remove(bigKey(k), CAP, shape, null), []);
+    const root = pm.rootNode();
+    if (root !== null) walk(root);
   }
   assert.equal(pmCount(pm), 0);
 });

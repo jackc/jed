@@ -937,12 +937,11 @@ impl PMap {
             // root hands the root down a level (height shrinks). The root is exempt from the
             // underfull rule, so no rebalance here. A root reached by a removal is decoded (a
             // dirty leaf or an interior), so `keys` is its true key list.
-            if root.keys.is_empty() {
+            while self.root.as_ref().is_some_and(|n| n.len() == 0) {
+                let root = self.root.as_ref().unwrap();
                 self.root = if root.is_leaf() {
                     None
                 } else {
-                    // The lone surviving child becomes the new root — fault it if it is an OnDisk
-                    // leaf (a tree of height 2 can collapse to its single bottom child).
                     Some(child(root, 0, src)?)
                 };
             }
@@ -1611,12 +1610,31 @@ fn rebalance_child(
         // with — its own parent merges *it* away; the root case collapses in `PMap::remove`.
         return Ok(());
     }
+    let child = node.children[i].resident();
+    if !child.is_leaf() && empty_unary_subtree(child) {
+        node.keys.remove(i.min(node.keys.len() - 1));
+        node.children.remove(i);
+        return Ok(());
+    }
     let j = if i + 1 < node.children.len() {
         i
     } else {
         i - 1
     };
     merge_at(node, j, src, cap, shape)
+}
+
+/// An empty leaf below zero-key interiors has no same-parent sibling. Remove
+/// its unary subtree at the first branching ancestor instead of pulling a
+/// separator down and retaining an empty descendant through another split.
+fn empty_unary_subtree(mut node: &Node) -> bool {
+    while node.children.len() == 1 && node.keys.is_empty() {
+        match &node.children[0] {
+            Child::Resident(child) => node = child,
+            Child::OnDisk(_) => return false,
+        }
+    }
+    node.is_leaf() && node.len() == 0
 }
 
 /// A merge operand's leaf entries. A uniquely owned dirty resident leaf gives its vectors up
@@ -2386,18 +2404,18 @@ mod tests {
     fn near_cap_keys_degenerate_interior() {
         use std::collections::BTreeMap;
         // Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240-12)/2
-        // = 114; keys of 110 bytes keep records under the cap while two separators (2·110 + 20)
+        // = 114; keys of 112 bytes keep records under the cap while two separators (2·112 + 20)
         // overflow an interior.
         let shape = LeafShape { fixed: 0, var: 0 };
         let big_key = |n: u64| {
-            let mut k = vec![0xAB; 110];
+            let mut k = vec![0xAB; 112];
             k[..8].copy_from_slice(&n.to_be_bytes());
             k
         };
         let mut pm = PMap::new();
         let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
         for k in shuffled(60) {
-            pm.insert(big_key(k), Vec::new(), 110, CAP, shape, None)
+            pm.insert(big_key(k), Vec::new(), 112, CAP, shape, None)
                 .unwrap();
             bt.insert(big_key(k), Vec::new());
         }
@@ -2405,6 +2423,9 @@ mod tests {
         // Structure: fits + routing correctness (0-key interiors allowed).
         fn walk(node: &Node, cap: Cap, shape: LeafShape) {
             assert!(node.payload(cap, shape) <= cap.c, "node overflows its page");
+            if node.is_leaf() {
+                assert!(node.len() > 0, "empty non-root leaf");
+            }
             if !node.is_leaf() {
                 assert_eq!(node.children.len(), node.keys.len() + 1);
                 for c in &node.children {
@@ -2424,6 +2445,9 @@ mod tests {
                 pm.remove(&big_key(k), CAP, shape, None).unwrap(),
                 Some(Vec::new())
             );
+            if let Some(root) = pm.root() {
+                walk(root, CAP, shape);
+            }
         }
         assert!(pm.is_empty());
     }

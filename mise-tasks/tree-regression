@@ -1,0 +1,17 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Focused supported-core B+tree structural regression checks"
+#USAGE arg "[core]" default="all" help="all, rust, go, or ts"
+
+root = File.expand_path("..", __dir__)
+cores = ENV.fetch("usage_core", "all")
+cores = cores == "all" ? %w[go rust ts] : [cores]
+abort "core must be all, rust, go, or ts" unless cores.all? { |core| %w[go rust ts].include?(core) }
+commands = {
+  "go" => ["go", "test", "./...", "-run", "^TestPMap", "-count=1"],
+  "rust" => ["cargo", "test", "--release", "pmap::tests"],
+  "ts" => ["node", "--test", "tests/pmap.test.ts"]
+}
+cores.each do |core|
+  abort "#{core} tree regression checks failed" unless system(*commands.fetch(core), chdir: File.join(root, "impl", core))
+end
