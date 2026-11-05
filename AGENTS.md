@@ -307,8 +307,6 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   shared working-tree assumptions.
 - Before continuing work reported by another instance, fetch and verify the
   referenced commit or branch locally.
-- Feature branches should be pushed promptly to the private `origin` after the
-  first commit and after subsequent commits.
 - Merge to `master` only when verification is green.
 - `master` history must stay linear. Use fast-forward-only integration, rebased
   branches, squash merges, or cherry-picks; do not create merge commits on
