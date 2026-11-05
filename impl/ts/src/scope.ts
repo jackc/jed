@@ -108,7 +108,7 @@ import type {
 import { cteBodyAsQuery, cteBodyIsDataModifying, forEachGroupExpr } from "./ast.ts";
 import { outputColumnLocation, requireSetopEquality, unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
-import { render, renderFloatPg } from "./value.ts";
+import { copyHostValue, render, renderFloatPg } from "./value.ts";
 import {
   coerceForStore,
   coerceRecordTextToValue,
@@ -1918,9 +1918,11 @@ export function bindParams(
   // A text value bound to a timestamptz parameter reads an offset-less string in the session zone,
   // as PostgreSQL's text-format parameter input does (timezones.md §9.3).
   return types.map((ty, i) =>
-    ty.kind === "scalar"
-      ? storeValue(supplied[i]!, ty.scalar, null, null, null, false, labels[i]!, iz)
-      : bindContainerParam(supplied[i]!, ty, labels[i]!, iz),
+    copyHostValue(
+      ty.kind === "scalar"
+        ? storeValue(supplied[i]!, ty.scalar, null, null, null, false, labels[i]!, iz)
+        : bindContainerParam(supplied[i]!, ty, labels[i]!, iz),
+    ),
   );
 }
 

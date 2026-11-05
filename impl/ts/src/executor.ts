@@ -518,6 +518,7 @@ import {
 } from "./operators.ts";
 import {
   type Value,
+  copyHostValue,
   arrayValue,
   byteaValue,
   boolValue,
@@ -24592,6 +24593,7 @@ export class Engine {
     // and never streams (streaming.md §7 / sequences.md §4).
     if (this.stmtIsWriteWithViews(stmt)) return null;
     if (stmt.kind !== "setOp" && stmt.kind !== "with") return null;
+    params = params.map(copyHostValue);
     // Resolve the output column names + types up front (the Rows cursor exposes them before the first
     // pull). Planning is unmetered + deterministic, so the names read here are IDENTICAL to what the
     // deferred run produces (it reuses runSetOp/runWith verbatim, so there is no rows/cost drift). A

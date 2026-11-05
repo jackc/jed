@@ -16,7 +16,7 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import type { Engine, InsertCacheHolder, Outcome, ScanCacheHolder } from "./executor.ts";
-import { renderIn, type Value } from "./value.ts";
+import { copyHostValue, renderIn, type Value } from "./value.ts";
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
 // holding only the parsed AST and its plan cache — no session or database reference (the converged
@@ -218,7 +218,7 @@ export class Rows implements Iterable<Value[]> {
         try {
           const row = self.cursor.nextRow();
           return row !== undefined
-            ? { done: false, value: row }
+            ? { done: false, value: row.map(copyHostValue) }
             : { done: true, value: undefined as unknown as Value[] };
         } catch (error) {
           self.fireErr();
@@ -237,7 +237,7 @@ export class Rows implements Iterable<Value[]> {
       throw error;
     }
     return row !== undefined
-      ? { done: false, value: row }
+      ? { done: false, value: row.map(copyHostValue) }
       : { done: true, value: undefined as unknown as Value[] };
   }
 }

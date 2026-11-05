@@ -271,6 +271,57 @@ export function byteaValue(b: Uint8Array): Value {
   return { kind: "bytea", bytes: b };
 }
 
+// Values may share storage inside the engine. At a host boundary copy their mutable payloads so
+// changing a bind argument or returned row cannot alter committed data or a retained query plan.
+export function copyHostValue(v: Value): Value {
+  switch (v.kind) {
+    case "bytea":
+    case "uuid":
+      return { ...v, bytes: new Uint8Array(v.bytes) };
+    case "decimal":
+      return { ...v, dec: Decimal.fromParts(v.dec.neg, v.dec.scale, v.dec.limbs.slice()) };
+    case "interval":
+      return { ...v, iv: { ...v.iv } };
+    case "composite":
+      return { ...v, fields: v.fields.map(copyHostValue) };
+    case "array":
+      return {
+        ...v,
+        dims: v.dims.slice(),
+        lbounds: v.lbounds.slice(),
+        elements: v.elements.map(copyHostValue),
+      };
+    case "range":
+      return {
+        ...v,
+        lower: v.lower === null ? null : copyHostValue(v.lower),
+        upper: v.upper === null ? null : copyHostValue(v.upper),
+      };
+    case "jsonb":
+      return { ...v, node: copyHostJson(v.node) };
+    case "unfetched":
+      throw new Error("BUG: unfetched large value escaped the storage layer");
+    default:
+      return { ...v };
+  }
+}
+
+function copyHostJson(v: JsonNode): JsonNode {
+  switch (v.kind) {
+    case "number":
+      return { ...v, dec: Decimal.fromParts(v.dec.neg, v.dec.scale, v.dec.limbs.slice()) };
+    case "array":
+      return { ...v, elements: v.elements.map(copyHostJson) };
+    case "object":
+      return {
+        ...v,
+        members: v.members.map(({ key, value }) => ({ key, value: copyHostJson(value) })),
+      };
+    default:
+      return { ...v };
+  }
+}
+
 // uuidValue builds a non-null uuid value from its 16 raw bytes (parseUuid guarantees 16).
 export function uuidValue(b: Uint8Array): Value {
   return { kind: "uuid", bytes: b };

@@ -1374,6 +1374,12 @@ optimization), so every run routes through the full session envelope. Verified b
 `impl/ts/tests/ergonomic.test.ts` (the affected-count, rows-as-objects + scalar mapping, `iterate`,
 the param mapping, the rich-type→text mapping, and the on-Session/Transaction surface).
 
+The TypeScript host boundary copies mutable values when binding parameters and yielding rows,
+including nested byte buffers, array/composite containers, and decimal/JSON payloads. This applies
+to the internal raw `Value` cursor as well as the ergonomic layer. A deferred cursor captures its
+parameters when opened. Mutating a supplied or returned value must not modify stored data, an
+index, a prepared plan, or a later result row.
+
 **All three cores now carry both halves** — cancellation *and* an idiomatic arg/scan ergonomic layer
 (Go `database/sql`/pgx, Rust `rusqlite`, TS better-sqlite3).
 
