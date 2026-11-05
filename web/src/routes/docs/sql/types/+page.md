@@ -20,6 +20,10 @@
   ('3.14159'::text)::numeric(4,2)  AS text_to_numeric,
   ('yes'::text)::boolean           AS text_to_bool;`;
 
+	const floatRoundDemo = `SELECT
+  round(1e308::f64, 1)::text AS large_value,
+  round(123::f64, -1000)::text AS coarse_rounding;`;
+
 	const textTemporalCastDemo = `SELECT
   ('2024-01-15 10:30'::text)::timestamp        AS text_to_timestamp,
   ('2024-01-15 10:30-05'::text)::timestamptz   AS with_offset,
@@ -275,6 +279,12 @@ An `f32` next to an `f64` widens exactly to `f64` first, as PostgreSQL widens `r
 binary value: `0.1::f32 = 0.1::f64` is false, because the `f32` nearest 0.1 is 0.100000001490116….
 The widening is an implicit cast (`cast(a as f64)` in `EXPLAIN (VERBOSE)`), so a comparison of an
 `f32` column with an `f64` value scans rather than using an index on that column.
+
+`round(float, places)` rounds half away from zero, with negative `places` rounding to the left
+of the decimal point. A large finite value stays finite when its rounded result fits, and a
+rounding unit larger than any finite float produces zero:
+
+<LiveSql demo="floatRoundDemo" query={floatRoundDemo} rows={1} />
 
 ## Integers with defined overflow
 

@@ -4050,7 +4050,15 @@ function floatPow(x: number, y: number, result: ScalarType): number {
 export function roundFloatHalfAway(x: number, places: number): number {
   if (!Number.isFinite(x)) return x;
   const f = 10 ** places;
+  if (f === 0) return x < 0 || Object.is(x, -0) ? -0 : 0;
+  if (!Number.isFinite(f)) {
+    if (places >= 324) return x;
+    // 10^309..10^323 overflows binary64, but rounding a subnormal can still change it.
+    const result = Number(Decimal.exactFromFloat64(x).roundPlaces(places).render());
+    return result === 0 && (x < 0 || Object.is(x, -0)) ? -0 : result;
+  }
   const scaled = x * f;
+  if (!Number.isFinite(scaled)) return x;
   const r = scaled < 0 ? -Math.round(-scaled) : Math.round(scaled);
   return r / f;
 }
