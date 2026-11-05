@@ -1104,12 +1104,26 @@ func roundFloatPlaces(f float64, n int64) float64 {
 		return math.Round(f) // math.Round is round-half-away-from-zero
 	}
 	scale := math.Pow(10, float64(n))
-	if math.IsInf(scale, 0) || scale == 0 {
-		// n far out of range: rounding has no effect (10^n overflows or underflows).
-		if scale == 0 {
+	if scale == 0 {
+		// The rounding unit is larger than any finite float.
+		return math.Copysign(0, f)
+	}
+	if math.IsInf(scale, 0) {
+		if n >= 324 {
 			return f
 		}
+		// Decimal scales 309..323 still round subnormal operands. Avoid an
+		// overflowing scale factor with the exact, bounded decimal form.
+		rounded := exactDecimalFromFloat64(f).RoundToScale(uint32(n))
+		// The rounded decimal is either zero or at least 1e-323, and cannot
+		// exceed the finite input's magnitude enough to overflow binary64.
+		out, _ := decimalToFloat64(rounded)
+		return math.Copysign(out, f)
+	}
+	scaled := f * scale
+	if math.IsInf(scaled, 0) {
+		// Scaling a large finite operand must not manufacture an infinity.
 		return f
 	}
-	return math.Round(f*scale) / scale
+	return math.Round(scaled) / scale
 }

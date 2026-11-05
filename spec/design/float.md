@@ -342,6 +342,13 @@ are irrational — are **`pi()`** (a shared f64 literal, no operand) and **`radi
 one IEEE op with one shared constant is byte-identical cross-core, so these carry **no** ledger
 entry.
 
+For `round(f, n)`, an intermediate decimal scale must not turn a representable rounded result
+into infinity. Precision 309–323 can still change subnormal operands even though `10^n`
+overflows binary64; those cases round the exact decimal representation before converting back.
+A precision of 324 or more preserves the float, and a precision below -323 produces signed
+zero for a finite operand. Check the full integer precision before narrowing it for host
+exponentiation; NaN and infinity remain unchanged.
+
 **Transcendental — exempted (G2/G3 dropped, ledgered):** `exp`, `ln`, `log10`, `pow(x, y)` /
 the `^` operator, `power` (the PG-name alias for `pow`), `sin`, `cos`, `tan`, `cbrt`, `asin`,
 `acos`, `atan`, `atan2`, `cot`, and the hyperbolics `sinh`/`cosh`/`tanh`/`asinh`/`acosh`/`atanh`.

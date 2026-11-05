@@ -2029,3 +2029,48 @@ reason = "jed: timestamptz ± a constant interval with zero months and days is a
 file = "expr/timestamptz_interval_zone.test"
 sql = "CREATE INDEX ev_hour2 ON ev ((interval '90 minutes' + at))"
 reason = "Same refinement as ev_hour (the commuted form); in the oracle replay it runs inside the transaction ev_hour aborted (25P02)."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(1e308::f64, 1)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(123::f64, -1000)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(-1e308::f64, 1)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(-123::f64, -1000)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(123::f64, 1000)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(1e-310::f64, 309)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(1.5e-310::f64, 310)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(123::f64, 4294967296)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."
+
+[[override]]
+file = "expr/float_round_extremes.test"
+sql = "SELECT round(123::f64, -4294967296)::text"
+reason = "jed extension: round(f64, n) rounds a float half away from zero at a decimal precision (float.md §8). PostgreSQL has no two-argument float round overload. This regression pins finite scaling, extreme precisions, and subnormal rounding."

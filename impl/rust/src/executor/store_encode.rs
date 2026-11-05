@@ -1903,12 +1903,31 @@ pub(crate) fn round_f64_places(f: f64, places: i64) -> f64 {
     if places == 0 {
         return f.round();
     }
+    if places > 308 {
+        if places >= 324 {
+            return f;
+        }
+        // Decimal places beyond the finite power-of-ten range can still round subnormals.
+        // The exact terminating decimal keeps this bounded fallback free of scaling overflow.
+        let rounded = Decimal::from_float64(f).round_to_scale(places as u32);
+        return rounded
+            .render()
+            .parse::<f64>()
+            .expect("finite rounded float")
+            .copysign(f);
+    }
+    if places < -323 {
+        return 0.0f64.copysign(f);
+    }
     let scale = 10f64.powi(places as i32);
-    if !scale.is_finite() || scale == 0.0 {
-        // Extreme `places` — clamp to the operand (no observable rounding at that magnitude).
+    if scale == 0.0 {
+        return 0.0f64.copysign(f);
+    }
+    let scaled = f * scale;
+    if !scale.is_finite() || !scaled.is_finite() {
         return f;
     }
-    (f * scale).round() / scale
+    scaled.round() / scale
 }
 
 /// Evaluate a float scalar function over a finite/non-finite f64 (spec/design/float.md §8). The

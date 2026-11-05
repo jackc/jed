@@ -1,0 +1,47 @@
+# Float rounding must not overflow merely because its decimal scale does.
+# requires: query.select_no_from, types.f64
+
+query T
+SELECT round(1e308::f64, 1)::text
+----
+1e+308
+
+query T
+SELECT round(123::f64, -1000)::text
+----
+0
+
+query T
+SELECT round(-1e308::f64, 1)::text
+----
+-1e+308
+
+query T
+SELECT round(-123::f64, -1000)::text
+----
+-0
+
+query T
+SELECT round(123::f64, 1000)::text
+----
+123
+
+query T
+SELECT round(1e-310::f64, 309)::text
+----
+0
+
+query T
+SELECT round(1.5e-310::f64, 310)::text
+----
+2e-310
+
+query T
+SELECT round(123::f64, 4294967296)::text
+----
+123
+
+query T
+SELECT round(123::f64, -4294967296)::text
+----
+0
