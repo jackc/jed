@@ -52,7 +52,8 @@ integer (you write `run(1)`, not `run(1n)`), but values _read back_ come as `big
 
 An exact `decimal` binds from the engine's own `Decimal` type, which keeps its written scale; in Go,
 `jed.ParseDecimal("12.50")` builds one from text. An integer or a `Decimal` also binds to a `f32`/`f64`
-parameter, rounded to the nearest float.
+parameter, rounded to the nearest float. A finite decimal outside that width's range, including a
+nonzero value that rounds to zero, returns `22003`.
 
 ### Arrays, ranges, and composite values
 

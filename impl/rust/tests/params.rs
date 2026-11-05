@@ -35,6 +35,23 @@ fn err_code(db: &mut Session, sql: &str, params: &[Value]) -> String {
         .to_string()
 }
 
+/// Host Decimal values must retain the same finite-underflow check as SQL casts when stored.
+#[test]
+fn decimal_host_value_rejects_float_underflow() {
+    for (ty, scale) in [("f32", 60), ("f64", 400)] {
+        let mut db = db_with(&[&format!("CREATE TABLE t (v {ty})")]);
+        let value = Value::Decimal(jed::decimal::Decimal::from_digits_scale(false, "1", scale));
+        assert_eq!(
+            err_code(&mut db, "INSERT INTO t VALUES ($1)", &[value]),
+            "22003"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT count(*) FROM t", &[]),
+            vec![vec![Value::Int(0)]]
+        );
+    }
+}
+
 #[test]
 fn composite_pk_float_param_widens_soundly() {
     let mut db = db_with(&[
