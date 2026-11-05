@@ -1,0 +1,10 @@
+# Signed NaN input matches PostgreSQL in both float widths.
+# requires: query.select_no_from, cast.operator, cast.string_literal, types.f32, types.f64, query.comparison_order
+
+query BBBB nosort
+SELECT '+NaN'::real = 'NaN'::real, '-NaN'::real = 'NaN'::real, '+NaN'::float = 'NaN'::float, '-NaN'::float = 'NaN'::float
+----
+true
+true
+true
+true
