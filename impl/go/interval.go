@@ -256,7 +256,7 @@ func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 	}
 	// Check the resulting timestamp, not the isolated calendar-day delta.
 	t, ok := timestampMulAdd(sign*int64(iv.Days), microsPerDay, t)
-	if !ok {
+	if !ok || t == negInfinity || t == posInfinity {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
 	return addShiftMicros(t, iv.Micros, subtract)
@@ -297,7 +297,7 @@ func tsShiftZoned(ts int64, iv Interval, subtract bool, zr ZoneRef) (int64, erro
 		if !ok {
 			return 0, errZoneShiftOutOfRange()
 		}
-		if local, ok = timestampMulAdd(days, microsPerDay, local); !ok {
+		if local, ok = timestampMulAdd(days, microsPerDay, local); !ok || local == negInfinity || local == posInfinity {
 			return 0, intervalFieldOverflow("timestamp out of range")
 		}
 		if t, ok = localToInstantMicros(zr, local); !ok {
@@ -342,7 +342,7 @@ func addMonthsClamped(t int64, months int64) (int64, error) {
 	// The fractional part can restore a finite value when the beginning of the
 	// earliest second lies below MinInt64. Check the complete civil value.
 	r, ok := timestampMulAdd(secs, microsPerSec, us)
-	if !ok {
+	if !ok || r == negInfinity || r == posInfinity {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
 	return r, nil

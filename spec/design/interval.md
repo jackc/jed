@@ -289,6 +289,12 @@ Calendar-day shifts check the resulting timestamp, not the day delta expressed i
 For example, `timestamp '294000-01-01' - interval '108000000 days'` is the finite
 `1695-01-17 00:00:00 BC` even though the day delta alone exceeds signed i64 microseconds.
 
+As in PostgreSQL, each completed month or day step must produce a finite timestamp before the
+next interval field is applied. An out-of-range intermediate, including either infinity sentinel,
+raises `22008` even if a later field would bring the final value back into range. This checks the
+completed calendar step, not the individual products used to construct it, and uses jed's finite
+timestamp bounds ([timestamp.md §1](timestamp.md)).
+
 **`timestamptz ± interval` reads the session zone.** The months step converts the instant to its
 wall clock in the session zone, adds the months with day-of-month clamping, and re-resolves the wall
 clock through the zone (the input rules at a DST gap/overlap, [timezones.md §6](timezones.md)); the

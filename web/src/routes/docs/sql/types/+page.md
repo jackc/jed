@@ -229,6 +229,9 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
 	const timestampDayShiftDemo = `SELECT
   timestamp '294000-01-01' - interval '108000000 days' AS earlier;`;
 
+	const timestampStepOverflowDemo = `SELECT
+  timestamp '294000-01-01' + interval '12000 months -365242 days';`;
+
 	const dateClockDemo = `SELECT
   current_date                  AS today,
   date 'tomorrow'               AS tomorrow,
@@ -836,6 +839,12 @@ Timestamp calendar-day shifts can span the full finite timestamp range. A large 
 accepted when the resulting timestamp is in range:
 
 <LiveSql demo="timestampDayShiftDemo" query={timestampDayShiftDemo} rows={1} />
+
+Interval arithmetic applies months, then days, then microseconds. Each completed calendar step
+must stay within the finite timestamp range, as in PostgreSQL. A later field cannot rescue an
+overflowing step; this example raises `22008` before applying the negative day count:
+
+<LiveSql demo="timestampStepOverflowDemo" query={timestampStepOverflowDemo} rows={1} />
 
 A date literal also accepts PostgreSQL's special words: `'epoch'` (1970-01-01) and the
 **clock-relative** `'today'` / `'now'` / `'tomorrow'` / `'yesterday'` — the current day in the

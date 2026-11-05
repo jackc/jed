@@ -81,6 +81,13 @@ test('the types page autoruns the timestamp precision / interval fields demo', a
   await expect(rows).toContainText('00:00:01.23');
 });
 
+test('the types page reports timestamp calendar-step overflow', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  await expect(livePanel(page, 'timestampStepOverflowDemo').getByTestId('error-code')).toHaveText(
+    '22008'
+  );
+});
+
 test('the types page autoruns the uuid ⇄ text/bytea cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The uuid cast demo: text→uuid (canonical lowercase), uuid→text, uuid→bytea

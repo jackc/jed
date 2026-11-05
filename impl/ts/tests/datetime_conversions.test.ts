@@ -137,3 +137,32 @@ test("timestamp month shifts preserve the earliest finite second", () => {
     );
   }
 });
+
+test("timestamp calendar steps reject nonfinite intermediates", () => {
+  // These use jed's finite boundaries, which differ from PostgreSQL's.
+  const db = dbWith([]);
+  for (const type of ["timestamp", "timestamptz"]) {
+    for (const [input, forward, reverse] of [
+      ["294246-12-10 04:00:54.775807", "1 month -1 day", "-1 month 1 day"],
+      ["294246-12-10 04:00:54.775808", "1 month -1 day", "-1 month 1 day"],
+      ["290308-01-21 19:59:05.224192 BC", "-1 month 1 day", "1 month -1 day"],
+      ["290308-01-21 19:59:05.224191 BC", "-1 month 1 day", "1 month -1 day"],
+      ["294247-01-09 04:00:54.775807", "1 day -1 second", "-1 day 1 second"],
+      ["294247-01-09 04:00:54.775808", "1 day -1 second", "-1 day 1 second"],
+      ["290309-12-22 19:59:05.224192 BC", "-1 day 1 second", "1 day -1 second"],
+      ["290309-12-22 19:59:05.224191 BC", "-1 day 1 second", "1 day -1 second"],
+    ]) {
+      for (const [op, interval] of [
+        ["+", forward],
+        ["-", reverse],
+      ]) {
+        const sql = `SELECT ${type} '${input}' ${op} interval '${interval}'`;
+        assert.equal(
+          errCode(() => query(db, sql)),
+          "22008",
+          sql,
+        );
+      }
+    }
+  }
+});

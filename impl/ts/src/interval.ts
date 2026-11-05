@@ -333,7 +333,8 @@ export function tsShift(ts: bigint, iv: Interval, subtract: boolean): bigint {
   let t = ts;
   const months = sign * BigInt(iv.months);
   if (months !== 0n) t = addMonthsClamped(t, months);
-  t = t + sign * BigInt(iv.days) * MICROS_PER_DAY;
+  // Validate the completed day step before a later time field can cancel its overflow.
+  t = finiteCalendarTimestamp(t + sign * BigInt(iv.days) * MICROS_PER_DAY);
   return addShiftMicros(t, iv.micros, subtract);
 }
 
@@ -356,7 +357,7 @@ export function tsShiftZoned(ts: bigint, iv: Interval, subtract: boolean, zr: Zo
   }
   const days = sign * BigInt(iv.days);
   if (days !== 0n) {
-    const local = instantToLocalMicros(zr, t) + days * MICROS_PER_DAY;
+    const local = finiteCalendarTimestamp(instantToLocalMicros(zr, t) + days * MICROS_PER_DAY);
     t = localToInstantMicros(zr, local);
   }
   return addShiftMicros(t, iv.micros, subtract);
@@ -379,7 +380,15 @@ function addMonthsClamped(t: bigint, months: bigint): bigint {
   const maxd = daysInMonth(ny, nmo);
   const nd = d > maxd ? maxd : d;
   const days = daysFromCivil(ny, nmo, nd);
-  return (days * 86_400n + h * 3600n + mi * 60n + s) * MICROS_PER_SEC + us;
+  // A later day/time field cannot rescue an out-of-range month step.
+  return finiteCalendarTimestamp((days * 86_400n + h * 3600n + mi * 60n + s) * MICROS_PER_SEC + us);
+}
+
+// Each completed calendar step must be finite before later fields can cancel it.
+function finiteCalendarTimestamp(micros: bigint): bigint {
+  if (micros <= NEG_INFINITY || micros >= POS_INFINITY)
+    throw intervalFieldOverflow("timestamp out of range");
+  return micros;
 }
 
 // addShiftMicros is the final micros step of a shift: t ± micros, never onto a ±infinity sentinel.

@@ -347,19 +347,25 @@ fn add_months_clamped(t: i64, months: i64) -> Result<i64> {
     let days = timestamp::days_from_civil(ny, nmo as i64, nd as i64);
     // The earliest finite second begins below i64::MIN; its fractional part can
     // restore a representable timestamp. Check the complete civil value.
-    i64::try_from(
+    finite_calendar_timestamp(
         (days as i128 * 86_400 + h as i128 * 3600 + mi as i128 * 60 + s as i128)
             * MICROS_PER_SEC as i128
             + us as i128,
     )
-    .map_err(|_| field_overflow("timestamp out of range"))
 }
 
 /// Calendar days can span more than i64 microseconds while the resulting timestamp
 /// remains representable. Validate the sum, not the isolated day delta.
 fn add_calendar_days(t: i64, days: i64) -> Result<i64> {
-    i64::try_from(t as i128 + days as i128 * MICROS_PER_DAY as i128)
-        .map_err(|_| field_overflow("timestamp out of range"))
+    finite_calendar_timestamp(t as i128 + days as i128 * MICROS_PER_DAY as i128)
+}
+
+/// Each completed calendar step must be finite before later fields can cancel it.
+fn finite_calendar_timestamp(micros: i128) -> Result<i64> {
+    if micros <= timestamp::NEG_INFINITY as i128 || micros >= timestamp::POS_INFINITY as i128 {
+        return Err(field_overflow("timestamp out of range"));
+    }
+    Ok(micros as i64)
 }
 
 /// The final micros step of a shift: `t ± micros`, checked, and never onto a ±infinity sentinel.

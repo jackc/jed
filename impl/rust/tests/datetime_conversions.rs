@@ -176,3 +176,61 @@ fn timestamp_month_shift_preserves_earliest_finite_second() {
         assert_eq!(err_code(&mut db, &sql), "22008", "{sql}");
     }
 }
+
+// PostgreSQL checks each completed calendar step before applying later fields.
+// These tests use jed's own finite boundaries, which differ from PostgreSQL's.
+#[test]
+fn timestamp_calendar_steps_reject_nonfinite_intermediates() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for ty in ["timestamp", "timestamptz"] {
+        for (input, forward, reverse) in [
+            (
+                "294246-12-10 04:00:54.775807",
+                "1 month -1 day",
+                "-1 month 1 day",
+            ),
+            (
+                "294246-12-10 04:00:54.775808",
+                "1 month -1 day",
+                "-1 month 1 day",
+            ),
+            (
+                "290308-01-21 19:59:05.224192 BC",
+                "-1 month 1 day",
+                "1 month -1 day",
+            ),
+            (
+                "290308-01-21 19:59:05.224191 BC",
+                "-1 month 1 day",
+                "1 month -1 day",
+            ),
+            (
+                "294247-01-09 04:00:54.775807",
+                "1 day -1 second",
+                "-1 day 1 second",
+            ),
+            (
+                "294247-01-09 04:00:54.775808",
+                "1 day -1 second",
+                "-1 day 1 second",
+            ),
+            (
+                "290309-12-22 19:59:05.224192 BC",
+                "-1 day 1 second",
+                "1 day -1 second",
+            ),
+            (
+                "290309-12-22 19:59:05.224191 BC",
+                "-1 day 1 second",
+                "1 day -1 second",
+            ),
+        ] {
+            for (op, interval) in [("+", forward), ("-", reverse)] {
+                let sql = format!("SELECT {ty} '{input}' {op} interval '{interval}'");
+                assert_eq!(err_code(&mut db, &sql), "22008", "{sql}");
+            }
+        }
+    }
+}
