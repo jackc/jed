@@ -7961,10 +7961,9 @@ pub(crate) fn finalize_percentile(
                     None => Value::Null,
                 });
             }
-            let n = out.len();
             Ok(Value::Array(crate::value::ArrayVal {
-                dims: vec![n],
-                lbounds: vec![1],
+                dims: arr.dims.clone(),
+                lbounds: arr.lbounds.clone(),
                 elements: out,
             }))
         }

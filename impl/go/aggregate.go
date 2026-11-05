@@ -1138,7 +1138,11 @@ func finalizePercentile(frac *Value, empty bool, compute func(p float64) (Value,
 			}
 			out = append(out, v)
 		}
-		return arrayValueOf(&ArrayVal{Dims: []int{len(out)}, Lbounds: []int32{1}, Elements: out}), nil
+		return arrayValueOf(&ArrayVal{
+			Dims:     append([]int(nil), frac.arrayVal().Dims...),
+			Lbounds:  append([]int32(nil), frac.arrayVal().Lbounds...),
+			Elements: out,
+		}), nil
 	}
 	p, err := fractionToF64(frac)
 	if err != nil {

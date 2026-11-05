@@ -586,6 +586,8 @@ GROUP (ORDER BY v)` returns the quartiles as `float8[]`. jed matches:
 - The direct argument may be a numeric **array** (any of the §17 forms, but array-typed); the result
   type becomes an **array** of the scalar result type — `float8[]` for `percentile_cont` over numeric,
   the input-type `[]` for `percentile_disc`, `interval[]` for `percentile_cont` over interval (§13).
+  The result preserves the fraction array's dimensions and lower bounds, including the
+  zero-dimensional shape of an empty fraction array.
 - The group is sorted **once**; each array element yields one percentile, in element order. A **NULL
   element** yields a **NULL element** in the result (it is not the whole-result NULL of a scalar NULL
   fraction). Every **non-NULL** element is range-checked (`22003`) **before** the empty-group check

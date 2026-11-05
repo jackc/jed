@@ -260,6 +260,8 @@ The ordered-set aggregates `mode`, `percentile_cont`, and `percentile_disc` are 
 `WITHIN GROUP (ORDER BY …)` clause (for example, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`
 for the median), and the hypothetical-set aggregates `rank`, `dense_rank`, `percent_rank`, and
 `cume_dist` take a hypothetical row the same way (`rank(50) WITHIN GROUP (ORDER BY score)`).
+The percentile functions also accept an array of fractions and return an array with the same
+dimensions and lower bounds, with one percentile per element and NULLs preserved.
 `FILTER (WHERE …)` and these aggregate forms also compose with window functions (`OVER`).
 
 A select-list (or `RETURNING`) item names its output column with `AS` (`count(*) AS items`) or, as

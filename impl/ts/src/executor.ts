@@ -42397,8 +42397,7 @@ export function finalizePercentile(
     for (const pf of fracs) {
       out.push(pf === null ? nullValue() : compute(pf));
     }
-    const n = out.length;
-    return { kind: "array", dims: [n], lbounds: [1], elements: out };
+    return { kind: "array", dims: [...frac.dims], lbounds: [...frac.lbounds], elements: out };
   }
   const p = fractionToF64(frac);
   if (p === null) return nullValue();
