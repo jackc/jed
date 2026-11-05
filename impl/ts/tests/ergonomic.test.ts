@@ -12,6 +12,21 @@ import { intValue } from "../src/value.ts";
 import { Decimal } from "../src/decimal.ts";
 import { memDb } from "./mem_db.ts";
 
+test("row objects preserve prototype-shaped column names as ordinary own properties", () => {
+  const db = memDb();
+  const sql = 'SELECT 1 AS __proto__, 2 AS constructor, 3 AS "toString", 4 AS __proto__';
+  for (const row of [db.get(sql)!, ...db.all(sql), ...db.prepare(sql).iterate()]) {
+    assert.equal(Object.getPrototypeOf(row), Object.prototype);
+    assert.deepStrictEqual(Object.keys(row), ["__proto__", "constructor", "toString"]);
+    assert.equal(row.__proto__, 4n);
+    assert.equal(row.constructor, 2n);
+    assert.equal(row.toString, 3n);
+  }
+  const bytes = db.get("SELECT decode('0102', 'hex') AS __proto__")!;
+  assert.equal(Object.getPrototypeOf(bytes), Object.prototype);
+  assert.deepStrictEqual(bytes.__proto__, new Uint8Array([1, 2]));
+});
+
 test("bound exact numbers round directly to an f32 column", () => {
   const db = memDb();
   db.run("CREATE TABLE f32_bound (v real)");

@@ -153,7 +153,13 @@ function bindParams(params: JsParam[]): Value[] {
 
 function rowObject(values: Value[], names: string[]): Row {
   const out: Row = {};
-  for (let i = 0; i < names.length; i++) out[names[i]!] = valueToJs(values[i]!);
+  for (let i = 0; i < names.length; i++)
+    Object.defineProperty(out, names[i]!, {
+      value: valueToJs(values[i]!),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
   return out;
 }
 
