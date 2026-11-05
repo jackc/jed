@@ -47,7 +47,7 @@ struct RangeSpecFact: Equatable, Sendable {
 
 enum GeneratedSpec {
     static let baseline = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
-    static let fingerprint = "68920423d1c74f1aef9cda1b5238500020c0155564e1f1d665d2309d5de078b7"
+    static let fingerprint = "8d60f8b77c8a63bd5ea5815788eda7bb0743953e256a71f1d9128f26a454d974"
     static let sourceHashes: [String: String] = [
         "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
         "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -62,7 +62,23 @@ enum GeneratedSpec {
         "spec/grammar/pg_keywords.toml": "897108620950faa56c1ce9f5d8d6f385644cae007d94ab2deed237fd8ee09c48",
         "spec/fileformat/lz4_vectors.toml": "e9882b5f9cb86272f307606afbfe111d310cf93ec166940ae73846a398a57a77",
         "spec/encoding/decimal.toml": "006049952dc0d0ac0253f2cdbe5bd49e4fd69fe1fb08fe30c0a13c060c248078",
+        "spec/encoding/integers.toml": "ffdca7e1b0a892bbb8cd6f655e58bb6eb15edc455d87f710f265c9dbe5b23b03",
+        "spec/encoding/text.toml": "f2531344da6e65eb995032cb377ebe4b1a7d6456e0635b1187189d118d3ad100",
+        "spec/encoding/bytea.toml": "23a10e5fe530b3c6599e1690abb9c149b677cfa152f23c62a254ccd4c23acc17",
+        "spec/encoding/timestamps.toml": "729d4c0d978656fd22885d99befd00e1a861deee07ad9f64b31fb1deaad52d05",
+        "spec/encoding/dates.toml": "7a9b81666c48bbdafcc1f5db0180057d0f654e5ca6efcf3d4f5071ec48cef4e3",
+        "spec/encoding/intervals.toml": "b6e2e3801d6fd8eeac8e45b10a38b304021aa1448f4ae9a3595e148d87aaa8c7",
+        "spec/encoding/interval.toml": "d986c938bd2e8f25701851ccc8eb9b2aa6d466539219c704146656eb0f7e6c77",
+        "spec/encoding/float.toml": "0b00469aa4fb069b0a67ea5f90393b3d7dfc93f9632341dff77014795729e213",
+        "spec/encoding/range.toml": "128638cbfcef1c3ca2e4d1da82acc48a45567c7c634c010ab41f9b60a4b73046",
+        "spec/encoding/composite.toml": "22389bbe1ceb6632e6293bb1594dec39b34f5f2dde5cee46b57a39c8028d1607",
+        "spec/encoding/ordered.toml": "ae7581803f75a7d49bc1584be73397798d97556d981ef04a5f4efd0f0efb065d",
+        "spec/tz/vectors/bundle.toml": "7fd87e29aeeb1a9b24c709cd68fd8aaf568b346e82413dccd17ca076159f9d6f",
+        "spec/tz/vectors/tzif.toml": "746a96dac17a6913ba8cbb1327e0a5df73b33aedf3080cfcd20bdabaa7a4fb66",
         "spec/fileformat/encryption_vectors.toml": "68295024e6df842fd653fced20a5b0b9838f4cbd48e3fc829c85e78da535d067",
+        "spec/fileformat/fixtures/encrypted_empty_db.jed": "49ec67b6e0773f270f7148429b90e9cdd4e8ffd253a79504e1372e98fc12c267",
+        "spec/fileformat/fixtures/encrypted_pk_table.jed": "004157e8941ea31e22a890d46cf364d896fd2dd6ff1247c479e61517d87b0edd",
+        "spec/tz/fixtures/tzdata.jtz": "59122b73e7c397bbddbccb8316274565d09ea6e01ff3412e807e307158400aa7",
     ]
     static let defaultScalarBytes: Int64 = 67108864
     static let memoryRow: Int64 = 32

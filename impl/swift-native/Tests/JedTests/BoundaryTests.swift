@@ -2,6 +2,10 @@ import XCTest
 @testable import Jed
 
 final class BoundaryTests: XCTestCase {
+    func testStableFloatStorageTypeCodes() {
+        XCTAssertEqual(ScalarType.f64.rawValue, 12)
+        XCTAssertEqual(ScalarType.f32.rawValue, 13)
+    }
     func testTextUsesByteIdentityAndCodePoints() throws {
         let composed = try SQLText("é")
         let decomposed = try SQLText("e\u{301}")

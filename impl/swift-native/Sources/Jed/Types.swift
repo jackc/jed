@@ -3,7 +3,7 @@
 public enum ScalarType: UInt8, CaseIterable, Sendable {
     case i16 = 1, i32 = 2, i64 = 3, text = 4, boolean = 5, decimal = 6
     case bytea = 7, uuid = 8, timestamp = 9, timestamptz = 10, interval = 11
-    case f32 = 12, f64 = 13, date = 16, json = 18, jsonb = 19, jsonpath = 20
+    case f64 = 12, f32 = 13, date = 16, json = 18, jsonb = 19, jsonpath = 20
 
     public var name: String {
         switch self {

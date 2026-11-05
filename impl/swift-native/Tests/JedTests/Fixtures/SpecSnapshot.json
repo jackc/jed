@@ -1,6 +1,6 @@
 {
   "baseline": "362e0798ac3a8bd04bd2da556044b6ec73bf468a",
-  "fingerprint": "68920423d1c74f1aef9cda1b5238500020c0155564e1f1d665d2309d5de078b7",
+  "fingerprint": "8d60f8b77c8a63bd5ea5815788eda7bb0743953e256a71f1d9128f26a454d974",
   "source_hashes": {
     "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
     "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -15,7 +15,23 @@
     "spec/grammar/pg_keywords.toml": "897108620950faa56c1ce9f5d8d6f385644cae007d94ab2deed237fd8ee09c48",
     "spec/fileformat/lz4_vectors.toml": "e9882b5f9cb86272f307606afbfe111d310cf93ec166940ae73846a398a57a77",
     "spec/encoding/decimal.toml": "006049952dc0d0ac0253f2cdbe5bd49e4fd69fe1fb08fe30c0a13c060c248078",
-    "spec/fileformat/encryption_vectors.toml": "68295024e6df842fd653fced20a5b0b9838f4cbd48e3fc829c85e78da535d067"
+    "spec/encoding/integers.toml": "ffdca7e1b0a892bbb8cd6f655e58bb6eb15edc455d87f710f265c9dbe5b23b03",
+    "spec/encoding/text.toml": "f2531344da6e65eb995032cb377ebe4b1a7d6456e0635b1187189d118d3ad100",
+    "spec/encoding/bytea.toml": "23a10e5fe530b3c6599e1690abb9c149b677cfa152f23c62a254ccd4c23acc17",
+    "spec/encoding/timestamps.toml": "729d4c0d978656fd22885d99befd00e1a861deee07ad9f64b31fb1deaad52d05",
+    "spec/encoding/dates.toml": "7a9b81666c48bbdafcc1f5db0180057d0f654e5ca6efcf3d4f5071ec48cef4e3",
+    "spec/encoding/intervals.toml": "b6e2e3801d6fd8eeac8e45b10a38b304021aa1448f4ae9a3595e148d87aaa8c7",
+    "spec/encoding/interval.toml": "d986c938bd2e8f25701851ccc8eb9b2aa6d466539219c704146656eb0f7e6c77",
+    "spec/encoding/float.toml": "0b00469aa4fb069b0a67ea5f90393b3d7dfc93f9632341dff77014795729e213",
+    "spec/encoding/range.toml": "128638cbfcef1c3ca2e4d1da82acc48a45567c7c634c010ab41f9b60a4b73046",
+    "spec/encoding/composite.toml": "22389bbe1ceb6632e6293bb1594dec39b34f5f2dde5cee46b57a39c8028d1607",
+    "spec/encoding/ordered.toml": "ae7581803f75a7d49bc1584be73397798d97556d981ef04a5f4efd0f0efb065d",
+    "spec/tz/vectors/bundle.toml": "7fd87e29aeeb1a9b24c709cd68fd8aaf568b346e82413dccd17ca076159f9d6f",
+    "spec/tz/vectors/tzif.toml": "746a96dac17a6913ba8cbb1327e0a5df73b33aedf3080cfcd20bdabaa7a4fb66",
+    "spec/fileformat/encryption_vectors.toml": "68295024e6df842fd653fced20a5b0b9838f4cbd48e3fc829c85e78da535d067",
+    "spec/fileformat/fixtures/encrypted_empty_db.jed": "49ec67b6e0773f270f7148429b90e9cdd4e8ffd253a79504e1372e98fc12c267",
+    "spec/fileformat/fixtures/encrypted_pk_table.jed": "004157e8941ea31e22a890d46cf364d896fd2dd6ff1247c479e61517d87b0edd",
+    "spec/tz/fixtures/tzdata.jtz": "59122b73e7c397bbddbccb8316274565d09ea6e01ff3412e807e307158400aa7"
   },
   "documents": {
     "spec/types/scalars.toml": {
@@ -12141,6 +12157,4469 @@
               "bytes": "fffc80000001023300"
             }
           ]
+        }
+      ]
+    },
+    "spec/encoding/integers.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "i16",
+          "cases": [
+            {
+              "value": -32768,
+              "bytes": "0000"
+            },
+            {
+              "value": -256,
+              "bytes": "7f00"
+            },
+            {
+              "value": -1,
+              "bytes": "7fff"
+            },
+            {
+              "value": 0,
+              "bytes": "8000"
+            },
+            {
+              "value": 1,
+              "bytes": "8001"
+            },
+            {
+              "value": 100,
+              "bytes": "8064"
+            },
+            {
+              "value": 256,
+              "bytes": "8100"
+            },
+            {
+              "value": 32767,
+              "bytes": "ffff"
+            }
+          ]
+        },
+        {
+          "type": "i32",
+          "cases": [
+            {
+              "value": -2147483648,
+              "bytes": "00000000"
+            },
+            {
+              "value": -1,
+              "bytes": "7fffffff"
+            },
+            {
+              "value": 0,
+              "bytes": "80000000"
+            },
+            {
+              "value": 1,
+              "bytes": "80000001"
+            },
+            {
+              "value": 100,
+              "bytes": "80000064"
+            },
+            {
+              "value": 32768,
+              "bytes": "80008000"
+            },
+            {
+              "value": 2000000000,
+              "bytes": "f7359400"
+            },
+            {
+              "value": 2147483647,
+              "bytes": "ffffffff"
+            }
+          ]
+        },
+        {
+          "type": "i64",
+          "cases": [
+            {
+              "value": -9223372036854775808,
+              "bytes": "0000000000000000"
+            },
+            {
+              "value": -1,
+              "bytes": "7fffffffffffffff"
+            },
+            {
+              "value": 0,
+              "bytes": "8000000000000000"
+            },
+            {
+              "value": 1,
+              "bytes": "8000000000000001"
+            },
+            {
+              "value": 10000000000,
+              "bytes": "80000002540be400"
+            },
+            {
+              "value": 9223372036854775807,
+              "bytes": "ffffffffffffffff"
+            }
+          ]
+        },
+        {
+          "type": "uuid",
+          "cases": [
+            {
+              "value": "00000000-0000-0000-0000-000000000000",
+              "bytes": "00000000000000000000000000000000"
+            },
+            {
+              "value": "00000000-0000-0000-0000-000000000001",
+              "bytes": "00000000000000000000000000000001"
+            },
+            {
+              "value": "550e8400-e29b-41d4-a716-446655440000",
+              "bytes": "550e8400e29b41d4a716446655440000"
+            },
+            {
+              "value": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+              "bytes": "f47ac10b58cc4372a5670e02b2c3d479"
+            },
+            {
+              "value": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+              "bytes": "ffffffffffffffffffffffffffffffff"
+            }
+          ]
+        },
+        {
+          "type": "boolean",
+          "cases": [
+            {
+              "value": false,
+              "bytes": "00"
+            },
+            {
+              "value": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "i16",
+          "cases": [
+            {
+              "value": -1,
+              "bytes": "007fff"
+            },
+            {
+              "value": 0,
+              "bytes": "008000"
+            },
+            {
+              "value": 1,
+              "bytes": "008001"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        },
+        {
+          "type": "uuid",
+          "cases": [
+            {
+              "value": "00000000-0000-0000-0000-000000000000",
+              "bytes": "0000000000000000000000000000000000"
+            },
+            {
+              "value": "550e8400-e29b-41d4-a716-446655440000",
+              "bytes": "00550e8400e29b41d4a716446655440000"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        },
+        {
+          "type": "boolean",
+          "cases": [
+            {
+              "value": false,
+              "bytes": "0000"
+            },
+            {
+              "value": true,
+              "bytes": "0001"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "i16",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "value": 1,
+              "bytes": "ff7ffe"
+            },
+            {
+              "value": 0,
+              "bytes": "ff7fff"
+            },
+            {
+              "value": -1,
+              "bytes": "ff8000"
+            }
+          ]
+        },
+        {
+          "type": "uuid",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "value": "550e8400-e29b-41d4-a716-446655440000",
+              "bytes": "ffaaf17bff1d64be2b58e9bb99aabbffff"
+            },
+            {
+              "value": "00000000-0000-0000-0000-000000000000",
+              "bytes": "ffffffffffffffffffffffffffffffffff"
+            }
+          ]
+        },
+        {
+          "type": "boolean",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "value": true,
+              "bytes": "fffe"
+            },
+            {
+              "value": false,
+              "bytes": "ffff"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/text.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "text",
+          "cases": [
+            {
+              "value": "",
+              "bytes": "0001"
+            },
+            {
+              "value": "a",
+              "bytes": "610001"
+            },
+            {
+              "value": "a\u0000b",
+              "bytes": "6100ff620001"
+            },
+            {
+              "value": "aa",
+              "bytes": "61610001"
+            },
+            {
+              "value": "ab",
+              "bytes": "61620001"
+            },
+            {
+              "value": "b",
+              "bytes": "620001"
+            },
+            {
+              "value": "é",
+              "bytes": "c3a90001"
+            },
+            {
+              "value": "中",
+              "bytes": "e4b8ad0001"
+            },
+            {
+              "value": "豈",
+              "bytes": "efa4800001"
+            },
+            {
+              "value": "ﬀ",
+              "bytes": "efac800001"
+            },
+            {
+              "value": "�",
+              "bytes": "efbfbd0001"
+            },
+            {
+              "value": "𝐀",
+              "bytes": "f09d90800001"
+            },
+            {
+              "value": "😀",
+              "bytes": "f09f98800001"
+            },
+            {
+              "value": "🚀",
+              "bytes": "f09f9a800001"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "text",
+          "cases": [
+            {
+              "value": "",
+              "bytes": "000001"
+            },
+            {
+              "value": "a",
+              "bytes": "00610001"
+            },
+            {
+              "value": "b",
+              "bytes": "00620001"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "text",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "value": "b",
+              "bytes": "ff9dfffe"
+            },
+            {
+              "value": "a",
+              "bytes": "ff9efffe"
+            },
+            {
+              "value": "",
+              "bytes": "fffffe"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/bytea.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "bytea",
+          "cases": [
+            {
+              "hex": "",
+              "bytes": "0001"
+            },
+            {
+              "hex": "00",
+              "bytes": "00ff0001"
+            },
+            {
+              "hex": "61",
+              "bytes": "610001"
+            },
+            {
+              "hex": "6100ff62",
+              "bytes": "6100ffff620001"
+            },
+            {
+              "hex": "6161",
+              "bytes": "61610001"
+            },
+            {
+              "hex": "62",
+              "bytes": "620001"
+            },
+            {
+              "hex": "ff",
+              "bytes": "ff0001"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "bytea",
+          "cases": [
+            {
+              "hex": "",
+              "bytes": "000001"
+            },
+            {
+              "hex": "61",
+              "bytes": "00610001"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "bytea",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "hex": "61",
+              "bytes": "ff9efffe"
+            },
+            {
+              "hex": "",
+              "bytes": "fffffe"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/timestamps.toml": {
+      "schema_version": 1,
+      "parse": [
+        {
+          "type": "timestamp",
+          "cases": [
+            {
+              "input": "1970-01-01 00:00:00",
+              "micros": 0
+            },
+            {
+              "input": "1970-01-01",
+              "micros": 0
+            },
+            {
+              "input": "2024-01-01 12:00:00",
+              "micros": 1704110400000000
+            },
+            {
+              "input": "2024-01-01T12:00:00",
+              "micros": 1704110400000000
+            },
+            {
+              "input": "  2024-01-01 12:00:00  ",
+              "micros": 1704110400000000
+            },
+            {
+              "input": "2024-01-01 12:00:00.5",
+              "micros": 1704110400500000
+            },
+            {
+              "input": "2024-01-01 12:00:00.001",
+              "micros": 1704110400001000
+            },
+            {
+              "input": "2024-01-01 12:00:00.123456",
+              "micros": 1704110400123456
+            },
+            {
+              "input": "2024-01-01 12:00:00+05",
+              "micros": 1704110400000000
+            },
+            {
+              "input": "2024-01-01 12:00:00-08:30",
+              "micros": 1704110400000000
+            },
+            {
+              "input": "2024-01-01 12:00:00.1234564",
+              "micros": 1704110400123456
+            },
+            {
+              "input": "2024-01-01 12:00:00.1234565",
+              "micros": 1704110400123457
+            },
+            {
+              "input": "2024-01-01 23:59:59.9999996",
+              "micros": 1704153600000000
+            },
+            {
+              "input": "2024-01-01 24:00:00",
+              "micros": 1704153600000000
+            },
+            {
+              "input": "1969-12-31 23:59:59",
+              "micros": -1000000
+            },
+            {
+              "input": "1969-12-31 23:59:59.5",
+              "micros": -500000
+            },
+            {
+              "input": "1969-07-20 20:17:00",
+              "micros": -14182980000000
+            },
+            {
+              "input": "0001-01-01 00:00:00",
+              "micros": -62135596800000000
+            },
+            {
+              "input": "9999-12-31 23:59:59.999999",
+              "micros": 253402300799999999
+            },
+            {
+              "input": "10000-01-01 00:00:00",
+              "micros": 253402300800000000
+            },
+            {
+              "input": "0001-01-01 00:00:00 BC",
+              "micros": -62167219200000000
+            },
+            {
+              "input": "0002-01-01 BC",
+              "micros": -62198755200000000
+            },
+            {
+              "input": "0044-03-15 00:00:00 BC",
+              "micros": -63517824000000000
+            },
+            {
+              "input": "infinity",
+              "micros": 9223372036854775807
+            },
+            {
+              "input": "+infinity",
+              "micros": 9223372036854775807
+            },
+            {
+              "input": "INFINITY",
+              "micros": 9223372036854775807
+            },
+            {
+              "input": "-infinity",
+              "micros": -9223372036854775808
+            }
+          ]
+        },
+        {
+          "type": "timestamptz",
+          "cases": [
+            {
+              "input": "1970-01-01 00:00:00+00",
+              "micros": 0
+            },
+            {
+              "input": "1970-01-01 00:00:00Z",
+              "micros": 0
+            },
+            {
+              "input": "1970-01-01 00:00:00",
+              "micros": 0
+            },
+            {
+              "input": "2024-01-01 12:00:00+00",
+              "micros": 1704110400000000
+            },
+            {
+              "input": "2024-01-01 12:00:00+05",
+              "micros": 1704092400000000
+            },
+            {
+              "input": "2024-01-01 12:00:00-08",
+              "micros": 1704139200000000
+            },
+            {
+              "input": "2024-01-01 12:00:00+05:30",
+              "micros": 1704090600000000
+            },
+            {
+              "input": "0001-01-01 00:00:00+00 BC",
+              "micros": -62167219200000000
+            },
+            {
+              "input": "infinity",
+              "micros": 9223372036854775807
+            },
+            {
+              "input": "-infinity",
+              "micros": -9223372036854775808
+            }
+          ]
+        }
+      ],
+      "parse_error": [
+        {
+          "type": "timestamp",
+          "cases": [
+            {
+              "input": "2024-13-01",
+              "error": "22008"
+            },
+            {
+              "input": "2024-00-01",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-32",
+              "error": "22008"
+            },
+            {
+              "input": "2024-02-30",
+              "error": "22008"
+            },
+            {
+              "input": "2023-02-29",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-01 25:00:00",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-01 12:60:00",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-01 12:00:60",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-01 24:00:01",
+              "error": "22008"
+            },
+            {
+              "input": "300000-01-01 00:00:00",
+              "error": "22008"
+            },
+            {
+              "input": "",
+              "error": "22007"
+            },
+            {
+              "input": "   ",
+              "error": "22007"
+            },
+            {
+              "input": "not a timestamp",
+              "error": "22007"
+            },
+            {
+              "input": "2024/01/01",
+              "error": "22007"
+            },
+            {
+              "input": "now",
+              "error": "22007"
+            },
+            {
+              "input": "today",
+              "error": "22007"
+            },
+            {
+              "input": "epoch",
+              "error": "22007"
+            },
+            {
+              "input": "2024-01-01 12:00:00 XY",
+              "error": "22007"
+            }
+          ]
+        },
+        {
+          "type": "timestamptz",
+          "cases": [
+            {
+              "input": "2024-01-01 12:00:00+99",
+              "error": "22008"
+            },
+            {
+              "input": "garbage",
+              "error": "22007"
+            },
+            {
+              "input": "now",
+              "error": "22007"
+            }
+          ]
+        }
+      ],
+      "render": [
+        {
+          "type": "timestamp",
+          "cases": [
+            {
+              "micros": 0,
+              "text": "1970-01-01 00:00:00"
+            },
+            {
+              "micros": 1704110400000000,
+              "text": "2024-01-01 12:00:00"
+            },
+            {
+              "micros": 1704110400500000,
+              "text": "2024-01-01 12:00:00.5"
+            },
+            {
+              "micros": 1704110400001000,
+              "text": "2024-01-01 12:00:00.001"
+            },
+            {
+              "micros": 1704110400123456,
+              "text": "2024-01-01 12:00:00.123456"
+            },
+            {
+              "micros": -1000000,
+              "text": "1969-12-31 23:59:59"
+            },
+            {
+              "micros": -500000,
+              "text": "1969-12-31 23:59:59.5"
+            },
+            {
+              "micros": -62135596800000000,
+              "text": "0001-01-01 00:00:00"
+            },
+            {
+              "micros": 253402300799999999,
+              "text": "9999-12-31 23:59:59.999999"
+            },
+            {
+              "micros": 253402300800000000,
+              "text": "10000-01-01 00:00:00"
+            },
+            {
+              "micros": -62167219200000000,
+              "text": "0001-01-01 00:00:00 BC"
+            },
+            {
+              "micros": -62198755200000000,
+              "text": "0002-01-01 00:00:00 BC"
+            },
+            {
+              "micros": -63517824000000000,
+              "text": "0044-03-15 00:00:00 BC"
+            },
+            {
+              "micros": 9223372036854775807,
+              "text": "infinity"
+            },
+            {
+              "micros": -9223372036854775808,
+              "text": "-infinity"
+            }
+          ]
+        },
+        {
+          "type": "timestamptz",
+          "cases": [
+            {
+              "micros": 0,
+              "text": "1970-01-01 00:00:00+00"
+            },
+            {
+              "micros": 1704110400000000,
+              "text": "2024-01-01 12:00:00+00"
+            },
+            {
+              "micros": 1704092400000000,
+              "text": "2024-01-01 07:00:00+00"
+            },
+            {
+              "micros": 1704110400500000,
+              "text": "2024-01-01 12:00:00.5+00"
+            },
+            {
+              "micros": -500000,
+              "text": "1969-12-31 23:59:59.5+00"
+            },
+            {
+              "micros": -62167219200000000,
+              "text": "0001-01-01 00:00:00+00 BC"
+            },
+            {
+              "micros": 9223372036854775807,
+              "text": "infinity"
+            },
+            {
+              "micros": -9223372036854775808,
+              "text": "-infinity"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/dates.toml": {
+      "schema_version": 1,
+      "parse": [
+        {
+          "type": "date",
+          "cases": [
+            {
+              "input": "1970-01-01",
+              "days": 0
+            },
+            {
+              "input": "2024-01-15",
+              "days": 19737
+            },
+            {
+              "input": "2024-01-15 12:34:56",
+              "days": 19737
+            },
+            {
+              "input": "2024-01-15T12:34:56.789",
+              "days": 19737
+            },
+            {
+              "input": "2024-01-15 12:34:56+05",
+              "days": 19737
+            },
+            {
+              "input": "2024-01-15 24:00:00",
+              "days": 19737
+            },
+            {
+              "input": "  2024-01-15  ",
+              "days": 19737
+            },
+            {
+              "input": "2000-01-01",
+              "days": 10957
+            },
+            {
+              "input": "2024-02-29",
+              "days": 19782
+            },
+            {
+              "input": "1969-12-31",
+              "days": -1
+            },
+            {
+              "input": "0001-01-01",
+              "days": -719162
+            },
+            {
+              "input": "9999-12-31",
+              "days": 2932896
+            },
+            {
+              "input": "10000-01-01",
+              "days": 2932897
+            },
+            {
+              "input": "0001-01-01 BC",
+              "days": -719528
+            },
+            {
+              "input": "0002-01-01 BC",
+              "days": -719893
+            },
+            {
+              "input": "0044-03-15 BC",
+              "days": -735160
+            },
+            {
+              "input": "5874898-01-01",
+              "days": 2145042906
+            },
+            {
+              "input": "infinity",
+              "days": 2147483647
+            },
+            {
+              "input": "+infinity",
+              "days": 2147483647
+            },
+            {
+              "input": "INFINITY",
+              "days": 2147483647
+            },
+            {
+              "input": "-infinity",
+              "days": -2147483648
+            },
+            {
+              "input": "epoch",
+              "days": 0
+            },
+            {
+              "input": "  EPOCH  ",
+              "days": 0
+            }
+          ]
+        }
+      ],
+      "parse_error": [
+        {
+          "type": "date",
+          "cases": [
+            {
+              "input": "2024-13-01",
+              "error": "22008"
+            },
+            {
+              "input": "2024-00-01",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-32",
+              "error": "22008"
+            },
+            {
+              "input": "2024-02-30",
+              "error": "22008"
+            },
+            {
+              "input": "2023-02-29",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-15 25:00:00",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-15 12:60:00",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-15 12:00:60",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-15 24:00:01",
+              "error": "22008"
+            },
+            {
+              "input": "2024-01-15 12:00:00+99",
+              "error": "22008"
+            },
+            {
+              "input": "",
+              "error": "22007"
+            },
+            {
+              "input": "   ",
+              "error": "22007"
+            },
+            {
+              "input": "not a date",
+              "error": "22007"
+            },
+            {
+              "input": "2024/01/15",
+              "error": "22007"
+            },
+            {
+              "input": "20240115",
+              "error": "22007"
+            },
+            {
+              "input": "Jan 15, 2024",
+              "error": "22007"
+            },
+            {
+              "input": "01/15/2024",
+              "error": "22007"
+            },
+            {
+              "input": "now",
+              "error": "22007"
+            },
+            {
+              "input": "today",
+              "error": "22007"
+            },
+            {
+              "input": "2024-01-15 12:00:00 XY",
+              "error": "22007"
+            }
+          ]
+        }
+      ],
+      "render": [
+        {
+          "type": "date",
+          "cases": [
+            {
+              "days": 0,
+              "text": "1970-01-01"
+            },
+            {
+              "days": 19737,
+              "text": "2024-01-15"
+            },
+            {
+              "days": 10957,
+              "text": "2000-01-01"
+            },
+            {
+              "days": -1,
+              "text": "1969-12-31"
+            },
+            {
+              "days": -719162,
+              "text": "0001-01-01"
+            },
+            {
+              "days": 2932896,
+              "text": "9999-12-31"
+            },
+            {
+              "days": 2932897,
+              "text": "10000-01-01"
+            },
+            {
+              "days": -719528,
+              "text": "0001-01-01 BC"
+            },
+            {
+              "days": -719893,
+              "text": "0002-01-01 BC"
+            },
+            {
+              "days": -735160,
+              "text": "0044-03-15 BC"
+            },
+            {
+              "days": 2147483647,
+              "text": "infinity"
+            },
+            {
+              "days": -2147483648,
+              "text": "-infinity"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/intervals.toml": {
+      "parse": [
+        {
+          "cases": [
+            {
+              "input": "1 day",
+              "months": 0,
+              "days": 1,
+              "micros": 0
+            },
+            {
+              "input": "2 days",
+              "months": 0,
+              "days": 2,
+              "micros": 0
+            },
+            {
+              "input": "1 year",
+              "months": 12,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 year 2 months",
+              "months": 14,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 mon",
+              "months": 1,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "30 days",
+              "months": 0,
+              "days": 30,
+              "micros": 0
+            },
+            {
+              "input": "3 weeks",
+              "months": 0,
+              "days": 21,
+              "micros": 0
+            },
+            {
+              "input": "1 week 1 day",
+              "months": 0,
+              "days": 8,
+              "micros": 0
+            },
+            {
+              "input": "1 decade",
+              "months": 120,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 century",
+              "months": 1200,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 millennium",
+              "months": 12000,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 day 02:30:00",
+              "months": 0,
+              "days": 1,
+              "micros": 9000000000
+            },
+            {
+              "input": "04:05:06",
+              "months": 0,
+              "days": 0,
+              "micros": 14706000000
+            },
+            {
+              "input": "1:2:3",
+              "months": 0,
+              "days": 0,
+              "micros": 3723000000
+            },
+            {
+              "input": "02:30",
+              "months": 0,
+              "days": 0,
+              "micros": 9000000000
+            },
+            {
+              "input": "100 hours",
+              "months": 0,
+              "days": 0,
+              "micros": 360000000000
+            },
+            {
+              "input": "1 hour 30 minutes",
+              "months": 0,
+              "days": 0,
+              "micros": 5400000000
+            },
+            {
+              "input": "1 second",
+              "months": 0,
+              "days": 0,
+              "micros": 1000000
+            },
+            {
+              "input": "1.5 seconds",
+              "months": 0,
+              "days": 0,
+              "micros": 1500000
+            },
+            {
+              "input": "0.5 seconds",
+              "months": 0,
+              "days": 0,
+              "micros": 500000
+            },
+            {
+              "input": "1 millisecond",
+              "months": 0,
+              "days": 0,
+              "micros": 1000
+            },
+            {
+              "input": "1 microsecond",
+              "months": 0,
+              "days": 0,
+              "micros": 1
+            },
+            {
+              "input": "5",
+              "months": 0,
+              "days": 0,
+              "micros": 5000000
+            },
+            {
+              "input": "1.5",
+              "months": 0,
+              "days": 0,
+              "micros": 1500000
+            },
+            {
+              "input": "-5",
+              "months": 0,
+              "days": 0,
+              "micros": -5000000
+            },
+            {
+              "input": "@ 5",
+              "months": 0,
+              "days": 0,
+              "micros": 5000000
+            },
+            {
+              "input": "1 day 2",
+              "months": 0,
+              "days": 1,
+              "micros": 2000000
+            },
+            {
+              "input": "1 day -5",
+              "months": 0,
+              "days": 1,
+              "micros": -5000000
+            },
+            {
+              "input": "1 hour 5",
+              "months": 0,
+              "days": 0,
+              "micros": 3605000000
+            },
+            {
+              "input": "1 1:00",
+              "months": 0,
+              "days": 1,
+              "micros": 3600000000
+            },
+            {
+              "input": "5 1 hour",
+              "months": 0,
+              "days": 5,
+              "micros": 3600000000
+            },
+            {
+              "input": "1-2",
+              "months": 14,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "-1-2",
+              "months": -14,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1-2 3",
+              "months": 14,
+              "days": 0,
+              "micros": 3000000
+            },
+            {
+              "input": "1-2 3 4:05:06",
+              "months": 14,
+              "days": 3,
+              "micros": 14706000000
+            },
+            {
+              "input": "-1 2:03:04",
+              "months": 0,
+              "days": -1,
+              "micros": 7384000000
+            },
+            {
+              "input": "1 -2:03:04",
+              "months": 0,
+              "days": 1,
+              "micros": -7384000000
+            },
+            {
+              "input": "1-",
+              "months": 12,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1:30.5",
+              "months": 0,
+              "days": 0,
+              "micros": 90500000
+            },
+            {
+              "input": "0:0:60",
+              "months": 0,
+              "days": 0,
+              "micros": 60000000
+            },
+            {
+              "input": "- 5 days",
+              "months": 0,
+              "days": -5,
+              "micros": 0
+            },
+            {
+              "input": ".5",
+              "months": 0,
+              "days": 0,
+              "micros": 500000
+            },
+            {
+              "input": "5. day",
+              "months": 0,
+              "days": 5,
+              "micros": 0
+            },
+            {
+              "input": "1;day",
+              "months": 0,
+              "days": 1,
+              "micros": 0
+            },
+            {
+              "input": "5 mm",
+              "months": 0,
+              "days": 0,
+              "micros": 300000000
+            },
+            {
+              "input": "1 mseconds 1 useconds",
+              "months": 0,
+              "days": 0,
+              "micros": 1001
+            },
+            {
+              "input": "1 millisecondsxyz",
+              "months": 0,
+              "days": 0,
+              "micros": 1000
+            },
+            {
+              "input": "1 day at",
+              "months": 0,
+              "days": 1,
+              "micros": 0
+            },
+            {
+              "input": "2 days at 5",
+              "months": 0,
+              "days": 2,
+              "micros": 5000000
+            },
+            {
+              "input": "2:00 hour",
+              "months": 0,
+              "days": 0,
+              "micros": 7200000000
+            },
+            {
+              "input": "1.5 days 1:00",
+              "months": 0,
+              "days": 1,
+              "micros": 46800000000
+            },
+            {
+              "input": "1:00 1.5 days",
+              "months": 0,
+              "days": 1,
+              "micros": 3600000000
+            },
+            {
+              "input": "P1Y2M3DT4H5M6S",
+              "months": 14,
+              "days": 3,
+              "micros": 14706000000
+            },
+            {
+              "input": "P2W",
+              "months": 0,
+              "days": 14,
+              "micros": 0
+            },
+            {
+              "input": "P-1Y-2M",
+              "months": -14,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "P1.5Y",
+              "months": 18,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "P0.5M",
+              "months": 0,
+              "days": 15,
+              "micros": 0
+            },
+            {
+              "input": "PT1.5S",
+              "months": 0,
+              "days": 0,
+              "micros": 1500000
+            },
+            {
+              "input": "PT",
+              "months": 0,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "P1D2D",
+              "months": 0,
+              "days": 3,
+              "micros": 0
+            },
+            {
+              "input": "P0001-02-03T04:05:06",
+              "months": 14,
+              "days": 3,
+              "micros": 14706000000
+            },
+            {
+              "input": "P00010203T040506",
+              "months": 14,
+              "days": 3,
+              "micros": 14706000000
+            },
+            {
+              "input": "P0001-02",
+              "months": 14,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "PT04:05",
+              "months": 0,
+              "days": 0,
+              "micros": 14700000000
+            },
+            {
+              "input": "P1e2D",
+              "months": 0,
+              "days": 100,
+              "micros": 0
+            },
+            {
+              "input": "PT0x10H",
+              "months": 0,
+              "days": 0,
+              "micros": 57600000000
+            },
+            {
+              "input": "PT0x1p-1050S",
+              "months": 0,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "PT0e999999S",
+              "months": 0,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1day",
+              "months": 0,
+              "days": 1,
+              "micros": 0
+            },
+            {
+              "input": "1hour 2min",
+              "months": 0,
+              "days": 0,
+              "micros": 3720000000
+            },
+            {
+              "input": "1:00:00ago",
+              "months": 0,
+              "days": 0,
+              "micros": -3600000000
+            },
+            {
+              "input": "1.5 days",
+              "months": 0,
+              "days": 1,
+              "micros": 43200000000
+            },
+            {
+              "input": "1.5 months",
+              "months": 1,
+              "days": 15,
+              "micros": 0
+            },
+            {
+              "input": "1.5 years",
+              "months": 18,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1.01 years",
+              "months": 12,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1.375 years",
+              "months": 16,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1.125 years",
+              "months": 14,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1.5 weeks",
+              "months": 0,
+              "days": 10,
+              "micros": 43200000000
+            },
+            {
+              "input": "1.15 months",
+              "months": 1,
+              "days": 4,
+              "micros": 43200000000
+            },
+            {
+              "input": "0.0000005 seconds",
+              "months": 0,
+              "days": 0,
+              "micros": 1
+            },
+            {
+              "input": "4.5 us",
+              "months": 0,
+              "days": 0,
+              "micros": 5
+            },
+            {
+              "input": "PT040506.5",
+              "months": 0,
+              "days": 0,
+              "micros": 14706000001
+            },
+            {
+              "input": "1.12345678901234567890123456789 sec",
+              "months": 0,
+              "days": 0,
+              "micros": 1123457
+            },
+            {
+              "input": "-1 day",
+              "months": 0,
+              "days": -1,
+              "micros": 0
+            },
+            {
+              "input": "1 day -02:00",
+              "months": 0,
+              "days": 1,
+              "micros": -7200000000
+            },
+            {
+              "input": "-00:00:01",
+              "months": 0,
+              "days": 0,
+              "micros": -1000000
+            },
+            {
+              "input": "-1 year 2 mons",
+              "months": -10,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "2 mons -1 day",
+              "months": 2,
+              "days": -1,
+              "micros": 0
+            },
+            {
+              "input": "1 day ago",
+              "months": 0,
+              "days": -1,
+              "micros": 0
+            },
+            {
+              "input": "1 year 1 day 01:00:00 ago",
+              "months": -12,
+              "days": -1,
+              "micros": -3600000000
+            },
+            {
+              "input": "@ 1 day",
+              "months": 0,
+              "days": 1,
+              "micros": 0
+            },
+            {
+              "input": "00:00:00",
+              "months": 0,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "0 seconds",
+              "months": 0,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 week 1 day",
+              "months": 0,
+              "days": 8,
+              "micros": 0
+            },
+            {
+              "input": "1 millennium 1 century 1 decade 1 year 1 mon",
+              "months": 13333,
+              "days": 0,
+              "micros": 0
+            },
+            {
+              "input": "1 day 01:00",
+              "months": 0,
+              "days": 1,
+              "micros": 3600000000
+            },
+            {
+              "input": "1 hour 1 min 1 sec 1 ms 1 us",
+              "months": 0,
+              "days": 0,
+              "micros": 3661001001
+            },
+            {
+              "input": "1.0 sec 1 ms",
+              "months": 0,
+              "days": 0,
+              "micros": 1001000
+            },
+            {
+              "input": "1 ms 5",
+              "months": 0,
+              "days": 0,
+              "micros": 5001000
+            }
+          ]
+        }
+      ],
+      "parse_error": [
+        {
+          "cases": [
+            {
+              "input": "",
+              "error": "22007"
+            },
+            {
+              "input": "1 fortnight",
+              "error": "22007"
+            },
+            {
+              "input": "1 day foo",
+              "error": "22007"
+            },
+            {
+              "input": "abc",
+              "error": "22007"
+            },
+            {
+              "input": "1 m",
+              "error": "22007"
+            },
+            {
+              "input": "infinity",
+              "error": "22007"
+            },
+            {
+              "input": "-infinity",
+              "error": "22007"
+            },
+            {
+              "input": "1 quarter",
+              "error": "22007"
+            },
+            {
+              "input": "1 jan",
+              "error": "22007"
+            },
+            {
+              "input": "1 day 2 days",
+              "error": "22007"
+            },
+            {
+              "input": "1-12",
+              "error": "22008"
+            },
+            {
+              "input": "1--2",
+              "error": "22008"
+            },
+            {
+              "input": "1-2-3",
+              "error": "22007"
+            },
+            {
+              "input": "1:60",
+              "error": "22008"
+            },
+            {
+              "input": "1:00:61",
+              "error": "22008"
+            },
+            {
+              "input": "1:2:3:4",
+              "error": "22007"
+            },
+            {
+              "input": "P",
+              "error": "22007"
+            },
+            {
+              "input": " P1D",
+              "error": "22007"
+            },
+            {
+              "input": "P1D ",
+              "error": "22007"
+            },
+            {
+              "input": "p1d",
+              "error": "22007"
+            },
+            {
+              "input": "P1D ago",
+              "error": "22007"
+            },
+            {
+              "input": "P1X",
+              "error": "22007"
+            },
+            {
+              "input": "P1-2X",
+              "error": "22007"
+            },
+            {
+              "input": "P1DT1H1D",
+              "error": "22007"
+            },
+            {
+              "input": "P1Y-2",
+              "error": "22007"
+            },
+            {
+              "input": "P1e15D",
+              "error": "22008"
+            },
+            {
+              "input": "P1.5e15D",
+              "error": "22008"
+            },
+            {
+              "input": "P-infD",
+              "error": "22008"
+            },
+            {
+              "input": "PT1e309S",
+              "error": "22007"
+            },
+            {
+              "input": "PT1e-400S",
+              "error": "22007"
+            },
+            {
+              "input": "P2147483648D",
+              "error": "22008"
+            },
+            {
+              "input": "1 2",
+              "error": "22007"
+            },
+            {
+              "input": "1 2 3",
+              "error": "22007"
+            },
+            {
+              "input": "1 -2",
+              "error": "22007"
+            },
+            {
+              "input": "5 ago",
+              "error": "22007"
+            },
+            {
+              "input": "1 day 5 ago",
+              "error": "22007"
+            },
+            {
+              "input": "1day-2",
+              "error": "22007"
+            },
+            {
+              "input": "1 day-1:00",
+              "error": "22007"
+            },
+            {
+              "input": "1hour2min",
+              "error": "22007"
+            },
+            {
+              "input": "1:00-2",
+              "error": "22007"
+            },
+            {
+              "input": "1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1",
+              "error": "22007"
+            },
+            {
+              "input": "1 day 1 day",
+              "error": "22007"
+            },
+            {
+              "input": "-1 day +1 day",
+              "error": "22007"
+            },
+            {
+              "input": "1 day 1d",
+              "error": "22007"
+            },
+            {
+              "input": "1 week 1 week",
+              "error": "22007"
+            },
+            {
+              "input": "1 mon 1 year 1 month",
+              "error": "22007"
+            },
+            {
+              "input": "1 hour 2 hours",
+              "error": "22007"
+            },
+            {
+              "input": "1 hour 1:00",
+              "error": "22007"
+            },
+            {
+              "input": "1:00 1 us",
+              "error": "22007"
+            },
+            {
+              "input": "1:00 5",
+              "error": "22007"
+            },
+            {
+              "input": "1 sec 5",
+              "error": "22007"
+            },
+            {
+              "input": "1.5 sec 1 ms",
+              "error": "22007"
+            },
+            {
+              "input": "1 ms 5.5",
+              "error": "22007"
+            },
+            {
+              "input": "1 day 1 day ago",
+              "error": "22007"
+            },
+            {
+              "input": "2000000000 days 2000000000 days",
+              "error": "22008"
+            },
+            {
+              "input": "1 day 1 day 99999999999 years",
+              "error": "22008"
+            },
+            {
+              "input": "99999999999 years 1 day 1 day",
+              "error": "22007"
+            }
+          ]
+        }
+      ],
+      "render": [
+        {
+          "cases": [
+            {
+              "months": 0,
+              "days": 1,
+              "micros": 0,
+              "text": "1 day"
+            },
+            {
+              "months": 0,
+              "days": 2,
+              "micros": 0,
+              "text": "2 days"
+            },
+            {
+              "months": 12,
+              "days": 0,
+              "micros": 0,
+              "text": "1 year"
+            },
+            {
+              "months": 14,
+              "days": 0,
+              "micros": 0,
+              "text": "1 year 2 mons"
+            },
+            {
+              "months": 1,
+              "days": 0,
+              "micros": 0,
+              "text": "1 mon"
+            },
+            {
+              "months": 0,
+              "days": 30,
+              "micros": 0,
+              "text": "30 days"
+            },
+            {
+              "months": 0,
+              "days": 1,
+              "micros": 9000000000,
+              "text": "1 day 02:30:00"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 14706000000,
+              "text": "04:05:06"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 360000000000,
+              "text": "100:00:00"
+            },
+            {
+              "months": 0,
+              "days": 1,
+              "micros": 43200000000,
+              "text": "1 day 12:00:00"
+            },
+            {
+              "months": 1,
+              "days": 15,
+              "micros": 0,
+              "text": "1 mon 15 days"
+            },
+            {
+              "months": 18,
+              "days": 0,
+              "micros": 0,
+              "text": "1 year 6 mons"
+            },
+            {
+              "months": 1,
+              "days": 4,
+              "micros": 43200000000,
+              "text": "1 mon 4 days 12:00:00"
+            },
+            {
+              "months": 0,
+              "days": -1,
+              "micros": 0,
+              "text": "-1 days"
+            },
+            {
+              "months": 0,
+              "days": 1,
+              "micros": -7200000000,
+              "text": "1 day -02:00:00"
+            },
+            {
+              "months": -10,
+              "days": 0,
+              "micros": 0,
+              "text": "-10 mons"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 1000000,
+              "text": "00:00:01"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 1500000,
+              "text": "00:00:01.5"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 500000,
+              "text": "00:00:00.5"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 1000,
+              "text": "00:00:00.001"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 1,
+              "text": "00:00:00.000001"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 0,
+              "text": "00:00:00"
+            },
+            {
+              "months": -12,
+              "days": -1,
+              "micros": -3600000000,
+              "text": "-1 years -1 days -01:00:00"
+            },
+            {
+              "months": 2,
+              "days": -1,
+              "micros": 0,
+              "text": "2 mons -1 days"
+            },
+            {
+              "months": 0,
+              "days": 8,
+              "micros": 0,
+              "text": "8 days"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": 5400000000,
+              "text": "01:30:00"
+            },
+            {
+              "months": 0,
+              "days": 0,
+              "micros": -1000000,
+              "text": "-00:00:01"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/interval.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "interval",
+          "cases": [
+            {
+              "label": "-100 years",
+              "months": -1200,
+              "days": 0,
+              "micros": 0,
+              "bytes": "7ffffffffffffffffff4f31b90e40000"
+            },
+            {
+              "label": "-1 mon",
+              "months": -1,
+              "days": 0,
+              "micros": 0,
+              "bytes": "7ffffffffffffffffffffda480c2c000"
+            },
+            {
+              "label": "-1 day",
+              "months": 0,
+              "days": -1,
+              "micros": 0,
+              "bytes": "7fffffffffffffffffffffebe228a000"
+            },
+            {
+              "label": "-00:00:01",
+              "months": 0,
+              "days": 0,
+              "micros": -1000000,
+              "bytes": "7ffffffffffffffffffffffffff0bdc0"
+            },
+            {
+              "label": "-0.000001 s",
+              "months": 0,
+              "days": 0,
+              "micros": -1,
+              "bytes": "7fffffffffffffffffffffffffffffff"
+            },
+            {
+              "label": "00:00:00",
+              "months": 0,
+              "days": 0,
+              "micros": 0,
+              "bytes": "80000000000000000000000000000000"
+            },
+            {
+              "label": "0.000001 s",
+              "months": 0,
+              "days": 0,
+              "micros": 1,
+              "bytes": "80000000000000000000000000000001"
+            },
+            {
+              "label": "00:00:01",
+              "months": 0,
+              "days": 0,
+              "micros": 1000000,
+              "bytes": "800000000000000000000000000f4240"
+            },
+            {
+              "label": "1 day",
+              "months": 0,
+              "days": 1,
+              "micros": 0,
+              "bytes": "8000000000000000000000141dd76000"
+            },
+            {
+              "label": "1 mon",
+              "months": 1,
+              "days": 0,
+              "micros": 0,
+              "bytes": "80000000000000000000025b7f3d4000"
+            },
+            {
+              "label": "100 years",
+              "months": 1200,
+              "days": 0,
+              "micros": 0,
+              "bytes": "8000000000000000000b0ce46f1c0000"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "interval",
+          "cases": [
+            {
+              "label": "-1 mon",
+              "months": -1,
+              "days": 0,
+              "micros": 0,
+              "bytes": "007ffffffffffffffffffffda480c2c000"
+            },
+            {
+              "label": "-1 day",
+              "months": 0,
+              "days": -1,
+              "micros": 0,
+              "bytes": "007fffffffffffffffffffffebe228a000"
+            },
+            {
+              "label": "00:00:00",
+              "months": 0,
+              "days": 0,
+              "micros": 0,
+              "bytes": "0080000000000000000000000000000000"
+            },
+            {
+              "label": "0.000001 s",
+              "months": 0,
+              "days": 0,
+              "micros": 1,
+              "bytes": "0080000000000000000000000000000001"
+            },
+            {
+              "label": "1 day",
+              "months": 0,
+              "days": 1,
+              "micros": 0,
+              "bytes": "008000000000000000000000141dd76000"
+            },
+            {
+              "label": "1 mon",
+              "months": 1,
+              "days": 0,
+              "micros": 0,
+              "bytes": "0080000000000000000000025b7f3d4000"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "interval",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "label": "1 mon",
+              "months": 1,
+              "days": 0,
+              "micros": 0,
+              "bytes": "ff7ffffffffffffffffffffda480c2bfff"
+            },
+            {
+              "label": "1 day",
+              "months": 0,
+              "days": 1,
+              "micros": 0,
+              "bytes": "ff7fffffffffffffffffffffebe2289fff"
+            },
+            {
+              "label": "0.000001 s",
+              "months": 0,
+              "days": 0,
+              "micros": 1,
+              "bytes": "ff7ffffffffffffffffffffffffffffffe"
+            },
+            {
+              "label": "00:00:00",
+              "months": 0,
+              "days": 0,
+              "micros": 0,
+              "bytes": "ff7fffffffffffffffffffffffffffffff"
+            },
+            {
+              "label": "-1 day",
+              "months": 0,
+              "days": -1,
+              "micros": 0,
+              "bytes": "ff8000000000000000000000141dd75fff"
+            },
+            {
+              "label": "-1 mon",
+              "months": -1,
+              "days": 0,
+              "micros": 0,
+              "bytes": "ff80000000000000000000025b7f3d3fff"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/float.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "f64",
+          "cases": [
+            {
+              "value": "-Infinity",
+              "bytes": "000fffffffffffff"
+            },
+            {
+              "value": "-1.7976931348623157e308",
+              "bytes": "0010000000000000"
+            },
+            {
+              "value": "-1.5",
+              "bytes": "4007ffffffffffff"
+            },
+            {
+              "value": "0.0",
+              "bytes": "8000000000000000"
+            },
+            {
+              "value": "1.5",
+              "bytes": "bff8000000000000"
+            },
+            {
+              "value": "1.7976931348623157e308",
+              "bytes": "ffefffffffffffff"
+            },
+            {
+              "value": "Infinity",
+              "bytes": "fff0000000000000"
+            },
+            {
+              "value": "NaN",
+              "bytes": "fff8000000000000"
+            }
+          ]
+        },
+        {
+          "type": "f32",
+          "cases": [
+            {
+              "value": "-Infinity",
+              "bytes": "007fffff"
+            },
+            {
+              "value": "-3.4028234663852886e38",
+              "bytes": "00800000"
+            },
+            {
+              "value": "-1.5",
+              "bytes": "403fffff"
+            },
+            {
+              "value": "0.0",
+              "bytes": "80000000"
+            },
+            {
+              "value": "1.5",
+              "bytes": "bfc00000"
+            },
+            {
+              "value": "3.4028234663852886e38",
+              "bytes": "ff7fffff"
+            },
+            {
+              "value": "Infinity",
+              "bytes": "ff800000"
+            },
+            {
+              "value": "NaN",
+              "bytes": "ffc00000"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "f64",
+          "cases": [
+            {
+              "value": "-Infinity",
+              "bytes": "00000fffffffffffff"
+            },
+            {
+              "value": "-1.7976931348623157e308",
+              "bytes": "000010000000000000"
+            },
+            {
+              "value": "-1.5",
+              "bytes": "004007ffffffffffff"
+            },
+            {
+              "value": "0.0",
+              "bytes": "008000000000000000"
+            },
+            {
+              "value": "1.5",
+              "bytes": "00bff8000000000000"
+            },
+            {
+              "value": "1.7976931348623157e308",
+              "bytes": "00ffefffffffffffff"
+            },
+            {
+              "value": "Infinity",
+              "bytes": "00fff0000000000000"
+            },
+            {
+              "value": "NaN",
+              "bytes": "00fff8000000000000"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        },
+        {
+          "type": "f32",
+          "cases": [
+            {
+              "value": "-Infinity",
+              "bytes": "00007fffff"
+            },
+            {
+              "value": "-3.4028234663852886e38",
+              "bytes": "0000800000"
+            },
+            {
+              "value": "-1.5",
+              "bytes": "00403fffff"
+            },
+            {
+              "value": "0.0",
+              "bytes": "0080000000"
+            },
+            {
+              "value": "1.5",
+              "bytes": "00bfc00000"
+            },
+            {
+              "value": "3.4028234663852886e38",
+              "bytes": "00ff7fffff"
+            },
+            {
+              "value": "Infinity",
+              "bytes": "00ff800000"
+            },
+            {
+              "value": "NaN",
+              "bytes": "00ffc00000"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "f64",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "value": "NaN",
+              "bytes": "ff0007ffffffffffff"
+            },
+            {
+              "value": "Infinity",
+              "bytes": "ff000fffffffffffff"
+            },
+            {
+              "value": "1.7976931348623157e308",
+              "bytes": "ff0010000000000000"
+            },
+            {
+              "value": "1.5",
+              "bytes": "ff4007ffffffffffff"
+            },
+            {
+              "value": "0.0",
+              "bytes": "ff7fffffffffffffff"
+            },
+            {
+              "value": "-1.5",
+              "bytes": "ffbff8000000000000"
+            },
+            {
+              "value": "-1.7976931348623157e308",
+              "bytes": "ffffefffffffffffff"
+            },
+            {
+              "value": "-Infinity",
+              "bytes": "fffff0000000000000"
+            }
+          ]
+        },
+        {
+          "type": "f32",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "value": "NaN",
+              "bytes": "ff003fffff"
+            },
+            {
+              "value": "Infinity",
+              "bytes": "ff007fffff"
+            },
+            {
+              "value": "3.4028234663852886e38",
+              "bytes": "ff00800000"
+            },
+            {
+              "value": "1.5",
+              "bytes": "ff403fffff"
+            },
+            {
+              "value": "0.0",
+              "bytes": "ff7fffffff"
+            },
+            {
+              "value": "-1.5",
+              "bytes": "ffbfc00000"
+            },
+            {
+              "value": "-3.4028234663852886e38",
+              "bytes": "ffff7fffff"
+            },
+            {
+              "value": "-Infinity",
+              "bytes": "ffff800000"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/range.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "i32range",
+          "elem": "i32",
+          "cases": [
+            {
+              "label": "empty",
+              "empty": true,
+              "bytes": "00"
+            },
+            {
+              "label": "(,5)",
+              "upper": 5,
+              "upper_inc": false,
+              "bytes": "0100018000000500"
+            },
+            {
+              "label": "(,)",
+              "bytes": "010002"
+            },
+            {
+              "label": "[1,5)",
+              "lower": 1,
+              "lower_inc": true,
+              "upper": 5,
+              "upper_inc": false,
+              "bytes": "01018000000100018000000500"
+            },
+            {
+              "label": "[1,10)",
+              "lower": 1,
+              "lower_inc": true,
+              "upper": 10,
+              "upper_inc": false,
+              "bytes": "01018000000100018000000a00"
+            },
+            {
+              "label": "[2,4)",
+              "lower": 2,
+              "lower_inc": true,
+              "upper": 4,
+              "upper_inc": false,
+              "bytes": "01018000000200018000000400"
+            },
+            {
+              "label": "[2,)",
+              "lower": 2,
+              "lower_inc": true,
+              "bytes": "0101800000020002"
+            }
+          ]
+        },
+        {
+          "type": "i64range",
+          "elem": "i64",
+          "cases": [
+            {
+              "label": "empty",
+              "empty": true,
+              "bytes": "00"
+            },
+            {
+              "label": "[-1,1)",
+              "lower": -1,
+              "lower_inc": true,
+              "upper": 1,
+              "upper_inc": false,
+              "bytes": "01017fffffffffffffff0001800000000000000100"
+            },
+            {
+              "label": "[1,5)",
+              "lower": 1,
+              "lower_inc": true,
+              "upper": 5,
+              "upper_inc": false,
+              "bytes": "010180000000000000010001800000000000000500"
+            }
+          ]
+        },
+        {
+          "type": "numrange",
+          "elem": "decimal",
+          "cases": [
+            {
+              "label": "(,1.5]",
+              "upper": "1.5",
+              "upper_inc": true,
+              "bytes": "010001058000000102330001"
+            },
+            {
+              "label": "[1,2)",
+              "lower": "1",
+              "lower_inc": true,
+              "upper": "2",
+              "upper_inc": false,
+              "bytes": "01010580000001020000010580000001030000"
+            },
+            {
+              "label": "[1,2]",
+              "lower": "1",
+              "lower_inc": true,
+              "upper": "2",
+              "upper_inc": true,
+              "bytes": "01010580000001020000010580000001030001"
+            },
+            {
+              "label": "(1,2)",
+              "lower": "1",
+              "lower_inc": false,
+              "upper": "2",
+              "upper_inc": false,
+              "bytes": "01010580000001020001010580000001030000"
+            },
+            {
+              "label": "(1,2]",
+              "lower": "1",
+              "lower_inc": false,
+              "upper": "2",
+              "upper_inc": true,
+              "bytes": "01010580000001020001010580000001030001"
+            },
+            {
+              "label": "[1.5,2)",
+              "lower": "1.5",
+              "lower_inc": true,
+              "upper": "2",
+              "upper_inc": false,
+              "bytes": "0101058000000102330000010580000001030000"
+            }
+          ]
+        },
+        {
+          "type": "daterange",
+          "elem": "date",
+          "cases": [
+            {
+              "label": "empty",
+              "empty": true,
+              "bytes": "00"
+            },
+            {
+              "label": "[0,1)",
+              "lower": 0,
+              "lower_inc": true,
+              "upper": 1,
+              "upper_inc": false,
+              "bytes": "01018000000000018000000100"
+            },
+            {
+              "label": "[10,20)",
+              "lower": 10,
+              "lower_inc": true,
+              "upper": 20,
+              "upper_inc": false,
+              "bytes": "01018000000a00018000001400"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "i32range",
+          "elem": "i32",
+          "cases": [
+            {
+              "label": "empty",
+              "empty": true,
+              "bytes": "0000"
+            },
+            {
+              "label": "[1,5)",
+              "lower": 1,
+              "lower_inc": true,
+              "upper": 5,
+              "upper_inc": false,
+              "bytes": "0001018000000100018000000500"
+            },
+            {
+              "label": "[2,)",
+              "lower": 2,
+              "lower_inc": true,
+              "bytes": "000101800000020002"
+            },
+            {
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "i32range",
+          "elem": "i32",
+          "base": "nullable",
+          "cases": [
+            {
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "label": "[2,)",
+              "lower": 2,
+              "lower_inc": true,
+              "bytes": "fffefe7ffffffdfffd"
+            },
+            {
+              "label": "[1,5)",
+              "lower": 1,
+              "lower_inc": true,
+              "upper": 5,
+              "upper_inc": false,
+              "bytes": "fffefe7ffffffefffe7ffffffaff"
+            },
+            {
+              "label": "empty",
+              "empty": true,
+              "bytes": "ffff"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/composite.toml": {
+      "schema_version": 1,
+      "bare": [
+        {
+          "type": "addr",
+          "cases": [
+            {
+              "label": "('',-1)",
+              "fields": [
+                {
+                  "text": ""
+                },
+                {
+                  "i32": -1
+                }
+              ],
+              "bytes": "000001007fffffff"
+            },
+            {
+              "label": "('Elm',100)",
+              "fields": [
+                {
+                  "text": "Elm"
+                },
+                {
+                  "i32": 100
+                }
+              ],
+              "bytes": "00456c6d00010080000064"
+            },
+            {
+              "label": "('Main',5)",
+              "fields": [
+                {
+                  "text": "Main"
+                },
+                {
+                  "i32": 5
+                }
+              ],
+              "bytes": "004d61696e00010080000005"
+            },
+            {
+              "label": "('Main',90210)",
+              "fields": [
+                {
+                  "text": "Main"
+                },
+                {
+                  "i32": 90210
+                }
+              ],
+              "bytes": "004d61696e00010080016062"
+            },
+            {
+              "label": "('Main',NULL)",
+              "fields": [
+                {
+                  "text": "Main"
+                },
+                {
+                  "null": true
+                }
+              ],
+              "bytes": "004d61696e000101"
+            }
+          ]
+        },
+        {
+          "type": "line",
+          "cases": [
+            {
+              "label": "((Main,1),(Elm,2))",
+              "fields": [
+                {
+                  "composite": [
+                    {
+                      "text": "Main"
+                    },
+                    {
+                      "i32": 1
+                    }
+                  ]
+                },
+                {
+                  "composite": [
+                    {
+                      "text": "Elm"
+                    },
+                    {
+                      "i32": 2
+                    }
+                  ]
+                }
+              ],
+              "bytes": "00004d61696e000100800000010000456c6d00010080000002"
+            },
+            {
+              "label": "((Main,1),(Elm,3))",
+              "fields": [
+                {
+                  "composite": [
+                    {
+                      "text": "Main"
+                    },
+                    {
+                      "i32": 1
+                    }
+                  ]
+                },
+                {
+                  "composite": [
+                    {
+                      "text": "Elm"
+                    },
+                    {
+                      "i32": 3
+                    }
+                  ]
+                }
+              ],
+              "bytes": "00004d61696e000100800000010000456c6d00010080000003"
+            },
+            {
+              "label": "(NULL,(Elm,2))",
+              "fields": [
+                {
+                  "null": true
+                },
+                {
+                  "composite": [
+                    {
+                      "text": "Elm"
+                    },
+                    {
+                      "i32": 2
+                    }
+                  ]
+                }
+              ],
+              "bytes": "010000456c6d00010080000002"
+            }
+          ]
+        }
+      ],
+      "nullable": [
+        {
+          "type": "addr",
+          "cases": [
+            {
+              "label": "('',-1)",
+              "fields": [
+                {
+                  "text": ""
+                },
+                {
+                  "i32": -1
+                }
+              ],
+              "bytes": "00000001007fffffff"
+            },
+            {
+              "label": "('Elm',100)",
+              "fields": [
+                {
+                  "text": "Elm"
+                },
+                {
+                  "i32": 100
+                }
+              ],
+              "bytes": "0000456c6d00010080000064"
+            },
+            {
+              "label": "('Main',5)",
+              "fields": [
+                {
+                  "text": "Main"
+                },
+                {
+                  "i32": 5
+                }
+              ],
+              "bytes": "00004d61696e00010080000005"
+            },
+            {
+              "label": "NULL",
+              "null": true,
+              "bytes": "01"
+            }
+          ]
+        }
+      ],
+      "descending": [
+        {
+          "type": "addr",
+          "cases": [
+            {
+              "label": "NULL",
+              "null": true,
+              "bytes": "fe"
+            },
+            {
+              "label": "('Main',5)",
+              "fields": [
+                {
+                  "text": "Main"
+                },
+                {
+                  "i32": 5
+                }
+              ],
+              "bytes": "ffffb29e9691fffeff7ffffffa"
+            },
+            {
+              "label": "('Elm',100)",
+              "fields": [
+                {
+                  "text": "Elm"
+                },
+                {
+                  "i32": 100
+                }
+              ],
+              "bytes": "ffffba9392fffeff7fffff9b"
+            },
+            {
+              "label": "('',-1)",
+              "fields": [
+                {
+                  "text": ""
+                },
+                {
+                  "i32": -1
+                }
+              ],
+              "bytes": "fffffffeff80000000"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/encoding/ordered.toml": {
+      "schema_version": 1,
+      "group": [
+        {
+          "type": "i16",
+          "cases": [
+            {
+              "label": "-32768",
+              "value": {
+                "i16": -32768
+              },
+              "asc_nulls_last": "000000",
+              "asc_nulls_first": "010000",
+              "desc_nulls_first": "ffffff",
+              "desc_nulls_last": "feffff"
+            },
+            {
+              "label": "-1",
+              "value": {
+                "i16": -1
+              },
+              "asc_nulls_last": "007fff",
+              "asc_nulls_first": "017fff",
+              "desc_nulls_first": "ff8000",
+              "desc_nulls_last": "fe8000"
+            },
+            {
+              "label": "0",
+              "value": {
+                "i16": 0
+              },
+              "asc_nulls_last": "008000",
+              "asc_nulls_first": "018000",
+              "desc_nulls_first": "ff7fff",
+              "desc_nulls_last": "fe7fff"
+            },
+            {
+              "label": "32767",
+              "value": {
+                "i16": 32767
+              },
+              "asc_nulls_last": "00ffff",
+              "asc_nulls_first": "01ffff",
+              "desc_nulls_first": "ff0000",
+              "desc_nulls_last": "fe0000"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "i32",
+          "cases": [
+            {
+              "label": "-2147483648",
+              "value": {
+                "i32": -2147483648
+              },
+              "asc_nulls_last": "0000000000",
+              "asc_nulls_first": "0100000000",
+              "desc_nulls_first": "ffffffffff",
+              "desc_nulls_last": "feffffffff"
+            },
+            {
+              "label": "-5",
+              "value": {
+                "i32": -5
+              },
+              "asc_nulls_last": "007ffffffb",
+              "asc_nulls_first": "017ffffffb",
+              "desc_nulls_first": "ff80000004",
+              "desc_nulls_last": "fe80000004"
+            },
+            {
+              "label": "0",
+              "value": {
+                "i32": 0
+              },
+              "asc_nulls_last": "0080000000",
+              "asc_nulls_first": "0180000000",
+              "desc_nulls_first": "ff7fffffff",
+              "desc_nulls_last": "fe7fffffff"
+            },
+            {
+              "label": "7",
+              "value": {
+                "i32": 7
+              },
+              "asc_nulls_last": "0080000007",
+              "asc_nulls_first": "0180000007",
+              "desc_nulls_first": "ff7ffffff8",
+              "desc_nulls_last": "fe7ffffff8"
+            },
+            {
+              "label": "2147483647",
+              "value": {
+                "i32": 2147483647
+              },
+              "asc_nulls_last": "00ffffffff",
+              "asc_nulls_first": "01ffffffff",
+              "desc_nulls_first": "ff00000000",
+              "desc_nulls_last": "fe00000000"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "i64",
+          "cases": [
+            {
+              "label": "-9223372036854775808",
+              "value": {
+                "i64": -9223372036854775808
+              },
+              "asc_nulls_last": "000000000000000000",
+              "asc_nulls_first": "010000000000000000",
+              "desc_nulls_first": "ffffffffffffffffff",
+              "desc_nulls_last": "feffffffffffffffff"
+            },
+            {
+              "label": "-1",
+              "value": {
+                "i64": -1
+              },
+              "asc_nulls_last": "007fffffffffffffff",
+              "asc_nulls_first": "017fffffffffffffff",
+              "desc_nulls_first": "ff8000000000000000",
+              "desc_nulls_last": "fe8000000000000000"
+            },
+            {
+              "label": "0",
+              "value": {
+                "i64": 0
+              },
+              "asc_nulls_last": "008000000000000000",
+              "asc_nulls_first": "018000000000000000",
+              "desc_nulls_first": "ff7fffffffffffffff",
+              "desc_nulls_last": "fe7fffffffffffffff"
+            },
+            {
+              "label": "9223372036854775807",
+              "value": {
+                "i64": 9223372036854775807
+              },
+              "asc_nulls_last": "00ffffffffffffffff",
+              "asc_nulls_first": "01ffffffffffffffff",
+              "desc_nulls_first": "ff0000000000000000",
+              "desc_nulls_last": "fe0000000000000000"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "timestamp",
+          "cases": [
+            {
+              "label": "-1",
+              "value": {
+                "timestamp": -1
+              },
+              "asc_nulls_last": "007fffffffffffffff",
+              "asc_nulls_first": "017fffffffffffffff",
+              "desc_nulls_first": "ff8000000000000000",
+              "desc_nulls_last": "fe8000000000000000"
+            },
+            {
+              "label": "0",
+              "value": {
+                "timestamp": 0
+              },
+              "asc_nulls_last": "008000000000000000",
+              "asc_nulls_first": "018000000000000000",
+              "desc_nulls_first": "ff7fffffffffffffff",
+              "desc_nulls_last": "fe7fffffffffffffff"
+            },
+            {
+              "label": "1577836800000000",
+              "value": {
+                "timestamp": 1577836800000000
+              },
+              "asc_nulls_last": "0080059b08c1fa4000",
+              "asc_nulls_first": "0180059b08c1fa4000",
+              "desc_nulls_first": "ff7ffa64f73e05bfff",
+              "desc_nulls_last": "fe7ffa64f73e05bfff"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "date",
+          "cases": [
+            {
+              "label": "-1",
+              "value": {
+                "date": -1
+              },
+              "asc_nulls_last": "007fffffff",
+              "asc_nulls_first": "017fffffff",
+              "desc_nulls_first": "ff80000000",
+              "desc_nulls_last": "fe80000000"
+            },
+            {
+              "label": "0",
+              "value": {
+                "date": 0
+              },
+              "asc_nulls_last": "0080000000",
+              "asc_nulls_first": "0180000000",
+              "desc_nulls_first": "ff7fffffff",
+              "desc_nulls_last": "fe7fffffff"
+            },
+            {
+              "label": "18262",
+              "value": {
+                "date": 18262
+              },
+              "asc_nulls_last": "0080004756",
+              "asc_nulls_first": "0180004756",
+              "desc_nulls_first": "ff7fffb8a9",
+              "desc_nulls_last": "fe7fffb8a9"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "boolean",
+          "cases": [
+            {
+              "label": "false",
+              "value": {
+                "boolean": false
+              },
+              "asc_nulls_last": "0000",
+              "asc_nulls_first": "0100",
+              "desc_nulls_first": "ffff",
+              "desc_nulls_last": "feff"
+            },
+            {
+              "label": "true",
+              "value": {
+                "boolean": true
+              },
+              "asc_nulls_last": "0001",
+              "asc_nulls_first": "0101",
+              "desc_nulls_first": "fffe",
+              "desc_nulls_last": "fefe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "uuid",
+          "cases": [
+            {
+              "label": "00000000-0000-0000-0000-000000000000",
+              "value": {
+                "uuid": "00000000-0000-0000-0000-000000000000"
+              },
+              "asc_nulls_last": "0000000000000000000000000000000000",
+              "asc_nulls_first": "0100000000000000000000000000000000",
+              "desc_nulls_first": "ffffffffffffffffffffffffffffffffff",
+              "desc_nulls_last": "feffffffffffffffffffffffffffffffff"
+            },
+            {
+              "label": "550e8400-e29b-41d4-a716-446655440000",
+              "value": {
+                "uuid": "550e8400-e29b-41d4-a716-446655440000"
+              },
+              "asc_nulls_last": "00550e8400e29b41d4a716446655440000",
+              "asc_nulls_first": "01550e8400e29b41d4a716446655440000",
+              "desc_nulls_first": "ffaaf17bff1d64be2b58e9bb99aabbffff",
+              "desc_nulls_last": "feaaf17bff1d64be2b58e9bb99aabbffff"
+            },
+            {
+              "label": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+              "value": {
+                "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff"
+              },
+              "asc_nulls_last": "00ffffffffffffffffffffffffffffffff",
+              "asc_nulls_first": "01ffffffffffffffffffffffffffffffff",
+              "desc_nulls_first": "ff00000000000000000000000000000000",
+              "desc_nulls_last": "fe00000000000000000000000000000000"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "f64",
+          "cases": [
+            {
+              "label": "-Infinity",
+              "value": {
+                "f64": "-Infinity"
+              },
+              "asc_nulls_last": "00000fffffffffffff",
+              "asc_nulls_first": "01000fffffffffffff",
+              "desc_nulls_first": "fffff0000000000000",
+              "desc_nulls_last": "fefff0000000000000"
+            },
+            {
+              "label": "-2.5",
+              "value": {
+                "f64": "-2.5"
+              },
+              "asc_nulls_last": "003ffbffffffffffff",
+              "asc_nulls_first": "013ffbffffffffffff",
+              "desc_nulls_first": "ffc004000000000000",
+              "desc_nulls_last": "fec004000000000000"
+            },
+            {
+              "label": "0",
+              "value": {
+                "f64": "0"
+              },
+              "asc_nulls_last": "008000000000000000",
+              "asc_nulls_first": "018000000000000000",
+              "desc_nulls_first": "ff7fffffffffffffff",
+              "desc_nulls_last": "fe7fffffffffffffff"
+            },
+            {
+              "label": "1.5",
+              "value": {
+                "f64": "1.5"
+              },
+              "asc_nulls_last": "00bff8000000000000",
+              "asc_nulls_first": "01bff8000000000000",
+              "desc_nulls_first": "ff4007ffffffffffff",
+              "desc_nulls_last": "fe4007ffffffffffff"
+            },
+            {
+              "label": "Infinity",
+              "value": {
+                "f64": "Infinity"
+              },
+              "asc_nulls_last": "00fff0000000000000",
+              "asc_nulls_first": "01fff0000000000000",
+              "desc_nulls_first": "ff000fffffffffffff",
+              "desc_nulls_last": "fe000fffffffffffff"
+            },
+            {
+              "label": "NaN",
+              "value": {
+                "f64": "NaN"
+              },
+              "asc_nulls_last": "00fff8000000000000",
+              "asc_nulls_first": "01fff8000000000000",
+              "desc_nulls_first": "ff0007ffffffffffff",
+              "desc_nulls_last": "fe0007ffffffffffff"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "f32",
+          "cases": [
+            {
+              "label": "-Infinity",
+              "value": {
+                "f32": "-Infinity"
+              },
+              "asc_nulls_last": "00007fffff",
+              "asc_nulls_first": "01007fffff",
+              "desc_nulls_first": "ffff800000",
+              "desc_nulls_last": "feff800000"
+            },
+            {
+              "label": "-0.5",
+              "value": {
+                "f32": "-0.5"
+              },
+              "asc_nulls_last": "0040ffffff",
+              "asc_nulls_first": "0140ffffff",
+              "desc_nulls_first": "ffbf000000",
+              "desc_nulls_last": "febf000000"
+            },
+            {
+              "label": "0",
+              "value": {
+                "f32": "0"
+              },
+              "asc_nulls_last": "0080000000",
+              "asc_nulls_first": "0180000000",
+              "desc_nulls_first": "ff7fffffff",
+              "desc_nulls_last": "fe7fffffff"
+            },
+            {
+              "label": "100.25",
+              "value": {
+                "f32": "100.25"
+              },
+              "asc_nulls_last": "00c2c88000",
+              "asc_nulls_first": "01c2c88000",
+              "desc_nulls_first": "ff3d377fff",
+              "desc_nulls_last": "fe3d377fff"
+            },
+            {
+              "label": "NaN",
+              "value": {
+                "f32": "NaN"
+              },
+              "asc_nulls_last": "00ffc00000",
+              "asc_nulls_first": "01ffc00000",
+              "desc_nulls_first": "ff003fffff",
+              "desc_nulls_last": "fe003fffff"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "decimal",
+          "cases": [
+            {
+              "label": "-100",
+              "value": {
+                "decimal": "-100"
+              },
+              "asc_nulls_last": "00037ffffffdfdff",
+              "asc_nulls_first": "01037ffffffdfdff",
+              "desc_nulls_first": "fffc800000020200",
+              "desc_nulls_last": "fefc800000020200"
+            },
+            {
+              "label": "-1.5",
+              "value": {
+                "decimal": "-1.5"
+              },
+              "asc_nulls_last": "00037ffffffefdccff",
+              "asc_nulls_first": "01037ffffffefdccff",
+              "desc_nulls_first": "fffc80000001023300",
+              "desc_nulls_last": "fefc80000001023300"
+            },
+            {
+              "label": "-0.001",
+              "value": {
+                "decimal": "-0.001"
+              },
+              "asc_nulls_last": "000380000000f4ff",
+              "asc_nulls_first": "010380000000f4ff",
+              "desc_nulls_first": "fffc7fffffff0b00",
+              "desc_nulls_last": "fefc7fffffff0b00"
+            },
+            {
+              "label": "0",
+              "value": {
+                "decimal": "0"
+              },
+              "asc_nulls_last": "0004",
+              "asc_nulls_first": "0104",
+              "desc_nulls_first": "fffb",
+              "desc_nulls_last": "fefb"
+            },
+            {
+              "label": "0.05",
+              "value": {
+                "decimal": "0.05"
+              },
+              "asc_nulls_last": "0005800000000600",
+              "asc_nulls_first": "0105800000000600",
+              "desc_nulls_first": "fffa7ffffffff9ff",
+              "desc_nulls_last": "fefa7ffffffff9ff"
+            },
+            {
+              "label": "1.5",
+              "value": {
+                "decimal": "1.5"
+              },
+              "asc_nulls_last": "000580000001023300",
+              "asc_nulls_first": "010580000001023300",
+              "desc_nulls_first": "fffa7ffffffefdccff",
+              "desc_nulls_last": "fefa7ffffffefdccff"
+            },
+            {
+              "label": "1.55",
+              "value": {
+                "decimal": "1.55"
+              },
+              "asc_nulls_last": "000580000001023800",
+              "asc_nulls_first": "010580000001023800",
+              "desc_nulls_first": "fffa7ffffffefdc7ff",
+              "desc_nulls_last": "fefa7ffffffefdc7ff"
+            },
+            {
+              "label": "100",
+              "value": {
+                "decimal": "100"
+              },
+              "asc_nulls_last": "0005800000020200",
+              "asc_nulls_first": "0105800000020200",
+              "desc_nulls_first": "fffa7ffffffdfdff",
+              "desc_nulls_last": "fefa7ffffffdfdff"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "cases": [
+            {
+              "label": "\"\"",
+              "value": {
+                "text": ""
+              },
+              "asc_nulls_last": "000001",
+              "asc_nulls_first": "010001",
+              "desc_nulls_first": "fffffe",
+              "desc_nulls_last": "fefffe"
+            },
+            {
+              "label": "\"a\"",
+              "value": {
+                "text": "a"
+              },
+              "asc_nulls_last": "00610001",
+              "asc_nulls_first": "01610001",
+              "desc_nulls_first": "ff9efffe",
+              "desc_nulls_last": "fe9efffe"
+            },
+            {
+              "label": "\"a\\u0000b\"",
+              "value": {
+                "text": "a\u0000b"
+              },
+              "asc_nulls_last": "006100ff620001",
+              "asc_nulls_first": "016100ff620001",
+              "desc_nulls_first": "ff9eff009dfffe",
+              "desc_nulls_last": "fe9eff009dfffe"
+            },
+            {
+              "label": "\"aa\"",
+              "value": {
+                "text": "aa"
+              },
+              "asc_nulls_last": "0061610001",
+              "asc_nulls_first": "0161610001",
+              "desc_nulls_first": "ff9e9efffe",
+              "desc_nulls_last": "fe9e9efffe"
+            },
+            {
+              "label": "\"ab\"",
+              "value": {
+                "text": "ab"
+              },
+              "asc_nulls_last": "0061620001",
+              "asc_nulls_first": "0161620001",
+              "desc_nulls_first": "ff9e9dfffe",
+              "desc_nulls_last": "fe9e9dfffe"
+            },
+            {
+              "label": "\"b\"",
+              "value": {
+                "text": "b"
+              },
+              "asc_nulls_last": "00620001",
+              "asc_nulls_first": "01620001",
+              "desc_nulls_first": "ff9dfffe",
+              "desc_nulls_last": "fe9dfffe"
+            },
+            {
+              "label": "\"é\"",
+              "value": {
+                "text": "é"
+              },
+              "asc_nulls_last": "00c3a90001",
+              "asc_nulls_first": "01c3a90001",
+              "desc_nulls_first": "ff3c56fffe",
+              "desc_nulls_last": "fe3c56fffe"
+            },
+            {
+              "label": "\"😀\"",
+              "value": {
+                "text": "😀"
+              },
+              "asc_nulls_last": "00f09f98800001",
+              "asc_nulls_first": "01f09f98800001",
+              "desc_nulls_first": "ff0f60677ffffe",
+              "desc_nulls_last": "fe0f60677ffffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "bytea",
+          "cases": [
+            {
+              "label": "\\x",
+              "value": {
+                "bytea": ""
+              },
+              "asc_nulls_last": "000001",
+              "asc_nulls_first": "010001",
+              "desc_nulls_first": "fffffe",
+              "desc_nulls_last": "fefffe"
+            },
+            {
+              "label": "\\x00",
+              "value": {
+                "bytea": "00"
+              },
+              "asc_nulls_last": "0000ff0001",
+              "asc_nulls_first": "0100ff0001",
+              "desc_nulls_first": "ffff00fffe",
+              "desc_nulls_last": "feff00fffe"
+            },
+            {
+              "label": "\\x61",
+              "value": {
+                "bytea": "61"
+              },
+              "asc_nulls_last": "00610001",
+              "asc_nulls_first": "01610001",
+              "desc_nulls_first": "ff9efffe",
+              "desc_nulls_last": "fe9efffe"
+            },
+            {
+              "label": "\\x6100",
+              "value": {
+                "bytea": "6100"
+              },
+              "asc_nulls_last": "006100ff0001",
+              "asc_nulls_first": "016100ff0001",
+              "desc_nulls_first": "ff9eff00fffe",
+              "desc_nulls_last": "fe9eff00fffe"
+            },
+            {
+              "label": "\\x6100ff62",
+              "value": {
+                "bytea": "6100ff62"
+              },
+              "asc_nulls_last": "006100ffff620001",
+              "asc_nulls_first": "016100ffff620001",
+              "desc_nulls_first": "ff9eff00009dfffe",
+              "desc_nulls_last": "fe9eff00009dfffe"
+            },
+            {
+              "label": "\\x6161",
+              "value": {
+                "bytea": "6161"
+              },
+              "asc_nulls_last": "0061610001",
+              "asc_nulls_first": "0161610001",
+              "desc_nulls_first": "ff9e9efffe",
+              "desc_nulls_last": "fe9e9efffe"
+            },
+            {
+              "label": "\\x62",
+              "value": {
+                "bytea": "62"
+              },
+              "asc_nulls_last": "00620001",
+              "asc_nulls_first": "01620001",
+              "desc_nulls_first": "ff9dfffe",
+              "desc_nulls_last": "fe9dfffe"
+            },
+            {
+              "label": "\\xff",
+              "value": {
+                "bytea": "ff"
+              },
+              "asc_nulls_last": "00ff0001",
+              "asc_nulls_first": "01ff0001",
+              "desc_nulls_first": "ff00fffe",
+              "desc_nulls_last": "fe00fffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "interval",
+          "cases": [
+            {
+              "label": "[0, -1, 0]",
+              "value": {
+                "interval": [
+                  0,
+                  -1,
+                  0
+                ]
+              },
+              "asc_nulls_last": "007fffffffffffffffffffffebe228a000",
+              "asc_nulls_first": "017fffffffffffffffffffffebe228a000",
+              "desc_nulls_first": "ff8000000000000000000000141dd75fff",
+              "desc_nulls_last": "fe8000000000000000000000141dd75fff"
+            },
+            {
+              "label": "[0, 0, 0]",
+              "value": {
+                "interval": [
+                  0,
+                  0,
+                  0
+                ]
+              },
+              "asc_nulls_last": "0080000000000000000000000000000000",
+              "asc_nulls_first": "0180000000000000000000000000000000",
+              "desc_nulls_first": "ff7fffffffffffffffffffffffffffffff",
+              "desc_nulls_last": "fe7fffffffffffffffffffffffffffffff"
+            },
+            {
+              "label": "[0, 0, 1]",
+              "value": {
+                "interval": [
+                  0,
+                  0,
+                  1
+                ]
+              },
+              "asc_nulls_last": "0080000000000000000000000000000001",
+              "asc_nulls_first": "0180000000000000000000000000000001",
+              "desc_nulls_first": "ff7ffffffffffffffffffffffffffffffe",
+              "desc_nulls_last": "fe7ffffffffffffffffffffffffffffffe"
+            },
+            {
+              "label": "[0, 29, 0]",
+              "value": {
+                "interval": [
+                  0,
+                  29,
+                  0
+                ]
+              },
+              "asc_nulls_last": "008000000000000000000002476165e000",
+              "asc_nulls_first": "018000000000000000000002476165e000",
+              "desc_nulls_first": "ff7ffffffffffffffffffffdb89e9a1fff",
+              "desc_nulls_last": "fe7ffffffffffffffffffffdb89e9a1fff"
+            },
+            {
+              "label": "[1, 0, 0]",
+              "value": {
+                "interval": [
+                  1,
+                  0,
+                  0
+                ]
+              },
+              "asc_nulls_last": "0080000000000000000000025b7f3d4000",
+              "asc_nulls_first": "0180000000000000000000025b7f3d4000",
+              "desc_nulls_first": "ff7ffffffffffffffffffffda480c2bfff",
+              "desc_nulls_last": "fe7ffffffffffffffffffffda480c2bfff"
+            },
+            {
+              "label": "[12, 0, 0]",
+              "value": {
+                "interval": [
+                  12,
+                  0,
+                  0
+                ]
+              },
+              "asc_nulls_last": "00800000000000000000001c49f6df0000",
+              "asc_nulls_first": "01800000000000000000001c49f6df0000",
+              "desc_nulls_first": "ff7fffffffffffffffffffe3b60920ffff",
+              "desc_nulls_last": "fe7fffffffffffffffffffe3b60920ffff"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "collated text (dev-root)",
+          "cases": [
+            {
+              "label": "\" \"",
+              "value": {
+                "collated": "020900000020000000020000200001"
+              },
+              "asc_nulls_last": "00020900000020000000020000200001",
+              "asc_nulls_first": "01020900000020000000020000200001",
+              "desc_nulls_first": "fffdf6ffffffdffffffffdffffdffffe",
+              "desc_nulls_last": "fefdf6ffffffdffffffffdffffdffffe"
+            },
+            {
+              "label": "\"a\"",
+              "value": {
+                "collated": "1c4700000020000000020000610001"
+              },
+              "asc_nulls_last": "001c4700000020000000020000610001",
+              "asc_nulls_first": "011c4700000020000000020000610001",
+              "desc_nulls_first": "ffe3b8ffffffdffffffffdffff9efffe",
+              "desc_nulls_last": "fee3b8ffffffdffffffffdffff9efffe"
+            },
+            {
+              "label": "\"A\"",
+              "value": {
+                "collated": "1c4700000020000000080000410001"
+              },
+              "asc_nulls_last": "001c4700000020000000080000410001",
+              "asc_nulls_first": "011c4700000020000000080000410001",
+              "desc_nulls_first": "ffe3b8ffffffdffffffff7ffffbefffe",
+              "desc_nulls_last": "fee3b8ffffffdffffffff7ffffbefffe"
+            },
+            {
+              "label": "\"ä\"",
+              "value": {
+                "collated": "1c470000002000470000000200020000c3a40001"
+              },
+              "asc_nulls_last": "001c470000002000470000000200020000c3a40001",
+              "asc_nulls_first": "011c470000002000470000000200020000c3a40001",
+              "desc_nulls_first": "ffe3b8ffffffdfffb8fffffffdfffdffff3c5bfffe",
+              "desc_nulls_last": "fee3b8ffffffdfffb8fffffffdfffdffff3c5bfffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "i32range",
+          "cases": [
+            {
+              "label": "{ empty = true }",
+              "value": {
+                "range": {
+                  "elem": "i32",
+                  "empty": true
+                }
+              },
+              "asc_nulls_last": "0000",
+              "asc_nulls_first": "0100",
+              "desc_nulls_first": "ffff",
+              "desc_nulls_last": "feff"
+            },
+            {
+              "label": "{ upper = 3, upper_inc = false }",
+              "value": {
+                "range": {
+                  "elem": "i32",
+                  "upper": 3,
+                  "upper_inc": false
+                }
+              },
+              "asc_nulls_last": "000100018000000300",
+              "asc_nulls_first": "010100018000000300",
+              "desc_nulls_first": "fffefffe7ffffffcff",
+              "desc_nulls_last": "fefefffe7ffffffcff"
+            },
+            {
+              "label": "{ lower = 1, lower_inc = true, upper = 4, upper_inc = false }",
+              "value": {
+                "range": {
+                  "elem": "i32",
+                  "lower": 1,
+                  "lower_inc": true,
+                  "upper": 4,
+                  "upper_inc": false
+                }
+              },
+              "asc_nulls_last": "0001018000000100018000000400",
+              "asc_nulls_first": "0101018000000100018000000400",
+              "desc_nulls_first": "fffefe7ffffffefffe7ffffffbff",
+              "desc_nulls_last": "fefefe7ffffffefffe7ffffffbff"
+            },
+            {
+              "label": "{ lower = 1, lower_inc = true, upper = 5, upper_inc = false }",
+              "value": {
+                "range": {
+                  "elem": "i32",
+                  "lower": 1,
+                  "lower_inc": true,
+                  "upper": 5,
+                  "upper_inc": false
+                }
+              },
+              "asc_nulls_last": "0001018000000100018000000500",
+              "asc_nulls_first": "0101018000000100018000000500",
+              "desc_nulls_first": "fffefe7ffffffefffe7ffffffaff",
+              "desc_nulls_last": "fefefe7ffffffefffe7ffffffaff"
+            },
+            {
+              "label": "{ lower = 1, lower_inc = true }",
+              "value": {
+                "range": {
+                  "elem": "i32",
+                  "lower": 1,
+                  "lower_inc": true
+                }
+              },
+              "asc_nulls_last": "000101800000010002",
+              "asc_nulls_first": "010101800000010002",
+              "desc_nulls_first": "fffefe7ffffffefffd",
+              "desc_nulls_last": "fefefe7ffffffefffd"
+            },
+            {
+              "label": "{ lower = 2, lower_inc = true, upper = 3, upper_inc = false }",
+              "value": {
+                "range": {
+                  "elem": "i32",
+                  "lower": 2,
+                  "lower_inc": true,
+                  "upper": 3,
+                  "upper_inc": false
+                }
+              },
+              "asc_nulls_last": "0001018000000200018000000300",
+              "asc_nulls_first": "0101018000000200018000000300",
+              "desc_nulls_first": "fffefe7ffffffdfffe7ffffffcff",
+              "desc_nulls_last": "fefefe7ffffffdfffe7ffffffcff"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "numrange",
+          "cases": [
+            {
+              "label": "{ lower = \"-1.5\", lower_inc = true, upper = \"2\", upper_inc = false }",
+              "value": {
+                "range": {
+                  "elem": "decimal",
+                  "lower": "-1.5",
+                  "lower_inc": true,
+                  "upper": "2",
+                  "upper_inc": false
+                }
+              },
+              "asc_nulls_last": "000101037ffffffefdccff00010580000001030000",
+              "asc_nulls_first": "010101037ffffffefdccff00010580000001030000",
+              "desc_nulls_first": "fffefefc80000001023300fffefa7ffffffefcffff",
+              "desc_nulls_last": "fefefefc80000001023300fffefa7ffffffefcffff"
+            },
+            {
+              "label": "{ lower = \"1.5\", lower_inc = true, upper = \"2\", upper_inc = true }",
+              "value": {
+                "range": {
+                  "elem": "decimal",
+                  "lower": "1.5",
+                  "lower_inc": true,
+                  "upper": "2",
+                  "upper_inc": true
+                }
+              },
+              "asc_nulls_last": "000101058000000102330000010580000001030001",
+              "asc_nulls_first": "010101058000000102330000010580000001030001",
+              "desc_nulls_first": "fffefefa7ffffffefdccfffffefa7ffffffefcfffe",
+              "desc_nulls_last": "fefefefa7ffffffefdccfffffefa7ffffffefcfffe"
+            },
+            {
+              "label": "{ lower = \"1.5\", lower_inc = false, upper = \"2\", upper_inc = true }",
+              "value": {
+                "range": {
+                  "elem": "decimal",
+                  "lower": "1.5",
+                  "lower_inc": false,
+                  "upper": "2",
+                  "upper_inc": true
+                }
+              },
+              "asc_nulls_last": "000101058000000102330001010580000001030001",
+              "asc_nulls_first": "010101058000000102330001010580000001030001",
+              "desc_nulls_first": "fffefefa7ffffffefdccfffefefa7ffffffefcfffe",
+              "desc_nulls_last": "fefefefa7ffffffefdccfffefefa7ffffffefcfffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "i32[]",
+          "cases": [
+            {
+              "label": "[]",
+              "value": {
+                "array": {
+                  "elem": "i32",
+                  "elements": []
+                }
+              },
+              "asc_nulls_last": "000000",
+              "asc_nulls_first": "010000",
+              "desc_nulls_first": "ffffff",
+              "desc_nulls_last": "feffff"
+            },
+            {
+              "label": "[1]",
+              "value": {
+                "array": {
+                  "elem": "i32",
+                  "elements": [
+                    1
+                  ]
+                }
+              },
+              "asc_nulls_last": "00018000000100010000000180000001",
+              "asc_nulls_first": "01018000000100010000000180000001",
+              "desc_nulls_first": "fffe7ffffffefffefffffffe7ffffffe",
+              "desc_nulls_last": "fefe7ffffffefffefffffffe7ffffffe"
+            },
+            {
+              "label": "[1, 2]",
+              "value": {
+                "array": {
+                  "elem": "i32",
+                  "elements": [
+                    1,
+                    2
+                  ]
+                }
+              },
+              "asc_nulls_last": "000180000001018000000200010000000280000001",
+              "asc_nulls_first": "010180000001018000000200010000000280000001",
+              "desc_nulls_first": "fffe7ffffffefe7ffffffdfffefffffffd7ffffffe",
+              "desc_nulls_last": "fefe7ffffffefe7ffffffdfffefffffffd7ffffffe"
+            },
+            {
+              "label": "[1, 2, 3]",
+              "value": {
+                "array": {
+                  "elem": "i32",
+                  "elements": [
+                    1,
+                    2,
+                    3
+                  ]
+                }
+              },
+              "asc_nulls_last": "0001800000010180000002018000000300010000000380000001",
+              "asc_nulls_first": "0101800000010180000002018000000300010000000380000001",
+              "desc_nulls_first": "fffe7ffffffefe7ffffffdfe7ffffffcfffefffffffc7ffffffe",
+              "desc_nulls_last": "fefe7ffffffefe7ffffffdfe7ffffffcfffefffffffc7ffffffe"
+            },
+            {
+              "label": "[1, { null = true }]",
+              "value": {
+                "array": {
+                  "elem": "i32",
+                  "elements": [
+                    1,
+                    {
+                      "null": true
+                    }
+                  ]
+                }
+              },
+              "asc_nulls_last": "0001800000010200010000000280000001",
+              "asc_nulls_first": "0101800000010200010000000280000001",
+              "desc_nulls_first": "fffe7ffffffefdfffefffffffd7ffffffe",
+              "desc_nulls_last": "fefe7ffffffefdfffefffffffd7ffffffe"
+            },
+            {
+              "label": "[2]",
+              "value": {
+                "array": {
+                  "elem": "i32",
+                  "elements": [
+                    2
+                  ]
+                }
+              },
+              "asc_nulls_last": "00018000000200010000000180000001",
+              "asc_nulls_first": "01018000000200010000000180000001",
+              "desc_nulls_first": "fffe7ffffffdfffefffffffe7ffffffe",
+              "desc_nulls_last": "fefe7ffffffdfffefffffffe7ffffffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "text[]",
+          "cases": [
+            {
+              "label": "[]",
+              "value": {
+                "array": {
+                  "elem": "text",
+                  "elements": []
+                }
+              },
+              "asc_nulls_last": "000000",
+              "asc_nulls_first": "010000",
+              "desc_nulls_first": "ffffff",
+              "desc_nulls_last": "feffff"
+            },
+            {
+              "label": "[\"a\"]",
+              "value": {
+                "array": {
+                  "elem": "text",
+                  "elements": [
+                    "a"
+                  ]
+                }
+              },
+              "asc_nulls_last": "000161000100010000000180000001",
+              "asc_nulls_first": "010161000100010000000180000001",
+              "desc_nulls_first": "fffe9efffefffefffffffe7ffffffe",
+              "desc_nulls_last": "fefe9efffefffefffffffe7ffffffe"
+            },
+            {
+              "label": "[\"a\", \"b\"]",
+              "value": {
+                "array": {
+                  "elem": "text",
+                  "elements": [
+                    "a",
+                    "b"
+                  ]
+                }
+              },
+              "asc_nulls_last": "00016100010162000100010000000280000001",
+              "asc_nulls_first": "01016100010162000100010000000280000001",
+              "desc_nulls_first": "fffe9efffefe9dfffefffefffffffd7ffffffe",
+              "desc_nulls_last": "fefe9efffefe9dfffefffefffffffd7ffffffe"
+            },
+            {
+              "label": "[\"a\", { null = true }]",
+              "value": {
+                "array": {
+                  "elem": "text",
+                  "elements": [
+                    "a",
+                    {
+                      "null": true
+                    }
+                  ]
+                }
+              },
+              "asc_nulls_last": "00016100010200010000000280000001",
+              "asc_nulls_first": "01016100010200010000000280000001",
+              "desc_nulls_first": "fffe9efffefdfffefffffffd7ffffffe",
+              "desc_nulls_last": "fefe9efffefdfffefffffffd7ffffffe"
+            },
+            {
+              "label": "[\"ab\"]",
+              "value": {
+                "array": {
+                  "elem": "text",
+                  "elements": [
+                    "ab"
+                  ]
+                }
+              },
+              "asc_nulls_last": "00016162000100010000000180000001",
+              "asc_nulls_first": "01016162000100010000000180000001",
+              "desc_nulls_first": "fffe9e9dfffefffefffffffe7ffffffe",
+              "desc_nulls_last": "fefe9e9dfffefffefffffffe7ffffffe"
+            },
+            {
+              "label": "[\"b\"]",
+              "value": {
+                "array": {
+                  "elem": "text",
+                  "elements": [
+                    "b"
+                  ]
+                }
+              },
+              "asc_nulls_last": "000162000100010000000180000001",
+              "asc_nulls_first": "010162000100010000000180000001",
+              "desc_nulls_first": "fffe9dfffefffefffffffe7ffffffe",
+              "desc_nulls_last": "fefe9dfffefffefffffffe7ffffffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        },
+        {
+          "type": "addr (street text, zip i32)",
+          "cases": [
+            {
+              "label": "[{ text = \"\" }, { i32 = 1 }]",
+              "value": {
+                "composite": [
+                  {
+                    "text": ""
+                  },
+                  {
+                    "i32": 1
+                  }
+                ]
+              },
+              "asc_nulls_last": "000000010080000001",
+              "asc_nulls_first": "010000010080000001",
+              "desc_nulls_first": "fffffffeff7ffffffe",
+              "desc_nulls_last": "fefffffeff7ffffffe"
+            },
+            {
+              "label": "[{ text = \"Mai\" }, { i32 = 5 }]",
+              "value": {
+                "composite": [
+                  {
+                    "text": "Mai"
+                  },
+                  {
+                    "i32": 5
+                  }
+                ]
+              },
+              "asc_nulls_last": "00004d616900010080000005",
+              "asc_nulls_first": "01004d616900010080000005",
+              "desc_nulls_first": "ffffb29e96fffeff7ffffffa",
+              "desc_nulls_last": "feffb29e96fffeff7ffffffa"
+            },
+            {
+              "label": "[{ text = \"Main\" }, { i32 = 90210 }]",
+              "value": {
+                "composite": [
+                  {
+                    "text": "Main"
+                  },
+                  {
+                    "i32": 90210
+                  }
+                ]
+              },
+              "asc_nulls_last": "00004d61696e00010080016062",
+              "asc_nulls_first": "01004d61696e00010080016062",
+              "desc_nulls_first": "ffffb29e9691fffeff7ffe9f9d",
+              "desc_nulls_last": "feffb29e9691fffeff7ffe9f9d"
+            },
+            {
+              "label": "[{ text = \"Main\" }, { null = true }]",
+              "value": {
+                "composite": [
+                  {
+                    "text": "Main"
+                  },
+                  {
+                    "null": true
+                  }
+                ]
+              },
+              "asc_nulls_last": "00004d61696e000101",
+              "asc_nulls_first": "01004d61696e000101",
+              "desc_nulls_first": "ffffb29e9691fffefe",
+              "desc_nulls_last": "feffb29e9691fffefe"
+            },
+            {
+              "label": "[{ null = true }, { i32 = 1 }]",
+              "value": {
+                "composite": [
+                  {
+                    "null": true
+                  },
+                  {
+                    "i32": 1
+                  }
+                ]
+              },
+              "asc_nulls_last": "00010080000001",
+              "asc_nulls_first": "01010080000001",
+              "desc_nulls_first": "fffeff7ffffffe",
+              "desc_nulls_last": "fefeff7ffffffe"
+            },
+            {
+              "null": true,
+              "asc_nulls_last": "01",
+              "asc_nulls_first": "00",
+              "desc_nulls_first": "fe",
+              "desc_nulls_last": "ff"
+            }
+          ]
+        }
+      ]
+    },
+    "spec/tz/vectors/bundle.toml": {
+      "schema_version": 1,
+      "bundle": [
+        {
+          "tzdata_version": "2026a",
+          "roundtrip_byte_identical": true,
+          "zones": [
+            "America/New_York",
+            "Asia/Kolkata",
+            "Australia/Lord_Howe",
+            "Etc/UTC",
+            "Europe/Paris"
+          ],
+          "links": [
+            "US/Eastern=America/New_York"
+          ]
+        }
+      ]
+    },
+    "spec/tz/vectors/tzif.toml": {
+      "schema_version": 1,
+      "case": [
+        {
+          "zone": "Etc/UTC",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": 0,
+          "abbrev": "UTC",
+          "is_dst": false
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": -18000,
+          "abbrev": "EST",
+          "is_dst": false
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": 1721044800000000,
+          "utoff_secs": -14400,
+          "abbrev": "EDT",
+          "is_dst": true
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": 1710053999000000,
+          "utoff_secs": -18000,
+          "abbrev": "EST",
+          "is_dst": false
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": 1710054000000000,
+          "utoff_secs": -14400,
+          "abbrev": "EDT",
+          "is_dst": true
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": -5364662400000000,
+          "utoff_secs": -17762,
+          "abbrev": "LMT",
+          "is_dst": false
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": 4086590400000000,
+          "utoff_secs": -14400,
+          "abbrev": "EDT",
+          "is_dst": true
+        },
+        {
+          "zone": "America/New_York",
+          "instant_micros": 4070952000000000,
+          "utoff_secs": -18000,
+          "abbrev": "EST",
+          "is_dst": false
+        },
+        {
+          "zone": "Asia/Kolkata",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": 19800,
+          "abbrev": "IST",
+          "is_dst": false
+        },
+        {
+          "zone": "Asia/Kolkata",
+          "instant_micros": 4072161600000000,
+          "utoff_secs": 19800,
+          "abbrev": "IST",
+          "is_dst": false
+        },
+        {
+          "zone": "Australia/Lord_Howe",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": 39600,
+          "abbrev": "+11",
+          "is_dst": true
+        },
+        {
+          "zone": "Australia/Lord_Howe",
+          "instant_micros": 1721044800000000,
+          "utoff_secs": 37800,
+          "abbrev": "+1030",
+          "is_dst": false
+        },
+        {
+          "zone": "Australia/Lord_Howe",
+          "instant_micros": 4072161600000000,
+          "utoff_secs": 39600,
+          "abbrev": "+11",
+          "is_dst": true
+        },
+        {
+          "zone": "US/Eastern",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": -18000,
+          "abbrev": "EST",
+          "is_dst": false
+        },
+        {
+          "zone": "+05:30",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": -19800,
+          "abbrev": "-05:30",
+          "is_dst": false
+        },
+        {
+          "zone": "-08:00",
+          "instant_micros": 1705320000000000,
+          "utoff_secs": 28800,
+          "abbrev": "+08:00",
+          "is_dst": false
         }
       ]
     },

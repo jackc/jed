@@ -29,7 +29,25 @@ module SwiftSpecGenerator
     spec/grammar/pg_keywords.toml
     spec/fileformat/lz4_vectors.toml
     spec/encoding/decimal.toml
+    spec/encoding/integers.toml
+    spec/encoding/text.toml
+    spec/encoding/bytea.toml
+    spec/encoding/timestamps.toml
+    spec/encoding/dates.toml
+    spec/encoding/intervals.toml
+    spec/encoding/interval.toml
+    spec/encoding/float.toml
+    spec/encoding/range.toml
+    spec/encoding/composite.toml
+    spec/encoding/ordered.toml
+    spec/tz/vectors/bundle.toml
+    spec/tz/vectors/tzif.toml
     spec/fileformat/encryption_vectors.toml
+  ].freeze
+  BYTE_INPUTS = %w[
+    spec/fileformat/fixtures/encrypted_empty_db.jed
+    spec/fileformat/fixtures/encrypted_pk_table.jed
+    spec/tz/fixtures/tzdata.jtz
   ].freeze
 
   module_function
@@ -77,10 +95,10 @@ module SwiftSpecGenerator
   end
 
   def read_sources
-    INPUTS.to_h do |path|
+    (INPUTS + BYTE_INPUTS).to_h do |path|
       bytes, error, status = Open3.capture3("git", "show", "#{BASELINE}:#{path}", chdir: ROOT)
       abort "cannot read baseline #{path}: #{error}" unless status.success?
-      [path, bytes]
+      [path, bytes.b]
     end
   end
 
@@ -194,8 +212,8 @@ module SwiftSpecGenerator
   def run(arguments)
     abort "usage: generate_spec.rb [--check]" unless arguments.empty? || arguments == ["--check"]
     sources = read_sources
-    fingerprint = Digest::SHA256.hexdigest(sources.map { |path, bytes| path + "\0" + bytes + "\0" }.join)
-    documents = sources.transform_values { |bytes| TomlRB.parse(bytes) }
+    fingerprint = Digest::SHA256.hexdigest(sources.map { |path, bytes| path.b + "\0" + bytes + "\0" }.join)
+    documents = INPUTS.to_h { |path| [path, TomlRB.parse(sources.fetch(path).dup.force_encoding(Encoding::UTF_8))] }
     snapshot = {
       "baseline" => BASELINE, "fingerprint" => fingerprint,
       "source_hashes" => sources.transform_values { |bytes| Digest::SHA256.hexdigest(bytes) },
@@ -206,13 +224,16 @@ module SwiftSpecGenerator
       "impl/swift-native/Tests/JedTests/Fixtures/SpecSnapshot.json" => JSON.pretty_generate(snapshot) + "\n",
       "impl/swift-native/Tests/JedCryptoTests/Fixtures/encryption_vectors.toml" => sources.fetch("spec/fileformat/encryption_vectors.toml")
     }
+    BYTE_INPUTS.each do |path|
+      outputs["impl/swift-native/Tests/JedTests/Fixtures/#{File.basename(path)}"] = sources.fetch(path)
+    end
     stale = outputs.keys.select do |path|
       target = File.join(ROOT, path)
       if arguments == ["--check"]
         !File.file?(target) || File.binread(target) != outputs.fetch(path).b
       else
         FileUtils.mkdir_p(File.dirname(target))
-        File.write(target, outputs.fetch(path))
+        File.binwrite(target, outputs.fetch(path))
         false
       end
     end
