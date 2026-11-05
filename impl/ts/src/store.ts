@@ -123,6 +123,7 @@ export function storeValue(
       if (isFloat(colTy)) {
         const d = colTy === "f32" ? float32FromText(v.dec.render()) : Number(v.dec.render());
         if (!Number.isFinite(d)) throw overflow(colTy);
+        if (d === 0 && !v.dec.isZero()) throw floatUnderflow();
         return makeFloat(colTy, d);
       }
       throw typeError(

@@ -26,6 +26,29 @@ test("bound exact numbers round directly to an f32 column", () => {
   );
 });
 
+test("bound nonzero decimals cannot silently underflow float columns", () => {
+  const db = memDb();
+  db.run("CREATE TABLE float_bound (a real, b float)");
+  for (const [column, scale] of [
+    ["a", 60],
+    ["b", 400],
+  ] as const) {
+    assert.throws(
+      () =>
+        db.run(
+          `INSERT INTO float_bound (${column}) VALUES ($1)`,
+          Decimal.fromDigitsScale(false, "1", scale),
+        ),
+      (error: unknown) => error instanceof EngineError && error.code() === "22003",
+    );
+  }
+  assert.deepStrictEqual(db.get("SELECT count(*) AS n FROM float_bound"), { n: 0n });
+  db.run("INSERT INTO float_bound VALUES ($1, $2)", Decimal.zero(60), Decimal.zero(400));
+  assert.deepStrictEqual(db.get("SELECT a = 0::real AND b = 0::float AS zero FROM float_bound"), {
+    zero: true,
+  });
+});
+
 function seeded(): Database {
   const db = memDb();
   db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text, score f64, flag boolean)");
