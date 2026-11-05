@@ -697,6 +697,9 @@ func assignValue(v Value, dest any) error {
 		if err != nil {
 			return err
 		}
+		if n < math.MinInt || n > math.MaxInt {
+			return fmt.Errorf("value %d overflows int", n)
+		}
 		*d = int(n)
 	case *int32:
 		n, err := asInt(v)
