@@ -254,11 +254,8 @@ func tsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 			return 0, err
 		}
 	}
-	dayUS, ok := mul64(sign*int64(iv.Days), microsPerDay)
-	if !ok {
-		return 0, intervalFieldOverflow("timestamp out of range")
-	}
-	t, ok = add64(t, dayUS)
+	// Check the resulting timestamp, not the isolated calendar-day delta.
+	t, ok := timestampMulAdd(sign*int64(iv.Days), microsPerDay, t)
 	if !ok {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
@@ -300,11 +297,7 @@ func tsShiftZoned(ts int64, iv Interval, subtract bool, zr ZoneRef) (int64, erro
 		if !ok {
 			return 0, errZoneShiftOutOfRange()
 		}
-		dayUS, ok := mul64(days, microsPerDay)
-		if !ok {
-			return 0, intervalFieldOverflow("timestamp out of range")
-		}
-		if local, ok = add64(local, dayUS); !ok {
+		if local, ok = timestampMulAdd(days, microsPerDay, local); !ok {
 			return 0, intervalFieldOverflow("timestamp out of range")
 		}
 		if t, ok = localToInstantMicros(zr, local); !ok {

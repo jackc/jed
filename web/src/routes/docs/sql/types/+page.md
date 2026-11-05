@@ -226,6 +226,9 @@ FROM (VALUES (date '2024-01-15'), (date '2024-02-15')) AS v(d);`;
   date '2024-01-31' + interval '1 month'    AS month_clamped,
   date '2024-01-15' - interval '12 hours'   AS midnight_minus;`;
 
+	const timestampDayShiftDemo = `SELECT
+  timestamp '294000-01-01' - interval '108000000 days' AS earlier;`;
+
 	const dateClockDemo = `SELECT
   current_date                  AS today,
   date 'tomorrow'               AS tomorrow,
@@ -825,6 +828,11 @@ returns a `timestamp` (month steps clamp the day-of-month, so Jan 31 + 1 month i
 year). The `±infinity` dates absorb any shift, and an out-of-range result raises `22008`:
 
 <LiveSql demo="dateArithDemo" query={dateArithDemo} rows={1} />
+
+Timestamp calendar-day shifts can span the full finite timestamp range. A large day count is
+accepted when the resulting timestamp is in range:
+
+<LiveSql demo="timestampDayShiftDemo" query={timestampDayShiftDemo} rows={1} />
 
 A date literal also accepts PostgreSQL's special words: `'epoch'` (1970-01-01) and the
 **clock-relative** `'today'` / `'now'` / `'tomorrow'` / `'yesterday'` — the current day in the

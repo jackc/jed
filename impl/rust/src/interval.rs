@@ -285,12 +285,7 @@ pub fn ts_shift(ts: i64, iv: &Interval, subtract: bool) -> Result<i64> {
     if months != 0 {
         t = add_months_clamped(t, months)?;
     }
-    let day_us = (sign * iv.days as i64)
-        .checked_mul(MICROS_PER_DAY)
-        .ok_or_else(|| field_overflow("timestamp out of range"))?;
-    t = t
-        .checked_add(day_us)
-        .ok_or_else(|| field_overflow("timestamp out of range"))?;
+    t = add_calendar_days(t, sign * iv.days as i64)?;
     add_shift_micros(t, iv.micros, subtract)
 }
 
@@ -325,10 +320,7 @@ pub fn ts_shift_zoned(
     if days != 0 {
         let local =
             instant_to_local_micros(zr, t).ok_or_else(timestamp::zone_shift_out_of_range)?;
-        let local = days
-            .checked_mul(MICROS_PER_DAY)
-            .and_then(|d| local.checked_add(d))
-            .ok_or_else(|| field_overflow("timestamp out of range"))?;
+        let local = add_calendar_days(local, days)?;
         t = local_to_instant_micros(zr, local).ok_or_else(timestamp::zone_shift_out_of_range)?;
     }
     add_shift_micros(t, iv.micros, subtract)
@@ -361,6 +353,13 @@ fn add_months_clamped(t: i64, months: i64) -> Result<i64> {
             + us as i128,
     )
     .map_err(|_| field_overflow("timestamp out of range"))
+}
+
+/// Calendar days can span more than i64 microseconds while the resulting timestamp
+/// remains representable. Validate the sum, not the isolated day delta.
+fn add_calendar_days(t: i64, days: i64) -> Result<i64> {
+    i64::try_from(t as i128 + days as i128 * MICROS_PER_DAY as i128)
+        .map_err(|_| field_overflow("timestamp out of range"))
 }
 
 /// The final micros step of a shift: `t ± micros`, checked, and never onto a ±infinity sentinel.
