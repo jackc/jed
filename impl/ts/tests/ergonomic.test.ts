@@ -9,7 +9,22 @@ import { test } from "node:test";
 
 import { attachMemory, type Database, EngineError } from "../src/tooling.ts";
 import { intValue } from "../src/value.ts";
+import { Decimal } from "../src/decimal.ts";
 import { memDb } from "./mem_db.ts";
+
+test("bound exact numbers round directly to an f32 column", () => {
+  const db = memDb();
+  db.run("CREATE TABLE f32_bound (v real)");
+  const insert = db.prepare("INSERT INTO f32_bound VALUES ($1)");
+  insert.run(Decimal.fromDigitsScale(false, "10000000596046447753906250000000000001", 37));
+  assert.deepStrictEqual(db.get("SELECT v > 1::real AS rounded FROM f32_bound"), { rounded: true });
+  db.run("DELETE FROM f32_bound");
+  insert.run(4611686293305294849n);
+  assert.deepStrictEqual(
+    db.get("SELECT v > 4611686018427387904::bigint::real AS rounded FROM f32_bound"),
+    { rounded: true },
+  );
+});
 
 function seeded(): Database {
   const db = memDb();

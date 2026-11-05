@@ -1,4 +1,5 @@
 import { cancellationCheckpoint } from "./cancel.ts";
+import { float32FromText } from "./float_input.ts";
 // resolveProjections resolves SELECT items into evaluable projections (any result type is
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
@@ -147,7 +148,6 @@ import {
   isTimestamptz,
   isUuid,
   promoteFloat,
-  roundToWidth,
   scalarTypeFromName,
   typeIsCollatable,
 } from "./types.ts";
@@ -1546,7 +1546,7 @@ function resolveLiteralExpr(
     }
     case "decimal":
       // A decimal literal adapts to a FLOAT context (float.md §4): decimal → float at resolve
-      // (the nearest binary64 to the exact decimal; Math.fround if the context is f32). The
+      // (the nearest binary value at the context's width, rounding only once). The
       // exact-decimal string already round-trips IEEE conversion via Number(...). Otherwise it
       // is decimal — cap-checked here (an over-long coefficient/scale traps 22003 at resolve).
       if (ctx !== null && isFloat(ctx)) {
@@ -1563,7 +1563,7 @@ function resolveLiteralExpr(
       // check then reports the family mismatch (42804) or widens it (int→decimal), never a wrong
       // range check.
       if (ctx !== null && isFloat(ctx)) {
-        const n = roundToWidth(ctx, Number(e.literal.int));
+        const n = ctx === "f32" ? float32FromText(e.literal.int.toString()) : Number(e.literal.int);
         return {
           node: { kind: "constFloat", ty: ctx, value: n },
           type: { kind: "float", ty: ctx },

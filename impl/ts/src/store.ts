@@ -51,6 +51,7 @@ import {
   isUuid,
 } from "./types.ts";
 import { Decimal } from "./decimal.ts";
+import { float32FromText } from "./float_input.ts";
 import { decimalCmpWork, makeFloat } from "./eval.ts";
 import { parseFloatLiteral } from "./kernels.ts";
 import {
@@ -108,15 +109,19 @@ export function storeValue(
       // DEFAULT bypass the expression resolver, so the adaptation lands here, like text→bytea). This
       // is literal adaptation, NOT an implicit cross-family cast of a value (storing a f64 into a
       // f32 is still rejected below). Out of binary range → 22003 (the finite-overflow rule).
-      if (isFloat(colTy)) return makeFloat(colTy, Number(v.int));
+      if (isFloat(colTy))
+        return makeFloat(
+          colTy,
+          colTy === "f32" ? float32FromText(v.int.toString()) : Number(v.int),
+        );
       throw typeError(
         "cannot store an integer value in " + canonicalName(colTy) + " column " + colName,
       );
     case "decimal":
       if (isDecimal(colTy)) return decimalValue(coerceDecimal(v.dec, typmod));
-      // A decimal LITERAL adapts to a float column (float.md §4): nearest binary, fround for f32.
+      // A decimal LITERAL adapts to a float column (float.md §4), directly at its width.
       if (isFloat(colTy)) {
-        const d = Number(v.dec.render());
+        const d = colTy === "f32" ? float32FromText(v.dec.render()) : Number(v.dec.render());
         if (!Number.isFinite(d)) throw overflow(colTy);
         return makeFloat(colTy, d);
       }
