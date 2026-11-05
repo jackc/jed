@@ -850,23 +850,47 @@ func isInfiniteTemporal(v Value) bool {
 // time zone. The result is a clean Value (no ref), and any other target keeps the timestamptz value,
 // whose family mismatch the binder then reports as a literal's (42804). A nil ty is "no inferred
 // scalar" (a container target): the value stays timestamptz.
-func hostTimeParam(v Value, ty *scalarType) Value {
+func hostTimeParam(v Value, ty *scalarType) (Value, error) {
 	t, ok := v.ref.(time.Time)
 	if !ok {
-		return v
+		return v, nil
 	}
 	if ty != nil {
 		switch {
 		case ty.IsTimestamp():
 			y, mo, d := t.Date()
 			h, mi, sec := t.Clock()
-			return TimestampValue(time.Date(y, mo, d, h, mi, sec, t.Nanosecond(), time.UTC).UnixMicro())
+			local := time.Date(y, mo, d, h, mi, sec, t.Nanosecond(), time.UTC)
+			micros, err := checkedHostTimeMicros(local)
+			return TimestampValue(micros), err
 		case ty.IsDate():
 			y, mo, d := t.Date()
-			return DateValue(int32(time.Date(y, mo, d, 0, 0, 0, 0, time.UTC).Unix() / 86400))
+			// Bound the year before calendar arithmetic, then check the finite
+			// day range before narrowing to the stored i32 representation.
+			if y < -6_000_000 || y > 6_000_000 {
+				return Value{}, datetimeFieldOverflow("date out of range")
+			}
+			days := daysFromCivil(int64(y), int64(mo), int64(d))
+			if days < dateMinFinite || days > dateMaxFinite {
+				return Value{}, datetimeFieldOverflow("date out of range")
+			}
+			return DateValue(int32(days)), nil
+		case ty.IsTimestamptz():
+			micros, err := checkedHostTimeMicros(t)
+			return TimestamptzValue(micros), err
 		}
 	}
-	return TimestamptzValue(v.Int)
+	return TimestamptzValue(v.Int), nil
+}
+
+// UnixMicro wraps outside the i64 microsecond range. Verify the conversion
+// round-trips at the engine's precision and does not occupy an infinity sentinel.
+func checkedHostTimeMicros(t time.Time) (int64, error) {
+	micros := t.UnixMicro()
+	if micros == negInfinity || micros == posInfinity || !time.UnixMicro(micros).Equal(t.Truncate(time.Microsecond)) {
+		return 0, datetimeFieldOverflow("timestamp out of range")
+	}
+	return micros, nil
 }
 
 func typeErr(v Value, want string) error {

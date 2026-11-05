@@ -10,6 +10,7 @@ package jed
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -165,5 +166,51 @@ func TestInfiniteTemporalHasNoTimeForm(t *testing.T) {
 	var tm time.Time
 	if err := s.QueryRow(ctx, "SELECT '2024-01-02'::date").Scan(&tm); err != nil || !tm.Equal(time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("finite date: %v %v", tm, err)
+	}
+}
+
+func TestHostTimeOutOfRangeDoesNotWrap(t *testing.T) {
+	t.Parallel()
+	db := memDB()
+	defer db.Close()
+	ctx := context.Background()
+	for _, ty := range []string{"timestamp", "timestamptz", "date"} {
+		times := []time.Time{
+			time.Date(6_000_000, 1, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(-6_000_000, 1, 1, 0, 0, 0, 0, time.UTC),
+		}
+		if ty != "date" {
+			times = append(times,
+				time.Date(300000, 1, 1, 0, 0, 0, 0, time.UTC),
+				time.Date(-300000, 1, 1, 0, 0, 0, 0, time.UTC),
+				time.UnixMicro(math.MinInt64).UTC(), time.UnixMicro(math.MaxInt64).UTC())
+		}
+		for _, tm := range times {
+			var out Value
+			err := db.QueryRow(ctx, "SELECT $1::"+ty, tm).Scan(&out)
+			if err == nil || sqlStateOf(t, err) != "22008" {
+				t.Fatalf("%s %v: got %v (%v), want 22008", ty, tm, out, err)
+			}
+			err = db.QueryRow(ctx, "SELECT $1::"+ty+"[]", []time.Time{tm}).Scan(&out)
+			if err == nil || sqlStateOf(t, err) != "22008" {
+				t.Fatalf("%s[] %v: got %v (%v), want 22008", ty, tm, out, err)
+			}
+		}
+	}
+	// A date has a wider finite range than a timestamp; do not reject its
+	// time.Time at initial argument conversion before the target type is known.
+	wideDate := time.Date(300000, 1, 1, 0, 0, 0, 0, time.UTC)
+	var date time.Time
+	if err := db.QueryRow(ctx, "SELECT $1::date", wideDate).Scan(&date); err != nil || !date.Equal(wideDate) {
+		t.Fatalf("wide date: %v %v, want %v", date, err, wideDate)
+	}
+	for _, micros := range []int64{math.MinInt64 + 1, math.MaxInt64 - 1} {
+		tm := time.UnixMicro(micros).UTC()
+		for _, ty := range []string{"timestamp", "timestamptz"} {
+			var out time.Time
+			if err := db.QueryRow(ctx, "SELECT $1::"+ty, tm).Scan(&out); err != nil || !out.Equal(tm) {
+				t.Fatalf("finite boundary %s: %v %v, want %v", ty, out, err, tm)
+			}
+		}
 	}
 }
