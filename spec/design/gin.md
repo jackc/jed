@@ -205,7 +205,7 @@ PostgreSQL's default `jsonb` GIN operator class, term-for-term (`gin_extract_jso
 
 PostgreSQL's `jsonb_ops` serves `col @? P` (strategy 15) and `col @@ P` (strategy 16) by extracting
 from the jsonpath an AND/OR **tree** of terms (`extract_jsp_query` in `jsonb_gin.c`); jed extracts the
-same tree, term for term, with the same §4.1 term bytes. A row is a candidate when the tree is TRUE
+same tree, with the soundness corrections in §9 and the same §4.1 term bytes. A row is a candidate when the tree is TRUE
 with each leaf read as "the row carries this term" (PostgreSQL's `execute_jsp_gin_node`); the
 operator always rechecks (PostgreSQL marks both strategies `recheck`).
 
@@ -222,8 +222,9 @@ are `.key`, `.*`, `.**`, `[*]`, and `[…]` subscripts, possibly with filters. W
 A completed walk with a scalar contributes a **KEY** term per `.key` accessor (in PostgreSQL's
 order, last accessor first) and the **scalar's** term: a `null`, boolean, or number value term; a
 string is a key term **or** a string value term (an `OR` node), because `jsonb_ops` indexes a string
-array element as a key. In `strict` mode the last accessor pins the string: none (the root), `.key`,
-or `.*` → the value term; `[*]` or `[…]` → the key term; `.**` → either. The statement's nodes are
+array element as a key. In `strict` mode the last accessor pins the string: `.key`
+or `.*` → the value term; `[*]` or `[…]` → the key term; `.**` or none (the root) → either.
+A top-level string carries a key term even in strict mode (§9). The statement's nodes are
 AND-ed. `exists (path)` contributes only that path's filter nodes (an `EXISTS` with a scalar-less walk
 adds no terms — PostgreSQL deliberately skips them as non-selective).
 
@@ -875,13 +876,21 @@ rows, `gin_entry` reads, and index pages, and the predicate's logical selectivit
   operator class, 0A000 for the deferred element types), house-style messages.
 - **`jsonb_ops` over-long terms** — PostgreSQL hashes a key/string longer than 125 bytes into its
   term; jed keeps the first 128 bytes (§4.1). Both are lossy and rechecked; unobservable in results.
-- **`jsonb_ops` jsonpath extraction** matches PostgreSQL's (§2.2) with two deliberate departures,
-  both plan-only: (a) under `!`, an `&&` whose one side is unextractable is unextractable when De
+- **`jsonb_ops` jsonpath extraction** follows PostgreSQL's (§2.2) with three deliberate soundness
+  corrections: (a) under `!`, an `&&` whose one side is unextractable is unextractable when De
   Morgan makes it an OR — PostgreSQL keeps the other side whenever the operator is written `&&`, so
   its index scan of `doc @@ '!(!($.a == 1) && $.b == 2)'` drops rows its sequential scan returns
   (oracle-verified); jed returns the sequential-scan rows; (b) a scalar side must be a step-less
   literal — PostgreSQL's `jspIsScalar` ignores accessors after a literal (`"x".type()`), extracting a
-  term the comparison does not need; jed extracts nothing there.
+  term the comparison does not need; jed extracts nothing there; (c) a strict root string equality
+  extracts the OR of key and string-value terms. PostgreSQL 18 extracts only a string-value term,
+  although a top-level string is indexed as a key. With a row `doc = '"x"'::jsonb`, the predicate
+  `doc @@ 'strict $ == "x"'` is true and a sequential scan returns the row, but a forced GIN bitmap
+  scan drops it (verified against the pinned PG18 oracle on 2026-11-05). The same issue applies to
+  `doc @? 'strict $ ? (@ == "x")'`. Jed preserves the direct predicate/sequential-scan answer:
+  using an index must not remove a matching row. `query/gin_jsonb_root_string.test` checks both
+  operators before and after creating an index. This corrects the original §2.2 rule; existing
+  on-disk terms and pages require no migration.
 
 ## 10. Narrowings this slice (deferred follow-ons)
 

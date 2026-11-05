@@ -181,8 +181,9 @@ function pathNodes(lax: boolean, outer: Item[], expr: PathExpr, scalar: JsonNode
     return nodes;
   }
   // jsonb_ops indexes a string array element as a KEY, so the scalar may be a key, a value, or
-  // either (lax mode unwraps arrays; .** reaches both).
-  let maybe = lax;
+  // either (lax mode unwraps arrays; .** reaches both). A root string is also
+  // indexed as KEY, including in strict mode (gin.md §9).
+  let maybe = lax || path.length === 0;
   let asKey = false;
   const last = path[path.length - 1];
   if (!lax && last !== undefined) {

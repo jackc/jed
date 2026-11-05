@@ -233,11 +233,12 @@ fn extract_path_expr_nodes(
         JsonNode::String(_) => {
             // jsonb_ops indexes a string array element as a KEY, so the scalar may be a key, a
             // value, or either (lax mode unwraps arrays; `.**` reaches both).
+            // A root string is also indexed as KEY in strict mode (gin.md §9).
             let key = if lax {
                 None
             } else {
                 match path.last() {
-                    None => Some(false),
+                    None => None,
                     Some(Item::AnyArray | Item::IndexArray) => Some(true),
                     Some(Item::Any) => None,
                     Some(_) => Some(false),

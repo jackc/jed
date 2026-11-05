@@ -13,6 +13,14 @@
 #           matches only that binding of the SQL, not every binding
 #   reason  why jed departs from PostgreSQL here
 
+# GIN root-string soundness correction (gin.md §9, 2026-11-05): PG18's forced
+# GIN bitmap scan drops a root JSON string for `doc @@ 'strict $ == "x"'` and
+# `doc @? 'strict $ ? (@ == "x")'`, while its direct predicate and sequential
+# scan return it. query/gin_jsonb_root_string.test deliberately keeps the scan
+# answer before and after CREATE INDEX. No override entry suppresses its oracle
+# check: the ordinary oracle plan agrees; the forced-index bug is documented here
+# and in the design's divergence ledger rather than adopted as SQL semantics.
+
 [[override]]
 file = "query/order_by_topk.test"
 sql = "SELECT id FROM tk ORDER BY 1 / (id - id) LIMIT 0"

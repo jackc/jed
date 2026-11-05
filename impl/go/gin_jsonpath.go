@@ -253,8 +253,9 @@ func jpGinPathNodes(lax bool, outer []jpGinItem, expr *jpPathExpr, scalar *JsonN
 		return append(nodes, &jpGinNode{kind: ginTreeTerm, entry: ginJsonbScalarTerm(scalar, false)})
 	}
 	// jsonb_ops indexes a string array element as a KEY, so the scalar may be a key, a value, or
-	// either (lax mode unwraps arrays; .** reaches both).
-	maybe, asKey := lax, false
+	// either (lax mode unwraps arrays; .** reaches both). A root string is also
+	// indexed as KEY, including in strict mode (gin.md §9).
+	maybe, asKey := lax || len(path) == 0, false
 	if !lax && len(path) > 0 {
 		switch path[len(path)-1].kind {
 		case jpGinAnyArray, jpGinIndexArray:
