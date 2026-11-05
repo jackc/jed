@@ -49,9 +49,11 @@ public enum ScalarType: UInt8, CaseIterable, Sendable {
 public struct TypeField: Sendable, Equatable {
     public let name: SQLText
     public let descriptor: TypeDescriptor
-    public init(name: SQLText, descriptor: TypeDescriptor) {
+    public let notNull: Bool
+    public init(name: SQLText, descriptor: TypeDescriptor, notNull: Bool = false) {
         self.name = name
         self.descriptor = descriptor
+        self.notNull = notNull
     }
 }
 

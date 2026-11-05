@@ -88,6 +88,15 @@ The separate user work under `tasks/memory` is not part of this experiment.
 - Added datetime and exact numeric template processors, exact IEEE-to-decimal
   conversion, JSON syntax/spans/canonical values, accessors/mutations/builders and
   streaming JSON SRF helpers. SQL resolution/evaluation is not connected yet.
+- Added v50 catalog metadata, two-pass nominal type resolution, reference/statistics
+  validation and continued-entry page chains. Catalogs from all 87 ordinary golden
+  images (including six encrypted images) decode and rebuild byte-exactly. All 112
+  file fixtures are now snapshotted from the frozen baseline; malformed/recovery
+  database-level acceptance remains separate and incomplete.
+- Added handwritten regex compiler/VM, SIMILAR translation and scalar/SRF helpers.
+  All shared regex program/match/SIMILAR vectors pass, including exact instruction
+  listings, captures and step counts. JSONPath compiler compiles; evaluator integration
+  remains active.
 
 ## Verification ledger
 
@@ -103,6 +112,8 @@ The separate user work under `tasks/memory` is not part of this experiment.
 | `mise run swift-native:test` | PASS 92 after parser, temporal/value/key, pager and packed-page slices; 0 failures (2026-11-05 16:45 UTC) |
 | `mise run swift-native:parser-audit` | PASS 21,525 frozen SQL records; zero unexpected rejections (see Tools/PARSER_AUDIT.md) |
 | `mise run swift-native:test` | PASS 113 after tree/disposition, temporal/numeric formatting and JSON foundations; 0 failures (2026-11-05 17:01 UTC) |
+| `mise run swift-native:test` | PASS 120 after catalog/golden and regex/SIMILAR slices; 0 failures (2026-11-05 17:08 UTC) |
+| `mise run swift-native:codegen --check` | PASS all 112 frozen file fixtures plus regex vectors; fingerprint `802cfd6bda26761f7dc3c91d811278ced3bd0a4e368c3e11f3d6b21e917ba77f` |
 | `mise run unit:go -- -run 'Test(Validated\|CommitCRC64\|CompleteManifest\|IncompleteEqualTxid\|Serialization)' -count=1` | PASS 8 selected recovery tests |
 | `mise run unit:rust -- --lib validated_cow_tests` | PASS 7 selected recovery tests |
 | `mise run unit:ts` | PASS 1,276 tests after sandbox Unix-socket access; initial sandbox-only EPERM failures resolved |
@@ -141,8 +152,12 @@ overflow bytes and costs, numeric template arithmetic and JSON internal boundari
 Initial disposition test inputs did not fit after one compression as assumed; changed
 the input from 80 to 70 bytes to exercise the intended boundary. An audit corrected
 Swift's encrypted compression quantum to C (chain payload capacity is separately C−16).
-No shared expected results changed. The catalog codec is under construction and has
-no verified catalog/file-level result yet.
+No shared expected results changed. The 120-test run verifies catalog page bytes,
+continued-entry corruption, nominal cycles and malformed FK/type references. A test
+initially expected the malformed-row-count image to fail at catalog open; that
+fixture explicitly defers count drift until a write/integrity check. The test now
+checks that boundary and separately rejects a zero root with nonzero cardinality.
+This is catalog verification, not complete database/file conformance.
 
 Local-only commits so far: `91aef346` (approved scope/design), `f9c09043`
 (verified foundations), `d2a56c3b` (syntax/numeric), `e83ff6d1`
@@ -150,6 +165,9 @@ Local-only commits so far: `91aef346` (approved scope/design), `f9c09043`
 (shared recovery correction). The foundation commit's staged whitespace check reported two existing
 whitespace defects in pinned, unmodified Argon2 upstream LICENSE/encoding.c. Those
 vendor bytes remain unchanged to preserve the recorded provenance hashes.
+
+Additional local-only commits: `b9e99410` (frozen syntax audit/tree fixtures),
+`a645434f` (packed B+trees/disposition), `a87abe2c` (formatting/JSON foundations).
 
 Initial SwiftPM compile failed while SQLDecimal was not yet present, then four
 missing `try` markers in decimal test autoclosures were corrected. No expected
@@ -163,8 +181,8 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 ## Next steps
 
 1. Active delegated slices: shared empty-unary-subtree correction (`host_inventory`),
-   native regex (`scope_inventory`), JSONPath (`crypto_audit`). Root owns integration
-   and catalog/storage. Numeric/temporal format and JSON foundations passed internal
+   native floats (`scope_inventory`), JSONPath (`crypto_audit`). Root owns integration,
+   type resolution and remaining catalog/storage wiring. Numeric/temporal format and JSON foundations passed internal
    verification; SQL behavior remains unverified.
 2. Build parser/resolver/evaluator and shared-corpus adapter over the established
    types, plus the pager/packed B+tree/validated-COW transaction path. Do not

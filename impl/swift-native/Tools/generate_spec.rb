@@ -47,14 +47,12 @@ module SwiftSpecGenerator
     spec/regex/match_vectors.toml
     spec/regex/similar_vectors.toml
   ].freeze
-  BYTE_INPUTS = %w[
-    spec/fileformat/fixtures/pk_table.jed
-    spec/fileformat/fixtures/tall_tree.jed
-    spec/fileformat/fixtures/max_sep_table.jed
-    spec/fileformat/fixtures/encrypted_empty_db.jed
-    spec/fileformat/fixtures/encrypted_pk_table.jed
-    spec/tz/fixtures/tzdata.jtz
-  ].freeze
+  fixture_listing, fixture_error, fixture_status = Open3.capture3(
+    "git", "ls-tree", "-r", "--name-only", BASELINE, "spec/fileformat/fixtures", chdir: ROOT
+  )
+  abort "cannot list frozen byte fixtures: #{fixture_error}" unless fixture_status.success?
+  BYTE_INPUTS = (fixture_listing.lines.map(&:strip).select { |path| path.end_with?(".jed") }.sort +
+    ["spec/tz/fixtures/tzdata.jtz"]).freeze
 
   module_function
 
