@@ -980,9 +980,15 @@ func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz
 		if ty.isScalar() {
 			// A text value bound to a timestamptz parameter reads an offset-less string in the session
 			// zone, as PostgreSQL's text-format parameter input does (timezones.md §9.3).
-			v, err = storeValue(hostTimeParam(supplied[i], &ty.Scalar), ty.Scalar, typmod{}, false, labels[i], iz)
+			v, err = hostTimeParam(supplied[i], &ty.Scalar)
+			if err == nil {
+				v, err = storeValue(v, ty.Scalar, typmod{}, false, labels[i], iz)
+			}
 		} else {
-			v, err = bindContainerParam(hostTimeArrayParam(supplied[i], ty), ty, labels[i], iz)
+			v, err = hostTimeArrayParam(supplied[i], ty)
+			if err == nil {
+				v, err = bindContainerParam(v, ty, labels[i], iz)
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -1007,9 +1013,9 @@ func checkHostParam(v Value) error {
 // hostTimeArrayParam is hostTimeParam for a container parameter: a one-dimensional array bound from
 // a Go []time.Time (every element a host time) re-coerces each element to the array's scalar element
 // type; any other value is returned as is.
-func hostTimeArrayParam(v Value, ty colType) Value {
+func hostTimeArrayParam(v Value, ty colType) (Value, error) {
 	if v.Kind != ValArray || ty.Elem == nil || !ty.Elem.isScalar() {
-		return v
+		return v, nil
 	}
 	elems := v.arrayVal().Elements
 	converted := false
@@ -1020,13 +1026,17 @@ func hostTimeArrayParam(v Value, ty colType) Value {
 		}
 	}
 	if !converted {
-		return v
+		return v, nil
 	}
 	out := make([]Value, len(elems))
 	for i, e := range elems {
-		out[i] = hostTimeParam(e, &ty.Elem.Scalar)
+		var err error
+		out[i], err = hostTimeParam(e, &ty.Elem.Scalar)
+		if err != nil {
+			return Value{}, err
+		}
 	}
-	return ArrayValue(out)
+	return ArrayValue(out), nil
 }
 
 // bindContainerParam coerces a host value to an array, range, or composite parameter type

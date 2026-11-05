@@ -55,6 +55,10 @@ An exact `decimal` binds from the engine's own `Decimal` type, which keeps its w
 parameter, rounded to the nearest float. A finite decimal outside that width's range, including a
 nonzero value that rounds to zero, returns `22003`.
 
+Go also accepts `time.Time` and `[]time.Time`. A `timestamptz` parameter keeps the instant;
+`timestamp` and `date` use the value's local calendar fields. A value outside the target type's
+finite range returns `22008`, including an out-of-range array element.
+
 ### Arrays, ranges, and composite values
 
 A parameter can also be an array, a range, or a composite type. It takes the container type it is

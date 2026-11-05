@@ -1184,6 +1184,11 @@ binds the date); a host that needs another rule passes a `Value`. A non-temporal
 `time.Time` as a family mismatch (`42804`), like a literal. A Go `string` is checked for valid UTF-8
 without NUL at conversion (`22021`, §5).
 
+Host times are checked against the inferred temporal type's finite range before storage
+(`22008` on overflow or an infinity sentinel), including each element of a `[]time.Time`.
+The check happens after the target is known: a date may be valid even when its midnight
+does not fit a timestamp's microsecond range.
+
 **Scan (`Value` → native `*T`).** The mirror, an **inline type switch with explicit cases for the
 common destinations** (`*i64/i32/i16/int`, `*string`, `*bool`, `*f64/f32`, `*[]byte`, the temporal
 type, the engine value types, `*any`) — **never reflection on this path**, and the destination must
