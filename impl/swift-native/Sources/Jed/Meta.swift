@@ -206,9 +206,23 @@ internal enum MetaRecovery {
                        read: (UInt32) throws -> [UInt8]) throws -> ValidatedMeta {
         try PageEnvelope.validateSize(pageSize, encrypted: false, opening: true)
         var candidates: [(UInt32, MetaPage, [UInt8])] = []
+        var declaredVariant: Bool?
         for slot: UInt32 in 0...1 {
             guard UInt64(slot + 1) * UInt64(pageSize) <= fileBytes else { continue }
             let bytes = try read(slot)
+            // Variant discovery uses CRC-valid envelopes before interpreting
+            // credentials. A damaged slot cannot silently reinterpret the file.
+            if bytes.count == pageSize,
+               try PageEnvelope.readU32(bytes, at: 32) == PageEnvelope.checksum(bytes, at: 32) {
+                let encrypted: Bool
+                if bytes[6] == 0 && bytes[7] == 0 { encrypted = false }
+                else if bytes[6] == 1 && bytes[7] == 40 { encrypted = true }
+                else { throw JedError.corruption("unknown encryption variant") }
+                guard declaredVariant == nil || declaredVariant == encrypted else {
+                    throw JedError.corruption("meta slots disagree about encryption variant")
+                }
+                declaredVariant = encrypted
+            }
             if let meta = try? MetaPage.decode(bytes), meta.pageSize == pageSize,
                UInt64(meta.pageCount) * UInt64(pageSize) <= fileBytes {
                 candidates.append((slot, meta, bytes))

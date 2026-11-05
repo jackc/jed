@@ -55,7 +55,48 @@ internal struct StoredCell: Sendable {
 internal struct PackedRecord: Sendable {
     let key: [UInt8]
     let cells: [StoredCell]
+    let overflows: [Int: PendingOverflow]
+    init(key: [UInt8], cells: [StoredCell], overflows: [Int: PendingOverflow] = [:]) {
+        self.key = key; self.cells = cells; self.overflows = overflows
+    }
     var weight: Int { cells.reduce(key.count) { $0 + $1.storedSize } }
+
+    func materialize(column: Int, pager: Pager? = nil, pageCount: UInt32? = nil) throws -> SQLValue {
+        if let overflow = overflows[column] {
+            let raw = overflow.compressed ? try LZ4.decompress(overflow.bytes, rawLength: overflow.rawLength) : overflow.bytes
+            return try ValueCodec.decodeRawBody(raw, type: cells[column].type)
+        }
+        return try cells[column].materialize(pager: pager, pageCount: pageCount)
+    }
+
+    func sealOverflow(allocator: inout PageAllocator, codec: any PageCodec,
+                      entropy: KeyEntropy? = nil) throws -> (record: PackedRecord, pages: [StoredPage]) {
+        var cells = cells, pages: [StoredPage] = []
+        for column in cells.indices {
+            guard let pending = overflows[column] else { continue }
+            let chain = try OverflowChain.write(pending.bytes, allocator: &allocator, codec: codec, entropy: entropy)
+            let pointer = try pending.pointer(chain.head)
+            cells[column] = StoredCell(bytes: pointer[...], type: cells[column].type)
+            pages.append(contentsOf: chain.pages)
+        }
+        return (PackedRecord(key: key, cells: cells), pages)
+    }
+}
+
+internal struct PendingOverflow: Sendable {
+    let bytes: [UInt8]
+    let rawLength: Int
+    let compressed: Bool
+    func pointer(_ reference: PageReference) throws -> [UInt8] {
+        guard bytes.count <= UInt32.max, rawLength >= 0, rawLength <= UInt32.max else {
+            throw JedError("0A000", "overflow value exceeds the byte-format limit")
+        }
+        var writer = ByteWriter()
+        writer.u8(compressed ? 4 : 2); writer.u32(reference.index); writer.u32(UInt32(bytes.count))
+        if compressed { writer.u32(UInt32(rawLength)) }
+        writer.append(reference.tag)
+        return writer.bytes
+    }
 }
 
 internal final class PackedLeaf: Sendable {

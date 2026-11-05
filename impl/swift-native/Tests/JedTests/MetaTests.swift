@@ -142,4 +142,18 @@ final class MetaTests: XCTestCase {
             // reserve until EncryptedPageCodec.sealMeta authenticates it.
         }
     }
+
+    func testCRCValidSlotsCannotDeclareDifferentEncryptionVariants() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "encrypted_empty_db", withExtension: "jed", subdirectory: "Fixtures"))
+        let store = MemoryBlockStore(); try store.write(at: 0, bytes: Array(Data(contentsOf: url)))
+        var other = try store.read(at: 1024, count: 1024)
+        other[6] = 0; other[7] = 0
+        try PageEnvelope.putU32(PageEnvelope.checksum(other, at: 32), into: &other, at: 32)
+        try store.write(at: 1024, bytes: other)
+        expect("XX001") { _ = try MetaRecovery.open(store) }
+        // A torn slot makes no variant declaration.
+        other[32] ^= 1
+        try store.write(at: 1024, bytes: other)
+        XCTAssertTrue(try MetaRecovery.open(store).meta.encrypted)
+    }
 }
