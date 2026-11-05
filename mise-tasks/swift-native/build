@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: build the native Swift experiment"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+
+require_relative "../../impl/swift-native/Tools/swift_task"
+SwiftNativeTasks.run("build", configuration: ENV.fetch("usage_configuration", "debug"))

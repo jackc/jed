@@ -19,6 +19,11 @@
 # Built gem packages.
 /impl/ruby/*.gem
 
+# Opt-in native Swift experiment. Package.resolved and vendored crypto are tracked.
+/impl/swift-native/.build/
+/impl/swift-native/.swiftpm/
+/impl/swift-native/results/
+
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).
 /impl/go/bin/

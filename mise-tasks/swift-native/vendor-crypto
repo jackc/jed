@@ -1,0 +1,44 @@
+#!/usr/bin/env ruby
+#MISE description="Fetch only the pinned approved Swift Argon2 cryptographic sources"
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'open3'
+
+root = File.expand_path('../..', __dir__)
+destination = File.join(root, 'impl/swift-native/Vendor/argon2')
+revision = '62358ba2123abd17fccf2a108a301d4b52c01a7c'
+files = %w[
+  LICENSE include/argon2.h src/argon2.c src/core.c src/core.h src/encoding.c
+  src/encoding.h src/ref.c src/thread.h src/blake2/blake2.h
+  src/blake2/blake2-impl.h src/blake2/blake2b.c src/blake2/blamka-round-ref.h
+].freeze
+provenance_path = File.join(destination, 'PROVENANCE.json')
+prior = File.exist?(provenance_path) ? JSON.parse(File.read(provenance_path)) : nil
+abort 'unexpected prior Argon2 revision' if prior && prior.fetch('revision') != revision
+checksums = {}
+files.each do |path|
+  output = File.join(destination, path)
+  expected = prior && prior.fetch('sha256').fetch(path)
+  if File.file?(output) && expected && Digest::SHA256.file(output).hexdigest == expected
+    checksums[path] = expected
+    next
+  end
+  url = "https://raw.githubusercontent.com/P-H-C/phc-winner-argon2/#{revision}/#{path}"
+  body, error, status = Open3.capture3('curl', '--fail', '--silent', '--show-error', '--location',
+                                     '--connect-timeout', '15', '--max-time', '60', url)
+  abort "fetch failed for #{path}: #{error}" unless status.success?
+  checksum = Digest::SHA256.hexdigest(body)
+  abort "checksum mismatch for #{path}" if expected && checksum != expected
+  FileUtils.mkdir_p(File.dirname(output))
+  File.binwrite(output, body)
+  checksums[path] = checksum
+end
+record = {
+  'repository' => 'https://github.com/P-H-C/phc-winner-argon2',
+  'release' => '20190702', 'revision' => revision,
+  'configuration' => 'portable ref.c, ARGON2_NO_THREADS; upstream source unmodified',
+  'sha256' => checksums,
+}
+File.write(provenance_path, JSON.pretty_generate(record) + "\n")
+puts "Verified #{files.length} pinned Argon2 source/license files."

@@ -1,0 +1,9 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: test the native Swift experiment's host and invariant surface"
+#USAGE flag "-c --configuration <configuration>" default="debug" help="debug or release"
+#USAGE flag "--filter <filter>" help="Swift test name filter"
+
+require_relative "../../impl/swift-native/Tools/swift_task"
+extra = ENV["usage_filter"] ? ["--filter", ENV.fetch("usage_filter")] : []
+SwiftNativeTasks.run("test", configuration: ENV.fetch("usage_configuration", "debug"), extra: extra)

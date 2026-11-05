@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: resolve the Swift experiment's pinned cryptographic packages"
+
+require_relative "../../impl/swift-native/Tools/swift_task"
+SwiftNativeTasks.run("package", extra: ["resolve"])

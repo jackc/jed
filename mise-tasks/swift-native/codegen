@@ -1,0 +1,9 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: generate Swift mechanical facts from the pinned shared spec"
+#USAGE flag "--check" help="Fail if checked-in generated data is stale"
+
+require "rbconfig"
+script = File.expand_path("../../impl/swift-native/Tools/generate_spec.rb", __dir__)
+args = ENV["usage_check"] == "true" ? ["--check"] : []
+exec(RbConfig.ruby, script, *args)
