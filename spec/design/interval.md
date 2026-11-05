@@ -436,9 +436,10 @@ one-argument form one for the current day and, for `timestamptz`, one for its mi
   decimal's canonical text: at most **18 integer digits** and **18 significant fractional digits**
   (trailing fractional zeros stripped first, so a `numeric(p, 10)` column value such as
   `1.0000000000` is the factor `1`); beyond either bound is `22008` "interval factor has too many
-  digits". The bound keeps the Rust `i128` cascade exact — every intermediate overflow it could still
-  reach implies an `i32`/`i64` field overflow, so all three cores trap the same `22008` — and lies far
-  past the ~16 significant digits PostgreSQL's `double` factor carries.
+  digits". The cascade must remain exact within this bound: a large common numerator does not
+  imply a field overflow. Fixed-width implementations use bounded quotient/remainder arithmetic
+  for rounded scaled fractions, rejecting only actual field overflow, so all three cores agree.
+  The bound lies far past the ~16 significant digits PostgreSQL's `double` factor carries.
 
 ### 6.1 Field qualifiers and precision — the interval typmod
 

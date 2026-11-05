@@ -1,0 +1,23 @@
+# Large exact interval divisors: intermediate numerators can exceed 128 bits while each
+# rounded result field is representable. Both signs and the month-to-day cascade are covered.
+# requires: query.select_no_from, types.interval, types.decimal
+
+query T nosort
+SELECT INTERVAL '2147483647 days' / 999999999999999999.999999999999999999
+----
+00:00:00.000186
+
+query T nosort
+SELECT INTERVAL '-2147483647 days' / 999999999999999999.999999999999999999
+----
+-00:00:00.000186
+
+query T nosort
+SELECT INTERVAL '2147483647 months' / 99999999999999999.999999999999999999
+----
+00:00:00.0864
+
+query T nosort
+SELECT INTERVAL '-2147483647 months' / 99999999999999999.999999999999999999
+----
+-00:00:00.0864
