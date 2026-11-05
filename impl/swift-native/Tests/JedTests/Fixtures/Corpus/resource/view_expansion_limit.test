@@ -1,0 +1,306 @@
+# Bounded planning for nested views and derived tables (spec/design/planner.md §3.2,
+# spec/design/views.md §4.1, spec/design/cost.md §7e). Planning is unmetered, so its work must be
+# bounded structurally:
+#
+# - Predicate pushdown plans a derived body again with the pushed conjuncts. Each body is first
+#   planned only as a shape (its outputs and pushability), so a chain of `d` bodies that each push
+#   into the next costs O(d²) plannings. Before this, each level planned its body twice in full, and
+#   the chains below took 2^d plannings and never finished.
+# - A view expands like a macro, so views that each reference the previous view twice expand to
+#   2^d views. One view reference written outside any view body may expand to at most
+#   MAX_VIEW_EXPANSIONS = 1024 views, itself included, or the statement is 54001
+#   (statement_too_complex). The count is of the full expansion, however often a body is planned.
+#
+# jed-specific (PostgreSQL has no such limit), so cross-core-checked, not oracle-checked.
+# requires: ddl.view, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.union, query.aggregates, query.derived_table, query.derived_pushdown, types.i32, resource.view_expansion_limit
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+# --- a chain of 60 views, each with a WHERE that pushes into the next -----------------------------
+
+statement ok
+CREATE VIEW c0 AS SELECT * FROM t WHERE b > 0
+
+statement ok
+CREATE VIEW c1 AS SELECT * FROM c0 WHERE a > -1
+
+statement ok
+CREATE VIEW c2 AS SELECT * FROM c1 WHERE a > -2
+
+statement ok
+CREATE VIEW c3 AS SELECT * FROM c2 WHERE a > -3
+
+statement ok
+CREATE VIEW c4 AS SELECT * FROM c3 WHERE a > -4
+
+statement ok
+CREATE VIEW c5 AS SELECT * FROM c4 WHERE a > -5
+
+statement ok
+CREATE VIEW c6 AS SELECT * FROM c5 WHERE a > -6
+
+statement ok
+CREATE VIEW c7 AS SELECT * FROM c6 WHERE a > -7
+
+statement ok
+CREATE VIEW c8 AS SELECT * FROM c7 WHERE a > -8
+
+statement ok
+CREATE VIEW c9 AS SELECT * FROM c8 WHERE a > -9
+
+statement ok
+CREATE VIEW c10 AS SELECT * FROM c9 WHERE a > -10
+
+statement ok
+CREATE VIEW c11 AS SELECT * FROM c10 WHERE a > -11
+
+statement ok
+CREATE VIEW c12 AS SELECT * FROM c11 WHERE a > -12
+
+statement ok
+CREATE VIEW c13 AS SELECT * FROM c12 WHERE a > -13
+
+statement ok
+CREATE VIEW c14 AS SELECT * FROM c13 WHERE a > -14
+
+statement ok
+CREATE VIEW c15 AS SELECT * FROM c14 WHERE a > -15
+
+statement ok
+CREATE VIEW c16 AS SELECT * FROM c15 WHERE a > -16
+
+statement ok
+CREATE VIEW c17 AS SELECT * FROM c16 WHERE a > -17
+
+statement ok
+CREATE VIEW c18 AS SELECT * FROM c17 WHERE a > -18
+
+statement ok
+CREATE VIEW c19 AS SELECT * FROM c18 WHERE a > -19
+
+statement ok
+CREATE VIEW c20 AS SELECT * FROM c19 WHERE a > -20
+
+statement ok
+CREATE VIEW c21 AS SELECT * FROM c20 WHERE a > -21
+
+statement ok
+CREATE VIEW c22 AS SELECT * FROM c21 WHERE a > -22
+
+statement ok
+CREATE VIEW c23 AS SELECT * FROM c22 WHERE a > -23
+
+statement ok
+CREATE VIEW c24 AS SELECT * FROM c23 WHERE a > -24
+
+statement ok
+CREATE VIEW c25 AS SELECT * FROM c24 WHERE a > -25
+
+statement ok
+CREATE VIEW c26 AS SELECT * FROM c25 WHERE a > -26
+
+statement ok
+CREATE VIEW c27 AS SELECT * FROM c26 WHERE a > -27
+
+statement ok
+CREATE VIEW c28 AS SELECT * FROM c27 WHERE a > -28
+
+statement ok
+CREATE VIEW c29 AS SELECT * FROM c28 WHERE a > -29
+
+statement ok
+CREATE VIEW c30 AS SELECT * FROM c29 WHERE a > -30
+
+statement ok
+CREATE VIEW c31 AS SELECT * FROM c30 WHERE a > -31
+
+statement ok
+CREATE VIEW c32 AS SELECT * FROM c31 WHERE a > -32
+
+statement ok
+CREATE VIEW c33 AS SELECT * FROM c32 WHERE a > -33
+
+statement ok
+CREATE VIEW c34 AS SELECT * FROM c33 WHERE a > -34
+
+statement ok
+CREATE VIEW c35 AS SELECT * FROM c34 WHERE a > -35
+
+statement ok
+CREATE VIEW c36 AS SELECT * FROM c35 WHERE a > -36
+
+statement ok
+CREATE VIEW c37 AS SELECT * FROM c36 WHERE a > -37
+
+statement ok
+CREATE VIEW c38 AS SELECT * FROM c37 WHERE a > -38
+
+statement ok
+CREATE VIEW c39 AS SELECT * FROM c38 WHERE a > -39
+
+statement ok
+CREATE VIEW c40 AS SELECT * FROM c39 WHERE a > -40
+
+statement ok
+CREATE VIEW c41 AS SELECT * FROM c40 WHERE a > -41
+
+statement ok
+CREATE VIEW c42 AS SELECT * FROM c41 WHERE a > -42
+
+statement ok
+CREATE VIEW c43 AS SELECT * FROM c42 WHERE a > -43
+
+statement ok
+CREATE VIEW c44 AS SELECT * FROM c43 WHERE a > -44
+
+statement ok
+CREATE VIEW c45 AS SELECT * FROM c44 WHERE a > -45
+
+statement ok
+CREATE VIEW c46 AS SELECT * FROM c45 WHERE a > -46
+
+statement ok
+CREATE VIEW c47 AS SELECT * FROM c46 WHERE a > -47
+
+statement ok
+CREATE VIEW c48 AS SELECT * FROM c47 WHERE a > -48
+
+statement ok
+CREATE VIEW c49 AS SELECT * FROM c48 WHERE a > -49
+
+statement ok
+CREATE VIEW c50 AS SELECT * FROM c49 WHERE a > -50
+
+statement ok
+CREATE VIEW c51 AS SELECT * FROM c50 WHERE a > -51
+
+statement ok
+CREATE VIEW c52 AS SELECT * FROM c51 WHERE a > -52
+
+statement ok
+CREATE VIEW c53 AS SELECT * FROM c52 WHERE a > -53
+
+statement ok
+CREATE VIEW c54 AS SELECT * FROM c53 WHERE a > -54
+
+statement ok
+CREATE VIEW c55 AS SELECT * FROM c54 WHERE a > -55
+
+statement ok
+CREATE VIEW c56 AS SELECT * FROM c55 WHERE a > -56
+
+statement ok
+CREATE VIEW c57 AS SELECT * FROM c56 WHERE a > -57
+
+statement ok
+CREATE VIEW c58 AS SELECT * FROM c57 WHERE a > -58
+
+statement ok
+CREATE VIEW c59 AS SELECT * FROM c58 WHERE a > -59
+
+statement ok
+CREATE VIEW c60 AS SELECT * FROM c59 WHERE a > -60
+
+query II nosort
+SELECT * FROM c60 WHERE a = 2
+----
+2
+20
+
+# --- 100 nested derived tables, each with a WHERE that pushes into the next --------------------------
+
+query II nosort
+SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM t WHERE b > 0) d0 WHERE a > -1) d1 WHERE a > -2) d2 WHERE a > -3) d3 WHERE a > -4) d4 WHERE a > -5) d5 WHERE a > -6) d6 WHERE a > -7) d7 WHERE a > -8) d8 WHERE a > -9) d9 WHERE a > -10) d10 WHERE a > -11) d11 WHERE a > -12) d12 WHERE a > -13) d13 WHERE a > -14) d14 WHERE a > -15) d15 WHERE a > -16) d16 WHERE a > -17) d17 WHERE a > -18) d18 WHERE a > -19) d19 WHERE a > -20) d20 WHERE a > -21) d21 WHERE a > -22) d22 WHERE a > -23) d23 WHERE a > -24) d24 WHERE a > -25) d25 WHERE a > -26) d26 WHERE a > -27) d27 WHERE a > -28) d28 WHERE a > -29) d29 WHERE a > -30) d30 WHERE a > -31) d31 WHERE a > -32) d32 WHERE a > -33) d33 WHERE a > -34) d34 WHERE a > -35) d35 WHERE a > -36) d36 WHERE a > -37) d37 WHERE a > -38) d38 WHERE a > -39) d39 WHERE a > -40) d40 WHERE a > -41) d41 WHERE a > -42) d42 WHERE a > -43) d43 WHERE a > -44) d44 WHERE a > -45) d45 WHERE a > -46) d46 WHERE a > -47) d47 WHERE a > -48) d48 WHERE a > -49) d49 WHERE a > -50) d50 WHERE a > -51) d51 WHERE a > -52) d52 WHERE a > -53) d53 WHERE a > -54) d54 WHERE a > -55) d55 WHERE a > -56) d56 WHERE a > -57) d57 WHERE a > -58) d58 WHERE a > -59) d59 WHERE a > -60) d60 WHERE a > -61) d61 WHERE a > -62) d62 WHERE a > -63) d63 WHERE a > -64) d64 WHERE a > -65) d65 WHERE a > -66) d66 WHERE a > -67) d67 WHERE a > -68) d68 WHERE a > -69) d69 WHERE a > -70) d70 WHERE a > -71) d71 WHERE a > -72) d72 WHERE a > -73) d73 WHERE a > -74) d74 WHERE a > -75) d75 WHERE a > -76) d76 WHERE a > -77) d77 WHERE a > -78) d78 WHERE a > -79) d79 WHERE a > -80) d80 WHERE a > -81) d81 WHERE a > -82) d82 WHERE a > -83) d83 WHERE a > -84) d84 WHERE a > -85) d85 WHERE a > -86) d86 WHERE a > -87) d87 WHERE a > -88) d88 WHERE a > -89) d89 WHERE a > -90) d90 WHERE a > -91) d91 WHERE a > -92) d92 WHERE a > -93) d93 WHERE a > -94) d94 WHERE a > -95) d95 WHERE a > -96) d96 WHERE a > -97) d97 WHERE a > -98) d98 WHERE a > -99) d99 WHERE a > -100) d WHERE a = 2
+----
+2
+20
+
+# --- views that reference the previous view twice: v_k expands to 2^(k+1) - 1 views ---------------
+
+statement ok
+CREATE VIEW v0 AS SELECT a FROM t WHERE a = 1
+
+statement ok
+CREATE VIEW v1 AS SELECT a FROM v0 UNION ALL SELECT a FROM v0
+
+statement ok
+CREATE VIEW v2 AS SELECT a FROM v1 UNION ALL SELECT a FROM v1
+
+statement ok
+CREATE VIEW v3 AS SELECT a FROM v2 UNION ALL SELECT a FROM v2
+
+statement ok
+CREATE VIEW v4 AS SELECT a FROM v3 UNION ALL SELECT a FROM v3
+
+statement ok
+CREATE VIEW v5 AS SELECT a FROM v4 UNION ALL SELECT a FROM v4
+
+statement ok
+CREATE VIEW v6 AS SELECT a FROM v5 UNION ALL SELECT a FROM v5
+
+statement ok
+CREATE VIEW v7 AS SELECT a FROM v6 UNION ALL SELECT a FROM v6
+
+statement ok
+CREATE VIEW v8 AS SELECT a FROM v7 UNION ALL SELECT a FROM v7
+
+statement ok
+CREATE VIEW v9 AS SELECT a FROM v8 UNION ALL SELECT a FROM v8
+
+statement ok
+CREATE VIEW v10 AS SELECT a FROM v9 UNION ALL SELECT a FROM v9
+
+# v9 expands to 1023 views, within the limit.
+query I nosort
+SELECT count(*) FROM v9
+----
+512
+
+# Creating v10 planned two references to v9, each 1023 views. Reading v10 expands to 2047.
+statement error 54001
+SELECT count(*) FROM v10
+
+# Each written reference is counted on its own.
+query I nosort
+SELECT count(*) FROM v9 x, v0 y
+----
+512
+
+# Exactly at the limit: w1024 and the 1023 views of v9.
+statement ok
+CREATE VIEW w1024 AS SELECT a FROM v9
+
+query I nosort
+SELECT count(*) FROM w1024
+----
+512
+
+# A pushed-down WHERE plans bodies again, but each view is counted once.
+query I nosort
+SELECT count(*) FROM w1024 WHERE a = 1
+----
+512
+
+# One past the limit.
+statement ok
+CREATE VIEW w1025 AS SELECT a FROM v9 UNION ALL SELECT a FROM v0
+
+statement error 54001
+SELECT count(*) FROM w1025
+
+# Inside a derived table the view reference is still written outside any view body.
+statement error 54001
+SELECT count(*) FROM (SELECT a FROM w1025) d WHERE a = 1
+
+query I nosort
+SELECT count(*) FROM (SELECT a FROM w1024) d WHERE a = 1
+----
+512
+
+# A view whose definition holds an over-limit reference cannot be created.
+statement error 54001
+CREATE VIEW too_big AS SELECT a FROM w1025

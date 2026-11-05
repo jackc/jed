@@ -1,0 +1,288 @@
+# JSON `\u` escapes that text cannot hold (spec/design/json.md §4.2, §6.2): a decoded `\u0000`
+# (22P05 "unsupported Unicode escape sequence") and an unpaired UTF-16 surrogate (22P02, PG's
+# "Unicode low surrogate must follow a high surrogate." / "Unicode high surrogate must not follow a
+# high surrogate." Detail). PostgreSQL decodes escapes only where it reads string contents (its
+# `need_escapes` lexer mode): jsonb input, json → jsonb, and every json function that de-escapes
+# (`->` `->>` `#>` `#>>`, json_each[_text], json_array_elements_text, json_object_keys,
+# json_strip_nulls, the record functions, the SQL/JSON query functions) check the WHOLE document,
+# while json input, json_typeof, json_array_length, json_array_elements, JSON(), and IS JSON without
+# UNIQUE KEYS only lex, so they accept both. A root container of the wrong kind raises its 22023 at
+# its opening bracket, before anything inside it is lexed; a wrong scalar root is lexed first.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.json, types.jsonb, types.composite, func.json_verbatim, func.json_srf, func.json_each, func.json_processing, func.json_record, func.json_populate, func.json_ctor, func.to_jsonb, expr.is_json, expr.json_query_fns, func.json_table
+
+# jsonb input rejects `\u0000` anywhere: a scalar, a member value, a key, mid-string.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '"\u0000"'::jsonb
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '{"a": "x\u0000y"}'::jsonb
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '{"\u0000": 1}'::jsonb
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '[1, ["\u0000"]]'::jsonb
+
+# An escaped backslash is not an escape; `\u0001` is an ordinary control character.
+query TT nosort
+SELECT '"\\u0000"'::jsonb, '"\u0001"'::jsonb
+----
+"\\u0000"
+"\u0001"
+
+# A surrogate pair combines; an unpaired surrogate is 22P02.
+query TT nosort
+SELECT '"\ud83d\ude00"'::jsonb, '["\uD83D\uDE00x"]'::jsonb
+----
+"😀"
+["😀x"]
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\ud800"'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\udc00"'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\ud800\ud800"'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\ud800\u0041"'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\ud800x"'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\ud800\n"'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\u00zz"'::jsonb
+
+# Errors surface in document order.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '["\u0000", x]'::jsonb
+
+statement error 22P02 invalid input syntax for type json
+SELECT '[x, "\u0000"]'::jsonb
+
+# json input only lexes: `\u0000` and unpaired surrogates are stored verbatim.
+statement ok
+CREATE TABLE docs (id int PRIMARY KEY, j json)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"a": 1, "b": "\u0000"}'), (2, '["\ud800", 2]'), (3, '"\udc00"')
+
+query T nosort
+SELECT j FROM docs WHERE id = 1
+----
+{"a": 1, "b": "\u0000"}
+
+query TTT nosort
+SELECT '"\u0000"'::json, '"\ud800"'::json, '"\ud800"'::json::text
+----
+"\u0000"
+"\ud800"
+"\ud800"
+
+# The lexing-only json functions accept them too.
+query TII nosort
+SELECT json_typeof('"\u0000"'::json), json_array_length('["\ud800", "\u0000"]'::json), json_array_length(j) FROM docs WHERE id = 2
+----
+string
+2
+2
+
+query T nosort
+SELECT * FROM json_array_elements('["\u0000", "\ud800"]'::json)
+----
+"\u0000"
+"\ud800"
+
+query BBB nosort
+SELECT '"\u0000"'::json IS JSON, '{"\ud800": 1}' IS JSON OBJECT, '"\u0000"' IS JSON SCALAR
+----
+true
+true
+true
+
+query T nosort
+SELECT JSON('{"\u0000": "\ud800"}')
+----
+{"\u0000": "\ud800"}
+
+# UNIQUE KEYS reads the keys, so it de-escapes the document: IS JSON is false, JSON() raises.
+query BBB nosort
+SELECT '{"\u0000": 1}' IS JSON WITH UNIQUE KEYS, '[1, "\ud800"]'::json IS JSON WITH UNIQUE KEYS, '[1, "\ud800"]'::json IS NOT JSON WITH UNIQUE KEYS
+----
+false
+false
+true
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT JSON('{"\u0000": 1}' WITH UNIQUE KEYS)
+
+statement error 22P02 invalid input syntax for type json
+SELECT JSON('{"a": "\ud800"}' WITH UNIQUE KEYS)
+
+# json → jsonb, and to_jsonb of a json value, de-escape.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT j::jsonb FROM docs WHERE id = 1
+
+statement error 22P02 invalid input syntax for type json
+SELECT '"\ud800"'::json::jsonb
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT to_jsonb('"\u0000"'::json)
+
+# The json accessors lex the WHOLE document: a bad escape raises even outside the matched path.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '{"a": "x\u0000y"}'::json ->> 'a'
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '{"a": "x\u0000y"}'::json -> 'a'
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT j -> 'a' FROM docs WHERE id = 1
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT j ->> 'zz' FROM docs WHERE id = 1
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '["\u0000"]'::json -> 0
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '"\u0000"'::json -> 'a'
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '"\u0000"'::json #> '{}'
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '{"a": ["\u0000"]}'::json #>> '{a,0}'
+
+statement error 22P02 invalid input syntax for type json
+SELECT j ->> 1 FROM docs WHERE id = 2
+
+statement error 22P02 invalid input syntax for type json
+SELECT '{"a": 1, "b": "\ud800"}'::json -> 'a'
+
+# A document with no bad escape reads normally (a pair de-escapes); a NULL path step short-circuits
+# before any lexing.
+query TTT nosort
+SELECT '{"a": "\ud83d\ude00"}'::json ->> 'a', '5'::json -> 'a', j #> ARRAY['a', NULL] FROM docs WHERE id = 1
+----
+😀
+NULL
+NULL
+
+# json_strip_nulls de-escapes.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT json_strip_nulls('{"a": null, "b": "\u0000"}'::json)
+
+statement error 22P02 invalid input syntax for type json
+SELECT json_strip_nulls('[1, "\ud800"]'::json)
+
+# The de-escaping SRFs: an escape error anywhere in the document ...
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_array_elements_text('["a", "\u0000"]'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_array_elements_text('[{"a": "\u0000"}]'::json)
+
+statement error 22P02 invalid input syntax for type json
+SELECT * FROM json_array_elements_text('["a", "\ud800"]'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_each('{"a": "\u0000"}'::json)
+
+statement error 22P02 invalid input syntax for type json
+SELECT * FROM json_each('{"a": [1, "\ud800"]}'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_each_text('{"\u0000": 1}'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_object_keys('{"a": "\u0000"}'::json)
+
+# ... except that a root container of the wrong kind raises first (22023), while a wrong scalar root
+# is lexed before its own 22023.
+statement error 22023
+SELECT * FROM json_array_elements_text('{"a": "\u0000"}'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_array_elements_text('"\u0000"'::json)
+
+statement error 22023
+SELECT * FROM json_each('["\u0000"]'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_each('"\u0000"'::json)
+
+statement error 22023
+SELECT * FROM json_object_keys('["\u0000"]'::json)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_object_keys('"\u0000"'::json)
+
+# The record functions: the whole object for _record; element by element for _recordset, so an
+# earlier element's conversion error precedes a later element's escape error, and a non-object
+# element raises at its bracket (an array) or after its token (a scalar).
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_to_record('{"a": "x", "b": "\u0000"}'::json) AS x(a int)
+
+statement error 22023
+SELECT * FROM json_to_record('["\u0000"]'::json) AS x(a text)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_to_record('"\u0000"'::json) AS x(a text)
+
+statement error 22P02 invalid input syntax for type integer
+SELECT * FROM json_to_recordset('[{"a": "x"}, {"a": "\u0000"}]'::json) AS x(a int)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_to_recordset('[{"a": "1"}, {"a": "\u0000"}]'::json) AS x(a int)
+
+statement error 22023
+SELECT * FROM json_to_recordset('[{"a": "1"}, ["\u0000"]]'::json) AS x(a int)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_to_recordset('[{"a": "1"}, "\u0000"]'::json) AS x(a int)
+
+statement error 22023
+SELECT * FROM json_to_recordset('{"a": "\u0000"}'::json) AS x(a text)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_to_recordset('"\u0000"'::json) AS x(a text)
+
+query T nosort
+SELECT * FROM json_to_record('{"a": "\ud83d\ude00"}'::json) AS x(a text)
+----
+😀
+
+statement ok
+CREATE TYPE pair AS (a text, b int)
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM json_populate_record(NULL::pair, '{"a": "\u0000"}'::json)
+
+statement error 22P02 invalid input syntax for type json
+SELECT * FROM json_populate_recordset(NULL::pair, '[{"a": "\ud800"}]'::json)
+
+# The SQL/JSON query functions read their context as jsonb.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT JSON_VALUE('"\u0000"', '$')
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT JSON_VALUE('{"a": "\u0000"}'::json, '$.b')
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT JSON_EXISTS('{"a": "\u0000"}'::json, '$.b')
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT JSON_QUERY('["\u0000"]'::json, '$')
+
+statement error 22P02 invalid input syntax for type json
+SELECT JSON_QUERY('["\ud800"]'::json, '$')
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM JSON_TABLE('["\u0000"]'::json, '$[*]' COLUMNS (a text PATH '$'))

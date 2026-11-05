@@ -1,0 +1,162 @@
+# ALTER TABLE slice 4: DROP COLUMN physically removes a non-PK column, compacts ordinals, and
+# rewrites existing rows (alter.md §3.2). PostgreSQL-clean behavior; the physical no-tombstone
+# difference is pinned by the byte-level per-core test.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.foreign_key, ddl.check, ddl.serial, ddl.sequence, func.sequence, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, types.i32, types.text, expr.arithmetic, resource.cost_metering
+
+statement ok
+CREATE TABLE alter_drop_parent (id i32 PRIMARY KEY, obsolete text, code i32 UNIQUE, amount i32 CHECK (amount > 0))
+
+statement ok
+CREATE TABLE alter_drop_child (id i32 PRIMARY KEY, parent_code i32 REFERENCES alter_drop_parent (code))
+
+statement ok
+INSERT INTO alter_drop_parent VALUES (1, 'old-a', 10, 5), (2, 'old-b', 20, 6)
+
+statement ok
+INSERT INTO alter_drop_child VALUES (1, 10)
+
+# cost: 3
+statement ok
+ALTER TABLE alter_drop_parent DROP COLUMN obsolete
+
+query III nosort
+SELECT id, code, amount FROM alter_drop_parent ORDER BY id
+----
+1
+10
+5
+2
+20
+6
+
+# The surviving UNIQUE/CHECK and the incoming FK all had ordinals above the removed column.
+statement error 23505
+INSERT INTO alter_drop_parent VALUES (3, 10, 7)
+
+statement error 23514
+INSERT INTO alter_drop_parent VALUES (3, 30, -1)
+
+statement error 23503
+INSERT INTO alter_drop_child VALUES (2, 99)
+
+# A removed column before the PK compacts the PK catalog ordinal without changing logical key bytes.
+statement ok
+CREATE TABLE alter_drop_before_pk (obsolete text, id i32 PRIMARY KEY, v i32 UNIQUE)
+
+statement ok
+INSERT INTO alter_drop_before_pk VALUES ('x', 1, 7), ('y', 2, 8)
+
+statement ok
+ALTER TABLE alter_drop_before_pk DROP obsolete
+
+query II nosort
+SELECT id, v FROM alter_drop_before_pk WHERE id = 2
+----
+2
+8
+
+statement error 23505
+INSERT INTO alter_drop_before_pk VALUES (3, 8)
+
+# COLUMN is optional; IF EXISTS makes only the missing action a no-op.
+statement ok
+ALTER TABLE alter_drop_parent DROP COLUMN IF EXISTS missing, DROP amount CASCADE
+
+statement ok
+ALTER TABLE alter_drop_parent DROP IF EXISTS missing RESTRICT
+
+query II nosort
+SELECT id, code FROM alter_drop_parent ORDER BY id
+----
+1
+10
+2
+20
+
+# DROP/ADD actions compose into one rewrite. The ADD action's captured default supplies old rows.
+statement ok
+CREATE TABLE alter_drop_multi (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO alter_drop_multi VALUES (1, 2, 3)
+
+statement ok
+ALTER TABLE alter_drop_multi DROP a, ADD c i32 DEFAULT 9, DROP b, ALTER c SET DEFAULT 11
+
+query II nosort
+SELECT id, c FROM alter_drop_multi
+----
+1
+9
+
+statement ok
+INSERT INTO alter_drop_multi (id) VALUES (2)
+
+query II nosort
+SELECT id, c FROM alter_drop_multi ORDER BY id
+----
+1
+9
+2
+11
+
+# An owned serial sequence follows its column: dropping the column auto-drops the sequence.
+statement ok
+CREATE TABLE alter_drop_serial (id i32 PRIMARY KEY, generated serial, note text)
+
+statement ok
+INSERT INTO alter_drop_serial (id, note) VALUES (1, 'x')
+
+statement ok
+ALTER TABLE alter_drop_serial DROP generated
+
+statement error 42P01
+SELECT nextval('alter_drop_serial_generated_seq')
+
+# A later ADD in the same action list sees the owned sequence as already dropped, so replacing a
+# serial column reuses the released auto-name rather than suffixing it.
+statement ok
+CREATE TABLE alter_drop_replace_serial (id i32 PRIMARY KEY, generated serial)
+
+statement ok
+INSERT INTO alter_drop_replace_serial (id) VALUES (1)
+
+statement ok
+ALTER TABLE alter_drop_replace_serial DROP generated, ADD generated serial
+
+query II nosort
+SELECT id, generated FROM alter_drop_replace_serial
+----
+1
+1
+
+query I nosort
+SELECT nextval('alter_drop_replace_serial_generated_seq')
+----
+2
+
+statement error 42P01
+SELECT nextval('alter_drop_replace_serial_generated_seq1')
+
+# The released owned sequence is no longer visible to defaults in later actions. In particular, a
+# rewrite cannot queue an advance that would resurrect the removed sequence with a stale owner.
+statement ok
+CREATE TABLE alter_drop_stale_serial (id i32 PRIMARY KEY, generated serial)
+
+statement ok
+INSERT INTO alter_drop_stale_serial (id) VALUES (1)
+
+statement error 42P01
+ALTER TABLE alter_drop_stale_serial DROP generated, ADD copied i32 DEFAULT nextval('alter_drop_stale_serial_generated_seq')
+
+# The failed statement is atomic: the original column and its owned sequence both remain.
+query II nosort
+SELECT id, generated FROM alter_drop_stale_serial
+----
+1
+1
+
+query I nosort
+SELECT nextval('alter_drop_stale_serial_generated_seq')
+----
+2

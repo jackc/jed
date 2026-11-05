@@ -1,0 +1,126 @@
+# CREATE RECURSIVE VIEW name (cols) AS query (spec/design/views.md §17): PostgreSQL's shorthand for
+# a view over WITH RECURSIVE name (cols) AS (query) SELECT cols FROM name. The column list is
+# required (42601); the body may name the view, which is the recursive CTE inside it. Every record is
+# PostgreSQL-oracle-checked; the stored text is pinned in views_jed.test.
+# requires: ddl.view, ddl.view_recursive, ddl.view_replace, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.aggregates, query.join_inner, query.cte_recursive, query.union, query.values_query, types.i32, types.text
+
+statement ok
+CREATE RECURSIVE VIEW r (n) AS VALUES (1) UNION ALL SELECT n + 1 FROM r WHERE n < 5
+
+query I nosort
+SELECT n FROM r ORDER BY n
+----
+1
+2
+3
+4
+5
+
+# the view is read like any other: joined, filtered, aggregated
+query I nosort
+SELECT count(*) FROM r WHERE n > 2
+----
+3
+
+# UNION (not ALL) deduplicates as the recursive CTE does
+statement ok
+CREATE RECURSIVE VIEW r2 (n) AS SELECT 1 UNION SELECT n + 1 FROM r2 WHERE n < 3
+
+query I nosort
+SELECT n FROM r2 ORDER BY n
+----
+1
+2
+3
+
+# a non-recursive body is allowed
+statement ok
+CREATE RECURSIVE VIEW r3 (n) AS SELECT 7
+
+query I nosort
+SELECT * FROM r3
+----
+7
+
+# a column list shorter than the body renames the leading columns, and only those are the view's
+statement ok
+CREATE RECURSIVE VIEW r4 (a) AS SELECT 1, 2
+
+query I nosort
+SELECT * FROM r4
+----
+1
+
+# a recursive view over a table, walking a tree
+statement ok
+CREATE TABLE tree (id i32 PRIMARY KEY, parent i32, name text)
+
+statement ok
+INSERT INTO tree VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), (4, 2, 'a1')
+
+statement ok
+CREATE RECURSIVE VIEW descendants (id, name, depth) AS SELECT id, name, 0 FROM tree WHERE parent IS NULL UNION ALL SELECT t.id, t.name, d.depth + 1 FROM tree t JOIN descendants d ON t.parent = d.id
+
+query ITI nosort
+SELECT id, name, depth FROM descendants ORDER BY id
+----
+1
+root
+0
+2
+a
+1
+3
+b
+1
+4
+a1
+2
+
+# the view sees the table's current rows
+statement ok
+INSERT INTO tree VALUES (5, 4, 'a1x')
+
+query I nosort
+SELECT depth FROM descendants WHERE id = 5
+----
+3
+
+# OR REPLACE RECURSIVE replaces the definition
+statement ok
+CREATE OR REPLACE RECURSIVE VIEW r (n) AS VALUES (1) UNION ALL SELECT n + 1 FROM r WHERE n < 3
+
+query I nosort
+SELECT n FROM r ORDER BY n
+----
+1
+2
+3
+
+# quoted column names are kept exactly
+statement ok
+CREATE RECURSIVE VIEW r5 ("N") AS SELECT 1 UNION ALL SELECT "N" + 1 FROM r5 WHERE "N" < 2
+
+query I nosort
+SELECT "N" FROM r5 ORDER BY 1
+----
+1
+2
+
+# --- errors ------------------------------------------------------------------------------------
+
+# the column list is required
+statement error 42601
+CREATE RECURSIVE VIEW bad AS SELECT 1
+
+# more column names than the body has columns
+statement error 42P10
+CREATE RECURSIVE VIEW bad (a, b) AS SELECT 1
+
+# a recursive view takes no check option
+statement error 0A000
+CREATE RECURSIVE VIEW bad (n) AS SELECT 1 UNION ALL SELECT n + 1 FROM bad WHERE n < 3 WITH CHECK OPTION
+
+# a recursive view is not updatable: its body is a WITH query
+statement error 55000
+INSERT INTO r3 VALUES (1)

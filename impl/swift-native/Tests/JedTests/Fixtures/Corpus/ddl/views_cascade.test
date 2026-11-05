@@ -1,0 +1,437 @@
+# DROP … CASCADE of dependent views (spec/design/views.md §6). DROP TABLE … CASCADE, DROP VIEW …
+# CASCADE, and ALTER TABLE … DROP COLUMN … CASCADE drop every view that depends on what they drop,
+# and every view that depends on one of those, transitively; views that do not are untouched. A
+# DROP COLUMN cascade drops only the views that reference the column, and the surviving views of the
+# table are rewritten and re-validated as for any DROP COLUMN. Within one ALTER TABLE, the drops run
+# in order and the type changes after them (PostgreSQL's passes). RESTRICT keeps refusing (2BP01).
+# Every record is PostgreSQL-oracle-checked.
+# requires: ddl.view, ddl.view_cascade, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.drop_table_multi, ddl.alter_table, ddl.foreign_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.order_by, query.join_inner, query.aggregates, query.cte, query.subquery_exists, query.subquery_correlated, query.union, types.i32, types.i64, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32, d i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10, 100), (2, 'y', 20, 200)
+
+statement ok
+CREATE TABLE s (k i32 PRIMARY KEY, n text)
+
+statement ok
+INSERT INTO s VALUES (1, 'one'), (3, 'three')
+
+statement ok
+CREATE TABLE other (z i32)
+
+statement ok
+INSERT INTO other VALUES (7)
+
+# --- DROP TABLE … CASCADE -----------------------------------------------------------------------
+
+statement ok
+CREATE VIEW vt AS SELECT a, b FROM t
+
+statement ok
+CREATE VIEW vtt AS SELECT b FROM vt WHERE a > 1
+
+statement ok
+CREATE VIEW vttt AS SELECT count(*) AS n FROM vtt
+
+statement ok
+CREATE VIEW vjoin AS SELECT t.a, s.n FROM t JOIN s ON s.k = t.a
+
+statement ok
+CREATE VIEW vsub AS SELECT z FROM other WHERE EXISTS (SELECT 1 FROM s WHERE s.k = other.z)
+
+statement ok
+CREATE VIEW vcte AS WITH x AS (SELECT k FROM s) SELECT k FROM x
+
+statement ok
+CREATE VIEW vunion AS SELECT z FROM other UNION ALL SELECT k FROM s
+
+statement ok
+CREATE VIEW vother AS SELECT z FROM other
+
+statement error 2BP01
+DROP TABLE s
+
+statement error 2BP01
+DROP TABLE s RESTRICT
+
+# every view reading s — through a join, a subquery, a CTE, or a set-operation arm — goes with it
+statement ok
+DROP TABLE s CASCADE
+
+statement error 42P01
+SELECT * FROM s
+
+statement error 42P01
+SELECT * FROM vjoin
+
+statement error 42P01
+SELECT * FROM vsub
+
+statement error 42P01
+SELECT * FROM vcte
+
+statement error 42P01
+SELECT * FROM vunion
+
+query I nosort
+SELECT * FROM vother
+----
+7
+
+query I nosort
+SELECT * FROM vttt
+----
+1
+
+# a chain of views over t goes with it
+statement ok
+DROP TABLE t CASCADE
+
+statement error 42P01
+SELECT * FROM vt
+
+statement error 42P01
+SELECT * FROM vtt
+
+statement error 42P01
+SELECT * FROM vttt
+
+query I nosort
+SELECT * FROM vother
+----
+7
+
+# the names are free again
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32, d i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10, 100), (2, 'y', 20, 200)
+
+statement ok
+CREATE VIEW vt AS SELECT a FROM t
+
+# --- DROP TABLE a, b CASCADE: views over either, and foreign keys ---------------------------------
+
+statement ok
+CREATE TABLE p (k i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE q (k i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE child (r i32 REFERENCES p (k))
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+INSERT INTO q VALUES (1)
+
+statement ok
+INSERT INTO child VALUES (1)
+
+statement ok
+CREATE VIEW vp AS SELECT k FROM p
+
+statement ok
+CREATE VIEW vq AS SELECT k FROM q
+
+statement ok
+CREATE VIEW vpq AS SELECT vp.k FROM vp JOIN vq ON vp.k = vq.k
+
+statement ok
+CREATE VIEW vchild AS SELECT r FROM child
+
+statement ok
+DROP TABLE p, q CASCADE
+
+statement error 42P01
+SELECT * FROM vp
+
+statement error 42P01
+SELECT * FROM vq
+
+statement error 42P01
+SELECT * FROM vpq
+
+# the referencing table loses only its foreign key; its view survives
+statement ok
+INSERT INTO child VALUES (99)
+
+query I rowsort
+SELECT * FROM vchild
+----
+1
+99
+
+statement ok
+DROP TABLE child CASCADE
+
+statement error 42P01
+SELECT * FROM vchild
+
+# --- DROP VIEW … CASCADE ------------------------------------------------------------------------
+
+statement ok
+CREATE VIEW v1 AS SELECT a, b, c FROM t
+
+statement ok
+CREATE VIEW v2 AS SELECT a, b FROM v1
+
+statement ok
+CREATE VIEW v3 AS SELECT a FROM v2 WHERE a > 1
+
+statement ok
+CREATE VIEW v4 AS SELECT v3.a, vt.a AS a2 FROM v3 JOIN vt ON v3.a = vt.a
+
+statement ok
+CREATE VIEW vside AS SELECT a FROM v1 WHERE a = 1
+
+statement error 2BP01
+DROP VIEW v2
+
+statement error 2BP01
+DROP VIEW v2 RESTRICT
+
+statement ok
+DROP VIEW v2 CASCADE
+
+statement error 42P01
+SELECT * FROM v2
+
+statement error 42P01
+SELECT * FROM v3
+
+statement error 42P01
+SELECT * FROM v4
+
+query I nosort
+SELECT * FROM vside
+----
+1
+
+query I rowsort
+SELECT * FROM vt
+----
+1
+2
+
+# a list whose members' dependents overlap, a repeated name, and a missing name under IF EXISTS
+statement ok
+CREATE VIEW v2 AS SELECT a, b FROM v1
+
+statement ok
+CREATE VIEW v3 AS SELECT a FROM v2
+
+statement ok
+DROP VIEW IF EXISTS nosuch, v2, vside, v2 CASCADE
+
+statement error 42P01
+SELECT * FROM v3
+
+query ITI nosort
+SELECT * FROM v1 ORDER BY a
+----
+1
+x
+10
+2
+y
+20
+
+# a missing name without IF EXISTS fails the whole statement
+statement error 42P01
+DROP VIEW v1, nosuch CASCADE
+
+query I nosort
+SELECT count(*) FROM v1
+----
+2
+
+statement ok
+DROP VIEW v1 CASCADE
+
+# --- ALTER TABLE … DROP COLUMN … CASCADE ----------------------------------------------------------
+
+statement ok
+CREATE VIEW vb AS SELECT a, b FROM t
+
+statement ok
+CREATE VIEW vbb AS SELECT b FROM vb
+
+statement ok
+CREATE VIEW vstar AS SELECT * FROM t
+
+statement ok
+CREATE VIEW vc AS SELECT a, c FROM t
+
+statement ok
+CREATE VIEW vcorr AS SELECT z FROM other WHERE EXISTS (SELECT 1 FROM t WHERE t.c = other.z)
+
+statement ok
+CREATE VIEW vcount AS SELECT count(*) AS n FROM t
+
+statement error 2BP01
+ALTER TABLE t DROP COLUMN b
+
+statement error 2BP01
+ALTER TABLE t DROP COLUMN b RESTRICT
+
+# the views that reference b go (vb, vstar), with the views over them (vbb); the others stay
+statement ok
+ALTER TABLE t DROP COLUMN b CASCADE
+
+statement error 42P01
+SELECT * FROM vb
+
+statement error 42P01
+SELECT * FROM vbb
+
+statement error 42P01
+SELECT * FROM vstar
+
+query II nosort
+SELECT * FROM vc ORDER BY a
+----
+1
+10
+2
+20
+
+query I nosort
+SELECT * FROM vcount
+----
+2
+
+query I nosort
+SELECT * FROM vt ORDER BY a
+----
+1
+2
+
+query III nosort
+SELECT * FROM t ORDER BY a
+----
+1
+10
+100
+2
+20
+200
+
+# a column reached only through a correlated subquery is a dependency too
+statement ok
+ALTER TABLE t DROP COLUMN c CASCADE
+
+statement error 42P01
+SELECT * FROM vc
+
+statement error 42P01
+SELECT * FROM vcorr
+
+query I nosort
+SELECT * FROM vcount
+----
+2
+
+# a column no view uses drops like RESTRICT
+statement ok
+ALTER TABLE t ADD COLUMN e i32
+
+statement ok
+ALTER TABLE t DROP COLUMN e CASCADE
+
+query II nosort
+SELECT * FROM t ORDER BY a
+----
+1
+100
+2
+200
+
+# --- several actions in one ALTER TABLE -----------------------------------------------------------
+
+statement ok
+ALTER TABLE t ADD COLUMN f i32
+
+statement ok
+ALTER TABLE t ADD COLUMN g i32
+
+statement ok
+CREATE VIEW vfg AS SELECT f, g FROM t
+
+# a later RESTRICT drop is no longer blocked by a view an earlier CASCADE drop took
+statement ok
+ALTER TABLE t DROP COLUMN f CASCADE, DROP COLUMN g
+
+statement error 42P01
+SELECT * FROM vfg
+
+statement ok
+ALTER TABLE t ADD COLUMN f i32
+
+statement ok
+ALTER TABLE t ADD COLUMN g i32
+
+statement ok
+CREATE VIEW vfg AS SELECT f, g FROM t
+
+# an earlier RESTRICT drop is still blocked
+statement error 2BP01
+ALTER TABLE t DROP COLUMN g, DROP COLUMN f CASCADE
+
+# a type change runs after the drops, in either order
+statement ok
+ALTER TABLE t ALTER COLUMN g TYPE i64, DROP COLUMN f CASCADE
+
+statement error 42P01
+SELECT * FROM vfg
+
+statement ok
+ALTER TABLE t ADD COLUMN f i32
+
+statement ok
+CREATE VIEW vfg AS SELECT f, g FROM t
+
+statement ok
+ALTER TABLE t DROP COLUMN f CASCADE, ALTER COLUMN g TYPE i32
+
+statement error 42P01
+SELECT * FROM vfg
+
+statement ok
+ALTER TABLE t ADD COLUMN f i32
+
+statement ok
+CREATE VIEW vfg AS SELECT f, g FROM t
+
+# a type change of a column a surviving view uses is still refused
+statement ok
+CREATE VIEW vd AS SELECT d FROM t
+
+statement error 0A000
+ALTER TABLE t ALTER COLUMN d TYPE i64, DROP COLUMN f CASCADE
+
+query I nosort
+SELECT count(*) FROM vfg
+----
+2
+
+statement ok
+DROP TABLE t, other CASCADE
+
+statement error 42P01
+SELECT * FROM vfg
+
+statement error 42P01
+SELECT * FROM vd
+
+statement error 42P01
+SELECT * FROM vt
+
+statement error 42P01
+SELECT * FROM vother

@@ -1,0 +1,202 @@
+# Composite PRIMARY KEY — the table-level PRIMARY KEY (a, b, …) constraint. The key is the
+# members' concatenated encodings in LIST (key) order — which may differ from declaration
+# order since the v5 catalog reshape; uniqueness is over the WHOLE tuple (23505); every
+# member is implicitly NOT NULL (23502); DDL errors match PostgreSQL (42703/42701/42P16);
+# a non-keyable member type is a documented 0A000 narrowing.
+# spec/design/constraints.md §3, grammar.md §28.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.i16, types.i32, types.text, types.decimal, types.interval, resource.cost_metering
+
+statement ok
+CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))
+
+# rows arrive out of tuple order; a negative first component exercises the sign-flip
+statement ok
+INSERT INTO t VALUES (2, 1, 50), (1, 2, 30), (1, 1, 20)
+
+statement ok
+INSERT INTO t VALUES (-1, 9, 10)
+
+# a shared first component is a distinct row — the whole tuple is the key
+statement ok
+INSERT INTO t VALUES (2, 0, 40)
+
+# a duplicate tuple traps 23505
+statement error 23505
+INSERT INTO t VALUES (1, 2, 99)
+
+# an in-batch duplicate too (two-phase / all-or-nothing: nothing stored)
+statement error 23505
+INSERT INTO t VALUES (5, 5, 1), (5, 5, 2)
+
+# ORDER BY over both members is fully deterministic (and mirrors the stored key order)
+query III nosort
+SELECT a, b, v FROM t ORDER BY a, b
+----
+-1
+9
+10
+1
+1
+20
+1
+2
+30
+2
+0
+40
+2
+1
+50
+
+# NULL into a member traps 23502 (PRIMARY KEY ⇒ NOT NULL, per member)
+statement error 23502
+INSERT INTO t VALUES (4, NULL, 1)
+
+# an omitted member (no default) traps 23502 the same way
+statement error 23502
+INSERT INTO t (a, v) VALUES (4, 1)
+
+# assigning a key member re-keys the row (§11 step 6 — the narrowing is lifted); here both
+# matched rows (1,1) and (1,2) would become (1,9), an in-batch key collision → 23505
+# (all-or-nothing, the table is unchanged)
+statement error 23505
+UPDATE t SET b = 9 WHERE a = 1
+
+# non-member columns update fine
+statement ok
+UPDATE t SET v = 99 WHERE a = 1 AND b = 1
+
+query III nosort
+SELECT a, b, v FROM t ORDER BY a, b
+----
+-1
+9
+10
+1
+1
+99
+1
+2
+30
+2
+0
+40
+2
+1
+50
+
+# a single-column table constraint is the column-level form's equivalent
+statement ok
+CREATE TABLE s (k i32, PRIMARY KEY (k))
+
+statement ok
+INSERT INTO s VALUES (1)
+
+statement error 23505
+INSERT INTO s VALUES (1)
+
+# --- DDL errors (codes match PostgreSQL, oracle-checked) ---
+
+# an unknown member column
+statement error 42703
+CREATE TABLE e1 (a i32, PRIMARY KEY (a, nosuch))
+
+# a repeated member column
+statement error 42701
+CREATE TABLE e2 (a i32, b i32, PRIMARY KEY (a, a))
+
+# at most one primary key across both forms
+statement error 42P16
+CREATE TABLE e3 (a i32 PRIMARY KEY, b i32, PRIMARY KEY (b))
+
+statement error 42P16
+CREATE TABLE e4 (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))
+
+# the list order is the KEY order — it may differ from declaration order (the original
+# 0A000 narrowing was lifted by the secondary-index catalog reshape, constraints.md §3):
+# this table keys by (b, a); a duplicate (b, a) tuple still traps 23505.
+statement ok
+CREATE TABLE e5 (a i32, b i32, PRIMARY KEY (b, a))
+
+statement ok
+INSERT INTO e5 VALUES (1, 20), (2, 10), (3, 15)
+
+statement error 23505
+INSERT INTO e5 VALUES (1, 20)
+
+# cost: 7
+query II nosort
+SELECT a, b FROM e5 ORDER BY b
+----
+2
+10
+3
+15
+1
+20
+
+# a text member is now key-encodable (the text-terminated-escape encoding, encoding.md §2.4 —
+# self-delimiting, so it composes with the fixed-width members); decimal (§2.5) and interval (§2.10)
+# are likewise key-encodable. Types still without a key encoding (float/composite/array/range) remain
+# the 0A000 narrowing.
+statement ok
+CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))
+
+statement ok
+INSERT INTO e6 VALUES (1, 'b'), (1, 'aa'), (1, 'a'), (2, 'a')
+
+# the composite key orders by a, then by the text member s in code-point order (a < aa < b)
+query IT nosort
+SELECT a, s FROM e6
+----
+1
+a
+1
+aa
+1
+b
+2
+a
+
+# a decimal member composes with a fixed-width member: its variable-width decimal-order-preserving
+# body is self-delimiting (terminator), so the following column is unambiguous. Orders by a, then
+# by the numeric member d (-1.5 < 0.5 < 2).
+statement ok
+CREATE TABLE e7 (a i32, d numeric, PRIMARY KEY (a, d))
+
+statement ok
+INSERT INTO e7 VALUES (1, 2), (1, -1.5), (1, 0.5), (2, -1.5)
+
+query DI nosort
+SELECT d, a FROM e7
+----
+-1.5
+1
+0.5
+1
+2
+1
+-1.5
+2
+
+# an interval member composes with a fixed-width member: its 16-byte span key (interval-span-i128,
+# encoding.md §2.10) is fixed-width, so the following column is unambiguous. Orders by a, then by the
+# interval member iv in canonical-span order (-1 day < 1 hour < 1 day).
+statement ok
+CREATE TABLE e8 (a i32, iv interval, PRIMARY KEY (a, iv))
+
+statement ok
+INSERT INTO e8 VALUES (1, '1 day'), (1, '-1 day'), (1, '1 hour'), (2, '-1 day')
+
+query TI nosort
+SELECT iv, a FROM e8
+----
+-1 days
+1
+01:00:00
+1
+1 day
+1
+-1 days
+2

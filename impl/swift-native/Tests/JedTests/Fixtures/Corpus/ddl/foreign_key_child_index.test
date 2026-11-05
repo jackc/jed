@@ -1,0 +1,226 @@
+# FOREIGN KEY reverse match through a child index (spec/design/constraints.md §6.5, §6.11;
+# spec/design/cost.md §3 "Foreign-key reverse match"). A parent DELETE/UPDATE whose referenced
+# tuple disappears searches every NO ACTION/RESTRICT child for a row still referencing it. A child
+# B-tree whose leading key columns are the FK columns (the child PK, or a non-partial plain-column
+# ordered index) is probed for the key prefix. With no such key the child is fully scanned. Both
+# are metered: an index probe charges the probed tree's overlapping pages, and the scan charges the
+# child's full-scan block plus one storage_row_read per row pulled, up to the first match. The
+# visible behavior — whether 23503 fires — is identical on every path; only cost and work change.
+# All units weigh 1, and every table here fits in one leaf unless stated otherwise.
+# requires: ddl.create_table, ddl.primary_key, ddl.foreign_key, ddl.foreign_key_child_index, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.set_returning, query.aggregates, query.where_eq, query.comparison_order, query.point_lookup, types.i32, resource.cost_metering, resource.cost_limit
+
+statement ok
+CREATE TABLE ci_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE ci_c (id i32 PRIMARY KEY, pid i32 REFERENCES ci_p, other i32)
+
+statement ok
+INSERT INTO ci_p VALUES (1), (2), (3), (4), (5), (6)
+
+statement ok
+INSERT INTO ci_c VALUES (10, 1, 0), (20, 1, 0), (30, 2, 0)
+
+# --- No usable child key: the full-scan fallback ----------------------------------------------
+
+# The parent point delete is 1 page + 1 row + 1 filter eval = 3. The reverse scan of ci_c (no key
+# leads with pid) adds 1 page + 3 rows pulled = 4, for 7 in total.
+# cost: 7
+statement ok
+DELETE FROM ci_p WHERE id = 6
+
+# A referenced parent is still rejected; the scan stops at the first match.
+statement error 23503
+DELETE FROM ci_p WHERE id = 2
+
+# An index whose LEADING column is not the FK column cannot serve the probe: still a scan.
+statement ok
+CREATE INDEX ci_c_other_pid ON ci_c (other, pid)
+
+# cost: 7
+statement ok
+DELETE FROM ci_p WHERE id = 5
+
+# A partial index can omit a referencing row, so it never qualifies.
+statement ok
+CREATE INDEX ci_c_pid_partial ON ci_c (pid) WHERE other > 0
+
+# An expression key never qualifies either.
+statement ok
+CREATE INDEX ci_c_pid_expr ON ci_c ((pid + 0))
+
+statement ok
+INSERT INTO ci_p VALUES (5)
+
+# cost: 7
+statement ok
+DELETE FROM ci_p WHERE id = 5
+
+# --- A usable index: the probe ------------------------------------------------------------------
+
+# A plain index on pid (trailing columns are ignored) is probed for the parent key: 1 page in place
+# of the scan's 1 page + 3 rows. 3 + 1 = 4.
+statement ok
+CREATE INDEX ci_c_pid ON ci_c (pid, other)
+
+# cost: 4
+statement ok
+DELETE FROM ci_p WHERE id = 4
+
+# The probe finds referencing children exactly as the scan did.
+statement error 23503
+DELETE FROM ci_p WHERE id = 1
+
+statement error 23503
+DELETE FROM ci_p WHERE id = 2
+
+# Deleting the last child releases the parent. The child delete itself is 1 page + 1 row + 1 eval.
+# cost: 3
+statement ok
+DELETE FROM ci_c WHERE id = 30
+
+# cost: 4
+statement ok
+DELETE FROM ci_p WHERE id = 2
+
+# A parent key UPDATE re-probes the parent (unmetered), then probes the child for the old key.
+# The parent UPDATE is 1 page + 1 row + 1 filter eval = 3; the child probe is 1 page.
+# cost: 4
+statement ok
+UPDATE ci_p SET id = 30 WHERE id = 3
+
+statement error 23503
+UPDATE ci_p SET id = 11 WHERE id = 1
+
+query I rowsort
+SELECT id FROM ci_p
+----
+1
+30
+
+# --- A child primary key that leads with the FK column -----------------------------------------
+
+statement ok
+CREATE TABLE ci_line (pid i32 REFERENCES ci_p, seq i32, PRIMARY KEY (pid, seq))
+
+statement ok
+INSERT INTO ci_p VALUES (7), (8)
+
+statement ok
+INSERT INTO ci_line VALUES (7, 1), (7, 2)
+
+# Two referencing tables (ci_c by its index, ci_line by its PK prefix): one page each. 3 + 1 + 1 = 5.
+# cost: 5
+statement ok
+DELETE FROM ci_p WHERE id = 8
+
+statement error 23503
+DELETE FROM ci_p WHERE id = 7
+
+# --- A composite FK served by an index in a different column order -----------------------------
+
+statement ok
+CREATE TABLE ci_cp (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE ci_cc (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (x, y) REFERENCES ci_cp (a, b))
+
+statement ok
+INSERT INTO ci_cp VALUES (1, 1), (1, 2), (2, 1)
+
+statement ok
+INSERT INTO ci_cc VALUES (1, 1, 2), (2, 2, 1), (3, NULL, 1)
+
+# Unindexed: the parent point delete (1 page + 1 row + 3 filter evals: two `=` and the AND) plus
+# the scan (1 page + 3 rows) = 9. The (NULL, 1) child references nothing (MATCH SIMPLE).
+# cost: 9
+statement ok
+DELETE FROM ci_cp WHERE a = 1 AND b = 1
+
+statement ok
+INSERT INTO ci_cp VALUES (1, 1)
+
+# The index lists the FK columns as (y, x); their set is the FK's, so it serves the probe, which
+# encodes the parent tuple in the index's column order. 5 + 1 page = 6.
+statement ok
+CREATE INDEX ci_cc_yx ON ci_cc (y, x)
+
+# cost: 6
+statement ok
+DELETE FROM ci_cp WHERE a = 1 AND b = 1
+
+statement error 23503
+DELETE FROM ci_cp WHERE a = 1 AND b = 2
+
+statement error 23503
+DELETE FROM ci_cp WHERE a = 2 AND b = 1
+
+# An index covering only one of the two FK columns does not qualify.
+statement ok
+CREATE TABLE ci_cc2 (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (x, y) REFERENCES ci_cp (a, b))
+
+statement ok
+CREATE INDEX ci_cc2_x ON ci_cc2 (x)
+
+statement ok
+INSERT INTO ci_cp VALUES (3, 3)
+
+# 5 (parent) + 1 page (the ci_cc probe) + 0 (the ci_cc2 scan: an empty table has no root, so
+# its scan block is 0 pages and it pulls no row) = 6.
+# cost: 6
+statement ok
+DELETE FROM ci_cp WHERE a = 3 AND b = 3
+
+# --- The ceiling now bounds the reverse match ---------------------------------------------------
+
+statement ok
+CREATE TABLE big_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE big_c (id i32 PRIMARY KEY, pid i32 REFERENCES big_p)
+
+statement ok
+INSERT INTO big_p SELECT x FROM generate_series(1, 200) x
+
+statement ok
+INSERT INTO big_c SELECT x, x % 100 + 1 FROM generate_series(1, 3000) x
+
+# Parents 101..200 have no children. Unindexed, the DELETE scans all 3000 children for each of the
+# 100 parents — 300000+ rows of work the meter now sees, so a ceiling stops it.
+# max_cost: 100000
+statement error 54P01
+DELETE FROM big_p WHERE id > 100
+
+# The aborted DELETE rolled back.
+query I nosort
+SELECT count(*) FROM big_p
+----
+200
+
+# Without a ceiling the DELETE completes. The parent range scan is 1 page + 100 rows + 100 filter
+# evals = 201. Each of the 100 reverse scans charges big_c's 7 pages + 3000 rows: 201 + 300700.
+# cost: 300901
+statement ok
+DELETE FROM big_p WHERE id > 100
+
+statement ok
+INSERT INTO big_p SELECT x FROM generate_series(101, 200) x
+
+statement ok
+CREATE INDEX big_c_pid ON big_c (pid)
+
+# Indexed, each parent is one descent of the two-level index: 201 + 100 × 2 = 401, well under the
+# same ceiling.
+# max_cost: 100000
+# cost: 401
+statement ok
+DELETE FROM big_p WHERE id > 100
+
+query I nosort
+SELECT count(*) FROM big_p
+----
+100
+
+# The probe still rejects a referenced parent.
+statement error 23503
+DELETE FROM big_p WHERE id = 50

@@ -1,0 +1,85 @@
+# Implicit argument coercion for scalar functions (spec/design/arg-coercion.md). A call that matches
+# no catalog row as written is resolved by the cheapest admissible argument coercions from the
+# compare.toml cost table: an integer (constant or value) takes a decimal overload (cost 3) before a
+# numeric constant enters the float family (cost 4), and a float-only function accepts a numeric
+# constant but never an integer or decimal value (the float island, float.md §6). The coercion
+# itself charges nothing. PostgreSQL resolves an integer through float8 instead, so the decimal
+# results below are ledgered type/value divergences (oracle_overrides.toml, arg-coercion.md §6);
+# the float-only results agree with PostgreSQL. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.where_eq, types.i16, types.i32, types.i64, types.decimal, types.f32, types.f64, expr.numeric_transcendental, func.arg_coercion, resource.cost_metering
+
+statement ok
+CREATE TABLE ac (id i32 PRIMARY KEY, s i16, i i32, b i64, d numeric, f f64)
+
+statement ok
+INSERT INTO ac VALUES (1, -3, 9, 3, 2.50, 2.0)
+
+# --- an integer constant takes the decimal overload of every decimal-slot function -------------
+query DDDDD nosort
+SELECT exp(1), log10(100), log(100), log(2, 8), pow(2, 3)
+----
+2.7182818284590452
+2.0000000000000000
+2.0000000000000000
+3.0000000000000000
+8.0000000000000000
+
+query DDIID nosort
+SELECT sign(-5), sign(0), scale(5), min_scale(5), trim_scale(5)
+----
+-1
+0
+0
+0
+5
+
+query DDDDD nosort
+SELECT round(5, 2), round(7), ceil(7), ceiling(7), floor(-7)
+----
+5.00
+7
+7
+7
+-7
+
+# --- an integer value converts the same way, at scale 0 ----------------------------------------
+query DDDDI nosort
+SELECT sqrt(i), sign(s), power(b, 2), round(b, 1), scale(b) FROM ac WHERE id = 1
+----
+3.000000000000000
+-1
+9.0000000000000000
+3.0
+0
+
+# --- a bare NULL adopts the cheapest candidate's type (decimal) --------------------------------
+query D nosort
+SELECT power(NULL, 2)
+----
+NULL
+
+# --- a float-only function admits a numeric constant (PostgreSQL agrees) -----------------------
+query RRRR nosort
+SELECT sin(0), radians(180), degrees(1), atan2(1, 1)
+----
+0
+3.141592653589793
+57.29577951308232
+0.7853981633974483
+
+# --- but never an integer or decimal value: the float island ----------------------------------
+statement error 42883
+SELECT sin(i) FROM ac WHERE id = 1
+
+# --- the coercion charges nothing: an explicit cast is one operator_eval more per row -----------
+# cost: 950
+query D nosort
+SELECT sqrt(i) FROM ac WHERE id = 1
+----
+3.000000000000000
+
+# cost: 951
+query D nosort
+SELECT sqrt(i::numeric) FROM ac WHERE id = 1
+----
+3.000000000000000

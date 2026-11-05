@@ -1,0 +1,149 @@
+# A DEFAULT on a composite column (spec/design/composite.md §12): a ROW(...) constructor (its fields
+# coerced by the assignment rule), a record_in string literal, or a nested ROW(ROW(...), ...) — kept
+# as an expression default and evaluated per applied row, by an omitted column, a DEFAULT slot,
+# UPDATE SET col = DEFAULT, ALTER TABLE ADD COLUMN (filling the existing rows), and ALTER COLUMN SET /
+# DROP DEFAULT. A bad default fails at CREATE TABLE: a malformed literal is 22P02, a field-count
+# mismatch 42846 (cannot_coerce, as PostgreSQL), a non-composite expression 42804, and a column
+# reference 0A000. Type names avoid PostgreSQL's built-in geometric types. Oracle-checked against
+# PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default, ddl.column_default_expr, ddl.alter_table, ddl.composite_default, dml.insert, dml.insert_column_list, dml.update, dml.update_default, query.select, query.order_by, types.i32, types.text, types.composite, types.timestamp, types.timestamp_precision, types.interval, types.interval_qualifier, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, h addr DEFAULT ROW('dflt', 1 + 1), k addr DEFAULT '(q,3)', n addr DEFAULT NULL)
+
+statement ok
+INSERT INTO d (id) VALUES (1)
+
+statement ok
+INSERT INTO d VALUES (2, DEFAULT, DEFAULT, DEFAULT)
+
+statement ok
+INSERT INTO d VALUES (3, ROW('x', 1), NULL, ROW('n', 0))
+
+query ITTT nosort
+SELECT id, h, k, n FROM d ORDER BY id
+----
+1
+(dflt,2)
+(q,3)
+NULL
+2
+(dflt,2)
+(q,3)
+NULL
+3
+(x,1)
+NULL
+(n,0)
+
+statement ok
+UPDATE d SET h = DEFAULT, k = DEFAULT WHERE id = 3
+
+query TT nosort
+SELECT h, k FROM d WHERE id = 3
+----
+(dflt,2)
+(q,3)
+
+# ADD COLUMN fills the existing rows with the default.
+statement ok
+ALTER TABLE d ADD COLUMN m addr DEFAULT ROW('added', 9)
+
+query IT nosort
+SELECT id, m FROM d ORDER BY id
+----
+1
+(added,9)
+2
+(added,9)
+3
+(added,9)
+
+statement ok
+ALTER TABLE d ALTER COLUMN n SET DEFAULT ROW(upper('s'), 5)
+
+statement ok
+INSERT INTO d (id) VALUES (4)
+
+statement ok
+ALTER TABLE d ALTER COLUMN h DROP DEFAULT
+
+statement ok
+INSERT INTO d (id) VALUES (5)
+
+query ITT nosort
+SELECT id, h, n FROM d WHERE id >= 4 ORDER BY id
+----
+4
+(dflt,2)
+(S,5)
+5
+NULL
+(S,5)
+
+# A nested ROW(ROW(...), ...) default.
+statement ok
+CREATE TYPE leg AS (a addr, b addr)
+
+statement ok
+CREATE TABLE dl (id i32 PRIMARY KEY, v leg DEFAULT ROW(ROW('x', 1), NULL))
+
+statement ok
+INSERT INTO dl (id) VALUES (1)
+
+query TT nosort
+SELECT v, (v).a FROM dl
+----
+("(x,1)",)
+(x,1)
+
+# --- a composite with typmod'd fields ----------------------------------------------------------------
+# The default's fields take their field typmods: timestamp(0) rounds, HOUR TO MINUTE cuts.
+
+statement ok
+CREATE TYPE stamp AS (at timestamp(0), d interval hour to minute)
+
+statement ok
+CREATE TABLE ds (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO ds VALUES (1)
+
+statement ok
+ALTER TABLE ds ADD COLUMN v stamp DEFAULT ROW(timestamp '2024-01-02 03:04:05.6', interval '1 day 01:02:03.7')
+
+statement ok
+INSERT INTO ds (id) VALUES (2)
+
+query IT nosort
+SELECT id, v FROM ds ORDER BY id
+----
+1
+("2024-01-02 03:04:06","1 day 01:02:00")
+2
+("2024-01-02 03:04:06","1 day 01:02:00")
+
+# --- rejections at CREATE TABLE ----------------------------------------------------------------------
+
+statement error 22P02
+CREATE TABLE bad (id i32 PRIMARY KEY, h addr DEFAULT '(a,zz)')
+
+statement error 42846
+CREATE TABLE bad (id i32 PRIMARY KEY, h addr DEFAULT ROW('a'))
+
+statement error 42846
+CREATE TABLE bad (id i32 PRIMARY KEY, h addr DEFAULT ROW('a', 1, 2))
+
+statement error 42804
+CREATE TABLE bad (id i32 PRIMARY KEY, h addr DEFAULT 5)
+
+statement error 0A000
+CREATE TABLE bad (id i32 PRIMARY KEY, h addr DEFAULT ROW('a', id))
+
+statement error 22P02
+ALTER TABLE d ALTER COLUMN n SET DEFAULT '(a,zz)'
+
+

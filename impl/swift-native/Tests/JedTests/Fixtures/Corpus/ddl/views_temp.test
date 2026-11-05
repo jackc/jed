@@ -1,0 +1,176 @@
+# skip: disk — temporary views and tables cannot survive the disk-mode per-record reopen
+# (spec/design/conformance.md §3).
+# Temporary views (spec/design/views.md §10): CREATE TEMP | TEMPORARY VIEW, and a view whose body
+# reads a temporary relation, which is temporary too (PostgreSQL also emits a notice; jed has no
+# notice channel). A temporary view lives in the session's temporary domain, may read temporary and
+# persistent relations, and is read, written through, renamed, replaced, and dropped like any view.
+# The relations it reads are its dependencies: dropping one is 2BP01 unless CASCADE, and an ON
+# COMMIT DROP table takes its dependent views with it. Every record is PostgreSQL-oracle-checked; the
+# jed-specific behavior (temp.jed_views, the temp. qualifier, the session gate) is in
+# views_temp_jed.test.
+# requires: ddl.view, ddl.view_temp, ddl.view_cascade, ddl.view_alter, ddl.view_replace, dml.view_write, ddl.temp_table, ddl.temp_on_commit, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.alter_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, query.subquery_scalar, txn.explicit, types.i32, types.text
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, a text)
+
+statement ok
+INSERT INTO p VALUES (1, 'one'), (2, 'two')
+
+statement ok
+CREATE TEMP TABLE tt (id i32 PRIMARY KEY, b text)
+
+statement ok
+INSERT INTO tt VALUES (1, 'uno'), (3, 'tres')
+
+# --- a temporary view over a persistent table --------------------------------------------------------
+
+statement ok
+CREATE TEMP VIEW tv AS SELECT id, a FROM p WHERE id > 0
+
+query IT nosort
+SELECT id, a FROM tv ORDER BY id
+----
+1
+one
+2
+two
+
+# it is updatable like any view
+statement ok
+INSERT INTO tv VALUES (5, 'five')
+
+statement ok
+UPDATE tv SET a = 'FIVE' WHERE id = 5
+
+query T nosort
+SELECT a FROM p WHERE id = 5
+----
+FIVE
+
+statement ok
+CREATE TEMPORARY VIEW tv2 AS SELECT count(*) AS n FROM p
+
+query I nosort
+SELECT n FROM tv2
+----
+3
+
+# --- a view over a temporary table is temporary ------------------------------------------------------
+
+statement ok
+CREATE VIEW jv AS SELECT p.id, p.a, tt.b FROM p JOIN tt ON p.id = tt.id
+
+query ITT nosort
+SELECT id, a, b FROM jv
+----
+1
+one
+uno
+
+# so is a view over a temporary view, or one whose subquery reads a temporary table
+statement ok
+CREATE VIEW jv2 AS SELECT id FROM jv
+
+statement ok
+CREATE VIEW jv3 AS SELECT (SELECT count(*) FROM tt) AS c
+
+query I nosort
+SELECT c FROM jv3
+----
+2
+
+# --- dependencies ------------------------------------------------------------------------------------
+
+statement error 2BP01
+DROP TABLE p
+
+statement error 2BP01
+DROP TABLE tt
+
+statement error 2BP01
+DROP VIEW jv
+
+statement ok
+DROP VIEW jv CASCADE
+
+statement error 42P01
+SELECT * FROM jv2
+
+# DROP TABLE … CASCADE drops the temporary views over the table
+statement ok
+DROP TABLE tt CASCADE
+
+statement error 42P01
+SELECT * FROM jv3
+
+# --- renames and replacement -------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE p RENAME TO p2
+
+query IT nosort
+SELECT id, a FROM tv ORDER BY id
+----
+1
+one
+2
+two
+5
+FIVE
+
+statement ok
+ALTER TABLE p2 RENAME COLUMN a TO aa
+
+query T nosort
+SELECT a FROM tv WHERE id = 1
+----
+one
+
+statement ok
+ALTER VIEW tv RENAME TO tv9
+
+query I nosort
+SELECT count(*) FROM tv9
+----
+3
+
+statement ok
+CREATE OR REPLACE TEMP VIEW tv9 AS SELECT id, aa AS a, id * 10 AS x FROM p2
+
+query ITI nosort
+SELECT id, a, x FROM tv9 WHERE id = 2
+----
+2
+two
+20
+
+statement ok
+DROP VIEW tv9, tv2
+
+statement ok
+DROP TABLE p2
+
+# --- ON COMMIT DROP takes the views over the table with it --------------------------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TEMP TABLE oc (a i32) ON COMMIT DROP
+
+statement ok
+CREATE TEMP VIEW ocv AS SELECT a FROM oc
+
+statement ok
+INSERT INTO ocv VALUES (1)
+
+query I nosort
+SELECT a FROM ocv
+----
+1
+
+statement ok
+COMMIT
+
+statement error 42P01
+SELECT * FROM ocv

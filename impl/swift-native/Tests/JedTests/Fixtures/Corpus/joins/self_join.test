@@ -1,0 +1,97 @@
+# Self-joins and multi-table chains (spec/design/grammar.md §15). A self-join joins a table to
+# itself under two distinct aliases (each is its own scope relation, with its own column offset).
+# A 3-table chain mixes INNER and CROSS, left-deep. With NO ORDER BY the row order is
+# unspecified (CLAUDE.md §8) — multi-row results are compared rowsort; ORDER BY pins a sequence.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.index_nested_loop, query.join_left, query.cross_join, query.table_alias, query.qualified_column, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE emp (id i32 PRIMARY KEY, name text, mgr i32)
+
+statement ok
+CREATE TABLE region (id i32 PRIMARY KEY, rname text)
+
+statement ok
+INSERT INTO emp VALUES (1, 'ceo', NULL), (2, 'vp', 1), (3, 'eng', 2), (4, 'eng2', 2)
+
+statement ok
+INSERT INTO region VALUES (1, 'us'), (2, 'eu')
+
+# Employee-to-manager self-join: e.mgr = m.id. The CEO (mgr NULL) matches no manager (3-valued
+# ON). The ON compares m's PK (m.id) to the sibling e.mgr, so m is bound per outer row by
+# index-nested-loop (query.index_nested_loop): e (outer) 1 page + 4 rows = 5; m seeks `m.id = e.mgr`
+# per e-row — e1 mgr NULL → 3VL-empty (0 page, 0 row), e2/e3/e4 → hit (1 page + 1 row each) = 3 page
+# + 3 rows = 6; 3 ON evals over the 3 hits; 3 produced. 5 + 6 + 3 + 3 = 17. (Pre-INL: emp full-scanned
+# twice + 16 ON = 27.)
+# names: name, name
+# cost: 17
+query TT nosort
+SELECT e.name, m.name FROM emp AS e JOIN emp AS m ON e.mgr = m.id ORDER BY e.id
+----
+vp
+ceo
+eng
+vp
+eng2
+vp
+
+# No ORDER BY -> order unspecified, compared rowsort (the exact row set is the contract).
+# e1 (mgr NULL) yields nothing; then e2->m1, e3->m2, e4->m2. Same index-nested-loop bound on m as
+# above: e 5 + m (3 seek pages + 3 rows) 6 + 3 ON + 3 produced = 17.
+# names: id, id
+# cost: 17
+query II rowsort
+SELECT e.id, m.id FROM emp AS e JOIN emp AS m ON e.mgr = m.id
+----
+2
+1
+3
+2
+4
+2
+
+# G26 — a self LEFT JOIN preserves the self-unmatched row: the CEO (e.mgr NULL) matches no manager
+# (3VL ON), but LEFT keeps it with the manager side NULL-extended. So all four employees appear,
+# the CEO carrying a NULL manager name. Index-nested-loop is SOUND for the LEFT join's nullable
+# side: the CEO's empty per-outer bound (mgr NULL) NULL-extends it, exactly as a full scan with no
+# match would. e 5 + m (3 seek pages + 3 rows) 6 + 3 ON + 4 produced (3 matched + CEO extended) = 18.
+# names: name, name
+# cost: 18
+query TT nosort
+SELECT e.name, m.name FROM emp AS e LEFT JOIN emp AS m ON e.mgr = m.id ORDER BY e.id
+----
+ceo
+NULL
+vp
+ceo
+eng
+vp
+eng2
+vp
+
+# 3-table chain: (emp e JOIN emp m ON e.mgr = m.id) CROSS JOIN region. The self-join yields 3
+# rows, CROSS region (2) gives 6. m is bound per outer row by index-nested-loop (as above); region
+# is a CROSS (materialized once). e 5 + m (3 seek pages + 3 rows) 6 + 3 ON + region (1 page + 2 rows)
+# 3 + 6 produced = 23. (Pre-INL: emp full-scanned twice + 16 ON = 32.)
+# names: name, name, rname
+# cost: 23
+query TTT nosort
+SELECT e.name, m.name, region.rname FROM emp AS e JOIN emp AS m ON e.mgr = m.id CROSS JOIN region ORDER BY e.id, region.id
+----
+vp
+ceo
+us
+vp
+ceo
+eu
+eng
+vp
+us
+eng
+vp
+eu
+eng2
+vp
+us
+eng2
+vp
+eu

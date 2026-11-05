@@ -1,0 +1,269 @@
+# Identifiers (spec/design/grammar.md §3): a BARE identifier folds to lowercase in the lexer; a
+# double-quoted identifier is the name VERBATIM (case kept, any character, `""` an embedded quote);
+# after the fold every name compares BYTE-EXACTLY — tables, columns, aliases, CTEs, composite types
+# and fields, sequences, functions, and type names. A quoted identifier is never a keyword, so a
+# keyword spelling quoted is always a name. PostgreSQL's rule, adopted exactly (oracle-clean).
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, dml.insert_multi_row, dml.returning, query.select, query.where_eq, query.order_by, query.order_by_alias, query.column_alias, query.table_alias, query.join_inner, query.cte, query.quoted_identifiers, types.i32, types.text, types.composite, ddl.sequence, ddl.serial, func.sequence, func.casing, cast.explicit
+
+# --- bare names fold; quoted names are exact -------------------------------------------------------
+
+statement ok
+CREATE TABLE Orders (Id i32 PRIMARY KEY, "userId" i32, "Order" text, "select" i32, "my col" text, "a""b" i32, "café" text)
+
+statement ok
+INSERT INTO ORDERS (ID, "userId", "Order", "select", "my col", "a""b", "café") VALUES (1, 10, 'a', 100, 'x', 7, 'é'), (2, 20, 'b', 200, 'y', 8, 'è')
+
+# the table is `orders` and the first column `id` (both folded); quoted columns keep their case
+# names: id, userId, Order, select, my col, a"b, café
+query IITITIT rowsort
+SELECT * FROM orders
+----
+1
+10
+a
+100
+x
+7
+é
+2
+20
+b
+200
+y
+8
+è
+
+query IIT rowsort
+SELECT o."userId", "orders"."select", o."my col" FROM Orders AS o JOIN "orders" ON o.id = "orders".ID
+----
+10
+100
+x
+20
+200
+y
+
+# a bare reference folds, so it cannot reach a mixed-case name
+statement error 42703
+SELECT userId FROM orders
+
+statement error 42703
+SELECT "UserId" FROM orders
+
+# and a quoted reference does not fold, so it cannot reach a folded one
+statement error 42703
+SELECT "Id" FROM orders
+
+statement error 42P01
+SELECT * FROM "Orders"
+
+# a zero-length quoted identifier is a syntax error
+statement error 42601
+SELECT "" FROM orders
+
+# --- a quoted keyword is a name, never the keyword ---------------------------------------------------
+
+statement ok
+CREATE TABLE n ("null" i32, "from" i32, "where" text)
+
+statement ok
+INSERT INTO n VALUES (NULL, 5, 'w')
+
+query BIT nosort
+SELECT "null" IS NULL, "from", "where" FROM n WHERE "from" = 5
+----
+true
+5
+w
+
+query I nosort
+SELECT "from"."from" FROM n AS "from"
+----
+5
+
+# --- names differing only in case are distinct -----------------------------------------------------
+
+statement error 42701
+CREATE TABLE d (a i32, "a" i32)
+
+statement ok
+CREATE TABLE d (a i32, "A" i32)
+
+statement ok
+INSERT INTO d VALUES (1, 2)
+
+# names: a, A
+query II nosort
+SELECT a, "A" FROM d
+----
+1
+2
+
+statement ok
+CREATE TABLE "Orders" (x i32)
+
+statement ok
+INSERT INTO "Orders" VALUES (42)
+
+query I nosort
+SELECT x FROM "Orders"
+----
+42
+
+statement error 42703
+SELECT x FROM orders
+
+# relation labels compare exactly too
+statement error 42712
+SELECT 1 FROM d AS A JOIN n AS a ON true
+
+query I nosort
+SELECT "A".a FROM d AS "A" JOIN n AS a ON true
+----
+1
+
+statement ok
+DROP TABLE "Orders"
+
+statement error 42P01
+SELECT x FROM "Orders"
+
+query I nosort
+SELECT count(*) FROM orders
+----
+2
+
+# --- output names fold like any identifier ---------------------------------------------------------
+
+# names: total
+query I nosort
+SELECT 1 AS Total
+----
+1
+
+# names: Total
+query I nosort
+SELECT 1 AS "Total"
+----
+1
+
+# a bare ORDER BY name folds; it matches a folded alias, not a quoted mixed-case one
+query I nosort
+SELECT id AS K FROM orders ORDER BY "k" DESC
+----
+2
+1
+
+statement error 42703
+SELECT id AS "K" FROM orders ORDER BY k
+
+# --- CTE names, composite types and fields ---------------------------------------------------------
+
+query I nosort
+WITH "X" AS (SELECT 1 AS a) SELECT a FROM "X"
+----
+1
+
+statement error 42P01
+WITH "X" AS (SELECT 1 AS a) SELECT a FROM x
+
+statement ok
+CREATE TYPE "Pt" AS ("X" i32, y i32)
+
+# names: X, y
+query II nosort
+SELECT ('(1,2)'::"Pt")."X", ('(1,2)'::"Pt").Y
+----
+1
+2
+
+statement error 42703
+SELECT ('(1,2)'::"Pt").x
+
+# --- function and type names are lowercase built-ins: a bare spelling folds to them, a quoted ------
+# --- mixed-case spelling does not ------------------------------------------------------------------
+
+query TT nosort
+SELECT LOWER('A'), "lower"('B')
+----
+a
+b
+
+statement error 42883
+SELECT "LOWER"('A')
+
+query I nosort
+SELECT CAST('5' AS "int4")
+----
+5
+
+statement error 42704
+SELECT CAST('5' AS "INT4")
+
+# --- sequence names; the regclass-style text argument parses as an identifier ----------------------
+
+statement ok
+CREATE SEQUENCE "MySeq"
+
+# a bare word in the text folds, so it misses the mixed-case sequence
+statement error 42P01
+SELECT nextval('MySeq')
+
+query I nosort
+SELECT nextval('"MySeq"')
+----
+1
+
+# surrounding whitespace is ignored
+statement ok
+CREATE SEQUENCE "Ws"
+
+query I nosort
+SELECT nextval('  "Ws"  ')
+----
+1
+
+# malformed name text is 42602 invalid_name: unterminated quote, empty, internal whitespace,
+# trailing characters
+statement error 42602
+SELECT nextval('"MySeq')
+
+statement error 42602
+SELECT nextval('')
+
+statement error 42602
+SELECT nextval('My Seq')
+
+statement error 42602
+SELECT nextval('"MySeq" x')
+
+# `""` is the empty name, which never exists
+statement error 42P01
+SELECT nextval('""')
+
+statement ok
+CREATE SEQUENCE lower_seq
+
+query I nosort
+SELECT nextval(' LOWER_SEQ ')
+----
+1
+
+# a serial column of a quoted table owns a sequence named from the exact names; its generated
+# DEFAULT quotes that name so it resolves
+statement ok
+CREATE TABLE "Tab" (id serial PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO "Tab" (v) VALUES (5)
+
+query II nosort
+SELECT id, v FROM "Tab"
+----
+1
+5
+
+query I nosort
+SELECT nextval('"Tab_id_seq"')
+----
+2

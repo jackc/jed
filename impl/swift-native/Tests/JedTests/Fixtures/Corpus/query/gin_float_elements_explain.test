@@ -1,0 +1,77 @@
+# GIN over f32[] / f64[] — the selected plan (jed-only: EXPLAIN is jed's own rendering, never
+# oracle-imported). Pins that a float-element GIN index bounds `= ANY`, `@>`, `&&`, array `=`, the
+# cross-width `f64 = ANY(f32[])` membership, and a mutation's target-row scan (spec/design/gin.md §6).
+# The rows themselves are oracle-checked in query/gin_float_elements.test.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_float_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.explain, dml.insert, dml.insert_multi_row, dml.delete, query.select, func.array_containment, func.array_quantified, cast.operator, types.f64, types.f32, types.i32, types.array
+
+statement ok
+CREATE TABLE f (id i32 PRIMARY KEY, v f64[], w f32[])
+
+statement ok
+CREATE INDEX f_v_gin ON f USING gin (v)
+
+statement ok
+CREATE INDEX f_w_gin ON f USING gin (w)
+
+statement ok
+INSERT INTO f VALUES
+  (1, '{-0,1.5}', '{-0,1.5}'),
+  (2, '{0,0}', '{0}'),
+  (3, '{NaN}', '{NaN}'),
+  (4, '{}', '{}'),
+  (5, NULL, NULL)
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM f WHERE '-0'::f64 = ANY(v)
+----
+0
+Filter
+conjuncts=1
+1
+Scan f
+GIN bound: using f_v_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM f WHERE w @> '{NaN}'::f32[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan f
+GIN bound: using f_w_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM f WHERE v = '{0,0}'::f64[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan f
+GIN bound: using f_v_gin; touched=2
+
+# cross-width membership: the f64 query value narrows to an f32 term at execution
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM f WHERE '1.5'::f64 = ANY(w)
+----
+0
+Filter
+conjuncts=1
+1
+Scan f
+GIN bound: using f_w_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) DELETE FROM f WHERE v && '{NaN,0}'::f64[]
+----
+0
+Delete f
+-
+1
+Filter
+conjuncts=1
+2
+Scan f
+GIN bound: using f_v_gin; touched=1

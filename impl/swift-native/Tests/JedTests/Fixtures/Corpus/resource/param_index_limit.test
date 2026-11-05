@@ -1,0 +1,35 @@
+# Bind-parameter index limit — a statement may name parameters up to $65535 (MAX_PARAM_INDEX,
+# PostgreSQL's wire-protocol limit on the parameters of one statement); a larger index is 42601
+# at the lexer (CLAUDE.md §13; spec/design/api.md §5, grammar.md §5). The parameter table a
+# statement allocates is sized by its LARGEST index, so without the bound `SELECT $4294967295`
+# allocated four billion slots and killed the process (a fatal out-of-memory, not an engine
+# error) — the §13 resource gate the cost ceiling cannot reach, since the allocation precedes
+# metering. The bound is a fixed, cross-core-identical constant, like the nesting-depth limit:
+# the same statement is accepted or rejected identically in Rust / Go / TS. jed-specific in its
+# trigger (PostgreSQL's parser accepts any index and its Bind message carries at most 65535), so
+# not oracle-checked.
+# requires: query.select_no_from, resource.param_index_limit
+
+# $65535 is the highest index the lexer accepts: it is lexed, and the statement then fails only
+# because the parameter has no type context (42P18) — a resolve-time error, past the lexer.
+statement error 42P18
+SELECT $65535
+
+# One past the maximum is rejected at the lexer with 42601, whatever follows.
+statement error 42601
+SELECT $65536
+
+# A huge index — the one that exhausted memory — is the same 42601.
+statement error 42601
+SELECT $4294967295
+
+# An index past any machine integer is rejected the same way, never parsed as a number first.
+statement error 42601
+SELECT $99999999999999999999999
+
+# The other lexer rules are unchanged: $0 and a leading zero are 42601.
+statement error 42601
+SELECT $0
+
+statement error 42601
+SELECT $01

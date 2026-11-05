@@ -1,0 +1,51 @@
+# Collation version-skew — the NON-SKEWED twin of skew.test (spec/design/collation.md §12/§14).
+#
+# Same pre-built fixture shape as collation_skew_corrupt.jed — table `t(id i32 PK, name text COLLATE
+# "unicode")`, same rows, a secondary index `t_name_idx` on `name` — but TWO things differ: the
+# `unicode` reference entry is pinned to 17.0.0, MATCHING the loaded bundle (verdict Full, read-write),
+# and the index stores the CORRECT `unicode` UCA sort keys. This is the contrast that makes skew.test
+# meaningful: a CORRECT collated index is safe to push down to, a SKEWED one is not.
+#
+# The same query returns the same correct rows here — and, unlike the skewed file, it would STAY
+# correct once collated-index pushdown uses this index (the index already agrees with the loaded
+# order). Writes succeed, because a Full table is read-write.
+#
+# requires: harness.fixture_open, expr.collate, ddl.collate_column, ddl.secondary_index, query.select, query.comparison_order, query.order_by, dml.insert, types.i32, types.text, resource.cost_metering
+
+# fixture: fileformat/fixtures/collation_skew_twin.jed
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+# The identical query to skew.test — correct today (full scan) and correct under future pushdown
+# (the index agrees with the loaded order). Set + order both pinned.
+query I rowsort
+SELECT id FROM t WHERE name >= 'b' COLLATE "unicode"
+----
+2
+4
+
+query I nosort
+SELECT id FROM t WHERE name >= 'b' COLLATE "unicode" ORDER BY name COLLATE "unicode"
+----
+4
+2
+
+# Equality returns the 'Z' row (id 2) — correct today and under a future equality pushdown, since
+# this index's keys agree with the loaded collation.
+query I rowsort
+SELECT id FROM t WHERE name = 'Z' COLLATE "unicode"
+----
+2
+
+# A Full (non-skewed) table is read-write — a write the skewed twin refuses with XX002 succeeds here.
+statement ok
+INSERT INTO t VALUES (5, 'c')
+
+# The new row participates in the loaded-collation order: a < ä < b < c < z-family < Z → 1,3,4,5,2.
+query I nosort
+SELECT id FROM t ORDER BY name COLLATE "unicode"
+----
+1
+3
+4
+5
+2

@@ -1,0 +1,354 @@
+# Linguistic collation — the COLLATE expression operator, ORDER BY … COLLATE, and the real
+# version-pinned vendored collations (spec/design/collation.md §1/§6/§7/§14). A collation is VENDORED
+# into the binary (reference-only model, collation.md §2/§9); the `# load-collation:` directive just
+# declares which vendored collation a test needs (a no-op assertion when it is vendored — the harness
+# only checks the build vendors it, never compiling the fixture path). `expr COLLATE "name"` and
+# `ORDER BY col COLLATE "name"` order text by that collation's UCA sort key in the ordering
+# comparisons (< <= > >=). `=`/`<>` stay byte-equality (deterministic-collation equality IS
+# byte-identity — §7). `"C"` is the built-in byte / code-point order.
+#
+# The vendored set is the real CLDR-DUCET data (UCA/UCD 17.0.0, spec/collation/17.0.0):
+#   unicode : the CLDR-tailored DUCET root — a < A < ä < … < n < ñ < o < … < z   (ä near a; ñ = n+accent)
+#   es      : root + the Spanish tailoring &N<ñ<<<Ñ — ñ is a DISTINCT primary letter after n, so a
+#             whole-letter word boundary appears: 'nz' < 'ña' (every n-word sorts before every ñ-word)
+# and built-in C (byte order): A(0x41) < a(0x61) < b < z < ä(0xC3A4).
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, types.i32, types.text, null.three_valued, expr.collate, ddl.collate_column, ddl.unique, ddl.secondary_index, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+# load-collation: es = collation/17.0.0/root.allkeys, collation/17.0.0/es.ldml
+
+# ============================================================================================
+# COLLATE on an ordering comparison — the collation flips the answer vs C
+# ============================================================================================
+
+# C (byte) order: 'ä' (0xC3A4) > 'z' (0x7A), so ä < z is FALSE
+query B nosort
+SELECT 'ä' < 'z'
+----
+false
+
+# unicode: ä sorts near a, so ä < z is TRUE (COLLATE on one operand sets the comparison collation)
+query B nosort
+SELECT 'ä' < 'z' COLLATE "unicode"
+----
+true
+
+# es treats ñ as a distinct letter after n, so 'nz' < 'ña' is TRUE (every n-word precedes every ñ-word)
+query B nosort
+SELECT 'nz' < 'ña' COLLATE "es"
+----
+true
+
+# … but under the untailored root ñ is just n+accent, so 'ña' sorts among the n-words: 'nz' < 'ña' FALSE
+query B nosort
+SELECT 'nz' < 'ña' COLLATE "unicode"
+----
+false
+
+# COLLATE on the left operand works the same (explicit collation propagates to the comparison)
+query B nosort
+SELECT 'ä' COLLATE "unicode" < 'z'
+----
+true
+
+# C orders uppercase before lowercase ('A' 0x41 < 'a' 0x61): A < a is TRUE under C …
+query B nosort
+SELECT 'A' < 'a'
+----
+true
+
+# … but unicode orders lowercase before uppercase (a < A): A < a is FALSE
+query B nosort
+SELECT 'A' < 'a' COLLATE "unicode"
+----
+false
+
+# <= / >= honor the collation too (ä <= z under unicode)
+query B nosort
+SELECT 'ä' >= 'z' COLLATE "unicode"
+----
+false
+
+# ============================================================================================
+# Equality / inequality are byte-equality even under a collation (§7: deterministic-collation
+# equality IS byte-identity). 'a' and 'A' are distinct byte strings → never equal under any.
+# ============================================================================================
+
+query B nosort
+SELECT 'a' = 'a' COLLATE "unicode"
+----
+true
+
+query B nosort
+SELECT 'a' = 'A' COLLATE "unicode"
+----
+false
+
+query B nosort
+SELECT 'a' <> 'A' COLLATE "es"
+----
+true
+
+# A NULL operand makes a collated ordering comparison UNKNOWN (three-valued, IS NULL → true)
+query B nosort
+SELECT ('a' < NULL COLLATE "unicode") IS NULL
+----
+true
+
+# ============================================================================================
+# ORDER BY … COLLATE — the same rows in different orders
+# ============================================================================================
+
+statement ok
+CREATE TABLE people (id i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO people VALUES (1, 'a'), (2, 'A'), (3, 'b'), (4, 'z'), (5, 'ä')
+
+# C (byte) order: A(0x41) < a(0x61) < b < z < ä → ids 2, 1, 3, 4, 5
+query I nosort
+SELECT id FROM people ORDER BY name
+----
+2
+1
+3
+4
+5
+
+# unicode: a < A < ä < b < z → ids 1, 2, 5, 3, 4
+query I nosort
+SELECT id FROM people ORDER BY name COLLATE "unicode"
+----
+1
+2
+5
+3
+4
+
+# explicit COLLATE "C" overrides back to byte order (= the un-annotated order)
+query I nosort
+SELECT id FROM people ORDER BY name COLLATE "C"
+----
+2
+1
+3
+4
+5
+
+# DESC under a collation reverses the collated order (unicode descending → z, b, ä, A, a)
+query I nosort
+SELECT id FROM people ORDER BY name COLLATE "unicode" DESC
+----
+4
+3
+5
+2
+1
+
+# unicode vs es on the SAME rows: 'ña' is n+accent under the root (sorts before 'nz') but a distinct
+# ñ-letter under es (sorts after every n-word) — the ordering literally swaps.
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO w VALUES (1, 'nz'), (2, 'ña')
+
+# unicode: ñ = n+accent, so 'ña' < 'nz' → ids 2, 1
+query I nosort
+SELECT id FROM w ORDER BY s COLLATE "unicode"
+----
+2
+1
+
+# es: ñ is a distinct letter after n, so 'nz' < 'ña' → ids 1, 2
+query I nosort
+SELECT id FROM w ORDER BY s COLLATE "es"
+----
+1
+2
+
+# ============================================================================================
+# Errors
+# ============================================================================================
+
+# an unvendored collation name is 42704 (undefined_object)
+statement error 42704
+SELECT 'a' < 'b' COLLATE "no_such_collation"
+
+# COLLATE on a non-text type is 42804 (datatype_mismatch) — "C" is built in but the type is wrong
+statement error 42804
+SELECT 1 COLLATE "C"
+
+# two DIFFERENT explicit collations in one comparison conflict — 42P21 (collation_mismatch)
+statement error 42P21
+SELECT 'a' COLLATE "unicode" < 'b' COLLATE "es"
+
+# the SAME explicit collation on both sides is NOT a conflict
+query B nosort
+SELECT 'a' COLLATE "unicode" < 'b' COLLATE "unicode"
+----
+true
+
+# ORDER BY a non-text column with COLLATE is 42804
+statement error 42804
+SELECT id FROM people ORDER BY id COLLATE "unicode"
+
+# ============================================================================================
+# Per-column COLLATE (slice 1d) — a column's collation is frozen at CREATE TABLE and becomes its
+# IMPLICIT collation: ORDER BY / comparisons use it with NO explicit COLLATE (collation.md §1/§5).
+# ============================================================================================
+
+statement ok
+CREATE TABLE c1 (id i32 PRIMARY KEY, name text COLLATE "unicode")
+
+statement ok
+INSERT INTO c1 VALUES (1, 'a'), (2, 'A'), (3, 'b'), (4, 'z'), (5, 'ä')
+
+# ORDER BY with NO explicit COLLATE uses the column's frozen unicode collation → a < A < ä < b < z
+query I nosort
+SELECT id FROM c1 ORDER BY name
+----
+1
+2
+5
+3
+4
+
+# an explicit COLLATE on the query overrides the column's implicit collation back to byte order
+query I nosort
+SELECT id FROM c1 ORDER BY name COLLATE "C"
+----
+2
+1
+3
+4
+5
+
+# a comparison against a literal uses the column's implicit collation (the literal takes its
+# neighbour's): ä < z is TRUE under the column's unicode collation
+query I rowsort
+SELECT id FROM c1 WHERE name < 'b'
+----
+1
+2
+5
+
+# two columns with DIFFERENT implicit collations, compared with no explicit COLLATE → 42P22
+# (indeterminate_collation). C counts as a distinct implicit collation, so unicode vs C conflicts.
+statement ok
+CREATE TABLE c2 (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")
+
+statement ok
+INSERT INTO c2 VALUES ('a', 'z', 'b')
+
+statement error 42P22
+SELECT a < b FROM c2
+
+statement error 42P22
+SELECT a < c FROM c2
+
+# an explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') under unicode = true
+query B nosort
+SELECT a < b COLLATE "unicode" FROM c2
+----
+true
+
+# COLLATE on a non-text column in CREATE TABLE is 42804 (datatype_mismatch)
+statement error 42804
+CREATE TABLE bad1 (a i32 COLLATE "unicode")
+
+# an unvendored collation name in a column COLLATE is 42704 (undefined_object)
+statement error 42704
+CREATE TABLE bad2 (a text COLLATE "no_such_collation")
+
+# ============================================================================================
+# Cost — the `collate` unit is charged per code point of each operand of a collated ORDERING
+# comparison (collation.md §11): operator_eval(1) + collate(cp('aä')=2 + cp('az')=2) + row_produced(1)
+# ============================================================================================
+
+# cost: 6
+query B nosort
+SELECT 'aä' < 'az' COLLATE "unicode"
+----
+true
+
+# a C / un-collated comparison charges NO collate, but DOES charge varlen_compare for the byte scan
+# (the collate complement, cost.md §3): operator_eval(1) + varlen_compare (min(2,2)−1 = 1) + produced(1) = 3
+# cost: 3
+query B nosort
+SELECT 'aä' < 'az'
+----
+false
+
+# ============================================================================================
+# Collated KEYS (slice 1e) — a non-C collated text column is a valid PRIMARY KEY / UNIQUE / index.
+# Its stored key is the UCA sort key (encoding.md §2.12), so the B-tree orders by collation. A
+# deterministic collation's equality is byte-identity (§7), so 'a' and 'A' are DISTINCT keys (both
+# admitted) and a byte-duplicate violates the constraint. Equality + range predicates on a collated
+# key now PUSH DOWN (the sort-key probe seeks/ranges the B-tree — §8); the cost proof of that engaging
+# is suites/collation/collated_pushdown.test. Here we only pin the rows are correct either way.
+# ============================================================================================
+
+# a collated text PRIMARY KEY admits 'a' and 'A' (distinct under a deterministic collation)
+statement ok
+CREATE TABLE k1 (name text COLLATE "unicode" PRIMARY KEY)
+
+statement ok
+INSERT INTO k1 VALUES ('z'), ('a'), ('b'), ('A')
+
+# ORDER BY the collated PK column (no explicit COLLATE) → collation order a < A < b < z
+query T nosort
+SELECT name FROM k1 ORDER BY name
+----
+a
+A
+b
+z
+
+# a byte-duplicate PK value violates the constraint (the auto-named <table>_pkey index)
+statement error 23505
+INSERT INTO k1 VALUES ('a')
+
+# a point lookup on the collated PK finds the row (= is byte-equality; pushed down via the sort-key probe)
+query T nosort
+SELECT name FROM k1 WHERE name = 'A'
+----
+A
+
+# a range predicate on the collated PK uses the collation: a < A < b, so name < 'b' → a, A (not z)
+query T rowsort
+SELECT name FROM k1 WHERE name < 'b'
+----
+A
+a
+
+# a collated UNIQUE constraint: distinct byte values admitted, a byte-duplicate rejected
+statement ok
+CREATE TABLE k2 (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)
+
+statement ok
+INSERT INTO k2 VALUES (1, 'a'), (2, 'A'), (3, 'b')
+
+statement error 23505
+INSERT INTO k2 VALUES (4, 'a')
+
+# a collated SECONDARY INDEX — ORDER BY the indexed column uses its frozen collation
+# unicode: a < A < ä < z, so ids → 2, 4, 3, 1
+statement ok
+CREATE TABLE k3 (id i32 PRIMARY KEY, name text COLLATE "unicode")
+
+statement ok
+CREATE INDEX k3_name ON k3 (name)
+
+statement ok
+INSERT INTO k3 VALUES (1, 'z'), (2, 'a'), (3, 'ä'), (4, 'A')
+
+query I nosort
+SELECT id FROM k3 ORDER BY name
+----
+2
+4
+3
+1

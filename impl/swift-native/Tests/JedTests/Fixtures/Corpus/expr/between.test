@@ -1,0 +1,114 @@
+# BETWEEN / NOT BETWEEN — the range predicate (spec/design/grammar.md §21). `x BETWEEN lo AND
+# hi` is `x >= lo AND x <= hi`; NOT BETWEEN is its negation. The connective is the Kleene AND,
+# so a NULL bound does NOT simply propagate: `5 BETWEEN 10 AND NULL` is `FALSE AND UNKNOWN` =
+# FALSE (a FALSE operand dominates), while `5 BETWEEN 1 AND NULL` is `TRUE AND UNKNOWN` = NULL.
+# Both bounds parse at the additive level, so the structural AND is not the logical connective
+# and `x BETWEEN a AND b AND c` is `(x BETWEEN a AND b) AND c`. Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, expr.between, expr.comparison_value, types.i16, types.i32, types.text, null.three_valued, resource.cost_metering, query.where_contradiction
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, NULL)
+
+# Range test: only a=15 falls in [10,20]; a=NULL is UNKNOWN (dropped). Cost: 1 page + 4 scanned, the
+# desugared `And(Ge(a,10), Le(a,20))` is 3 interior nodes per scanned row except a=5 and a=NULL,
+# where `a >= 10` is not TRUE and stops the WHERE's AND (2) = 10, plus 1 produced = 16.
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE a BETWEEN 10 AND 20 ORDER BY id
+----
+2
+
+# NOT BETWEEN keeps the present values outside [10,20] (a=5, a=25); a=NULL stays UNKNOWN.
+query I nosort
+SELECT id FROM t WHERE a NOT BETWEEN 10 AND 20 ORDER BY id
+----
+1
+3
+
+# Projected as a boolean — a NULL `a` makes both bounds UNKNOWN, so the result is NULL.
+# names: ?column?
+query B nosort
+SELECT a BETWEEN 1 AND 100 FROM t ORDER BY id
+----
+true
+true
+true
+NULL
+
+# G19 — REVERSED bounds. BETWEEN does NOT reorder its bounds: `a BETWEEN 20 AND 10` is
+# `a >= 20 AND a <= 10`, which no value can satisfy, so it is empty. The planner proves that
+# contradiction from the literals (planner.md §3.1) and reads nothing: cost 0.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE a BETWEEN 20 AND 10 ORDER BY id
+----
+
+# NOT BETWEEN over the same reversed range is TRUE for every PRESENT value (the inner BETWEEN is
+# always FALSE), while the NULL `a` row stays UNKNOWN and is dropped. The desugared
+# `Not(And(Ge,Le))` is 4 interior nodes per row, 3 where `a >= 20` is FALSE (a=5, a=15) and decides
+# the AND. 4 scanned + 14 + 3 produced + 1 page = 22.
+# cost: 22
+query I nosort
+SELECT id FROM t WHERE a NOT BETWEEN 20 AND 10 ORDER BY id
+----
+1
+2
+3
+
+# Expression bounds: both endpoints are general expressions, evaluated per row. `a BETWEEN id AND
+# id + 20` keeps id 1 (5 in [1,21]) and id 2 (15 in [2,22]); id 3 (25 > 23) and the NULL row drop.
+# `And(Ge(a,id), Le(a, id+20))` is 4 interior nodes per row (the `id + 20` Add included), 2 on the
+# NULL row, whose NULL `a >= id` stops the WHERE's AND. 4 scanned + 14 + 2 produced + 1 page = 21.
+# cost: 21
+query I nosort
+SELECT id FROM t WHERE a BETWEEN id AND id + 20 ORDER BY id
+----
+1
+2
+
+# A one-row table to evaluate constant predicates: the headline Kleene-AND cases.
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# `5 BETWEEN 10 AND NULL` = `(5>=10) AND (5<=NULL)` = `FALSE AND UNKNOWN` = FALSE — a FALSE
+# operand dominates the Kleene AND, so a NULL bound does NOT poison the result here.
+query B nosort
+SELECT 5 BETWEEN 10 AND NULL FROM one
+----
+false
+
+# `5 BETWEEN 1 AND NULL` = `TRUE AND UNKNOWN` = NULL — no FALSE to dominate, so it is UNKNOWN.
+query B nosort
+SELECT 5 BETWEEN 1 AND NULL FROM one
+----
+NULL
+
+query B nosort
+SELECT 5 BETWEEN 1 AND 10 FROM one
+----
+true
+
+# Precedence: the second AND is the logical connective, so this is
+# `(a BETWEEN 1 AND 20) AND (id = 2)` — only id=2 (a=15 is in range and id=2) survives.
+query I nosort
+SELECT id FROM t WHERE a BETWEEN 1 AND 20 AND id = 2 ORDER BY id
+----
+2
+
+# A cross-family bound is a type error (an integer column vs a text bound).
+statement error 42804
+SELECT id FROM t WHERE a BETWEEN 1 AND 'x'
+
+# An untyped integer-literal bound too wide for the column's type traps at resolve.
+statement ok
+CREATE TABLE s16 (id i32 PRIMARY KEY, v i16)
+
+statement error 22003
+SELECT id FROM s16 WHERE v BETWEEN 1 AND 100000

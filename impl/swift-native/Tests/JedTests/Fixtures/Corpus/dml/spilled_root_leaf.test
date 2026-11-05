@@ -1,0 +1,63 @@
+# A table that shrinks back to a single root leaf keeps reading its spilled values correctly
+# (large-values.md §14, bplus-reshape.md B4). Rows faulted in from a demoted leaf hold unfetched
+# references to their overflow chains. When a commit rewrites a dirty leaf it resolves those
+# references and writes the values into FRESH chains, and the old chains join the free list. A
+# non-root leaf is then demoted and re-read from disk, but a root leaf stays resident — so it must
+# not keep the old references, or the next commit that reuses those freed pages corrupts it.
+# (Found by deterministic simulation: the stale root read "expected an overflow page", XX001.)
+#
+# The 4500-char values are built by a recursive CTE over a 64-symbol LCG (lpad(c, n + 1, s)
+# appends c to s), so LZ4 cannot shrink them and they spill plain at the default 8 KiB page; the
+# 3000-char filler stays inline and spreads the table over many leaves. jed-specific storage shape,
+# CROSS-CORE-checked; the results themselves are plain PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.delete, query.select, query.order_by, query.cte, query.cte_recursive, query.set_returning, query.values, types.i32, types.i64, types.text
+
+statement ok
+CREATE TABLE shrink (id i32 PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO shrink SELECT k, s FROM (WITH RECURSIVE gen(k, n, x, s) AS (SELECT k, 0, seed, ''::text FROM (VALUES (1, 12345::i64), (2, 777::i64)) AS seeds(k, seed) UNION ALL SELECT k, n + 1, (x * 1103515245 + 12345) % 2147483648, lpad(chr((48 + x / 65536 % 64)::i32), n + 1, s) FROM gen WHERE n < 4500) SELECT k, s FROM gen WHERE n = 4500) AS big
+
+statement ok
+INSERT INTO shrink SELECT g, repeat('x', 3000) FROM generate_series(3, 40) g
+
+query IIT nosort
+SELECT id, length(v), md5(v) FROM shrink WHERE id <= 2 ORDER BY id
+----
+1
+4500
+c4ac5420bf9ffb72c51cc79de45a5238
+2
+4500
+8f0677459c2ebee9550b21f11d2f1e0b
+
+# Deleting the filler collapses the tree to one root leaf holding rows 1 and 2, whose values were
+# faulted in as references; this commit rewrites them into fresh chains.
+statement ok
+DELETE FROM shrink WHERE id >= 3
+
+# Commits that never touch `shrink` grow the file until free-list compaction frees its old chains,
+# then reuse those pages.
+statement ok
+CREATE TABLE shrink_other (id i32 PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO shrink_other SELECT g, repeat('y', 3000) FROM generate_series(1, 40) g
+
+statement ok
+INSERT INTO shrink_other SELECT g, repeat('z', 3000) FROM generate_series(41, 80) g
+
+query IIT nosort
+SELECT id, length(v), md5(v) FROM shrink ORDER BY id
+----
+1
+4500
+c4ac5420bf9ffb72c51cc79de45a5238
+2
+4500
+8f0677459c2ebee9550b21f11d2f1e0b
+
+query I nosort
+SELECT count(*) FROM shrink_other
+----
+80

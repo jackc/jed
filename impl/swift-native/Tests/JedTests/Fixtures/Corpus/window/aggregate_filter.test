@@ -1,0 +1,101 @@
+# FILTER (WHERE cond) on a WINDOW aggregate (spec/design/aggregates.md §20). agg(x) FILTER (WHERE
+# cond) OVER (...) folds only the frame rows for which cond is TRUE. Works with the default frame,
+# explicit frames, EXCLUDE, and PARTITION BY. FILTER on a non-aggregate window function stays 0A000.
+# requires: ddl.create_table, dml.insert, query.select, query.window, query.window_aggregate, query.window_aggregate_filter, types.i32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,2,50)
+
+# Default frame (running): sum(v) FILTER (WHERE v >= 20) — id=1 frame {10} has no passing row -> NULL;
+# then cumulative over rows with v>=20: 20, 50, 90, 140.
+# names: id, sum
+query II nosort
+SELECT id, sum(v) FILTER (WHERE v >= 20) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+NULL
+2
+20
+3
+50
+4
+90
+5
+140
+
+# count(*) FILTER over the running frame counts passing rows so far.
+# names: id, count
+query II nosort
+SELECT id, count(*) FILTER (WHERE v >= 20) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+0
+2
+1
+3
+2
+4
+3
+5
+4
+
+# A moving ROWS frame [1 PRECEDING, CURRENT ROW] with FILTER (forces the naive re-fold path).
+# id=1 {10}->NULL; id=2 {10,20}->20; id=3 {20,30}->50; id=4 {30,40}->70; id=5 {40,50}->90.
+# names: id, sum
+query II nosort
+SELECT id, sum(v) FILTER (WHERE v >= 20) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id
+----
+1
+NULL
+2
+20
+3
+50
+4
+70
+5
+90
+
+# PARTITION BY + FILTER: the count restarts per partition.
+# names: id, g, count
+query III nosort
+SELECT id, g, count(*) FILTER (WHERE v >= 20) OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id
+----
+1
+1
+0
+2
+1
+1
+3
+2
+1
+4
+2
+2
+5
+2
+3
+
+# avg(v) FILTER over the running frame (decimal result), excludes id=1's 10.
+# names: id, avg
+query ID nosort
+SELECT id, avg(v) FILTER (WHERE v >= 20) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1
+NULL
+2
+20.0000000000000000
+3
+25.0000000000000000
+4
+30.0000000000000000
+5
+35.0000000000000000
+
+# FILTER on a non-aggregate window function is 0A000.
+statement error 0A000
+SELECT row_number() FILTER (WHERE v >= 20) OVER (ORDER BY id) FROM t

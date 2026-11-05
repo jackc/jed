@@ -1,0 +1,491 @@
+# WITH [CASCADED | LOCAL] CHECK OPTION on an updatable view (spec/design/views.md §15.6). An INSERT
+# or UPDATE through the view checks each new row against the WHERE of every checked view in the
+# chain — a view with its own check option, or one below a CASCADED view — nearest the table first.
+# The WHERE is a filter: FALSE or NULL fails with 44000, naming the failing view. Bare WITH CHECK
+# OPTION is CASCADED. DELETE checks nothing. A view that is not automatically updatable cannot take
+# the clause (0A000). Every record here is PostgreSQL-oracle-checked; jed-only behavior
+# (jed_views.check_option, cost, divergences) lives in view_check_option_jed.test.
+# requires: ddl.view, dml.view_write, dml.view_check_option, ddl.view_replace, ddl.view_alter, ddl.view_rename, ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, dml.delete, dml.returning, query.select, query.select_star, query.where_eq, query.order_by, query.table_alias, query.table_column_alias, query.subquery_scalar, query.subquery_correlated, query.subquery_exists, query.cte, query.cte_data_modifying, query.distinct, query.group_by, query.aggregates, query.union, query.limit, query.derived_table, query.window, expr.arithmetic, null.three_valued, types.i32, types.text
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, c i32 DEFAULT -1, u i32 UNIQUE)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1, 1), (2, 2, 2, 2)
+
+statement ok
+CREATE VIEW v AS SELECT id, a, u FROM t WHERE a > 0 WITH CHECK OPTION
+
+# --- INSERT ------------------------------------------------------------------------------------------
+
+query III nosort
+INSERT INTO v VALUES (3, 3, 3) RETURNING *
+----
+3
+3
+3
+
+statement error 44000
+INSERT INTO v VALUES (4, -4, 4)
+
+# NULL fails the check: the row would not be shown.
+statement error 44000
+INSERT INTO v VALUES (4, NULL, 4)
+
+statement error 44000
+INSERT INTO v (id, u) VALUES (4, 4)
+
+# Nothing was written.
+query I nosort
+SELECT count(*) FROM t
+----
+3
+
+# Every row is checked; one failure aborts the whole statement.
+statement error 44000
+INSERT INTO v VALUES (5, 5, 5), (6, -6, 6)
+
+statement error 44000
+INSERT INTO v SELECT id + 10, a - 2, NULL FROM t
+
+query I nosort
+SELECT count(*) FROM t
+----
+3
+
+query II nosort
+INSERT INTO v SELECT id + 10, a, NULL FROM t WHERE a > 1 RETURNING id, a
+----
+12
+2
+13
+3
+
+# --- UPDATE ------------------------------------------------------------------------------------------
+
+query III nosort
+UPDATE v SET a = 100 WHERE id = 12 RETURNING *
+----
+12
+100
+NULL
+
+# An UPDATE that would move a row out of the view fails.
+statement error 44000
+UPDATE v SET a = -1 WHERE id = 12
+
+statement error 44000
+UPDATE v SET a = NULL WHERE id = 12
+
+statement error 44000
+UPDATE v SET a = a - 2
+
+query II nosort
+SELECT id, a FROM t ORDER BY id
+----
+1
+1
+2
+2
+3
+3
+12
+100
+13
+3
+
+# A row the UPDATE does not reach is not checked.
+statement ok
+UPDATE v SET a = -1 WHERE id = 999
+
+# --- DELETE checks nothing ---------------------------------------------------------------------------
+
+query I nosort
+DELETE FROM v WHERE id = 13 RETURNING id
+----
+13
+
+# --- order against the table's own constraints -------------------------------------------------------
+
+# The primary-key and UNIQUE checks come first, as in PostgreSQL.
+statement error 23505
+INSERT INTO v VALUES (1, -1, 9)
+
+statement error 23505
+INSERT INTO v VALUES (9, -1, 1)
+
+statement error 23505
+UPDATE v SET u = 2, a = -1 WHERE id = 1
+
+statement error 23502
+INSERT INTO v (a) VALUES (-1)
+
+# An INSERT checks row by row: the first row that fails anything is reported.
+statement error 44000
+INSERT INTO v VALUES (20, 1, 20), (21, -1, 21), (NULL, 3, 22)
+
+statement error 23502
+INSERT INTO v VALUES (20, 1, 20), (NULL, 3, 22), (21, -1, 21)
+
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, a i32, CHECK (a < 50))
+
+statement ok
+CREATE VIEW ckv AS SELECT id, a FROM ck WHERE a > 0 WITH CHECK OPTION
+
+statement error 23514
+INSERT INTO ckv VALUES (1, 60)
+
+statement error 44000
+INSERT INTO ckv VALUES (1, -1), (2, 60)
+
+statement error 23514
+INSERT INTO ckv VALUES (1, 60), (2, -1)
+
+# --- the base row: unexposed columns and defaults ----------------------------------------------------
+
+# The view does not output c, so an INSERT fills it with its default (-1), which fails the check.
+statement ok
+CREATE VIEW dv AS SELECT id, a FROM t WHERE c > 0 WITH CHECK OPTION
+
+statement error 44000
+INSERT INTO dv VALUES (30, 30)
+
+statement ok
+UPDATE dv SET a = 7 WHERE id = 1
+
+query II nosort
+SELECT id, a FROM t WHERE id = 1
+----
+1
+7
+
+# A column alias list on the body's FROM item binds the WHERE's names.
+statement ok
+CREATE VIEW av AS SELECT p, q FROM t AS x (p, q) WHERE q > 0 WITH CHECK OPTION
+
+statement error 44000
+INSERT INTO av VALUES (31, 0)
+
+query II nosort
+INSERT INTO av VALUES (31, 31) RETURNING p, q
+----
+31
+31
+
+# A read-only column can appear in the view; the check still reads the base row.
+statement ok
+CREATE VIEW rv AS SELECT id, a, a * 2 AS a2 FROM t WHERE a > 10 WITH LOCAL CHECK OPTION
+
+query III nosort
+UPDATE rv SET a = 11 WHERE id = 31 RETURNING *
+----
+31
+11
+22
+
+statement error 44000
+UPDATE rv SET a = 10 WHERE id = 31
+
+# --- the WHERE is a filter: its AND chain stops at the first conjunct that is not TRUE -------------
+
+statement ok
+CREATE VIEW nv AS SELECT id, a FROM t WHERE a > 0 AND 100 / a > 1 WITH CHECK OPTION
+
+# a NULL stops the chain before the division
+statement error 44000
+INSERT INTO nv VALUES (40, NULL)
+
+statement error 44000
+INSERT INTO nv VALUES (40, 200)
+
+statement error 44000
+INSERT INTO nv VALUES (40, 0)
+
+statement ok
+CREATE VIEW zv AS SELECT id, a FROM t WHERE 100 / a > 1 WITH CHECK OPTION
+
+# an error while evaluating the check is that error
+statement error 22012
+INSERT INTO zv VALUES (40, 0)
+
+statement ok
+INSERT INTO zv VALUES (40, 5)
+
+# --- subqueries read the pre-statement snapshot ------------------------------------------------------
+
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO s VALUES (1, 1), (2, 2)
+
+statement ok
+CREATE VIEW sv AS SELECT id, n FROM s WHERE n > (SELECT count(*) FROM s) WITH CHECK OPTION
+
+statement error 44000
+INSERT INTO sv VALUES (3, 2)
+
+# count(*) is 2 for every row the statement writes; neither row sees the other.
+query II rowsort
+INSERT INTO sv VALUES (3, 3), (4, 3) RETURNING *
+----
+3
+3
+4
+3
+
+statement ok
+CREATE TABLE allowed (n i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO allowed VALUES (10), (20)
+
+statement ok
+CREATE VIEW ev AS SELECT id, n FROM s WHERE EXISTS (SELECT 1 FROM allowed WHERE allowed.n = s.n) WITH CHECK OPTION
+
+statement ok
+INSERT INTO ev VALUES (10, 10)
+
+statement error 44000
+INSERT INTO ev VALUES (11, 11)
+
+statement ok
+UPDATE ev SET n = 20 WHERE id = 10
+
+statement error 44000
+UPDATE ev SET n = 21 WHERE id = 10
+
+# --- chains: LOCAL and CASCADED ----------------------------------------------------------------------
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, a i32)
+
+# b0 has no check option.
+statement ok
+CREATE VIEW b0 AS SELECT id, a FROM c WHERE a < 100
+
+# LOCAL checks l1's own WHERE but not b0's.
+statement ok
+CREATE VIEW l1 AS SELECT id, a FROM b0 WHERE a > 0 WITH LOCAL CHECK OPTION
+
+statement ok
+INSERT INTO l1 VALUES (1, 200)
+
+statement error 44000
+INSERT INTO l1 VALUES (2, -1)
+
+# CASCADED (and bare WITH CHECK OPTION) checks every view below too.
+statement ok
+CREATE VIEW c1 AS SELECT id, a FROM b0 WHERE a > 0 WITH CASCADED CHECK OPTION
+
+statement error 44000
+INSERT INTO c1 VALUES (2, 200)
+
+statement error 44000
+INSERT INTO c1 VALUES (2, -1)
+
+statement ok
+INSERT INTO c1 VALUES (2, 50)
+
+# A view with no check option over l1: l1's own option still applies, top's WHERE does not.
+statement ok
+CREATE VIEW top AS SELECT id, a FROM l1 WHERE id < 50
+
+statement ok
+INSERT INTO top VALUES (60, 5)
+
+statement error 44000
+INSERT INTO top VALUES (3, -1)
+
+# CASCADED over a LOCAL view checks b0 as well.
+statement ok
+CREATE VIEW topc AS SELECT id, a FROM l1 WHERE id < 50 WITH CASCADED CHECK OPTION
+
+statement error 44000
+INSERT INTO topc VALUES (3, 500)
+
+statement error 44000
+INSERT INTO topc VALUES (70, 5)
+
+statement ok
+INSERT INTO topc VALUES (3, 5)
+
+# LOCAL over a CASCADED view: c1's option still checks c1 and b0.
+statement ok
+CREATE VIEW topl AS SELECT id, a FROM c1 WHERE id < 50 WITH LOCAL CHECK OPTION
+
+statement error 44000
+INSERT INTO topl VALUES (4, -3)
+
+statement error 44000
+INSERT INTO topl VALUES (4, 500)
+
+statement error 44000
+INSERT INTO topl VALUES (80, 5)
+
+# A CASCADED view with no WHERE of its own still checks the views below it.
+statement ok
+CREATE VIEW cnw AS SELECT id, a FROM b0 WITH CASCADED CHECK OPTION
+
+statement error 44000
+INSERT INTO cnw VALUES (5, 200)
+
+statement ok
+CREATE VIEW lnw AS SELECT id, a FROM b0 WITH LOCAL CHECK OPTION
+
+statement ok
+INSERT INTO lnw VALUES (5, 200)
+
+# UPDATE through a chain is checked the same way.
+statement error 44000
+UPDATE topc SET a = 150 WHERE id = 3
+
+# top has no check option, so an UPDATE through it may move a row out of top (l1 still holds).
+statement ok
+UPDATE top SET id = 90 WHERE id = 3
+
+query II nosort
+SELECT id, a FROM c ORDER BY id
+----
+1
+200
+2
+50
+5
+200
+60
+5
+90
+5
+
+# --- writable CTEs -----------------------------------------------------------------------------------
+
+statement error 44000
+WITH x AS (INSERT INTO c1 VALUES (6, -6) RETURNING id) SELECT id FROM x
+
+query I nosort
+WITH x AS (INSERT INTO c1 VALUES (6, 6) RETURNING id) SELECT id FROM x
+----
+6
+
+statement error 44000
+WITH x AS (UPDATE c1 SET a = 0 WHERE id = 6 RETURNING id) SELECT id FROM x
+
+# --- CREATE VIEW: only automatically updatable views take the clause ---------------------------------
+
+statement error 0A000
+CREATE VIEW e1 AS SELECT a + 1 AS x FROM t WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e2 AS SELECT id, count(*) AS n FROM t GROUP BY id WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e3 AS SELECT id FROM t ORDER BY id LIMIT 1 WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e4 AS SELECT DISTINCT id FROM t WITH LOCAL CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e5 AS SELECT id FROM (SELECT id FROM t) AS d WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e6 AS WITH q AS (SELECT id FROM t) SELECT id FROM q WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e7 AS SELECT id FROM t UNION SELECT id FROM c WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e8 AS SELECT id, row_number() OVER () AS r FROM t WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e9 AS SELECT 1 AS one FROM t WITH CHECK OPTION
+
+# The body's own errors come first, then the check option, then the column list.
+statement error 42P01
+CREATE VIEW e10 AS SELECT a + 1 FROM nosuch WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e11 (p, q) AS SELECT a + 1 AS x FROM t WITH CHECK OPTION
+
+statement error 42601
+CREATE VIEW e12 (p, q) AS SELECT a FROM t WITH CHECK OPTION
+
+statement error 0A000
+CREATE VIEW e13 AS SELECT a + 1, a + 1 FROM t WITH CHECK OPTION
+
+# The clause follows a complete body; the body's syntax errors are its own.
+statement error 42601
+CREATE VIEW e14 AS SELECT a FROM t WHERE WITH CHECK OPTION
+
+statement error 42601
+CREATE VIEW e15 AS SELECT a FROM t WITH CHECK OPTION WITH CHECK OPTION
+
+# `*` expands to updatable columns, and a read-only column beside an updatable one is fine.
+statement ok
+CREATE VIEW ok1 AS SELECT * FROM t WHERE a > 0 WITH CHECK OPTION
+
+statement ok
+CREATE VIEW ok2 AS SELECT id, (SELECT 1) AS one FROM t WITH LOCAL CHECK OPTION
+
+statement error 44000
+INSERT INTO ok1 VALUES (50, 0, 1, 50)
+
+# Only the view's own body is checked: its base view need not be updatable.
+statement ok
+CREATE VIEW nu AS SELECT a + 1 AS x, id FROM t
+
+statement ok
+CREATE VIEW over_nu AS SELECT x, id FROM nu WHERE id > 0 WITH CHECK OPTION
+
+statement error 0A000
+INSERT INTO over_nu VALUES (1, 1)
+
+statement error 44000
+INSERT INTO over_nu (id) VALUES (-1)
+
+statement ok
+INSERT INTO over_nu (id) VALUES (70)
+
+# --- CREATE OR REPLACE VIEW replaces the check option ------------------------------------------------
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT id, a, u FROM t WHERE a > 0
+
+statement ok
+INSERT INTO v VALUES (60, -60, 60)
+
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT id, a, u FROM t WHERE a > 0 WITH LOCAL CHECK OPTION
+
+statement error 44000
+INSERT INTO v VALUES (61, -61, 61)
+
+statement error 0A000
+CREATE OR REPLACE VIEW v AS SELECT id + 0 AS id, a + 0 AS a, u + 0 AS u FROM t WITH CHECK OPTION
+
+# --- renames keep the check option -------------------------------------------------------------------
+
+statement ok
+CREATE TABLE rn (id i32 PRIMARY KEY, a i32)
+
+statement ok
+CREATE VIEW rnv AS SELECT id, a FROM rn WHERE a > 0 WITH LOCAL CHECK OPTION
+
+statement ok
+ALTER TABLE rn RENAME COLUMN a TO aa
+
+statement ok
+ALTER TABLE rn RENAME TO rn2
+
+statement ok
+ALTER VIEW rnv RENAME TO rnv2
+
+statement error 44000
+INSERT INTO rnv2 VALUES (1, -1)
+
+query II nosort
+INSERT INTO rnv2 VALUES (1, 1) RETURNING *
+----
+1
+1

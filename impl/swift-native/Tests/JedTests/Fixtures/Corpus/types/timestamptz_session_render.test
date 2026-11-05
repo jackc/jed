@@ -1,0 +1,240 @@
+# Every timestamptz rendered to text follows the SESSION zone, as PostgreSQL's timestamptz_out does
+# (spec/design/timezones.md §9.5): a result cell — which the harness renders through the host
+# session render, in the zone of the session that ran the record — and a timestamptz at any depth
+# inside an array, composite, or range, whether returned as a result cell or cast with array → text.
+# The offset uses PostgreSQL's spelling: +HH, +HH:MM when the minutes are nonzero, +HH:MM:SS for a
+# pre-standard-time local mean time. ±infinity render bare. The scalar `::text` cast is covered by
+# cast/scalar_to_text.test; offset-less input in the session zone by timestamptz_session_input.test.
+#
+# OUT of this corpus (per-core tested): the host render API itself (the canonical Value render stays
+# UTC), and EXPLAIN's canonical UTC spelling of a timestamptz constant (a documented divergence).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, query.select, query.select_no_from, query.order_by, types.i32, types.text, types.timestamptz, types.array, types.range, types.composite, func.range_constructors, cast.explicit, cast.operator, cast.array, cast.scalar_text, session.timezone, resource.cost_metering, types.timestamptz_session_render
+
+# load-timezone: America/New_York
+# load-timezone: Asia/Kolkata
+
+# ============================================================================================
+# A bare timestamptz result cell
+# ============================================================================================
+
+# The default session zone is UTC.
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00'
+----
+2024-01-15 12:00:00+00
+
+# New York is EST (-05) in January and EDT (-04) in July: a whole-hour offset renders +HH.
+# timezone: America/New_York
+query TT nosort
+SELECT timestamptz '2024-01-15 12:00:00+00', timestamptz '2024-07-01 12:00:00.25+00'
+----
+2024-01-15 07:00:00-05
+2024-07-01 08:00:00.25-04
+
+# A half-hour offset renders minutes.
+# timezone: Asia/Kolkata
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00'
+----
+2024-01-15 17:30:00+05:30
+
+# A pre-standard-time instant renders the zone's local mean time offset, seconds included — and
+# the local date may fall on the previous day.
+# timezone: America/New_York
+query TT nosort
+SELECT timestamptz '1800-01-01 00:00:00+00', timestamptz '1800-06-01 12:00:00+00'
+----
+1799-12-31 19:03:58-04:56:02
+1800-06-01 07:03:58-04:56:02
+
+# A BC instant: the offset precedes the era.
+# timezone: Asia/Kolkata
+query T nosort
+SELECT timestamptz '0100-01-01 00:00:00+00 BC'
+----
+0100-01-01 05:53:28+05:53:28 BC
+
+# A fixed numeric zone uses the POSIX sign: '+05:00' is five hours WEST of UTC.
+# timezone: +05:00
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00'
+----
+2024-01-15 07:00:00-05
+
+# ±infinity render bare and NULL is NULL, whatever the zone.
+# timezone: Asia/Kolkata
+query TTT nosort
+SELECT timestamptz 'infinity', timestamptz '-infinity', NULL::timestamptz
+----
+infinity
+-infinity
+NULL
+
+# A stored column renders in the session zone of the reading record, not the writing one.
+statement ok
+CREATE TABLE ev (id integer PRIMARY KEY, at timestamptz)
+
+statement ok
+INSERT INTO ev VALUES (1, '2024-01-15 12:00:00+00'), (2, '2024-07-01 12:00:00+00'), (3, NULL), (4, 'infinity')
+
+# timezone: America/New_York
+query IT nosort
+SELECT id, at FROM ev ORDER BY id
+----
+1
+2024-01-15 07:00:00-05
+2
+2024-07-01 08:00:00-04
+3
+NULL
+4
+infinity
+
+# timezone: Asia/Kolkata
+query IT nosort
+SELECT id, at FROM ev ORDER BY id
+----
+1
+2024-01-15 17:30:00+05:30
+2
+2024-07-01 17:30:00+05:30
+3
+NULL
+4
+infinity
+
+# ============================================================================================
+# A timestamptz inside an array
+# ============================================================================================
+
+# timezone: America/New_York
+query T nosort
+SELECT ARRAY[timestamptz '2024-01-15 12:00:00+00', NULL, timestamptz 'infinity', timestamptz '2024-07-01 12:00:00+00']
+----
+{"2024-01-15 07:00:00-05",NULL,infinity,"2024-07-01 08:00:00-04"}
+
+# The array → text cast renders the same text.
+# timezone: America/New_York
+query T nosort
+SELECT ARRAY[timestamptz '2024-01-15 12:00:00+00', NULL, timestamptz 'infinity', timestamptz '2024-07-01 12:00:00+00']::text
+----
+{"2024-01-15 07:00:00-05",NULL,infinity,"2024-07-01 08:00:00-04"}
+
+# timezone: Asia/Kolkata
+query T nosort
+SELECT '{{"2024-01-15 12:00:00+00"},{"1800-01-01 00:00:00+00"}}'::timestamptz[]::text
+----
+{{"2024-01-15 17:30:00+05:30"},{"1800-01-01 05:53:28+05:53:28"}}
+
+# An array column, as a result cell and through the cast.
+statement ok
+CREATE TABLE evs (id integer PRIMARY KEY, ats timestamptz[])
+
+statement ok
+INSERT INTO evs VALUES (1, ARRAY[timestamptz '2024-01-15 12:00:00+00', timestamptz '-infinity']), (2, NULL), (3, '{}')
+
+# timezone: America/New_York
+query ITT nosort
+SELECT id, ats, ats::text FROM evs ORDER BY id
+----
+1
+{"2024-01-15 07:00:00-05",-infinity}
+{"2024-01-15 07:00:00-05",-infinity}
+2
+NULL
+NULL
+3
+{}
+{}
+
+# The array → text cast charges one timezone unit per finite timestamptz it renders (two here, over
+# the zone-free array below);
+# NULL and ±infinity elements charge nothing.
+# timezone: America/New_York
+# cost: 5
+query T nosort
+SELECT ARRAY[timestamptz '2024-01-15 12:00:00+00', NULL, timestamptz 'infinity', timestamptz '2024-07-01 12:00:00+00']::text
+----
+{"2024-01-15 07:00:00-05",NULL,infinity,"2024-07-01 08:00:00-04"}
+
+# An array of a zone-free element type charges no timezone unit.
+# cost: 3
+query T nosort
+SELECT ARRAY[1, 2, 3]::text
+----
+{1,2,3}
+
+# ============================================================================================
+# A timestamptz inside a composite
+# ============================================================================================
+
+# timezone: America/New_York
+query T nosort
+SELECT ROW(timestamptz '2024-01-15 12:00:00+00', 1)
+----
+("2024-01-15 07:00:00-05",1)
+
+statement ok
+CREATE TYPE stamp AS (at timestamptz, n integer)
+
+statement ok
+CREATE TABLE stamps (id integer PRIMARY KEY, s stamp, ss stamp[])
+
+statement ok
+INSERT INTO stamps VALUES (1, '("2024-01-15 12:00:00+00",1)'::stamp, '{"(\"2024-01-15 12:00:00+00\",1)","(infinity,2)",NULL}'), (2, '(,2)'::stamp, NULL)
+
+# timezone: Asia/Kolkata
+query ITT nosort
+SELECT id, s, ss FROM stamps ORDER BY id
+----
+1
+("2024-01-15 17:30:00+05:30",1)
+{"(\"2024-01-15 17:30:00+05:30\",1)","(infinity,2)",NULL}
+2
+(,2)
+NULL
+
+# An array of composites cast to text renders the nested field in the session zone.
+# timezone: America/New_York
+query T nosort
+SELECT ss::text FROM stamps WHERE id = 1
+----
+{"(\"2024-01-15 07:00:00-05\",1)","(infinity,2)",NULL}
+
+# ============================================================================================
+# A timestamptz inside a range
+# ============================================================================================
+
+# timezone: America/New_York
+query T nosort
+SELECT tstzrange(timestamptz '2024-01-15 12:00:00+00', timestamptz '2024-07-01 12:00:00+00')
+----
+["2024-01-15 07:00:00-05","2024-07-01 08:00:00-04")
+
+# An unbounded side renders empty; an empty range renders `empty`.
+# timezone: Asia/Kolkata
+query TT nosort
+SELECT tstzrange(timestamptz '2024-01-15 12:00:00+00', NULL, '(]'), 'empty'::tstzrange
+----
+("2024-01-15 17:30:00+05:30",)
+empty
+
+# An array of ranges cast to text renders each bound in the session zone.
+# timezone: America/New_York
+query T nosort
+SELECT ARRAY[tstzrange(timestamptz '2024-01-15 12:00:00+00', timestamptz '2024-01-16 12:00:00+00')]::text
+----
+{"[\"2024-01-15 07:00:00-05\",\"2024-01-16 07:00:00-05\")"}
+
+# ============================================================================================
+# Volatility: rendering a timestamptz to text reads the session zone
+# ============================================================================================
+
+# An array → text cast whose element type contains timestamptz is STABLE, so it cannot be an
+# index expression.
+statement error 42P17
+CREATE INDEX evs_text ON evs ((ats::text))
+
+statement error 42P17
+CREATE INDEX stamps_text ON stamps ((ss::text))

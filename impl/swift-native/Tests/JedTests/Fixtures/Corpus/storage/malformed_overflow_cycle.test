@@ -1,0 +1,18 @@
+# Malformed page: an overflow page that links back to itself (storage.md §6; large-values.md §12).
+# Ruby-forged (verify.rb MALFORMED_FIXTURES): row 1's large values live in overflow chains; the first
+# page of a multi-page chain now names itself as its successor, checksum resealed. Following the chain
+# would re-read the same slab until the value length is met and return a wrong value; a page reached
+# twice is XX001 instead. Values stay unread until touched, so the rest of the table still serves.
+# requires: harness.fixture_open, query.select, query.where_eq, query.order_by, types.i32, types.text, types.bytea
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_overflow_cycle.jed
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+statement error XX001
+SELECT body, blob FROM t WHERE id = 1

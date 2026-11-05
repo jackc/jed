@@ -1,0 +1,114 @@
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# composite-typed columns on a temporary table (spec/design/temp-tables.md §8) — the lifted 0A000
+# narrowing: a temp table now takes a column of a user-defined
+# composite (row) type, exactly like a persistent one. The composite TYPE itself is always persistent
+# (CREATE TYPE is persistent DDL); a temp table only REFERENCES it. The column's resolved codec/coercion
+# tree (ColType) is built against the persistent type catalog when the table is staged and is fully
+# self-contained thereafter (spec/design/composite.md §4), so the temp store needs nothing from the
+# catalog per row — and, like every temp construct, the table makes ZERO writes to the database file
+# (no format_version change). A composite column is a valid PRIMARY KEY on a temp table too (the same
+# scope-agnostic key gate now admits the composite container key, composite-field-slots, encoding.md
+# §2.15). DROP TYPE of a type a temp
+# table references is 2BP01 (the dependency check is scope-aware, matching the persistent case). The
+# composite semantics — ROW(...) construction, record_out rendering, field access, comparison/ordering
+# — are identical to a persistent column (validated against PG in types/composite.test); this suite
+# proves they hold on a temp table. jed-specific (the temp divergences + the
+# host-configured gate cannot be reproduced via the same SQL on PostgreSQL), so it is CROSS-CORE-checked,
+# NOT PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
+# requires: ddl.temp_table, ddl.composite_key, types.composite, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.i32, types.text, session.allow_temp_ddl
+
+# --- a composite column on a SESSION-LOCAL temp table: storable, rendered, field-accessible ----------
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+statement ok
+CREATE TEMP TABLE person (id i32 PRIMARY KEY, home addr)
+
+# a ROW(...) constructor builds the composite value stored in the temp column (a NULL field too)
+statement ok
+INSERT INTO person VALUES (1, ROW('Oak', 90210)), (2, ROW('Main', NULL))
+
+# an omitted composite column is the whole-value NULL
+statement ok
+INSERT INTO person (id) VALUES (3)
+
+# record_out renders the composite exactly as on a persistent column (a NULL field is empty; a
+# whole-NULL value is NULL)
+query IT nosort
+SELECT id, home FROM person ORDER BY id
+----
+1
+(Oak,90210)
+2
+(Main,)
+3
+NULL
+
+# field access (expr).field works on a temp composite column
+query IT nosort
+SELECT (home).zip, (home).street FROM person WHERE id = 1
+----
+90210
+Oak
+
+# composite comparison / ORDER BY uses the element-wise total order (first field decides
+# 'Main' < 'Oak'; a whole-NULL value sorts last) — so the home order differs from the id order
+query I nosort
+SELECT id FROM person ORDER BY home
+----
+2
+1
+3
+
+# --- a composite column IS a valid PRIMARY KEY on a temp table too — the scope-agnostic key gate
+# now admits the composite container key (composite-field-slots, encoding.md §2.15 / composite.md §6),
+# so the same code path keys a temp composite PK. Fully exercised in ddl/composite_key.test. ---------
+
+statement ok
+CREATE TEMP TABLE keyed (h addr PRIMARY KEY)
+
+statement ok
+INSERT INTO keyed VALUES (ROW('Main', 5)), (ROW('Elm', 9))
+
+# a duplicate composite value traps 23505 on the temp table
+statement error 23505
+INSERT INTO keyed VALUES (ROW('Main', 5))
+
+query T nosort
+SELECT (h).street FROM keyed ORDER BY h
+----
+Elm
+Main
+
+statement ok
+DROP TABLE keyed
+
+# --- DROP TYPE of a type a TEMP table references is 2BP01 (the dependency check is scope-aware) ------
+
+statement error 2BP01
+DROP TYPE addr
+
+# --- DROP TABLE first; the type is then free to drop ------------------------------------------------
+
+statement ok
+DROP TABLE person
+
+statement ok
+DROP TYPE addr
+
+# --- the temp-scoped DDL gate covers a composite temp CREATE (temp-tables.md §5) --------------------
+
+statement ok
+CREATE TYPE g AS (a i32, b text)
+
+# a composite CREATE TEMP TABLE is denied when allow_temp_ddl is off
+# allow_temp_ddl: off
+statement error 42501
+CREATE TEMP TABLE gt (id i32 PRIMARY KEY, c g)
+
+# the untrusted-scratch split: a composite temp table succeeds with allow_ddl off + allow_temp_ddl on
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+CREATE TEMP TABLE gt (id i32 PRIMARY KEY, c g)

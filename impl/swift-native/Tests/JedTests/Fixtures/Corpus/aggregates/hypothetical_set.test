@@ -1,0 +1,101 @@
+# Hypothetical-set aggregates rank/dense_rank/percent_rank/cume_dist WITHIN GROUP (ORDER BY keys)
+# (spec/design/aggregates.md §19). Each computes where the hypothetical direct-argument row would
+# rank if inserted into the group. rank = 1 + rows strictly before; dense_rank = 1 + distinct values
+# before; percent_rank = (rank-1)/N; cume_dist = (#rows <= hyp + 1)/(N+1). These names are also window
+# functions — the WITHIN GROUP clause routes them here.
+# requires: ddl.create_table, dml.insert, query.select, query.aggregates, query.group_by, query.hypothetical_set_aggregate, types.i32, types.f64
+
+statement ok
+CREATE TABLE t (v i32)
+
+statement ok
+INSERT INTO t VALUES (10),(20),(20),(30),(40)
+
+# rank/dense_rank/percent_rank/cume_dist of the hypothetical 20 over [10,20,20,30,40] (N=5):
+# 1 row (10) sorts before 20 -> rank 2; 1 distinct value before -> dense_rank 2;
+# percent_rank (2-1)/5 = 0.2; cume_dist (#<=20 = 3, +1)/(5+1) = 4/6.
+# names: rank, dense_rank, percent_rank, cume_dist
+query IIRR nosort
+SELECT rank(20) WITHIN GROUP (ORDER BY v),
+       dense_rank(20) WITHIN GROUP (ORDER BY v),
+       percent_rank(20) WITHIN GROUP (ORDER BY v),
+       cume_dist(20) WITHIN GROUP (ORDER BY v)
+FROM t
+----
+2
+2
+0.2
+0.6666666666666666
+
+# A value between rows: 25 has 3 rows (10,20,20) before it -> rank 4.
+# names: rank
+query I nosort
+SELECT rank(25) WITHIN GROUP (ORDER BY v) FROM t
+----
+4
+
+# DESC order flips which rows precede: 40,30 sort before 20 -> rank 3.
+# names: rank
+query I nosort
+SELECT rank(20) WITHIN GROUP (ORDER BY v DESC) FROM t
+----
+3
+
+# rank composes with GROUP BY (per group).
+statement ok
+CREATE TABLE g (k i32, v i32)
+
+statement ok
+INSERT INTO g VALUES (1,10),(1,30),(2,5),(2,5),(2,9)
+
+# k=1: rank(20) over [10,30] -> 1 before -> 2; k=2: rank(20) over [5,5,9] -> 3 before -> 4.
+# names: k, rank
+query II nosort
+SELECT k, rank(20) WITHIN GROUP (ORDER BY v) FROM g GROUP BY k ORDER BY k
+----
+1
+2
+2
+4
+
+# Multi-key hypothetical row: rank(1, 2) WITHIN GROUP (ORDER BY a, b).
+statement ok
+CREATE TABLE m (a i32, b i32)
+
+statement ok
+INSERT INTO m VALUES (1,1),(1,2),(2,1),(2,2)
+
+# Rows sorting strictly before (1,2): only (1,1) -> rank 2.
+# names: rank
+query I nosort
+SELECT rank(1, 2) WITHIN GROUP (ORDER BY a, b) FROM m
+----
+2
+
+# An empty group: rank/dense_rank 1, percent_rank 0, cume_dist 1.
+statement ok
+CREATE TABLE e (v i32)
+
+# names: rank, dense_rank, percent_rank, cume_dist
+query IIRR nosort
+SELECT rank(5) WITHIN GROUP (ORDER BY v),
+       dense_rank(5) WITHIN GROUP (ORDER BY v),
+       percent_rank(5) WITHIN GROUP (ORDER BY v),
+       cume_dist(5) WITHIN GROUP (ORDER BY v)
+FROM e
+----
+1
+1
+0
+1
+
+# A mismatched direct-arg count vs ordering columns is 42883.
+statement error 42883
+SELECT rank(1, 2) WITHIN GROUP (ORDER BY v) FROM t
+
+# DISTINCT is rejected (42601), OVER is 0A000.
+statement error 42601
+SELECT rank(DISTINCT 1) WITHIN GROUP (ORDER BY v) FROM t
+
+statement error 0A000
+SELECT rank(1) WITHIN GROUP (ORDER BY v) OVER () FROM t

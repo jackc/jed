@@ -1,0 +1,285 @@
+# Container-typed bound parameters (spec/design/api.md §5): a bare $N facing an array, range, or
+# named composite takes that type; `x op ANY($N)` takes the array of x's type; a cast or an assignment
+# to a container column types it too. A container parameter binds the matching host value — written
+# ARRAY[…] / ROW(…) in the directive (conformance.md §1.2) — or its text form, read by the type's input.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: harness.params, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.update_container, dml.delete, query.select, query.select_no_from, query.where_eq, query.order_by, types.array, types.array_multidim, types.range, types.composite, types.array_composite, types.i32, types.i64, types.text, cast.array, func.array, func.array_containment, func.array_quantified, func.range_constructors, func.range_operators, func.range_set_operators, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], tags text[])
+
+statement ok
+INSERT INTO t VALUES (1, '{1,2}', '{a,b}'), (2, '{3}', '{c}'), (3, NULL, '{a,c}')
+
+# --- arrays ---------------------------------------------------------------------------------------
+
+# `x = ANY($N)` binds a list: $1 is i32[], the array of id's type.
+# params: ARRAY[1, 3]
+query I nosort
+SELECT id FROM t WHERE id = ANY($1) ORDER BY id
+----
+1
+3
+
+# params: ARRAY[1, 3]
+query I nosort
+SELECT id FROM t WHERE id <> ALL($1) ORDER BY id
+----
+2
+
+# The text form of the array binds the same way.
+# params: '{2,3}'
+query I nosort
+SELECT id FROM t WHERE id = ANY($1) ORDER BY id
+----
+2
+3
+
+# An empty list matches nothing, and a NULL list is unknown.
+# params: ARRAY[]
+query I nosort
+SELECT id FROM t WHERE id = ANY($1)
+----
+
+# params: NULL
+query I nosort
+SELECT id FROM t WHERE id = ANY($1)
+----
+
+# Each element is coerced to the element type: out of range, the wrong family, malformed text.
+# params: ARRAY[1, 2147483648]
+statement error 22003
+SELECT id FROM t WHERE id = ANY($1)
+
+# params: ARRAY['x']
+statement error 42804
+SELECT id FROM t WHERE id = ANY($1)
+
+# params: '{1,x}'
+statement error 22P02
+SELECT id FROM t WHERE id = ANY($1)
+
+# A scalar value for an array parameter is the wrong family.
+# params: 1
+statement error 42804
+SELECT id FROM t WHERE id = ANY($1)
+
+# A parameter beside an array column takes its type: comparison, containment, overlap.
+# params: ARRAY[1, 2]
+query I nosort
+SELECT id FROM t WHERE nums = $1
+----
+1
+
+# params: ARRAY['a']
+query I nosort
+SELECT id FROM t WHERE tags @> $1 ORDER BY id
+----
+1
+3
+
+# params: '{a,b,c}'
+query I nosort
+SELECT id FROM t WHERE tags <@ $1 ORDER BY id
+----
+1
+2
+3
+
+# params: ARRAY['c', 'z']
+query I nosort
+SELECT id FROM t WHERE $1 && tags ORDER BY id
+----
+2
+3
+
+# `||` beside an array concatenates two arrays; an element needs a cast.
+# params: ARRAY[9]
+query T nosort
+SELECT nums || $1 FROM t WHERE id = 1
+----
+{1,2,9}
+
+# params: ARRAY[9]
+query T nosort
+SELECT $1 || nums FROM t WHERE id = 1
+----
+{9,1,2}
+
+# params: 9
+query T nosort
+SELECT nums || $1::i32 FROM t WHERE id = 1
+----
+{1,2,9}
+
+# A cast types the parameter as the array, keeping a multidimensional text value's shape.
+# params: '{{1,2},{3,4}}'
+# types: i32[]
+query T nosort
+SELECT $1::i32[]
+----
+{{1,2},{3,4}}
+
+# INSERT, UPDATE, and ON CONFLICT DO UPDATE assign a bound array to an array column.
+# params: 4, ARRAY[7, NULL], ARRAY['d']
+statement ok
+INSERT INTO t VALUES ($1, $2, $3)
+
+# params: ARRAY[8], 2
+statement ok
+UPDATE t SET nums = $1 WHERE id = $2
+
+# params: 3, '{5,6}'
+statement ok
+INSERT INTO t VALUES ($1, '{9}', NULL) ON CONFLICT (id) DO UPDATE SET nums = $2
+
+query IT nosort
+SELECT id, nums FROM t ORDER BY id
+----
+1
+{1,2}
+2
+{8}
+3
+{5,6}
+4
+{7,NULL}
+
+# One parameter inferred as both an array and a scalar.
+# params: 1
+statement error 42804
+SELECT id FROM t WHERE nums = $1 OR id = $1
+
+# --- ranges ---------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, span int4range)
+
+statement ok
+INSERT INTO r VALUES (1, '[1,5)'), (2, '[5,10)'), (3, 'empty')
+
+# A parameter beside a range takes the range type; its text form binds.
+# params: '[4,6)'
+query I nosort
+SELECT id FROM r WHERE span && $1 ORDER BY id
+----
+1
+2
+
+# params: '[2,3)'
+query I nosort
+SELECT id FROM r WHERE span @> $1 ORDER BY id
+----
+1
+
+# The element form of @> needs a cast.
+# params: 7
+query I nosort
+SELECT id FROM r WHERE span @> $1::i32 ORDER BY id
+----
+2
+
+# params: '[1,5)'
+query I nosort
+SELECT id FROM r WHERE span = $1
+----
+1
+
+# A discrete range binds canonicalized, as its constructor's result would be.
+# params: '[1,4]'
+query I nosort
+SELECT id FROM r WHERE span = $1
+----
+1
+
+# params: '[1,3]'
+# types: i32range
+query T nosort
+SELECT $1::int4range
+----
+[1,4)
+
+# params: '[5,1)'
+statement error 22000
+SELECT $1::int4range
+
+# params: 4, '[20,30)'
+statement ok
+INSERT INTO r VALUES ($1, $2)
+
+# params: '(0,2]', 3
+statement ok
+UPDATE r SET span = $1 WHERE id = $2
+
+query IT nosort
+SELECT id, span FROM r ORDER BY id
+----
+1
+[1,5)
+2
+[5,10)
+3
+[1,3)
+4
+[20,30)
+
+# --- composites -----------------------------------------------------------------------------------
+
+statement ok
+CREATE TYPE pt AS (x i32, y i32)
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, p pt)
+
+statement ok
+INSERT INTO c VALUES (1, ROW(1, 2)), (2, ROW(3, 4))
+
+# A parameter beside a named composite takes its type; a ROW value or the text form binds.
+# params: ROW(1, 2)
+query I nosort
+SELECT id FROM c WHERE p = $1
+----
+1
+
+# params: '(3,4)'
+query I nosort
+SELECT id FROM c WHERE p = $1
+----
+2
+
+# params: ROW(1, 2)
+# types: pt
+query T nosort
+SELECT $1::pt
+----
+(1,2)
+
+# The field count must match, and each field is coerced.
+# params: ROW(1)
+statement error 42804
+SELECT id FROM c WHERE p = $1
+
+# params: ROW(1, 'x')
+statement error 42804
+SELECT id FROM c WHERE p = $1
+
+# params: 3, ROW(5, 6)
+statement ok
+INSERT INTO c VALUES ($1, $2)
+
+# params: '(7,8)', 1
+statement ok
+UPDATE c SET p = $1 WHERE id = $2
+
+# An array of a composite binds as a list of ROW values.
+# params: ARRAY[ROW(7, 8), ROW(5, 6)]
+query I nosort
+SELECT id FROM c WHERE p = ANY($1) ORDER BY id
+----
+1
+3
+
+# An anonymous ROW(…) does not type a parameter.
+# params: ROW(1, 2)
+statement error 42P18
+SELECT id FROM c WHERE ROW(1, 2) = $1

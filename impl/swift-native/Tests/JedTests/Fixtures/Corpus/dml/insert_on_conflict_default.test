@@ -1,0 +1,191 @@
+# ON CONFLICT DO UPDATE SET col = DEFAULT (spec/design/upsert.md §5, constraints.md §2): the
+# conflict action resets a column of the existing row to its declared constant/expression default,
+# or NULL when it has none, exactly as standalone UPDATE SET col = DEFAULT does. The default is
+# evaluated once per UPDATED row (not for inserted or WHERE-skipped rows), so a nextval/identity
+# default advances its sequence only then; a GENERATED ALWAYS identity column accepts this form.
+# PostgreSQL 18 was used as the oracle for the rows and SQLSTATEs below.
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, ddl.column_default_expr, ddl.identity, ddl.sequence, func.sequence, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_on_conflict, dml.insert_on_conflict_default, dml.update, dml.update_default, dml.returning, dml.with_clause, query.select, query.select_no_from, query.order_by, query.cte_data_modifying, types.i32, types.i64, types.text, expr.arithmetic, resource.cost_metering
+
+statement ok
+CREATE TABLE kv (k i32 PRIMARY KEY, n i32 DEFAULT 6 * 7, c i32 DEFAULT 5, note text)
+
+statement ok
+INSERT INTO kv VALUES (1, 1, 1, 'one'), (2, 2, 2, 'two')
+
+# Expression, constant, and no-default columns, mixed with an ordinary excluded assignment. The
+# DEFAULT applies only to the updated row (k = 1); the inserted row (k = 3) takes its omitted
+# column defaults as usual.
+query IIIT rowsort
+INSERT INTO kv (k, note) VALUES (1, 'x'), (3, 'y')
+  ON CONFLICT (k) DO UPDATE SET n = DEFAULT, c = DEFAULT, note = DEFAULT
+  RETURNING k, n, c, note
+----
+1
+42
+5
+NULL
+3
+42
+5
+y
+
+query IIIT nosort
+SELECT k, n, c, note FROM kv ORDER BY k
+----
+1
+42
+5
+NULL
+2
+2
+2
+two
+3
+42
+5
+y
+
+# DEFAULT composes with the excluded pseudo-relation and a WHERE; a skipped row is unchanged.
+statement ok
+INSERT INTO kv (k, n, note) VALUES (2, 9, 'new'), (3, 7, 'skip')
+  ON CONFLICT (k) DO UPDATE SET n = excluded.n, note = DEFAULT WHERE kv.k = 2
+
+query IIIT nosort
+SELECT k, n, c, note FROM kv ORDER BY k
+----
+1
+42
+5
+NULL
+2
+9
+2
+NULL
+3
+42
+5
+y
+
+# The default-expression node (6 * 7) is charged once for the proposed row's omitted n and
+# once more for the conflicting row's SET n = DEFAULT, plus one RETURNING row. The constant-default
+# assignment and the arbiter probe are free.
+# cost: 3
+query II nosort
+INSERT INTO kv (k) VALUES (2) ON CONFLICT (k) DO UPDATE SET n = DEFAULT, c = DEFAULT RETURNING k, n
+----
+2
+42
+
+# DEFAULT still passes through NOT NULL; the statement is all-or-nothing.
+statement ok
+CREATE TABLE nn (k i32 PRIMARY KEY, v i32 NOT NULL DEFAULT NULL)
+
+statement ok
+INSERT INTO nn VALUES (1, 10)
+
+statement error 23502
+INSERT INTO nn VALUES (1, 11) ON CONFLICT (k) DO UPDATE SET v = DEFAULT
+
+query II nosort
+SELECT k, v FROM nn
+----
+1
+10
+
+# A nextval default advances only for rows actually updated, interleaved per row with the proposed
+# rows' own defaults.
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE TABLE sq (k i32 PRIMARY KEY, a i64 DEFAULT nextval('s'), b i64 DEFAULT nextval('s'))
+
+statement ok
+INSERT INTO sq (k) VALUES (1), (2)
+
+query III nosort
+SELECT k, a, b FROM sq ORDER BY k
+----
+1
+1
+2
+2
+3
+4
+
+# Each proposed row draws a and b (2 values); each conflicting row then draws its SET b default.
+query III rowsort
+INSERT INTO sq (k) VALUES (1), (5), (2)
+  ON CONFLICT (k) DO UPDATE SET b = DEFAULT RETURNING k, a, b
+----
+1
+1
+7
+2
+3
+12
+5
+8
+9
+
+# A DO UPDATE WHERE that skips the row skips its DEFAULT too: no value is drawn for it.
+statement ok
+INSERT INTO sq (k) VALUES (1) ON CONFLICT (k) DO UPDATE SET b = DEFAULT WHERE false
+
+query I nosort
+SELECT nextval('s')
+----
+15
+
+# GENERATED ALWAYS identity: DEFAULT is the one accepted DO UPDATE form and advances the sequence;
+# an ordinary assignment remains 428C9.
+statement ok
+CREATE TABLE ga (k i32 PRIMARY KEY, id i64 GENERATED ALWAYS AS IDENTITY, v text)
+
+statement ok
+INSERT INTO ga (k, v) VALUES (1, 'a'), (2, 'b')
+
+query IIT rowsort
+INSERT INTO ga (k, v) VALUES (1, 'c') ON CONFLICT (k) DO UPDATE SET id = DEFAULT, v = excluded.v
+  RETURNING k, id, v
+----
+1
+4
+c
+
+statement error 428C9
+INSERT INTO ga (k, v) VALUES (1, 'd') ON CONFLICT (k) DO UPDATE SET id = 100
+
+query IIT nosort
+SELECT k, id, v FROM ga ORDER BY k
+----
+1
+4
+c
+2
+2
+b
+
+# DEFAULT is recognized as a complete RHS inside a writable CTE body (before its closing paren),
+# for both the conflict action and standalone UPDATE.
+statement ok
+WITH w AS (INSERT INTO kv (k) VALUES (1) ON CONFLICT (k) DO UPDATE SET c = DEFAULT, note = DEFAULT) SELECT 1
+
+statement ok
+WITH w AS (UPDATE kv SET note = DEFAULT, c = DEFAULT) SELECT 1
+
+query IIIT nosort
+SELECT k, n, c, note FROM kv ORDER BY k
+----
+1
+42
+5
+NULL
+2
+42
+5
+NULL
+3
+42
+5
+NULL

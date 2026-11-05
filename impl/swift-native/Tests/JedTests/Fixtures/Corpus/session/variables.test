@@ -1,0 +1,86 @@
+# Session variables — PostgreSQL's GUC model scoped to the session (spec/design/session.md §6.1).
+# The session holds a string→string variable map the host configures (session.set_var / reset_var /
+# var) and SQL reads with current_setting('name'[, missing_ok]). The session is the engine's "fourth
+# host seam" (§6), and the values feed query RESULTS, so they are deterministic and cross-core. This
+# behavior is jed-specific — the values are configured through the host API, not reproducible as the
+# same SQL against PostgreSQL — so the suite is CROSS-CORE-checked (every core must agree), NOT
+# PostgreSQL-oracle-checked.
+#
+# The stock-runner-ignored `# set: name=value, …` directive configures the session variables for the
+# NEXT record and resets after (like `# seed:` / `# grant:`). A custom variable is namespaced like PG
+# (a DOTTED name); names are case-insensitive (folded to lowercase). An unset name is 42704
+# (unrecognized configuration parameter) unless the two-arg overload's missing_ok is true (→ NULL);
+# current_setting(NULL) is NULL (the function is STABLE and null-propagating). The host setters
+# (set_var/reset_var, the 42704-on-non-dotted, additional-session isolation, the no-rollback) are
+# per-core unit tested — the corpus cannot call them. Format + the `requires` gate:
+# ../../../design/conformance.md.
+# requires: query.select_no_from, types.text, session.variables
+
+# --- a set variable reads back through current_setting -------------------------------------------
+
+# set: myapp.tenant=acme
+query T nosort
+SELECT current_setting('myapp.tenant')
+----
+acme
+
+# Several variables in one directive (comma-separated); each reads back independently. A value keeps
+# its internal spaces (only the ends are trimmed) — each column renders on its own line.
+# set: myapp.tenant=acme, myapp.label=blue widget
+query TT nosort
+SELECT current_setting('myapp.tenant'), current_setting('myapp.label')
+----
+acme
+blue widget
+
+# --- names are case-insensitive (folded to lowercase, PG GUC names); the value is verbatim --------
+
+# set: myApp.Tenant=Acme
+query T nosort
+SELECT current_setting('MYAPP.TENANT')
+----
+Acme
+
+# current_setting composes in a comparison — the value comes back as a real text value.
+# set: myapp.tenant=acme
+query B nosort
+SELECT current_setting('myapp.tenant') = 'acme'
+----
+true
+
+# --- an unset name is 42704 (unrecognized configuration parameter) -------------------------------
+
+statement error 42704
+SELECT current_setting('myapp.never_set')
+
+# A non-dotted unknown name is the same 42704 (it is simply not in the map).
+statement error 42704
+SELECT current_setting('bogus')
+
+# --- missing_ok = true turns the unset-name error into NULL --------------------------------------
+
+query T nosort
+SELECT current_setting('myapp.never_set', true)
+----
+NULL
+
+# missing_ok = false is the same as the one-arg form (42704 on an unset name).
+statement error 42704
+SELECT current_setting('myapp.never_set', false)
+
+# When the name IS set, missing_ok is irrelevant — the value comes back either way.
+# set: myapp.tenant=acme
+query T nosort
+SELECT current_setting('myapp.tenant', true)
+----
+acme
+
+# (null = "propagates" — a NULL name short-circuits to NULL — is the generic scalar-function NULL
+# rule, exercised per-core in the unit tests with a text-typed NULL value, since jed defers text
+# casts so a NULL::text literal is not yet writable here.)
+
+# --- the directive is per-record: a variable set by an earlier record does not leak forward -------
+
+# This record has no `# set:`, so myapp.tenant (set above) is gone — current_setting is 42704 again.
+statement error 42704
+SELECT current_setting('myapp.tenant')

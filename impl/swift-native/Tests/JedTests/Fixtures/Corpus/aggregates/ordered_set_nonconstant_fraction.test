@@ -1,0 +1,51 @@
+# A non-constant ordered-set-aggregate fraction (spec/design/aggregates.md §17). The direct argument
+# of percentile_cont / percentile_disc may be any numeric expression over GROUPING columns, evaluated
+# once per group. A non-grouped column in the direct argument is 42803 (PG: direct arguments must use
+# only grouped columns).
+# requires: ddl.create_table, dml.insert, query.select, query.aggregates, query.group_by, query.ordered_set_aggregate, query.ordered_set_nonconstant_fraction, types.i32, types.decimal, types.f64
+
+statement ok
+CREATE TABLE t (p decimal, v i32)
+
+statement ok
+INSERT INTO t VALUES (0.0,10),(0.0,20),(0.0,30),(0.5,10),(0.5,20),(0.5,30),(1.0,10),(1.0,20),(1.0,30)
+
+# percentile_cont with a per-group fraction = the grouping column p: 0 -> 10, 0.5 -> 20, 1 -> 30.
+# names: p, percentile_cont
+query DR nosort
+SELECT p, percentile_cont(p) WITHIN GROUP (ORDER BY v) FROM t GROUP BY p ORDER BY p
+----
+0.0
+10
+0.5
+20
+1.0
+30
+
+# percentile_disc likewise (an actual input value, i32 result).
+# names: p, percentile_disc
+query DI nosort
+SELECT p, percentile_disc(p) WITHIN GROUP (ORDER BY v) FROM t GROUP BY p ORDER BY p
+----
+0.0
+10
+0.5
+20
+1.0
+30
+
+# An expression over the grouping column: percentile_disc(1 - p) flips the percentile.
+# names: p, percentile_disc
+query DI nosort
+SELECT p, percentile_disc(1 - p) WITHIN GROUP (ORDER BY v) FROM t GROUP BY p ORDER BY p
+----
+0.0
+30
+0.5
+20
+1.0
+10
+
+# A non-grouped column in the direct argument is 42803 (must use only grouped columns).
+statement error 42803
+SELECT percentile_cont(v) WITHIN GROUP (ORDER BY v) FROM t

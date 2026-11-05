@@ -1,0 +1,69 @@
+# Float inputs round directly to their target width and accept signed NaN.
+# Comparisons expose one-ULP differences that approximate R results would conceal.
+# requires: query.select_no_from, query.select, ddl.create_table, dml.insert, dml.update, cast.operator, cast.string_literal, types.f32, types.f64, types.decimal, types.i64, query.comparison_order
+
+query BBBB nosort
+SELECT '+NaN'::real = 'NaN'::real, '-NaN'::real = 'NaN'::real, '+NaN'::float = 'NaN'::float, '-NaN'::float = 'NaN'::float
+----
+true
+true
+true
+true
+
+query BBBB nosort
+SELECT '1.0000000596046447753906250000000000001'::real > 1::real, '-1.0000000596046447753906250000000000001'::real < -1::real, '1.0000001788139343261718749999999999999'::real < '1.0000002384185791015625'::real, '1.000000059604644775390625'::real = 1::real
+----
+true
+true
+true
+true
+
+query BB nosort
+SELECT 1.0000000596046447753906250000000000001::real > 1::real, 1.0000000596046447753906250000000000001::numeric::real > 1::real
+----
+true
+true
+
+query B nosort
+SELECT 4611686293305294849::bigint::real > 4611686018427387904::bigint::real
+----
+true
+
+# An explicit f64 cast intentionally rounds before narrowing; it must remain different.
+query B nosort
+SELECT '1.0000000596046447753906250000000000001'::float::real = 1::real
+----
+true
+
+# The same double-rounding issue occurs at the underflow and overflow boundaries.
+query B nosort
+SELECT '0.0000000000000000000000000000000000000000000007006492321624085354618647916449580656401309709382578858785341419448955413429303007433190941810607910156251'::real > 0::real
+----
+true
+
+query B nosort
+SELECT '340282356779733661637539395458142568447'::real < 'Infinity'::real
+----
+true
+
+statement error 22003
+SELECT '340282356779733661637539395458142568448'::real
+
+statement ok
+CREATE TABLE f32_inputs (v real)
+
+statement ok
+INSERT INTO f32_inputs VALUES (1.0000000596046447753906250000000000001)
+
+query B nosort
+SELECT v > 1::real FROM f32_inputs
+----
+true
+
+statement ok
+UPDATE f32_inputs SET v = 4611686293305294849
+
+query B nosort
+SELECT v > 4611686018427387904::bigint::real FROM f32_inputs
+----
+true

@@ -1,0 +1,56 @@
+# PostgreSQL checks each completed calendar step before applying the next interval field.
+# Inputs fit both engines; each intermediate crosses both engines' finite timestamp bounds.
+# requires: types.timestamp, types.timestamptz, types.interval, expr.interval_arithmetic
+
+# A later day adjustment cannot rescue the month step.
+statement error 22008
+SELECT timestamp '294000-01-01' + interval '12000 months -365242 days'
+
+statement error 22008
+SELECT timestamp '294000-01-01' - interval '-12000 months 365242 days'
+
+statement error 22008
+SELECT timestamp '2000-01-01' + interval '-4000000 months 121747000 days'
+
+# A later time adjustment cannot rescue the day step.
+statement error 22008
+SELECT timestamp '294000-01-01' + interval '103000 days -2472000 hours'
+
+statement error 22008
+SELECT timestamp '294000-01-01' - interval '-103000 days 2472000 hours'
+
+statement error 22008
+SELECT timestamp '4000-01-01 BC' + interval '-105000000 days 2520000000 hours'
+
+statement error 22008
+SELECT timestamptz '294000-01-01+00' + interval '12000 months -365242 days'
+
+statement error 22008
+SELECT timestamptz '2000-01-01+00' + interval '-4000000 months 121747000 days'
+
+statement error 22008
+SELECT timestamptz '294000-01-01+00' + interval '103000 days -2472000 hours'
+
+statement error 22008
+SELECT timestamptz '4000-01-01+00 BC' + interval '-105000000 days 2520000000 hours'
+
+# Mixed signs are valid when every step remains finite.
+query T nosort
+SELECT timestamp '2024-01-10' + interval '1 month -31 days'
+----
+2024-01-10 00:00:00
+
+query T nosort
+SELECT timestamp '2024-01-10' + interval '1 day -24 hours'
+----
+2024-01-10 00:00:00
+
+query T nosort
+SELECT timestamp '2024-01-10' - interval '1 month -31 days'
+----
+2024-01-10 00:00:00
+
+query T nosort
+SELECT timestamptz '2024-01-10+00' + interval '1 day -24 hours'
+----
+2024-01-10 00:00:00+00

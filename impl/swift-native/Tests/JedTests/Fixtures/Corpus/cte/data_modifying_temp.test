@@ -1,0 +1,250 @@
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# Data-modifying (writable) CTEs over session-local temp tables (spec/design/writable-cte.md §2,
+# temp-tables.md §2): the read pin covers the temp domain exactly as it covers the main database, so
+# every sub-statement reads the temp tables' PRE-statement state and data crosses only through a
+# CTE's RETURNING buffer. Foreign keys among temp tables are checked against the state the earlier
+# sub-statements produced (PostgreSQL's end-of-statement RI checks), not against the pin. Rows
+# verified against the live PostgreSQL 18 oracle.
+# requires: ddl.temp_table, ddl.create_table, ddl.primary_key, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, dml.with_clause, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.join_inner, query.table_alias, query.qualified_column, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32
+
+statement ok
+CREATE TEMP TABLE tp (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO tp VALUES (1, 10), (2, 20), (3, 30)
+
+# --- the shared snapshot ---------------------------------------------------------------------------
+
+# The primary reads the pre-statement temp table: the CTE's delete is invisible to it.
+query I nosort
+WITH d AS (DELETE FROM tp WHERE id = 1 RETURNING id) SELECT count(*) FROM tp
+----
+3
+
+# ... and the delete really landed.
+query II nosort
+SELECT id, v FROM tp ORDER BY id
+----
+2
+20
+3
+30
+
+# The primary does not see an INSERT-CTE's row either.
+query I nosort
+WITH i AS (INSERT INTO tp VALUES (4, 40) RETURNING id) SELECT count(*) FROM tp
+----
+2
+
+# A sibling query CTE reads the pre-statement state too (b does not see a's insert).
+query I nosort
+WITH a AS (INSERT INTO tp VALUES (5, 50) RETURNING id),
+     b AS (SELECT count(*) AS n FROM tp)
+SELECT n FROM b
+----
+3
+
+query II nosort
+SELECT id, v FROM tp ORDER BY id
+----
+2
+20
+3
+30
+4
+40
+5
+50
+
+# UPDATE visibility: the RETURNING buffer carries the new values, the table read in the same
+# statement still shows the old ones.
+query III nosort
+WITH u AS (UPDATE tp SET v = v + 1 WHERE id <= 3 RETURNING id, v)
+SELECT t.id, t.v, u.v FROM tp t JOIN u ON u.id = t.id ORDER BY t.id
+----
+2
+20
+21
+3
+30
+31
+
+query II nosort
+SELECT id, v FROM tp ORDER BY id
+----
+2
+21
+3
+31
+4
+40
+5
+50
+
+# A DELETE primary whose WHERE reads the table an UPDATE-CTE rewrites: it matches the PRE-statement
+# values (v = 40 still matches id 4, although the CTE moves it to 41).
+query II rowsort
+WITH u AS (UPDATE tp SET v = v + 1 WHERE id = 4 RETURNING id)
+DELETE FROM tp WHERE v = 40 RETURNING id, v
+----
+4
+40
+
+query II nosort
+SELECT id, v FROM tp ORDER BY id
+----
+2
+21
+3
+31
+5
+50
+
+# --- RETURNING chains --------------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE inbox (id i32 PRIMARY KEY, payload i32)
+
+statement ok
+CREATE TEMP TABLE archive (id i32 PRIMARY KEY, payload i32)
+
+statement ok
+INSERT INTO inbox VALUES (1, 100), (2, 200), (3, 300)
+
+# Move rows: the delete's RETURNING feeds the insert, whose RETURNING feeds the primary; the primary
+# sees neither table changed.
+query III nosort
+WITH moved AS (DELETE FROM inbox WHERE payload >= 200 RETURNING id, payload),
+     ins AS (INSERT INTO archive SELECT id, payload FROM moved RETURNING id)
+SELECT (SELECT count(*) FROM ins), (SELECT count(*) FROM inbox), (SELECT count(*) FROM archive)
+----
+2
+3
+0
+
+query II nosort
+SELECT id, payload FROM inbox ORDER BY id
+----
+1
+100
+
+query II nosort
+SELECT id, payload FROM archive ORDER BY id
+----
+2
+200
+3
+300
+
+# The move-rows idiom with a data-modifying primary.
+statement ok
+WITH moved AS (DELETE FROM inbox RETURNING id, payload) INSERT INTO archive SELECT id, payload FROM moved
+
+query II nosort
+SELECT id, payload FROM archive ORDER BY id
+----
+1
+100
+2
+200
+3
+300
+
+query I nosort
+SELECT count(*) FROM inbox
+----
+0
+
+# Two parts inserting the same key: neither sees the other's row, so the second write collides.
+statement error 23505
+WITH a AS (INSERT INTO archive VALUES (9, 900) RETURNING id) INSERT INTO archive VALUES (9, 901)
+
+# ... and the statement is all-or-nothing.
+query I nosort
+SELECT count(*) FROM archive
+----
+3
+
+# A temp table and a main-database table in one writable WITH: each domain reads its own
+# pre-statement state.
+statement ok
+CREATE TABLE main_log (id i32 PRIMARY KEY)
+
+query II nosort
+WITH a AS (INSERT INTO main_log SELECT id FROM archive RETURNING id),
+     b AS (DELETE FROM archive WHERE id = 1 RETURNING id)
+SELECT (SELECT count(*) FROM main_log), (SELECT count(*) FROM archive)
+----
+0
+3
+
+query I nosort
+SELECT count(*) FROM main_log
+----
+3
+
+query I nosort
+SELECT count(*) FROM archive
+----
+2
+
+# --- foreign keys among temp tables -----------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE fp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE fc (id i32 PRIMARY KEY, pid i32 REFERENCES fp)
+
+statement ok
+INSERT INTO fp VALUES (1), (2)
+
+# A parent inserted by a CTE satisfies a child inserted by the primary.
+statement ok
+WITH p AS (INSERT INTO fp VALUES (3) RETURNING id) INSERT INTO fc SELECT id * 10, id FROM p
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+3
+
+# A child re-pointed by the primary at a parent the CTE inserted.
+statement ok
+WITH p AS (INSERT INTO fp VALUES (4) RETURNING id) UPDATE fc SET pid = (SELECT id FROM p) WHERE id = 30
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4
+
+# A parent deleted by a CTE does not satisfy a child the primary inserts, though the primary's own
+# read of fp still sees it.
+statement error 23503
+WITH d AS (DELETE FROM fp WHERE id = 1 RETURNING id) INSERT INTO fc SELECT 10, id FROM fp WHERE id = 1
+
+# ... nothing changed.
+query I nosort
+SELECT id FROM fp ORDER BY id
+----
+1
+2
+3
+4
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4
+
+# Deleting a parent that a CTE's inserted child references fails the parent-side check.
+statement error 23503
+WITH c AS (INSERT INTO fc VALUES (20, 2) RETURNING id) DELETE FROM fp WHERE id = 2
+
+query II nosort
+SELECT id, pid FROM fc ORDER BY id
+----
+30
+4

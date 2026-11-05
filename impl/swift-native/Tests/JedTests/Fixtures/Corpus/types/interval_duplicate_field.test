@@ -1,0 +1,235 @@
+# PostgreSQL's duplicate-field rule for interval text input (spec/design/interval.md §3): a value
+# that names the same field twice is malformed (22007 invalid input syntax for type interval), not
+# summed. Each unit is its own field — `week` and `day` are different fields, as are year / decade /
+# century / millennium and second / millisecond / microsecond — while a bare `HH:MM[:SS]` time claims
+# hour through microsecond, a trailing unitless number is seconds, and a seconds value with a nonzero
+# fraction also claims millisecond and microsecond. The rule lives in the one interval parser, so it
+# binds every text→interval path: the INTERVAL literal, a string literal adapting to an interval
+# column, the `::interval` / CAST spelling, the runtime per-row text cast, and container element text.
+# Out-of-range precedence follows PG's right-to-left reading: a running total that is already out of
+# range at the duplicate reports 22008 (PG's dedicated 22015 — the oracle_overrides ledger).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, types.interval, types.array, types.composite, cast.explicit, cast.operator, cast.string_literal, cast.text_string_native
+
+# --- the same field twice -------------------------------------------------------------------------
+
+statement error 22007
+SELECT INTERVAL '1 day 1 day'
+
+statement error 22007
+SELECT INTERVAL '1 day 2 days 3 days'
+
+# a sign, a different spelling, or an abutting unit does not make it a different field
+statement error 22007
+SELECT INTERVAL '-1 day +1 day'
+
+statement error 22007
+SELECT INTERVAL '1 day 1d'
+
+statement error 22007
+SELECT INTERVAL '1 mon 1 month'
+
+statement error 22007
+SELECT INTERVAL '1 y 1 yrs'
+
+statement error 22007
+SELECT INTERVAL '1 hour 2 hours'
+
+statement error 22007
+SELECT INTERVAL '1 min 1 mins'
+
+statement error 22007
+SELECT INTERVAL '1 week 1 w'
+
+statement error 22007
+SELECT INTERVAL '1 mil 1 millennium'
+
+statement error 22007
+SELECT INTERVAL '1 sec 1 sec'
+
+statement error 22007
+SELECT INTERVAL '1 ms 1 ms'
+
+statement error 22007
+SELECT INTERVAL '1 us 1 us'
+
+# `ago` does not hide a duplicate
+statement error 22007
+SELECT INTERVAL '1 day 1 day ago'
+
+# --- distinct fields combine ----------------------------------------------------------------------
+
+query T nosort
+SELECT INTERVAL '1 week 1 day'
+----
+8 days
+
+query T nosort
+SELECT INTERVAL '1 year 1 mon'
+----
+1 year 1 mon
+
+query T nosort
+SELECT INTERVAL '1 millennium 1 century 1 decade 1 year'
+----
+1111 years
+
+query T nosort
+SELECT INTERVAL '1 hour 1 min 1 sec 1 ms 1 us'
+----
+01:01:01.001001
+
+query T nosort
+SELECT INTERVAL '1.5 years 1 mon'
+----
+1 year 7 mons
+
+query T nosort
+SELECT INTERVAL '1 hour 1.5 days'
+----
+1 day 13:00:00
+
+# --- a bare time claims hour through microsecond --------------------------------------------------
+
+query T nosort
+SELECT INTERVAL '1 day 01:00'
+----
+1 day 01:00:00
+
+statement error 22007
+SELECT INTERVAL '1:00 1:00'
+
+statement error 22007
+SELECT INTERVAL '1 hour 1:00'
+
+statement error 22007
+SELECT INTERVAL '1 min 1:00'
+
+statement error 22007
+SELECT INTERVAL '1 sec 1:00'
+
+statement error 22007
+SELECT INTERVAL '1 ms 1:00'
+
+statement error 22007
+SELECT INTERVAL '1 us 1:00'
+
+statement error 22007
+SELECT INTERVAL '1 day 00:00:00.5 1 us'
+
+# --- seconds: a trailing unitless number is seconds; a fraction also claims ms and us -------------
+
+statement error 22007
+SELECT INTERVAL '1:00 5'
+
+statement error 22007
+SELECT INTERVAL '1 sec 5'
+
+statement error 22007
+SELECT INTERVAL '1 s 0.0'
+
+query T nosort
+SELECT INTERVAL '1 ms 5'
+----
+00:00:05.001
+
+statement error 22007
+SELECT INTERVAL '1 ms 5.5'
+
+statement error 22007
+SELECT INTERVAL '1 us 0.5'
+
+query T nosort
+SELECT INTERVAL '1 sec 1 ms'
+----
+00:00:01.001
+
+query T nosort
+SELECT INTERVAL '1 ms 1 us'
+----
+00:00:00.001001
+
+statement error 22007
+SELECT INTERVAL '1.5 sec 1 ms'
+
+statement error 22007
+SELECT INTERVAL '1.5 sec 1 us'
+
+statement error 22007
+SELECT INTERVAL '1 ms 1.5 sec'
+
+# a zero fraction is plain seconds
+query T nosort
+SELECT INTERVAL '1.0 sec 1 ms'
+----
+00:00:01.001
+
+query T nosort
+SELECT INTERVAL '1.000 sec 1 ms'
+----
+00:00:01.001
+
+# --- out-of-range precedence (PG reads the fields right to left) ----------------------------------
+
+# the running total overflows at the duplicate itself: out of range, not malformed
+statement error 22008
+SELECT INTERVAL '2000000000 days 2000000000 days'
+
+# an overflowing field to the right of the duplicate is read first
+statement error 22008
+SELECT INTERVAL '1 day 1 day 99999999999 years'
+
+# one to its left is never reached
+statement error 22007
+SELECT INTERVAL '99999999999 years 1 day 1 day'
+
+# --- every text→interval path ---------------------------------------------------------------------
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, s text, v interval)
+
+# a string literal adapting to an interval column
+statement error 22007
+INSERT INTO d VALUES (1, NULL, '1 day 1 day')
+
+statement ok
+INSERT INTO d VALUES (1, '1 day 1 day', '1 day'), (2, '1 week 1 day', '2 days')
+
+# the cast spellings over a literal
+statement error 22007
+SELECT '1 hour 1:00'::interval
+
+statement error 22007
+SELECT CAST('1 hour 1:00' AS interval)
+
+# the runtime per-row text cast
+statement error 22007
+SELECT s::interval FROM d WHERE id = 1
+
+query T nosort
+SELECT s::interval FROM d WHERE id = 2
+----
+8 days
+
+# comparison against an adapting literal
+statement error 22007
+SELECT id FROM d WHERE v = '1 day 1 day'
+
+# container element text: an interval[] literal and a composite field
+statement error 22007
+SELECT '{"1 day","1 day 1 day"}'::interval[]
+
+query T nosort
+SELECT '{"1 week 1 day","1 day"}'::interval[]
+----
+{"8 days","1 day"}
+
+statement ok
+CREATE TYPE span AS (label text, len interval)
+
+statement error 22007
+SELECT '(a,"1 day 1 day")'::span
+
+query T nosort
+SELECT '(a,"1 week 1 day")'::span
+----
+(a,"8 days")

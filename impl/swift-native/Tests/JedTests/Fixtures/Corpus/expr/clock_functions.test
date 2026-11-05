@@ -1,0 +1,91 @@
+# Current-time functions (spec/design/entropy.md §5) — now() / current_timestamp (STABLE) and
+# clock_timestamp() (VOLATILE), on the host-injected clock seam. The `# clock:` directive pins a
+# FIXED statement clock; `# clock_advance: start,step` injects an ADVANCING clock (one increment per
+# read, in expression-evaluation order) so clock_timestamp()'s per-call reads are deterministic and
+# distinguishable from the statement-stable now() — byte-identical across Rust/Go/TS, EXACT
+# assertions. NOT oracle-imported (PG's wall clock differs); expected values come from the injected
+# clock. now() reads the clock ONCE per statement and reuses it; clock_timestamp() reads on every
+# call. current_timestamp is the bare-keyword SQL-standard spelling, pure parser sugar for now()
+# (same value, same `now` column label). Format: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, query.set_returning, types.timestamptz, types.boolean, func.now, func.clock_timestamp, resource.cost_metering
+
+# --- now(): the injected statement clock, rendered as timestamptz (always UTC, +00) ----------
+# clock: 1721056591872000
+# types: timestamptz
+# names: now
+# cost: 2
+query T nosort
+SELECT now()
+----
+2024-07-15 15:16:31.872+00
+
+# --- current_timestamp is parser sugar for now(): same value AND the same `now` column label --
+# clock: 1721056591872000
+# names: now
+# cost: 2
+query T nosort
+SELECT current_timestamp
+----
+2024-07-15 15:16:31.872+00
+
+# --- clock_timestamp(): under a FIXED clock every read is the same instant -------------------
+# clock: 1721056591872000
+# types: timestamptz
+# names: clock_timestamp
+# cost: 2
+query T nosort
+SELECT clock_timestamp()
+----
+2024-07-15 15:16:31.872+00
+
+# --- current_timestamp shares now()'s STATEMENT clock even under an ADVANCING clock ----------
+# (both read the once-resolved statement clock, NOT a fresh per-call read), so they are equal.
+# clock_advance: 1721056591872000,1000000
+query B nosort
+SELECT now() = current_timestamp
+----
+true
+
+# --- now() is STABLE: two calls in one statement are equal even under an advancing clock ------
+# clock_advance: 1721056591872000,1000000
+query B nosort
+SELECT now() = now()
+----
+true
+
+# --- clock_timestamp() is VOLATILE: it advances per call, so the left call precedes the right -
+# clock_advance: 1721056591872000,1000000
+query B nosort
+SELECT clock_timestamp() < clock_timestamp()
+----
+true
+
+# --- the contrast, fully spelled: now() (cols 1,3) is fixed while clock_timestamp() (col 2)
+# advances. Eval order is left-to-right: now() reads the source first (caches `start`), then
+# clock_timestamp() takes the next tick (start + 1s), then now() reuses the cached `start`.
+# clock_advance: 1721056591872000,1000000
+query TTT nosort
+SELECT now(), clock_timestamp(), now()
+----
+2024-07-15 15:16:31.872+00
+2024-07-15 15:16:32.872+00
+2024-07-15 15:16:31.872+00
+
+# --- multi-row: now() is read ONCE for the statement, so every row sees the same instant ------
+# clock_advance: 1721056591872000,1000000
+query T rowsort
+SELECT now() FROM generate_series(1, 3)
+----
+2024-07-15 15:16:31.872+00
+2024-07-15 15:16:31.872+00
+2024-07-15 15:16:31.872+00
+
+# --- multi-row: clock_timestamp() reads per row, so it advances one tick per generated row ----
+# (rowsort: the three distinct instants sort chronologically, so order need not be asserted.)
+# clock_advance: 1721056591872000,1000000
+query T rowsort
+SELECT clock_timestamp() FROM generate_series(1, 3)
+----
+2024-07-15 15:16:31.872+00
+2024-07-15 15:16:32.872+00
+2024-07-15 15:16:33.872+00

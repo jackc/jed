@@ -1,0 +1,230 @@
+# Correlated subqueries (spec/design/grammar.md §26): a subquery referencing a column of an
+# enclosing query, resolved via the scope chain (inner FROM first, then outward) and re-executed
+# per outer row. Covers correlated EXISTS / scalar / IN, correlation in a JOIN ON, an outer
+# reference inside an aggregate argument, multi-level + skip-level (grandparent) correlation, a
+# correlated ORDER BY key (an inner ORDER BY referencing an enclosing-query column — now allowed,
+# query.order_by_correlated; a correlated GROUP BY key is group_by_correlated.test). Results
+# verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.order_by_correlated, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t1 (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE t2 (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE t3 (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (2, 20)
+
+statement ok
+INSERT INTO t2 VALUES (1, 10), (2, 30)
+
+statement ok
+INSERT INTO t3 VALUES (1, 10), (2, 20)
+
+# Correlated EXISTS — keep a t1 row iff some t2 row has the same v. t1.v=10 matches t2 (v=10);
+# t1.v=20 has no match. Cost (per-outer-row, cost.md §3): scan t1 (2). For each t1 row the WHERE
+# evaluates the subquery node (1 operator_eval) + its run: scan t2 (2) + `t2.v=t1.v` per t2 row (2
+# operator_eval) + row_produced per inner match (1 for v=10, 0 for v=20). So row1 = 1+(2+2+1)=6,
+# row2 = 1+(2+2+0)=5. Plus 1 row_produced for the surviving t1 row. 2+6+5+1 = 14.
+# cost: 17
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)
+----
+1
+
+# Correlated NOT EXISTS is the complement.
+query I rowsort
+SELECT t1.id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v)
+----
+2
+
+# Correlated scalar with an aggregate over a correlated WHERE — count the t2 rows whose v exceeds
+# this t1 row's v. (count(*) > 10 -> 1 row [v=30]; > 20 -> 1 row [v=30].)
+query II nosort
+SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v > t1.v) FROM t1 ORDER BY t1.id
+----
+1
+1
+2
+1
+
+# A correlated scalar with no matching row yields NULL (the typed empty scalar), per outer row.
+query II nosort
+SELECT t1.id, (SELECT t2.v FROM t2 WHERE t2.v = t1.v * 100) FROM t1 ORDER BY t1.id
+----
+1
+NULL
+2
+NULL
+
+# An outer reference inside an aggregate ARGUMENT (mixed with an inner column) — sum(t2.v + t1.v)
+# over t2 for each t1 row: (10+10)+(30+10)=60 ; (10+20)+(30+20)=80. (A PURELY-outer argument like
+# sum(t1.v) is a documented divergence — jed sums it at the inner level; see grammar.md §26.)
+query II nosort
+SELECT t1.id, (SELECT sum(t2.v + t1.v) FROM t2) FROM t1 ORDER BY t1.id
+----
+1
+60
+2
+80
+
+# Correlated IN — t1.v in the t2 values selected for this t1 row. id=1: t2.id=1 -> {10}, 10 in -> yes.
+# id=2: t2.id=2 -> {30}, 20 in -> no. The inner correlation `t2.id = t1.id` is on t2's PRIMARY KEY, so
+# it pushes down to a per-outer-row point lookup (the inner seeks t2 instead of re-scanning it). That is
+# a cost-only optimization — the rows are identical with or without it — so the cost contract for this
+# shape is pinned separately in subquery/correlated_pushdown.test (which requires query.correlated_pushdown);
+# here only the rows are asserted, keeping this file runnable without that capability.
+query I rowsort
+SELECT t1.id FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id)
+----
+1
+
+# Correlated NOT IN.
+query I rowsort
+SELECT t1.id FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.id = t1.id)
+----
+2
+
+# Correlation in a nested JOIN's ON predicate — the inner self-join's ON references the outer t1.
+# id=1 (v=10): t2b has a v=10 row, so the join is non-empty -> EXISTS. id=2 (v=20): no t2b.v=20.
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 JOIN t2 AS t2b ON t2b.v = t1.v WHERE t2.id = t1.id)
+----
+1
+
+# Two-level nesting, each level correlating to its IMMEDIATE parent: t1.v -> t2.v, then t2.v -> t3.v.
+# t1.id=1 (v=10): t2 has v=10, and t3 has v=10 -> yes. t1.id=2 (v=20): t2 has no v=20 -> no.
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v AND EXISTS (SELECT 1 FROM t3 WHERE t3.v = t2.v))
+----
+1
+
+# Skip-level (grandparent) correlation — the innermost references t1, skipping t2. Both t1 rows
+# have a matching t3 (v=10 and v=20), and t2 is non-empty, so both survive.
+query I rowsort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.v = t1.v))
+----
+1
+2
+
+# G27 — a subquery correlated to a JOINED outer. The outer is `t1 JOIN t3`, and the correlated
+# EXISTS references `t1.v` (one joined alias): id 1 (v=10) has a matching t2 row, id 2 (v=20) does
+# not.
+query I nosort
+SELECT t1.id FROM t1 JOIN t3 ON t1.id = t3.id WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v) ORDER BY t1.id
+----
+1
+
+# The correlated reference can resolve to the OTHER relation of the multi-relation outer: here the
+# scalar subquery correlates to `t3.v`, counting matching t2 rows per joined row.
+query II nosort
+SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v = t3.v) FROM t1 JOIN t3 ON t1.id = t3.id ORDER BY t1.id
+----
+1
+1
+2
+0
+
+# An UNQUALIFIED correlated name that is present in MORE THAN ONE outer relation is ambiguous:
+# `v` is not a column of the inner FROM (inr), so it escapes to the outer scope, where both t1 and
+# t3 expose `v` → 42702.
+statement ok
+CREATE TABLE inr (id i32 PRIMARY KEY, x i32)
+
+statement ok
+INSERT INTO inr VALUES (1, 10)
+
+statement error 42702
+SELECT t1.id FROM t1 JOIN t3 ON t1.id = t3.id WHERE EXISTS (SELECT 1 FROM inr WHERE inr.x = v)
+
+# A correlated ORDER BY key — an inner ORDER BY referencing an enclosing-query column — is now
+# allowed (query.order_by_correlated). The outer column is a per-evaluation constant of the enclosing
+# row (a degenerate leading sort key), so a deterministic later key decides the order; PostgreSQL
+# matches. The subquery becomes correlated PURELY through its ORDER BY, so it re-executes per outer row.
+
+# Outer t1.v leads (constant), t2.v DESC decides -> the max t2.v (30) for every outer row.
+# names: id, pick
+query II nosort
+SELECT t1.id, (SELECT t2.v FROM t2 ORDER BY t1.v, t2.v DESC LIMIT 1) AS pick FROM t1 ORDER BY t1.id
+----
+1
+30
+2
+30
+
+# Outer key combined into an arithmetic expression key (t1.v + t2.v DESC) -> t2.id 2 each.
+# names: id, pid
+query II nosort
+SELECT t1.id, (SELECT t2.id FROM t2 ORDER BY t1.v + t2.v DESC LIMIT 1) AS pid FROM t1 ORDER BY t1.id
+----
+1
+2
+2
+2
+
+# Ordering inside an EXISTS subquery by an outer column is a no-op but must not error: t2 is
+# non-empty so EXISTS holds for every t1 row.
+# names: id
+query I nosort
+SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v) ORDER BY t1.id
+----
+1
+2
+
+# A grandparent (skip-level, level 2) correlated ORDER BY key: the innermost ORDER BY references
+# t1.v two frames out. t3.id DESC decides -> 2 for every outer row.
+# names: id, x
+query II nosort
+SELECT t1.id,
+       (SELECT (SELECT t3.id FROM t3 ORDER BY t1.v, t3.id DESC LIMIT 1) FROM t2 WHERE t2.id = t1.id) AS x
+FROM t1 ORDER BY t1.id
+----
+1
+2
+2
+2
+
+# G15 — a correlated scalar subquery used as an expression must return at most ONE row; more than
+# one is a cardinality violation (21000). This is a PER-OUTER-ROW check made at EXECUTION, not a
+# plan-time error: the same subquery shape returns one row for one outer row and two for another,
+# so the engine cannot know it will trip until it runs the subquery for the offending row.
+statement ok
+CREATE TABLE s1 (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE s2 (id i32 PRIMARY KEY, v i32)
+
+# s2 has two rows with v=5 and one with v=100. The correlated scalar (SELECT s2.v WHERE s2.v = s1.k)
+# returns one row when s1.k=100 (the single v=100) and two when s1.k=5 (the duplicated v=5).
+statement ok
+INSERT INTO s1 VALUES (1, 100), (2, 5)
+
+statement ok
+INSERT INTO s2 VALUES (1, 5), (2, 5), (3, 100)
+
+# Isolating the offending outer row (s1.id=2, k=5): the subquery returns two rows -> 21000.
+statement error 21000
+SELECT s1.id, (SELECT s2.v FROM s2 WHERE s2.v = s1.k) FROM s1 WHERE s1.id = 2
+
+# The other outer row (s1.id=1, k=100) is fine on its own — the same scalar subquery returns exactly
+# one row. This is the data baseline the variant below builds on. Outer point lookup: 1 page + 1
+# scanned + 1 filter (s1.id=1) + 1 subquery node; inner per-row run: 1 page + 3 scanned s2 + 3
+# `s2.v = s1.k` compares + 1 inner produced; + 1 outer produced = 13.
+# names: id, ?column?
+# cost: 13
+query II nosort
+SELECT s1.id, (SELECT s2.v FROM s2 WHERE s2.v = s1.k) FROM s1 WHERE s1.id = 1
+----
+1
+100
+
+# The "later outer row" variant: scanning the whole of s1, the FIRST outer row (id=1, k=100) yields
+# a valid single-row scalar, and only the LATER outer row (id=2, k=5) trips 21000 — proving the
+# violation is detected while executing that row, after an earlier row already succeeded, not up
+# front at plan time.
+statement error 21000
+SELECT s1.id, (SELECT s2.v FROM s2 WHERE s2.v = s1.k) FROM s1 ORDER BY s1.id

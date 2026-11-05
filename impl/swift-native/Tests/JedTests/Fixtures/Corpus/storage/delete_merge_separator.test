@@ -1,0 +1,161 @@
+# Delete rebalance whose merge-overflow split hands the parent a LONGER separator (format.md
+# "Delete", the second abandon rule). Deleting from an underfull leaf merges it with its right
+# sibling; the merged leaf overflows the page and is split by the balanced rule, and the split key
+# REPLACES the parent separator between the pair. Here the split lands on the one oversized key
+# ('017' || 1197 y's), which is 200 bytes longer than the separator it would replace, and the parent
+# (a 35-record text-keyed tree at 8192-byte pages, whose interior is already near capacity) cannot
+# take it: nothing on the delete path splits an interior, so the merge is abandoned instead and the
+# underfull leaf tolerated. Before that rule the over-capacity parent reached the commit, which
+# refused it with 0A000 and left the row undeletable. The shape is a byte contract: every core
+# abandons the same merge, so the file stays byte-identical. Runs in memory and on disk.
+# requires: query.select, query.aggregates, query.order_by, ddl.create_table, ddl.primary_key, dml.insert, dml.delete, types.text, expr.like, expr.text_concat
+
+statement ok
+CREATE TABLE t (k text PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES ('000' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('001' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('002' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('003' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('004' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('005' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('006' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('007' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('008' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('009' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('010' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('011' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('012' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('013' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('014' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('015' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('016' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('017' || repeat('y', 1197))
+
+statement ok
+INSERT INTO t VALUES ('018' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('019' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('020' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('021' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('022' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('023' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('024' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('025' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('026' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('027' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('028' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('029' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('030' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('031' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('032' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('033' || repeat('x', 997))
+
+statement ok
+INSERT INTO t VALUES ('034' || repeat('x', 997))
+
+statement ok
+DELETE FROM t WHERE k LIKE '012%'
+
+statement ok
+DELETE FROM t WHERE k LIKE '013%'
+
+query I
+SELECT count(*) FROM t
+----
+33
+
+query T nosort
+SELECT left(k, 3) FROM t WHERE k LIKE '01%' ORDER BY k
+----
+010
+011
+014
+015
+016
+017
+018
+019
+
+statement ok
+DELETE FROM t WHERE k LIKE '017%'
+
+statement ok
+DELETE FROM t WHERE k LIKE '018%'
+
+query I
+SELECT count(*) FROM t
+----
+31
+
+statement ok
+DELETE FROM t
+
+query I
+SELECT count(*) FROM t
+----
+0

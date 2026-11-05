@@ -1,0 +1,102 @@
+# Windowed TOP-N (spec/design/window.md §5.2 "windowed top-N", cost.md §3). A plain window query
+# whose LIMIT is answerable from the first OFFSET+LIMIT primary-key-scan rows — a BACKWARD window over
+# the PK-ordered scan (every window value at scan position k depends only on rows at positions <= k) —
+# scans only that prefix instead of the whole table. It is the window analog of the streaming-scan
+# LIMIT short-circuit: the rows are byte-identical to the eager whole-table fold, and only the metered
+# cost drops (fewer rows scanned + folded), IDENTICALLY across every core (the cross-core cost
+# contract, CLAUDE.md §8/§13). So these stay oracle-clean (PG agrees on the rows); the `# cost:`
+# directives pin the lowered cost.
+#
+# Eligibility (windowTopNEligible): a single base-table PK scan, plain (non-grouped) window, not
+# DISTINCT, a LIMIT, an outer ORDER BY the PK satisfies (pkOrdered), and EVERY window function
+# backward over the scan order — row_number/rank/dense_rank/lag, or an aggregate/first_value/
+# last_value/nth_value whose frame END does not look forward. cume_dist/percent_rank/ntile (need the
+# total partition size N) and lead (looks forward) DISABLE the optimization — the last query pins that
+# fallback: it reads the whole table, so its cost is higher.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.limit, query.window, query.window_ranking, query.window_aggregate, query.window_frame, resource.cost_metering, types.i32
+
+statement ok
+CREATE TABLE tw (id i32 PRIMARY KEY, g i32, x i32)
+
+statement ok
+INSERT INTO tw VALUES (1,1,10),(2,1,20),(3,1,30),(4,2,40),(5,2,50),(6,2,60),(7,3,70),(8,3,80)
+
+# Running SUM (expanding ROWS frame, backward). LIMIT 3 ⇒ only the first 3 PK rows are scanned +
+# folded; the running totals are byte-identical to the whole-table fold's first three.
+# names: id, s
+# cost: 13
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM tw ORDER BY id LIMIT 3
+----
+1
+10
+2
+30
+3
+60
+
+# Moving COUNT (bounded ROWS frame ending at CURRENT ROW — backward). Same top-3 scan.
+# names: id, c
+# cost: 13
+query II nosort
+SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS c FROM tw ORDER BY id LIMIT 3
+----
+1
+1
+2
+2
+3
+3
+
+# row_number() — frame-independent, backward (position). LIMIT 3.
+# names: id, rn
+# cost: 10
+query II nosort
+SELECT id, row_number() OVER (ORDER BY id) AS rn FROM tw ORDER BY id LIMIT 3
+----
+1
+1
+2
+2
+3
+3
+
+# The DEFAULT frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW) over the UNIQUE primary key id — the
+# current-row peer group is a single row, so it is backward-safe and top-N applies.
+# names: id, s
+# cost: 13
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY id) AS s FROM tw ORDER BY id LIMIT 3
+----
+1
+10
+2
+30
+3
+60
+
+# OFFSET: the cap is OFFSET+LIMIT = 5 rows scanned; the window is computed over that prefix, then the
+# OFFSET..OFFSET+LIMIT slice emitted. The running totals still match the whole-table fold.
+# names: id, s
+# cost: 18
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM tw ORDER BY id LIMIT 2 OFFSET 3
+----
+4
+100
+5
+150
+
+# FALLBACK — cume_dist() needs the total partition size N, so the optimization does NOT apply: the
+# whole table is scanned (higher cost than the backward windows above). The rows are unchanged.
+# names: id, cd
+# cost: 20
+query IR nosort
+SELECT id, cume_dist() OVER (ORDER BY id) AS cd FROM tw ORDER BY id LIMIT 3
+----
+1
+0.125
+2
+0.25
+3
+0.375

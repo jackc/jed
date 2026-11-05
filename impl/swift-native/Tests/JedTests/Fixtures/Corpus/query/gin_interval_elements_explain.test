@@ -1,0 +1,78 @@
+# GIN over interval[] — the selected plan (jed-only: EXPLAIN is jed's own rendering, never
+# oracle-imported). Pins that an interval-element GIN index bounds `= ANY`, `@>`, `&&`, array `=`,
+# and a mutation's target-row scan (spec/design/gin.md §6), whichever spelling of a span the query
+# uses (`1 mon`, `720 hours`, `43200 minutes` are one term).
+# The rows themselves are oracle-checked in query/gin_interval_elements.test.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_interval_elements, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, query.explain, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, func.array_containment, func.array_quantified, cast.operator, types.interval, types.i32, types.array
+
+statement ok
+CREATE TABLE iv (id i32 PRIMARY KEY, v interval[])
+
+statement ok
+CREATE INDEX iv_v_gin ON iv USING gin (v)
+
+statement ok
+INSERT INTO iv VALUES
+  (1, '{1 mon,2 days}'),
+  (2, '{30 days}'),
+  (3, '{720:00:00}'),
+  (4, '{-1 day}'),
+  (5, '{}'),
+  (6, NULL)
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM iv WHERE '1 mon'::interval = ANY(v)
+----
+0
+Filter
+conjuncts=1
+1
+Scan iv
+GIN bound: using iv_v_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM iv WHERE v @> '{720 hours,2 days}'::interval[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan iv
+GIN bound: using iv_v_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) SELECT id FROM iv WHERE v = '{30 days}'::interval[]
+----
+0
+Filter
+conjuncts=1
+1
+Scan iv
+GIN bound: using iv_v_gin; touched=2
+
+query ITT nosort
+EXPLAIN (COSTS false) UPDATE iv SET v = '{1 day}' WHERE v && '{-24 hours}'::interval[]
+----
+0
+Update iv
+sets=1
+1
+Filter
+conjuncts=1
+2
+Scan iv
+GIN bound: using iv_v_gin; touched=1
+
+query ITT nosort
+EXPLAIN (COSTS false) DELETE FROM iv WHERE '43200 minutes'::interval = ANY(v)
+----
+0
+Delete iv
+-
+1
+Filter
+conjuncts=1
+2
+Scan iv
+GIN bound: using iv_v_gin; touched=1

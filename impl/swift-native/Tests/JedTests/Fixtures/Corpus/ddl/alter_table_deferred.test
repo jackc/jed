@@ -1,0 +1,14 @@
+# ALTER TABLE's remaining deferred identity surface and named-PK divergence (§2.3/§7). jed-specific; do not
+# PostgreSQL-oracle-check.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.check, types.i32, types.i64
+
+statement ok
+CREATE TABLE deferred_alter (id i32 PRIMARY KEY, v i32)
+
+# jed derives this introspection handle; it has no named PK object to rename (PG would succeed).
+statement error 42704
+ALTER TABLE deferred_alter RENAME CONSTRAINT deferred_alter_pkey TO renamed_pkey
+
+# SET TYPE is not grammar; PostgreSQL's spellings are TYPE or SET DATA TYPE.
+statement error 42601
+ALTER TABLE deferred_alter ALTER COLUMN v SET TYPE i64

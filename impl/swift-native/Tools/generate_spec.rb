@@ -40,19 +40,34 @@ module SwiftSpecGenerator
     spec/encoding/range.toml
     spec/encoding/composite.toml
     spec/encoding/ordered.toml
+    spec/encoding/gin_posting_runs.toml
+    spec/encoding/gin_jsonb_terms.toml
     spec/tz/vectors/bundle.toml
     spec/tz/vectors/tzif.toml
     spec/fileformat/encryption_vectors.toml
     spec/regex/program_vectors.toml
     spec/regex/match_vectors.toml
     spec/regex/similar_vectors.toml
+    spec/collation/vectors/bundle.toml
+    spec/collation/vectors/compiler.toml
+    spec/collation/vectors/sortkey.toml
   ].freeze
   fixture_listing, fixture_error, fixture_status = Open3.capture3(
     "git", "ls-tree", "-r", "--name-only", BASELINE, "spec/fileformat/fixtures", chdir: ROOT
   )
   abort "cannot list frozen byte fixtures: #{fixture_error}" unless fixture_status.success?
   BYTE_INPUTS = (fixture_listing.lines.map(&:strip).select { |path| path.end_with?(".jed") }.sort +
-    ["spec/tz/fixtures/tzdata.jtz"]).freeze
+    %w[spec/tz/fixtures/tzdata.jtz spec/collation/fixtures/unicode.jucd
+       spec/collation/fixtures/unicode.coll spec/collation/fixtures/es.coll
+       spec/collation/fixtures/dev-root.allkeys spec/collation/fixtures/dev-nordic.ldml]).freeze
+  corpus_listing, corpus_error, corpus_status = Open3.capture3(
+    "git", "ls-tree", "-r", "--name-only", BASELINE,
+    "spec/conformance/suites", chdir: ROOT
+  )
+  abort "cannot list frozen conformance corpus: #{corpus_error}" unless corpus_status.success?
+  CORPUS_INPUTS = corpus_listing.lines.map(&:strip).select { |path| path.end_with?(".test") }.sort.freeze
+  abort "frozen corpus inventory changed" unless CORPUS_INPUTS.length == 749 &&
+    CORPUS_INPUTS.count { |path| path.include?("/concurrency/") } == 7
 
   module_function
 
@@ -99,7 +114,7 @@ module SwiftSpecGenerator
   end
 
   def read_sources
-    (INPUTS + BYTE_INPUTS).to_h do |path|
+    (INPUTS + BYTE_INPUTS + CORPUS_INPUTS).to_h do |path|
       bytes, error, status = Open3.capture3("git", "show", "#{BASELINE}:#{path}", chdir: ROOT)
       abort "cannot read baseline #{path}: #{error}" unless status.success?
       [path, bytes.b]
@@ -231,6 +246,15 @@ module SwiftSpecGenerator
     BYTE_INPUTS.each do |path|
       outputs["impl/swift-native/Tests/JedTests/Fixtures/#{File.basename(path)}"] = sources.fetch(path)
     end
+    CORPUS_INPUTS.each do |path|
+      relative = path.delete_prefix("spec/conformance/suites/")
+      outputs["impl/swift-native/Tests/JedTests/Fixtures/Corpus/#{relative}"] = sources.fetch(path)
+    end
+    # Keep future accidental working-tree corpus copies out of this immutable
+    # snapshot. This check never removes files; it reports the unexpected paths.
+    corpus_root = "impl/swift-native/Tests/JedTests/Fixtures/Corpus"
+    extras = Dir.glob("#{corpus_root}/**/*.test", base: ROOT) - outputs.keys
+    abort "unexpected Swift frozen corpus files: #{extras.join(', ')}" unless extras.empty?
     stale = outputs.keys.select do |path|
       target = File.join(ROOT, path)
       if arguments == ["--check"]

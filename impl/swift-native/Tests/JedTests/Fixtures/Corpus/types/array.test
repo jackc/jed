@@ -1,0 +1,343 @@
+# Array (T[]) values (spec/design/array.md): the ARRAY(...) constructor + the '{...}' text literal
+# (§1), the compact value codec (§4), array_out rendering (§7), element-wise comparison with PG
+# BTREE NULL semantics (§5 — NULLs comparable and mutually equal, NOT the composite 3VL rule),
+# ORDER BY / DISTINCT array keys (the array_cmp total order — NULLs-last per element,
+# shorter-prefix-first), and the whole-value IS NULL rule. A keyable-element array is now a valid
+# PRIMARY KEY (the lift is pinned here; the full key surface is types/array_key.test). array_out
+# matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.update, dml.update_container, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.aggregates, query.group_by, expr.not_equal, types.array, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])
+
+# The ARRAY[…] constructor builds the array value stored in the column.
+statement ok
+INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])
+
+# A bare string literal adapts to the array column via array_in; '{}' is the empty array.
+statement ok
+INSERT INTO t VALUES (2, '{40,50}', '{}')
+
+# A NULL element renders as the unquoted token NULL; a NULL array renders NULL.
+statement ok
+INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)
+
+# array_out renders {e1,e2,…}; the empty array is {}, a NULL array is NULL.
+query ITT nosort
+SELECT id, xs, tags FROM t ORDER BY id
+----
+1
+{10,20,30}
+{a,b}
+2
+{40,50}
+{}
+3
+{1,NULL,3}
+NULL
+
+# Whole-value IS NULL: only a SQL-NULL array is NULL — a non-null array of NULL elements is NOT NULL.
+query I nosort
+SELECT id FROM t WHERE xs IS NULL ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE tags IS NULL ORDER BY id
+----
+3
+
+# Equality is element-wise with btree NULL semantics: an exact match.
+query I nosort
+SELECT id FROM t WHERE xs = ARRAY[10,20,30] ORDER BY id
+----
+1
+
+# {1,NULL,3} = {1,NULL,3} is TRUE (NULL elements are mutually equal — not UNKNOWN).
+query I nosort
+SELECT id FROM t WHERE xs = ARRAY[1,NULL,3] ORDER BY id
+----
+3
+
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, xs i32[])
+
+statement ok
+INSERT INTO s VALUES (1, ARRAY[1, 2, 3])
+
+statement ok
+INSERT INTO s VALUES (2, ARRAY[1, 2])
+
+statement ok
+INSERT INTO s VALUES (3, ARRAY[1, 3])
+
+statement ok
+INSERT INTO s VALUES (4, ARRAY[1])
+
+# ORDER BY is element-wise; a shorter array (prefix) sorts before a longer one.
+query T nosort
+SELECT xs FROM s ORDER BY xs
+----
+{1}
+{1,2}
+{1,2,3}
+{1,3}
+
+# DISTINCT dedups by structural (btree) equality.
+query T rowsort
+SELECT DISTINCT xs FROM s
+----
+{1,2,3}
+{1,2}
+{1,3}
+{1}
+
+# A comma in a text element forces double-quoting in array_out.
+statement ok
+CREATE TABLE q (id i32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO q VALUES (1, ARRAY['a,b', 'c'])
+
+query T nosort
+SELECT tags FROM q ORDER BY id
+----
+{"a,b",c}
+
+# An over-range element value traps 22003 at store.
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, xs i16[])
+
+statement error 22003
+INSERT INTO o VALUES (1, ARRAY[100000])
+
+# A malformed array literal traps 22P02.
+statement error 22P02
+INSERT INTO t VALUES (4, '{1,2', NULL)
+
+# INSERT ... SELECT into an array column takes a source column of exactly the column's type (the
+# container assignment rule UPDATE shares, array.md §6). A bare ARRAY[1] in a select list is i64[]
+# (no target hint reaches a SELECT), so it is 42804 at the type-assignability gate, before any row
+# is produced; PostgreSQL assignment-casts it.
+statement error 42804
+INSERT INTO t (id, xs) SELECT 9, ARRAY[1]
+
+# Comparing arrays of different element types is 42804.
+statement error 42804
+SELECT id FROM t WHERE xs = tags
+
+# An array of a key-encodable scalar element IS a valid PRIMARY KEY (the array-elements-terminated
+# key, encoding.md §2.14) — the positive surface (point lookup, 23505, ordering, secondary index,
+# UNIQUE, FK) is exercised in types/array_key.test. Here just the lift: a keyable-element array PK is
+# accepted where it was 0A000 before.
+statement ok
+CREATE TABLE k (xs i32[] PRIMARY KEY)
+
+# --- array comparison with NULL ELEMENTS yields a DEFINITE boolean (PG btree semantics, array.md
+# §5), NOT the composite 3VL rule: a NULL element sorts LAST (is the largest), every comparison is
+# TRUE or FALSE (never NULL/UNKNOWN), and NULL elements are mutually equal. (Inequality is
+# exercised below via <, >, <=, >=; whole-array `=`/`<>` are definite the same way — array.md §5.)
+statement ok
+CREATE TABLE cmpn (id i32 PRIMARY KEY, xs i32[])
+
+statement ok
+INSERT INTO cmpn VALUES (1, ARRAY[1,2]), (2, ARRAY[1,NULL]), (3, ARRAY[1,3]), (4, ARRAY[1])
+
+# ORDER BY: a shorter prefix sorts first, then element-wise; a NULL element sorts after every
+# non-NULL, so {1,NULL} is last: {1} < {1,2} < {1,3} < {1,NULL}.
+query T nosort
+SELECT xs FROM cmpn ORDER BY xs
+----
+{1}
+{1,2}
+{1,3}
+{1,NULL}
+
+# Strict ordering is irreflexive; the non-strict operators include structural equality.
+query BBBB nosort
+SELECT ARRAY[1,NULL] < ARRAY[1,NULL], ARRAY[1,NULL] <= ARRAY[1,NULL],
+       ARRAY[1,NULL] > ARRAY[1,NULL], ARRAY[1,NULL] >= ARRAY[1,NULL]
+FROM cmpn WHERE id = 1
+----
+false
+true
+false
+true
+
+# {1,NULL} > {1,3}: the 2nd element NULL is larger than 3 -> TRUE (definite, not UNKNOWN).
+query B nosort
+SELECT xs > ARRAY[1,3] FROM cmpn WHERE id = 2
+----
+true
+
+# {1,2} <= {1,NULL}: 2 < NULL -> TRUE.
+query B nosort
+SELECT xs <= ARRAY[1,NULL] FROM cmpn WHERE id = 1
+----
+true
+
+# {1,NULL} = {1,NULL}: NULL elements are mutually equal -> TRUE (not UNKNOWN).
+query B nosort
+SELECT xs = ARRAY[1,NULL] FROM cmpn WHERE id = 2
+----
+true
+
+# <> is the negation of array =, and stays DEFINITE: {1,NULL} <> {1,3} differs at the 2nd element
+# -> TRUE, never UNKNOWN (the contrast with composite <>, which is 3VL — types/composite.test).
+query B nosort
+SELECT xs <> ARRAY[1,3] FROM cmpn WHERE id = 2
+----
+true
+
+# {1,NULL} != {1,NULL}: the elements are mutually equal, so = is TRUE and != is FALSE (the !=
+# alias folds to the same operator).
+query B nosort
+SELECT xs != ARRAY[1,NULL] FROM cmpn WHERE id = 2
+----
+false
+
+# --- array_out / array_in text I/O (array.md §7). An element is double-quoted when it is empty,
+# contains a delimiter/brace/quote/backslash, or equals the word NULL; `"` and `\` are
+# backslash-escaped. The unquoted token NULL (any case) is a NULL ELEMENT; "NULL" (quoted) is the
+# 4-character string. array_in is the inverse and trims unquoted surrounding whitespace.
+statement ok
+CREATE TABLE aio (id i32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO aio VALUES
+  (1, '{""}'),
+  (2, '{NULL}'),
+  (3, '{"NULL"}'),
+  (4, '{nUlL}'),
+  (5, '{a,"NULL",c}'),
+  (6, '{ x , y }')
+
+query IT nosort
+SELECT id, tags FROM aio ORDER BY id
+----
+1
+{""}
+2
+{NULL}
+3
+{"NULL"}
+4
+{NULL}
+5
+{a,"NULL",c}
+6
+{x,y}
+
+# the unquoted-NULL element (id 2) is a NULL ELEMENT, not a NULL array: IS NULL is false (no rows).
+query I nosort
+SELECT id FROM aio WHERE tags IS NULL ORDER BY id
+----
+
+# the quoted "NULL" (id 3) is the 4-character string and equals ARRAY['NULL']; the NULL-element
+# row (id 2) does not.
+query I nosort
+SELECT id FROM aio WHERE tags = ARRAY['NULL'] ORDER BY id
+----
+3
+
+# array_out escapes an embedded double-quote (\") and backslash (\\), and quotes a brace-bearing
+# element.
+statement ok
+CREATE TABLE aesc (id i32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO aesc VALUES (1, ARRAY['a"b']), (2, ARRAY['a\b']), (3, ARRAY['{x}'])
+
+query T nosort
+SELECT tags FROM aesc ORDER BY id
+----
+{"a\"b"}
+{"a\\b"}
+{"{x}"}
+
+# --- text[] comparison/ORDER BY recurses into the element's text comparator (array.md §5) — the
+# path where the TS UTF-16-vs-UTF-8 ordering trap must not surface (the per-element byte/astral
+# edge is pinned scalar-side in types/text.test; the same comparator is reused here). Lowercase
+# ASCII so the ordering is collation-independent (oracle-clean): a shorter prefix sorts first.
+statement ok
+CREATE TABLE tarr (id i32 PRIMARY KEY, tags text[])
+
+statement ok
+INSERT INTO tarr VALUES (1, ARRAY['banana']), (2, ARRAY['apple']), (3, ARRAY['apple','zebra']), (4, ARRAY['cherry'])
+
+query IT nosort
+SELECT id, tags FROM tarr ORDER BY tags
+----
+2
+{apple}
+3
+{apple,zebra}
+1
+{banana}
+4
+{cherry}
+
+# text[] equality recurses element-wise too (collation-independent).
+query I nosort
+SELECT id FROM tarr WHERE tags = ARRAY['apple','zebra']
+----
+3
+
+# G22 — GROUP BY an array column. The whole array is the grouping key, compared with the same
+# btree-NULL semantics as equality (NULLs comparable + mutually equal), so duplicate arrays collapse
+# and two {1,NULL,3} rows group TOGETHER (the NULL element does not make the group key UNKNOWN, the
+# array-vs-composite distinction). ORDER BY xs uses the array_cmp total order (NULLs-last per
+# element): {1,2} < {1,NULL,3} < {3}. 5 scanned + 5 accumulate + 3 produced + 1 page = 14.
+statement ok
+CREATE TABLE ga (id i32 PRIMARY KEY, xs i32[])
+
+statement ok
+INSERT INTO ga VALUES (1, ARRAY[1,2]), (2, ARRAY[1,2]), (3, ARRAY[3]), (4, ARRAY[1,NULL,3]), (5, ARRAY[1,NULL,3])
+
+# names: xs, count
+# Per-row keys add 672 (cost.md §3 "sort_key / hash_key"): 14 before them.
+# cost: 686
+query TI nosort
+SELECT xs, count(*) FROM ga GROUP BY xs ORDER BY xs
+----
+{1,2}
+2
+{1,NULL,3}
+2
+{3}
+1
+
+# U1 — updating an array column (dml.update_container, array.md §4). The RHS adapts like INSERT: a
+# bare ARRAY[…] constructor adapts its elements to the column's element type (i32), a bare string
+# literal via array_in, and a NULL clears the column.
+statement ok
+CREATE TABLE au (id i32 PRIMARY KEY, xs i32[])
+
+statement ok
+INSERT INTO au VALUES (1, ARRAY[1,2,3]), (2, ARRAY[4,5]), (3, ARRAY[9])
+
+statement ok
+UPDATE au SET xs = ARRAY[7,8,9] WHERE id = 1
+
+statement ok
+UPDATE au SET xs = '{10,20}' WHERE id = 2
+
+statement ok
+UPDATE au SET xs = NULL WHERE id = 3
+
+query IT nosort
+SELECT id, xs FROM au ORDER BY id
+----
+1
+{7,8,9}
+2
+{10,20}
+3
+NULL
+
+# A text array is not assignable to an i32[] column (the element type differs) — 42804.
+statement error 42804
+UPDATE au SET xs = ARRAY['x'] WHERE id = 1
+
+# A scalar RHS is not assignable to an array column — 42804.
+statement error 42804
+UPDATE au SET xs = 5 WHERE id = 1

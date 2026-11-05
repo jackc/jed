@@ -1,0 +1,77 @@
+# json/jsonb introspection & processing functions (B1, spec/design/json-sql-functions.md §2):
+# json[b]_typeof → the JSON type name, json[b]_array_length → the array element count (22023 on a
+# non-array), json[b]_strip_nulls → recursively remove object members whose value is JSON null (array
+# nulls kept). The json overloads parse the verbatim text on demand and dispatch to the same kernel;
+# json_strip_nulls renders COMPACT (PG json output), jsonb_strip_nulls spaced-canonical. All
+# propagate a SQL NULL input. A bare string-literal arg needs an explicit ::json/::jsonb cast (jed's
+# general function-argument strictness). jsonb_pretty (multi-line) is a per-core unit test. Output
+# matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.jsonb, types.json, func.json_processing
+
+# json[b]_typeof — the JSON type name (object/array/string/number/boolean/null).
+query TTTTTT nosort
+SELECT jsonb_typeof('{}'::jsonb), jsonb_typeof('[1]'::jsonb), jsonb_typeof('1'::jsonb),
+       jsonb_typeof('"x"'::jsonb), jsonb_typeof('true'::jsonb), jsonb_typeof('null'::jsonb)
+----
+object
+array
+number
+string
+boolean
+null
+
+# The json overload parses on demand; a SQL NULL input propagates.
+query TTT nosort
+SELECT json_typeof('1.5'::json), json_typeof('[]'::json), jsonb_typeof(NULL::jsonb)
+----
+number
+array
+NULL
+
+# json[b]_array_length — the element count.
+query II nosort
+SELECT jsonb_array_length('[1,2,3]'::jsonb), json_array_length('[]'::json)
+----
+3
+0
+
+# A non-array array_length is 22023.
+statement error 22023
+SELECT jsonb_array_length('5'::jsonb)
+
+statement error 22023
+SELECT json_array_length('{"a":1}'::json)
+
+# jsonb_strip_nulls — recursively remove object members with a JSON-null value (array nulls kept),
+# rendered spaced-canonical.
+query T nosort
+SELECT jsonb_strip_nulls('{"a":1,"b":null,"c":{"d":null,"e":2}}'::jsonb)
+----
+{"a": 1, "c": {"e": 2}}
+
+# json_strip_nulls keeps array nulls and renders COMPACT (PG json output style).
+query TT nosort
+SELECT json_strip_nulls('[1,null,{"x":null}]'::json), json_strip_nulls('{"a": 1, "b": null}'::json)
+----
+[1,null,{}]
+{"a":1}
+
+# Used over a stored column.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"a":1,"tags":["x","y","z"]}'), (2, '[10,20]'), (3, '"scalar"')
+
+query ITT nosort
+SELECT id, jsonb_typeof(b), jsonb_typeof(b -> 'tags') FROM t WHERE id = 1
+----
+1
+object
+array
+
+query II nosort
+SELECT id, jsonb_array_length(b) FROM t WHERE id = 2
+----
+2
+2

@@ -1,0 +1,444 @@
+# A set operation as an INSERT source (grammar.md §24/§25): `INSERT INTO t SELECT … UNION [ALL] |
+# INTERSECT [ALL] | EXCEPT [ALL] SELECT …`, with parenthesized operands, a parenthesized whole
+# source, a trailing ORDER BY / LIMIT / OFFSET over the combined result, and a WITH prefix. The
+# source is the same set-op plan a top-level query runs: its per-position unified column types are
+# then checked for assignability to the target columns (42804, even over an empty source) and its
+# arity against the target (42601), and its rows run through the ordinary two-phase /
+# all-or-nothing INSERT validation, ON CONFLICT, and RETURNING. Cost = the set operation's own cost
+# (lhs + rhs, cost.md §3) — the INSERT adds nothing. Probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: dml.insert_select_setop, ddl.create_table, ddl.primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.insert_on_conflict, dml.returning, query.select, query.select_star, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.order_by_ordinal, query.limit, query.offset, query.union, query.intersect, query.except, query.cte, query.cte_recursive, query.cte_data_modifying, expr.arithmetic, types.i16, types.i32, types.i64, types.decimal, types.text, error.overflow_trap, resource.cost_metering
+
+statement ok
+CREATE TABLE s1 (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO s1 VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE TABLE s2 (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO s2 VALUES (2, 20), (4, 40), (5, 50)
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+# --- the four operators -----------------------------------------------------------------------
+
+# UNION dedups (2,20) -> 5 rows. Cost is the set operation's: each bare-column operand scans and
+# produces 3 rows, exactly the same query's cost as a top-level statement (below).
+# cost: 14
+statement ok
+INSERT INTO t SELECT id, a FROM s1 UNION SELECT id, a FROM s2
+
+# cost: 14
+query II rowsort
+SELECT id, a FROM s1 UNION SELECT id, a FROM s2
+----
+1
+10
+2
+20
+3
+30
+4
+40
+5
+50
+
+query II rowsort
+SELECT id, a FROM t
+----
+1
+10
+2
+20
+3
+30
+4
+40
+5
+50
+
+statement ok
+DELETE FROM t
+
+# UNION ALL keeps both copies of id 2, so the PK traps 23505 and nothing is stored
+statement error 23505
+INSERT INTO t SELECT id, a FROM s1 UNION ALL SELECT id, a FROM s2
+
+query I rowsort
+SELECT count(*) FROM t
+----
+0
+
+# UNION ALL with disjoint keys
+query II rowsort
+INSERT INTO t SELECT id, a FROM s1 UNION ALL SELECT id + 10, a FROM s2 RETURNING id, a
+----
+1
+10
+12
+20
+14
+40
+15
+50
+2
+20
+3
+30
+
+statement ok
+DELETE FROM t
+
+# INTERSECT: only (2,20) is in both
+query II rowsort
+INSERT INTO t SELECT id, a FROM s1 INTERSECT SELECT id, a FROM s2 RETURNING *
+----
+2
+20
+
+# EXCEPT: s1 minus s2 on whole rows -> (1,10), (3,30); (2,20) is already stored
+query II rowsort
+INSERT INTO t SELECT id, a FROM s1 EXCEPT SELECT id, a FROM s2 RETURNING *
+----
+1
+10
+3
+30
+
+statement ok
+DELETE FROM t
+
+# INTERSECT ALL / EXCEPT ALL over a multiset source; the target has no key
+statement ok
+CREATE TABLE m (v i32)
+
+statement ok
+INSERT INTO m SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 2 INTERSECT ALL SELECT 1
+
+statement ok
+INSERT INTO m SELECT a FROM s1 EXCEPT ALL SELECT 10
+
+query I rowsort
+SELECT v FROM m
+----
+1
+1
+20
+30
+
+# INTERSECT binds tighter: 1 UNION (2 INTERSECT 3) -> just 1
+statement ok
+INSERT INTO m SELECT 1 UNION SELECT 2 INTERSECT SELECT 3
+
+query I rowsort
+SELECT v FROM m WHERE v = 1
+----
+1
+1
+1
+
+# --- trailing ORDER BY / LIMIT / OFFSET over the combined result -------------------------------
+
+# the 6 UNION ALL rows ordered by id DESC: (5,50), (4,40), (3,30), (2,20), (2,20), (1,10). OFFSET 3
+# LIMIT 2 keeps the two (2,20) rows, which collide on the key; OFFSET 1 LIMIT 2 keeps 4 and 3
+statement error 23505
+INSERT INTO t SELECT id, a FROM s1 UNION ALL SELECT id, a FROM s2 ORDER BY id DESC LIMIT 2 OFFSET 3
+
+query II rowsort
+INSERT INTO t SELECT id, a FROM s1 UNION ALL SELECT id, a FROM s2 ORDER BY id DESC LIMIT 2 OFFSET 1 RETURNING *
+----
+3
+30
+4
+40
+
+statement ok
+DELETE FROM t
+
+# an ordinal key, and LIMIT applying to the whole result rather than the last operand
+query II rowsort
+INSERT INTO t SELECT id, a FROM s1 UNION ALL SELECT id + 10, a FROM s2 ORDER BY 1 DESC LIMIT 2 RETURNING *
+----
+14
+40
+15
+50
+
+# the set-op ORDER BY names output columns only: a qualified key or an out-of-range ordinal fails
+statement error 42P01
+INSERT INTO t SELECT id, a FROM s1 UNION SELECT id, a FROM s2 ORDER BY s1.id
+
+statement error 42P10
+INSERT INTO t SELECT id, a FROM s1 UNION SELECT id, a FROM s2 ORDER BY 3
+
+statement ok
+DELETE FROM t
+
+# --- parenthesized operands and a parenthesized whole source ----------------------------------
+
+# each operand carries its own ORDER BY / LIMIT before the combine
+query II rowsort
+INSERT INTO t (SELECT id, a FROM s1 ORDER BY id LIMIT 1) UNION ALL (SELECT id, a FROM s2 ORDER BY id DESC LIMIT 1) RETURNING *
+----
+1
+10
+5
+50
+
+# parentheses override precedence: (s1 UNION s2) INTERSECT s2 -> s2's rows not yet stored
+query II rowsort
+INSERT INTO t (SELECT id + 100, a FROM s1 UNION SELECT id + 100, a FROM s2) INTERSECT SELECT id + 100, a FROM s2 RETURNING *
+----
+102
+20
+104
+40
+105
+50
+
+# the whole source parenthesized, with the target's column list before it
+query II rowsort
+INSERT INTO t (a, id) (SELECT a, id + 200 FROM s1 EXCEPT SELECT 30, 203) RETURNING *
+----
+201
+10
+202
+20
+
+# a parenthesized source with no column list; trailing clauses fold onto it
+query II rowsort
+INSERT INTO t (SELECT id + 300, a FROM s1) ORDER BY 1 LIMIT 1 RETURNING *
+----
+301
+10
+
+# a doubly parenthesized source
+query II rowsort
+INSERT INTO t ((SELECT 400, 1) UNION SELECT 401, 2) RETURNING *
+----
+400
+1
+401
+2
+
+# a parenthesized query that already has an ORDER BY cannot take another
+statement error 42601
+INSERT INTO t (SELECT id, a FROM s1 ORDER BY id LIMIT 1) ORDER BY id LIMIT 2
+
+statement ok
+DELETE FROM t
+
+# --- WITH-prefixed sources ---------------------------------------------------------------------
+
+query II rowsort
+INSERT INTO t WITH w AS (SELECT id, a FROM s1 WHERE id < 3) SELECT * FROM w UNION SELECT id, a FROM s2 WHERE id = 4 RETURNING *
+----
+1
+10
+2
+20
+4
+40
+
+query II rowsort
+INSERT INTO t WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n + 10, n * 10 FROM r UNION ALL SELECT 20, 0 RETURNING *
+----
+11
+10
+12
+20
+13
+30
+20
+0
+
+# after a column list
+query II rowsort
+INSERT INTO t (a, id) WITH w AS (SELECT 7 AS x) SELECT x, x + 700 FROM w UNION SELECT 8, 800 RETURNING *
+----
+707
+7
+800
+8
+
+# a data-modifying CTE must be at the statement top level, not inside the INSERT source
+statement error 0A000
+INSERT INTO t WITH w AS (INSERT INTO s1 VALUES (9, 9) RETURNING *) SELECT * FROM w UNION SELECT 5, 5
+
+statement ok
+DELETE FROM t
+
+# --- as a writable CTE, and under a WITH primary ----------------------------------------------
+
+query I rowsort
+WITH ins AS (INSERT INTO t SELECT id, a FROM s1 UNION SELECT id, a FROM s2 WHERE id = 4 RETURNING id) SELECT id FROM ins
+----
+1
+2
+3
+4
+
+statement ok
+DELETE FROM t
+
+query II rowsort
+WITH src AS (SELECT id, a FROM s2) INSERT INTO t SELECT * FROM src INTERSECT SELECT id, a FROM s1 RETURNING *
+----
+2
+20
+
+statement ok
+DELETE FROM t
+
+# --- self-insert: every operand reads the pre-insert snapshot ---------------------------------
+
+statement ok
+INSERT INTO t VALUES (1, 1), (2, 2)
+
+query II rowsort
+INSERT INTO t SELECT id + 10, a FROM t UNION ALL SELECT id + 20, a FROM t RETURNING *
+----
+11
+1
+12
+2
+21
+1
+22
+2
+
+statement ok
+DELETE FROM t
+
+# --- ON CONFLICT -------------------------------------------------------------------------------
+
+statement ok
+INSERT INTO t VALUES (1, 1)
+
+query II rowsort
+INSERT INTO t SELECT id, a FROM s1 UNION SELECT 500, 500 ON CONFLICT (id) DO UPDATE SET a = excluded.a + 1000 RETURNING *
+----
+1
+1010
+2
+20
+3
+30
+500
+500
+
+query II rowsort
+INSERT INTO t SELECT id, a FROM s2 UNION ALL SELECT 600, 600 ON CONFLICT DO NOTHING RETURNING *
+----
+4
+40
+5
+50
+600
+600
+
+statement ok
+DELETE FROM t
+
+# --- column types: unified per position, then assignment-checked to the target ----------------
+
+# i16 UNION i64 -> i64, assignable to i32; the values fit
+statement ok
+INSERT INTO t SELECT 1::i16, 2::i64 UNION SELECT 3, 4
+
+# ... and one that does not fit traps 22003 per row, storing nothing
+statement error 22003
+INSERT INTO t SELECT 5, 6 UNION SELECT 3000000000, 7
+
+query II rowsort
+SELECT id, a FROM t
+----
+1
+2
+3
+4
+
+# integer UNION decimal -> decimal, into a decimal column (each value keeps its own scale)
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, v decimal)
+
+query ID rowsort
+INSERT INTO d SELECT 1, 1 UNION ALL SELECT 2, 2.50 RETURNING *
+----
+1
+1
+2
+2.50
+
+# a text column is not assignable to an i32 target: 42804, even over an empty source
+statement error 42804
+INSERT INTO t SELECT 1, 'x'::text UNION SELECT 2, 'y'
+
+statement error 42804
+INSERT INTO t SELECT id, a FROM s1 WHERE id > 100 UNION SELECT 1, 'y'::text WHERE false
+
+# operand types that cannot be unified are the set operation's own 42804
+statement error 42804
+INSERT INTO t SELECT 1, 2 WHERE false UNION SELECT 2, 'y'::text WHERE false
+
+# --- arity --------------------------------------------------------------------------------------
+
+# the operands disagree with each other: the set operation's 42601
+statement error 42601
+INSERT INTO t SELECT 1 UNION SELECT 4, 5
+
+# the operands agree but not with the target: the INSERT's 42601, even over an empty source
+statement error 42601
+INSERT INTO t SELECT 1, 2, 3 UNION SELECT 4, 5, 6
+
+statement error 42601
+INSERT INTO t SELECT 1, 2, 3 WHERE false UNION SELECT 4, 5, 6 WHERE false
+
+# --- NOT NULL is checked per produced row -------------------------------------------------------
+
+statement ok
+CREATE TABLE nn (id i32 PRIMARY KEY, a i32 NOT NULL)
+
+statement error 23502
+INSERT INTO nn SELECT 1, 1 UNION SELECT 2, NULL
+
+query I rowsort
+SELECT count(*) FROM nn
+----
+0
+
+# --- jed: keywords are not reserved (grammar.md §3) -------------------------------------------
+# `(` after the target begins a query source only when `(`, a WITH clause, or a SELECT that is not
+# itself a listed column name follows; `(select, a)` and `(select)` stay column lists. PostgreSQL
+# reserves SELECT, so both are its 42601 (ledgered).
+statement ok
+CREATE TABLE kw ("select" i32 PRIMARY KEY, a i32)
+
+query II rowsort
+INSERT INTO kw (select, a) SELECT 1, 2 UNION SELECT 3, 4 RETURNING *
+----
+1
+2
+3
+4
+
+query II rowsort
+INSERT INTO kw (select) VALUES (5) RETURNING *
+----
+5
+NULL
+
+# --- jed: an all-NULL set-op column stays untyped (grammar.md §25) ----------------------------
+# so it is assignable to any target column and stores NULLs. PostgreSQL resolves the column to
+# text first and rejects it for the i32 column (42804; ledgered).
+query II rowsort
+INSERT INTO t (a, id) SELECT NULL, 300 UNION SELECT NULL, 301 RETURNING *
+----
+300
+NULL
+301
+NULL

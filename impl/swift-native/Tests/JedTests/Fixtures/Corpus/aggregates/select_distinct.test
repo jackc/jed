@@ -1,0 +1,85 @@
+# SELECT DISTINCT in an aggregate query (spec/design/aggregates.md §10). Once the grouped
+# output rows are produced (GROUP BY / HAVING / window / ORDER BY), they are projected and
+# deduplicated by equality keeping the first occurrence, then LIMIT/OFFSET applied — the same
+# project->dedup->window pipeline as the non-aggregate DISTINCT (query/distinct.test). The
+# DISTINCT ORDER BY restriction applies: each ORDER BY key must be a select-list item, else 42P10.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.distinct, query.aggregate_select_distinct, types.i32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,30),(5,3,40)
+
+# DISTINCT over the grouped COUNT(*): per-group counts are {2, 2, 1} -> the distinct multiset
+# {1, 2}. ORDER BY 1 sorts by the projected count.
+# names: count
+query I nosort
+SELECT DISTINCT count(*) FROM t GROUP BY a ORDER BY 1
+----
+1
+2
+
+# DISTINCT over the grouped SUM(b): per-group sums are {30, 60, 40} -> all distinct.
+# names: sum
+query I nosort
+SELECT DISTINCT sum(b) FROM t GROUP BY a ORDER BY 1
+----
+30
+40
+60
+
+# A multi-column DISTINCT where the grouping key keeps every row distinct: nothing collapses.
+# names: a, count
+query II nosort
+SELECT DISTINCT a, count(*) FROM t GROUP BY a ORDER BY a
+----
+1
+2
+2
+2
+3
+1
+
+# Whole-table aggregate (no GROUP BY) with DISTINCT — exactly one group, so one row.
+# Cost: 5 storage_row_read + 5 aggregate_accumulate + 1 count(*) projection operator_eval +
+# 1 row_produced = 12 (the one group row is projected once, then emitted).
+# names: count
+# cost: 12
+query I nosort
+SELECT DISTINCT count(*) FROM t
+----
+5
+
+# DISTINCT composes with HAVING: only groups a=1, a=2 survive (count > 1), counts {2, 2} ->
+# distinct {2}.
+# names: count
+query I nosort
+SELECT DISTINCT count(*) FROM t GROUP BY a HAVING count(*) > 1 ORDER BY 1
+----
+2
+
+# DISTINCT with an output alias as the ORDER BY key (DISTINCT-restriction: the key is a
+# select-list item). z = a*0 is 0 for every group, so the distinct pairs are (0,30),(0,40),(0,60).
+# names: z, s
+query II nosort
+SELECT DISTINCT a*0 AS z, sum(b) AS s FROM t GROUP BY a ORDER BY s
+----
+0
+30
+0
+40
+0
+60
+
+# DISTINCT then LIMIT: dedup first ({1, 2}), then take one.
+# names: count
+query I nosort
+SELECT DISTINCT count(*) FROM t GROUP BY a ORDER BY 1 LIMIT 1
+----
+1
+
+# The DISTINCT ORDER BY restriction (42P10): an ORDER BY key that is not a select-list item is
+# rejected — `a` is a grouping column but is not projected.
+statement error 42P10
+SELECT DISTINCT count(*) FROM t GROUP BY a ORDER BY a

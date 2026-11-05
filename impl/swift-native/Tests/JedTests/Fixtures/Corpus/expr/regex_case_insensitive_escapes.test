@@ -1,0 +1,150 @@
+# Case-insensitive matching keeps escape letters intact (spec/design/regex.md §1/§5). `~*`, `!~*` and
+# the regexp_* `'i'` flag fold the pattern's literal characters and class members to lowercase, but
+# never the letter after a backslash: `\D \W \S` stay the negations of `\d \w \s`, and `\A` stays the
+# start anchor. A fold of the raw pattern text would turn `\D` into `\d` (inverting it) and `\A` into
+# the invalid `\a`. Each case runs with a constant pattern (precompiled at resolve) and with a pattern
+# read from a table (compiled per row at eval). Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, expr.regex_match, expr.regex_imatch, func.regexp_like, func.regexp_replace, func.regexp_match, types.i32, types.text, types.boolean, types.array, resource.cost_metering
+
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# --- `~*` with a constant pattern -----------------------------------------------------------------
+
+# `\D` is a non-digit: a letter matches, a digit does not.
+query BB nosort
+SELECT 'a' ~* '\D', '1' ~* '\D' FROM one
+----
+true
+false
+
+# `\W` is a non-word character: a letter (either case) does not match, a space does.
+query BBB nosort
+SELECT 'A' ~* '\W', 'a' ~* '\W', ' ' ~* '\W' FROM one
+----
+false
+false
+true
+
+# `\S` is a non-space: a space does not match, a letter does.
+query BB nosort
+SELECT ' ' ~* '\S', 'X' ~* '\S' FROM one
+----
+false
+true
+
+# `\A` is the start anchor; the literal letters after it still fold.
+query BB nosort
+SELECT 'ABC' ~* '\Aab', 'xABC' ~* '\Aab' FROM one
+----
+true
+false
+
+# The negated escapes inside a bracket class, beside folded literal members.
+query BBB nosort
+SELECT 'a' ~* '^[\DX]$', '7' ~* '^[\DX]$', 'x' ~* '^[\SQ]$' FROM one
+----
+true
+false
+true
+
+# `!~*` is the negation.
+query BB nosort
+SELECT 'a' !~* '\D', '1' !~* '\D' FROM one
+----
+false
+true
+
+# An escaped backslash ends the escape: in `\\D` the `D` is a literal letter, and it folds.
+query BB nosort
+SELECT 'x\d' ~* '\\D', 'x\D' ~* '\\d' FROM one
+----
+true
+true
+
+# --- the regexp_* `'i'` flag ----------------------------------------------------------------------
+
+query BBBB nosort
+SELECT regexp_like('a', '\D', 'i'), regexp_like('A', '\W', 'i'), regexp_like(' ', '\S', 'i'), regexp_like('ABC', '\Ab', 'i') FROM one
+----
+true
+false
+false
+false
+
+query BB nosort
+SELECT regexp_like('1', '\D', 'i'), regexp_like('ABC', '\Aa', 'i') FROM one
+----
+false
+true
+
+# Only the non-digits are replaced; the result keeps the subject's case.
+query T nosort
+SELECT regexp_replace('Ab1C2', '\D', '_', 'gi') FROM one
+----
+__1_2
+
+query T nosort
+SELECT regexp_match('12 Ab', '\S+\s(\W*AB)', 'i') FROM one
+----
+{Ab}
+
+# --- non-constant patterns and flags (compiled per row) -------------------------------------------
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, pat text, flags text)
+
+statement ok
+INSERT INTO p VALUES (1, '\D', 'i'), (2, '\W', 'i'), (3, '\S', 'i'), (4, '\Aab', 'i'), (5, '^[\DX]$', 'i')
+
+query IBBB nosort
+SELECT id, 'a' ~* pat, ' ' ~* pat, '1' ~* pat FROM p ORDER BY id
+----
+1
+true
+true
+false
+2
+false
+true
+false
+3
+true
+false
+true
+4
+false
+false
+false
+5
+true
+true
+false
+
+query IBBB nosort
+SELECT id, regexp_like('ABc', pat, flags), regexp_like(' ', pat, flags), regexp_like('7', pat, flags) FROM p ORDER BY id
+----
+1
+true
+true
+false
+2
+false
+true
+false
+3
+true
+false
+true
+4
+true
+false
+false
+5
+false
+true
+false

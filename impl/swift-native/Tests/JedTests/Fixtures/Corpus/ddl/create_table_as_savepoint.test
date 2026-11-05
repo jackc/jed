@@ -1,0 +1,82 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# CREATE TABLE … AS and SELECT … INTO inside a savepoint (spec/design/create-table-as.md,
+# transactions.md §11): ROLLBACK TO removes the created table and its rows, RELEASE keeps them.
+# Oracle-checked against PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: ddl.create_table_as, ddl.select_into, ddl.create_table_as_writable_with, txn.savepoint, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.cte, query.cte_data_modifying, query.aggregates, query.order_by, types.i32
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO src VALUES (1, 10), (2, 20)
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+statement ok
+CREATE TABLE c1 AS SELECT id, v FROM src
+
+statement ok
+SELECT id INTO c2 FROM src WHERE v > 10
+
+statement ok
+ROLLBACK TO a
+
+statement error 42P01
+SELECT * FROM c1
+
+statement ok
+ROLLBACK TO a
+
+statement error 42P01
+SELECT * FROM c2
+
+statement ok
+ROLLBACK TO a
+
+# a writable WITH in the CTAS query: the rollback undoes its insert into src too
+statement ok
+CREATE TABLE c3 AS WITH w AS (INSERT INTO src VALUES (3, 30) RETURNING id) SELECT id FROM w
+
+query I
+SELECT count(*) FROM src
+----
+3
+
+statement ok
+ROLLBACK TO a
+
+query I
+SELECT count(*) FROM src
+----
+2
+
+statement error 42P01
+SELECT * FROM c3
+
+statement ok
+ROLLBACK TO a
+
+# RELEASE keeps the table and its rows
+statement ok
+SAVEPOINT b
+
+statement ok
+CREATE TABLE c4 AS SELECT id, v FROM src
+
+statement ok
+RELEASE b
+
+statement ok
+COMMIT
+
+query II
+SELECT id, v FROM c4 ORDER BY id
+----
+1
+10
+2
+20

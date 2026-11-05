@@ -1,0 +1,45 @@
+# Stored canonical text never keeps the Unicode-escape spelling (grammar.md §3): a `U&'…'` string
+# and a `U&"…"` identifier are decoded by the lexer, so a view definition, a CHECK expression, and
+# an expression DEFAULT render them as a plain quoted literal / quoted identifier, which re-lexes
+# to the same token. jed-specific (the catalog relations), so CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked.
+# requires: introspect.views, introspect.constraints, introspect.columns, ddl.view, ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default, ddl.column_default_expr, dml.insert, dml.insert_column_list, query.select, query.where_eq, query.order_by, query.unicode_escapes, expr.text_concat, types.i32, types.text
+
+statement ok
+CREATE TABLE U&"T\0061b" (U&"\0049d" i32 PRIMARY KEY, s text CHECK (s <> U&'it''s \00e9'), d text DEFAULT U&'!+01F600' UESCAPE '!' || 'x')
+
+statement ok
+CREATE VIEW U&"V\0031" AS SELECT U&"\0049d" AS U&"!004B" UESCAPE '!', U&'\00e9' || s AS e FROM U&"T\0061b" WHERE s <> U&'\\'
+
+query TT nosort
+SELECT name, definition FROM jed_views
+----
+V1
+select "Id" as "K" , 'é' || s as e from "Tab" where s <> '\'
+
+
+query T nosort
+SELECT expression FROM jed_constraints WHERE table_name = 'Tab'
+----
+s <> 'it''s é'
+
+query T nosort
+SELECT column_default FROM jed_columns WHERE table_name = 'Tab' AND name = 'd'
+----
+'😀' || 'x'
+
+statement ok
+INSERT INTO "Tab" ("Id", s) VALUES (1, 'a')
+
+statement error 23514
+INSERT INTO "Tab" ("Id", s) VALUES (2, 'it''s é')
+
+statement error 23514
+INSERT INTO "Tab" ("Id", s) VALUES (2, U&'it''s \00E9')
+
+query ITT nosort
+SELECT "K", e, (SELECT d FROM "Tab") FROM "V1"
+----
+1
+éa
+😀x

@@ -1,0 +1,328 @@
+# jsonpath unquoted member names (spec/design/jsonpath.md §2.1) — PostgreSQL's jsonpath scanner
+# (jsonpath_scan.l): an unquoted name is a run of any characters outside the special set
+# `? % $ . [ ] { } ( ) | & ! = < > @ # , * : - + /`, whitespace, and `"`, non-ASCII included, with the
+# same backslash escapes as a quoted string. A keyword spelled as a name is a member key (`$.type`);
+# followed by `(` it is an item method (`$.type()`). Keywords match case-insensitively (all but
+# `null`/`true`/`false`) after their escapes are decoded. A name renders quoted. Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonb, types.jsonpath, expr.jsonpath_filter, func.jsonb_path
+
+# Any character outside the special set belongs to a name, non-ASCII included.
+query TTTTT nosort
+SELECT '$.é'::jsonpath, '$.aA'::jsonpath, '$.ä.ö'::jsonpath, '$.a€'::jsonpath, '$.a😀'::jsonpath
+----
+$."é"
+$."aA"
+$."ä"."ö"
+$."a€"
+$."a😀"
+
+query TTTTT nosort
+SELECT '$.a~b'::jsonpath, '$.a;b'::jsonpath, '$.a''b'::jsonpath, '$.a^b'::jsonpath, '$.a`b'::jsonpath
+----
+$."a~b"
+$."a;b"
+$."a'b"
+$."a^b"
+$."a`b"
+
+query TTT nosort
+SELECT '$._a1'::jsonpath, '$.a1.b_2'::jsonpath, '$ . a . b'::jsonpath
+----
+$."_a1"
+$."a1"."b_2"
+$."a"."b"
+
+# Backslash escapes, as in a quoted string; an escaped character never ends the name.
+query TTTTT nosort
+SELECT '$.a\u0041'::jsonpath, '$.\u0041bc'::jsonpath, '$.a\x41'::jsonpath, '$.a\q'::jsonpath, '$.\u0041\u{42}'::jsonpath
+----
+$."aA"
+$."Abc"
+$."aA"
+$."aq"
+$."AB"
+
+query TTTTT nosort
+SELECT '$.a\u002eb'::jsonpath, '$.a\ b'::jsonpath, '$.\"'::jsonpath, '$.\\'::jsonpath, '$.a\"b'::jsonpath
+----
+$."a.b"
+$."a b"
+$."\""
+$."\\"
+$."a\"b"
+
+query TTT nosort
+SELECT '$.a\ud83d\ude00'::jsonpath, '$.a\u{1F600}'::jsonpath, '$. \u0041'::jsonpath
+----
+$."a😀"
+$."a😀"
+$."A"
+
+# Control characters render as PostgreSQL's escape_json does: \b \f \n \r \t, else \u00XX.
+query TTT nosort
+SELECT '$.a\b\f'::jsonpath, '$.a\n\r\t'::jsonpath, '$.a\v'::jsonpath
+----
+$."a\b\f"
+$."a\n\r\t"
+$."a\u000b"
+
+query TT nosort
+SELECT '$."\b\f"'::jsonpath, '$ ? (@ == "\b")'::jsonpath
+----
+$."\b\f"
+$?(@ == "\b")
+
+# A keyword spelled as a name is a member key, in any case.
+query TTTTTTTT nosort
+SELECT '$.type'::jsonpath, '$.TYPE'::jsonpath, '$.true'::jsonpath, '$.null'::jsonpath, '$.last'::jsonpath, '$.strict'::jsonpath, '$.lax'::jsonpath, '$.size'::jsonpath
+----
+$."type"
+$."TYPE"
+$."true"
+$."null"
+$."last"
+$."strict"
+$."lax"
+$."size"
+
+query TTTTTTTT nosort
+SELECT '$.datetime'::jsonpath, '$.decimal'::jsonpath, '$.like_regex'::jsonpath, '$.exists'::jsonpath, '$.to'::jsonpath, '$.is'::jsonpath, '$.starts'::jsonpath, '$.with'::jsonpath
+----
+$."datetime"
+$."decimal"
+$."like_regex"
+$."exists"
+$."to"
+$."is"
+$."starts"
+$."with"
+
+# Followed by `(` (whitespace allowed) a method keyword is an item method; its escapes are decoded
+# before the keyword is matched.
+query TTTTT nosort
+SELECT '$.type()'::jsonpath, '$.TYPE()'::jsonpath, '$.Type ()'::jsonpath, '$.\u0074ype()'::jsonpath, '$.\u0074ype'::jsonpath
+----
+$.type()
+$.type()
+$.type()
+$.type()
+$."type"
+
+query TT nosort
+SELECT '$.é.type()'::jsonpath, '$.a ? (@ == 1) . é'::jsonpath
+----
+$."é".type()
+$."a"?(@ == 1)."é"
+
+# Keywords other than null / true / false match case-insensitively, and after escape decoding.
+query TTTTT nosort
+SELECT '$[LAST]'::jsonpath, '$[1 TO 2]'::jsonpath, 'STRICT $.a'::jsonpath, 'Lax $.a'::jsonpath, '$[l\u0061st]'::jsonpath
+----
+$[last]
+$[1 to 2]
+strict $."a"
+$."a"
+$[last]
+
+query TTT nosort
+SELECT 'strict$.a'::jsonpath, '$ ? (@ == n\u0075ll)'::jsonpath, '$ ? (@.\u0061 == 1)'::jsonpath
+----
+strict $."a"
+$?(@ == null)
+$?(@."a" == 1)
+
+# After whitespace, a name may start with a digit when it runs longer than any number token there
+# (lengths in bytes: `12é` is four, the trailing-junk token `12` and one byte three).
+query TT nosort
+SELECT '$. 12é'::jsonpath, '$. 1😀'::jsonpath
+----
+$."12é"
+$."1😀"
+
+query TTTTTT nosort
+SELECT '$. 1abc'::jsonpath, '$. 0x1Fz'::jsonpath, '$. 1e3xy'::jsonpath, '$. 1ex'::jsonpath, '$. 1__0'::jsonpath, '$. 1_000ab'::jsonpath
+----
+$."1abc"
+$."0x1Fz"
+$."1e3xy"
+$."1ex"
+$."1__0"
+$."1_000ab"
+
+# Evaluation reads the decoded key.
+query TTTT nosort
+SELECT jsonb_path_query_first('{"é": 1}', '$.é'), jsonb_path_query_first('{"aA": 2}', '$.a\u0041'), jsonb_path_query_first('{"a.b": 3}', '$.a\u002eb'), jsonb_path_query_first('{"type": "t"}', '$.type')
+----
+1
+2
+3
+"t"
+
+query BBB nosort
+SELECT jsonb_path_exists('{"x": [{"é": 1}]}', '$.x[*] ? (@.é == 1)'), '{"1abc": 1}'::jsonb @? '$. 1abc', '{"a b": 1}'::jsonb @? '$.a\ b'
+----
+true
+true
+true
+
+query T nosort
+SELECT jsonb_path_query_first('{"TYPE": 1, "type": 2}', 'strict $.TYPE')
+----
+1
+
+# A special character, whitespace, or `"` ends a name; what follows is a syntax error.
+statement error 42601
+SELECT '$.a#b'::jsonpath
+
+statement error 42601
+SELECT '$.a:b'::jsonpath
+
+statement error 42601
+SELECT '$.a,b'::jsonpath
+
+statement error 42601
+SELECT '$.a@b'::jsonpath
+
+statement error 42601
+SELECT '$.a{b'::jsonpath
+
+statement error 42601
+SELECT '$.a}b'::jsonpath
+
+statement error 42601
+SELECT '$.a)b'::jsonpath
+
+statement error 42601
+SELECT '$.a]b'::jsonpath
+
+statement error 42601
+SELECT '$.a=b'::jsonpath
+
+statement error 42601
+SELECT '$.a$b'::jsonpath
+
+statement error 42601
+SELECT '$.$a'::jsonpath
+
+statement error 42601
+SELECT '$.a"b"'::jsonpath
+
+statement error 42601
+SELECT '$.a b'::jsonpath
+
+statement error 42601
+SELECT '$.a \u0041'::jsonpath
+
+statement error 42601
+SELECT '$.a[b]'::jsonpath
+
+statement error 42601
+SELECT '$.a < b'::jsonpath
+
+# A number token is not a name: right after the `.` (`.5` is a number), or as long as the run.
+statement error 42601
+SELECT '$.1abc'::jsonpath
+
+statement error 42601
+SELECT '$.a.5'::jsonpath
+
+statement error 42601
+SELECT '$. 12'::jsonpath
+
+statement error 42601
+SELECT '$. 1a'::jsonpath
+
+statement error 42601
+SELECT '$. 1e'::jsonpath
+
+statement error 42601
+SELECT '$. 1.5'::jsonpath
+
+statement error 42601
+SELECT '$. 1_000a'::jsonpath
+
+# A name is not an item method, and a bare name is not an expression.
+statement error 42601
+SELECT '$.é()'::jsonpath
+
+statement error 42601
+SELECT '$.ab()'::jsonpath
+
+statement error 42601
+SELECT '$.true()'::jsonpath
+
+statement error 42601
+SELECT '$."type"()'::jsonpath
+
+statement error 42601
+SELECT 'abc'::jsonpath
+
+statement error 42601
+SELECT 'stricté $.a'::jsonpath
+
+statement error 42601
+SELECT 'lastx'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == abc)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == TRUE)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == NULL)'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ abc)'::jsonpath
+
+statement error 42601
+SELECT '$.a ? (@ == "x") abc'::jsonpath
+
+statement error 42601
+SELECT '$.a is unknown'::jsonpath
+
+# The escape errors are a quoted string's: a NUL is 22P05, an unpaired surrogate 22P02, a malformed
+# escape (the whole `\u` run is lexed first) or a code point past U+10FFFF 42601. A name is lexed
+# before the grammar rejects it.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$.a\u0000'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$.a\u{41}\x00'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$.a \u0000'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$ ? (@ == \u0000)'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$.a?(@ == 1abc\u0000)'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$"\u0000"'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$.a\ud83d'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$.a\uD800x'::jsonpath
+
+statement error 42601
+SELECT '$.a\u004'::jsonpath
+
+statement error 42601
+SELECT '$.a\u{}b'::jsonpath
+
+statement error 42601
+SELECT '$.\x4'::jsonpath
+
+statement error 42601
+SELECT '$.a\'::jsonpath
+
+statement error 42601
+SELECT '$.a\u{110000}'::jsonpath
+
+statement error 42601
+SELECT '$.\u0000\u12'::jsonpath

@@ -1,0 +1,170 @@
+# View options (spec/design/views.md §16.2): CREATE VIEW v WITH (option [= value], …) AS …, ALTER
+# VIEW v SET (option [= value], …), and ALTER VIEW v RESET (option, …), PostgreSQL's reloptions for
+# views: check_option (local | cascaded), security_barrier, and security_invoker (booleans). The
+# check_option option is the WITH … CHECK OPTION clause by another spelling. Unknown or repeated
+# options and bad values are 22023. Every record is PostgreSQL-oracle-checked; the options' values
+# in jed_views and security_invoker's privilege effect are in views_options_jed.test.
+# requires: ddl.view, ddl.view_options, dml.view_write, dml.view_check_option, ddl.view_alter, ddl.view_replace, ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, query.order_by, query.aggregates, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+# --- check_option through WITH ( … ) ------------------------------------------------------------
+
+statement ok
+CREATE VIEW v WITH (check_option = local) AS SELECT id, a FROM t WHERE a > 0
+
+statement error 44000
+INSERT INTO v VALUES (1, -1)
+
+statement ok
+INSERT INTO v VALUES (1, 1)
+
+# a bare check_option has the value true, which is not local or cascaded
+statement error 22023
+CREATE VIEW bad WITH (check_option) AS SELECT id, a FROM t
+
+statement error 22023
+CREATE VIEW bad WITH (check_option = foo) AS SELECT id, a FROM t
+
+# the value is matched without regard to case, and may be a string or a quoted identifier
+statement ok
+CREATE VIEW v2 WITH (check_option = 'Cascaded') AS SELECT id, a FROM v WHERE a < 100
+
+statement error 44000
+INSERT INTO v2 VALUES (2, -5)
+
+statement error 44000
+INSERT INTO v2 VALUES (2, 500)
+
+statement ok
+CREATE VIEW v3 WITH (check_option = "local") AS SELECT id, a FROM t WHERE a > 10
+
+statement error 44000
+INSERT INTO v3 VALUES (3, 5)
+
+# WITH ( check_option ) and a trailing WITH CHECK OPTION together name it twice
+statement error 22023
+CREATE VIEW bad WITH (check_option = local) AS SELECT id, a FROM t WITH CHECK OPTION
+
+# a check option needs an automatically updatable view
+statement error 0A000
+CREATE VIEW bad WITH (check_option = local) AS SELECT count(*) AS n FROM t
+
+# --- ALTER VIEW … SET / RESET ---------------------------------------------------------------------
+
+statement ok
+CREATE VIEW w AS SELECT id, a FROM t WHERE a > 0
+
+statement ok
+INSERT INTO w VALUES (4, -4)
+
+statement ok
+ALTER VIEW w SET (check_option = cascaded)
+
+statement error 44000
+INSERT INTO w VALUES (5, -5)
+
+statement ok
+ALTER VIEW w RESET (check_option)
+
+statement ok
+INSERT INTO w VALUES (5, -5)
+
+# SET and RESET in one statement apply in order
+statement ok
+ALTER VIEW w RESET (check_option), SET (check_option = local)
+
+statement error 44000
+UPDATE w SET a = -1 WHERE id = 1
+
+# several options in one list
+statement ok
+ALTER VIEW w SET (security_barrier, security_invoker = false)
+
+statement ok
+ALTER VIEW w RESET (security_barrier, security_invoker)
+
+# RESET of a name that is not an option is ignored
+statement ok
+ALTER VIEW w RESET (nosuch)
+
+# boolean values: PostgreSQL's spellings
+statement ok
+ALTER VIEW w SET (security_barrier = true, security_invoker = off)
+
+statement ok
+ALTER VIEW w SET (security_barrier = 'yes', security_invoker = 'of')
+
+statement ok
+ALTER VIEW w SET (security_barrier = 1, security_invoker = 0)
+
+statement ok
+ALTER VIEW w SET (security_barrier = 't', security_invoker = 'FALSE')
+
+statement error 22023
+ALTER VIEW w SET (security_barrier = maybe)
+
+statement error 22023
+ALTER VIEW w SET (security_barrier = 'o')
+
+statement error 22023
+ALTER VIEW w SET (security_invoker = 2)
+
+statement error 22023
+ALTER VIEW w SET (security_invoker = -1)
+
+# unknown and repeated options
+statement error 22023
+ALTER VIEW w SET (nosuch = 1)
+
+statement error 22023
+CREATE VIEW bad WITH (fillfactor = 10) AS SELECT id FROM t
+
+statement error 22023
+ALTER VIEW w SET (check_option = local, check_option = cascaded)
+
+# a check option set on a view that is not automatically updatable
+statement ok
+CREATE VIEW n AS SELECT count(*) AS c FROM t
+
+statement error 0A000
+ALTER VIEW n SET (check_option = local)
+
+# the other options are allowed on any view
+statement ok
+ALTER VIEW n SET (security_barrier)
+
+statement ok
+CREATE VIEW n2 WITH (security_barrier, security_invoker) AS SELECT count(*) AS c FROM t
+
+query I nosort
+SELECT c FROM n2
+----
+3
+
+# RESET takes names only
+statement error 42601
+ALTER VIEW w RESET (check_option = local)
+
+# body errors are reported before option errors
+statement error 42P01
+CREATE VIEW bad WITH (nosuch = 1) AS SELECT * FROM nosuchtable
+
+# CREATE OR REPLACE VIEW replaces the options with the statement's
+statement ok
+CREATE OR REPLACE VIEW v AS SELECT id, a FROM t WHERE a > 0
+
+statement ok
+INSERT INTO v VALUES (9, -9)
+
+# --- a security_barrier view reads exactly as without the option ---------------------------------
+
+statement ok
+CREATE VIEW sb WITH (security_barrier) AS SELECT id, a FROM t WHERE a > 0
+
+query II nosort
+SELECT id, a FROM sb WHERE id < 3 ORDER BY id
+----
+1
+1

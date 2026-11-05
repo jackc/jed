@@ -1,0 +1,72 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# ON CONFLICT DO UPDATE re-keying inside a savepoint (spec/design/upsert.md §5, transactions.md
+# §11): ROLLBACK TO restores the row at its old key, with its secondary-index entry; RELEASE keeps
+# the move. Oracle-checked against PostgreSQL 18. Format: ../../../design/conformance.md.
+# requires: txn.savepoint, txn.explicit, ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.insert_on_conflict_rekey, dml.returning, query.select, query.where_eq, query.order_by, types.i32, expr.arithmetic
+
+statement ok
+CREATE TABLE sk (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE INDEX sk_v ON sk (v)
+
+statement ok
+INSERT INTO sk VALUES (1, 10), (2, 20)
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT a
+
+query II nosort
+INSERT INTO sk VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET id = 101, v = sk.v + 1 RETURNING *
+----
+101
+11
+
+statement ok
+ROLLBACK TO a
+
+query II nosort
+SELECT id, v FROM sk ORDER BY id
+----
+1
+10
+2
+20
+
+query I nosort
+SELECT id FROM sk WHERE v = 10
+----
+1
+
+query I nosort
+SELECT id FROM sk WHERE v = 11
+----
+
+# The rolled-back move left key 101 free; re-key again and keep it.
+query II nosort
+INSERT INTO sk VALUES (2, 0) ON CONFLICT (id) DO UPDATE SET id = 101 RETURNING *
+----
+101
+20
+
+statement ok
+RELEASE a
+
+statement ok
+COMMIT
+
+query II nosort
+SELECT id, v FROM sk ORDER BY id
+----
+1
+10
+101
+20
+
+query I nosort
+SELECT id FROM sk WHERE v = 20
+----
+101

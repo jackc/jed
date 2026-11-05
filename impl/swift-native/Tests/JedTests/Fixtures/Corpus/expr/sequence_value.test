@@ -1,0 +1,191 @@
+# skip: disk — session currval/nextval state does not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# nextval / currval / setval / lastval — the sequence value functions (spec/design/sequences.md
+# §4/§6, functions.md §14). nextval advances the sequence and returns the new i64 value (first
+# call = START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap). setval sets the
+# counter directly and returns the value (setval(s, n, false) makes the next nextval return n).
+# currval/lastval read THIS SESSION's history. nextval/setval are WRITES (each charges one
+# sequence_advance unit beyond its operator_eval) and jed-transactional (§5).
+#
+# Corpus structure (oracle-reproducible): the PostgreSQL oracle harness replays every successful
+# `statement ok` (its SQL runs again in each later record's prefix) but NOT a `query` (a read,
+# never replayed). So a counter state a later assertion must observe is pinned in ONE replayable
+# statement — `statement ok SELECT setval('s', K)` — and then a `query SELECT nextval('s')` reads
+# exactly `K + INCREMENT`, independent of any earlier `query nextval` (jed runs those, PG never sees
+# them, and the setval overwrites their effect). The transactional-rollback divergence (§5), the
+# read-only 25006, and cross-handle session-locality are per-core unit tests.
+# requires: func.sequence, ddl.sequence, query.select, types.i64, resource.cost_metering
+
+statement ok
+CREATE SEQUENCE s INCREMENT BY 5 MINVALUE 1 MAXVALUE 1000 START WITH 10
+
+# lastval before any nextval this session is 55000 (checked first, before any nextval runs — lastval
+# is session-global, so once any nextval runs it is defined; currval's 55000 uses a fresh sequence)
+statement error 55000
+SELECT lastval()
+
+# --- nextval -----------------------------------------------------------------
+# the first nextval on a fresh sequence returns START (10), without adding INCREMENT
+# cost: 3
+query I nosort
+SELECT nextval('s')
+----
+10
+
+# pin the counter with setval, then nextval adds INCREMENT (5)
+statement ok
+SELECT setval('s', 100)
+
+query I nosort
+SELECT nextval('s')
+----
+105
+
+# --- setval ------------------------------------------------------------------
+# setval('s', n) returns n
+query I nosort
+SELECT setval('s', 200)
+----
+200
+
+# after setval('s', n) (is_called defaults true) the next nextval is n + INCREMENT
+statement ok
+SELECT setval('s', 300)
+
+query I nosort
+SELECT nextval('s')
+----
+305
+
+# setval('s', n, false) makes the next nextval return n itself (is_called = false)
+statement ok
+SELECT setval('s', 400, false)
+
+query I nosort
+SELECT nextval('s')
+----
+400
+
+# a setval value outside [MINVALUE, MAXVALUE] is 22003 (s caps at 1000)
+statement error 22003
+SELECT setval('s', 5000)
+
+# setval on a missing sequence is 42P01
+statement error 42P01
+SELECT setval('nope', 1)
+
+# --- currval -----------------------------------------------------------------
+# setval('s', n) (is_called true) defines currval = n
+statement ok
+SELECT setval('s', 500)
+
+query I nosort
+SELECT currval('s')
+----
+500
+
+# currval does not advance: repeated reads return the same value
+query I nosort
+SELECT currval('s')
+----
+500
+
+# setval('s', n, false) leaves currval at its prior value (it does not define currval)
+statement ok
+SELECT setval('s', 600)
+
+statement ok
+SELECT setval('s', 700, false)
+
+query I nosort
+SELECT currval('s')
+----
+600
+
+# currval before any nextval/setval(true) this session, on a fresh sequence, is 55000
+statement ok
+CREATE SEQUENCE fresh
+
+statement error 55000
+SELECT currval('fresh')
+
+# currval/nextval on a missing sequence is 42P01
+statement error 42P01
+SELECT nextval('nope')
+
+statement error 42P01
+SELECT currval('nope')
+
+# --- lastval -----------------------------------------------------------------
+# lastval tracks the value of the most recent nextval, across sequences
+statement ok
+CREATE SEQUENCE la START WITH 100
+
+statement ok
+CREATE SEQUENCE lb START WITH 200
+
+statement ok
+SELECT nextval('la')
+
+statement ok
+SELECT nextval('lb')
+
+# the most recent nextval was on lb → 200
+query I nosort
+SELECT lastval()
+----
+200
+
+# a setval on la (NOT the last-used sequence) does not change lastval — it stays lb's value
+statement ok
+SELECT setval('la', 999)
+
+query I nosort
+SELECT lastval()
+----
+200
+
+# a setval on lb (the last-used sequence) IS reflected by lastval (it reads lb's current value)
+statement ok
+SELECT setval('lb', 777)
+
+query I nosort
+SELECT lastval()
+----
+777
+
+# --- bounds (2200H) and CYCLE ------------------------------------------------
+# pinned at MAXVALUE, the next ascending nextval without CYCLE is 2200H
+statement ok
+CREATE SEQUENCE cap INCREMENT 1 MAXVALUE 2
+
+statement ok
+SELECT setval('cap', 2)
+
+statement error 2200H
+SELECT nextval('cap')
+
+# with CYCLE, nextval wraps to MINVALUE at the bound
+statement ok
+CREATE SEQUENCE wrap INCREMENT 1 MINVALUE 1 MAXVALUE 2 CYCLE
+
+statement ok
+SELECT setval('wrap', 2)
+
+query I nosort
+SELECT nextval('wrap')
+----
+1
+
+# a descending sequence pinned at MINVALUE reaches the bound → 2200H
+statement ok
+CREATE SEQUENCE down INCREMENT BY -1 MINVALUE -2 MAXVALUE -1
+
+statement ok
+SELECT setval('down', -2)
+
+statement error 2200H
+SELECT nextval('down')
+
+# clean up the live oracle (autocommit DDL persists across corpus:check files)
+statement ok
+DROP SEQUENCE s, fresh, la, lb, cap, wrap, down

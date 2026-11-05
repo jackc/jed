@@ -1,0 +1,80 @@
+# The IS JSON predicate (S1, SQL/JSON standard syntax, spec/design/json-sql-functions.md §5):
+# expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]]. Tests well-formedness
+# of a string/json/jsonb operand, optionally the kind and unique object keys. Malformed → false; a
+# NULL operand → NULL; a non-string/json operand → 42804. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, expr.is_json
+
+# Well-formedness over jsonb / text; a malformed string → false.
+query BBB nosort
+SELECT '{"a":1}'::jsonb IS JSON, '{"a":1}'::text IS JSON, 'not json'::text IS JSON
+----
+true
+true
+false
+
+# The kind words: OBJECT / ARRAY / SCALAR / VALUE.
+query BBBB nosort
+SELECT '{"a":1}' IS JSON OBJECT, '[1,2]' IS JSON OBJECT, '5' IS JSON SCALAR, '[1,2]' IS JSON ARRAY
+----
+true
+false
+true
+true
+
+query BBB nosort
+SELECT '5' IS JSON VALUE, 'null' IS JSON, '"x"' IS JSON SCALAR
+----
+true
+true
+true
+
+# A scalar is not an object/array; an object is not a scalar.
+query BB nosort
+SELECT '5' IS JSON OBJECT, '{"a":1}' IS JSON SCALAR
+----
+false
+false
+
+# WITH / WITHOUT UNIQUE KEYS (recursively); a duplicate key fails WITH UNIQUE.
+query BBB nosort
+SELECT '{"a":1,"a":2}' IS JSON WITH UNIQUE KEYS, '{"a":1,"a":2}' IS JSON WITHOUT UNIQUE KEYS, '{"a":{"b":1,"b":2}}' IS JSON WITH UNIQUE KEYS
+----
+false
+true
+false
+
+# IS NOT JSON; a NULL operand → NULL.
+query BB nosort
+SELECT '{"a":1}'::text IS NOT JSON, 'bad' IS NOT JSON
+----
+false
+true
+
+query B nosort
+SELECT NULL::text IS JSON
+----
+NULL
+
+# A non-string/json operand (integer) → 42804.
+statement error 42804
+SELECT 5 IS JSON
+
+# Over a stored column: filter rows whose text column is well-formed JSON of a kind.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, doc text)
+
+statement ok
+INSERT INTO t VALUES (1, '{"k":1}'), (2, '[1,2]'), (3, 'oops'), (4, '42')
+
+query I rowsort
+SELECT id FROM t WHERE doc IS JSON OBJECT
+----
+1
+
+query I rowsort
+SELECT id FROM t WHERE doc IS JSON
+----
+1
+2
+4

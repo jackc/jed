@@ -1,0 +1,368 @@
+# EXPLAIN of pushdown below a window and into inlined CTE bodies (spec/design/planner.md §3.2/§3.4;
+# explain.md §5). A conjunct moved below a window is the body's WHERE, rendered below its Window node
+# (or as its access bound). A CTE inlined at its reference renders its body under that reference's
+# `CTE Scan` node — like a `Subquery` — and its definition under the WITH node carries no body; a
+# materialized CTE (MATERIALIZED, or referenced twice) keeps its body under the WITH node. This
+# rendering is jed-specific and not oracle-imported.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.qualified_column, query.join_inner, query.derived_table, query.cte, query.window, query.window_ranking, query.point_lookup, query.join_pushdown, query.hash_join, query.where_pushdown, query.derived_pushdown, query.explain, query.explain_analyze, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, w i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 1, 40), (5, 2, NULL), (6, 3, 60), (7, 1, 70), (8, 2, 80)
+
+statement ok
+INSERT INTO u VALUES (1, 10), (2, NULL), (3, 30)
+
+# A partition-key conjunct renders as the body's Filter, below the Window.
+query ITTII nosort
+EXPLAIN SELECT d.id, d.rn FROM (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d WHERE d.k = 2
+----
+0
+Subquery d
+-
+1
+20
+1
+Window
+funcs=1
+1
+19
+2
+Filter
+conjuncts=1
+1
+17
+3
+Scan t
+Full scan; touched=2
+8
+9
+
+# A conjunct over a column the window does not partition by stays in the outer Filter.
+query ITTII nosort
+EXPLAIN SELECT d.id, d.rn FROM (SELECT id, k, v, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d WHERE d.v > 20
+----
+0
+Filter
+conjuncts=1
+3
+36
+1
+Subquery d
+-
+8
+25
+2
+Window
+funcs=1
+8
+25
+3
+Scan t
+Full scan; touched=3
+8
+9
+
+# VERBOSE shows the moved conjunct in the body's own slots.
+query ITTII nosort
+EXPLAIN (VERBOSE) SELECT d.id, d.rn FROM (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY id) AS rn FROM t) d WHERE d.k = 2
+----
+0
+Subquery d
+output=[#0, #2]
+1
+20
+1
+Window
+funcs=1; output=[#0, #1, #3]
+1
+19
+2
+Filter
+filter=(#1 = 2)
+1
+17
+3
+Scan t
+Full scan; touched=2
+8
+9
+
+# An inlined CTE renders its body under its CTE Scan, where the moved conjunct bounds t's key.
+query ITTII nosort
+EXPLAIN WITH c AS (SELECT id, k, v FROM t) SELECT * FROM c WHERE c.id = 5
+----
+0
+WITH
+ctes=1
+1
+5
+1
+CTE c
+inlined
+8
+0
+1
+CTE Scan c
+-
+1
+5
+2
+Filter
+conjuncts=1
+1
+4
+3
+Scan t
+PK bound: id = 5; touched=3
+1
+2
+
+# With nothing to push, an inlined CTE still renders its body at its reference.
+query ITTII nosort
+EXPLAIN WITH c AS (SELECT id, v FROM t) SELECT * FROM c
+----
+0
+WITH
+ctes=1
+8
+25
+1
+CTE c
+inlined
+8
+0
+1
+CTE Scan c
+-
+8
+25
+2
+Scan t
+Full scan; touched=2
+8
+17
+
+# MATERIALIZED keeps the body under the WITH node; the outer Filter judges the buffered rows.
+query ITTII nosort
+EXPLAIN WITH c AS MATERIALIZED (SELECT id, k, v FROM t) SELECT * FROM c WHERE c.id = 5
+----
+0
+WITH
+ctes=1
+1
+34
+1
+CTE c
+materialized
+8
+17
+2
+Scan t
+Full scan; touched=3
+8
+17
+1
+Filter
+conjuncts=1
+1
+17
+2
+CTE Scan c
+-
+8
+8
+
+# Two references materialize the CTE: its body stays under the WITH node and each CTE Scan carries
+# its own scan-pushed filter.
+query ITTII nosort
+EXPLAIN WITH c AS (SELECT id, k FROM t) SELECT c1.id, c2.id FROM c c1 JOIN c c2 ON c1.k = c2.k WHERE c1.id = 3 AND c2.id > 6
+----
+0
+WITH
+ctes=1
+1
+75
+1
+CTE c
+materialized
+8
+17
+2
+Scan t
+Full scan; touched=2
+8
+17
+1
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+58
+2
+CTE Scan c
+filter:conjuncts=1
+1
+16
+2
+CTE Scan c
+filter:conjuncts=1
+3
+16
+
+# A chain of inlined CTEs nests at the references; both conjuncts reach t.
+query ITTII nosort
+EXPLAIN WITH a AS (SELECT id, k, v FROM t), b AS (SELECT id, v FROM a WHERE a.k = 1) SELECT b.id, b.v FROM b WHERE b.id < 5
+----
+0
+WITH
+ctes=2
+1
+16
+1
+CTE a
+inlined
+8
+0
+1
+CTE b
+inlined
+1
+0
+1
+CTE Scan b
+-
+1
+16
+2
+CTE Scan a
+-
+1
+15
+3
+Filter
+conjuncts=2
+1
+14
+4
+Scan t
+PK bound: id < 5; touched=3
+3
+4
+
+# An unreferenced CTE keeps its body under the WITH node as plan metadata; the referenced one renders
+# at its reference.
+query ITTII nosort
+EXPLAIN WITH unused AS (SELECT v FROM t), c AS (SELECT id, w FROM u) SELECT c.w FROM c WHERE c.id = 3
+----
+0
+WITH
+ctes=2
+1
+5
+1
+CTE unused
+inlined
+8
+0
+2
+Scan t
+Full scan; touched=1
+8
+17
+1
+CTE c
+inlined
+3
+0
+1
+CTE Scan c
+-
+1
+5
+2
+Filter
+conjuncts=1
+1
+4
+3
+Scan u
+PK bound: id = 3; touched=2
+1
+2
+
+# A CTE whose body has a window takes the partition-key conjunct below its Window.
+query ITTII nosort
+EXPLAIN WITH r AS (SELECT id, k, row_number() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM t) SELECT r.id, r.rn FROM r WHERE r.k = 3
+----
+0
+WITH
+ctes=1
+1
+20
+1
+CTE r
+inlined
+8
+0
+1
+CTE Scan r
+-
+1
+20
+2
+Window
+funcs=1
+1
+19
+3
+Filter
+conjuncts=1
+1
+17
+4
+Scan t
+Full scan; touched=3
+8
+9
+
+# ANALYZE attributes the inlined body's actual work to the nodes under its CTE Scan.
+query ITTI nosort
+EXPLAIN (ANALYZE, COSTS FALSE) WITH c AS (SELECT id, k, v FROM t) SELECT c.id, u.w FROM c JOIN u ON c.k = u.id WHERE c.id < 4
+----
+0
+Analyze
+cost=22 rows=3
+22
+1
+WITH
+ctes=1
+22
+2
+CTE c
+inlined
+0
+2
+Nested Loop
+inner; on:conjuncts=1
+22
+3
+CTE Scan c
+-
+10
+4
+Filter
+conjuncts=1
+10
+5
+Scan t
+PK bound: id < 4; touched=3
+4
+3
+Scan u
+Index-nested-loop PK bound: id = join; touched=2
+6

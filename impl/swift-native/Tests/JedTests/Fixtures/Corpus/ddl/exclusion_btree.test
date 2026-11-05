@@ -1,0 +1,164 @@
+# EXCLUDE USING btree (spec/design/gist.md §7.2) — the all-`=` exclusion constraint.
+#
+# PostgreSQL's default access method for EXCLUDE is btree, so `EXCLUDE (a WITH =)` is this form too.
+# It forbids two rows whose every excluded column is equal — UNIQUE's rule, NULLs never conflicting —
+# but observably it is an exclusion constraint, not a unique one: a conflict is 23P01 (not 23505), its
+# backing ordered index is not unique (no FOREIGN KEY target, no ON CONFLICT column-list arbiter), and
+# only `=` is accepted. Any type an ordered index keys works (text included). Oracle-checked; the
+# end-state UPDATE divergence lives in exclusion_btree_jed.test. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.exclusion_constraint, ddl.exclusion_btree, ddl.alter_table, ddl.foreign_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, types.text
+
+# --- a two-column exclusion, the default method ------------------------------------------------------
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, a i32, c text, EXCLUDE (a WITH =, c WITH =))
+
+statement ok
+INSERT INTO b VALUES (1, 1, 'x'), (2, 1, 'y'), (3, 2, 'x')
+
+statement error 23P01
+INSERT INTO b VALUES (4, 1, 'x')
+
+# a NULL in any excluded column never conflicts
+statement ok
+INSERT INTO b VALUES (4, 1, NULL), (5, 1, NULL), (6, NULL, 'x'), (7, NULL, 'x')
+
+# two new rows of one statement conflict with each other; nothing is written
+statement error 23P01
+INSERT INTO b VALUES (8, 3, 'z'), (9, 3, 'z')
+
+query I nosort
+SELECT count(*) FROM b WHERE a = 3
+----
+0
+
+statement error 23P01
+UPDATE b SET c = 'x' WHERE id = 2
+
+statement error 23P01
+UPDATE b SET c = 'x' WHERE id = 4
+
+# an UPDATE that keeps a row's own key does not conflict with itself
+statement ok
+UPDATE b SET a = 1, c = 'y' WHERE id = 2
+
+statement ok
+DELETE FROM b WHERE id = 1
+
+statement ok
+INSERT INTO b VALUES (1, 1, 'x')
+
+# the backing ordered index serves reads like any index, returning every matching row
+query IIT nosort
+SELECT id, a, c FROM b WHERE a = 1 ORDER BY id
+----
+1
+1
+x
+2
+1
+y
+4
+1
+NULL
+5
+1
+NULL
+
+# --- USING btree spelled out; a single column ---------------------------------------------------------
+statement ok
+CREATE TABLE s (id i32 PRIMARY KEY, code text, EXCLUDE USING btree (code WITH =))
+
+statement ok
+INSERT INTO s VALUES (1, 'abc'), (2, 'ABC')
+
+statement error 23P01
+INSERT INTO s VALUES (3, 'abc')
+
+# --- only `=`: btree has no other commutative operator ------------------------------------------------
+statement error 42809
+CREATE TABLE bad1 (id i32 PRIMARY KEY, a i32, EXCLUDE USING btree (a WITH <))
+
+statement error 42809
+CREATE TABLE bad2 (id i32 PRIMARY KEY, a i32, EXCLUDE (a WITH <>))
+
+statement error 42809
+CREATE TABLE bad3 (id i32 PRIMARY KEY, r int4range, EXCLUDE (r WITH &&))
+
+# a repeated column is accepted (its backing index repeats the key column, as CREATE INDEX may)
+statement ok
+CREATE TABLE dup (id i32 PRIMARY KEY, a i32, EXCLUDE (a WITH =, a WITH =))
+
+statement ok
+INSERT INTO dup VALUES (1, 1), (2, 2)
+
+statement error 23P01
+INSERT INTO dup VALUES (3, 1)
+
+statement error 42703
+CREATE TABLE bad5 (id i32 PRIMARY KEY, a i32, EXCLUDE (missing WITH =))
+
+# --- not a unique constraint: no FOREIGN KEY target, no ON CONFLICT column-list arbiter ---------------
+statement error 42830
+CREATE TABLE child (id i32 PRIMARY KEY, code text REFERENCES s (code))
+
+statement error 42P10
+INSERT INTO s VALUES (3, 'abc') ON CONFLICT (code) DO NOTHING
+
+# --- the backing index belongs to the constraint ------------------------------------------------------
+statement error 2BP01
+DROP INDEX s_code_excl
+
+statement ok
+ALTER TABLE s DROP CONSTRAINT s_code_excl
+
+statement ok
+INSERT INTO s VALUES (3, 'abc')
+
+# --- ALTER TABLE … ADD validates the existing rows ------------------------------------------------------
+statement error 23P01
+ALTER TABLE s ADD EXCLUDE (code WITH =)
+
+statement ok
+DELETE FROM s WHERE id = 3
+
+statement ok
+ALTER TABLE s ADD EXCLUDE (code WITH =)
+
+statement error 23P01
+INSERT INTO s VALUES (3, 'ABC')
+
+# --- RENAME COLUMN keeps the constraint ------------------------------------------------------------------
+statement ok
+ALTER TABLE s RENAME COLUMN code TO label
+
+statement error 23P01
+INSERT INTO s VALUES (3, 'ABC')
+
+statement ok
+INSERT INTO s VALUES (3, 'xyz')
+
+query IT nosort
+SELECT id, label FROM s ORDER BY id
+----
+1
+abc
+2
+ABC
+3
+xyz
+
+# --- RENAME CONSTRAINT renames the backing index with it --------------------------------------------------
+statement ok
+ALTER TABLE s RENAME CONSTRAINT s_code_excl TO s_label_once
+
+statement error 23P01
+INSERT INTO s VALUES (4, 'xyz')
+
+statement error 2BP01
+DROP INDEX s_label_once
+
+statement ok
+ALTER TABLE s DROP CONSTRAINT s_label_once
+
+statement ok
+INSERT INTO s VALUES (4, 'xyz')

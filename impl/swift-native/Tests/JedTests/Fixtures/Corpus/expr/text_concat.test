@@ -1,0 +1,279 @@
+# The text concatenation operator `||` (spec/design/string-functions.md §5; PostgreSQL's "String
+# Functions and Operators", manual §9.4): text || text, and PG's anynonarray || text / text ||
+# anynonarray, which render the non-text operand through its text output. With no array operand,
+# `||` is text concatenation when either operand is text, a bare string literal, or an untyped NULL.
+# STRICT (a NULL operand → NULL). PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, types.bytea, types.boolean, types.decimal, types.uuid, types.date, types.interval, types.json, types.jsonb, types.timestamptz, ddl.secondary_index, ddl.index_expr, expr.text_concat
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a text, b text, n i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'foo', 'bar', 7), (2, '', 'x', -1), (3, NULL, 'y', NULL), (4, 'héllo', '😀', 0)
+
+# === text || text ==========================================================================
+
+query T nosort
+SELECT 'abc' || 'def'
+----
+abcdef
+
+query IT rowsort
+SELECT id, a || b FROM t
+----
+1
+foobar
+2
+x
+3
+NULL
+4
+héllo😀
+
+# chained, left-associative; the empty string is the identity
+query T nosort
+SELECT 'a' || '' || 'b' || 'c'
+----
+abc
+
+query IT rowsort
+SELECT id, a || '-' || b FROM t
+----
+1
+foo-bar
+2
+-x
+3
+NULL
+4
+héllo-😀
+
+# multi-byte characters are kept whole: length counts code points of the result
+query II nosort
+SELECT length('é' || '😀'), octet_length('é' || '😀')
+----
+2
+6
+
+query T nosort
+SELECT 'x' || 'y' AS v
+----
+xy
+
+# `||` binds tighter than comparison, looser than arithmetic
+query B nosort
+SELECT 'ab' || 'c' = 'abc'
+----
+true
+
+query T nosort
+SELECT 'x' || 1 + 2
+----
+x3
+
+query T nosort
+SELECT 3 - 1 || 'x'
+----
+2x
+
+query I nosort
+SELECT id FROM t WHERE a || b = 'foobar'
+----
+1
+
+# === NULL: STRICT, and an untyped NULL operand is text =====================================
+
+query T nosort
+SELECT 'a' || NULL
+----
+NULL
+
+query T nosort
+SELECT NULL || 'a'
+----
+NULL
+
+query T nosort
+SELECT NULL || NULL
+----
+NULL
+
+# a bare NULL with a non-text operand is still TEXT concatenation (not an array)
+query T nosort
+SELECT NULL || 1
+----
+NULL
+
+query T nosort
+SELECT 1 || NULL
+----
+NULL
+
+query I nosort
+SELECT length(NULL || 1)
+----
+NULL
+
+query T nosort
+SELECT 'a' || NULL::i32
+----
+NULL
+
+# === text || anynonarray / anynonarray || text: the other operand's text output ==============
+
+query TT nosort
+SELECT 'a' || 1, 1 || 'a'
+----
+a1
+1a
+
+query IT rowsort
+SELECT id, a || n FROM t
+----
+1
+foo7
+2
+-1
+3
+NULL
+4
+héllo0
+
+query IT rowsort
+SELECT id, n || b FROM t
+----
+1
+7bar
+2
+-1x
+3
+NULL
+4
+0😀
+
+query T nosort
+SELECT 'ab' || 'c' || 1 || true
+----
+abc1true
+
+query TT nosort
+SELECT 1.50 || 'x', 'x' || -2.5
+----
+1.50x
+x-2.5
+
+query TT nosort
+SELECT true || 'x', 'x' || false
+----
+truex
+xfalse
+
+query T nosort
+SELECT 'x' || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid
+----
+xa0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+
+query TT nosort
+SELECT 'x' || DATE '2020-01-02', 'x' || INTERVAL '1 day'
+----
+x2020-01-02
+x1 day
+
+# a bare string literal is not text yet: it adapts, so '{1}' || 1 is text, not an array
+query TT nosort
+SELECT '{1}' || 1, 1 || '{1}'
+----
+{1}1
+1{1}
+
+# json has no || of its own: with a string operand it renders as text
+query TT nosort
+SELECT '{"a":1}'::json || 'x', 'x' || '{"a":1}'::json
+----
+{"a":1}x
+x{"a":1}
+
+# a TYPED text operand takes jsonb and bytea || to text concatenation (the other operand renders)
+query TT nosort
+SELECT '{"a":1}'::jsonb || 'x'::text, 'x'::text || '{"a":[1, 2]}'::jsonb
+----
+{"a": 1}x
+x{"a": [1, 2]}
+
+query TT nosort
+SELECT bytea '\x01' || 'a'::text, 'a'::text || bytea '\x01'
+----
+\x01a
+a\x01
+
+# ...but a bare literal adapts to the jsonb / bytea operand
+query T nosort
+SELECT '{"a":1}'::jsonb || '{"b":2}'
+----
+{"a": 1, "b": 2}
+
+query T nosort
+SELECT bytea '\x01' || '\x02'
+----
+\x0102
+
+statement error 22P02
+SELECT '{"a":1}'::jsonb || 'x'
+
+# varchar is text: the result is text
+query T nosort
+SELECT 'x'::varchar(3) || 'yz'
+----
+xyz
+
+# === arrays keep the array overloads ========================================================
+
+query T nosort
+SELECT ARRAY['a','b'] || 'c'::text
+----
+{a,b,c}
+
+query T nosort
+SELECT 'z'::text || ARRAY['a']
+----
+{z,a}
+
+query T nosort
+SELECT ARRAY['a'] || NULL
+----
+{a}
+
+# === volatility ============================================================================
+
+statement ok
+CREATE TABLE tz (id i32 PRIMARY KEY, a text, ts timestamptz)
+
+# text || text is immutable, so it may key an expression index
+statement ok
+CREATE INDEX tz_a_a ON tz ((a || a))
+
+# a timestamptz operand renders in the session zone, so the expression is not immutable (42P17)
+statement error 42P17
+CREATE INDEX tz_a_ts ON tz ((a || ts))
+
+# the volatility is the operand's text cast: an integer operand stays immutable (as PostgreSQL's
+# inlined anytextcat is)
+statement ok
+CREATE INDEX tz_a_id ON tz ((a || id))
+
+# === no operator ===========================================================================
+
+statement error 42883
+SELECT 1 || 2
+
+statement error 42883
+SELECT n || n FROM t
+
+statement error 42883
+SELECT 1 || 2 || 'x'
+
+statement error 42883
+SELECT '{}'::json || '{}'::json
+
+statement error 42883
+SELECT 'a'::text || ARRAY[1]

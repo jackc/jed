@@ -1,0 +1,43 @@
+# A MERGE target aliased like one of its joined source's inner relations (spec/design/merge.md §2):
+# the alias is accepted — the target's label is checked only against the source's own label —
+# but a qualified reference to it names two relations and is 42P09 (ambiguous_alias), never a
+# silent bind to the target. Oracle-probed against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.merge, dml.returning, query.select, query.order_by, query.join_inner, query.qualified_column, query.qualified_star, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, k i32, v i32)
+
+statement ok
+CREATE TABLE a (k i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE b (k i32 PRIMARY KEY, y i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 0)
+
+statement ok
+INSERT INTO a VALUES (1, 5)
+
+statement ok
+INSERT INTO b VALUES (1, 7)
+
+statement error 42P09
+MERGE INTO t AS a USING a JOIN b ON a.k = b.k ON a.id = b.k WHEN MATCHED THEN UPDATE SET v = b.y
+
+statement error 42P09
+MERGE INTO t AS b USING a JOIN b ON a.k = b.k ON b.id = a.k WHEN MATCHED THEN UPDATE SET v = a.x
+
+statement error 42P09
+MERGE INTO t AS a USING a JOIN b ON a.k = b.k ON b.k = 1 WHEN MATCHED THEN UPDATE SET v = b.y RETURNING a.*
+
+# Without the collision the same statement runs.
+statement ok
+MERGE INTO t AS m USING a JOIN b ON a.k = b.k ON m.id = b.k WHEN MATCHED THEN UPDATE SET v = b.y + a.x
+
+query III nosort
+SELECT id, k, v FROM t ORDER BY id
+----
+1
+1
+12

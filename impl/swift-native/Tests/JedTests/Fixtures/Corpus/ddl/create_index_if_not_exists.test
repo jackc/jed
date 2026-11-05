@@ -1,0 +1,182 @@
+# CREATE INDEX IF NOT EXISTS — the idempotent form of CREATE INDEX (grammar.md §30, indexes.md §1).
+# A name already taken in the relation namespace (a table, index, sequence, or view) makes the
+# statement a no-op success instead of 42P07 (PostgreSQL emits a notice; jed has no notice channel,
+# so it is silent). Unlike CREATE TABLE IF NOT EXISTS, the skip is decided where PostgreSQL's
+# index_create decides it: AFTER the whole definition is validated (table, access method, columns,
+# expressions, predicate — oracle-probed), BEFORE the build scan — so a skipped statement charges
+# zero cost, never runs the UNIQUE build check, and leaves the existing relation untouched. A name is
+# required after IF NOT EXISTS (PostgreSQL's grammar). Every index kind shares the path: btree, gin,
+# gist, UNIQUE, expression, partial. The TEMP namespace is covered in temp_index.test, an
+# attachment's namespace in attach/in_memory.test, the jed_ reservation in reserved_names.test.
+# Format + the `requires` directive: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.create_index_if_not_exists, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_expr, ddl.index_partial, ddl.gin_index, ddl.gist_index, ddl.sequence, ddl.drop_table, ddl.view, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32, types.text, types.array, types.range, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b i32, v text, arr i32[], span int4range)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'a', ARRAY[1, 2], '[1,5)'), (2, 10, 'b', ARRAY[3], '[2,8)')
+
+# --- a missing name creates the index, exactly like the bare form ----------------------------------
+
+# the build scan: page_read(1) + 2 storage_row_read = 3
+# cost: 3
+statement ok
+CREATE INDEX IF NOT EXISTS t_b ON t (b)
+
+# --- a taken name is a no-op: no build scan, zero cost ---------------------------------------------
+
+# cost: 0
+statement ok
+CREATE INDEX IF NOT EXISTS t_b ON t (b)
+
+# the bare form still rejects the duplicate
+statement error 42P07
+CREATE INDEX t_b ON t (b)
+
+# a skipped UNIQUE definition is not built: the existing duplicate b values do not raise 23505 ...
+# cost: 0
+statement ok
+CREATE UNIQUE INDEX IF NOT EXISTS t_b ON t (b)
+
+# ... and t_b stays the original non-unique index, so a further duplicate is accepted
+statement ok
+INSERT INTO t VALUES (3, 10, 'c', ARRAY[4], '[3,4)')
+
+query II nosort
+SELECT id, b FROM t ORDER BY id
+----
+1
+10
+2
+10
+3
+10
+
+# --- every index kind takes the same path ----------------------------------------------------------
+
+statement ok
+CREATE INDEX IF NOT EXISTS t_arr ON t USING gin (arr)
+
+# cost: 0
+statement ok
+CREATE INDEX IF NOT EXISTS t_arr ON t USING gin (arr)
+
+statement ok
+CREATE INDEX IF NOT EXISTS t_span ON t USING gist (span)
+
+# cost: 0
+statement ok
+CREATE INDEX IF NOT EXISTS t_span ON t USING gist (span)
+
+statement ok
+CREATE UNIQUE INDEX IF NOT EXISTS t_v ON t (v)
+
+# cost: 0
+statement ok
+CREATE UNIQUE INDEX IF NOT EXISTS t_v ON t (v)
+
+statement ok
+CREATE INDEX IF NOT EXISTS t_lower ON t (lower(v))
+
+statement ok
+CREATE INDEX IF NOT EXISTS t_lower ON t ((b + 1))
+
+statement ok
+CREATE INDEX IF NOT EXISTS t_part ON t (b) WHERE b > 5
+
+statement ok
+CREATE INDEX IF NOT EXISTS t_part ON t (v) WHERE v <> 'x'
+
+# a definition of a different kind is skipped just the same (t_b is a btree)
+statement ok
+CREATE INDEX IF NOT EXISTS t_b ON t USING gin (arr)
+
+# the UNIQUE t_v created above is enforced
+statement error 23505
+INSERT INTO t VALUES (4, 1, 'a', ARRAY[5], '[1,2)')
+
+# --- every relation kind shares the namespace ------------------------------------------------------
+
+statement ok
+CREATE SEQUENCE s
+
+statement ok
+CREATE VIEW tv AS SELECT id FROM t
+
+statement ok
+CREATE TABLE other (x i32)
+
+# a name taken by a table, a sequence, or a view is a no-op (the bare form is 42P07)
+statement ok
+CREATE INDEX IF NOT EXISTS other ON t (b)
+
+statement ok
+CREATE INDEX IF NOT EXISTS s ON t (b)
+
+statement ok
+CREATE INDEX IF NOT EXISTS tv ON t (b)
+
+# the indexed table's own name is taken too
+statement ok
+CREATE INDEX IF NOT EXISTS t ON t (b)
+
+statement error 42P07
+CREATE INDEX s ON t (b)
+
+# --- the definition is validated BEFORE the skip (PostgreSQL's index_create order) -----------------
+
+# a missing table
+statement error 42P01
+CREATE INDEX IF NOT EXISTS t_b ON nosuch (b)
+
+# an unknown access method
+statement error 42704
+CREATE INDEX IF NOT EXISTS t_b ON t USING nosuch (b)
+
+# an unknown key column
+statement error 42703
+CREATE INDEX IF NOT EXISTS t_b ON t (nosuch)
+
+# an unknown column in an expression key
+statement error 42703
+CREATE INDEX IF NOT EXISTS t_b ON t ((nosuch + 1))
+
+# an unknown column in the predicate
+statement error 42703
+CREATE INDEX IF NOT EXISTS t_b ON t (b) WHERE nosuch > 1
+
+# a gin index on a non-array column has no operator class
+statement error 42704
+CREATE INDEX IF NOT EXISTS t_b ON t USING gin (b)
+
+# a non-immutable expression key
+statement error 42P17
+CREATE INDEX IF NOT EXISTS t_b ON t ((now()))
+
+# --- a name is required, and IF NOT is a two-token lookahead ---------------------------------------
+
+# PostgreSQL's grammar takes a name after IF NOT EXISTS: the unnamed form is a syntax error
+statement error 42601
+CREATE INDEX IF NOT EXISTS ON t (b)
+
+# a lone `if` is an ordinary index name
+statement ok
+CREATE INDEX if ON t (b)
+
+statement error 42P07
+CREATE INDEX if ON t (b)
+
+statement ok
+CREATE INDEX IF NOT EXISTS if ON t (b)
+
+# --- the skipped name is still droppable, and once dropped IF NOT EXISTS creates it ----------------
+
+statement ok
+DROP INDEX t_b
+
+statement ok
+CREATE UNIQUE INDEX IF NOT EXISTS t_b ON t (id)
+
+statement error 23505
+INSERT INTO t VALUES (1, 0, 'z', ARRAY[6], '[1,2)')

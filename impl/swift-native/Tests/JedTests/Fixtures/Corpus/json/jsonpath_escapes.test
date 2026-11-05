@@ -1,0 +1,96 @@
+# jsonpath string escapes (spec/design/jsonpath.md §2.1) — PostgreSQL's jsonpath scanner: `\b \f \n
+# \r \t \v`; a run of `\uXXXX` / `\u{X…}` (1–6 hex digits) escapes, within which a UTF-16 surrogate
+# pair combines; `\xHH`; and a backslash before any other character is that character. A decoded
+# NUL is 22P05 ("unsupported Unicode escape sequence"); an unpaired surrogate 22P02 ("invalid input
+# syntax for type jsonpath" with PG's Detail); a malformed `\u` / `\x` (the whole `\u` run is
+# lexed first) or a code point above U+10FFFF 42601. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonb, types.jsonpath, expr.jsonpath_filter, func.jsonb_path, func.json_table
+
+# Decoded escapes render canonically (a control character as `\u00XX`).
+query TTT nosort
+SELECT '$ ? (@ == "\ud83d\ude00")'::jsonpath, '$ ? (@ == "\u{D800}\u{DC00}")'::jsonpath, '$ ? (@ == "\x41\v\q\"\/")'::jsonpath
+----
+$?(@ == "😀")
+$?(@ == "𐀀")
+$?(@ == "A\u000bq\"/")
+
+query TT nosort
+SELECT '$."\u0041\u{42}\u{000043}"'::jsonpath, '$ ? (@ == "é\é\xe9")'::jsonpath
+----
+$."ABC"
+$?(@ == "ééé")
+
+query BB nosort
+SELECT jsonb_path_exists('{"aé": 1}', '$."a\u00e9"'), jsonb_path_exists('["\\"]', '$ ? (@ == "\\")')
+----
+true
+true
+
+# A NUL is 22P05, however it is spelled.
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$ ? (@ == "\u0000")'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$."a\u0000b"'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$ ? (@ == "\u{0}")'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$ ? (@ == "\x00")'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT jsonb_path_query_first('"a"', '$ ? (@ == "\u0000")')
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT * FROM JSON_TABLE('[1]'::jsonb, '$ ? (@ == "\u0000")' COLUMNS (a text PATH '$'))
+
+# An unpaired surrogate is 22P02: alone, doubled, or followed by anything but a low surrogate within
+# the same run of escapes.
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\ud800")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\udc00")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\ud800\ud800")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\ud800\u0041")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\ud800x")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\ud800\n")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$ ? (@ == "\ud800\x41")'::jsonpath
+
+statement error 22P02 invalid input syntax for type jsonpath
+SELECT '$."\u{D800}"'::jsonpath
+
+# A malformed escape, or a code point past U+10FFFF, is a syntax error; a run is lexed whole, so a
+# malformed escape later in it wins over a NUL earlier in it.
+statement error 42601
+SELECT '$ ? (@ == "\u12")'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == "\u{}")'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == "\u{1234567}")'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == "\x4")'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == "\u{110000}")'::jsonpath
+
+statement error 42601
+SELECT '$ ? (@ == "\u0000\u12")'::jsonpath
+
+statement error 22P05 unsupported Unicode escape sequence
+SELECT '$ ? (@ == "\u0000\x4")'::jsonpath

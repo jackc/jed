@@ -1,0 +1,164 @@
+# IN (list) / NOT IN — membership over a non-empty value list (spec/design/grammar.md §20).
+# `x IN (a,b,c)` is the OR-chain PostgreSQL defines it as: `x = a OR x = b OR x = c`; `NOT IN`
+# is its negation. So three-valued NULL falls out of the Kleene OR — `1 IN (2,NULL)` is NULL,
+# `1 IN (1,NULL)` is TRUE (a match dominates), `1 NOT IN (2,NULL)` is NULL — and per-element
+# typing reuses the `=` operand contract (a too-wide literal traps 22003, a cross-family
+# element is 42804). The empty list `IN ()` is a 42601 syntax error. Verified against the
+# live PostgreSQL 18 oracle.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.in_list, expr.comparison_value, types.i16, types.i32, types.i64, types.text, types.decimal, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, NULL)
+
+# Projected as a boolean: a present value that matches is TRUE; a present value that matches
+# nothing but the list has a NULL is UNKNOWN (the NOT-IN-with-NULL gotcha); a NULL `a` is
+# UNKNOWN. `1 IN (1,NULL)` = TRUE because a match dominates the Kleene OR.
+# names: ?column?
+query B nosort
+SELECT a IN (10, NULL) FROM t ORDER BY id
+----
+true
+NULL
+NULL
+
+# With no NULL in the list, a non-matching present value is a definite FALSE; only the NULL
+# `a` row is UNKNOWN.
+query B nosort
+SELECT a IN (10, 20) FROM t ORDER BY id
+----
+true
+true
+NULL
+
+# NOT IN is the exact negation: NOT(true)=false, NOT(unknown)=unknown.
+query B nosort
+SELECT a NOT IN (10, NULL) FROM t ORDER BY id
+----
+false
+NULL
+NULL
+
+# G19 — a single-NULL list `a IN (NULL)` desugars to the lone `a = NULL`, which is UNKNOWN for
+# EVERY row (a present value compared to NULL, or a NULL `a`) — so the projection is all NULL.
+# names: ?column?
+query B nosort
+SELECT a IN (NULL) FROM t ORDER BY id
+----
+NULL
+NULL
+NULL
+
+# ...and in WHERE that UNKNOWN keeps no rows.
+query I nosort
+SELECT id FROM t WHERE a IN (NULL) ORDER BY id
+----
+
+# In WHERE, only rows whose predicate is TRUE survive: a=10 and a=20 match; a=NULL is dropped
+# (UNKNOWN). Cost: 1 page + 3 scanned, the desugared `Or(Eq(a,10),Eq(a,20))` is 3 interior nodes per
+# scanned row (1 or + 2 eq, leaf column/constant operands free), 2 on a=10 where the TRUE first Eq
+# decides the OR = 8, plus 2 produced = 14.
+# cost: 14
+query I nosort
+SELECT id FROM t WHERE a IN (10, 20) ORDER BY id
+----
+1
+2
+
+# NOT IN with a NULL in the list keeps NO rows: every present `a` is either a match (NOT IN
+# false) or UNKNOWN (a non-match against the NULL element), and the NULL `a` is UNKNOWN too.
+query I nosort
+SELECT id FROM t WHERE a NOT IN (20, NULL) ORDER BY id
+----
+
+# A single-element list desugars to a lone equality.
+query I nosort
+SELECT id FROM t WHERE a IN (10) ORDER BY id
+----
+1
+
+# Text IN list compares by the C collation; an exact element match wins.
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO w VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')
+
+query T nosort
+SELECT s FROM w WHERE s IN ('alice', 'carol') ORDER BY id
+----
+alice
+carol
+
+# Decimal IN compares by exact numeric value: 1.5 and 1.50 are equal, so the row matches.
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, n numeric(5,2))
+
+statement ok
+INSERT INTO d VALUES (1, 1.50), (2, 2.00)
+
+query I nosort
+SELECT id FROM d WHERE n IN (1.5, 9.9) ORDER BY id
+----
+1
+
+# G19 — cross-width IN: an i64 column against a list of untyped integer literals. Each element
+# adapts to the column's i64 type through the `=` operand contract (the promotion tower), so a
+# small-magnitude literal and one outside i32's range coexist in the same list. `v IN (10, 20)`
+# matches the two small rows; `v IN (5000000000, 99)` matches the row whose value exceeds i32.
+statement ok
+CREATE TABLE big (id i32 PRIMARY KEY, v i64)
+
+statement ok
+INSERT INTO big VALUES (1, 10), (2, 20), (3, 5000000000)
+
+# cost: 14
+query I nosort
+SELECT id FROM big WHERE v IN (10, 20) ORDER BY id
+----
+1
+2
+
+# cost: 13
+query I nosort
+SELECT id FROM big WHERE v IN (5000000000, 99) ORDER BY id
+----
+3
+
+# Empty list is a syntax error (the parser requires at least one element).
+statement error 42601
+SELECT id FROM t WHERE a IN ()
+
+# A cross-family element is a type error (an integer column vs a text element).
+statement error 42804
+SELECT id FROM t WHERE a IN (10, 'x')
+
+# An untyped integer-literal element too wide for the column's type traps at resolve, before
+# any row is scanned — the same literal range check `=` performs (types.md §6).
+statement ok
+CREATE TABLE s16 (id i32 PRIMARY KEY, v i16)
+
+statement error 22003
+SELECT id FROM s16 WHERE v IN (1, 100000)
+
+# A flat 240-element list must remain executable when its OR expansion is deep.
+# The matching value is last: both present rows and the NULL row visit all 240
+# equalities and 239 OR nodes. One page + 3 scans + 3*479 operators + 1 result.
+# names: id
+# cost: 1442
+query I nosort
+SELECT id FROM t WHERE a IN (100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,276,277,278,279,280,281,282,283,284,285,286,287,288,289,290,291,292,293,294,295,296,297,298,299,300,301,302,303,304,305,306,307,308,309,310,311,312,313,314,315,316,317,318,319,320,321,322,323,324,325,326,327,328,329,330,331,332,333,334,335,336,337,338,20) ORDER BY id
+----
+2
+
+# NOT IN keeps the nonmatching present row; the NULL input remains UNKNOWN.
+# The additional NOT operator is charged once for each of the three rows.
+# names: id
+# cost: 1445
+query I nosort
+SELECT id FROM t WHERE a NOT IN (100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,276,277,278,279,280,281,282,283,284,285,286,287,288,289,290,291,292,293,294,295,296,297,298,299,300,301,302,303,304,305,306,307,308,309,310,311,312,313,314,315,316,317,318,319,320,321,322,323,324,325,326,327,328,329,330,331,332,333,334,335,336,337,338,20) ORDER BY id
+----
+1

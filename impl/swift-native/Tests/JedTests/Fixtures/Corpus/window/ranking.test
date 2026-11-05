@@ -1,0 +1,115 @@
+# Window functions S1 — peer-aware ranking: rank() and dense_rank() (spec/design/window.md §4).
+#
+# Peers are rows EQUAL on the window ORDER BY keys only (the PK tie-break sequences peers but does
+# not split a peer group). rank() = 1 + the number of rows in earlier peer groups (ties share a
+# rank, then a gap: 1,1,3); dense_rank() = 1 + the number of earlier peer groups (no gap: 1,1,2).
+# Both are i64 and frame-insensitive, so they match PostgreSQL exactly (no PK dependence). With no
+# window ORDER BY every row is one peer group, so both are 1 for every row.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_ranking, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 10), (3, 1, 30), (4, 2, 20), (5, 2, 20), (6, 2, 20)
+
+# rank() OVER (ORDER BY v) — peer groups {10:id1,id2}, {20:id4,id5,id6}, {30:id3}. rank 1,1,3,3,3,6.
+# Displayed ORDER BY id. 6 scanned + 6 window_result + 6 produced + page_read.
+# names: id, rnk
+# cost: 19
+query II nosort
+SELECT id, rank() OVER (ORDER BY v) AS rnk FROM t ORDER BY id
+----
+1
+1
+2
+1
+3
+6
+4
+3
+5
+3
+6
+3
+
+# dense_rank() OVER (ORDER BY v) — same peer groups, no gaps: 1,1,2,2,2,3.
+# names: id, drnk
+query II nosort
+SELECT id, dense_rank() OVER (ORDER BY v) AS drnk FROM t ORDER BY id
+----
+1
+1
+2
+1
+3
+3
+4
+2
+5
+2
+6
+2
+
+# PARTITION BY g ORDER BY v — ranking restarts per partition. g=1 {10:id1,id2},{30:id3} -> rank
+# 1,1,3; g=2 all v=20 (one peer group) -> rank 1,1,1.
+# names: id, g, rnk, drnk
+query IIII nosort
+SELECT id, g, rank() OVER (PARTITION BY g ORDER BY v) AS rnk, dense_rank() OVER (PARTITION BY g ORDER BY v) AS drnk FROM t ORDER BY id
+----
+1
+1
+1
+1
+2
+1
+1
+1
+3
+1
+3
+2
+4
+2
+1
+1
+5
+2
+1
+1
+6
+2
+1
+1
+
+# No window ORDER BY — every row is one peer group, so rank() and dense_rank() are 1 everywhere.
+# names: id, rnk, drnk
+query III nosort
+SELECT id, rank() OVER () AS rnk, dense_rank() OVER () AS drnk FROM t ORDER BY id
+----
+1
+1
+1
+2
+1
+1
+3
+1
+1
+4
+1
+1
+5
+1
+1
+6
+1
+1
+
+# A ranking function without OVER is 42809 (the window-without-OVER rule, like row_number).
+statement error 42809
+SELECT rank() FROM t
+
+# A ranking function in WHERE is 42P20.
+statement error 42P20
+SELECT id FROM t WHERE rank() OVER (ORDER BY v) > 1

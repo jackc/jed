@@ -1,0 +1,83 @@
+# Scalar UPDATE storage-assignability regression. One identity assignment covers every currently
+# storable scalar family, preventing an UPDATE-only checker from drifting away from INSERT ...
+# SELECT/default storage semantics. The float tower additionally permits f32 → f64 widening and
+# rejects implicit f64 → f32 narrowing (explicit CAST only).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, types.i16, types.i32, types.i64, types.text, types.boolean, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f32, types.f64, types.date, types.json, types.jsonb
+
+statement ok
+CREATE TABLE scalar_assignment (
+  id i32 PRIMARY KEY,
+  v16 i16,
+  v32 i32,
+  v64 i64,
+  t text,
+  flag boolean,
+  n numeric,
+  bytes bytea,
+  u uuid,
+  ts timestamp,
+  tstz timestamptz,
+  iv interval,
+  r f32,
+  d f64,
+  day date,
+  j json,
+  jb jsonb
+)
+
+statement ok
+INSERT INTO scalar_assignment VALUES (
+  1, 2, 3, 4, 'text', true, 1.50, '\x00ff',
+  '550e8400-e29b-41d4-a716-446655440000',
+  '2024-01-02 03:04:05', '2024-01-02 03:04:05+00', '1 day 02:03:04',
+  1.25, 2.5, '2024-01-02', '{ "j" : 1 }', '{"jb":1}'
+)
+
+# If any storable scalar is omitted from the common predicate, this statement fails at resolve.
+statement ok
+UPDATE scalar_assignment SET
+  v16 = v16,
+  v32 = v32,
+  v64 = v64,
+  t = t,
+  flag = flag,
+  n = n,
+  bytes = bytes,
+  u = u,
+  ts = ts,
+  tstz = tstz,
+  iv = iv,
+  r = r,
+  d = d,
+  day = day,
+  j = j,
+  jb = jb
+
+query TTRR nosort
+SELECT j, jb, r, d FROM scalar_assignment WHERE id = 1
+----
+{ "j" : 1 }
+{"jb": 1}
+1.25
+2.5
+
+# f32 widens losslessly into f64 under assignment.
+statement ok
+UPDATE scalar_assignment SET d = r WHERE id = 1
+
+query RR nosort
+SELECT r, d FROM scalar_assignment WHERE id = 1
+----
+1.25
+1.25
+
+# f64 → f32 remains lossy/explicit-only, even when this particular value is representable.
+statement error 42804
+UPDATE scalar_assignment SET r = d WHERE id = 1
+
+query RR nosort
+SELECT r, d FROM scalar_assignment WHERE id = 1
+----
+1.25
+1.25

@@ -1,0 +1,143 @@
+# Range accessor functions (spec/design/range-functions.md §1, RF1): the seven polymorphic, STRICT
+# readers of a range value — lower/upper (the bound value, NULL when empty/unbounded on that side)
+# and isempty/lower_inc/upper_inc/lower_inf/upper_inf (boolean). Polymorphic over anyrange (binds
+# ELEM := the element type; lower/upper return ELEM, the rest boolean). A NULL range propagates to
+# NULL. Edge cases (oracle-pinned vs postgres:18): the empty range → isempty true, every other
+# reader false/NULL; an infinite bound → *_inf true, *_inc false, lower/upper NULL. The names
+# int4range/int8range/numrange/daterange are jed aliases / canonical spellings; the SQL is
+# oracle-clean. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.range, types.i32, func.range_accessors, resource.cost_metering
+
+# --- accessors over stored ranges, every shape in one table (int4range) ---
+
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, ir int4range)
+
+statement ok
+INSERT INTO r VALUES (1, '[1,5)'), (2, 'empty'), (3, '(,5)'), (4, '[1,)'), (5, '(,)'), (6, NULL)
+
+# id, lower, upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf. The empty range: isempty
+# true, every other reader false/NULL. An infinite bound: that side's lower/upper is NULL, *_inf
+# true, *_inc false. A NULL range (id 6): every accessor is NULL (STRICT propagation).
+query IIIBBBBB nosort
+SELECT id, lower(ir), upper(ir), isempty(ir), lower_inc(ir), upper_inc(ir), lower_inf(ir), upper_inf(ir) FROM r ORDER BY id
+----
+1
+1
+5
+false
+true
+false
+false
+false
+2
+NULL
+NULL
+true
+false
+false
+false
+false
+3
+NULL
+5
+false
+false
+false
+true
+false
+4
+1
+NULL
+false
+true
+false
+false
+true
+5
+NULL
+NULL
+false
+false
+false
+true
+true
+6
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# --- literal-cast forms + element typing (the bound value is ELEM) ---
+
+# int4range bounds are integer (the canonical [1,5) keeps lower 1, upper 5).
+query II nosort
+SELECT lower('[1,5)'::int4range), upper('[1,5)'::int4range)
+----
+1
+5
+
+# int8range bounds are bigint.
+query II nosort
+SELECT lower('[100,200)'::int8range), upper('[100,200)'::int8range)
+----
+100
+200
+
+# numrange is continuous — the bounds are decimal, kept verbatim.
+query DD nosort
+SELECT lower('[1.5,2.5]'::numrange), upper('[1.5,2.5]'::numrange)
+----
+1.5
+2.5
+
+# daterange bounds are date (the inclusive upper canonicalized one day forward: [.,2024-02-02)).
+query TT nosort
+SELECT lower('[2024-01-01,2024-02-01]'::daterange), upper('[2024-01-01,2024-02-01]'::daterange)
+----
+2024-01-01
+2024-02-02
+
+# --- the boolean readers on the literal forms ---
+
+# A both-inclusive numrange: lower_inc + upper_inc true, neither side infinite.
+query BBBBB nosort
+SELECT isempty('[1.5,2.5]'::numrange), lower_inc('[1.5,2.5]'::numrange), upper_inc('[1.5,2.5]'::numrange), lower_inf('[1.5,2.5]'::numrange), upper_inf('[1.5,2.5]'::numrange)
+----
+false
+true
+true
+false
+false
+
+# The empty range: isempty true; every bound reader false.
+query BBBBB nosort
+SELECT isempty('empty'::int4range), lower_inc('empty'::int4range), upper_inc('empty'::int4range), lower_inf('empty'::int4range), upper_inf('empty'::int4range)
+----
+true
+false
+false
+false
+false
+
+# The unbounded-both range: not empty; both *_inf true, both *_inc false.
+query BBBBB nosort
+SELECT isempty('(,)'::int4range), lower_inc('(,)'::int4range), upper_inc('(,)'::int4range), lower_inf('(,)'::int4range), upper_inf('(,)'::int4range)
+----
+false
+false
+false
+true
+true
+
+# --- NULL propagation (STRICT): a NULL range → NULL for every accessor ---
+
+query IIB nosort
+SELECT lower(NULL::int4range), upper(NULL::int4range), isempty(NULL::int4range)
+----
+NULL
+NULL
+NULL

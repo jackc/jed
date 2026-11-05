@@ -1,0 +1,15 @@
+# Malformed page: a CRC-valid leaf holding a decimal whose base-10^4 digit group is 65535
+# (storage.md §6; format.md decimal value codec). Ruby-forged (verify.rb MALFORMED_FIXTURES): row 2's
+# d is -12345.6789 with its first group overwritten and the page checksum resealed. A group above
+# 9999 is no decimal at all, so touching the value is XX001 — not a crash, not a misread number.
+# requires: harness.fixture_open, query.select, query.where_eq, query.aggregates, types.i32, types.decimal
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_decimal_group.jed
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+statement error XX001
+SELECT d FROM t WHERE id = 2

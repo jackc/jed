@@ -1,0 +1,26 @@
+# PostgreSQL owns a FOREIGN KEY through its referencing columns: dropping one of those columns
+# automatically drops the whole constraint, even under the default RESTRICT mode. An unrelated
+# incoming FK (the dropped column is on the referenced side) remains an external dependency.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.foreign_key, dml.insert, query.select, types.i32
+
+statement ok
+CREATE TABLE alter_drop_local_fk_parent (id i32 PRIMARY KEY, code i32 UNIQUE)
+
+statement ok
+CREATE TABLE alter_drop_local_fk_child (id i32 PRIMARY KEY, parent_code i32 REFERENCES alter_drop_local_fk_parent (code))
+
+statement ok
+ALTER TABLE alter_drop_local_fk_child DROP COLUMN parent_code
+
+# Reusing the name creates an ordinary unconstrained column; the dropped FK must not survive.
+statement ok
+ALTER TABLE alter_drop_local_fk_child ADD COLUMN parent_code i32
+
+statement ok
+INSERT INTO alter_drop_local_fk_child VALUES (1, 999)
+
+query II nosort
+SELECT id, parent_code FROM alter_drop_local_fk_child
+----
+1
+999

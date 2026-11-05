@@ -1,0 +1,228 @@
+# Interval field qualifiers and precision (spec/design/interval.md §6.1): `interval YEAR TO MONTH`,
+# `interval '1' DAY`, `interval(p)`, `interval DAY TO SECOND(p)` on a column, composite field, cast
+# target, or literal. PostgreSQL's semantics: text read under a qualifier gives a unitless rightmost
+# number the qualifier's least field, and reads `a:b` as minutes:seconds under MINUTE TO SECOND; the
+# value is then cut below the least field (YEAR keeps whole years, MONTH zeroes days and time, DAY
+# zeroes the time, HOUR/MINUTE truncate the time toward zero — higher fields are KEPT) and the time
+# rounded half away from zero to the precision. All rows oracle-checked against PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.select_no_from, query.where_eq, query.order_by, query.values_query, cast.explicit, cast.string_literal, types.i32, types.text, types.interval, types.composite, types.interval_qualifier, harness.params
+
+# --- a unitless number takes the qualifier's least field -----------------------------------------
+query TTTTTT nosort
+SELECT interval '1' year, interval '1' month, interval '1' day, interval '1' hour, interval '1' minute, interval '1' second
+----
+1 year
+1 mon
+1 day
+01:00:00
+00:01:00
+00:00:01
+
+query TTTTTTT nosort
+SELECT interval '5' year to month, interval '5' day to hour, interval '5' day to minute, interval '5' day to second, interval '5' hour to minute, interval '5' hour to second, interval '5' minute to second
+----
+5 mons
+05:00:00
+00:05:00
+00:00:05
+00:05:00
+00:00:05
+00:00:05
+
+# the SQL-standard forms
+query TTTT nosort
+SELECT interval '1-2' year to month, interval '1 2' day to hour, interval '1 2:03' day to minute, interval '1 2:03:04.5678' day to second
+----
+1 year 2 mons
+1 day 02:00:00
+1 day 02:03:00
+1 day 02:03:04.5678
+
+# `a:b` is hours:minutes, except under MINUTE TO SECOND, where it is minutes:seconds
+query TTTTT nosort
+SELECT interval '2:03' hour to minute, interval '2:03' minute to second, interval '2:03.5' minute to second, interval '-1:30' minute to second, interval '1 1:30' minute to second
+----
+02:03:00
+00:02:03
+00:02:03.5
+-00:01:30
+1 day 00:01:30
+
+# a minutes field past 59 under MINUTE TO SECOND is out of range
+statement error 22008
+SELECT interval '90:30' minute to second
+
+# --- the value is cut below the least field; higher fields stay -----------------------------------
+query TTT nosort
+SELECT interval '1 year 2 months 3 days 04:05:06.789' year, interval '1 year 2 months 3 days 04:05:06.789' month, interval '1 year 2 months 3 days 04:05:06.789' day
+----
+1 year
+1 year 2 mons
+1 year 2 mons 3 days
+
+query TTT nosort
+SELECT interval '1 year 2 months 3 days 04:05:06.789' hour, interval '1 year 2 months 3 days 04:05:06.789' minute, interval '1 year 2 months 3 days 04:05:06.789' second
+----
+1 year 2 mons 3 days 04:00:00
+1 year 2 mons 3 days 04:05:00
+1 year 2 mons 3 days 04:05:06.789
+
+# YEAR keeps whole years of the months (toward zero); a fraction of the least field is dropped
+query TTTTT nosort
+SELECT interval '23 months' year, interval '-23 months' year, interval '1.5' year to month, interval '1.5' day, interval '1.5' hour to minute
+----
+1 year
+-1 years
+1 mon
+1 day
+00:01:00
+
+# negative times truncate toward zero
+query TT nosort
+SELECT interval '-1 year -2 months -3 days -04:05:06.789' hour, interval '-04:05:06.789' minute
+----
+-1 years -2 mons -3 days -04:00:00
+-04:05:00
+
+# an ISO 8601 or '@' form is cut the same way
+query TT nosort
+SELECT interval '@ 5' day, interval 'P1Y2M3DT4H5M6.789S' hour
+----
+5 days
+1 year 2 mons 3 days 04:00:00
+
+# --- precision: interval(p) and … SECOND(p) round the time half away from zero ---------------------
+query TTTT nosort
+SELECT '1.2345'::interval(2), interval '1.2345' second(2), CAST('1.2345' AS interval second(3)), interval '1 2:03:04.5678' day to second(2)
+----
+00:00:01.23
+00:00:01.23
+00:00:01.235
+1 day 02:03:04.57
+
+query TTTT nosort
+SELECT interval '-04:05:06.75' second(1), interval '-0.5' second(0), interval '0.5' second(0), interval '2:03.45' minute to second(1)
+----
+-04:05:06.8
+-00:00:01
+00:00:01
+00:02:03.5
+
+# a rounding past the representable range is out of range
+statement error 22008
+SELECT interval '9223372036854775807 microseconds' second(0)
+
+# --- casts of a runtime value --------------------------------------------------------------------
+# A runtime text is read WITHOUT the qualifier, then cut (PostgreSQL's CoerceViaIO + interval_scale):
+# '2:03' is 2 hours 3 minutes even under MINUTE TO SECOND — only a literal is read under it.
+query TT nosort
+SELECT (interval '1 day 3 hours')::interval day, (interval '1 day 02:03:04.56' + interval '1 second')::interval(1)
+----
+1 day
+1 day 02:03:05.6
+
+query TTT nosort
+SELECT x::interval hour to minute, x::interval(1), y::interval minute to second FROM (VALUES ('1 day 2:03:04.56'::text, '2:03'::text)) v(x, y)
+----
+1 day 02:03:00
+1 day 02:03:04.6
+02:03:00
+
+# --- assignment: a qualified column cuts every stored value --------------------------------------
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, ym interval year to month, d interval day, ds interval day to second(1), ms interval minute to second, p interval(3))
+
+statement ok
+INSERT INTO t VALUES (1, '1 year 14 months 5 days', '3 days 04:05', '1 day 01:02:03.45', '2:03', '1.23456'), (2, '5', '5', '5', '5', '5')
+
+# a runtime value rounds and cuts too
+statement ok
+INSERT INTO t VALUES (3, interval '2 years' + interval '40 days', interval '1 day' + interval '12 hours', interval '1.04 seconds' * 2, interval '1 minute 1.5 seconds', interval '1 second' / 3)
+
+statement ok
+INSERT INTO t VALUES (4, NULL, NULL, NULL, NULL, NULL)
+
+query ITTTTT nosort
+SELECT id, ym, d, ds, ms, p FROM t ORDER BY id
+----
+1
+2 years 2 mons
+3 days
+1 day 01:02:03.5
+00:02:03
+00:00:01.235
+2
+5 mons
+5 days
+00:00:05
+00:00:05
+00:00:05
+3
+2 years
+1 day
+00:00:02.1
+00:01:01.5
+00:00:00.333
+4
+NULL
+NULL
+NULL
+NULL
+NULL
+
+statement ok
+UPDATE t SET d = d + interval '5 hours', ds = ds + interval '0.07 seconds' WHERE id = 1
+
+query TT nosort
+SELECT d, ds FROM t WHERE id = 1
+----
+3 days
+1 day 01:02:03.6
+
+# a bound text parameter is an interval first (PostgreSQL types the parameter without the
+# qualifier), then cut on assignment: '2:03' stays 2 hours 3 minutes
+# params: '2:03', '1 day 02:03:04.56'
+statement ok
+INSERT INTO t (id, ms, ds) VALUES (5, $1, $2)
+
+query TT nosort
+SELECT ms, ds FROM t WHERE id = 5
+----
+02:03:00
+1 day 02:03:04.6
+
+# params: '1 day 02:03:04'
+query T nosort
+SELECT $1::interval hour
+----
+1 day 02:00:00
+
+# --- a composite field cuts its values -----------------------------------------------------------
+statement ok
+CREATE TYPE span AS (h interval hour, note text)
+
+query T nosort
+SELECT '("1 day 02:03",x)'::span
+----
+("1 day 02:00:00",x)
+
+# --- qualifier syntax errors (42601) -------------------------------------------------------------
+statement error 42601
+SELECT interval '1' day to month
+
+statement error 42601
+SELECT interval '1' second to minute
+
+statement error 42601
+SELECT interval '1' year to second
+
+# only a trailing SECOND takes a precision
+statement error 42601
+SELECT interval '1' year(2)
+
+# interval(p) takes no qualifier
+statement error 42601
+SELECT '1'::interval(3) second
+
+statement error 42601
+SELECT '1'::interval(1, 2)

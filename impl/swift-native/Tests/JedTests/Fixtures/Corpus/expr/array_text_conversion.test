@@ -1,0 +1,184 @@
+# The array <-> text conversion functions (spec/design/array-functions.md §15):
+#   - array_to_string(anyarray, sep [, null_string]) → text: every element (any dimensionality,
+#     row-major) rendered as its type's OUTPUT text — not array_out's quoting — joined by sep. A NULL
+#     element is skipped, or written as null_string when that is given and non-NULL. A NULL array or a
+#     NULL separator → NULL; an empty array → ''. An untyped array operand is 42804 (PostgreSQL).
+#   - string_to_array(text, sep [, null_string]) → text[]: the string split at each non-overlapping
+#     occurrence of sep. A NULL sep splits into characters; an empty sep keeps the string whole; an
+#     empty string → {}; a piece equal to null_string → a NULL element. A NULL string → NULL.
+# PostgreSQL-oracle-verified (postgres:18). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.array, types.array_multidim, types.i32, types.text, types.boolean, types.decimal, types.bytea, types.date, types.composite, func.array, func.array_to_string, func.string_to_array, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, xs text[], sep text)
+
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY['a', 'b', 'c'], ','),
+  (2, ARRAY['a', NULL, 'c'], '-'),
+  (3, '{}', ','),
+  (4, NULL, ','),
+  (5, ARRAY['x', 'y'], NULL),
+  (6, ARRAY[NULL, NULL]::text[], ',')
+
+# --- array_to_string: the 2-argument form skips NULL elements ---------------------------------
+query IT nosort
+SELECT id, '[' || array_to_string(xs, sep) || ']' FROM t ORDER BY id
+----
+1
+[a,b,c]
+2
+[a-c]
+3
+[]
+4
+NULL
+5
+NULL
+6
+[]
+
+# --- the 3-argument form writes null_string for each NULL element ------------------------------
+query IT nosort
+SELECT id, '[' || array_to_string(xs, sep, '*') || ']' FROM t ORDER BY id
+----
+1
+[a,b,c]
+2
+[a-*-c]
+3
+[]
+4
+NULL
+5
+NULL
+6
+[*,*]
+
+# a NULL null_string is the 2-argument form (NULL elements are skipped, not NULL-propagating)
+query IT nosort
+SELECT id, '[' || array_to_string(xs, sep, NULL) || ']' FROM t ORDER BY id
+----
+1
+[a,b,c]
+2
+[a-c]
+3
+[]
+4
+NULL
+5
+NULL
+6
+[]
+
+# an empty null_string still counts as a printed item, so its separators appear
+query T nosort
+SELECT array_to_string(ARRAY['a', NULL, 'c'], ',', '')
+----
+a,,c
+
+# --- elements render as their type's output text (no array_out quoting) ------------------------
+query TTT nosort
+SELECT array_to_string(ARRAY[1, NULL, 3], ','), array_to_string(ARRAY[1.50, 2.0], '|'), array_to_string(ARRAY['a b', '"q"', 'NULL'], ',')
+----
+1,3
+1.50|2.0
+a b,"q",NULL
+
+query TTT nosort
+SELECT array_to_string(ARRAY[true, false], ','), array_to_string(ARRAY['\x01ff'::bytea], ','), array_to_string(ARRAY[date '2024-01-02', date '2024-03-04'], ' to ')
+----
+t,f
+\x01ff
+2024-01-02 to 2024-03-04
+
+# a multidimensional array is flattened in row-major order
+query TT nosort
+SELECT array_to_string(ARRAY[ARRAY[1, 2], ARRAY[3, NULL]], '-', '*'), array_to_string(ARRAY[ARRAY['a', 'b'], ARRAY['c', 'd']], '')
+----
+1-2-3-*
+abcd
+
+# an empty separator and a multi-character separator
+query TT nosort
+SELECT array_to_string(ARRAY['a', 'b', 'c'], ''), array_to_string(ARRAY['a', 'b', 'c'], ' and ')
+----
+abc
+a and b and c
+
+# a composite element renders as its record text
+statement ok
+CREATE TYPE pair AS (n i32, s text)
+
+query T nosort
+SELECT array_to_string('{"(1,\"a b\")","(2,)"}'::pair[], ';')
+----
+(1,"a b");(2,)
+
+# an untyped array operand cannot determine the polymorphic type
+statement error 42804
+SELECT array_to_string(NULL, ',')
+
+statement error 42804
+SELECT array_to_string('{1,2}', ',')
+
+# a non-array first argument has no overload
+statement error 42883
+SELECT array_to_string(1, ',')
+
+# --- string_to_array -----------------------------------------------------------------------------
+query TTTT nosort
+SELECT string_to_array('a,b,,c', ','), string_to_array('aXbXXc', 'XX'), string_to_array('abc', 'abc'), string_to_array('xx', 'x')
+----
+{a,b,"",c}
+{aXb,c}
+{"",""}
+{"","",""}
+
+# a NULL separator splits into characters (code points, not bytes); an empty separator keeps the
+# string whole
+query TT nosort
+SELECT string_to_array('héllo', NULL), string_to_array('abc', '')
+----
+{h,é,l,l,o}
+{abc}
+
+# an empty string is the empty array, whatever the separator
+query TTT nosort
+SELECT string_to_array('', ','), string_to_array('', ''), string_to_array('', NULL)
+----
+{}
+{}
+{}
+
+# a NULL string is NULL
+query T nosort
+SELECT string_to_array(NULL, ',')
+----
+NULL
+
+# a piece equal to null_string becomes a NULL element; a NULL null_string replaces nothing
+query TTT nosort
+SELECT string_to_array('a,*,b', ',', '*'), string_to_array('a,b', ',', NULL), string_to_array('a,b', NULL, 'b')
+----
+{a,NULL,b}
+{a,b}
+{a,",",NULL}
+
+# the result is a real text[]: subscript it, and round-trip it through array_to_string
+query TIB nosort
+SELECT (string_to_array('x;y;z', ';'))[2], cardinality(string_to_array('x;y;z', ';')), array_length(string_to_array('', ';'), 1) IS NULL
+----
+y
+3
+true
+
+query T nosort
+SELECT array_to_string(string_to_array('1 2 3', ' '), '+')
+----
+1+2+3
+
+# a non-text argument has no overload
+statement error 42883
+SELECT string_to_array(123, ',')

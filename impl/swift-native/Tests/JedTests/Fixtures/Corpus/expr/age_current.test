@@ -1,0 +1,87 @@
+# The one-argument age(timestamp) / age(timestamptz) (spec/design/interval.md §5.2) — PostgreSQL's
+# SQL wrappers age(CURRENT_DATE::timestamp[tz], x): the STATEMENT clock's day in the SESSION zone,
+# at midnight, minus x by age's symbolic field-wise difference. STABLE like CURRENT_DATE: the clock
+# is read once per statement and shared. The `# clock:` directive pins the statement clock
+# (1721056591872000 µs = 2024-07-15 15:16:31.872 UTC — already 2024-07-16 on Lord Howe Island), so
+# values are exact and byte-identical across Rust/Go/TS. NOT oracle-imported (PG's wall clock
+# differs); every value here equals the two-argument age with that explicit midnight, which
+# age.test oracle-checks. Cost: operator_eval + one timezone unit for the day, plus for timestamptz
+# one for the midnight instant and one per decomposed operand.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.boolean, types.timestamp, types.timestamptz, types.interval, func.current_date, func.age, expr.at_time_zone, session.timezone, resource.cost_metering
+
+# load-timezone: Australia/Lord_Howe
+
+# --- age(timestamp): from today's midnight -------------------------------------------------------
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT age(timestamp '2000-02-29 12:00:00')
+----
+24 years 4 mons 14 days 12:00:00
+
+# a future value is a negative age
+# clock: 1721056591872000
+query T nosort
+SELECT age(timestamp '2025-01-31 06:30:00')
+----
+-6 mons -16 days -06:30:00
+
+# the day is the session zone's: on Lord Howe Island it is already July 16
+# clock: 1721056591872000
+# timezone: Australia/Lord_Howe
+query T nosort
+SELECT age(timestamp '2000-02-29 12:00:00')
+----
+24 years 4 mons 15 days 12:00:00
+
+# --- age(timestamptz): midnight in the session zone, both sides decomposed there -----------------
+# clock: 1721056591872000
+# cost: 6
+query T nosort
+SELECT age(timestamptz '2000-02-29 12:00:00+00')
+----
+24 years 4 mons 14 days 12:00:00
+
+# 12:00 UTC is 23:00 on Lord Howe Island (+11 in February)
+# clock: 1721056591872000
+# timezone: Australia/Lord_Howe
+query T nosort
+SELECT age(timestamptz '2000-02-29 12:00:00+00')
+----
+24 years 4 mons 15 days 01:00:00
+
+# --- STABLE: one clock read per statement, even under an advancing clock -------------------------
+# clock_advance: 1721056591872000,86400000000
+query B nosort
+SELECT age(timestamp '2000-01-01') = age(timestamp '2000-01-01')
+----
+true
+
+statement ok
+CREATE TABLE ac (id i32 PRIMARY KEY, t timestamp)
+
+statement ok
+INSERT INTO ac VALUES (1, '2024-07-14 00:00:00'), (2, '2024-07-15 00:00:00'), (3, '2024-07-16 00:00:00'), (4, NULL)
+
+# clock_advance: 1721056591872000,86400000000
+query IT nosort
+SELECT id, age(t) FROM ac ORDER BY id
+----
+1
+1 day
+2
+00:00:00
+3
+-1 days
+4
+NULL
+
+# --- an infinite operand is 22008 (PostgreSQL returns an infinite interval) -----------------------
+# clock: 1721056591872000
+statement error 22008
+SELECT age(timestamp 'infinity')
+
+# clock: 1721056591872000
+statement error 22008
+SELECT age(timestamptz '-infinity')

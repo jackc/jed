@@ -1,0 +1,99 @@
+# The runtime text → jsonpath cast (spec/types/casts.toml, spec/design/jsonpath.md §1/§7). A
+# NON-literal text expression (a concatenation, a text column, a text-cast path) compiles per row
+# through the same parser the '…'::jsonpath literal uses and yields the canonical path text, as
+# PostgreSQL's jsonpath_in; a malformed path traps 42601 per row; a NULL adapts; a jsonpath operand
+# is the identity. Any other source type is 42846 (cannot_coerce), as in PostgreSQL. Cost: the
+# cast's operator_eval plus jsonpath_compile per UTF-8 byte of the text (§7). Results verified
+# against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, cast.explicit, cast.scalar_text, expr.text_concat, types.text, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, resource.cost_metering
+
+# 1 concat + 1 cast + 4 bytes compiled = 6.
+# cost: 6
+query T nosort
+SELECT ('$' || '.a')::jsonpath
+----
+$."a"
+
+# cost: 5
+query T nosort
+SELECT '$.a'::text::jsonpath
+----
+$."a"
+
+# cost: 16
+query T nosort
+SELECT CAST('strict $' || '.a[*]' AS jsonpath)
+----
+strict $."a"[*]
+
+# jsonpath → text → jsonpath round-trips the canonical text.
+# cost: 8
+query T nosort
+SELECT '$.a'::jsonpath::text::jsonpath
+----
+$."a"
+
+# cost: 7
+query T nosort
+SELECT ('$' || '.a')::jsonpath::text
+----
+$."a"
+
+# A NULL adapts.
+# cost: 2
+query T nosort
+SELECT (NULL::text)::jsonpath
+----
+NULL
+
+# cost: 14
+query T nosort
+SELECT ('$' || ' ? (@ > 1)')::jsonpath
+----
+$?(@ > 1)
+
+# The compiled path drives the path functions like a literal.
+# cost: 24
+query B nosort
+SELECT jsonb_path_exists('{"a": [1, 2]}', ('$' || '.a[1]')::jsonpath)
+----
+true
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO p VALUES (1, '$.a'), (2, 'strict $[0]'), (3, NULL), (4, '$.b ? (@ == 1)')
+
+# cost: 41
+query IT nosort
+SELECT id, s::jsonpath FROM p ORDER BY id
+----
+1
+$."a"
+2
+strict $[0]
+3
+NULL
+4
+$."b"?(@ == 1)
+
+# A malformed path traps per row.
+statement error 42601
+SELECT ('$' || '.a[')::jsonpath
+
+statement ok
+INSERT INTO p VALUES (5, '$.')
+
+statement error 42601
+SELECT id, s::jsonpath FROM p ORDER BY id
+
+# Only text casts to jsonpath.
+statement error 42846
+SELECT 1::jsonpath
+
+statement error 42846
+SELECT true::jsonpath
+
+statement error 42846
+SELECT id::jsonpath FROM p

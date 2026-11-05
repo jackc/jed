@@ -1,0 +1,349 @@
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# FOREIGN KEY constraints among session-local temp tables (spec/design/temp-tables.md §8,
+# constraints.md §6). A temp table may reference another temp table of its session, or itself, and
+# the FK behaves exactly as among main-database tables: child-side 23503 at every write site, MATCH
+# SIMPLE/FULL, NO ACTION/RESTRICT, CASCADE/SET NULL/SET DEFAULT (recursive, metered like the main
+# database), ALTER TABLE ADD FOREIGN KEY validation, and DROP TABLE's 2BP01/CASCADE. An FK never
+# crosses between the temp domain and the main database: a temp table referencing a permanent one,
+# or a permanent table referencing a temp one, is 42P16 (PostgreSQL's ATAddForeignKeyConstraint).
+# Oracle-checked against PostgreSQL 18; the ON COMMIT interaction is in temp_on_commit_foreign_key.test.
+# requires: ddl.temp_table, ddl.foreign_key, ddl.foreign_key_match_full, ddl.create_table, ddl.primary_key, ddl.unique, ddl.alter_table, ddl.drop_table, ddl.drop_table_multi, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.order_by, types.i32, resource.cost_metering
+
+# --- child-side checks: 23503 at INSERT and UPDATE, NULL exempt --------------------------------
+
+statement ok
+CREATE TEMP TABLE tp (id i32 PRIMARY KEY, code i32 UNIQUE)
+
+statement ok
+CREATE TEMP TABLE tc (id i32 PRIMARY KEY, pid i32 REFERENCES tp, pcode i32 REFERENCES tp (code))
+
+statement ok
+INSERT INTO tp VALUES (1, 100), (2, 200)
+
+statement ok
+INSERT INTO tc VALUES (10, 1, 100), (20, NULL, NULL)
+
+statement error 23503
+INSERT INTO tc VALUES (30, 3, NULL)
+
+statement error 23503
+INSERT INTO tc VALUES (30, NULL, 300)
+
+statement error 23503
+UPDATE tc SET pid = 5 WHERE id = 10
+
+statement ok
+UPDATE tc SET pid = 2, pcode = 200 WHERE id = 20
+
+statement error 23503
+INSERT INTO tc VALUES (10, 1, 100) ON CONFLICT (id) DO UPDATE SET pid = 7
+
+statement ok
+INSERT INTO tc VALUES (10, 1, 100) ON CONFLICT (id) DO UPDATE SET pid = 2
+
+query III nosort
+SELECT id, pid, pcode FROM tc ORDER BY id
+----
+10
+2
+100
+20
+2
+200
+
+# --- parent-side NO ACTION / RESTRICT: 23503 while referenced ----------------------------------
+
+statement error 23503
+DELETE FROM tp WHERE id = 2
+
+statement error 23503
+UPDATE tp SET code = 201 WHERE id = 2
+
+statement error 23503
+DELETE FROM tp WHERE id = 1
+
+# an unreferenced parent row can go
+statement ok
+UPDATE tc SET pcode = 200 WHERE id = 10
+
+statement ok
+DELETE FROM tp WHERE id = 1
+
+query II nosort
+SELECT id, code FROM tp ORDER BY id
+----
+2
+200
+
+statement ok
+CREATE TEMP TABLE rp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE rc (id i32 PRIMARY KEY, pid i32 REFERENCES rp ON DELETE RESTRICT ON UPDATE RESTRICT)
+
+statement ok
+INSERT INTO rp VALUES (1)
+
+statement ok
+INSERT INTO rc VALUES (1, 1)
+
+# RESTRICT shares NO ACTION's 23503 (constraints.md §6.7; PostgreSQL's 23001 is ledgered)
+statement error 23503
+DELETE FROM rp
+
+statement error 23503
+UPDATE rp SET id = 2
+
+# a referenced UNIQUE column cannot be dropped while the FK depends on it; CASCADE drops the FK
+statement error 2BP01
+ALTER TABLE tp DROP COLUMN code
+
+statement ok
+ALTER TABLE tp DROP COLUMN code CASCADE
+
+statement ok
+INSERT INTO tc VALUES (30, 2, 999)
+
+statement error 23503
+INSERT INTO tc VALUES (40, 9, NULL)
+
+# --- MATCH FULL: a partly-NULL key is rejected ---------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE mp (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TEMP TABLE mc (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (x, y) REFERENCES mp MATCH FULL)
+
+statement ok
+INSERT INTO mp VALUES (1, 1)
+
+statement ok
+INSERT INTO mc VALUES (1, 1, 1), (2, NULL, NULL)
+
+statement error 23503
+INSERT INTO mc VALUES (3, 1, NULL)
+
+# --- self-reference: the statement's end state supplies the parent -----------------------------
+
+statement ok
+CREATE TEMP TABLE tree (id i32 PRIMARY KEY, parent i32 REFERENCES tree)
+
+statement ok
+INSERT INTO tree VALUES (2, 1), (1, NULL)
+
+statement error 23503
+INSERT INTO tree VALUES (3, 4)
+
+statement error 23503
+DELETE FROM tree WHERE id = 1
+
+# --- referential actions: CASCADE recursion, SET NULL, SET DEFAULT, metered as in main ----------
+
+statement ok
+CREATE TEMP TABLE act_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE act_c (id i32 PRIMARY KEY, pid i32 REFERENCES act_p ON UPDATE CASCADE ON DELETE CASCADE)
+
+statement ok
+CREATE TEMP TABLE act_g (id i32 PRIMARY KEY, cid i32 REFERENCES act_c ON DELETE CASCADE)
+
+statement ok
+INSERT INTO act_p VALUES (1), (2)
+
+statement ok
+INSERT INTO act_c VALUES (10, 1), (20, 1), (30, 2)
+
+statement ok
+INSERT INTO act_g VALUES (100, 10), (200, 20), (300, 30)
+
+# The same statement over the same main-database tables costs the same 8 (ddl/foreign_key_actions.test):
+# the parent UPDATE is 1 page + 1 row + 1 filter eval + 1 returned row = 4, and the keyed cascade
+# into act_c is one full scan, 1 page + 3 rows.
+# cost: 8
+query I nosort
+UPDATE act_p SET id = 11 WHERE id = 1 RETURNING id
+----
+11
+
+query II nosort
+SELECT id, pid FROM act_c ORDER BY id
+----
+10
+11
+20
+11
+30
+2
+
+statement ok
+DELETE FROM act_p WHERE id = 11
+
+query II nosort
+SELECT id, pid FROM act_c ORDER BY id
+----
+30
+2
+
+query II nosort
+SELECT id, cid FROM act_g ORDER BY id
+----
+300
+30
+
+statement ok
+CREATE TEMP TABLE sd_p (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO sd_p VALUES (1), (2), (7)
+
+statement ok
+CREATE TEMP TABLE sd_c (id i32 PRIMARY KEY, pid i32 DEFAULT 7 REFERENCES sd_p ON UPDATE SET DEFAULT ON DELETE SET NULL)
+
+statement ok
+INSERT INTO sd_c VALUES (10, 1), (20, 2)
+
+statement ok
+UPDATE sd_p SET id = 11 WHERE id = 1
+
+statement ok
+DELETE FROM sd_p WHERE id = 2
+
+query II nosort
+SELECT id, pid FROM sd_c ORDER BY id
+----
+10
+7
+20
+NULL
+
+# a SET DEFAULT whose default is no longer present fails the whole statement
+statement ok
+UPDATE sd_c SET pid = 11 WHERE id = 10
+
+statement ok
+DELETE FROM sd_c WHERE id = 20
+
+statement ok
+DELETE FROM sd_p WHERE id = 7
+
+statement error 23503
+UPDATE sd_p SET id = 12 WHERE id = 11
+
+query II nosort
+SELECT id, pid FROM sd_c ORDER BY id
+----
+10
+11
+
+# --- ALTER TABLE ADD FOREIGN KEY validates the existing rows ------------------------------------
+
+statement ok
+CREATE TEMP TABLE ap (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE ac (id i32 PRIMARY KEY, pid i32)
+
+statement ok
+INSERT INTO ap VALUES (1)
+
+statement ok
+INSERT INTO ac VALUES (1, 1), (2, 2)
+
+statement error 23503
+ALTER TABLE ac ADD FOREIGN KEY (pid) REFERENCES ap
+
+statement ok
+DELETE FROM ac WHERE id = 2
+
+statement ok
+ALTER TABLE ac ADD CONSTRAINT ac_pid_fk FOREIGN KEY (pid) REFERENCES ap
+
+statement error 23503
+INSERT INTO ac VALUES (3, 3)
+
+statement ok
+ALTER TABLE ac ADD COLUMN pid2 i32 REFERENCES ap
+
+statement error 23503
+UPDATE ac SET pid2 = 5
+
+statement ok
+ALTER TABLE ac DROP CONSTRAINT ac_pid_fk
+
+statement ok
+INSERT INTO ac VALUES (3, 3, NULL)
+
+# renaming the parent keeps the FK
+statement ok
+ALTER TABLE ap RENAME TO ap2
+
+statement error 23503
+INSERT INTO ac VALUES (4, 1, 9)
+
+statement ok
+INSERT INTO ac VALUES (4, 1, 1)
+
+# --- DROP TABLE: 2BP01 while referenced, CASCADE drops the dependent FK ------------------------
+
+statement error 2BP01
+DROP TABLE ap2
+
+statement ok
+DROP TABLE ap2 CASCADE
+
+statement ok
+INSERT INTO ac VALUES (5, 5, 5)
+
+statement ok
+CREATE TEMP TABLE dp (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE dc (id i32 PRIMARY KEY, pid i32 REFERENCES dp)
+
+# both ends in one drop set never block
+statement ok
+DROP TABLE dp, dc
+
+# --- an FK never crosses between temp and permanent tables: 42P16 -----------------------------
+
+statement ok
+CREATE TABLE perm_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TEMP TABLE temp_p (id i32 PRIMARY KEY)
+
+statement error 42P16
+CREATE TEMP TABLE x (id i32 PRIMARY KEY, pid i32 REFERENCES perm_p)
+
+statement error 42P16
+CREATE TABLE x (id i32 PRIMARY KEY, pid i32 REFERENCES temp_p)
+
+statement error 42P16
+CREATE TEMP TABLE x (id i32 PRIMARY KEY, pid i32, FOREIGN KEY (pid) REFERENCES perm_p (id))
+
+statement ok
+CREATE TEMP TABLE temp_c (id i32 PRIMARY KEY, pid i32)
+
+statement ok
+CREATE TABLE perm_c (id i32 PRIMARY KEY, pid i32)
+
+statement error 42P16
+ALTER TABLE temp_c ADD FOREIGN KEY (pid) REFERENCES perm_p
+
+statement error 42P16
+ALTER TABLE perm_c ADD FOREIGN KEY (pid) REFERENCES temp_p
+
+statement error 42P16
+ALTER TABLE perm_c ADD COLUMN pid2 i32 REFERENCES temp_p
+
+statement error 42P16
+ALTER TABLE temp_c ADD COLUMN pid2 i32 REFERENCES perm_p
+
+# the persistent child stays unconstrained, and a missing parent is still 42P01
+statement error 42P01
+CREATE TEMP TABLE x (id i32 PRIMARY KEY, pid i32 REFERENCES no_such_table)
+
+statement ok
+INSERT INTO perm_c VALUES (1, 99)

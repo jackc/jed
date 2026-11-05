@@ -1,0 +1,1014 @@
+# String / text scalar functions (spec/design/string-functions.md). Pure per-row text built-ins
+# (PostgreSQL's "String Functions and Operators", manual §9.4), STRICT (a NULL argument → NULL).
+# They reuse the generic scalar-function mold (functions.md §9): resolved by argument family, kernel
+# by name, NULL short-circuited at eval, one operator_eval per call. The character-counting /
+# character-indexing functions count UNICODE CODE POINTS (matching PG's UTF8 character semantics —
+# NOT UTF-8 bytes nor UTF-16 units, the cross-core trap exercised by the astral 😀 below);
+# octet_length / bit_length count UTF-8 bytes / bits. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, types.bytea, expr.text_concat, resource.cost_metering
+
+# === length(text) → int: the number of characters (code points) ========================
+
+query I
+SELECT length('hello')
+----
+5
+
+# 'héllo' is 5 code points but 6 UTF-8 bytes (é = 2 bytes) — length counts characters, not bytes.
+query I
+SELECT length('héllo')
+----
+5
+
+# the empty string is 0 characters
+query I
+SELECT length('')
+----
+0
+
+# an astral character (😀 = U+1F600) is ONE code point — but TWO UTF-16 units, so a naïve TS
+# `.length` would over-count it as 2. The code-point count of 'a😀b' is 3.
+query I
+SELECT length('a😀b')
+----
+3
+
+# NULL propagates
+query I
+SELECT length(NULL::text)
+----
+NULL
+
+# length is valid anywhere an expression is (here in WHERE), like any scalar function.
+statement ok
+CREATE TABLE words (id i32 PRIMARY KEY, w text)
+
+statement ok
+INSERT INTO words VALUES (1, 'a'), (2, 'bb'), (3, 'ccc'), (4, NULL)
+
+query IT rowsort
+SELECT length(w), w FROM words WHERE length(w) >= 2
+----
+2
+bb
+3
+ccc
+
+# the cost of a single length() over a constant is the uniform scalar-function shape — node
+# operator_eval + the literal argument's own eval + the one produced row — identical cross-core.
+# cost: 2
+query I
+SELECT length('abc')
+----
+3
+
+# === char_length / character_length: SQL-standard aliases of length ====================
+
+query I
+SELECT char_length('héllo')
+----
+5
+
+query I
+SELECT character_length('a😀b')
+----
+3
+
+query I
+SELECT char_length(''), character_length(NULL::text)
+----
+0
+NULL
+
+# Unlike length, the aliases take only text: there is no char_length(bytea), as in PostgreSQL.
+statement error 42883
+SELECT char_length('\x0102'::bytea)
+
+statement error 42883
+SELECT character_length('\x0102'::bytea)
+
+# === octet_length(text) → int: the number of UTF-8 BYTES (not characters) ==============
+
+# 'héllo' is 6 bytes (é = 2 bytes) but 5 characters — octet_length counts bytes.
+query I
+SELECT octet_length('héllo')
+----
+6
+
+# an astral character (😀) is 4 UTF-8 bytes; 'a😀b' is 6 bytes (1 + 4 + 1).
+query I
+SELECT octet_length('a😀b')
+----
+6
+
+# empty string is 0 bytes; ASCII is one byte per character; NULL propagates.
+query I
+SELECT octet_length(''), octet_length('abc'), octet_length(NULL::text)
+----
+0
+3
+NULL
+
+# === bit_length(text) → int: UTF-8 bits = octet_length × 8 =============================
+
+query I
+SELECT bit_length('héllo')
+----
+48
+
+query I
+SELECT bit_length('abc'), bit_length(''), bit_length(NULL::text)
+----
+24
+0
+NULL
+
+# === substr(text, start[, count]) → text: the function form of SUBSTRING ================
+
+# 2-arg form: characters from `start` to the end (1-based)
+query T
+SELECT substr('alphabet', 3)
+----
+phabet
+
+# 3-arg form: `count` characters starting at `start`
+query T
+SELECT substr('alphabet', 3, 2)
+----
+ph
+
+# start ≤ 0 clips: the window [0,3) keeps positions 1..2
+query T
+SELECT substr('alphabet', 0, 3)
+----
+al
+
+# a negative start also clips (window [-2,3) → positions 1..2)
+query T
+SELECT substr('alphabet', -2, 5)
+----
+al
+
+# count past the end clips to the end
+query T
+SELECT substr('alphabet', 5, 100)
+----
+abet
+
+# start past the end, or count 0, yields the empty string (asserted via = '' since the harness
+# cannot carry an empty / edge-whitespace value in an expected block)
+query B
+SELECT substr('alphabet', 100, 2) = '', substr('alphabet', 5, 0) = ''
+----
+true
+true
+
+# code-point indexed (not bytes): position 2 of 'héllo' is é
+query T
+SELECT substr('héllo', 2, 3)
+----
+éll
+
+# a NEGATIVE count is 22011 (substring_error, "negative substring length not allowed")
+statement error 22011
+SELECT substr('abc', 1, -1)
+
+# any NULL argument propagates (typed NULLs here; a bare NULL argument adopts its slot's family,
+# expr/unknown_function_args.test)
+query T
+SELECT substr('abc', NULL::int, 2), substr(NULL::text, 1, 2), substr('abc', 2, NULL::int)
+----
+NULL
+NULL
+NULL
+
+# === OVERLAY(string PLACING new FROM start [FOR count]) → text: splice ==================
+
+# FOR defaults to the length of the new string
+query TTT nosort
+SELECT overlay('abcdef' PLACING 'XY' FROM 2), overlay('abcdef' PLACING 'XY' FROM 2 FOR 3), overlay('abcdef' PLACING '' FROM 2 FOR 3)
+----
+aXYdef
+aXYef
+aef
+
+# code-point indexed: é and 😀 are one character each
+query TT nosort
+SELECT overlay('héllo' PLACING 'E' FROM 2 FOR 1), overlay('a😀b' PLACING 'xyz' FROM 2 FOR 1)
+----
+hEllo
+axyzb
+
+# a start past the end appends; FOR 0 inserts; a negative FOR re-includes the head in the tail
+query TTT nosort
+SELECT overlay('abc' PLACING 'X' FROM 9), overlay('abc' PLACING 'X' FROM 1 FOR 0), overlay('abc' PLACING 'X' FROM 2 FOR -5)
+----
+abcX
+Xabc
+aXabc
+
+# the ordinary four- and three-argument calls
+query TT nosort
+SELECT overlay('abc', 'X', 2, 1), overlay('abc', 'XY', 2)
+----
+aXc
+aXY
+
+query TTT nosort
+SELECT overlay(NULL PLACING 'X' FROM 1), overlay('abc' PLACING 'X' FROM NULL), overlay('abc' PLACING 'X' FROM 1 FOR NULL)
+----
+NULL
+NULL
+NULL
+
+# a start ≤ 0 is a negative substring length
+statement error 22011
+SELECT overlay('abc' PLACING 'X' FROM 0)
+
+statement error 22011
+SELECT overlay('abc' PLACING 'X' FROM -1 FOR 2)
+
+# start + count past the int4 range
+statement error 22003
+SELECT overlay('abc' PLACING 'X' FROM 2147483647 FOR 1)
+
+# FROM is required in the special form
+statement error 42601
+SELECT overlay('abc' PLACING 'X')
+
+statement error 42601
+SELECT overlay('abc' PLACING 'X' FOR 1)
+
+# === left(text, n) → text: the first n characters (negative drops from the right) =====
+
+query T
+SELECT left('abcde', 2)
+----
+ab
+
+# code-point indexed
+query T
+SELECT left('héllo', 2)
+----
+hé
+
+# a negative n returns all but the last |n| characters
+query T
+SELECT left('abcde', -2)
+----
+abc
+
+# n past the length returns the whole string; n=0 or a too-large negative is empty
+query B
+SELECT left('abcde', 10) = 'abcde', left('abcde', 0) = '', left('abcde', -10) = ''
+----
+true
+true
+true
+
+query T
+SELECT left(NULL::text, 2), left('abc', NULL::int)
+----
+NULL
+NULL
+
+# === right(text, n) → text: the last n characters (negative drops from the left) ======
+
+query T
+SELECT right('abcde', 2)
+----
+de
+
+query T
+SELECT right('héllo', 2)
+----
+lo
+
+# a negative n returns all but the first |n| characters
+query T
+SELECT right('abcde', -2)
+----
+cde
+
+# n=0 or a too-large negative is empty
+query B
+SELECT right('abcde', 0) = '', right('abcde', -10) = ''
+----
+true
+true
+
+query T
+SELECT right(NULL::text, 2), right('abc', NULL::int)
+----
+NULL
+NULL
+
+# === lpad(text, length[, fill]) → text: left-pad / truncate ============================
+
+# explicit fill, cyclically applied (no edge whitespace to confuse the harness)
+query T
+SELECT lpad('hi', 5, 'xy')
+----
+xyxhi
+
+# default fill is a space; assert via equality so the spaces ride inside the SQL literal, not the
+# (whitespace-trimmed) expected block
+query B
+SELECT lpad('hi', 5) = '   hi', lpad('héllo', 7, '-') = '--héllo'
+----
+true
+true
+
+# a string longer than length truncates to its first `length` characters
+query T
+SELECT lpad('hello', 3)
+----
+hel
+
+# length ≤ 0 is empty; an empty fill cannot pad (returns the unchanged short string)
+query B
+SELECT lpad('hi', 0) = '', lpad('hi', -1) = '', lpad('hi', 5, '') = 'hi'
+----
+true
+true
+true
+
+# a pathologically large length traps 54000 (program_limit_exceeded)
+statement error 54000
+SELECT lpad('x', 2000000000)
+
+query T
+SELECT lpad(NULL::text, 5), lpad('hi', NULL::int), lpad('hi', 5, NULL::text)
+----
+NULL
+NULL
+NULL
+
+# === rpad(text, length[, fill]) → text: right-pad / truncate ==========================
+
+query T
+SELECT rpad('hi', 5, 'xy')
+----
+hixyx
+
+# default fill is a space (assert via equality); a longer string truncates
+query B
+SELECT rpad('hi', 5) = 'hi   ', rpad('hello', 3) = 'hel'
+----
+true
+true
+
+statement error 54000
+SELECT rpad('x', 2000000000)
+
+query T
+SELECT rpad(NULL::text, 5), rpad('hi', NULL::int)
+----
+NULL
+NULL
+
+# === btrim(text[, characters]) → text: trim a character SET from both ends =============
+
+# the `characters` argument is a SET of code points, trimmed from both ends
+query T
+SELECT btrim('xxhixx', 'x')
+----
+hi
+
+# default trims spaces from both ends
+query T
+SELECT btrim('  hi  ')
+----
+hi
+
+# the set is matched per-character (not as a substring); code-point based
+query T
+SELECT btrim('héllo', 'ho')
+----
+éll
+
+# all characters in the set → empty; an empty set trims nothing
+query B
+SELECT btrim('xyzzyx', 'xyz') = '', btrim('abc', '') = 'abc'
+----
+true
+true
+
+query T
+SELECT btrim(NULL::text), btrim('abc', NULL::text)
+----
+NULL
+NULL
+
+# === ltrim(text[, characters]) → text: trim from the LEADING end only =================
+
+query T
+SELECT ltrim('xxhixx', 'x')
+----
+hixx
+
+# default trims leading spaces only (trailing remain — asserted via equality)
+query B
+SELECT ltrim('  hi  ') = 'hi  '
+----
+true
+
+query T
+SELECT ltrim(NULL::text), ltrim('abc', NULL::text)
+----
+NULL
+NULL
+
+# === rtrim(text[, characters]) → text: trim from the TRAILING end only ================
+
+query T
+SELECT rtrim('xxhixx', 'x')
+----
+xxhi
+
+# default trims trailing spaces only (leading remain — asserted via equality)
+query B
+SELECT rtrim('  hi  ') = '  hi'
+----
+true
+
+query T
+SELECT rtrim(NULL::text), rtrim('abc', NULL::text)
+----
+NULL
+NULL
+
+# === replace(text, from, to) → text: substring replace-all ============================
+
+query T
+SELECT replace('abcabc', 'bc', 'X')
+----
+aXaX
+
+# a single-character substring, multiple occurrences; code-point safe
+query T
+SELECT replace('héllo', 'l', 'L')
+----
+héLLo
+
+# an EMPTY `from` replaces nothing (returns the string unchanged); a non-matching `from` is a no-op
+query B
+SELECT replace('abc', '', 'X') = 'abc', replace('abc', 'x', 'y') = 'abc'
+----
+true
+true
+
+query T
+SELECT replace(NULL::text, 'a', 'b'), replace('abc', NULL::text, 'b'), replace('abc', 'a', NULL::text)
+----
+NULL
+NULL
+NULL
+
+# === translate(text, from, to) → text: per-character map / delete =====================
+
+# each `from` character maps to the `to` character at the same position
+query T
+SELECT translate('12345', '14', 'ax')
+----
+a23x5
+
+# a `from` character past the end of `to` is DELETED (here '3')
+query T
+SELECT translate('12345', '143', 'ax')
+----
+a2x5
+
+# a character's first occurrence in `from` wins; code-point based
+query T
+SELECT translate('abc', 'aa', 'xy'), translate('héllo', 'lo', 'LO')
+----
+xbc
+héLLO
+
+# empty `from` maps nothing; an all-mapped-to-empty `to` deletes everything
+query B
+SELECT translate('abc', '', 'x') = 'abc', translate('abc', 'abc', '') = ''
+----
+true
+true
+
+query T
+SELECT translate(NULL::text, 'a', 'b'), translate('abc', NULL::text, 'b'), translate('abc', 'a', NULL::text)
+----
+NULL
+NULL
+NULL
+
+# === repeat(text, n) → text: the string concatenated n times ==========================
+
+query T
+SELECT repeat('ab', 3)
+----
+ababab
+
+# code-point safe; n ≤ 0 is empty
+query T
+SELECT repeat('héllo', 2)
+----
+héllohéllo
+
+query B
+SELECT repeat('x', 0) = '', repeat('x', -1) = ''
+----
+true
+true
+
+# a pathologically large result traps 54000 (program_limit_exceeded)
+statement error 54000
+SELECT repeat('x', 2000000000)
+
+query T
+SELECT repeat(NULL::text, 3), repeat('x', NULL::int)
+----
+NULL
+NULL
+
+# === reverse(text) → text: the code points in reverse order ===========================
+
+query T
+SELECT reverse('abc')
+----
+cba
+
+# code-point reversal: a multibyte char stays whole
+query T
+SELECT reverse('héllo')
+----
+olléh
+
+# an astral character (😀) reverses as ONE code point, not two UTF-16 units
+query T
+SELECT reverse('a😀b')
+----
+b😀a
+
+query B
+SELECT reverse('') = ''
+----
+true
+
+query T
+SELECT reverse(NULL::text)
+----
+NULL
+
+# === strpos(text, substring) → int: 1-based code-point position (POSITION) =============
+
+query I
+SELECT strpos('high', 'ig')
+----
+2
+
+# code-point position, not byte: 'llo' starts at character 3 of 'héllo'
+query I
+SELECT strpos('héllo', 'llo')
+----
+3
+
+# not found → 0; an empty substring → 1; multiple occurrences → the first
+query I
+SELECT strpos('abc', 'x'), strpos('abc', ''), strpos('aXbXc', 'X')
+----
+0
+1
+2
+
+query I
+SELECT strpos(NULL::text, 'a'), strpos('abc', NULL::text)
+----
+NULL
+NULL
+
+# === POSITION(substring IN string) → int: the SQL special form of strpos ================
+
+# the special form desugars to position(string, substring) — the strpos kernel
+query IIII nosort
+SELECT position('ig' IN 'high'), position('llo' IN 'héllo'), position('x' IN 'abc'), position('' IN 'abc')
+----
+2
+3
+0
+1
+
+# an astral character is one code point
+query I nosort
+SELECT position('b' IN 'a😀b')
+----
+3
+
+# each operand is an expression without a predicate: || binds inside it
+query I nosort
+SELECT position('c' || 'd' IN 'ab' || 'cd')
+----
+3
+
+query II nosort
+SELECT position(NULL IN 'abc'), position('a' IN NULL)
+----
+NULL
+NULL
+
+# the quoted name is an ordinary call, (string, substring) order
+query I nosort
+SELECT "position"('high', 'ig')
+----
+2
+
+# the unquoted name is only the special form: the comma form is a syntax error
+statement error 42601
+SELECT position('high', 'ig')
+
+statement error 42883
+SELECT position(1 IN 2)
+
+# === split_part(text, delimiter, n) → text: the n-th field ============================
+
+query T
+SELECT split_part('a,b,c', ',', 2)
+----
+b
+
+# a negative n counts from the end (PG 14+)
+query T
+SELECT split_part('a,b,c', ',', -1)
+----
+c
+
+# an empty delimiter treats the whole string as field 1; out-of-range fields are empty
+query B
+SELECT split_part('a,b,c', '', 1) = 'a,b,c', split_part('a,b,c', ',', 4) = '', split_part('a,b,c', ',', -4) = ''
+----
+true
+true
+true
+
+# n = 0 traps 22023 (field position must not be zero)
+statement error 22023
+SELECT split_part('a,b,c', ',', 0)
+
+query T
+SELECT split_part(NULL::text, ',', 1), split_part('a,b', NULL::text, 1), split_part('a,b', ',', NULL::int)
+----
+NULL
+NULL
+NULL
+
+# === starts_with(text, prefix) → boolean ==============================================
+
+query B
+SELECT starts_with('abcde', 'abc'), starts_with('abc', 'bc'), starts_with('abc', ''), starts_with('héllo', 'hé')
+----
+true
+false
+true
+true
+
+query B
+SELECT starts_with(NULL::text, 'a') IS NULL, starts_with('abc', NULL::text) IS NULL
+----
+true
+true
+
+# === ascii(text) → int: the code point of the first character =========================
+
+query I
+SELECT ascii('x'), ascii('é'), ascii('abc')
+----
+120
+233
+97
+
+# an astral first character returns the FULL code point (😀 = U+1F600 = 128512), not a surrogate
+query I
+SELECT ascii('😀')
+----
+128512
+
+# the empty string is 0; NULL propagates
+query I
+SELECT ascii(''), ascii(NULL::text)
+----
+0
+NULL
+
+# === chr(int) → text: the one-character string for a code point =======================
+
+query T
+SELECT chr(65), chr(233)
+----
+A
+é
+
+# an astral code point builds the full character
+query T
+SELECT chr(128512)
+----
+😀
+
+# ascii and chr are inverses
+query B
+SELECT ascii(chr(128512)) = 128512
+----
+true
+
+# a negative code point is 22023; 0, too-large, and a surrogate are 54000 (PG's split)
+statement error 22023
+SELECT chr(-1)
+
+statement error 54000
+SELECT chr(0)
+
+statement error 54000
+SELECT chr(1114112)
+
+statement error 54000
+SELECT chr(55296)
+
+query T
+SELECT chr(NULL::int)
+----
+NULL
+
+# === initcap(text) → text: titlecase each word (ASCII word boundaries) =================
+
+query T
+SELECT initcap('hello world')
+----
+Hello World
+
+# already-uppercase tails are lowercased; punctuation/underscore separate words
+query T
+SELECT initcap('hi-THERE_now'), initcap('o''brien')
+----
+Hi-There_Now
+O'Brien
+
+# a leading digit is the word's first character, so the following letter is NOT uppercased
+query T
+SELECT initcap('123abc def'), initcap('a1b2 c')
+----
+123abc Def
+A1b2 C
+
+query B
+SELECT initcap('') = '', initcap(NULL::text) IS NULL
+----
+true
+true
+
+# === to_hex(int) → text: lowercase hexadecimal ========================================
+
+query T
+SELECT to_hex(255), to_hex(0), to_hex(2147483647)
+----
+ff
+0
+7fffffff
+
+# a negative value renders the 64-bit two's-complement pattern (pinned at ::i64 so PG uses bigint)
+query T
+SELECT to_hex((-1)::i64), to_hex((-255)::i64)
+----
+ffffffffffffffff
+ffffffffffffff01
+
+query T
+SELECT to_hex(NULL::int)
+----
+NULL
+
+# === encode(bytea, format) → text: hex / base64 / escape ==============================
+
+# hex: two lowercase hex digits per byte
+query T
+SELECT encode(bytea '\x616263', 'hex'), encode(bytea '\x00ff41', 'hex')
+----
+616263
+00ff41
+
+# base64 (short values, no 76-char wrap): standard alphabet + '=' padding
+query T
+SELECT encode(bytea '\x616263', 'base64'), encode(bytea '\x6162', 'base64'), encode(bytea '\x61', 'base64')
+----
+YWJj
+YWI=
+YQ==
+
+# escape: printable bytes verbatim; 0x00 → \000, 0xff → \377, backslash doubled
+query T
+SELECT encode(bytea '\x00ff41', 'escape'), encode(bytea '\x415c42', 'escape')
+----
+\000\377A
+A\\B
+
+# base64 encode wraps at 76 chars with a newline (PG): 60 bytes → 80 base64 chars + 1 '\n' = 81
+query I
+SELECT length(encode(bytea '\x616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161', 'base64'))
+----
+81
+
+# an unrecognized format is 22023
+statement error 22023
+SELECT encode(bytea '\x00', 'utf8')
+
+# a NULL format propagates (jed has no text→bytea cast, so the bytea-side NULL is exercised by the
+# generic scalar-function short-circuit, identical for every argument position)
+query T
+SELECT encode(bytea '\x00', NULL::text)
+----
+NULL
+
+# === decode(text, format) → bytea: the inverse of encode ==============================
+
+# decode returns bytea (jed renders it \x… like PG's default hex output)
+query T
+SELECT decode('616263', 'hex')
+----
+\x616263
+
+# round-trips through every format; hex is case-insensitive and ignores whitespace
+query T
+SELECT encode(decode('61 62 63', 'hex'), 'hex'), encode(decode('YWJj', 'base64'), 'hex'), encode(decode('\000\377A', 'escape'), 'hex')
+----
+616263
+616263
+00ff41
+
+# base64 decode ignores whitespace, so it round-trips the 76-char-wrapped encode output (60 bytes)
+query B
+SELECT encode(decode(encode(bytea '\x616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161', 'base64'), 'base64'), 'hex') = encode(bytea '\x616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161', 'hex')
+----
+true
+
+# malformed hex/base64 is 22023; a malformed escape (here a lone backslash) is 22P02 (PG's split)
+statement error 22023
+SELECT decode('xyz', 'hex')
+
+statement error 22023
+SELECT decode('616', 'hex')
+
+# decode(s, 'hex') shares bytea input's hex decoder (PostgreSQL hex_decode_safe): a space, tab,
+# newline, or carriage return is skipped between digit pairs only ...
+query T
+SELECT decode(' 61 62' || chr(9) || '63' || chr(10) || chr(13), 'hex')
+----
+\x616263
+
+# ... inside a pair it is an invalid digit (22023) ...
+statement error 22023
+SELECT decode('6 1', 'hex')
+
+# ... and a form feed is no whitespace
+statement error 22023
+SELECT decode('61' || chr(12) || '62', 'hex')
+
+# Empty/whitespace-only inputs are empty bytea; ASCII hex letters accept either case.
+query T
+SELECT decode('', 'hex'), decode(' ' || chr(9) || chr(10) || chr(13), 'hex'), decode('aAbBcCdDeEfF', 'hex')
+----
+\x
+\x
+\xaabbccddeeff
+
+# Each row still evaluates the scalar and preserves its deterministic charge.
+# cost: 9
+query T
+SELECT decode('0001feff', 'hex') FROM generate_series(1, 3)
+----
+\x0001feff
+\x0001feff
+\x0001feff
+
+# Non-ASCII characters are invalid in either digit position and between pairs.
+statement error 22023
+SELECT decode('é0', 'hex')
+
+statement error 22023
+SELECT decode('0😀', 'hex')
+
+statement error 22023
+SELECT decode('61' || chr(160) || '62', 'hex')
+
+statement error 22023
+SELECT decode('６１', 'hex')
+
+# base64 decode skips exactly the same four characters: a form feed or vertical tab is an invalid
+# symbol (22023)
+query T
+SELECT decode('YW' || chr(13) || chr(10) || 'Jj', 'base64')
+----
+\x616263
+
+statement error 22023
+SELECT decode('YW' || chr(12) || 'Jj', 'base64')
+
+statement error 22023
+SELECT decode('YW' || chr(11) || 'Jj', 'base64')
+
+statement error 22P02
+SELECT decode('\1', 'escape')
+
+# an unrecognized format is 22023
+statement error 22023
+SELECT decode('00', 'utf8')
+
+query T
+SELECT encode(decode(NULL::text, 'hex'), 'hex'), encode(decode('00', NULL::text), 'hex')
+----
+NULL
+NULL
+
+# === quote_literal(text) → text: wrap as a SQL string literal =========================
+
+# wraps in single quotes, doubling each internal quote
+query T
+SELECT quote_literal('abc'), quote_literal('O''Reilly')
+----
+'abc'
+'O''Reilly'
+
+# a backslash → doubled, with an E-string prefix (PG); jed string literals have no escapes, so
+# 'a\b' is the three chars a, backslash, b
+query T
+SELECT quote_literal('a\b')
+----
+E'a\\b'
+
+# STRICT: NULL → NULL (distinct from quote_nullable)
+query T
+SELECT quote_literal(NULL::text)
+----
+NULL
+
+# === quote_ident(text) → text: wrap as a SQL identifier ===============================
+
+# a safe lowercase identifier is returned unchanged; otherwise it is double-quoted
+query T
+SELECT quote_ident('foo'), quote_ident('Foo'), quote_ident('foo bar')
+----
+foo
+"Foo"
+"foo bar"
+
+# an internal double-quote is doubled
+query T
+SELECT quote_ident('a"b')
+----
+"a""b"
+
+# PostgreSQL's reserved, column-name, and type/function-name keywords are quoted; an unreserved
+# keyword (abort, name, text) and a non-keyword stay bare (spec/grammar/pg_keywords.toml)
+query TTTTTTTT nosort
+SELECT quote_ident('select'), quote_ident('table'), quote_ident('integer'), quote_ident('left'), quote_ident('xmltable'), quote_ident('abort'), quote_ident('name'), quote_ident('selects')
+----
+"select"
+"table"
+"integer"
+"left"
+"xmltable"
+abort
+name
+selects
+
+# a keyword is matched exactly: an upper-case spelling is quoted for its case alone
+query TT nosort
+SELECT quote_ident('SELECT'), quote_ident('_select')
+----
+"SELECT"
+_select
+
+# STRICT: NULL → NULL
+query T
+SELECT quote_ident(NULL::text)
+----
+NULL
+
+# === quote_nullable(text) → text: like quote_literal but NON-STRICT ===================
+
+# a present value quotes exactly like quote_literal
+query T
+SELECT quote_nullable('x'), quote_nullable('O''Reilly')
+----
+'x'
+'O''Reilly'
+
+# the distinguishing case: a NULL argument yields the 4-character text 'NULL', not a SQL NULL
+# (a typed NULL — jed's family resolution needs a type; a bare untyped NULL is 42883)
+query T
+SELECT quote_nullable(NULL::text)
+----
+NULL
+
+# and the result is genuinely the non-NULL text 'NULL' (length 4), unlike quote_literal(NULL)
+query B
+SELECT quote_nullable(NULL::text) IS NOT NULL, length(quote_nullable(NULL::text)) = 4, quote_literal(NULL::text) IS NULL
+----
+true
+true
+true

@@ -1,0 +1,86 @@
+# skip: disk — session temp state and the host-attached in-memory database do not survive the disk
+# runner's per-record reopen (spec/design/conformance.md §3).
+# `jed_statistics` and ANALYZE use ordinary database qualification. Main, temp, and attachments own
+# independent facts even when tables have similar shapes; a DML mark in one scope cannot leak into
+# another. This embedded multi-database behavior is jed-specific and cross-core checked.
+# attach: analytics
+# requires: maintenance.analyze, introspect.statistics, harness.attach, attach.in_memory, ddl.create_table, ddl.temp_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.order_by, query.qualified_table, session.allow_ddl, session.allow_temp_ddl, types.i32
+
+statement ok
+CREATE TABLE main_stats (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO main_stats VALUES (1, 10), (2, 10)
+
+statement ok
+CREATE TABLE analytics.attached_stats (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO analytics.attached_stats VALUES (1, 20), (2, 30), (3, 30)
+
+statement ok
+CREATE TEMP TABLE temp_stats (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO temp_stats VALUES (1, 40)
+
+statement ok
+ANALYZE main.main_stats (v)
+
+statement ok
+ANALYZE analytics.attached_stats (v)
+
+statement ok
+ANALYZE temp.temp_stats (v)
+
+query TII nosort
+SELECT table_name, analyzed_rows, distinct_count FROM main.jed_statistics
+----
+main_stats
+2
+1
+
+query TII nosort
+SELECT table_name, analyzed_rows, distinct_count FROM analytics.jed_statistics
+----
+attached_stats
+3
+2
+
+query TII nosort
+SELECT table_name, analyzed_rows, distinct_count FROM temp.jed_statistics
+----
+temp_stats
+1
+1
+
+# Scope-local DML marks only the attachment fact stale.
+statement ok
+UPDATE analytics.attached_stats SET v = 30 WHERE id = 1
+
+query TB nosort
+SELECT table_name, is_stale FROM main.jed_statistics
+----
+main_stats
+false
+
+query TB nosort
+SELECT table_name, is_stale FROM analytics.jed_statistics
+----
+attached_stats
+true
+
+query TB nosort
+SELECT table_name, is_stale FROM temp.jed_statistics
+----
+temp_stats
+false
+
+# A temp write is likewise isolated and never advances persistent file state.
+statement ok
+UPDATE temp.temp_stats SET v = 41 WHERE id = 1
+
+query B nosort
+SELECT is_stale FROM temp.jed_statistics WHERE table_name = 'temp_stats'
+----
+true

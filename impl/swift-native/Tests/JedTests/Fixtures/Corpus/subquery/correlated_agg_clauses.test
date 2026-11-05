@@ -1,0 +1,88 @@
+# A correlated reference that appears ONLY in an aggregate's or window function's auxiliary
+# expressions — an aggregate FILTER, an ordered-set fraction, a hypothetical-set aggregate's direct
+# argument, a window function's default argument, a window aggregate's FILTER — still makes the
+# subquery correlated, so it re-executes per outer row (spec/design/grammar.md §26). Each inner
+# aggregate also reads an inner column, so it stays an aggregate of the subquery (PostgreSQL's
+# outer-level aggregate rule does not apply). Results verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.qualified_column, query.table_alias, query.aggregates, query.aggregate_filter, query.ordered_set_aggregate, query.ordered_set_nonconstant_fraction, query.hypothetical_set_aggregate, query.window, query.window_offset, query.window_aggregate, query.window_aggregate_filter, expr.arithmetic, query.subquery_scalar, query.subquery_correlated, types.i32, types.decimal
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 10), (3, 30)
+
+# The outer column is read only inside FILTER.
+query I rowsort
+SELECT (SELECT count(u.id) FILTER (WHERE t.a > 20) FROM t u) FROM t
+----
+0
+0
+3
+
+query I rowsort
+SELECT (SELECT count(*) FILTER (WHERE t.a > u.a) FROM t u) FROM t
+----
+0
+0
+2
+
+# An ordered-set aggregate's fraction.
+query I rowsort
+SELECT (SELECT percentile_disc(t.a / 40.0) WITHIN GROUP (ORDER BY u.a) FROM t u) FROM t
+----
+10
+10
+30
+
+# A hypothetical-set aggregate's direct argument.
+query I rowsort
+SELECT (SELECT rank(t.a) WITHIN GROUP (ORDER BY u.a) FROM t u) FROM t
+----
+1
+1
+3
+
+# A window function's default argument.
+query I rowsort
+SELECT (SELECT lag(u.a, 1, t.id) OVER (ORDER BY u.id) FROM t u WHERE u.id = 1) FROM t
+----
+1
+2
+3
+
+# A window aggregate's FILTER.
+query I rowsort
+SELECT (SELECT count(*) FILTER (WHERE u.a < t.a) OVER () FROM t u WHERE u.id = 1) FROM t
+----
+0
+0
+1
+
+# In WHERE, the outer column read only through those clauses must also be in the scan's touched set
+# (large-values.md §14), or it reads as NULL.
+query I rowsort
+SELECT id FROM t WHERE (SELECT count(*) FILTER (WHERE u.a < t.a) FROM t u) = 2
+----
+3
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT percentile_disc(t.a / 40.0) WITHIN GROUP (ORDER BY u.a) FROM t u) = 30
+----
+3
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT rank(t.a) WITHIN GROUP (ORDER BY u.a) FROM t u) = 1
+----
+1
+2
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT lag(u.a, 1, t.a) OVER (ORDER BY u.id) FROM t u WHERE u.id = 1) = 30
+----
+3
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT count(*) FILTER (WHERE u.a < t.a) OVER () FROM t u WHERE u.id = 1) = 1
+----
+3

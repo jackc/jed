@@ -1,0 +1,390 @@
+# A collation travels through function results and set operations (spec/design/collation.md §1
+# "Function results" / "Set operations", PostgreSQL's rules):
+#   - a scalar function whose result is text carries its arguments' combined collation, so
+#     `ORDER BY btrim(s)` sorts by `s`'s collation;
+#   - a set-operation output column takes its inputs' common collation. Two different implicit
+#     collations are 42P21 at once for UNION / INTERSECT / EXCEPT; under UNION ALL (and a VALUES
+#     list) the column settles to no collation, which yields to a neighbour's but is 42P22 when
+#     consumed alone (a bare ORDER BY);
+#   - a recursive CTE's non-recursive term fixes each column's collation, so a recursive term that
+#     changes it is 42P21.
+#
+# The vendored `unicode` collation is the CLDR-DUCET root: a < A < b < B (lowercase before its
+# uppercase). Built-in C is byte / code-point order: A(0x41) < B < a(0x61) < b.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_expr, query.where_eq, query.join_inner, query.cross_join, query.lateral, query.join_using, query.derived_table, query.values, query.cte, query.cte_recursive, query.union, query.intersect, query.except, query.window, query.window_ranking, query.index_expr, func.casing, expr.collate, ddl.collate_column, types.i32, types.text, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE ct (id i32 PRIMARY KEY, s text COLLATE "unicode")
+
+statement ok
+CREATE TABLE cc (id i32 PRIMARY KEY, c text COLLATE "C")
+
+statement ok
+INSERT INTO ct VALUES (1, 'b'), (2, 'A'), (3, 'a'), (4, 'B')
+
+statement ok
+INSERT INTO cc VALUES (1, 'B'), (2, 'a')
+
+# ============================================================================================
+# Function results carry their arguments' collation.
+# ============================================================================================
+
+query T nosort
+SELECT s FROM ct ORDER BY btrim(s)
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT s FROM ct ORDER BY substr(s, 1) DESC
+----
+B
+b
+A
+a
+
+query T nosort
+SELECT s FROM ct ORDER BY lpad(s, 3, '*')
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT s FROM ct ORDER BY replace(reverse(s), 'z', 'y')
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT ltrim(s) AS t FROM ct ORDER BY t
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT s FROM ct ORDER BY rtrim(rpad(s, 2))
+----
+a
+A
+b
+B
+
+# A function over a literal has no collation and takes its neighbour's.
+query T nosort
+SELECT s FROM ct WHERE s < btrim(' b ') ORDER BY s
+----
+a
+A
+
+# The carried collation drives comparisons too: under unicode only a and A sort before b.
+query T nosort
+SELECT s FROM ct WHERE btrim(s) < 'b' ORDER BY s
+----
+a
+A
+
+query T nosort
+SELECT s FROM ct WHERE right(s, 1) >= 'b' ORDER BY s
+----
+b
+B
+
+# An explicit COLLATE inside the argument is the result's collation.
+query T nosort
+SELECT s FROM ct ORDER BY btrim(s COLLATE "C")
+----
+A
+B
+a
+b
+
+query T nosort
+SELECT s FROM ct ORDER BY btrim(s) COLLATE "C"
+----
+A
+B
+a
+b
+
+# A window ORDER BY over a function result.
+query TI nosort
+SELECT s, row_number() OVER (ORDER BY btrim(s)) FROM ct ORDER BY s
+----
+a
+1
+A
+2
+b
+3
+B
+4
+
+# A function result's collation flows into a derived table's column.
+query T nosort
+SELECT x FROM (SELECT btrim(s) AS x FROM ct) d ORDER BY x
+----
+a
+A
+b
+B
+
+# Arguments with two different implicit collations leave the result indeterminate (an explicit
+# COLLATE resolves it).
+statement error 42P22
+SELECT s FROM ct JOIN cc USING (id) WHERE lpad(s, 2, c) < 'b'
+
+query T rowsort
+SELECT s FROM ct JOIN cc USING (id) WHERE lpad(s, 2, c) < 'b' COLLATE "unicode"
+----
+A
+
+# A function returning a non-text type carries no collation.
+query T nosort
+SELECT s FROM ct ORDER BY length(s), s
+----
+a
+A
+b
+B
+
+# ============================================================================================
+# Set operations: the output column takes its inputs' common collation.
+# ============================================================================================
+
+query T nosort
+SELECT s FROM ct UNION SELECT 'C' ORDER BY s
+----
+a
+A
+b
+B
+C
+
+query T nosort
+SELECT s FROM ct WHERE id < 3 UNION ALL SELECT s FROM ct WHERE id >= 3 ORDER BY 1
+----
+a
+A
+b
+B
+
+query T nosort
+SELECT s FROM ct EXCEPT SELECT 'b' ORDER BY s DESC
+----
+B
+A
+a
+
+query T nosort
+SELECT s FROM ct INTERSECT SELECT s FROM ct WHERE id > 1 ORDER BY s
+----
+a
+A
+B
+
+query T nosort
+SELECT upper(s) FROM ct UNION SELECT lower(s) FROM ct ORDER BY 1
+----
+a
+A
+b
+B
+
+# An explicit COLLATE in an input wins over an implicit one; two different explicit ones conflict.
+query T nosort
+SELECT s COLLATE "C" FROM ct UNION SELECT s FROM ct ORDER BY 1
+----
+A
+B
+a
+b
+
+query T nosort
+SELECT s FROM ct UNION SELECT c COLLATE "unicode" FROM cc ORDER BY 1
+----
+a
+A
+b
+B
+
+statement error 42P21
+SELECT s COLLATE "C" FROM ct UNION SELECT c COLLATE "unicode" FROM cc
+
+# Two different implicit collations: an error at once, unless UNION ALL.
+statement error 42P21
+SELECT s FROM ct UNION SELECT c FROM cc
+
+statement error 42P21
+SELECT s FROM ct INTERSECT ALL SELECT c FROM cc
+
+statement error 42P21
+SELECT s FROM ct EXCEPT SELECT c FROM cc
+
+query T rowsort
+SELECT s FROM ct UNION ALL SELECT c FROM cc
+----
+A
+B
+B
+a
+a
+b
+
+# UNION ALL leaves the column with no collation: sorting it alone is 42P22, even over no rows.
+statement error 42P22
+SELECT s FROM ct UNION ALL SELECT c FROM cc ORDER BY 1
+
+statement error 42P22
+SELECT s FROM ct WHERE false UNION ALL SELECT c FROM cc WHERE false ORDER BY 1
+
+query T nosort
+SELECT x FROM (SELECT s FROM ct UNION ALL SELECT c FROM cc) d(x) ORDER BY x COLLATE "unicode"
+----
+a
+a
+A
+b
+B
+B
+
+# Set operations nest left to right: a column with no collation yields to the other input's.
+query T nosort
+SELECT s FROM ct UNION ALL SELECT c FROM cc UNION ALL SELECT s FROM ct WHERE id = 1 ORDER BY 1
+----
+a
+a
+A
+b
+b
+B
+B
+
+# ============================================================================================
+# A derived table / CTE over a set operation carries its column's collation.
+# ============================================================================================
+
+query T nosort
+SELECT x FROM (SELECT s FROM ct UNION SELECT 'C') d(x) ORDER BY x
+----
+a
+A
+b
+B
+C
+
+query T nosort
+WITH w AS (SELECT s FROM ct WHERE id < 3 UNION ALL SELECT s FROM ct WHERE id >= 3) SELECT s FROM w ORDER BY s
+----
+a
+A
+b
+B
+
+statement error 42P22
+SELECT x FROM (SELECT s FROM ct UNION ALL SELECT c FROM cc) d(x) ORDER BY x
+
+# With no collation, a comparison takes the neighbour's: a literal's (byte order) or a column's.
+query T rowsort
+SELECT x FROM (SELECT s FROM ct UNION ALL SELECT c FROM cc) d(x) WHERE x < 'b'
+----
+A
+B
+B
+a
+a
+
+query T rowsort
+SELECT x FROM (SELECT s FROM ct UNION ALL SELECT c FROM cc) d(x), ct WHERE x < ct.s AND ct.id = 1
+----
+A
+a
+a
+
+# A VALUES column takes its rows' common collation like UNION ALL.
+query T nosort
+SELECT x FROM (VALUES ('b' COLLATE "unicode"), ('A'), ('a')) v(x) ORDER BY x
+----
+a
+A
+b
+
+statement error 42P22
+SELECT x FROM ct JOIN cc USING (id), LATERAL (VALUES (s), (c)) v(x) ORDER BY x
+
+# ============================================================================================
+# A recursive CTE's recursive term may not change the non-recursive term's collation.
+# ============================================================================================
+
+query T nosort
+WITH RECURSIVE r(x) AS (SELECT s FROM ct WHERE id = 1 UNION ALL SELECT rpad(x, length(x) + 1, 'z') FROM r WHERE length(x) < 3) SELECT x FROM r ORDER BY x
+----
+b
+bz
+bzz
+
+query T nosort
+WITH RECURSIVE r(x) AS (SELECT s FROM ct WHERE id = 4 UNION SELECT btrim(x) FROM r) SELECT x FROM r
+----
+B
+
+# A literal's no-collation non-recursive term meets a unicode recursive term.
+statement error 42P21
+WITH RECURSIVE r(x) AS (SELECT 'a'::text UNION ALL SELECT s FROM ct, r WHERE false) SELECT x FROM r
+
+statement error 42P21
+WITH RECURSIVE r(x) AS (SELECT c FROM cc WHERE id = 1 UNION ALL SELECT s FROM ct, r WHERE false) SELECT x FROM r
+
+statement error 42P21
+WITH RECURSIVE r(x) AS (SELECT c FROM cc WHERE id = 1 UNION SELECT s FROM ct, r WHERE false) SELECT x FROM r
+
+query T nosort
+WITH RECURSIVE r(x) AS (SELECT 'a' COLLATE "unicode" UNION ALL SELECT s FROM ct, r WHERE false) SELECT x FROM r
+----
+a
+
+# ============================================================================================
+# An expression index over a collated column keeps its stored keys; an equality on the expression
+# still seeks it.
+# ============================================================================================
+
+statement ok
+CREATE INDEX ct_lower ON ct (lower(s))
+
+# The equality seeks the index (a full scan + filter would cost 15).
+# cost: 11
+query I rowsort
+SELECT id FROM ct WHERE lower(s) = 'a'
+----
+2
+3
+
+query T nosort
+SELECT s FROM ct WHERE lower(s) < 'b' ORDER BY lower(s), s
+----
+a
+A
+
+statement ok
+INSERT INTO ct VALUES (5, 'C'), (6, 'c')
+
+statement ok
+DELETE FROM ct WHERE lower(s) = 'c'
+
+query T nosort
+SELECT s FROM ct ORDER BY lower(s), s
+----
+a
+A
+b
+B

@@ -1,0 +1,427 @@
+# to_char over timestamp, timestamptz, and interval (spec/design/formatting.md §3–§4; PostgreSQL's
+# "Data Type Formatting Functions", manual §9.8). The template patterns, the FM / TM / TH / th
+# modifiers, double-quoted literals and backslash escapes, BC and wide years, ISO weeks, Julian
+# days, the zone patterns (TZ / tz / OF / TZH / TZM) in the session zone, and the interval rules.
+# Results are bracketed so leading and trailing spaces are visible. PostgreSQL-oracle-verified
+# (postgres:18, lc_time = C).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.text, types.timestamp, types.timestamptz, types.interval, session.timezone, func.to_char
+
+# load-timezone: America/New_York
+# load-timezone: Asia/Kolkata
+
+statement ok
+CREATE TABLE ts (id i32 PRIMARY KEY, t timestamp)
+
+statement ok
+INSERT INTO ts VALUES (1, '2024-03-05 13:04:05.123456'), (2, '1999-12-31 23:59:59'), (3, '2000-01-01 00:00:00'), (4, '0044-03-15 12:00:00 BC'), (5, '12345-06-07 08:09:10.5'), (6, '2021-01-03 01:02:03'), (7, '2020-12-31 11:59:00'), (8, NULL)
+
+# === the field patterns ===================================================================
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'YYYY-MM-DD HH24:MI:SS.US') || ']' FROM ts ORDER BY id
+----
+1
+[2024-03-05 13:04:05.123456]
+2
+[1999-12-31 23:59:59.000000]
+3
+[2000-01-01 00:00:00.000000]
+4
+[0044-03-15 12:00:00.000000]
+5
+[12345-06-07 08:09:10.500000]
+6
+[2021-01-03 01:02:03.000000]
+7
+[2020-12-31 11:59:00.000000]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'HH HH12 HH24 MI SS MS US FF1 FF2 FF3 FF4 FF5 FF6 SSSS SSSSS') || ']' FROM ts ORDER BY id
+----
+1
+[01 01 13 04 05 123 123456 1 12 123 1234 12345 123456 47045 47045]
+2
+[11 11 23 59 59 000 000000 0 00 000 0000 00000 000000 86399 86399]
+3
+[12 12 00 00 00 000 000000 0 00 000 0000 00000 000000 0 0]
+4
+[12 12 12 00 00 000 000000 0 00 000 0000 00000 000000 43200 43200]
+5
+[08 08 08 09 10 500 500000 5 50 500 5000 50000 500000 29350 29350]
+6
+[01 01 01 02 03 000 000000 0 00 000 0000 00000 000000 3723 3723]
+7
+[11 11 11 59 00 000 000000 0 00 000 0000 00000 000000 43140 43140]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'AM am PM pm A.M. a.m. P.M. p.m.') || ']' FROM ts ORDER BY id
+----
+1
+[PM pm PM pm P.M. p.m. P.M. p.m.]
+2
+[PM pm PM pm P.M. p.m. P.M. p.m.]
+3
+[AM am AM am A.M. a.m. A.M. a.m.]
+4
+[PM pm PM pm P.M. p.m. P.M. p.m.]
+5
+[AM am AM am A.M. a.m. A.M. a.m.]
+6
+[AM am AM am A.M. a.m. A.M. a.m.]
+7
+[AM am AM am A.M. a.m. A.M. a.m.]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'Y,YYY YYYY YYY YY Y IYYY IYY IY I') || ']' FROM ts ORDER BY id
+----
+1
+[2,024 2024 024 24 4 2024 024 24 4]
+2
+[1,999 1999 999 99 9 1999 999 99 9]
+3
+[2,000 2000 000 00 0 1999 999 99 9]
+4
+[0,044 0044 044 44 4 0044 044 44 4]
+5
+[12,345 12345 345 45 5 12345 345 45 5]
+6
+[2,021 2021 021 21 1 2020 020 20 0]
+7
+[2,020 2020 020 20 0 2020 020 20 0]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'BC bc AD ad B.C. b.c. A.D. a.d. CC cc') || ']' FROM ts ORDER BY id
+----
+1
+[AD ad AD ad A.D. a.d. A.D. a.d. 21 21]
+2
+[AD ad AD ad A.D. a.d. A.D. a.d. 20 20]
+3
+[AD ad AD ad A.D. a.d. A.D. a.d. 20 20]
+4
+[BC bc BC bc B.C. b.c. B.C. b.c. -01 -01]
+5
+[AD ad AD ad A.D. a.d. A.D. a.d. 124 124]
+6
+[AD ad AD ad A.D. a.d. A.D. a.d. 21 21]
+7
+[AD ad AD ad A.D. a.d. A.D. a.d. 21 21]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'MONTH Month month MON Mon mon MM RM rm') || ']' FROM ts ORDER BY id
+----
+1
+[MARCH     March     march     MAR Mar mar 03 III  iii ]
+2
+[DECEMBER  December  december  DEC Dec dec 12 XII  xii ]
+3
+[JANUARY   January   january   JAN Jan jan 01 I    i   ]
+4
+[MARCH     March     march     MAR Mar mar 03 III  iii ]
+5
+[JUNE      June      june      JUN Jun jun 06 VI   vi  ]
+6
+[JANUARY   January   january   JAN Jan jan 01 I    i   ]
+7
+[DECEMBER  December  december  DEC Dec dec 12 XII  xii ]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'DAY Day day DY Dy dy DDD IDDD DD D ID') || ']' FROM ts ORDER BY id
+----
+1
+[TUESDAY   Tuesday   tuesday   TUE Tue tue 065 065 05 3 2]
+2
+[FRIDAY    Friday    friday    FRI Fri fri 365 362 31 6 5]
+3
+[SATURDAY  Saturday  saturday  SAT Sat sat 001 363 01 7 6]
+4
+[FRIDAY    Friday    friday    FRI Fri fri 074 075 15 6 5]
+5
+[THURSDAY  Thursday  thursday  THU Thu thu 158 158 07 5 4]
+6
+[SUNDAY    Sunday    sunday    SUN Sun sun 003 371 03 1 7]
+7
+[THURSDAY  Thursday  thursday  THU Thu thu 366 368 31 5 4]
+8
+NULL
+
+query IT nosort
+SELECT id, '[' || to_char(t, 'W WW IW Q J') || ']' FROM ts ORDER BY id
+----
+1
+[1 10 10 1 2460375]
+2
+[5 53 52 4 2451544]
+3
+[1 01 52 1 2451545]
+4
+[3 11 11 1 1705428]
+5
+[1 23 23 2 6230136]
+6
+[1 01 53 1 2459218]
+7
+[5 53 53 4 2459215]
+8
+NULL
+
+# a timestamp has no zone: TZ / tz render nothing, the offsets render as zero
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', 'TZ|tz|OF|TZH|TZM') || ']'
+----
+[||+00|+00|00]
+
+# === modifiers ==============================================================================
+
+# FM suppresses the padding
+query IT nosort
+SELECT id, '[' || to_char(t, 'FMMonth FMDay FMDD FMHH12 FMMI FMSS FMYYYY FMDDD FMRM FMCC') || ']' FROM ts ORDER BY id
+----
+1
+[March Tuesday 5 1 4 5 2024 65 III 21]
+2
+[December Friday 31 11 59 59 1999 365 XII 20]
+3
+[January Saturday 1 12 0 0 2000 1 I 20]
+4
+[March Friday 15 12 0 0 44 74 III -1]
+5
+[June Thursday 7 8 9 10 12345 158 VI 124]
+6
+[January Sunday 3 1 2 3 2021 3 I 21]
+7
+[December Thursday 31 11 59 0 2020 366 XII 21]
+8
+NULL
+
+# TM (translation) uses the English names under the C locale, unpadded
+query IT nosort
+SELECT id, '[' || to_char(t, 'TMMonth TMDay TMMONTH TMDAY TMmonth TMday TMMon TMDy') || ']' FROM ts ORDER BY id
+----
+1
+[March Tuesday MARCH TUESDAY march tuesday Mar Tue]
+2
+[December Friday DECEMBER FRIDAY december friday Dec Fri]
+3
+[January Saturday JANUARY SATURDAY january saturday Jan Sat]
+4
+[March Friday MARCH FRIDAY march friday Mar Fri]
+5
+[June Thursday JUNE THURSDAY june thursday Jun Thu]
+6
+[January Sunday JANUARY SUNDAY january sunday Jan Sun]
+7
+[December Thursday DECEMBER THURSDAY december thursday Dec Thu]
+8
+NULL
+
+# the ordinal suffixes
+query IT nosort
+SELECT id, '[' || to_char(t, 'DDth DDTH Dth MMth YYYYth HH24th FMDDth FMHHTH') || ']' FROM ts ORDER BY id
+----
+1
+[05th 05TH 3rd 03rd 2024th 13th 5th 1ST]
+2
+[31st 31ST 6th 12th 1999th 23rd 31st 11TH]
+3
+[01st 01ST 7th 01st 2000th 00th 1st 12TH]
+4
+[15th 15TH 6th 03rd 0044th 12th 15th 12TH]
+5
+[07th 07TH 5th 06th 12345th 08th 7th 8TH]
+6
+[03rd 03RD 1st 01st 2021st 01st 3rd 1ST]
+7
+[31st 31ST 5th 12th 2020th 11th 31st 11TH]
+8
+NULL
+
+query T nosort
+SELECT '[' || to_char(timestamp '2024-01-01', 'DDth') || '|' || to_char(timestamp '2024-01-02', 'DDth') || '|' || to_char(timestamp '2024-01-03', 'DDth') || '|' || to_char(timestamp '2024-01-11', 'DDth') || '|' || to_char(timestamp '2024-01-12', 'DDth') || '|' || to_char(timestamp '2024-01-13', 'DDth') || '|' || to_char(timestamp '2024-01-21', 'DDth') || '|' || to_char(timestamp '2024-01-22', 'DDth') || '|' || to_char(timestamp '2024-01-23', 'DDth') || ']'
+----
+[01st|02nd|03rd|11th|12th|13th|21st|22nd|23rd]
+
+# SP and FX are accepted and print nothing; a dangling FM is dropped
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', 'DDSP FXHH24 FM') || ']'
+----
+[05 13 ]
+
+# === literals ===============================================================================
+
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', '"Year "YYYY", day "DDD') || ']'
+----
+[Year 2024, day 065]
+
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', 'HH24 "h" MI "m" SS "s" xyz!@#') || ']'
+----
+[13 h 04 m 05 s x4z!@#]
+
+# a backslash quotes the next character inside quotes, and a quote outside them
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', '"a\"b" \"YYYY\" \YYYY "unterminated') || ']'
+----
+[a"b "2024" \2024 unterminated]
+
+# characters that are not patterns pass through, including multibyte ones and lowercase lookalikes
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', 'é YYYY ü — hh24 mi ss xx') || ']'
+----
+[é 2024 ü — 13 04 05 xx]
+
+# longest match: HH24 before HH, DDD before DD, Month before Mon
+query T nosort
+SELECT '[' || to_char(timestamp '2024-03-05 13:04:05', 'HH24HH12HHDDDDDDMonthMonMONTHMONYYYYYYY') || ']'
+----
+[130101065065March    MarMARCH    MAR2024024]
+
+# === the empty template and infinities are NULL ============================================
+
+query T nosort
+SELECT to_char(timestamp '2024-03-05', '')
+----
+NULL
+
+query TT nosort
+SELECT to_char(timestamp 'infinity', 'YYYY'), to_char(timestamp '-infinity', 'YYYY')
+----
+NULL
+NULL
+
+query TT nosort
+SELECT to_char(timestamptz 'infinity', 'YYYY'), to_char(timestamptz '-infinity', 'YYYY')
+----
+NULL
+NULL
+
+query T nosort
+SELECT to_char(t, NULL) FROM ts WHERE id = 1
+----
+NULL
+
+# === ISO weeks around the year boundary =====================================================
+
+query T nosort
+SELECT '[' || to_char(timestamp '2020-12-28', 'IYYY-IW-ID IDDD') || '|' || to_char(timestamp '2021-01-03', 'IYYY-IW-ID IDDD') || '|' || to_char(timestamp '2021-01-04', 'IYYY-IW-ID IDDD') || '|' || to_char(timestamp '2018-12-31', 'IYYY-IW-ID IDDD') || '|' || to_char(timestamp '2016-01-01', 'IYYY-IW-ID IDDD') || ']'
+----
+[2020-53-1 365|2020-53-7 371|2021-01-1 001|2019-01-1 001|2015-53-5 369]
+
+# === timestamptz in the session zone ======================================================
+
+query T nosort
+SELECT '[' || to_char(timestamptz '2024-03-05 13:04:05+00', 'YYYY-MM-DD HH24:MI:SS TZ tz OF TZH:TZM FMOF') || ']'
+----
+[2024-03-05 13:04:05 UTC utc +00 +00:00 +0]
+
+# timezone: America/New_York
+query T nosort
+SELECT '[' || to_char(timestamptz '2024-03-05 13:04:05+00', 'YYYY-MM-DD HH24:MI:SS TZ tz OF TZH:TZM FMOF') || ']'
+----
+[2024-03-05 08:04:05 EST est -05 -05:00 -5]
+
+# timezone: America/New_York
+query T nosort
+SELECT '[' || to_char(timestamptz '2024-07-05 13:04:05+00', 'YYYY-MM-DD HH24:MI:SS TZ tz OF TZH:TZM') || ']'
+----
+[2024-07-05 09:04:05 EDT edt -04 -04:00]
+
+# timezone: America/New_York
+query T nosort
+SELECT '[' || to_char(timestamptz '1850-07-05 13:04:05+00', 'YYYY-MM-DD HH24:MI:SS TZ OF TZH:TZM') || ']'
+----
+[1850-07-05 08:08:03 LMT -04:56 -04:56]
+
+# timezone: Asia/Kolkata
+query T nosort
+SELECT '[' || to_char(timestamptz '2024-03-05 20:00:00+00', 'YYYY-MM-DD HH24:MI TZ OF TZH:TZM FMOF Day') || ']'
+----
+[2024-03-06 01:30 IST +05:30 +05:30 +5:30 Wednesday]
+
+# === interval ===============================================================================
+
+query T nosort
+SELECT '[' || to_char(interval '1 year 2 months 3 days 04:05:06.789', 'YYYY MM DD HH24 MI SS MS US') || ']'
+----
+[0001 02 03 04 05 06 789 789000]
+
+query T nosort
+SELECT '[' || to_char(interval '15 hours 7 minutes', 'HH HH12 HH24 MI AM pm') || ']'
+----
+[03 03 15 07 PM pm]
+
+query T nosort
+SELECT '[' || to_char(interval '-1 year -2 months -3 days -04:05:06.789', 'YYYY MM DD HH24 MI SS MS US FF2') || ']'
+----
+[-0001 -02 -3 -04 -05 -06 -789 -789000 -78]
+
+query T nosort
+SELECT '[' || to_char(interval '1000000 hours 59 minutes', 'HH24:MI SSSS') || ']'
+----
+[1000000:59 3600003540]
+
+query T nosort
+SELECT '[' || to_char(interval '25 months 40 days', 'Y,YYY YYY YY Y CC Q W WW DDD RM rm') || ']'
+----
+[0,002 002 02 2 00 1 6 113 790 I    i   ]
+
+query T nosort
+SELECT '[' || to_char(interval '-13 months', 'YYYY MM Q RM FMRM') || ']'
+----
+[-0001 -01 1 XII  XII]
+
+query T nosort
+SELECT '[' || to_char(interval '2 years', 'RM') || '|' || to_char(interval '-2 years', 'RM') || '|' || to_char(interval '0 years', 'RM') || ']'
+----
+[XII |I   |]
+
+query T nosort
+SELECT '[' || to_char(interval '1 year 2 months 3 days', 'J IYYY IW IDDD') || ']'
+----
+[1721459 0001 05 034]
+
+query T nosort
+SELECT to_char(interval '1 day', '')
+----
+NULL
+
+# patterns tied to a calendar date are 22007 for an interval
+statement error 22007
+SELECT to_char(interval '1 day', 'Month')
+
+statement error 22007
+SELECT to_char(interval '1 day', 'Day')
+
+statement error 22007
+SELECT to_char(interval '1 day', 'D')
+
+statement error 22007
+SELECT to_char(interval '1 day', 'BC')
+
+statement error 22007
+SELECT to_char(interval '1 day', 'TZ')
+
+statement error 22007
+SELECT to_char(interval '1 day', 'OF')
+
+# === resolution =============================================================================
+
+# a bare string literal source is ambiguous among the to_char overloads, as in PostgreSQL
+statement error 42725
+SELECT to_char('2024-01-01', 'YYYY')
+
+statement error 42883
+SELECT to_char(date '2024-01-01', 'YYYY')

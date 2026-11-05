@@ -1,0 +1,305 @@
+# A correlated reference into a GROUPED enclosing query (spec/design/grammar.md §26,
+# aggregates.md §10). A subquery in a grouped query's select list, HAVING, ORDER BY or window keys
+# runs once per GROUP, over the group row — so an enclosing-query column it references must be one
+# of that query's grouping columns (or functionally dependent on its grouped primary key) and reads
+# the group's value; any other column is 42803, PostgreSQL's "subquery uses ungrouped column".
+# A subquery in WHERE, or inside an aggregate's argument, still sees the input row. Results
+# verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.order_by_alias, query.qualified_column, query.table_alias, query.distinct, query.aggregates, query.group_by, query.group_by_expr, query.group_by_functional_dependency, query.grouping_sets, query.having, query.window, query.window_ranking, query.window_aggregate, query.window_grouped, query.window_expr_keys, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.group_by_correlated, types.i32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, x i32)
+
+statement ok
+INSERT INTO a VALUES (1, 1, 10), (2, 2, 20), (3, NULL, 30), (4, 4, 40), (5, 4, 50)
+
+statement ok
+INSERT INTO b VALUES (1, 1), (2, 1), (3, NULL), (5, 5), (6, 40)
+
+# HAVING: the EXISTS runs per group over the group's x.
+# cost: 62
+query II nosort
+SELECT x, count(*) FROM a GROUP BY x HAVING EXISTS (SELECT 1 FROM b WHERE b.x = a.x) ORDER BY 1
+----
+1
+1
+
+# The select list, beside and without an aggregate.
+# cost: 69
+query III nosort
+SELECT x, max(y), (SELECT count(*) FROM b WHERE b.x = a.x) FROM a GROUP BY x ORDER BY 1
+----
+1
+10
+2
+2
+20
+0
+4
+50
+0
+NULL
+30
+0
+
+# cost: 64
+query II nosort
+SELECT x, (SELECT count(*) FROM b WHERE b.x = a.x) FROM a GROUP BY x ORDER BY 1
+----
+1
+2
+2
+0
+4
+0
+NULL
+0
+
+# cost: 64
+query II nosort
+SELECT DISTINCT x, (SELECT count(*) FROM b WHERE b.x = a.x) FROM a GROUP BY x ORDER BY 1
+----
+1
+2
+2
+0
+4
+0
+NULL
+0
+
+# ORDER BY, as a key expression and through an alias.
+# cost: 64
+query I nosort
+SELECT x FROM a GROUP BY x ORDER BY (SELECT count(*) FROM b WHERE b.x = a.x) DESC, x
+----
+1
+2
+4
+NULL
+
+# cost: 118
+query II nosort
+SELECT x, (SELECT count(*) FROM b WHERE b.x = a.x) AS n FROM a GROUP BY x ORDER BY n DESC, x
+----
+1
+2
+2
+0
+4
+0
+NULL
+0
+
+# Window keys over the grouped rows.
+# cost: 73
+query III nosort
+SELECT x, max(y), rank() OVER (ORDER BY (SELECT count(*) FROM b WHERE b.x = a.x)) FROM a GROUP BY x ORDER BY 1
+----
+1
+10
+4
+2
+20
+1
+4
+50
+1
+NULL
+30
+1
+
+# cost: 82
+query III nosort
+SELECT x, max(y), sum(max(y)) OVER (PARTITION BY (SELECT count(*) FROM b WHERE b.x = a.x)) FROM a GROUP BY x ORDER BY 1
+----
+1
+10
+10
+2
+20
+100
+4
+50
+100
+NULL
+30
+100
+
+# Grouping sets: a column grouped away in a row's set is NULL inside the subquery too.
+# cost: 98
+query III nosort
+SELECT x, count(*), (SELECT count(*) FROM b WHERE b.x = a.x) FROM a GROUP BY ROLLUP(x) ORDER BY 1, 2
+----
+1
+1
+2
+2
+1
+0
+4
+2
+0
+NULL
+1
+0
+NULL
+5
+0
+
+# cost: 157
+query IIII nosort
+SELECT x, y, (SELECT count(*) FROM b WHERE b.x = a.x), (SELECT count(*) FROM b WHERE b.id = a.y) FROM a GROUP BY GROUPING SETS ((x), (y)) ORDER BY 1, 2
+----
+1
+NULL
+2
+0
+2
+NULL
+0
+0
+4
+NULL
+0
+0
+NULL
+10
+0
+0
+NULL
+20
+0
+0
+NULL
+30
+0
+0
+NULL
+40
+0
+0
+NULL
+50
+0
+0
+NULL
+NULL
+0
+0
+
+# Grouping by the primary key: every column is reachable.
+# cost: 42
+query III nosort
+SELECT id, x, (SELECT count(*) FROM b WHERE b.id = a.id AND b.x = a.y) FROM a GROUP BY id ORDER BY 1
+----
+1
+1
+0
+2
+2
+0
+3
+NULL
+0
+4
+4
+0
+5
+4
+0
+
+# Two levels down, and the grouped column projected back by a FROM-less subquery.
+# cost: 94
+query II nosort
+SELECT x, (SELECT count(*) FROM b WHERE b.x = a.x AND EXISTS (SELECT 1 FROM b b2 WHERE b2.id = a.x)) FROM a GROUP BY x ORDER BY 1
+----
+1
+2
+2
+0
+4
+0
+NULL
+0
+
+# cost: 18
+query II nosort
+SELECT x, (SELECT x) FROM a GROUP BY x ORDER BY 1
+----
+1
+1
+2
+2
+4
+4
+NULL
+NULL
+
+# The subquery groups by the enclosing group's column: one group of every b row.
+# cost: 62
+query II nosort
+SELECT x, (SELECT count(*) FROM b GROUP BY a.x) FROM a GROUP BY x ORDER BY 1
+----
+1
+5
+2
+5
+4
+5
+NULL
+5
+
+# A membership subquery correlated to the group.
+# cost: 53
+query IB nosort
+SELECT x, x IN (SELECT b.x FROM b WHERE b.id > a.x) FROM a GROUP BY x ORDER BY 1
+----
+1
+true
+2
+NULL
+4
+false
+NULL
+false
+
+# An aggregate's argument and the WHERE clause see the INPUT row, so any column is in reach there.
+# cost: 81
+query ID nosort
+SELECT x, sum((SELECT count(*) FROM b WHERE b.x = a.y)) FROM a GROUP BY x ORDER BY 1
+----
+1
+0
+2
+0
+4
+1
+NULL
+0
+
+# cost: 69
+query I nosort
+SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.x = a.x) GROUP BY x ORDER BY 1
+----
+1
+
+# An ungrouped column of the enclosing query is 42803 wherever the subquery sits.
+statement error 42803
+SELECT x, count(*) FROM a GROUP BY x HAVING EXISTS (SELECT 1 FROM b WHERE b.id = a.id)
+
+statement error 42803
+SELECT x, (SELECT y) FROM a GROUP BY x
+
+statement error 42803
+SELECT (SELECT count(*) FROM b WHERE b.x = a.x) FROM a HAVING count(*) > 0
+
+statement error 42803
+SELECT x FROM a GROUP BY x ORDER BY (SELECT count(*) FROM b WHERE b.id = a.id)
+
+# An expression key does not make its columns reachable from a subquery.
+statement error 42803
+SELECT x + 1 AS k, (SELECT count(*) FROM b WHERE b.x = a.x + 1) FROM a GROUP BY x + 1 ORDER BY 1

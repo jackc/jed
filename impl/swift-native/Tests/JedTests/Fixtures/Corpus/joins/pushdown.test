@@ -1,0 +1,95 @@
+# Join base-table primary-key pushdown (spec/design/cost.md §3 "bounded scan / JOIN"). In a
+# multi-table FROM each base table is materialized independently; a WHERE predicate on a table's OWN
+# primary key against a CONSTANT bounds THAT table's scan to a seek/range, so it materializes fewer
+# rows (and pages) before the physical join. It is the same bounded-scan mechanism as a single-table
+# point lookup (query.point_lookup), applied per relation. The bound only narrows the scan; every
+# WHERE conjunct is still evaluated — a single-relation conjunct by its relation's scan as each row
+# is read (query.where_pushdown, planner.md §3.2), the rest over the joined rows — so the ROWS are
+# unchanged; only the cost drops. That drop is the cross-core contract pinned here with `# cost:`. All units weigh 1; `a` and `b` are three rows in
+# one leaf each, so page_read is 1 per non-empty scan and 0 for an empty bound. Sound for outer joins:
+# a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding the
+# NULL-extended side cannot drop a surviving row (the `WHERE b.id = …` LEFT-JOIN case below).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_pushdown, query.index_nested_loop, query.hash_join, query.point_lookup, types.i32, resource.cost_metering, query.where_pushdown
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (10, 10), (20, 20), (30, 99)
+
+# INNER, WHERE on a's PK bounds a to one row; b materializes fully. The selected nested loop checks
+# that row against b, rechecks ON/WHERE, and produces the one match.
+# cost: 11
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 1 ORDER BY a.id, b.id
+----
+1
+10
+
+# INNER, WHERE `a.id = 999` is a point-lookup MISS. b still materializes, but there is no ON/output.
+# cost: 5
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
+----
+
+# INNER, range `a.id >= 2` bounds a to rows 2,3, and a's scan rechecks the pushed conjunct on both.
+# Their nested-loop pairs yield one match.
+# cost: 16
+query I nosort
+SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.id >= 2 ORDER BY a.id, b.id
+----
+2
+
+# Both sides bounded to one row and rechecked by their scans; the one nested-loop pair matches, and
+# nothing is left to apply after the join.
+# cost: 8
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 1 AND b.id = 10 ORDER BY a.id
+----
+1
+10
+
+# LEFT JOIN, WHERE on the LEFT (preserved) side's PK bounds a to row 3, which has no b match and is
+# NULL-extended. Its hash probe misses, then WHERE keeps the extended row.
+# cost: 24
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE a.id = 3 ORDER BY a.id
+----
+3
+NULL
+
+# LEFT JOIN, WHERE on the RIGHT (NULL-extended) side's PK — the soundness case. `b.id = 10` bounds b
+# to one row; a is a full scan. The two a rows that do not match the single b row are NULL-extended,
+# then `b.id = 10` (NULL = 10 -> unknown) discards them — exactly as a full scan would. b: 1 page + 1
+# row. Three probes yield one match and two NULL-extensions; WHERE keeps only the match.
+# cost: 35
+query II nosort
+SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.id = 10 ORDER BY a.id
+----
+1
+10
+
+# Contrast 1 — a NON-key WHERE does not bound: `a.k = 10` full-scans a, but a's scan applies it to
+# each row, so only row 1 reaches the nested-loop ON.
+# cost: 15
+query I nosort
+SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.k = 10 ORDER BY a.id
+----
+1
+
+# Contrast 2 — a CROSS-relation PK predicate `b.id = a.id` DOES bound now, via index-nested-loop
+# (query.index_nested_loop): b's PK is compared to the sibling column `a.id`, so b is re-materialized
+# per a-row and seeks `b.id = a.id` instead of a full scan. a: 1 page + 3 rows. Per a-row seek b.id =
+# a.id: a.id ∈ {1,2,3} but b's PKs are {10,20,30}, so all THREE are point-lookup MISSES — 1 page + 0
+# rows each. b: 3 page + 0 rows. No combined pair survives the seek, so 0 ON, 0 WHERE, 0 produced.
+# 2 (a page + b's 3 seek pages... a:1 + b:3 = 4) + 3 (a rows) = 7. (The full-double-scan baseline was 19.)
+# cost: 7
+query I nosort
+SELECT a.id FROM a JOIN b ON a.k = b.k WHERE b.id = a.id ORDER BY a.id
+----

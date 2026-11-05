@@ -1,0 +1,47 @@
+# The jsonpath type — the literal + canonical render (P1a, spec/design/jsonpath.md). A
+# '…'::jsonpath / jsonpath '…' literal is compiled at resolve and rendered to its canonical
+# normalized form: member keys quoted ($.a → $."a"), lax omitted, strict kept, [*] / [i] / [i to j] /
+# [last] subscripts. P1a covers the structural-accessor subset; filters / item methods / arithmetic
+# are a deferred P1b (a per-core 0A000). A malformed path literal is 42601. Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonpath
+
+# Member accessors render with quoted keys; a quoted member preserves its content.
+query TTT nosort
+SELECT '$.a.b'::jsonpath, '$."a b".c'::jsonpath, '$.*'::jsonpath
+----
+$."a"."b"
+$."a b"."c"
+$.*
+
+# Subscripts: a single index, a comma list, a `to` slice, the wildcard, and `last`.
+query TTTTT nosort
+SELECT '$[0]'::jsonpath, '$[0,1]'::jsonpath, '$[1 to 3]'::jsonpath, '$[*]'::jsonpath, '$[last]'::jsonpath
+----
+$[0]
+$[0,1]
+$[1 to 3]
+$[*]
+$[last]
+
+# The mode word: `lax` (default) is omitted, `strict` is kept.
+query TTT nosort
+SELECT '$'::jsonpath, 'lax $.a'::jsonpath, 'strict $.a'::jsonpath
+----
+$
+$."a"
+strict $."a"
+
+# A combined path; the `jsonpath '…'` typed-literal spelling is equivalent to the cast.
+query TT nosort
+SELECT '$.a[*].b[1 to 3]'::jsonpath, jsonpath '$."x"[0]'
+----
+$."a"[*]."b"[1 to 3]
+$."x"[0]
+
+# A malformed path literal → 42601 (PostgreSQL's syntax-error class).
+statement error 42601
+SELECT '$.'::jsonpath
+
+statement error 42601
+SELECT '$[1 to'::jsonpath

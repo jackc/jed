@@ -1,0 +1,62 @@
+# json[b]_populate_record(set) — the populate-record functions (R2, spec/design/json-table.md §2).
+# Like json[b]_to_record(set) but the column shape comes from the COMPOSITE TYPE of the (typically
+# NULL) first argument. Each field takes the JSON member of its name, coerced to the field type; a
+# missing member / JSON null → SQL NULL. _record → one row, _recordset → one per array element.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, types.composite, func.json_populate
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+# jsonb_populate_record fills the composite type's columns from the json members.
+query TI nosort
+SELECT * FROM jsonb_populate_record(NULL::addr, '{"street": "Main", "zip": 90210}')
+----
+Main
+90210
+
+# A missing member → SQL NULL.
+query TI nosort
+SELECT * FROM jsonb_populate_record(NULL::addr, '{"street": "Main"}')
+----
+Main
+NULL
+
+# json_populate_record (json input) works the same.
+query TI nosort
+SELECT * FROM json_populate_record(NULL::addr, '{"street": "X", "zip": 7}')
+----
+X
+7
+
+# _recordset: one row per array element, in order.
+query TI nosort
+SELECT * FROM jsonb_populate_recordset(NULL::addr, '[{"street": "A", "zip": 1}, {"street": "B", "zip": 2}]')
+----
+A
+1
+B
+2
+
+# A NULL document → zero rows.
+query I nosort
+SELECT count(*)::i32 FROM jsonb_populate_recordset(NULL::addr, NULL::jsonb)
+----
+0
+
+# Lateral over a stored jsonb column (CROSS JOIN).
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, j jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"street": "First", "zip": 10}'), (2, '{"street": "Second", "zip": 20}')
+
+query ITI nosort
+SELECT d.id, r.street, r.zip FROM docs d CROSS JOIN jsonb_populate_record(NULL::addr, d.j) AS r ORDER BY d.id
+----
+1
+First
+10
+2
+Second
+20

@@ -1,0 +1,354 @@
+# Bytea scalar type (spec/design/types.md §13): storage, hex- and escape-input literals, equality,
+# ordering (UNSIGNED byte order = memcmp), and NULL. The empty byte string '\x' is a distinct,
+# non-NULL value. bytea IS a valid PRIMARY KEY / index / UNIQUE key — its variable-width
+# bytea-terminated-escape key encoding (encoding.md §2.6) is self-delimiting and order-preserving
+# (exercised below, incl. the embedded-0x00 escape). A single-quoted literal adapts to a bytea
+# context (§6) and decodes as PostgreSQL's byteain does: \x hex input, otherwise the traditional
+# escape format; malformed input traps 22P02. A literal in a NON-bytea context is never decoded (it
+# stays text). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, types.array, expr.text_concat, cast.explicit, cast.operator, cast.string_literal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO t VALUES (1, '\xdeadbeef'), (2, '\x'), (3, '\x00'), (4, '\xff'), (5, NULL)
+
+# a bytea value renders as \x + LOWERCASE hex under the `T` tag (PostgreSQL bytea_output = hex)
+query T nosort
+SELECT b FROM t WHERE id = 1
+----
+\xdeadbeef
+
+# the empty byte string renders as the bare \x prefix
+query T nosort
+SELECT b FROM t WHERE id = 2
+----
+\x
+
+# equality on bytea: exact byte match
+query I nosort
+SELECT id FROM t WHERE b = '\xdeadbeef'
+----
+1
+
+# the hex INPUT is case-insensitive: uppercase digits decode to the same bytes, so they
+# match the value stored from the lowercase literal (and render lowercase, above)
+query I nosort
+SELECT id FROM t WHERE b = '\xDEADBEEF'
+----
+1
+
+# the empty byte string '\x' is a distinct, non-NULL value: it matches '\x' (id 2) and is NOT
+# NULL, while NULL (id 5) is neither '\x' nor any value
+query I nosort
+SELECT id FROM t WHERE b = '\x'
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE b IS NULL
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE b IS NOT NULL ORDER BY id
+----
+1
+2
+3
+4
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for bytea as for integers/text
+query I nosort
+SELECT id FROM t WHERE b = NULL
+----
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on bytea — NULL is a comparable value here
+query I nosort
+SELECT id FROM t WHERE b IS NOT DISTINCT FROM NULL
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE b IS DISTINCT FROM '\xdeadbeef' ORDER BY id
+----
+2
+3
+4
+5
+
+# bytea vs a non-bytea operand is NOT comparable: a 42804 type error (like text = int)
+statement error 42804
+SELECT id FROM t WHERE b = 1
+
+# an integer literal into a bytea column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (6, 123)
+
+# a string literal into an integer column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES ('seven', '\x00')
+
+# malformed hex in a bytea context traps 22P02, deterministically and before any scan:
+# an odd number of digits ...
+statement error 22P02
+INSERT INTO t VALUES (7, '\xabc')
+
+# ... a non-hex character ...
+statement error 22P02
+INSERT INTO t VALUES (8, '\xzz')
+
+# ... and a backslash followed by anything but another backslash or three octal digits. A string
+# that does not begin with \x is read in the traditional escape format (below), where \y is no
+# valid escape.
+statement error 22P02
+INSERT INTO t VALUES (9, '\y00')
+
+# ... and a comparison literal traps the same way (pre-scan)
+statement error 22P02
+SELECT id FROM t WHERE b = '\xgg'
+
+# --- whitespace in hex input (PostgreSQL hex_decode_safe) ---------------------------------
+# A space, tab, newline, or carriage return is skipped BETWEEN hex digit pairs (and before the
+# first or after the last), on every bytea text-input path: a bytea-context literal ...
+query I nosort
+SELECT id FROM t WHERE b = '\x de ad  be ef '
+----
+1
+
+# ... a literal cast, where whitespace-only hex input is the empty byte string ...
+query TT nosort
+SELECT '\x 01 02' :: bytea, '\x ' :: bytea
+----
+\x0102
+\x
+
+# ... the per-row text -> bytea cast (tab, newline, carriage return) ...
+query T nosort
+SELECT ('\x01' || chr(9) || '02' || chr(10) || chr(13) || '03') :: bytea
+----
+\x010203
+
+# ... and an array element
+query T nosort
+SELECT '{"\\x 01 02"}' :: bytea[]
+----
+{"\\x0102"}
+
+# whitespace INSIDE a digit pair is an invalid digit (22P02) ...
+statement error 22P02
+SELECT '\x0 1' :: bytea
+
+# ... a lone final digit is still an odd digit count, whitespace aside ...
+statement error 22P02
+SELECT '\x 0' :: bytea
+
+# ... and only those four characters are whitespace: a form feed or vertical tab is an invalid
+# digit
+statement error 22P02
+SELECT ('\x01' || chr(12) || '02') :: bytea
+
+statement error 22P02
+SELECT ('\x01' || chr(11) || '02') :: bytea
+
+# --- the traditional escape input format (PostgreSQL byteain) ------------------------------
+# A string that does NOT begin with \x is read in escape format: \\ is one backslash, \nnn (three
+# octal digits, the first 0-3) is one byte, and any other byte stands for itself. (Backslashes in
+# a standard string literal are ordinary characters, so '\101' is the four characters \ 1 0 1.)
+statement ok
+CREATE TABLE esc (id i32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO esc VALUES (1, 'deadbeef'), (2, '\101\102C'), (3, 'a\\b'), (4, ''), (5, '\000\377'), (6, '\\x41'), (7, 'é')
+
+query IT nosort
+SELECT id, b FROM esc ORDER BY id
+----
+1
+\x6465616462656566
+2
+\x414243
+3
+\x615c62
+4
+\x
+5
+\x00ff
+6
+\x5c783431
+7
+\xc3a9
+
+# escape-format and hex-format spellings of the same bytes are the same value
+query I nosort
+SELECT id FROM esc WHERE b = '\x414243'
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE b = '\336\255\276\357'
+----
+1
+
+# the empty string is the empty byte string in either format
+query I nosort
+SELECT id FROM esc WHERE b = '\x'
+----
+4
+
+# the same decoding applies to an explicit cast of a literal
+query T nosort
+SELECT CAST('\001\\z' AS bytea)
+----
+\x015c7a
+
+query T nosort
+SELECT 'abc' :: bytea
+----
+\x616263
+
+query T nosort
+SELECT bytea '\\'
+----
+\x5c
+
+# ... and to each element of an array literal (inside a quoted element, \\ is one backslash, so
+# "\\101" is the escape \101)
+query T nosort
+SELECT '{abc,"\\101",NULL,"\\x00ff"}' :: bytea[]
+----
+{"\\x616263","\\x41",NULL,"\\x00ff"}
+
+statement error 22P02
+SELECT '{"\\400"}' :: bytea[]
+
+# a malformed escape traps 22P02: an octal value whose first digit is above 3 ...
+statement error 22P02
+INSERT INTO esc VALUES (10, '\400')
+
+# ... a non-octal digit ...
+statement error 22P02
+INSERT INTO esc VALUES (10, '\8')
+
+# ... too few octal digits ...
+statement error 22P02
+INSERT INTO esc VALUES (10, '\10')
+
+# ... a trailing lone backslash ...
+statement error 22P02
+INSERT INTO esc VALUES (10, 'a\')
+
+# ... and an uppercase X, which is not the hex marker
+statement error 22P02
+SELECT id FROM esc WHERE b = '\X01'
+
+# a string literal with NO bytea context stays text and is never decoded: '\xzz' compared with
+# a text column is the ordinary 4-character text value \xzz, NOT a 22P02 (and here it matches).
+statement ok
+CREATE TABLE txt (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO txt VALUES (1, '\xzz')
+
+query I nosort
+SELECT id FROM txt WHERE s = '\xzz'
+----
+1
+
+# --- bytea as a PRIMARY KEY (encoding.md §2.6: bytea-terminated-escape) ---------------
+# bytea IS a valid PRIMARY KEY — its order-preserving key encoding is exercised here.
+statement ok
+CREATE TABLE bk (k bytea PRIMARY KEY, n i32)
+
+# insert NOT in key order; the empty '\x' is the smallest key, then UNSIGNED byte order. The
+# embedded-0x00 value '\x6100ff62' exercises the 0x00 → 0x00 0xFF escape, and '\x61' < '\x6161'
+# the prefix/length case.
+statement ok
+INSERT INTO bk VALUES ('\x61', 1), ('\x6161', 2), ('\x62', 3), ('\x6100ff62', 4), ('\x', 5)
+
+# point lookup on the bytea PK (key-encoded equality)
+query I nosort
+SELECT n FROM bk WHERE k = '\x6161'
+----
+2
+
+# a full scan iterates in unsigned byte (key) order. '\x6100ff62' sorts between '\x61' and
+# '\x6161': after the shared 0x61, its real 0x00 content byte beats '\x6161''s next 0x61 — the
+# escape keeps that 0x00 from masquerading as the terminator.
+query TI nosort
+SELECT k, n FROM bk
+----
+\x
+5
+\x61
+1
+\x6100ff62
+4
+\x6161
+2
+\x62
+3
+
+# a duplicate bytea PK is a unique violation (23505)
+statement error 23505
+INSERT INTO bk VALUES ('\x61', 9)
+
+# a NULL bytea PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO bk VALUES (NULL, 9)
+
+# --- ordering: UNSIGNED byte order, the prefix/length case, embedded 0x00, and cost --------
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO w VALUES (1, '\x62'), (2, '\x6161'), (3, '\x6162'), (4, '\x61'), (5, '\x00'), (6, '\xff')
+
+# unsigned byte order including the prefix/length case (\x61 < \x6161 < \x6162 < \x62 — a
+# shorter value that is a prefix of a longer one sorts first, the length-prefix counterexample)
+# and that a 0x00 byte sorts first while 0xff sorts last. Expected ascending b:
+# \x00, \x61, \x6161, \x6162, \x62, \xff → ids 5, 4, 2, 3, 1, 6.
+query T nosort
+SELECT b FROM w ORDER BY b
+----
+\x00
+\x61
+\x6161
+\x6162
+\x62
+\xff
+
+# ordering predicate on bytea (unsigned byte order): b < '\x62'. \x00, \x61, \x6161, \x6162 are
+# all < \x62, but \x62 is not < itself and \xff > \x62. → ids 2, 3, 4, 5.
+query I nosort
+SELECT id FROM w WHERE b < '\x62' ORDER BY id
+----
+2
+3
+4
+5
+
+# deterministic, cross-core cost: a bytea comparison is ONE operator_eval (weight 1), like an
+# integer/text comparison — independent of byte-string length. 6 scanned + 6 filter (one `=`
+# per row) + 1 produced + 0 projection (bare column) = 13.
+# cost: 14
+query I nosort
+SELECT id FROM w WHERE b = '\x61'
+----
+4
+
+# G30 — an EMBEDDED leading 0x00 is a real byte, not a terminator: \x0061 (bytes 0x00, 0x61)
+# compares first-byte 0x00 < 0x61, so it sorts BEFORE the single-byte \x61. A core that treated
+# 0x00 as a C-string terminator would mis-order these.
+statement ok
+CREATE TABLE nul (id i32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO nul VALUES (1, '\x0061'), (2, '\x61')
+
+query T nosort
+SELECT b FROM nul ORDER BY b
+----
+\x0061
+\x61

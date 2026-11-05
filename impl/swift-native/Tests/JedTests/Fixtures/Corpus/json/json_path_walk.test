@@ -1,0 +1,245 @@
+# The jsonb path walk shared by jsonb_set / jsonb_set_lax / jsonb_insert / `#-` (PostgreSQL's
+# setPath), and `- text[]` (spec/design/json-sql-functions.md §2.1). A multidimensional path is
+# 2202E; a scalar ROOT is 22023 even for an empty path; an empty container short-circuits for
+# jsonb_set without create_if_missing and for `#-`, but not for jsonb_insert. A NULL path element is
+# 22004 ("path element at position N is null", 1-based) only when the walk REACHES it — it is checked
+# at each step before the node is looked at, so a NULL under a scalar member still raises, while one
+# past a missing key or an out-of-range index never does. A scalar below the root ends the walk
+# without error. An array step is PostgreSQL's strtoint (leading whitespace and a sign allowed,
+# nothing trailing, within i32) or 22P02. The extractors (`#>`, `#>>`) instead return NULL for any
+# NULL element, and `- text[]` skips a NULL key. Output matches the postgres:18 oracle. Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.jsonb, func.json_set, func.json_set_lax, func.jsonb_mutate
+
+# A NULL path element reached by jsonb_set: the first step, and a step under a matching key (object
+# or array child, or a scalar member).
+statement error 22004 path element at position 1 is null
+SELECT jsonb_set('{"a": 1}', '{NULL}', '2')
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_set('{"a": {"c": 1}}', '{a,NULL}', '2')
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_set('{"a": {"c": 1}}', '{a,NULL,x}', '2')
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_set('{"a": 1}', '{a,NULL}', '2')
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_set('[[1]]', '{0,NULL}', '2')
+
+statement error 22004 path element at position 3 is null
+SELECT jsonb_set('{"a": [{"b": 1}]}', '{a,0,NULL}', '2')
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_set('{"a": [1]}', '{a,NULL}', '2', false)
+
+# An empty object with create_if_missing (the default) still walks, so the NULL raises.
+statement error 22004 path element at position 1 is null
+SELECT jsonb_set('{}', '{NULL}', '2')
+
+statement error 22004 path element at position 1 is null
+SELECT jsonb_set('[]', '{NULL}', '2')
+
+# A NULL element the walk never reaches: past a missing key, past an out-of-range index, or in an
+# empty object without create_if_missing.
+query TTT nosort
+SELECT jsonb_set('{"a": 1}', '{b,NULL}', '2'), jsonb_set('[1]', '{5,NULL}', '2'), jsonb_set('{}', '{NULL}', '2', false)
+----
+{"a": 1}
+[1]
+{}
+
+# The checks before the walk come first: a STRICT NULL argument, then a multidimensional path, then a
+# scalar root.
+query TT nosort
+SELECT jsonb_set(NULL, '{NULL}', '1'), jsonb_set('{"a": 1}', '{NULL}', '1', NULL)
+----
+NULL
+NULL
+
+statement error 2202E wrong number of array subscripts
+SELECT jsonb_set('{"a": 1}', '{{NULL}}', '2')
+
+statement error 2202E wrong number of array subscripts
+SELECT jsonb_set('1', '{{a}}', '2')
+
+statement error 22023 cannot set path in scalar
+SELECT jsonb_set('1', '{NULL}', '2')
+
+# A non-integer step into an array is raised at its own step, before a later NULL is reached.
+statement error 22P02 path element at position 1 is not an integer: "x"
+SELECT jsonb_set('[[1]]', '{x,NULL}', '2')
+
+statement error 22P02 path element at position 2 is not an integer: "x"
+SELECT jsonb_set('{"a": [1]}', '{a,x}', '2')
+
+# jsonb_set_lax: a NULL path element is checked by jsonb_set (non-NULL value or use_json_null) and by
+# the delete_key walk; return_target never walks; raise_exception and a NULL treatment raise first.
+statement error 22004 path element at position 1 is null
+SELECT jsonb_set_lax('{"a": 1}', '{NULL}', '1')
+
+statement error 22004 path element at position 1 is null
+SELECT jsonb_set_lax('{"a": 1}', '{NULL}', NULL)
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_set_lax('{"a": [1]}', '{a,NULL}', NULL, true, 'delete_key')
+
+query TT nosort
+SELECT jsonb_set_lax('{"a": 1}', '{NULL}', NULL, true, 'return_target'), jsonb_set_lax('{}', '{NULL}', NULL, false, 'delete_key')
+----
+{"a": 1}
+{}
+
+statement error 22004 JSON value must not be null
+SELECT jsonb_set_lax('{"a": 1}', '{NULL}', NULL, true, 'raise_exception')
+
+statement error 22023 null_value_treatment must be "delete_key", "return_target", "use_json_null", or "raise_exception"
+SELECT jsonb_set_lax('{"a": 1}', '{NULL}', '1', true, NULL)
+
+statement error 22023 cannot delete path in scalar
+SELECT jsonb_set_lax('1', '{}', NULL, true, 'delete_key')
+
+# jsonb_insert walks even an empty container.
+statement error 22004 path element at position 1 is null
+SELECT jsonb_insert('{"a": 1}', '{NULL}', '1')
+
+statement error 22004 path element at position 1 is null
+SELECT jsonb_insert('{}', '{NULL}', '1')
+
+statement error 22004 path element at position 1 is null
+SELECT jsonb_insert('[]', '{NULL}', '1')
+
+statement error 22004 path element at position 2 is null
+SELECT jsonb_insert('{"a": [1]}', '{a,NULL}', '1')
+
+# `#-`: an empty container short-circuits before the walk; a scalar root is 22023 even for an empty
+# path; a NULL reached raises, one past a missing key does not.
+statement error 22004 path element at position 1 is null
+SELECT '{"a": 1}'::jsonb #- '{NULL}'
+
+statement error 22004 path element at position 2 is null
+SELECT '{"a": {"b": 1}}'::jsonb #- '{a,NULL}'
+
+statement error 22004 path element at position 2 is null
+SELECT '[[1]]'::jsonb #- '{0,NULL}'
+
+query TT nosort
+SELECT '{}'::jsonb #- '{NULL}', '{"a": {"b": 1}}'::jsonb #- '{c,NULL}'
+----
+{}
+{"a": {"b": 1}}
+
+statement error 22023 cannot delete path in scalar
+SELECT '1'::jsonb #- '{NULL}'
+
+statement error 22023 cannot delete path in scalar
+SELECT '1'::jsonb #- '{}'
+
+statement error 2202E wrong number of array subscripts
+SELECT '{"a": 1}'::jsonb #- '{{a}}'
+
+# `#-` parses an array step like jsonb_set: a non-integer step is 22P02, not a miss.
+statement error 22P02 path element at position 1 is not an integer: "x"
+SELECT '[1]'::jsonb #- '{x}'
+
+statement error 22P02 path element at position 2 is not an integer: "x"
+SELECT '{"a": [1]}'::jsonb #- '{a,x}'
+
+# A scalar below the root ends the walk unchanged (no error) for every mutator.
+query TTTT nosort
+SELECT jsonb_set('{"a": 1}', '{a,b}', '2'), jsonb_insert('{"a": 1}', '{a,b}', '2'), '{"a": 1}'::jsonb #- '{a,b}', '{"a": 1}'::jsonb #- '{a,b,NULL}'
+----
+{"a": 1}
+{"a": 1}
+{"a": 1}
+{"a": 1}
+
+# A scalar root is 22023 even for an empty path.
+statement error 22023 cannot set path in scalar
+SELECT jsonb_set('1', '{}', '2')
+
+statement error 22023 cannot set path in scalar
+SELECT jsonb_insert('"s"', '{}', '2')
+
+# Array step parsing (strtoint): leading whitespace and a sign are accepted; trailing characters, an
+# empty step, and anything outside i32 are 22P02.
+query TT nosort
+SELECT jsonb_set('[1,2]', '{" 1"}', '9'), jsonb_set('[1,2]', '{"+1"}', '9')
+----
+[1, 9]
+[1, 9]
+
+statement error 22P02 path element at position 1 is not an integer: "1 "
+SELECT jsonb_set('[1,2]', '{"1 "}', '9')
+
+statement error 22P02 path element at position 1 is not an integer: ""
+SELECT jsonb_set('[1,2]', '{""}', '9')
+
+statement error 22P02 path element at position 1 is not an integer: "3000000000"
+SELECT jsonb_set('[1,2]', '{3000000000}', '9')
+
+statement error 22P02 path element at position 1 is not an integer: "-3000000000"
+SELECT jsonb_set('[1,2]', '{-3000000000}', '9')
+
+query TTT nosort
+SELECT jsonb_set('[1,2]', '{2147483647}', '9'), jsonb_set('[1,2]', '{-2147483648}', '9'), jsonb_set('[1,2]', '{-2}', '9', false)
+----
+[1, 2, 9]
+[9, 1, 2]
+[9, 2]
+
+# jsonb_insert with an index before the start prepends even with insert_after; past the end appends.
+query TTT nosort
+SELECT jsonb_insert('[1,2]', '{-5}', '9', true), jsonb_insert('[1,2]', '{5}', '9', true), jsonb_insert('[1,2]', '{-1}', '9', true)
+----
+[9, 1, 2]
+[1, 2, 9]
+[1, 2, 9]
+
+# jsonb_insert on an existing key is 22023 with PostgreSQL's hint.
+statement error 22023 cannot replace existing key
+SELECT jsonb_insert('{"a": {"b": 1}}', '{a,b}', '9')
+
+# The extractors return NULL for a NULL path element instead (jsonb and json, verbatim json too).
+query TTTT nosort
+SELECT '{"a": 1}'::jsonb #> '{NULL}', '{"a": 1}'::jsonb #>> '{a,NULL}', '{"a": 1}'::json #> '{NULL}', '{"a": 1}'::json #>> '{a,NULL}'
+----
+NULL
+NULL
+NULL
+NULL
+
+# `- text[]` skips a NULL key; a scalar root is 22023 even for an empty key list; a multidimensional
+# key list is 2202E.
+query TTT nosort
+SELECT '{"a": 1, "b": 2}'::jsonb - '{a,NULL}'::text[], '["a", "b"]'::jsonb - '{NULL,b}'::text[], '{}'::jsonb - '{NULL}'::text[]
+----
+{"b": 2}
+["a"]
+{}
+
+statement error 22023 cannot delete from scalar
+SELECT '5'::jsonb - '{}'::text[]
+
+statement error 22023 cannot delete from scalar
+SELECT '5'::jsonb - '{NULL}'::text[]
+
+statement error 2202E wrong number of array subscripts
+SELECT '[]'::jsonb - '{{a}}'::text[]
+
+# Over a stored column: the walk is per row, so only rows whose walk reaches the NULL raise.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, doc jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"a": 1}'), (2, '{"b": {"c": 1}}')
+
+query IT nosort
+SELECT id, jsonb_set(doc, '{a,NULL}', '0') FROM t WHERE id = 2
+----
+2
+{"b": {"c": 1}}
+
+statement error 22004 path element at position 2 is null
+SELECT id, jsonb_set(doc, '{a,NULL}', '0') FROM t

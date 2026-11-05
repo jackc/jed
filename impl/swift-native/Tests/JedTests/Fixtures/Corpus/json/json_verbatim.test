@@ -1,0 +1,345 @@
+# The verbatim-`json` accessors and SRFs (spec/design/json-sql-functions.md §1/§3, json.md §4): the
+# `json` overloads of `->` / `->>` / `#>` / `#>>` and json_array_elements[_text] / json_each[_text].
+# A json value is its validated input text, so every sub-document comes back as the EXACT original
+# sub-text — inner whitespace, key order, number spelling (1.50, 1e2), and escapes kept — while the
+# text forms (`->>`, `#>>`, `_text`) de-escape a string and turn a JSON null into SQL NULL. Duplicate
+# keys are visible: `->` / `#>` take the LAST matching member in document order (a path walks every
+# duplicate), and json_each yields every member in input order. A negative array index follows PG's
+# streaming rebase (see the quirk entries below). Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.cross_join, types.json, types.jsonb, func.json_verbatim
+
+# -> by key returns the member's sub-text exactly as written (inner whitespace kept, outer trimmed).
+query TT nosort
+SELECT '{"a" : {"b" :  1 } , "c":[1, 2 ]}'::json -> 'a', '{"a" : {"b" :  1 } , "c":[1, 2 ]}'::json -> 'c'
+----
+{"b" :  1 }
+[1, 2 ]
+
+# -> by index (a negative index counts from the end); a string element keeps its quotes + escapes.
+query TTT nosort
+SELECT '[1, {"a" : 2} ,  "x\"y"]'::json -> 1, '[1, {"a" : 2} ,  "x\"y"]'::json -> -1, '[1, {"a" : 2} ,  "x\"y"]'::json -> 0
+----
+{"a" : 2}
+"x\"y"
+1
+
+# ->> renders text: a string de-escaped, a number in its original spelling, a container verbatim,
+# true as written.
+query TTTTT nosort
+SELECT '{"s": "x\"y\/z"}'::json ->> 's', '{"n": 1.50}'::json ->> 'n', '{"e": 1e2}'::json ->> 'e', '{"o": {"k" : [ 1 ]}}'::json ->> 'o', '{"t": true}'::json ->> 't'
+----
+x"y/z
+1.50
+1e2
+{"k" : [ 1 ]}
+true
+
+# A unicode escape stays escaped in the json sub-text and is decoded only by the text forms.
+query TT nosort
+SELECT '{"e": "\u00e9\u0041"}'::json -> 'e', '{"e": "\u00e9\u0041"}'::json ->> 'e'
+----
+"\u00e9\u0041"
+éA
+
+# A JSON null member: -> returns the json null text, ->> SQL NULL.
+query TT nosort
+SELECT '{"c": null}'::json -> 'c', '{"c": null}'::json ->> 'c'
+----
+null
+NULL
+
+# A missing key, an out-of-range index, a key into an array, an index into an object, or any
+# access into a scalar is SQL NULL.
+query TTTTTT nosort
+SELECT '{"a":1}'::json -> 'b', '[1,2]'::json -> 2, '[1,2]'::json -> -3, '[1,2]'::json -> 'a', '{"a":1}'::json -> 0, '"s"'::json -> 'a'
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# Duplicate keys: -> and ->> take the LAST matching member.
+query TTT nosort
+SELECT '{"a":1,"a":2}'::json -> 'a', '{"a":1,"a":"two"}'::json ->> 'a', '{"a":{"b":1}, "a":5}'::json -> 'a'
+----
+2
+two
+5
+
+# A later duplicate whose value is JSON null wins too (->> → SQL NULL).
+query T nosort
+SELECT '{"a":"x","a":null}'::json ->> 'a'
+----
+NULL
+
+# Surrounding document whitespace is not part of a member's sub-text.
+query T nosort
+SELECT '  {"a" : 1}  '::json -> 'a'
+----
+1
+
+# Chained accessors: -> returns json, so it chains; the last step may render text.
+query TTT nosort
+SELECT ' {"a": [ 1 , {"b" : "v"} ] } '::json -> 'a' -> 1, ' {"a": [ 1 , {"b" : "v"} ] } '::json -> 'a' -> 1 ->> 'b', '{"a":1}'::json -> 'a' -> 'b'
+----
+{"b" : "v"}
+v
+NULL
+
+# #> / #>> navigate a text[] path; a path step is a key for an object and an integer for an array
+# (negative from the end).
+query TTT nosort
+SELECT '{"a":{"b":[10, {"c" : 3}]}}'::json #> '{a,b,1}', '{"a":{"b":[10, {"c" : 3}]}}'::json #>> '{a,b,1,c}', '{"a":{"b":[10, 20]}}'::json #> '{a,b,-1}'
+----
+{"c" : 3}
+3
+20
+
+# A missing step, a non-integer step into an array, or a NULL path element is SQL NULL.
+query TTT nosort
+SELECT '{"a":{"b":1}}'::json #> '{a,x}', '{"a":[1]}'::json #> '{a,z}', '{"a":1}'::json #> ARRAY['a', NULL]
+----
+NULL
+NULL
+NULL
+
+# A path walks EVERY duplicate key: the result is the last match in document order, so an earlier
+# duplicate can supply it when a later one has no such path.
+query TTTT nosort
+SELECT '{"a":1, "a":{"b":2}}'::json #> '{a,b}', '{"a":{"b":1}, "a":{"c":2}}'::json #> '{a,b}', '{"a":{"b":1}, "a":5}'::json #> '{a,b}', '{"a":[1,2], "a":{"x":1}}'::json #> '{a,0}'
+----
+2
+1
+1
+1
+
+# A later duplicate's JSON null still wins the path (#> → json null, #>> → SQL NULL).
+query TT nosort
+SELECT '{"a":{"b":1}, "a":{"b":null}}'::json #> '{a,b}', '{"a":{"b":1}, "a":{"b":null}}'::json #>> '{a,b}'
+----
+null
+NULL
+
+# PG quirk (pinned against the oracle): a negative path index is rebased onto the length of the
+# FIRST array met at its depth — matched or not — and the rebased index then applies to every later
+# array at that depth. So '{b,-1}' over {"a":[1,2,3], "b":[4,5]} looks for b[2] (NULL), and over
+# {"a":[9], "b":[4,5]} for b[0]. (jsonb has no such quirk.)
+query TTTTT nosort
+SELECT '{"a":[1,2,3], "b":[4,5]}'::json #> '{b,-1}', '{"a":[9], "b":[4,5]}'::json #> '{b,-1}', '[[1,2,3],[4,5]]'::json #> '{1,-1}', '{"a":[1,2,3], "a":[4,5]}'::json #> '{a,-1}', '{"a":[1,2,3], "b":[4,5]}'::jsonb #> '{b,-1}'
+----
+NULL
+4
+NULL
+3
+5
+
+# A path step parses as an array index PG's way: leading whitespace and a sign are allowed, a
+# leading zero is fine, trailing characters are not (json and jsonb alike).
+query TTTTTTTT nosort
+SELECT '[1,2,3]'::json #> ARRAY[' 1'], '[1,2,3]'::json #> ARRAY['1 '], '[1,2,3]'::json #> '{+1}', '[1,2,3]'::json #> '{01}', '[1,2,3]'::jsonb #> ARRAY[' 1'], '[1,2,3]'::jsonb #> ARRAY['1 '], '[1,2,3]'::jsonb #> '{+1}', '[1,2,3]'::jsonb #> '{01}'
+----
+2
+NULL
+2
+2
+2
+NULL
+2
+2
+
+# An out-of-i32 index step never matches; an empty step is the empty key.
+query TTT nosort
+SELECT '[1,2,3]'::json #> '{9999999999}', '[1,2,3]'::jsonb #> '{9999999999}', '{"":5}'::json #> ARRAY['']
+----
+NULL
+NULL
+5
+
+# An empty path returns the whole document: a container without its surrounding whitespace, a
+# scalar from the start of the text (PG keeps the leading whitespace); #>> de-escapes a string and
+# turns a JSON null into SQL NULL.
+query TTTTTT nosort
+SELECT '[' || ('  [1]  '::json #> '{}')::text || ']', '[' || ('  5  '::json #> '{}')::text || ']', '[' || ('  5  '::json #>> '{}') || ']', '[' || ('  "x"  '::json #> '{}')::text || ']', '[' || ('  "x"  '::json #>> '{}') || ']', '[' || ('  {"a": 1}  '::json #>> '{}') || ']'
+----
+[[1]]
+[  5]
+[  5]
+[  "x"]
+[x]
+[{"a": 1}]
+
+query T nosort
+SELECT '  null '::json #>> '{}'
+----
+NULL
+
+# A NULL base or argument is SQL NULL (the operators are strict).
+query TTT nosort
+SELECT '{"a":1}'::json -> NULL::text, NULL::json -> 'a', '{"a":1}'::json #> NULL::text[]
+----
+NULL
+NULL
+NULL
+
+# A json column: the accessors read its stored verbatim text; ->> filters.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, j json)
+
+statement ok
+INSERT INTO t VALUES (1, '{"k": "x",  "v" : [1,  2]}'), (2, '{"k":"y","v":{"n" :null}}'), (3, '[ "x" ]')
+
+query ITT rowsort
+SELECT id, j -> 'v', j ->> 'k' FROM t
+----
+1
+[1,  2]
+x
+2
+{"n" :null}
+y
+3
+NULL
+NULL
+
+query I nosort
+SELECT id FROM t WHERE j ->> 'k' = 'y'
+----
+2
+
+# --- json_array_elements[_text] ---------------------------------------------------------------
+
+# json_array_elements: one json row per element, each its verbatim sub-text.
+query T nosort
+SELECT * FROM json_array_elements('  [ 1 ,  {"a" : [ 2 ] } , "s\"q" , null , true, -1.50e3 ]  '::json)
+----
+1
+{"a" : [ 2 ] }
+"s\"q"
+null
+true
+-1.50e3
+
+# json_array_elements_text: a string de-escaped, a JSON null → SQL NULL, the rest verbatim.
+query T nosort
+SELECT * FROM json_array_elements_text('  [ 1 ,  {"a" : [ 2 ] } , "s\"q" , null , true, -1.50e3 ]  '::json)
+----
+1
+{"a" : [ 2 ] }
+s"q
+NULL
+true
+-1.50e3
+
+# A bare string literal adapts to json; an empty array / a NULL argument yields zero rows.
+query T nosort
+SELECT * FROM json_array_elements('[{"b":1,"b":2}]')
+----
+{"b":1,"b":2}
+
+query T nosort
+SELECT * FROM json_array_elements('[]'::json)
+----
+
+query T nosort
+SELECT * FROM json_array_elements_text(NULL::json)
+----
+
+# A non-array argument (an object or a scalar) is 22023.
+statement error 22023
+SELECT * FROM json_array_elements('{"a":1}'::json)
+
+statement error 22023
+SELECT * FROM json_array_elements_text('5'::json)
+
+# --- json_each[_text] ---------------------------------------------------------------------------
+
+# json_each: one (key, json) row per top-level member in INPUT order, duplicate keys kept, each
+# value its verbatim sub-text.
+query TT nosort
+SELECT * FROM json_each('{"a" : 1 , "b":{"x" :  [1, 2]}, "a": "two", "c": null}'::json)
+----
+a
+1
+b
+{"x" :  [1, 2]}
+a
+"two"
+c
+null
+
+# json_each_text: the value is the ->>-style text (a string de-escaped, a JSON null → SQL NULL).
+query TT nosort
+SELECT key, value FROM json_each_text('{"a" : 1 , "b":{"x" :  [1, 2]}, "a": "t\"wo", "c": null}'::json)
+----
+a
+1
+b
+{"x" :  [1, 2]}
+a
+t"wo
+c
+NULL
+
+# Keys are de-escaped.
+query TT nosort
+SELECT * FROM json_each('{"k\"1": 1.0}')
+----
+k"1
+1.0
+
+query TT nosort
+SELECT * FROM json_each_text('{"\u0041b": "\u00e9"}')
+----
+Ab
+é
+
+query TT nosort
+SELECT * FROM json_each('{}'::json)
+----
+
+query TT nosort
+SELECT * FROM json_each_text(NULL::json)
+----
+
+# A non-object argument (an array or a scalar) is 22023.
+statement error 22023
+SELECT * FROM json_each('[1]'::json)
+
+statement error 22023
+SELECT * FROM json_each_text('"s"'::json)
+
+# Implicitly lateral over a json column (the alias renames the relation).
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, d json)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"k": "x",  "v" : [1,  "two"]}'), (2, '{"v":[ {"n" :null} ], "k":"y"}')
+
+query ITT rowsort
+SELECT docs.id, e.key, e.value FROM docs CROSS JOIN json_each(docs.d) AS e
+----
+1
+k
+"x"
+1
+v
+[1,  "two"]
+2
+k
+"y"
+2
+v
+[ {"n" :null} ]
+
+query IT rowsort
+SELECT docs.id, e.* FROM docs CROSS JOIN json_array_elements_text(docs.d -> 'v') AS e
+----
+1
+1
+1
+two
+2
+{"n" :null}

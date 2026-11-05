@@ -1,0 +1,271 @@
+# JOIN ... USING (col, …) (spec/design/grammar.md §15): an equi-join on the named columns that
+# MERGES each into a single output column. `a JOIN b USING(k)` matches on `a.k = b.k` (3-valued,
+# like any ON) and the output carries ONE `k` — placed FIRST, before a's other columns then b's
+# (PostgreSQL; applied per join, so in a chain the newest join's merges lead). A bare `k` resolves to the merged column (never the 42702 ambiguity of the two
+# underlying copies); the qualified `a.k`/`b.k` still reach each side. The merge is the SURVIVING
+# side: the left for INNER/LEFT, the right for RIGHT. `FULL JOIN ... USING` (whose merge is a
+# COALESCE) is a deferred 0A000 narrowing, and a type-mismatched USING column is jed's strict-
+# comparison 42804 — both documented divergences from PostgreSQL in oracle_overrides.toml.
+# requires: ddl.create_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_using, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.hash_join, types.i32, types.text, resource.cost_metering, query.where_pushdown
+
+statement ok
+CREATE TABLE a (k i32, x i32)
+
+statement ok
+CREATE TABLE b (k i32, y i32)
+
+statement ok
+CREATE TABLE c (k i32, z i32)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+INSERT INTO b VALUES (2, 200), (3, 300), (4, 400)
+
+statement ok
+INSERT INTO c VALUES (3, 3000), (5, 5000)
+
+# INNER USING: `*` expands the MERGED k first, then a's other cols, then b's: k, x, y. Only matched
+# rows (k in {2,3}).
+# names: k, x, y
+# cost: 19
+query III nosort
+SELECT * FROM a JOIN b USING(k) ORDER BY k
+----
+2
+20
+200
+3
+30
+300
+
+# A bare `k` resolves to the merged column (unambiguous despite both tables having k).
+# names: k, x, y
+# cost: 19
+query III nosort
+SELECT k, x, y FROM a JOIN b USING(k) ORDER BY k
+----
+2
+20
+200
+3
+30
+300
+
+# The qualified a.k / b.k still reach each side (here equal, so both = the merged value).
+# names: k, k, x, y
+# cost: 19
+query IIII nosort
+SELECT a.k, b.k, x, y FROM a JOIN b USING(k) ORDER BY a.k
+----
+2
+2
+20
+200
+3
+3
+30
+300
+
+# WHERE on the merged column (`a.k` for an INNER USING) is pushed to a's scan (planner.md §3.2).
+# names: x, y
+# cost: 15
+query II nosort
+SELECT x, y FROM a JOIN b USING(k) WHERE k = 3
+----
+30
+300
+
+# LEFT USING: every left row kept; the merged k of an unmatched-left row (k=1) is the LEFT value.
+# names: k, x, y
+# cost: 53
+query III nosort
+SELECT k, x, y FROM a LEFT JOIN b USING(k) ORDER BY k
+----
+1
+10
+NULL
+2
+20
+200
+3
+30
+300
+
+# RIGHT USING: every right row kept; the merged k of an unmatched-right row (k=4) is the RIGHT value.
+# names: k, x, y
+# cost: 20
+query III nosort
+SELECT k, x, y FROM a RIGHT JOIN b USING(k) ORDER BY k
+----
+2
+20
+200
+3
+30
+300
+4
+NULL
+400
+
+# A USING CHAIN re-merges the same column: `a JOIN b USING(k) JOIN c USING(k)` keeps one k, then
+# x, y, z. Only k present in all three (k=3) survives.
+# names: k, x, y, z
+# cost: 21
+query IIII nosort
+SELECT * FROM a JOIN b USING(k) JOIN c USING(k) ORDER BY k
+----
+3
+30
+300
+3000
+
+# A multi-column USING merges each named column. p/q share (k, m).
+statement ok
+CREATE TABLE p (k i32, m i32, x i32)
+
+statement ok
+CREATE TABLE q (k i32, m i32, y i32)
+
+statement ok
+INSERT INTO p VALUES (1, 1, 10), (1, 2, 20)
+
+statement ok
+INSERT INTO q VALUES (1, 2, 200), (1, 3, 300)
+
+# Both k and m are merged, FIRST and in USING order: k, m, x, y. Match is (k=1, m=2).
+# names: k, m, x, y
+# cost: 19
+query IIII nosort
+SELECT * FROM p JOIN q USING(k, m) ORDER BY k, m
+----
+1
+2
+20
+200
+
+# A USING column absent from the right table is 42703 (matching PostgreSQL).
+statement error 42703
+SELECT * FROM a JOIN b USING(x)
+
+# A USING column absent from BOTH tables is 42703.
+statement error 42703
+SELECT * FROM a JOIN b USING(nope)
+
+# FULL JOIN ... USING is a deferred 0A000 narrowing — its merged column is COALESCE(left, right),
+# which jed's single-index merge does not model (PostgreSQL supports it).
+statement error 0A000
+SELECT * FROM a FULL JOIN b USING(k)
+
+# A type-mismatched USING column is jed's strict-comparison 42804 (PostgreSQL reports 42883
+# "operator does not exist: integer = text"). tt.k is text while a.k is i32.
+statement ok
+CREATE TABLE tt (k text, w i32)
+
+statement error 42804
+SELECT * FROM a JOIN tt USING(k)
+
+# A chain of USING joins on DIFFERENT columns lays `*` out per join, PostgreSQL's rule: each join's
+# output is its OWN merged columns, then the left input's remaining columns (already laid out by
+# the earlier join), then the right's. So the NEWEST join's merges come first.
+statement ok
+CREATE TABLE ua (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE TABLE ud (k i32, x i32)
+
+statement ok
+CREATE TABLE ue (k i32, y i32)
+
+statement ok
+CREATE TABLE ub (id i32, z i32)
+
+statement ok
+CREATE TABLE uc (k i32, w i32)
+
+statement ok
+INSERT INTO ua VALUES (1, 10)
+
+statement ok
+INSERT INTO ud VALUES (5, 10)
+
+statement ok
+INSERT INTO ue VALUES (5, 7)
+
+statement ok
+INSERT INTO ub VALUES (1, 2)
+
+statement ok
+INSERT INTO uc VALUES (5, 3)
+
+# (ua JOIN ud USING (x)) is x, id, k; joining ue USING (k) puts k first: k, x, id, y.
+# names: k, x, id, y
+# cost: 9
+query IIII nosort
+SELECT * FROM ua JOIN ud USING (x) JOIN ue USING (k)
+----
+5
+10
+1
+7
+
+# A third merge on yet another column again leads: id, then k, x, y, then ub's z.
+# names: id, k, x, y, z
+# cost: 12
+query IIIII nosort
+SELECT * FROM ua JOIN ud USING (x) JOIN ue USING (k) JOIN ub USING (id)
+----
+1
+5
+10
+7
+2
+
+# A RIGHT join's merged column (the right copy) leads its join's output the same way.
+# names: k, x, id, y
+# cost: 9
+query IIII nosort
+SELECT * FROM ua JOIN ud USING (x) RIGHT JOIN ue USING (k)
+----
+5
+10
+1
+7
+
+# A parenthesized join on the RIGHT is one input whose own `*` order (x, id, k) follows ue's
+# remaining column: k, y, x, id.
+# names: k, y, x, id
+# cost: 26
+query IIII nosort
+SELECT * FROM ue JOIN (ua JOIN ud USING (x)) USING (k)
+----
+5
+7
+10
+1
+
+# Comma-separated FROM items each lay out their OWN merged columns at the item's position — the
+# second item's k is not hoisted to the front.
+# names: id, x, z, k, x, w
+# cost: 11
+query IIIIII nosort
+SELECT * FROM ua JOIN ub USING (id), ud JOIN uc USING (k)
+----
+1
+10
+2
+5
+10
+3
+
+# names: id, x, k, x, y
+# cost: 8
+query IIIII nosort
+SELECT * FROM ua, ud JOIN ue USING (k)
+----
+1
+10
+5
+10
+7

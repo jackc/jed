@@ -1,0 +1,71 @@
+# The JSON cast matrix (J3, spec/design/json.md §6.1) — the RUNTIME casts on a non-literal
+# expression (a string-LITERAL operand still coerces at resolve via the J0 literal cast). The six
+# matrix rows: json → jsonb (re-parse + canonicalize), jsonb → json (render the canonical text),
+# json → text (identity on the verbatim bytes), jsonb → text (canonical jsonb_out), text → json
+# (validate + store verbatim), text → jsonb (parse + canonicalize). Same-type is the identity; a
+# NULL adapts; malformed text → json/jsonb traps 22P02. Output matches the postgres:18 oracle.
+# A non-text/json/jsonb source to json/jsonb (integer → jsonb) is a per-core divergence test (jed
+# 42804 vs PG 42846). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.jsonb, types.json, types.json_casts
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b jsonb, j json, s text)
+
+statement ok
+INSERT INTO t VALUES (1, '{ "a":1, "a":2 }', '{ "a" : 1 }', '[1, 2, 3]')
+
+# json → jsonb: re-parse + canonicalize (the duplicate "a" reduces last-wins to 2).
+query T nosort
+SELECT (j::jsonb) FROM t
+----
+{"a": 1}
+
+# jsonb → json: render the canonical text. The stored jsonb already deduped "a" to 2.
+query T nosort
+SELECT (b::json) FROM t
+----
+{"a": 2}
+
+# json → text: the identity on the stored verbatim bytes (whitespace preserved).
+query T nosort
+SELECT (j::text) FROM t
+----
+{ "a" : 1 }
+
+# jsonb → text: the canonical jsonb_out form.
+query T nosort
+SELECT (b::text) FROM t
+----
+{"a": 2}
+
+# text → json: validate + store verbatim (the text's exact bytes).
+query T nosort
+SELECT (s::json) FROM t
+----
+[1, 2, 3]
+
+# text → jsonb: parse + canonicalize (here already canonical, so identical text out).
+query T nosort
+SELECT (s::jsonb) FROM t
+----
+[1, 2, 3]
+
+# A chain text → jsonb canonicalizes a non-canonical string; same-type jsonb → jsonb is identity.
+query TT nosort
+SELECT ('{"z":1,"aa":2,"z":3}'::text)::jsonb, (b::jsonb) FROM t
+----
+{"z": 3, "aa": 2}
+{"a": 2}
+
+# A NULL operand adapts to the cast target.
+query T nosort
+SELECT (CAST(NULL AS text))::jsonb FROM t
+----
+NULL
+
+# Malformed text → json / jsonb traps 22P02 (the runtime json_in / jsonb_in).
+statement error 22P02
+SELECT ('not json'::text)::jsonb FROM t
+
+statement error 22P02
+SELECT ('{bad}'::text)::json FROM t

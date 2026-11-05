@@ -1,0 +1,55 @@
+# Aggregate every(boolean) -> boolean (spec/design/aggregates.md §23): the SQL-standard spelling of
+# bool_and — TRUE iff every non-NULL input is TRUE, NULL over an empty or all-NULL group. Output name
+# `every`.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.window_aggregate, types.i32, types.boolean_storable, resource.cost_metering, func.every, func.bool_and
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, b boolean)
+
+statement ok
+INSERT INTO t VALUES (1, 1, true), (2, 1, NULL), (3, 2, true), (4, 2, false), (5, 3, NULL)
+
+# names: every
+# cost: 12
+query B nosort
+SELECT every(b) FROM t
+----
+false
+
+# names: g, every, bool_and
+query IBB rowsort
+SELECT g, every(b), bool_and(b) FROM t GROUP BY g
+----
+1
+true
+true
+2
+false
+false
+3
+NULL
+NULL
+
+# names: every
+query B nosort
+SELECT every(b) FROM t WHERE g = 9
+----
+NULL
+
+# names: id, every
+query IB nosort
+SELECT id, every(b) OVER (PARTITION BY g) FROM t ORDER BY id
+----
+1
+true
+2
+true
+3
+false
+4
+false
+5
+NULL
+
+statement error 42883
+SELECT every(id) FROM t

@@ -1,0 +1,128 @@
+# INNER JOIN ... ON (spec/design/grammar.md §15): a logical left-deep join combining two
+# tables on a boolean ON predicate. A bare JOIN is INNER. The ON is three-valued — only a TRUE
+# result keeps a candidate pair, so a NULL on either side of the join key never matches (the
+# PostgreSQL inner-join semantics). Qualified (t.col) and bare column references both resolve
+# through the FROM scope. Eligible bare equalities use hash join; other predicates retain nested
+# loop. Cost is the CROSS-CORE contract of cost.md §3.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, query.hash_join, expr.arithmetic, types.i32, types.text, resource.cost_metering, query.where_pushdown
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, label text)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, NULL)
+
+# b has a row with a NULL join key (id 30) — it must match no left row (3-valued ON).
+statement ok
+INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'), (30, NULL, 'nullk')
+
+# Equi-join on k. a.k=10 → b(10); a.k=20 → b(20) and b(21); a.k=30 → no b; a.k=NULL → none.
+# P7 selects nested loop for this small pair: both relations materialize once, all 16 pairs recheck
+# ON, and the three matches are produced. Projection leaves add no operator_eval.
+# names: id, label
+# cost: 29
+query IT nosort
+SELECT a.id, b.label FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+ten
+2
+twenty
+2
+twentyish
+
+# An explicit INNER keyword is identical to a bare JOIN and selects the same plan/cost.
+# names: id
+# cost: 29
+query I nosort
+SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+2
+2
+
+# A WHERE conjunct on one relation runs as that relation is read (planner.md §3.2): `b.label =
+# 'twenty'` evaluates on each b row and keeps one, so only that row reaches the join. Its ordinary
+# operator_eval and varlen_compare work composes with the selected nested-loop ON and output cost.
+# names: id, k
+# cost: 35
+query II nosort
+SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id
+----
+2
+20
+
+# An ON predicate may reference a single side. `a.k > 25` is TRUE only for a row k=30 (a.id 3;
+# a NULL k is unknown), which then pairs with every b row → 4 results. The conjunct is pushed to a's
+# scan (planner.md §3.3): a 1 page + 4 rows + 4 filter evals = 9, b 1 page + 4 rows = 5; no ON is
+# left, so the one surviving a row pairs with every b row; 4 produced. 9 + 5 + 4 = 18.
+# Both output columns are named `id` (duplicate output names across tables are allowed).
+# names: id, id
+# cost: 18
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
+----
+3
+10
+3
+20
+3
+21
+3
+30
+
+# G26 — a NON-equi ON comparing BOTH sides (`a.k > b.k`): each a row pairs with every b row whose
+# k is strictly smaller (a NULL on either side is UNKNOWN, never a match). a.k=20 beats b.k=10;
+# a.k=30 beats b.k=10/20/20. 8 materialize + 2 page + 16 ON (4x4 `>`) + 4 produced = 30.
+# names: id, id
+# cost: 30
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k > b.k ORDER BY a.id, b.id
+----
+2
+10
+3
+10
+3
+20
+3
+21
+
+# An EXPRESSION-keyed equi-join: `a.k = b.k + 10` evaluates the `b.k + 10` per candidate pair.
+# a.k=20 = b.k(10)+10 → (2,10); a.k=30 = b.k(20)+10 → (3,20),(3,21). 8 materialize + 2 page + 32 ON
+# (4x4 pairs x 2 ops: the Add and the `=`) + 3 produced = 45.
+# names: id, id
+# cost: 45
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k + 10 ORDER BY a.id, b.id
+----
+2
+10
+3
+20
+3
+21
+
+# A join with no surviving pair yields the empty result. ON matches 3, WHERE `a.id = 999` drops all 3.
+# (The WHERE bounds a's scan to its PRIMARY KEY — a point-lookup miss, so a materializes 0 rows — but
+# that is a cost-only optimization pinned in joins/pushdown.test; here only the rows are asserted.)
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
+----
+
+# SELECT * expands across BOTH tables in FROM order, each in catalog order: a(id, k) then b(id, k,
+# label). Five output columns. ON matches 3 rows; WHERE `a.id = 1` evaluates on each and keeps one.
+# (The WHERE also bounds a's scan to its PRIMARY KEY — a cost-only optimization pinned in
+# joins/pushdown.test; here only the rows and the star column order/names are asserted.)
+# names: id, k, id, k, label
+query IIIIT nosort
+SELECT * FROM a JOIN b ON a.k = b.k WHERE a.id = 1
+----
+1
+10
+10
+10
+ten

@@ -1,0 +1,264 @@
+# Collated window ORDER BY (spec/design/window.md §3/§5, S10). A window definition's ORDER BY honors
+# a per-key COLLATE and a text column's frozen implicit collation, exactly like the query ORDER BY:
+# text orders by the collation's UCA sort key, while COLLATE "C" / no collation keep raw-byte order.
+# The collation drives BOTH the per-partition sort AND peer determination — ranking peer groups, the
+# running aggregate default frame, and RANGE/GROUPS frame peer groups. Because the vendored collations
+# are deterministic (collated-equality IS byte-identity, collation.md §7), collated peer groups
+# coincide with byte-equal groups; only the order changes. COLLATE on a non-text key is 42804.
+#
+# The vendored `unicode` collation is the CLDR-DUCET root: a < A < ä < b < B < z (lowercase before its
+# uppercase, ä near a). Built-in C is byte / code-point order: A(0x41) < B < a(0x61) < b < z < ä(0xC3A4).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.window, query.window_ranking, query.window_aggregate, query.window_frame, query.window_frame_range, query.window_collation, expr.collate, ddl.collate_column, types.i32, types.text
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE wc (id i32 PRIMARY KEY, g i32, name text, v i32)
+
+statement ok
+INSERT INTO wc VALUES (1,1,'b',10),(2,1,'A',20),(3,1,'ä',30),(4,2,'z',40),(5,2,'a',50),(6,2,'B',60)
+
+# ============================================================================================
+# row_number over a collated ORDER BY — the unicode sequence a < A < ä < b < B < z assigns 1..6.
+# (Distinct names, so no peer/tie ambiguity — sequence functions are deterministic vs PG here.)
+# ============================================================================================
+
+query II nosort
+SELECT id, row_number() OVER (ORDER BY name COLLATE "unicode") AS rn FROM wc ORDER BY id
+----
+1
+4
+2
+2
+3
+3
+4
+6
+5
+1
+6
+5
+
+# COLLATE "C" forces raw-byte order back: A < B < a < b < z < ä → a different sequence
+query II nosort
+SELECT id, row_number() OVER (ORDER BY name COLLATE "C") AS rn FROM wc ORDER BY id
+----
+1
+4
+2
+1
+3
+6
+4
+5
+5
+3
+6
+2
+
+# DESC under the collation reverses the collated order (z < B < b < ä < A < a descending)
+query II nosort
+SELECT id, row_number() OVER (ORDER BY name COLLATE "unicode" DESC) AS rn FROM wc ORDER BY id
+----
+1
+3
+2
+5
+3
+4
+4
+1
+5
+6
+6
+2
+
+# ============================================================================================
+# rank / dense_rank under a collation, PARTITION BY a column. Within g=1 (A,ä,b) the unicode order
+# is A<ä<b → 1,2,3; within g=2 (z,a,B) it is a<B<z → 1,2,3. All distinct → rank == dense_rank.
+# ============================================================================================
+
+query III nosort
+SELECT id,
+       rank() OVER (PARTITION BY g ORDER BY name COLLATE "unicode") AS rk,
+       dense_rank() OVER (PARTITION BY g ORDER BY name COLLATE "unicode") AS dr
+FROM wc ORDER BY id
+----
+1
+3
+3
+2
+1
+1
+3
+2
+2
+4
+3
+3
+5
+1
+1
+6
+2
+2
+
+# ============================================================================================
+# Aggregate window over a collated ORDER BY (default frame = RANGE UNBOUNDED PRECEDING TO CURRENT
+# ROW). Running sum follows the unicode sequence a(50) < A(20) < ä(30) < b(10) < B(60) < z(40):
+# 50, 70, 100, 110, 170, 210 — assigned back to the rows by collation position.
+# ============================================================================================
+
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY name COLLATE "unicode") AS s FROM wc ORDER BY id
+----
+1
+110
+2
+70
+3
+100
+4
+210
+5
+50
+6
+170
+
+# first_value over the whole partition (explicit ROWS frame): the collation-first row is 'a' for all
+query IT nosort
+SELECT id, first_value(name) OVER (ORDER BY name COLLATE "unicode"
+       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS fv
+FROM wc ORDER BY id
+----
+1
+a
+2
+a
+3
+a
+4
+a
+5
+a
+6
+a
+
+# ============================================================================================
+# Byte-identical PEERS under a collation. Three 'a' rows are one peer group (deterministic
+# collation: collated-equal = byte-equal), 'A' a distinct group. Peer-order-independent functions
+# (rank/dense_rank/sum/count) match PG exactly even though jed pins intra-peer order by PK (D1).
+# ============================================================================================
+
+statement ok
+CREATE TABLE wp (id i32 PRIMARY KEY, s text, v i32)
+
+statement ok
+INSERT INTO wp VALUES (1,'a',10),(2,'a',20),(3,'A',30),(4,'b',40),(5,'a',50)
+
+# unicode peer groups: {a,a,a} then {A} then {b}. rank = 1,1,1,4,5 ; dense_rank = 1,1,1,2,3
+query III nosort
+SELECT id,
+       rank() OVER (ORDER BY s COLLATE "unicode") AS rk,
+       dense_rank() OVER (ORDER BY s COLLATE "unicode") AS dr
+FROM wp ORDER BY id
+----
+1
+1
+1
+2
+1
+1
+3
+4
+2
+4
+5
+3
+5
+1
+1
+
+# running sum, default frame: CURRENT ROW spans the whole 'a' peer group, so all three 'a' rows get
+# the cumulative sum through that group = 10+20+50 = 80; then +30 (A) = 110; then +40 (b) = 150
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY s COLLATE "unicode") AS s FROM wp ORDER BY id
+----
+1
+80
+2
+80
+3
+110
+4
+150
+5
+80
+
+# GROUPS frame over the collated peer groups: CURRENT ROW AND 1 FOLLOWING. For an 'a' row that is
+# group {a,a,a}(3) + group {A}(1) = 4; for 'A' it is {A}(1) + {b}(1) = 2; for 'b' it is {b}(1) = 1.
+query II nosort
+SELECT id, count(*) OVER (ORDER BY s COLLATE "unicode"
+       GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS c
+FROM wp ORDER BY id
+----
+1
+4
+2
+4
+3
+2
+4
+1
+5
+4
+
+# ============================================================================================
+# A text column's FROZEN implicit collation drives a bare window ORDER BY (no explicit COLLATE) —
+# previously this was 0A000 even for the column's own collation.
+# ============================================================================================
+
+statement ok
+CREATE TABLE wf (id i32 PRIMARY KEY, name text COLLATE "unicode")
+
+statement ok
+INSERT INTO wf VALUES (1,'b'),(2,'A'),(3,'a'),(4,'z'),(5,'ä')
+
+# bare ORDER BY name uses the column's unicode collation → a < A < ä < b < z → rn 4,2,1,5,3
+query II nosort
+SELECT id, row_number() OVER (ORDER BY name) AS rn FROM wf ORDER BY id
+----
+1
+4
+2
+2
+3
+1
+4
+5
+5
+3
+
+# an explicit COLLATE "C" on the window key overrides the column's implicit collation back to byte
+# order: A(0x41) < a < b < z < ä → rn 3,1,2,4,5
+query II nosort
+SELECT id, row_number() OVER (ORDER BY name COLLATE "C") AS rn FROM wf ORDER BY id
+----
+1
+3
+2
+1
+3
+2
+4
+4
+5
+5
+
+# ============================================================================================
+# Errors — COLLATE on a non-text window ORDER BY key is 42804 (datatype_mismatch), as in query ORDER BY
+# ============================================================================================
+
+statement error 42804
+SELECT id, row_number() OVER (ORDER BY id COLLATE "unicode") FROM wc

@@ -1,0 +1,130 @@
+# Base-table column alias lists — `FROM t AS x (p, q)` (spec/design/grammar.md §15). The list
+# renames the columns this FROM item exposes, left to right: a shorter list is a partial rename, a
+# longer one is 42P10, and only the new names resolve. `*`, `x.*`, USING and NATURAL see the new
+# names. The rename is resolution-only, so access paths are unchanged. The same lists apply to a
+# view reference (ddl/views.test). PostgreSQL-oracle-checked.
+# requires: query.table_column_alias, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_star, query.where_eq, query.order_by, query.join_inner, query.join_using, query.join_natural, query.table_alias, query.qualified_column, query.qualified_star, query.subquery_scalar, query.subquery_in, query.aggregates, types.i32, types.text
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b text, c i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, 'z', NULL)
+
+# names: p, q, c
+query ITI nosort
+SELECT * FROM t AS x (p, q) ORDER BY p
+----
+1
+x
+10
+2
+y
+20
+3
+z
+NULL
+
+# AS is optional before the alias
+# names: p, c
+query II nosort
+SELECT x.p, c FROM t x (p) WHERE x.p = 1
+----
+1
+10
+
+query T nosort
+SELECT q FROM t AS x (p, q) WHERE p = 2
+----
+y
+
+# names: p, b, c
+query ITI nosort
+SELECT x.* FROM t AS x (p) WHERE p = 3
+----
+3
+z
+NULL
+
+# the old names are gone from this FROM item
+statement error 42703
+SELECT x.a FROM t AS x (p)
+
+statement error 42703
+SELECT a FROM t AS x (p)
+
+statement error 42P10
+SELECT * FROM t AS x (p, q, r, s)
+
+# a duplicated name is accepted; only a bare reference to it is ambiguous
+# names: p, p, c
+query ITI nosort
+SELECT * FROM t AS x (p, p) WHERE c = 20
+----
+2
+y
+20
+
+statement error 42702
+SELECT p FROM t AS x (p, p)
+
+# --- joins: USING and NATURAL match on the renamed names -------------------------------------------
+
+# names: k, b, c, b, c
+query ITITI nosort
+SELECT * FROM t AS x (k) JOIN t AS y (k) USING (k) WHERE k = 1
+----
+1
+x
+10
+x
+10
+
+# names: k, v, c
+query ITI nosort
+SELECT * FROM t AS x (k, v) NATURAL JOIN t AS y (k, v) ORDER BY k
+----
+1
+x
+10
+2
+y
+20
+
+query II nosort
+SELECT l.k, r.k FROM t AS l (k) JOIN t AS r (k) ON r.k = l.k + 1 ORDER BY l.k
+----
+1
+2
+2
+3
+
+# --- in subqueries and DML predicates ---------------------------------------------------------------
+
+query I nosort
+SELECT a FROM t WHERE a IN (SELECT k FROM t AS s (k) WHERE k > 1) ORDER BY a
+----
+2
+3
+
+query I nosort
+SELECT (SELECT max(k) FROM t AS s (k))
+----
+3
+
+statement ok
+UPDATE t SET c = 0 WHERE a IN (SELECT k FROM t AS s (k, v) WHERE v = 'z')
+
+statement ok
+DELETE FROM t WHERE a = (SELECT min(k) FROM t AS s (k))
+
+statement error 42703
+SELECT p, c FROM t AS x (p, q, r)
+
+query II nosort
+SELECT p, r FROM t AS x (p, q, r) ORDER BY p
+----
+2
+20
+3
+0

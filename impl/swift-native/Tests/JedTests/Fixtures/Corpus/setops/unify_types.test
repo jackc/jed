@@ -1,0 +1,346 @@
+# Type unification at a combining position (spec/design/grammar.md §25 "Column types") — the ONE
+# pairwise rule a set operation's output column, a VALUES-body column, a CASE result arm, and a
+# COALESCE argument all fold. Its core promise: IDENTICAL TYPES ALWAYS UNIFY, whatever the family —
+# json, jsonb, jsonpath, date, interval, f32/f64, arrays, ranges, composites — not only the
+# text/boolean/bytea/uuid/timestamp scalars the rule once enumerated. Beyond identity it promotes
+# integer widths (also inside an array element), int with decimal to decimal, and f32 with f64 to
+# f64 (the narrower values widened). Anything else is 42804.
+#
+# Unifying is not matching: every set operation except UNION ALL matches rows, so each column also
+# needs an EQUALITY operator — json and jsonpath ship none (nor does an array or composite holding
+# one), so UNION / INTERSECT / EXCEPT (with or without ALL) and a UNION recursive CTE over them are
+# 42883, exactly PostgreSQL's "could not identify an equality operator". UNION ALL, VALUES, CASE,
+# and COALESCE never compare, so json flows through them.
+# requires: query.select, query.select_no_from, query.values, query.derived_table, query.union, query.intersect, query.except, query.cte, query.cte_recursive, expr.case, expr.coalesce, cast.operator, types.i32, types.i64, types.decimal, types.text, types.f32, types.f64, types.date, types.interval, types.json, types.jsonb, types.jsonpath, types.array, types.range, types.composite
+
+# --- VALUES: identical types unify across rows -----------------------------------------------
+
+# The motivating case: two jsonb rows.
+query I nosort
+SELECT count(*) FROM (VALUES ('1'::jsonb), ('2'::jsonb)) v(x)
+----
+2
+
+# names: x
+# types: jsonb
+query T rowsort
+SELECT x FROM (VALUES ('{"b":1,"a":2}'::jsonb), ('[1, 2]'::jsonb)) v(x)
+----
+[1, 2]
+{"a": 2, "b": 1}
+
+# json keeps its input text verbatim.
+# types: json
+query T rowsort
+SELECT x FROM (VALUES ('{"b":1,  "a":2}'::json), ('[1, 2]'::json)) v(x)
+----
+[1, 2]
+{"b":1,  "a":2}
+
+# types: jsonpath
+query T rowsort
+SELECT x FROM (VALUES ('$.a'::jsonpath), ('$.b[0]'::jsonpath)) v(x)
+----
+$."a"
+$."b"[0]
+
+# types: date
+query T rowsort
+SELECT x FROM (VALUES ('2024-01-02'::date), ('1999-12-31'::date)) v(x)
+----
+1999-12-31
+2024-01-02
+
+# types: interval
+query T rowsort
+SELECT x FROM (VALUES ('1 day'::interval), ('2 hours'::interval)) v(x)
+----
+02:00:00
+1 day
+
+# types: f32
+query R rowsort
+SELECT x FROM (VALUES (1.5::f32), (2.25::f32)) v(x)
+----
+1.5
+2.25
+
+# Arrays of the same element type, including a json element.
+# types: i32[]
+query T rowsort
+SELECT x FROM (VALUES (ARRAY[1::i32, 2::i32]), (ARRAY[3::i32])) v(x)
+----
+{1,2}
+{3}
+
+# types: json[]
+query T rowsort
+SELECT x FROM (VALUES (ARRAY['1'::json]), (ARRAY['{"a":1}'::json])) v(x)
+----
+{"{\"a\":1}"}
+{1}
+
+# types: i32range
+query T rowsort
+SELECT x FROM (VALUES ('[1,5)'::int4range), ('[7,9]'::int4range)) v(x)
+----
+[1,5)
+[7,10)
+
+# types: numrange
+query T rowsort
+SELECT x FROM (VALUES ('[1.5,2.5)'::numrange), (numrange(3, NULL))) v(x)
+----
+[1.5,2.5)
+[3,)
+
+# A NULL row takes the column's type from the other rows.
+# types: daterange
+query T rowsort
+SELECT x FROM (VALUES (NULL), ('[2024-01-01,2024-02-01)'::daterange)) v(x)
+----
+NULL
+[2024-01-01,2024-02-01)
+
+statement ok
+CREATE TYPE uaddr AS (street text, zip i32)
+
+statement ok
+CREATE TYPE uaddr2 AS (street text, zip i32)
+
+# types: uaddr
+query T rowsort
+SELECT x FROM (VALUES ('(main,1)'::uaddr), ('(elm,2)'::uaddr)) v(x)
+----
+(elm,2)
+(main,1)
+
+# Integer widths promote inside an array element (a value no-op).
+# types: i64[]
+query T rowsort
+SELECT x FROM (VALUES (ARRAY[1::i32]), (ARRAY[2::i64])) v(x)
+----
+{1}
+{2}
+
+# f32 with f64 is f64: the f32 value widens exactly (1.1 as f32 is 1.100000023841858 as f64).
+# types: f64
+query R rowsort
+SELECT x FROM (VALUES (1.1::f32), (2.5::f64)) v(x)
+----
+1.100000023841858
+2.5
+
+# --- VALUES: no common type -> 42804 ---------------------------------------------------------
+
+# json and jsonb are distinct types (PostgreSQL reports this pair as 42846).
+statement error 42804
+SELECT x FROM (VALUES ('1'::json), ('1'::jsonb)) v(x)
+
+statement error 42804
+SELECT x FROM (VALUES ('[1,2)'::int4range), ('[1,2)'::int8range)) v(x)
+
+statement error 42804
+SELECT x FROM (VALUES (ARRAY[1::i32]), (ARRAY['a'::text])) v(x)
+
+statement error 42804
+SELECT x FROM (VALUES ('(main,1)'::uaddr), ('(main,1)'::uaddr2)) v(x)
+
+statement error 42804
+SELECT x FROM (VALUES ('2024-01-01'::date), ('1 day'::interval)) v(x)
+
+# An element-wise int -> decimal (or f32 -> f64) widening inside an array is a deferred narrowing
+# (PostgreSQL unifies to numeric[]): jed unifies array elements only across integer widths.
+statement error 42804
+SELECT x FROM (VALUES (ARRAY[1::i32]), (ARRAY[1.5])) v(x)
+
+# --- UNION ALL: identical types concatenate, no equality needed ------------------------------
+
+# types: json
+query T rowsort
+SELECT '{"a":1}'::json UNION ALL SELECT '{"a":1}'::json
+----
+{"a":1}
+{"a":1}
+
+# types: jsonpath
+query T rowsort
+SELECT '$.a'::jsonpath UNION ALL SELECT '$.a'::jsonpath
+----
+$."a"
+$."a"
+
+# types: json[]
+query T rowsort
+SELECT ARRAY['1'::json] UNION ALL SELECT ARRAY['2'::json]
+----
+{1}
+{2}
+
+# types: f64
+query R rowsort
+SELECT 1.1::f32 UNION ALL SELECT 2.5::f64
+----
+1.100000023841858
+2.5
+
+# --- UNION / INTERSECT / EXCEPT: the matching forms dedup by each type's equality ------------
+
+# jsonb keys are canonical, so the two spellings are one value.
+query T rowsort
+SELECT '{"a":1,"b":2}'::jsonb UNION SELECT '{"b":2,"a":1}'::jsonb
+----
+{"a": 1, "b": 2}
+
+query T rowsort
+SELECT '[1,5)'::int4range UNION SELECT '[1,4]'::int4range UNION SELECT '[2,3)'::int4range
+----
+[1,5)
+[2,3)
+
+query T rowsort
+SELECT ARRAY[1, 2] INTERSECT SELECT ARRAY[1, 2]
+----
+{1,2}
+
+query T rowsort
+SELECT '2024-01-01'::date EXCEPT SELECT '2024-01-02'::date
+----
+2024-01-01
+
+query T rowsort
+SELECT '(main,1)'::uaddr UNION SELECT '(main,1)'::uaddr
+----
+(main,1)
+
+# 1.5 is exact in f32, so it matches the f64 1.5 after widening; 1.1 is not, so it does not.
+query R rowsort
+SELECT 1.5::f32 INTERSECT SELECT 1.5::f64
+----
+1.5
+
+query R rowsort
+SELECT 1.1::f32 INTERSECT SELECT 1.1::f64
+----
+
+# --- json / jsonpath have no equality operator: the matching forms are 42883 -----------------
+
+statement error 42883
+SELECT '1'::json UNION SELECT '1'::json
+
+statement error 42883
+SELECT '1'::json INTERSECT SELECT '1'::json
+
+statement error 42883
+SELECT '1'::json EXCEPT SELECT '2'::json
+
+statement error 42883
+SELECT '1'::json INTERSECT ALL SELECT '1'::json
+
+statement error 42883
+SELECT '1'::json EXCEPT ALL SELECT '1'::json
+
+statement error 42883
+SELECT '$.a'::jsonpath UNION SELECT '$.a'::jsonpath
+
+statement error 42883
+SELECT ARRAY['1'::json] EXCEPT SELECT ARRAY['1'::json]
+
+# A NULL operand takes json's type, so the column is still json.
+statement error 42883
+SELECT '1'::json UNION SELECT NULL
+
+# --- set operations: no common type -> 42804 -------------------------------------------------
+
+statement error 42804
+SELECT '1'::json UNION ALL SELECT '1'::jsonb
+
+statement error 42804
+SELECT ARRAY[1::i32] UNION ALL SELECT ARRAY['a'::text]
+
+statement error 42804
+SELECT '[1,2)'::int4range UNION ALL SELECT '[1,2)'::int8range
+
+statement error 42804
+SELECT '(main,1)'::uaddr UNION ALL SELECT '(main,1)'::uaddr2
+
+# --- CASE / COALESCE: the same rule --------------------------------------------------------
+
+# types: jsonpath
+query T nosort
+SELECT CASE WHEN true THEN '$.a'::jsonpath ELSE '$.b'::jsonpath END
+----
+$."a"
+
+# types: json
+query T nosort
+SELECT COALESCE(NULL::json, '{"x": 1}'::json)
+----
+{"x": 1}
+
+# types: i32range
+query T nosort
+SELECT COALESCE(NULL, '[1,3)'::int4range, '[2,4)'::int4range)
+----
+[1,3)
+
+# A mixed-width float CASE / COALESCE is f64, its f32 arm widened.
+# types: f64
+query R nosort
+SELECT CASE WHEN true THEN 1.1::f32 ELSE 2.5::f64 END
+----
+1.100000023841858
+
+# types: f64, f64
+query RR nosort
+SELECT COALESCE(NULL::f32, 2.5::f64), COALESCE(1.1::f32, 2.5::f64)
+----
+2.5
+1.100000023841858
+
+statement error 42804
+SELECT CASE WHEN true THEN ARRAY[1::i32] ELSE ARRAY['a'::text] END
+
+statement error 42804
+SELECT COALESCE('[1,2)'::int4range, '[1,2)'::int8range)
+
+statement error 42804
+SELECT COALESCE('(main,1)'::uaddr, '(main,1)'::uaddr2)
+
+statement error 42804
+SELECT COALESCE('1'::json, '1'::jsonb)
+
+# --- derived tables and CTEs carry these column types ------------------------------------------
+
+# types: jsonb, i32range
+query TT nosort
+WITH c AS (SELECT '{"k": true}'::jsonb AS j, '[1,5)'::int4range AS r) SELECT j, r FROM c
+----
+{"k": true}
+[1,5)
+
+query I nosort
+SELECT count(*) FROM (SELECT '1'::json UNION ALL SELECT '2'::json) s
+----
+2
+
+# --- recursive CTE: a UNION (dedup) recursive CTE needs equality; UNION ALL does not ---------
+
+statement error 42883
+WITH RECURSIVE r(j, n) AS (SELECT '1'::json, 1 UNION SELECT j, n + 1 FROM r WHERE n < 3) SELECT count(*) FROM r
+
+query I nosort
+WITH RECURSIVE r(j, n) AS (SELECT '1'::json, 1 UNION ALL SELECT j, n + 1 FROM r WHERE n < 3) SELECT count(*) FROM r
+----
+3
+
+# The anchor fixes f64; the recursive term's f32 widens to it.
+query RI rowsort
+WITH RECURSIVE r(x, n) AS (SELECT 1.5::f64, 1 UNION ALL SELECT 2.5::f32, n + 1 FROM r WHERE n < 3) SELECT x, n FROM r
+----
+1.5
+1
+2.5
+2
+2.5
+3

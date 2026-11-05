@@ -1,0 +1,61 @@
+# Patterns with many capture groups (spec/design/regex.md §4.1). A thread's capture slots are a
+# persistent array, a tree of 16-slot leaves, so a Save copies only the path to the slot it sets. The
+# small patterns elsewhere fit in one leaf; these 300-group patterns have 602 slots, three levels, so
+# every group must still report its own span from its own leaf. Oracle-checked against PostgreSQL.
+# requires: query.select_no_from, query.set_returning, func.array, func.regexp_match, func.regexp_matches, func.regexp_replace, func.regexp_substr, func.regexp_instr, types.array, types.i32, types.text, null.three_valued
+
+query I nosort
+SELECT cardinality(regexp_match(repeat('ab', 150), repeat('(a)(b)', 150)))
+----
+300
+
+# The first group, a group in the middle leaf, and the last group.
+query TTT nosort
+SELECT (regexp_match(repeat('ab', 150), repeat('(a)(b)', 150)))[1],
+       (regexp_match(repeat('ab', 150), repeat('(a)(b)', 150)))[150],
+       (regexp_match(repeat('ab', 150), repeat('(a)(b)', 150)))[300]
+----
+a
+b
+b
+
+# An optional group that does not participate stays unset (NULL) beside groups that do.
+query TTT nosort
+SELECT (regexp_match(repeat('a', 150), repeat('(a)(x)?', 150)))[297],
+       (regexp_match(repeat('a', 150), repeat('(a)(x)?', 150)))[298],
+       (regexp_match(repeat('a', 150), repeat('(a)(x)?', 150)))[299]
+----
+a
+NULL
+a
+
+# A repeated group keeps only its last iteration's span.
+query T nosort
+SELECT regexp_match('abcabd', '((a)(b)(c|d))+')
+----
+{abd,a,b,d}
+
+# The replacement template reads groups 9 and 2 of the many-group match.
+query T nosort
+SELECT regexp_replace(repeat('ab', 150) || 'z', repeat('(a)(b)', 150), '[\9\2]')
+----
+[ab]z
+
+# regexp_substr and regexp_instr select the last group.
+query TI nosort
+SELECT regexp_substr('x' || repeat('ab', 150), repeat('(a)(b)', 150), 1, 1, '', 300),
+       regexp_instr('x' || repeat('ab', 150), repeat('(a)(b)', 150), 1, 1, 0, '', 300)
+----
+b
+301
+
+# Every match of a global search reports its own groups.
+query TT nosort
+SELECT m[1], m[20] FROM regexp_matches(repeat('ab', 30), repeat('(a)(b)', 10), 'g') AS m
+----
+a
+b
+a
+b
+a
+b

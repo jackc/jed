@@ -1,0 +1,92 @@
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# Database-qualified table names — the `temp.` qualifier + main/temp cross-scope resolution (Slice 1a
+# of attached databases, spec/design/attached-databases.md §3). The `temp` qualifier reaches the
+# session-local temp domain; `main` reaches the file/persistent database. Because jed precludes
+# overlaps (a name is temp XOR persistent within a session — §3), a `temp.`/`main.` qualifier is a
+# VALIDATION GATE: it asserts the relation is in the claimed scope, else 42P01. This suite needs temp
+# tables, so it skips disk mode (like ddl/temp_table.test). jed-specific, CROSS-CORE-checked, NOT
+# oracle-checked.
+# requires: query.qualified_table, ddl.temp_table, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, session.allow_temp_ddl
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p VALUES (1, 10), (2, 20)
+
+statement ok
+CREATE TEMP TABLE tt (id i32 PRIMARY KEY, w i32)
+
+statement ok
+INSERT INTO tt VALUES (1, 100), (2, 200), (3, 300)
+
+# --- the `temp.` qualifier reads the session-local temp table ---------------------------------
+
+query I rowsort
+SELECT w FROM temp.tt
+----
+100
+200
+300
+
+query I nosort
+SELECT w FROM temp.tt WHERE id = 2
+----
+200
+
+# a bare name and the `temp.` qualifier name the same relation (preclude-overlaps)
+query I nosort
+SELECT w FROM tt WHERE id = 3
+----
+300
+
+# --- qualified DML targets on the temp table --------------------------------------------------
+
+statement ok
+INSERT INTO temp.tt VALUES (4, 400)
+
+statement ok
+UPDATE temp.tt SET w = 999 WHERE id = 4
+
+query I nosort
+SELECT w FROM temp.tt WHERE id = 4
+----
+999
+
+statement ok
+DELETE FROM temp.tt WHERE id = 4
+
+query I nosort
+SELECT id FROM temp.tt ORDER BY id
+----
+1
+2
+3
+
+# --- a cross-scope join: a persistent table (main) joined to a temp table ----------------------
+
+query II nosort
+SELECT a.v, b.w FROM main.p AS a JOIN temp.tt AS b ON a.id = b.id ORDER BY a.id
+----
+10
+100
+20
+200
+
+# --- the qualifier fixes the scope: no temp-vs-persistent shadow ------------------------------
+
+# a persistent table is not in the temp domain → 42P01
+statement error 42P01
+SELECT * FROM temp.p
+
+# a temp table is not in the file/persistent database → 42P01
+statement error 42P01
+SELECT * FROM main.tt
+
+# an absent name under the temp qualifier is 42P01
+statement error 42P01
+SELECT * FROM temp.nope
+
+# an unknown database qualifier is 42P01 even when a like-named temp table exists
+statement error 42P01
+SELECT * FROM other.tt

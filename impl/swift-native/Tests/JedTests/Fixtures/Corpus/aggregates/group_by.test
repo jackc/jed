@@ -1,0 +1,212 @@
+# GROUP BY — one result row per distinct grouping-key combination (spec/design/aggregates.md
+# §5-6, grammar.md §18). NULL is its own single group; decimal keys bucket value-canonically;
+# a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803. ORDER BY over a grouping
+# column sorts the group rows. Cost = rows scanned + rows x aggregates accumulated + 1 per
+# emitted group, plus each row's grouping and sort keys by size (0 for integers — cost.md §3 "sort_key / hash_key").
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, query.order_by_expr, query.order_by_alias, query.limit, types.i32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, NULL, 50), (6, NULL, 60)
+
+# One row per g group; NULL rows collapse into ONE group (NULL groups with NULL). ORDER BY g
+# sorts the groups, NULLs last (PG model). 6 scanned + 6x2 accumulate + 3 produced = 21.
+# names: g, count, sum
+# cost: 22
+query III nosort
+SELECT g, COUNT(*), SUM(a) FROM t GROUP BY g ORDER BY g
+----
+1
+2
+30
+2
+2
+70
+NULL
+2
+110
+
+# A qualified grouping key (t.g) resolves the same way.
+# names: g, count
+query II nosort
+SELECT t.g, COUNT(*) FROM t GROUP BY t.g ORDER BY t.g
+----
+1
+2
+2
+2
+NULL
+2
+
+# Decimal keys bucket by VALUE-canonical form: 1.5 and 1.50 (unconstrained numeric, distinct
+# stored scales) share ONE group of count 2; the displayed key is the first occurrence (1.5).
+statement ok
+CREATE TABLE td (id i32 PRIMARY KEY, d numeric)
+
+statement ok
+INSERT INTO td VALUES (1, 1.5), (2, 1.50), (3, 2.00)
+
+# names: d, count
+# Per-row keys add 20 (cost.md §3 "sort_key / hash_key"): 9 before them.
+# cost: 29
+query DI nosort
+SELECT d, COUNT(*) FROM td GROUP BY d ORDER BY d
+----
+1.5
+2
+2.00
+1
+
+# Composite grouping key (x, y): group by the pair.
+statement ok
+CREATE TABLE tc (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+INSERT INTO tc VALUES (1, 1, 1), (2, 1, 1), (3, 1, 2), (4, 2, 1)
+
+# names: x, y, count
+# cost: 12
+query III nosort
+SELECT x, y, COUNT(*) FROM tc GROUP BY x, y ORDER BY x, y
+----
+1
+1
+2
+1
+2
+1
+2
+1
+1
+
+# Grouping error: `a` is neither grouped nor aggregated -> 42803.
+statement error 42803
+SELECT g, a FROM t GROUP BY g
+
+# ORDER BY a non-grouping column in a grouped query -> 42803 (the grouping-error rule again).
+statement error 42803
+SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY a
+
+# GROUP BY over an empty table yields ZERO rows (contrast whole-table aggregation's one row).
+statement ok
+CREATE TABLE e (id i32 PRIMARY KEY, g i32)
+
+query II nosort
+SELECT g, COUNT(*) FROM e GROUP BY g ORDER BY g
+----
+
+# G29 — COUNT(*) vs COUNT(col) per group: COUNT(*) counts rows, COUNT(a) counts non-NULL values,
+# so COUNT(a) < COUNT(*) in any group with a NULL. g=1 has one NULL (2 vs 1); g=2 has two (3 vs 1).
+# 5 scan + 5x2 accumulate + 2 produced + 1 page = 18.
+statement ok
+CREATE TABLE tg (id i32 PRIMARY KEY, g i32, a i32)
+
+statement ok
+INSERT INTO tg VALUES (1, 1, 10), (2, 1, NULL), (3, 2, NULL), (4, 2, NULL), (5, 2, 50)
+
+# names: g, count, count
+# cost: 18
+query III nosort
+SELECT g, COUNT(*), COUNT(a) FROM tg GROUP BY g ORDER BY g
+----
+1
+2
+1
+2
+3
+1
+
+# Post-aggregation window: ORDER BY g DESC orders the GROUP rows (the NULL group sorts FIRST under
+# DESC, the PG model), and LIMIT 2 keeps the top two — NULL then g=2. The operands still accumulate
+# every row; the sort/limit are unmetered. 6 scan + 6 accumulate + 2 produced + 1 page = 15.
+# names: g, count
+# cost: 15
+query II nosort
+SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC LIMIT 2
+----
+NULL
+2
+2
+2
+
+# --- General-expression ORDER BY in a grouped query (grammar.md §10, query.order_by_expr) ---------
+# A grouped ORDER BY may sort by an AGGREGATE that is NOT in the select list: ORDER BY sum(a) adds a
+# new aggregate over the group, sorting g=1 (sum 30), g=2 (sum 70), NULL (sum 110) ascending.
+# names: g
+query I nosort
+SELECT g FROM t GROUP BY g ORDER BY sum(a)
+----
+1
+2
+NULL
+
+# An expression over a GROUPING key (g + 10): g+10 is 11, 12, NULL → ASC NULLS LAST keeps the group
+# order, the NULL group last. The aggregate sum(a) rides along in the projection.
+# names: g, sum
+query II nosort
+SELECT g, sum(a) FROM t GROUP BY g ORDER BY g + 10
+----
+1
+30
+2
+70
+NULL
+110
+
+# An expression over an aggregate (sum(a) DESC), descending: 110 (NULL group), 70 (g=2), 30 (g=1).
+# Under DESC the NULL group sorts where its (largest) sum lands — here naturally first.
+# names: g, sum
+query II nosort
+SELECT g, sum(a) FROM t GROUP BY g ORDER BY sum(a) DESC
+----
+NULL
+110
+2
+70
+1
+30
+
+# A non-grouped, non-aggregated column inside an ORDER BY EXPRESSION is 42803, the grouping-error rule
+# (the expression resolves against the group context like a select-list item — grammar.md §10).
+statement error 42803
+SELECT g FROM t GROUP BY g ORDER BY a + 1
+
+# The same column bare (not in an expression) is the existing 42803 path.
+statement error 42803
+SELECT g FROM t GROUP BY g ORDER BY a
+
+# --- Output-alias ORDER BY in a grouped query (grammar.md §10, query.order_by_alias) --------------
+# A bare ORDER BY name binds an OUTPUT column first (the alias form). `s` is the alias for the
+# aggregate sum(a), so ORDER BY s DESC sorts the groups by sum(a) descending: 110 (NULL group), 70
+# (g=2), 30 (g=1) — the same order as `ORDER BY sum(a) DESC` above, reached via the alias.
+# names: g, s
+query II nosort
+SELECT g, sum(a) AS s FROM t GROUP BY g ORDER BY s DESC
+----
+NULL
+110
+2
+70
+1
+30
+
+# The alias may bind the GROUPING column: `gg` is the alias for g, so ORDER BY gg sorts the groups
+# by g (1, 2, NULL last) — the column fast path through the group-key slot.
+# names: gg
+query I nosort
+SELECT g AS gg FROM t GROUP BY g ORDER BY gg
+----
+1
+2
+NULL
+
+# A DERIVED output name (no alias) also binds: an un-aliased aggregate is named by its lowercased
+# function name (§8), so `SELECT count(*) ... ORDER BY count` binds the count column. One implicit
+# group over the whole table → a single row (count 6).
+# names: count
+query I nosort
+SELECT count(*) FROM t ORDER BY count
+----
+6

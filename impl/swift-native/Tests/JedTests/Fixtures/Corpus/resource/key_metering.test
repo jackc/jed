@@ -1,0 +1,330 @@
+# Per-row key metering — the work a sort, a grouping/dedup table, or a window partition does on
+# each row's KEY VALUES is charged once per row, scaled by the value's size (spec/design/cost.md §3
+# "sort_key / hash_key — per-row key work"). Comparisons inside a sort and probes inside a hash table
+# stay unmetered; what is charged is the per-row measure that bounds them:
+#
+#   - a sort charges `sort_key × payload(v)` for each non-collated key value of every row it receives,
+#     and `collate × codepoints(v)` for a collated text key instead (its UCA sort key is built once per
+#     row);
+#   - GROUP BY, SELECT DISTINCT, a DISTINCT aggregate, a set operation's dedup or count table, a
+#     recursive CTE's UNION, and a window's PARTITION BY charge `hash_key × payload(v)` for each key
+#     value of every row they receive.
+#
+# `payload` is the shared logical size measure of the query-memory account (spec/design/memory.md §3):
+# UTF-8 bytes for text, 0 for NULL and every fixed-width type, so integer keys charge nothing. A sort
+# the plan elides (an ORDER BY served by primary-key or index order) receives no rows and charges
+# nothing. The charges are taken where the row enters the operator, so they are identical whether or
+# not the operator later spills.
+#
+# Why: without them, one large value repeated across many rows (a cross join with generate_series)
+# made a sort or dedup do work proportional to rows × value length for a cost proportional to
+# rows + value length, so a cost ceiling did not bound its CPU time.
+#
+# Each expected cost below is the cost the query had before these units, plus the per-row charge
+# shown. jed-specific (PostgreSQL has no cost meter), so the costs are cross-core-checked, not
+# oracle-checked; the result rows match PostgreSQL. Format + the `requires` gate:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_expr, query.order_by_topk, query.order_by_pk_scan, query.limit, query.group_by, query.distinct, query.distinct_on, query.aggregates, query.aggregate_distinct, query.aggregate_order_by, query.ordered_set_aggregate, query.window, query.window_ranking, query.union, query.intersect, query.cte, query.cte_recursive, query.set_returning, query.cross_join, query.table_alias, query.qualified_column, query.derived_table, func.string_agg, func.array, types.array, types.i32, types.text, expr.text_concat, expr.collate, null.three_valued, resource.cost_metering, resource.cost_limit, resource.key_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+# Five rows whose `s` payloads are 3, 2, 0 (NULL), 5, and 3 UTF-8 bytes: Σ payload(s) = 13.
+# Their code-point counts are 3, 2, 0, 3, and 3: Σ codepoints(s) = 11 ('ünï' is 3 code points in 5
+# bytes).
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text, n i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'abc', 1), (2, 'de', 2), (3, NULL, 1), (4, 'ünï', 2), (5, 'abc', 1)
+
+statement ok
+CREATE TABLE tk (k text PRIMARY KEY)
+
+statement ok
+INSERT INTO tk VALUES ('abc'), ('de'), ('ünï')
+
+# ============================================================================================
+# Sorts — sort_key per non-collated key value, collate per collated key
+# ============================================================================================
+
+# Fixed-width keys have payload 0: an integer ORDER BY charges nothing new. 11 + 0.
+# cost: 11
+query I nosort
+SELECT id FROM t ORDER BY n, id
+----
+1
+3
+5
+2
+4
+
+# A text key charges its payload on every row the sort receives: 11 + sort_key 13 = 24. The i32 tie
+# key adds nothing.
+# cost: 24
+query I nosort
+SELECT id FROM t ORDER BY s, id
+----
+1
+5
+2
+4
+3
+
+# A collated key charges collate per code point instead, never sort_key as well:
+# 11 + collate 11 = 22.
+# cost: 22
+query I nosort
+SELECT id FROM t ORDER BY s COLLATE "unicode", id
+----
+1
+5
+2
+4
+3
+
+# A top-k heap receives every row, including those it discards, so LIMIT does not lower the key
+# charge: 7 + sort_key 13 = 20.
+# cost: 20
+query I nosort
+SELECT id FROM t ORDER BY s, id LIMIT 1
+----
+1
+
+# An expression key charges its own evaluation as before, then its result's payload: 'abc!' 4,
+# 'de!' 3, NULL 0, 'ünï!' 6, 'abc!' 4. 33 + sort_key 17 = 50.
+# cost: 50
+query I nosort
+SELECT id FROM t ORDER BY s || '!', id
+----
+1
+5
+2
+4
+3
+
+# A container key is measured whole: payload(ARRAY[n]) = ARRAY_DIM 16 + one element's value_bytes
+# 32 = 48 per row, although its element is fixed-width. 256 + sort_key 5 × 48 = 496.
+# cost: 496
+query I nosort
+SELECT id FROM t ORDER BY ARRAY[n], id
+----
+1
+3
+5
+2
+4
+
+# A sort the plan elides receives no rows: ORDER BY a text primary key is served by storage order.
+# 7 + 0.
+# cost: 7
+query T nosort
+SELECT k FROM tk ORDER BY k
+----
+abc
+de
+ünï
+
+# DISTINCT ON sorts by its ON keys and ORDER BY keys and keeps the first row of each group; the
+# keep-first pass adds no charge. 10 + sort_key 13 = 23.
+# cost: 23
+query TI nosort
+SELECT DISTINCT ON (s) s, id FROM t ORDER BY s, id
+----
+abc
+1
+de
+2
+ünï
+4
+NULL
+3
+
+# An in-aggregate ORDER BY sorts the aggregate's inputs: 17 + sort_key 13 = 30.
+# cost: 30
+query T nosort
+SELECT string_agg(s, ',' ORDER BY s) FROM t
+----
+abc,abc,de,ünï
+
+# An ordered-set aggregate sorts its retained (non-NULL) inputs: 12 + sort_key 13 = 25.
+# cost: 25
+query T nosort
+SELECT mode() WITHIN GROUP (ORDER BY s) FROM t
+----
+abc
+
+# A window ORDER BY sorts each partition: 16 + sort_key 13 = 29.
+# cost: 29
+query II rowsort
+SELECT id, rank() OVER (ORDER BY s) FROM t
+----
+1
+1
+2
+3
+3
+5
+4
+4
+5
+1
+
+# Window definitions with an identical PARTITION BY and ORDER BY share one sort (window.md §5.2), so
+# the second function adds no key charge: 21 + sort_key 13 = 34.
+# cost: 34
+query III rowsort
+SELECT id, rank() OVER (ORDER BY s), dense_rank() OVER (ORDER BY s) FROM t
+----
+1
+1
+1
+2
+3
+2
+3
+5
+4
+4
+4
+3
+5
+1
+1
+
+# ============================================================================================
+# Grouping, dedup, and partitioning — hash_key per key value
+# ============================================================================================
+
+# GROUP BY charges every input row's grouping keys: 15 + hash_key 13 = 28.
+# cost: 28
+query TI rowsort
+SELECT s, count(*) FROM t GROUP BY s
+----
+NULL
+1
+abc
+2
+de
+1
+ünï
+1
+
+# SELECT DISTINCT charges every projected row it dedups: 10 + hash_key 13 = 23.
+# cost: 23
+query T rowsort
+SELECT DISTINCT s FROM t
+----
+NULL
+abc
+de
+ünï
+
+# A DISTINCT aggregate charges every input it checks against its value set: 12 + hash_key 13 = 25.
+# cost: 25
+query I nosort
+SELECT count(DISTINCT s) FROM t
+----
+3
+
+# UNION dedups the rows of both arms: 22 + hash_key 2 × 13 = 48.
+# cost: 48
+query T rowsort
+SELECT s FROM t UNION SELECT s FROM t
+----
+NULL
+abc
+de
+ünï
+
+# UNION ALL keeps every row and builds no table: 22 + 0.
+# cost: 22
+query T rowsort
+SELECT s FROM t UNION ALL SELECT s FROM t
+----
+NULL
+NULL
+abc
+abc
+abc
+abc
+de
+de
+ünï
+ünï
+
+# INTERSECT builds its table from one arm and checks the other arm's rows against it, charging both:
+# 22 + hash_key 2 × 13 = 48.
+# cost: 48
+query T rowsort
+SELECT s FROM t INTERSECT SELECT s FROM t
+----
+NULL
+abc
+de
+ünï
+
+# A window PARTITION BY charges every row's partition keys; its i32 ORDER BY adds nothing:
+# 16 + hash_key 13 = 29.
+# cost: 29
+query II rowsort
+SELECT id, row_number() OVER (PARTITION BY s ORDER BY id) FROM t
+----
+1
+1
+2
+1
+3
+1
+4
+1
+5
+2
+
+# A recursive CTE's UNION checks every row each step produces: 'ab' (2), 'abc' (3), 'abcc' (4).
+# 27 + hash_key 9 = 36.
+# cost: 36
+query T rowsort
+WITH RECURSIVE r(x) AS (SELECT 'ab' UNION SELECT x || 'c' FROM r WHERE length(x) < 4) SELECT x FROM r
+----
+ab
+abc
+abcc
+
+# ============================================================================================
+# The amplification these units close
+# ============================================================================================
+
+# One 10,000-byte value repeated across 100 rows. repeat() charges its output once, but the sort
+# works on the value in every row: 10304 + sort_key 100 × 10000 = 1010304.
+# cost: 1010304
+query I nosort
+SELECT count(*) FROM (SELECT g FROM (SELECT repeat('a', 10000) AS s) x, generate_series(1, 100) g ORDER BY x.s, g OFFSET 0) q
+----
+100
+
+# Collated, the sort builds a 10,000-code-point UCA key for every row: 10304 + collate 1000000.
+# cost: 1010304
+query I nosort
+SELECT count(*) FROM (SELECT g FROM (SELECT repeat('a', 10000) AS s) x, generate_series(1, 100) g ORDER BY x.s COLLATE "unicode", g OFFSET 0) q
+----
+100
+
+# DISTINCT hashes the value in every projected row: 10304 + hash_key 1000000.
+# cost: 1010304
+query I nosort
+SELECT count(*) FROM (SELECT DISTINCT x.s, g FROM (SELECT repeat('a', 10000) AS s) x, generate_series(1, 100) g) q
+----
+100
+
+# So a ceiling that the query's other work fits under now stops it.
+# max_cost: 100000
+statement error 54P01
+SELECT count(*) FROM (SELECT g FROM (SELECT repeat('a', 10000) AS s) x, generate_series(1, 100) g ORDER BY x.s, g OFFSET 0) q
+
+# max_cost: 100000
+statement error 54P01
+SELECT count(*) FROM (SELECT g FROM (SELECT repeat('a', 10000) AS s) x, generate_series(1, 100) g ORDER BY x.s COLLATE "unicode", g OFFSET 0) q
+
+# max_cost: 100000
+statement error 54P01
+SELECT count(*) FROM (SELECT DISTINCT x.s, g FROM (SELECT repeat('a', 10000) AS s) x, generate_series(1, 100) g) q

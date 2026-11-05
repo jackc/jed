@@ -1,0 +1,216 @@
+# ALTER TABLE slice 3: ADD COLUMN appends the catalog column and rewrites every existing row.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, ddl.column_default_expr, ddl.check, ddl.unique, ddl.foreign_key, ddl.secondary_index, ddl.serial, ddl.identity, ddl.sequence, func.sequence, dml.insert, dml.insert_column_list, query.select, query.where_eq, query.order_by, query.is_null, types.i32, types.text, expr.arithmetic, resource.cost_metering
+
+statement ok
+CREATE TABLE alter_add (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add VALUES (1), (2)
+
+# cost: 5
+statement ok
+ALTER TABLE alter_add ADD COLUMN amount i32 DEFAULT 1 + 1 NOT NULL
+
+query II nosort
+SELECT id, amount FROM alter_add ORDER BY id
+----
+1
+2
+2
+2
+
+statement ok
+ALTER TABLE alter_add ADD note text
+
+query IT nosort
+SELECT id, note FROM alter_add ORDER BY id
+----
+1
+NULL
+2
+NULL
+
+statement error 23502
+ALTER TABLE alter_add ADD COLUMN required i32 NOT NULL
+
+statement ok
+ALTER TABLE alter_add ADD COLUMN IF NOT EXISTS amount text
+
+statement error 42701
+ALTER TABLE alter_add ADD COLUMN amount text
+
+# A failed later action publishes neither the catalog column nor rewritten rows.
+statement error 23514
+ALTER TABLE alter_add ADD bad i32 DEFAULT 1, ADD CHECK (bad > 5)
+
+statement error 42703
+SELECT bad FROM alter_add
+
+# Inline constraints validate the rewritten rows and govern later writes.
+statement ok
+CREATE TABLE alter_add_one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add_one VALUES (1)
+
+statement ok
+ALTER TABLE alter_add_one ADD COLUMN v i32 DEFAULT 7 CONSTRAINT v_positive CHECK (v > 0) UNIQUE
+
+statement error 23505
+INSERT INTO alter_add_one (id) VALUES (2)
+
+statement ok
+CREATE TABLE alter_add_parent (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add_parent VALUES (10)
+
+statement ok
+CREATE TABLE alter_add_child (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add_child VALUES (1), (2)
+
+statement ok
+ALTER TABLE alter_add_child ADD parent_id i32 DEFAULT 10 REFERENCES alter_add_parent (id)
+
+statement error 23503
+INSERT INTO alter_add_child VALUES (3, 99)
+
+# Owned sequence defaults run once per old row in key order and continue for future inserts.
+statement ok
+CREATE TABLE alter_add_serial (label text UNIQUE)
+
+statement ok
+INSERT INTO alter_add_serial VALUES ('a'), ('b')
+
+statement ok
+ALTER TABLE alter_add_serial ADD id serial PRIMARY KEY
+
+statement ok
+INSERT INTO alter_add_serial (label) VALUES ('c')
+
+query TI nosort
+SELECT label, id FROM alter_add_serial ORDER BY id
+----
+a
+1
+b
+2
+c
+3
+
+query I nosort
+SELECT id FROM alter_add_serial WHERE label = 'b'
+----
+2
+
+# IDENTITY is the same owned-sequence rewrite with its explicit-value policy preserved.
+statement ok
+CREATE TABLE alter_add_identity (label text)
+
+statement ok
+INSERT INTO alter_add_identity VALUES ('a'), ('b')
+
+statement ok
+ALTER TABLE alter_add_identity ADD id i32 GENERATED ALWAYS AS IDENTITY
+
+statement ok
+INSERT INTO alter_add_identity (label) VALUES ('c')
+
+query TI nosort
+SELECT label, id FROM alter_add_identity ORDER BY id
+----
+a
+1
+b
+2
+c
+3
+
+statement error 428C9
+INSERT INTO alter_add_identity VALUES ('d', 9)
+
+# A new primary key rejects duplicate rewritten values atomically, and a table that already has a
+# primary key rejects a second one before rewriting.
+statement ok
+CREATE TABLE alter_add_bad_pk (label text)
+
+statement ok
+INSERT INTO alter_add_bad_pk VALUES ('x'), ('y')
+
+statement error 23505
+ALTER TABLE alter_add_bad_pk ADD id i32 DEFAULT 1 PRIMARY KEY
+
+query T nosort
+SELECT label FROM alter_add_bad_pk ORDER BY label
+----
+x
+y
+
+statement error 42P16
+ALTER TABLE alter_add ADD another_id serial PRIMARY KEY
+
+# A named inline UNIQUE index reserves its shared-relation-namespace name before the owned serial
+# sequence is named. The sequence takes the smallest free suffix instead of colliding with the index.
+statement ok
+CREATE TABLE alter_add_namespace (label text)
+
+statement ok
+ALTER TABLE alter_add_namespace ADD id serial CONSTRAINT alter_add_namespace_id_seq UNIQUE
+
+statement ok
+INSERT INTO alter_add_namespace (label) VALUES ('x')
+
+query I nosort
+SELECT nextval('alter_add_namespace_id_seq1')
+----
+2
+
+# A later comma-action sees the owned sequence already pending in the same statement and cannot
+# publish an index under that relation name. The failed statement leaves neither column nor sequence.
+statement ok
+CREATE TABLE alter_add_namespace_later (label text)
+
+statement error 42P07
+ALTER TABLE alter_add_namespace_later ADD id serial, ADD CONSTRAINT alter_add_namespace_later_id_seq UNIQUE (id)
+
+statement error 42703
+SELECT id FROM alter_add_namespace_later
+
+# Later actions see the new column, but the rewrite uses the ADD action's original default.
+statement ok
+CREATE TABLE alter_add_multi (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add_multi VALUES (1)
+
+statement ok
+ALTER TABLE alter_add_multi ADD v i32 DEFAULT 4, ALTER v SET DEFAULT 9, ADD w i32 DEFAULT 5
+
+query III nosort
+SELECT id, v, w FROM alter_add_multi
+----
+1
+4
+5
+
+statement ok
+INSERT INTO alter_add_multi (id) VALUES (2)
+
+query III nosort
+SELECT id, v, w FROM alter_add_multi WHERE id = 2
+----
+2
+9
+5
+
+# Empty tables accept a NOT NULL column without a default.
+statement ok
+CREATE TABLE alter_add_empty (id i32 PRIMARY KEY)
+
+statement ok
+ALTER TABLE alter_add_empty ADD required i32 NOT NULL
+
+statement error 23502
+INSERT INTO alter_add_empty (id) VALUES (1)

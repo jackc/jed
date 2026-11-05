@@ -1,0 +1,415 @@
+# The jsonpath any-level accessor `.**` (spec/design/jsonpath.md §3.3): the item and its descendants
+# within `{n}` / `{n to m}` / `last` level bounds, in preorder; every emitted item runs the rest of
+# the path with navigation errors suppressed, even in strict. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: query.select, query.set_returning, types.jsonb, types.jsonpath, func.jsonb_path, expr.jsonpath_filter, expr.jsonpath_match, expr.jsonpath_methods, expr.jsonpath_vars, expr.jsonpath_predicates, expr.jsonpath_any
+
+# --- The canonical render ---------------------------------------------------------------------
+
+query TTTTTTT nosort
+SELECT '$.**{2 to last}'::jsonpath, '$.**{last}'::jsonpath, '$.**{0 to last}'::jsonpath, '$.**{last to 3}'::jsonpath, '$.**{2}'::jsonpath, '$.**{ 2 to 5 }'::jsonpath, '$.** . a'::jsonpath
+----
+$.**{2 to last}
+$.**{last}
+$.**
+$.**{last to 3}
+$.**{2}
+$.**{2 to 5}
+$.**."a"
+
+query TTTTTT nosort
+SELECT '$ . **'::jsonpath, '$.**{2 TO 5}'::jsonpath, '$.**{LAST}'::jsonpath, '$.**.**'::jsonpath, '$.**[*]'::jsonpath, '$.** {1}'::jsonpath
+----
+$.**
+$.**{2 to 5}
+$.**{last}
+$.**.**
+$.**[*]
+$.**{1}
+
+query TTTTT nosort
+SELECT '$.**{0}'::jsonpath, '$.**{0 to 0}'::jsonpath, '$.**{last to last}'::jsonpath, '$.**{2147483647 to last}'::jsonpath, '$.**{/* c */ 1}'::jsonpath
+----
+$.**{0}
+$.**{0}
+$.**{last}
+$.**{2147483647 to last}
+$.**{1}
+
+query TTT nosort
+SELECT '$ ? (@.** == 1)'::jsonpath, '$.**.a ? (@ > 1)'::jsonpath, 'strict $.**{1}.size()'::jsonpath
+----
+$?(@.** == 1)
+$.**."a"?(@ > 1)
+strict $.**{1}.size()
+
+# --- Malformed levels -------------------------------------------------------------------------
+
+statement error 22003
+SELECT '$.**{2147483648}'::jsonpath
+
+statement error 22003
+SELECT '$.**{4294967296}'::jsonpath
+
+statement error 42601
+SELECT '$.**{-1}'::jsonpath
+
+statement error 42601
+SELECT '$.**{+1}'::jsonpath
+
+statement error 42601
+SELECT '$.**{01}'::jsonpath
+
+statement error 42601
+SELECT '$.**{1.0}'::jsonpath
+
+statement error 42601
+SELECT '$.**{1e1}'::jsonpath
+
+statement error 42601
+SELECT '$.**{$x}'::jsonpath
+
+statement error 42601
+SELECT '$.**{}'::jsonpath
+
+statement error 42601
+SELECT '$.**{1,2}'::jsonpath
+
+statement error 42601
+SELECT '$.**{1 to}'::jsonpath
+
+statement error 42601
+SELECT '$.**{1}{2}'::jsonpath
+
+statement error 42601
+SELECT '$.**{2to5}'::jsonpath
+
+statement error 42601
+SELECT '$.***'::jsonpath
+
+statement error 42601
+SELECT '$.* *'::jsonpath
+
+statement error 42601
+SELECT '$**'::jsonpath
+
+statement error 42601
+SELECT '$.a**'::jsonpath
+
+statement error 42601
+SELECT '**'::jsonpath
+
+# --- Levels and order ---------------------------------------------------------------------------
+
+# A scalar context item has no descendants.
+query T nosort
+SELECT * FROM jsonb_path_query('1', '$.**')
+----
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**')
+----
+{"a": [1, {"b": 2}], "c": 3}
+[1, {"b": 2}]
+1
+{"b": 2}
+2
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{0}')
+----
+{"a": [1, {"b": 2}], "c": 3}
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{1}')
+----
+[1, {"b": 2}]
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{2 to 3}')
+----
+1
+{"b": 2}
+2
+
+# {last} is the non-container descendants; {n to last} is every level from n.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{last}')
+----
+1
+2
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{2 to last}')
+----
+1
+{"b": 2}
+2
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{last to 1}')
+----
+0
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('{"a":[1,{"b":2}],"c":3}', '$.**{3 to 1}')
+----
+0
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('1', '$.**{last}')
+----
+0
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1]', '$.**{last}')
+----
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('[[[1]]]', '$.**{1 to 2}')
+----
+[[1]]
+[1]
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1,[2]]', '$.**{1}.**{1}')
+----
+2
+
+# Object members are visited in canonical key order.
+query T nosort
+SELECT * FROM jsonb_path_query('{"b":{"y":1,"x":2},"a":[3]}', '$.**')
+----
+{"a": [3], "b": {"x": 2, "y": 1}}
+[3]
+3
+{"x": 2, "y": 1}
+2
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"**":1}', '$.**')
+----
+{"**": 1}
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":1}', '$.a.**')
+----
+1
+
+# .keyvalue() objects are containers of id, key, value.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":1}}', '$.keyvalue().**')
+----
+{"id": 0, "key": "a", "value": {"b": 1}}
+0
+"a"
+{"b": 1}
+1
+
+query T nosort
+SELECT jsonb_path_query_array('{"a":[1,2,{"b":3}]}', '$.**')
+----
+[{"a": [1, 2, {"b": 3}]}, [1, 2, {"b": 3}], 1, 2, {"b": 3}, 3]
+
+# --- The rest of the path -----------------------------------------------------------------------
+
+# Lax unwraps each emitted item for the next step, so an array's members are reached twice.
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[{"a":1}]}', 'lax $.**.a')
+----
+[{"a": 1}]
+1
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":[1,{"c":2}]}}', 'lax $.**.c')
+----
+2
+2
+
+query T nosort
+SELECT * FROM jsonb_path_query('[[1,2],[3]]', 'lax $.**[0]')
+----
+[1, 2]
+1
+1
+2
+3
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,2,{"b":3}]}', '$.** ? (@ > 1)')
+----
+2
+2
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('[{"a":1},{"a":2}]', '$.**{1}.a')
+----
+1
+2
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,2]}', '$.**.size()')
+----
+1
+2
+1
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":1}}', '$.**.*')
+----
+{"b": 1}
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":{"c":"x"}},"c":"y"}', '$.**.c')
+----
+"y"
+"x"
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":[{"id":7},{"id":8}]}}', '$.**.id ? (@ > 7)')
+----
+8
+8
+
+# --- Strict: navigation errors are suppressed below .** ------------------------------------------
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"a":1}}', 'strict $.**.a')
+----
+{"a": 1}
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[{"a":1}]}', 'strict $.**.a')
+----
+[{"a": 1}]
+1
+
+query T nosort
+SELECT * FROM jsonb_path_query('[[1,2],[3]]', 'strict $.**[0]')
+----
+[1, 2]
+1
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,2,{"b":3}]}', 'strict $.** ? (@ > 1)')
+----
+2
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":[1,2]}', 'strict $.**.size()')
+----
+2
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":1}}', 'strict $.**.*')
+----
+{"b": 1}
+1
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('[1,2]', 'strict $.**{1}[1 to 5]')
+----
+0
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1,2]', 'strict $.**{0}[1 to 5]')
+----
+2
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1,[2,3]]', 'strict $.**{0 to 1}[1 to 5]')
+----
+[2, 3]
+3
+
+query T nosort
+SELECT * FROM jsonb_path_query('[1,{"a":3}]', 'strict $.**{1}.*')
+----
+3
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('{"a":1}', 'strict $.**.a.b')
+----
+0
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('[1,2]', 'strict $.**{1}[last]')
+----
+0
+
+query I nosort
+SELECT count(*) FROM jsonb_path_query('[1,2]', 'strict $.**{1}[2147483648]')
+----
+0
+
+# The suppression reaches filter operands: a missing member is an empty operand (false), not unknown.
+query T nosort
+SELECT * FROM jsonb_path_query('[{"x":1},{"y":2}]', 'strict $.** ? (!(@.x == 1))')
+----
+[{"x": 1}, {"y": 2}]
+1
+{"y": 2}
+2
+
+query T nosort
+SELECT * FROM jsonb_path_query('[{"x":1},{"y":2}]', 'strict $.**{1} ? (exists(@.x))')
+----
+{"x": 1}
+
+# In strict, an incomparable pair still makes a comparison unknown.
+query I nosort
+SELECT count(*) FROM jsonb_path_query('{"a":{"b":[1,{"c":2}]}}', 'strict $ ? (@.** == 2)')
+----
+0
+
+query T nosort
+SELECT * FROM jsonb_path_query('{"a":{"b":[1,{"c":2}]}}', '$ ? (@.** == 2)')
+----
+{"a": {"b": [1, {"c": 2}]}}
+
+# Item-method errors are not navigation errors: they still raise.
+statement error 22036
+SELECT * FROM jsonb_path_query('[1,"a",2]', 'strict $.**.double()')
+
+statement error 22036
+SELECT * FROM jsonb_path_query('[1,"a",2]', 'lax $.**.double()')
+
+statement error 2203C
+SELECT * FROM jsonb_path_query('{"a":{"b":1}}', '$.**.keyvalue()')
+
+# The level-0 item runs first, so its error is the one raised even for an existence test.
+statement error 22036
+SELECT jsonb_path_exists('{"a":[1,"x"]}', '$.**.double()')
+
+statement error 22033
+SELECT * FROM jsonb_path_query('[1,2]', 'strict $.**{0}[2147483648]')
+
+# --- Existence and match ------------------------------------------------------------------------
+
+query BBB nosort
+SELECT jsonb_path_exists('{"a":{"b":{"c":1}}}', '$.** ? (@ == 1)'), jsonb_path_exists('{"a":{"b":{"c":1}}}', '$.**{1} ? (@ == 1)'), '{"a":[{"k":"v"}]}'::jsonb @? '$.**.k'
+----
+true
+false
+true
+
+query BB nosort
+SELECT jsonb_path_match('{"a":[1,5]}', 'exists($.** ? (@ > 4))'), '{"a":[1,5]}'::jsonb @@ '$.** > 9'
+----
+true
+NULL

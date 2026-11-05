@@ -1,0 +1,138 @@
+# Budget-aware spilling (memory.md §6.6). On a file-backed database aggregates, DISTINCT, joins, and a
+# blocking ORDER BY take spill-capable lanes, whose structures spill when the query-memory account
+# rejects a reservation, not only when their residency exceeds work_mem: a budget far below the
+# resident peak still completes, and only owners that cannot spill (a derived table's result, an eager
+# buffer) fail 54P05. The in-memory pass is skipped because an in-memory database never spills; its
+# thresholds for the same operators are pinned by query_memory_state.test. A jed-specific resource
+# contract, not a PostgreSQL limit.
+# skip: memory — an in-memory database has no scratch target, so its structures never spill
+# requires: query.select, ddl.create_table, dml.insert, dml.insert_select, types.text, types.jsonb, func.json_agg, func.json_processing, query.set_returning, query.aggregates, query.group_by, query.distinct, query.join_inner, query.hash_join, query.order_by, resource.query_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, pad text)
+
+statement ok
+INSERT INTO t SELECT x, x % 7, repeat('p', 40 + x % 13) FROM generate_series(1, 300) x
+
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, pad text)
+
+statement ok
+INSERT INTO w SELECT x, repeat(chr(97 + x % 5), 200) FROM generate_series(1, 20) x
+
+# Every structure these queries hold can spill, and their output is handed to the host as it is
+# produced, so even a one-byte budget completes: each structure spills on its first rejected
+# reservation and reserves nothing further. Before budget-aware spilling the GROUP BY needed its whole
+# 104390-byte resident input under the default work_mem.
+# max_query_memory_bytes: 1
+query III rowsort
+SELECT g, count(*), sum(length(pad)) FROM t GROUP BY g
+----
+0
+42
+1930
+1
+43
+1974
+2
+43
+1978
+3
+43
+1982
+4
+43
+1986
+5
+43
+1977
+6
+43
+1968
+
+# Retained aggregate inputs (jsonb_agg) live in a spill-capable hash row table.
+# max_query_memory_bytes: 1
+query II rowsort
+SELECT g, jsonb_array_length(jsonb_agg(id)) FROM t GROUP BY g
+----
+0
+42
+1
+43
+2
+43
+3
+43
+4
+43
+5
+43
+6
+43
+
+# A hash join's spilled build table and its probe spools.
+# max_query_memory_bytes: 1
+query I nosort
+SELECT count(*) FROM t a JOIN t b ON b.g = a.g
+----
+12858
+
+# The streaming external sort writes a run whenever the account rejects a row.
+# max_query_memory_bytes: 1
+query I nosort
+SELECT id FROM w ORDER BY pad DESC, id
+----
+4
+9
+14
+19
+3
+8
+13
+18
+2
+7
+12
+17
+1
+6
+11
+16
+5
+10
+15
+20
+
+# work_mem 0 means never spill: the operators run on the eager lane and the account fails as it does
+# on an in-memory database.
+# work_mem: 0
+# max_query_memory_bytes: 1
+statement error 54P05
+SELECT g, count(*), sum(length(pad)) FROM t GROUP BY g
+
+# A derived table's result is a row buffer, which cannot spill, so the statement has an exact
+# threshold. Its inner DISTINCT spills whenever the account rejects an entry, so the threshold also
+# depends on when that happens; work_mem is pinned so that only the account decides.
+# work_mem: 268435456
+# max_query_memory_bytes: 31353
+query I nosort
+SELECT count(*) FROM (SELECT DISTINCT id % 10, pad FROM t) d
+----
+130
+
+# work_mem: 268435456
+# max_query_memory_bytes: 31352
+statement error 54P05
+SELECT count(*) FROM (SELECT DISTINCT id % 10, pad FROM t) d
+
+# work_mem: 268435456
+# max_query_memory_bytes: 1130
+query I nosort
+SELECT count(*) FROM (SELECT g, max(pad) FROM t GROUP BY g) s
+----
+7
+
+# work_mem: 268435456
+# max_query_memory_bytes: 1129
+statement error 54P05
+SELECT count(*) FROM (SELECT g, max(pad) FROM t GROUP BY g) s

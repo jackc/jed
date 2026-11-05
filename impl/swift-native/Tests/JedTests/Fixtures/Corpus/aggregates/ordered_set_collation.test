@@ -1,0 +1,60 @@
+# A collated WITHIN GROUP order key (spec/design/aggregates.md §13). mode() / percentile_disc honor
+# an explicit COLLATE on the WITHIN GROUP key (or a text column's frozen collation) when sorting the
+# buffered values, so the collation drives mode's tie-break and percentile_disc's index. The default
+# is byte (C) order. Loading `unicode` (the DUCET) makes case/accent a non-byte order.
+# requires: ddl.create_table, dml.insert, query.select, query.aggregates, query.ordered_set_aggregate, query.ordered_set_collation, expr.collate, ddl.collate_column, types.text, types.f64
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE t (s text)
+
+statement ok
+INSERT INTO t VALUES ('B'), ('a'), ('C')
+
+# COLLATE "C" (byte order): sorted [B, C, a]; percentile_disc(0.5) at row 2 -> C.
+# names: percentile_disc
+query T nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s COLLATE "C") FROM t
+----
+C
+
+# COLLATE "unicode" (DUCET, case-insensitive primary): sorted [a, B, C]; row 2 -> B.
+# names: percentile_disc
+query T nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s COLLATE "unicode") FROM t
+----
+B
+
+# mode() ties broken by the WITHIN GROUP order: C order -> first is B; unicode order -> first is a.
+# names: mode
+query T nosort
+SELECT mode() WITHIN GROUP (ORDER BY s COLLATE "C") FROM t
+----
+B
+
+# names: mode
+query T nosort
+SELECT mode() WITHIN GROUP (ORDER BY s COLLATE "unicode") FROM t
+----
+a
+
+# A text column's frozen collation is inherited by an un-annotated WITHIN GROUP key.
+statement ok
+CREATE TABLE tc (s text COLLATE "unicode")
+
+statement ok
+INSERT INTO tc VALUES ('B'), ('a'), ('C')
+
+# names: percentile_disc
+query T nosort
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY s) FROM tc
+----
+B
+
+# COLLATE on a non-text WITHIN GROUP key is a type error (42804, like the query ORDER BY).
+statement ok
+CREATE TABLE n (v i32)
+
+statement error 42804
+SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY v COLLATE "unicode") FROM n

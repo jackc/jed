@@ -1,0 +1,82 @@
+# skip: disk — a transaction spanning records cannot survive the disk-mode per-record reopen
+# (spec/design/conformance.md §3).
+# View DDL inside a savepoint (spec/design/views.md, transactions.md §11): ROLLBACK TO undoes
+# CREATE VIEW, ALTER VIEW … SET DEFAULT, ALTER VIEW … SET (option), RENAME, and CREATE OR REPLACE
+# VIEW made after the savepoint, and keeps what came before it. Every record is
+# PostgreSQL-oracle-checked.
+# requires: txn.savepoint, txn.explicit, ddl.view, ddl.view_default, ddl.view_options, ddl.view_alter, ddl.view_replace, dml.view_write, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32
+
+statement ok
+CREATE TABLE sp (id i32 PRIMARY KEY, a i32)
+
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT s1
+
+statement ok
+CREATE VIEW spv AS SELECT id, a * 2 AS a FROM sp
+
+statement ok
+ROLLBACK TO SAVEPOINT s1
+
+# the name is free again: the rolled-back view is gone
+statement ok
+CREATE VIEW spv AS SELECT id, a FROM sp
+
+statement ok
+SAVEPOINT s2
+
+statement ok
+ALTER VIEW spv ALTER COLUMN a SET DEFAULT 7
+
+statement ok
+ALTER VIEW spv SET (security_barrier)
+
+statement ok
+INSERT INTO spv (id) VALUES (1)
+
+statement ok
+ROLLBACK TO SAVEPOINT s2
+
+# the default is gone with the row
+statement ok
+INSERT INTO spv (id) VALUES (2)
+
+query II nosort
+SELECT id, a FROM spv ORDER BY id
+----
+2
+NULL
+
+statement ok
+SAVEPOINT s3
+
+statement ok
+ALTER VIEW spv RENAME TO spw
+
+statement ok
+CREATE OR REPLACE VIEW spw AS SELECT id, a, a AS b FROM sp
+
+statement ok
+ROLLBACK TO SAVEPOINT s3
+
+query II nosort
+SELECT * FROM spv ORDER BY id
+----
+2
+NULL
+
+statement ok
+RELEASE SAVEPOINT s3
+
+# the whole block rolls back: the view made inside it is gone
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT * FROM spv
+
+statement ok
+DROP TABLE sp

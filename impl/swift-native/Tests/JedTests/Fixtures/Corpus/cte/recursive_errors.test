@@ -1,0 +1,67 @@
+# Error surface of recursive common table expressions (spec/design/recursive-cte.md §6). The
+# structural well-formedness of a self-referencing CTE is `42P19` (invalid_recursion), matching
+# PostgreSQL; the anchor-fixed column types give `42804`; PG-unimplemented shapes (ORDER BY in a
+# recursive query) are `0A000` in both. Codes verified against the live PostgreSQL 18 oracle except
+# the three deferred jed narrowings recorded in oracle_overrides.toml (a set-operation / FROM-subquery
+# recursive term, and mutual recursion — all of which PostgreSQL accepts or codes differently).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.union, query.cross_join, query.join_left, query.aggregates, query.subquery_scalar, query.cte, query.cte_recursive, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1), (2)
+
+statement ok
+CREATE TABLE base (n i32)
+
+# A self-referencing CTE whose body is not a top-level UNION [ALL] does not have the recursive form.
+statement error 42P19
+WITH RECURSIVE c AS (SELECT n FROM c) SELECT n FROM c
+
+# The self-reference must not appear in the non-recursive (anchor) term.
+statement error 42P19
+WITH RECURSIVE c(n) AS (SELECT n FROM c UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c
+
+# The self-reference must appear at most once in the recursive term.
+statement error 42P19
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT a.n + 1 FROM c a CROSS JOIN c b WHERE a.n < 3) SELECT n FROM c
+
+# The self-reference must not appear inside an expression subquery (sublink) — even when a valid
+# FROM reference is also present, PostgreSQL reports the subquery position.
+statement error 42P19
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < (SELECT max(n) FROM c)) SELECT n FROM c
+
+# An aggregate is not allowed in the recursive term.
+statement error 42P19
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c) SELECT n FROM c
+
+# The self-reference must not sit on the nullable side of an outer join.
+statement error 42P19
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT base.n FROM base LEFT JOIN c ON true WHERE c.n < 3) SELECT n FROM c
+
+# The recursive term's column types are fixed by the non-recursive term: a wider recursive-term
+# column (integer anchor, bigint recursive) is 42804 — NOT the symmetric UNION widening.
+statement error 42804
+WITH RECURSIVE c(n) AS (SELECT id FROM t UNION ALL SELECT (n + 1)::i64 FROM c WHERE n < 100) SELECT n FROM c
+
+# ORDER BY in a recursive query is not implemented (PostgreSQL also 0A000).
+statement error 0A000
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 ORDER BY n) SELECT n FROM c
+
+# --- deferred jed narrowings (overridden — PostgreSQL accepts or codes these differently) ---
+
+# A set-operation recursive term is a jed narrowing (0A000); PostgreSQL accepts the INTERSECT. The
+# recursive term `SELECT … FROM c … INTERSECT SELECT 99` is the UNION's right operand (INTERSECT
+# binds tighter than UNION), so it reaches the analyzer as a set-operation recursive term.
+statement error 0A000
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 INTERSECT SELECT 99) SELECT n FROM c
+
+# A self-reference inside a FROM derived table is a jed narrowing (0A000); PostgreSQL allows it.
+statement error 0A000
+WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT n FROM c) s WHERE n < 3) SELECT n FROM c
+
+# Mutual recursion surfaces via forward-only visibility as 42P01 (a reference to a later CTE is out
+# of scope); PostgreSQL detects it specifically and raises 0A000.
+statement error 42P01
+WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 3), b(n) AS (SELECT n FROM a) SELECT n FROM a

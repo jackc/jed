@@ -1,0 +1,131 @@
+# json / jsonb — the literal-only surface (J0, spec/design/json.md §12). The two document types
+# exist as scalar arms with text I/O (json_in/out + jsonb_in/out) and the '…'::json / '…'::jsonb
+# literal cast (+ the `json '…'` / `jsonb '…'` typed-literal form). `json` validates RFC-8259
+# well-formedness and stores the bytes VERBATIM (whitespace, key order, duplicate keys preserved);
+# `jsonb` parses + CANONICALIZES (numbers → exact decimal, object keys deduped last-wins then sorted
+# length-then-bytewise, one space after each ':' and ','). A storable json/jsonb COLUMN, comparison,
+# casts, and the operator surface are later slices (J1–J6) — a column declaration is 0A000 this slice
+# (a per-core divergence test). Malformed JSON traps 22P02. Output matches the postgres:18 oracle
+# byte-for-byte (the `T` printable-ASCII render tag). Format: ../../../design/conformance.md.
+# requires: query.select, types.jsonb_literal
+
+# --- json: stored VERBATIM (insignificant whitespace, key order, duplicate keys preserved) -----
+query T nosort
+SELECT '{ "a" : 1 }'::json
+----
+{ "a" : 1 }
+
+# The `json '…'` typed-literal form is equivalent to the cast; arrays/key order are verbatim.
+query T nosort
+SELECT json '[1,2,3]'
+----
+[1,2,3]
+
+# json keeps duplicate keys verbatim (the deliberate contrast with jsonb's last-wins dedup).
+query T nosort
+SELECT '{"a":1,"a":2}'::json
+----
+{"a":1,"a":2}
+
+# --- jsonb: CANONICAL form (one space after ':'/',', keys sorted, numbers exact) ---------------
+query T nosort
+SELECT '{ "a" : 1, "b":[1,2 ,3] }'::jsonb
+----
+{"a": 1, "b": [1, 2, 3]}
+
+# Object keys sort length-then-bytewise ("b" length 1 before "aa" length 2); duplicate keys reduce
+# last-wins BEFORE sorting ("b" keeps its last value 3).
+query T nosort
+SELECT '{"b":2,"aa":1,"b":3}'::jsonb
+----
+{"b": 3, "aa": 1}
+
+# Numbers are exact decimal: `1e2` normalizes to `100`, `1.50` keeps its scale, `-0` is `0`.
+query T nosort
+SELECT '1e2'::jsonb
+----
+100
+
+query T nosort
+SELECT '1.50'::jsonb
+----
+1.50
+
+query T nosort
+SELECT jsonb '  -0 '
+----
+0
+
+query T nosort
+SELECT '0.10'::jsonb
+----
+0.10
+
+# A large integer literal is held exactly (no float).
+query T nosort
+SELECT '100000000000000000000'::jsonb
+----
+100000000000000000000
+
+# Mixed-type array; jsonb adds one space after each comma. Trailing-zero scale is preserved (2.0).
+query T nosort
+SELECT '[1, "a", true, null, 2.0]'::jsonb
+----
+[1, "a", true, null, 2.0]
+
+# Nested objects/arrays canonicalize recursively.
+query T nosort
+SELECT '{"x":{"y":[true,false,null]}}'::jsonb
+----
+{"x": {"y": [true, false, null]}}
+
+# A bare JSON scalar is a valid document (RFC 8259): boolean, number (whitespace trimmed), string.
+query T nosort
+SELECT 'true'::jsonb
+----
+true
+
+query T nosort
+SELECT '  42  '::jsonb
+----
+42
+
+# A non-ASCII string is emitted as raw UTF-8 (jsonb_out does not \u-escape non-ASCII).
+query T nosort
+SELECT '"héllo"'::jsonb
+----
+"héllo"
+
+# Control characters re-escape with the short forms (\n) on jsonb_out.
+query T nosort
+SELECT '"a\nb"'::jsonb
+----
+"a\nb"
+
+# Empty object / empty array.
+query T nosort
+SELECT '{}'::jsonb
+----
+{}
+
+query T nosort
+SELECT '[]'::jsonb
+----
+[]
+
+# --- malformed JSON traps 22P02 (invalid_text_representation), json and jsonb alike --------------
+statement error 22P02
+SELECT '{bad}'::jsonb
+
+statement error 22P02
+SELECT '[1,2,'::jsonb
+
+statement error 22P02
+SELECT '{"a":1} trailing'::json
+
+statement error 22P02
+SELECT 'nul'::jsonb
+
+# A duplicate decimal point / leading zero is malformed.
+statement error 22P02
+SELECT '01'::jsonb

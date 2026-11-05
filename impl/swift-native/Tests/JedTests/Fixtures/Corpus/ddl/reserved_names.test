@@ -1,0 +1,167 @@
+# The jed_ name reservation (spec/design/introspection.md §4): a USER-written name for any object
+# in the relation namespace (table — incl. TEMP — index, sequence, or a named UNIQUE/EXCLUDE
+# constraint, whose name IS its backing index) or the type namespace (composite type) may not begin
+# with jed_ — the prefix is reserved for the engine's future catalog relations (jed_tables,
+# jed_columns, …). Byte-exact on the FOLDED name (grammar.md §3): a bare JED_x folds to jed_x and
+# is rejected, a quoted "jed_x" is the same name and is rejected, but a quoted "JED_x" is a different
+# name that does not begin with jed_ and is allowed — PostgreSQL's rule for pg_: 42939 reserved_name. The check sits with each site's namespace-collision check, so
+# established validation orders keep priority (42P01 before 42939 for CREATE INDEX). Deliberately
+# NOT reserved (each pinned below): column names, CHECK constraint names (per-table namespace only),
+# and engine-GENERATED names — a serial's <table>_<col>_seq and an index auto-name both stay legal
+# for a table named jed. IF NOT EXISTS does not suppress the error (a reservation is not a
+# collision).
+# requires: query.quoted_identifiers, introspect.tables, query.where_eq, ddl.drop_table, ddl.create_table, ddl.create_table_if_not_exists, ddl.create_index_if_not_exists, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.alter_table, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
+
+# --- the relation namespace: tables (persistent + TEMP) --------------------------------------------
+
+statement error 42939
+CREATE TABLE jed_tables (a i32)
+
+# a bare name folds first, so any letter case of the prefix is reserved
+statement error 42939
+CREATE TABLE JED_Tables (a i32)
+
+# quoting the folded spelling does not escape the reservation
+statement error 42939
+CREATE TABLE "jed_tables" (a i32)
+
+# but a quoted mixed-case name is a different name: it does not begin with the bytes jed_
+statement ok
+CREATE TABLE "JED_Tables" (a i32)
+
+statement ok
+INSERT INTO "JED_Tables" VALUES (1)
+
+# and it never shadows the built-in relation (lookups are byte-exact)
+query I nosort
+SELECT a FROM "JED_Tables"
+----
+1
+
+query T nosort
+SELECT name FROM jed_tables WHERE name = 'JED_Tables'
+----
+JED_Tables
+
+statement ok
+DROP TABLE "JED_Tables"
+
+# the bare prefix itself is a valid identifier — and reserved
+statement error 42939
+CREATE TABLE jed_ (a i32)
+
+statement error 42939
+CREATE TEMP TABLE jed_scratch (a i32)
+
+# a reservation is not a collision: IF NOT EXISTS does not suppress it (persistent or TEMP)
+statement error 42939
+CREATE TABLE IF NOT EXISTS jed_tables (a i32)
+
+statement error 42939
+CREATE TEMP TABLE IF NOT EXISTS jed_scratch (a i32)
+
+# --- indexes, sequences, named UNIQUE / EXCLUDE constraints ----------------------------------------
+
+statement ok
+CREATE TABLE t (a i32)
+
+statement error 42939
+CREATE INDEX jed_idx ON t (a)
+
+# a reservation is not a collision: IF NOT EXISTS does not suppress it
+statement error 42939
+CREATE INDEX IF NOT EXISTS jed_idx ON t (a)
+
+statement error 42939
+CREATE SEQUENCE jed_seq
+
+# a reservation is not a collision: IF NOT EXISTS does not suppress it
+statement error 42939
+CREATE SEQUENCE IF NOT EXISTS jed_seq
+
+# a named UNIQUE constraint IS its backing index (constraints.md §5) — the name enters the
+# relation namespace
+statement error 42939
+CREATE TABLE u1 (a i32, CONSTRAINT jed_u UNIQUE (a))
+
+# same for a named EXCLUDE constraint's backing GiST index (gist.md §7)
+statement error 42939
+CREATE TABLE e1 (id i32 PRIMARY KEY, r i32range, CONSTRAINT jed_e EXCLUDE USING gist (r WITH &&))
+
+# --- the type namespace: composite types -----------------------------------------------------------
+
+statement error 42939
+CREATE TYPE jed_point AS (x i32, y i32)
+
+# --- validation order: existence checks keep priority over the reserved-name check -----------------
+
+statement error 42P01
+CREATE INDEX jed_i ON nosuch (a)
+
+# --- a rename cannot smuggle a reserved name in ----------------------------------------------------
+
+statement ok
+CREATE SEQUENCE s1
+
+statement error 42939
+ALTER SEQUENCE s1 RENAME TO jed_s1
+
+# --- NOT reserved: near-miss relation names, column names, CHECK constraint names ------------------
+
+statement ok
+CREATE TABLE jedx (a i32)
+
+statement ok
+CREATE TABLE myjed_t (a i32)
+
+statement ok
+CREATE TABLE t2 (jed_col i32)
+
+statement ok
+CREATE TABLE t3 (a i32, CONSTRAINT jed_c CHECK (a > 0))
+
+# --- engine-GENERATED names are exempt: a table legally named jed ----------------------------------
+
+# the serial column auto-creates the OWNED sequence jed_id_seq (sequences.md §12) — legal
+statement ok
+CREATE TABLE jed (id serial, v i32)
+
+statement ok
+INSERT INTO jed (v) VALUES (7)
+
+query II nosort
+SELECT id, v FROM jed
+----
+1
+7
+
+# the unnamed index auto-names itself jed_v_idx (indexes.md §2) — legal
+statement ok
+CREATE INDEX ON jed (v)
+
+# --- ALTER TABLE RENAME CONSTRAINT preserves the same namespace boundary ------------------------
+
+# CHECK owns no relation, so jed_ remains legal in its table-local constraint namespace.
+statement ok
+CREATE TABLE alter_check_reserved (id i32 PRIMARY KEY, v i32, CONSTRAINT ck CHECK (v > 0))
+
+statement ok
+ALTER TABLE alter_check_reserved RENAME CONSTRAINT ck TO jed_check
+
+# UNIQUE owns a B-tree relation, so renaming it into the reserved relation namespace is 42939.
+statement ok
+CREATE TABLE alter_unique_reserved (id i32 PRIMARY KEY, v i32, CONSTRAINT uq UNIQUE (v))
+
+statement error 42939
+ALTER TABLE alter_unique_reserved RENAME CONSTRAINT uq TO jed_unique
+
+# The failed rename is atomic: the original constraint handle remains usable.
+statement ok
+ALTER TABLE alter_unique_reserved RENAME CONSTRAINT uq TO uq2
+
+# EXCLUDE likewise owns a GiST relation and must reject a reserved new name.
+statement ok
+CREATE TABLE alter_exclude_reserved (id i32 PRIMARY KEY, span int4range, CONSTRAINT ex EXCLUDE USING gist (span WITH &&))
+
+statement error 42939
+ALTER TABLE alter_exclude_reserved RENAME CONSTRAINT ex TO jed_exclude

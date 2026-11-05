@@ -1,0 +1,272 @@
+# EXPLAIN of multi-column secondary-index tuple interval sets (spec/design/cost.md §3 "Multi-column
+# secondary indexes", explain.md §5): a set that consumes more than the index's leading column names
+# the consumed key columns in key order after the index, `intervals=` sums every member's set
+# disjuncts, and `arrays=` counts the `= ANY` arrays among them. Rows and costs are pinned in
+# index_key_set.test. The plans are jed-owned, so this file is cross-core checked, not oracle-checked.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, dml.insert, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.index_range, query.index_mutation, query.or_in_point_lookup, query.interval_set, query.any_array_point_lookup, query.composite_key_set, query.logical_connectives, query.order_by, query.limit, query.explain, query.set_returning, maintenance.analyze, func.array_quantified, types.array, cast.array, types.i32, types.i64, types.text, types.bytea, types.decimal, types.interval, expr.case, cast.string_literal
+
+statement ok
+CREATE TABLE ix (id i64 PRIMARY KEY, a i32, b i64, v i64)
+
+statement ok
+INSERT INTO ix SELECT (t - 1) * 400 + i, t, i, t * 1000 + i FROM generate_series(1, 3) AS t, generate_series(1, 400) AS i
+
+statement ok
+CREATE INDEX ix_ab ON ix (a, b)
+
+# An equality column then an array column: both consumed, one array.
+query ITTII nosort
+EXPLAIN SELECT v FROM ix WHERE a = 1 AND b = ANY(ARRAY[2, 4, 900])
+----
+0
+Filter
+conjuncts=2
+3
+35
+1
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=1; arrays=1; touched=3
+3
+11
+
+# The IN spelling counts its disjuncts.
+query ITTII nosort
+EXPLAIN SELECT v FROM ix WHERE a = 1 AND b IN (2, 4, 900)
+----
+0
+Filter
+conjuncts=2
+3
+35
+1
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=3; touched=3
+3
+11
+
+# Sets on both columns.
+query ITTII nosort
+EXPLAIN SELECT v FROM ix WHERE a = ANY(ARRAY[1, 2]) AND b IN (2, 9)
+----
+0
+Filter
+conjuncts=2
+2
+26
+1
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=3; arrays=1; touched=3
+2
+8
+
+# A final range column.
+query ITTII nosort
+EXPLAIN SELECT v FROM ix WHERE a IN (1, 3) AND b >= 399
+----
+0
+Filter
+conjuncts=2
+4
+38
+1
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=2; touched=3
+4
+14
+
+# A set on the leading column alone keeps the plain spelling.
+query ITTII nosort
+EXPLAIN SELECT v FROM ix WHERE a IN (1, 3)
+----
+0
+Filter
+conjuncts=1
+12
+86
+1
+Scan ix
+Index interval set: using ix_ab; intervals=2; touched=2
+12
+38
+
+# Index-key order elides the sort.
+query ITTII nosort
+EXPLAIN SELECT a, b FROM ix WHERE a IN (1, 2, 3) AND b = ANY(ARRAY[30, 10]) ORDER BY a, b
+----
+0
+Filter
+conjuncts=2
+2
+30
+1
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=4; arrays=1; touched=2; ordered: index order: ix_ab
+2
+8
+
+# LIMIT streams the probes.
+query ITTII nosort
+EXPLAIN SELECT v FROM ix WHERE a IN (2, 3) AND b = ANY(ARRAY[30, 10]) ORDER BY a, b LIMIT 3
+----
+0
+Limit
+limit=3
+2
+26
+1
+Filter
+conjuncts=2
+2
+24
+2
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=3; arrays=1; touched=3; ordered: index order: ix_ab
+2
+8
+
+# UPDATE and DELETE share the path.
+query ITTII nosort
+EXPLAIN UPDATE ix SET v = 0 WHERE a = 2 AND b IN (1, 3)
+----
+0
+Update ix
+sets=1
+2
+18
+1
+Filter
+conjuncts=2
+2
+18
+2
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=2; touched=2
+2
+8
+
+query ITTII nosort
+EXPLAIN DELETE FROM ix WHERE a IN (1, 3) AND b = ANY(ARRAY[1, 4])
+----
+0
+Delete ix
+-
+2
+24
+1
+Filter
+conjuncts=2
+2
+24
+2
+Scan ix
+Index interval set: using ix_ab (a, b); intervals=3; arrays=1; touched=2
+2
+8
+
+# A unique index whose every column is a point: the estimate is the smaller of the members' AND and
+# the probe count.
+statement ok
+CREATE TABLE uq (id i64 PRIMARY KEY, a i32, b i32, v i32)
+
+statement ok
+INSERT INTO uq SELECT g, (g - 1) / 400 + 1, (g - 1) % 400 + 1, g FROM generate_series(1, 1200) AS g
+
+statement ok
+CREATE UNIQUE INDEX uq_ab ON uq (a, b)
+
+query ITTII nosort
+EXPLAIN SELECT v FROM uq WHERE a IN (1, 3) AND b IN (10, 20)
+----
+0
+Filter
+conjuncts=2
+2
+24
+1
+Scan uq
+Index interval set: using uq_ab (a, b); intervals=4; touched=3
+2
+8
+
+# A text point column before the first later set.
+statement ok
+CREATE TABLE tm (id i64 PRIMARY KEY, a i32, s text, c i32)
+
+statement ok
+INSERT INTO tm SELECT row_number() OVER (ORDER BY a, s, c), a, s, c FROM generate_series(1, 3) AS a, (VALUES ('x'), ('y'), ('z')) AS t(s), generate_series(1, 100) AS c
+
+statement ok
+CREATE INDEX tm_asc ON tm (a, s, c)
+
+statement ok
+ANALYZE tm
+
+query ITTII nosort
+EXPLAIN SELECT a, c, id FROM tm WHERE a = 2 AND s = 'y' AND c IN (7, 70)
+----
+0
+Filter
+conjuncts=3
+2
+24
+1
+Scan tm
+Index interval set: using tm_asc (a, s, c); intervals=2; touched=4
+2
+8
+
+# A set on the text column is consumed too: an admitted entry steps over its text slot by decoding
+# the terminator.
+query ITTII nosort
+EXPLAIN SELECT a, c, id FROM tm WHERE a = 2 AND s IN ('x', 'y') AND c = 7
+----
+0
+Filter
+conjuncts=3
+2
+24
+1
+Scan tm
+Index interval set: using tm_asc (a, s, c); intervals=2; touched=4
+2
+8
+
+# A final text range under a set.
+query ITTII nosort
+EXPLAIN SELECT a, c, id FROM tm WHERE a IN (1, 3) AND s > 'x' AND c = 4
+----
+0
+Filter
+conjuncts=3
+4
+4007
+1
+Scan tm
+Index interval set: using tm_asc (a, s); intervals=2; touched=4
+400
+1203
+
+# Every variable-width key type after a leading set is stepped over.
+statement ok
+CREATE TABLE vw (id i64 PRIMARY KEY, a i32, t text, b bytea, d decimal, iv interval, c i32)
+
+statement ok
+INSERT INTO vw SELECT g, g % 4, CASE g % 3 WHEN 0 THEN NULL WHEN 1 THEN 'v1' ELSE 'v2' END, CASE g % 5 WHEN 0 THEN NULL WHEN 1 THEN '\x00ff00'::bytea WHEN 2 THEN '\x00'::bytea ELSE '\x61'::bytea END, CASE g % 7 WHEN 0 THEN NULL WHEN 1 THEN -1.25 WHEN 2 THEN 0 WHEN 3 THEN 0.5 ELSE 12345.678 END, CASE g % 11 WHEN 0 THEN NULL WHEN 1 THEN '1 day'::interval ELSE '-3 hours'::interval END, g % 10 FROM generate_series(1, 400) AS g
+
+statement ok
+CREATE INDEX vw_all ON vw (a, t, b, d, iv, c)
+
+query ITTII nosort
+EXPLAIN SELECT id, a, t, c FROM vw WHERE a IN (1, 3) AND c = 7 AND id < 120
+----
+0
+Filter
+conjuncts=3
+1
+43
+1
+Scan vw
+Index interval set: using vw_all; intervals=2; touched=4
+4
+14

@@ -1,0 +1,475 @@
+# date_part and EXTRACT over a ±infinity date / timestamp / timestamptz (spec/design/timezones.md
+# §9.2), ported from PostgreSQL 18's timestamp.c NonFiniteTimestampTzPart and date.c extract_date.
+# The unit is decoded first, so an unrecognized unit is still 22023 and a recognized-but-unsupported
+# one 0A000. Then a monotonically-increasing field (year, decade, century, millennium, julian,
+# isoyear, epoch) of an infinite source is ±Infinity with the source's sign, and every other
+# (oscillating) field is NULL — for a timestamp/timestamptz every unit is one or the other, even
+# timezone of a timestamp; for a date the time and timezone fields stay 0A000. date_part (float8)
+# returns both answers; its date overload widens to an infinite timestamp, so the timestamp matrix
+# applies. EXTRACT (numeric) returns the NULLs here; its ±Infinity results trap 22003 instead (jed's
+# decimal is finite-only — a per-core divergence test, not here: the oracle corpus is PG-clean), as
+# does EXTRACT(timezone FROM an infinite timestamp), which jed rejects at resolve like every
+# EXTRACT field the type does not support (PG returns NULL). Oracle-checked against postgres:18.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.derived_table, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.text, expr.extract, func.date_part, session.timezone
+# load-timezone: Asia/Kolkata
+
+statement ok
+CREATE TABLE fields (id integer PRIMARY KEY, f text)
+
+statement ok
+INSERT INTO fields VALUES (1, 'microseconds'), (2, 'milliseconds'), (3, 'second'), (4, 'minute'), (5, 'hour'), (6, 'day'), (7, 'week'), (8, 'month'), (9, 'quarter'), (10, 'year'), (11, 'decade'), (12, 'century'), (13, 'millennium'), (14, 'dow'), (15, 'isodow'), (16, 'doy'), (17, 'isoyear'), (18, 'epoch'), (19, 'julian'), (20, 'timezone'), (21, 'timezone_hour'), (22, 'timezone_minute'), (23, 'JD'), (24, 'Hours'), (25, 'y'), (26, 'mons'), (27, 'msec'), (28, 'Epoch')
+
+# --- date_part over a ±infinity timestamp: every field, then its aliases ---
+query TRR nosort
+SELECT f, date_part(f, TIMESTAMP 'infinity'), date_part(f, TIMESTAMP '-infinity') FROM fields ORDER BY id
+----
+microseconds
+NULL
+NULL
+milliseconds
+NULL
+NULL
+second
+NULL
+NULL
+minute
+NULL
+NULL
+hour
+NULL
+NULL
+day
+NULL
+NULL
+week
+NULL
+NULL
+month
+NULL
+NULL
+quarter
+NULL
+NULL
+year
+Infinity
+-Infinity
+decade
+Infinity
+-Infinity
+century
+Infinity
+-Infinity
+millennium
+Infinity
+-Infinity
+dow
+NULL
+NULL
+isodow
+NULL
+NULL
+doy
+NULL
+NULL
+isoyear
+Infinity
+-Infinity
+epoch
+Infinity
+-Infinity
+julian
+Infinity
+-Infinity
+timezone
+NULL
+NULL
+timezone_hour
+NULL
+NULL
+timezone_minute
+NULL
+NULL
+JD
+Infinity
+-Infinity
+Hours
+NULL
+NULL
+y
+Infinity
+-Infinity
+mons
+NULL
+NULL
+msec
+NULL
+NULL
+Epoch
+Infinity
+-Infinity
+
+# --- date_part over a ±infinity timestamptz: every field, then its aliases ---
+query TRR nosort
+SELECT f, date_part(f, TIMESTAMPTZ 'infinity'), date_part(f, TIMESTAMPTZ '-infinity') FROM fields ORDER BY id
+----
+microseconds
+NULL
+NULL
+milliseconds
+NULL
+NULL
+second
+NULL
+NULL
+minute
+NULL
+NULL
+hour
+NULL
+NULL
+day
+NULL
+NULL
+week
+NULL
+NULL
+month
+NULL
+NULL
+quarter
+NULL
+NULL
+year
+Infinity
+-Infinity
+decade
+Infinity
+-Infinity
+century
+Infinity
+-Infinity
+millennium
+Infinity
+-Infinity
+dow
+NULL
+NULL
+isodow
+NULL
+NULL
+doy
+NULL
+NULL
+isoyear
+Infinity
+-Infinity
+epoch
+Infinity
+-Infinity
+julian
+Infinity
+-Infinity
+timezone
+NULL
+NULL
+timezone_hour
+NULL
+NULL
+timezone_minute
+NULL
+NULL
+JD
+Infinity
+-Infinity
+Hours
+NULL
+NULL
+y
+Infinity
+-Infinity
+mons
+NULL
+NULL
+msec
+NULL
+NULL
+Epoch
+Infinity
+-Infinity
+
+# --- date_part over a ±infinity date (widened to an infinite timestamp): every field, then its aliases ---
+query TRR nosort
+SELECT f, date_part(f, DATE 'infinity'), date_part(f, DATE '-infinity') FROM fields ORDER BY id
+----
+microseconds
+NULL
+NULL
+milliseconds
+NULL
+NULL
+second
+NULL
+NULL
+minute
+NULL
+NULL
+hour
+NULL
+NULL
+day
+NULL
+NULL
+week
+NULL
+NULL
+month
+NULL
+NULL
+quarter
+NULL
+NULL
+year
+Infinity
+-Infinity
+decade
+Infinity
+-Infinity
+century
+Infinity
+-Infinity
+millennium
+Infinity
+-Infinity
+dow
+NULL
+NULL
+isodow
+NULL
+NULL
+doy
+NULL
+NULL
+isoyear
+Infinity
+-Infinity
+epoch
+Infinity
+-Infinity
+julian
+Infinity
+-Infinity
+timezone
+NULL
+NULL
+timezone_hour
+NULL
+NULL
+timezone_minute
+NULL
+NULL
+JD
+Infinity
+-Infinity
+Hours
+NULL
+NULL
+y
+Infinity
+-Infinity
+mons
+NULL
+NULL
+msec
+NULL
+NULL
+Epoch
+Infinity
+-Infinity
+
+# the session zone is never consulted for an infinite timestamptz
+# timezone: Asia/Kolkata
+query RRRR nosort
+SELECT date_part('timezone', TIMESTAMPTZ 'infinity'), date_part('hour', TIMESTAMPTZ '-infinity'), date_part('epoch', TIMESTAMPTZ 'infinity'), date_part('julian', TIMESTAMPTZ '-infinity')
+----
+NULL
+NULL
+Infinity
+-Infinity
+
+# --- the unit is decoded before the infinity check -------------------------------
+# an unrecognized unit is 22023
+statement error 22023
+SELECT date_part('nosuch', TIMESTAMP 'infinity')
+
+statement error 22023
+SELECT date_part('nosuch', TIMESTAMPTZ '-infinity')
+
+statement error 22023
+SELECT date_part('nosuch', DATE 'infinity')
+
+# a reserved word other than epoch is recognized but unsupported: 0A000
+statement error 0A000
+SELECT date_part('now', TIMESTAMP 'infinity')
+
+statement error 0A000
+SELECT date_part('today', TIMESTAMPTZ '-infinity')
+
+statement error 0A000
+SELECT date_part('infinity', DATE '-infinity')
+
+# EXTRACT over infinity timestamp: every oscillating field is NULL
+query DDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM v), EXTRACT(milliseconds FROM v), EXTRACT(second FROM v), EXTRACT(minute FROM v), EXTRACT(hour FROM v), EXTRACT(day FROM v), EXTRACT(week FROM v), EXTRACT(month FROM v), EXTRACT(quarter FROM v), EXTRACT(dow FROM v), EXTRACT(isodow FROM v), EXTRACT(doy FROM v) FROM (SELECT TIMESTAMP 'infinity' AS v) AS s
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query DDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM v), EXTRACT(milliseconds FROM v), EXTRACT(second FROM v), EXTRACT(minute FROM v), EXTRACT(hour FROM v), EXTRACT(day FROM v), EXTRACT(week FROM v), EXTRACT(month FROM v), EXTRACT(quarter FROM v), EXTRACT(dow FROM v), EXTRACT(isodow FROM v), EXTRACT(doy FROM v) FROM (SELECT TIMESTAMP '-infinity' AS v) AS s
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# EXTRACT over infinity timestamptz: every oscillating field is NULL
+query DDDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM v), EXTRACT(milliseconds FROM v), EXTRACT(second FROM v), EXTRACT(minute FROM v), EXTRACT(hour FROM v), EXTRACT(day FROM v), EXTRACT(week FROM v), EXTRACT(month FROM v), EXTRACT(quarter FROM v), EXTRACT(dow FROM v), EXTRACT(isodow FROM v), EXTRACT(doy FROM v), EXTRACT(timezone FROM v), EXTRACT(timezone_hour FROM v), EXTRACT(timezone_minute FROM v) FROM (SELECT TIMESTAMPTZ 'infinity' AS v) AS s
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query DDDDDDDDDDDDDDD nosort
+SELECT EXTRACT(microseconds FROM v), EXTRACT(milliseconds FROM v), EXTRACT(second FROM v), EXTRACT(minute FROM v), EXTRACT(hour FROM v), EXTRACT(day FROM v), EXTRACT(week FROM v), EXTRACT(month FROM v), EXTRACT(quarter FROM v), EXTRACT(dow FROM v), EXTRACT(isodow FROM v), EXTRACT(doy FROM v), EXTRACT(timezone FROM v), EXTRACT(timezone_hour FROM v), EXTRACT(timezone_minute FROM v) FROM (SELECT TIMESTAMPTZ '-infinity' AS v) AS s
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# EXTRACT over infinity date: every oscillating field is NULL
+query DDDDDDD nosort
+SELECT EXTRACT(day FROM v), EXTRACT(week FROM v), EXTRACT(month FROM v), EXTRACT(quarter FROM v), EXTRACT(dow FROM v), EXTRACT(isodow FROM v), EXTRACT(doy FROM v) FROM (SELECT DATE 'infinity' AS v) AS s
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+query DDDDDDD nosort
+SELECT EXTRACT(day FROM v), EXTRACT(week FROM v), EXTRACT(month FROM v), EXTRACT(quarter FROM v), EXTRACT(dow FROM v), EXTRACT(isodow FROM v), EXTRACT(doy FROM v) FROM (SELECT DATE '-infinity' AS v) AS s
+----
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+# the date's time and timezone fields stay 0A000 over an infinite date
+statement error 0A000
+SELECT EXTRACT(hour FROM DATE 'infinity')
+
+statement error 0A000
+SELECT EXTRACT(timezone FROM DATE '-infinity')
+
+statement error 22023
+SELECT EXTRACT(nosuch FROM DATE 'infinity')
+
+statement error 0A000
+SELECT EXTRACT(now FROM TIMESTAMP 'infinity')
+
+# --- a column mixing finite and infinite values ---------------------------------------
+statement ok
+CREATE TABLE d (id integer PRIMARY KEY, v date)
+
+statement ok
+INSERT INTO d VALUES (1, DATE '2024-06-09'), (2, DATE 'infinity'), (3, DATE '-infinity'), (4, NULL)
+
+query IDDRR nosort
+SELECT id, EXTRACT(month FROM v), EXTRACT(dow FROM v), date_part('month', v), date_part('year', v) FROM d ORDER BY id
+----
+1
+6
+0
+6
+2024
+2
+NULL
+NULL
+NULL
+Infinity
+3
+NULL
+NULL
+NULL
+-Infinity
+4
+NULL
+NULL
+NULL
+NULL
+
+query I nosort
+SELECT count(*) FROM d WHERE EXTRACT(day FROM v) IS NULL
+----
+3
+
+query IR nosort
+SELECT id, date_part('isoyear', v) FROM d ORDER BY date_part('isoyear', v), id
+----
+3
+-Infinity
+1
+2024
+2
+Infinity
+4
+NULL

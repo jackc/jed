@@ -1,0 +1,370 @@
+# Exact decimal / numeric type (spec/design/decimal.md): storage, decimal literals, display-scale
+# preservation, comparison/ordering by VALUE (1.5 = 1.50), the first cross-family integer<->decimal
+# comparison, casts (int->decimal implicit, decimal->int explicit half-away), numeric(p,s) coercion
+# (round half away from zero) on store, and the typmod / decimal-PK narrowings. Arithmetic is in
+# expr/decimal_arithmetic.test. Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, query.distinct, cast.explicit, types.i32, types.decimal
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO t VALUES (1, 1.50), (2, 1.5), (3, 0.00), (4, -0.013), (5, 123), (6, NULL)
+
+# a decimal renders as its canonical base-10 string, PRESERVING its display scale: 1.50 stays
+# 1.50, distinct in display from 1.5 though equal in value (spec/design/decimal.md §6).
+query D nosort
+SELECT v FROM t WHERE id = 1
+----
+1.50
+
+query D nosort
+SELECT v FROM t WHERE id = 2
+----
+1.5
+
+# the zero value keeps its scale; a leading-dot/0 integer part renders as 0
+query D nosort
+SELECT v FROM t WHERE id = 3
+----
+0.00
+
+query D nosort
+SELECT v FROM t WHERE id = 4
+----
+-0.013
+
+# an integer literal into a numeric column widens (int -> decimal, scale 0)
+query D nosort
+SELECT v FROM t WHERE id = 5
+----
+123
+
+# equality is by VALUE, independent of display scale: both 1.50 (row 1) and 1.5 (row 2) equal
+# 1.5, and they equal 1.500 too — display scale never affects equality
+query I nosort
+SELECT id FROM t WHERE v = 1.5 ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE v = 1.500 ORDER BY id
+----
+1
+2
+
+# the first cross-family comparison: an integer literal promotes to decimal, so `v = 123`
+# matches the row stored from the integer literal 123
+query I nosort
+SELECT id FROM t WHERE v = 123
+----
+5
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for decimal as for integers
+query I nosort
+SELECT id FROM t WHERE v = NULL
+----
+
+query I nosort
+SELECT id FROM t WHERE v IS NULL
+----
+6
+
+# ORDER BY decimal is NUMERIC order (not lexicographic), NULLs last (the PostgreSQL model):
+# -0.013 < 0.00 < 1.5(=1.50) ... but two rows are equal in value (1 and 2). A stable sort keeps
+# the primary-key scan order for the tie, so 1 precedes 2. Expected by value:
+# -0.013(4) < 0(3) < 1.5(1) = 1.5(2) < 123(5), NULL(6) last.
+query I nosort
+SELECT id FROM t ORDER BY v
+----
+4
+3
+1
+2
+5
+6
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on decimal
+query I nosort
+SELECT id FROM t WHERE v IS NOT DISTINCT FROM NULL
+----
+6
+
+# --- numeric(p,s): rounding (half away from zero) + precision-overflow on store ---------------
+statement ok
+CREATE TABLE money (id i32 PRIMARY KEY, amt numeric(10,2))
+
+statement ok
+INSERT INTO money VALUES (1, 1.5), (2, 1.555), (3, 1.554), (4, 5), (5, -2.5)
+
+# stored values are rounded to scale 2 (half away from zero) and zero-padded to exactly 2 places
+query D nosort
+SELECT amt FROM money ORDER BY id
+----
+1.50
+1.56
+1.55
+5.00
+-2.50
+
+# numeric(3,2): the integer part may have at most p - s = 1 digit.
+statement ok
+CREATE TABLE tight (id i32 PRIMARY KEY, x numeric(3,2))
+
+# 12.34 has a 2-digit integer part -> 22003 overflow
+statement error 22003
+INSERT INTO tight VALUES (1, 12.34)
+
+# 9.999 ROUNDS UP to 10.00, whose integer part is now 2 digits -> also 22003
+statement error 22003
+INSERT INTO tight VALUES (2, 9.999)
+
+# --- casts: int <-> decimal -------------------------------------------------------------------
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, i i32, d numeric)
+
+statement ok
+INSERT INTO c VALUES (1, 7, 2.5)
+
+# int -> decimal is implicit/lossless; with a typmod it coerces (pads to scale)
+query D nosort
+SELECT CAST(i AS numeric(10,2)) FROM c WHERE id = 1
+----
+7.00
+
+# decimal -> int is explicit; it ROUNDS half away from zero (2.5 -> 3, -2.5 -> -3)
+query I nosort
+SELECT CAST(d AS i32) FROM c WHERE id = 1
+----
+3
+
+query I nosort
+SELECT CAST(-2.5 AS i32) FROM c WHERE id = 1
+----
+-3
+
+# --- type errors and the deliberate narrowings ------------------------------------------------
+# decimal vs text is not comparable (a 42804 type error, like bool = int)
+statement error 42804
+SELECT id FROM c WHERE d = '2.5'
+
+# a decimal literal stored into an integer column is a type error: decimal->int is explicit
+# CAST only (stricter than PostgreSQL) — 42804
+statement error 42804
+INSERT INTO c VALUES (2, 1.5, 9.9)
+
+# a bad numeric typmod traps 22023 (PostgreSQL's invalid_parameter_value)
+statement error 22023
+CREATE TABLE bad1 (x numeric(0))
+
+statement error 22023
+CREATE TABLE bad2 (x numeric(1001))
+
+statement error 22023
+CREATE TABLE bad3 (x numeric(5,7))
+
+# a type modifier on a type that takes none (an integer) is unsupported: 0A000. (decimal(p,s) and
+# varchar(n) DO take a modifier — see types/varchar.test; an integer typmod stays 0A000.)
+statement error 0A000
+CREATE TABLE bad4 (x i32(5))
+
+# --- decimal as a PRIMARY KEY (encoding.md §2.5: decimal-order-preserving) ---------------------
+# decimal IS a valid PRIMARY KEY — its order-preserving, scale-independent key encoding is
+# exercised here (the first variable-width SIGNED key).
+statement ok
+CREATE TABLE dk (k numeric PRIMARY KEY, n i32)
+
+# insert deliberately NOT in key order; the spread crosses the sign boundary, through zero, a
+# sub-1 fraction, and a trailing-zero value (100.50 stores scale 2 but normalizes in the key).
+statement ok
+INSERT INTO dk VALUES (1.5, 2), (-2.5, 6), (100.50, 7), (0, 4), (0.25, 1), (10, 3)
+
+# point lookup on the decimal PK (key-encoded equality) resolves the matching row
+query I nosort
+SELECT n FROM dk WHERE k = 1.5
+----
+2
+
+# the key encodes the VALUE, not the display scale: 1.50 finds the row stored as 1.5
+query I nosort
+SELECT n FROM dk WHERE k = 1.50
+----
+2
+
+# a full scan iterates in key (= numeric) order: -2.5 < 0 < 0.25 < 1.5 < 10 < 100.50
+query DI nosort
+SELECT k, n FROM dk
+----
+-2.5
+6
+0
+4
+0.25
+1
+1.5
+2
+10
+3
+100.50
+7
+
+# a duplicate decimal PK is a unique violation (23505)
+statement error 23505
+INSERT INTO dk VALUES (0.25, 9)
+
+# scale-independence: 1.50 equals the stored 1.5, so it conflicts too (23505) — they index as one
+statement error 23505
+INSERT INTO dk VALUES (1.50, 9)
+
+# a NULL decimal PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO dk VALUES (NULL, 9)
+
+# decimal is also a valid UNIQUE column and an ordered secondary-index key (the same lifted gate)
+statement ok
+CREATE TABLE du (id i32 PRIMARY KEY, amt numeric UNIQUE)
+
+statement ok
+INSERT INTO du VALUES (1, 3.14), (2, 2.5)
+
+# the UNIQUE decimal index treats 3.140 as equal to the stored 3.14 (scale-independent) — 23505
+statement error 23505
+INSERT INTO du VALUES (3, 3.140)
+
+statement ok
+CREATE INDEX du_amt ON du (amt)
+
+# --- DISTINCT collapses values equal across display scale --------------------------------------
+statement ok
+CREATE TABLE d2 (id i32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO d2 VALUES (1, 1.5), (2, 1.50), (3, 1.500), (4, 2.0)
+
+# 1.5, 1.50, 1.500 are one VALUE; DISTINCT keeps the first occurrence (1.5)
+query D nosort
+SELECT DISTINCT v FROM d2 ORDER BY v
+----
+1.5
+2.0
+
+# --- format caps: PG’s numeric limits — the original 1000/1000 absolute cap is lifted ------
+# An unconstrained value is now bounded by PG’s numeric-format caps (decimal.md §2): 131072
+# integer-part digits and scale 16383, trapping 22003; a multiplication result over max_scale
+# ROUNDS to 16383 instead (PG numeric_mul). The byte-giant edges (at/over 131072/16383, the
+# mul rounding) are pinned in the per-core decimal suites to keep corpus lines reviewable;
+# here the corpus pins representative over-OLD-cap values storing and round-tripping.
+statement ok
+CREATE TABLE caps (id i32 PRIMARY KEY, v numeric)
+
+# 1010 significant digits — over the original 1000-digit cap — store and round-trip exactly.
+statement ok
+INSERT INTO caps VALUES (1, 1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345.6789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890)
+
+query D nosort
+SELECT v FROM caps WHERE id = 1
+----
+1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345.6789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890
+
+# scale 1100 — over the original scale-1000 cap — stores and round-trips exactly.
+statement ok
+INSERT INTO caps VALUES (2, 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001)
+
+query D nosort
+SELECT v FROM caps WHERE id = 2
+----
+0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001
+
+# arithmetic across the old cap boundary is exact: 0.0…01 (scale 1100) + 1 keeps scale 1100.
+query B nosort
+SELECT (v + 1 = 1) FROM caps WHERE id = 2
+----
+false
+
+# --- scientific e-notation literals (grammar.md §14, PostgreSQL numeric.c) --------------------
+# A significand with an exponent `[eE][+-]?digits` is a DECIMAL even with no '.': the display
+# scale is max(0, frac_digits - exponent) and the value shifts by 10^exponent, matching PG. An
+# exponent makes 5e2 a decimal (not an integer), and the written display scale is preserved
+# through storage exactly like a '.'-spelled literal (1.50e1 -> 15.0 scale 1, 1.5e1 -> 15 scale 0).
+statement ok
+CREATE TABLE enote (id i32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO enote VALUES (1, 1.5e3), (2, 5e2), (3, 1.5e-3), (4, 1.50e-3), (5, 1.234e2), (6, 1.50e1), (7, 1.5e1), (8, .5e2), (9, 100e-2), (10, 2E3), (11, 1.5e+3), (12, -1.5e3)
+
+query D nosort
+SELECT v FROM enote ORDER BY id
+----
+1500
+500
+0.0015
+0.00150
+123.4
+15.0
+15
+50
+1.00
+2000
+1500
+-1500
+
+# value equality ignores the spelling: 5e2 (row 2) equals the integer literal 500, and 1.5e3
+# (rows 1 and 11) equals 1500; display scale never affects equality
+query I nosort
+SELECT id FROM enote WHERE v = 500 ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM enote WHERE v = 1500 ORDER BY id
+----
+1
+11
+
+# an exponent makes 5e2 a DECIMAL literal, so storing it into an integer column is the same
+# 42804 as any decimal literal — even though 500 is integer-valued (no decimal->int assignment)
+statement error 42804
+INSERT INTO c VALUES (10, 5e2, 0)
+
+# the exponent obeys the format caps at resolve: 1e131072 is a 131073-digit integer, one past
+# max_int_digits, so it traps 22003 (PG's numeric overflow), exactly like the written-out form
+statement error 22003
+INSERT INTO enote VALUES (99, 1e131072)
+
+# --- exact-half rounding ties + negative-zero canonicalization (decimal.md §2/§3) -------------
+# Rounding is half-AWAY-from-zero, so an exact .5 at the rounding digit rounds up in magnitude:
+# 0.125 -> 0.13, -0.125 -> -0.13, 0.135 -> 0.14 at scale 2. This is the canonical determinism
+# example (§3); the money table above uses 1.555/1.554, which are not exact halves at the digit.
+statement ok
+CREATE TABLE htie (id i32 PRIMARY KEY, x numeric(10,2))
+
+statement ok
+INSERT INTO htie VALUES (1, 0.125), (2, -0.125), (3, 0.135)
+
+query D nosort
+SELECT x FROM htie ORDER BY id
+----
+0.13
+-0.13
+0.14
+
+# Negative zero never survives: a decimal carries a positive sign on every zero (§2), so a value
+# that rounds to zero renders 0, never -0. CAST(-0.4 AS i32) rounds half-away to 0 (magnitude
+# < 0.5); the literals -0.0 / -0.000 store and render as 0.0 / 0.000 (scale kept, sign dropped).
+query I nosort
+SELECT CAST(-0.4 AS i32) FROM htie WHERE id = 1
+----
+0
+
+statement ok
+CREATE TABLE nz (id i32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO nz VALUES (1, -0.0), (2, -0.000)
+
+query D nosort
+SELECT v FROM nz ORDER BY id
+----
+0.0
+0.000

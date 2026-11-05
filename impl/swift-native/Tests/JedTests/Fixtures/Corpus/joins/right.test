@@ -1,0 +1,121 @@
+# RIGHT [OUTER] JOIN ... ON (spec/design/grammar.md §15): the mirror of LEFT — it preserves EVERY
+# right row, NULL-extending the left side for a right row that matched no left row. The OUTER
+# keyword is optional. The ON stays three-valued (a NULL join key never matches → that right row
+# is preserved, left side NULL). In a left-deep chain the "left" side is the whole accumulated
+# result so far, so the left NULL-pad spans all prior columns; its width comes from the scope (the
+# right relation's flat offset), so an empty left side pads correctly rather than crashing. Cost is
+# the cost.md §3 contract: ON over the same |running|×|right| candidate set, only the produced-row
+# count grows.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.order_by, query.order_by_keys, query.join_right, query.qualified_column, null.three_valued, types.i32, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, label text)
+
+statement ok
+CREATE TABLE empt (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, NULL)
+
+# b(30) has a NULL join key — it matches no left row, so RIGHT preserves it with the left NULL.
+statement ok
+INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'), (30, NULL, 'nullk')
+
+# Equi-join on k, RIGHT. b(10)↔a(1); b(20)↔a(2); b(21)↔a(2); b(30) NULL key → unmatched, preserved
+# with a side NULL. a(3)/a(4) are NOT preserved (RIGHT keeps right rows only). 4+4 materialize (8)
+# + 16 ON + 4 produced (3 matched + 1 extended) = 28.
+# names: id, id
+# cost: 30
+query II nosort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k ORDER BY a.id, b.id
+----
+1
+10
+2
+20
+2
+21
+NULL
+30
+
+# SELECT * — the preserved b(30) row carries NULLs across both a columns (a.id, a.k).
+# 8 materialize + 16 ON + 4 produced = 28.
+# names: id, k, id, k, label
+# cost: 30
+query IIIIT nosort
+SELECT * FROM a RIGHT JOIN b ON a.k = b.k ORDER BY b.id
+----
+1
+10
+10
+10
+ten
+2
+20
+20
+20
+twenty
+2
+20
+21
+20
+twentyish
+NULL
+NULL
+30
+NULL
+nullk
+
+# An empty LEFT table preserves every right row, NULL-extended on the (2-column) left side. The
+# left NULL-pad width comes from the scope even though no left row exists. The 0x4 loop evaluates
+# the ON zero times. 0+4 materialize + 0 ON + 4 produced = 8.
+# names: v, id
+# cost: 9
+query II nosort
+SELECT empt.v, b.id FROM empt RIGHT JOIN b ON empt.v = b.k ORDER BY b.id
+----
+NULL
+10
+NULL
+20
+NULL
+21
+NULL
+30
+
+# G14 — the ON-vs-WHERE outer-join trap. The same predicate on the NULLABLE (left) side behaves
+# very differently depending on where it sits. In the ON clause it is part of the match: a left row
+# that fails it simply does not match, so EVERY right row is still preserved (NULL-extended where it
+# found no qualifying left row). b(10) keeps its a(1) match (a.k=10 holds); b(20)/b(21)/b(30) match
+# no qualifying left row and are preserved with a NULL. All four b rows survive. `a.k = 10` filters the
+# NULL-extended (left) side, so it is pushed to a's scan (planner.md §3.3): a 1 page + 4 rows + 4
+# filter evals = 9, b 1 page + 4 rows = 5; only a(1) survives, so the residual `a.k = b.k` runs over
+# 1 × 4 pairs = 4; 4 produced. 9 + 5 + 4 + 4 = 22 (the unpushed ON ran 16 pairs × 3 ops = 48).
+# names: id, id
+# cost: 22
+query II nosort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k AND a.k = 10 ORDER BY b.id
+----
+1
+10
+NULL
+20
+NULL
+21
+NULL
+30
+
+# Move the identical predicate to WHERE and it filters AFTER the join — the NULL-extended rows
+# (a.k is NULL on the preserved side) fail `a.k = 10` (NULL = 10 is UNKNOWN) and are dropped,
+# downgrading the RIGHT join to inner-join-like behavior: only the genuinely matched a(1)/b(10) row
+# survives. 2 page + 8 materialize + 16 ON + 4 WHERE (one per join-produced row) + 1 produced = 31.
+# names: id, id
+# cost: 31
+query II nosort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k WHERE a.k = 10 ORDER BY b.id
+----
+1
+10

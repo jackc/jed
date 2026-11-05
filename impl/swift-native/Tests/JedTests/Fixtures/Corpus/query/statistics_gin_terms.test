@@ -1,0 +1,392 @@
+# GIN term statistics (spec/design/statistics.md §4.5/§6.1): ANALYZE counts each array / jsonb
+# column's GIN terms by lossy counting and keeps the 100 most common, and the planner prices a GIN
+# predicate with a literal operand from them — the predicate's logical rows and the GIN candidate's
+# scan rows, gin_entry reads, and index pages. These deterministic integer estimates, plan choices,
+# and ANALYZE costs are jed-owned and cross-core checked; NoREC relation gin_stats checks the rows.
+# requires: maintenance.analyze, maintenance.analyze_gin_terms, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, query.gin_scan, query.gin_any_eq, query.gin_jsonb_ops, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.set_returning, query.explain, query.order_by, query.aggregates, func.array_containment, func.array_quantified, func.array, func.jsonb_contains, func.json_builders, func.jsonb_mutate, expr.arithmetic, expr.case, cast.operator, types.i32, types.i64, types.text, types.array, types.jsonb, resource.cost_metering
+
+# --- a skewed array and document column beside an ordered index ------------------------------
+
+statement ok
+CREATE TABLE gt (id i32 PRIMARY KEY, tags i32[], n i32, doc jsonb)
+
+statement ok
+INSERT INTO gt SELECT g::i32, ARRAY[0::i32, (g % 10)::i32, (1000 + g)::i32], (g % 10)::i32,
+  jsonb_build_object('k', g % 4, 'all', true) || CASE WHEN g % 50 = 0 THEN '{"rare": 1}'::jsonb ELSE '{}'::jsonb END
+FROM generate_series(1, 1000) AS g
+
+statement ok
+CREATE INDEX gt_tags ON gt USING gin (tags)
+
+statement ok
+CREATE INDEX gt_n ON gt (n)
+
+statement ok
+CREATE INDEX gt_doc ON gt USING gin (doc)
+
+# Without statistics every GIN strategy takes the `matching` default (1/100) and the ordered
+# equality (1/200) wins.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags @> '{1005}'::i32[] AND n = 5
+----
+0
+Filter
+conjuncts=2
+2
+34
+1
+Scan gt
+Index bound: using gt_n; touched=3
+5
+17
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags @> '{0}'::i32[]
+----
+0
+Filter
+conjuncts=1
+10
+62
+1
+Scan gt
+GIN bound: using gt_tags; touched=2
+10
+42
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ? 'all'
+----
+0
+Filter
+conjuncts=1
+10
+62
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+10
+42
+
+# The cost pins each row's term extraction (statistics_value per term byte) cross-core.
+# cost: 82560
+statement ok
+ANALYZE gt (tags, n, doc)
+
+# tags has 1011 distinct terms (truncated to 100); doc's keys and values fit (complete); n has none.
+query TI nosort
+SELECT column_name, term_count FROM jed_statistics ORDER BY column_name
+----
+doc
+8
+n
+NULL
+tags
+100
+
+# 1005 is in one row and n = 5 in 100: the GIN bound now wins.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags @> '{1005}'::i32[] AND n = 5
+----
+0
+Filter
+conjuncts=2
+1
+10
+1
+Scan gt
+GIN bound: using gt_tags; touched=3
+1
+6
+
+# 0 is in every row: a full scan beats 1000 posting entries plus 1000 point fetches.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags @> '{0}'::i32[]
+----
+0
+Filter
+conjuncts=1
+1000
+3010
+1
+Scan gt
+Full scan; touched=2
+1000
+1010
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE 5 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+100
+602
+1
+Scan gt
+GIN bound: using gt_tags; touched=2
+100
+402
+
+# ANY sums its terms' rows.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags && '{3,4}'::i32[]
+----
+0
+Filter
+conjuncts=1
+200
+1202
+1
+Scan gt
+GIN bound: using gt_tags; touched=2
+200
+802
+
+# ALL folds the rarer term first: 100 rows, then 100 entries probed for 0 (in every row).
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags @> '{0,3}'::i32[]
+----
+0
+Filter
+conjuncts=1
+100
+702
+1
+Scan gt
+GIN bound: using gt_tags; touched=2
+100
+502
+
+# 1999 is absent; the truncated list's untracked bound (the 101st term's count, 1) gives it one row.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE tags @> '{1999}'::i32[]
+----
+0
+Filter
+conjuncts=1
+1
+8
+1
+Scan gt
+GIN bound: using gt_tags; touched=2
+1
+6
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ? 'rare'
+----
+0
+Filter
+conjuncts=1
+20
+122
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+20
+82
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ? 'all'
+----
+0
+Filter
+conjuncts=1
+1000
+3010
+1
+Scan gt
+Full scan; touched=2
+1000
+1010
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc @> '{"k": 1}'
+----
+0
+Filter
+conjuncts=1
+270
+1892
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+270
+1352
+
+# doc's list is complete and fresh, so the absent key 'nokey' proves zero rows.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ?| '{rare,nokey}'::text[]
+----
+0
+Filter
+conjuncts=1
+20
+122
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+20
+82
+
+# An ARRAY[...] of literals is a plan-time literal too.
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ?| ARRAY['rare', 'nokey']
+----
+0
+Filter
+conjuncts=1
+20
+142
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+20
+82
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ?& '{rare,all}'::text[]
+----
+0
+Filter
+conjuncts=1
+20
+142
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+20
+102
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gt WHERE doc ? 'nokey'
+----
+0
+Filter
+conjuncts=1
+0
+0
+1
+Scan gt
+GIN bound: using gt_doc; touched=2
+0
+0
+
+query I nosort
+SELECT count(*) FROM gt WHERE tags @> '{1005}'::i32[] AND n = 5
+----
+1
+
+query I nosort
+SELECT count(*) FROM gt WHERE doc ?& '{rare,all}'::text[]
+----
+20
+
+# --- a complete list proves absence only while fresh -----------------------------------------
+
+statement ok
+CREATE TABLE gs (id i32 PRIMARY KEY, tags i32[])
+
+statement ok
+INSERT INTO gs SELECT g::i32, ARRAY[(g % 3)::i32] FROM generate_series(1, 20) AS g
+
+statement ok
+CREATE INDEX gs_tags ON gs USING gin (tags)
+
+statement ok
+ANALYZE gs
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gs WHERE 9 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+0
+0
+1
+Scan gs
+GIN bound: using gs_tags; touched=2
+0
+0
+
+statement ok
+INSERT INTO gs VALUES (21, '{9}')
+
+query TB nosort
+SELECT column_name, is_stale FROM jed_statistics WHERE table_name = 'gs' ORDER BY column_name
+----
+id
+true
+tags
+true
+
+# Stale: an unlisted term gets one row.
+query ITTII nosort
+EXPLAIN SELECT id FROM gs WHERE 9 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+1
+6
+1
+Scan gs
+GIN bound: using gs_tags; touched=2
+1
+4
+
+# --- lossy counting prunes: 30,000 term occurrences, every term but 0 seen once -------------
+
+statement ok
+CREATE TABLE gp (id i32 PRIMARY KEY, tags i32[])
+
+statement ok
+INSERT INTO gp SELECT g::i32, ARRAY[0::i32, g::i32, (g + 20000)::i32] FROM generate_series(1, 10000) AS g
+
+statement ok
+CREATE INDEX gp_tags ON gp USING gin (tags)
+
+# Each bucket of 10,000 occurrences ends by dropping every term seen once, so only 0 survives
+# and the untracked bound is ceil(30000 / 10000) = 3.
+# cost: 400100
+statement ok
+ANALYZE gp
+
+query TI nosort
+SELECT column_name, term_count FROM jed_statistics WHERE table_name = 'gp' ORDER BY column_name
+----
+id
+NULL
+tags
+1
+
+# An unlisted term gets ceil(3 / 2) = 2 rows.
+query ITTII nosort
+EXPLAIN SELECT id FROM gp WHERE 5 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+2
+14
+1
+Scan gp
+GIN bound: using gp_tags; touched=2
+2
+10
+
+query ITTII nosort
+EXPLAIN SELECT id FROM gp WHERE 0 = ANY(tags)
+----
+0
+Filter
+conjuncts=1
+10000
+30050
+1
+Scan gp
+Full scan; touched=2
+10000
+10050

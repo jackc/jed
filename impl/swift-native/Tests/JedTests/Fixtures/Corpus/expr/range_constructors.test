@@ -1,0 +1,137 @@
+# Range constructor functions (spec/design/range-functions.md §2, RF2): the six concrete-result
+# builders int4range/int8range/numrange/tsrange/tstzrange/daterange (jed also accepts the i/f-prefix
+# spellings i32range/i64range — a documented extra tested per-core), each with a 2-arg (lo, hi) form
+# defaulting the bounds to [) and a 3-arg (lo, hi, bounds) form taking the 2-char flags text
+# ('[]'/'[)'/'(]'/'()'). The constructor is NON-strict: a NULL bound is an INFINITE bound, not a NULL
+# result. The constructed value is finalized exactly like a range literal — discrete subtypes
+# (i32/i64/date) canonicalize to [), equal bounds not-both-inclusive normalize to empty, lower > upper
+# traps 22000. A NULL 3-arg flags traps 22000, an invalid flags string 42601. Oracle-pinned vs
+# postgres:18. Format: ../../../design/conformance.md.
+# requires: query.select, types.range, types.i32, func.range_constructors, func.range_accessors, resource.cost_metering
+
+# --- int4range: 2-arg default [) and 3-arg explicit bounds (discrete → canonical [)) ---
+
+query T nosort
+SELECT int4range(1, 5)
+----
+[1,5)
+
+query T nosort
+SELECT int4range(1, 5, '[]')
+----
+[1,6)
+
+query T nosort
+SELECT int4range(1, 5, '(]')
+----
+[2,6)
+
+query T nosort
+SELECT int4range(1, 5, '()')
+----
+[2,5)
+
+# Equal bounds, not both inclusive → the empty range.
+query T nosort
+SELECT int4range(5, 5)
+----
+empty
+
+# Equal bounds, both inclusive → a one-element range, canonicalized [).
+query T nosort
+SELECT int4range(5, 5, '[]')
+----
+[5,6)
+
+# --- NULL bound = infinite bound (the constructor is non-strict) ---
+
+query T nosort
+SELECT int4range(NULL, 5)
+----
+(,5)
+
+query T nosort
+SELECT int4range(1, NULL)
+----
+[1,)
+
+query T nosort
+SELECT int4range(NULL, NULL)
+----
+(,)
+
+# --- int8range / numrange / daterange ---
+
+query T nosort
+SELECT int8range(100, 200)
+----
+[100,200)
+
+query T nosort
+SELECT numrange(1.5, 2.5, '[]')
+----
+[1.5,2.5]
+
+# Integer arguments widen to the decimal element (int → numeric).
+query T nosort
+SELECT numrange(1, 2)
+----
+[1,2)
+
+query T nosort
+SELECT daterange('2024-01-01', '2024-02-01')
+----
+[2024-01-01,2024-02-01)
+
+# An inclusive upper date canonicalizes one day forward.
+query T nosort
+SELECT daterange('2024-01-01', '2024-02-01', '[]')
+----
+[2024-01-01,2024-02-02)
+
+# --- tsrange / tstzrange (continuous: bounds kept verbatim, PG bound quoting) ---
+
+query T nosort
+SELECT tsrange('2024-01-01 09:00:00', '2024-02-01 12:30:00')
+----
+["2024-01-01 09:00:00","2024-02-01 12:30:00")
+
+query T nosort
+SELECT tstzrange('2024-01-01 09:00:00+00', '2024-02-01 12:30:00+00')
+----
+["2024-01-01 09:00:00+00","2024-02-01 12:30:00+00")
+
+# --- the accessors read a constructed range back (RF1 over RF2) ---
+
+query IIB nosort
+SELECT lower(int4range(1, 5, '[]')), upper(int4range(1, 5, '[]')), isempty(int4range(5, 5))
+----
+1
+6
+true
+
+# A constructed unbounded range: the infinite side reads NULL / *_inf true.
+query IBB nosort
+SELECT upper(int4range(1, NULL)), upper_inf(int4range(1, NULL)), lower_inc(int4range(1, NULL))
+----
+NULL
+true
+true
+
+# --- errors ---
+
+# lower > upper is a data exception.
+statement error 22000
+SELECT int4range(5, 1)
+
+# An invalid bounds-flags string is a syntax error (PG "invalid range bound flags").
+statement error 42601
+SELECT int4range(1, 5, 'xy')
+
+# A NULL bounds-flags argument is a data exception (PG "flags argument must not be null").
+statement error 22000
+SELECT int4range(1, 5, NULL)
+
+# A discrete canonicalization step past the element domain overflows (i32 max + 1).
+statement error 22003
+SELECT int4range(2147483647, 2147483647, '[]')

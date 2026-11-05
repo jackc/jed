@@ -1,0 +1,42 @@
+# Dates and times held in JSON: extract, then cast. jed does not support the jsonpath datetime item
+# methods (.datetime() / .date() / .time() / .time_tz() / .timestamp() / .timestamp_tz()), by
+# decision (spec/design/jsonpath.md §3.1); this is the supported form. Output matches the postgres:18
+# oracle except the ledgered 0A000 entries at the end. Format: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.jsonb, types.jsonpath, types.date, types.timestamp, types.timestamptz, func.jsonb_path, expr.json_query_fns
+
+# ->> gives text; the runtime text casts parse it.
+query TTT nosort
+SELECT ('{"d": "2020-01-05"}'::jsonb ->> 'd')::date, ('{"t": "2020-01-05 10:30:00"}'::jsonb ->> 't')::timestamp, ('{"t": "2020-01-05T10:30:00+02:00"}'::jsonb ->> 't')::timestamptz
+----
+2020-01-05
+2020-01-05 10:30:00
+2020-01-05 08:30:00+00
+
+# JSON_VALUE ... RETURNING coerces the scalar through the same text casts.
+query TTT nosort
+SELECT JSON_VALUE('{"d": "2020-01-05"}', '$.d' RETURNING date), JSON_VALUE('{"t": "2020-01-05 10:30:00"}', '$.t' RETURNING timestamp), JSON_VALUE('{"t": "2020-01-05T10:30:00+02:00"}', '$.t' RETURNING timestamptz)
+----
+2020-01-05
+2020-01-05 10:30:00
+2020-01-05 08:30:00+00
+
+# A malformed date is NULL under JSON_VALUE's default NULL ON ERROR, 22007 under ERROR ON ERROR.
+query T nosort
+SELECT JSON_VALUE('{"d": "not a date"}', '$.d' RETURNING date)
+----
+NULL
+
+statement error 22007
+SELECT JSON_VALUE('{"d": "not a date"}', '$.d' RETURNING date ERROR ON ERROR)
+
+# --- Deliberate divergences (ledgered in oracle_overrides.toml) ---
+
+# The datetime item methods are not supported (jsonpath.md §3.1); PostgreSQL parses the string.
+statement error 0A000
+SELECT jsonb_path_query_first('"2020-01-05"', '$.datetime()')
+
+statement error 0A000
+SELECT jsonb_path_query_first('"2020-01-05"', '$.date()')
+
+statement error 0A000
+SELECT jsonb_path_query_first('"2020-01-05 10:30:00+02"', '$.timestamp_tz()')

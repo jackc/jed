@@ -1,0 +1,95 @@
+# A `text` context item for the SQL/JSON query functions and JSON_TABLE (spec/design/json-sql-functions.md
+# §5.1, json-table.md §3): JSON_EXISTS / JSON_VALUE / JSON_QUERY / JSON_TABLE accept a text-typed
+# context (a `::text` expression or a text column), with or without FORMAT JSON, and parse it as a
+# jsonb document (keys canonical, duplicates last-wins — the json → jsonb conversion). Malformed
+# text is 22P02 raised by the context's conversion, which ON ERROR does not catch (json.md §4.2), as
+# in PostgreSQL. Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.comma_from, types.jsonb, types.jsonpath, func.jsonb_path, expr.json_query_fns, func.json_table, resource.cost_metering
+
+# cost: 25
+query TTB nosort
+SELECT JSON_QUERY('[1, 2]'::text, '$[0]'), JSON_VALUE('[1, 2]'::text, '$[1]'), JSON_EXISTS('[1, 2]'::text, '$[1]')
+----
+1
+2
+true
+
+# FORMAT JSON on a text context is the same parse.
+# cost: 29
+query TTB nosort
+SELECT JSON_QUERY('{"a": [1]}'::text FORMAT JSON, '$.a'), JSON_VALUE('{"a": "x"}'::text FORMAT JSON, '$.a'), JSON_EXISTS('{"a": 1}'::text FORMAT JSON, '$.b')
+----
+[1]
+x
+false
+
+# The text is read as jsonb: duplicate keys last-wins, canonical render.
+# cost: 4
+query T nosort
+SELECT JSON_QUERY('{"a":1, "a":2}'::text, '$')
+----
+{"a": 2}
+
+# Malformed text is 22P02 — outside ON ERROR.
+statement error 22P02
+SELECT JSON_QUERY('[1'::text, '$[0]')
+
+statement error 22P02
+SELECT JSON_QUERY('[1'::text, '$[0]' NULL ON ERROR)
+
+statement error 22P02
+SELECT JSON_VALUE('nope'::text, '$' DEFAULT 'd' ON ERROR)
+
+statement error 22P02
+SELECT JSON_EXISTS('{'::text, '$' FALSE ON ERROR)
+
+# JSON_TABLE over a text context.
+# cost: 13
+query I nosort
+SELECT * FROM JSON_TABLE('[1, 2]'::text, '$[*]' COLUMNS (v int PATH '$'))
+----
+1
+2
+
+statement error 22P02
+SELECT * FROM JSON_TABLE('[1'::text, '$[*]' COLUMNS (v int PATH '$'))
+
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, body text)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"n": 1}'), (2, '{"n": 2, "tags": ["x", "y"]}'), (3, NULL)
+
+# A text column as the context; a NULL context → NULL.
+# cost: 80
+query IITB nosort
+SELECT id, JSON_VALUE(body, '$.n' RETURNING i32), JSON_QUERY(body, '$.tags'), JSON_EXISTS(body, '$.tags') FROM docs ORDER BY id
+----
+1
+1
+NULL
+false
+2
+2
+["x", "y"]
+true
+3
+NULL
+NULL
+NULL
+
+# cost: 43
+query IT nosort
+SELECT d.id, jt.tag FROM docs d, JSON_TABLE(d.body, '$.tags[*]' COLUMNS (tag text PATH '$')) jt ORDER BY d.id, jt.tag
+----
+2
+x
+2
+y
+
+statement ok
+INSERT INTO docs VALUES (4, '{broken')
+
+# A malformed stored document raises when the row is read, ON ERROR notwithstanding.
+statement error 22P02
+SELECT JSON_VALUE(body, '$.n' NULL ON ERROR) FROM docs WHERE id = 4

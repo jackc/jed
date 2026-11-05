@@ -1,0 +1,78 @@
+# MERGE whose join condition no access path narrows, over inputs large enough that the matching loop
+# takes its hash form (spec/design/merge.md §3, estimator.md §9.4). The hash form changes cost, never
+# results: matches keep the nested loop's order, a NULL key never matches, and the complete join
+# condition is rechecked on every candidate. Oracle-probed against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.merge, query.select, query.order_by, query.where_eq, query.aggregates, query.set_returning, types.i32, types.text, expr.arithmetic
+
+statement ok
+CREATE TABLE hb (id i32 PRIMARY KEY, grp i32, tag text, n i32)
+
+statement ok
+INSERT INTO hb SELECT g, g % 20, 't' || g, 0 FROM generate_series(1, 200) AS s(g)
+
+statement ok
+CREATE TABLE hs (grp i32, tag text, d i32)
+
+statement ok
+INSERT INTO hs SELECT g % 30, 't' || g, g FROM generate_series(1, 60) AS s(g)
+
+statement ok
+INSERT INTO hs VALUES (NULL, 'tnull', 1000)
+
+# Each target row matches the one source row with its tag; the extra grp equality filters further.
+statement ok
+MERGE INTO hb USING hs ON hb.tag = hs.tag AND hb.grp = hs.grp
+WHEN MATCHED THEN UPDATE SET n = hs.d
+WHEN NOT MATCHED THEN INSERT VALUES (1000 + hs.d, hs.grp, hs.tag, -1)
+
+query IIII nosort
+SELECT count(*), sum(n), min(id), max(id) FROM hb
+----
+241
+209
+1
+2000
+
+query I nosort
+SELECT count(*) FROM hb WHERE n > 0 AND id <= 200
+----
+20
+
+# A NULL key never matches: the source row with a NULL grp was inserted.
+query IIT nosort
+SELECT id, n, tag FROM hb WHERE id = 2000
+----
+2000
+-1
+tnull
+
+# A target row matched by two source rows that both act on it is 21000.
+statement ok
+CREATE TABLE hdup (grp i32, d i32)
+
+statement ok
+INSERT INTO hdup SELECT g % 10, g FROM generate_series(1, 100) AS s(g)
+
+statement error 21000
+MERGE INTO hb USING hdup ON hb.grp = hdup.grp AND hb.id < 50
+WHEN MATCHED THEN UPDATE SET n = hdup.d
+
+# BY SOURCE with the hash form: every target row in a group no source row has is deleted.
+statement ok
+CREATE TABLE hkeep (grp i32)
+
+statement ok
+INSERT INTO hkeep SELECT g FROM generate_series(0, 9) AS s(g)
+
+statement ok
+MERGE INTO hb USING (SELECT h.grp, s.g FROM hkeep AS h CROSS JOIN generate_series(1, 5) AS s(g)) AS k
+ON hb.grp = k.grp AND k.g = 1
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+
+query III nosort
+SELECT count(*), min(grp), max(grp) FROM hb
+----
+110
+0
+9

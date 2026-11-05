@@ -1,0 +1,411 @@
+# SELECT DISTINCT ON (spec/design/grammar.md §11.1): keep the FIRST row of each group of equal ON
+# keys, in the query's fully determined sort order. The ON keys resolve like ORDER BY keys (ordinal,
+# output name, input column, expression), must match the leading ORDER BY keys (42P10), and are
+# appended to the sort when the ORDER BY does not name them all. Grouping is NULL-safe sort
+# equality. The dedup runs after the sort and before LIMIT/OFFSET; window functions see every row.
+#
+# Every query whose ORDER BY decides the kept row is oracle-clean. Where the ORDER BY leaves a tie
+# inside a group (or there is no ORDER BY), PostgreSQL's choice is unspecified while jed keeps the
+# first row in the primary-key tie order; those entries project only the keys, or are ledgered.
+# requires: ddl.create_table, ddl.primary_key, dml.insert_multi_row, query.select, query.distinct, query.distinct_on, query.order_by, query.order_by_keys, query.order_by_ordinal, query.order_by_expr, query.order_by_alias, query.column_alias, query.limit, query.offset, query.join_inner, query.cte, types.text, query.aggregates, query.group_by, query.window, query.derived_table, query.union, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, types.decimal, types.json, error.division_by_zero, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, cust i32, placed i32, total i32)
+
+# Customers 10 (ids 1, 2, 8), 20 (ids 3, 4), 30 (id 5), and two NULL-customer rows (ids 6, 7).
+statement ok
+INSERT INTO o VALUES (1, 10, 100, 5), (2, 10, 300, 7), (3, 20, 200, 9), (4, 20, 250, 1), (5, 30, 50, 4), (6, NULL, 10, 2), (7, NULL, 20, 3), (8, 10, 200, 6)
+
+# Greatest-n-per-group: each customer's latest order. The NULL customers form one group, sorted
+# last (NULL is the largest value, ASC NULLS LAST).
+query III nosort
+SELECT DISTINCT ON (cust) cust, id, placed FROM o ORDER BY cust, placed DESC
+----
+10
+2
+300
+20
+4
+250
+30
+5
+50
+NULL
+7
+20
+
+# The ON key need not be projected, and neither need the ORDER BY keys.
+query I nosort
+SELECT DISTINCT ON (cust) id FROM o ORDER BY cust, placed
+----
+1
+3
+5
+6
+
+# An ordinal ON key names a select-list item, as in ORDER BY.
+query II nosort
+SELECT DISTINCT ON (1) cust, total FROM o ORDER BY 1, total DESC
+----
+10
+7
+20
+9
+30
+4
+NULL
+3
+
+# An output name binds before an input column; ON (c) and ORDER BY c are the same key.
+query II nosort
+SELECT DISTINCT ON (c) cust AS c, id FROM o ORDER BY c, id DESC
+----
+10
+8
+20
+4
+30
+5
+NULL
+7
+
+# A qualified ON key matches the bare ORDER BY key: both resolve to the column o.cust.
+query II nosort
+SELECT DISTINCT ON (o.cust) cust, id FROM o ORDER BY cust, id
+----
+10
+1
+20
+3
+30
+5
+NULL
+6
+
+# An expression key groups by its value: cust % 20 is 0 for 20, 10 for 10 and 30, NULL for NULL.
+query II nosort
+SELECT DISTINCT ON (cust % 20) cust, id FROM o ORDER BY cust % 20, id
+----
+20
+3
+10
+1
+NULL
+6
+
+# A descending matched key orders the groups; the dedup still keeps one row per customer.
+query II nosort
+SELECT DISTINCT ON (cust) cust, id FROM o ORDER BY cust DESC, id
+----
+NULL
+6
+30
+5
+20
+3
+10
+1
+
+# With no ORDER BY the sort is the ON keys. Output order is unspecified (rowsort), and only the
+# key is projected because PostgreSQL leaves the kept row unspecified here.
+query I rowsort
+SELECT DISTINCT ON (cust) cust FROM o
+----
+10
+20
+30
+NULL
+
+# LIMIT / OFFSET slice the deduplicated rows, not the sorted source rows.
+query II nosort
+SELECT DISTINCT ON (cust) cust, id FROM o ORDER BY cust, id LIMIT 2 OFFSET 1
+----
+20
+3
+30
+5
+
+# LIMIT 0 keeps nothing.
+query II nosort
+SELECT DISTINCT ON (cust) cust, id FROM o ORDER BY cust, id LIMIT 0
+----
+
+# Window functions run before the dedup, so they see every row of each customer.
+query II nosort
+SELECT DISTINCT ON (cust) cust, count(*) OVER (PARTITION BY cust) AS n FROM o ORDER BY cust, id
+----
+10
+3
+20
+2
+30
+1
+NULL
+2
+
+# Over a grouped query the ON key resolves in the group context. Groups: 10 → 18, 20 → 10, 30 → 4,
+# NULL → 5; cust > 15 is false for 10, true for 20 and 30, NULL for NULL.
+query BII nosort
+SELECT DISTINCT ON (cust > 15) cust > 15 AS big, cust, sum(total) FROM o GROUP BY cust ORDER BY cust > 15, sum(total) DESC
+----
+false
+10
+18
+true
+20
+10
+NULL
+NULL
+5
+
+# An aggregate ON key.
+query II nosort
+SELECT DISTINCT ON (count(*)) count(*), cust FROM o GROUP BY cust ORDER BY count(*), cust
+----
+1
+30
+2
+20
+3
+10
+
+statement ok
+CREATE TABLE c (cid i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO c VALUES (10, 'ann'), (20, 'bob'), (30, 'cy'), (40, 'dee')
+
+# Over a join: each named customer's largest order total.
+query TII nosort
+SELECT DISTINCT ON (c.name) c.name, o.id, o.total FROM c JOIN o ON o.cust = c.cid ORDER BY c.name, o.total DESC
+----
+ann
+2
+7
+bob
+3
+9
+cy
+5
+4
+
+# A derived table: the outer WHERE reads a column that is not an ON key, so it must filter the
+# deduplicated rows. Each customer keeps its highest id (8, 4, 5, 7) and only id 8 has total > 5.
+query III nosort
+SELECT * FROM (SELECT DISTINCT ON (cust) cust, id, total FROM o ORDER BY cust, id DESC) s WHERE total > 5
+----
+10
+8
+6
+
+# The same through a CTE.
+query III nosort
+WITH s AS (SELECT DISTINCT ON (cust) cust, id, total FROM o ORDER BY cust, id DESC) SELECT * FROM s WHERE total > 5 ORDER BY id
+----
+10
+8
+6
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO p VALUES (1, 1, 1), (2, 1, 1), (3, 1, 2), (4, 2, 1), (5, 2, 1), (6, NULL, NULL), (7, NULL, NULL)
+
+# Two ON keys in a different order than the ORDER BY: the leading run a, b matches {b, a}.
+query III nosort
+SELECT DISTINCT ON (b, a) a, b, id FROM p ORDER BY a, b, id DESC
+----
+1
+1
+2
+1
+2
+3
+2
+1
+5
+NULL
+NULL
+7
+
+# An ON key the ORDER BY does not name is appended: ORDER BY a sorts by a, b. Only the keys are
+# projected, because the ORDER BY leaves the row within each (a, b) group unspecified in PostgreSQL.
+query II nosort
+SELECT DISTINCT ON (a, b) a, b FROM p ORDER BY a
+----
+1
+1
+1
+2
+2
+1
+NULL
+NULL
+
+# A duplicate ON key is one key.
+query II nosort
+SELECT DISTINCT ON (a, a) a, id FROM p ORDER BY a, id
+----
+1
+1
+2
+4
+NULL
+6
+
+# DISTINCT ON combines with a set operation; the arm sorts by its own ON key.
+query I rowsort
+SELECT DISTINCT ON (a) a FROM p UNION ALL SELECT 99
+----
+1
+2
+99
+NULL
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, x decimal)
+
+statement ok
+INSERT INTO d VALUES (1, 1.50), (2, 1.5), (3, 2), (4, NULL), (5, NULL)
+
+# Grouping is the sort equality: 1.50 and 1.5 are one group, and the kept row shows its own value.
+# The NULLs are one group.
+query DI nosort
+SELECT DISTINCT ON (x) x, id FROM d ORDER BY x, id
+----
+1.50
+1
+2
+3
+NULL
+4
+
+query DI nosort
+SELECT DISTINCT ON (x) x, id FROM d ORDER BY x, id DESC
+----
+1.5
+2
+2
+3
+NULL
+5
+
+# --- errors ---
+
+# An ORDER BY key that matches an ON key after one that does not.
+statement error 42P10
+SELECT DISTINCT ON (cust) cust, id FROM o ORDER BY placed, cust
+
+# An ON key the ORDER BY does not reach, after an unmatched ORDER BY key.
+statement error 42P10
+SELECT DISTINCT ON (cust, total) cust FROM o ORDER BY cust, id
+
+# The ON keys must lead: matching a later key is not enough.
+statement error 42P10
+SELECT DISTINCT ON (cust) cust FROM o ORDER BY id
+
+# An ordinal out of range.
+statement error 42P10
+SELECT DISTINCT ON (5) cust FROM o ORDER BY cust
+
+statement error 42P10
+SELECT DISTINCT ON (0) cust FROM o
+
+# A bare name two output columns share.
+statement error 42702
+SELECT DISTINCT ON (s) cust AS s, id AS s FROM o
+
+# An unknown column.
+statement error 42703
+SELECT DISTINCT ON (nope) cust FROM o
+
+# An empty list and a direction are syntax errors.
+statement error 42601
+SELECT DISTINCT ON () cust FROM o
+
+statement error 42601
+SELECT DISTINCT ON (cust DESC) cust FROM o
+
+# json has no equality or ordering operator.
+statement ok
+CREATE TABLE js (id i32 PRIMARY KEY, j json)
+
+statement error 42883
+SELECT DISTINCT ON (j) id FROM js
+
+statement error 42883
+SELECT DISTINCT ON (j) id FROM js ORDER BY j
+
+# An aggregate ON key outside a grouped query.
+statement error 42803
+SELECT DISTINCT ON (count(*)) cust FROM o ORDER BY count(*)
+
+# --- jed's determinism (ledgered: PostgreSQL leaves these rows unspecified) ---
+
+# A tie inside a group is broken like any ORDER BY tie, by the primary-key scan order, so the kept
+# row is the lowest id: customer 20 keeps id 3. PostgreSQL's sort may return either row.
+query II nosort
+SELECT DISTINCT ON (cust) cust, id FROM o ORDER BY cust
+----
+10
+1
+20
+3
+30
+5
+NULL
+6
+
+# With no ORDER BY the sort is the ON key with the same tie-break (rows compared rowsort).
+query II rowsort
+SELECT DISTINCT ON (cust) cust, id FROM o
+----
+10
+1
+20
+3
+30
+5
+NULL
+6
+
+# Only emitted rows are projected: row 2 (total 7) is dropped by the dedup, so 100 / (total - 7) is
+# never evaluated over it. PostgreSQL computes a cheap select item below its sort and traps 22012.
+query II nosort
+SELECT DISTINCT ON (cust) cust, 100 / (total - 7) FROM o ORDER BY cust, id
+----
+10
+-50
+20
+50
+30
+-33
+NULL
+-20
+
+# --- cost (cost.md §3 "SELECT DISTINCT ON") ---
+
+statement ok
+CREATE TABLE k (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO k VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50)
+
+# Every row is scanned; only the emitted row is projected (v + 1 once) and produced:
+# 1 page + 5 rows read + 1 operator_eval + 1 row_produced = 8.
+# cost: 8
+query II nosort
+SELECT DISTINCT ON (g) g, v + 1 FROM k ORDER BY g, v DESC LIMIT 1
+----
+1
+21
+
+# An expression key is materialized once per sorted row; the matching ORDER BY key is the same
+# key, evaluated once: 1 page + 5 rows read + 5 operator_evals + 2 rows produced = 13.
+# cost: 13
+query I nosort
+SELECT DISTINCT ON (g % 2) id FROM k ORDER BY g % 2, id
+----
+3
+1

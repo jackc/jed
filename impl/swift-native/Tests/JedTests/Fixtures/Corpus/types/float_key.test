@@ -1,0 +1,148 @@
+# float (f32/f64) as a KEY (spec/design/encoding.md §2.8, the `float-order-preserving` rule —
+# the LAST scalar to become keyable, so every scalar is now keyable). A f32/f64 column is a valid
+# PRIMARY KEY / ordered secondary index / UNIQUE key / FK target, and a float-element array
+# (f64[]/f32[]) is keyable too (§2.14). The key is the IEEE bits canonicalized (-0 → +0, every NaN →
+# one quiet pattern) then the order-preserving bit-flip, so the B-tree iterates in PostgreSQL's
+# float8/float4 TOTAL order: -Infinity < finite < +Infinity < NaN, with -0 = +0 and NaN = NaN. This
+# agrees with PostgreSQL byte-for-byte (PG admits float btree keys), so the suite is oracle-clean;
+# floats render under the `R` tag (parsed-value compare). All values here are in-contract literals
+# (no transcendentals), so the result is cross-core exact. The multidim/lower-bound float-element
+# array key tiebreak (which diverges from PG's ORDER BY) is pinned per-core, not here.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.where_eq, query.order_by, query.is_null, types.f32, types.f64, types.float_key, types.array, types.i32, resource.cost_metering
+
+# --- a f64 PRIMARY KEY: the store iterates in the float total order --------------------------------
+statement ok
+CREATE TABLE fk (k f64 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO fk VALUES (1.5, 1), (-1.5, 5), (0.0, 3)
+
+# the specials enter via INSERT ... SELECT (a bare VALUES slot takes only bare literals)
+statement ok
+INSERT INTO fk SELECT f64 '-Infinity', 2
+
+statement ok
+INSERT INTO fk SELECT f64 'Infinity', 6
+
+statement ok
+INSERT INTO fk SELECT f64 'NaN', 4
+
+# -Infinity < -1.5 < 0 < 1.5 < +Infinity < NaN (NaN is the largest value)
+query RI nosort
+SELECT k, v FROM fk ORDER BY k
+----
+-Infinity
+2
+-1.5
+5
+0
+3
+1.5
+1
+Infinity
+6
+NaN
+4
+
+# --- -0 = +0 and NaN = NaN under the key (a UNIQUE/PK collapses them) ------------------------------
+# inserting +0 when -0 (== 0) is already the key for v=3 is a duplicate
+statement error 23505
+INSERT INTO fk VALUES (-0.0, 99)
+
+# inserting a second NaN collides with the stored NaN (NaN = NaN in the btree order)
+statement error 23505
+INSERT INTO fk SELECT f64 'NaN', 99
+
+# --- point lookup by a float key (full-scan + residual filter; correct rows). A bare literal does
+# not adapt in a float comparison (only in assignment), so probes use an explicit f64 '…' literal. ---
+query I nosort
+SELECT v FROM fk WHERE k = f64 '1.5'
+----
+1
+
+# NaN is the largest value, so it satisfies k > 0 (PG float8 btree semantics)
+query I rowsort
+SELECT v FROM fk WHERE k > f64 '0'
+----
+1
+4
+6
+
+# --- a f32 PRIMARY KEY: same total order at single precision ---------------------------------------
+statement ok
+CREATE TABLE rk (k f32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO rk VALUES (2.5, 1), (-2.5, 2), (100.25, 3)
+
+query RI nosort
+SELECT k, v FROM rk ORDER BY k
+----
+-2.5
+2
+2.5
+1
+100.25
+3
+
+# --- a UNIQUE float column: NULLS DISTINCT; -0/+0 collapse ------------------------------------------
+statement ok
+CREATE TABLE uq (id i32 PRIMARY KEY, m f64 UNIQUE)
+
+statement ok
+INSERT INTO uq VALUES (1, 1.25), (2, NULL), (3, NULL)
+
+statement error 23505
+INSERT INTO uq VALUES (4, 1.25)
+
+# --- a secondary index over a float column orders the scan -----------------------------------------
+statement ok
+CREATE TABLE si (id i32 PRIMARY KEY, m f64)
+
+statement ok
+INSERT INTO si VALUES (1, 3.5), (2, -1.0), (3, 2.0), (4, 3.5)
+
+statement ok
+CREATE INDEX si_m ON si (m)
+
+query RI rowsort
+SELECT m, id FROM si WHERE m = f64 '3.5'
+----
+3.5
+1
+3.5
+4
+
+# --- a FK referencing a float PRIMARY KEY ----------------------------------------------------------
+statement ok
+CREATE TABLE child (id i32 PRIMARY KEY, parent f64 REFERENCES fk(k))
+
+statement ok
+INSERT INTO child VALUES (1, 1.5), (2, -1.5)
+
+# a child pointing at a missing parent key traps the FK violation
+statement error 23503
+INSERT INTO child VALUES (3, 7.0)
+
+# --- a f64[] (float-element array) PRIMARY KEY: 1-D agrees with PostgreSQL --------------------------
+statement ok
+CREATE TABLE ak (k f64[] PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO ak VALUES ('{1.5,2.5}', 1), ('{1.5}', 2), ('{-1.5}', 3)
+
+query TI nosort
+SELECT k, v FROM ak ORDER BY k
+----
+{-1.5}
+3
+{1.5}
+2
+{1.5,2.5}
+1
+
+query I nosort
+SELECT v FROM ak WHERE k = ARRAY[f64 '1.5']
+----
+2

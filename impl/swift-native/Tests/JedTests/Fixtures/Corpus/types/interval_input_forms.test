@@ -1,0 +1,411 @@
+# PostgreSQL's interval input forms beyond plain units (spec/design/interval.md §3): the SQL-standard
+# forms — `N-M` years-months, a unitless number read positionally (seconds at the right end, days
+# left of an hour or a time), `D H:M:S` — and ISO 8601, both the "format with designators"
+# (`P1Y2M3DT4H5M6S`, `P2W`, negative and fractional fields) and the "alternative format"
+# (`P0001-02-03T04:05:06`, basic `P00010203T040506`). The parser is a port of PG 18's interval_in
+# under IntervalStyle = postgres, so a leading sign stays on its own field (`'-1 2:03:04'` is
+# `-1 days +02:03:04`). A year fraction becomes whole months (the rest dropped), as in PG. Every
+# text→interval path shares the one parser: the INTERVAL literal, a string adapting to an interval
+# column, the `::interval` / CAST spelling, the runtime per-row text cast, and container element text.
+# Field overflow is 22008 here (PG's 22015 — the oracle_overrides ledger).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, types.interval, types.array, types.composite, cast.explicit, cast.operator, cast.string_literal, cast.text_string_native
+
+# --- SQL standard: years-months -------------------------------------------------------------------
+
+query T nosort
+SELECT INTERVAL '1-2'
+----
+1 year 2 mons
+
+query T nosort
+SELECT INTERVAL '-1-2'
+----
+-1 years -2 mons
+
+query T nosort
+SELECT INTERVAL '0-11'
+----
+11 mons
+
+query T nosort
+SELECT INTERVAL '+3-0'
+----
+3 years
+
+# the months field is 0..11
+statement error 22008
+SELECT INTERVAL '1-12'
+
+statement error 22007
+SELECT INTERVAL '1-2-3'
+
+# --- SQL standard: day-time and positional numbers ------------------------------------------------
+
+query T nosort
+SELECT INTERVAL '1 1:00'
+----
+1 day 01:00:00
+
+query T nosort
+SELECT INTERVAL '3 4:05:06'
+----
+3 days 04:05:06
+
+query T nosort
+SELECT INTERVAL '1-2 3 4:05:06'
+----
+1 year 2 mons 3 days 04:05:06
+
+query T nosort
+SELECT INTERVAL '-1-2 -3 -4:05:06'
+----
+-1 years -2 mons -3 days -04:05:06
+
+# under IntervalStyle postgres a leading sign does not carry to the later fields
+query T nosort
+SELECT INTERVAL '-1 2:03:04'
+----
+-1 days +02:03:04
+
+query T nosort
+SELECT INTERVAL '1 -2:03:04'
+----
+1 day -02:03:04
+
+# a unitless number left of an hour is days; at the right end it is seconds
+query T nosort
+SELECT INTERVAL '5 1 hour'
+----
+5 days 01:00:00
+
+query T nosort
+SELECT INTERVAL '1 2 hours 3'
+----
+1 day 02:00:03
+
+query T nosort
+SELECT INTERVAL '1-2 3'
+----
+1 year 2 mons 00:00:03
+
+# a unitless number takes the unit to its right, so two in a row repeat a field
+statement error 22007
+SELECT INTERVAL '1 2'
+
+statement error 22007
+SELECT INTERVAL '1 2 days'
+
+statement error 22007
+SELECT INTERVAL '1 1-2'
+
+# a time: H:M, H:M:S[.f], or M:S.f
+query T nosort
+SELECT INTERVAL '1:30.5'
+----
+00:01:30.5
+
+query T nosort
+SELECT INTERVAL '0:0:60'
+----
+00:01:00
+
+statement error 22008
+SELECT INTERVAL '1:60'
+
+statement error 22007
+SELECT INTERVAL '1:2:3:4'
+
+# a sign may be separated from its number; punctuation separates fields
+query T nosort
+SELECT INTERVAL '- 5 days'
+----
+-5 days
+
+query T nosort
+SELECT INTERVAL '1 day, 2 hours'
+----
+1 day 02:00:00
+
+query T nosort
+SELECT INTERVAL '.5'
+----
+00:00:00.5
+
+query T nosort
+SELECT INTERVAL '5. day'
+----
+5 days
+
+# --- ISO 8601: format with designators ------------------------------------------------------------
+
+query T nosort
+SELECT INTERVAL 'P1Y2M3DT4H5M6S'
+----
+1 year 2 mons 3 days 04:05:06
+
+query T nosort
+SELECT INTERVAL 'P2W'
+----
+14 days
+
+query T nosort
+SELECT INTERVAL 'P1W2D'
+----
+9 days
+
+query T nosort
+SELECT INTERVAL 'PT36H'
+----
+36:00:00
+
+query T nosort
+SELECT INTERVAL 'P1M'
+----
+1 mon
+
+query T nosort
+SELECT INTERVAL 'PT1M'
+----
+00:01:00
+
+query T nosort
+SELECT INTERVAL 'P-1Y-2M'
+----
+-1 years -2 mons
+
+query T nosort
+SELECT INTERVAL 'P1DT-1H'
+----
+1 day -01:00:00
+
+query T nosort
+SELECT INTERVAL 'P1.5Y'
+----
+1 year 6 mons
+
+query T nosort
+SELECT INTERVAL 'P0.5M'
+----
+15 days
+
+query T nosort
+SELECT INTERVAL 'P1.5W'
+----
+10 days 12:00:00
+
+query T nosort
+SELECT INTERVAL 'P-1.5D'
+----
+-1 days -12:00:00
+
+query T nosort
+SELECT INTERVAL 'PT1.5H2.5M3.5S'
+----
+01:32:33.5
+
+query T nosort
+SELECT INTERVAL 'PT'
+----
+00:00:00
+
+query T nosort
+SELECT INTERVAL 'P1e2D'
+----
+100 days
+
+# --- ISO 8601: alternative format -----------------------------------------------------------------
+
+query T nosort
+SELECT INTERVAL 'P0001-02-03T04:05:06'
+----
+1 year 2 mons 3 days 04:05:06
+
+query T nosort
+SELECT INTERVAL 'P00010203T040506'
+----
+1 year 2 mons 3 days 04:05:06
+
+query T nosort
+SELECT INTERVAL 'P0001-02'
+----
+1 year 2 mons
+
+query T nosort
+SELECT INTERVAL 'PT04:05'
+----
+04:05:00
+
+query T nosort
+SELECT INTERVAL 'P0001-02-03T04:05:06.5'
+----
+1 year 2 mons 3 days 04:05:06.5
+
+# --- ISO 8601: malformed or out of range ----------------------------------------------------------
+
+statement error 22007
+SELECT INTERVAL 'P'
+
+# the whole text, untrimmed, with an upper-case P
+statement error 22007
+SELECT INTERVAL ' P1D'
+
+statement error 22007
+SELECT INTERVAL 'P1D '
+
+statement error 22007
+SELECT INTERVAL 'p1d'
+
+statement error 22007
+SELECT INTERVAL 'P1D ago'
+
+statement error 22007
+SELECT INTERVAL 'P1X'
+
+statement error 22007
+SELECT INTERVAL 'P1DT1D'
+
+statement error 22007
+SELECT INTERVAL 'P1Y-2'
+
+statement error 22008
+SELECT INTERVAL 'P2147483648D'
+
+statement error 22008
+SELECT INTERVAL 'P1e15D'
+
+# --- fractions ------------------------------------------------------------------------------------
+
+# a year fraction becomes whole months, the rest of a month dropped
+query T nosort
+SELECT INTERVAL '1.01 years'
+----
+1 year
+
+query T nosort
+SELECT INTERVAL '1.125 years'
+----
+1 year 2 mons
+
+query T nosort
+SELECT INTERVAL '1.5 centuries'
+----
+150 years
+
+query T nosort
+SELECT INTERVAL '1.15 months'
+----
+1 mon 4 days 12:00:00
+
+query T nosort
+SELECT INTERVAL '1.5 weeks'
+----
+10 days 12:00:00
+
+query T nosort
+SELECT INTERVAL '1.1234567891 sec'
+----
+00:00:01.123457
+
+# a time replaces the microseconds read before it (to its right), as in PG
+query T nosort
+SELECT INTERVAL '1.5 days 1:00'
+----
+1 day 13:00:00
+
+query T nosort
+SELECT INTERVAL '1:00 1.5 days'
+----
+1 day 01:00:00
+
+# --- PostgreSQL's other unit spellings ------------------------------------------------------------
+
+query T nosort
+SELECT INTERVAL '5 mm'
+----
+00:05:00
+
+query T nosort
+SELECT INTERVAL '1 msecond 1 useconds'
+----
+00:00:00.001001
+
+query T nosort
+SELECT INTERVAL '2 microseconds'
+----
+00:00:00.000002
+
+query T nosort
+SELECT INTERVAL '1 day at'
+----
+1 day
+
+# a unit word before a time is dropped
+query T nosort
+SELECT INTERVAL '2:00 hour'
+----
+02:00:00
+
+statement error 22007
+SELECT INTERVAL '1 quarter'
+
+# --- every text→interval path ---------------------------------------------------------------------
+
+statement ok
+CREATE TABLE f (id i32 PRIMARY KEY, s text, v interval)
+
+# a string literal adapting to an interval column
+statement ok
+INSERT INTO f VALUES (1, 'P1Y2M', '1-2'), (2, '1 1:00', 'P1DT1H'), (3, '1-12', 'PT0S')
+
+query IT rowsort
+SELECT id, v FROM f
+----
+1
+1 year 2 mons
+2
+1 day 01:00:00
+3
+00:00:00
+
+# the cast spellings over a literal
+query T nosort
+SELECT '1-2'::interval
+----
+1 year 2 mons
+
+query T nosort
+SELECT CAST('P2W' AS interval)
+----
+14 days
+
+# the runtime per-row text cast
+query IT nosort
+SELECT id, s::interval FROM f WHERE id < 3 ORDER BY id
+----
+1
+1 year 2 mons
+2
+1 day 01:00:00
+
+statement error 22008
+SELECT s::interval FROM f WHERE id = 3
+
+# comparison against an adapting literal
+query I nosort
+SELECT id FROM f WHERE v = 'P1Y2M'
+----
+1
+
+# container element text: an interval[] literal and a composite field
+query T nosort
+SELECT '{1-2,P1D,"1 1:00"}'::interval[]
+----
+{"1 year 2 mons","1 day","1 day 01:00:00"}
+
+statement ok
+CREATE TYPE iso_span AS (label text, len interval)
+
+query T nosort
+SELECT '(a,P1Y2M3DT4H5M6S)'::iso_span
+----
+(a,"1 year 2 mons 3 days 04:05:06")

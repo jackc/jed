@@ -1,0 +1,178 @@
+# A data-modifying WITH in a CREATE TABLE … AS query (spec/design/create-table-as.md §1/§3,
+# writable-cte.md): the query's own WITH — directly after AS or inside its parentheses — is the
+# statement's writable WITH, as in PostgreSQL. The table is created, then filled from the query's
+# rows; every part reads the pre-statement snapshot, each data-modifying CTE runs exactly once, and a
+# failure anywhere leaves nothing behind. WITH NO DATA and an IF NOT EXISTS skip run no part of the
+# query. A data-modifying CTE nested deeper stays 0A000. Oracle-checked against PostgreSQL 18.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table_as, ddl.create_table_as_writable_with, ddl.create_table, ddl.create_table_if_not_exists, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.union, query.cte, query.cte_data_modifying, query.subquery_scalar, query.aggregates, query.cross_join, query.derived_table, expr.arithmetic, types.i32, types.i64, types.decimal, types.text, types.varchar_length
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, price decimal(10,2), name varchar(5))
+
+statement ok
+INSERT INTO src VALUES (1, 1.5, 'ab'), (2, 2.25, 'cd'), (3, 10, NULL)
+
+# --- a DELETE … RETURNING fills the new table with the deleted rows --------------------------------
+
+statement ok
+CREATE TABLE gone AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING *) SELECT * FROM d
+
+query IDT nosort
+SELECT * FROM gone
+----
+3
+10.00
+NULL
+
+query I nosort
+SELECT count(*) FROM src
+----
+2
+
+# RETURNING columns keep their typmods: the new table's price is decimal(10,2), its name varchar(5)
+statement ok
+CREATE TABLE ret AS WITH u AS (UPDATE src SET price = price + 1 WHERE id = 1 RETURNING price, name) SELECT * FROM u
+
+query DT nosort
+SELECT * FROM ret
+----
+2.50
+ab
+
+statement ok
+INSERT INTO ret VALUES (1.234, 'abcde')
+
+query D nosort
+SELECT price FROM ret ORDER BY price
+----
+1.23
+2.50
+
+statement error 22001
+INSERT INTO ret VALUES (1, 'abcdef')
+
+# --- the body reads the pre-statement snapshot: it sees the CTE's RETURNING rows, not its writes ----
+
+statement ok
+CREATE TABLE snap AS WITH i AS (INSERT INTO src VALUES (4, 4, 'x') RETURNING id) SELECT (SELECT count(*) FROM src) AS before, id FROM i
+
+query II nosort
+SELECT * FROM snap
+----
+2
+4
+
+query I nosort
+SELECT count(*) FROM src
+----
+3
+
+# an unreferenced data-modifying CTE still runs, once; the body reads the rows it deleted
+statement ok
+CREATE TABLE se AS WITH d AS (DELETE FROM src WHERE id = 4) SELECT id FROM src
+
+query I nosort
+SELECT id FROM se ORDER BY id
+----
+1
+2
+4
+
+query I nosort
+SELECT id FROM src ORDER BY id
+----
+1
+2
+
+# two data-modifying CTEs, both read by the body
+statement ok
+CREATE TABLE twice AS WITH a AS (INSERT INTO src VALUES (5, 5, 'y') RETURNING id), b AS (DELETE FROM src WHERE id = 1 RETURNING id) SELECT id FROM a UNION ALL SELECT id FROM b
+
+query I nosort
+SELECT id FROM twice ORDER BY id
+----
+1
+5
+
+# a query CTE read by a data-modifying CTE and by the body
+statement ok
+CREATE TABLE fromq AS WITH r AS (SELECT 9 AS x), i AS (INSERT INTO src SELECT x, x, 'q' FROM r RETURNING id) SELECT id, x FROM i, r
+
+query II nosort
+SELECT * FROM fromq
+----
+9
+9
+
+# the parenthesized query and a column list
+statement ok
+CREATE TABLE par (k) AS (WITH i AS (INSERT INTO src VALUES (6, 6, 'z') RETURNING id) SELECT id FROM i)
+
+query I nosort
+SELECT k FROM par
+----
+6
+
+query I nosort
+SELECT id FROM src ORDER BY id
+----
+2
+5
+6
+9
+
+# --- nothing runs under WITH NO DATA or an IF NOT EXISTS skip -------------------------------------
+
+statement ok
+CREATE TABLE nd AS WITH i AS (INSERT INTO src VALUES (7, 7, 'n') RETURNING id) SELECT id FROM i WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM nd
+----
+0
+
+statement ok
+CREATE TABLE IF NOT EXISTS snap AS WITH i AS (INSERT INTO src VALUES (8, 8, 'v') RETURNING id) SELECT id FROM i
+
+query I nosort
+SELECT id FROM src ORDER BY id
+----
+2
+5
+6
+9
+
+# --- a failure anywhere leaves nothing behind ------------------------------------------------------
+
+# the CTE's own error
+statement error 23505
+CREATE TABLE bad AS WITH i AS (INSERT INTO src VALUES (2, 7, 'w') RETURNING id) SELECT id FROM i
+
+# the body's error, after the CTE ran
+statement error 22012
+CREATE TABLE bad AS WITH i AS (INSERT INTO src VALUES (7, 7, 'w') RETURNING id) SELECT 1 / (id - 7) AS q FROM i
+
+statement error 42P01
+SELECT * FROM bad
+
+query I nosort
+SELECT id FROM src ORDER BY id
+----
+2
+5
+6
+9
+
+# --- a data-modifying CTE nested below the query's own WITH is 0A000 --------------------------------
+
+statement error 0A000
+CREATE TABLE bad AS (WITH d AS (DELETE FROM src RETURNING id) SELECT id FROM d) UNION SELECT 1
+
+statement error 0A000
+CREATE TABLE bad AS SELECT * FROM (WITH d AS (DELETE FROM src RETURNING id) SELECT id FROM d) s
+
+query I nosort
+SELECT count(*) FROM src
+----
+4

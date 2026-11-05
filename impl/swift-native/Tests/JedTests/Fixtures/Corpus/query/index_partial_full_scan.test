@@ -1,0 +1,163 @@
+# A FULL partial-index scan (spec/design/indexes.md §9.2). When a single-relation statement's WHERE
+# implies a partial index's predicate but bounds none of its keys, the whole (narrow) index is still
+# a complete source of the rows the query can return: the planner may walk it, point-looking-up each
+# entry's row and rechecking the complete WHERE. It is chosen by estimated cost against the full
+# scan, composes with an exact same-index ORDER BY (the sort is elided) and LIMIT streaming, and
+# serves UPDATE/DELETE targets. The canonical shape is a soft-delete index over the few live rows.
+# Rows never change; the `# cost:` lines pin the walk (each costs far less than the full scan).
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, dml.insert, dml.insert_select, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.comparison_order, query.order_by, query.limit, query.set_returning, query.aggregates, query.order_by_index_scan, query.index_partial, query.index_partial_implication, query.index_partial_full_scan, types.i32, types.text, types.boolean, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE sd (id i32 PRIMARY KEY, name text, rank i32, deleted_at i32, hot boolean)
+
+statement ok
+INSERT INTO sd SELECT g, 'n' || g, (g * 37) % 101, CASE WHEN g % 25 = 0 THEN NULL ELSE g END, g % 40 = 3 FROM generate_series(1, 300) AS g
+
+statement ok
+CREATE INDEX sd_live_rank ON sd (rank) WHERE deleted_at IS NULL
+
+# the WHERE is exactly the predicate: the whole partial index (12 entries) is walked
+# cost: 61
+query IT rowsort
+SELECT id, name FROM sd WHERE deleted_at IS NULL
+----
+100
+n100
+125
+n125
+150
+n150
+175
+n175
+200
+n200
+225
+n225
+25
+n25
+250
+n250
+275
+n275
+300
+n300
+50
+n50
+75
+n75
+
+# an extra residual conjunct rides along
+# cost: 93
+query I rowsort
+SELECT id FROM sd WHERE deleted_at IS NULL AND name > 'n2'
+----
+200
+225
+25
+250
+275
+300
+50
+75
+
+# ORDER BY the index key: the walk already delivers rank order (ties by PK), so the sort is elided
+# and the LIMIT stops the point lookups
+# cost: 21
+query II nosort
+SELECT rank, id FROM sd WHERE deleted_at IS NULL ORDER BY rank LIMIT 4
+----
+11
+175
+16
+25
+27
+200
+32
+50
+
+# an aggregate over the live rows
+# cost: 74
+query II rowsort
+SELECT count(*), sum(rank) FROM sd WHERE deleted_at IS NULL
+----
+12
+642
+
+# NOT implied: the full scan
+# cost: 1207
+query I rowsort
+SELECT count(*) FROM sd WHERE deleted_at IS NULL OR rank = 3
+----
+15
+
+# --- a boolean-column predicate --------------------------------------------------------------------
+
+statement ok
+CREATE INDEX sd_hot ON sd (name) WHERE hot
+
+# cost: 13
+query IT nosort
+SELECT id, name FROM sd WHERE hot ORDER BY name LIMIT 3
+----
+123
+n123
+163
+n163
+203
+n203
+
+# --- UPDATE / DELETE targets take the walk too -----------------------------------------------------
+
+# cost: 49
+query II rowsort
+UPDATE sd SET rank = rank + 1000 WHERE deleted_at IS NULL AND rank < 50 RETURNING id, rank
+----
+175
+1011
+200
+1027
+225
+1043
+25
+1016
+50
+1032
+75
+1048
+
+# cost: 110
+query I rowsort
+DELETE FROM sd WHERE deleted_at IS NULL AND name >= 'n275' RETURNING id
+----
+275
+300
+50
+75
+
+# a bare boolean predicate estimates at the default boolean selectivity, so this DELETE's full scan
+# is cheaper than walking the index with a point lookup per entry
+# cost: 307
+query I rowsort
+DELETE FROM sd WHERE hot RETURNING id
+----
+123
+163
+203
+243
+283
+3
+43
+83
+
+# the indexes stay consistent with the table
+query II rowsort
+SELECT count(*), max(rank) FROM sd WHERE deleted_at IS NULL
+----
+8
+1043
+
+query I rowsort
+SELECT count(*) FROM sd WHERE hot
+----
+0

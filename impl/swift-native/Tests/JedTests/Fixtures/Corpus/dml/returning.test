@@ -1,0 +1,405 @@
+# The RETURNING clause (grammar.md §32, cost.md §3). INSERT/UPDATE/DELETE take a terminal
+# `RETURNING <select_items>`, turning the statement into a query result projecting each
+# affected row: INSERT the STORED row (post-default, post-coercion), UPDATE the NEW
+# (post-assignment) row, DELETE the deleted OLD row. Items resolve against the target table
+# only (42703/42P01; aggregates 42803); subqueries are allowed and observe the PRE-statement
+# snapshot; zero affected rows is an empty query result. Row order is unspecified (rowsort —
+# no ORDER BY exists here). The old./new. row-version qualifiers (PG 18 semantics) name the
+# pre-/post-statement row, the absent side the all-NULL row; a target table actually named
+# old/new shadows the qualifier. `WITH (OLD AS o, NEW AS n)` optionally renames either or both
+# qualifier-only relations, hiding the renamed version's standard name. Cost: per returned row, row_produced + the items' metered
+# evaluation; the items' column reads join an UPDATE/DELETE's touched set (old side always,
+# new side minus assigned). The PG-divergent block sits LAST with ledger overrides
+# (conformance.md §5): keyword-spelled aliases and `AS returning` parse because jed reserves no
+# words, while PG rejects them.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, dml.delete, dml.returning, dml.returning_old_new, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.aggregates, query.subquery_scalar, query.subquery_correlated, query.table_alias, query.qualified_column, query.qualified_star, expr.arithmetic, null.three_valued, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
+
+# --- INSERT ... VALUES RETURNING -------------------------------------------------------
+
+# Each stored row projects back; cost = 2 x (row_produced + one operator_eval). A plain
+# VALUES insert still costs zero — the projection is the only metered work here.
+# cost: 4
+query II rowsort
+INSERT INTO t VALUES (4, 40, 400), (5, 50, 500) RETURNING id, v + 1
+----
+4
+41
+5
+51
+
+# `*` expands every column in declaration order; the DEFAULT fills in (v = 7) and the
+# omitted column is NULL. Bare columns are leaves: one row_produced only.
+# cost: 1
+query III nosort
+INSERT INTO t (id) VALUES (6) RETURNING *
+----
+6
+7
+NULL
+
+# Output names follow §8: the AS label, the fixed ?column? for an expression, the
+# catalog's canonical name for a bare column.
+# names: id, dbl, ?column?
+# cost: 3
+query III nosort
+INSERT INTO t VALUES (7, 1, 2) RETURNING id, v * 2 AS dbl, w - 2
+----
+7
+2
+0
+
+# --- UPDATE / DELETE RETURNING ----------------------------------------------------------
+
+# UPDATE returns the NEW (post-assignment) values. Under the PK point bound:
+# page_read(1) + storage_row_read(1) + filter(1) + assignment v+1 (1) + row_produced(1).
+# cost: 5
+query II nosort
+UPDATE t SET v = v + 1 WHERE id = 1 RETURNING id, v
+----
+1
+11
+
+# Zero affected rows: still a query result — empty, names intact (never a bare statement).
+# names: id
+query I rowsort
+UPDATE t SET v = 0 WHERE id = 999 RETURNING id
+----
+
+# DELETE returns the deleted row's OLD values.
+# cost: 4
+query II nosort
+DELETE FROM t WHERE id = 7 RETURNING id, v
+----
+7
+1
+
+# --- INSERT ... SELECT ... RETURNING ----------------------------------------------------
+
+statement ok
+CREATE TABLE src (a i32)
+
+statement ok
+INSERT INTO src VALUES (100), (101)
+
+# The clause belongs to the INSERT: it projects the INSERTED rows (defaults filled), after
+# the source ran. Cost = the source (page 1 + 2 rows + 2 produced) + 2 returned rows.
+# cost: 7
+query II rowsort
+INSERT INTO t (id) SELECT a FROM src RETURNING id, v
+----
+100
+7
+101
+7
+
+# A bare trailing `returning` after the source is the CLAUSE, never an implicit alias
+# (the §15 stop set) — with no item list it is a syntax error, as in PostgreSQL.
+statement error 42601
+INSERT INTO t (id) SELECT a FROM src returning
+
+# --- subqueries observe the pre-statement snapshot (probed against PG 18) ---------------
+
+# Uncorrelated: folds once, reading the snapshot BEFORE the statement's writes — the
+# count excludes the two rows being inserted (8 rows live here).
+# cost: 20
+query II rowsort
+INSERT INTO t VALUES (8, 0, 0), (9, 0, 0) RETURNING id, (SELECT count(*) FROM t)
+----
+8
+8
+9
+8
+
+# An UPDATE's subquery sees the pre-update values: ids 8 and 9 still sum to 0.
+# cost: 16
+query I nosort
+UPDATE t SET v = 99 WHERE id = 8 RETURNING (SELECT sum(v) FROM t WHERE id > 7 AND id < 100)
+----
+0
+
+# A DELETE's subquery sees the row still present: ids 8, 9, 100, 101 all count.
+# cost: 18
+query I nosort
+DELETE FROM t WHERE id = 9 RETURNING (SELECT count(*) FROM t WHERE id >= 8)
+----
+4
+
+# Correlated: the outer reference reads the row being returned (the deleted row itself —
+# its own w is 0); the inner re-scan is PK-bounded per returned row.
+# cost: 9
+query I nosort
+DELETE FROM t WHERE id = 8 RETURNING (SELECT s.w FROM t AS s WHERE s.id = t.id)
+----
+0
+
+# --- errors (PG codes, probed) ----------------------------------------------------------
+
+# Resolution precedes execution: the unknown column beats the would-be 23505 duplicate.
+statement error 42703
+INSERT INTO t VALUES (1, 0, 0) RETURNING nosuch
+
+statement error 42803
+INSERT INTO t VALUES (90, 0, 0) RETURNING sum(v)
+
+statement error 42P01
+UPDATE t SET v = 1 WHERE id = 1 RETURNING other.v
+
+statement error 42601
+DELETE FROM t RETURNING
+
+statement error 42601
+DELETE FROM t WHERE id = 1 RETURNING id ORDER BY id
+
+statement error 42601
+SELECT v FROM t returning
+
+# --- the old./new. row-version qualifiers (PG 18 semantics, probed; grammar.md §32) -----
+
+# INSERT: old is the all-NULL row (the key included); new = bare = the stored row.
+# cost: 1
+query IIII nosort
+INSERT INTO t VALUES (70, 5, 700) RETURNING old.v, new.v, v, old.id
+----
+NULL
+5
+5
+NULL
+
+# UPDATE: old = pre-assignment, new = bare = post-assignment; expressions span both
+# versions, and the qualifier never leaks into the output name (§8).
+# names: v, v, ?column?
+# cost: 6
+query III nosort
+UPDATE t SET v = v + 9 WHERE id = 70 RETURNING old.v, new.v, new.v - old.v
+----
+5
+14
+9
+
+# DELETE: old = bare = the deleted row; new is the all-NULL row (which reads nothing —
+# cost.md §3).
+# cost: 4
+query II nosort
+DELETE FROM t WHERE id = 70 RETURNING old.v, new.v
+----
+14
+NULL
+
+# old/new resolve inside item subqueries like any outer reference; the correlated old.id
+# bounds the inner re-scan (the pre-statement snapshot still holds the row).
+# cost: 9
+query I nosort
+DELETE FROM t WHERE id = 100 RETURNING (SELECT s.v FROM t AS s WHERE s.id = old.id)
+----
+7
+
+# A target table literally named old keeps the ordinary table-qualified meaning — the
+# unaliased pseudo-relation is suppressed (and recovered through an alias below).
+statement ok
+CREATE TABLE old (x i32)
+
+# cost: 1
+query I nosort
+INSERT INTO old VALUES (1) RETURNING old.x
+----
+1
+
+# cost: 4
+query I nosort
+UPDATE old SET x = x + 1 RETURNING old.x
+----
+2
+
+# Explicit aliases recover the hidden old-row pseudo-relation while `old.x` keeps its ordinary
+# target-table meaning (the new row). Qualified-star expansion works under an alias too.
+# names: x, x, x
+# cost: 4
+query III nosort
+UPDATE old SET x = x + 1 RETURNING WITH (OLD AS o, NEW AS n) old.x, o.*, n.x
+----
+3
+2
+3
+
+# Both versions may be renamed in either order. On INSERT, the aliased old row is all-NULL;
+# the aliased new row is the stored row.
+# names: id, v, v
+# cost: 1
+query III nosort
+INSERT INTO t VALUES (71, 8, 710) RETURNING WITH (NEW AS n, OLD AS o) o.id, n.v, n.v
+----
+NULL
+8
+8
+
+# Aliasing OLD hides only `old`; the unaliased NEW name remains available, including in a
+# correlated item subquery.
+# cost: 7
+query II nosort
+UPDATE t SET v = v + 1 WHERE id = 71 RETURNING WITH (OLD AS o) o.v, (SELECT new.v)
+----
+8
+9
+
+# An explicit alias is installed before unaliased defaults. Here `new` names the OLD version,
+# suppressing the ordinary new-row pseudo-relation.
+# cost: 4
+query I nosort
+DELETE FROM t WHERE id = 71 RETURNING WITH (OLD AS new) new.v
+----
+9
+
+# A renamed version's standard name is no longer in scope.
+statement error 42P01
+UPDATE t SET v = 1 WHERE id = 1 RETURNING WITH (OLD AS o) old.v
+
+# Each version may occur once; relation-label collisions use PostgreSQL's duplicate-alias code.
+statement error 42601
+UPDATE t SET v = 1 WHERE id = 1 RETURNING WITH (OLD AS o, OLD AS p) o.v
+
+statement error 42601
+UPDATE t SET v = 1 WHERE id = 1 RETURNING WITH (NEW AS n, NEW AS p) n.v
+
+statement error 42712
+UPDATE t SET v = 1 WHERE id = 1 RETURNING WITH (OLD AS r, NEW AS r) r.v
+
+statement error 42712
+UPDATE t SET v = 1 WHERE id = 1 RETURNING WITH (OLD AS t) t.v
+
+# AS is mandatory.
+statement error 42601
+UPDATE t SET v = 1 WHERE id = 1 RETURNING WITH (OLD o) o.v
+
+# An unknown column under a qualifier is 42703; outside RETURNING, old/new are ordinary
+# unknown qualifiers (probed: PG agrees on both).
+statement error 42703
+UPDATE t SET v = 1 WHERE id = 1 RETURNING old.nosuch
+
+statement error 42P01
+UPDATE t SET v = old.v + 1 WHERE id = 1
+
+# --- G18: multi-row UPDATE / DELETE RETURNING (every case above affects <=1 row) ---------
+
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO m VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+# A PK range bound (id >= 4) matches TWO rows, so RETURNING projects both — the old./new.
+# qualifiers span the pre-/post-assignment versions per row. Order is unspecified (rowsort).
+# page_read(1) + 2 storage_row_read + 2 filter + 2 assignment (v+1) + 2 row_produced = 9.
+# names: id, v, v
+# cost: 9
+query III rowsort
+UPDATE m SET v = v + 1 WHERE id >= 4 RETURNING id, old.v, new.v
+----
+4
+40
+41
+5
+50
+51
+
+# DELETE ... RETURNING * over the same two-row range returns each deleted OLD row (now v+1).
+# page_read(1) + 2 storage_row_read + 2 filter + 2 row_produced (bare columns, no eval) = 7.
+# names: id, v
+# cost: 7
+query II rowsort
+DELETE FROM m WHERE id >= 4 RETURNING *
+----
+4
+41
+5
+51
+
+# --- qualified star in RETURNING: t.* / new.* / old.* (grammar.md §15) -------------------
+# A qualified star works in RETURNING like the bare `*`: `t.*` and `new.*` expand the produced
+# (new) row; `old.*` expands the opposite version (all-NULL under INSERT). Matches PostgreSQL 18.
+
+statement ok
+CREATE TABLE qs (id i32 PRIMARY KEY, v i32)
+
+# new.* / qs.* both expand the new row's columns; old.* is the all-NULL old version on an INSERT.
+# names: id, v
+# cost: 1
+query II nosort
+INSERT INTO qs VALUES (1, 10) RETURNING new.*
+----
+1
+10
+
+# names: id, v
+# cost: 1
+query II nosort
+INSERT INTO qs VALUES (2, 20) RETURNING qs.*
+----
+2
+20
+
+# old.* under INSERT is the all-NULL old row version.
+# names: id, v
+# cost: 1
+query II nosort
+INSERT INTO qs VALUES (3, 30) RETURNING old.*
+----
+NULL
+NULL
+
+# UPDATE: old.* is the pre-image, new.* the post-image, mixable with other items.
+# names: id, v, v
+# cost: 5
+query III nosort
+UPDATE qs SET v = v + 1 WHERE id = 1 RETURNING old.*, new.v
+----
+1
+10
+11
+
+# --- documented PG divergence (oracle-overridden; conformance.md §5) --------------------
+
+# The alias prefix is recognized only by the structural `WITH (OLD|NEW AS` shape, preserving
+# jed's no-reserved-word rule. Here `with` is an ordinary (unknown) function, not a clause.
+statement error 42883
+UPDATE old SET x = x RETURNING with(old.x)
+
+# Every bare word is legal as an alias (grammar.md §3), including spellings that otherwise start
+# literals or keyword-led expressions. The qualified-reference shape takes precedence in each case.
+statement ok
+CREATE TABLE keyword_alias (v i32)
+
+statement ok
+INSERT INTO keyword_alias VALUES (12)
+
+query II nosort
+UPDATE keyword_alias SET v = v RETURNING WITH (OLD AS null, NEW AS cast) null.v, cast.v
+----
+12
+12
+
+query II nosort
+UPDATE keyword_alias SET v = v RETURNING WITH (OLD AS case, NEW AS not) case.v, not.v
+----
+12
+12
+
+query I nosort
+UPDATE keyword_alias SET v = v RETURNING WITH (OLD AS current_date) current_date.v
+----
+12
+
+# jed reserves no words (§3): an explicit `AS returning` source alias parses, with the
+# clause after it. PostgreSQL fully reserves RETURNING and rejects this (42601).
+# cost: 9
+query I rowsort
+INSERT INTO t (id) SELECT a + 100 FROM src AS returning RETURNING id
+----
+200
+201

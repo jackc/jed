@@ -1,0 +1,6 @@
+# Malformed catalog: a table column whose composite type has no catalog entry (storage.md §6;
+# composite.md §3). Ruby-forged (verify.rb MALFORMED_FIXTURES) by dropping the type entry from a valid
+# catalog. Resolving the column's type would dereference nothing, so open rejects it as XX001.
+# requires: harness.fixture_open, harness.fixture_open_error
+# skip: disk prebuilt malformed image must remain the initial state
+# fixture: fileformat/fixtures/malformed_missing_type.jed error XX001

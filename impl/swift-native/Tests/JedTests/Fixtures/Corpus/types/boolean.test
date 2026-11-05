@@ -1,0 +1,206 @@
+# Storable boolean column (spec/design/types.md §9): CREATE/INSERT/store/retrieve of
+# false/true/NULL, boolean×boolean equality and ordering (false < true), and NULL under
+# three-valued logic. A boolean renders as the canonical `true`/`false` under the `B` tag,
+# and a NULL/unknown boolean as `NULL`. boolean is ALSO a KEY type — a boolean PRIMARY KEY /
+# index uses the `bool-byte` key encoding (the second non-integer key after uuid; encoding.md
+# §2.9), exercised below. boolean ⇄ i32 casts have landed (cast/bool_int.test); a smoke check is
+# at the end. Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.boolean, types.boolean_storable, cast.bool_int, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)
+
+statement ok
+INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE), (5, FALSE)
+
+# a boolean value renders under the `B` tag as the canonical `true`/`false`; a NULL boolean
+# renders `NULL` (not t/f, not 0/1 — spec/design/types.md §9)
+query B nosort
+SELECT flag FROM t WHERE id = 1
+----
+true
+
+query B nosort
+SELECT flag FROM t WHERE id = 2
+----
+false
+
+query B nosort
+SELECT flag FROM t WHERE id = 3
+----
+NULL
+
+# equality on boolean: flag = TRUE / flag = FALSE select the matching rows (rowsort — no ORDER BY)
+query I rowsort
+SELECT id FROM t WHERE flag = TRUE
+----
+1
+4
+
+query I rowsort
+SELECT id FROM t WHERE flag = FALSE
+----
+2
+5
+
+# a boolean column is itself a predicate: WHERE flag keeps a row iff it is TRUE (FALSE and
+# NULL/unknown both exclude — Kleene)
+query I rowsort
+SELECT id FROM t WHERE flag
+----
+1
+4
+
+# IS NULL / IS NOT NULL on a boolean column
+query I nosort
+SELECT id FROM t WHERE flag IS NULL
+----
+3
+
+query I nosort
+SELECT id FROM t WHERE flag IS NOT NULL ORDER BY id
+----
+1
+2
+4
+5
+
+# = NULL is UNKNOWN, never a match (three-valued logic), for boolean as for every type
+query I nosort
+SELECT id FROM t WHERE flag = NULL
+----
+
+# ordering comparisons: false < true. flag < TRUE selects the FALSE rows; flag > FALSE
+# selects the TRUE rows; NULL is excluded from both (UNKNOWN).
+query I nosort
+SELECT id FROM t WHERE flag < TRUE ORDER BY id
+----
+2
+5
+
+query I nosort
+SELECT id FROM t WHERE flag > FALSE ORDER BY id
+----
+1
+4
+
+# IS [NOT] DISTINCT FROM: NULL-safe equality on boolean — NULL is a comparable value here
+query I nosort
+SELECT id FROM t WHERE flag IS NOT DISTINCT FROM NULL
+----
+3
+
+query I nosort
+SELECT id FROM t WHERE flag IS DISTINCT FROM TRUE ORDER BY id
+----
+2
+3
+5
+
+# ORDER BY a boolean column: false < true, then NULL last (PostgreSQL model). Within a tie
+# the stable sort keeps primary-key scan order. Expected: false (2,5), true (1,4), NULL (3).
+query I nosort
+SELECT id FROM t ORDER BY flag
+----
+2
+5
+1
+4
+3
+
+# the same ordering, projecting the boolean itself: false, false, true, true, NULL
+query B nosort
+SELECT flag FROM t ORDER BY flag
+----
+false
+false
+true
+true
+NULL
+
+# deterministic, cross-core cost: a boolean comparison is ONE operator_eval (weight 1), like
+# an integer comparison. 5 scanned + 5 filter (one `=` per row) + 2 produced + 0 projection
+# (bare column) = 12.
+# cost: 13
+query I rowsort
+SELECT id FROM t WHERE flag = TRUE
+----
+1
+4
+
+# boolean vs a non-boolean operand is NOT comparable: a 42804 type error (like bool = int)
+statement error 42804
+SELECT id FROM t WHERE flag = 1
+
+# an integer literal into a boolean column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (6, 1)
+
+# a boolean literal into an integer column is a type error: 42804
+statement error 42804
+INSERT INTO t VALUES (TRUE, TRUE)
+
+# --- boolean as a KEY (encoding.md §2.9): a boolean PRIMARY KEY is SUPPORTED ------------------
+# The stored key is the bare `bool-byte` (0x00 false < 0x01 true; a PK is NOT NULL, so no
+# presence tag). A boolean key admits at most two distinct rows — well-defined, if rarely useful.
+statement ok
+CREATE TABLE bk (k boolean PRIMARY KEY, label text)
+
+statement ok
+INSERT INTO bk VALUES (TRUE, 'yes'), (FALSE, 'no')
+
+# point lookup on the boolean PK (key-encoded equality) resolves the matching row
+query T nosort
+SELECT label FROM bk WHERE k = TRUE
+----
+yes
+
+query T nosort
+SELECT label FROM bk WHERE k = FALSE
+----
+no
+
+# a duplicate boolean PK is a unique violation (23505) — only two keys exist
+statement error 23505
+INSERT INTO bk VALUES (TRUE, 'again')
+
+# a NULL boolean PK is rejected NOT NULL (23502), like any primary key
+statement error 23502
+INSERT INTO bk VALUES (NULL, 'null')
+
+# a full scan iterates in key (byte) order: false (0x00) before true (0x01)
+query BT nosort
+SELECT k, label FROM bk
+----
+false
+no
+true
+yes
+
+# a boolean member of a COMPOSITE primary key concatenates with the leading i32 component;
+# (1,false) and (1,true) are distinct keys, and key order is a-ascending then false<true
+statement ok
+CREATE TABLE ck (a i32, b boolean, v i32, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO ck VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)
+
+statement error 23505
+INSERT INTO ck VALUES (1, FALSE, 99)
+
+query IB nosort
+SELECT a, b FROM ck
+----
+1
+false
+1
+true
+2
+false
+
+# boolean ⇄ i32 casts have landed (the boolean cast slice — types.md §9, full coverage in
+# cast/bool_int.test): i32 → boolean maps 0 → false, nonzero → true (id = 1 → true).
+query B nosort
+SELECT CAST(id AS boolean) FROM t WHERE id = 1
+----
+true

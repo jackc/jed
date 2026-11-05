@@ -1,0 +1,34 @@
+# Calendar day shifts validate the resulting timestamp, not an i64 microsecond
+# encoding of the day delta, which may be wider than a timestamp itself.
+# requires: types.timestamp, types.timestamptz, types.interval, expr.interval_arithmetic
+
+query T nosort
+SELECT timestamp '294000-01-01' - interval '108000000 days'
+----
+1695-01-17 00:00:00 BC
+
+query T nosort
+SELECT timestamptz '294000-01-01+00' - interval '108000000 days'
+----
+1695-01-17 00:00:00+00 BC
+
+query T nosort
+SELECT timestamp '1695-01-17 BC' + interval '108000000 days'
+----
+294000-01-01 00:00:00
+
+query T nosort
+SELECT timestamptz '1695-01-17+00 BC' + interval '108000000 days'
+----
+294000-01-01 00:00:00+00
+
+query T nosort
+SELECT timestamp '294000-01-01' + interval '-108000000 days'
+----
+1695-01-17 00:00:00 BC
+
+statement error 22008
+SELECT timestamp '294000-01-01' + interval '108000000 days'
+
+statement error 22008
+SELECT timestamptz '294000-01-01+00' + interval '108000000 days'

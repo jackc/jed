@@ -1,0 +1,154 @@
+# skip: disk — session-local temp tables and multi-record transactions do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# SELECT … INTO and a CREATE TABLE … AS with a data-modifying WITH, the jed-specific parts
+# (spec/design/create-table-as.md §1/§4/§6): temporary and database-qualified targets (the temp
+# namespace and the qualifiers are jed's), UNLOGGED refused 0A000 (jed has no unlogged tables;
+# PostgreSQL creates one), the read-only transaction (where an EXPLAIN ANALYZE of CREATE TABLE … AS is
+# a write — PostgreSQL 18 runs it), and the session envelope — the DDL gates and
+# a data-modifying CTE's write privilege, which WITH NO DATA does not need. CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
+# requires: ddl.select_into, ddl.explain_create_table_as, query.explain, query.explain_analyze, ddl.create_table_as, ddl.create_table_as_writable_with, ddl.temp_table, ddl.create_table, ddl.primary_key, txn.explicit, txn.read_only, dml.insert, dml.insert_multi_row, dml.delete, dml.returning, query.select, query.where_eq, query.order_by, query.qualified_table, query.cte, query.cte_data_modifying, types.i32, types.text, session.allow_temp_ddl, session.allow_ddl, session.privileges
+
+statement ok
+CREATE TABLE src (id i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+# --- temporary and qualified targets -----------------------------------------------------------------
+
+statement ok
+SELECT id INTO TEMP t1 FROM src WHERE id = 1
+
+statement ok
+SELECT id INTO TEMPORARY TABLE t2 FROM src WHERE id = 2
+
+statement ok
+SELECT id INTO temp.t3 FROM src WHERE id = 3
+
+query TI nosort
+SELECT t.name, count(*) FROM temp.jed_tables t JOIN temp.jed_columns c ON c.table_name = t.name GROUP BY t.name ORDER BY t.name
+----
+t1
+1
+t2
+1
+t3
+1
+
+statement ok
+SELECT name INTO main.p1 FROM src
+
+query I nosort
+SELECT count(*) FROM main.p1
+----
+3
+
+# a temp target in main is contradictory, as for CREATE TABLE
+statement error 42601
+SELECT id INTO TEMP main.p2 FROM src
+
+# the temp namespace precludes a persistent name (temp-tables.md §3)
+statement error 42P07
+SELECT id INTO TEMP src FROM src
+
+# --- UNLOGGED is refused ---------------------------------------------------------------------------
+
+statement error 0A000
+SELECT id INTO UNLOGGED p3 FROM src
+
+statement error 0A000
+SELECT id INTO UNLOGGED TABLE p3 FROM src
+
+statement error 0A000
+CREATE UNLOGGED TABLE p3 (id i32)
+
+statement error 0A000
+CREATE UNLOGGED TABLE p3 AS SELECT id FROM src
+
+# --- a read-only transaction -------------------------------------------------------------------------
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+SELECT id INTO p4 FROM src
+
+statement ok
+ROLLBACK
+
+# a plain EXPLAIN of CREATE TABLE … AS is a read, an EXPLAIN ANALYZE a write (PostgreSQL 18 runs it)
+statement ok
+BEGIN READ ONLY
+
+query ITTII nosort
+EXPLAIN SELECT id INTO p4 FROM src
+----
+0
+Scan src
+Full scan; touched=1
+3
+7
+
+statement error 25006
+EXPLAIN ANALYZE CREATE TABLE p4 AS SELECT id FROM src
+
+statement ok
+ROLLBACK
+
+# --- the session envelope ----------------------------------------------------------------------------
+
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+SELECT id INTO TEMP g1 FROM src
+
+# allow_ddl: off
+statement error 42501
+SELECT id INTO g2 FROM src
+
+# revoke: SELECT ON src
+statement error 42501
+SELECT id INTO g2 FROM src
+
+# a data-modifying CTE needs its write privilege...
+# revoke: DELETE ON src
+statement error 42501
+CREATE TABLE g2 AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d
+
+# revoke: DELETE ON src
+statement error 42501
+WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id INTO g2 FROM d
+
+# ...but WITH NO DATA runs no part of the query
+# revoke: DELETE ON src
+statement ok
+CREATE TABLE g3 AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d WITH NO DATA
+
+query I nosort
+SELECT count(*) FROM src
+----
+3
+
+# --- a rolled-back transaction takes the table and the CTE's write with it ---------------------------
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE g4 AS WITH d AS (DELETE FROM src WHERE id = 3 RETURNING id) SELECT id FROM d
+
+query I nosort
+SELECT id FROM g4
+----
+3
+
+statement ok
+ROLLBACK
+
+statement error 42P01
+SELECT * FROM g4
+
+query I nosort
+SELECT count(*) FROM src
+----
+3

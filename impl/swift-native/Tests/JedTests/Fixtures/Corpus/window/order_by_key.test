@@ -1,0 +1,78 @@
+# A window function inside a query ORDER BY key (spec/design/grammar.md §10, window.md §5.1,
+# query.order_by_window). The window stage runs over the post-WHERE rows (appending each window
+# result), then the ORDER BY key — a window function directly, or an expression containing one — is
+# materialized over those rows and the result sorted by it. A query whose ONLY OVER call is in the
+# ORDER BY still sets up the window machinery. Sorting by a window function via an output alias works
+# the same way (the alias binds the computed item). Results verified against PostgreSQL 18.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_ranking, query.window_aggregate, query.order_by, query.order_by_expr, query.order_by_window, expr.arithmetic, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE wb (a i32 PRIMARY KEY, b i32)
+
+statement ok
+INSERT INTO wb VALUES (1,30),(2,10),(3,20),(4,10),(5,30)
+
+# --- row_number() OVER (...) directly as the ORDER BY key (no window in the select list) ---
+# names: a
+query I nosort
+SELECT a FROM wb ORDER BY row_number() OVER (ORDER BY b, a)
+----
+2
+4
+3
+1
+5
+
+# --- rank() OVER (...) as the key, a deterministic tiebreak after it ---
+# names: a, b
+query II nosort
+SELECT a, b FROM wb ORDER BY rank() OVER (ORDER BY b), a
+----
+2
+10
+4
+10
+3
+20
+1
+30
+5
+30
+
+# --- an aggregate window function (count(*) OVER PARTITION) as the key, DESC ---
+# names: a
+query I nosort
+SELECT a FROM wb ORDER BY count(*) OVER (PARTITION BY b) DESC, a
+----
+1
+2
+4
+5
+3
+
+# --- sort by a window function via its output alias (the alias binds the computed window item) ---
+# names: a, rn
+query II nosort
+SELECT a, row_number() OVER (ORDER BY b DESC, a) AS rn FROM wb ORDER BY rn
+----
+1
+1
+5
+2
+3
+3
+2
+4
+4
+5
+
+# --- a window function INSIDE a larger expression key (row_number() % 2), then a tiebreak ---
+# names: a
+query I nosort
+SELECT a FROM wb ORDER BY row_number() OVER (ORDER BY b, a) % 2, a
+----
+1
+4
+2
+3
+5

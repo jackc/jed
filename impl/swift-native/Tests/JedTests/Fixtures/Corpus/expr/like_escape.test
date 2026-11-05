@@ -1,0 +1,291 @@
+# LIKE / ILIKE … ESCAPE e — choosing the escape character (spec/design/grammar.md §22). The parser
+# desugars `s LIKE p ESCAPE e` to `s LIKE like_escape(p, e)`, PostgreSQL's own rewrite of the pattern
+# into the default-`\` form (string-functions.md §3): '' turns escaping off, any other single code
+# point is the escape, two or more code points is 22025. like_escape is strict and is evaluated as
+# the pattern operand, so a NULL pattern/escape is NULL with no error, while a NULL subject does not
+# suppress an invalid escape. Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.view, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.like, expr.ilike, expr.like_escape, types.i32, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO t VALUES (1, '50%'), (2, '50x'), (3, 'a_b'), (4, 'a\b'), (5, NULL)
+
+# `#` is the escape, so `#%` is a literal percent sign. Cost: 5 rows scanned, and each row
+# evaluates the LIKE node and its like_escape pattern operand (one operator_eval each, the pattern
+# and escape being constant charges no output bytes) — the NULL row too, since the pattern is
+# evaluated before the NULL check.
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE s LIKE '50#%' ESCAPE '#' ORDER BY id
+----
+1
+
+# NOT LIKE … ESCAPE keeps the present non-matches; the NULL row stays UNKNOWN (dropped).
+query I nosort
+SELECT id FROM t WHERE s NOT LIKE '50#%' ESCAPE '#' ORDER BY id
+----
+2
+3
+4
+
+# `!_` is a literal underscore.
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a!_b' ESCAPE '!' ORDER BY id
+----
+3
+
+# An empty escape turns escaping off: the backslash is an ordinary character.
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a\b' ESCAPE '' ORDER BY id
+----
+4
+
+# Under any other escape the backslash is ordinary too.
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a\b' ESCAPE '#' ORDER BY id
+----
+4
+
+# Without ESCAPE, `\b` is an escaped `b`, so the pattern is the literal 'ab' (no row).
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a\b' ORDER BY id
+----
+
+# A one-row table to evaluate constant patterns.
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# names: ?column?
+query B nosort
+SELECT 'a%b' LIKE 'a#%b' ESCAPE '#' FROM one
+----
+true
+
+query B nosort
+SELECT 'axb' LIKE 'a#%b' ESCAPE '#' FROM one
+----
+false
+
+# The escape may be a wildcard character; escaping wins. `%%` is a literal percent sign.
+query B nosort
+SELECT 'a%' LIKE 'a%%' ESCAPE '%' FROM one
+----
+true
+
+query B nosort
+SELECT 'a_' LIKE 'a__' ESCAPE '_' FROM one
+----
+true
+
+# ESCAPE '\' is the default escape, spelled out.
+query B nosort
+SELECT 'a%' LIKE 'a\%' ESCAPE '\' FROM one
+----
+true
+
+# The escape escaping itself is a literal escape character.
+query B nosort
+SELECT 'a#b' LIKE 'a##b' ESCAPE '#' FROM one
+----
+true
+
+# The escape followed by a backslash is a literal backslash.
+query B nosort
+SELECT 'a\b' LIKE 'a#\b' ESCAPE '#' FROM one
+----
+true
+
+# The trailing-escape error stays lazy: it traps only when matching reaches the escape with
+# subject left over.
+statement error 22025
+SELECT 'ax' LIKE 'a#' ESCAPE '#' FROM one
+
+query B nosort
+SELECT 'a' LIKE 'a#' ESCAPE '#' FROM one
+----
+false
+
+query B nosort
+SELECT 'x' LIKE 'a#' ESCAPE '#' FROM one
+----
+false
+
+# An escape of two or more characters is an invalid escape string.
+statement error 22025
+SELECT 'ab' LIKE 'ab' ESCAPE 'xy' FROM one
+
+# The escape is ONE CODE POINT: the astral 😀 is a valid escape (a core counting UTF-16 units would
+# see two and reject it). `😀%` is a literal percent sign, so 'a😀' does not match 'a' + '%'.
+query B nosort
+SELECT 'a😀' LIKE 'a😀%' ESCAPE '😀' FROM one
+----
+false
+
+query B nosort
+SELECT 'a%' LIKE 'a😀%' ESCAPE '😀' FROM one
+----
+true
+
+query B nosort
+SELECT 'a😀x' LIKE 'a😀😀_' ESCAPE '😀' FROM one
+----
+true
+
+statement error 22025
+SELECT 'ab' LIKE 'ab' ESCAPE '😀😀' FROM one
+
+# A NULL pattern or a NULL escape yields NULL, with no error even for an invalid escape.
+query B nosort
+SELECT 'a' LIKE NULL ESCAPE 'xy' FROM one
+----
+NULL
+
+query B nosort
+SELECT 'a' LIKE 'a' ESCAPE NULL FROM one
+----
+NULL
+
+# But a NULL SUBJECT does not suppress an invalid escape: the pattern operand is evaluated first.
+statement error 22025
+SELECT s LIKE 'a' ESCAPE 'xy' FROM t WHERE id = 5
+
+query B nosort
+SELECT s LIKE 'a#%' ESCAPE '#' FROM t WHERE id = 5
+----
+NULL
+
+# ILIKE … ESCAPE: case-insensitive matching, the escape recognized before folding.
+query B nosort
+SELECT 'A_B' ILIKE 'a!_b' ESCAPE '!' FROM one
+----
+true
+
+query B nosort
+SELECT 'AXB' NOT ILIKE 'a!_b' ESCAPE '!' FROM one
+----
+true
+
+# The escape is case-sensitive: under ESCAPE 'X' a lowercase `x` is an ordinary character…
+query B nosort
+SELECT 'ax' ILIKE 'ax' ESCAPE 'X' FROM one
+----
+true
+
+# …and an uppercase `X` escapes the `%`.
+query B nosort
+SELECT 'a%' ILIKE 'aX%' ESCAPE 'X' FROM one
+----
+true
+
+query B nosort
+SELECT 'A%' ILIKE 'ax%' ESCAPE 'X' FROM one
+----
+false
+
+# ESCAPE's operand binds tighter than AND.
+query B nosort
+SELECT 'x%' LIKE 'x!%' ESCAPE '!' AND 'y' LIKE 'y' FROM one
+----
+true
+
+# ESCAPE with no operand is a syntax error, not a column label.
+statement error 42601
+SELECT 'a' LIKE 'b' escape
+
+# A non-text escape: no like_escape function takes those argument types.
+statement error 42883
+SELECT 'a' LIKE 'a' ESCAPE 5 FROM one
+
+# A per-row escape column.
+statement ok
+CREATE TABLE pe (id i32 PRIMARY KEY, s text, p text, e text)
+
+statement ok
+INSERT INTO pe VALUES (1, 'a%', 'a#%', '#'), (2, 'a%', 'a%%', '%'), (3, 'a\', 'a\', ''), (4, 'ab', 'ab', NULL), (5, 'ax', 'a#%', '#')
+
+# A non-constant like_escape is a growth kernel (cost.md §8.1): beyond its operator_eval it charges
+# scalar_byte per byte of each non-NULL rewritten pattern ('a\%' 3 + 'a\%' 3 + 'a\\' 3 + 'a\%' 3 =
+# 12; row 4's NULL escape yields NULL, which charges no bytes). Cost: 1 page + 5 rows read + 5 LIKE
+# + 5 like_escape + 12 bytes + 5 produced.
+# cost: 33
+query IB nosort
+SELECT id, s LIKE p ESCAPE e FROM pe ORDER BY id
+----
+1
+true
+2
+true
+3
+true
+4
+NULL
+5
+false
+
+statement ok
+INSERT INTO pe VALUES (6, 'a', 'a', 'xy')
+
+statement error 22025
+SELECT id, s LIKE p ESCAPE e FROM pe ORDER BY id
+
+# like_escape is also callable directly: the rewrite into the default-`\` form.
+# names: like_escape
+query T nosort
+SELECT like_escape('a#%b\c##d#', '#') FROM one
+----
+a\%b\\c\#d\
+
+query T nosort
+SELECT like_escape('a\b%', '') FROM one
+----
+a\\b%
+
+query T nosort
+SELECT like_escape('a\b#', '\') FROM one
+----
+a\b#
+
+query T nosort
+SELECT like_escape('a😀%x', '😀') FROM one
+----
+a\%x
+
+# names: ?column?
+query B nosort
+SELECT like_escape('', '') = '' FROM one
+----
+true
+
+query T nosort
+SELECT like_escape(NULL::text, 'xy') FROM one
+----
+NULL
+
+# An empty pattern still has its escape checked.
+statement error 22025
+SELECT like_escape('', 'xy') FROM one
+
+# A CHECK constraint and a view keep the clause in their stored text, parsed again on each use (and
+# after a reopen).
+statement ok
+CREATE TABLE codes (id i32 PRIMARY KEY, code text CHECK (code NOT LIKE '%!%%' ESCAPE '!'))
+
+statement ok
+INSERT INTO codes VALUES (1, 'ab'), (2, 'a_b')
+
+statement error 23514
+INSERT INTO codes VALUES (3, '50%')
+
+statement ok
+CREATE VIEW underscored AS SELECT id FROM codes WHERE code LIKE '%!_%' ESCAPE '!'
+
+query I nosort
+SELECT id FROM underscored ORDER BY id
+----
+2

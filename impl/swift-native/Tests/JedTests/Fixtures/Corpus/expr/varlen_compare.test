@@ -1,0 +1,80 @@
+# Variable-length value comparison cost — text and bytea comparison work scales with the operand
+# LENGTH, not a flat operator_eval (spec/design/cost.md §3 "varlen_compare"). A comparison over two
+# non-NULL text (or two non-NULL bytea) operands charges `varlen_compare × (W − 1)` where
+# W = max(1, min(len_lhs, len_rhs)) — the SHORTER operand's length, counted in CODE POINTS for text
+# and BYTES for bytea. `min` is a true upper bound (a byte/code-point compare stops at the first
+# differing position or the shorter end) and keeps `body = $short` against one large value cheap.
+# It complements `collate` (which meters non-`C` ORDERING): this unit covers `=`/`<>`, `C`/default-
+# collation ordering, and ALL bytea comparison.
+#
+# Cost is a CROSS-CORE contract (no reference impl, §2): the `# cost: N` here holds byte-identically
+# for Rust, Go, and TS. jed-specific (PostgreSQL has no cost meter), so the cost directives are not
+# oracle-checked; the boolean RESULTS still match PG. Format + the `requires` gate:
+# ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, expr.comparison_value, query.comparison_order, cast.operator, cast.string_literal, types.text, types.bytea, types.boolean, resource.cost_metering
+
+# A FROM-less SELECT has no scan, so cost = the compare's operator_eval (1) + varlen_compare (W − 1)
+# + 1 row_produced. The string/bytea literals are leaves (charge nothing); the ::bytea casts fold at
+# parse.
+
+# Two equal-length 5-char operands: W = min(5,5) = 5, charged 4. 1 + 4 + 1 = 6.
+# cost: 6
+query B nosort
+SELECT 'abcde' = 'abcde'
+----
+true
+
+# `min`, NOT `max`: a long operand vs a short one is CHEAP — W = min(10,2) = 2, charged 1, total 3.
+# A `max`-based charge would bill 10 here, so `WHERE body = $short` against one big-text row would
+# blow up; `min` keeps it O(shorter).
+# cost: 3
+query B nosort
+SELECT 'abcdefghij' = 'xy'
+----
+false
+
+# Ordering under the default (C) collation scans bytes too: W = min(3,3) = 3, charged 2, total 4.
+# (A non-`C` COLLATE would instead charge `collate`; this is the C/default path.)
+# cost: 4
+query B nosort
+SELECT 'abc' < 'abd'
+----
+true
+
+# bytea comparison is metered in BYTES: W = min(5,2) = 2, charged 1, total 3.
+# cost: 3
+query B nosort
+SELECT '\x0102030405'::bytea = '\x0607'::bytea
+----
+false
+
+# One code point / one byte ⇒ W = 1, charges NOTHING beyond the flat operator_eval, so small
+# comparisons are UNCHANGED by this unit. 1 compare + 0 + 1 produced = 2.
+# cost: 2
+query B nosort
+SELECT 'a' = 'b'
+----
+false
+
+# An empty operand: W = max(1, min(0,3)) = 1 ⇒ no varlen charge (an empty-vs-nonempty compare is O(1)).
+# cost: 2
+query B nosort
+SELECT '' = 'abc'
+----
+false
+
+# A NULL operand makes the comparison Unknown before any byte work ⇒ no varlen charge.
+# 1 compare + 1 produced = 2.
+# cost: 2
+query B nosort
+SELECT 'abcde' = NULL
+----
+NULL
+
+# A multi-byte code point counts as ONE unit (code points, not UTF-8 bytes / UTF-16 units — the
+# cross-core count, CLAUDE.md §8). 'ñé' and 'ñx' are each 2 code points: W = min(2,2) = 2, charged 1.
+# cost: 3
+query B nosort
+SELECT 'ñé' = 'ñx'
+----
+false

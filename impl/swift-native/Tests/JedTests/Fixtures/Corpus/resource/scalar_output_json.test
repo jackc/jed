@@ -1,0 +1,242 @@
+# Output-constructing kernels (spec/design/cost.md §8.1), slice S2: JSON construction. The JSON
+# builders, mutators, and renders are growth kernels: they charge scalar_byte × payload(result) after
+# building it, never reserve the scalar allowance, and are free over constant operands. jsonb_pretty is
+# an amplifier: indentation grows with depth, so it sizes its exact output, charges it, and reserves it
+# before rendering. payload(jsonb) = 32 per node beyond the root, plus key and string UTF-8 bytes and
+# 4 per decimal digit group; payload(json/text) = UTF-8 bytes.
+# jed-SPECIFIC resource contract (PostgreSQL has no cost meter or scalar allowance).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_no_from, query.cte, query.cte_recursive, query.aggregates, func.array, func.jsonb_mutate, func.json_processing, func.json_ctor, func.jsonb_path, func.json_object, func.json_set, func.json_set_lax, func.json_builders, func.row_to_json, types.composite, types.timestamptz, expr.json_query_fns, types.array, types.json, types.jsonb, types.jsonpath, types.i32, types.text, resource.cost_metering, resource.cost_limit, resource.scalar_memory
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, j jsonb, s text, a i32[])
+
+statement ok
+INSERT INTO t VALUES (1, '{"a": 1}', 'q"x', ARRAY[1, 2])
+
+# The baseline scan for the column cases below.
+# cost: 3
+query T nosort
+SELECT j FROM t
+----
+{"a": 1}
+
+# === Growth kernels ===
+
+# Constant operands are free.
+# cost: 2
+query T nosort
+SELECT '{"a": 1}'::jsonb || '{"b": 2}'::jsonb
+----
+{"a": 1, "b": 2}
+
+# A column operand is charged: {"a": 1, "b": 2} has two members of 1 + 32 + 4 = 37 → payload 74.
+# cost: 78
+query T nosort
+SELECT j || '{"b": 2}' FROM t
+----
+{"a": 1, "b": 2}
+
+# The builders: two string elements of 32 + 3 → payload 70.
+# cost: 76
+query T nosort
+SELECT jsonb_build_array(s, s) FROM t
+----
+["q\"x", "q\"x"]
+
+# The json (text) builders charge their rendered bytes, escapes included: 14 bytes.
+# cost: 20
+query T nosort
+SELECT json_build_object('k', s) FROM t
+----
+{"k" : "q\"x"}
+
+# to_json / to_jsonb / array_to_json / JSON_SCALAR / JSON_SERIALIZE.
+# cost: 105
+query TTTTT nosort
+SELECT to_json(s), to_jsonb(a), array_to_json(a), JSON_SCALAR(s), JSON_SERIALIZE(j) FROM t
+----
+"q\"x"
+[1, 2]
+[1,2]
+"q\"x"
+{"a": 1}
+
+# row_to_json charges its rendered bytes: {"f1":"q\"x","f2":1} is 20, on top of the scan's 3 and
+# one operator_eval each for ROW and row_to_json. Constant operands are free. A finite timestamptz
+# field adds one timezone unit, charged before rendering: 3 + 2 + 1 + 41 bytes.
+# cost: 25
+query T nosort
+SELECT row_to_json(ROW(s, id)) FROM t
+----
+{"f1":"q\"x","f2":1}
+
+# cost: 3
+query T nosort
+SELECT row_to_json(ROW('q', 1), false)
+----
+{"f1":"q","f2":1}
+
+# cost: 47
+query T nosort
+SELECT row_to_json(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
+----
+{"f1":"2024-01-15T12:00:00+00:00","f2":1}
+
+# The other JSON-image conversions charge the same way: their rendered bytes (jsonb: its payload),
+# one operator_eval per argument value for the builders, and one timezone unit per finite
+# timestamptz, charged before rendering.
+# cost: 25
+query T nosort
+SELECT to_json(ROW(s, id)) FROM t
+----
+{"f1":"q\"x","f2":1}
+
+# JSON_SCALAR is to_json: 3 + 1 (ROW) + 1 + 1 timezone + 41 bytes.
+# cost: 47
+query T nosort
+SELECT JSON_SCALAR(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
+----
+{"f1":"2024-01-15T12:00:00+00:00","f2":1}
+
+# cost: 103
+query T nosort
+SELECT to_jsonb(ROW(timestamptz '2024-01-15 12:00:00+00', id)) FROM t
+----
+{"f1": "2024-01-15T12:00:00+00:00", "f2": 1}
+
+# cost: 39
+query T nosort
+SELECT json_build_array(timestamptz '2024-01-15 12:00:00+00', id) FROM t
+----
+["2024-01-15T12:00:00+00:00", 1]
+
+# cost: 68
+query T nosort
+SELECT jsonb_build_object(timestamptz '2024-01-15 12:00:00+00', id) FROM t
+----
+{"2024-01-15T12:00:00+00:00": 1}
+
+# cost: 7
+query T nosort
+SELECT json_agg(ARRAY[timestamptz '2024-01-15 12:00:00+00', NULL]) FROM t
+----
+[["2024-01-15T12:00:00+00:00",null]]
+
+# cost: 7
+query T nosort
+SELECT jsonb_object_agg(timestamptz '2024-01-15 12:00:00+00', id) FROM t
+----
+{"2024-01-15T12:00:00+00:00": 1}
+
+# jsonb_set and jsonb_object(text[]).
+# cost: 234
+query TT nosort
+SELECT jsonb_set(j, '{b}', j), jsonb_object(ARRAY['k', s]) FROM t
+----
+{"a": 1, "b": {"a": 1}}
+{"k": "q\"x"}
+
+# jsonb_set_lax charges like jsonb_set when it sets — here use_json_null's {"a": null}: one member
+# of 1 + 32 → payload 33.
+# cost: 37
+query T nosort
+SELECT jsonb_set_lax(j, '{a}', NULL) FROM t
+----
+{"a": null}
+
+# Its delete_key (as #-) and return_target only remove from or return the target: no output charge.
+# cost: 5
+query TT nosort
+SELECT jsonb_set_lax(j, '{a}', NULL, true, 'delete_key'), jsonb_set_lax(j, '{a}', NULL, true, 'return_target') FROM t
+----
+{}
+{"a": 1}
+
+# jsonb_path_query_array collects its items into a new array: [1] → payload 36.
+# cost: 46
+query T nosort
+SELECT jsonb_path_query_array(j, '$.*') FROM t
+----
+[1]
+
+# JSON_QUERY is charged only when a wrapper builds the array; the unwrapped result is an extraction.
+# cost: 49
+query T nosort
+SELECT JSON_QUERY(j, '$.a' WITH WRAPPER) FROM t
+----
+[1]
+
+# cost: 6
+query T nosort
+SELECT JSON_QUERY(j, '$') FROM t
+----
+{"a": 1}
+
+# Growth kernels never reserve the allowance, so a tiny budget still admits them.
+# max_scalar_bytes: 1
+query T nosort
+SELECT jsonb_build_array(j, j, j) FROM t
+----
+[{"a": 1}, {"a": 1}, {"a": 1}]
+
+# The geometric-growth hole: each recursive step nests two copies of the previous document, and the
+# output charge makes the cost grow with the nodes built (2^10 leaves here).
+# cost: 230646
+query I nosort
+WITH RECURSIVE r(n, v) AS (SELECT 1, j FROM t UNION ALL SELECT n + 1, jsonb_build_array(v, v) FROM r WHERE n < 11) SELECT max(length(v::text)) FROM r
+----
+12284
+
+# ...so a cost ceiling stops thirty doublings long before they build a billion nodes.
+# max_cost: 100000
+statement error 54P01
+WITH RECURSIVE r(n, v) AS (SELECT 1, j FROM t UNION ALL SELECT n + 1, jsonb_build_array(v, v) FROM r WHERE n < 30) SELECT max(length(v::text)) FROM r
+
+# === jsonb_pretty (an amplifier) ===
+
+# Charged even over constants: the input payload, then the 41-byte rendering
+# '{\n    "a": [\n        1,\n        2\n    ]\n}'.
+# cost: 149
+query I nosort
+SELECT octet_length(jsonb_pretty('{"a": [1, 2]}'::jsonb))
+----
+41
+
+# The exact rendering size is reserved; equality is allowed.
+# max_scalar_bytes: 41
+query I nosort
+SELECT length(jsonb_pretty('{"a": [1, 2]}'::jsonb))
+----
+41
+
+# max_scalar_bytes: 40
+statement error 54P04
+SELECT length(jsonb_pretty('{"a": [1, 2]}'::jsonb))
+
+# Escaped keys and strings count their escapes: 22 bytes.
+# max_scalar_bytes: 22
+query I nosort
+SELECT octet_length(jsonb_pretty('{"a\"b": "x\ny"}'::jsonb))
+----
+22
+
+# max_scalar_bytes: 21
+statement error 54P04
+SELECT octet_length(jsonb_pretty('{"a\"b": "x\ny"}'::jsonb))
+
+# An empty container still takes its own line: '[\n]' is 3 bytes.
+# max_scalar_bytes: 3
+query I nosort
+SELECT octet_length(jsonb_pretty('[]'::jsonb))
+----
+3
+
+# Indentation amplifies depth: 150 bytes of nesting render to 22 499 bytes.
+# max_scalar_bytes: 10000
+statement error 54P04
+SELECT jsonb_pretty(rpad(repeat('[', 75), 150, ']')::jsonb)
+
+query I nosort
+SELECT octet_length(jsonb_pretty(rpad(repeat('[', 75), 150, ']')::jsonb))
+----
+22499

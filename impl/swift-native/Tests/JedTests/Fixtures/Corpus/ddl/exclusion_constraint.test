@@ -1,0 +1,118 @@
+# EXCLUDE constraints (spec/design/gist.md §7, GX3).
+#
+# An EXCLUDE constraint guarantees no two DISTINCT rows make every element comparison
+# `R1.expr_i op_i R2.expr_i` simultaneously TRUE. The supported WITH operators are `&&` (a range
+# column, range_ops) and `=` (a fixed-width keyable scalar, the in-core btree_gist); the constraint
+# IS its backing MULTI-COLUMN GiST index. Enforcement is a conjunction probe inside the two-phase
+# INSERT/UPDATE pass — a conflict traps 23P01. The NULL rule (PG-matched): a NULL in any excluded
+# column, or an empty range under `&&`, exempts the row (it never conflicts). End-state semantics
+# follow UNIQUE (an end-state-valid swap succeeds where PG fails the per-row transient).
+#
+# NOT oracle-imported: the canonical multi-column form `EXCLUDE (room WITH =, during WITH &&)` needs
+# PostgreSQL's `CREATE EXTENSION btree_gist` for the scalar `=` member, so the DDL is a jed in-core
+# divergence (gist.md §10). The ROWS and ERRORS are PG-faithful (range overlap semantics + the NULL
+# rule are PG's). The single-column range form `EXCLUDE (during WITH &&)` is pure PG. The plan/cost
+# and the on-disk tree shape are jed's own. Deliberate type-error divergences (42704/0A000, the
+# DROP-INDEX 2BP01, exclude-on-temp) live in each core's per-core gist tests. Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.exclusion_constraint, dml.insert, dml.insert_multi_row, dml.update, query.select, query.order_by, query.where_eq, types.i32, types.range
+
+# --- single-column range exclusion (PG-clean: no overlapping reservations) -----------------------
+statement ok
+CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))
+
+statement ok
+INSERT INTO rsv VALUES (1, '[1,5)')
+
+# an overlapping range conflicts
+statement error 23P01
+INSERT INTO rsv VALUES (2, '[3,8)')
+
+# an adjacent (non-overlapping) range is fine; an empty range is exempt (empty && anything = FALSE);
+# a NULL range is exempt (the NULL rule)
+statement ok
+INSERT INTO rsv VALUES (2, '[5,10)')
+
+statement ok
+INSERT INTO rsv VALUES (3, 'empty')
+
+statement ok
+INSERT INTO rsv VALUES (4, 'empty')
+
+statement ok
+INSERT INTO rsv VALUES (5, NULL)
+
+statement ok
+INSERT INTO rsv VALUES (6, NULL)
+
+query I nosort
+SELECT id FROM rsv ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+
+# --- multi-column EXCLUDE (room WITH =, during WITH &&) — no double-booking --------------------
+statement ok
+CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, EXCLUDE USING gist (room WITH =, during WITH &&))
+
+statement ok
+INSERT INTO booking VALUES (1, 101, '[10,20)')
+
+# same room + overlapping range → conflict
+statement error 23P01
+INSERT INTO booking VALUES (2, 101, '[15,25)')
+
+# same room, non-overlapping range → ok
+statement ok
+INSERT INTO booking VALUES (2, 101, '[20,30)')
+
+# different room, overlapping range → ok (the conjunction needs BOTH)
+statement ok
+INSERT INTO booking VALUES (3, 102, '[10,20)')
+
+# a NULL room is exempt (the NULL rule), even with an overlapping range and a duplicate room elsewhere
+statement ok
+INSERT INTO booking VALUES (4, NULL, '[10,20)')
+
+query I nosort
+SELECT id FROM booking ORDER BY id
+----
+1
+2
+3
+4
+
+# --- in-batch conflict (two new rows that conflict with each other), all-or-nothing ---------------
+statement error 23P01
+INSERT INTO booking VALUES (10, 200, '[1,5)'), (11, 200, '[2,6)')
+
+# nothing was written (the batch aborted before phase 2)
+query I nosort
+SELECT id FROM booking WHERE room = 200 ORDER BY id
+----
+
+# --- end-state UPDATE: a room swap succeeds (per-row transient collides; end state is clean) ------
+statement ok
+CREATE TABLE swap (id i32 PRIMARY KEY, room i32, during i32range, EXCLUDE USING gist (room WITH =, during WITH &&))
+
+statement ok
+INSERT INTO swap VALUES (1, 101, '[10,20)'), (2, 102, '[10,20)')
+
+statement ok
+UPDATE swap SET room = CASE WHEN room = 101 THEN 102 ELSE 101 END
+
+query II nosort
+SELECT id, room FROM swap ORDER BY id
+----
+1
+102
+2
+101
+
+# an UPDATE that creates a genuine conflict (row 1 → room 101, colliding with row 2) → 23P01
+statement error 23P01
+UPDATE swap SET room = 101 WHERE id = 1

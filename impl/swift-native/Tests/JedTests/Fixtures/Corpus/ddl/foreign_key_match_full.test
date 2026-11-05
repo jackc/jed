@@ -1,0 +1,244 @@
+# FOREIGN KEY … MATCH FULL (spec/design/constraints.md §6.3, grammar.md §43).
+# Under MATCH FULL a referencing tuple is either ALL NULL (exempt, references nothing) or NONE
+# NULL (checked against the parent); a partly-NULL tuple is a 23503 (PostgreSQL's DETAIL "MATCH FULL
+# does not allow mixing of null and nonnull key values.", carried in jed's structured Detail field).
+# MATCH SIMPLE stays the default and may be written explicitly; MATCH PARTIAL is 0A000, as in
+# PostgreSQL ("MATCH PARTIAL not yet implemented"). The rule applies at every child-side write — INSERT,
+# UPDATE, the ON CONFLICT DO UPDATE arm, a generated SET NULL / SET DEFAULT action row, and ALTER
+# TABLE … ADD FOREIGN KEY validation of existing rows. The parent side is unchanged: a partly-NULL
+# child cannot exist, and an all-NULL one references nothing. Every record below agrees with
+# PostgreSQL 18 (oracle-checked).
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.unique, ddl.foreign_key, ddl.foreign_key_match_full, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.order_by, types.i32, types.text, null.three_valued
+
+statement ok
+CREATE TABLE mf_p (a i32, b i32, label text, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO mf_p VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 2, 'z')
+
+# --- the table-level form: all-NULL is exempt, partly-NULL is rejected -------------------------
+
+statement ok
+CREATE TABLE mf_c (id i32 PRIMARY KEY, pa i32, pb i32, FOREIGN KEY (pa, pb) REFERENCES mf_p MATCH FULL)
+
+# a complete tuple must exist in the parent
+statement ok
+INSERT INTO mf_c VALUES (1, 1, 1)
+
+statement error 23503
+INSERT INTO mf_c VALUES (2, 9, 9)
+
+# an all-NULL tuple references nothing
+statement ok
+INSERT INTO mf_c VALUES (3, NULL, NULL)
+
+# a partly-NULL tuple mixes null and nonnull key values (MATCH SIMPLE would exempt it)
+statement error 23503
+INSERT INTO mf_c VALUES (4, 1, NULL)
+
+statement error 23503
+INSERT INTO mf_c VALUES (4, NULL, 2)
+
+# even when the non-NULL component matches nothing, the mix itself is the violation
+statement error 23503
+INSERT INTO mf_c VALUES (4, 99, NULL)
+
+# one bad row fails the whole multi-row statement (all-or-nothing)
+statement error 23503
+INSERT INTO mf_c VALUES (5, 1, 2), (6, NULL, 1)
+
+query III nosort
+SELECT id, pa, pb FROM mf_c ORDER BY id
+----
+1
+1
+1
+3
+NULL
+NULL
+
+# --- UPDATE: assigning a partly-NULL tuple is rejected ----------------------------------------
+
+statement error 23503
+UPDATE mf_c SET pb = NULL WHERE id = 1
+
+statement error 23503
+UPDATE mf_c SET pa = 2 WHERE id = 3
+
+# nulling every member, or completing an all-NULL tuple with a real key, is fine
+statement ok
+UPDATE mf_c SET pa = NULL, pb = NULL WHERE id = 1
+
+statement ok
+UPDATE mf_c SET pa = 2, pb = 2 WHERE id = 3
+
+query III nosort
+SELECT id, pa, pb FROM mf_c ORDER BY id
+----
+1
+NULL
+NULL
+3
+2
+2
+
+# --- INSERT … ON CONFLICT DO UPDATE checks the updated row the same way -----------------------
+
+statement error 23503
+INSERT INTO mf_c VALUES (3, 1, 1) ON CONFLICT (id) DO UPDATE SET pa = NULL
+
+statement ok
+INSERT INTO mf_c VALUES (3, 1, 1) ON CONFLICT (id) DO UPDATE SET pa = excluded.pa, pb = excluded.pb
+
+query III nosort
+SELECT id, pa, pb FROM mf_c ORDER BY id
+----
+1
+NULL
+NULL
+3
+1
+1
+
+# --- explicit MATCH SIMPLE is the default behavior: a partly-NULL tuple is exempt -------------
+
+statement ok
+CREATE TABLE ms_c (id i32 PRIMARY KEY, pa i32, pb i32, FOREIGN KEY (pa, pb) REFERENCES mf_p (a, b) MATCH SIMPLE)
+
+statement ok
+INSERT INTO ms_c VALUES (1, 99, NULL)
+
+statement error 23503
+INSERT INTO ms_c VALUES (2, 99, 99)
+
+# --- the column-level form; a single-column MATCH FULL behaves like MATCH SIMPLE ---------------
+
+statement ok
+CREATE TABLE mf_u (id i32 PRIMARY KEY, code i32 UNIQUE)
+
+statement ok
+INSERT INTO mf_u VALUES (1, 100)
+
+statement ok
+CREATE TABLE mf_one (id i32 PRIMARY KEY, code i32 CONSTRAINT mf_one_fk REFERENCES mf_u (code) MATCH FULL ON DELETE CASCADE)
+
+statement ok
+INSERT INTO mf_one VALUES (1, 100), (2, NULL)
+
+statement error 23503
+INSERT INTO mf_one VALUES (3, 200)
+
+statement ok
+DELETE FROM mf_u WHERE id = 1
+
+query II nosort
+SELECT id, code FROM mf_one ORDER BY id
+----
+2
+NULL
+
+# --- MATCH FULL to a UNIQUE pair --------------------------------------------------------------
+
+statement ok
+CREATE TABLE mf_up (id i32 PRIMARY KEY, x i32, y text, UNIQUE (x, y))
+
+statement ok
+INSERT INTO mf_up VALUES (1, 10, 'a')
+
+statement ok
+CREATE TABLE mf_uc (id i32 PRIMARY KEY, x i32, y text, FOREIGN KEY (x, y) REFERENCES mf_up (x, y) MATCH FULL)
+
+statement ok
+INSERT INTO mf_uc VALUES (1, 10, 'a'), (2, NULL, NULL)
+
+statement error 23503
+INSERT INTO mf_uc VALUES (3, NULL, 'a')
+
+# --- referential actions: SET NULL nulls every member; SET DEFAULT is re-checked --------------
+
+statement ok
+CREATE TABLE act_p (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO act_p VALUES (1, 1), (2, 2), (3, 3)
+
+statement ok
+CREATE TABLE act_null (id i32 PRIMARY KEY, pa i32, pb i32, FOREIGN KEY (pa, pb) REFERENCES act_p MATCH FULL ON DELETE SET NULL ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO act_null VALUES (1, 1, 1), (2, 2, 2)
+
+statement ok
+DELETE FROM act_p WHERE a = 1
+
+statement ok
+UPDATE act_p SET b = 20 WHERE a = 2
+
+query III nosort
+SELECT id, pa, pb FROM act_null ORDER BY id
+----
+1
+NULL
+NULL
+2
+2
+20
+
+# SET DEFAULT assigns pa NULL (no default) and pb 9: a partly-NULL tuple, so the DELETE fails
+statement ok
+CREATE TABLE act_def (id i32 PRIMARY KEY, pa i32, pb i32 DEFAULT 9, FOREIGN KEY (pa, pb) REFERENCES act_p MATCH FULL ON DELETE SET DEFAULT)
+
+statement ok
+INSERT INTO act_def VALUES (1, 3, 3)
+
+statement error 23503
+DELETE FROM act_p WHERE a = 3
+
+query II nosort
+SELECT a, b FROM act_p ORDER BY a
+----
+2
+20
+3
+3
+
+# --- ALTER TABLE … ADD FOREIGN KEY … MATCH FULL validates the existing rows -------------------
+
+statement ok
+CREATE TABLE alt_c (id i32 PRIMARY KEY, pa i32, pb i32)
+
+statement ok
+INSERT INTO alt_c VALUES (1, 2, 20), (2, NULL, NULL), (3, 3, NULL)
+
+# row 3 is partly NULL: fine under MATCH SIMPLE, a violation under MATCH FULL
+statement error 23503
+ALTER TABLE alt_c ADD FOREIGN KEY (pa, pb) REFERENCES act_p MATCH FULL
+
+statement ok
+ALTER TABLE alt_c ADD CONSTRAINT alt_simple FOREIGN KEY (pa, pb) REFERENCES act_p MATCH SIMPLE
+
+statement ok
+DELETE FROM alt_c WHERE id = 3
+
+statement ok
+ALTER TABLE alt_c ADD CONSTRAINT alt_full FOREIGN KEY (pa, pb) REFERENCES act_p MATCH FULL
+
+statement error 23503
+INSERT INTO alt_c VALUES (4, NULL, 3)
+
+# --- the grammar: MATCH precedes the actions, at most once; PARTIAL is not implemented ---------
+
+statement error 0A000
+CREATE TABLE bad (pa i32, pb i32, FOREIGN KEY (pa, pb) REFERENCES act_p MATCH PARTIAL)
+
+statement error 0A000
+CREATE TABLE bad (pa i32 REFERENCES mf_u (code) MATCH PARTIAL)
+
+statement error 42601
+CREATE TABLE bad (pa i32, pb i32, FOREIGN KEY (pa, pb) REFERENCES act_p ON DELETE CASCADE MATCH FULL)
+
+statement error 42601
+CREATE TABLE bad (pa i32 REFERENCES mf_u (code) MATCH FULL MATCH FULL)
+
+statement error 42601
+CREATE TABLE bad (pa i32 REFERENCES mf_u (code) MATCH)

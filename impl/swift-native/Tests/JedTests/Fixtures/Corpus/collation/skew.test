@@ -1,0 +1,84 @@
+# Collation version-SKEW read safety — the regression tripwire for the deferred collated-index
+# pushdown follow-on (spec/design/collation.md §8/§12/§14, spec/design/conformance.md).
+#
+# This file runs against a PRE-BUILT database image (the `# fixture:` directive) rather than a fresh
+# database, because the state it needs CANNOT be produced by SQL: the engine always pins the loaded
+# collation version and always builds a correct index. The fixture (authored in
+# spec/fileformat/verify.rb, byte-pinned like every golden) is a table `t` whose `name` column is
+# COLLATE "unicode", but:
+#   - the `unicode` reference entry is pinned to a BOGUS 9999.0.0 — different from the loaded 17.0.0
+#     bundle — so on open the collation's verdict is SKEWED and `t` is read-only (XX002 on write); and
+#   - its secondary index `t_name_idx` over `name` is deliberately keyed in C / BYTE order, i.e. WRONG
+#     for the loaded `unicode` order.
+#
+# WHY THIS TEST EXISTS — read before "fixing" it. Today every collated operation heap-scans and
+# recomputes against the LOADED collation; collated keys NEVER push down (the slice-1e narrowing,
+# collation.md §8, executor: a `Compare` carrying a collation contributes no index/PK bound). So the
+# wrong index is never consulted and these reads are correct DESPITE it. The moment collated-index
+# pushdown lands ("the obvious follow-on", collation.md §14 / encoding.md §2.12), a query that would
+# use `t_name_idx` MUST first bypass or rebuild a SKEWED index (the deferred REINDEX/COLLATION UPGRADE
+# migration) — otherwise it serves wrong rows. This file is green now and goes RED the instant a
+# skewed index is trusted. Do NOT make it pass by editing the expected rows; make pushdown
+# skew-aware. The non-skewed twin (skew_full.test) shows what a CORRECT index here returns.
+#
+# The rows pin a case where the unicode order (a < ä < b < … < z < Z) and the byte order
+# (Z 0x5A < a 0x61 < b 0x62 < ä 0xC3A4) disagree on the *set* of `name >= 'b'`, not just its order:
+#   unicode:  >= 'b'  ⇒ {b, Z}   (ä sorts before b; Z is z's uppercase, after b)  ⇒ ids 4, 2
+#   byte:     >= 'b'  ⇒ {b, ä}   (Z 0x5A < 'b'; ä 0xC3A4 > 'b')                    ⇒ ids 4, 3
+# so a wrong-index scan fails even under rowsort (a different set, not a reordering).
+#
+# requires: harness.fixture_open, expr.collate, ddl.collate_column, ddl.secondary_index, query.select, query.comparison_order, query.order_by, dml.insert, dml.update, dml.delete, types.i32, types.text, resource.cost_metering
+
+# fixture: fileformat/fixtures/collation_skew_corrupt.jed
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+# ============================================================================================
+# Reads on a version-skewed table are CORRECT for the loaded collation (full scan + recompute),
+# despite a secondary index whose stored keys are wrong for that collation.
+# ============================================================================================
+
+# The set of names >= 'b' under the loaded `unicode` order is {b, Z} (NOT {b, ä} — that is the
+# wrong byte order the skewed index would yield). rowsort proves the SET is right.
+query I rowsort
+SELECT id FROM t WHERE name >= 'b' COLLATE "unicode"
+----
+2
+4
+
+# Ordered: unicode places b before Z, so the ids are 4 then 2 (a byte-keyed index would give 4, 3).
+query I nosort
+SELECT id FROM t WHERE name >= 'b' COLLATE "unicode" ORDER BY name COLLATE "unicode"
+----
+4
+2
+
+# A full ORDER BY pins the whole loaded-collation order: a < ä < b < z-family < Z → 1, 3, 4, 2.
+query I nosort
+SELECT id FROM t ORDER BY name COLLATE "unicode"
+----
+1
+3
+4
+2
+
+# Equality too — the FIRST likely pushdown follow-on (§8, "the obvious follow-on"). A future
+# collated-equality seek would compute the LOADED sort key for 'Z' and look for it in this index of
+# wrong-version (byte) keys → a miss, returning nothing; the full scan finds the 'Z' row (id 2).
+query I rowsort
+SELECT id FROM t WHERE name = 'Z' COLLATE "unicode"
+----
+2
+
+# ============================================================================================
+# Writes to a version-skewed table are refused — XX002 (collation.md §12). A write would encode a
+# new key at the loaded version into a B-tree of old-version keys, interleaving two orderings.
+# ============================================================================================
+
+statement error XX002
+INSERT INTO t VALUES (5, 'c')
+
+statement error XX002
+UPDATE t SET name = 'c' WHERE id = 1
+
+statement error XX002
+DELETE FROM t WHERE id = 1

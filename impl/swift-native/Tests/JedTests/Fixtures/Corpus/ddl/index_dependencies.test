@@ -1,0 +1,166 @@
+# Compositional persisted-index admission: spec/design/index-dependencies.md.
+# PostgreSQL-comparable cases; argument-sensitive extensions and dependency lifetime have host tests.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.aggregates, types.i32, types.text, types.timestamp, types.timestamptz, expr.at_time_zone
+# load-timezone: America/New_York
+
+statement ok
+CREATE TABLE events (id int PRIMARY KEY, account int, closed timestamptz, local timestamp, zone text)
+
+statement ok
+INSERT INTO events VALUES (1,7,NULL,'2024-01-15 12:00:00','America/New_York'),(2,7,'2024-01-15 12:00:00+00',NULL,'UTC'),(3,8,NULL,NULL,'UTC')
+
+statement ok
+CREATE UNIQUE INDEX active_account ON events (account) WHERE closed IS NULL
+
+statement error 23505
+INSERT INTO events VALUES (4,7,NULL,NULL,'UTC')
+
+statement ok
+INSERT INTO events VALUES (4,7,'2024-06-15 12:00:00+00',NULL,'UTC')
+
+statement error 23505
+UPDATE events SET closed = NULL WHERE id = 2
+
+statement ok
+UPDATE events SET closed = TIMESTAMPTZ '2024-07-01 00:00:00+00' WHERE id = 1
+
+statement ok
+UPDATE events SET closed = NULL WHERE id = 2
+
+query I nosort
+SELECT id FROM events WHERE closed IS NULL AND account = 7 ORDER BY id
+----
+2
+
+statement ok
+DELETE FROM events WHERE id = 2
+
+statement ok
+INSERT INTO events VALUES (2,7,NULL,NULL,'UTC')
+
+query I nosort
+SELECT id FROM events WHERE closed IS NULL ORDER BY id
+----
+2
+3
+
+statement ok
+CREATE INDEX safe_0 ON events (account) WHERE closed IS NOT NULL
+
+statement ok
+CREATE INDEX safe_1 ON events (account) WHERE closed > TIMESTAMPTZ '2024-01-01 00:00:00+00'
+
+statement ok
+CREATE INDEX safe_2 ON events (account) WHERE closed IS DISTINCT FROM TIMESTAMPTZ '2024-01-01 00:00:00+00'
+
+statement ok
+CREATE INDEX safe_3 ON events (account) WHERE COALESCE(closed, TIMESTAMPTZ '2024-01-01 00:00:00+00') >= TIMESTAMPTZ '2024-01-01 00:00:00+00'
+
+statement ok
+CREATE INDEX safe_4 ON events (account) WHERE CASE WHEN account = 7 THEN closed IS NULL ELSE closed IS NOT NULL END
+
+statement ok
+CREATE INDEX safe_5 ON events (account) WHERE (closed AT TIME ZONE 'UTC')::date >= DATE '2024-01-01'
+
+statement ok
+CREATE INDEX safe_6 ON events (account) WHERE (closed AT TIME ZONE '+01')::date >= DATE '2024-01-01'
+
+statement ok
+CREATE INDEX safe_7 ON events (account) WHERE (closed AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01'
+
+statement ok
+CREATE INDEX safe_8 ON events (account) WHERE (closed AT TIME ZONE zone)::date >= DATE '2024-01-01'
+
+statement ok
+CREATE INDEX safe_9 ON events (account) WHERE date_trunc('day', closed, 'America/New_York') = closed
+
+statement ok
+CREATE INDEX safe_10 ON events (account) WHERE timezone('UTC',local) IS NULL
+
+statement ok
+CREATE INDEX safe_11 ON events (account) WHERE (ARRAY[closed,closed])[1] IS NULL
+
+statement ok
+CREATE INDEX key_0 ON events ((COALESCE(closed,TIMESTAMPTZ '2024-01-01 00:00:00+00')))
+
+statement ok
+CREATE INDEX key_1 ON events ((closed AT TIME ZONE 'America/New_York'))
+
+statement ok
+CREATE INDEX key_2 ON events ((local AT TIME ZONE zone))
+
+statement ok
+CREATE INDEX key_3 ON events ((date_trunc('day',closed,'UTC')))
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE closed::date IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE closed::timestamp IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE local::timestamptz IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE DATE '2024-01-01'::timestamptz IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE COALESCE(local::timestamptz,closed) IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE CASE WHEN account = 7 THEN true ELSE local::timestamptz IS NULL END
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE (ARRAY[local::timestamptz,closed])[1] IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE EXTRACT(year FROM closed) > 2000
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE date_part('year',closed)>2000
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE date_part(zone,closed)>0
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE date_trunc('day',closed) IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE make_timestamptz(2024,1,1,0,0,0) IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE now() IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE clock_timestamp() IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE CURRENT_DATE IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE current_setting('app.zone',true) IS NULL
+
+statement error 42P17
+CREATE INDEX rejected ON events (account) WHERE uuidv4() IS NULL
+
+statement error 42P17
+CREATE INDEX rejected_key ON events ((local::timestamptz))
+
+# Indexed and forced full-scan results agree across a DST transition.
+query I nosort
+SELECT id FROM events WHERE (closed AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01' AND account = 7 ORDER BY id
+----
+1
+4
+
+query I nosort
+SELECT id FROM events WHERE CASE WHEN (closed AT TIME ZONE 'America/New_York')::date >= DATE '2024-01-01' AND account = 7 THEN true ELSE false END ORDER BY id
+----
+1
+4
+
+statement error 42P02
+CREATE INDEX rejected_parameter ON events (($1::int))
+
+statement ok
+CREATE INDEX named_constructor ON events (account) WHERE make_timestamp(year => 2024, month => 1, mday => 1, hour => 0, min => 0, sec => 0) < local

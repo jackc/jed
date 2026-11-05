@@ -1,0 +1,282 @@
+# Scalar pre-allocation admission. This is a jed-specific resource contract, not a PG limit.
+# requires: query.select, query.select_no_from, types.text, types.decimal, resource.cost_metering, resource.cost_limit, resource.scalar_memory, ddl.create_table, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, dml.update, query.union, query.cte, query.subquery_scalar, query.aggregates, expr.case, expr.numeric_transcendental, cast.operator, cast.explicit
+
+# Exact UTF-8 bytes; budget equality is allowed, unlike a cost ceiling.
+# max_scalar_bytes: 6
+# cost: 10
+query T nosort
+SELECT repeat('ab', 3)
+----
+ababab
+
+# max_scalar_bytes: 5
+statement error 54P04
+SELECT repeat('ab', 3)
+
+# max_scalar_bytes: 5
+statement error 54P04
+SELECT repeat('é', 3)
+
+# max_scalar_bytes: 11
+# cost: 20
+query T nosort
+SELECT lpad('é', 4, '🙂x')
+----
+🙂x🙂é
+
+# max_scalar_bytes: 10
+statement error 54P04
+SELECT rpad('é', 4, '🙂x')
+
+# Actual result, not requested length; truncated source and empty fill.
+# max_scalar_bytes: 1
+# cost: 6
+query T nosort
+SELECT rpad('ab', 1, 'x')
+----
+a
+
+# max_scalar_bytes: 2
+# cost: 6
+query T nosort
+SELECT lpad('ab', 100, '')
+----
+ab
+
+# Allocation budget is cumulative through nested calls.
+# max_scalar_bytes: 14
+statement error 54P04
+SELECT repeat(repeat('x', 3), 4)
+
+# max_scalar_bytes: 15
+# cost: 22
+query T nosort
+SELECT repeat(repeat('x', 3), 4)
+----
+xxxxxxxxxxxx
+
+# Also cumulative across sibling calls.
+# max_scalar_bytes: 5
+statement error 54P04
+SELECT repeat('a', 3), repeat('b', 3)
+
+# Cost admission precedes the allocation budget and output construction.
+# max_cost: 100
+statement error 54P01
+SELECT repeat('x', 1073741823)
+
+# The finite default catches the same request on a cost-unlimited handle.
+statement error 54P04
+SELECT repeat('x', 1073741823)
+
+# Unicode output can exceed the structural byte cap below the character cap.
+statement error 54000
+SELECT lpad('x', 300000000, '🙂')
+
+statement error 54000
+SELECT repeat('xy', 2000000000)
+
+# Non-positive/empty requests do no byte work. NULL never calls the kernel.
+# max_scalar_bytes: 1
+query BBT nosort
+SELECT repeat('', 2000000000) = '', lpad('abc', 0, '🙂') = '', repeat(NULL::text, 2000000000)
+----
+true
+true
+NULL
+
+# Decimal work can exhaust either independent gate before a big computation.
+# max_cost: 100
+statement error 54P01
+SELECT exp(1000.0)
+
+# max_scalar_bytes: 1
+statement error 54P04
+SELECT sqrt(4.0)
+
+# Statement failure is atomic, including failure after an earlier row allocated.
+statement ok
+CREATE TABLE scalar_budget (v text)
+
+statement ok
+INSERT INTO scalar_budget VALUES ('a'), ('b')
+
+# max_scalar_bytes: 5
+statement error 54P04
+UPDATE scalar_budget SET v = repeat(v, 3)
+
+query T rowsort
+SELECT v FROM scalar_budget
+----
+a
+b
+
+# A failed statement and the per-record setting do not leak into the next statement.
+query T nosort
+SELECT repeat('z', 3)
+----
+zzz
+
+# Cross-core boundary/abort tests for every exact kernel, including inner iterations.
+
+# max_cost: 1097
+statement error 54P01
+SELECT sqrt(4.0)
+
+# max_cost: 1098
+query D nosort
+SELECT sqrt(4.0)
+----
+2.000000000000000
+
+# max_cost: 1000
+statement error 54P01
+SELECT sqrt(4.0)
+
+# max_cost: 17909
+statement error 54P01
+SELECT exp(1.0)
+
+# max_cost: 17910
+query D nosort
+SELECT exp(1.0)
+----
+2.7182818284590452
+
+# max_cost: 1000
+statement error 54P01
+SELECT exp(1.0)
+
+# max_cost: 77477
+statement error 54P01
+SELECT ln(2.0)
+
+# max_cost: 77478
+query D nosort
+SELECT ln(2.0)
+----
+0.6931471805599453
+
+# max_cost: 1000
+statement error 54P01
+SELECT ln(2.0)
+
+# max_cost: 292138
+statement error 54P01
+SELECT log(100.0)
+
+# max_cost: 292139
+query D nosort
+SELECT log(100.0)
+----
+2.0000000000000000
+
+# max_cost: 1000
+statement error 54P01
+SELECT log(100.0)
+
+# max_cost: 292138
+statement error 54P01
+SELECT log10(100.0)
+
+# max_cost: 292139
+query D nosort
+SELECT log10(100.0)
+----
+2.0000000000000000
+
+# max_cost: 1000
+statement error 54P01
+SELECT log10(100.0)
+
+# max_cost: 242473
+statement error 54P01
+SELECT log(2.0, 8.0)
+
+# max_cost: 242474
+query D nosort
+SELECT log(2.0, 8.0)
+----
+3.0000000000000000
+
+# max_cost: 1000
+statement error 54P01
+SELECT log(2.0, 8.0)
+
+# max_cost: 234498
+statement error 54P01
+SELECT power(2.0, 3.0)
+
+# max_cost: 234499
+query D nosort
+SELECT power(2.0, 3.0)
+----
+8.0000000000000000
+
+# max_cost: 1000
+statement error 54P01
+SELECT power(2.0, 3.0)
+
+# max_cost: 234498
+statement error 54P01
+SELECT pow(2.0, -3.0)
+
+# max_cost: 234499
+query D nosort
+SELECT pow(2.0, -3.0)
+----
+0.1250000000000000
+
+# max_cost: 1000
+statement error 54P01
+SELECT pow(2.0, -3.0)
+
+# max_cost: 149250
+statement error 54P01
+SELECT power(2.0, 0.5)
+
+# max_cost: 149251
+query D nosort
+SELECT power(2.0, 0.5)
+----
+1.4142135623730950
+
+# max_cost: 1000
+statement error 54P01
+SELECT power(2.0, 0.5)
+
+# CTEs, set operations and scalar subqueries share one allocation allowance.
+# max_scalar_bytes: 5
+statement error 54P04
+SELECT repeat('a', 3) UNION ALL SELECT repeat('b', 3)
+
+# max_scalar_bytes: 5
+statement error 54P04
+SELECT repeat('a', 3), (SELECT repeat('b', 3))
+
+# max_scalar_bytes: 5
+statement error 54P04
+WITH a AS MATERIALIZED (SELECT repeat('a', 3) AS v) SELECT repeat(v, 1) FROM a
+
+# Unselected branches perform no allocation.
+# max_scalar_bytes: 1
+query T nosort
+SELECT CASE WHEN true THEN 'ok' ELSE repeat('x', 1073741823) END
+----
+ok
+
+# Shared budget also applies to legacy unreported expression-index maintenance.
+statement ok
+CREATE TABLE scalar_index (v text)
+
+statement ok
+CREATE INDEX scalar_idx ON scalar_index ((repeat(v, 3)))
+
+# max_scalar_bytes: 5
+statement error 54P04
+INSERT INTO scalar_index VALUES ('a'), ('b')
+
+query I nosort
+SELECT count(*) FROM scalar_index
+----
+0

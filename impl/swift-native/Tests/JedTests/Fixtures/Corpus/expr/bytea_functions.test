@@ -1,0 +1,456 @@
+# Binary string (bytea) functions and operators (spec/design/string-functions.md §4; PostgreSQL's
+# "Binary String Functions and Operators", manual §9.5): length / octet_length / bit_length, the
+# `||` concatenation operator, substr / substring (and the SQL special form SUBSTRING(x FROM s FOR
+# l)), get_byte / set_byte, get_bit / set_bit, OVERLAY, POSITION, and btrim / ltrim / rtrim. All
+# STRICT (a NULL argument → NULL) and BYTE-indexed — the bytea twins of the text functions, which
+# count code points. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, types.bytea, resource.cost_metering
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, v bytea, w bytea)
+
+statement ok
+INSERT INTO b VALUES (1, '\x0102ff', '\x00'), (2, '\x', '\xabcd'), (3, NULL, '\x01'), (4, '\x68656c6c6f', NULL)
+
+# === length / octet_length / bit_length(bytea) → int: the BYTE count ========================
+
+query III nosort
+SELECT length(bytea '\x0102ff'), octet_length(bytea '\x0102ff'), bit_length(bytea '\x0102ff')
+----
+3
+3
+24
+
+# 'héllo' as bytea is its 6 UTF-8 bytes: length(bytea) counts bytes, unlike length(text)
+query II nosort
+SELECT length(bytea '\x68c3a96c6c6f'), length('héllo')
+----
+6
+5
+
+query IIII rowsort
+SELECT id, length(v), octet_length(v), bit_length(v) FROM b
+----
+1
+3
+3
+24
+2
+0
+0
+0
+3
+NULL
+NULL
+NULL
+4
+5
+5
+40
+
+# === bytea || bytea → bytea ===================================================================
+
+query T nosort
+SELECT bytea '\x01' || bytea '\x02ff'
+----
+\x0102ff
+
+# a bare string literal on either side adapts to bytea (decoded as bytea input)
+query TT nosort
+SELECT bytea '\x01' || '\x02', '\xab' || bytea '\xcd'
+----
+\x0102
+\xabcd
+
+# an untyped NULL on either side keeps the operator bytea (STRICT → NULL)
+query TT nosort
+SELECT bytea '\x01' || NULL, NULL || bytea '\x01'
+----
+NULL
+NULL
+
+# the empty bytea is the identity
+query T nosort
+SELECT bytea '\x' || bytea '\x' || bytea '\x0a'
+----
+\x0a
+
+query IT rowsort
+SELECT id, v || w FROM b
+----
+1
+\x0102ff00
+2
+\xabcd
+3
+NULL
+4
+NULL
+
+# chained with the other functions: the result is a real bytea
+query IT nosort
+SELECT length(v || w || v), substring(v || w FROM 3) FROM b WHERE id = 1
+----
+7
+\xff00
+
+# a bytea[] operand stays on the ARRAY overloads (array_append / array_prepend)
+query TT nosort
+SELECT ARRAY[bytea '\x01'] || bytea '\x02', bytea '\x00' || ARRAY[bytea '\x01']
+----
+{"\\x01","\\x02"}
+{"\\x00","\\x01"}
+
+# bytea || a non-bytea, non-text operand is no operator
+statement error 42883
+SELECT bytea '\x01' || 1
+
+# a TYPED text operand makes it text concatenation, the bytea rendered as its text output
+query T nosort
+SELECT bytea '\x01' || 'a'::text
+----
+\x01a
+
+# === substr / substring(bytea, start[, count]) → bytea ======================================
+
+query TTTT nosort
+SELECT substr(bytea '\x0102030405', 2, 3), substr(bytea '\x0102030405', 2), substring(bytea '\x0102030405', 2, 3), substring(bytea '\x0102030405', 4)
+----
+\x020304
+\x02030405
+\x020304
+\x0405
+
+# a start ≤ 0 or past the end CLIPS (the window [start, start+count) ∩ [1, n])
+query TTTT nosort
+SELECT substr(bytea '\x0102030405', 0, 3), substr(bytea '\x0102030405', -2, 5), substr(bytea '\x0102030405', 100, 2), substr(bytea '\x0102030405', 5, 100)
+----
+\x0102
+\x0102
+\x
+\x05
+
+# a huge start + count does not overflow
+query T nosort
+SELECT substring(bytea '\x01' FROM 2147483647 FOR 2147483647)
+----
+\x
+
+# a negative count traps 22011
+statement error 22011
+SELECT substr(bytea '\x0102', 1, -1)
+
+statement error 22011
+SELECT substring(bytea '\x0102' FROM 1 FOR -1)
+
+# the SQL special form: FROM / FOR in either order, FOR alone starts at 1
+query TTTT nosort
+SELECT substring(bytea '\x0102030405' FROM 2 FOR 3), substring(bytea '\x0102030405' FROM 2), substring(bytea '\x0102030405' FOR 2), substring(bytea '\x0102030405' FOR 2 FROM 3)
+----
+\x020304
+\x02030405
+\x0102
+\x0304
+
+query IT rowsort
+SELECT id, substring(v FROM 2 FOR 2) FROM b
+----
+1
+\x02ff
+2
+\x
+3
+NULL
+4
+\x656c
+
+# the special form and the comma form take expressions
+query T nosort
+SELECT substring(v FROM id FOR id + 1) FROM b WHERE id = 1
+----
+\x0102
+
+# substring is also the SQL name of substr over text (code-point indexed)
+query TTTT nosort
+SELECT substring('héllo', 2, 3), substring('héllo' FROM 2), substring('héllo' FOR 2), substring('héllo' FROM 2 FOR 3)
+----
+éll
+éllo
+hé
+éll
+
+# NULL arguments propagate
+query TTT nosort
+SELECT substring(NULL::bytea, 1, 2), substr(bytea '\x01', NULL::i32), substring(bytea '\x01' FROM 1 FOR NULL::i32)
+----
+NULL
+NULL
+NULL
+
+# === get_byte(bytea, n) → int: the 0-based n-th byte, unsigned ===============================
+
+query III nosort
+SELECT get_byte(bytea '\x0102ff', 0), get_byte(bytea '\x0102ff', 1), get_byte(bytea '\x0102ff', 2)
+----
+1
+2
+255
+
+query II rowsort
+SELECT id, get_byte(w, 0) FROM b
+----
+1
+0
+2
+171
+3
+1
+4
+NULL
+
+# an index outside [0, length-1] traps 2202E
+# index 3 out of valid range, 0..2
+statement error 2202E
+SELECT get_byte(bytea '\x0102ff', 3)
+
+statement error 2202E
+SELECT get_byte(bytea '\x0102ff', -1)
+
+# the empty bytea has no valid index (PG reports the range as 0..-1)
+statement error 2202E
+SELECT get_byte(bytea '\x', 0)
+
+statement error 2202E
+SELECT get_byte(v, 0) FROM b WHERE id = 2
+
+query II nosort
+SELECT get_byte(NULL::bytea, 0), get_byte(bytea '\x01', NULL::i32)
+----
+NULL
+NULL
+
+# a text argument matches no overload
+statement error 42883
+SELECT get_byte('abc'::text, 0)
+
+# === set_byte(bytea, n, newbyte) → bytea: the n-th byte replaced =============================
+
+query TTT nosort
+SELECT set_byte(bytea '\x010203', 0, 255), set_byte(bytea '\x010203', 1, 0), set_byte(bytea '\x010203', 2, 171)
+----
+\xff0203
+\x010003
+\x0102ab
+
+# the new byte is the int's low 8 bits
+query TTT nosort
+SELECT set_byte(bytea '\x010203', 1, 256), set_byte(bytea '\x010203', 1, -1), set_byte(bytea '\x010203', 1, 513)
+----
+\x010003
+\x01ff03
+\x010103
+
+query IT rowsort
+SELECT id, set_byte(w, 0, 16) FROM b
+----
+1
+\x10
+2
+\x10cd
+3
+\x10
+4
+NULL
+
+# index 3 out of valid range, 0..2
+statement error 2202E
+SELECT set_byte(bytea '\x010203', 3, 1)
+
+statement error 2202E
+SELECT set_byte(bytea '\x010203', -1, 1)
+
+statement error 2202E
+SELECT set_byte(bytea '\x', 0, 1)
+
+query TT nosort
+SELECT set_byte(NULL, 0, 1), set_byte(bytea '\x01', 0, NULL)
+----
+NULL
+NULL
+
+# === get_bit(bytea, n) / set_bit(bytea, n, newbit): bit n % 8 of byte n / 8 ===================
+
+# bits are numbered from the least-significant bit of each byte: \x01 has bit 0, \x02 bit 9
+query IIIII nosort
+SELECT get_bit(bytea '\x010203', 0), get_bit(bytea '\x010203', 1), get_bit(bytea '\x010203', 8), get_bit(bytea '\x010203', 9), get_bit(bytea '\x80', 7)
+----
+1
+0
+0
+1
+1
+
+query II rowsort
+SELECT id, get_bit(w, 0) FROM b
+----
+1
+0
+2
+1
+3
+1
+4
+NULL
+
+# index 24 out of valid range, 0..23
+statement error 2202E
+SELECT get_bit(bytea '\x010203', 24)
+
+statement error 2202E
+SELECT get_bit(bytea '\x010203', -1)
+
+statement error 2202E
+SELECT get_bit(bytea '\x', 0)
+
+# the index is a bigint
+statement error 2202E
+SELECT get_bit(bytea '\x01', 4294967296)
+
+query TTT nosort
+SELECT set_bit(bytea '\x010203', 9, 0), set_bit(bytea '\x00', 7, 1), set_bit(bytea '\x01', 0, 1)
+----
+\x010003
+\x80
+\x01
+
+# the new bit must be 0 or 1
+statement error 22023
+SELECT set_bit(bytea '\x010203', 0, 2)
+
+statement error 22023
+SELECT set_bit(bytea '\x010203', 0, -1)
+
+# the index is checked before the new bit
+statement error 2202E
+SELECT set_bit(bytea '\x01', 8, 2)
+
+statement error 2202E
+SELECT set_bit(bytea '\x01', 4294967296, 1)
+
+query ITT nosort
+SELECT get_bit(NULL, 0), set_bit(bytea '\x01', NULL, 1), set_bit(bytea '\x01', 0, NULL)
+----
+NULL
+NULL
+NULL
+
+# === OVERLAY(bytes PLACING new FROM start [FOR count]) → bytea ================================
+
+# FOR defaults to the length of the new bytes
+query TT nosort
+SELECT overlay(bytea '\x0102030405' PLACING bytea '\xaabb' FROM 2 FOR 3), overlay(bytea '\x0102030405' PLACING bytea '\xaabb' FROM 2)
+----
+\x01aabb05
+\x01aabb0405
+
+# a start past the end appends; FOR 0 inserts; a negative FOR re-includes the head in the tail
+query TTT nosort
+SELECT overlay(bytea '\x0102030405' PLACING bytea '\xaabb' FROM 10), overlay(bytea '\x0102' PLACING bytea '\xff' FROM 1 FOR 0), overlay(bytea '\x0102030405' PLACING bytea '\xaabb' FROM 2 FOR -1)
+----
+\x0102030405aabb
+\xff0102
+\x01aabb0102030405
+
+# the ordinary call
+query TT nosort
+SELECT overlay(bytea '\x0102', bytea '\xff', 1, 1), overlay(bytea '\x0102', bytea '\xff', 2)
+----
+\xff02
+\x01ff
+
+query IT rowsort
+SELECT id, overlay(v PLACING w FROM 2) FROM b
+----
+1
+\x0100ff
+2
+\xabcd
+3
+NULL
+4
+NULL
+
+statement error 22011
+SELECT overlay(bytea '\x0102' PLACING bytea '\xff' FROM 0)
+
+statement error 22003
+SELECT overlay(bytea '\x0102' PLACING bytea '\xff' FROM 2147483647 FOR 1)
+
+# === POSITION(substring IN bytes) → int: the 1-based byte position ============================
+
+query IIII nosort
+SELECT position(bytea '\x02' IN bytea '\x010203'), position(bytea '\x0203' IN bytea '\x010203'), position(bytea '\x' IN bytea '\x010203'), position(bytea '\x0304' IN bytea '\x010203')
+----
+2
+2
+1
+0
+
+query II rowsort
+SELECT id, position(w IN v) FROM b
+----
+1
+0
+2
+0
+3
+NULL
+4
+NULL
+
+query I nosort
+SELECT "position"(bytea '\x010203', bytea '\x03')
+----
+3
+
+# a bytea substring in a text string matches no overload
+statement error 42883
+SELECT position(bytea '\x01' IN 'abc'::text)
+
+# === btrim / ltrim / rtrim(bytea, bytes) → bytea: trim a byte SET ============================
+
+query TTT nosort
+SELECT btrim(bytea '\x0001020100', bytea '\x0001'), ltrim(bytea '\x0001020100', bytea '\x0001'), rtrim(bytea '\x0001020100', bytea '\x0001')
+----
+\x02
+\x020100
+\x000102
+
+# an empty set trims nothing; a set covering every byte trims everything
+query TT nosort
+SELECT btrim(bytea '\x0001', bytea '\x'), btrim(bytea '\x0001', bytea '\x000102')
+----
+\x0001
+\x
+
+query IT rowsort
+SELECT id, btrim(v, bytea '\x01ff6f') FROM b
+----
+1
+\x02
+2
+\x
+3
+NULL
+4
+\x68656c6c
+
+query T nosort
+SELECT btrim(bytea '\x01', NULL)
+----
+NULL
+
+# there is no one-argument bytea form
+statement error 42883
+SELECT btrim(bytea '\x0001')
+

@@ -1,0 +1,72 @@
+# CREATE RECURSIVE VIEW — the stored definition (spec/design/views.md §17): the body is wrapped as
+# `with recursive "name" ( "cols" ) as ( body ) select "cols" from "name"`, every substituted name a
+# quoted identifier, and the view is then an ordinary view: renamed, its columns renamed, and replaced
+# without disturbing the CTE inside it. CREATE RECURSIVE VIEW IF NOT EXISTS follows the CREATE VIEW
+# extension. jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: ddl.view, ddl.view_recursive, ddl.view_alter, ddl.view_cascade, introspect.views, query.select, query.order_by, query.aggregates, query.cte_recursive, query.union, query.values_query, query.where_eq, types.i32
+
+statement ok
+CREATE RECURSIVE VIEW r (n) AS VALUES (1) UNION ALL SELECT n + 1 FROM r WHERE n < 3
+
+query TTT nosort
+SELECT name, definition, columns FROM jed_views
+----
+r
+with recursive "r" ( "n" ) as ( values ( 1 ) union all select n + 1 from r where n < 3 ) select "n" from "r"
+{n}
+
+# a rename changes the view's name, not the CTE inside its definition
+statement ok
+ALTER VIEW r RENAME TO counter
+
+query I nosort
+SELECT n FROM counter ORDER BY n
+----
+1
+2
+3
+
+statement ok
+ALTER VIEW counter RENAME COLUMN n TO i
+
+query TTT nosort
+SELECT name, definition, columns FROM jed_views
+----
+counter
+with recursive "r" ( "n" ) as ( values ( 1 ) union all select n + 1 from r where n < 3 ) select "n" from "r"
+{i}
+
+query I nosort
+SELECT i FROM counter ORDER BY i
+----
+1
+2
+3
+
+# IF NOT EXISTS: a taken name is a silent no-op, as for CREATE VIEW
+statement ok
+CREATE RECURSIVE VIEW IF NOT EXISTS counter (i) AS SELECT 99
+
+query I nosort
+SELECT count(*) FROM counter
+----
+3
+
+# a view over the recursive view is an ordinary dependent
+statement ok
+CREATE VIEW evens AS SELECT i FROM counter WHERE i % 2 = 0
+
+query I nosort
+SELECT i FROM evens
+----
+2
+
+statement error 2BP01
+DROP VIEW counter
+
+statement ok
+DROP VIEW counter CASCADE
+
+query T nosort
+SELECT name FROM jed_views
+----
