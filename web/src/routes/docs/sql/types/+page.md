@@ -21,6 +21,8 @@
   ('yes'::text)::boolean           AS text_to_bool;`;
 
 	const floatInputDemo = `SELECT
+  '1.5'::double precision AS double_alias,
+  DOUBLE PRECISION '2.5'  AS typed_double,
   ('+NaN'::text)::f64::text AS signed_nan,
   ('1.0000000596046447753906250000000000001'::text)::f32::text
     AS rounded_to_real;`;
@@ -278,6 +280,9 @@ difference from PostgreSQL, which resolves an integer through `double precision`
 float version. A float-only function takes a number literal, so `sin(1)` works and `power(x, 3)` on
 an `f64` column returns `f64`, but an integer or `numeric` column next to a float still needs a cast
 (`42883`).
+
+`double precision` is an alias for `f64` in column declarations, casts, arrays, and typed
+string literals such as `DOUBLE PRECISION '1.5'`. Both words are bare SQL keywords.
 
 An `f32` next to an `f64` widens exactly to `f64` first, as PostgreSQL widens `real` to
 `double precision`, so the comparison or arithmetic runs at `f64`. The widened `f32` keeps its

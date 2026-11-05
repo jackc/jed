@@ -7483,8 +7483,9 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		return exprNode{Kind: exprTypedLiteral, TypeLitName: name, TypeLitText: t.Word, TypeLitPos: typePos, Pos: pos}, nil
 	}
-	// The two-word `character varying '...'` typed literal (types.md §15).
-	if p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying" && p.peekKindAt(2) == tokStr {
+	// Two-word typed literals (types.md §2/§15).
+	if ((p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying") ||
+		(p.peekKeyword() == "double" && p.peekKeywordAt(1) == "precision")) && p.peekKindAt(2) == tokStr {
 		typePos := p.here()
 		name, err := p.expectTypeName()
 		if err != nil {
@@ -8513,7 +8514,13 @@ func (p *parser) expectKeyword(kw string) error {
 // returns the alias "character varying", which the catalog resolves to text exactly like varchar.
 // Any other `character` stays a one-word name (unknown type → 42704 at resolve). A CLAUDE.md §8
 // cross-core determinism surface (spec/design/grammar.md §14).
+// Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2).
 func (p *parser) expectTypeName() (string, error) {
+	if p.peekKeyword() == "double" && p.peekKeywordAt(1) == "precision" {
+		p.advance() // DOUBLE
+		p.advance() // PRECISION
+		return "double precision", nil
+	}
 	if p.peekKeyword() == "character" && p.peekKeywordAt(1) == "varying" {
 		p.advance() // CHARACTER
 		p.advance() // VARYING
