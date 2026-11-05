@@ -1,6 +1,6 @@
 {
   "baseline": "362e0798ac3a8bd04bd2da556044b6ec73bf468a",
-  "fingerprint": "8d60f8b77c8a63bd5ea5815788eda7bb0743953e256a71f1d9128f26a454d974",
+  "fingerprint": "310915d6ffb2b2914167bba90e424c2753ba10dd490fea72e68311733c6ee1d0",
   "source_hashes": {
     "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
     "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -29,6 +29,12 @@
     "spec/tz/vectors/bundle.toml": "7fd87e29aeeb1a9b24c709cd68fd8aaf568b346e82413dccd17ca076159f9d6f",
     "spec/tz/vectors/tzif.toml": "746a96dac17a6913ba8cbb1327e0a5df73b33aedf3080cfcd20bdabaa7a4fb66",
     "spec/fileformat/encryption_vectors.toml": "68295024e6df842fd653fced20a5b0b9838f4cbd48e3fc829c85e78da535d067",
+    "spec/regex/program_vectors.toml": "ebf3dc0441976d7e60e57f237bf404d40028dd7abd7c7e9fa09407c84d27b02c",
+    "spec/regex/match_vectors.toml": "c3e8ab48b220f03780611cd7ef64e8bcf76b10143481b176e8931e24e45f368a",
+    "spec/regex/similar_vectors.toml": "b48e02a66159f852b0bc2a03e1c14530f44e37fa65f7571ac98b1dd8f4820ace",
+    "spec/fileformat/fixtures/pk_table.jed": "7ed0a5b03185ce5564c3c7d7f4e9656e7901fc5fd1f025fda7c2614854578975",
+    "spec/fileformat/fixtures/tall_tree.jed": "9d2b0b255322c2400145b2edb2b74f81e1e4c87d87e4205719cf37c47de2feda",
+    "spec/fileformat/fixtures/max_sep_table.jed": "da26a6fe23eed279542f3f1c35291374608e73c21ed9d62ad2c91a6749eaae15",
     "spec/fileformat/fixtures/encrypted_empty_db.jed": "49ec67b6e0773f270f7148429b90e9cdd4e8ffd253a79504e1372e98fc12c267",
     "spec/fileformat/fixtures/encrypted_pk_table.jed": "004157e8941ea31e22a890d46cf364d896fd2dd6ff1247c479e61517d87b0edd",
     "spec/tz/fixtures/tzdata.jtz": "59122b73e7c397bbddbccb8316274565d09ea6e01ff3412e807e307158400aa7"
@@ -16679,6 +16685,1193 @@
         "parallelism": 1,
         "key_hex": "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7"
       }
+    },
+    "spec/regex/program_vectors.toml": {
+      "schema_version": 1,
+      "case": [
+        {
+          "pattern": "a",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 7
+        },
+        {
+          "pattern": "ab",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "char 98",
+            "save 1",
+            "match"
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "save 1",
+            "match"
+          ],
+          "count": 6
+        },
+        {
+          "pattern": "^a$",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "assertstart",
+            "char 97",
+            "assertend",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "\\Aa\\z",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "assertstart",
+            "char 97",
+            "assertend",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "^a$",
+          "flags": "m",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "assertlinestart",
+            "char 97",
+            "assertlineend",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "\\Aa\\z",
+          "flags": "m",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "assertstart",
+            "char 97",
+            "assertend",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "a|b",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "split 5 7",
+            "char 97",
+            "jmp 8",
+            "char 98",
+            "save 1",
+            "match"
+          ],
+          "count": 10
+        },
+        {
+          "pattern": "a|b|c",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "split 5 7",
+            "char 97",
+            "jmp 11",
+            "split 8 10",
+            "char 98",
+            "jmp 11",
+            "char 99",
+            "save 1",
+            "match"
+          ],
+          "count": 13
+        },
+        {
+          "pattern": "a*",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "split 5 7",
+            "char 97",
+            "jmp 4",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "a+",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "split 4 6",
+            "save 1",
+            "match"
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "a?",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "split 5 6",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "a*?",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "split 7 5",
+            "char 97",
+            "jmp 4",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "a+?",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "split 6 4",
+            "save 1",
+            "match"
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "a??",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "split 6 5",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "a{2}",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 8
+        },
+        {
+          "pattern": "a{1,2}",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "split 6 7",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "a{2,}",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "char 97",
+            "split 7 9",
+            "char 97",
+            "jmp 6",
+            "save 1",
+            "match"
+          ],
+          "count": 11
+        },
+        {
+          "pattern": "a{0,0}",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "save 1",
+            "match"
+          ],
+          "count": 6
+        },
+        {
+          "pattern": "(a)",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "save 2",
+            "char 97",
+            "save 3",
+            "save 1",
+            "match"
+          ],
+          "count": 9
+        },
+        {
+          "pattern": "(?:a)",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 7
+        },
+        {
+          "pattern": "(a)(b)",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "save 2",
+            "char 97",
+            "save 3",
+            "save 4",
+            "char 98",
+            "save 5",
+            "save 1",
+            "match"
+          ],
+          "count": 12
+        },
+        {
+          "pattern": ".",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "any",
+            "save 1",
+            "match"
+          ],
+          "count": 7
+        },
+        {
+          "pattern": "[a-c]",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "class 0",
+            "save 1",
+            "match"
+          ],
+          "count": 7,
+          "classes": [
+            "97-99"
+          ]
+        },
+        {
+          "pattern": "[^0-9]",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "class 0",
+            "save 1",
+            "match"
+          ],
+          "count": 7,
+          "classes": [
+            "^48-57"
+          ]
+        },
+        {
+          "pattern": "\\d",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "class 0",
+            "save 1",
+            "match"
+          ],
+          "count": 7,
+          "classes": [
+            "48-57"
+          ]
+        },
+        {
+          "pattern": "[a-c][a-c]",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "class 0",
+            "class 1",
+            "save 1",
+            "match"
+          ],
+          "count": 8,
+          "classes": [
+            "97-99",
+            "97-99"
+          ]
+        },
+        {
+          "pattern": "A",
+          "flags": "i",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 97",
+            "save 1",
+            "match"
+          ],
+          "count": 7
+        },
+        {
+          "pattern": "\\AX\\D",
+          "flags": "i",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "assertstart",
+            "char 120",
+            "class 0",
+            "save 1",
+            "match"
+          ],
+          "count": 9,
+          "classes": [
+            "^48-57"
+          ]
+        },
+        {
+          "pattern": "\\.",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 46",
+            "save 1",
+            "match"
+          ],
+          "count": 7
+        },
+        {
+          "pattern": "\\%",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "char 37",
+            "save 1",
+            "match"
+          ],
+          "count": 7
+        },
+        {
+          "pattern": "[\\-]",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "class 0",
+            "save 1",
+            "match"
+          ],
+          "count": 7,
+          "classes": [
+            "45-45"
+          ]
+        },
+        {
+          "pattern": "(a+)+",
+          "prog": [
+            "split 3 1",
+            "anychar",
+            "jmp 0",
+            "save 0",
+            "save 2",
+            "char 97",
+            "split 5 7",
+            "save 3",
+            "split 4 9",
+            "save 1",
+            "match"
+          ],
+          "count": 11
+        }
+      ]
+    },
+    "spec/regex/match_vectors.toml": {
+      "schema_version": 1,
+      "case": [
+        {
+          "pattern": "a",
+          "input": "a",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 11
+        },
+        {
+          "pattern": "a",
+          "input": "xay",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              2
+            ]
+          ],
+          "steps": 16
+        },
+        {
+          "pattern": "a",
+          "input": "z",
+          "matched": false,
+          "caps": [],
+          "steps": 9
+        },
+        {
+          "pattern": "b",
+          "input": "abc",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              2
+            ]
+          ],
+          "steps": 16
+        },
+        {
+          "pattern": "",
+          "input": "x",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              0
+            ]
+          ],
+          "steps": 5
+        },
+        {
+          "pattern": "^a$",
+          "input": "a",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 13
+        },
+        {
+          "pattern": "^a$",
+          "input": "ab",
+          "matched": false,
+          "caps": [],
+          "steps": 16
+        },
+        {
+          "pattern": "\\Aa\\z",
+          "input": "a",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 13
+        },
+        {
+          "pattern": "\\Aa\\z",
+          "input": "ab",
+          "matched": false,
+          "caps": [],
+          "steps": 16
+        },
+        {
+          "pattern": "a|b",
+          "input": "b",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 15
+        },
+        {
+          "pattern": "a|b|c",
+          "input": "c",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 19
+        },
+        {
+          "pattern": "a*",
+          "input": "aaa",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              3
+            ]
+          ],
+          "steps": 22
+        },
+        {
+          "pattern": "a+",
+          "input": "b",
+          "matched": false,
+          "caps": [],
+          "steps": 9
+        },
+        {
+          "pattern": "a?b",
+          "input": "b",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 15
+        },
+        {
+          "pattern": "a{2}",
+          "input": "aa",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              2
+            ]
+          ],
+          "steps": 18
+        },
+        {
+          "pattern": "a{1,2}",
+          "input": "aaa",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              2
+            ]
+          ],
+          "steps": 15
+        },
+        {
+          "pattern": "a{2,}",
+          "input": "aaaa",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              4
+            ]
+          ],
+          "steps": 30
+        },
+        {
+          "pattern": ".",
+          "input": "x",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 11
+        },
+        {
+          "pattern": ".",
+          "input": "\n",
+          "matched": false,
+          "caps": [],
+          "steps": 9
+        },
+        {
+          "pattern": "b",
+          "input": "a\nb",
+          "matched": true,
+          "caps": [
+            [
+              2,
+              3
+            ]
+          ],
+          "steps": 21
+        },
+        {
+          "pattern": "a.c",
+          "input": "abc",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              3
+            ]
+          ],
+          "steps": 23
+        },
+        {
+          "pattern": "[a-c]+",
+          "input": "xbca",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              4
+            ]
+          ],
+          "steps": 25
+        },
+        {
+          "pattern": "[^0-9]",
+          "input": "5a",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              2
+            ]
+          ],
+          "steps": 16
+        },
+        {
+          "pattern": "\\d{3}",
+          "input": "ab123",
+          "matched": true,
+          "caps": [
+            [
+              2,
+              5
+            ]
+          ],
+          "steps": 36
+        },
+        {
+          "pattern": "\\w+",
+          "input": " foo_1 ",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              6
+            ]
+          ],
+          "steps": 33
+        },
+        {
+          "pattern": "(foo|bar)baz",
+          "input": "xbarbazy",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              7
+            ],
+            [
+              1,
+              4
+            ]
+          ],
+          "steps": 73
+        },
+        {
+          "pattern": "a(b+)c",
+          "input": "xabbbcx",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              6
+            ],
+            [
+              2,
+              5
+            ]
+          ],
+          "steps": 50
+        },
+        {
+          "pattern": "(a)(b)",
+          "input": "ab",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              2
+            ],
+            [
+              0,
+              1
+            ],
+            [
+              1,
+              2
+            ]
+          ],
+          "steps": 23
+        },
+        {
+          "pattern": "(a+)+$",
+          "input": "aaaaaaaaaa!",
+          "matched": false,
+          "caps": [],
+          "steps": 111
+        },
+        {
+          "pattern": "A",
+          "flags": "i",
+          "input": "a",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 11
+        },
+        {
+          "pattern": "FOO",
+          "flags": "i",
+          "input": "the foo",
+          "matched": true,
+          "caps": [
+            [
+              4,
+              7
+            ]
+          ],
+          "steps": 43
+        },
+        {
+          "pattern": "[a-z]+",
+          "flags": "i",
+          "input": "ABC",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              3
+            ]
+          ],
+          "steps": 20
+        },
+        {
+          "pattern": "\\W",
+          "flags": "i",
+          "input": "Ab ",
+          "matched": true,
+          "caps": [
+            [
+              2,
+              3
+            ]
+          ],
+          "steps": 21
+        },
+        {
+          "pattern": "😀x",
+          "input": "z😀xz",
+          "matched": true,
+          "caps": [
+            [
+              1,
+              3
+            ]
+          ],
+          "steps": 22
+        },
+        {
+          "pattern": "_x",
+          "input": "😀x",
+          "matched": false,
+          "caps": [],
+          "steps": 14
+        },
+        {
+          "pattern": "^b$",
+          "flags": "m",
+          "input": "a\nb",
+          "matched": true,
+          "caps": [
+            [
+              2,
+              3
+            ]
+          ],
+          "steps": 24
+        },
+        {
+          "pattern": "a$",
+          "flags": "m",
+          "input": "a\nb",
+          "matched": true,
+          "caps": [
+            [
+              0,
+              1
+            ]
+          ],
+          "steps": 12
+        },
+        {
+          "pattern": "^$",
+          "flags": "m",
+          "input": "a\n\nb",
+          "matched": true,
+          "caps": [
+            [
+              2,
+              2
+            ]
+          ],
+          "steps": 18
+        },
+        {
+          "pattern": "a$",
+          "flags": "m",
+          "input": "ab\nb",
+          "matched": false,
+          "caps": [],
+          "steps": 25
+        },
+        {
+          "pattern": "\\Ab",
+          "flags": "m",
+          "input": "a\nb",
+          "matched": false,
+          "caps": [],
+          "steps": 20
+        },
+        {
+          "pattern": "b\\z",
+          "flags": "m",
+          "input": "a\nb\n",
+          "matched": false,
+          "caps": [],
+          "steps": 25
+        }
+      ]
+    },
+    "spec/regex/similar_vectors.toml": {
+      "schema_version": 1,
+      "case": [
+        {
+          "pattern": "abc",
+          "input": "abc",
+          "translation": "^(?:abc)$",
+          "similar": true,
+          "similar_compile": 11,
+          "similar_steps": 25,
+          "substring": "abc",
+          "substring_compile": 11,
+          "substring_steps": 25
+        },
+        {
+          "pattern": "a%",
+          "input": "abc",
+          "translation": "^(?:a.*)$",
+          "similar": true,
+          "similar_compile": 12,
+          "similar_steps": 33,
+          "substring": "abc",
+          "substring_compile": 12,
+          "substring_steps": 33
+        },
+        {
+          "pattern": "a%",
+          "input": "xbc",
+          "translation": "^(?:a.*)$",
+          "similar": false,
+          "similar_compile": 12,
+          "similar_steps": 20,
+          "substring_null": true,
+          "substring_compile": 12,
+          "substring_steps": 20
+        },
+        {
+          "pattern": "a_c",
+          "input": "a\nc",
+          "translation": "^(?:a.c)$",
+          "similar": true,
+          "similar_compile": 11,
+          "similar_steps": 25,
+          "substring": "a\nc",
+          "substring_compile": 11,
+          "substring_steps": 25
+        },
+        {
+          "pattern": "50\\%",
+          "input": "50%",
+          "translation": "^(?:50\\%)$",
+          "similar": true,
+          "similar_compile": 11,
+          "similar_steps": 25,
+          "substring": "50%",
+          "substring_compile": 11,
+          "substring_steps": 25
+        },
+        {
+          "pattern": "50#%",
+          "escape": "#",
+          "input": "50%",
+          "translation": "^(?:50\\%)$",
+          "similar": true,
+          "similar_compile": 11,
+          "similar_steps": 25,
+          "substring": "50%",
+          "substring_compile": 11,
+          "substring_steps": 25
+        },
+        {
+          "pattern": "(a|b)*c",
+          "input": "abac",
+          "translation": "^(?:(?:a|b)*c)$",
+          "similar": true,
+          "similar_compile": 15,
+          "similar_steps": 52,
+          "substring": "abac",
+          "substring_compile": 15,
+          "substring_steps": 52
+        },
+        {
+          "pattern": "[]a]",
+          "input": "]",
+          "translation": "^(?:[]a])$",
+          "similar": true,
+          "similar_compile": 9,
+          "similar_steps": 13,
+          "substring": "]",
+          "substring_compile": 9,
+          "substring_steps": 13
+        },
+        {
+          "pattern": "a.^$",
+          "escape": "",
+          "input": "a.^$",
+          "translation": "^(?:a\\.\\^\\$)$",
+          "similar": true,
+          "similar_compile": 12,
+          "similar_steps": 31,
+          "substring": "a.^$",
+          "substring_compile": 12,
+          "substring_steps": 31
+        },
+        {
+          "pattern": "%#\"o_b#\"%",
+          "escape": "#",
+          "input": "foobar",
+          "translation": "^(?:.*){1,1}?(o.b){1,1}(?:.*)$",
+          "similar": true,
+          "similar_compile": 19,
+          "similar_steps": 86,
+          "substring": "oob",
+          "substring_compile": 45,
+          "substring_steps": 194
+        },
+        {
+          "pattern": "%#\"o%#\"%",
+          "escape": "#",
+          "input": "foobar",
+          "translation": "^(?:.*){1,1}?(o.*){1,1}(?:.*)$",
+          "similar": true,
+          "similar_compile": 20,
+          "similar_steps": 108,
+          "substring": "oobar",
+          "substring_compile": 47,
+          "substring_steps": 244
+        },
+        {
+          "pattern": "a%#\"b%#\"",
+          "escape": "#",
+          "input": "abcabc",
+          "translation": "^(?:a.*){1,1}?(b.*){1,1}(?:)$",
+          "similar": true,
+          "similar_compile": 18,
+          "similar_steps": 90,
+          "substring": "bcabc",
+          "substring_compile": 42,
+          "substring_steps": 210
+        },
+        {
+          "pattern": "f#\"o%",
+          "escape": "#",
+          "input": "foobar",
+          "translation": "^(?:f){1,1}?(o.*)$",
+          "similar": true,
+          "similar_compile": 15,
+          "similar_steps": 63,
+          "substring": "oobar",
+          "substring_compile": 20,
+          "substring_steps": 81
+        },
+        {
+          "pattern": "#\"a|aa#\"%",
+          "escape": "#",
+          "input": "aab",
+          "translation": "^(?:){1,1}?(a|aa){1,1}(?:.*)$",
+          "similar": true,
+          "similar_compile": 18,
+          "similar_steps": 40,
+          "substring": "aa",
+          "substring_compile": 46,
+          "substring_steps": 107
+        },
+        {
+          "pattern": "%#\"[0-9]+#\"%",
+          "escape": "#",
+          "input": "ab123cd",
+          "translation": "^(?:.*){1,1}?([0-9]+){1,1}(?:.*)$",
+          "similar": true,
+          "similar_compile": 18,
+          "similar_steps": 105,
+          "substring": "123",
+          "substring_compile": 43,
+          "substring_steps": 242
+        },
+        {
+          "pattern": "%#\"x#\"%",
+          "escape": "#",
+          "input": "abc",
+          "translation": "^(?:.*){1,1}?(x){1,1}(?:.*)$",
+          "similar": false,
+          "similar_compile": 17,
+          "similar_steps": 38,
+          "substring_null": true,
+          "substring_compile": 41,
+          "substring_steps": 58
+        },
+        {
+          "pattern": "(a#\"b)#\"",
+          "escape": "#",
+          "input": "ab",
+          "translation": "^(?:(?:a){1,1}?(b)){1,1}(?:)$",
+          "similar": true,
+          "similar_compile": 12,
+          "similar_steps": 21,
+          "substring_error": "2201B"
+        },
+        {
+          "pattern": "a",
+          "escape": "ab",
+          "input": "a",
+          "error": "22025"
+        },
+        {
+          "pattern": "a#\"b#\"c#\"d",
+          "escape": "#",
+          "input": "abcd",
+          "error": "2200C"
+        }
+      ]
     }
   }
 }

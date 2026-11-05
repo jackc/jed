@@ -1,0 +1,6 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#MISE description="Explicit opt-in: parse every frozen SQL corpus record without executing it"
+
+require "rbconfig"
+exec(RbConfig.ruby, File.expand_path("../../impl/swift-native/Tools/parse_corpus_audit.rb", __dir__))

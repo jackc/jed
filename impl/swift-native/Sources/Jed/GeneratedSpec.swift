@@ -47,7 +47,7 @@ struct RangeSpecFact: Equatable, Sendable {
 
 enum GeneratedSpec {
     static let baseline = "362e0798ac3a8bd04bd2da556044b6ec73bf468a"
-    static let fingerprint = "8d60f8b77c8a63bd5ea5815788eda7bb0743953e256a71f1d9128f26a454d974"
+    static let fingerprint = "310915d6ffb2b2914167bba90e424c2753ba10dd490fea72e68311733c6ee1d0"
     static let sourceHashes: [String: String] = [
         "spec/types/scalars.toml": "8b82f81965452cf031d8fb2b91642ad5165fb7a8973421b9e333969a69874a8d",
         "spec/types/ranges.toml": "9209b33203992b39dbf2a05fc4eeb9ae7dcd56f347b80a2cc1f39c3995309aa4",
@@ -76,6 +76,12 @@ enum GeneratedSpec {
         "spec/tz/vectors/bundle.toml": "7fd87e29aeeb1a9b24c709cd68fd8aaf568b346e82413dccd17ca076159f9d6f",
         "spec/tz/vectors/tzif.toml": "746a96dac17a6913ba8cbb1327e0a5df73b33aedf3080cfcd20bdabaa7a4fb66",
         "spec/fileformat/encryption_vectors.toml": "68295024e6df842fd653fced20a5b0b9838f4cbd48e3fc829c85e78da535d067",
+        "spec/regex/program_vectors.toml": "ebf3dc0441976d7e60e57f237bf404d40028dd7abd7c7e9fa09407c84d27b02c",
+        "spec/regex/match_vectors.toml": "c3e8ab48b220f03780611cd7ef64e8bcf76b10143481b176e8931e24e45f368a",
+        "spec/regex/similar_vectors.toml": "b48e02a66159f852b0bc2a03e1c14530f44e37fa65f7571ac98b1dd8f4820ace",
+        "spec/fileformat/fixtures/pk_table.jed": "7ed0a5b03185ce5564c3c7d7f4e9656e7901fc5fd1f025fda7c2614854578975",
+        "spec/fileformat/fixtures/tall_tree.jed": "9d2b0b255322c2400145b2edb2b74f81e1e4c87d87e4205719cf37c47de2feda",
+        "spec/fileformat/fixtures/max_sep_table.jed": "da26a6fe23eed279542f3f1c35291374608e73c21ed9d62ad2c91a6749eaae15",
         "spec/fileformat/fixtures/encrypted_empty_db.jed": "49ec67b6e0773f270f7148429b90e9cdd4e8ffd253a79504e1372e98fc12c267",
         "spec/fileformat/fixtures/encrypted_pk_table.jed": "004157e8941ea31e22a890d46cf364d896fd2dd6ff1247c479e61517d87b0edd",
         "spec/tz/fixtures/tzdata.jtz": "59122b73e7c397bbddbccb8316274565d09ea6e01ff3412e807e307158400aa7",

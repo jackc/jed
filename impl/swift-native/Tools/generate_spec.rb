@@ -43,8 +43,14 @@ module SwiftSpecGenerator
     spec/tz/vectors/bundle.toml
     spec/tz/vectors/tzif.toml
     spec/fileformat/encryption_vectors.toml
+    spec/regex/program_vectors.toml
+    spec/regex/match_vectors.toml
+    spec/regex/similar_vectors.toml
   ].freeze
   BYTE_INPUTS = %w[
+    spec/fileformat/fixtures/pk_table.jed
+    spec/fileformat/fixtures/tall_tree.jed
+    spec/fileformat/fixtures/max_sep_table.jed
     spec/fileformat/fixtures/encrypted_empty_db.jed
     spec/fileformat/fixtures/encrypted_pk_table.jed
     spec/tz/fixtures/tzdata.jtz
