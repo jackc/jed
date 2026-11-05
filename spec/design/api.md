@@ -1193,7 +1193,8 @@ does not fit a timestamp's microsecond range.
 common destinations** (`*i64/i32/i16/int`, `*string`, `*bool`, `*f64/f32`, `*[]byte`, the temporal
 type, the engine value types, `*any`) — **never reflection on this path**, and the destination must
 not escape (so it stays allocation-free). Narrowing integer destinations are range-checked
-(`22003`-style). **NULL into a plain scalar destination is an error**; the nullable targets are the
+(`22003`-style), including Go `*int` at the host's native integer width.
+**NULL into a plain scalar destination is an error**; the nullable targets are the
 language's idiom plus a generic `Null[T]` (Go) — which implements the `Scanner` hook so it needs no
 per-type case — and `*any` (→ the language's null). A `Scanner`/`ScanJed` hook covers custom types.
 
