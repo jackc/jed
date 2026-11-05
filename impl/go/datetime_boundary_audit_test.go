@@ -59,3 +59,18 @@ func TestDateTruncFiniteBoundary(t *testing.T) {
 	}
 	wantErr(t, db, "SELECT date_trunc('day', timestamptz '290309-12-21 19:59:06 BC', 'UTC')", "22008")
 }
+
+func TestTimestampMonthShiftPreservesEarliestFiniteSecond(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t)
+	for _, typ := range []string{"timestamp", "timestamptz"} {
+		for _, shift := range []string{"- interval '1 month'", "+ interval '-1 month'"} {
+			sql := fmt.Sprintf("SELECT %s '290308-01-21 19:59:05.224193 BC' %s", typ, shift)
+			rows := query(t, db, sql)
+			if got := rows[0][0].Int; got != math.MinInt64+1 {
+				t.Errorf("%s: got %d, want %d", sql, got, int64(math.MinInt64+1))
+			}
+		}
+		wantErr(t, db, fmt.Sprintf("SELECT %s '290308-01-21 19:59:05.224192 BC' - interval '1 month'", typ), "22008")
+	}
+}

@@ -120,3 +120,20 @@ test("a non-datetime, non-text source to a datetime target is forbidden (42804; 
     "42804",
   );
 });
+
+test("timestamp month shifts preserve the earliest finite second", () => {
+  // These BC dates are outside PostgreSQL's supported range.
+  const db = dbWith([]);
+  for (const type of ["timestamp", "timestamptz"]) {
+    for (const shift of ["- interval '1 month'", "+ interval '-1 month'"]) {
+      const sql = `SELECT (${type} '290308-01-21 19:59:05.224193 BC' ${shift}) = ${type} '290309-12-21 19:59:05.224193 BC'`;
+      assert.deepEqual(query(db, sql), [["true"]], sql);
+    }
+    const sql = `SELECT ${type} '290308-01-21 19:59:05.224192 BC' - interval '1 month'`;
+    assert.equal(
+      errCode(() => query(db, sql)),
+      "22008",
+      sql,
+    );
+  }
+});

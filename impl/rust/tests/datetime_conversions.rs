@@ -152,3 +152,27 @@ fn non_datetime_source_to_datetime_is_forbidden() {
         "42804"
     );
 }
+
+// Calendar arithmetic must preserve the earliest finite second just as input
+// construction does. These BC dates are outside PostgreSQL's supported range.
+#[test]
+fn timestamp_month_shift_preserves_earliest_finite_second() {
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    for ty in ["timestamp", "timestamptz"] {
+        for shift in ["- interval '1 month'", "+ interval '-1 month'"] {
+            let sql = format!(
+                "SELECT ({ty} '290308-01-21 19:59:05.224193 BC' {shift}) = {ty} '290309-12-21 19:59:05.224193 BC'"
+            );
+            match db.query_outcome(&sql, &[]).unwrap() {
+                jed::Outcome::Query { rows, .. } => {
+                    assert_eq!(rows, vec![vec![jed::Value::Bool(true)]], "{sql}");
+                }
+                other => panic!("expected query, got {other:?}"),
+            }
+        }
+        let sql = format!("SELECT {ty} '290308-01-21 19:59:05.224192 BC' - interval '1 month'");
+        assert_eq!(err_code(&mut db, &sql), "22008", "{sql}");
+    }
+}

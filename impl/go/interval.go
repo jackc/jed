@@ -346,7 +346,9 @@ func addMonthsClamped(t int64, months int64) (int64, error) {
 	if !ok {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}
-	r, ok := mulAdd(secs, microsPerSec, us)
+	// The fractional part can restore a finite value when the beginning of the
+	// earliest second lies below MinInt64. Check the complete civil value.
+	r, ok := timestampMulAdd(secs, microsPerSec, us)
 	if !ok {
 		return 0, intervalFieldOverflow("timestamp out of range")
 	}

@@ -353,11 +353,14 @@ fn add_months_clamped(t: i64, months: i64) -> Result<i64> {
     let nmo = total.rem_euclid(12) as u32 + 1;
     let nd = d.min(timestamp::days_in_month(ny, nmo)); // clamp to the new month's length
     let days = timestamp::days_from_civil(ny, nmo as i64, nd as i64);
-    days.checked_mul(86_400)
-        .and_then(|x| x.checked_add(h as i64 * 3600 + mi as i64 * 60 + s as i64))
-        .and_then(|secs| secs.checked_mul(MICROS_PER_SEC))
-        .and_then(|m| m.checked_add(us as i64))
-        .ok_or_else(|| field_overflow("timestamp out of range"))
+    // The earliest finite second begins below i64::MIN; its fractional part can
+    // restore a representable timestamp. Check the complete civil value.
+    i64::try_from(
+        (days as i128 * 86_400 + h as i128 * 3600 + mi as i128 * 60 + s as i128)
+            * MICROS_PER_SEC as i128
+            + us as i128,
+    )
+    .map_err(|_| field_overflow("timestamp out of range"))
 }
 
 /// The final micros step of a shift: `t ± micros`, checked, and never onto a ±infinity sentinel.
