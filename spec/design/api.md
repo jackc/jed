@@ -1222,7 +1222,10 @@ native mapping is a follow-on.
 - **Single-row.** `QueryRow(...).Scan(dest…)` runs, scans the first row (ignoring extras, like
   `database/sql`/pgx), closes the cursor, and returns `ErrNoRows` when empty.
 - **Struct mapping.** `RowToStructByName[T]` (generics/reflection, **off** the hot path) matches
-  column names to `db:"…"`-tagged fields; `RowTo[T]` scans a single-column row into a `T`. Both
+  column names case-insensitively to exported fields, using `db:"…"` tags or falling back
+  to field names. An exact `db:"-"` tag excludes the field from mapping. Every result column
+  must match an eligible field or mapping returns an error; excluded fields remain zero-valued.
+  `RowTo[T]` scans a single-column row into a `T`. Both
   compose with `Collect` for `for row, err := range Collect(rows, RowToStructByName[T])`.
 
 ### 11.4 Cancellation (`context.Context` → `57014`)

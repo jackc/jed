@@ -492,7 +492,9 @@ func RowTo[T any](rows *Rows) (T, error) {
 }
 
 // RowToStructByName maps the current row into a struct T by matching column names against `db:"…"`
-// tags (falling back to the field name, case-insensitively). This is the convenience path: it
+// tags (falling back to the field name, case-insensitively). An exact `db:"-"` tag excludes
+// a field. Every result column must match an exported, non-excluded field or mapping fails.
+// This is the convenience path: it
 // reflects once per row, which is fine off the hot loop — use Scan / typed accessors when it isn't.
 func RowToStructByName[T any](rows *Rows) (T, error) {
 	var out T
@@ -510,8 +512,12 @@ func RowToStructByName[T any](rows *Rows) (T, error) {
 		if f.PkgPath != "" { // unexported
 			continue
 		}
+		tag := f.Tag.Get("db")
+		if tag == "-" {
+			continue
+		}
 		name := f.Name
-		if tag := f.Tag.Get("db"); tag != "" && tag != "-" {
+		if tag != "" {
 			name = strings.Split(tag, ",")[0]
 		}
 		byName[strings.ToLower(name)] = i
