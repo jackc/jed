@@ -994,13 +994,36 @@ pub(crate) fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> boo
             .having
             .as_ref()
             .is_some_and(|h| rexpr_references_outer(h, depth))
+        // Every expression an aggregate evaluates — its operand, FILTER, in-aggregate ORDER BY
+        // keys, an ordered-set fraction, and a hypothetical-set aggregate's direct args and
+        // WITHIN GROUP keys — may carry a correlated reference.
         || sp.agg_specs.iter().any(|s| {
             s.operand
                 .as_ref()
                 .is_some_and(|op| rexpr_references_outer(op, depth))
+                || s.filter
+                    .as_ref()
+                    .is_some_and(|f| rexpr_references_outer(f, depth))
                 || s.order.as_ref().is_some_and(|o| {
                     o.keys.iter().any(|k| rexpr_references_outer(k, depth))
                 })
+                || s.osa
+                    .as_ref()
+                    .and_then(|o| o.frac.as_ref())
+                    .is_some_and(|f| rexpr_references_outer(f, depth))
+                || s.hypo.as_ref().is_some_and(|h| {
+                    h.args
+                        .iter()
+                        .chain(h.keys.iter())
+                        .any(|e| rexpr_references_outer(e, depth))
+                })
+        })
+        // A window function's arguments (`lag(x, 1, outer.col)`) and a window aggregate's FILTER.
+        || sp.window_specs.iter().any(|w| {
+            w.args.iter().any(|a| rexpr_references_outer(a, depth))
+                || w.filter
+                    .as_ref()
+                    .is_some_and(|f| rexpr_references_outer(f, depth))
         })
         || sp
             .projections

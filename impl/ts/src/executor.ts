@@ -37011,9 +37011,23 @@ export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolea
   for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
   if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
   if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
+  // Every expression an aggregate evaluates — its operand, FILTER, in-aggregate ORDER BY keys, an
+  // ordered-set fraction, and a hypothetical-set aggregate's direct args and WITHIN GROUP keys — may
+  // carry a correlated reference.
   for (const s of plan.aggSpecs) {
     if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
+    if (s.filter != null && rexprReferencesOuter(s.filter, depth)) return true;
+    if (s.osaFrac != null && rexprReferencesOuter(s.osaFrac, depth)) return true;
     if (s.order != null && s.order.keys.some((k) => rexprReferencesOuter(k, depth))) return true;
+    if (s.hypo != null) {
+      for (const e of s.hypo.args) if (rexprReferencesOuter(e, depth)) return true;
+      for (const e of s.hypo.keys) if (rexprReferencesOuter(e, depth)) return true;
+    }
+  }
+  // A window function's arguments (lag(x, 1, outer.col)) and a window aggregate's FILTER.
+  for (const w of plan.windowSpecs) {
+    for (const a of w.args) if (rexprReferencesOuter(a, depth)) return true;
+    if (w.filter != null && rexprReferencesOuter(w.filter, depth)) return true;
   }
   for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
   // A materialized ORDER BY expression may itself carry a correlated reference (query.order_by_correlated):

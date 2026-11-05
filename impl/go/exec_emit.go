@@ -1779,16 +1779,50 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 	if sp.having != nil && rexprReferencesOuter(sp.having, depth) {
 		return true
 	}
+	// Every expression an aggregate evaluates — its operand, FILTER, in-aggregate ORDER BY keys, an
+	// ordered-set fraction, and a hypothetical-set aggregate's direct args and WITHIN GROUP keys — may
+	// carry a correlated reference.
 	for i := range sp.aggSpecs {
-		if sp.aggSpecs[i].operand != nil && rexprReferencesOuter(sp.aggSpecs[i].operand, depth) {
+		s := &sp.aggSpecs[i]
+		if s.operand != nil && rexprReferencesOuter(s.operand, depth) {
 			return true
 		}
-		if o := sp.aggSpecs[i].order; o != nil {
+		if s.filter != nil && rexprReferencesOuter(s.filter, depth) {
+			return true
+		}
+		if s.osaFrac != nil && rexprReferencesOuter(s.osaFrac, depth) {
+			return true
+		}
+		if o := s.order; o != nil {
 			for _, k := range o.keys {
 				if rexprReferencesOuter(k, depth) {
 					return true
 				}
 			}
+		}
+		if h := s.hypo; h != nil {
+			for _, e := range h.args {
+				if rexprReferencesOuter(e, depth) {
+					return true
+				}
+			}
+			for _, e := range h.keys {
+				if rexprReferencesOuter(e, depth) {
+					return true
+				}
+			}
+		}
+	}
+	// A window function's arguments (lag(x, 1, outer.col)) and a window aggregate's FILTER.
+	for i := range sp.windowSpecs {
+		w := &sp.windowSpecs[i]
+		for _, a := range w.args {
+			if rexprReferencesOuter(a, depth) {
+				return true
+			}
+		}
+		if w.filter != nil && rexprReferencesOuter(w.filter, depth) {
+			return true
 		}
 	}
 	for _, p := range sp.projections {
