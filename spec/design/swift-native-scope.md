@@ -17,6 +17,26 @@ verification evidence must update these matrices without moving the baseline.
 When later work changes a row to verified, record the implementation path, exact
 opt-in command, result, platform, and revision; preserve failed/remaining lanes.
 
+### Foundation evidence (2026-11-05; acceptance remains unverified)
+
+The implementation is now in progress on local-only branch
+`codex/swift-native-experiment`. The initial `U` entries below remain acceptance
+states: no SQL capability is verified until the resolver/executor and full shared
+corpus exercise it. The [implementation ledger](../../impl/swift-native/PROGRESS.md)
+records integrated command results and local revision boundaries.
+
+| Matrix rows | Handwritten foundation and focused evidence | Remaining acceptance work |
+|---|---|---|
+| T02 | [Decimal arithmetic](../../impl/swift-native/Sources/Jed/Decimal.swift), exact numeric functions and guarded transcendental kernels; all 41 shared decimal key vectors and internal arithmetic/admission invariants pass | SQL resolution, every numeric corpus result/error/type/cost, aggregate integration |
+| T03, F03 | [Numeric formatting](../../impl/swift-native/Sources/Jed/NumericFormat.swift), [float input/output](../../impl/swift-native/Sources/Jed/FloatText.swift) and [float kernels](../../impl/swift-native/Sources/Jed/FloatFunctions.swift); exact IEEE expansion, ties-even/Roman invariants, and three float width/strict-interval/round-trip tests pass through the 133-test green integrated run | Full float and numeric formatting SQL corpus, including resolved casts, errors, types and costs |
+| T05, T06, F03 | [Temporal values](../../impl/swift-native/Sources/Jed/Temporal.swift), [timezone reader](../../impl/swift-native/Sources/Jed/TimeZone.swift), scalar functions and datetime templates; shared date/timestamp/interval vectors, JTZ bundle round trip and all 16 TZif vectors pass | SQL temporal/formatting corpus, session/environment lifecycle and persisted timezone dependency integration |
+| F04 | [Regex compiler/VM](../../impl/swift-native/Sources/Jed/Regex.swift) and [SIMILAR](../../impl/swift-native/Sources/Jed/Similar.swift); all 33 shared program listings, 41 capture/step vectors and 19 SIMILAR vectors pass in the green 120-test integration; capture/replacement admission invariants pass through the 133-test run | SQL regexp/SRF/substring and resource corpus; environment Unicode fold and per-execution scratch integration; retained SRF producer tests pending |
+
+These are bounded foundation results, not completion claims for the matrix rows.
+The platform for these checks is Linux x86-64 with Swift 6.4.2, using the opt-in
+`mise run swift-native:test` task. Apple builds, whole-file interchange, process
+schedules, simulations, and complete cost/memory conformance remain unverified.
+
 ## 1. Scope rules
 
 1. Implement the currently implemented contract, including deliberately rejected

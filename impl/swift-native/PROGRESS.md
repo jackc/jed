@@ -84,7 +84,9 @@ The separate user work under `tasks/memory` is not part of this experiment.
   whole-image serialization, and deterministic large-value disposition/kept chains.
   Three frozen B+tree goldens rebuild byte-exactly. A near-capacity delete regression
   exposed an inherited empty unary subtree; Swift fixes it. The same issue has a
-  confirmed Go reproduction; a separate supported-core correction is in progress.
+  confirmed Go reproduction; the separate supported-core correction is saved locally
+  as `7b4883b6`. Focused tests in all three cores, two shared simulation traces,
+  TypeScript type checks, selected formatting and default spec verification pass.
 - Added datetime and exact numeric template processors, exact IEEE-to-decimal
   conversion, JSON syntax/spans/canonical values, accessors/mutations/builders and
   streaming JSON SRF helpers. SQL resolution/evaluation is not connected yet.
@@ -95,8 +97,26 @@ The separate user work under `tasks/memory` is not part of this experiment.
   database-level acceptance remains separate and incomplete.
 - Added handwritten regex compiler/VM, SIMILAR translation and scalar/SRF helpers.
   All shared regex program/match/SIMILAR vectors pass, including exact instruction
-  listings, captures and step counts. JSONPath compiler compiles; evaluator integration
-  remains active.
+  listings, captures and step counts. Regex SRFs retain compact capture/span state
+  after the specified whole-search admission and materialize one row per next call.
+- Added native float input, exact shortest-round-trip output and scalar math kernels;
+  three internal float tests pass. Added recursive total/SQL comparison and static
+  type rules; an independent key-order agreement invariant passes. Independent
+  review caught and corrected JSON-family element-wise array cast admission.
+- Added JSONPath compiler/evaluator and a retained query cursor. The frozen kernel
+  adapter passes 723 records / 898 cells; 133 records are explicitly excluded because
+  they need SQL resolution, relations, session state or SQL/JSON syntax. This is not
+  SQL conformance. Initial probes had 30 failures, corrected against unchanged shared
+  inputs/expectations: adapter SQLSTATE extraction, numeric member names/comments,
+  and decimal method negative/over-precision scales. Exists/first/match retain at most
+  one value while preserving required evaluation; arithmetic/comparison operands
+  collect the sequences required by jsonpath.md. Relation integration must reserve
+  producer rows and charge generated_row. The array function intentionally collects
+  and charges its growth.
+- Added GiST scalar/range tuple bounds, canonical resident R-tree construction/search
+  and page codecs. Four plaintext goldens and malformed/encrypted boundary tests
+  pass. Independent review found no additional primitive defect; actual encrypted
+  golden rebuilding and empty-root/equal-endpoint refinements await the next run.
 
 ## Verification ledger
 
@@ -113,12 +133,17 @@ The separate user work under `tasks/memory` is not part of this experiment.
 | `mise run swift-native:parser-audit` | PASS 21,525 frozen SQL records; zero unexpected rejections (see Tools/PARSER_AUDIT.md) |
 | `mise run swift-native:test` | PASS 113 after tree/disposition, temporal/numeric formatting and JSON foundations; 0 failures (2026-11-05 17:01 UTC) |
 | `mise run swift-native:test` | PASS 120 after catalog/golden and regex/SIMILAR slices; 0 failures (2026-11-05 17:08 UTC) |
+| `mise run swift-native:test` | PASS 122 after comparator/key invariants and regex admission; 0 failures (17:14 UTC) |
+| `mise run swift-native:test` | FAIL 127 tests / 30 JSONPath kernel probe failures; adapter and kernel issues preserved in `/tmp/jed-swift-jsonpath-first.log` (17:16 UTC) |
+| `mise run swift-native:test` | PASS 133 after JSONPath fixes, float kernels and GiST slice; 0 failures (17:20 UTC); same 133 PASS after scalar-cast source compilation (17:22 UTC) |
 | `mise run swift-native:codegen --check` | PASS all 112 frozen file fixtures plus regex vectors; fingerprint `802cfd6bda26761f7dc3c91d811278ced3bd0a4e368c3e11f3d6b21e917ba77f` |
 | `mise run unit:go -- -run 'Test(Validated\|CommitCRC64\|CompleteManifest\|IncompleteEqualTxid\|Serialization)' -count=1` | PASS 8 selected recovery tests |
 | `mise run unit:rust -- --lib validated_cow_tests` | PASS 7 selected recovery tests |
 | `mise run unit:ts` | PASS 1,276 tests after sandbox Unix-socket access; initial sandbox-only EPERM failures resolved |
 | `mise run durability-review …` (temporary wrapper, removed) | PASS 27 targeted TS recovery tests, TS typecheck, selected Rust/Go/TS formatting checks |
 | `mise run verify` after shared recovery correction | PASS all default spec checks |
+| Focused Go/Rust/TS PMap tests; `mise run tree-regression` | PASS shared empty-unary-subtree regression, plus delete-merge-separator-overflow simulation; exact transcripts and images agree |
+| `mise run typecheck:ts`, selected formatting and `mise run verify` after shared deletion correction | PASS |
 | `git diff --check` | PASS before first integrated foundation test |
 
 The 35 tests include all 11 shared LZ4 and 41 decimal key vectors, arithmetic
@@ -167,7 +192,8 @@ whitespace defects in pinned, unmodified Argon2 upstream LICENSE/encoding.c. Tho
 vendor bytes remain unchanged to preserve the recorded provenance hashes.
 
 Additional local-only commits: `b9e99410` (frozen syntax audit/tree fixtures),
-`a645434f` (packed B+trees/disposition), `a87abe2c` (formatting/JSON foundations).
+`a645434f` (packed B+trees/disposition), `a87abe2c` (formatting/JSON foundations),
+`16569ff1` (catalog codecs and frozen images), `7b4883b6` (shared deletion correction).
 
 Initial SwiftPM compile failed while SQLDecimal was not yet present, then four
 missing `try` markers in decimal test autoclosures were corrected. No expected
@@ -180,9 +206,9 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 
 ## Next steps
 
-1. Active delegated slices: shared empty-unary-subtree correction (`host_inventory`),
-   native floats (`scope_inventory`), JSONPath (`crypto_audit`). Root owns integration,
-   type resolution and remaining catalog/storage wiring. Numeric/temporal format and JSON foundations passed internal
+1. Active delegated slices: GIN (`host_inventory`, JSONPath extraction by `crypto_audit`),
+   Unicode/collation and scalar-cast review (`scope_inventory`). Root owns integration,
+   scalar casts, type resolution and remaining catalog/storage wiring. Numeric/temporal format and JSON foundations passed internal
    verification; SQL behavior remains unverified.
 2. Build parser/resolver/evaluator and shared-corpus adapter over the established
    types, plus the pager/packed B+tree/validated-COW transaction path. Do not
