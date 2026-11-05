@@ -88,6 +88,7 @@ How a row arrives depends on the idiom:
   nothing matched); `query_map` maps every row.
 - **Go** scans columns into pointers with `Scan(&a, &b)`, or maps a whole row into a struct by column
   name with `RowToStructByName`. `QueryRow(...).Scan(...)` returns `jed.ErrNoRows` on an empty result.
+  Integer scan destinations reject out-of-range values; `*int` uses the host's native integer width.
 - **TypeScript** returns each row as an **object keyed by output column name** — `get` gives the first
   (or `undefined`) and `all` gives an array, both through promises. `query` yields positional
   typed values through async iteration with bounded batch fetching.
