@@ -181,8 +181,9 @@ barrier ([page-service.md](page-service.md) §6). The rules:
    pending, the floor is the previous generation, so this alternates exactly as `txid & 1` does under
    `synchronous = on`; while commits are pending, every one of them overwrites the same non-floor
    slot. At open the floor slot is the slot of the selected candidate, or slot `txid & 1` when both
-   slots carry the selected `txid` (`create`, compaction). An adopted generation is stabilized before
-   the first write (§3), so it is the floor by then.
+   slots fully validate, including their manifests, and carry the selected `txid` (`create`,
+   compaction). A matching header alone never makes an incomplete sibling the floor. An adopted
+   generation is stabilized before the first write (§3), so it is the floor by then.
 2. **Cumulative manifest.** A commit's manifest lists the pending set plus its own dirty pages, in
    page order. A meta that validates therefore proves every page written since the floor that it
    could depend on, not only its own.

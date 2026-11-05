@@ -4703,18 +4703,31 @@ export function* loadEnginePagedAtSteps(
     }
   }
   if (selected === undefined) throw engineError("data_corrupted", "no valid meta page");
-  const other = parseCommitMeta(blocks[1 - selected.slot]!, pageSize, physicalPages);
+  const other = candidates.find(
+    (candidate) => candidate.slot !== selected.slot && candidate.meta.txid === selected.meta.txid,
+  );
+  // A matching header alone cannot make the sibling the durability floor: its manifest must
+  // also validate. Preserve the selected generation's protected pages and propagate host errors.
+  const bothSlots =
+    other !== undefined &&
+    (paging.cachedValidation(other.bytes) ??
+      (yield* validateCommitMetaSteps(
+        other.meta,
+        pageSize,
+        (p) => paging.readPageSteps(p),
+        (indices) => paging.readWindowSteps(indices),
+      ))) !== null;
   const adopt = {
     bytes: selected.bytes,
     slot: selected.slot,
-    bothSlots: other !== null && other.txid === selected.meta.txid,
+    bothSlots,
   };
   return yield* loadAtMetaSteps(paging, environment, selected.meta, adopt, protectedPages, at);
 }
 
 // loadAtMeta loads the catalog and interior skeleton the meta mt publishes. adopt is the selected
-// meta slot (its bytes, its slot, and whether both slots carry its txid; null for a backup's load at a given meta, which reads no free list and adopts
-// nothing into the pager).
+// meta slot (its bytes, its slot, and whether both fully validated slots carry its txid; null for a
+// backup's load at a given meta, which reads no free list and adopts nothing into the pager).
 function* loadAtMetaSteps(
   paging: SharedPaging,
   environment: Environment,

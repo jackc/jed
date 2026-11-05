@@ -90,6 +90,45 @@ function apply(image: Uint8Array, writes: { offset: number; bytes: Uint8Array }[
   return copy;
 }
 
+test("incomplete equal-txid sibling cannot become the durability floor", () => {
+  for (const txid of [1n, 2n]) {
+    const pageSize = 256;
+    const image = toImage(new Snapshot(new Environment(), txid), pageSize, txid);
+    const badSlot = Number(txid & 1n),
+      goodSlot = badSlot ^ 1;
+    const bad = image.subarray(badSlot * pageSize, (badSlot + 1) * pageSize);
+    const dv = new DataView(bad.buffer, bad.byteOffset, bad.byteLength);
+    const root = dv.getUint32(20, false);
+    dv.setUint32(40, 1, false);
+    dv.setUint32(64, root, false);
+    dv.setBigUint64(
+      68,
+      crc64Update(0n, image.subarray(root * pageSize, (root + 1) * pageSize)) ^ 1n,
+      false,
+    );
+    dv.setUint32(32, metaChecksum(bad), false);
+    assert.notEqual(
+      parseCommitMeta(bad, pageSize, image.length / pageSize),
+      null,
+      "header is valid",
+    );
+    const good = image.slice(goodSlot * pageSize, (goodSlot + 1) * pageSize);
+    const store = new RecordingStore(image);
+    const db = openStore(store);
+    db.paging!.reserve(512);
+    store.reset();
+    execute(db, "CREATE TABLE after_recovery (id i32 PRIMARY KEY)");
+    const metas = store.writes.filter((write) => write.offset < 2 * pageSize);
+    assert.equal(metas.length, 1);
+    assert.equal(metas[0].offset, badSlot * pageSize, "preserve the only complete fallback");
+    assert.deepEqual(store.image().subarray(goodSlot * pageSize, (goodSlot + 1) * pageSize), good);
+    // All body writes survive, but the successor meta is torn beyond its header.
+    const crashed = store.image();
+    crashed.fill(0, badSlot * pageSize + 32, (badSlot + 1) * pageSize);
+    assert.equal(loadEngine(crashed).committed.txid, txid);
+  }
+});
+
 test("CRC64 ECMA-182 check value and incremental extension", () => {
   const input = new TextEncoder().encode("123456789");
   assert.equal(crc64Update(0n, input), 0x6c40df5f0b497347n);

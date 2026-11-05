@@ -94,6 +94,48 @@ fn seeded(rows: usize) -> (Arc<Mutex<Device>>, Engine) {
     let db = open(&device);
     (device, db)
 }
+
+#[test]
+fn incomplete_equal_txid_sibling_cannot_become_durability_floor() {
+    for txid in [1_u64, 2] {
+        let mut image = Engine::new().to_image(PS as u32, txid).unwrap();
+        let bad_slot = (txid & 1) as usize;
+        let good_slot = bad_slot ^ 1;
+        let at = bad_slot * PS;
+        let root = u32::from_be_bytes(image[at + 20..at + 24].try_into().unwrap()) as usize;
+        let digest = crate::format::commit_crc64(0, &image[root * PS..(root + 1) * PS]);
+        let bad = &mut image[at..at + PS];
+        bad[40..44].copy_from_slice(&1_u32.to_be_bytes());
+        bad[64..68].copy_from_slice(&(root as u32).to_be_bytes());
+        bad[68..76].copy_from_slice(&(digest ^ 1).to_be_bytes());
+        let crc = crate::format::meta_crc(bad);
+        bad[32..36].copy_from_slice(&crc.to_be_bytes());
+        assert!(crate::format::parse_meta(bad).is_some(), "header is valid");
+        let good = image[good_slot * PS..(good_slot + 1) * PS].to_vec();
+        image.resize(1024 * PS, 0);
+        let device = Arc::new(Mutex::new(Device {
+            cache: image.clone(),
+            durable: image,
+            ..Default::default()
+        }));
+        let mut db = open(&device);
+        execute(&mut db, "CREATE TABLE after_recovery (id i32 PRIMARY KEY)").unwrap();
+        let d = device.lock().unwrap();
+        let meta_writes: Vec<_> = d
+            .writes
+            .iter()
+            .filter(|(offset, _)| *offset < 2 * PS)
+            .collect();
+        assert_eq!(meta_writes.len(), 1);
+        assert_eq!(meta_writes[0].0, at, "preserve the only complete fallback");
+        assert_eq!(&d.cache[good_slot * PS..(good_slot + 1) * PS], good);
+        // All body writes survive, but the successor meta is torn beyond its header.
+        let mut crashed = d.cache.clone();
+        crashed[at + 32..at + PS].fill(0);
+        assert_eq!(Engine::from_image(&crashed).unwrap().committed.txid, txid);
+    }
+}
+
 fn values(db: &Engine) -> Vec<i64> {
     db.rows_in_key_order("t")
         .unwrap()

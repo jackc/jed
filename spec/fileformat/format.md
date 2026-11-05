@@ -717,8 +717,9 @@ overwrites only the **older** slot, leaving the previously-published meta intact
 present (copy-on-write never overwrote them). `create` seeds **both** slots with the initial
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit then
 overwrites slot 0). An opener takes the selected candidate's slot as the floor slot, or slot
-`txid & 1` when both slots carry the selected `txid`. **New in v49:** under `synchronous = off`
-every commit pending after the floor writes the same non-floor slot, so a valid meta may sit in either
+`txid & 1` when both slots fully validate, including their manifests, and carry the selected `txid`.
+A matching header alone never makes an incomplete sibling the floor. **New in v49:** under
+`synchronous = off` every commit pending after the floor writes the same non-floor slot, so a valid meta may sit in either
 slot whatever its `txid` parity, and its manifest also lists every body page written since the floor.
 Slot selection on open is unchanged; the version bump keeps a v48 writer, which always writes
 `txid & 1`, from overwriting the only durable fallback of such a file.

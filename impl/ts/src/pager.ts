@@ -550,8 +550,8 @@ export class Pager {
 
   // A recovered descriptor can represent a complete but unacknowledged transaction. Make that
   // generation durable before any successor overwrites its fallback or relies on inherited pages.
-  // slot is the selected meta's slot and bothSlots whether the other slot carries the same txid: an
-  // adopted generation is the floor once stabilized, in slot txid & 1 when both slots carry it
+  // slot is the selected meta's slot and bothSlots whether the fully validated other slot carries
+  // the same txid: an adopted generation is the floor once stabilized, in slot txid & 1 when both carry it
   // (create, compaction), and nothing is pending (validated-cow.md §3–§4).
   adoptCommit(
     txid: bigint,

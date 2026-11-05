@@ -225,16 +225,28 @@ func (p *pager) selectValidatedMeta() (meta, error) {
 				}
 			}
 			adopted := !bytes.Equal(raw, p.validatedMeta)
+			floorSlot := slots[k]
+			if adopted {
+				// A matching header is insufficient: the other slot must have a complete
+				// manifest before parity may choose it as the durable fallback.
+				if other, ok := parseMeta(blocks[1-k]); ok && other.txid == m.txid &&
+					other.pageCount <= p.allocatedPages && other.suite == m.suite {
+					_, _, valid, err := commitManifestDependencies(other, blocks[1-k], p.pageSize, p.readBlock)
+					if err != nil {
+						return meta{}, err
+					}
+					if valid {
+						floorSlot = uint32(m.txid & 1)
+					}
+				}
+			}
 			p.validatedMeta = append(p.validatedMeta[:0], raw...)
 			p.recoverySync = p.recoverySync || (adopted && m.dirtyCount != 0)
 			if adopted {
 				// The adopted generation is the floor once stabilized (validated-cow.md §3–§4). When both
-				// slots carry its txid (create, compaction), the floor slot is txid & 1, so the next commit
-				// writes the other slot exactly as txid parity would.
-				p.floorSlot = slots[k]
-				if other, ok := parseMeta(blocks[1-k]); ok && other.txid == m.txid {
-					p.floorSlot = uint32(m.txid & 1)
-				}
+				// fully validated slots carry its txid (create, compaction), the floor slot is txid & 1,
+				// so the next commit writes the other slot exactly as txid parity would.
+				p.floorSlot = floorSlot
 				p.pending = nil
 			}
 		}

@@ -245,8 +245,8 @@ impl Pager {
     }
 
     /// Adopt the selected meta's generation. `floor_slot` is the slot it becomes the floor in once
-    /// stabilized (validated-cow.md §3–§4): the selected slot, or `txid & 1` when both slots carry
-    /// its txid (create, compaction), so the next commit writes the other slot exactly as txid
+    /// stabilized (validated-cow.md §3–§4): the selected slot, or `txid & 1` when both fully
+    /// validated slots carry its txid (create, compaction), so the next commit writes the other slot as txid
     /// parity would. A newly adopted generation ends any pending batch.
     pub(crate) fn adopt_generation(
         &mut self,

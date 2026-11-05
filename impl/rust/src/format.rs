@@ -2924,9 +2924,6 @@ impl Engine {
                 .filter_map(|(slot, b)| parse_meta(b).map(|m| (m, b, slot as u32)))
                 .collect();
             candidates.sort_by(|a, b| b.0.txid.cmp(&a.0.txid));
-            // Whether both slots carry the same txid (create, compaction): the floor slot is then
-            // txid & 1 (format.md, *Slot alternation*).
-            let same_txid = candidates.len() == 2 && candidates[0].0.txid == candidates[1].0.txid;
             let mut selected = None;
             let encrypted = paging.codec().is_some();
             for (mut m, bytes, slot) in candidates {
@@ -2959,9 +2956,26 @@ impl Engine {
                             verified?;
                         }
                     }
+                    let mut floor_slot = slot;
+                    let other_bytes = &blocks[(slot ^ 1) as usize];
+                    if let Some(other) = parse_meta(other_bytes) {
+                        // Parity is safe only when the sibling's manifest also validates.
+                        // Keep the selected generation's protected set unchanged.
+                        if other.txid == m.txid
+                            && other.suite == m.suite
+                            && other.page_count <= physical
+                            && (pg.trusts_meta()
+                                || pg.cached_validation(other_bytes).is_some()
+                                || commit_manifest::validate(other_bytes, physical, |id| {
+                                    pg.read_block(id)
+                                })?
+                                .is_some())
+                        {
+                            floor_slot = (m.txid & 1) as u32;
+                        }
+                    }
                     pg.cache_validation(bytes, Arc::clone(&protected));
                     m.protected = protected;
-                    let floor_slot = if same_txid { (m.txid & 1) as u32 } else { slot };
                     pg.adopt_generation(
                         m.txid,
                         u32::from_be_bytes(bytes[32..36].try_into().unwrap()),

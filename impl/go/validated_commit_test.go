@@ -42,6 +42,57 @@ func recordedCommitEngine(t *testing.T, image []byte) (*engine, *recordingStore,
 	return db, rec, base
 }
 
+func TestIncompleteEqualTxidSiblingCannotBecomeDurabilityFloor(t *testing.T) {
+	for _, txid := range []uint64{1, 2} {
+		t.Run(fmt.Sprintf("txid=%d", txid), func(t *testing.T) {
+			const pageSize = 256
+			image, err := newSnapshot(NewEnvironment()).ToImage(pageSize, txid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Make the parity slot header-valid but incomplete. The opposite slot is the
+			// only complete generation, so the next commit must preserve it.
+			badSlot := int(txid & 1)
+			goodSlot := badSlot ^ 1
+			bad := image[badSlot*pageSize : (badSlot+1)*pageSize]
+			root := binary.BigEndian.Uint32(bad[20:24])
+			binary.BigEndian.PutUint32(bad[40:44], 1)
+			binary.BigEndian.PutUint32(bad[64:68], root)
+			digest := commitCRC64(0, image[int(root)*pageSize:int(root+1)*pageSize])
+			binary.BigEndian.PutUint64(bad[68:76], digest^1)
+			binary.BigEndian.PutUint32(bad[32:36], metaCRC(bad))
+			if _, ok := parseMeta(bad); !ok {
+				t.Fatal("crafted sibling must pass header validation")
+			}
+			good := append([]byte(nil), image[goodSlot*pageSize:(goodSlot+1)*pageSize]...)
+			db, rec, base := recordedCommitEngine(t, image)
+			mustExec(t, db, "CREATE TABLE after_recovery (id i32 PRIMARY KEY)")
+			metaWrites := 0
+			for _, op := range rec.ops {
+				if op.kind == opWrite && op.off < 2*pageSize {
+					metaWrites++
+					if op.off != int64(badSlot*pageSize) {
+						t.Fatalf("overwrote only complete fallback in slot %d", goodSlot)
+					}
+				}
+			}
+			if metaWrites != 1 {
+				t.Fatalf("meta writes = %d, want one", metaWrites)
+			}
+			if string(base.buf[goodSlot*pageSize:(goodSlot+1)*pageSize]) != string(good) {
+				t.Fatal("complete fallback changed")
+			}
+			// All body writes survive, but the successor meta is torn beyond its header.
+			crashed := append([]byte(nil), base.buf...)
+			clear(crashed[badSlot*pageSize+32 : (badSlot+1)*pageSize])
+			recovered, err := loadEngine(crashed, NewEnvironment())
+			if err != nil || recovered.committed.txid != txid {
+				t.Fatalf("torn successor failed to recover txid %d: %v", txid, err)
+			}
+		})
+	}
+}
+
 func TestValidatedCommitUsesOneBarrierAndPoisonsFailedWriter(t *testing.T) {
 	image, err := newSnapshot(NewEnvironment()).ToImage(256, 1)
 	if err != nil {
