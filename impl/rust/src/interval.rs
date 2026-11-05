@@ -131,8 +131,8 @@ fn igcd(mut a: i128, mut b: i128) -> i128 {
 }
 
 /// The maximum integer and significant fractional digits of an `interval × / number` factor
-/// (spec/design/interval.md §6) — bounds chosen so every i128 overflow in the cascade below implies
-/// an `i32`/`i64` field overflow (so Go big.Int / TS BigInt, which never overflow, trap identically).
+/// (spec/design/interval.md §6). Rounded products use bounded quotient/remainder arithmetic
+/// where their common numerator can exceed i128 despite a representable result.
 const MAX_INT_DIGITS: usize = 18;
 const MAX_FRAC_DIGITS: usize = 18;
 /// TSROUND's 1e-6 quantum, applied to the fractional-month days (micro-days).
@@ -169,8 +169,8 @@ pub fn parse_factor_decimal(s: &str) -> Result<(i128, i128)> {
 /// both rounded half to even like C `rint`) and the move of whole days out of a seconds remainder
 /// of 24 h or more. The arithmetic is EXACT rational math in i128 (PG's is `double`), so the cores
 /// agree byte-for-byte and differ from PG only where its double lands on the other side of a
-/// quantum boundary. A field beyond `i32`/`i64` — or an i128 overflow, which the factor digit cap
-/// makes imply one — traps `22008`.
+/// quantum boundary. A field beyond `i32`/`i64` traps `22008`; oversized intermediate numerators
+/// are avoided by quotient/remainder decomposition rather than rejected as field overflows.
 pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval> {
     let g = igcd(fnum, fden).max(1);
     let fnum = fnum / g;
@@ -200,16 +200,9 @@ pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval
     let mut r_day = d_total / fden;
     let day_frac = d_total - r_day * fden; // over fden
     // sec_remainder = TSROUND((day_frac/fden + mrd_frac/1e6) × 86 400): quantized to µs, half to
-    // even. mrd_frac × 86 400 is that part in whole µs; it is scaled by fden to share the divisor.
-    let sec_num = day_frac
-        .checked_mul(MICROS_PER_DAY as i128)
-        .and_then(|x| {
-            (mrd_frac * 86_400)
-                .checked_mul(fden)
-                .and_then(|y| x.checked_add(y))
-        })
-        .ok_or_else(of)?;
-    let mut sec_rem = round_half_even_div(sec_num, fden); // µs
+    // even. mrd_frac × 86 400 is already whole µs, so add it after dividing the day fraction.
+    let mut sec_rem =
+        round_scaled_fraction(day_frac, MICROS_PER_DAY as i128, fden, mrd_frac * 86_400); // µs
     // A remainder of 24 h or more (rounding, or the month cascade on top of the day fraction)
     // moves its whole days up into the days field.
     if sec_rem.abs() >= MICROS_PER_DAY as i128 {
@@ -220,17 +213,48 @@ pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval
     r_day = r_day.checked_add(mrd_whole).ok_or_else(of)?;
 
     // result.time = rint(u × factor + sec_remainder).
-    let time_num = u
-        .checked_mul(fnum)
-        .and_then(|x| sec_rem.checked_mul(fden).and_then(|y| x.checked_add(y)))
-        .ok_or_else(of)?;
-    let r_time = round_half_even_div(time_num, fden);
+    let time_num = u.checked_mul(fnum).ok_or_else(of)?;
+    let r_time = round_scaled_fraction(time_num, 1, fden, sec_rem);
 
     Ok(Interval {
         months: i32::try_from(r_month).map_err(|_| field_overflow("interval out of range"))?,
         days: i32::try_from(r_day).map_err(|_| field_overflow("interval out of range"))?,
         micros: i64::try_from(r_time).map_err(|_| field_overflow("interval out of range"))?,
     })
+}
+
+/// Round `num * scale / den + offset` without materializing the potentially overflowing
+/// common numerator. The factor cap bounds `den` by 10^36, so doubling a remainder and
+/// adding another remainder fits i128. Only the day-to-microsecond product needs this
+/// bounded binary multiplication fallback; ordinary inputs keep the direct arithmetic path.
+fn round_scaled_fraction(num: i128, scale: i128, den: i128, offset: i128) -> i128 {
+    let (q, r) = if let Some(product) = num.checked_mul(scale) {
+        (product / den, product % den)
+    } else {
+        let magnitude = num.abs();
+        let whole = magnitude / den;
+        let fraction = magnitude % den;
+        let mut q = 0i128;
+        let mut r = 0i128;
+        for bit in (0..128 - scale.leading_zeros()).rev() {
+            q *= 2;
+            r *= 2;
+            if (scale >> bit) & 1 != 0 {
+                q += whole;
+                r += fraction;
+            }
+            q += r / den;
+            r %= den;
+        }
+        if num < 0 { (-q, -r) } else { (q, r) }
+    };
+    let q = q + offset;
+    let twice = r.abs() * 2;
+    if twice > den || (twice == den && q % 2 != 0) {
+        q + r.signum()
+    } else {
+        q
+    }
 }
 
 /// Round `num / den` (`den > 0`) to the nearest integer, ties to even — C `rint` under the
