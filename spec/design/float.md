@@ -206,7 +206,8 @@ existing literal machinery — types.md §6, grammar.md §36):
   an optional sign, decimal digits with an optional point and **`e`-notation** (`1.5e10`,
   `-3E-7` — the same e-notation a bare decimal literal now takes, grammar.md §14, here via
   f64's own string parse), plus the case-insensitive special words
-  **`Infinity`/`+Infinity`/`-Infinity`/`inf`/`NaN`** (PG's `float8in` spellings). Malformed
+  **`Infinity`/`+Infinity`/`-Infinity`/`inf`/`NaN`** (PG's `float8in` spellings), with an optional
+  sign on `inf` and `NaN` as well. A NaN's sign is discarded. Malformed
   input traps **`22P02`** (`invalid_text_representation`) deterministically at resolve, before
   any row is scanned; a value outside the binary64 range traps **`22003`**.
 - **A bare string literal adapting to a float column.** An untyped string literal stored into an

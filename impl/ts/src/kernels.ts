@@ -1130,6 +1130,8 @@ export function parseFloatLiteral(s: string, ty: ScalarType): number {
   let special: number | undefined;
   switch (lower) {
     case "nan":
+    case "+nan":
+    case "-nan":
       special = NaN;
       break;
     case "infinity":
