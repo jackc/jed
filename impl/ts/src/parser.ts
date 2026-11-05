@@ -5671,13 +5671,13 @@ class Parser {
       this.tokens[this.pos + 1]?.kind === "str"
     )
       return this.parseTypedLiteral();
-    // The two-word `character varying '...'` typed literal (types.md §15).
+    // Two-word typed literals (types.md §2/§15).
     if (
-      tlKw === "character" &&
-      this.peekKeywordAt(1) === "varying" &&
+      ((tlKw === "character" && this.peekKeywordAt(1) === "varying") ||
+        (tlKw === "double" && this.peekKeywordAt(1) === "precision")) &&
       this.tokens[this.pos + 2]?.kind === "str"
     )
-      return this.parseCharacterVaryingLiteral();
+      return this.parseMultiwordTypedLiteral();
     // The SQL/JSON query functions `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY`
     // (json-sql-functions.md §5, S2) — keyword-led primaries with sub-clauses, recognized when the
     // keyword is immediately followed by `(` (so the words stay usable as identifiers otherwise).
@@ -5860,8 +5860,8 @@ class Parser {
     return { kind: "typedLiteral", typeName, text: t.str!, loc, typeLoc };
   }
 
-  // parseCharacterVaryingLiteral parses the `character varying '...'` typed literal (a parsePrimary arm).
-  private parseCharacterVaryingLiteral(): Expr {
+  // parseMultiwordTypedLiteral parses a two-word typed literal (a parsePrimary arm).
+  private parseMultiwordTypedLiteral(): Expr {
     const typeLoc = this.here();
     const typeName = this.expectTypeName();
     const loc = this.here();
@@ -6882,7 +6882,13 @@ class Parser {
   // identifier) — and returns the alias "character varying", which the catalog resolves to text
   // exactly like varchar. Any other `character` stays a one-word name (unknown type → 42704 at
   // resolve). A CLAUDE.md §8 cross-core determinism surface (spec/design/grammar.md §14).
+  // Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2).
   private expectTypeName(): string {
+    if (this.peekKeyword() === "double" && this.peekKeywordAt(1) === "precision") {
+      this.advance(); // DOUBLE
+      this.advance(); // PRECISION
+      return "double precision";
+    }
     if (this.peekKeyword() === "character" && this.peekKeywordAt(1) === "varying") {
       this.advance(); // CHARACTER
       this.advance(); // VARYING

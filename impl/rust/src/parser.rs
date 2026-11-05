@@ -6897,9 +6897,11 @@ impl Parser {
                 unreachable!("peeked a string literal after the type name");
             });
         }
-        // The two-word `character varying '...'` typed literal (types.md §15).
-        if self.peek_keyword().as_deref() == Some("character")
-            && self.peek_keyword_at(1).as_deref() == Some("varying")
+        // Two-word typed literals (types.md §2/§15).
+        if ((self.peek_keyword().as_deref() == Some("character")
+            && self.peek_keyword_at(1).as_deref() == Some("varying"))
+            || (self.peek_keyword().as_deref() == Some("double")
+                && self.peek_keyword_at(1).as_deref() == Some("precision")))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Str(_)))
         {
             return outline(|| {
@@ -7779,7 +7781,15 @@ impl Parser {
     /// resolves to `text` exactly like `varchar`. Any other `character` stays a one-word name
     /// (unknown type → 42704 at resolve). A CLAUDE.md §8 cross-core determinism surface
     /// (spec/design/grammar.md §14).
+    /// Also accepts the bare keyword pair DOUBLE PRECISION as the f64 alias (types.md §2).
     fn expect_type_name(&mut self) -> Result<String> {
+        if self.peek_keyword().as_deref() == Some("double")
+            && self.peek_keyword_at(1).as_deref() == Some("precision")
+        {
+            self.advance(); // DOUBLE
+            self.advance(); // PRECISION
+            return Ok("double precision".to_string());
+        }
         if self.peek_keyword().as_deref() == Some("character")
             && self.peek_keyword_at(1).as_deref() == Some("varying")
         {

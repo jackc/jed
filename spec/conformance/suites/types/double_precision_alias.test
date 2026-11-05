@@ -1,0 +1,39 @@
+# The documented two-word f64 alias must be consumed in full in every type position.
+# requires: ddl.create_table, dml.insert, query.select, query.select_no_from, cast.explicit, types.f64, types.array
+
+statement ok
+CREATE TABLE double_alias (value double precision, items DOUBLE PRECISION[])
+
+statement ok
+INSERT INTO double_alias VALUES (1.5, '{2.5,3.5}')
+
+# types: f64, f64[]
+query RT nosort
+SELECT value, items FROM double_alias
+----
+1.5
+{2.5,3.5}
+
+# types: f64, f64, f64
+query RRR nosort
+SELECT '1.5'::double precision, CAST('2.5' AS DoUbLe PrEcIsIoN), DOUBLE PRECISION '3.5'
+----
+1.5
+2.5
+3.5
+
+# types: f64[]
+query T nosort
+SELECT CAST('{1.5,2.5}' AS double precision[])
+----
+{1.5,2.5}
+
+# Comments between the bare keywords do not change the alias.
+query R nosort
+SELECT '4.5'::double /* alias */ precision
+----
+4.5
+
+# A quoted second word does not form the keyword sequence.
+statement error 42601
+SELECT CAST('1.5' AS double "precision")
