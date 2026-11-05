@@ -16,6 +16,57 @@ import (
 // aggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
 // operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
+// rejectOuterLevelAggregate rejects an OUTER-LEVEL aggregate (spec/design/grammar.md §26): an aggregate
+// inside a subquery whose aggregated arguments — operand, FILTER, in-aggregate ORDER BY keys,
+// hypothetical-set WITHIN GROUP keys — read enclosing-query columns and none of the subquery's own.
+// PostgreSQL evaluates such an aggregate in the enclosing query (`SELECT (SELECT max(t.a)) FROM t` is one
+// row); jed does not, and aggregating it per subquery row would silently answer differently, so it is
+// 42803. before is len(ag.specs) before the call: a reused (deduplicated) spec was checked when first
+// collected. A nested subquery in the arguments is conservatively treated as reading the subquery's own
+// level.
+func rejectOuterLevelAggregate(ag *aggCtx, before int) error {
+	if len(ag.specs) <= before {
+		return nil
+	}
+	sp := &ag.specs[len(ag.specs)-1]
+	var stack []*rExpr
+	push := func(e *rExpr) {
+		if e != nil {
+			stack = append(stack, e)
+		}
+	}
+	push(sp.operand)
+	push(sp.filter)
+	if sp.order != nil {
+		for _, k := range sp.order.keys {
+			push(k)
+		}
+	}
+	if sp.hypo != nil {
+		for _, k := range sp.hypo.keys {
+			push(k)
+		}
+	}
+	outer := false
+	for len(stack) > 0 {
+		e := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch e.kind {
+		case reColumn, reSubquery:
+			return nil
+		case reOuterColumn:
+			outer = true
+		}
+		for _, c := range rexprChildren(e) {
+			push(c)
+		}
+	}
+	if outer {
+		return newError(GroupingError, "an aggregate whose arguments reference only outer-query columns (an outer-level aggregate) is not supported")
+	}
+	return nil
+}
+
 func resolveAggregate(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if !ag.collecting {
 		return nil, resolvedType{}, newError(GroupingError, "aggregate functions are not allowed here")

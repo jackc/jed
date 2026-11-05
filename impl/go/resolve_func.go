@@ -3577,7 +3577,15 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
-		return resolveAggregate(s, fc, ag, params)
+		before := len(ag.specs)
+		node, ty, err := resolveAggregate(s, fc, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if err := rejectOuterLevelAggregate(ag, before); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return node, ty, nil
 	}
 	// The array <-> text conversions (array-functions.md §15): array_to_string's anyarray slot binds
 	// no result type and string_to_array's text[] result is not scalar, so both have their own

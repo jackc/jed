@@ -43662,6 +43662,36 @@ export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
 // AggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
 // operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
+// rejectOuterLevelAggregate rejects an OUTER-LEVEL aggregate (spec/design/grammar.md §26): an
+// aggregate inside a subquery whose aggregated arguments — operand, FILTER, in-aggregate ORDER BY keys,
+// hypothetical-set WITHIN GROUP keys — read enclosing-query columns and none of the subquery's own.
+// PostgreSQL evaluates such an aggregate in the enclosing query (`SELECT (SELECT max(t.a)) FROM t` is
+// one row); jed does not, and aggregating it per subquery row would silently answer differently, so it
+// is 42803. `before` is ag.specs.length before the call: a reused (deduplicated) spec was checked when
+// first collected. A nested subquery in the arguments is conservatively treated as reading the
+// subquery's own level.
+function rejectOuterLevelAggregate(ag: AggCtx, before: number): void {
+  if (ag.specs.length <= before) return;
+  const s = ag.specs[ag.specs.length - 1] as AggSpec;
+  const stack: RExpr[] = [];
+  if (s.operand !== null) stack.push(s.operand);
+  if (s.filter != null) stack.push(s.filter);
+  if (s.order != null) stack.push(...s.order.keys);
+  if (s.hypo != null) stack.push(...s.hypo.keys);
+  let outer = false;
+  for (let e = stack.pop(); e !== undefined; e = stack.pop()) {
+    if (e.kind === "column" || e.kind === "subquery") return;
+    if (e.kind === "outerColumn") outer = true;
+    stack.push(...estimatorExpressionChildren(e));
+  }
+  if (outer) {
+    throw engineError(
+      "grouping_error",
+      "an aggregate whose arguments reference only outer-query columns (an outer-level aggregate) is not supported",
+    );
+  }
+}
+
 export function resolveAggregate(
   scope: Scope,
   e: {
@@ -45447,7 +45477,10 @@ export function resolveFuncCall(
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
   if (isAggregateName(lname)) {
     rejectNamed(lname, e.argNames);
-    return resolveAggregate(scope, e, ag, params);
+    const before = ag.specs.length;
+    const out = resolveAggregate(scope, e, ag, params);
+    rejectOuterLevelAggregate(ag, before);
+    return out;
   }
   // The array <-> text conversions (array-functions.md §15): array_to_string's anyarray slot binds
   // no result type and string_to_array's text[] result is not scalar, so both have their own

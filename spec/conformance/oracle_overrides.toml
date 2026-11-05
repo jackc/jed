@@ -1182,6 +1182,27 @@ file = "expr/regex.test"
 sql = "SELECT 'abc' ~ 'abc\\Z' FROM one"
 reason = "jed: `\\Z` (uppercase) is NOT a jed anchor (regex.md §2) — its only distinguishing PCRE behavior is trailing-newline leniency jed does nowhere, so it is an invalid escape (2201B). PostgreSQL accepts `\\Z` as an end-of-string anchor and returns true. A deliberate flavor narrowing; jed spells the absolute-end anchor `\\z` (regex.md §1/§2)."
 
+# --- outer-level aggregates: not supported (grammar.md §26), so 42803; PostgreSQL computes them at the outer level.
+[[override]]
+file = "subquery/outer_level_aggregate.test"
+sql = "SELECT (SELECT max(t.a)) FROM t"
+reason = "jed: an outer-level aggregate (an aggregate inside a subquery whose aggregated arguments read only enclosing-query columns) is 42803 (grammar.md §26). PostgreSQL evaluates it in the enclosing query; jed does not support that, and rejects it rather than aggregating per subquery row."
+
+[[override]]
+file = "subquery/outer_level_aggregate.test"
+sql = "SELECT (SELECT count(*) FILTER (WHERE t.a > 5)) FROM t"
+reason = "jed: an outer-level aggregate (an aggregate inside a subquery whose aggregated arguments read only enclosing-query columns) is 42803 (grammar.md §26). PostgreSQL evaluates it in the enclosing query; jed does not support that, and rejects it rather than aggregating per subquery row."
+
+[[override]]
+file = "subquery/outer_level_aggregate.test"
+sql = "SELECT (SELECT array_agg(t.id ORDER BY t.id)) FROM t"
+reason = "jed: an outer-level aggregate (an aggregate inside a subquery whose aggregated arguments read only enclosing-query columns) is 42803 (grammar.md §26). PostgreSQL evaluates it in the enclosing query; jed does not support that, and rejects it rather than aggregating per subquery row."
+
+[[override]]
+file = "subquery/outer_level_aggregate.test"
+sql = "SELECT a, (SELECT sum(a)) FROM t GROUP BY a"
+reason = "jed: an outer-level aggregate (an aggregate inside a subquery whose aggregated arguments read only enclosing-query columns) is 42803 (grammar.md §26). PostgreSQL evaluates it in the enclosing query; jed does not support that, and rejects it rather than aggregating per subquery row."
+
 # --- regex POSIX bracket syntax: not in jed's flavor (regex.md §2), so 2201B; PostgreSQL accepts it.
 [[override]]
 file = "expr/regex.test"

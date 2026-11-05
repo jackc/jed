@@ -1,0 +1,55 @@
+# An OUTER-LEVEL aggregate — one inside a subquery whose aggregated arguments (operand, FILTER,
+# in-aggregate ORDER BY) read enclosing-query columns and none of the subquery's own — is 42803
+# (spec/design/grammar.md §26). PostgreSQL evaluates such an aggregate in the enclosing query, so
+# `SELECT (SELECT max(t.a)) FROM t` aggregates t; jed does not support that, and rejects it rather
+# than aggregating per subquery row. The rows PostgreSQL answers are oracle-overridden; the WHERE
+# rows are 42803 in PostgreSQL too. An aggregate that also reads a subquery column, or no column at
+# all, stays the subquery's own and matches PostgreSQL.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.qualified_column, query.table_alias, query.aggregates, query.aggregate_filter, query.aggregate_order_by, query.group_by, expr.arithmetic, query.subquery_scalar, query.subquery_correlated, types.i32
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 10), (3, 30)
+
+statement error 42803
+SELECT (SELECT max(t.a)) FROM t
+
+statement error 42803
+SELECT (SELECT count(*) FILTER (WHERE t.a > 5)) FROM t
+
+statement error 42803
+SELECT (SELECT array_agg(t.id ORDER BY t.id)) FROM t
+
+statement error 42803
+SELECT a, (SELECT sum(a)) FROM t GROUP BY a
+
+statement error 42803
+SELECT id FROM t WHERE a = (SELECT max(t.a))
+
+statement error 42803
+SELECT (SELECT max(t.a) FROM t u WHERE u.id = t.id) FROM t
+
+# Reading a subquery column too keeps the aggregate at the subquery's level.
+query I rowsort
+SELECT (SELECT max(t.a + u.id) FROM t u) FROM t
+----
+13
+13
+33
+
+# No column at all: the subquery's own aggregate.
+query I rowsort
+SELECT (SELECT count(*)) FROM t
+----
+1
+1
+1
+
+query I rowsort
+SELECT (SELECT max(1)) FROM t
+----
+1
+1
+1

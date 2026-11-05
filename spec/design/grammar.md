@@ -2320,10 +2320,17 @@ real cause (the type can't be determined) and is consistent with its strict, no-
   so an enclosing-query column it reads must be one of that query's grouping columns (or
   functionally dependent on its grouped primary key — aggregates.md §16) and reads the group's
   value; any other is `42803` (PostgreSQL's *subquery uses ungrouped column*). A subquery in
-  `WHERE` or inside an aggregate's argument still sees the input row. **Narrowing:** an aggregate
-  written inside the subquery over an enclosing column — PostgreSQL's outer-level aggregate,
-  `SELECT a, (SELECT max(b)) FROM t GROUP BY a` — is `42803` (PostgreSQL computes it at the outer
-  level); relaxable.
+  `WHERE` or inside an aggregate's argument still sees the input row.
+- **Outer-level aggregates** — an aggregate inside a subquery whose aggregated arguments (operand,
+  `FILTER`, in-aggregate `ORDER BY` keys, hypothetical-set `WITHIN GROUP` keys) read one or more
+  enclosing-query columns and none of the subquery's own — PostgreSQL's outer-level aggregate,
+  `SELECT (SELECT max(t.a)) FROM t` or `SELECT a, (SELECT sum(b)) FROM t GROUP BY a` — is `42803`,
+  grouped enclosing query or not. PostgreSQL computes it as an aggregate of the enclosing query;
+  aggregating it per subquery row instead would silently answer differently, so jed rejects it. An
+  aggregate whose arguments also read a subquery column, or no column (`count(*)`, `max(1)`), is the
+  subquery's own, as in PostgreSQL. A nested subquery inside the arguments is conservatively taken to
+  read the subquery's level (not rejected). Relaxable
+  (`suites/subquery/outer_level_aggregate.test`).
 - **Derived tables** — `FROM ( query_expr ) AS t` (a subquery as a relation) landed as its own
   slice; see §42.
 - **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)` landed (the subquery spelling of `IN`);

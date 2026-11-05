@@ -1721,6 +1721,58 @@ pub(crate) fn aggregate_plan(
 /// valid in `Collect` mode; in `Forbidden` mode (WHERE/ON/nested) it is 42803. The operand is
 /// resolved in a fresh `Forbidden` sub-context (a nested aggregate is 42803; its columns
 /// resolve against the real row). The result type follows the PG widening (aggregates.md §3).
+/// How many aggregates `agg` has collected so far (0 for a context that collects none).
+pub(crate) fn collected_agg_count(agg: &AggCtx) -> usize {
+    match agg {
+        AggCtx::Collect { specs, .. } => specs.len(),
+        AggCtx::GroupedWindow { agg_specs, .. } => agg_specs.len(),
+        _ => 0,
+    }
+}
+
+/// Reject an **outer-level aggregate** (spec/design/grammar.md §26): an aggregate inside a subquery
+/// whose aggregated arguments — operand, FILTER, in-aggregate ORDER BY keys, hypothetical-set
+/// WITHIN GROUP keys — read enclosing-query columns and none of the subquery's own. PostgreSQL
+/// evaluates such an aggregate in the enclosing query (`SELECT (SELECT max(t.a)) FROM t` is one row);
+/// jed does not, and aggregating it per subquery row would silently answer differently, so it is
+/// 42803. `before` is the collected count before the call: a reused (deduplicated) spec was checked
+/// when first collected. A nested subquery in the arguments is conservatively treated as reading
+/// the subquery's own level.
+pub(crate) fn reject_outer_level_aggregate(agg: &AggCtx, before: usize) -> Result<()> {
+    let spec = match agg {
+        AggCtx::Collect { specs, .. } if specs.len() > before => specs.last(),
+        AggCtx::GroupedWindow { agg_specs, .. } if agg_specs.len() > before => agg_specs.last(),
+        _ => None,
+    };
+    let Some(s) = spec else { return Ok(()) };
+    let mut stack: Vec<&RExpr> = Vec::new();
+    stack.extend(s.operand.as_ref());
+    stack.extend(s.filter.as_ref());
+    if let Some(o) = &s.order {
+        stack.extend(o.keys.iter());
+    }
+    if let Some(h) = &s.hypo {
+        stack.extend(h.keys.iter());
+    }
+    let mut outer = false;
+    while let Some(e) = stack.pop() {
+        match e {
+            RExpr::Column(_) | RExpr::Subquery { .. } => return Ok(()),
+            RExpr::OuterColumn { .. } => outer = true,
+            _ => {}
+        }
+        stack.extend(estimator_expression_children(e));
+    }
+    if outer {
+        return Err(EngineError::new(
+            SqlState::GroupingError,
+            "an aggregate whose arguments reference only outer-query columns (an outer-level \
+             aggregate) is not supported",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_aggregate(
     scope: &Scope,
     name: &str,

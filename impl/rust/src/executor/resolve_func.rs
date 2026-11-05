@@ -223,9 +223,12 @@ pub(crate) fn resolve_func_call(
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
     if is_aggregate_name(&lname) {
         reject_named(&lname, arg_names)?;
-        return resolve_aggregate(
+        let before = collected_agg_count(agg);
+        let out = resolve_aggregate(
             scope, &lname, args, star, distinct, filter, agg_order, agg, params,
-        );
+        )?;
+        reject_outer_level_aggregate(agg, before)?;
+        return Ok(out);
     }
     // The array <-> text conversions (array-functions.md §15): array_to_string's anyarray slot binds
     // no result type and string_to_array's text[] result is not scalar, so both have their own
