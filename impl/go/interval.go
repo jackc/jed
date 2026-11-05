@@ -87,18 +87,16 @@ func (iv Interval) Add(o Interval) (Interval, error) {
 
 // Sub is field-wise interval subtraction. Overflow traps 22008.
 func (iv Interval) Sub(o Interval) (Interval, error) {
-	months, ok1 := addI32(iv.Months, -o.Months)
-	days, ok2 := addI32(iv.Days, -o.Days)
+	// Widen before subtracting: an i32 minimum on the right can produce an in-range result,
+	// even though negating that field in isolation would overflow.
+	months := int64(iv.Months) - int64(o.Months)
+	days := int64(iv.Days) - int64(o.Days)
 	micros, ok3 := sub64(iv.Micros, o.Micros)
-	// -o.Months / -o.Days can themselves overflow at i32::MIN; addI32 catches the result range,
-	// but guard the negation operand too.
-	if o.Months == -2147483648 || o.Days == -2147483648 {
+	if months < -2147483648 || months > 2147483647 ||
+		days < -2147483648 || days > 2147483647 || !ok3 {
 		return Interval{}, intervalFieldOverflow("interval out of range")
 	}
-	if !ok1 || !ok2 || !ok3 {
-		return Interval{}, intervalFieldOverflow("interval out of range")
-	}
-	return Interval{Months: months, Days: days, Micros: micros}, nil
+	return Interval{Months: int32(months), Days: int32(days), Micros: micros}, nil
 }
 
 // MakeInterval builds an interval from PostgreSQL make_interval's components (functions.md §11).

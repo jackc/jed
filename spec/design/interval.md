@@ -278,6 +278,10 @@ surface):
 | timestamp | `-` | timestamp | interval (`micros = a − b`, `months = 0`, then `justify_hours`) |
 | timestamptz | `-` | timestamptz | interval (same) |
 
+Interval subtraction checks each resulting field, not a separately negated right operand:
+`interval '-2147483648 months' - interval '-2147483648 months'` is zero. The same rule
+applies to the day and microsecond fields.
+
 `timestamp − timestamp` produces a **justified** interval: the difference in µs is computed, then
 whole 24 h chunks move into `days` (PG `timestamp_mi` → `interval_justify_hours`), `months = 0`.
 

@@ -434,6 +434,10 @@ underneath, with the same collation, comparison, and key encoding.
 
 ## Timestamp precision and interval fields
 
+Interval addition and subtraction operate on the month, day, and microsecond fields separately.
+Subtraction succeeds whenever each resulting field fits, including subtracting
+`interval '-2147483648 months'` from itself to produce `00:00:00`.
+
 A `timestamp` or `timestamptz` may declare a **precision**, the number of fractional-second digits
 it keeps: `timestamp(3)`, `timestamptz(0)` (0 through 6; a larger precision means 6). A value stored
 in such a column or cast to such a type is **rounded**, not truncated, exactly as in PostgreSQL —

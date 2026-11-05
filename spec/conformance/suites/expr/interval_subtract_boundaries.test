@@ -1,0 +1,28 @@
+# Subtraction checks the resulting fields, even when the right-hand field cannot be negated.
+# requires: query.select_no_from, types.interval, expr.interval_arithmetic
+
+query T nosort
+SELECT INTERVAL '-2147483648 months' - INTERVAL '-2147483648 months'
+----
+00:00:00
+
+query T nosort
+SELECT INTERVAL '-2147483648 days' - INTERVAL '-2147483648 days'
+----
+00:00:00
+
+query T nosort
+SELECT INTERVAL '-2147483647 months' - INTERVAL '-2147483648 months'
+----
+1 mon
+
+query T nosort
+SELECT INTERVAL '-1 days' - INTERVAL '-2147483648 days'
+----
+2147483647 days
+
+statement error 22008
+SELECT INTERVAL '0 months' - INTERVAL '-2147483648 months'
+
+statement error 22008
+SELECT INTERVAL '0 days' - INTERVAL '-2147483648 days'
