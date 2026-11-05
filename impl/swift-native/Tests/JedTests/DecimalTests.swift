@@ -7,6 +7,46 @@ import XCTest
 final class DecimalTests: XCTestCase {
     private func decimal(_ text: String) throws -> SQLDecimal { try SQLDecimal.parse(text) }
 
+    func testExactIEEEExpansionRoundTripsAndEvenRounding() throws {
+        var state: UInt64 = 0xa917_e321_8426_5823
+        for _ in 0..<1000 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1
+            let value = Double(bitPattern: state)
+            if value.isFinite && value != 0 {
+                let expanded = try BinaryFloatDecimal.exact(bits64: state)
+                XCTAssertEqual(Double(expanded.description)?.bitPattern, state)
+            }
+            let narrowBits = UInt32(truncatingIfNeeded: state)
+            let narrow = Float(bitPattern: narrowBits)
+            if narrow.isFinite && narrow != 0 {
+                let expanded = try BinaryFloatDecimal.exact(bits32: narrowBits)
+                XCTAssertEqual(Float(expanded.description)?.bitPattern, narrowBits)
+            }
+        }
+        for (input, expected) in [("1.25", "1.2"), ("1.35", "1.4"), ("-1.25", "-1.2"), ("-1.35", "-1.4")] {
+            XCTAssertEqual(BinaryFloatDecimal.roundedEven(try decimal(input), scale: 1).description, expected)
+        }
+        for value in [Double.infinity, -.infinity, .nan] {
+            assertCode("22003") { _ = try BinaryFloatDecimal.exact(bits64: value.bitPattern) }
+        }
+    }
+
+    func testRomanProcessorRoundTripAndFormattingOutputMeter() throws {
+        let meter = CostMeter(), template = try SQLText("FMRN")
+        for value: Int64 in 1...3999 {
+            let rendered = try NumericFormat.toChar(.integer(value), type: .i32, template: template)
+            guard case .text(let text) = rendered else { return XCTFail("expected text") }
+            let parsed = try NumericFormat.toNumber(text, template: template, meter: meter)
+            guard case .decimal(let number) = parsed else { return XCTFail("expected decimal") }
+            XCTAssertEqual(number, SQLDecimal(value))
+        }
+        XCTAssertEqual(meter.accrued, 0)
+        let rendered = try NumericFormat.toChar(.decimal(decimal("1.25")), type: .decimal, template: SQLText("\u{FEFF}FM00.00"), meter: meter)
+        guard case .text(let text) = rendered else { return XCTFail("expected text") }
+        XCTAssertEqual(meter.accrued, Int64(text.utf8.count))
+        XCTAssertEqual(text.utf8.prefix(3), [239, 187, 191])
+    }
+
     private func assertCode(_ code: String, _ operation: () throws -> Void,
                             file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertThrowsError(try operation(), file: file, line: line) {

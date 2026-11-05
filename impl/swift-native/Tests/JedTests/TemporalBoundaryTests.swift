@@ -105,4 +105,46 @@ final class TemporalBoundaryTests: XCTestCase {
             XCTAssertEqual(try east.localToInstant(east.instantToLocal(value)), value)
         }
     }
+
+    func testFormattingByteNodesAndRichErrorBoundaries() throws {
+        let nodes = FormatTemplate.parse(try SQLText("\u{FEFF}\"é😀\"FMYYYYTH-MM-FF6"))
+        XCTAssertEqual(nodes.filter { $0.keyword == nil }.flatMap(\.bytes), Array("\u{FEFF}é😀--".utf8))
+        XCTAssertEqual(nodes.compactMap { $0.keyword?.id }, ["YYYY", "MM", "FF6"])
+        XCTAssertEqual(nodes.first { $0.keyword?.id == "YYYY" }?.fill, true)
+        XCTAssertEqual(nodes.first { $0.keyword?.id == "YYYY" }?.ordinal, "TH")
+        XCTAssertEqual(FormatTemplate.parse(try SQLText("FM")).count, 0)
+        for (input, message, detail) in [
+            ("20€401", "invalid value \"20�\" for \"YYYY\"", "Field requires 4 characters, but only 2 could be parsed."),
+            ("2😀01", "invalid value \"2�\" for \"YYYY\"", "Field requires 4 characters, but only 1 could be parsed.")
+        ] {
+            XCTAssertThrowsError(try TemporalFormat.parse(SQLText(input), template: SQLText("YYYYMM"))) {
+                let error = $0 as? JedError
+                XCTAssertEqual(error?.code, "22007")
+                XCTAssertEqual(error?.message, message)
+                XCTAssertEqual(error?.detail, detail)
+                XCTAssertEqual(error?.hint, "If your source string is not fixed-width, try using the \"FM\" modifier.")
+            }
+        }
+    }
+
+    func testFormattingCalendarAgreementAndOutputAccounting() throws {
+        for year in stride(from: Int64(-4000), through: 9000, by: 13) {
+            for month: Int64 in [1, 2, 3, 12] {
+                let day: Int64 = 17
+                let julian = FormatCalendar.julian(year, month, day)
+                XCTAssertEqual(Int64(julian), Temporal.daysFromCivil(year: year, month: month, day: day) + 2_440_588)
+                let restored = FormatCalendar.civil(julian)
+                XCTAssertEqual(restored, Temporal.Civil(year: year, month: month, day: day))
+            }
+        }
+        let meter = CostMeter(), template = try SQLText("\u{FEFF}YYYY-MM-DD HH24:MI:SS OF")
+        let rendered = try TemporalFormat.toChar(.timestamptz(0), template: template, timezone: SQLTimeZone(fixed: 3600), meter: meter)
+        guard case .text(let text) = rendered else { return XCTFail("expected text") }
+        XCTAssertEqual(meter.accrued, 1 + Int64(text.utf8.count))
+        XCTAssertEqual(text.utf8.prefix(3), [239, 187, 191])
+        let ceiling = CostMeter(limit: 3)
+        XCTAssertThrowsError(try TemporalFormat.toChar(.timestamp(0), template: template, meter: ceiling)) {
+            XCTAssertEqual(($0 as? JedError)?.code, "54P01")
+        }
+    }
 }

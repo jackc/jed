@@ -67,13 +67,27 @@ The separate user work under `tasks/memory` is not part of this experiment.
 - Independent storage review caught an equal-txid fallback defect: an incomplete
   sibling's valid header cannot make it the durable floor. Swift now validates the
   sibling manifest before parity selection. The same existing issue was found in
-  supported cores; a separate narrow correction/regression slice is in progress.
+  supported cores; the separate correction/regression slice is committed locally
+  as `196feb8a`. Focused Go/Rust tests, all 1,276 TypeScript unit tests and default
+  spec verification pass. The pinned Swift scope baseline remains unchanged.
 - Independent codec work found reversed f32/f64 stable type codes in the initial
   Swift enum; corrected to canonical f64=12/f32=13, with a byte-boundary regression.
 - No SQL resolver/executor, database, complete tree/catalog commit path or
   conformance adapter yet. Parser acceptance is not SQL conformance.
   No database-level encryption, recovery, process, simulation or interchange result.
 - No performance baseline or Apple-platform verification yet.
+- Frozen parser audit covers all 21,525 SQL records in 749 files: 21,171 parse,
+  354 reject with the expected SQLSTATE, zero unexpected rejection. The 262
+  accepted records expecting eventual `42601` still require later semantic checks.
+- Added persistent packed B+tree mutation, bounded cursors, interior skeletons,
+  CLOCK leaf pool with single-flight loading and invalidation, incremental and
+  whole-image serialization, and deterministic large-value disposition/kept chains.
+  Three frozen B+tree goldens rebuild byte-exactly. A near-capacity delete regression
+  exposed an inherited empty unary subtree; Swift fixes it. The same issue has a
+  confirmed Go reproduction; a separate supported-core correction is in progress.
+- Added datetime and exact numeric template processors, exact IEEE-to-decimal
+  conversion, JSON syntax/spans/canonical values, accessors/mutations/builders and
+  streaming JSON SRF helpers. SQL resolution/evaluation is not connected yet.
 
 ## Verification ledger
 
@@ -87,6 +101,13 @@ The separate user work under `tasks/memory` is not part of this experiment.
 | `mise run swift-native:test` | PASS 32 foundation/crypto tests, then PASS 35 after byte-host/logical-size slice; 0 failures |
 | `mise run swift-native:test` | PASS 61 after lexer/numeric/encryption/meta slices; 0 failures (2026-11-05 16:31 UTC) |
 | `mise run swift-native:test` | PASS 92 after parser, temporal/value/key, pager and packed-page slices; 0 failures (2026-11-05 16:45 UTC) |
+| `mise run swift-native:parser-audit` | PASS 21,525 frozen SQL records; zero unexpected rejections (see Tools/PARSER_AUDIT.md) |
+| `mise run swift-native:test` | PASS 113 after tree/disposition, temporal/numeric formatting and JSON foundations; 0 failures (2026-11-05 17:01 UTC) |
+| `mise run unit:go -- -run 'Test(Validated\|CommitCRC64\|CompleteManifest\|IncompleteEqualTxid\|Serialization)' -count=1` | PASS 8 selected recovery tests |
+| `mise run unit:rust -- --lib validated_cow_tests` | PASS 7 selected recovery tests |
+| `mise run unit:ts` | PASS 1,276 tests after sandbox Unix-socket access; initial sandbox-only EPERM failures resolved |
+| `mise run durability-review …` (temporary wrapper, removed) | PASS 27 targeted TS recovery tests, TS typecheck, selected Rust/Go/TS formatting checks |
+| `mise run verify` after shared recovery correction | PASS all default spec checks |
 | `git diff --check` | PASS before first integrated foundation test |
 
 The 35 tests include all 11 shared LZ4 and 41 decimal key vectors, arithmetic
@@ -114,8 +135,19 @@ instead of `hex`; both corrected against unchanged shared fixtures. Intermediate
 build failures while parser files were still being written were not test failures;
 subsequent complete sources compiled and all 92 tests passed.
 
-Local-only commits so far: `91aef346` (approved scope/design) and `f9c09043`
-(verified foundations). The latter's staged whitespace check reported two existing
+The 113-test run additionally covers packed-tree snapshot/cursor boundaries, per-delete
+near-capacity structure, golden rebuilds, cache faults/concurrent invalidation, kept/fresh
+overflow bytes and costs, numeric template arithmetic and JSON internal boundaries.
+Initial disposition test inputs did not fit after one compression as assumed; changed
+the input from 80 to 70 bytes to exercise the intended boundary. An audit corrected
+Swift's encrypted compression quantum to C (chain payload capacity is separately C−16).
+No shared expected results changed. The catalog codec is under construction and has
+no verified catalog/file-level result yet.
+
+Local-only commits so far: `91aef346` (approved scope/design), `f9c09043`
+(verified foundations), `d2a56c3b` (syntax/numeric), `e83ff6d1`
+(recursive codecs/temporal), `a0cb024b` (pager/packed primitives), and `196feb8a`
+(shared recovery correction). The foundation commit's staged whitespace check reported two existing
 whitespace defects in pinned, unmodified Argon2 upstream LICENSE/encoding.c. Those
 vendor bytes remain unchanged to preserve the recorded provenance hashes.
 
@@ -130,9 +162,10 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 
 ## Next steps
 
-1. Active delegated slices: persistent B+tree/cursor/pool (`host_inventory`), temporal
-   format templates (`scope_inventory`), shared equal-txid recovery correction
-   (`crypto_audit`). Root owns integration, record disposition and catalog/storage.
+1. Active delegated slices: shared empty-unary-subtree correction (`host_inventory`),
+   native regex (`scope_inventory`), JSONPath (`crypto_audit`). Root owns integration
+   and catalog/storage. Numeric/temporal format and JSON foundations passed internal
+   verification; SQL behavior remains unverified.
 2. Build parser/resolver/evaluator and shared-corpus adapter over the established
    types, plus the pager/packed B+tree/validated-COW transaction path. Do not
    substitute decoded dictionary storage or engine-owned cursor collection.
