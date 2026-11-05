@@ -90,6 +90,7 @@ fn datetime_boundary_regressions() {
         "SELECT make_date('-9223372036854775808'::bigint, 1, 1)",
         "SELECT make_timestamp('-9223372036854775808'::bigint, 1, 1, 0, 0, 0.0::f64)",
         "SELECT make_timestamptz('-9223372036854775808'::bigint, 1, 1, 0, 0, 0.0::f64)",
+        "SELECT make_timestamptz('-9223372036854775808'::i64, 1, 1, 0, 0, 0, 'UTC')",
     ] {
         assert_eq!(err_code(&mut db, sql), "22008", "{sql}");
     }
