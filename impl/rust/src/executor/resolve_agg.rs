@@ -355,10 +355,30 @@ pub(crate) fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut
                 if let Some(op) = &s.operand {
                     collect_touched(op, depth, touched);
                 }
+                if let Some(f) = &s.filter {
+                    collect_touched(f, depth, touched);
+                }
                 if let Some(order) = &s.order {
                     for k in &order.keys {
                         collect_touched(k, depth, touched);
                     }
+                }
+                if let Some(f) = s.osa.as_ref().and_then(|o| o.frac.as_ref()) {
+                    collect_touched(f, depth, touched);
+                }
+                if let Some(h) = &s.hypo {
+                    for e in h.args.iter().chain(h.keys.iter()) {
+                        collect_touched(e, depth, touched);
+                    }
+                }
+            }
+            // A window function's arguments and a window aggregate's FILTER.
+            for w in &sp.window_specs {
+                for a in &w.args {
+                    collect_touched(a, depth, touched);
+                }
+                if let Some(f) = &w.filter {
+                    collect_touched(f, depth, touched);
                 }
             }
             for p in &sp.projections {

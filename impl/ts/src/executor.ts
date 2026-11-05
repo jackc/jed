@@ -37938,7 +37938,18 @@ export function collectTouchedPlan(plan: QueryPlan, depth: number, touched: bool
     if (plan.having !== null) collectTouched(plan.having, depth, touched);
     for (const s of plan.aggSpecs) {
       if (s.operand !== null) collectTouched(s.operand, depth, touched);
+      if (s.filter != null) collectTouched(s.filter, depth, touched);
+      if (s.osaFrac != null) collectTouched(s.osaFrac, depth, touched);
       if (s.order != null) for (const k of s.order.keys) collectTouched(k, depth, touched);
+      if (s.hypo != null) {
+        for (const e of s.hypo.args) collectTouched(e, depth, touched);
+        for (const e of s.hypo.keys) collectTouched(e, depth, touched);
+      }
+    }
+    // A window function's arguments and a window aggregate's FILTER.
+    for (const w of plan.windowSpecs) {
+      for (const a of w.args) collectTouched(a, depth, touched);
+      if (w.filter != null) collectTouched(w.filter, depth, touched);
     }
     for (const p of plan.projections) collectTouched(p, depth, touched);
     // A materialized ORDER BY expression and a set-returning relation's args / a LATERAL derived body

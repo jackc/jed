@@ -2344,12 +2344,30 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 		collectTouched(sp.filter, depth, touched)
 		collectTouched(sp.having, depth, touched)
 		for i := range sp.aggSpecs {
-			collectTouched(sp.aggSpecs[i].operand, depth, touched)
-			if o := sp.aggSpecs[i].order; o != nil {
+			s := &sp.aggSpecs[i]
+			collectTouched(s.operand, depth, touched)
+			collectTouched(s.filter, depth, touched)
+			collectTouched(s.osaFrac, depth, touched)
+			if o := s.order; o != nil {
 				for _, k := range o.keys {
 					collectTouched(k, depth, touched)
 				}
 			}
+			if h := s.hypo; h != nil {
+				for _, e := range h.args {
+					collectTouched(e, depth, touched)
+				}
+				for _, e := range h.keys {
+					collectTouched(e, depth, touched)
+				}
+			}
+		}
+		// A window function's arguments and a window aggregate's FILTER.
+		for i := range sp.windowSpecs {
+			for _, a := range sp.windowSpecs[i].args {
+				collectTouched(a, depth, touched)
+			}
+			collectTouched(sp.windowSpecs[i].filter, depth, touched)
 		}
 		for _, p := range sp.projections {
 			collectTouched(p, depth, touched)

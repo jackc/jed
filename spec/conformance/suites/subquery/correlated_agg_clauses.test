@@ -58,3 +58,31 @@ SELECT (SELECT count(*) FILTER (WHERE u.a < t.a) OVER () FROM t u WHERE u.id = 1
 0
 0
 1
+
+# In WHERE, the outer column read only through those clauses must also be in the scan's touched set
+# (large-values.md §14), or it reads as NULL.
+query I rowsort
+SELECT id FROM t WHERE (SELECT count(*) FILTER (WHERE u.a < t.a) FROM t u) = 2
+----
+3
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT percentile_disc(t.a / 40.0) WITHIN GROUP (ORDER BY u.a) FROM t u) = 30
+----
+3
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT rank(t.a) WITHIN GROUP (ORDER BY u.a) FROM t u) = 1
+----
+1
+2
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT lag(u.a, 1, t.a) OVER (ORDER BY u.id) FROM t u WHERE u.id = 1) = 30
+----
+3
+
+query I rowsort
+SELECT id FROM t WHERE (SELECT count(*) FILTER (WHERE u.a < t.a) OVER () FROM t u WHERE u.id = 1) = 1
+----
+3
