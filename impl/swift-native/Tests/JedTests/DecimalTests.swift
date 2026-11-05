@@ -199,4 +199,76 @@ final class DecimalTests: XCTestCase {
             assertCode("XX001") { _ = try SQLDecimal.decodeBody(bytes) }
         }
     }
+
+    func testIntegerRootFloorInvariant() {
+        for value: UInt64 in [0, 1, 2, 3, 4, 15, 16, 17, 999_999_999, UInt64.max] {
+            let input = BigMagnitude(value)
+            let root = input.squareRoot()
+            let successor = root.adding(BigMagnitude(1))
+            XCTAssertLessThanOrEqual(root.multiplying(root).compare(to: input), 0)
+            XCTAssertGreaterThan(successor.multiplying(successor).compare(to: input), 0)
+        }
+        let largeRoot = BigMagnitude(decimalDigits: Array("123456789012345678901234567890".utf8)[...])
+        XCTAssertEqual(largeRoot.multiplying(largeRoot).squareRoot(), largeRoot)
+        XCTAssertEqual(largeRoot.multiplying(largeRoot).subtracting(BigMagnitude(1)).squareRoot(),
+                       largeRoot.subtracting(BigMagnitude(1)))
+    }
+
+    func testTranscendentalAdmissionUsesLogicalDigitsAndSharedAccount() throws {
+        let value = try decimal("123.4500") // precision 7, scale 4
+        let resources = StatementResources()
+        let meter = CostMeter(resources: resources)
+        // D = 32 + 12 + (7 + 4) = 55; ceil(D/4)^2 = 196.
+        try DecimalTranscendental.admit(meter, scale: 12, values: [value])
+        XCTAssertEqual(meter.accrued, 196)
+        XCTAssertEqual(resources.scalarUsed, 440)
+        let nested = CostMeter(resources: resources)
+        try DecimalTranscendental.admit(nested, scale: -12, squareRoot: true, values: [value])
+        XCTAssertEqual(nested.accrued, 196 * 6) // bit_length(55) = 6
+        XCTAssertEqual(resources.scalarUsed, 880)
+
+        let both = CostMeter(limit: 1, resources: StatementResources(scalarLimit: 1))
+        assertCode("54P01") { _ = try DecimalFunctions.call(name: "sqrt", args: [value], meter: both) }
+        XCTAssertEqual(both.resources.scalarUsed, 0)
+        let memory = CostMeter(resources: StatementResources(scalarLimit: 1))
+        assertCode("54P04") { _ = try DecimalFunctions.call(name: "sqrt", args: [value], meter: memory) }
+        XCTAssertGreaterThan(memory.accrued, 0)
+        XCTAssertEqual(memory.resources.scalarUsed, 0)
+    }
+
+    func testDecimalWorkDependsOnLogicalGroupsAndChecksBeforeWork() throws {
+        let left = try decimal("123456789.0000")
+        let right = try decimal("1.00000000")
+        XCTAssertEqual(DecimalFunctions.work("+", left, right), 5)
+        XCTAssertEqual(DecimalFunctions.work("*", left, right), 12)
+        XCTAssertEqual(DecimalFunctions.work("%", left, right), 15)
+        XCTAssertEqual(DecimalFunctions.work("/", try decimal("1e-16383"), SQLDecimal(1)), 3846)
+        let meter = CostMeter(limit: 1)
+        assertCode("54P01") { _ = try DecimalFunctions.binary("*", left, right, meter: meter) }
+        XCTAssertEqual(meter.accrued, 11)
+        // Zero-divisor failure precedes additional arithmetic work admission.
+        let divisorMeter = CostMeter(limit: 1)
+        divisorMeter.charge(1)
+        assertCode("22012") { _ = try DecimalFunctions.binary("/", left, SQLDecimal(0), meter: divisorMeter) }
+        XCTAssertEqual(divisorMeter.accrued, 1)
+    }
+
+    func testGuardedKernelsKeepFiniteDecimalInvariants() throws {
+        for (name, arguments) in [("sqrt", ["2.0"]), ("exp", ["1.0"]), ("ln", ["2.0"]),
+                                  ("log", ["2.0", "8.0"]), ("power", ["2.0", "0.5"]),
+                                  ("power", ["-1.0", "2147483649"])] {
+            let meter = CostMeter()
+            let result = try DecimalFunctions.call(name: name, args: arguments.map(decimal), meter: meter)
+            XCTAssertEqual(try SQLDecimal.decodeBody(result.encodedBody()).description, result.description)
+            XCTAssertLessThanOrEqual(result.scale, 1000)
+            XCTAssertGreaterThan(meter.accrued, 0)
+            XCTAssertGreaterThan(meter.resources.scalarUsed, 0)
+            XCTAssertFalse(result.isZero && result.negative)
+        }
+        let root = try DecimalFunctions.call(name: "sqrt", args: [decimal("4.0")], meter: CostMeter())
+        XCTAssertEqual(try root.multiplying(root), SQLDecimal(4))
+        let logarithm = try DecimalFunctions.call(name: "ln", args: [SQLDecimal(1)], meter: CostMeter())
+        XCTAssertTrue(logarithm.isZero)
+        XCTAssertFalse(logarithm.negative)
+    }
 }
