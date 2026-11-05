@@ -146,6 +146,17 @@ recorded baseline revision, coverage, omissions, and performance are part of the
 experiment, and promotion requires a separate decision. See
 [ruby-native-experiment.md](spec/design/ruby-native-experiment.md).
 
+The separately approved **native Swift experiment** (`impl/swift-native`, 2026-11-05)
+targets the entire supported Rust/Go/TypeScript surface at
+`362e0798ac3a8bd04bd2da556044b6ec73bf468a`, not Ruby's frozen coverage. It is a
+handwritten independent Swift engine, with opt-in tooling only, Linux verification,
+and no website documentation or automatic future feature updates. Completion requires
+the full recorded conformance, host, file, crypto, process/simulation and performance
+acceptance matrix; then the experiment freezes. It neither promotes Swift into the
+differential set nor selects native versus wrapped production delivery. Apple platforms
+remain unverified until built and tested there. See
+[swift-native-experiment.md](spec/design/swift-native-experiment.md).
+
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.
 For encryption at rest (the 2026-10-27 parity update) it also approved OpenSSL's
@@ -1449,6 +1460,17 @@ first module dependency, pure Go; in TS, `node:crypto` in a Node-only module and
 `@noble/hashes` Argon2id. The XAES derivation glue over library AES is written per core against
 the C2SP vectors, admitted as glue, not a primitive. The RustCrypto AES/GHASH backends' reviewed
 intrinsics are accepted under the guardrail above, as for `sha2`.
+
+**Approved Swift experiment dependencies (2026-11-05, clause 3).** `impl/swift-native`
+may use Apple's `swift-crypto`, including CryptoExtras, and the reference Argon2
+implementation packaged from pinned source. Approval includes necessary cryptographic
+C/assembly backends behind narrow safe Swift interfaces. Verify the selected release's
+public APIs and pin reproducible versions; prefer SwiftPM integration without system
+crypto libraries. This does not authorize OpenSSL substitution, unrelated dependencies,
+new cryptographic primitives, or native engine components. Parser, planner, executor,
+types, exact arithmetic, codecs, storage algorithms and noncrypto built-ins remain
+handwritten Swift. Ordinary OS interfaces may implement sanctioned host seams. See
+[swift-native-crypto.md](spec/design/swift-native-crypto.md).
 
 **Approved AEAD benchmark dependencies (2026-10-17, clause 3).** The isolated `bench/aead/`
 experiment may use exact-pinned RustCrypto `aes-gcm` / `chacha20poly1305`, Go

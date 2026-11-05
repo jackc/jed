@@ -30,6 +30,13 @@ feature maintenance obligation. Its recorded coverage applies to the experiment'
 source revision; it does not constitute promotion or a promise of current-feature
 parity. See [ruby-native-experiment.md](ruby-native-experiment.md).
 
+The approved [native Swift experiment](swift-native-experiment.md) follows the same
+opt-in lifecycle. It targets the complete supported surface at its recorded baseline,
+including Linux storage, encryption and page-service behavior, independently of Ruby's
+coverage. Its development is active until the acceptance matrix and measurements are
+complete, after which it freezes. This is not promotion, an Apple-platform support claim,
+or a change to the separate production Swift native-versus-wrapper decision.
+
 The value of an implementation, *for the spec*, is proportional to the new divergence it
 can surface. The corollary is sharp:
 

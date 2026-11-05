@@ -7,7 +7,7 @@
 > here changes, update encryption.md and [CLAUDE.md](../../CLAUDE.md) §9 in the same change.
 
 An encrypted file is the same page-structured copy-on-write B+tree as a plaintext file, at the same
-`format_version` (49). A meta slot whose `suite` byte is `0` describes a plaintext file and every other
+`format_version` (50). A meta slot whose `suite` byte is `0` describes a plaintext file and every other
 byte rule of format.md applies unchanged; a reader that predates this variant rejects a nonzero
 `suite` as a nonzero reserved field (`XX001`), so no version bump was needed.
 
@@ -378,4 +378,3 @@ writes its pages holds the DEK. No message is added to the wire protocol (spec/p
   sent on every connection. A relaying `jed pages` discards it and passes ciphertext through; one that
   must own the database opens with it. Without one, owning an encrypted database is `28P02`, and with
   one for a plaintext database `28P03` (the `encrypted_stream` process scenario).
-

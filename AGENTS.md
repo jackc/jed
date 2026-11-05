@@ -47,11 +47,14 @@ files in the same change.
   supply a fresh worker through `workerFactory` and call the public
   `startDatabaseWorker({ configure })` helper. Jed owns worker cleanup. Configuration may await;
   SQL kernels remain synchronous, with no application-thread callback RPC.
-- Frozen experimental cores (currently `impl/ruby-native`) are opt-in: exclude them
+- Experimental cores (`impl/ruby-native` and `impl/swift-native`) are opt-in: exclude them
   from normal tests, benchmarks, CI, and future feature updates unless explicitly
   requested. Record coverage and omissions against the experiment's source revision;
   promotion to supported status requires a separate decision. See
-  `spec/design/ruby-native-experiment.md`.
+  `spec/design/ruby-native-experiment.md` and `spec/design/swift-native-experiment.md`.
+  The Swift experiment targets the complete supported surface at its recorded baseline,
+  develops and verifies on Linux, and freezes when completed. It selects no production
+  Swift delivery strategy and adds no website docs, references, or live panels.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.
 
@@ -252,6 +255,13 @@ whole-engine memory guarantee. Host extensions remain outside these guarantees.
   engine dependency or Rust/WASM binding is authorized by these utility exceptions.
 - Bench modules are not cores, but new benchmark dependencies still require
   explicit confirmation.
+- The Swift experiment has explicit maintainer approval (2026-11-05) for Apple's
+  `swift-crypto` (including CryptoExtras), pinned reference Argon2 source, and their
+  necessary cryptographic C/assembly backends behind narrow safe Swift interfaces.
+  No OpenSSL substitution, native engine component, or unrelated dependency is
+  authorized. Its engine and exact arithmetic stay handwritten Swift; ordinary OS
+  interfaces are confined to sanctioned host seams. Prefer self-contained SwiftPM
+  packaging without application-installed system crypto libraries.
 
 ## Local References And Heavy Operations
 
