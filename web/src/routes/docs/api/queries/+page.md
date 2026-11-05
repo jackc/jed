@@ -25,6 +25,10 @@ Use the **language selector** in the top bar to switch this example between the 
 
 <CodeTabs topic="queries" />
 
+Go’s `RowToStructByName[T]` matches result columns case-insensitively to exported fields,
+using `db:"…"` tags or field names. An exact `db:"-"` tag excludes a field and leaves it
+zero-valued. Every result column must match an eligible field; otherwise mapping returns an error.
+
 ## Binding parameters
 
 Parameters are positional `$1`, `$2`, … placeholders, bound left to right from the values you pass.
