@@ -1,0 +1,250 @@
+/// Resolved expressions carry static types independently of their current value.
+/// A nil descriptor is an untyped SQL NULL/parameter, never an inferred row type.
+internal struct ResolvedExpression {
+    var type: TypeDescriptor?
+    var node: Node
+    var position: Int
+    var isConstant: Bool { if case .constant = node { return true }; return false }
+    indirect enum Node {
+        case constant(SQLValue), column(Int), parameter(Int)
+        case currentTimestamp, currentDate, dateInput(SQLText)
+        case cast(ResolvedExpression, TypeDescriptor, TypeRules.CastMode)
+        case convert(ResolvedExpression, TypeDescriptor)
+        case unary(String, ResolvedExpression)
+        case binary(String, ResolvedExpression, ResolvedExpression, TypeDescriptor)
+        case isNull(ResolvedExpression, Bool)
+        case distinct(ResolvedExpression, ResolvedExpression, TypeDescriptor, Bool)
+        case conditional([(ResolvedExpression, ResolvedExpression)], ResolvedExpression?)
+        case coalesce([ResolvedExpression])
+        case extreme([ResolvedExpression], greatest: Bool)
+        case nullif(ResolvedExpression, ResolvedExpression, TypeDescriptor)
+        case row([ResolvedExpression])
+        case field(ResolvedExpression, Int)
+    }
+}
+
+internal struct ExpressionContext {
+    var scalar: ScalarCasts.Context
+    var column: (Int) throws -> SQLValue
+    var parameters: [SQLValue]
+    let meter: CostMeter
+    var collatedKey: KeyEncoding.CollatedKey?
+
+    init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
+         parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {
+        self.meter = meter
+        scalar = ScalarCasts.Context(timezone: timezone, statementMicros: statementMicros, meter: meter)
+        self.parameters = parameters; self.column = column
+    }
+
+    func evaluate(_ expression: ResolvedExpression) throws -> SQLValue {
+        switch expression.node {
+        case .constant(let value): return value
+        case .column(let index): return try column(index)
+        case .parameter(let index):
+            guard index > 0 && index <= parameters.count else { throw JedError("42P02", "there is no parameter $\(index)") }
+            return parameters[index - 1]
+        case .convert(let source, let target):
+            return try convert(evaluate(source), from: source.type?.type, to: target)
+        default: meter.charge(1); try meter.step()
+        }
+        switch expression.node {
+        case .currentTimestamp:
+            guard let clock = scalar.statementMicros else { throw JedError("XX000", "statement clock is unavailable") }
+            return .timestamptz(clock)
+        case .currentDate:
+            guard let clock = scalar.statementMicros else { throw JedError("XX000", "statement clock is unavailable") }
+            try Temporal.chargeZone(meter)
+            return .date(try Temporal.finiteDate(Temporal.floorDiv(scalar.timezone.instantToLocal(clock), Temporal.microsPerDay)))
+        case .dateInput(let text):
+            return try ScalarCasts.input(text, to: TypeDescriptor(.scalar(.date)), context: scalar)
+        case .cast(let source, let target, let mode):
+            let value = try evaluate(source)
+            guard let sourceType = source.type?.type else { return .null }
+            guard case .scalar(let sourceType) = sourceType else { throw JedError("0A000", "container cast evaluation is not yet connected") }
+            return try ScalarCasts.cast(value, from: sourceType, to: target, mode: mode, context: scalar)
+        case .unary(let op, let source):
+            let value = try evaluate(source)
+            if value.isNull { return .null }
+            if op == "not", case .boolean(let b) = value { return .boolean(!b) }
+            if op == "+" { return value }
+            if op == "-" {
+                switch value {
+                case .integer(let n):
+                    guard n != .min, case .scalar(let type) = expression.type?.type else { throw JedError("22003", "integer out of range") }
+                    return .integer(try ScalarCasts.checkedInteger(-n, type: type))
+                case .decimal(let n): return .decimal(n.negated())
+                case .f32, .f64: return try FloatFunctions.unary(op: op, value: value)
+                case .interval(let n): return .interval(try TemporalFunctions.negate(n))
+                default: break
+                }
+            }
+            if op == "~", case .integer(let n) = value { return .integer(~n) }
+            throw JedError("42804", "invalid resolved unary operand")
+        case .binary(let op, let left, let right, let operandType):
+            let a = try evaluate(left)
+            if op == "and", case .boolean(false) = a { return .boolean(false) }
+            if op == "or", case .boolean(true) = a { return .boolean(true) }
+            let b = try evaluate(right)
+            if op == "and" {
+                if case .boolean(false) = b { return .boolean(false) }
+                return a.isNull || b.isNull ? .null : .boolean(true)
+            }
+            if op == "or" {
+                if case .boolean(true) = b { return .boolean(true) }
+                return a.isNull || b.isNull ? .null : .boolean(false)
+            }
+            if ["=", "<>", "<", "<=", ">", ">="].contains(op) {
+                try comparisonWork(op, a, b, type: operandType)
+                return try ValueComparison.sql(op, a, b, type: operandType, collatedKey: collatedKey)
+            }
+            if a.isNull || b.isNull { return .null }
+            return try arithmetic(op, a, b, type: operandType, constant: left.isConstant && right.isConstant)
+        case .isNull(let source, let negated): return .boolean(ValueComparison.isNull(try evaluate(source), negated: negated))
+        case .distinct(let left, let right, let type, let negated):
+            let a = try evaluate(left), b = try evaluate(right)
+            let equal: Bool
+            if a.isNull || b.isNull { equal = a.isNull && b.isNull }
+            else { try comparisonWork("=", a, b, type: type); equal = try ValueComparison.total(a, b, type: type, collatedKey: collatedKey) == 0 }
+            return .boolean(negated ? equal : !equal)
+        case .conditional(let arms, let fallback):
+            for (condition, value) in arms {
+                if case .boolean(true) = try evaluate(condition) { return try evaluate(value) }
+            }
+            return try fallback.map(evaluate) ?? .null
+        case .coalesce(let sources):
+            for source in sources { let value = try evaluate(source); if !value.isNull { return value } }
+            return .null
+        case .extreme(let sources, let greatest):
+            var result = SQLValue.null
+            for source in sources {
+                let value = try evaluate(source)
+                if value.isNull { continue }
+                if result.isNull { result = value; continue }
+                let type = expression.type!
+                try comparisonWork(greatest ? ">" : "<", value, result, type: type)
+                let order = try ValueComparison.total(value, result, type: type, collatedKey: collatedKey)
+                if greatest ? order > 0 : order < 0 { result = value }
+            }
+            return result
+        case .nullif(let first, let second, let type):
+            let a = try evaluate(first), b = try evaluate(second)
+            try comparisonWork("=", a, b, type: type)
+            if case .boolean(true) = try ValueComparison.sql("=", a, b, type: type, collatedKey: collatedKey) { return .null }
+            return a
+        case .row(let fields): return .composite(try fields.map(evaluate))
+        case .field(let source, let index):
+            let value = try evaluate(source)
+            if value.isNull { return .null }
+            guard case .composite(let fields) = value, fields.indices.contains(index) else { throw JedError("42804", "invalid record value") }
+            return fields[index]
+        case .constant, .column, .parameter, .convert: throw JedError("XX000", "invalid expression dispatch")
+        }
+    }
+
+    func convert(_ value: SQLValue, from source: SQLType?, to target: TypeDescriptor) throws -> SQLValue {
+        if value.isNull { return .null }
+        if source == target.type { return value }
+        if case .scalar(let source) = source, case .scalar = target.type {
+            return try ScalarCasts.cast(value, from: source, to: target, mode: .implicitCast, context: scalar)
+        }
+        if case .composite(let fields) = value, let sources = source.flatMap(TypeRules.fields), let targets = TypeRules.fields(target.type) {
+            return .composite(try zip(fields.indices, targets).map { i, target in try convert(fields[i], from: sources[i].descriptor.type, to: target.descriptor) })
+        }
+        if case .array(let array) = value, case .array(let element) = source, case .array(let destination) = target.type {
+            return .array(try SQLArray(dimensions: array.dimensions, lowerBounds: array.lowerBounds,
+                                      elements: array.elements.map { try convert($0, from: element, to: TypeDescriptor(destination)) }))
+        }
+        throw JedError("42804", "cannot convert resolved value")
+    }
+
+    func comparisonWork(_ op: String, _ left: SQLValue, _ right: SQLValue, type: TypeDescriptor) throws {
+        if left.isNull || right.isNull { return }
+        switch (left, right) {
+        case (.decimal(let a), .decimal(let b)): try DecimalFunctions.chargeWork(op, a, b, meter: meter)
+        case (.integer(let a), .decimal(let b)): try DecimalFunctions.chargeWork(op, SQLDecimal(a), b, meter: meter)
+        case (.decimal(let a), .integer(let b)): try DecimalFunctions.chargeWork(op, a, SQLDecimal(b), meter: meter)
+        case (.text(let a), .text(let b)):
+            if type.collation != nil && type.collation?.utf8 != [67] && op != "=" && op != "<>" {
+                meter.charge(saturatingAdd(Int64(a.scalarCount), Int64(b.scalarCount)))
+            } else { meter.charge(Int64(max(0, min(a.scalarCount, b.scalarCount) - 1))) }
+            try meter.guardCost()
+        case (.bytea(let a), .bytea(let b)):
+            meter.charge(Int64(max(0, min(a.count, b.count) - 1))); try meter.guardCost()
+        default: break
+        }
+    }
+
+    private func arithmetic(_ op: String, _ a: SQLValue, _ b: SQLValue, type: TypeDescriptor, constant: Bool = false) throws -> SQLValue {
+        func decimal(_ value: SQLValue) throws -> SQLDecimal {
+            switch value { case .integer(let n): return SQLDecimal(n); case .decimal(let n): return n; default: throw JedError("42804", "not an exact numeric operand") }
+        }
+        if case .interval(let interval) = a, op == "*" || op == "/" {
+            return .interval(try TemporalFunctions.scale(interval, factor: decimal(b), divide: op == "/"))
+        }
+        if case .interval(let interval) = b, op == "*" {
+            return .interval(try TemporalFunctions.scale(interval, factor: decimal(a)))
+        }
+        switch (a, b) {
+        case (.interval(let left), .interval(let right)) where op == "+" || op == "-":
+            return .interval(try TemporalFunctions.add(left, right, subtract: op == "-"))
+        case (.timestamp(let left), .interval(let right)) where op == "+" || op == "-":
+            return .timestamp(try TemporalFunctions.shift(left, by: right, subtract: op == "-"))
+        case (.timestamptz(let left), .interval(let right)) where op == "+" || op == "-":
+            return .timestamptz(try TemporalFunctions.shift(left, by: right, subtract: op == "-", timezone: scalar.timezone, meter: meter))
+        case (.interval, .timestamp) where op == "+",
+             (.interval, .timestamptz) where op == "+",
+             (.interval, .date) where op == "+":
+            return try arithmetic(op, b, a, type: type)
+        case (.date(let left), .interval(let right)) where op == "+" || op == "-":
+            let stamp = try TemporalFunctions.cast(.date(left), to: .timestamp)
+            return try arithmetic(op, stamp, .interval(right), type: type)
+        case (.date(let left), .integer(let right)) where op == "+" || op == "-":
+            return .date(try TemporalFunctions.shiftDate(left, by: right, subtract: op == "-"))
+        case (.integer, .date) where op == "+": return try arithmetic(op, b, a, type: type)
+        case (.date(let left), .date(let right)) where op == "-": return .integer(Int64(try TemporalFunctions.dateDifference(left, right)))
+        case (.timestamp(let left), .timestamp(let right)) where op == "-",
+             (.timestamptz(let left), .timestamptz(let right)) where op == "-":
+            return .interval(try TemporalFunctions.timestampDifference(left, right))
+        default: break
+        }
+        if case .scalar(.decimal) = type.type {
+            func decimal(_ v: SQLValue) throws -> SQLDecimal {
+                switch v { case .integer(let n): return SQLDecimal(n); case .decimal(let n): return n; default: throw JedError("42804", "not a decimal operand") }
+            }
+            return .decimal(try DecimalFunctions.binary(op, decimal(a), decimal(b), meter: meter))
+        }
+        if case .scalar(let width) = type.type, width == .f32 || width == .f64 {
+            return try FloatFunctions.binary(op: op, left: a, right: b, width: width)
+        }
+        if case .integer(let x) = a, case .integer(let y) = b, case .scalar(let width) = type.type {
+            let value: Int64
+            switch op {
+            case "+", "-", "*":
+                let result = op == "+" ? x.addingReportingOverflow(y) : op == "-" ? x.subtractingReportingOverflow(y) : x.multipliedReportingOverflow(by: y)
+                guard !result.overflow else { throw JedError("22003", "\(width.name) out of range") }; value = result.partialValue
+            case "/", "%":
+                guard y != 0 else { throw JedError("22012", "division by zero") }
+                if op == "%" && y == -1 { value = 0 }
+                else { guard x != .min || y != -1 else { throw JedError("22003", "\(width.name) out of range") }; value = op == "/" ? x / y : x % y }
+            case "&": value = x & y
+            case "|": value = x | y
+            case "#": value = x ^ y
+            default: throw JedError("42883", "integer operator does not exist")
+            }
+            return .integer(try ScalarCasts.checkedInteger(value, type: width))
+        }
+        if op == "||", case .text(let left) = a, case .text(let right) = b {
+            if !constant { meter.charge(saturatingAdd(Int64(left.utf8.count), Int64(right.utf8.count))); try meter.guardCost() }
+            return .text(SQLText(validatedUTF8: left.utf8 + right.utf8))
+        }
+        if op == "||", case .bytea(let left) = a, case .bytea(let right) = b {
+            if !constant { meter.charge(saturatingAdd(Int64(left.count), Int64(right.count))); try meter.guardCost() }
+            return .bytea(left + right)
+        }
+        if op == "||", case .jsonb(let left) = a, case .jsonb(let right) = b {
+            return try JSONFunctions.concatenate(left, right, constant: constant, meter: meter)
+        }
+        throw JedError("42883", "resolved operator is not connected")
+    }
+}

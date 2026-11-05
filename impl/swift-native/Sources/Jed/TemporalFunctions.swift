@@ -222,11 +222,14 @@ internal enum TemporalFunctions {
     /// The factor's input width is capped by interval.md. Rational intermediates
     /// use our own limbs so a large common numerator cannot cause false overflow.
     static func scale(_ value: SQLInterval, factor: SQLDecimal, divide: Bool = false) throws -> SQLInterval {
+        if divide && factor.isZero { throw JedError("22012", "division by zero") }
+        // The shared cascade corpus admits a zero interval independently of
+        // the factor's magnitude; no rational intermediate is needed here.
+        if value.months == 0 && value.days == 0 && value.microseconds == 0 { return value }
         let reduced = factor.rescaledUncapped(to: DecimalFunctions.minimumScale(factor), round: false)
         guard max(1, reduced.precision - reduced.scale) <= 18, reduced.scale <= 18 else {
             throw JedError("22008", "interval factor has too many digits")
         }
-        if divide && reduced.isZero { throw JedError("22012", "division by zero") }
         let coefficient = SQLDecimal(negative: reduced.negative, magnitude: reduced.magnitude, scale: 0)
         let denominator = SQLDecimal(negative: false, magnitude: BigMagnitude(1).shiftedDecimal(reduced.scale), scale: 0)
         let numerator = divide ? (reduced.negative ? denominator.negated() : denominator) : coefficient

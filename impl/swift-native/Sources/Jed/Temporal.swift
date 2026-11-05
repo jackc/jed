@@ -508,7 +508,9 @@ internal enum IntervalParser {
                 guard !year.nonzeroFraction && !month.nonzeroFraction else { throw Failure.syntax }
                 guard month.whole >= 0 && month.whole <= 11 else { throw Failure.overflow }
                 result.months += (year.whole * 12 + month.whole) * (negative ? -1 : 1)
-                claims = ["month"]; unit = "second"
+                // The SQL-standard field leaves the positional unit at month;
+                // a bare number to its left therefore repeats its field mask.
+                claims = ["month"]; unit = "month"
             } else {
                 let value = try number(token)
                 try result.add(value, unit: unit)

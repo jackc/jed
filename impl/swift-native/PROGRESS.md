@@ -72,7 +72,7 @@ The separate user work under `tasks/memory` is not part of this experiment.
   spec verification pass. The pinned Swift scope baseline remains unchanged.
 - Independent codec work found reversed f32/f64 stable type codes in the initial
   Swift enum; corrected to canonical f64=12/f32=13, with a byte-boundary regression.
-- No SQL resolver/executor, database, complete tree/catalog commit path or
+- No complete SQL resolver/executor, database, complete tree/catalog commit path or
   conformance adapter yet. Parser acceptance is not SQL conformance.
   No database-level encryption, recovery, process, simulation or interchange result.
 - No performance baseline or Apple-platform verification yet.
@@ -115,8 +115,42 @@ The separate user work under `tasks/memory` is not part of this experiment.
   and charges its growth.
 - Added GiST scalar/range tuple bounds, canonical resident R-tree construction/search
   and page codecs. Four plaintext goldens and malformed/encrypted boundary tests
-  pass. Independent review found no additional primitive defect; actual encrypted
-  golden rebuilding and empty-root/equal-endpoint refinements await the next run.
+  pass, together with actual encrypted golden rebuilding and empty-root/equal-endpoint
+  refinements. Independent review found no additional primitive defect.
+- Added GIN term/query extraction, exact posting runs, packed-tree edits and span-based
+  gathering. Six tests cover shared run/history/JSON term vectors, nine plaintext or
+  encrypted golden images, candidate/cost/cancellation behavior and malformed data.
+  GIN candidate buffers have explicit lifetime but no new logical-memory charge:
+  the frozen Q1/Q2 schedule does not charge this storage-read staging. SQL row admission
+  remains required; this is not a new whole-engine memory guarantee.
+- GIN integration uncovered a supported-core false negative for a strict root-string
+  JSONPath equality. PostgreSQL 18's forced GIN scan has the same bug, while its direct
+  predicate/sequential scan returns the row. Separate local correction `2e13d1b8`
+  widens the candidate term to KEY OR VALUE in all cores; shared regression, oracle
+  check, 36 scoped memory/disk suite executions and default verification pass.
+  The divergence is documented in gin.md §9; the original frozen baseline is retained.
+- Added loaded Unicode/JCOLL/JUCD decoding/merge, UCA sort keys and casing; three
+  tests include 46 frozen sort-key vectors and loaded-versus-bare environment behavior.
+  Initial delta decoding followed a stale README layout; corrected to the canonical
+  frozen counts-first bytes. No host Unicode/ICU fallback or compiler claim.
+- Scalar casts and the first typed expression resolver/evaluator now compile and
+  pass 432 frozen expression records, 527 result cells, 18 costs and five type
+  assertions; 966 records are explicitly excluded. This uses the real expression
+  path, but does not establish query/database conformance. Initial probes caught
+  missing adapter timezone/clock directives, literal JSONPath/NULL-cast costs,
+  temporal arithmetic wiring and an interval positional-field bug, all corrected
+  against unchanged shared expectations. Clock-relative dates remain runtime nodes.
+  Full function/container/subquery resolution and query execution remain incomplete.
+- The immutable corpus snapshot now contains all 749 baseline files (742 SQL,
+  seven concurrency). Expanded expression probes pass 642 records / 740 cells,
+  72 costs and 11 type assertions; 3,630 records in the selected cast/type/expression
+  files remain excluded by the explicit AST/query-shape gate. Expansion initially
+  exposed 73 failures (preserved in `/tmp/jed-swift-expression-expanded.log`):
+  text/bytea/jsonb concatenation routing, interval scaling, and preparation-only
+  temporal literal charges. Independent review corrected NULLIF's left-width
+  preservation and conditional parameter-registry adoption; host metadata and all
+  256 octal input bytes now have boundary checks. A zero interval scales to zero
+  before factor-width rejection, after divide-by-zero checking.
 
 ## Verification ledger
 
@@ -136,6 +170,12 @@ The separate user work under `tasks/memory` is not part of this experiment.
 | `mise run swift-native:test` | PASS 122 after comparator/key invariants and regex admission; 0 failures (17:14 UTC) |
 | `mise run swift-native:test` | FAIL 127 tests / 30 JSONPath kernel probe failures; adapter and kernel issues preserved in `/tmp/jed-swift-jsonpath-first.log` (17:16 UTC) |
 | `mise run swift-native:test` | PASS 133 after JSONPath fixes, float kernels and GiST slice; 0 failures (17:20 UTC); same 133 PASS after scalar-cast source compilation (17:22 UTC) |
+| `mise run swift-native:test` | PASS 135 after retained regex producers and encrypted GiST golden (17:24 UTC) |
+| `mise run swift-native:test` | FAIL 138 / two new Unicode decoder failures (17:30 UTC); subsequent expression probe failures retained in `/tmp/jed-swift-expression-first.log` |
+| `mise run swift-native:test` | PASS 146 after Unicode/interval corrections, GIN vectors/goldens and scalar-expression integration (17:35 UTC) |
+| `mise run swift-native:test` | FAIL 147 / 73 after full-corpus expression expansion; then PASS 147 after corrections (17:41 UTC), including 642 shared expression records |
+| `mise run swift-native:codegen --check` | PASS frozen cast/type/expression corpus, Unicode and GIN fixtures; fingerprint `76da6b8479747b97050e7c7709a6ec4bd57bd2f322bd5d85aa781e1aa7547c28` |
+| `mise run swift-native:codegen --check` | PASS all 749 frozen corpus files; fingerprint `37257dce1710682ff656ee83474597acd4adc91e8f040d8155e9d16e8b63ff50` |
 | `mise run swift-native:codegen --check` | PASS all 112 frozen file fixtures plus regex vectors; fingerprint `802cfd6bda26761f7dc3c91d811278ced3bd0a4e368c3e11f3d6b21e917ba77f` |
 | `mise run unit:go -- -run 'Test(Validated\|CommitCRC64\|CompleteManifest\|IncompleteEqualTxid\|Serialization)' -count=1` | PASS 8 selected recovery tests |
 | `mise run unit:rust -- --lib validated_cow_tests` | PASS 7 selected recovery tests |
@@ -144,6 +184,9 @@ The separate user work under `tasks/memory` is not part of this experiment.
 | `mise run verify` after shared recovery correction | PASS all default spec checks |
 | Focused Go/Rust/TS PMap tests; `mise run tree-regression` | PASS shared empty-unary-subtree regression, plus delete-merge-separator-overflow simulation; exact transcripts and images agree |
 | `mise run typecheck:ts`, selected formatting and `mise run verify` after shared deletion correction | PASS |
+| `JED_CONFORMANCE_FILTER=gin_jsonb_ mise run conformance:{go,rust,ts}` (three commands) | PASS six memory + six disk suites per core; initial sandbox Unix-socket denials resolved by scoped reruns |
+| `mise run corpus:check spec/conformance/suites/query/gin_jsonb_root_string.test` | PASS, byte-identical oracle output; separate forced-index PG18 probe confirmed the documented bug |
+| Selected formatting, independent review, `mise run verify` after GIN correction | PASS |
 | `git diff --check` | PASS before first integrated foundation test |
 
 The 35 tests include all 11 shared LZ4 and 41 decimal key vectors, arithmetic
@@ -194,6 +237,10 @@ vendor bytes remain unchanged to preserve the recorded provenance hashes.
 Additional local-only commits: `b9e99410` (frozen syntax audit/tree fixtures),
 `a645434f` (packed B+trees/disposition), `a87abe2c` (formatting/JSON foundations),
 `16569ff1` (catalog codecs and frozen images), `7b4883b6` (shared deletion correction).
+Further local-only checkpoints: `111932fa` (float/regex/type foundations),
+`2e13d1b8` (shared GIN root-string correction).
+Further experimental checkpoints: `4c14d61c` (GiST), `ba7859bd` (JSONPath and full
+frozen corpus), `35579e82` (GIN and loaded Unicode runtime), all local-only.
 
 Initial SwiftPM compile failed while SQLDecimal was not yet present, then four
 missing `try` markers in decimal test autoclosures were corrected. No expected
@@ -206,8 +253,9 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 
 ## Next steps
 
-1. Active delegated slices: GIN (`host_inventory`, JSONPath extraction by `crypto_audit`),
-   Unicode/collation and scalar-cast review (`scope_inventory`). Root owns integration,
+1. Active delegated slices: Unicode review and storage lifecycle (`host_inventory`),
+   function resolution/dispatch and expression review (`crypto_audit`), container
+   input/casts/array/range kernels (`scope_inventory`). Root owns integration,
    scalar casts, type resolution and remaining catalog/storage wiring. Numeric/temporal format and JSON foundations passed internal
    verification; SQL behavior remains unverified.
 2. Build parser/resolver/evaluator and shared-corpus adapter over the established
