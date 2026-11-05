@@ -84,7 +84,10 @@ internal enum Checksums {
         return ~crc
     }
     static func crc64(_ bytes: some Sequence<UInt8>) -> UInt64 {
-        var crc: UInt64 = 0
+        crc64Update(0, bytes)
+    }
+    static func crc64Update(_ initial: UInt64, _ bytes: some Sequence<UInt8>) -> UInt64 {
+        var crc = initial
         for byte in bytes { crc = (crc << 8) ^ crc64Table[Int((crc >> 56) ^ UInt64(byte))] }
         return crc
     }

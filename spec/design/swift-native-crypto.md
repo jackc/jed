@@ -93,7 +93,9 @@ function through `CCryptoBoringSSL`, with a scoped immutable input buffer and a
 28-byte output buffer. This accesses the explicitly approved crypto backend,
 not a second crypto implementation. `CCryptoBoringSSL` is not a public SwiftPM
 product: successful transitive module import and static linkage must be proven
-with the exact selected release. If SwiftPM rejects it, an audited narrow C shim
+with the exact selected release; the Linux compile/link and digest execution
+checks below establish that proof on the inspected host. If another host rejects
+it, an audited narrow C shim
 to the same exported, pinned symbol is the fallback; no engine FFI or handwritten
 hash implementation is admitted. Do not describe this bridge as a stable upstream
 Swift API.
@@ -125,20 +127,29 @@ encryption threat model and does not claim a new security review.
 ## Verification obligations and audit status
 
 On 2026-11-05, inspection confirmed the host toolchain is Swift 6.4.2 targeting
-`x86_64-unknown-linux-gnu`. Upstream source/API and commit inspection is complete;
-package compile/link checks and vector execution are separate required work,
-not implied by this audit. Apple-platform builds have not been performed.
+`x86_64-unknown-linux-gnu`. The opt-in integrated SwiftPM test run compiled and
+linked the pinned dependencies and passed all six `CryptoTests`, including the
+transitive `CCryptoBoringSSL` SHA-224 import and digest vectors. Apple-platform
+builds have not been performed. The direct swift-asn1 exact constraint emits an
+unused direct dependency warning because the target consumes it transitively
+through CryptoExtras; the constraint deliberately pins that required dependency.
 
-The crypto slice must reproduce all of
-[encryption_vectors.toml](../fileformat/encryption_vectors.toml): both C2SP XAES
-vectors, page associated data, page/meta subkeys, host KEK, key block, rewrap, and
-the Argon2id vector. XAES is only the already-specified doubling/XOR/two-block
+The primitive tests reproduce
+[encryption_vectors.toml](../fileformat/encryption_vectors.toml): three XAES cases
+(two C2SP cases and one page-associated-data case), one subkey fixture containing
+two outputs, one host KEK, one key-block wrapping payload, one rewrap payload,
+and one Argon2id case. The key-block codec tests additionally reproduce each
+complete 128-byte key-block/rewrap record and exact seeded entropy draw order.
+TOML field counts are not vector counts. XAES is only the already-specified doubling/XOR/two-block
 derivation over library AES and AES-GCM. SQL digest cases come from the shared
-corpus. Add adapter tests for invalid sizes, authentication failures, embedded
-zero input, and lifetime-safe empty input. At storage integration, run encrypted
+corpus. Adapter tests cover invalid sizes, authentication failures, embedded
+zero input, lifetime-safe empty input, and reference Argon2 with multiple lanes.
+At storage integration, run encrypted
 goldens, bidirectional interchange, rekey/credential changes, scratch sealing,
 process tests, and encrypted simulations. Passing primitive vectors alone does
 not establish file-format, durability, or security correctness.
 
 No dependency approval blocker has been identified. The SHA-224 bridge's
-compile/link proof remains the concrete packaging question at this audit stage.
+compile/link and execution proof is established on the inspected Linux host.
+This is cryptographic and page-codec foundation evidence, not completion of
+database open/create, validated-COW commits, credential repair, or rotation.
