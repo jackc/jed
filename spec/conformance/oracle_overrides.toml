@@ -1182,6 +1182,27 @@ file = "expr/regex.test"
 sql = "SELECT 'abc' ~ 'abc\\Z' FROM one"
 reason = "jed: `\\Z` (uppercase) is NOT a jed anchor (regex.md §2) — its only distinguishing PCRE behavior is trailing-newline leniency jed does nowhere, so it is an invalid escape (2201B). PostgreSQL accepts `\\Z` as an end-of-string anchor and returns true. A deliberate flavor narrowing; jed spells the absolute-end anchor `\\z` (regex.md §1/§2)."
 
+# --- regex POSIX bracket syntax: not in jed's flavor (regex.md §2), so 2201B; PostgreSQL accepts it.
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'A' ~ '[[:upper:]]' FROM one"
+reason = "jed: POSIX bracket syntax ([:class:], [.coll.], [=equiv=]) is not in jed's regex flavor (regex.md §2), so an unescaped `[` followed by `:`, `.` or `=` inside a class is 2201B. PostgreSQL's ARE engine accepts it. A deliberate flavor narrowing that fails loudly rather than reading the brackets as literal characters."
+
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'x' ~ '[^[:digit:]]' FROM one"
+reason = "jed: POSIX bracket syntax ([:class:], [.coll.], [=equiv=]) is not in jed's regex flavor (regex.md §2), so an unescaped `[` followed by `:`, `.` or `=` inside a class is 2201B. PostgreSQL's ARE engine accepts it. A deliberate flavor narrowing that fails loudly rather than reading the brackets as literal characters."
+
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'a' ~ '[[.a.]]' FROM one"
+reason = "jed: POSIX bracket syntax ([:class:], [.coll.], [=equiv=]) is not in jed's regex flavor (regex.md §2), so an unescaped `[` followed by `:`, `.` or `=` inside a class is 2201B. PostgreSQL's ARE engine accepts it. A deliberate flavor narrowing that fails loudly rather than reading the brackets as literal characters."
+
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'a' ~ '[[=a=]]' FROM one"
+reason = "jed: POSIX bracket syntax ([:class:], [.coll.], [=equiv=]) is not in jed's regex flavor (regex.md §2), so an unescaped `[` followed by `:`, `.` or `=` inside a class is 2201B. PostgreSQL's ARE engine accepts it. A deliberate flavor narrowing that fails loudly rather than reading the brackets as literal characters."
+
 # --- date_trunc on a date argument: jed has no implicit date->timestamp cast, so there is no
 # matching overload (42883). PostgreSQL implicitly casts the date to timestamptz and the call
 # succeeds (returning a timestamptz). A deliberate jed-stricter divergence (timezones.md §9.1).

@@ -530,6 +530,15 @@ impl Parser {
         let c = self
             .bump()
             .expect("class_item called at end (loop guards None)");
+        // `[:name:]`, `[.coll.]` and `[=equiv=]` are POSIX bracket syntax, which jed lacks
+        // (regex.md §2). PostgreSQL always reads an unescaped `[` followed by `:`, `.` or `=`
+        // inside a bracket expression as one of them, so reading it as literal characters would
+        // silently match differently; it is 2201B instead.
+        if c == '[' && matches!(self.peek(), Some(':' | '.' | '=')) {
+            return Err(invalid(
+                "POSIX bracket expressions ([:class:], [.coll.], [=equiv=]) are not supported",
+            ));
+        }
         if c != '\\' {
             return Ok(ClassItem::Char(c));
         }

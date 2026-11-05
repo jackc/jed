@@ -111,7 +111,9 @@ intervals + a `negated` flag (the canonical form the fixtures pin).
 **Deliberately excluded** (each `2201B` if used as the corresponding metasyntax, or a literal where
 PCRE would also read it literally): backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`,
 named groups `(?<name>)`, inline flag groups `(?i)`, the `s`/`m`/`x` flags, `\b` word boundary,
-POSIX `[[:alpha:]]` classes, `\xHH`/`\x{…}`/`\uHHHH` numeric escapes, Unicode property escapes
+POSIX bracket syntax (`[[:alpha:]]` classes, `[[.a.]]` collating elements, `[[=a=]]` equivalence
+classes — an unescaped `[` followed by `:`, `.` or `=` inside a class, which PostgreSQL always reads
+as one of them, so it is never taken literally), `\xHH`/`\x{…}`/`\uHHHH` numeric escapes, Unicode property escapes
 `\p{…}`, and **`\Z`** (the PCRE end-anchor that also matches *before a trailing newline*). `\Z` is
 excluded on purpose: its **only** behavior distinct from `\z` is that trailing-newline leniency,
 which jed does nowhere — `$` itself is strict end-of-subject — so admitting `\Z` would either
@@ -715,7 +717,7 @@ Two engine rules make the translation compile as PostgreSQL's does. Every escape
 is not an ASCII letter or digit is the literal `c` (§2), so `\%` is a percent sign. And `SIMILAR`
 compiles in the dot-all mode (§8d), where `.` matches a newline: PostgreSQL's `.` does, and `%` and
 `_` must match any character. An unknown escaped letter is still `2201B` (`\b` is a backspace in
-PostgreSQL), and a class item the engine lacks (`[[:alpha:]]`, §2) reads as the engine reads it.
+PostgreSQL), and so is a class item the engine lacks (`[[:alpha:]]`, §2).
 
 **Cost.** A growth kernel ([cost.md](cost.md) §8.1), like `like_escape`: one `operator_eval`, plus
 `scalar_byte` per output byte when an argument is not constant.

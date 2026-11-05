@@ -463,6 +463,18 @@ class RegexParser {
   // single code point (escapes resolved).
   private classItem(): { ch: number | null; set: [number, number][] | null } {
     const c = this.bump() as string;
+    // `[:name:]`, `[.coll.]` and `[=equiv=]` are POSIX bracket syntax, which jed lacks (regex.md §2).
+    // PostgreSQL always reads an unescaped `[` followed by `:`, `.` or `=` inside a bracket expression
+    // as one of them, so reading it as literal characters would silently match differently; it is
+    // 2201B instead.
+    if (c === "[") {
+      const n = this.peek();
+      if (n === ":" || n === "." || n === "=") {
+        throw regexInvalid(
+          "POSIX bracket expressions ([:class:], [.coll.], [=equiv=]) are not supported",
+        );
+      }
+    }
     if (c !== "\\") return { ch: c.codePointAt(0) as number, set: null };
     const e = this.bump();
     if (e === undefined) throw regexInvalid("trailing backslash");

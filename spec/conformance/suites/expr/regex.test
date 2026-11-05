@@ -245,3 +245,24 @@ SELECT 'a' ~ 'a{2,1}' FROM one
 
 statement error 2201B
 SELECT 'a' ~ '[a' FROM one
+
+# POSIX bracket syntax inside a class (`[:class:]`, `[.coll.]`, `[=equiv=]`) is not in jed's
+# flavor (regex.md §2): it is 2201B rather than a silently different literal reading. PostgreSQL
+# accepts these, so the rows are oracle-overridden. A `[` not followed by `:`, `.` or `=` is still a
+# literal class member, as in PostgreSQL.
+statement error 2201B
+SELECT 'A' ~ '[[:upper:]]' FROM one
+
+statement error 2201B
+SELECT 'x' ~ '[^[:digit:]]' FROM one
+
+statement error 2201B
+SELECT 'a' ~ '[[.a.]]' FROM one
+
+statement error 2201B
+SELECT 'a' ~ '[[=a=]]' FROM one
+
+query B nosort
+SELECT '[' ~ '[x[]' FROM one
+----
+true

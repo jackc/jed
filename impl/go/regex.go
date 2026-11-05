@@ -567,6 +567,15 @@ func (p *regexParser) parseClass() (*regexNode, error) {
 // single char (escapes resolved).
 func (p *regexParser) classItem() (lo rune, set [][2]rune, isSet bool, err error) {
 	c, _ := p.bump()
+	// `[:name:]`, `[.coll.]` and `[=equiv=]` are POSIX bracket syntax, which jed lacks (regex.md §2).
+	// PostgreSQL always reads an unescaped `[` followed by `:`, `.` or `=` inside a bracket expression
+	// as one of them, so reading it as literal characters would silently match differently; it is
+	// 2201B instead.
+	if c == '[' {
+		if n, ok := p.peek(); ok && (n == ':' || n == '.' || n == '=') {
+			return 0, nil, false, regexInvalid("POSIX bracket expressions ([:class:], [.coll.], [=equiv=]) are not supported")
+		}
+	}
 	if c != '\\' {
 		return c, nil, false, nil
 	}
