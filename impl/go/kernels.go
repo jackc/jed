@@ -1075,35 +1075,21 @@ func widthBucketNumeric(op, low, high Decimal, count int64) (int64, error) {
 	}
 	countDec := decimalFromInt64(count)
 	bucket := func(hiNum, loNum, hiDen, loDen Decimal) (int64, error) {
-		diff, err := hiNum.Sub(loNum)
-		if err != nil {
-			return 0, err
+		// Only the bucket index is a result value; intermediate values may exceed numeric's cap.
+		num := hiNum.AddUncapped(loNum.Negate()).mulExact(countDec)
+		den := hiDen.AddUncapped(loDen.Negate())
+		// The quotient lies in [0, count). Exact-product bisection avoids long division
+		// over a near-limit decimal denominator.
+		left, right := int64(0), count
+		for right-left > 1 {
+			mid := left + (right-left)/2
+			if den.mulExact(decimalFromInt64(mid)).CmpValue(num) <= 0 {
+				left = mid
+			} else {
+				right = mid
+			}
 		}
-		num, err := diff.Mul(countDec)
-		if err != nil {
-			return 0, err
-		}
-		den, err := hiDen.Sub(loDen)
-		if err != nil {
-			return 0, err
-		}
-		r, err := num.Rem(den)
-		if err != nil {
-			return 0, err
-		}
-		numMinusR, err := num.Sub(r)
-		if err != nil {
-			return 0, err
-		}
-		q, err := numMinusR.Div(den)
-		if err != nil {
-			return 0, err
-		}
-		b, ok := q.RoundToScale(0).ToInt64Round()
-		if !ok {
-			return 0, overflowErr(scalarInt32)
-		}
-		return satAdd1(b), nil
+		return left + 1, nil
 	}
 	if cmpBounds < 0 { // ascending low < high
 		if op.CmpValue(low) < 0 {

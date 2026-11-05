@@ -1,0 +1,34 @@
+# Numeric bucket calculations keep intermediate differences and products uncapped.
+# The inputs fit numeric, and the result is a small integer even at the numeric digit limit.
+# requires: query.select_no_from, types.decimal, types.i32, cast.operator
+
+query I nosort
+SELECT width_bucket(1e131071, 0::numeric, 2e131071, 10)
+----
+6
+
+query I nosort
+SELECT width_bucket(0::numeric, -9e131071, 9e131071, 10)
+----
+6
+
+query I nosort
+SELECT width_bucket(0::numeric, 9e131071, -9e131071, 10)
+----
+6
+
+query I nosort
+SELECT width_bucket(1e131071, 0::numeric, 3e131071, 10)
+----
+4
+
+query I nosort
+SELECT width_bucket(1e131071, 0::numeric, 2e131071, 2147483647)
+----
+1073741824
+
+query II nosort
+SELECT width_bucket(-9e131071, -9e131071, 9e131071, 10), width_bucket(9e131071, -9e131071, 9e131071, 10)
+----
+1
+11

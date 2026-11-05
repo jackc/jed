@@ -414,6 +414,12 @@ resolver-routed functions with numeric pairs reconcile by the same rules in thei
 `mod`/`div`/`gcd`/`lcm` promote an integer beside a decimal, and `width_bucket`'s float form adapts
 its literal operands to `f64`, so `width_bucket(f, 0, 10, 5)` resolves as in PostgreSQL.
 
+Numeric `width_bucket` keeps its internal differences and scaled numerator exact without
+applying the numeric value-format cap to them. Valid operands near the digit limit can still
+produce a small bucket index; only the resulting index is checked against `i32`.
+The interior quotient is found by bisection on `[0, count)`, comparing exact products with the
+numerator, so the calculation takes at most 63 comparisons even at the numeric digit limit.
+
 ## 10. Set-returning functions (`generate_series`) — the fourth function mold
 
 A **set-returning function (SRF)** is the fourth function shape, distinct from the three

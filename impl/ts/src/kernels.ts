@@ -57,12 +57,19 @@ export function widthBucketNumeric(
   if (cmpBounds === 0) throw widthBucketErr("lower bound cannot equal upper bound");
   const countDec = Decimal.fromBigInt(count);
   const bucket = (hiNum: Decimal, loNum: Decimal, hiDen: Decimal, loDen: Decimal): bigint => {
-    const num = hiNum.sub(loNum).mul(countDec);
-    const den = hiDen.sub(loDen);
-    const q = num.sub(num.rem(den)).div(den).roundToScale(0);
-    const b = q.toBigIntRound();
-    if (b === null) throw overflow("i32");
-    return b + 1n;
+    // Only the bucket index is a result value; intermediate values may exceed numeric's cap.
+    const num = hiNum.subUncapped(loNum).mulExact(countDec);
+    const den = hiDen.subUncapped(loDen);
+    // The quotient lies in [0, count). Exact-product bisection avoids long division
+    // over a near-limit decimal denominator.
+    let left = 0n;
+    let right = count;
+    while (right - left > 1n) {
+      const mid = left + (right - left) / 2n;
+      if (den.mulExact(Decimal.fromBigInt(mid)).cmpValue(num) <= 0) left = mid;
+      else right = mid;
+    }
+    return left + 1n;
   };
   if (cmpBounds < 0) {
     // ascending low < high

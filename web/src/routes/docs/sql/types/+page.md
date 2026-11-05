@@ -276,6 +276,9 @@ Every example below is a **live database in your browser**. Edit the SQL and run
 
 <LiveSql demo="decimalDemo" query={decimalDemo} rows={5} />
 
+Numeric `width_bucket(value, low, high, count)` also works at the numeric digit limit:
+intermediate calculations can exceed that limit when the final bucket index fits `i32`.
+
 An integer argument takes a function's `numeric` overload when it has one: `power(2.0, 3)`,
 `log(2, 8.0)`, `round(5)`, `sqrt(2)` and `power(2, 3)` all return `numeric`. This is a deliberate
 difference from PostgreSQL, which resolves an integer through `double precision`: `sqrt(2)` is

@@ -1973,13 +1973,22 @@ pub(crate) fn width_bucket_numeric(
     // floor((hi_num − lo_num)·count / (hi_den − lo_den)), all operands ≥ 0 in range (trunc == floor).
     let bucket =
         |hi_num: &Decimal, lo_num: &Decimal, hi_den: &Decimal, lo_den: &Decimal| -> Result<i64> {
-            let num = hi_num.sub(lo_num)?.mul(&count_dec)?;
-            let den = hi_den.sub(lo_den)?;
-            let q = num.sub(&num.rem(&den)?)?.div(&den)?.round_to_scale(0);
-            let b = q
-                .to_i64_round()
-                .ok_or_else(|| overflow(ScalarType::Int32))?;
-            Ok(b.saturating_add(1))
+            // Only the bucket index is a result value. The differences and scaled
+            // numerator may exceed numeric's value cap even for valid inputs.
+            let num = hi_num.add_uncapped(&lo_num.neg()).mul_exact(&count_dec);
+            let den = hi_den.add_uncapped(&lo_den.neg());
+            // The quotient lies in [0, count). Search it with exact products:
+            // this avoids long division over a near-limit decimal denominator.
+            let (mut left, mut right) = (0, count);
+            while right - left > 1 {
+                let mid = left + (right - left) / 2;
+                if den.mul_exact(&Decimal::from_i64(mid)).cmp_value(&num) != Ordering::Greater {
+                    left = mid;
+                } else {
+                    right = mid;
+                }
+            }
+            Ok(left + 1)
         };
     if cmp_bounds == Ordering::Less {
         // ascending low < high
