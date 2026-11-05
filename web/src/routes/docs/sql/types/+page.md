@@ -20,6 +20,11 @@
   ('3.14159'::text)::numeric(4,2)  AS text_to_numeric,
   ('yes'::text)::boolean           AS text_to_bool;`;
 
+	const floatInputDemo = `SELECT
+  ('+NaN'::text)::f64::text AS signed_nan,
+  ('1.0000000596046447753906250000000000001'::text)::f32::text
+    AS rounded_to_real;`;
+
 	const floatRoundDemo = `SELECT
   round(1e308::f64, 1)::text AS large_value,
   round(123::f64, -1000)::text AS coarse_rounding;`;
@@ -324,7 +329,11 @@ One exception, as in PostgreSQL: a bare string **literal** stored into an `f32` 
 `±Infinity` without a cast. A text *expression* (a text column, `'Inf' || 'inity'`) is still a type
 error (`42804`).
 
-Float input also accepts signed `NaN` (`+NaN` and `-NaN`); each renders as `NaN`.
+Float input also accepts signed `NaN` (`+NaN` and `-NaN`); each renders as `NaN`. Conversion
+from text or an exact number to `f32` rounds directly to binary32. An explicit intermediate
+`f64` cast can change the answer near a rounding boundary:
+
+<LiveSql demo="floatInputDemo" query={floatInputDemo} rows={1} />
 
 ## Parsing text into dates, times, intervals, and bytea
 

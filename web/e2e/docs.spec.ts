@@ -22,6 +22,16 @@ test('the types page shows the integer overflow trap (22003)', async ({ page }) 
   await expect(overflowPanel.getByTestId('error-code')).toHaveText('22003');
 });
 
+test('the types page runs float input and extreme rounding demos', async ({ page }) => {
+  await page.goto('/docs/sql/types/');
+  const inputs = livePanel(page, 'floatInputDemo').getByTestId('result-rows');
+  await expect(inputs).toContainText('NaN');
+  await expect(inputs).toContainText('1.0000001');
+  const rounded = livePanel(page, 'floatRoundDemo').getByTestId('result-rows');
+  await expect(rounded).toContainText('1e+308');
+  await expect(rounded.getByRole('cell', { name: '0', exact: true })).toBeVisible();
+});
+
 test('the types page autoruns the boolean ⇄ i32 cast demo', async ({ page }) => {
   await page.goto('/docs/sql/types/');
   // The boolean⇄i32 cast demo: true→1, false→0, 0→false, -5→true.

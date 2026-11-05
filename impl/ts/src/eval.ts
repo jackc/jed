@@ -1,4 +1,5 @@
 import { runSync, type Steps } from "./execution.ts";
+import { float32FromText } from "./float_input.ts";
 import { evalSubscriptSteps } from "./eval_ops.ts";
 import type {
   EvalEnv,
@@ -4163,19 +4164,23 @@ export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | n
     // → true. The resolver guarantees the source is i32, so v.int is already in i32 range.
     if (isBool(target)) return boolValue(v.int !== 0n);
     if (isDecimal(target)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
-    // int → float (explicit, lossy): nearest binary representable, then fround for f32. Exact
+    // int → float (explicit, lossy): nearest binary representable at the target width. Exact
     // for |int| ≤ 2^53; a larger i64 may round. Never traps (float.md §6).
-    if (isFloat(target)) return makeFloat(target, Number(v.int));
+    if (isFloat(target))
+      return makeFloat(
+        target,
+        target === "f32" ? float32FromText(v.int.toString()) : Number(v.int),
+      );
     if (!inRange(target, v.int)) throw overflow(target);
     return intValue(v.int);
   }
   if (v.kind === "decimal") {
     if (isDecimal(target)) return decimalValue(coerceDecimal(v.dec, typmod));
-    // decimal → float (explicit, lossy): nearest binary to the exact decimal (Number of the
-    // canonical decimal string is the IEEE conversion). A huge decimal → ±Inf traps 22003 rather
+    // decimal → float (explicit, lossy): nearest binary to the exact decimal at the target width.
+    // A huge decimal → ±Inf traps 22003 rather
     // than yielding Infinity (the finite-overflow rule, float.md §6).
     if (isFloat(target)) {
-      const d = Number(v.dec.render());
+      const d = target === "f32" ? float32FromText(v.dec.render()) : Number(v.dec.render());
       if (!Number.isFinite(d)) throw overflow(target);
       const f = makeFloat(target, d);
       // A non-zero decimal that rounds to 0 at the width underflowed → 22003 (float.md §6).

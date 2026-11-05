@@ -224,6 +224,11 @@ existing literal machinery — types.md §6, grammar.md §36):
   column) is not assignable to a float column (`42804`, as in PostgreSQL), keeping §6's "a value
   never silently becomes a float". (`suites/types/float_string_literal.test`.)
 
+Every exact numeric input (text, integer, or decimal; literals and explicit casts alike) rounds
+once to its destination width. An `f32` conversion must not first round to binary64: a decimal
+just above a binary32 midpoint can round to that midpoint at binary64 and then incorrectly tie
+down at binary32. Explicit `f64 → f32` casts still round the already-represented binary64 value.
+
 ## 5. Arithmetic — the correctly-rounded kernel
 
 `f64 ⊕ f64 → f64` for `+ − * /` and unary `−` (and `%`/`mod`, IEEE `fmod`, exact).

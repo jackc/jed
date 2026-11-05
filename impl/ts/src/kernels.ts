@@ -3,6 +3,7 @@
 // truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
 // caller range-checks it to int4). count > 0 is checked by the caller.
 import { Decimal, EXP_LIMIT, decimalFromParts } from "./decimal.ts";
+import { float32FromText } from "./float_input.ts";
 import {
   type Engine,
   type ParamTypes,
@@ -33,7 +34,7 @@ import { EngineError, atPosition, engineError, positionedAt } from "./errors.ts"
 import { assignableTo, exprLocation } from "./eval_ops.ts";
 import type { DecimalTypmod, ScalarType, TemporalTypmod, Type } from "./types.ts";
 import { emptyRangeValue, parseByteaHex, parseRecordTokens, parseUuid } from "./value.ts";
-import { canonicalName, minOf, rank, roundToWidth, typeCanonicalName } from "./types.ts";
+import { canonicalName, minOf, rank, typeCanonicalName } from "./types.ts";
 import { radixDigitValue } from "./lexer.ts";
 import type { ColType, Column, CompositeField, CompositeType } from "./catalog.ts";
 import { resolvedRangeElementScalar } from "./scope.ts";
@@ -460,9 +461,8 @@ export const trimLit = (s: string): string => s.replace(LIT_WS, "");
 export const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
 
 // floatFromDecimalLiteral converts an untyped decimal/integer literal adapting to a float context
-// into a float constant (float.md §4): the nearest binary64 to the exact decimal value (round-
-// ties-to-even — JS Number(...) of the canonical decimal string is exactly the IEEE conversion),
-// then Math.fround if the context width is f32. The exact-decimal cap-check is NOT applied: a
+// into a float constant (float.md §4): round directly to the context width, ties to even.
+// The exact-decimal cap-check is NOT applied: a
 // literal adapting to a float column is a float value, not a stored decimal. A magnitude beyond the
 // binary64 range becomes ±Infinity here — but a finite literal is meant, so an out-of-range literal
 // traps 22003 (the finite-overflow rule, §3) rather than silently yielding Infinity.
@@ -472,7 +472,7 @@ export function floatFromDecimalLiteral(
 ): { node: RExpr; type: ResolvedType } {
   const exact = Number(d.render());
   if (!Number.isFinite(exact)) throw overflow(ty);
-  const n = roundToWidth(ty, exact);
+  const n = ty === "f32" ? float32FromText(d.render()) : exact;
   if (!Number.isFinite(n)) throw overflow(ty); // f32 rounding pushed a finite double to ±Inf
   // A non-zero literal that rounds to 0 at the width underflowed → 22003 (float.md §6).
   if (n === 0 && !d.isZero()) throw floatUnderflow();
@@ -1115,7 +1115,7 @@ export const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[
 // trimmed ASCII whitespace (the shared LIT_WS), optional sign, finite decimal with optional point
 // and e-notation, OR the case-insensitive specials Infinity/+Infinity/-Infinity/inf/+inf/-inf/NaN.
 // Malformed input → 22P02; a finite value outside the binary64 range → 22003. For f32 the
-// parsed binary64 is Math.fround'd; a finite value that frounds to ±Inf (beyond binary32 range)
+// input rounds directly to binary32; a finite value that rounds to ±Inf (beyond binary32 range)
 // also traps 22003. NaN/±Infinity are first-class here (they enter ONLY via this path, casts, or
 // stored values — float.md §3).
 export function parseFloatLiteral(s: string, ty: ScalarType): number {
@@ -1155,7 +1155,7 @@ export function parseFloatLiteral(s: string, ty: ScalarType): number {
   // A finite literal that overflows the binary64 range parses to ±Infinity — trap 22003 rather than
   // yield Infinity (Infinity is input-only via the special words above, not via a finite literal).
   if (!Number.isFinite(d)) throw overflow(ty);
-  const n = ty === "f32" ? Math.fround(d) : d;
+  const n = ty === "f32" ? float32FromText(t) : d;
   if (!Number.isFinite(n)) throw overflow(ty); // finite double beyond binary32 range
   // A non-zero literal that rounded to 0 at the width underflowed: out of range (22003), as PG's
   // float8in / float4in (Number() does not report underflow — float.md §4).
