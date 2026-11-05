@@ -547,7 +547,8 @@ and the first storable non-integer scalar. The empty string `''` is a distinct, 
 `54000` *"null character not permitted"*, string-functions.md §4; a JSON `\u0000` has no text
 value, json.md §4.2). The engine enforces this where text enters from outside, as PostgreSQL's
 `pg_verifymbstr` does: the whole SQL text is checked before it is lexed (a string literal, a quoted
-identifier, even a comment), and every host-supplied text parameter at bind ([api.md §5](api.md)).
+identifier, even a comment), and every host-supplied text parameter at bind ([api.md §5](api.md)),
+including text nested in array elements, composite fields, and range bounds before coercion.
 An invalid sequence or a NUL byte is **`22021` `character_not_in_repertoire`** with PostgreSQL's
 exact message naming the first bad sequence's bytes, up to its expected length — `invalid byte
 sequence for encoding "UTF8": 0xe2 0x82 0x27` — and no position. So a stored text value is valid

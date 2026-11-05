@@ -1914,7 +1914,7 @@ export function bindParams(
   }
   // A host text value is checked as PostgreSQL checks a text-format parameter's encoding: a NUL or
   // a lone surrogate is 22021 (types.md §11), so no such value is ever compared, stored, or rendered.
-  for (const v of supplied) if (v.kind === "text") checkTextEncoding(v.text);
+  for (const v of supplied) checkHostParamText(v);
   // A text value bound to a timestamptz parameter reads an offset-less string in the session zone,
   // as PostgreSQL's text-format parameter input does (timezones.md §9.3).
   return types.map((ty, i) =>
@@ -1924,6 +1924,24 @@ export function bindParams(
         : bindContainerParam(supplied[i]!, ty, labels[i]!, iz),
     ),
   );
+}
+
+function checkHostParamText(v: Value): void {
+  switch (v.kind) {
+    case "text":
+      checkTextEncoding(v.text);
+      break;
+    case "array":
+      for (const element of v.elements) checkHostParamText(element);
+      break;
+    case "composite":
+      for (const field of v.fields) checkHostParamText(field);
+      break;
+    case "range":
+      if (v.lower !== null) checkHostParamText(v.lower);
+      if (v.upper !== null) checkHostParamText(v.upper);
+      break;
+  }
 }
 
 // bindContainerParam coerces a host value to an array, range, or composite parameter type

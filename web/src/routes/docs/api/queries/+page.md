@@ -39,6 +39,9 @@ SQL string**, so there is no string-interpolation injection surface.
 Bound values and result rows are independent of stored data. Changing a byte buffer after binding
 it, or changing a buffer returned by a query, does not update the database; use SQL to make changes.
 
+Text parameters must be valid UTF-8 without NUL, including text nested inside arrays and composite
+values. Invalid text returns `22021` before any rows are stored.
+
 Each placeholder's static type comes from its SQL context: a compared column, an arithmetic sibling,
 an `INSERT`/`UPDATE` target, a cast, the common result type of `CASE`, `COALESCE`, `GREATEST`, and
 `LEAST`, or the argument type a function declares. For example, `COALESCE($1, 0)` infers an integer

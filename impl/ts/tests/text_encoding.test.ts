@@ -9,6 +9,20 @@ import { test } from "node:test";
 import { EngineError, queryOutcome } from "../src/tooling.ts";
 import { lex, lexWithPositions } from "../src/lexer.ts";
 import { memDb } from "./mem_db.ts";
+import { arrayValue, compositeValue, textValue } from "../src/value.ts";
+
+test("nested text parameters reject invalid encoding before storing", () => {
+  const db = memDb();
+  db.run("CREATE TYPE text_box AS (items text[])");
+  db.run("CREATE TABLE t (v text_box[])");
+  for (const text of ["a\u0000b", "\ud800"]) {
+    assert.equal(errorOf(() => db.get("SELECT $1::text[]", [text])).code(), "22021");
+    const nested = arrayValue([compositeValue([arrayValue([textValue(text)])])]);
+    assert.equal(errorOf(() => db.run("INSERT INTO t VALUES ($1)", nested)).code(), "22021");
+  }
+  assert.equal(db.get("SELECT count(*) AS n FROM t")!.n, 0n);
+  assert.equal(db.get("SELECT $1::text[] AS v", ["hé😀"])!.v, "{hé😀}");
+});
 
 function errorOf(fn: () => unknown): EngineError {
   try {

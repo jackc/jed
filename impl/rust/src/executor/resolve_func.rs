@@ -2252,9 +2252,7 @@ pub(crate) fn bind_params_with_labels(
     for (i, (v, ty)) in supplied.iter().zip(types).enumerate() {
         // A host text value is checked as PostgreSQL checks a text-format parameter's encoding: a
         // NUL byte is 22021 (types.md §11), so no such value is ever compared, stored, or rendered.
-        if let Value::Text(s) = v {
-            crate::lexer::check_text_encoding(s)?;
-        }
+        check_host_param_text(v)?;
         // A bound parameter is coerced exactly like a literal in that position: typmod is
         // unconstrained (a comparison/insert against a column re-applies the column typmod),
         // not_null is false (NULL is a legal bound value; a NOT NULL target re-checks at store).
@@ -2266,6 +2264,32 @@ pub(crate) fn bind_params_with_labels(
         });
     }
     Ok(bound)
+}
+
+fn check_host_param_text(v: &Value) -> Result<()> {
+    match v {
+        Value::Text(s) => crate::lexer::check_text_encoding(s)?,
+        Value::Array(a) => {
+            for element in &a.elements {
+                check_host_param_text(element)?;
+            }
+        }
+        Value::Composite(fields) => {
+            for field in fields {
+                check_host_param_text(field)?;
+            }
+        }
+        Value::Range(r) => {
+            if let Some(lower) = &r.lower {
+                check_host_param_text(lower)?;
+            }
+            if let Some(upper) = &r.upper {
+                check_host_param_text(upper)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Coerce a host value to an array, range, or composite parameter type (spec/design/api.md §5). A

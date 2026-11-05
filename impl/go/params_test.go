@@ -54,6 +54,27 @@ func firstInts(rows [][]Value) []int64 {
 	return out
 }
 
+func TestNestedTextParametersRejectBadEncodingBeforeStoring(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t, "CREATE TYPE text_box AS (items text[])", "CREATE TABLE t (v text_box[])")
+	for _, text := range []string{"a\x00b", "\xff"} {
+		bad := TextValue(text)
+		if code := paramErrCode(t, db, "SELECT $1::text[]", ArrayValue([]Value{bad})); code != "22021" {
+			t.Fatalf("array encoding: got %s", code)
+		}
+		nested := ArrayValue([]Value{CompositeValue([]Value{ArrayValue([]Value{bad})})})
+		if code := paramErrCode(t, db, "INSERT INTO t VALUES ($1)", nested); code != "22021" {
+			t.Fatalf("nested encoding: got %s", code)
+		}
+	}
+	if got := queryRows(t, db, "SELECT count(*) FROM t")[0][0].Int; got != 0 {
+		t.Fatalf("stored %d invalid rows", got)
+	}
+	if got := queryRows(t, db, "SELECT $1::text[]", ArrayValue([]Value{TextValue("hé😀")}))[0][0].Render(); got != "{hé😀}" {
+		t.Fatalf("valid unicode: %s", got)
+	}
+}
+
 func TestCompositePKFloatParamWidensSoundly(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t,

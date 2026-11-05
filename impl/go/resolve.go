@@ -1003,11 +1003,33 @@ func bindParamsWithLabels(supplied []Value, types []colType, labels []string, iz
 // such value is ever compared, stored, or rendered. The ergonomic binder (toValue) checks a Go string
 // the same way; this covers a Value a host builds itself.
 func checkHostParam(v Value) error {
-	if v.Kind != ValText {
-		return nil
+	switch v.Kind {
+	case ValText:
+		_, err := decodeUTF8Text(v.str())
+		return err
+	case ValArray:
+		for _, element := range v.arrayVal().Elements {
+			if err := checkHostParam(element); err != nil {
+				return err
+			}
+		}
+	case ValComposite:
+		for _, field := range *v.composite() {
+			if err := checkHostParam(field); err != nil {
+				return err
+			}
+		}
+	case ValRange:
+		rv := v.rangeVal()
+		for _, bound := range []*Value{rv.Lower, rv.Upper} {
+			if bound != nil {
+				if err := checkHostParam(*bound); err != nil {
+					return err
+				}
+			}
+		}
 	}
-	_, err := decodeUTF8Text(v.str())
-	return err
+	return nil
 }
 
 // hostTimeArrayParam is hostTimeParam for a container parameter: a one-dimensional array bound from

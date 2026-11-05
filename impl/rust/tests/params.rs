@@ -3,7 +3,7 @@
 //! conformance.md §1.2). What stays here binds host value kinds the directive does not spell (a
 //! binary float, raw bytes, a range value) and the ergonomic `Array` mapping.
 
-use jed::value::{RangeVal, Value};
+use jed::value::{ArrayVal, RangeVal, Value};
 use jed::{Array, CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
@@ -33,6 +33,45 @@ fn err_code(db: &mut Session, sql: &str, params: &[Value]) -> String {
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
         .to_string()
+}
+
+#[test]
+fn nested_text_parameters_reject_nul_before_storing() {
+    let mut db = db_with(&[
+        "CREATE TYPE text_box AS (items text[])",
+        "CREATE TABLE t (v text_box[])",
+    ]);
+    let bad = Value::Text("a\0b".to_string());
+    assert_eq!(
+        err_code(
+            &mut db,
+            "SELECT $1::text[]",
+            &[Value::Array(ArrayVal::one_dim(vec![bad.clone()]))]
+        ),
+        "22021"
+    );
+    let nested = Value::Array(ArrayVal::one_dim(vec![Value::Composite(vec![
+        Value::Array(ArrayVal::one_dim(vec![bad])),
+    ])]));
+    assert_eq!(
+        err_code(&mut db, "INSERT INTO t VALUES ($1)", &[nested]),
+        "22021"
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT count(*) FROM t", &[]),
+        vec![vec![Value::Int(0)]]
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT $1::text[]",
+            &[Value::Array(ArrayVal::one_dim(vec![Value::Text(
+                "hé😀".into()
+            )]))]
+        )[0][0]
+            .render(),
+        "{hé😀}"
+    );
 }
 
 /// Host Decimal values must retain the same finite-underflow check as SQL casts when stored.
