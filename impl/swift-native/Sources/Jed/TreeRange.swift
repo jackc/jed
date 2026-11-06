@@ -19,7 +19,10 @@ internal extension BPlusTree {
             // Equality always routes right at a separator. Only the upper
             // endpoint's inclusivity changes the final child's window.
             let first = lower.map { window(node.keys, value: $0.key, inclusive: true) } ?? 0
-            let last = max(first, upper.map { window(node.keys, value: $0.key, inclusive: $0.inclusive) } ?? node.keys.count)
+            let last = upper.map { window(node.keys, value: $0.key, inclusive: $0.inclusive) } ?? node.keys.count
+            // A contradictory bound can exclude every child while retaining
+            // the cost of visiting this interior node.
+            guard first <= last else { return 1 }
             var total = 1
             for index in first...last {
                 total += count(node.children[index], lower: index == first ? lower : nil, upper: index == last ? upper : nil)

@@ -71,10 +71,16 @@ internal final class PreparedSelectCache {
     }
 }
 
+/// Admitted parameters are carried only when the cache and returned generic
+/// plan share the exact resolution that created their parameter descriptors.
+/// Cold, custom and memo paths keep the caller's ordinary final admission.
+internal typealias PreparedSelectBinding = (plan: SelectPlan, admittedParameters: [SQLValue]?,
+                                           requirements: PreparedSelectRequirements?)
+
 extension PreparedStatement {
     internal func select(_ query: SQLQuery, snapshot: DomainSnapshot, settings: SessionSettings,
                          context: ExpressionContext, supplied: [SQLValue], core: StorageRevision,
-                         committed: QueryDomains) throws -> SelectPlan {
+                         committed: QueryDomains) throws -> PreparedSelectBinding {
         guard let domains = settings.domains else { throw JedError("XX000", "prepared query has no domain map") }
         let signature = PreparedQuerySignature(query: query, core: core, domains: domains)
         func resolve(_ probe: PlanningProbe) throws -> SelectPlan {
@@ -87,18 +93,18 @@ extension PreparedStatement {
             let bound = try ParameterBinding.bind(supplied, types: cached.parameters, timezone: settings.timeZone)
             if !cached.sensitive, !(cached.nullRead && bound.contains(where: \.isNull)), let generic = cached.generic {
                 selectCacheHits += 1
-                return try generic.bind(settings: settings, context: context)
+                return (try generic.bind(settings: settings, context: context), bound, generic.requirements)
             }
             let key = cached.sensitive ? cached.key(bound) : nil
             if let key, let found = cached.find(key) {
                 selectCacheHits += 1
-                return try found.bind(settings: settings, context: context)
+                return (try found.bind(settings: settings, context: context), nil, found.requirements)
             }
             customPlans += 1
             let frame = PlanningProbe.custom(bound); defer { frame.end() }
             let result = try resolve(frame)
             if let key, let detached = PreparedSelectPlan(result) { cached.retain(detached, key: key) }
-            return result
+            return (result, nil, nil)
         }
         selectCacheMisses += 1; probePlans += 1
         let probe = PlanningProbe.probe()
@@ -120,7 +126,7 @@ extension PreparedStatement {
             if sensitive, let key = entry.key(bound) { entry.retain(detached, key: key) }
             selectCache = entry
         }
-        return result
+        return (result, nil, nil)
     }
 }
 

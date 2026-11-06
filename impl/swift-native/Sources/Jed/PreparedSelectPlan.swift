@@ -1,3 +1,15 @@
+/// Requirements belong to one admitted detached plan. Cache admission has
+/// rejected every subquery, so reusing that exact plan needs no eager fold.
+/// Mutable plans and runtime rewrites do not inherit this proof.
+internal final class PreparedSelectRequirements {
+    let mutatesSequences: Bool
+    let needsEagerSubqueryPreparation = false
+
+    fileprivate init(_ plan: SelectPlan) {
+        mutatesSequences = SequenceExecution.mutates(plan.expressions)
+    }
+}
+
 /// A cached plan has no physical roots or session settings. Only immutable
 /// resolution/selection metadata crosses executions; binding installs current
 /// pinned stores and fresh statement services without planning again.
@@ -141,6 +153,7 @@ internal final class PreparedSelectPlan {
     let access: PreparedAccessPlan?
     let join: Join?
     let nway: NWay?
+    let requirements: PreparedSelectRequirements
     init?(_ value: SelectPlan) {
         guard value.withQuery == nil, value.sourceDomain != DomainNames.temporary,
               PreparedExpressions.reusable(value.expressions + [value.completePredicate].compactMap { $0 }) else { return nil }
@@ -168,6 +181,7 @@ internal final class PreparedSelectPlan {
         template.store = nil; template.sourceSnapshot = nil; template.relation = nil; template.compound = nil
         template.accessCandidates = nil; template.chosenAccess = nil; template.chosenJoin = nil; template.chosenNWay = nil
         self.template = template
+        requirements = PreparedSelectRequirements(value)
     }
     func bind(settings: SessionSettings, context: ExpressionContext) throws -> SelectPlan {
         guard let domains = settings.domains else { throw JedError("XX000", "prepared query has no executing domains") }

@@ -360,7 +360,8 @@ internal final class ScanRecord {
 internal final class SelectExecution {
     private(set) var plan: SelectPlan
     let context: ExpressionContext
-    private var input: SelectInput
+    private let preparedRequirements: PreparedSelectRequirements?
+    private var input: SelectInput?
     private var started = false
     private var skipped: Int64 = 0
     private var produced: Int64 = 0
@@ -387,8 +388,15 @@ internal final class SelectExecution {
     /// DISTINCT owns its survivor window while this producer must keep pulling
     /// duplicate rows. This bounds speculation without imposing a SQL LIMIT.
     var hostBatchRemaining: (() -> Int64?)?
-    init(plan: SelectPlan, context: ExpressionContext) {
-        self.plan = plan; self.context = context; input = SelectInput(plan: plan, context: context)
+    init(plan: SelectPlan, context: ExpressionContext, preparedRequirements: PreparedSelectRequirements? = nil) {
+        self.plan = plan; self.context = context
+        self.preparedRequirements = preparedRequirements
+    }
+    private func scalarInput() -> SelectInput {
+        if let input { return input }
+        let input = SelectInput(plan: plan, context: context)
+        self.input = input
+        return input
     }
     /// Only the public read cursor calls this. Nested execution continues using
     /// next(), so its caller owns the established evaluation boundary.
@@ -412,12 +420,16 @@ internal final class SelectExecution {
             }
         }
         if let deduplicated { try deduplicated.openCursor() }
-        else { try input.prime(directCursor: true); started = true }
+        else { try scalarInput().prime(directCursor: true); started = true }
     }
     private func initializeSubqueries() throws {
         if !initializedSubqueries {
             if context.eagerSubqueries {
-                try context.profile(plan.profileIdentity, .folded) { try context.subqueries.prepare(plan.foldExpressions, context: context) }
+                try context.profile(plan.profileIdentity, .folded) {
+                    if preparedRequirements?.needsEagerSubqueryPreparation ?? true {
+                        try context.subqueries.prepare(plan.foldExpressions, context: context)
+                    }
+                }
             }
             initializedSubqueries = true
         }
@@ -433,7 +445,6 @@ internal final class SelectExecution {
            plan.order.isEmpty, plan.limit == nil, !ColumnarExecution.projection(plan, context) {
             plan.materializeSource = true
         }
-        input = SelectInput(plan: plan, context: context)
         initializedBackend = true
         if let withPlan = plan.withQuery { withQuery = WithQueryExecution(plan: withPlan, context: context) }
         else if plan.distinct { deduplicated = DistinctExecution(plan: plan, context: context) }
@@ -462,7 +473,7 @@ internal final class SelectExecution {
                     bufferedScanBytes = saturatingAdd(bufferedScanBytes, bytes)
                     bufferedScan!.append(row)
                 }
-                input.close()
+                input?.close()
             } catch {
                 bufferedScan = []
                 context.meter.resources.query.release(bufferedScanBytes); bufferedScanBytes = 0
@@ -503,6 +514,7 @@ internal final class SelectExecution {
         if let columnar { return try columnar.next() }
         if let orderedJoin { return try orderedJoin.next() }
         if let orderedNWay { return try orderedNWay.next() }
+        let input = scalarInput()
         let meter = context.meter
         if !started { try input.prime(); started = true }
         if !initializedBatches {
@@ -589,7 +601,7 @@ internal final class SelectExecution {
         readAhead?.reset(); readAhead = nil; filterBatch?.reset(); filterBatch = nil
         projectionBatch?.reset(); projectionBatch = nil
         blocking?.close(); blocking = nil
-        input.close(); ordered?.close(); ordered = nil; grouped?.close(); grouped = nil
+        input?.close(); ordered?.close(); ordered = nil; grouped?.close(); grouped = nil
         combined?.close(); combined = nil; deduplicated?.close(); deduplicated = nil; windowed?.close(); windowed = nil
         withQuery?.close(); withQuery = nil; columnar?.close(); columnar = nil; orderedJoin?.close(); orderedJoin = nil; orderedNWay?.close(); orderedNWay = nil
     }
@@ -605,9 +617,9 @@ internal enum ScanCost {
         let variable = touched.filter { ValueCodec.fixedWidth(store.tree.types[$0].type) == nil }
         if !variable.isEmpty {
             var scan = access.cursor(store); defer { scan.close() }
-            while let record = try scan.next() {
+            while let position = try scan.nextPosition() {
                 try meter.pollStep()
-                units = saturatingAdd(units, try payload(record, store: store, touched: variable))
+                units = saturatingAdd(units, try payload(position, store: store, touched: variable))
             }
         }
         return units
@@ -631,6 +643,19 @@ internal enum ScanCost {
         var units: Int64 = 0
         for column in touched where ValueCodec.fixedWidth(store.tree.types[column].type) == nil {
             guard let facts = try record.cells[column].largeFacts(encrypted: store.tree.codec.reservedBytes != 0) else { continue }
+            if facts.external != nil { units = saturatingAdd(units, Int64((facts.stored + chainSlab - 1) / chainSlab)) }
+            if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
+        }
+        return units
+    }
+    /// A preflight inspects the same packed tags, including dirty placeholder
+    /// cells, without reconstructing an unused key and every column's cell.
+    private static func payload(_ position: TreePosition, store: TableStore, touched: [Int]) throws -> Int64 {
+        let slab = store.tree.codec.capacity
+        let chainSlab = slab - (store.tree.codec.reservedBytes == 0 ? 0 : 16)
+        var units: Int64 = 0
+        for column in touched {
+            guard let facts = try position.cell(column).largeFacts(encrypted: store.tree.codec.reservedBytes != 0) else { continue }
             if facts.external != nil { units = saturatingAdd(units, Int64((facts.stored + chainSlab - 1) / chainSlab)) }
             if facts.compressed { units = saturatingAdd(units, Int64((facts.raw + slab - 1) / slab)) }
         }

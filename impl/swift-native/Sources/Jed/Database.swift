@@ -410,16 +410,16 @@ public final class Session {
                     let services = StatementServices(settings: planning, meter: meter)
                     var context = services.context()
                     let committed = transaction?.writer?.initial ?? transaction?.pin?.domains ?? pin.domains
-                    let plan = try prepared.select(query, snapshot: snapshot, settings: planning, context: context,
+                    let (plan, admittedParameters, requirements) = try prepared.select(query, snapshot: snapshot, settings: planning, context: context,
                         supplied: parameters, core: database.core.planIdentity, committed: committed)
-                    if SequenceExecution.mutates(plan.expressions) {
+                    if requirements?.mutatesSequences ?? SequenceExecution.mutates(plan.expressions) {
                         pin.close()
                         return try writeQuery(query, parameters: parameters, meter: meter, cancellation: cancellation)
                     }
                     let sequences = SequenceExecution(domains: pin.domains, history: sequenceHistory, meter: meter, writable: false)
                     sequences.install(into: &context)
-                    context.parameters = try ParameterBinding.bind(parameters, types: plan.parameters, timezone: settings.timeZone)
-                    let execution = SelectExecution(plan: plan, context: context), active = transaction
+                    context.parameters = try admittedParameters ?? ParameterBinding.bind(parameters, types: plan.parameters, timezone: settings.timeZone)
+                    let execution = SelectExecution(plan: plan, context: context, preparedRequirements: requirements), active = transaction
                     try execution.openCursor()
                     let rows = Rows(columns: plan.columns, meter: meter, guardCostOnPull: false,
                                     pull: { try pin.checkRole(); return try execution.next() },

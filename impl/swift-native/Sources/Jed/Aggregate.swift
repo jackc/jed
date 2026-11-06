@@ -8,6 +8,16 @@ internal struct AggregatePlan {
     let withinGroup: [AggregateOrder]
     let resultType: TypeDescriptor
     let star: Bool
+    let kernel: AggregateKernel
+
+    private init(metadata: FunctionSpecFact, name: String, inputTypes: [TypeDescriptor],
+                 directTypes: [TypeDescriptor], withinGroup: [AggregateOrder],
+                 resultType: TypeDescriptor, star: Bool) {
+        self.metadata = metadata; self.name = name; self.inputTypes = inputTypes
+        self.directTypes = directTypes; self.withinGroup = withinGroup
+        self.resultType = resultType; self.star = star
+        kernel = AggregateKernel.resolve(name: name, result: resultType.type, ordered: !withinGroup.isEmpty)
+    }
 
     static func resolve(name: String, inputTypes: [TypeDescriptor], star: Bool = false,
                         withinGroup: [AggregateOrder] = [], directTypes: [TypeDescriptor] = []) throws -> Self {
@@ -103,6 +113,43 @@ internal struct AggregateOrder {
     }
 }
 
+/// Runtime transition selection is a resolved-plan fact. Every execution
+/// owner uses this discriminator; SQL names and result types stay out of folds.
+internal enum AggregateKernel {
+    enum Bit { case and, or, xor }
+    case countStar, count, pairCount, pairs
+    case integerSum, exactSum, floatSum(binary32: Bool)
+    case exactMoments, floatMoments
+    case extreme(minimum: Bool), boolean(or: Bool), bit(Bit)
+    case collection, orderedSet, unsupported
+
+    static func resolve(name: String, result: SQLType, ordered: Bool) -> Self {
+        if ordered { return .orderedSet }
+        if AggregateCollection.names.contains(name) { return .collection }
+        if name == "count_star" { return .countStar }
+        if name == "count" { return .count }
+        if name == "regr_count" { return .pairCount }
+        if AggregateStatistics.pairs.contains(name) { return .pairs }
+        if AggregateStatistics.moments.contains(name) {
+            return result == .scalar(.f64) ? .floatMoments : .exactMoments
+        }
+        switch name {
+        case "sum", "avg":
+            if result == .scalar(.f32) { return .floatSum(binary32: true) }
+            if result == .scalar(.f64) { return .floatSum(binary32: false) }
+            return result == .scalar(.i64) ? .integerSum : .exactSum
+        case "min": return .extreme(minimum: true)
+        case "max": return .extreme(minimum: false)
+        case "bool_and", "every": return .boolean(or: false)
+        case "bool_or": return .boolean(or: true)
+        case "bit_and": return .bit(.and)
+        case "bit_or": return .bit(.or)
+        case "bit_xor": return .bit(.xor)
+        default: return .unsupported
+        }
+    }
+}
+
 /// One group/window owner creates and closes each state. The caller charges
 /// aggregate_accumulate before DISTINCT admission and fold; it also owns FILTER,
 /// argument evaluation, and in-aggregate ORDER BY. Fixed state rides group ENTRY.
@@ -122,8 +169,8 @@ internal final class AggregateState {
 
     init(plan: AggregatePlan, context: ExpressionContext, bounded: Bool = false) {
         self.plan = plan; self.context = context
-        if AggregateCollection.names.contains(plan.name) { collection = AggregateCollection(plan: plan, context: context, measured: !bounded) }
-        if !plan.withinGroup.isEmpty { orderedSet = AggregateOrderedSet(plan: plan, context: context, measured: !bounded) }
+        if case .collection = plan.kernel { collection = AggregateCollection(plan: plan, context: context, measured: !bounded) }
+        if case .orderedSet = plan.kernel { orderedSet = AggregateOrderedSet(plan: plan, context: context, measured: !bounded) }
     }
     /// Private finite-state tuple. Its field shape is also the bounded map's
     /// logical residency measure; retained inputs have a different owner.
@@ -204,71 +251,101 @@ internal final class AggregateState {
     private func increment() throws {
         guard count < Int64.max else { throw JedError("22003", "aggregate count out of range") }; count += 1
     }
-    func fold(_ values: [SQLValue]) throws {
+    private func checkFold(width: Int) throws {
         guard !closed else { throw JedError("55000", "aggregate state is closed") }
-        guard values.count == plan.inputTypes.count else { throw JedError("XX000", "aggregate argument width mismatch") }
-        if let orderedSet { try orderedSet.fold(values); return }
-        if let collection { try collection.fold(values); return }
-        let name = plan.name
-        if name == "count_star" { try increment(); return }
-        if name == "regr_count" {
-            if !values.contains(where: \.isNull) { try increment() }; return
-        }
-        if AggregateStatistics.pairs.contains(name) {
+        guard width == plan.inputTypes.count else { throw JedError("XX000", "aggregate argument width mismatch") }
+    }
+
+    /// The general tuple adapter remains the entry for grouped, window and
+    /// spill owners. A scalar owner need not allocate a one-element array.
+    func fold(_ values: [SQLValue]) throws {
+        try checkFold(width: values.count)
+        switch plan.kernel {
+        case .orderedSet: try orderedSet!.fold(values)
+        case .collection: try collection!.fold(values)
+        case .countStar: try increment()
+        case .pairCount:
+            if !values.contains(where: \.isNull) { try increment() }
+        case .pairs:
             if !values.contains(where: \.isNull) {
                 try moments.addPair(y: AggregateStatistics.number(values[0]), x: AggregateStatistics.number(values[1]))
             }
-            return
+        default:
+            guard let value = values.first else { throw JedError("XX000", "aggregate is missing its argument") }
+            try foldValue(value)
         }
-        guard let value = values.first else { throw JedError("XX000", "aggregate is missing its argument") }
+    }
+
+    func foldScalar(_ value: SQLValue) throws {
+        try checkFold(width: 1)
+        switch plan.kernel {
+        case .orderedSet: try orderedSet!.fold([value])
+        case .collection: try collection!.fold([value])
+        default: try foldValue(value)
+        }
+    }
+
+    /// COUNT's packed operand is stored nullness, not a fabricated SQL value.
+    func foldCount(isNull: Bool) throws {
+        try checkFold(width: 1)
+        guard case .count = plan.kernel else { throw JedError("XX000", "aggregate does not accept a nullness operand") }
+        if !isNull { try increment() }
+    }
+
+    func foldStar() throws {
+        try checkFold(width: 0)
+        guard case .countStar = plan.kernel else { throw JedError("XX000", "aggregate is missing its argument") }
+        try increment()
+    }
+
+    /// All scalar entry forms share these transitions and their existing
+    /// accumulator fields, work charges, overflow order and finalization.
+    private func foldValue(_ value: SQLValue) throws {
         if value.isNull { return }
-        if AggregateStatistics.moments.contains(name) {
-            if plan.resultType.type == .scalar(.f64) { try moments.add(try FloatFunctions.number(value)) }
-            else {
-                let x = try AggregateStatistics.decimal(value)
-                // Frozen cross-core transition schedule: the exact square's
-                // precision determines the combined addition charge. See the
-                // tracked pre-charge multiplication issue before changing this.
-                let square = x.multiplyingUncapped(x)
-                let work = DecimalFunctions.work("*", x, x) - 1 + DecimalFunctions.work("+", sum, x) - 1
-                    + DecimalFunctions.work("+", squares, square) - 1
-                context.meter.charge(work); try context.meter.guardCost()
-                sum = sum.addingUncapped(x); squares = squares.addingUncapped(square); try increment()
-            }
-            return
-        }
-        switch name {
-        case "count": try increment()
-        case "sum", "avg":
-            if plan.resultType.type == .scalar(.f32) || plan.resultType.type == .scalar(.f64) {
-                try float.add(value, binary32: plan.resultType.type == .scalar(.f32)); return
-            }
-            if plan.resultType.type == .scalar(.i64) {
-                guard case .integer(let value) = value else { throw JedError("XX000", "integer aggregate operand mismatch") }
-                let next = integer.addingReportingOverflow(value)
-                guard !next.overflow else { throw JedError("22003", "bigint out of range").withDataType("i64") }; integer = next.partialValue
-            } else {
-                let value = try AggregateStatistics.decimal(value)
-                try DecimalFunctions.chargeWork("+", sum, value, meter: context.meter)
-                sum = sum.addingUncapped(value)
-            }
+        switch plan.kernel {
+        case .count: try increment()
+        case .integerSum:
+            guard case .integer(let value) = value else { throw JedError("XX000", "integer aggregate operand mismatch") }
+            let next = integer.addingReportingOverflow(value)
+            guard !next.overflow else { throw JedError("22003", "bigint out of range").withDataType("i64") }; integer = next.partialValue
             try increment()
-        case "min", "max":
+        case .exactSum:
+            let value = try AggregateStatistics.decimal(value)
+            try DecimalFunctions.chargeWork("+", sum, value, meter: context.meter)
+            sum = sum.addingUncapped(value)
+            try increment()
+        case .floatSum(let binary32): try float.add(value, binary32: binary32)
+        case .floatMoments: try moments.add(try FloatFunctions.number(value))
+        case .exactMoments:
+            let x = try AggregateStatistics.decimal(value)
+            // Frozen cross-core transition schedule: the exact square's
+            // precision determines the combined addition charge. See the
+            // tracked pre-charge multiplication issue before changing this.
+            let square = x.multiplyingUncapped(x)
+            let work = DecimalFunctions.work("*", x, x) - 1 + DecimalFunctions.work("+", sum, x) - 1
+                + DecimalFunctions.work("+", squares, square) - 1
+            context.meter.charge(work); try context.meter.guardCost()
+            sum = sum.addingUncapped(x); squares = squares.addingUncapped(square); try increment()
+        case .extreme(let minimum):
             if current.isNull { current = value }
             else {
                 let comparison = try ValueComparison.total(value, current, type: plan.inputTypes[0], collatedKey: context.collatedKey)
-                if name == "min" ? comparison < 0 : comparison > 0 { current = value }
+                if minimum ? comparison < 0 : comparison > 0 { current = value }
             }
-        case "bool_and", "every", "bool_or":
+        case .boolean(let or):
             guard case .boolean(let incoming) = value else { throw JedError("XX000", "boolean aggregate operand mismatch") }
-            if case .boolean(let previous) = current { current = .boolean(name == "bool_or" ? previous || incoming : previous && incoming) }
+            if case .boolean(let previous) = current { current = .boolean(or ? previous || incoming : previous && incoming) }
             else { current = value }
-        case "bit_and", "bit_or", "bit_xor":
+        case .bit(let operation):
             guard case .integer(let incoming) = value else { throw JedError("XX000", "bit aggregate operand mismatch") }
             if case .integer(let previous) = current {
-                current = .integer(name == "bit_and" ? previous & incoming : name == "bit_or" ? previous | incoming : previous ^ incoming)
+                switch operation {
+                case .and: current = .integer(previous & incoming)
+                case .or: current = .integer(previous | incoming)
+                case .xor: current = .integer(previous ^ incoming)
+                }
             } else { current = value }
-        default: throw JedError("0A000", "aggregate kernel is not yet connected: \(name)")
+        default: throw JedError("0A000", "aggregate kernel is not yet connected: \(plan.name)")
         }
     }
     /// Only COUNT has an exact inverse across a moving window boundary.

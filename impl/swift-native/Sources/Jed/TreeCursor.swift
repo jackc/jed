@@ -13,7 +13,7 @@ internal struct TreePosition: Sendable {
     let row: Int
 
     func record() -> PackedRecord { node.record(at: row) }
-    func cell(_ column: Int) -> StoredCell { node.leaf!.cell(row: row, column: column) }
+    func cell(_ column: Int) -> StoredCell { node.cell(row: row, column: column) }
     func materialize(_ column: Int, pager: Pager?) throws -> SQLValue {
         let cell = cell(column)
         if let overflow = node.pending[row]?[column] {
@@ -25,7 +25,7 @@ internal struct TreePosition: Sendable {
 }
 
 /// A snapshot cursor owns only its root, one interior frame per level, and its
-/// current packed leaf. It never collects a range or follows sibling links.
+/// current leaf. It never collects a range or follows sibling links.
 internal struct TreeCursor: Sendable {
     private struct Frame: Sendable {
         let node: TreeNode
@@ -52,10 +52,10 @@ internal struct TreeCursor: Sendable {
     }
 
     mutating func nextPosition() throws -> TreePosition? {
-        guard let tree, !finished else { return nil }
+        guard !finished else { return nil }
         if !started {
             started = true
-            guard let root = tree.root else { finish(); return nil }
+            guard let tree, let root = tree.root else { finish(); return nil }
             if let lower, let upper,
                upper.key.lexicographicallyPrecedes(lower.key) ||
                 (upper.key == lower.key && (!upper.inclusive || !lower.inclusive)) {
@@ -66,12 +66,12 @@ internal struct TreeCursor: Sendable {
         while let leaf {
             if row >= 0, row < leaf.entryCount {
                 if let lower {
-                    let key = leaf.leaf!.key(at: row)
+                    let key = leaf.key(at: row)
                     if key.lexicographicallyPrecedes(lower.key) ||
                         (key.elementsEqual(lower.key) && !lower.inclusive) { finish(); return nil }
                 }
                 if let upper {
-                    let key = leaf.leaf!.key(at: row)
+                    let key = leaf.key(at: row)
                     if upper.key.lexicographicallyPrecedes(key) ||
                         (key.elementsEqual(upper.key) && !upper.inclusive) { finish(); return nil }
                 }
@@ -79,6 +79,9 @@ internal struct TreeCursor: Sendable {
                 row += descending ? -1 : 1
                 return position
             }
+            // The tree is needed only at a leaf transition. Binding it before
+            // the row loop copies its reference-bearing snapshot on every pull.
+            guard let tree else { finish(); return nil }
             try advanceLeaf(tree)
         }
         finish(); return nil

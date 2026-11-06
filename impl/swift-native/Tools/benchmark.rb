@@ -320,9 +320,11 @@ module SwiftNativeBenchmark
     sources.each { |name, bytes| File.binwrite(File.join(corpus, name), bytes) }
     input_path = File.join(output, "input.json"); File.write(input_path, JSON.pretty_generate(projected) + "\n")
     metadata = {
-      baseline: BASELINE, corpus_sha256: HASHES, dataset_images: images, data_directory: data,
+      baseline: BASELINE, corpus_sha256: sources.transform_values { Digest::SHA256.hexdigest(_1) },
+      canonical_corpus_sha256: HASHES, dataset_images: images, data_directory: data,
       selected: projected.fetch(:benchmarks).map { _1.fetch(:name) }, omitted: all - projected.fetch(:benchmarks).map { _1.fetch(:name) },
-      diagnostic: !filter.nil? || cores.sort != CORES.sort, cores: cores, rounds: rounds,
+      diagnostic: !filter.nil? || cores.sort != CORES.sort || projected.fetch(:benchmarks).length != all.length,
+      cores: cores, rounds: rounds,
       commands: %w[swift rustc go node ruby].to_h { |tool| [tool, command([tool, tool == "go" ? "version" : "--version"])] },
       git_head: command(%w[git rev-parse HEAD]), git_status: command(%w[git status --porcelain]),
       uname: command(%w[uname -a]), cpu: command(%w[lscpu]), filesystem: command(["df", "-T", data]),

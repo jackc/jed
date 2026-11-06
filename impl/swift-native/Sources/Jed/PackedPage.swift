@@ -115,22 +115,6 @@ internal final class PackedLeaf: Sendable {
         try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0)
     }
 
-    /// Dirty nodes stay packed even when no valid split exists. Pending writes
-    /// retain these bytes until commit preflight rejects the physical page fit;
-    /// the on-disk initializer above always uses the codec's exact capacity.
-    static func pending(_ records: [PackedRecord], types: [TypeDescriptor], codec: any PageCodec) throws -> PackedLeaf {
-        let total = records.reduce(overhead(records: records.count, types: types)) { $0 + $1.weight }
-        guard total <= UInt32.max else { throw JedError("0A000", "pending leaf exceeds the byte-format limit") }
-        let capacity = max(codec.capacity, total)
-        let payload = try encodePayload(records, types: types, capacity: capacity)
-        var writer = ByteWriter(); writer.u8(2); writer.u8(0); writer.u16(0)
-        writer.u32(UInt32(records.count)); writer.u32(0); writer.u32(0); writer.append(payload)
-        writer.append(repeatElement(UInt8(0), count: capacity - payload.count))
-        var bytes = writer.bytes
-        try PageEnvelope.putU32(PageEnvelope.checksum(bytes, at: 12), into: &bytes, at: 12)
-        return try PackedLeaf(bytes: bytes, types: types, capacity: capacity, encrypted: codec.reservedBytes != 0)
-    }
-
     convenience init(integrityBytes bytes: [UInt8], types: [TypeDescriptor], codec: any PageCodec) throws {
         try self.init(bytes: bytes, types: types, capacity: codec.capacity, encrypted: codec.reservedBytes != 0, integrity: true)
     }

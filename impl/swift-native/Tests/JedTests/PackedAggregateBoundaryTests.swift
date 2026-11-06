@@ -81,8 +81,11 @@ final class PackedAggregateBoundaryTests: XCTestCase {
         }
         let resolved = try SelectPlan.resolve(syntax, snapshot: snapshot, settings: settings, scalar: context.scalar)
         let plan = try resolved.selectAccess(parameters: context.parameters, context: context)
-        let aggregate = try XCTUnwrap(plan.aggregation)
-        XCTAssertEqual(ColumnarExecution.packedWholeTable(plan, aggregate, context), expectPacked, sql)
+        if let aggregate = plan.aggregation {
+            XCTAssertEqual(ColumnarExecution.packedAggregation(plan, aggregate, context), expectPacked, sql)
+        } else {
+            XCTAssertEqual(ColumnarExecution.projection(plan, context), expectPacked, sql)
+        }
         let execution = SelectExecution(plan: plan, context: context)
         defer { execution.close() }
         var output: [[UInt8]] = [], failure: String?
@@ -138,8 +141,7 @@ final class PackedAggregateBoundaryTests: XCTestCase {
         cursor.close()
         XCTAssertTrue(sawPending, "dirty probe must retain an untouched overflow payload")
         try check(dirty)
-        // Variable-width COUNT intentionally remains outside this first direct lane.
-        try compare("SELECT count(pad) FROM t", snapshot: dirty, environment: database.environment, expectPacked: false)
+        try compare("SELECT count(pad) FROM t", snapshot: dirty, environment: database.environment)
     }
 
     func testGroupEntryAndOutputHaveSeparateMemoryAdmissions() throws {
@@ -159,6 +161,65 @@ final class PackedAggregateBoundaryTests: XCTestCase {
         XCTAssertEqual(outputFailure.error, "54P05"); XCTAssertEqual(outputFailure.peak, 32)
         XCTAssertEqual(outputFailure.cost, direct.cost - 1, "output admission precedes row production")
         XCTAssertTrue(outputFailure.rows.isEmpty)
+    }
+
+    func testFilteredBoundsGroupsAndProjectionShareThePackedReader() throws {
+        let (initial, device) = try fixture()
+        var database = initial
+        defer { try? database.close() }
+        try database.execute("UPDATE t SET pad=CASE WHEN id%3=0 THEN NULL ELSE ('p'||id::text)::bytea END")
+        let probes = [
+            "SELECT count(pad),min(pad),max(pad),sum(b) FROM t WHERE id>=11 AND id<73 AND b IS NOT NULL",
+            "SELECT a,count(pad),sum(b) FROM t WHERE id<=40 GROUP BY a",
+            "SELECT count(pad) FROM t WHERE id>200",
+            "SELECT id,pad,id FROM t WHERE id<=40 AND b IS NOT NULL",
+            "SELECT pad,id FROM t",
+        ]
+        func check(_ snapshot: DomainSnapshot) throws {
+            for sql in probes { try compare(sql, snapshot: snapshot, environment: database.environment) }
+        }
+        try check(database.core.routingSnapshot)
+        database = try reopen(database, device: device)
+        try check(database.core.routingSnapshot)
+        let pinned = database.core.routingSnapshot
+        let writer = try database.writeSession(); defer { writer.close() }
+        try writer.execute("UPDATE t SET pad='changed'::bytea,a=7 WHERE id<=20")
+        let dirty = try XCTUnwrap(writer.transaction?.working.snapshots[DomainNames.main])
+        try check(dirty)
+        try check(pinned)
+        let old = try run("SELECT count(pad),min(pad) FROM t", snapshot: pinned, environment: database.environment)
+        let new = try run("SELECT count(pad),min(pad) FROM t", snapshot: dirty, environment: database.environment)
+        XCTAssertNotEqual(old.rows, new.rows, "the pinned and dirty snapshots must stay independent")
+    }
+
+    func testVariableCountReadsNullnessWithoutDecodingBodiesOrFollowingOverflow() throws {
+        let (database, device) = try fixture(); defer { try? database.close() }
+        try database.execute("CREATE TABLE nullness(id i32 PRIMARY KEY,v bytea)")
+        try database.execute("INSERT INTO nullness VALUES(1,'value'::bytea)")
+        let name = try SQLText("nullness"), base = database.core.routingSnapshot
+        let original = try XCTUnwrap(base.tables[name])
+        var cursor = original.cursor()
+        let record = try XCTUnwrap(cursor.next()); cursor.close()
+        var external = ByteWriter()
+        external.u8(2); external.u32(UInt32.max); external.u32(8)
+        // Both cells have valid page-level tags. The first has an invalid
+        // inline length; the second refers to a nonexistent overflow page.
+        let bodies: [[UInt8]] = [[0,0,2,41], external.bytes]
+        for body in bodies {
+            var cells = record.cells
+            cells[1] = StoredCell(bytes: body[...], type: cells[1].type)
+            var table = original
+            try table.put(PackedRecord(key: record.key, cells: cells), netStaging: false)
+            var snapshot = base; snapshot.setTableStore(name, table)
+            device.arm(reject: true)
+            let counted = try run("SELECT count(v) FROM nullness", snapshot: snapshot, environment: database.environment)
+            XCTAssertNil(counted.error)
+            XCTAssertEqual(counted.rows, [try SpillRowCodec.encode([.integer(1)])])
+            XCTAssertEqual(device.reads, 0, "nullness must not follow an overflow pointer")
+            device.arm()
+            let decoded = try run("SELECT min(v) FROM nullness", snapshot: snapshot, environment: database.environment)
+            XCTAssertEqual(decoded.error, "XX001", "value consumers must still validate the stored body")
+        }
     }
 
     func testCanceledAndFailedPackedReadsReleaseGroupOwnership() throws {
@@ -208,6 +269,12 @@ final class PackedAggregateBoundaryTests: XCTestCase {
             }
             XCTAssertEqual(actual, raw)
             XCTAssertTrue(try retained.materialize(2, pager: nil).isNull)
+            let frame = PackedLaneRow(width: types.count, touched: [0,1,2], pager: nil)
+            frame.begin(retained)
+            let saved = try frame.value(1)
+            frame.close(); frame.close()
+            guard case .bytea(let owned) = saved else { return XCTFail("packed row lost its returned value") }
+            XCTAssertEqual(owned, raw, "returned values must outlive the frame and its leaf position")
         }
     }
 }

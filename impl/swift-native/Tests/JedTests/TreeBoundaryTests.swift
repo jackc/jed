@@ -32,8 +32,8 @@ final class TreeBoundaryTests: XCTestCase {
             if node.isLeaf {
                 XCTAssertGreaterThan(node.entryCount, 0, "committed leaf cannot be empty")
                 if node.entryCount > 0 {
-                    try BPlusTree.checkBounds(Array(node.leaf!.key(at: 0)),
-                        Array(node.leaf!.key(at: node.entryCount - 1)), lower: lower, upper: upper)
+                    try BPlusTree.checkBounds(Array(node.key(at: 0)),
+                        Array(node.key(at: node.entryCount - 1)), lower: lower, upper: upper)
                 }
                 return (1, 1)
             }
@@ -87,6 +87,39 @@ final class TreeBoundaryTests: XCTestCase {
         XCTAssertNil(cache.capacity)
         XCTAssertEqual(try orderedKeys(source).count, 200)
         XCTAssertGreaterThan(cache.residentLeaves, 1)
+    }
+
+    func testCopiedCursorRetainsIndependentPositionAcrossEvictionAndClose() throws {
+        let codec = try PlainPageCodec(pageSize: 256), device = MemoryBlockStore()
+        var tree = BPlusTree(codec: codec, types: [])
+        for id in 0..<400 { try tree.insert(PackedRecord(key: key(id), cells: [])) }
+        var allocator = try PageAllocator(highWater: 2, free: [], firstBody: 2)
+        let written = try tree.serialize(allocator: &allocator, fromScratch: true)
+        try write(written.pages, to: device, pageSize: 256)
+        let reads = TreeReadCounter(), cache = try pool(device, codec: codec, reads: reads)
+        let source = try BPlusTree.open(root: written.root, pageCount: allocator.highWater, types: [], pool: cache)
+        var original = TreeCursor(source, lower: TreeBound(key(0)), upper: TreeBound(key(175), inclusive: false))
+        let first = try XCTUnwrap(original.nextPosition())
+        XCTAssertEqual(first.record().key, key(0))
+        XCTAssertGreaterThan(first.node.entryCount, 1)
+        var copied = original
+        for id in 1..<175 { XCTAssertEqual(try original.next()?.key, key(id)) }
+        XCTAssertNil(try original.next())
+        let expectedVisits = original.visitedNodes
+        original.close(); cache.invalidateAll()
+
+        // The copy still owns its first leaf after another cursor advances,
+        // closes, and evicts the cache. It faults later leaves only on demand.
+        let before = reads.value.withLock { $0 }
+        XCTAssertEqual(try copied.next()?.key, key(1))
+        XCTAssertEqual(reads.value.withLock { $0 }, before)
+        for id in 2..<175 { XCTAssertEqual(try copied.next()?.key, key(id)) }
+        XCTAssertNil(try copied.next())
+        XCTAssertGreaterThan(reads.value.withLock { $0 }, before)
+        XCTAssertEqual(copied.visitedNodes, expectedVisits)
+        copied.rewind(); XCTAssertEqual(try copied.next()?.key, key(0))
+        copied.close(); XCTAssertNil(try copied.next())
+        XCTAssertNil(try original.next())
     }
 
     func testStreamReadAheadStartsAtOneAndFailedHintsRemainPhysicalOnly() throws {
@@ -279,11 +312,9 @@ final class TreeBoundaryTests: XCTestCase {
             XCTAssertEqual(store.pendingBytes, Int64(large.key.count))
             XCTAssertEqual(try store.get(large.key)?.key, large.key)
             XCTAssertEqual(try orderedKeys(store.tree), [small.key, large.key])
-            let leaf = try XCTUnwrap(store.tree.resolve(XCTUnwrap(store.tree.root)).leaf)
-            XCTAssertGreaterThan(leaf.bytes.count, codec.pageSize - codec.reservedBytes)
-            XCTAssertThrowsError(try PackedLeaf(bytes: leaf.bytes, types: [], codec: codec)) {
-                XCTAssertEqual(($0 as? JedError)?.code, "XX001")
-            }
+            let leaf = try store.tree.resolve(XCTUnwrap(store.tree.root))
+            XCTAssertGreaterThan(leaf.payloadSize, codec.capacity)
+            XCTAssertNil(leaf.leaf)
             XCTAssertThrowsError(try PackedLeaf.encodePayload([small, large],
                 types: [], capacity: codec.capacity)) {
                 XCTAssertEqual(($0 as? JedError)?.code, "0A000")

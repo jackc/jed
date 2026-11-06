@@ -160,7 +160,7 @@ The shared generator produced these files locally; their sidecars contain the `d
 
 ## What the timers measure
 
-`spec/design/benchmarks.md` §§3–8 and the unchanged shared records define SQL, setup, seed, parameters, warmups, iterations, and durability. Warmup and measured parameters share one continuous SplitMix64 stream. Queries include parameter generation, prepared execution, full result draining and checksum folding. Ordinary setup and preparation happen outside that per-query timed span.
+`spec/design/benchmarks.md` §§3–8 and the unchanged shared records define SQL, setup, seed, parameters, warmups, iterations, and durability. Warmup and measured parameters share one continuous SplitMix64 stream. Queries include prepared execution, full result draining and checksum folding. A later adapter audit found that query/durable parameter generation is inside Swift and Go timers but outside Rust and TypeScript timers (and the original Ruby adapter). The retained actors are unchanged; this asymmetry qualifies small parameterized comparisons but cannot explain parameter-free aggregate gaps. Ordinary setup and preparation happen outside that per-query timed span.
 
 Rollback ns/op includes BEGIN, the complete authored batch of writes, and ROLLBACK; it is not automatically ns per modified row or per individual statement. Durable-write ns/op covers one real autocommit and its durability work. Default synchronous mode stays on; only the authored `insert_commit_relaxed` and `update_commit_relaxed` lanes use relaxed mode. Their post-run counts include warmup writes as required.
 

@@ -5,6 +5,19 @@ try benchmarkSelfCheck()
 let arguments = Array(CommandLine.arguments.dropFirst())
 if arguments == ["--check-adapter"] {
     print("benchmark PRNG and checksum vectors: PASS")
+} else if arguments == ["--value-layout"] {
+    // Physical layout is diagnostic metadata, never the logical query-memory
+    // schedule. Run outside any measured workload.
+    let layout = [
+        "SQLValue": MemoryLayout<SQLValue>.stride,
+        "SQLType": MemoryLayout<SQLType>.stride,
+        "SQLJSONValue": MemoryLayout<SQLJSONValue>.stride,
+        "SQLArray": MemoryLayout<SQLArray>.stride,
+        "SQLDecimal": MemoryLayout<SQLDecimal>.stride,
+        "TypeDescriptor": MemoryLayout<TypeDescriptor>.stride,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: layout, options: [.sortedKeys])
+    print(String(decoding: data, as: UTF8.self))
 } else {
     guard arguments.count == 4 else {
         throw BenchmarkError("usage: jed-bench <mechanical-input.json> <data-dir> <results.jsonl> <samples.jsonl>")

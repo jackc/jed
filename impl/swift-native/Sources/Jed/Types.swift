@@ -74,11 +74,13 @@ public struct CompositeType: Sendable, Equatable {
     }
 }
 
-public indirect enum SQLType: Sendable, Equatable {
+/// Scalar types do not need a heap box. Recursive and large descriptors retain
+/// indirection; field lists already have their own shared array storage.
+public enum SQLType: Sendable, Equatable {
     case scalar(ScalarType)
-    case composite(CompositeType)
-    case array(SQLType)
-    case range(SQLType)
+    indirect case composite(CompositeType)
+    indirect case array(SQLType)
+    indirect case range(SQLType)
     case record([TypeField])
 
     public var name: String {

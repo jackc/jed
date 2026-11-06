@@ -1,25 +1,28 @@
 /// Values carry their exact representation; resolved expressions and column
 /// descriptors carry static types. SQL comparison is explicit: synthesized
 /// Equatable would get decimals, floats, intervals and NULL wrong.
-public indirect enum SQLValue: Sendable {
+/// Keep scalar payloads and collection handles inline. Boxing the whole enum
+/// would allocate even an integer decoded from a resident page. Only large or
+/// recursively embedded payloads are indirect, so scalar row slots stay small.
+public enum SQLValue: Sendable {
     case null
     case integer(Int64)
     case boolean(Bool)
     case text(SQLText)
-    case decimal(SQLDecimal)
+    indirect case decimal(SQLDecimal)
     case bytea([UInt8])
     case uuid(SQLUUID)
     case timestamp(Int64)
     case timestamptz(Int64)
     case date(Int32)
-    case interval(SQLInterval)
+    indirect case interval(SQLInterval)
     case f32(UInt32)
     case f64(UInt64)
     case composite([SQLValue])
-    case array(SQLArray)
-    case range(SQLRange)
+    indirect case array(SQLArray)
+    indirect case range(SQLRange)
     case json(SQLText)
-    case jsonb(SQLJSONValue)
+    indirect case jsonb(SQLJSONValue)
     case jsonpath(SQLText)
 
     public var isNull: Bool {
@@ -120,11 +123,11 @@ public struct SQLJSONMember: Sendable {
 
 /// jsonb's exact-number tree. Object order and duplicate elimination belong to
 /// the handwritten JSON parser/canonicalizer, never a host dictionary encoder.
-public indirect enum SQLJSONValue: Sendable {
+public enum SQLJSONValue: Sendable {
     case null
     case boolean(Bool)
     case string(SQLText)
-    case number(SQLDecimal)
+    indirect case number(SQLDecimal)
     case array([SQLJSONValue])
     case object([SQLJSONMember])
 }

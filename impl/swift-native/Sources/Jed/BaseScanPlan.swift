@@ -217,34 +217,11 @@ internal struct ScanAccess {
         ScanCursor(store: store, intervals: isEmpty ? [] : intervals ?? [ScanInterval(lower: lower, upper: upper)], descending: descending)
     }
     func pages(_ tree: BPlusTree) -> Int64 {
-        guard !isEmpty, let root = tree.root else { return 0 }
+        guard !isEmpty, tree.root != nil else { return 0 }
         if let intervals {
             return intervals.reduce(0) { saturatingAdd($0, ScanAccess(lower: $1.lower, upper: $1.upper, isEmpty: false).pages(tree)) }
         }
-        if lower == nil && upper == nil { return Int64(tree.nodeCount) }
-        func overlaps(_ low: [UInt8]?, _ high: [UInt8]?) -> Bool {
-            if let lower, let high, !lower.key.lexicographicallyPrecedes(high) { return false }
-            if let upper, let low, upper.key.lexicographicallyPrecedes(low) || (upper.key == low && !upper.inclusive) { return false }
-            return true
-        }
-        func visit(_ node: TreeNode, low: [UInt8]?, high: [UInt8]?) -> Int64 {
-            if !overlaps(low, high) { return 0 }
-            var count: Int64 = 1
-            for ordinal in node.children.indices {
-                let a = ordinal == 0 ? low : node.keys[ordinal - 1]
-                let b = ordinal < node.keys.count ? node.keys[ordinal] : high
-                guard overlaps(a, b) else { continue }
-                switch node.children[ordinal] {
-                case .resident(let child): count += visit(child, low: a, high: b)
-                case .onDisk: count += 1
-                }
-            }
-            return count
-        }
-        switch root {
-        case .resident(let node): return visit(node, low: nil, high: nil)
-        case .onDisk: return 1
-        }
+        return Int64(tree.overlapNodeCount(lower: lower, upper: upper))
     }
 }
 
@@ -262,13 +239,16 @@ internal struct ScanCursor {
         self.store = store; self.intervals = descending ? Array(intervals.reversed()) : intervals; self.descending = descending
     }
     mutating func next() throws -> PackedRecord? {
+        try nextPosition()?.record()
+    }
+    mutating func nextPosition() throws -> TreePosition? {
         while true {
             if current == nil {
                 guard position < intervals.count else { return nil }
                 let bounds = intervals[position]; position += 1
                 current = store.cursor(lower: bounds.lower, upper: bounds.upper, descending: descending)
             }
-            if let row = try current?.next() { return row }
+            if let row = try current?.nextPosition() { return row }
             current?.close(); current = nil
         }
     }

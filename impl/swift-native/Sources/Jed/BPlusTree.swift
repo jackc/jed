@@ -12,11 +12,12 @@ internal enum TreeChild: Sendable {
     }
 }
 
-/// Records reside in packed bytes, including dirty nodes. Decoded records are
-/// bounded writer scratch. Fresh overflow bytes live beside their placeholder
-/// cells until serialization, indexed by row and then declared column ordinal.
+/// Clean leaves borrow packed bytes; writer leaves retain immutable stored
+/// records until serialization. Fresh overflow bytes live beside their
+/// placeholder cells, indexed by row and then declared column ordinal.
 internal final class TreeNode: Sendable {
     let leaf: PackedLeaf?
+    private let recordLeaf: RecordLeaf?
     let pending: [Int: [Int: PendingOverflow]]
     let keys: [[UInt8]]
     let children: [TreeChild]
@@ -27,18 +28,25 @@ internal final class TreeNode: Sendable {
     let containsRecords: Bool
 
     var isLeaf: Bool { children.isEmpty }
-    var entryCount: Int { isLeaf ? leaf?.count ?? 0 : keys.count }
+    var entryCount: Int { isLeaf ? leaf?.count ?? recordLeaf?.records.count ?? 0 : keys.count }
 
     init(leaf: PackedLeaf?, pending: [Int: [Int: PendingOverflow]] = [:], reference: PageReference? = nil,
          emptyPayload: Int = 0) {
         self.leaf = leaf; self.pending = pending; self.reference = reference
+        recordLeaf = nil
         keys = []; children = []; payloadSize = leaf?.payloadSize ?? emptyPayload
         height = 1; nodeCount = 1
         containsRecords = leaf != nil
     }
 
+    init(records: RecordLeaf, reference: PageReference? = nil) {
+        leaf = nil; recordLeaf = records; pending = records.pending; self.reference = reference
+        keys = []; children = []; payloadSize = records.payloadSize
+        height = 1; nodeCount = 1; containsRecords = !records.records.isEmpty
+    }
+
     init(keys: [[UInt8]], children: [TreeChild], codec: any PageCodec, reference: PageReference? = nil) {
-        leaf = nil; pending = [:]; self.keys = keys; self.children = children; self.reference = reference
+        leaf = nil; recordLeaf = nil; pending = [:]; self.keys = keys; self.children = children; self.reference = reference
         payloadSize = PackedInterior.payloadSize(keys: keys, codec: codec)
         height = 1 + (children.first?.height ?? 0)
         nodeCount = children.reduce(1) { $0 + $1.nodeCount }
@@ -46,11 +54,22 @@ internal final class TreeNode: Sendable {
     }
 
     func record(at index: Int) -> PackedRecord {
+        if let recordLeaf { return recordLeaf.records[index] }
         let record = leaf!.record(at: index)
         return PackedRecord(key: record.key, cells: record.cells, overflows: pending[index] ?? [:])
     }
 
-    func records() -> [PackedRecord] { (0..<entryCount).map { record(at: $0) } }
+    func records() -> [PackedRecord] { recordLeaf?.records ?? (0..<entryCount).map { record(at: $0) } }
+
+    func key(at index: Int) -> ArraySlice<UInt8> {
+        if let leaf { return leaf.key(at: index) }
+        return recordLeaf!.records[index].key[...]
+    }
+
+    func cell(row: Int, column: Int) -> StoredCell {
+        if let leaf { return leaf.cell(row: row, column: column) }
+        return recordLeaf!.records[row].cells[column]
+    }
 
     func childSlot(_ key: [UInt8]) -> Int {
         var lower = 0, upper = keys.count
@@ -66,10 +85,10 @@ internal final class TreeNode: Sendable {
         var lower = 0, upper = entryCount
         while lower < upper {
             let middle = lower + (upper - lower) / 2
-            if leaf!.key(at: middle).lexicographicallyPrecedes(key) { lower = middle + 1 }
+            if self.key(at: middle).lexicographicallyPrecedes(key) { lower = middle + 1 }
             else { upper = middle }
         }
-        return (lower, lower < entryCount && leaf!.key(at: lower).elementsEqual(key))
+        return (lower, lower < entryCount && self.key(at: lower).elementsEqual(key))
     }
 }
 
@@ -192,10 +211,15 @@ internal struct BPlusTree: Sendable {
             throw JedError("0A000", "record differs from its tree's type contract")
         }
         guard count != Int64.max else { throw JedError("54000", "tree row count exhausted") }
+        // Composite equality is nominal. Retain the tree's current metadata,
+        // as reconstructing this record from a packed page would do.
+        let canonical = PackedRecord(key: record.key, cells: record.cells.enumerated().map {
+            StoredCell(bytes: $0.element.bytes, type: types[$0.offset])
+        }, overflows: record.overflows)
         let result: Rebuild
         var previous: PackedRecord?
-        if let root { result = try inserting(resolve(root), record: record, previous: &previous) }
-        else { result = .whole(try makeLeaf([record])) }
+        if let root { result = try inserting(resolve(root), record: canonical, previous: &previous) }
+        else { result = .whole(try makeLeaf([canonical])) }
         let newRoot: TreeNode
         switch result {
         case .whole(let node): newRoot = node
@@ -231,13 +255,7 @@ internal struct BPlusTree: Sendable {
     }
 
     private func makeLeaf(_ records: [PackedRecord], reference: PageReference? = nil) throws -> TreeNode {
-        if records.isEmpty {
-            return TreeNode(leaf: nil, emptyPayload: PackedLeaf.overhead(records: 0, types: types))
-        }
-        let leaf = try PackedLeaf.pending(records, types: types, codec: codec)
-        var pending: [Int: [Int: PendingOverflow]] = [:]
-        for (row, record) in records.enumerated() where !record.overflows.isEmpty { pending[row] = record.overflows }
-        return TreeNode(leaf: leaf, pending: pending, reference: reference)
+        TreeNode(records: try RecordLeaf(records, types: types), reference: reference)
     }
 
     /// Exact format.md fan-out selection. nil is the first delete abandon guard.
@@ -390,7 +408,7 @@ internal struct BPlusTree: Sendable {
         var allocation = allocator, pages: [StoredPage] = [], kept: Set<UInt32> = []
         var chains: [PageReference] = []
         // A whole-image export has a different page-address space. Its returned
-        // tree retains packed leaves until the destination binds its own pool;
+        // tree retains encoded records until the destination binds its own pool;
         // never send its newly assigned ids to the source's cache/device.
         var result = fromScratch ? BPlusTree(codec: codec, types: types) : self
         result.count = count

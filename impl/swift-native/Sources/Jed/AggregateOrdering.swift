@@ -52,7 +52,7 @@ internal final class AggregateOrdering {
         for entry in rows {
             try context.meter.checkpoint()
             let operand = entry.row[order.count]
-            if state.plan.inputTypes.count == 1 { try state.fold([operand]) }
+            if state.plan.inputTypes.count == 1 { try state.foldScalar(operand) }
             else if case .composite(let arguments) = operand { try state.fold(arguments) }
             else { throw JedError("XX000", "ordered aggregate tuple shape mismatch") }
         }

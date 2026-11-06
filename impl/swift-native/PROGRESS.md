@@ -1,5 +1,131 @@
 # Swift experiment progress
 
+## Authorized structural performance follow-up (2026-11-06, in progress)
+
+The maintainer requested investigation and broad fixes for the final Swift/peer
+gap. The original completed snapshot and all evidence below remain preserved;
+the new investigation starts at local-only `56972d2f`. See
+[the investigation design](../../spec/design/swift-native-performance.md).
+No new production-delivery decision or default-task inclusion is implied.
+
+Initial static audit confirms the original actor was compiled with `-O` and
+whole-module optimization on Swift 6.4.2, with matching runtime libraries and
+no sanitizer/testability flags. Current cgroups show no CPU/memory cap. This
+does not establish controlled historical clock/governor conditions.
+
+Identified structural hypotheses: enum-wide `indirect` boxes scalar SQL values
+and types; every TreeCursor row copies the BPlusTree value; nominal columnar
+paths commonly reconstruct rows and contexts; variable-width storage-cost
+preflight constructs complete records; peers use packed nullness/span filters
+and reusable scratch rows. Ruby's old timing reports use different revisions,
+locking and statistics, and its generated kernels are a material architectural
+difference. No direct Ruby speed ratio is claimed.
+
+The first controlled source experiment changes only Value.swift/Types.swift to
+selective indirection (plus an untimed layout diagnostic). All eight canonical
+workloads pass across three alternating rounds against the retained original
+actor, pinned to CPU 1. SQLValue now occupies 16 bytes inline, SQLType and
+SQLJSONValue eight each. Full-scan aggregate median time falls from 217.843 to
+151.244 ms (1.4403×); point lookup improves 1.0450×, array COUNT 1.0855×,
+array containment 1.0553×, text nullness 1.0909×, text MAX 1.0794×. Durable insert
+changes 1.0223× amid visibly overlapping round ranges. These are focused
+experiments, not new whole-suite or peer ratios. Evidence:
+`results/architecture-20261106/value-layout-comparison`; candidate actor SHA-256
+`7bc64cc8df35aedc92979c123d5eb11de7b12487a9f2b735ca675f7c397ccf7d`.
+
+The lookup sampler identifies retained-tree ownership and linear page-cost
+counting in the hot path; its 49 observations are call-path evidence, not CPU
+percentages. The array COUNT sampler mostly observed setup and cannot establish
+the query's hot path. Both captures and the initial socket-denied failure remain
+under `results/architecture-20261106`.
+
+Cursor ownership, binary-window page counting and reusable packed-row execution
+pass 21 focused release tests. A separate production build (173.60 seconds) is
+captured as actor `9b9cdad788cc7b92ed422e988e6526906ef91b6ba09ebe1c0042617458bc1e9f`.
+The same eight-workload, three-round alternating comparison passes all exact
+signatures: primary lookup 45.398→31.412 µs (1.4452×), miss 36.604→26.513 µs
+(1.3806×), array COUNT 138.167→19.438 ms (7.1080×), text nullness
+83.353→18.835 ms (4.4254×), and text MAX 120.620→26.873 ms (4.4886×).
+Full-scan aggregate 215.081→178.757 ms is faster than the original actor but
+slower than the value-only candidate; this intermediate regression is retained,
+and the unfiltered frame/aggregate dispatch is under investigation. Array
+containment improves 1.3830× and durable insert 1.0129×. Evidence:
+`results/architecture-20261106/packed-foundation-comparison`.
+
+Encoded-span filters and immutable record leaves are independently reviewed and
+integrated for focused release testing. The writer change removes per-edit PAX
+encoding/padding/CRC/reparse while retaining immutable snapshots, canonical
+column descriptors, stored spans and pending overflow ownership. Swift's dirty
+records contain encoded bytes, unlike peers' decoded SQLValue records; their
+available nonpending spans can therefore use the same validated atom path.
+All broad correctness and final performance acceptance remains pending.
+
+The encoded-span/record-leaf stage passes 39 focused release tests. After the
+reviewed resolved aggregate kernels and direct unfiltered operand vector are
+integrated, 45 focused tests pass, followed by the complete release suite:
+538 native tests, all 749 SQL files, 21,597 records, 39,148 cells and the unchanged
+2,271 cost / 1,154 name / 100 type assertions, five host actions and no failures
+or exclusions. Logs: `/tmp/jed-swift-architecture-span-record-tests.log`,
+`/tmp/jed-swift-architecture-kernel-tests.log`, and
+`/tmp/jed-swift-architecture-prepared-prestage-all749.log`. Later prepared-query
+ownership work still needs its own integrated acceptance.
+
+The final diagnostic matrix is selected in advance: 22 unchanged authored
+workloads, all four cores, three rounds, CPU 1. It includes lookup, fixed and
+variable scans, filtered/grouped controls, rollback/durable writes and cold
+open, with 121 omitted workloads explicit. The projection changes membership
+only; field-by-field TOML and normalized-input equality are checked. Initial
+metadata now records actual corpus hashes, canonical hashes separately, and
+diagnostic status before any actor starts. This does not replace the original
+143-workload report. A supplementary three-workload Ruby comparison is being
+prepared against the same retained **v50** dataset files; the older sibling
+`bench/data/small.jed` is v34 and is not a matrix input.
+
+The final prepared-plan/bundle ownership stages pass the integrated release
+gate: **543 native tests and all 749 frozen SQL files**, with the same complete
+record, value, cost, type and name totals above. Generic cache hits reuse their
+already admitted values, exact detached plans own sequence/subquery facts,
+bundles retain their domain map/order, and scalar inputs are created only when
+needed. Cold/custom error order, profile boundaries and role checks remain
+unchanged. Independent cumulative ownership and execution reviews found no
+blockers. Log: `/tmp/jed-swift-architecture-final-all749.log`.
+
+Repository spec/code-generation verification passes. Final cross-core exact
+accounting and encrypted SQL gates are running from immutable XCTest actor
+`3bed91b6345d597308d2101c385fd615e6fbcb8b7cbc5832a8d4c758200c30bd`
+with unchanged resource identity `0568c671be49ea6e8e3ff902f41b48a110b612ab428fd105a8bbd67cabb5ba10`.
+The separate production build and remaining affected storage/process gates are
+pending; no final performance conclusion is recorded yet.
+
+Final accounting passes all 241,412 measurements, encrypted SQL all 77,612,
+saved simulations all 18 traces/core and 153 Swift images, mixed process all
+496 pairings plus two Rust-serving streams, and stress all 20,000 invariants.
+The production build completes in 183.73 seconds; benchmark actor SHA-256 is
+`5bc33bffebd2064a393e0f8a8acecd5c3792d4ef8affeeccb64fb2f6575d4c6d`.
+Compiler descriptions confirm ordinary `-O`/whole-module optimization without
+testability or sanitizer flags.
+
+The first final service run is preserved as **failed** under
+`results/architecture-20261106/verification-final/service`: five pairs pass,
+but Go-client/Swift-owner fails the later shared
+`resource/query_memory_gist_reopen.test` at a one-byte-budget statement and
+misses 25 expected page-client records. The reused Go test binary reports old
+source `48c0c068`; a fresh-Go diagnostic is running with the same Swift owner.
+No expectation is changed or failed run relabeled. Interchange and generated
+simulation gates remain in progress.
+
+**Final correctness acceptance is green.** Full interchange passes 2,691/2,691
+phases. Generated simulations pass all 176 traces/core, 459 comparable
+transcripts and 7,049 independently checked Swift images, with the original
+23 per-core-fault exemptions unchanged. The fresh-Go probe passes, followed by
+the complete rebuilt-peer service matrix: 116,628 records, six pairs, zero
+failures. Disassembly confirms the old Go adapter lacked the existing
+`01c483cc` committed-GiST staging fix; the Swift binary and fixtures did not
+change. Both failure and successful retries remain in `verification-final`.
+Production source is ready for the isolated final 22/8/3 workload comparisons.
+
+## Original completed experiment
+
 Status: **Frozen experimental snapshot; required Linux acceptance and measured
 optimization are complete.** Semantic baseline:
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).

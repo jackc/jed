@@ -57,6 +57,9 @@ files in the same change.
   `impl/swift-native/VERIFICATION.md` and `impl/swift-native/BENCHMARKS.md`.
   Apple platforms remain unverified. Production Swift delivery is undecided;
   the experiment adds no website docs, references, or live panels.
+  An explicitly authorized performance investigation (2026-11-06) may revise
+  this snapshot while preserving its baseline evidence; see
+  `spec/design/swift-native-performance.md`. It remains opt-in and experimental.
 - SQL is the primary access path and every built-in capability must be reachable
   through SQL, while storage must keep room for non-SQL access paths later.
 

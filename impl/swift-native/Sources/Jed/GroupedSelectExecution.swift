@@ -14,6 +14,9 @@ internal final class GroupedSelectExecution {
             seen = Array(repeating: Set<[UInt8]>(), count: states.count)
         }
     }
+    private enum PackedOperand {
+        case star, nullness(Int), direct(Int), cached(Int)
+    }
     private struct Output {
         let row: [SQLValue]
         var bytes: Int64
@@ -165,8 +168,8 @@ internal final class GroupedSelectExecution {
                 else { try group.states[ordinal].fold(arguments) }
             }
         }
-            if ColumnarExecution.packedWholeTable(plan, aggregate, context) {
-                try foldPackedWholeTable(groups[0])
+            if ColumnarExecution.packedAggregation(plan, aggregate, context) {
+                try foldPacked(members: members, membership: membership)
             } else if columnar {
                 while let row = try input.next() {
                     var current = context; current.column = { row[$0] }
@@ -214,31 +217,81 @@ internal final class GroupedSelectExecution {
             position = Int(min(Int64(outputs.count), plan.offset))
         }
     }
-    private func foldPackedWholeTable(_ group: Group) throws {
-        let store = plan.store!, meter = context.meter
+    private func foldPacked(members: [Int], membership: Set<Int>) throws {
+        let meter = context.meter
         // As on SelectInput's scalar drive, the group exists before the access
         // block is charged. No rows are gathered or admitted to the Q1 account.
-        try ScanCost.charge(store, touched: plan.touched, meter: meter)
-        var cursor = TreeCursor(store.tree, descending: plan.descending)
-        defer { cursor.close() }
-        let operands = aggregate.calls.map { call -> Int? in
-            guard let argument = call.arguments.first, case .column(let column) = argument.node else { return nil }
-            return plan.touched.firstIndex(of: column)!
+        let input = try PackedLaneInput(plan: plan, context: context)
+        defer { input.close() }
+        let row = input.row
+        var current = context; current.column = { try row.value($0) }
+        let operands = aggregate.calls.map { call -> (column: Int?, nullness: Bool) in
+            guard let argument = call.arguments.first, case .column(let column) = argument.node else { return (nil, false) }
+            return (column, call.plan.name == "count")
         }
-        var values = Array(repeating: SQLValue.null, count: plan.touched.count)
-        while let position = try cursor.nextPosition() {
-            // Decode touched cells in their original order before any fold.
-            // Bare columns add no expression cost; every aggregate, including
-            // COUNT(*) and NULL operands, still pays its own accumulation unit.
-            try meter.step(); meter.charge(1)
-            for (slot, column) in plan.touched.enumerated() {
-                values[slot] = try position.materialize(column, pager: store.tree.pool?.pager)
+        let filter = PackedLaneFilter(predicate: plan.predicate, types: plan.store!.tree.types,
+            touched: plan.touched, context: current)
+        // COUNT needs only stored nullness (packed-leaf.md §11 A4). Generic
+        // filters retain the original eager touched-column decode; encoded
+        // filters defer aggregate/key decoding until their row survives.
+        var nullnessOnly = Set(operands.filter { $0.nullness }.compactMap { $0.column })
+        for operand in operands where !operand.nullness {
+            if let column = operand.column { nullnessOnly.remove(column) }
+        }
+        for column in aggregate.keyColumns { nullnessOnly.remove(column) }
+        let required = Set(operands.filter { !$0.nullness }.compactMap { $0.column })
+            .union(aggregate.keyColumns)
+        let decoded: [Int]
+        if filter.hasEncodedPredicates { decoded = plan.touched.filter { required.contains($0) } }
+        else if plan.predicate == nil { decoded = plan.touched.filter { !nullnessOnly.contains($0) } }
+        else { decoded = [] } // The plain filter prepares all touched columns.
+        // With no predicate there is no decoded value to reuse. Fill one
+        // compact vector directly, retaining touched order before any fold.
+        // Filtered consumers keep the frame's once-per-record value reuse.
+        let direct = plan.predicate == nil, pager = plan.store!.tree.pool?.pager
+        var values = Array(repeating: SQLValue.null, count: direct ? decoded.count : 0)
+        let keySlots = direct ? aggregate.keyColumns.map { decoded.firstIndex(of: $0)! } : []
+        let reads: [PackedOperand] = operands.map { operand in
+            guard let column = operand.column else { return .star }
+            if operand.nullness { return .nullness(column) }
+            return direct ? .direct(decoded.firstIndex(of: column)!) : .cached(column)
+        }
+        while let position = try input.nextPosition() {
+            if direct {
+                for (slot, column) in decoded.enumerated() { values[slot] = try position.materialize(column, pager: pager) }
+            } else {
+                row.begin(position)
+                guard try filter.keep(row, context: current) else { continue }
+                try row.prepare(decoded)
             }
             try meter.checkpoint()
+            let group: Group
+            if aggregate.keys.isEmpty { group = groups[0] }
+            else {
+                let allKeys: [SQLValue]
+                if direct { allKeys = keySlots.map { values[$0] } }
+                else { allKeys = try aggregate.keyColumns.map { try row.value($0) } }
+                let keys = members.map { allKeys[$0] }
+                for value in keys {
+                    let payload = MemorySizes.payload(value)
+                    if payload > 0 { meter.charge(payload); try meter.guardCost() }
+                }
+                let key = try ValueEqualityKey.encode(keys)
+                let index: Int
+                if let existing = lookup[key] { index = existing }
+                else { index = try create(keys: allKeys.indices.map { membership.contains($0) ? allKeys[$0] : .null }, selected: keys, key: key) }
+                group = groups[index]
+            }
             for ordinal in group.states.indices {
+                // Bare columns add no expression cost; every aggregate,
+                // including COUNT(*) and NULL, pays its accumulation unit.
                 meter.charge(1)
-                if let slot = operands[ordinal] { try group.states[ordinal].fold([values[slot]]) }
-                else { try group.states[ordinal].fold([]) }
+                switch reads[ordinal] {
+                case .star: try group.states[ordinal].foldStar()
+                case .nullness(let column): try group.states[ordinal].foldCount(isNull: position.cell(column).isNull)
+                case .direct(let slot): try group.states[ordinal].foldScalar(values[slot])
+                case .cached(let column): try group.states[ordinal].foldScalar(row.value(column))
+                }
             }
         }
     }

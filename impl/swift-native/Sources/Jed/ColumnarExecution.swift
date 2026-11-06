@@ -31,19 +31,12 @@ internal enum ColumnarExecution {
         }
     }
 
-    /// The first direct packed fold deliberately retains the existing lane's
-    /// eligibility and narrows it to an unfiltered full walk of fixed cells.
-    /// Variable-width operands, filters and grouping keep their current driver.
-    static func packedWholeTable(_ plan: SelectPlan, _ aggregate: AggregateQueryPlan, _ context: ExpressionContext) -> Bool {
-        guard aggregation(plan, aggregate, context), aggregate.keys.isEmpty,
-              plan.predicate == nil, !plan.materializeSource,
-              plan.chosenJoin == nil, plan.chosenNWay == nil, plan.scan.terms.isEmpty,
-              let store = plan.store,
-              plan.touched.allSatisfy({ ValueCodec.fixedWidth(store.tree.types[$0].type) != nil }) else { return false }
-        if let candidate = plan.chosenAccess {
-            guard case .full = candidate.path else { return false }
-        }
-        return true
+    /// The existing lane admits packed operands, filters, and its one integer
+    /// group key. Only sources with no materialization owner use the direct
+    /// reader; every other lane keeps its original admission schedule.
+    static func packedAggregation(_ plan: SelectPlan, _ aggregate: AggregateQueryPlan, _ context: ExpressionContext) -> Bool {
+        aggregation(plan, aggregate, context) && !plan.materializeSource
+            && plan.chosenJoin == nil && plan.chosenNWay == nil
     }
 }
 
@@ -73,11 +66,14 @@ internal final class ColumnarProjectionExecution {
             preconditionFailure("columnar projection contains an expression")
         }
         lanes = Array(repeating: [], count: columns.count)
-        let input = SelectInput(plan: plan, context: context); defer { input.close() }
-        while let row = try input.next() {
-            var current = context; current.column = { row[$0] }
-            if !input.predicateApplied, let predicate = plan.predicate, try !context.profile(plan.profileIdentity, .filter, { try current.matches(predicate) }) { continue }
-            for (lane, column) in columns.enumerated() { lanes[lane].append(row[column]) }
+        let input = try PackedLaneInput(plan: plan, context: context); defer { input.close() }
+        let row = input.row
+        var current = context; current.column = { try row.value($0) }
+        let filter = PackedLaneFilter(predicate: plan.predicate, types: plan.store!.tree.types,
+            touched: plan.touched, context: current)
+        while try input.next() {
+            guard try filter.keep(row, context: current) else { continue }
+            for (lane, column) in columns.enumerated() { lanes[lane].append(try row.value(column)) }
             count += 1
         }
         let bytes = lanes.reduce(Int64(0)) { total, lane in lane.reduce(total) { saturatingAdd($0, MemorySizes.value($1)) } }

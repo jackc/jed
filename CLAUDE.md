@@ -161,6 +161,10 @@ merge or package publication is implied. It neither promotes Swift into the
 differential set nor selects native versus wrapped production delivery. Apple platforms
 remain unverified until built and tested there. See
 [swift-native-experiment.md](spec/design/swift-native-experiment.md).
+The maintainer authorized a structural performance investigation on 2026-11-06;
+see [swift-native-performance.md](spec/design/swift-native-performance.md).
+It may revise the frozen implementation while preserving its original evidence,
+without changing experimental status or the separate production decision.
 
 The maintainer approved Ruby's OpenSSL binding for vetted cryptographic digest
 functions and stdlib Zlib for byte-identical CRC32 checksums in this experiment.
