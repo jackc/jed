@@ -1,0 +1,105 @@
+# Frozen Swift release benchmark plan
+
+Status: inventory complete; the handwritten executable and immutable comparison
+driver are published, independently reviewed, and compiled by the integrated
+build. The adapter's exact 143-workload inventory checks pass.
+Canonical local dataset generation is authorized and uses the existing shared
+generator. No Swift performance baseline or parity claim exists.
+Do not run measurements until correctness acceptance is established, and retain
+the first verified release executable before changing optimization code.
+
+Baseline revision: `362e0798ac3a8bd04bd2da556044b6ec73bf468a`. The shared benchmark
+inputs are still byte-identical to that revision:
+
+| Input | SHA-256 |
+|---|---|
+| `bench/corpus/benchmarks.toml` | `a7be0f426d9d4432b238eca05b73d6a29b4a114b9c8aaca6c85f71cb94fe3f96` |
+| `bench/corpus/datasets.toml` | `b9bfb4cb1f27ae1757268a94434e96df67626bc6b39f005c3626ab3a6e289133` |
+| `bench/corpus/spill.toml` | `53c7d9034296e5c6cb03c61f30323f859f034a0ceb8645a49032f00790f084fb` |
+
+The benchmark corpus contains **143 jed-applicable workloads**: 114 queries,
+17 rollback-write lanes, six durable-write lanes, four concurrent-reader lanes,
+and two cold-open lanes. Their dataset assignments are 33 large, 89 scratch,
+12 small, seven GIN and two text. No favorable subset substitutes for this
+inventory; a filtered diagnostic must report the omitted lane names.
+
+## Harness boundaries
+
+- A handwritten Swift executable imports public `Jed` APIs, opens native files,
+  drives one explicit Session with prepared statements, drains every Rows cursor,
+  propagates terminal errors and closes all resources. No engine SPI is needed.
+- An opt-in Ruby driver reads pinned shared TOML through the already-installed
+  repository TOML utility, emits mechanical JSON workload data for Swift, and
+  invokes the existing supported Go/Rust/TS benchmark runners. No new dependency
+  or default benchmark registration is needed.
+- The driver rejects changed corpus bytes, missing/stale dataset fingerprints,
+  missing/duplicate result lanes, checksum or row-count disagreements, and
+  incompatible warmup/iterations/durability parameters. It captures immutable
+  executables, corpus bytes and hashes, source revision/diff, toolchain/CPU/OS,
+  filesystem and configuration details, commands, raw JSONL and per-core logs.
+- Dataset setup remains the shared generator. The opt-in
+  `mise run swift-native:bench-setup` invokes its `--engine jed` lane with offline
+  dependency resolution and writes isolated `bench/data/swift-native` files.
+  It does not generate PostgreSQL/SQLite data or perform measurements. Existing
+  data must pass the canonical `sha256(datasets.toml)` sidecar and current-format
+  gates before measurement. No reference download or dependency addition occurs.
+- Measured database copies and scratch files stay below the selected dataset
+  directory on the same filesystem. Evidence may live under `/tmp`, but this
+  host's `/tmp` is tmpfs and must not silently replace durable disk workloads.
+- Release builds use the existing isolated SwiftPM cache/scratch launcher.
+  Measurement runs serialize engines and rotate their order across repetitions.
+  Preserve a release baseline, measure before/after with identical inputs, then
+  report distributions and any regressions, not an unsupported parity claim.
+
+## Exact shared execution contract
+
+`spec/design/benchmarks.md` §§3–8 is authoritative. The audited runner sources are
+`bench/go/internal/bench/{corpus,runner,prng,checksum,fingerprint}.go`,
+`bench/go/cmd/bench-jed/main.go`, `bench/rust/src/lib.rs` and
+`bench/rust/src/bin/bench_jed.rs`, and `bench/ts/src/{lib,bench-jed}.ts`.
+
+One splitmix64 stream continues through warmup and measured iterations. Parameter
+generators are `serial`, inclusive `int_uniform`, earlier-parameter `int_window`,
+lowercase text and one-dimensional `i64[]`; use the pinned shared PRNG vectors.
+Measured output uses FNV-1a 64, UTF-8 canonical NULL/integer/raw-text cells, `1F`
+cell and `1E` row delimiters; the shared two-row vector hashes to
+`dd6e60407d30d28b`. No result kind may be silently coerced or ignored.
+
+Queries time parameter generation, prepared execution and draining, as in the
+existing native harness. Rollback lanes include BEGIN, their authored batch of
+writes and ROLLBACK. Durable lanes execute each statement as a real autocommit,
+with fsync enabled unless the corpus explicitly requests relaxed durability.
+Write checksums fold the validated final `count(*)`; warmup writes count toward
+the expected final state. Scratch databases are fresh native files and use the
+authored setup SQL outside timing.
+
+Cold-open lanes close the fingerprint handle first, then time open + prepare +
+one full drain per iteration; close occurs after the timed span. Concurrent lanes
+create independent reader Sessions on one Database, partition parameters into
+contiguous blocks, use real Swift threads, and fold block hashes in reader order.
+Host-function lanes register the exact immutable row and batch kernels
+`x * 2654435761 % 1000003`, retaining the ordinary host evaluation paths.
+
+Results preserve schema-2 fields and lower-sample percentiles
+`floor((n-1)*p/100)`. Include complete raw per-iteration samples in the experimental
+report even though the canonical peer JSONL only exposes aggregate percentiles.
+The existing standalone spill corpus is a separate larger-than-work-memory
+acceptance/performance family; shared `work_mem`/cache settings and exact result
+checksums/costs must remain visible if measured later.
+
+## Prepared local datasets
+
+`mise run swift-native:bench-setup` completed successfully without measurements.
+All four sidecars equal the frozen `datasets.toml` fingerprint above. Generated
+files are ignored under `bench/data/swift-native`; the original benchmark data
+directory was preserved. The native generator executable SHA-256 was
+`3738fc52721d20cde95bc3623a34447f100a9ef166083ea3933ab2c75c3a4608`.
+The full setup log is `/tmp/jed-swift-native-bench-setup.log`, and the machine
+record is `/tmp/jed-swift-native-bench-datasets.json`.
+
+| Dataset | Bytes | SHA-256 |
+|---|---:|---|
+| `small.jed` | 1,572,864 | `b03f463e6108f9bd4157e85484bfbe543aea8ac48e2c9454dd55a87d63e4d440` |
+| `large.jed` | 110,624,768 | `cb6af3e8ace33e49dfe61b29f2fe9a95890121a61e2bfb8f3f51cc5159f1cdc2` |
+| `gin.jed` | 17,301,504 | `227e5e5cde77e30a6a4d7b19035c512bfdc1d0f7277f19990051323da95cc9ac` |
+| `text.jed` | 46,661,632 | `82dc8efde2a3161ec1a0acb8605be4c874b4e8b83eefe929e920ddf9066c3d08` |

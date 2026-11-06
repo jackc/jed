@@ -1,10 +1,835 @@
 # Swift experiment progress
 
-Status: **active implementation; incomplete**. Baseline:
+Status: **Linux correctness acceptance passes; performance work remains**. Baseline:
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
-## Current integration checkpoint (2026-11-05 23:06 CST)
+## Current integration checkpoint (2026-11-06 07:04 CST)
+
+**Latest release acceptance is green:** all **509 native tests and 749 frozen SQL
+files** pass, with 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type
+assertions and five host actions. There are zero SQL failures, blocked files or
+aborted host controls. Command:
+`JED_SWIFT_SQL_TRACE_PATH=/tmp/jed-swift-native-release-eof-all749-progress.log mise run swift-native:test --configuration release --all-sql --trace-sql`.
+Log: `/tmp/jed-swift-native-release-all749-eof-fourth.log` (exit 0).
+The remaining pin assertion below is resolved by observing EOF on the captured
+old connection before checking its pin, retaining the original invalidation,
+promotion and persisted-data assertions. This changes test ordering, not the
+engine's asynchronous transport-loss contract.
+
+Current local-only commits: view **592bb88c**, shared GiST accounting **01c483cc**,
+empty Rust corpus rejection **7bf87b13**, Swift handoff **4cf6f1fc**. Canonical Rust
+artifacts have been repaired and checked in release/checked memory/disk modes.
+Default CI now passes **18/18** in 137.9 seconds:
+`/tmp/jed-swift-native-default-ci-gist-canonical-retry.log`. The additional
+Rust-pages stream lane passes **2/2** plaintext/encrypted scenarios at
+`/tmp/jed-swift-native-process-rust-stream.log`. Corrected full release V04 passes
+**241,412 measurements, zero failures** across all four cores and all three
+storage modes: `/tmp/jed-swift-query-memory-20261106-1996511-bxwolu/report.json`,
+log `/tmp/jed-swift-native-query-memory-release-gist-third.log`. Its captured
+XCTest is `944718bbc37e4af7e56f13d13981611503dab04f1af454caaf9f0270fbdea4da`,
+resource digest `0568c671be49ea6e8e3ff902f41b48a110b612ab428fd105a8bbd67cabb5ba10`.
+Current release mixed-process acceptance passes **496/496** at
+`/tmp/jed-swift-native-process-mixed-release-final.log`; saved simulations pass
+all **18 traces / 54 comparisons / 153 checked Swift images** at
+`/tmp/jed-swift-sim-sweep-20261106-2057112-ozakk7/summary.json`. Generated release
+simulation also passes all **176 traces per core, 459 transcript comparisons and
+7,049 independent Swift image checks**, with zero failures and the same 23 frozen
+fault-comparison exemptions:
+`/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json`. All required Linux
+correctness gates are green before optimization. Performance remains pending;
+preserve its upcoming baseline under the ignored durable ext4 path
+`impl/swift-native/results/benchmark-baseline-20261106`, not temporary tmpfs.
+Additional local-only tooling commits are **1c27c331** (Rust pages serving) and
+**41a90bb2** (strict benchmark timestamps).
+The successful preoptimization evidence is also retained durably in
+`impl/swift-native/results/verification-preoptimization-20261106`: 50 reports,
+logs and TSVs, 10.86 MiB, with a complete per-file hash manifest. Manifest SHA-256:
+`f5aa79e7f6e4213f7cb088a5ffdb883a1e01b9be889224c5417638f35c4a2f00`.
+
+Local-only integration commit **33a0add5** records the reviewed engine, host APIs,
+fixtures and opt-in runners; **40d15151** records the shared Go float metadata
+correction. None is pushed. Unrelated `tasks/memory` remains preserved.
+
+The release build passes **505 native tests and all 749 frozen SQL files**:
+21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type assertions,
+five host actions, zero failures or omissions. Command:
+`mise run swift-native:test --configuration release --all-sql --trace-sql`;
+log: `/tmp/jed-swift-native-release-all749-first.log`. This is correctness
+verification, not a performance measurement. The debug sixth run passes every
+SQL record; its two stale GIN assertions are corrected and the final **42-test**
+diagnostic/storage follow-up passes at `/tmp/jed-swift-native-diagnostics-final.log`.
+
+Release forced-TEMP refresh passes **28 files / 1,255 records / 571 cells /
+23 costs / 26 scratch files** (`/tmp/jed-swift-native-temp-spill-full-second.log`).
+Encrypted refresh passes **77,612 records**, zero failures, with report
+`/tmp/jed-swift-encrypted-corpus-20261106-939870-6kf73i/report.json`.
+The complete release V04 executes **241,412 measurements** but fails with
+**376 exact-accounting differences**: 188 in disk and the same 188 in disk-spill,
+across 22 files. All storage-byte measurements agree. Memory has **21,477 records
+per core**, exact zero differences. The complete debug run produces exactly the
+same 376 failures. Independent spec/loader review identifies a shared defect:
+Go/Rust/TS reconstruct committed GiST leaf-key stores through ordinary insertion
+without clearing the temporary staging charge. Loading committed records is not
+a transaction write under memory.md §7; Swift's zero initial balance is correct.
+The reviewed shared correction and six host regressions are now integrated; the
+private before/after runs fail before and pass after in all three supported cores.
+The full corrected matrix is pending. Failed evidence is preserved at
+`/tmp/jed-swift-query-memory-20261106-1135756-exgp9z/report.json` and
+`/tmp/jed-swift-native-query-memory-release-first.log`; debug evidence is
+`/tmp/jed-swift-query-memory-20261106-939537-ml7e92/report.json`.
+Refreshed interchange passes **2,691/2,691 phases** at
+`/tmp/jed-swift-interchange-20261106-996175-9832xa/report.json`.
+The generated simulation refresh passes all **176 traces per core, 459 transcript
+comparisons and 7,049 independently checked Swift images**, zero failures, at
+`/tmp/jed-swift-sim-sweep-20261106-980401-9e3v3g/summary.json`.
+The service refresh passes all six directions and **116,628 records**, zero
+failures, at `/tmp/jed-swift-service-corpus-20261106-1040687-2wheah/report.json`.
+Its source-hash freeze is released. This captured actor predates the new Swift
+handoff correction; targeted integration and process refresh cover that change.
+
+**Remaining implementation gap:** the guard audit found CREATE VIEW rejects SRF
+and JSON_TABLE FROM sources during dependency tracing, although query execution
+and all three supported cores accept them. The independently reviewed correction
+is integrated; its new 41-record regression passes PostgreSQL byte-identically,
+all three supported actors, and Swift in both memory and disk modes. The focused
+Swift gate passes **14 native tests**, five frozen files / 301 records / 231 cells /
+20 names, with log `/tmp/jed-swift-native-view-producers-retry.log`.
+The full release/native refresh executes **507 tests**, passes all 749 SQL files,
+but fails six assertions in two page-service tests:
+`/tmp/jed-swift-native-release-all749-view-second.log`. A focused optimized run
+reproduces four assertions at `/tmp/jed-swift-native-release-gist-service-first.log`;
+the new GiST regression passes 33 records / 10 cells in both Swift memory and disk
+modes. The exact-version client fixture races an allowed post-ACK maintenance
+commit and needs a reader pin plus protocol barrier. The ownership fixture exposes
+a real admission race: `requestOwnership` acknowledges before its asynchronously
+dispatched worker closes admission. The independently reviewed correction reserves
+the drain and pauses admission before acknowledgment, preserves cancellation and
+replacement ordering, and includes a deterministic delayed-worker regression.
+The integrated debug gate passes **21 tests** at
+`/tmp/jed-swift-native-handoff-admission-debug-first.log`. The next full release
+run passes all 749 SQL files and executes **509 native tests**, with one remaining
+failure: the graceful-close test checks a child's old pin before it has observed
+connection closure (`PageServiceAutomaticTests.swift:50`). That failure is under
+investigation; the six earlier handoff/client assertions pass. Log:
+`/tmp/jed-swift-native-release-all749-handoff-third.log`. No scalar/aggregate
+catalog kernel gap was found. The new shared corpus files are being integrated
+after the service run. No performance measurements or optimization pass have run.
+
+The queued release command reset the default trace path while debug SQL was
+running; use the complete separate test logs for acceptance, not the mixed
+`.build/sql-progress.log` progress file. The experiment remains incomplete.
+
+The first integrated shared-GiST CI attempt finishes **16/18**: formatter and
+conformance fail (`/tmp/jed-swift-native-default-ci-gist-load.log`). The new TS
+host test was formatted outside the repository configuration; that formatting
+is corrected. More importantly, the private before/after Rust probe reused the
+canonical Cargo target directory, leaving a cached conformance binary compiled
+with `/tmp/jed-gist-load-staging/probe/rust` as its manifest path. Its ordinary
+walk finds zero corpus files. The strict Swift V04 adapter rejects the missing
+21,477 Rust measurements; the run is stopped and retained at
+`/tmp/jed-swift-query-memory-20261106-1610643-e6008r`, log
+`/tmp/jed-swift-native-query-memory-release-gist-second.log`. No acceptance is
+claimed from that attempt. Private probe targets are being isolated, canonical
+jed package artifacts cleaned/rebuilt, and CI/V04 rerun from the actual checkout.
+
+A final acceptance audit identifies one additional V07 role combination: the
+496-pair process runner captures Swift as the remote page server even for the
+two frozen stream scenarios whose baseline specifies Rust serving. Existing
+coverage proves Swift serving, but does not prove Swift clients with Rust's
+remote stream endpoint. An explicit opt-in Rust page-server selection and two
+targeted stream scenarios are being added; the existing Swift-server matrix
+remains required. This is a verification gap, not an observed engine failure.
+
+## Integration checkpoint (2026-11-06 05:50 CST)
+
+Full page-service comparison passes all six Swift/peer directions and
+**116,628 records** (`/tmp/jed-swift-native-service-full-first.log`). Full
+interchange passes **2,691/2,691 phases** over all 112 frozen files, the three
+supported peers and generated plaintext/encrypted/attachment cases
+(`/tmp/jed-swift-interchange-20261106-19-17b0uj/report.json`). The complete
+Layer 3 stress profile passes five core/storage runs, **20,000 snapshot
+invariants and 5,000 writer transactions**, with checksum `f3e75496a3111181`
+throughout (`/tmp/jed-swift-stress-20261106-19-vqyx3y/report.json`). These are
+correctness gates, not performance measurements.
+
+Public integrity acceptance now passes **21 native tests**, including **24
+damaged image/report fixtures (50 mode/constraint probes) and 112 ordinary file
+fixtures**, simulation-integrity and spec checks. The two older GiST decoder
+assertions are aligned with frozen readers: stored routing bounds and unused
+padding are not rejected by open, but the damaged-bound integrity report is
+still checked exactly; cycles and malformed fanout remain rejected. Evidence:
+`/tmp/jed-swift-native-integrity-second.log`. A separate real-socket test passes
+plaintext/encrypted remote snapshots, writer visibility, pin release and role
+loss (`/tmp/jed-swift-native-integrity-sockets-retry.log`). CLI checks pass all
+50 exact frozen reports and 11 credential/exit/text/read-only probes:
+`/tmp/jed-swift-integrity-cli-20261106-675919-qw5gej/report.json`.
+
+Direct shared-contract consumers pass **246 coercion captures and 23 estimator
+vectors**. The diagnostic integration now passes all **61 Detail, 346
+Position/Hint and 10 structured object-field cases**, plus three ordinary SQL
+files (78 records, 274 cells, 21 cost / 12 name assertions). The deep-view
+resource fixture passes after two mechanical resolver helper extractions:
+the dominant per-level query-source frame shrank from 18,792 to 8,056 bytes;
+seven repeated frame reservations total 20,032 bytes. No nesting limit or stack
+configuration changed. Evidence:
+`/tmp/jed-swift-native-diagnostics-complete-first.log`. This gate exits 1 only
+because a new runtime metadata test incorrectly expected SUM(i64) to overflow;
+the canonical result widens to decimal. The test is corrected to direct i64
+addition and all **20 runtime metadata probes pass** at
+`/tmp/jed-swift-native-runtime-diagnostics-retry.log`.
+Original failed reports remain
+`/tmp/jed-swift-native-shared-contract-first.log`,
+`/tmp/jed-swift-native-diagnostics-first-retry.log`, and
+`/tmp/jed-swift-native-diagnostics-name-first.log` (the stack crash).
+
+The runtime metadata audit found Go omitted type names on finite floating
+operation overflow where Rust/TypeScript and the canonical spec supply them.
+The narrow two-file Go correction has independent review and all **93 new
+public host cases** pass (31 per supported core). Swift's reviewed correction
+is published; generic operation underflow/domain diagnostics retain their
+contract. Normal CI passes **18/18** at
+`/tmp/jed-swift-native-default-ci-float-fields.log`; the six-file shared correction
+is local-only commit `40d15151`.
+
+The third V04 run completed all **21,477 Swift memory** and **19,438 each
+Swift disk/disk-spill** measurements without SQL failures. Comparison of available memory
+records identifies three remaining Swift accounting differences; all three
+now pass exact focused comparisons over all four cores and all three modes:
+360 short-circuit, 804 EXPLAIN and 384 correlated-query measurements, zero
+failures. Logs: `/tmp/jed-swift-native-memory-short-circuit-fixed.log`,
+`/tmp/jed-swift-native-memory-explain-followon-fixed.log`, and
+`/tmp/jed-swift-native-memory-correlated-fixed.log`. This run also has
+infrastructure failures: Go memory records omit 25 file-backed fixture cases,
+and all peer disk executions fail local socket bind/setsockopt with EPERM.
+It was launched inside the restricted sandbox. It cannot establish complete
+acceptance; a new run with required local socket access is necessary. Original
+evidence remains `/tmp/jed-swift-query-memory-20261106-19-ydlyx6`.
+
+The refreshed mixed process gate passes **496/496 ordered pairs**
+(`/tmp/jed-swift-native-process-mixed-second.log`); the saved simulation gate
+passes **18 traces, 54 transcript comparisons and 153 checked images**
+(`/tmp/jed-swift-native-sim-regress-final.log`). The new broad actor is
+`b7d500a94102edb3efe02d30ce0778031b17b89a39e7608fd1474f68a47e5852`,
+resource digest `06cdcd8d00fdf7d7f2232e0a338d2ca42c2408520895d2424c272500a16c9b71`.
+Full native/749 SQL (sixth run), V04 (fourth run, now with local socket access),
+encrypted/service (second runs) and all 22 simulation profiles × eight seeds
+are running from captured executables. Logs use `/tmp/jed-swift-native-` prefixes:
+`all749-all-host-sixth.log`, `query-memory-full-fourth.log`,
+`encrypted-full-second.log`, `service-full-second.log`, `sim-profiles-final.log`.
+
+The sixth native run has identified one stale GIN unit expectation: oversized
+key-only pending nodes are admitted until serialization, per the previously
+verified shared page-fit contract. Its reviewed test correction checks `0A000`
+at serialization, unchanged allocator high-water/free entries and original
+snapshot keys. A separate diagnostic-only correction preserves authored RETURNING
+relation order for target aliases literally named old/new; all three supported
+public APIs confirm four direct/nested probes. The final diagnostic/GIN/depth
+gate is queued at `/tmp/jed-swift-native-diagnostics-final.log`. These changes
+postdate the captured broad actor; no executor, storage or accounting logic changes.
+
+No performance measurements have run. The experiment remains incomplete.
+
+## Integration checkpoint (2026-11-06 04:51 CST)
+
+The second complete memory-only V04 run produced all **21,477 records per
+core, 85,908 measurements**, with zero Swift SQL failures or omitted records
+and **65 exact accounting differences**. Evidence:
+`/tmp/jed-swift-query-memory-20261106-148914-gcpdwl`. The second focused
+integration passes **32 native tests, 34 SQL files, 1,463 records and 4,074
+cells** (`/tmp/jed-swift-native-accounting-integration-second.log`). Additional
+reviewed collation/window, PK point-set, VALUES folding and implication fixes
+are awaiting the next build.
+
+Full encrypted execution completed **77,612 records** across four cores;
+Swift completed all **662 eligible files, 19,403 records and 38,026 cells**
+with zero SQL failures. The first report has 20 adapter errors: five Unicode
+SQL keys in each core were read as binary Ruby strings. The parser now
+validates UTF-8 explicitly, with positive Unicode and invalid-byte checks;
+independent review is clean. The strict retained-evidence recheck passes all
+**77,612 records with zero failures**, preserving the original report and
+recording input hashes in `recheck.json`. Full service comparison continues. Full interchange reached
+**2,667/2,691 phases**; three intentionally opaque-definition fixtures expose
+an adapter metadata assumption, under independent review.
+
+The coverage audit found two concrete outstanding requirements: the public
+quick/full integrity API (I1–I5) and its 24 image/report fixtures, and the
+Layer 3 threaded reader/writer stress profile adapter. Internal simulation
+checks do not replace the public integrity contract. Implementation is
+assigned; the experiment remains incomplete. No performance measurements
+will run before correctness acceptance. The reviewed benchmark actor is
+published, and four canonical datasets have been generated locally.
+
+Full forced-TEMP mode passes **28 files, 1,255 records, 571 cells and 26
+native scratch files** (`/tmp/jed-swift-native-temp-spill-full-first.log`).
+The public embedding examples pass memory, durable reopen and cancellation
+checks (`/tmp/jed-swift-native-examples-first.log`).
+
+## Integration checkpoint (2026-11-06 04:31 CST)
+
+The fifth complete ordinary SQL/native run is **green**: **749 frozen files,
+21,597 records (11,990 statements, 9,607 queries), 39,148 cells, 2,271 cost /
+1,154 name / 100 type assertions**, five host actions, and **484 native tests**.
+There are zero SQL failures, adapter blocks, control aborts or file exclusions.
+Command: `mise run swift-native:test --all-sql --trace-sql`; evidence:
+`/tmp/jed-swift-native-all749-all-host-fifth.log` and
+`/tmp/jed-swift-native-all749-fifth-progress.log`. The immutable actor captured
+after this build has SHA-256
+`02d0b80e6a83938b44641601838dda4c0342a4521175bf4a23952f03e0cae999`;
+the resource digest is
+`5834cf5c6274f1f8bd23b191fa18ac4e2a78e19654a6a9283277c0b7368eedb6`.
+This precedes the accounting corrections now being integrated.
+
+The first complete V04 matrix failed, with all peers complete and Swift
+stopping at the already-fixed view stack boundary in each mode. The available
+Swift prefixes contain **446 memory, 561 disk and 580 disk-spill accounting
+differences**. Together with absent records this yielded 12,323 failures over
+230,679 measurements. All original evidence remains at
+`/tmp/jed-swift-query-memory-20261106-4001051-bbkrw9`; exact differences are in
+`/tmp/jed-swift-all-modes-accounting-differences.txt`. No expectations or
+comparisons have been relaxed.
+
+Independently reviewed fixes are published for inherited Q3 floor/admission
+phases, pre-FK write admission, delayed INSERT SELECT assignment diagnostics,
+statement-owned INSERT source buffers, eager scan/DISTINCT output ownership,
+cast/row-admission timing, aggregate and synthetic ORDER keys, forced Q4
+compaction after a rejected limit, and oversized pending index-node rejection
+at serialization. The focused integrated build/test passes **71 tests,
+29 files, 1,056 records, 1,592 cells, 82 cost / 49 name / four type assertions,
+zero failures** at `/tmp/jed-swift-native-accounting-integration-first.log`.
+The fresh full-memory diagnostic captures immutable actor
+`f232355dcc75f65b6dbe3a6bbf67ac66e892f30d62fff993c5c186eec0c058f4`
+at `/tmp/jed-swift-query-memory-20261106-148914-gcpdwl`; the first full
+encrypted comparison is also running. Remaining join,
+recursive and DISTINCT ON accounting differences are being investigated in
+isolated drafts. Full exact-accounting acceptance is still required.
+
+V06's six real client/owner directions pass a 17-record point-lookup smoke
+test (**102 records, zero failures**):
+`/tmp/jed-swift-native-service-six-pair-first.log`, retained output
+`/tmp/jed-swift-service-corpus-20261106-4062030-42nfv4`. V10's encrypted-empty
+TS/Swift fixture smoke passes all eight phases after reviewed adapter cleanup;
+the generated interchange diagnostic exposed the specified attached-view
+column omission, now corrected with a host-boundary regression test awaiting
+this build. Full encrypted, service, interchange and forced-TEMP runs remain
+outstanding. Public examples compile but still need their runtime check.
+
+Default `mise run ci` passed **17 of 18 steps**, including all supported-core
+conformance, process, simulation and browser gates. Its sole failure was the
+new opt-in Go adapter's octal permission literal formatting. That literal is
+corrected and `mise run fmt` passes. Evidence:
+`/tmp/jed-swift-native-default-ci-first.log` and
+`/tmp/jed-swift-native-default-fmt-fixed.log`. No default task requires Swift.
+Release baseline, measured optimization, final reports and freezing remain
+required; this experiment is still incomplete and local-only.
+
+## Integration checkpoint (2026-11-06 04:12 CST)
+
+H16 now passes all **15 batching boundary tests**, including 64-row primary
+windows, 1,024-row in-hand chunks, strict NULL/error replay, finite cost caps,
+DISTINCT/LIMIT, interval charging, sorted/spooled output, cleanup and exact
+query-account schedules. The integrated resource gate passes **30 tests** and
+**six SQL files, 255 records, 333 cells, zero SQL failures**. Evidence:
+`/tmp/jed-swift-native-host-batching-resource-integration.log`. This includes
+the native forced-TEMP adapter check; the full TEMP mode remains pending.
+
+The fourth full SQL/native run aborted on a planner stack overflow at the
+deepest valid view chain; it is not passing acceptance. Its obsolete rebuild
+fixture also expected a 600-byte key to exceed an encrypted 1,024-byte page,
+which no longer holds after the independently justified actual-page-fit fix.
+The fixture now uses a 1,200-byte key, preserving its failure/source-unchanged
+contract. Splitting SELECT/WITH/VALUES dispatcher construction into separate
+helpers reduces the recursive dispatcher frame from 13,504 to 1,488 bytes
+without changing the canonical 256-depth limit. Independent review is clean.
+The fresh focused gate passes **10 files, 342 records, 562 cells, 43 cost /
+65 name / five type assertions, zero failures**, plus all **three rebuild
+tests**: `/tmp/jed-swift-native-planner-stack-rebuild.log`. The failed full run
+is retained at `/tmp/jed-swift-native-all749-all-host-fourth.log` and
+`/tmp/jed-swift-native-all749-fourth-progress.log`.
+
+The first full V04 matrix captured immutable pre-stack-fix actor
+`d27b0b058bc8f2377beeb94e28894cae39e0ed9b723a7ec610d3667b2a42f282` at
+`/tmp/jed-swift-query-memory-20261106-4001051-bbkrw9`. It is still collecting
+disk modes, but Swift memory stopped at 17,602/21,477 records while all three
+peers completed. The available prefix exposes **446 exact accounting
+differences**, with the peers agreeing; these require implementation fixes,
+not comparison exceptions. Full differences are retained in
+`/tmp/jed-swift-memory-all-prefix-differences.txt`. Query-side Q1/Q2 review is
+delegated; parent owns mutation/transaction pending accounting and the live
+storage divergence. A new actor and complete matrix are required afterward.
+
+Reviewed V05 encrypted and V06 real-service test-adapter hooks are published;
+V05's bounded adapter check passes, native compile/runtime acceptance remains
+pending. V06's six-direction driver and V10's exhaustive 112-image fixture /
+bidirectional interchange driver are being integrated. Local runnable public
+API examples are added, awaiting compile/run. The default `mise run verify`
+gate passes all **17 checks** (`/tmp/jed-swift-default-verify-final.log`);
+full default CI and measured release optimization remain outstanding.
+
+## Integration checkpoint (2026-11-06 03:44 CST)
+
+The third **22 profiles × eight seeds** simulation comparison is green:
+**176 traces, 459 transcript comparisons, 7,049 independently checked images,
+zero failures**. Immutable actor
+`b4c1180774d7f48c4df911248156aaea822ec0e03a988f1b4cd871be0ed2e34f` includes
+the ALTER pending-write, create publication, mixed overflow refault,
+credential/rekey and direct attachment reuse corrections. Command:
+`mise run swift-native:sim:sweep --seeds 1..8`; evidence
+`/tmp/jed-swift-native-sim-profiles-allocation-q3-fixed.log`, retained output
+`/tmp/jed-swift-sim-sweep-20261106-19-lawllp`. Later host API and batching
+changes are outside this actor and need fresh integrated acceptance.
+
+All seven residuals from the third full749 run pass the socket-enabled
+focused gate: **13 files, 437 records, 1,328 cells, 79 cost / 96 name / five
+type assertions, zero SQL failures**. Page-service6, attachment-reuse1,
+credential2, root-residency3, prepared12, planning-probe6 and maintenance6
+pass. The one ergonomic fixture failure (an eagerly materialized SRF under
+a streaming-only budget) was corrected to use a primary-key table scan.
+Evidence: `/tmp/jed-swift-native-final-sql-residuals-ergonomic-host.log`.
+
+The fresh host/API foundation gate passes **30 tests**: cursor admission3,
+escaped file-host lifetime1, native argument/typed row helpers6, scripts7,
+session settings5, frozen resource budgets2, corpus accounting2 and host
+batch primitives4. Command: `mise run swift-native:test --filter
+'HostBatchBoundaryTests|CursorAdmissionBoundaryTests|CursorHostLifetimeBoundaryTests|ErgonomicBoundaryTests|ScriptExecutionBoundaryTests|SessionSettingsAccessTests|SQLCorpusAccountingTests|FrozenResourceBoundaryTests'`;
+log `/tmp/jed-swift-native-host-api-batch-foundation.log`. The first compile
+found one omitted catalog validator in the new admission fixture; corrected
+before the passing run. Cursor timing evidence from all three supported
+cores justifies a narrow streaming.md prose correction, recorded separately
+in `Tools/BASELINE_FINDINGS.md`.
+
+V04 now has a strict opt-in four-core exact peak/live-storage adapter.
+`mise run swift-native:query-memory --no-build --filter
+resource/query_memory_state.test --mode memory` passes **42 records per
+core, 168 measurements, zero differences**. Evidence:
+`/tmp/jed-swift-native-query-memory-diagnostic.log`,
+`/tmp/jed-swift-query-memory-20261106-19-ugjlso/report.json`. This is a
+diagnostic subset; full memory/disk/disk-spill acceptance remains unrun.
+The reviewed forced-TEMP adapter and tests are published but not yet built.
+
+H16 speculative batch/scalar replay framework and all named emitter sites
+are implemented and independently reviewed. New primary-scan, interval and
+emitter tests still need integration. Review found and repaired DISTINCT's
+speculation cap (its inner producer must use the outer survivor window).
+A remaining audit concerns the top-level plain buffered projection's source
+admission/lifetime; do not claim H16 complete until its 1,024-row in-hand
+lane and exact Q1 schedule are tested. V10 exhaustive bidirectional
+interchange tooling is being implemented. No release optimization has run.
+
+## Current integration checkpoint (2026-11-06 03:14 CST)
+
+The **third full749 run completes 749/749 files and 21,597 records** (11,990
+statements, 9,607 queries), **39,135 cells, 2,271 cost / 1,154 name / 100 type
+assertions and five host actions**. It reports **seven SQL failures across
+three files**, zero adapter blocks/control aborts/storage-mode exclusions:
+`aggregates/select_distinct.test` five incorrect DISTINCT/ORDER admission
+errors, `joins/comma.test:127` cost20/19, and `query/subquery_point_set.test:123`
+cost36014/44. All three corrections are independently reviewed and published,
+but postdate this actor. Evidence: `/tmp/jed-swift-native-sql-all749-third.log`,
+`...-progress.log`, `...-report.json`; command adds `--all-sql --trace-sql` to the
+focused prepared/probe/root/credential/page-service/maintenance filter. The
+staged-memory fixture is corrected and all three RootResidency tests pass;
+credential2, maintenance6, prepared11 and probe6 pass. Six native page-service
+tests fail Unix socket `errno1` under the sandbox; these require the separate
+socket-enabled rerun, not source changes or acceptance exclusions.
+
+The next socket-enabled focused gate is running in
+`/tmp/jed-swift-native-final-sql-residuals-ergonomic-host.log`, selecting 13 SQL
+files including all three failures, neighboring derived/CTE/aggregate cases,
+partial-index EXPLAIN and pending-memory limits. It also tests new ergonomic
+native-argument/typed-row helpers, exact large-value memo keys, corrected
+credential/rekey ordering, direct attachment reuse and native page clients.
+Root's H09 implementation is independently reviewed; runtime acceptance is
+pending. A host audit found escaped cursors retain DatabaseCore but not the
+Database/file-host lifetime; a narrow ownership repair and native regression
+are being drafted. H12 executeScript remains missing and is in implementation.
+Reviewed ALTER rewrite Q3 staging now matches cumulative frozen behavior;
+new simulator build/profile acceptance remains pending.
+
+Two further **local-only** reviewable commits: `d8b23ec9` clarifies the existing
+zero-manifest bootstrap stabilization exemption; `40ac047d` adds the reviewed,
+previously tested bounded scratch row/sort/hash primitives. Neither is pushed.
+
+### Previous focused checkpoint
+
+The prepared/probe/deep-view gate completes **12/12 SQL files, 560 records,
+1,138 cells, 35 cost assertions, zero SQL failures**, without adapter blocks,
+control aborts or exclusions. All **10 prepared API/cache**, **six planning
+probe**, and **two bounded-operator cleanup** tests pass. Two of three new
+root-residency tests pass; the staged-memory case fails `XX001` because its
+live-page delta disagrees with reachability, under host diagnosis. Evidence:
+`/tmp/jed-swift-native-prepared-select-probe-deep-view.log`. Command:
+`mise run swift-native:test --sql-files resource/view_expansion_limit.test,resource/view_depth_limit.test,ddl/views_options.test,dml/merge_view.test,dml/view_check_option.test,dml/view_on_conflict.test,subquery/correlated_grouped.test,subquery/outer_level_aggregate.test,subquery/derived_correlated.test,params/like_pattern_proof.test,params/custom_plans.test,json/to_json_sources.test --trace-sql --filter 'SQLCorpusBoundaryTests|PreparedBoundaryTests|PreparedSelectBoundaryTests|PlanningProbeBoundaryTests|BlockingOperatorBoundaryTests|RootResidencyBoundaryTests'`.
+
+H06 now has `Database`/`Session` prepare, queryPrepared and executePrepared
+through the total cursor seam. Typed VALUES INSERT and SELECT caches contain
+immutable detached metadata, rebound to the current domain snapshots, index
+contexts, permissions and meters. SELECT uses source-ordered schema/estimator
+identity tokens, exact value-read and NULL-read probes, committed-only fills,
+and up to eight exact-value custom plans. Tests cover rollback, working DDL
+and DML, database identity, temporary shadowing, ANALYZE, memo eviction,
+joins/compound queries, cancellation and read-only admission. Independent
+reviews corrected pushed-predicate cacheability and dynamic-timezone index
+exclusion; the latter has a new host test awaiting its next gate. Every
+subquery remains uncacheable, matching the frozen resolvers. Full host/value
+acceptance and refreshed whole-corpus verification are still required.
+
+The second full749 attempt (`/tmp/jed-swift-native-sql-all749-second.log`,
+trace `...-progress.log`) **aborted**, so it is not a completed conformance
+result. Recursive AND scanning and derived-view pushdown both overflowed on
+`resource/view_expansion_limit.test`; ordered iterative walks now pass that
+whole file. The focused gate also verifies restored pushed-down view write /
+CHECK OPTION predicates, grouped correlation, outer aggregates and
+array_to_json overload resolution. Remaining known SQL failures are comma
+join cost, partial-index EXPLAIN wording and derived subquery point-set
+folding time. The EXPLAIN correction is applied but not yet rerun.
+
+The second **22 profiles × eight seeds** simulation comparison completes
+**176 traces, 459 transcript comparisons and 6,884 independently checked
+images**, with **112 failures** (previous run: 634). Swift passes 173/176
+local oracles; all three supported cores pass 176/176. Evidence:
+`/tmp/jed-swift-native-sim-profiles-corrected-hosts.log`, output
+`/tmp/jed-swift-sim-sweep-20261106-19-89lt3a`, actor
+`56ea638a5fa57adb96153fd9cb737c4fcaa9e0bc93ad520cda77ad289ea6592a`.
+A reviewed create-publication fix closes the temporary handle and reopens
+the published path after the directory barrier; mixed inherited/fresh
+root-leaf overflow refaulting is published with the focused test failure
+above. Credential admission/entropy ordering fixes are being integrated.
+Resource profile5 reveals an earlier ALTER rewrite pending-byte hold being
+released by a later UPDATE only in Swift; correction is in progress. These
+are post-actor changes; the sweep has **not** passed acceptance.
+
+Next: finish the focused storage/resource repairs, rerun all749 SQL files,
+refresh simulator actor/regressions/profile comparisons, complete the host
+matrix audit and all remaining byte/interchange/resource/process gates,
+then release-baseline and measured optimization. No completeness or
+performance-parity claim; Apple platforms remain unverified.
+
+### Earlier integrated checkpoints
+
+The integrated VALUES, proof, pushdown and bounded DISTINCT gate completes
+**18/18 files, 495 records, 2,187 cells, 209 cost / 12 name / 5 type assertions**:
+**9 SQL failures**, zero adapter blocks or exclusions. All **24 spill, sort and
+storage-domain boundary tests pass**. Evidence:
+`/tmp/jed-swift-native-bounded-distinct-proof-values.log`; command selects
+`setops/values_query.test,setops/parenthesized.test,subquery/values_order_by.test,types/utf16_split.test,query/table_column_alias.test,query/grouped_setop_pushdown_explain.test,query/safe_conjunct_pushdown_explain.test,query/contradiction.test,dml/contradiction.test,query/where_rewrite_explain.test,params/custom_plans.test,joins/safe_conjunct_pushdown.test,storage/malformed_row_count.test,subquery/derived_pushdown.test,subquery/grouped_setop_pushdown.test,joins/on_pushdown.test,aggregates/blocking_spill.test,resource/query_memory_spill.test`
+through `mise run swift-native:test --sql-files ... --filter
+'SQLCorpusBoundaryTests|SpillBoundaryTests|SpillHashBoundaryTests|ExternalSortBoundaryTests|StorageDomainBoundaryTests'`.
+Remaining failures: VALUES scalar-subquery ORDER cost, one opaque INL estimate,
+two derived pushdown costs, and five memory-spill assertions. Bounded aggregate,
+window and DISTINCT ON have independently reviewed drafts; bounded joins are
+drafted and under review. Derived-result Q1 admission also has a reviewed fix.
+No claim that all consumers are bounded or that full SQL conformance passes.
+
+The first **complete 749/749 frozen SQL file run** finished: 21,597 records,
+39,042 cells, 2,271 cost / 1,154 name / 100 type assertions and 5 host actions.
+It reports **246 record failures in 46 files**, with zero adapter blocks,
+control aborts or storage-mode exclusions. File-only suites now use the native
+file host. Exact evidence: `/tmp/jed-swift-native-sql-all749-native-file.log`
+and `...-report.json`; command `mise run swift-native:test --all-sql --trace-sql
+--filter 'SQLCorpusBoundaryTests|PostbaselineSQLTests|JSONBoundaryTests|ResourceTests'`.
+All completed records remain authoritative; this is diagnostic, not acceptance.
+
+All **18 frozen cross-core simulation regressions pass**: all four actors pass
+18/18 local oracles, **54 transcript comparisons and 153 independent images**
+match, zero failures. Swift actor:
+`ecedde3298fef53ec972d0d0d55237ae1eb0b4fee5b7e741a2156069caad8a8f`.
+Command `mise run swift-native:sim:sweep --regress`; evidence
+`/tmp/jed-swift-native-sim-cross-core-final-hash.log`. The final three differences
+were an adapter hashing post-open repaired key blocks while emitting the saved
+pre-open image; the adapter now hashes the emitted bytes and has a passing host
+assertion. No engine format or fixture changed. The **22 profiles × 8 seeds**
+comparison completed from this immutable actor, command
+`mise run swift-native:sim:sweep --no-build --seeds 1..8`; log
+`/tmp/jed-swift-native-sim-profiles-all22-eight-seeds.log`, output
+`/tmp/jed-swift-sim-sweep-20261106-19-rfibm0`. It **fails 634 checks** across
+176 traces, 459 transcript comparisons and 5,344 independent images. Swift
+passes 131/176 local oracles; all three supported cores pass 176/176. First
+divergences involve directory-barrier fault behavior during backup, attachment
+recovery, sync/crash generation selection and durable-floor truncation; later
+differences include cascades. Host agent is diagnosing and correcting causes.
+The 18-regression result remains valid but does not establish sweep acceptance.
+
+Reviewed optional affected-row metadata, exact promoted INL bounds, LEFT hash
+estimates, and quantified EXPLAIN admission pass the focused 152-record gate
+except two then-outstanding lateral records. Evidence:
+`/tmp/jed-swift-native-rows-sim-promoted.log` (14 tests, two corpus failures).
+The subsequent temporal/lateral/depth gate completes 133 records with only the
+excess-alias error-priority record remaining; all date/interval corrections,
+lateral cost/EXPLAIN and all22 deep-view records pass. Evidence:
+`/tmp/jed-swift-native-spill-foundation-temporal-lateral.log` (14 tests, two
+failures: that SQL record and a new sorter test using an inactive unlimited
+memory account; the test now enables a positive limit).
+
+Scratch row/config/spool and stable external sorting are implemented; five
+codec/spool host checks and both forced-sort/fault checks pass. The keyed disk
+state/hash-row structures and general derived/group/window/set-op plus ON scan
+pushdown passed all 13 host tests in their first integrated focused gate:
+`/tmp/jed-swift-native-pushdown-spill-foundation.log`; 209 SQL records in nine
+files then had 20 failures, many resolved by the newer gate above.
+Operator consumers are being connected through a
+separate bounded file-host lane; no full spilling claim is made. Root owns
+bounded joins and plain sort integration; crypto agent owns BlockingRows,
+DISTINCT and aggregate consumers; host owns primitives; scope owns VALUES/set-op
+resolution. CTE/bound-parameter body pushdown and other fresh SQL failures remain.
+Linux completion, fresh process/interchange acceptance, release baselines,
+measured optimization, coherent implementation commits and final reports are
+still outstanding. No freeze or completion is claimed.
+
+## Previous integration checkpoint (2026-11-06 01:14 CST)
+
+The unchanged deep-view file now completes **22/22 records**, with all **26/26**
+tests in the combined view, maintenance, client, simulated-service and record
+gate passing (`/tmp/jed-swift-native-view-host-recovery.log`). The earlier parser
+gate passes **6/6**, including maximum-depth nested function probes and all 10
+records in `query/order_by_topk_explain.test`
+(`/tmp/jed-swift-native-max-function-topk.log`). The native 256-level policy and
+all frozen expectations remain unchanged. Planner and executor helper splits
+reduce retained frames; query-expression collection uses an explicit work stack.
+
+The first completed cross-core simulation regression comparison found **180
+disagreements**, despite all four actors passing their local history oracles.
+See `Tools/SIMULATION_COMPARISON.md` for immutable evidence and first divergences.
+Reviewed native corrections preserve recovery stabilization across credential
+rewrap, retain poisoned owner tenure until close/death, and borrow the writer's
+existing pin for transaction cursors. Their new host invariants pass in the
+26-test gate. ANALYZE and lost-close transcript formatting are corrected. The
+remaining ordered-LIMIT discrepancy was traced to attachment PK order metadata;
+its reviewed correction is published but awaits the next test/comparison gate.
+Cross-core regression acceptance and the 22-profile sweep remain outstanding.
+
+Focused multi-file corpus selection now validates every requested filename and
+rejects duplicates/omissions. Its adapter invariant passed in the same gate.
+The latest full 749-file attempt remains the incomplete 602-file result below;
+no completed whole-corpus result is claimed. Correlated query-block cost meters
+and terminal cursor guards have reviewed corrections awaiting resource checks.
+File-only corpus lanes, JSON resource corrections, and optional host affected-row
+metadata are being integrated before the next full run. Linux completion,
+release baselines, and measured optimization remain outstanding.
+
+## Previous integration checkpoint (2026-11-06 00:54 CST)
+
+Native service, backup, maintenance, deadline, transport, tree and record-boundary
+checks pass **92/92** in `/tmp/jed-swift-native-native-service-wide-params.log`.
+This includes `params/custom_plans.test`: all 59 records, 482 cells and 12 cost
+assertions pass. The unchanged default integer/ANY/ALL binding files had no
+reported failures in the subsequent broad run. The exact-fit wide-row correction
+and plain/encrypted index separator boundaries pass; root pending-cache reuse has
+a separately reviewed follow-up awaiting its next integrated gate.
+
+All **31/31 native Swift process schedules** pass using immutable actor
+`ffe818a97e17f7f159ac6bc7ebdb5641dae768d540923949e3ef598ca0752e56`
+(`/tmp/jed-swift-native-process-service-integrated.log`,
+`mise run swift-native:process --no-build`). Mixed 496 pairings still require a
+fresh run. All 18 same-core simulation regressions remain verified at the prior
+checkpoint; a cross-core comparison is now running in
+`/tmp/jed-swift-native-sim-cross-core-regress-bytecheck.log`. Its first launch
+stopped before any actor because a UTF-8-vs-binary Ruby string comparison falsely
+rejected identical pinned generator bytes; comparison now uses binary strings.
+No simulation comparison or generated-profile sweep completion is claimed yet.
+
+The second full SQL attempt reached `resource/view_depth_limit.test:30` and
+crashed during nested view parsing/planning. Preserved trace:
+`/tmp/jed-swift-native-sql-all749-after-depth-progress.log`; diagnostic JSON:
+`/tmp/jed-swift-native-sql-all749-after-depth-report.json`. It records 605 file
+starts, 602 ends, 17,672 whole-corpus record starts, **201 distinct observed
+mismatches across 60 files**, and two explicit adapter setup blocks for file-only
+resource cases. These remain partial diagnostics, not a completed corpus result.
+A reviewed planner stack split is compiling; the previous recursive frames were
+47,264 bytes in SelectPlan.resolve and 109,472 bytes in RelationPlan's source
+resolver. The shared depth policy and all fixture expectations remain unchanged.
+
+Reviewed corrections for scalar short-circuiting, filter conjunct ordering,
+LIKE/SIMILAR error and NULL behavior, keyword result names, radix LIMIT bounds,
+and fenced N-way join islands are published, but their broad semantic gates are
+still pending. The file-mode corpus adapter and generated simulation sweeps are
+being connected explicitly; no unsupported records are silently omitted.
+
+Shared prose clarifications are local-only commit `1ee030e4` (not pushed).
+Unchanged `dml/index_spilled_key`, `ddl/views_long_definition` and
+`ddl/views_owned_sequences` pass in all three supported cores in both memory and
+disk modes (18 file/mode/core checks; `/tmp/jed-index-page-fit-{go,rust,ts}.log`,
+`/tmp/jed-wide-record-{go,rust,ts}.log`, `/tmp/jed-view-default-{go,rust,ts}.log`).
+The correction records existing page-fit/default admission, with no byte-format
+version, fixture, or supported-core algorithm change. The Swift experiment is
+still active, incomplete and unoptimized.
+
+## Previous integration checkpoint (2026-11-06 00:37 CST)
+
+The integrated depth, index boundary, independent integrity and simulated service
+checks pass **28/28**:
+`mise run swift-native:test --sql-file resource/depth_limit.test --trace-sql --filter 'SQLCorpusBoundaryTests|ExpressionBoundaryTests/testOperatorProbes|ExpressionBoundaryTests/testFunctionProbes|ExpressionBoundaryTests/testConstructorHints|TreeBoundaryTests|SimIntegrityBoundaryTests|SimulationServiceBoundaryTests|SimulationRunnerBoundaryTests'`
+(`/tmp/jed-swift-native-depth-key-service.log`). The unchanged allowed 256-level
+expression now resolves/evaluates successfully, and the forbidden depth keeps its
+specified error. Splitting recursive resolver/evaluator case families alone was
+insufficient: `/tmp/jed-swift-native-depth-integrity-service-compiled.log` still
+crashed in container overload probing. Moving initial operand resolution before
+that larger dispatch frame reduces its active debug frame from 14,552 to 936
+bytes; no parser limit, corpus expectation or type-hint rule was weakened.
+
+Named-composite literal ROW costs, unanchored local parameter widths, scalar
+ANY/ALL array context, constraint-name truncation/classification, RETURNING alias
+scope and INSERT SELECT literal provenance have reviewed corrections in this
+build. Full SQL verification is pending. Key-only index entries now use actual
+leaf/interior page fit; plain/encrypted host boundaries verify single-leaf
+capacity, contextual separator rejection without replacing the prior tree, and
+exact-capacity interiors. Shared format prose is corrected against the existing
+index design and unchanged large-key corpus (see `Tools/BASELINE_FINDINGS.md`).
+
+The simulated host now routes actual page-service protocol traffic through
+resident crash-clean coordination and framed streams. Focused checks cover
+client deltas, async pin release, owner death/promotion, and the unchanged
+service-disconnect trace twice. Retained root overflow caches are validated
+against their real sealed chains, including an independently corrupted chain.
+These focused passes do not establish whole-simulation acceptance.
+
+All 18 frozen simulation regressions now pass twice: **18 PASS, zero failures,
+zero skipped**, immutable actor SHA-256
+`e5494608f618785d74297a9318875e77c8a3dcf19c251eae65369cd18b8692d0`,
+`/tmp/jed-swift-native-sim-service-integrated.log`, outputs
+`/tmp/jed-swift-sim-results-20261106-3772157-pnbmp6`. The eight earlier passing
+traces retain their prior transcript and operation hashes. Generated-profile
+sweeps and comparisons with supported cores remain separate work.
+
+The all-749 attempt in `/tmp/jed-swift-native-sql-all749-after-depth.log` later
+crashed at nested view depth; see the newer checkpoint for preserved partial counts. Fenced N-way joins remain drafted, and full native process/mixed-core
+reverification is still required after the service-host extraction. This is an
+active, incomplete experiment; no completion or performance-parity claim.
+
+## Previous integration checkpoint (2026-11-06 00:13 CST)
+
+The combined concurrency, deadline and resolver gate passed **27/27**:
+`mise run swift-native:test --sql-file ddl/catalog_long_table_indexes.test --trace-sql --filter 'BatchFlushBoundaryTests|SimulationRunnerBoundaryTests|ConcurrencyCorpusBoundaryTests|PageServiceCoreTests|SQLCorpusBoundary|ExpressionBoundaryTests/testOperatorProbes|ExpressionBoundaryTests/testFunctionProbes|IntervalBoundary'`
+(`/tmp/jed-swift-native-deadline-concurrency-green.log`). All seven frozen
+concurrency schedules ran through real sessions and cursor draining: 180 steps,
+72 SQL records, 40 version/watermark assertions and two queued writer handoffs.
+Eight deadline tests verify foreground expiry, native idle flushing, multi-domain
+budget-before-flush ordering, writer exclusion and poisoning after a client clock
+failure following body writes. The unchanged S14 deadline simulation also passes.
+
+The earlier operator fix exposed the same recurrence in nested scalar-family
+fallthrough and array-concat polymorphic retyping. Those paths now retain the
+same compound operands; literals, parameters, arrays and rows still receive
+their contextual type hints. Two callback-count invariants cover five 32-term
+operator chains and 32 nested lower/upper/array-append calls. Broader nested
+constructor retention is still under review; this is not an arbitrary-expression
+resource-safety proof. The original long catalog file passes all 16 records.
+
+The reviewed all-base N-way access planner and collation/datetime dependency
+corrections are compiled in this gate. The full SQL attempt used
+`--all-sql --trace-sql --filter 'SQLCorpusBoundaryTests|PostbaselineSQLTests'`
+(`/tmp/jed-swift-native-sql-all749-complete-attempt.log`). It crashed at the
+explicitly allowed 256-level arithmetic chain in `resource/depth_limit.test:89`.
+Direct tracing records 576 file starts, 575 ends and 16,901 record starts;
+stdout contains 260 distinct observed mismatches across 67 files, no adapter
+blocks and no completion summary. These are partial diagnostics, not full-corpus
+results. The parser limit stays unchanged; focused resolver case dispatch is
+being split to remove the oversized recursive debug stack frame.
+
+All 18 frozen simulations completed, each run twice, with
+immutable actor SHA-256
+`fb88b3a47af72578f2cb40f465795943c177260640f20e2dff51f9352a5d1f3d`
+(`/tmp/jed-swift-native-sim-resolver-fixed.log`, output directory
+`/tmp/jed-swift-sim-results-20261106-19-eto6n2`): **8 PASS, 10 FAIL, zero skipped**.
+Nine failures explicitly lack simulated service routing; the other exposed a
+checker assumption that committed root leaves could not retain overflow payloads.
+The reviewed correction validates retained bytes against their real sealed
+chains and has been published for the next gate. Simulated service and fenced
+join islands remain unfinished. The experiment remains opt-in and incomplete.
+
+## Previous integration checkpoint (2026-11-05 23:50 CST)
+
+The new interval, two-base join and GiST query paths compile together with the
+single-process simulation runner and independent image/live integrity checkers.
+The focused integration command was:
+`mise run swift-native:test --sql-file ddl/alter_table_type_primary_key.test --trace-sql --filter 'SQLCorpusBoundary|IntervalBoundary|GistBoundary|SimIntegrityBoundary|SimulationBoundary|SimulationRunnerBoundary|ResourceTests|SpecDataTests'`
+(`/tmp/jed-swift-native-access-simulation-integration.log`). **33/34 tests passed**;
+two assertions in one interval byte-adjacency test failed. The selected SQL file
+completed all 57 records, 43 cells and three cost assertions with zero failures.
+Both integrity tests passed, including a validly encoded row with a wrong primary
+key that the independent checker rejects; the first shared simulation regression
+also reproduced its transcript and operations hash twice. This is not all-trace
+or whole-corpus acceptance. Simulated service and timed relaxed flushes remain
+unfinished and fail explicitly.
+
+Three `--all-sql` attempts were interrupted after sustained CPU use; none
+produced a completion report. Direct progress tracing identified
+`ddl/catalog_long_table_indexes.test:21`: overload probes repeatedly resolved
+the same nested arithmetic operands, making a 40-term expression exponential.
+The same issue stalled a long concat in the encrypted simulation trace. A local
+operand retention fix preserves contextual literals/parameters/arrays/rows while
+reusing compound expressions across JSON/container/scalar operator probes.
+The unchanged catalog file now completes **16/16 records in 0.254 seconds**.
+Focused gate **11/11 PASS**:
+`mise run swift-native:test --sql-file ddl/catalog_long_table_indexes.test --trace-sql --filter 'SQLCorpusBoundary|IntervalBoundary|SimIntegrityBoundary|ExpressionBoundaryTests/testConditionalParameterAdoptionAndByteInputBoundaries'`
+(`/tmp/jed-swift-native-resolver-long-chain.log`, 2026-11-06 00:00 CST).
+The interval test correction follows the frozen prefix-successor contract;
+the new 7-dimensional secondary-index boundary also passes. No shared expected
+SQL or cost result changed. Full 749-file verification must still complete.
+
+The preceding native filesystem/simulation foundation gate passed **44/44**
+(`/tmp/jed-swift-native-simulation-foundation.log`), and the rebuilt native
+process actor passed **31/31** after that host seam refactor
+(`/tmp/jed-swift-native-process-filesystem-seam.log`; executable SHA-256
+`0a531a19a605dd2cd82644d275c00631379e27fc1efba5634977563c7de31edc`).
+Commit `0afb7301` records that independently verified host foundation, local-only.
+Mechanical inclusion of the baseline's 18 simulation regressions and 22 profiles
+expanded the frozen input fingerprint to
+`369ad9def9a39d16e8812714f9100f1ad86df6822910021c32cfa19e4c2e7bfc`;
+codegen and `--check` pass. The baseline revision and 749 SQL files did not change.
+
+Next: correct adjacency, finish the direct-traced whole corpus, route all seven
+shared concurrency schedules through an audited adapter, complete simulation
+service/deadline coverage, then continue full acceptance and measured release
+optimization. All changes remain opt-in and all commits local-only/unpushed.
+
+## Previous checkpoint (2026-11-05 23:26 CST)
+
+The expanded gate compiled and completed:
+`mise run swift-native:test --filter 'SQLCorpusBoundary|GinBoundary|ResourceTests|SessionCursorTests'`
+(`/tmp/jed-swift-native-sql-344-gin-merge.log`). **343 frozen files completed**;
+one mistakenly selected postbaseline GIN regression was absent from the frozen
+bundle and explicitly reported as an adapter block. It is now pinned in the
+separate `PostbaselineSQLTests` lane. The run consumed 9,743 records
+(6,278 statements / 3,465 queries), 15,533 cells, 921 cost / 893 name / 14 type
+assertions and two host actions; **78 SQL failures**, no failed-action aborts.
+All 21 tests outside the whole SQL test passed (nine GIN boundaries, five resource
+invariants, four session cursors, three adapters). 406 baseline files remained
+outside that run; the earlier printed 405 counted the mistaken extra selection.
+
+GIN physical scans, candidate estimates, OR gathers, scalar-array/JSON/path
+operations and MERGE now compile together. Term-statistics failures fell from
+19 to one. Review traced the new failures to array comparison promotion hiding
+bare GIN columns, quantified varlen charges, row-independent concat growth,
+statistics fraction scaling, MERGE source aliasing/qual ordering, and existing
+join/interval/GiST gaps. The eager materialization filter move introduced one
+resource regression: only a proven scan-pushed filter may precede row admission,
+not a whole WHERE. That move has been reverted. New tests also exposed a collated
+top-k temporary-memory mismatch. No expected SQL or cost result was changed.
+
+The next gate uses explicit `swift-native:test --all-sql` to attempt all **749**
+frozen SQL files, with both later shared regressions counted separately. Interval
+planning, join access selection and simulation are being developed independently.
+The experiment remains incomplete, local-only/unpushed, and excluded from defaults.
+
+## Previous checkpoint (2026-11-05 23:13 CST)
+
+Latest completed gate:
+`mise run swift-native:test --filter 'SQLCorpusBoundary|SerializationBoundary|SessionAdmissionBoundary'`
+(`/tmp/jed-swift-native-sql-308-prefix-host.log`): **308/308** selected whole files,
+8,922 records (5,875 statements / 3,047 queries), 13,764 result cells,
+728 cost / 893 name / 14 type assertions, two host actions; **56 SQL failures**,
+zero adapter blocks or failed-action aborts, 441 frozen files not yet admitted.
+All seven tests outside the whole SQL test passed: three adapter, two named
+serialization, and two session admission tests. The newly admitted collation skew
+and upgrade files passed. LIMIT estimation, expression-key default collation
+identity, and decimal comparison bound admission now pass their prior failures.
+Named attachment serialization pins its committed domain without waiting for a
+writer or pinning main; eager write sessions own their gate immediately.
+GIN query execution/term estimates, MERGE, and eager scan accounting are being
+integrated for the next gate; this is not a completed-core acceptance result.
+
+## Previous checkpoint (2026-11-05 23:06 CST)
 
 Status remains **incomplete**. Latest completed SQL gate:
 `mise run swift-native:test --filter 'SQLCorpusBoundary|GinBoundary'`

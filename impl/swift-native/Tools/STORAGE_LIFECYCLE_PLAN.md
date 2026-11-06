@@ -1,14 +1,50 @@
-# Proposed database storage and state seam
+# Database storage and state seam
 
-This is an implementation plan for the frozen Swift experiment, not a new
-shared storage design. The contracts are `transactions.md` §§2–3, 6–8, 11;
-`pager.md` §§2–5; `validated-cow.md` §§1–4; `memory.md` §§7–8; `large-values.md`
-§15; `gist.md` §4.1; and the v50 plain/encrypted file formats. Work remains
-unimplemented until the corresponding source and verification evidence exist.
+Durable preoptimization evidence is preserved in the ignored ext4
+[verification archive](../results/verification-preoptimization-20261106/manifest.json):
+50 successful report/log/TSV files, 11,386,296 bytes, with original paths and
+SHA-256 hashes in its manifest. Originals remain intact; binaries and simulation
+images are excluded. The complete correctness matrix passes; only performance
+baseline/optimization/reporting remains outstanding.
+
+This records the implemented storage architecture of the frozen Swift experiment,
+not a new shared storage design. The contracts are `transactions.md` §§2–3, 6–8,
+11; `pager.md` §§2–5; `validated-cow.md` §§1–4; `memory.md` §§7–8;
+`large-values.md` §15; `gist.md` §4.1; and the v50 plain/encrypted formats.
+The dated foundation checkpoints below are history, not current omissions.
+
+Current evidence (2026-11-06): refreshed interchange passes all 112 frozen images
+and 2,691 phases; the process matrix passes 496 ordered pairs; saved simulations
+pass 18 traces/54 comparisons/153 checked Swift images; generated simulations
+pass 176 traces per core/459 comparisons/7,049 checked Swift images. Reports:
+`/tmp/jed-swift-interchange-20261106-996175-9832xa/report.json` and
+`/tmp/jed-swift-sim-sweep-20261106-980401-9e3v3g/summary.json`.
+
+The corrected full release V04 matrix passes all 241,412 measurements with zero
+failures and complete membership (21,477 memory and 19,438 disk/disk-spill
+records per core). Peaks and storage bytes agree:
+`/tmp/jed-swift-query-memory-20261106-1996511-bxwolu/report.json`. Earlier debug/release reports
+retain 376 GiST-load differences; the shared loader correction, six host cases
+and reopen regression resolve them without altering the comparator. The failed
+private Rust manifest/cache attempt also remains preserved in RESOURCE_ACCEPTANCE.
+Service SQL passes all six directions and 116,628 frozen records:
+`/tmp/jed-swift-service-corpus-20261106-1040687-2wheah/report.json`.
+The fourth release refresh passes all 509 native tests and all 749 SQL files
+in `/tmp/jed-swift-native-release-all749-eof-fourth.log`. Prior handoff/client and
+old-pin assertion failures are resolved and retained as historical evidence.
+Both Swift-client/Rust-pages stream scenarios pass in
+`/tmp/jed-swift-native-process-rust-stream.log`; canonical default CI retry passes
+18/18 in `/tmp/jed-swift-native-default-ci-gist-canonical-retry.log`. Fresh full
+release mixed process passes 496/496; saved simulations pass 18 per core,
+54 comparisons and 153 checked Swift images at
+`/tmp/jed-swift-sim-sweep-20261106-2057112-ozakk7/summary.json`. The final generated release sweep
+also passes 176 traces per core, 459 comparisons and 7,049 checked Swift images
+(/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json); only performance remains
+pending.
 
 ## State and ownership
 
-| Proposed type | Responsibility |
+| Implemented type | Responsibility |
 |---|---|
 | `TableStore` | A value-semantic B+tree, synthetic next-rowid, and Q3 pending-version ledger. Returns packed records and lazy cells. |
 | `DomainSnapshot` | Immutable published catalog plus independent table/index roots, nominal type identities, txid, catalog/data revisions, and estimator revision tokens. |
@@ -97,10 +133,11 @@ against Q1/Q2 beside the pending balance, with cost errors taking precedence.
    used by pin-latest. A reader in the persist/publication interval pins the old
    version and therefore prevents later unsafe reuse.
 
-The lifecycle owner must expose full persisted free entries separately from
-safe reusable entries; Pager's current `allocationState(reuseAllowed:)` exposes
-only the latter. Losing the filtered remainder would change allocation and
-reclamation behavior. Cache invalidation is not a replacement for reader pins.
+The lifecycle owner exposes full persisted free entries separately from safe
+reusable entries through `Pager.allocationSnapshot(reuseAllowed:)`. The older
+`allocationState(reuseAllowed:)` helper exposes only the reusable subset. Keeping
+both sets preserves allocation/reclamation behavior. Cache invalidation does
+not replace reader pins.
 
 From-scratch export/create/compaction retain their distinct allocation rules:
 children before parents, a leaf page ID before its overflow chain IDs, catalog
@@ -111,7 +148,7 @@ seams; maintenance must not alias a source cache into a new page-address space.
 
 ## Integration boundary
 
-The storage slice proposes owning `TableStore.swift`, `DomainSnapshot.swift`,
+The storage slice owns `TableStore.swift`, `DomainSnapshot.swift`,
 `StorageDomain.swift`, `DomainCommit.swift`, and `PageReachability.swift`.
 Root integration retains session APIs, transaction/savepoint control, attachment
 routing, the writer gate/pin coordinator, and SQL constraint/index maintenance.
@@ -126,11 +163,11 @@ domain on behalf of a multi-domain coordinator.
 | Lazy open | Instrumented host proves catalog/skeleton open avoids unrelated table leaves and overflow reads; new tables bind the pool. |
 | Round trip | All frozen table/index/large-value/continued-catalog images open and rebuild byte exactly, including seeded encrypted images. |
 | Independent roots | Editing one table/index retains other roots and their pages; no-op and temp-only transactions issue no main writes/barrier/txid increment. |
-| Snapshot safety | Pinned roots/cursors and savepoint restores keep old records, rowids, catalog facts, and pending accounting. Shared concurrency corpus drives session behavior later. |
+| Snapshot safety | Pinned roots/cursors and savepoint restores keep old records, rowids, catalog facts, and pending accounting. The seven shared concurrency schedules exercise session behavior. |
 | Dirty-region accounting | Incremental live counts equal an independent reachability recount, including kept overflow chains, drops, rewrites, and GiST. |
 | Reuse safety | Fallback readers, manifest-only dependencies, deferred reuse, relaxed batches, and cache flights cannot observe overwritten pages. |
 | Limits and failure | Q3 net/savepoint rules and Q4 file/memory/repair/multi-root cases; no storage writes on preparation rejection; I/O failures poison and recovery selects a valid generation. |
-| Shared execution | Full memory/disk SQL corpus, concurrency, simulation, process scenarios, integrity fixtures, and interop remain required beyond these internal storage checks. |
+| Shared execution | Whole SQL, concurrency, simulation, process, integrity and interop gates have separate retained evidence. Corrected exact accounting, all 509 release native tests, fresh mixed process/saved simulations and the refreshed service SQL matrix pass. Final generated release simulations also pass; only performance remains pending. |
 
 ## Implemented integration interfaces
 
@@ -177,9 +214,10 @@ page count, initially zero after memory create/open; bootstrap catalog pages do
 not qualify an initial empty-object mutation for repair. File admission uses
 the loaded live catalog page count, as specified by the separate Q4c rule.
 
-From-scratch export, atomic file compaction/rekey, process ownership, public
-sessions/cursors, and shared SQL adapter acceptance remain separate work. The
-current incremental source must not be described as completing those host APIs.
+From-scratch export, atomic file compaction/rekey, process ownership and public
+sessions/cursors are now connected through their dedicated modules. Their host
+and cross-core gates remain distinct from the incremental-storage checks; see
+the current acceptance summary and the host matrix.
 
 ## Streamed image implementation
 
@@ -206,15 +244,18 @@ its pages emit in reverse chain sealing order.
 The serializer supports the existing page layout, including a fresh encryption
 key with the same layout. Changing page size or plain/encrypted layout requires
 a separate ascending-record rebuild before invoking it; the current writer
-rejects such a request with `0A000` before output. Full migration/rekey remains
-required by the experiment's scope and is not claimed by this rejection path.
+rejects such a request with `0A000` before output. `DomainRebuilder` and
+`DatabaseMaintenance.rekey` provide the required rebuild before this sink. The
+public compaction contract keeps page size unchanged; the sink guard is not a
+missing rekey implementation.
 
 Image boundary tests compare 85 canonical frozen images byte-for-byte, including
 six encrypted images under the canonical seeded entropy stream. Two additional
 torn-meta fixtures compare every body byte and require both output meta slots
 to equal the selected valid source generation, repairing the intentional CRC damage. They
 also cover output failure and retry, source immutability, metadata preflight,
-and callback ordering. Results await the parent's integrated test run.
+and callback ordering. The historical 197-test checkpoint below passed these
+cases; the current 112-image interchange refresh provides broader file evidence.
 
 ## Memory attachment staging
 
@@ -236,7 +277,7 @@ test injects main-file failure after attachment staging, checks the attachment's
 old roots and metadata/accounting, then overwrites the abandoned slots and
 verifies token rejection and zero-I/O adoption.
 
-## Verified checkpoint
+## Historical verified checkpoint (2026-11-05)
 
 The parent's `mise run swift-native:test` run completed on 2026-11-05 at
 18:20:42 local with **197 tests, zero failures** (64.269 seconds). It includes
@@ -254,8 +295,9 @@ maintenance exclusion, read-only boundaries, and current-versus-older Q4 pins.
 Mechanical codegen verification also passed with the complete frozen corpus,
 112 database byte fixtures, Unicode source/artifact fixtures, and PRNG vectors:
 `7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83`.
-This is internal storage/host evidence, not acceptance of the pending full SQL,
-process service, host maintenance, or page-layout migration surface.
+That checkpoint established internal storage/host behavior only. The later SQL,
+process, maintenance and migration gates are recorded separately; the current
+acceptance summary identifies the remaining failures and required reruns.
 
 ## Scratch record rebuild implementation
 
@@ -296,9 +338,9 @@ The byte-device injection is the native spill-host boundary. A MemoryBlockStore
 alone still holds its entire scratch image in memory. The native host must
 provide migration to an exclusively created, unlinked scratch file after the
 page-cache budget, with no grow barriers and sealed host scratch when required.
-That host spill/migration adapter and atomic file maintenance remain separate
-work; bounded leaf/record residency must not be presented as a whole-engine heap
-limit. The three rebuild boundary tests passed in the parent-owned integrated run at
+The native spill/migration adapter and atomic file maintenance are implemented
+in the following sections. Bounded leaf/record residency is not a whole-engine
+heap limit. The three rebuild boundary tests passed in the parent-owned integrated run at
 18:31:30 on 2026-11-05 (1.0 seconds).
 
 ## Native scratch host follow-on
@@ -330,9 +372,9 @@ The four new ScratchBoundaryTests cover byte-preserving migration, threshold
 admission, zeroed holes/truncation, stale-version and cross-file/ordinal replay,
 private-file unlinking, and actual native sealed spill during a 150-row indexed
 rebuild. All four passed in the parent-owned integrated run at 18:43:59 on
-2026-11-05 (0.182 seconds). File coordination,
-public lifecycle wiring, page service, atomic replacement and SQL spill
-operators remain separate work.
+2026-11-05 (0.182 seconds). File coordination, public lifecycle, page service,
+atomic replacement and bounded SQL spill were connected later and have their
+own gates in the current acceptance reports.
 
 ## Native lifecycle and protocol-v2 exclusive host
 
@@ -356,16 +398,19 @@ The byte device is closed before owner removal and presence release. The bundle
 itself remains in place. Inherited handles refuse operations across fork.
 
 `locking: .none` is the explicit external-coordination escape hatch. The default
-`.automatic` currently returns `0A000`: full page-service owner/client, election,
-handoff, remote pins and commit deltas are not implemented by this slice. This
-is an explicit incomplete acceptance row, not exclusive fallback or a skipped
-process test. File attachments remain later work; maintenance follows below.
+`.automatic` is routed by public `Database.create/open` through
+`ServiceDatabaseHost` on Linux, providing owner/client election, handoff, remote
+pins and commit deltas. The direct `FileDatabaseHost` automatic-mode guard is
+intercepted before this path; it is not a reachable Linux capability omission
+or an exclusive fallback. File attachments use the same host routing. Apple
+platform support remains unverified.
 
 Public serialization pins the committed snapshot and collects the canonical
 page-sink output into its explicit host buffer. It rejects encrypted sources
 with `0A000`; deserialize rejects encrypted images with `55000`, as required by
 the frozen baseline. Internal maintenance retains encrypted DomainImage support.
-Unknown database names, including `temp`, are `42704` until attachment routing.
+Named attachments resolve through `DatabaseDomains.pinCommitted`; only the
+selected committed domain is pinned. Unknown names and `temp` return `42704`.
 
 Catalog environment admission rejects a completely absent referenced collation
 with `XX002`, preserves version-skewed collation pins and stored definitions, and
@@ -425,7 +470,10 @@ insertion, including canonical GiST reconstruction; ordinary compact retains the
 source tree shape.
 
 Credential change retains the data key privately inside EncryptedPageCodec and
-runs rewrapping/KDF work before the writer gate. It checks both storage identity
+runs rewrapping/KDF work before admission. Its local-maintenance gate excludes
+local writers but allows an idle remote writer grant; a streamed remote delta
+refuses credential writes with `58030`. Commit-boundary serialization and exact
+lease cleanup preserve this distinction. It checks both storage identity
 and selected key-block generation again under the gate. Its storage phase
 flushes any pending relaxed batch, performs stabilization and the retained
 first-directory sync, writes the unselected copy, barriers, writes the other
@@ -440,11 +488,11 @@ poisoned pager fails, preserving the first failure. Refusal to acquire the
 maintenance gate leaves the handle open. Five MaintenanceBoundaryTests cover
 these host/byte invariants, including a frozen encrypted GiST fixture rebuilt
 through plaintext, encryption and key rotation. All five passed in the
-parent-owned integrated selected run at 19:18:54 on 2026-11-05 (0.861 seconds). Process/crash simulations and attachment maintenance remain separate
-acceptance requirements. The named maintenance publication adds four host tests
-for target-only pin exclusion, root writer exclusion, attachment identity after
-preflight, credential readers, and root scratch policy; their verification is
-recorded separately when the integrated run completes.
+parent-owned integrated selected run at 19:18:54 on 2026-11-05 (0.861 seconds).
+The later named-maintenance tests cover target-only pin exclusion, root writer
+exclusion, attachment identity after preflight, credential readers and root
+scratch policy. Native maintenance, refreshed process and generated simulation
+gates now pass; the refreshed service SQL matrix also passes all six directions.
 
 ## Grouped domain commit integration
 
@@ -468,15 +516,20 @@ reports known success, memory accounting and per-core root adoption are
 nonthrowing; a remote file role replacement keeps the existing known-commit
 resolution behavior. No unchanged file gets a txid, meta write or barrier.
 
-Failure before file success leaves memory roots and selected accounting
+Failure before file success leaves memory roots and selected page high-water
 unchanged. Staged bytes occupy only safe slots; an abandoned group is discarded
 and a later transaction prepares and stages again. A memory device I/O failure
-poisons that domain only. Forced memory Q4 reclamation now produces a private
-allocation proof during preflight, rather than mutating the published free list
-while another domain may still refuse. Old pins continue to protect their own
-domain's pages. Five host invariant tests cover these phase and failure rules;
-all five passed in the parent-owned integrated verification. A sixth test covers
-the pre-durable memory staging hook used by private temp spill.
+poisons that domain only. Forced memory Q4 compaction retains its reader-safe
+free-list, compaction baseline and free-generation update even if this or a
+later domain refuses, as memory.md §8.3 explicitly requires. No bytes or roots
+change during that preflight. The initial group implementation mistakenly kept
+this proof private; the all-corpus storage gauge comparison exposed the error,
+and the correction/regression evidence is recorded in RESOURCE_ACCEPTANCE.md.
+Old pins continue to protect their own domain's pages. The original five host
+invariants passed their earlier gate. The corrected compaction assertions and
+new refusal/retry test passed subsequent focused and full native gates; complete
+debug/release V04 now agrees on committed-storage bytes. A sixth test
+covers the pre-durable memory staging hook used by private temp spill.
 
 The frozen process backup prefix also exposed the explicit large-values.md
 §15.2 root-leaf exception: newly written resident overflow values continue to
@@ -485,3 +538,12 @@ retains those original pending payloads alongside its packed root leaf and
 demotes other leaves. Reloaded values keep their stored chain pointers. This
 preserves the baseline's allocation/free-list behavior without decoding table
 maps or changing the shared golden expectations.
+
+A committed root with an inherited external reference follows the separate
+mixed-root rule: after persistence the root re-faults through the page pool,
+converting neighboring fresh caches to stored references too. Pure-fresh roots
+retain their caches and continue rewriting chains. The generated attachment and
+reuse-under-pins regressions distinguish these cases; their refreshed byte/image
+comparisons pass. This does not change GiST accounting: reconstruction of
+committed GiST keys creates no pending transaction versions. The shared
+supported-core loader correction discussed at the top preserves that contract.

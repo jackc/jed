@@ -1,6 +1,7 @@
 # Native Swift core experiment
 
-Approved 2026-11-05. **In progress; not a complete core.** The target is the supported
+Approved 2026-11-05. **Linux correctness acceptance passes; performance acceptance
+and the final freeze remain in progress.** The target is the supported
 Rust/Go/TypeScript surface at `362e0798ac3a8bd04bd2da556044b6ec73bf468a`.
 The language-neutral specification and shared corpus define behavior. Existing cores
 provide implementation patterns, never authority over the spec. Ruby's frozen surface
@@ -67,6 +68,28 @@ boundaries. Approved libraries are Apple's swift-crypto (including CryptoExtras)
 pinned reference Argon2 with necessary cryptographic backends. Native code is confined
 to those utilities and sanctioned OS host calls. No new primitives or unrelated
 dependencies are permitted without approval.
+
+### Swift host conversions
+
+The additive ergonomic surface follows api.md §11 through Swift protocols,
+without reflection or a second executor. `SQLValueConvertible` converts native
+parameters to the existing exact `SQLValue`; `SQLValueDecodable` reads typed row
+values. `Optional` is the nullable native target; a nonoptional NULL read is
+`22004`, a family mismatch `42804`, and integer narrowing overflow `22003`.
+Integer widths, Boolean, Float/Double bit patterns, UTF-8 String/SQLText, bytes,
+exact SQLDecimal, UUID, interval and open SQL values have explicit conversions.
+Native lists bind as one-dimensional arrays; `[UInt8]` is bytea. Raw SQLValue
+retains every temporal and recursive representation without host reinterpretation.
+
+`Row` owns a returned row and exposes exact-name/index access; missing columns
+are `42703`. `Rows.nextRow()` remains streaming. Database and Session accept
+native `arguments:` alongside the existing typed `parameters:` methods, including
+prepared execution. `queryRow` reads one row and closes its cursor;
+`queryRows`/`queryMap` collect through the engine's existing Q1-accounted collector.
+Argument-conversion errors poison an open transaction; host row-decoding errors
+do not masquerade as SQL execution failures. Database scoped view/update helpers
+mint one session and use its existing transaction state machine. These APIs are
+thread-affine where their underlying Session, Rows or PreparedStatement is.
 
 ## Progress and ownership
 
