@@ -8,6 +8,7 @@ require "json"
 require "tmpdir"
 require "timeout"
 require "find"
+require "time"
 
 # Explicit experiment only. Shared benchmark inputs and peer runners are data
 # and transport references; no default benchmark/CI task imports this module.
@@ -204,6 +205,15 @@ module SwiftNativeBenchmark
     end
   end
 
+  def valid_started_at?(value)
+    # All four actors emit UTC RFC3339 to whole seconds. Round-trip as well as
+    # parsing: Time can normalize impossible dates or an out-of-range hour.
+    return false unless value.is_a?(String) && value.match?(/\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z/)
+    Time.iso8601(value).utc.iso8601 == value
+  rescue ArgumentError
+    false
+  end
+
   def validate_results(path, core, workloads)
     expected = workloads.to_h { [_1.fetch(:name), _1] }
     found = {}
@@ -214,6 +224,7 @@ module SwiftNativeBenchmark
       bench = expected.fetch(name)
       raise "#{core}: invalid result schema/identity at #{number}" unless row.fetch("schema") == 2 && row.fetch("engine") == "jed" && row.fetch("lang") == core
       raise "#{core}: wrong benchmark variant" unless row.fetch("variant") == (core == "swift" ? "experimental-native" : "core")
+      raise "#{core}: malformed started_at at #{number}" unless valid_started_at?(row["started_at"])
       raise "#{core}: malformed numeric results" unless INTEGER_FIELDS.all? { |field| row.fetch(field).is_a?(Integer) && row.fetch(field) >= 0 }
       expected_fields = { "dataset" => bench.fetch(:dataset), "iterations" => bench.fetch(:iterations), "warmup" => bench.fetch(:warmup),
                           "readers" => bench.fetch(:readers), "fingerprint" => HASHES.fetch("datasets.toml") }
@@ -260,17 +271,36 @@ module SwiftNativeBenchmark
       good = { "schema" => 2, "engine" => "jed", "lang" => "swift", "variant" => "experimental-native", "bench" => bench.fetch(:name),
                "dataset" => bench.fetch(:dataset), "iterations" => bench.fetch(:iterations), "warmup" => bench.fetch(:warmup), "readers" => bench.fetch(:readers),
                "total_ns" => bench.fetch(:iterations), "ns_per_op" => 1, "min_ns" => 1, "p50_ns" => 1, "p90_ns" => 1, "p99_ns" => 1,
-               "rows_total" => bench.fetch(:iterations), "checksum" => "0123456789abcdef", "fingerprint" => HASHES.fetch("datasets.toml") }
+               "rows_total" => bench.fetch(:iterations), "checksum" => "0123456789abcdef", "fingerprint" => HASHES.fetch("datasets.toml"),
+               "started_at" => "2026-11-06T12:34:56Z" }
       path = File.join(directory, "result.jsonl")
-      File.write(path, JSON.generate(good) + "\n"); validate_results(path, "swift", [bench])
+      # Go UTC/RFC3339, Rust's civil formatter, TS after removing milliseconds,
+      # and Swift's default ISO8601DateFormatter emit this same whole-second form.
+      CORES.each do |core|
+        [good.fetch("started_at"), "2024-02-29T00:00:00Z"].each do |timestamp|
+          row = good.merge("lang" => core, "variant" => core == "swift" ? "experimental-native" : "core", "started_at" => timestamp)
+          File.write(path, JSON.generate(row) + "\n"); validate_results(path, core, [bench])
+        end
+      end
       ["", (JSON.generate(good) + "\n") * 2, JSON.generate(good.merge("warmup" => 0)) + "\n"].each do |invalid|
         File.write(path, invalid)
         begin; validate_results(path, "swift", [bench]); raise "invalid results accepted"; rescue RuntimeError => error
           raise if error.message == "invalid results accepted"
         end
       end
+      invalid_timestamps = [nil, 0, "", "not-a-time", "2026-02-29T12:34:56Z", "2026-02-30T12:34:56Z",
+                            "2026-13-01T12:34:56Z", "2026-11-06T24:00:00Z", "2026-11-06T12:60:00Z",
+                            "2026-11-06T12:34:60Z", "2026-11-06T12:34:56", "2026-11-06 12:34:56Z",
+                            "2026-11-06T12:34:56Z\n"]
+      invalid_rows = [good.reject { |key, _| key == "started_at" }] + invalid_timestamps.map { good.merge("started_at" => _1) }
+      invalid_rows.each do |row|
+        File.write(path, JSON.generate(row) + "\n")
+        begin; validate_results(path, "swift", [bench]); raise "invalid timestamp accepted"; rescue RuntimeError => error
+          raise unless error.message == "swift: malformed started_at at 1"
+        end
+      end
     end
-    puts "benchmark adapter: 143 shared workloads; membership/parameter rejection checks PASS"
+    puts "benchmark adapter: 143 shared workloads; membership/parameter/timestamp rejection checks PASS"
   end
 
   def run
