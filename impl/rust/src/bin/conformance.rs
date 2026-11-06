@@ -62,6 +62,10 @@ fn main() -> ExitCode {
     let suites = suites_dir();
     let mut files = Vec::new();
     collect_tests(&suites, &mut files);
+    if files.is_empty() {
+        eprintln!("no conformance test files found under {}", suites.display());
+        return ExitCode::FAILURE;
+    }
     files.sort();
     if let Ok(filter) = std::env::var("JED_CONFORMANCE_FILTER") {
         files.retain(|path| path.to_string_lossy().contains(&filter));
