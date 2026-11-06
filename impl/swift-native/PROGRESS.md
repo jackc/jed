@@ -4,7 +4,72 @@ Status: **Linux correctness acceptance passes; performance work remains**. Basel
 `362e0798ac3a8bd04bd2da556044b6ec73bf468a` (2026-11-05).
 Branch: `codex/swift-native-experiment`, local-only, not pushed.
 
-## Current integration checkpoint (2026-11-06 07:04 CST)
+## Current performance checkpoint (2026-11-06 11:45 CST)
+
+The complete preoptimization release baseline passed: **143 workloads × four
+cores × three rounds**, all 12 runs complete, zero failures. Values, row counts,
+checksums, parameters and workload settings agree across all cores and rounds.
+Command: `mise run swift-native:bench --output /home/jack/dev/jed/impl/swift-native/results/benchmark-baseline-20261106`.
+The retained immutable actors and source snapshot record local-only source
+revision **76f4c4c866ddf04f01a9b7d38f6e0b7573c592c6**. The run completed at
+17:19 UTC; log: `/tmp/jed-swift-native-benchmark-baseline.log`.
+
+Strict analysis is in `results/benchmark-baseline-summary-20261106`. The median
+of three round means for `full_scan_agg` is 1,119.919 ms in Swift, 20.261 ms in
+Rust, 13.790 ms in Go and 135.551 ms in TypeScript. These are matching authored
+operations, not a performance-parity claim. The unweighted geometric mean of
+all 143 Swift/peer ratios is 9.5012 / 7.7748 / 2.2143 respectively.
+
+The first diagnostic LLDB capture stopped after six observations because the
+sampler misread an asynchronous debugger transition. Its failed report and
+stacks remain in `results/profile-full-scan-before`. The corrected capture in
+`results/profile-full-scan-before-second` passed with 91 observations in 20
+seconds; all main-thread stacks were beneath `GroupedSelectExecution`, with 29
+leaf observations in `swift_release`, 25 in `swift_retain` and four in slow
+reference-count decrement. These coarse debugger observations identify repeated
+row/context ownership work; they are not CPU percentages or benchmark timings.
+Exact sampler code, cleanup proof and analysis are retained in its `tooling/`
+directory (manifest SHA-256
+`8f700635f12eee8de4b5da3f046db75ff3857fc6549e4351990ebb4d645accd7`).
+
+Independently reviewed source changes remove intermediate decoder byte copies
+and add a retained leaf-position driver only for already-eligible, unfiltered
+whole-table aggregates with fixed-width touched columns. Existing accumulator,
+finalization, charge and memory schedules remain in use. Four focused host tests
+cover lane equivalence, memory admission, cancellation/I/O cleanup and retained
+pending cells; decoder tests cover nonzero slice offsets, truncation, trailing
+bytes and recursive validation. Optimized source is committed locally at
+**cec8170bfc33f087fa98949ae661b1eaa5490218**. The full release gate passes **515
+native tests and all 749 SQL files**, with the same 21,597 records, 39,148 cells
+and 2,271 costs, zero failures or omissions:
+`/tmp/jed-swift-native-release-packed-all749-first.log`.
+Full three-mode V04 also passes **241,412 measurements**, zero differences,
+at `results/query-memory-postoptimization-20261106/report.json`. The captured
+XCTest SHA-256 is `8a6ab03b598c31d73c14a3468cdf9ca047d1329f809af22671f889cb8f44e56e`;
+resource digest remains `0568c671be49ea6e8e3ff902f41b48a110b612ab428fd105a8bbd67cabb5ba10`.
+Saved simulations pass all 18 traces per core, 54 comparisons and 153 independent
+Swift images at `results/sim-regress-postoptimization-20261106/summary.json`.
+Full encrypted comparison passes **77,612 records**, zero failures, at
+`results/encrypted-postoptimization-20261106-sockets/report.json`. Its first
+attempt is preserved separately: Swift completed, while the peers could not
+bind local sockets inside the sandbox. The unchanged retry used local-socket
+permission; no expectation, adapter or source change was needed.
+
+A one-round, two-workload diagnostic at `results/benchmark-packed-diagnostic-20261106`
+measured unfiltered COUNT/SUM at 229.996 ms versus the baseline median 1,119.919 ms;
+the filtered control measured 978.662 ms versus 1,001.085 ms. Row counts and
+checksums agree. This diagnostic does not replace the required full after run.
+The matching after profile completed its canonical workload with 19 observations
+and exit 0; 17 show `foldPackedWholeTable`, with no observed `SelectInput` frame.
+Its archive manifest is `aefaeb1157162f5e9325fc99465abcd74ad7ef6be7e274a7a97c35d0a0cac67b`.
+Before/after observations have different stopping conditions (duration versus
+natural exit), so their counts are not CPU-percentage comparisons.
+
+File interchange, the full matched after benchmark, final reporting and freeze
+remain outstanding. The strict opt-in report task is committed locally as
+**fd70237c**; its 61 synthetic adapter checks and independent review pass.
+
+## Preoptimization correctness acceptance (2026-11-06 07:04 CST)
 
 **Latest release acceptance is green:** all **509 native tests and 749 frozen SQL
 files** pass, with 21,597 records, 39,148 cells, 2,271 cost / 1,154 name / 100 type
@@ -37,8 +102,8 @@ simulation also passes all **176 traces per core, 459 transcript comparisons and
 7,049 independent Swift image checks**, with zero failures and the same 23 frozen
 fault-comparison exemptions:
 `/tmp/jed-swift-sim-sweep-20261106-2104641-awof5y/summary.json`. All required Linux
-correctness gates are green before optimization. Performance remains pending;
-preserve its upcoming baseline under the ignored durable ext4 path
+correctness gates are green before optimization. Its subsequent baseline is
+preserved under the ignored durable ext4 path
 `impl/swift-native/results/benchmark-baseline-20261106`, not temporary tmpfs.
 Additional local-only tooling commits are **1c27c331** (Rust pages serving) and
 **41a90bb2** (strict benchmark timestamps).
