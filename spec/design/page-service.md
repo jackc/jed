@@ -299,8 +299,10 @@ snapshot locally (reload the skeleton; drop the owner's buffer-pool entries for 
 append the delta to the replication tee, record `(txid, manifest digest)` in the resolution window
 (§8.4), acknowledge, and release the gate (after a maintenance commit, if one is due, §6). A write
 or sync failure poisons the owner's storage handle exactly as an alone process's does ([validated-cow.md](validated-cow.md)): the
-owner stops serving and closes, and the commit's outcome is resolved by recovery under the next
-owner (§8.4).
+owner stops serving and closes its listener and client connections. Its poisoned host handle
+retains the file descriptor and `presence EX` until that handle closes or its process dies;
+stopping service alone does not end ownership. The commit's outcome can then be resolved by
+recovery under the next owner (§8.4), or remains `08007` while no serving owner can be reached.
 
 ## 6. Page reuse and reclamation
 
