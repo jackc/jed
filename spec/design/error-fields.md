@@ -159,6 +159,22 @@ produces is about storing into that relation, so the stamp is always correct.
 range-element overflow sites and the `varchar(n)` truncation), so every "value out of range for type
 X" carries the type without touching each arithmetic site individually.
 
+For floating-point overflow, the field is the canonical **result or conversion target** type,
+even when the informational message uses the generic "value out of range: overflow" wording.
+Binary arithmetic and `SUM`/`AVG` report their result width (`f32` or `f64`); scalar math functions
+such as `exp`/`power` and statistical moments report `f64`, including when their inputs are `f32`.
+Decimal-to-float and narrowing float casts report the target width. Rejecting a non-finite float
+when converting to an integer or decimal reports that target type. Float text input reports its
+target width on either magnitude overflow or input underflow.
+
+The `22003` row in §4 describes these typed range/coercion errors, not every use of that SQLSTATE.
+Floating **operation** underflow (including decimal-to-float and narrowing casts), math-domain
+errors, negative factorial, percentile-domain errors, and formatter number/position errors keep
+`DataTypeName` unset. A dynamic `format` width argument is an ordinary conversion to `i32`, so an
+out-of-range argument reports `i32`; overflow while parsing the format template itself remains
+generic. These distinctions concern structured metadata; they do not require identical message
+wording across cores.
+
 ## 6. Determinism & cross-core identity — why `File`/`Line`/`Routine` are excluded
 
 pgx's `File`/`Line`/`Routine` carry the PostgreSQL **C source** location that raised the error.

@@ -438,7 +438,7 @@ func float64Op(op binaryOp, x, y float64) (float64, error) {
 	// Finite operands that produced a non-finite result = finite overflow → trap 22003. If an
 	// operand was already non-finite, the result propagates (no trap).
 	if (math.IsInf(r, 0) || math.IsNaN(r)) && isFinite(x) && isFinite(y) {
-		return 0, overflowFloatErr()
+		return 0, overflowFloatErr(scalarFloat64)
 	}
 	// Underflow (PG float8_mul / float8_div, float.md §3): a product of two non-zero operands, or
 	// a quotient of a non-zero dividend by a finite divisor, that rounds to exactly zero traps
@@ -489,7 +489,7 @@ func float32Op(op binaryOp, x, y float32) (float32, error) {
 		r = float32(math.Mod(float64(x), float64(y)))
 	}
 	if (math.IsInf(float64(r), 0) || math.IsNaN(float64(r))) && isFinite32(x) && isFinite32(y) {
-		return 0, overflowFloatErr()
+		return 0, overflowFloatErr(scalarFloat32)
 	}
 	if r == 0 && floatUnderflowed(op, float64(x), float64(y)) {
 		return 0, underflowFloatErr() // the binary32 underflow (PG float4_mul / float4_div)
@@ -510,8 +510,8 @@ func isFinite(f float64) bool   { return !math.IsInf(f, 0) && !math.IsNaN(f) }
 func isFinite32(f float32) bool { return isFinite(float64(f)) }
 
 // overflowFloatErr is the 22003 a finite float operation traps on overflow to ±Inf (§3).
-func overflowFloatErr() error {
-	return newError(NumericValueOutOfRange, "value out of range: overflow")
+func overflowFloatErr(ty scalarType) error {
+	return newError(NumericValueOutOfRange, "value out of range: overflow").withDataType(ty.CanonicalName())
 }
 
 // underflowFloatErr is the 22003 a float operation traps when a non-zero exact result rounds to
@@ -561,7 +561,7 @@ func floatToInt(f float64, target scalarType) (int64, error) {
 // so it is byte-identical across cores. typmod nil = cap-check only.
 func floatToDecimal(f float64, typmod *decimalTypmod) (Value, error) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return Value{}, newError(NumericValueOutOfRange, "cannot convert a non-finite float to decimal")
+		return Value{}, newError(NumericValueOutOfRange, "cannot convert a non-finite float to decimal").withDataType("decimal")
 	}
 	d := exactDecimalFromFloat64(f)
 	if typmod != nil {
@@ -672,7 +672,7 @@ func decimalFromFloatSigDigits(f float64, sig uint32) Decimal {
 func decimalToFloat64(d Decimal) (float64, error) {
 	f, err := strconv.ParseFloat(d.Render(), 64)
 	if err != nil || math.IsInf(f, 0) {
-		return 0, overflowFloatErr()
+		return 0, overflowFloatErr(scalarFloat64)
 	}
 	if f == 0 && !d.IsZero() {
 		return 0, underflowFloatErr()
@@ -684,7 +684,7 @@ func decimalToFloat64(d Decimal) (float64, error) {
 func decimalToFloat32(d Decimal) (float32, error) {
 	f, err := strconv.ParseFloat(d.Render(), 32)
 	if err != nil || math.IsInf(f, 0) {
-		return 0, overflowFloatErr()
+		return 0, overflowFloatErr(scalarFloat32)
 	}
 	if f == 0 && !d.IsZero() {
 		return 0, underflowFloatErr()
@@ -698,7 +698,7 @@ func decimalToFloat32(d Decimal) (float32, error) {
 func float64ToFloat32(f float64) (float32, error) {
 	r := float32(f)
 	if math.IsInf(float64(r), 0) && isFinite(f) {
-		return 0, overflowFloatErr()
+		return 0, overflowFloatErr(scalarFloat32)
 	}
 	if r == 0 && f != 0 {
 		return 0, underflowFloatErr()
@@ -766,7 +766,7 @@ func (a *floatSumAcc) sumF64() (float64, bool, error) {
 		return special, true, nil
 	}
 	if math.IsInf(a.total, 0) {
-		return 0, false, overflowFloatErr()
+		return 0, false, overflowFloatErr(scalarFloat64)
 	}
 	return a.total, true, nil
 }
@@ -782,7 +782,7 @@ func (a *floatSumAcc) sumF32() (float32, bool, error) {
 	}
 	t := float32(a.total)
 	if math.IsInf(float64(t), 0) {
-		return 0, false, overflowFloatErr()
+		return 0, false, overflowFloatErr(scalarFloat32)
 	}
 	return t, true, nil
 }
@@ -871,7 +871,7 @@ func evalFloatFunc(fn scalarFunc, vals []Value, result scalarType) (Value, error
 		r := math.Exp(x)
 		if isFinite(x) {
 			if math.IsInf(r, 0) {
-				return Value{}, overflowFloatErr() // exp(710) overflows → 22003
+				return Value{}, overflowFloatErr(result) // exp(710) overflows → 22003
 			}
 			if r == 0 {
 				return Value{}, underflowFloatErr() // exp(-746) underflows to 0 → 22003 (PG dexp)
@@ -1078,13 +1078,13 @@ func floatPow(x, y float64) (float64, error) {
 		case absx == 1:
 			return 1, nil
 		case (y >= 0) == (absx > 1):
-			return 0, overflowFloatErr()
+			return 0, overflowFloatErr(scalarFloat64)
 		default:
 			return 0, underflowFloatErr()
 		}
 	}
 	if math.IsInf(r, 0) {
-		return 0, overflowFloatErr()
+		return 0, overflowFloatErr(scalarFloat64)
 	}
 	if r == 0 && x != 0 {
 		return 0, underflowFloatErr()

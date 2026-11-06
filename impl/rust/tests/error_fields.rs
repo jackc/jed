@@ -439,3 +439,99 @@ fn position_hint_shared_cases() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Floating range errors carry the result/target type; operation underflow and
+/// numeric-domain errors remain generic (error-fields.md §5). The public execute
+/// API drains the cursor, including errors raised during aggregate evaluation.
+#[test]
+fn float_overflow_data_types() {
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("add32", "SELECT '3e38'::f32 + '3e38'::f32", Some("f32")),
+        ("add64", "SELECT '1e308'::f64 + '1e308'::f64", Some("f64")),
+        ("multiply32", "SELECT '3e38'::f32 * 2::f32", Some("f32")),
+        ("multiply64", "SELECT '1e308'::f64 * 2::f64", Some("f64")),
+        ("exp32_input", "SELECT exp(710::f32)", Some("f64")),
+        ("exp64_input", "SELECT exp(710::f64)", Some("f64")),
+        (
+            "power32_input",
+            "SELECT power(10::f32, 400::f32)",
+            Some("f64"),
+        ),
+        (
+            "power64_input",
+            "SELECT power(10::f64, 400::f64)",
+            Some("f64"),
+        ),
+        ("degrees64", "SELECT degrees('1e308'::f64)", Some("f64")),
+        (
+            "sum32",
+            "SELECT sum(x) FROM (VALUES ('3e38'::f32), ('3e38'::f32)) AS v(x)",
+            Some("f32"),
+        ),
+        (
+            "sum64",
+            "SELECT sum(x) FROM (VALUES ('1e308'::f64), ('1e308'::f64)) AS v(x)",
+            Some("f64"),
+        ),
+        (
+            "avg32",
+            "SELECT avg(x) FROM (VALUES ('3e38'::f32), ('3e38'::f32)) AS v(x)",
+            Some("f32"),
+        ),
+        (
+            "avg64",
+            "SELECT avg(x) FROM (VALUES ('1e308'::f64), ('1e308'::f64)) AS v(x)",
+            Some("f64"),
+        ),
+        (
+            "varpop64",
+            "SELECT var_pop(x) FROM (VALUES ('1e200'::f64), ('-1e200'::f64)) AS v(x)",
+            Some("f64"),
+        ),
+        (
+            "covarpop64",
+            "SELECT covar_pop(x,y) FROM (VALUES ('1e200'::f64,'1e200'::f64), ('-1e200'::f64,'-1e200'::f64)) AS v(x,y)",
+            Some("f64"),
+        ),
+        ("narrow32", "SELECT '1e100'::f64::f32", Some("f32")),
+        ("decimal32", "SELECT '1e100'::decimal::f32", Some("f32")),
+        ("decimal64", "SELECT '1e400'::decimal::f64", Some("f64")),
+        (
+            "nonfinite_decimal",
+            "SELECT 'Infinity'::f64::decimal",
+            Some("decimal"),
+        ),
+        ("text_overflow32", "SELECT '1e100'::f32", Some("f32")),
+        ("text_overflow64", "SELECT '1e400'::f64", Some("f64")),
+        ("underflow32", "SELECT '1e-30'::f32 * '1e-30'::f32", None),
+        ("underflow64", "SELECT '1e-200'::f64 * '1e-200'::f64", None),
+        ("underflow_narrow", "SELECT '1e-100'::f64::f32", None),
+        ("underflow_decimal", "SELECT '1e-400'::decimal::f64", None),
+        ("underflow_text32", "SELECT '1e-100'::f32", Some("f32")),
+        ("underflow_text64", "SELECT '1e-400'::f64", Some("f64")),
+        ("domain_asin", "SELECT asin(2::f64)", None),
+        ("negative_factorial", "SELECT factorial(-1)", None),
+        (
+            "format_literal_width",
+            "SELECT format('%2147483648s', 'x')",
+            None,
+        ),
+        (
+            "format_dynamic_width",
+            "SELECT format('%*s', 2147483648::i64, 'x')",
+            Some("i32"),
+        ),
+    ];
+    for &(name, sql, data_type) in cases {
+        let handle = Database::create(CreateOptions::default()).unwrap();
+        let mut db = handle.session(SessionOptions::default());
+        let e = db.execute(sql, &[]).expect_err(name);
+        assert_eq!(e.code(), "22003", "{name}: {}", e.message);
+        assert_eq!(
+            e.data_type_name.as_deref(),
+            data_type,
+            "{name}: {}",
+            e.message
+        );
+    }
+}

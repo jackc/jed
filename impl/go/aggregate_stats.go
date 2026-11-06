@@ -115,7 +115,7 @@ func (s *momentsFloat) fold(v Value) error {
 		sxx += float64(tmp*tmp) / float64(n*s.n)
 		if math.IsInf(sx, 0) || math.IsInf(sxx, 0) {
 			if !math.IsInf(s.sx, 0) && !math.IsInf(x, 0) {
-				return overflowFloatErr()
+				return overflowFloatErr(scalarFloat64)
 			}
 			sxx = math.NaN()
 		}
@@ -235,7 +235,7 @@ func (s *pairsFloat) fold(v Value) error {
 			if ((inf(sx, 0) || inf(sxx, 0)) && !inf(s.sx, 0) && !inf(x, 0)) ||
 				((inf(sy, 0) || inf(syy, 0)) && !inf(s.sy, 0) && !inf(y, 0)) ||
 				(inf(sxy, 0) && !inf(s.sx, 0) && !inf(x, 0) && !inf(s.sy, 0) && !inf(y, 0)) {
-				return overflowFloatErr()
+				return overflowFloatErr(scalarFloat64)
 			}
 			if inf(sxx, 0) {
 				sxx = math.NaN()

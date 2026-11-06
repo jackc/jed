@@ -7,6 +7,7 @@ package jed
 // and impl/ts/tests/error_fields.test.ts.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -374,5 +375,60 @@ func TestErrorFieldsPositionHintSharedCases(t *testing.T) {
 	}
 	if len(failures) > 0 {
 		t.Error(strings.Join(failures, "\n"))
+	}
+}
+
+// Floating range errors carry the result/target type; operation underflow and
+// numeric-domain errors remain generic (error-fields.md §5). Exercise the public
+// draining API because failures may arise while a row cursor is being consumed.
+func TestErrorFieldsFloatOverflowDataTypes(t *testing.T) {
+	cases := []struct{ name, sql, dataType string }{
+		{"add32", "SELECT '3e38'::f32 + '3e38'::f32", "f32"},
+		{"add64", "SELECT '1e308'::f64 + '1e308'::f64", "f64"},
+		{"multiply32", "SELECT '3e38'::f32 * 2::f32", "f32"},
+		{"multiply64", "SELECT '1e308'::f64 * 2::f64", "f64"},
+		{"exp32_input", "SELECT exp(710::f32)", "f64"},
+		{"exp64_input", "SELECT exp(710::f64)", "f64"},
+		{"power32_input", "SELECT power(10::f32, 400::f32)", "f64"},
+		{"power64_input", "SELECT power(10::f64, 400::f64)", "f64"},
+		{"degrees64", "SELECT degrees('1e308'::f64)", "f64"},
+		{"sum32", "SELECT sum(x) FROM (VALUES ('3e38'::f32), ('3e38'::f32)) AS v(x)", "f32"},
+		{"sum64", "SELECT sum(x) FROM (VALUES ('1e308'::f64), ('1e308'::f64)) AS v(x)", "f64"},
+		{"avg32", "SELECT avg(x) FROM (VALUES ('3e38'::f32), ('3e38'::f32)) AS v(x)", "f32"},
+		{"avg64", "SELECT avg(x) FROM (VALUES ('1e308'::f64), ('1e308'::f64)) AS v(x)", "f64"},
+		{"varpop64", "SELECT var_pop(x) FROM (VALUES ('1e200'::f64), ('-1e200'::f64)) AS v(x)", "f64"},
+		{"covarpop64", "SELECT covar_pop(x,y) FROM (VALUES ('1e200'::f64,'1e200'::f64), ('-1e200'::f64,'-1e200'::f64)) AS v(x,y)", "f64"},
+		{"narrow32", "SELECT '1e100'::f64::f32", "f32"},
+		{"decimal32", "SELECT '1e100'::decimal::f32", "f32"},
+		{"decimal64", "SELECT '1e400'::decimal::f64", "f64"},
+		{"nonfinite_decimal", "SELECT 'Infinity'::f64::decimal", "decimal"},
+		{"text_overflow32", "SELECT '1e100'::f32", "f32"},
+		{"text_overflow64", "SELECT '1e400'::f64", "f64"},
+		{"underflow32", "SELECT '1e-30'::f32 * '1e-30'::f32", ""},
+		{"underflow64", "SELECT '1e-200'::f64 * '1e-200'::f64", ""},
+		{"underflow_narrow", "SELECT '1e-100'::f64::f32", ""},
+		{"underflow_decimal", "SELECT '1e-400'::decimal::f64", ""},
+		{"underflow_text32", "SELECT '1e-100'::f32", "f32"},
+		{"underflow_text64", "SELECT '1e-400'::f64", "f64"},
+		{"domain_asin", "SELECT asin(2::f64)", ""},
+		{"negative_factorial", "SELECT factorial(-1)", ""},
+		{"format_literal_width", "SELECT format('%2147483648s', 'x')", ""},
+		{"format_dynamic_width", "SELECT format('%*s', 2147483648::i64, 'x')", "i32"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, err := CreateDatabase(CreateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			_, err = db.Exec(context.Background(), c.sql)
+			var e *EngineError
+			if !errors.As(err, &e) {
+				t.Fatalf("expected EngineError from %q, got %v", c.sql, err)
+			}
+			efEq(t, e.Code(), "22003", "code")
+			efEq(t, e.DataTypeName, c.dataType, "DataTypeName")
+		})
 	}
 }
