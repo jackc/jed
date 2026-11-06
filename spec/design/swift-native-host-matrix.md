@@ -53,7 +53,7 @@ The evidence column names the existing test family, generally present as
 |---|---|---|---|
 | H01 | `create(options)` supports absent path as memory and present path as new durable file; `open(path, options)` opens only an existing file. Validate page size, preserve duplicate/missing/corrupt/I/O errors, and never clobber a pre-existing path. | api.md §2.1; `api`, `fileformat_golden` | missing |
 | H02 | Open/create options preserve defaults and distinguish absent from explicit zero: cache, work memory, read-only, skip-fsync testing knob, synchronous mode, flush interval, locking, election timeout, owner limits/preference, environment, storage allowance, credential and scratch encryption. File page size is immutable. | Rust `file.rs`/`shared.rs`; Go `file.go`/`shared.go`; `api`, `file_sessions`, `encryption` | missing |
-| H03 | Database owns storage identity and a default session; independent sessions own semantic settings and safety envelopes. Database and environment lifetimes outlive temporary host references. Close is idempotent where specified and discards pending writes, while flushing already-committed relaxed durability batches as required. | api.md §§1–2; `environment`, `session`, `file_sessions`, `shared` | missing |
+| H03 | Database owns storage identity; convenience calls mint fresh sessions, and explicit sessions retain semantic settings and safety envelopes. Database and environment lifetimes outlive temporary host references. Close is idempotent where specified and discards pending writes, while flushing already-committed relaxed durability batches as required. | api.md §§1–2; session.md §1 update; `environment`, `session`, `file_sessions`, `shared` | missing |
 | H04 | The total `query` operation returns a cursor for every statement; DDL, transaction control and DML without RETURNING have no columns. Command count is optional, with no-count distinct from zero. `execute` drains the same cursor and returns its command result. | api.md §§1,4; `api` tests `QueryOnNonQueryStatementIsTotal` and `RowsAffectedReportsDMLCounts` | missing |
 | H05 | Explicit begin/read-write/read-only, commit, rollback, scoped view/update, autocommit and SQL transaction control use one state machine. Expose idle/open/failed status; block errors poison the transaction, including errors discovered while pulling rows; savepoint rollback restores the required state. Scoped callbacks cannot terminate the transaction underneath their owner. | api.md §2.3–2.5; session.md §2.2; `api`, `session`; shared transaction/savepoint/concurrency corpus | missing |
 | H06 | Prepared statement parse/resolve/bind behavior and parameter count/types; execution on database/session/transaction; relation-scoped cache invalidation and exact binding-sensitive plans. Host NULL, integer, exact decimal, byte, date/time and recursive values obey SQL static typing. Do not substitute SQL interpolation for binding. | api.md §5; estimator.md §6.1; `api`, `ergonomic`; parameter and planning corpus | missing |
@@ -220,3 +220,16 @@ exclusions and remaining omissions. A permissive cross-core comparator can
 compare only records present in each result, so verify membership/counts before
 calling equal values or equal peaks a full pass. Preserve crash images,
 transcripts, seeds and exact reproduction commands for failures.
+
+### First-party native publication shim
+
+`Sources/CJedHost/host.c` is a narrow ordinary-OS adapter under the experiment's
+approved host-interface exception. It exposes one operation omitted by Swift's
+Linux Glibc module: atomic no-replace rename. Linux calls `renameat2` with
+`RENAME_NOREPLACE`; Darwin calls `renameatx_np` with `RENAME_EXCL`. Both inputs are
+borrowed NUL-terminated paths for one synchronous call, no pointer or buffer is
+retained, and the return is the OS status/errno. There is no third-party
+library, allocation, SQL, codec, locking policy, or storage algorithm in this C
+target. The file host retains the exclusive protocol-v2 bundle while publishing.
+Unsupported hosts fail `0A000`; there is no link/unlink publication fallback that
+could leave a hard-link crash window.

@@ -1,0 +1,291 @@
+/// Blocking aggregation owns its source rows, group table, and final rows. The
+/// compact logical group row is [keys..., results...]; sparse base ordinals are
+/// solely the evaluator's addressing layout and do not add logical row fields.
+internal final class GroupedSelectExecution {
+    private final class Group {
+        let keys: [SQLValue]
+        let states: [AggregateState]
+        let ordering: [AggregateOrdering?]
+        var seen: [Set<[UInt8]>]
+        var reserved: Int64
+        init(keys: [SQLValue], states: [AggregateState], ordering: [AggregateOrdering?], reserved: Int64) {
+            self.keys = keys; self.states = states; self.reserved = reserved
+            self.ordering = ordering
+            seen = Array(repeating: Set<[UInt8]>(), count: states.count)
+        }
+    }
+    private struct Output {
+        let row: [SQLValue]
+        let bytes: Int64
+        let ordinal: Int
+        var order: [SQLValue] = []
+    }
+    private let plan: SelectPlan
+    private let aggregate: AggregateQueryPlan
+    private let context: ExpressionContext
+    private var sources: [[SQLValue]] = []
+    private var groups: [Group] = []
+    private var lookup: [[UInt8]: Int] = [:]
+    private var outputs: [Output] = []
+    private var reserved: Int64 = 0
+    private var sourceBytes: Int64 = 0
+    private var started = false
+    private var position = 0
+    private var emitted: Int64 = 0
+
+    init(plan: SelectPlan, aggregate: AggregateQueryPlan, context: ExpressionContext) {
+        self.plan = plan; self.aggregate = aggregate; self.context = context
+    }
+    func next() throws -> [SQLValue]? {
+        if !started { try prepare(); started = true }
+        guard position < outputs.count, plan.limit == nil || emitted < plan.limit! else { return nil }
+        let row = outputs[position].row; position += 1; emitted += 1
+        if plan.productionCharge { context.meter.charge(1); try context.meter.guardCost() }
+        let current = groupedContext(row)
+        return try plan.projections.map { try current.evaluate($0) }
+    }
+    private func reserve(_ bytes: Int64) throws {
+        try context.meter.reserveQuery(bytes); reserved = saturatingAdd(reserved, bytes)
+    }
+    private func release(_ bytes: Int64) {
+        context.meter.resources.query.release(bytes); reserved -= bytes
+    }
+    private func source(_ row: [SQLValue]) throws {
+        let bytes = MemorySizes.row(row)
+        try reserve(bytes); sourceBytes = saturatingAdd(sourceBytes, bytes); sources.append(row)
+    }
+    private func prepare() throws {
+        let meter = context.meter
+        let input = SelectInput(plan: plan, context: context)
+        defer { input.close() }
+        while let row = try input.next() { try source(row) }
+        // WHERE consumes the complete source materialization, preserving error
+        // and memory visitation before any aggregate argument is evaluated.
+        if let predicate = plan.predicate {
+            var kept: [[SQLValue]] = []
+            for row in sources {
+                var current = context; current.column = { row[$0] }
+                if try current.matches(predicate) { kept.append(row) }
+                else { let bytes = MemorySizes.row(row); release(bytes); sourceBytes -= bytes }
+            }
+            sources = kept
+        }
+        // Materialized key expressions run once, before expansion into sets.
+        for sourceIndex in sources.indices {
+            let row = sources[sourceIndex]
+            try meter.checkpoint()
+            var current = context; current.column = { row[$0] }
+            for (column, expression) in zip(aggregate.keyColumns, aggregate.keys) where column >= aggregate.sourceWidth {
+                let value = try current.evaluate(expression)
+                let bytes = MemorySizes.value(value)
+                try reserve(bytes); sourceBytes = saturatingAdd(sourceBytes, bytes)
+                sources[sourceIndex].append(value)
+            }
+        }
+        for members in aggregate.sets {
+            let membership = Set(members)
+            if members.isEmpty { _ = try create(keys: Array(repeating: .null, count: aggregate.keys.count), selected: [], key: []) }
+            for row in sources {
+            try meter.checkpoint()
+            var current = context; current.column = { row[$0] }
+            let allKeys = aggregate.keyColumns.map { row[$0] }
+            let keys = members.map { allKeys[$0] }
+            let payload = keys.reduce(Int64(0)) { saturatingAdd($0, MemorySizes.payload($1)) }
+            if payload > 0 { meter.charge(payload); try meter.guardCost() }
+            let key = keys.isEmpty ? [] : try ValueEqualityKey.encode(keys)
+            let index: Int
+            if let existing = lookup[key] { index = existing }
+            else { index = try create(keys: allKeys.indices.map { membership.contains($0) ? allKeys[$0] : .null }, selected: keys, key: key) }
+            let group = groups[index]
+            for (ordinal, call) in aggregate.calls.enumerated() {
+                if let filter = call.filter, try !current.matches(filter) { continue }
+                // Multi-argument aggregates use one logical ROW operand.
+                if call.arguments.count > 1 { meter.charge(1); try meter.step() }
+                let arguments = try call.arguments.map { try current.evaluate($0) }
+                meter.charge(1); try meter.guardCost()
+                let ordered = try group.ordering[ordinal]?.tuple(arguments: arguments, current: current)
+                if call.distinct {
+                    let operand = arguments.count == 1 ? arguments[0] : .composite(arguments)
+                    let payload = MemorySizes.payload(operand)
+                    if payload > 0 { meter.charge(payload); try meter.guardCost() }
+                    let keepsNull = ["array_agg", "json_agg", "jsonb_agg", "json_agg_strict", "jsonb_agg_strict"].contains(call.plan.name)
+                    if operand.isNull && !keepsNull { continue }
+                    let key = try ValueEqualityKey.encode([operand])
+                    if group.seen[ordinal].contains(key) { continue }
+                    let bytes = saturatingAdd(GeneratedSpec.memoryEntry, MemorySizes.value(operand))
+                    try reserve(bytes); group.reserved = saturatingAdd(group.reserved, bytes)
+                    group.seen[ordinal].insert(key)
+                }
+                if let ordered { try group.ordering[ordinal]?.append(ordered) }
+                else { try group.states[ordinal].fold(arguments) }
+            }
+        }
+        for group in groups {
+            for index in group.states.indices { try group.ordering[index]?.fold(into: group.states[index]) }
+            let results = try group.states.map { try $0.finish() }
+            var row = Array(repeating: SQLValue.null, count: aggregate.layoutWidth)
+            for (index, value) in zip(aggregate.keyColumns, group.keys) { row[index] = value }
+            row.append(contentsOf: results)
+            let masks = aggregate.grouping.map { positions -> SQLValue in
+                .integer(positions.reduce(Int64(0)) { ($0 << 1) | (membership.contains($1) ? 0 : 1) })
+            }
+            row.append(contentsOf: masks)
+            let logical = group.keys + results + masks, bytes = MemorySizes.row(logical)
+            for state in group.states { state.close() }
+            for ordering in group.ordering { ordering?.close() }
+            group.seen = []; release(group.reserved); group.reserved = 0
+            try reserve(bytes)
+            outputs.append(Output(row: row, bytes: bytes, ordinal: outputs.count))
+        }
+            groups = []; lookup = [:]
+        }
+        sources = []; release(sourceBytes); sourceBytes = 0
+        if let having = aggregate.having {
+            var kept: [Output] = []
+            for output in outputs {
+                let current = groupedContext(output.row)
+                if try current.matches(having) { kept.append(output) } else { release(output.bytes) }
+            }
+            outputs = kept
+        }
+        try sort()
+        position = Int(min(Int64(outputs.count), plan.offset))
+    }
+    private func create(keys: [SQLValue], selected: [SQLValue], key: [UInt8]) throws -> Int {
+        let bytes = selected.reduce(GeneratedSpec.memoryEntry) { saturatingAdd($0, MemorySizes.value($1)) }
+        try reserve(bytes)
+        let index = groups.count
+        groups.append(Group(keys: keys, states: aggregate.calls.map { $0.plan.makeState(context: context) },
+                            ordering: aggregate.calls.map { $0.order.isEmpty ? nil : AggregateOrdering(order: $0.order, context: context) }, reserved: bytes))
+        lookup[key] = index; return index
+    }
+    private func groupedContext(_ row: [SQLValue]) -> ExpressionContext {
+        var current = context
+        let groupingBase = aggregate.layoutWidth + aggregate.calls.count
+        current.column = { index in row[index >= 0 ? index : groupingBase - index - 1] }
+        return current
+    }
+    private func sort() throws {
+        guard !plan.order.isEmpty else { return }
+        let meter = context.meter
+        for index in outputs.indices {
+            let row = outputs[index].row
+            let current = groupedContext(row)
+            for term in plan.order {
+                let value = try current.evaluate(term.expression)
+                if case .column = term.expression.node {} else { try reserve(MemorySizes.value(value)) }
+                outputs[index].order.append(value)
+            }
+        }
+        var decorations: Int64 = 0
+        for index in outputs.indices {
+            for ordinal in plan.order.indices {
+                let value = outputs[index].order[ordinal], type = plan.order[ordinal].type
+                if let name = type.collation, name.description != "C", !value.isNull, ExpressionCollation.collatable(type.type) {
+                    let units: Int64
+                    switch value {
+                    case .text(let text): units = Int64(text.scalarCount)
+                    case .array(let array): units = array.elements.reduce(0) { n, value in
+                        if case .text(let text) = value { return saturatingAdd(n, Int64(text.scalarCount)) }; return n
+                    }
+                    default: units = 0
+                    }
+                    if units > 0 { meter.charge(units); try meter.guardCost() }
+                    let key = try KeyEncoding.encode(value, type: type, collatedKey: context.collatedKey)
+                    let bytes = saturatingAdd(GeneratedSpec.memoryValue, Int64(key.count))
+                    try reserve(bytes); decorations = saturatingAdd(decorations, bytes)
+                    outputs[index].order[ordinal] = .bytea(key)
+                } else {
+                    let units = MemorySizes.payload(value)
+                    if units > 0 { meter.charge(units); try meter.guardCost() }
+                }
+            }
+        }
+        try outputs.sort { a, b in
+            for ordinal in plan.order.indices {
+                let term = plan.order[ordinal], left = a.order[ordinal], right = b.order[ordinal]
+                if left.isNull != right.isNull { return left.isNull == term.nullsFirst }
+                var type = term.type
+                if type.collation?.description != nil && type.collation?.description != "C" && ExpressionCollation.collatable(type.type) {
+                    type = TypeDescriptor(.scalar(.bytea))
+                }
+                let result = try ValueComparison.total(left, right, type: type)
+                if result != 0 { return term.descending ? result > 0 : result < 0 }
+            }
+            return a.ordinal < b.ordinal
+        }
+        for index in outputs.indices { outputs[index].order = [] }
+        release(decorations)
+    }
+    func close() {
+        for group in groups { for state in group.states { state.close() }; for ordering in group.ordering { ordering?.close() } }
+        sources = []; groups = []; lookup = [:]; outputs = []
+        context.meter.resources.query.release(reserved); reserved = 0; sourceBytes = 0
+    }
+    deinit { close() }
+}
+
+/// Equality keys are ephemeral and byte-canonical, independent of collation and
+/// the persisted ordered-key type restrictions. Dictionary order is never read.
+internal enum ValueEqualityKey {
+    static func encode(_ values: [SQLValue]) throws -> [UInt8] {
+        var writer = ByteWriter()
+        for value in values { try append(value, to: &writer) }
+        return writer.bytes
+    }
+    private static func bytes(_ bytes: [UInt8], to writer: inout ByteWriter) {
+        writer.u64(UInt64(bytes.count)); writer.append(bytes)
+    }
+    private static func append(_ value: SQLValue, to writer: inout ByteWriter) throws {
+        switch value {
+        case .null: writer.u8(0)
+        case .boolean(let value): writer.u8(1); writer.u8(value ? 1 : 0)
+        case .integer(let value): writer.u8(2); writer.u64(UInt64(bitPattern: value))
+        case .decimal(let value): writer.u8(3); bytes(try value.keyBytes(), to: &writer)
+        case .f32(let raw):
+            writer.u8(4); let value = Float(bitPattern: raw)
+            writer.u32(value == 0 ? 0 : ValueCodec.canonicalFloat32(raw))
+        case .f64(let raw):
+            writer.u8(5); let value = Double(bitPattern: raw)
+            writer.u64(value == 0 ? 0 : ValueCodec.canonicalFloat64(raw))
+        case .text(let value): writer.u8(6); bytes(value.utf8, to: &writer)
+        case .bytea(let value): writer.u8(7); bytes(value, to: &writer)
+        case .uuid(let value): writer.u8(8); writer.append(value.bytes)
+        case .date(let value): writer.u8(9); writer.u32(UInt32(bitPattern: value))
+        case .timestamp(let value): writer.u8(10); writer.u64(UInt64(bitPattern: value))
+        case .timestamptz(let value): writer.u8(11); writer.u64(UInt64(bitPattern: value))
+        case .interval(let value):
+            writer.u8(12); let span = UInt128(bitPattern: value.comparisonSpan)
+            writer.u64(UInt64(truncatingIfNeeded: span >> 64)); writer.u64(UInt64(truncatingIfNeeded: span))
+        case .array(let value):
+            writer.u8(13); writer.u64(UInt64(value.dimensions.count))
+            for (length, lower) in zip(value.dimensions, value.lowerBounds) { writer.u32(UInt32(length)); writer.u32(UInt32(bitPattern: lower)) }
+            writer.u64(UInt64(value.elements.count))
+            for element in value.elements { try append(element, to: &writer) }
+        case .composite(let fields):
+            writer.u8(14); writer.u64(UInt64(fields.count))
+            for field in fields { try append(field, to: &writer) }
+        case .range(let range):
+            writer.u8(15); writer.u8(range.isEmpty ? 1 : 0)
+            if !range.isEmpty {
+                writer.u8(range.lowerInclusive ? 1 : 0); writer.u8(range.upperInclusive ? 1 : 0)
+                try append(range.lower ?? .null, to: &writer); try append(range.upper ?? .null, to: &writer)
+            }
+        case .jsonb(let value): writer.u8(16); try json(value, to: &writer)
+        case .json, .jsonpath: throw JedError("42883", "type has no equality operator")
+        }
+    }
+    private static func json(_ value: SQLJSONValue, to writer: inout ByteWriter) throws {
+        switch value {
+        case .null: writer.u8(0)
+        case .boolean(let value): writer.u8(1); writer.u8(value ? 1 : 0)
+        case .number(let value): writer.u8(2); bytes(try value.keyBytes(), to: &writer)
+        case .string(let value): writer.u8(3); bytes(value.utf8, to: &writer)
+        case .array(let values):
+            writer.u8(4); writer.u64(UInt64(values.count)); for value in values { try json(value, to: &writer) }
+        case .object(let members):
+            writer.u8(5); writer.u64(UInt64(members.count))
+            for member in members { bytes(member.key.utf8, to: &writer); try json(member.value, to: &writer) }
+        }
+    }
+}

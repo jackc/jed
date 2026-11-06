@@ -67,11 +67,14 @@ internal enum TemporalFunctions {
             return try extract(unit: text(args[0]), value: args[1], asFloat: name == "date_part", timezone: timezone, meter: meter)
         case "timezone":
             guard args.count == 2 else { throw missing() }
-            let zone = try database.resolve(text(args[0]))
             try Temporal.chargeZone(meter)
             switch args[1] {
-            case .timestamp(let value): return .timestamptz(try zone.localToInstant(value))
-            case .timestamptz(let value): return .timestamp(try zone.instantToLocal(value))
+            case .timestamp(let value):
+                if value == .min || value == .max { return .timestamptz(value) }
+                return .timestamptz(try database.resolve(text(args[0])).localToInstant(value))
+            case .timestamptz(let value):
+                if value == .min || value == .max { return .timestamp(value) }
+                return .timestamp(try database.resolve(text(args[0])).instantToLocal(value))
             default: throw missing()
             }
         case "to_timestamp" where args.count == 1:

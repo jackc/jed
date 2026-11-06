@@ -101,7 +101,7 @@ internal enum ArrayFunctions {
                 var found = false
                 if !value.isNull {
                     for candidate in a.elements where !candidate.isNull {
-                        if try ValueComparison.total(value, candidate, type: element, collatedKey: collatedKey) == 0 { found = true; break }
+                        if try ValueComparison.total(value, candidate, type: element, collatedKey: collatedKey, equality: true) == 0 { found = true; break }
                     }
                 }
                 if overlap && found { return .boolean(true) }
@@ -124,7 +124,7 @@ internal enum ArrayFunctions {
             var matched: [Bool] = [], positions: [SQLValue] = []
             var size = Int64(a.dimensions.count) * GeneratedSpec.memoryArrayDimension
             for (index, value) in a.elements.enumerated() {
-                let equal = try ValueComparison.total(value, args[1], type: element, collatedKey: collatedKey) == 0
+                let equal = try ValueComparison.total(value, args[1], type: element, collatedKey: collatedKey, equality: true) == 0
                 if name == "array_replace" {
                     matched.append(equal)
                     size = saturatingAdd(size, MemorySizes.value(equal ? args[2] : value))
@@ -332,7 +332,8 @@ internal enum ArrayFunctions {
             if operand.isNull || value.isNull { answer = .null }
             else if rowWise { answer = try ValueComparison.sql(operation, operand, value, type: element, collatedKey: collatedKey) }
             else {
-                let comparison = try ValueComparison.total(operand, value, type: element, collatedKey: collatedKey)
+                let comparison = try ValueComparison.total(operand, value, type: element, collatedKey: collatedKey,
+                                                           equality: ["=", "<>", "!="].contains(operation))
                 switch operation {
                 case "=": answer = .boolean(comparison == 0)
                 case "<>", "!=": answer = .boolean(comparison != 0)

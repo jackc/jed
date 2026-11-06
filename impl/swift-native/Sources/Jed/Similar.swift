@@ -45,14 +45,15 @@ internal enum Similar {
         let programs: [RegexProgram]
         var instructionCount: Int { programs.reduce(0) { $0 + $1.instructionCount } }
         func chargeCompile(_ meter: CostMeter) throws { meter.charge(Int64(instructionCount)); try meter.guardCost() }
-        func match(_ subject: SQLText, meter: CostMeter) throws -> SQLText? {
+        func match(_ subject: SQLText, meter: CostMeter, scratch: [RegexScratch]? = nil) throws -> SQLText? {
+            func state(_ index: Int) -> RegexScratch? { scratch.flatMap { $0.indices.contains(index) ? $0[index] : nil } }
             let scalars = subject.description.unicodeScalars.map(\.value)
-            if programs.count == 1 { return try programs[0].search(scalars: scalars, meter: meter) != nil ? subject : nil }
-            let firstEnds = try programs[0].ends(scalars: scalars, gates: [0], meter: meter)
-            guard let first = try programs[1].search(scalars: scalars, gates: firstEnds, meter: meter)?.span()?.lowerBound else { return nil }
+            if programs.count == 1 { return try programs[0].search(scalars: scalars, meter: meter, scratch: state(0)) != nil ? subject : nil }
+            let firstEnds = try programs[0].ends(scalars: scalars, gates: [0], meter: meter, scratch: state(0))
+            guard let first = try programs[1].search(scalars: scalars, gates: firstEnds, meter: meter, scratch: state(1))?.span()?.lowerBound else { return nil }
             if programs.count == 2 { return RegexSubject(subject).slice(first..<scalars.count) }
-            let middleEnds = try programs[2].ends(scalars: scalars, gates: [first], meter: meter)
-            guard let last = try programs[3].search(scalars: scalars, gates: middleEnds, meter: meter)?.span()?.lowerBound else { return nil }
+            let middleEnds = try programs[2].ends(scalars: scalars, gates: [first], meter: meter, scratch: state(2))
+            guard let last = try programs[3].search(scalars: scalars, gates: middleEnds, meter: meter, scratch: state(3))?.span()?.lowerBound else { return nil }
             return RegexSubject(subject).slice(first..<last)
         }
     }

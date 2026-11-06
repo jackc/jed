@@ -156,6 +156,8 @@ internal struct SQLFrom: Sendable {
     var columnDefinitions: [SQLColumnDefinition] = []
     var joins: [SQLJoin] = []
     var span: SQLSourceSpan
+    /// Nesting within this SQL text, used when a named view expands in place.
+    var parserDepth = 0
     indirect enum Source: Sendable {
         case table(SQLName), query(SQLQuery), function(SQLExpression)
         case joined(SQLFrom), jsonTable(SQLJSONTable)

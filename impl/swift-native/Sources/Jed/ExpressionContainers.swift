@@ -59,7 +59,8 @@ extension ExpressionResolver {
             let name = leftArray && (rightArray || b.type == nil) || rightArray && a.type == nil ? "array_cat" : leftArray ? "array_append" : "array_prepend"
             let call = SQLCall(name: SQLText(validatedUTF8: Array(name.utf8)), arguments: [SQLArgument(value: left), SQLArgument(value: right)])
             guard let resolved = try ContainerFunctionResolver.resolve(call, resolve: { try self.resolve($0, expected: $1) }) else { throw JedError("XX000", "array concatenation catalog entry missing") }
-            return ResolvedExpression(type: resolved.resultType, node: .call(resolved), position: position)
+            return ResolvedExpression(type: resolved.resultType, node: .call(resolved), position: position,
+                collation: try ExpressionCollation.combine(resolved.arguments, storage: storageCollation))
         }
         if ["@>", "<@", "&&"].contains(op) {
             let descriptor = leftArray ? a.type! : b.type!

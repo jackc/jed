@@ -109,19 +109,25 @@ internal struct EncryptedPageCodec: PageCodec {
     let pageSize: Int
     let reservedBytes = 40
     let firstBodyPage: UInt32 = 4
+    private let dataKey: [UInt8]
     private let pageCipher: XAES256GCM
     private let metaCipher: XAES256GCM
 
     init(pageSize: Int, dataKey: [UInt8], opening: Bool = false) throws {
         try PageEnvelope.validateSize(pageSize, encrypted: true, opening: opening)
         guard dataKey.count == 32 else { throw JedError("22023", "data key must contain 32 bytes") }
-        self.pageSize = pageSize
+        self.pageSize = pageSize; self.dataKey = dataKey
         do {
             let pageKey = try JedCrypto.hkdfSHA256(inputKeyMaterial: dataKey, salt: [], info: Array("jed/v1/page".utf8))
             let metaKey = try JedCrypto.hkdfSHA256(inputKeyMaterial: dataKey, salt: [], info: Array("jed/v1/meta".utf8))
             pageCipher = try XAES256GCM(key: pageKey)
             metaCipher = try XAES256GCM(key: metaKey)
         } catch { throw JedError("58030", "page-key derivation failed") }
+    }
+
+    func rewrap(_ block: KeyBlock, credential: Credential, parameters: Argon2Parameters,
+                entropy: KeyEntropy) throws -> KeyBlock {
+        try block.rewrap(dataKey: dataKey, credential: credential, parameters: parameters, entropy: entropy)
     }
 
     private func bodyAAD(_ index: UInt32) -> [UInt8] {

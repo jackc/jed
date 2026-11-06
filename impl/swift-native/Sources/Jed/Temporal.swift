@@ -82,7 +82,7 @@ internal enum Temporal {
     /// A caller passes no clock for bound parameters or container text input.
     static func parse(text: SQLText, type: ScalarType, timezone: SQLTimeZone = .utc,
                       statementMicros: Int64? = nil, typmod: TemporalTypmod? = nil,
-                      meter: CostMeter? = nil) throws -> SQLValue {
+                      meter: CostMeter? = nil, sessionDependency: (() -> Void)? = nil) throws -> SQLValue {
         if type == .interval {
             return .interval(try IntervalParser.parse(text.description, typmod: typmod))
         }
@@ -116,6 +116,7 @@ internal enum Temporal {
         } else {
             micros = try microsFromCivil(parsed.civil)
             if type == .timestamptz {
+                sessionDependency?()
                 try chargeZone(meter)
                 micros = try timezone.localToInstant(micros)
             }

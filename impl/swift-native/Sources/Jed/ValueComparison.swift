@@ -10,7 +10,7 @@ internal enum ValueComparison {
     /// Total order for sort/group/key/internal bounds. SQL row operators use
     /// the distinct three-valued entry point below. NULL sorts last recursively.
     static func total(_ left: SQLValue, _ right: SQLValue, type: TypeDescriptor,
-                      collatedKey: KeyEncoding.CollatedKey? = nil) throws -> Int {
+                      collatedKey: KeyEncoding.CollatedKey? = nil, equality: Bool = false) throws -> Int {
         if left.isNull { return right.isNull ? 0 : 1 }
         if right.isNull { return -1 }
         if let a = float(left), let b = float(right) {
@@ -25,7 +25,7 @@ internal enum ValueComparison {
         case (.decimal(let a), .integer(let b)): return a.compare(to: SQLDecimal(b))
         case (.boolean(let a), .boolean(let b)): return a == b ? 0 : a ? 1 : -1
         case (.text(let a), .text(let b)):
-            if let collation = type.collation, collation.utf8 != [67] {
+            if !equality, let collation = type.collation, collation.utf8 != [67] {
                 guard let collatedKey else { throw JedError("XX002", "collation data is unavailable") }
                 return try bytes(collatedKey(a, collation), collatedKey(b, collation))
             }
@@ -41,7 +41,7 @@ internal enum ValueComparison {
                 throw JedError("42804", "composite value does not match comparison type")
             }
             for index in fields.indices {
-                let result = try total(a[index], b[index], type: fields[index].descriptor, collatedKey: collatedKey)
+                let result = try total(a[index], b[index], type: fields[index].descriptor, collatedKey: collatedKey, equality: equality)
                 if result != 0 { return result }
             }
             return 0
@@ -49,7 +49,7 @@ internal enum ValueComparison {
             guard case .array(let element) = type.type else { throw JedError("42804", "array value does not match comparison type") }
             var descriptor = TypeDescriptor(element); descriptor.collation = type.collation
             for (a, b) in zip(a.elements, b.elements) {
-                let result = try total(a, b, type: descriptor, collatedKey: collatedKey)
+                let result = try total(a, b, type: descriptor, collatedKey: collatedKey, equality: equality)
                 if result != 0 { return result }
             }
             let length = order(a.elements.count, b.elements.count)
@@ -112,7 +112,7 @@ internal enum ValueComparison {
             }
             return .boolean(operation == "<=" || operation == ">=")
         }
-        let result = try total(left, right, type: type, collatedKey: collatedKey)
+        let result = try total(left, right, type: type, collatedKey: collatedKey, equality: operation == "=" || operation == "<>")
         switch operation {
         case "=": return .boolean(result == 0)
         case "<>": return .boolean(result != 0)

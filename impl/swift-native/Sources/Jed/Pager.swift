@@ -77,10 +77,15 @@ internal final class Pager: Sendable {
 
     static func open(store: any BlockStore, credential: Credential? = nil,
                      writable: Bool = false, ephemeral: Bool = false,
+                     unlockedCodec: EncryptedPageCodec? = nil,
                      syncDirectory: () throws -> Void = {}) throws -> Pager {
         let selected = try MetaRecovery.open(store)
         guard !ephemeral || !selected.meta.encrypted else { throw JedError("55000", "in-memory databases cannot be encrypted") }
-        try EncryptionPolicy.checkCredential(encrypted: selected.meta.encrypted, credential: credential)
+        if unlockedCodec == nil {
+            try EncryptionPolicy.checkCredential(encrypted: selected.meta.encrypted, credential: credential)
+        } else if !selected.meta.encrypted || unlockedCodec!.pageSize != selected.meta.pageSize {
+            throw JedError.corruption("unlocked codec does not match replacement image")
+        }
         let size = selected.meta.pageSize
         let codec: any PageCodec
         var keyBlock: KeyBlockSelection?
@@ -88,7 +93,7 @@ internal final class Pager: Sendable {
             let copy2 = try store.read(at: UInt64(size) * 2, count: size)
             let copy3 = try store.read(at: UInt64(size) * 3, count: size)
             let block = try KeyBlock.select(page2: copy2, page3: copy3, pageSize: size)
-            let encrypted = try EncryptedPageCodec(pageSize: size, dataKey: block.block.unlock(credential), opening: true)
+            let encrypted = try unlockedCodec ?? EncryptedPageCodec(pageSize: size, dataKey: block.block.unlock(credential), opening: true)
             // Structural fallback is finished. Authentication errors propagate.
             var chain: [ManifestPageBytes] = []
             for index in selected.chain {
@@ -109,6 +114,33 @@ internal final class Pager: Sendable {
             keyBlock: keyBlock, allocatedPages: UInt32(allocated))
         pager.state.withLock { $0.ephemeral = ephemeral }
         if writable, keyBlock?.needsRepair == true { try pager.repairKeyBlock(syncDirectory: syncDirectory) }
+        return pager
+    }
+
+    /// A private scratch address space has synthetic metadata only. The host
+    /// owns its cleanup and any sealed spill device; it can never be reopened
+    /// as a database. Its throwaway page codec may use the encrypted layout.
+    static func scratch(store: any BlockStore, codec: any PageCodec, root: PageReference,
+                        pageCount: UInt32, body: [StoredPage]) throws -> Pager {
+        guard try store.size() == 0 else { throw JedError("55006", "scratch storage must be empty") }
+        let manifest = try CommitManifest.build(pageSize: codec.pageSize, encrypted: codec.reservedBytes != 0,
+            txid: 0, root: root, pageCount: pageCount, freeList: PageSealer.nullReference(codec),
+            livePages: 0, entries: [], chain: [])
+        var written: Set<UInt32> = []
+        for page in body {
+            guard page.index >= codec.firstBodyPage, page.index < pageCount,
+                  page.bytes.count == codec.pageSize, written.insert(page.index).inserted else {
+                throw JedError.corruption("invalid scratch bootstrap page")
+            }
+        }
+        guard written.contains(root.index) else { throw JedError.corruption("scratch bootstrap omits its root") }
+        let selected = try ValidatedMeta(meta: manifest.meta, slot: 0, floorSlot: 0,
+            bytes: manifest.meta.encode(inline: []), entries: [], chain: [])
+        try store.setSize(UInt64(pageCount) * UInt64(codec.pageSize))
+        for page in body { try store.write(at: UInt64(page.index) * UInt64(codec.pageSize), bytes: page.bytes) }
+        let pager = Pager(store: store, selected: selected, codec: codec, freePages: [],
+            keyBlock: nil, allocatedPages: pageCount)
+        pager.state.withLock { $0.ephemeral = true; $0.recoverySync = false; $0.directorySync = false }
         return pager
     }
 
@@ -196,8 +228,8 @@ internal final class Pager: Sendable {
                 throw JedError.corruption("invalid ephemeral free list")
             }
             let txid = state.selected.meta.txid + 1
-            let manifest = try CommitManifest.build(pageSize: pageSize, encrypted: false, txid: txid,
-                root: root, pageCount: pageCount, freeList: PageReference(0), livePages: 0, entries: [], chain: [])
+            let manifest = try CommitManifest.build(pageSize: pageSize, encrypted: codec.reservedBytes != 0, txid: txid,
+                root: root, pageCount: pageCount, freeList: PageSealer.nullReference(codec), livePages: 0, entries: [], chain: [])
             return PreparedPageCommit(baseTxid: state.selected.meta.txid, body: body, manifest: manifest,
                 metaBytes: try manifest.meta.encode(inline: []), slot: UInt32(txid & 1), freePages: freePages, entries: [])
         }
@@ -384,6 +416,36 @@ internal final class Pager: Sendable {
                 try barrier(&state)
                 state.keyBlock = KeyBlockSelection(block: selected.block, selectedPage: 2, needsRepair: false)
             } catch { state.poisoned = true; throw error }
+        }
+    }
+
+    /// No stale snapshot may use a descriptor after maintenance changes its
+    /// address space. Normal commits retain their narrower writer poison rule.
+    func revoke() { state.withLock { $0.poisoned = true; $0.revoked = true } }
+
+    /// Rewrapping changes only the redundant key pages. The KDF and encoding
+    /// finish before this storage phase, and readers may keep their data roots.
+    func changeKeyBlock(_ replacement: KeyBlock, replacing expected: KeyBlock,
+                        syncDirectory: () throws -> Void) throws {
+        let bytes = try replacement.encode(pageSize: pageSize)
+        try state.withLock { state in
+            try Self.checkWritable(state)
+            guard let selected = state.keyBlock, selected.block == expected,
+                  expected.generation < UInt64.max, replacement.generation == expected.generation + 1 else {
+                throw JedError("55006", "the credential changed concurrently")
+            }
+            do {
+                // A pending relaxed batch receives its ordinary flush barrier;
+                // the key operation always has its own stabilization barrier.
+                try flushState(&state, shrink: true)
+                if state.directorySync { try syncDirectory(); state.directorySync = false }
+                try barrier(&state); state.recoverySync = false
+                try write(selected.unselectedPage, bytes: bytes, state: &state)
+                try barrier(&state)
+                try write(selected.selectedPage, bytes: bytes, state: &state)
+                try barrier(&state)
+                state.keyBlock = KeyBlockSelection(block: replacement, selectedPage: 2, needsRepair: false)
+            } catch { state.poisoned = true; state.revoked = true; throw error }
         }
     }
 

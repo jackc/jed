@@ -53,14 +53,15 @@ internal final class SnapshotPin: Sendable {
 /// SQL/session state and attachment routing stay above this storage identity.
 internal final class DatabaseCore: Sendable {
     struct Registry: Sendable {
+        var storage: StorageDomain
         var snapshot: DomainSnapshot
         var pins: [UInt64: Int] = [:]
     }
-    let storage: StorageDomain
+    var storage: StorageDomain { registry.withLock { $0.storage } }
     private let registry: Mutex<Registry>
     private let writer = WriterGate()
 
-    init(storage: StorageDomain) { self.storage = storage; registry = Mutex(Registry(snapshot: storage.committed)) }
+    init(storage: StorageDomain) { registry = Mutex(Registry(storage: storage, snapshot: storage.committed)) }
     var version: UInt64 { registry.withLock { $0.snapshot.txid } }
     var oldestLiveVersion: UInt64 { registry.withLock { $0.pins.keys.min() ?? $0.snapshot.txid } }
     var livePinCount: Int { registry.withLock { $0.pins.values.reduce(0, +) } }
@@ -93,6 +94,16 @@ internal final class DatabaseCore: Sendable {
     func maintenance<T>(_ operation: () throws -> T) throws -> T {
         let token = try writer.acquire(wait: false); defer { writer.release(token) }
         return try operation()
+    }
+    /// The watermark remains locked through streaming and replacement. A reader
+    /// can pin either address space, never a root whose file has been replaced.
+    func replaceStorage(_ operation: (StorageDomain, DomainSnapshot) throws -> StorageDomain) throws {
+        let token = try writer.acquire(wait: false); defer { writer.release(token) }
+        try registry.withLock { state in
+            guard state.pins.isEmpty else { throw JedError("55006", "database has active readers") }
+            let replacement = try operation(state.storage, state.snapshot)
+            state.storage = replacement; state.snapshot = replacement.committed
+        }
     }
     fileprivate func check(_ lease: WriterLease) throws {
         guard lease.core === self, writer.owns(lease.token) else { throw JedError("55000", "writer lease is closed") }

@@ -20,6 +20,7 @@ internal struct ResolvedFunction {
     var constantArguments: [Bool]
     var hostID: UInt64?
     var variadicArray = false
+    var regex: ResolvedRegexFunction?
     var name: String { metadata.name }
     var nullBehavior: String { FunctionResolver.text(metadata.metadata, "null") ?? "propagates" }
     var cost: Int64 { if case .integer(let n) = metadata.metadata["cost"] { n } else { 1 } }
@@ -68,7 +69,7 @@ internal enum FunctionResolver {
         for row in rows {
             if let placed = try place(call, row: row) { placements.append((row, placed)) }
         }
-        func candidates(coercing: Bool, stringsUnknown: Bool) throws -> [Candidate] {
+        func candidates(coercing: Bool, stringsUnknown: Bool, parametersUnknown: Bool = false) throws -> [Candidate] {
             var result: [Candidate] = []
             for (row, placement) in placements {
                 var targets: [ScalarType?] = [], score = 0, matches = true
@@ -77,8 +78,9 @@ internal enum FunctionResolver {
                     let sourceIndex = placement.source[index]
                     let argument = sourceIndex.map { original[$0] }
                     let unknownString = stringsUnknown && bareString(placement.syntax[index])
+                    let unknownParameter = parametersUnknown && bareParameter(placement.syntax[index])
                     if unknownString && !stringFamilies.contains(family) { matches = false; break }
-                    if sourceIndex == nil || argument?.type == nil || unknownString {
+                    if sourceIndex == nil || argument?.type == nil || unknownString || unknownParameter {
                         targets.append(familyType(family)); continue
                     }
                     if family == "any" { targets.append(nil); continue }
@@ -118,6 +120,7 @@ internal enum FunctionResolver {
             }
         }
         let selected: Candidate
+        var adoptingParameterContext = false
         let exact = try candidates(coercing: false, stringsUnknown: false)
         if !exact.isEmpty { selected = try choose(exact, original: original, stringsUnknown: false) }
         else {
@@ -128,8 +131,19 @@ internal enum FunctionResolver {
                 if !converted.isEmpty { selected = try choose(converted, original: original, stringsUnknown: false) }
                 else {
                     let fallback = try candidates(coercing: false, stringsUnknown: true)
-                    guard !fallback.isEmpty else { throw JedError("42883", "function does not exist: \(call.name)") }
-                    selected = try choose(fallback, original: original, stringsUnknown: true)
+                    if !fallback.isEmpty { selected = try choose(fallback, original: original, stringsUnknown: true) }
+                    else {
+                        // An already-inferred bare parameter still receives a
+                        // unique declared slot's context. The resolver then
+                        // diagnoses an incompatible use as 42804. Only a unique
+                        // candidate may do this; ordinary overload selection
+                        // and concrete wrong-type arguments remain unchanged.
+                        let adopting = try candidates(coercing: false, stringsUnknown: true, parametersUnknown: true)
+                        guard adopting.count == 1, call.arguments.contains(where: { bareParameter($0.value) }) else {
+                            throw JedError("42883", "function does not exist: \(call.name)")
+                        }
+                        selected = adopting[0]; adoptingParameterContext = true
+                    }
                 }
             }
         }
@@ -138,7 +152,7 @@ internal enum FunctionResolver {
             let syntax = selected.placement.syntax[index], target = selected.targets[index]
             let initial = selected.placement.source[index].map { original[$0] }
             var argument: ResolvedExpression
-            if let target, initial == nil || initial?.type == nil || bareString(syntax) && initial?.type?.type != .scalar(target) || numericLiteral(syntax) != nil && target != .decimal && initial?.type?.type != .scalar(target) {
+            if let target, adoptingParameterContext && bareParameter(syntax) || initial == nil || initial?.type == nil || bareString(syntax) && initial?.type?.type != .scalar(target) || numericLiteral(syntax) != nil && target != .decimal && initial?.type?.type != .scalar(target) {
                 argument = try resolve(syntax, TypeDescriptor(.scalar(target)))
             } else if let initial { argument = initial }
             else { argument = try resolve(syntax, target.map { TypeDescriptor(.scalar($0)) }) }
@@ -168,13 +182,22 @@ internal enum FunctionResolver {
     /// results depend on argument types, so no scalar catalog row exists.
     private static func special(_ call: SQLCall, resolve: Resolve) throws -> ResolvedFunction? {
         let name = call.name.description
-        guard ["date_trunc", "mod", "div", "gcd", "lcm"].contains(name) || name == "width_bucket" && call.arguments.count == 4 else { return nil }
+        guard ["timezone", "date_trunc", "mod", "div", "gcd", "lcm"].contains(name) || name == "width_bucket" && call.arguments.count == 4 else { return nil }
         guard call.arguments.allSatisfy({ $0.name == nil && !$0.variadic }) else { throw JedError("42883", "function has no matching named or variadic signature") }
         let syntax = call.arguments.map(\.value)
         var arguments: [ResolvedExpression] = []
         let result: TypeDescriptor
         var volatility = "immutable"
-        if name == "date_trunc" {
+        if name == "timezone" {
+            guard syntax.count == 2 else { throw JedError("42883", "function does not exist: timezone") }
+            arguments = [try resolve(syntax[0], TypeDescriptor(.scalar(.text))), try resolve(syntax[1], nil)]
+            guard arguments[0].type?.type == .scalar(.text) else { throw JedError("42883", "function does not exist: timezone") }
+            switch arguments[1].type?.type {
+            case .scalar(.timestamp): result = TypeDescriptor(.scalar(.timestamptz))
+            case .scalar(.timestamptz): result = TypeDescriptor(.scalar(.timestamp))
+            default: throw JedError("42883", "function does not exist: timezone")
+            }
+        } else if name == "date_trunc" {
             guard syntax.count == 2 || syntax.count == 3 else { throw JedError("42883", "function does not exist: date_trunc") }
             arguments = [try resolve(syntax[0], TypeDescriptor(.scalar(.text))), try resolve(syntax[1], nil)]
             guard arguments[0].type?.type == .scalar(.text), let source = arguments[1].type,
@@ -313,6 +336,9 @@ internal enum FunctionResolver {
     static func bareString(_ syntax: SQLExpression) -> Bool {
         switch syntax.kind { case .string: true; case .parenthesized(let child): bareString(child); default: false }
     }
+    private static func bareParameter(_ syntax: SQLExpression) -> Bool {
+        switch syntax.kind { case .parameter: true; case .parenthesized(let child): bareParameter(child); default: false }
+    }
     static func numericLiteral(_ syntax: SQLExpression) -> String? {
         switch syntax.kind {
         case .number(let spelling): spelling.utf8.contains(46) || (!spelling.lowercased().hasPrefix("0x") && spelling.utf8.contains { $0 == 101 || $0 == 69 }) ? "decimal_literal" : "integer_literal"
@@ -329,6 +355,8 @@ internal enum FunctionResolver {
     static func isConstant(_ expression: ResolvedExpression) -> Bool {
         switch expression.node {
         case .constant, .parameter: return true
+        case .json(let expression): return expression.isConstant
+        case .pattern(let pattern): return pattern.isConstant
         case .cast(let child, _, _), .convert(let child, _), .unary(_, let child), .isNull(let child, _), .field(let child, _): return isConstant(child)
         case .binary(_, let a, let b, _), .distinct(let a, let b, _, _), .nullif(let a, let b, _): return isConstant(a) && isConstant(b)
         case .coalesce(let children), .row(let children), .extreme(let children, _), .array(let children, _): return children.allSatisfy(isConstant)

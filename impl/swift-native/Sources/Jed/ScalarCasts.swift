@@ -4,6 +4,8 @@ internal enum ScalarCasts {
     struct Context {
         var timezone: SQLTimeZone = .utc
         var statementMicros: Int64?
+        var statementClock: (() throws -> Int64)?
+        var sessionDependency: (() -> Void)?
         var meter: CostMeter?
     }
 
@@ -20,8 +22,14 @@ internal enum ScalarCasts {
         case .uuid: value = .uuid(try SQLUUID(bytes: uuid(text)))
         case .bytea: value = .bytea(try bytea(text))
         case .timestamp, .timestamptz, .date, .interval:
+            var clock = context.statementMicros
+            if type == .date, clock == nil {
+                let word = String(decoding: Temporal.trimmed(text.utf8).map(Temporal.asciiLower), as: UTF8.self)
+                if ["today", "now", "tomorrow", "yesterday"].contains(word) { clock = try context.statementClock?() }
+            }
             value = try Temporal.parse(text: text, type: type, timezone: context.timezone,
-                                       statementMicros: context.statementMicros, typmod: descriptor.temporal, meter: context.meter)
+                                       statementMicros: clock, typmod: descriptor.temporal, meter: context.meter,
+                                       sessionDependency: context.sessionDependency)
         case .json, .jsonb: value = try SQLJSON.parse(text: text, preserveText: type == .json)
         case .jsonpath: value = .jsonpath(try JSONPathProgram.compile(text, meter: context.meter).text)
         }
@@ -36,9 +44,21 @@ internal enum ScalarCasts {
         }
         if case .null = value { return .null }
         let result: SQLValue
-        if source == target { result = value }
+        if source == target {
+            // A shared parameter slot can hold the widest inferred integer
+            // while this occurrence retains a narrower explicit cast type.
+            if case .integer(let number) = value, target.integerWidth != nil {
+                result = .integer(try checkedInteger(number, type: target))
+            } else { result = value }
+        }
         else if case .text(let text) = value {
-            return try input(text, to: descriptor, explicit: mode == .explicit, context: context)
+            var inputContext = context
+            if mode != .explicit {
+                // Clock words belong to literal adaptation or an explicit cast,
+                // never assignment coercion of text data or bound parameters.
+                inputContext.statementMicros = nil; inputContext.statementClock = nil
+            }
+            return try input(text, to: descriptor, explicit: mode == .explicit, context: inputContext)
         } else if target == .text {
             result = .text(try render(value, context: context, growth: true))
         } else {

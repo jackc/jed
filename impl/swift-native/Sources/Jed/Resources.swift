@@ -32,7 +32,7 @@ public final class MemoryDiagnostics: Sendable {
 
 internal final class LifetimeCost {
     var accrued: Int64
-    let limit: Int64
+    var limit: Int64
     init(limit: Int64 = 0, accrued: Int64 = 0) {
         self.limit = max(0, limit)
         self.accrued = max(0, accrued)
@@ -122,6 +122,7 @@ internal final class CostMeter {
     private(set) var accrued: Int64 = 0
     let limit: Int64
     let lifetime: LifetimeCost?
+    let lifetimeLimit: Int64
     let resources: StatementResources
     let cancellation: CancellationToken?
 
@@ -129,6 +130,7 @@ internal final class CostMeter {
          resources: StatementResources = StatementResources(), cancellation: CancellationToken? = nil) {
         self.limit = max(0, limit)
         self.lifetime = lifetime
+        self.lifetimeLimit = max(0, lifetime?.limit ?? 0)
         self.resources = resources
         self.cancellation = cancellation
     }
@@ -137,9 +139,9 @@ internal final class CostMeter {
         precondition(units >= 0)
         if firstCeiling == nil {
             let statementRemaining = limit > 0 ? limit - accrued : Int64.max
-            let lifetimeRemaining = lifetime.map { $0.limit > 0 ? $0.limit - $0.accrued : Int64.max } ?? Int64.max
+            let lifetimeRemaining = lifetime.map { lifetimeLimit > 0 ? lifetimeLimit - $0.accrued : Int64.max } ?? Int64.max
             let statementHit = limit > 0 && units >= statementRemaining
-            let lifetimeHit = lifetime != nil && lifetime!.limit > 0 && units >= lifetimeRemaining
+            let lifetimeHit = lifetime != nil && lifetimeLimit > 0 && units >= lifetimeRemaining
             if statementHit { firstCeiling = .statement }
             if lifetimeHit && (!statementHit || lifetimeRemaining < statementRemaining) { firstCeiling = .lifetime }
         }
@@ -149,15 +151,15 @@ internal final class CostMeter {
 
     func guardCost() throws {
         let statementOver = limit > 0 && accrued >= limit
-        let lifetimeOver = lifetime != nil && lifetime!.limit > 0 && lifetime!.accrued >= lifetime!.limit
+        let lifetimeOver = lifetime != nil && lifetimeLimit > 0 && lifetime!.accrued >= lifetimeLimit
         guard statementOver || lifetimeOver else { return }
         var useLifetime = lifetimeOver
         if statementOver && lifetimeOver, let lifetime {
-            useLifetime = lifetime.accrued - lifetime.limit > accrued - limit
+            useLifetime = lifetime.accrued - lifetimeLimit > accrued - limit
         }
         if let firstCeiling { useLifetime = firstCeiling == .lifetime }
         if useLifetime, let lifetime {
-            throw JedError("54P02", "session exceeded the lifetime cost limit of \(lifetime.limit) (accrued \(lifetime.accrued))")
+            throw JedError("54P02", "session exceeded the lifetime cost limit of \(lifetimeLimit) (accrued \(lifetime.accrued))")
         }
         throw JedError("54P01", "query exceeded the cost limit of \(limit) (accrued \(accrued))")
     }

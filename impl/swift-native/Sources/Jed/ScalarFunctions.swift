@@ -28,6 +28,7 @@ internal enum ScalarFunctions {
             guard let call = environment.hostCall else { throw JedError("55000", "host function is unavailable") }
             return try call(id, values)
         }
+        if function.metadata.category == "json" { return try JsonScalarFunctions.evaluate(function, values: values, context: context) }
         let name = function.name, meter = context.meter
         let types = function.arguments.map { $0.type ?? TypeDescriptor(.scalar(.text)) }
         let constant = function.constantArguments.allSatisfy { $0 }
@@ -35,6 +36,7 @@ internal enum ScalarFunctions {
             var scalar = context.scalar; scalar.meter = meter
             return try ContainerText.render(value, type: descriptor, context: scalar, growth: false)
         }
+        let jsonRenderer: JSONFunctions.ScalarRenderer = { try JsonScalarFunctions.render($0, type: $1, context: context, meter: $2) }
         func text(_ index: Int) throws -> SQLText {
             guard values.indices.contains(index), case .text(let result) = values[index] else { throw JedError("42804", "text argument required") }; return result
         }
@@ -53,7 +55,7 @@ internal enum ScalarFunctions {
         if name == "array_to_json" {
             let pretty: Bool
             if values.count > 1, case .boolean(let enabled) = values[1] { pretty = enabled } else { pretty = false }
-            return try JSONFunctions.chargeGrowth(JSONFunctions.image(values[0], type: types[0], binary: false, meter: meter, scalarRender: renderer, pretty: pretty), constant: constant, meter: meter)
+            return try JSONFunctions.chargeGrowth(JSONFunctions.image(values[0], type: types[0], binary: false, meter: meter, scalarRender: jsonRenderer, pretty: pretty), constant: constant, meter: meter)
         }
         let arrayNames: Set<String> = ["@>", "<@", "&&", "array_ndims", "array_length", "array_lower", "array_upper", "cardinality", "array_dims", "array_append", "array_prepend", "array_cat", "array_remove", "array_replace", "array_position", "array_positions", "array_to_string", "string_to_array"]
         if arrayNames.contains(name) || name == "width_bucket" && values.count == 2 {
@@ -67,8 +69,10 @@ internal enum ScalarFunctions {
             return try ArrayFunctions.call(name: name, args: values, element: descriptor, context: context.scalar, constant: constant, collatedKey: context.collatedKey)
         }
         if ["now", "current_timestamp", "current_date", "localtimestamp", "make_date", "make_timestamp", "make_timestamptz", "make_interval", "justify_hours", "justify_days", "justify_interval", "age", "date_trunc", "date_part", "extract", "timezone"].contains(name) || name == "to_timestamp" && values.count == 1 {
+            let usesClock = ["now", "current_timestamp", "current_date", "localtimestamp"].contains(name) || name == "age" && values.count == 1
+            let clock = usesClock ? try context.now() : context.scalar.statementMicros
             return try TemporalFunctions.call(name: name, args: values, timezone: context.scalar.timezone,
-                                              database: environment.timezones, statementMicros: context.scalar.statementMicros, meter: meter)
+                                              database: environment.timezones, statementMicros: clock, meter: meter)
         }
         switch name {
         case "to_char":
@@ -138,7 +142,7 @@ internal enum ScalarFunctions {
         case "jsonb_strip_nulls", "json_strip_nulls": return try JSONFunctions.stripNulls(values[0])
         case "jsonb_pretty": return .text(try SQLJSON.render(JSONFunctions.node(values[0]), pretty: true, meter: meter))
         case "to_json", "to_jsonb", "json_scalar":
-            let image = try JSONFunctions.image(values[0], type: types[0], binary: name == "to_jsonb", meter: meter, scalarRender: renderer)
+            let image = try JSONFunctions.image(values[0], type: types[0], binary: name == "to_jsonb", meter: meter, scalarRender: jsonRenderer)
             return try JSONFunctions.chargeGrowth(image, constant: constant, meter: meter)
         case "json_serialize":
             switch values[0] {
@@ -154,17 +158,14 @@ internal enum ScalarFunctions {
                 guard case .array(let array) = values[0], case .array(let element) = types[0].type else { throw JedError("42804", "VARIADIC argument must be an array") }
                 items = array.elements; descriptors = items.map { _ in TypeDescriptor(element) }
             }
-            return try JSONFunctions.build(items, types: descriptors, object: name.hasSuffix("object"), binary: name.hasPrefix("jsonb"), constant: constant, meter: meter, scalarRender: renderer)
-        case "similar_to_escape": return .text(try Similar.translate(text(0), escape: values.count > 1 ? text(1) : nil, meter: meter).text)
+            return try JSONFunctions.build(items, types: descriptors, object: name.hasSuffix("object"), binary: name.hasPrefix("jsonb"), constant: constant, meter: meter, scalarRender: jsonRenderer)
+        case "similar_to_escape": return .text(try Similar.translate(text(0), escape: values.count > 1 ? text(1) : nil, meter: constant ? nil : meter).text)
         case "substring" where values.count == 3 && types[1].type == .scalar(.text):
-            let translated = try Similar.translate(text(1), escape: text(2), meter: meter)
-            let program = try Similar.compileSubstring(translated)
-            try program.chargeCompile(meter)
-            return try program.match(text(0), meter: meter).map(SQLValue.text) ?? .null
+            return try context.patterns.similarSubstring(function, values: values, meter: meter)
         default: break
         }
         if name.hasPrefix("regexp_") || name == "substring" && types.count > 1 && types[1].type == .scalar(.text) {
-            let execution = try environment.regexExecution?(function) ?? RegexExecution()
+            let execution = try environment.regexExecution?(function) ?? context.patterns.regexExecution(function)
             let unicode = environment.unicode
             return try RegexFunctions.call(name: name, args: values, program: execution.program, chargeCompile: execution.chargeCompile,
                                            scratch: execution.scratch, fold: { unicode.simpleLower($0) }, meter: meter)

@@ -108,6 +108,7 @@ internal enum ContainerCasts {
             }
             var output: [SQLValue] = []
             for (value, field) in zip(values, fields) {
+                if value.isNull && field.notNull { throw JedError("23502", "null value in composite field \(field.name)") }
                 output.append(try store(value, to: field.descriptor, explicit: explicit, context: context, depth: depth + 1))
             }
             return .composite(output)

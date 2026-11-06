@@ -30,7 +30,8 @@ records integrated command results and local revision boundaries.
 | T02 | [Decimal arithmetic](../../impl/swift-native/Sources/Jed/Decimal.swift), exact numeric functions and guarded transcendental kernels; all 41 shared decimal key vectors and internal arithmetic/admission invariants pass | SQL resolution, every numeric corpus result/error/type/cost, aggregate integration |
 | T03, F03 | [Numeric formatting](../../impl/swift-native/Sources/Jed/NumericFormat.swift), [float input/output](../../impl/swift-native/Sources/Jed/FloatText.swift) and [float kernels](../../impl/swift-native/Sources/Jed/FloatFunctions.swift); exact IEEE expansion, ties-even/Roman invariants, and three float width/strict-interval/round-trip tests pass through the 133-test green integrated run | Full float and numeric formatting SQL corpus, including resolved casts, errors, types and costs |
 | T05, T06, F03 | [Temporal values](../../impl/swift-native/Sources/Jed/Temporal.swift), [timezone reader](../../impl/swift-native/Sources/Jed/TimeZone.swift), scalar functions and datetime templates; shared date/timestamp/interval vectors, JTZ bundle round trip and all 16 TZif vectors pass | SQL temporal/formatting corpus, session/environment lifecycle and persisted timezone dependency integration |
-| F04 | [Regex compiler/VM](../../impl/swift-native/Sources/Jed/Regex.swift) and [SIMILAR](../../impl/swift-native/Sources/Jed/Similar.swift); all 33 shared program listings, 41 capture/step vectors and 19 SIMILAR vectors pass in the green 120-test integration; capture/replacement admission invariants pass through the 133-test run | SQL regexp/SRF/substring and resource corpus; environment Unicode fold and per-execution scratch integration; retained SRF producer tests pending |
+| F04 | [Regex compiler/VM](../../impl/swift-native/Sources/Jed/Regex.swift) and [SIMILAR](../../impl/swift-native/Sources/Jed/Similar.swift); all 33 shared program listings, 41 capture/step vectors and 19 SIMILAR vectors pass; capture/replacement admission and retained SRF producer invariants pass through the 146-test green integrated run | SQL regexp/SRF/substring and resource corpus; environment Unicode fold and per-execution scratch integration |
+| T07 | [Unicode bundle/property reader](../../impl/swift-native/Sources/Jed/UnicodeData.swift) and [collation tables/executor](../../impl/swift-native/Sources/Jed/Collation.swift); three tests pass in the 146-test green run, including frozen artifact bytes, sparse delta/full-table merge identity, all 46 shared sort-key vectors, 2,933 simple and 103 special case mappings, explicit environment isolation and regex fold injection. The separate handwritten [DUCET/LDML compiler](../../impl/swift-native/Sources/JedUnicodeCompiler/) and artifact writer pass four further tests in the 2026-11-05 integrated run, including all compiler/bundle vectors and byte-for-byte production artifact rebuilding | CLI smoke test; SQL collation/casing corpus, environment lifecycle, persisted collation dependencies and skew handling |
 
 These are bounded foundation results, not completion claims for the matrix rows.
 The platform for these checks is Linux x86-64 with Swift 6.4.2, using the opt-in
@@ -59,6 +60,22 @@ schedules, simulations, and complete cost/memory conformance remain unverified.
    files and early slice descriptions is stale: for example encryption, timezones,
    collation, array keys, and hash spill are implemented at this baseline. Conversely,
    a future design document does not make its proposed feature part of acceptance.
+
+Frozen host clarification: although the general session prose describes a lazy
+bare `BEGIN`, all three baseline session drivers default an unspecified mode to
+READ WRITE and acquire the gate eagerly (Rust `shared.rs::begin_block`, Go
+`shared.go::beginBlock`, TypeScript `shared.ts::beginBlock`). Swift retains that
+observable baseline behavior. An invalid session-option timezone similarly
+falls back to UTC in all three constructors; the explicit timezone setter
+validates and reports `22023`.
+
+Frozen sequence clarification: [sequences.md §6](sequences.md#6-currval--lastval--per-session-state-not-snapshot-state)
+still describes a value-only `lastval` cache and says `setval` never changes it.
+The baseline [shared sequence corpus](../conformance/suites/expr/sequence_value.test)
+explicitly requires `setval` on the last-used sequence to change `lastval`, while
+`setval` on another sequence leaves it unchanged. All three baseline cores retain
+the last sequence name and read its session value. Swift follows that shared
+corpus behavior; the stale prose is not an alternate expected result.
 
 ## 2. Audited baseline totals
 

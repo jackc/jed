@@ -2,6 +2,30 @@ import XCTest
 @testable import Jed
 
 final class JSONBoundaryTests: XCTestCase {
+    /// Host callbacks cannot be represented by the shared SQL corpus. They
+    /// expose the lazy boundary without relying on a SQL clock or random seed.
+    func testSQLJSONRetainsLazyHostCallbacksAndEscapingCallbackErrors() throws {
+        let resolver = ExpressionResolver()
+        resolver.hostFunctions = [HostFunctionSignature(id: 42, name: try SQLText("next_value"), arguments: [], result: .i32)]
+        var calls = 0
+        var execution = ExpressionContext(meter: CostMeter())
+        execution.functions.hostCall = { id, values in
+            XCTAssertEqual(id, 42); XCTAssertTrue(values.isEmpty)
+            calls += 1; return .integer(Int64(calls))
+        }
+        func evaluate(_ sql: String) throws -> SQLValue { try execution.evaluate(resolver.resolve(SQLParser(sql).parseExpressionOnly())) }
+        _ = try evaluate("JSON_VALUE('{\"a\":7}', '$.a' RETURNING i32 DEFAULT next_value() ON EMPTY)")
+        XCTAssertEqual(calls, 0)
+        guard case .integer(1) = try evaluate("JSON_VALUE('{}', '$.a' RETURNING i32 DEFAULT next_value() ON EMPTY)") else { return XCTFail("default result missing") }
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(try evaluate("JSON_EXISTS(NULL::jsonb, '$n' PASSING next_value() AS n)").isNull)
+        XCTAssertEqual(calls, 1)
+        execution.functions.hostCall = { _, _ in throw JedError("22012", "injected callback failure") }
+        XCTAssertThrowsError(try evaluate("JSON_VALUE('{}', '$.a' RETURNING i32 DEFAULT next_value() ON EMPTY DEFAULT 9 ON ERROR)")) {
+            XCTAssertEqual(($0 as? JedError)?.code, "22012")
+        }
+    }
+
     private func text(_ value: String) throws -> SQLText { try SQLText(value) }
     private func code(_ expected: String, _ body: () throws -> Void, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertThrowsError(try body(), file: file, line: line) { XCTAssertEqual(($0 as? JedError)?.code, expected, "\($0)", file: file, line: line) }

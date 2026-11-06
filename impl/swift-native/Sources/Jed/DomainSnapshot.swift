@@ -55,20 +55,23 @@ internal struct DomainSnapshot: Sendable {
             }
         }
         let definitions = Dictionary(uniqueKeysWithValues: image.composites.map { ($0.name, $0) })
-        var resolved: [SQLText: CompositeType] = [:], active: Set<SQLText> = []
+        var resolved: [SQLText: CompositeType] = [:], active: Set<SQLText> = [], depths: [SQLText: Int] = [:]
         func visit(_ name: SQLText) throws {
             if resolved[name] != nil { return }
-            guard let definition = definitions[name], active.insert(name).inserted, active.count <= 256 else {
+            guard let definition = definitions[name], active.insert(name).inserted, active.count <= 32 else {
                 throw JedError.corruption("invalid composite type dependency")
             }
+            var depth = 1
             func dependency(_ type: CatalogType) throws {
                 switch type {
-                case .composite(let name): try visit(name)
+                case .composite(let name): try visit(name); depth = max(depth, 1 + depths[name]!)
                 case .array(let element): try dependency(element)
                 default: break
                 }
             }
             for field in definition.fields { try dependency(field.type.type) }
+            guard depth <= 32 else { throw JedError.corruption("composite type graph exceeds nesting limit") }
+            depths[name] = depth
             let fields = try definition.fields.map {
                 TypeField(name: $0.name, descriptor: try $0.type.resolve(resolved), notNull: $0.notNull)
             }

@@ -393,6 +393,7 @@ internal final class SQLParser {
     }
     func tableReference() throws -> SQLFrom {
         let start = cursor
+        let referenceDepth = depth
         let lateral = word() == "lateral" && (symbol("(", 1) || (isIdentifier(1) && symbol("(", 2)))
         if lateral { advance() }
         let source: SQLFrom.Source
@@ -411,7 +412,7 @@ internal final class SQLParser {
         } else if word() == "json_table" && symbol("(", 1) { source = .jsonTable(try jsonTable()) }
         else if isIdentifier() && symbol("(", 1) { source = .function(try functionCall()) }
         else { source = .table(try qualifiedName()) }
-        var result = SQLFrom(source: source, lateral: lateral, span: span(start))
+        var result = SQLFrom(source: source, lateral: lateral, span: span(start), parserDepth: referenceDepth)
         let explicit = eat("as")
         if explicit && symbol("(") {
             advance(); result.columnDefinitions = try fieldDefinitions()

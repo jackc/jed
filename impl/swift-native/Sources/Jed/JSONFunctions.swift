@@ -490,6 +490,7 @@ internal enum JSONFunctions {
             for index in stride(from: 0, to: keys.elements.count, by: 2) { pairs.append((keys.elements[index], keys.elements[index + 1])) }
         }
         var members: [(SQLText, SQLValue)] = []
+        meter.charge(Int64(pairs.count)); try meter.guardCost()
         for (key, value) in pairs {
             guard case .text(let key) = key else { throw JedError("22004", "null value not allowed for object key") }
             let node: SQLJSONValue
@@ -498,6 +499,6 @@ internal enum JSONFunctions {
             else { throw JedError("42804", "text[] values required") }
             members.append((key, binary ? .jsonb(node) : .json(try SQLJSON.render(node))))
         }
-        return try chargeGrowth(joinObject(members, binary: binary, colon: [58, 32]), constant: constant, meter: meter)
+        return try chargeGrowth(joinObject(members, binary: binary, colon: [32, 58, 32]), constant: constant, meter: meter)
     }
 }

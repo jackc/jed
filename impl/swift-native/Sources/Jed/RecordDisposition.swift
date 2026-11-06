@@ -2,7 +2,7 @@ internal enum RecordInput: Sendable {
     case value(SQLValue)
     /// Only an unchanged column of the same record may retain an external
     /// reference. Row-copying operations materialize their source values first.
-    case kept(StoredCell)
+    case kept(StoredCell, pending: PendingOverflow? = nil)
 }
 
 /// The deterministic two-pass large-value plan. Split weights and serialization
@@ -11,6 +11,7 @@ internal enum RecordDisposition {
     private struct Candidate {
         let type: TypeDescriptor
         var original: StoredCell?
+        var pending: PendingOverflow?
         var raw: [UInt8]?
         var rawLength = 0
         var compressed: [UInt8]?
@@ -50,12 +51,24 @@ internal enum RecordDisposition {
                 candidate.null = value.isNull
                 if !value.isNull { candidate.raw = try ValueCodec.encodeRawBody(value, type: type) }
                 candidate.rawLength = candidate.raw?.count ?? 0
-            case .kept(let stored):
+            case .kept(let stored, let pending):
                 guard stored.type == type else { throw JedError("42804", "kept value changed its static type") }
                 candidate.original = stored; candidate.null = stored.isNull
+                if let pending {
+                    guard let facts = try stored.largeFacts(encrypted: codec.reservedBytes != 0),
+                          let head = facts.external, head.index == 0, head.tag.allSatisfy({ $0 == 0 }),
+                          !pending.bytes.isEmpty, pending.bytes.count == facts.stored,
+                          pending.rawLength == facts.raw, pending.compressed == facts.compressed else {
+                        throw JedError.corruption("pending kept value disagrees with its placeholder")
+                    }
+                    candidate.pending = pending
+                }
                 if let bytes = stored.bytes {
                     if width != nil { candidate.raw = Array(bytes); candidate.rawLength = bytes.count }
                     else if let facts = try stored.largeFacts(encrypted: codec.reservedBytes != 0) {
+                        guard facts.external?.index != 0 || pending != nil else {
+                            throw JedError.corruption("kept placeholder is missing its pending value")
+                        }
                         candidate.rawLength = facts.raw
                         if facts.compressed {
                             candidate.compressedLength = facts.stored
@@ -124,6 +137,7 @@ internal enum RecordDisposition {
             if item.null { cells.append(StoredCell(bytes: nil, type: item.type)); continue }
             if let original = item.original,
                item.fixed != nil || original.bytes?.first == item.form {
+                if let pending = item.pending { overflows[column] = pending }
                 cells.append(original); continue
             }
             let encoded: [UInt8]
@@ -157,6 +171,7 @@ internal enum RecordDisposition {
 
     private static func storedContent(_ item: Candidate, codec: any PageCodec, pager: Pager?,
                                       pageCount: UInt32?) throws -> [UInt8] {
+        if let pending = item.pending { return pending.bytes }
         guard let original = item.original, let facts = try original.largeFacts(encrypted: codec.reservedBytes != 0),
               let reference = facts.external, let pager else { throw JedError.corruption("kept chain has no owning pager") }
         return try OverflowChain.read(reference, length: facts.stored,

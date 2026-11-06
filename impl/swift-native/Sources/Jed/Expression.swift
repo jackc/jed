@@ -4,6 +4,11 @@ internal struct ResolvedExpression {
     var type: TypeDescriptor?
     var node: Node
     var position: Int
+    /// Cached query provenance; nil on a synthesized node derives from children.
+    var collation: CollationDerivation?
+    /// Input folding can consume session state without retaining an operation
+    /// node (notably offsetless timestamptz inside a container text literal).
+    var nonimmutable = false
     var isConstant: Bool { if case .constant = node { return true }; return false }
     indirect enum Node {
         case constant(SQLValue), column(Int), parameter(Int)
@@ -25,6 +30,8 @@ internal struct ResolvedExpression {
         case subscriptValue(ResolvedExpression, [ResolvedSubscript])
         case rangeOperation(String, ResolvedExpression, ResolvedExpression, SQLType)
         case quantified(String, all: Bool, ResolvedExpression, ResolvedExpression, TypeDescriptor)
+        case json(ResolvedJSONExpression)
+        case pattern(ResolvedPattern)
     }
 }
 
@@ -41,12 +48,38 @@ internal struct ExpressionContext {
     let meter: CostMeter
     var collatedKey: KeyEncoding.CollatedKey?
     var functions = ScalarFunctions.Environment()
+    var patterns = PatternExecution()
 
     init(meter: CostMeter, timezone: SQLTimeZone = .utc, statementMicros: Int64? = nil,
          parameters: [SQLValue] = [], column: @escaping (Int) throws -> SQLValue = { _ in throw JedError("XX000", "missing expression row") }) {
         self.meter = meter
         scalar = ScalarCasts.Context(timezone: timezone, statementMicros: statementMicros, meter: meter)
         self.parameters = parameters; self.column = column
+    }
+
+    func now() throws -> Int64 {
+        if let clock = scalar.statementMicros { return clock }
+        guard let clock = scalar.statementClock else { throw JedError("55000", "statement clock is unavailable") }
+        return try clock()
+    }
+
+    /// Filter contexts need only TRUE. In an AND, both FALSE and UNKNOWN reject
+    /// the row before visiting the right child; value expressions retain 3VL.
+    func matches(_ expression: ResolvedExpression) throws -> Bool {
+        if case .binary(let operation, let left, let right, _) = expression.node {
+            if operation == "and" {
+                meter.charge(1); try meter.step()
+                guard try matches(left) else { return false }
+                return try matches(right)
+            }
+            if operation == "or" {
+                meter.charge(1); try meter.step()
+                if try matches(left) { return true }
+                return try matches(right)
+            }
+        }
+        if case .boolean(true) = try evaluate(expression) { return true }
+        return false
     }
 
     func evaluate(_ expression: ResolvedExpression) throws -> SQLValue {
@@ -63,10 +96,9 @@ internal struct ExpressionContext {
         }
         switch expression.node {
         case .currentTimestamp:
-            guard let clock = scalar.statementMicros else { throw JedError("XX000", "statement clock is unavailable") }
-            return .timestamptz(clock)
+            return .timestamptz(try now())
         case .currentDate:
-            guard let clock = scalar.statementMicros else { throw JedError("XX000", "statement clock is unavailable") }
+            let clock = try now()
             try Temporal.chargeZone(meter)
             return .date(try Temporal.finiteDate(Temporal.floorDiv(scalar.timezone.instantToLocal(clock), Temporal.microsPerDay)))
         case .dateInput(let text):
@@ -117,7 +149,7 @@ internal struct ExpressionContext {
             let a = try evaluate(left), b = try evaluate(right)
             let equal: Bool
             if a.isNull || b.isNull { equal = a.isNull && b.isNull }
-            else { try comparisonWork("=", a, b, type: type); equal = try ValueComparison.total(a, b, type: type, collatedKey: collatedKey) == 0 }
+            else { try comparisonWork("=", a, b, type: type); equal = try ValueComparison.total(a, b, type: type, collatedKey: collatedKey, equality: true) == 0 }
             return .boolean(negated ? equal : !equal)
         case .conditional(let arms, let fallback):
             for (condition, value) in arms {
@@ -145,6 +177,8 @@ internal struct ExpressionContext {
             if case .boolean(true) = try ValueComparison.sql("=", a, b, type: type, collatedKey: collatedKey) { return .null }
             return a
         case .row(let fields): return .composite(try fields.map(evaluate))
+        case .json(let expression): return try expression.evaluate(context: self)
+        case .pattern(let pattern): return try pattern.evaluate(context: self)
         case .array(let sources, let nested):
             return try ArrayFunctions.construct(sources.map(evaluate), nested: nested,
                                                 constant: sources.allSatisfy(FunctionResolver.isConstant), meter: meter)
@@ -221,6 +255,18 @@ internal struct ExpressionContext {
             try meter.guardCost()
         case (.bytea(let a), .bytea(let b)):
             meter.charge(Int64(max(0, min(a.count, b.count) - 1))); try meter.guardCost()
+        case (.array(let a), .array(let b)):
+            if type.type == .array(.scalar(.text)), let name = type.collation, name.utf8 != [67], op != "=" && op != "<>" {
+                var element = TypeDescriptor(.scalar(.text)); element.collation = name
+                for (left, right) in zip(a.elements, b.elements) {
+                    if left.isNull || right.isNull {
+                        if left.isNull != right.isNull { break }
+                        continue
+                    }
+                    try comparisonWork(op, left, right, type: element)
+                    if try ValueComparison.total(left, right, type: element, collatedKey: collatedKey) != 0 { break }
+                }
+            }
         default: break
         }
     }

@@ -276,7 +276,54 @@ constraint, retained intentionally to pin CryptoExtras' required transitive pack
 
 ## Current integration checkpoint
 
-Latest integrated run (2026-11-05 18:20 CST): **197 tests passed**. It includes
+Verified integration (2026-11-05 19:24 CST): **250 tests passed, zero failures**
+with `mise run swift-native:test` (82.999 seconds). The public
+Database/Session/Rows path now executes DDL, INSERT/UPDATE/DELETE, ordered and bounded
+base scans, parameter admission, transactional sequence functions, serial/identity
+defaults, initial grouped aggregates, set operations, VALUES queries, derived
+relations and authored nested-loop joins, SELECT DISTINCT, and initial stored-view
+reads/inserts. This is
+still a partial SQL engine: costed join search/hash/INL/pushdown, complete expression
+and relation sources, complete view DML/dependencies, windows, constraints, prepared plans, attachments,
+temporary domains, spill integration and process page service remain incomplete.
+
+An earlier `mise run swift-native:test` at 19:04 CST ran 242 tests: two assertions failed in
+one new catalog environment test because collecting an in-memory statistics summary
+duplicated its continuation arrays. The collector fix is now published and its
+targeted and full tests now pass. That run's original 28 SQL files passed (618 records,
+721 cells, 60 cost and 45 name assertions); the expression adapter passed its
+expanded scalar/temporal selection. File-host tests cover exclusive protocol-v2
+ownership, atomic no-clobber creation, encrypted opening, descriptor/lock cleanup,
+fork and special-file refusal, collation grading, and retained directory durability.
+Automatic owner/client page service remains explicitly unavailable.
+
+The latest full run passes **56/749 complete SQL files**, 1,334 records (814
+statements and 520 queries), 1,458 cells, 152 cost, 192 name, and two type assertions.
+All records in every admitted file execute; 693 files remain outside this gate.
+The final failure was all-NULL set-operation metadata: `ResultColumn.type` is now
+optional so unresolved `unknown` remains observable through the host API.
+Independent review also corrected definer-view INSERT privileges leaking into an
+unrelated SELECT source, view DEFAULT VALUES mapping, and identity defaults.
+All five new maintenance tests pass, including encrypted rekey round trips and
+pre-replacement failure isolation. Independent crypto review found no blocking
+maintenance defect; native replacement/reopen failure injection remains outstanding.
+
+An earlier `mise run swift-native:test --filter SQLCorpusBoundaryTests` at 19:13 CST ran
+46 complete admitted files / 1,099 records / 1,084 cells, with 92 cost, 100 name,
+and one type assertion. Seven failures remained: five consequences of unconnected
+view operations and two consequences of unconnected SELECT DISTINCT. No failing
+record was removed. At that point 703 frozen corpus files remained outside the gate.
+The 45-file run before compound/derived integration had 15 failures; a duplicated
+aggregate collector entry (resolver revisiting one source call during literal
+adoption) was fixed, along with the missing query paths. Subsequent commands and
+results are recorded above; these intermediate failures are retained as history.
+
+The Linux host uses a first-party CJedHost shim containing only the OS atomic
+no-replace rename call; it adds no dependency or native engine algorithm. Swift
+retains all storage, SQL, type and codec policy. Scratch/rebuild and host maintenance
+work are opt-in and remain separately tracked in Tools/STORAGE_LIFECYCLE_PLAN.md.
+
+Previous storage checkpoint (2026-11-05 18:20 CST): **197 tests passed**. It includes
 3,235 frozen expression records / 3,793 cells / 294 cost checks / 13 type checks,
 with 2,547 records explicitly outside the expression adapter's gate. JSON/SQLJSON
 initially exposed 14 failures, fixed against unchanged expectations. A speculative
@@ -302,20 +349,20 @@ the shared fixture. Current snapshot fingerprint is
 `7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83`.
 Environment sources, host-kernel boundaries and lazy per-block clock/UUID services
 are included in the 197-test run. New Database/Session cursor tests and expanded
-clock/seed/variables expression probes were added afterwards and await validation.
+clock/seed/variables expression probes added afterwards pass in the 250-test run.
+`mise run swift-native:codegen --check` also passes at the current fingerprint.
 
 ## Next steps
 
-1. Active delegated slices: streamed images and memory-domain staging
-   (`host_inventory`), pattern/collation resolution and host-overload review
-   (`crypto_audit`), statement services, frozen adapter expansion and host lifecycle
-   review (`scope_inventory`). Root owns database/session/query integration and
-   binding. The public read/transaction API is being connected; DDL/DML, prepared
-   caches, joins/aggregates/windows, complete file/process hosts and full corpus
-   execution remain incomplete.
-2. Build parser/resolver/evaluator and shared-corpus adapter over the established
-   types, plus the pager/packed B+tree/validated-COW transaction path. Do not
-   substitute decoded dictionary storage or engine-owned cursor collection.
+1. Active delegated slices: Linux protocol-v2 page service (`host_inventory`),
+   ordered-set/hypothetical aggregates and corpus admission (`crypto_audit`), views and
+   ALTER/constraint DDL (`scope_inventory`). Root owns query/DML/session integration
+   and verification. Keep source publication coordinated with integrated checks.
+   The experiment is not frozen.
+2. Extend the whole-file corpus gate and connected execution paths. Audit cost
+   charge granularity, view dependencies, costed join planning, resource accounting,
+   and rejected/unconnected SQL surfaces. Do not substitute decoded dictionary
+   storage or engine-owned cursor collection.
 3. Continue vertical slices across expressions, SQL, pager/storage and host APIs,
    verifying against shared data/corpus at every slice and retaining failing counts.
 4. Complete full verification and independent reviews, then measured optimization

@@ -27,3 +27,41 @@ Normal repository CI, tests, benchmarks and generated website references do not
 include Swift. Generated metadata is pinned to the recorded baseline Git blobs;
 updating supported cores does not refresh the experiment. Completion is followed
 by a freeze, with promotion subject to a separate decision.
+
+The current native file host supports explicit exclusive ownership. For example:
+
+```swift
+let database = try Database.open("example.jed", options: OpenOptions(locking: .exclusive))
+try database.compact()
+try database.close()
+```
+
+The SQL path uses explicit sessions and pull cursors:
+
+```swift
+import Jed
+
+let database = try Database()
+let session = try database.session()
+try session.execute("CREATE TABLE item (id i32 PRIMARY KEY, label text)")
+try session.execute("INSERT INTO item VALUES (1, 'first')")
+let rows = try session.query("SELECT label FROM item WHERE id = $1",
+                             parameters: [.integer(1)])
+while let row = try rows.next() { print(row) }
+session.close()
+try database.close()
+```
+
+Keep a session for transactions, variables and sequence history. Convenience
+queries on `Database` create fresh sessions. Result-column `type` is optional:
+nil represents the unresolved SQL `unknown` type of an all-NULL output. Consult
+the progress record for the currently admitted SQL subset.
+
+`Database.create`, `deserialize` and `serialize` provide creation and byte import/
+export. File maintenance also exposes `changeCredential(credential:kdf:)` and
+`rekey(credential:kdf:)`; a nil rekey credential produces plaintext. Open a
+plaintext source with `scratchEncryption: .on` before encrypting it. Maintenance
+currently targets `"main"`; attachments and the automatic page-service host are
+still being implemented. The default `.automatic` locking mode reports `0A000`
+until that host is available. These experimental APIs do not change supported
+core delivery or normal repository verification.

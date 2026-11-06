@@ -256,3 +256,186 @@ Mechanical codegen verification also passed with the complete frozen corpus,
 `7024bdb84a3dc257a81d965161303df5ae427f0870a4c5750dcc99432d6d7f83`.
 This is internal storage/host evidence, not acceptance of the pending full SQL,
 process service, host maintenance, or page-layout migration surface.
+
+## Scratch record rebuild implementation
+
+`ScratchDomain.create(store:codec:cacheBytes:entropy:)` owns a private, non-reopenable
+page address space over a caller-owned byte device. It emits one empty catalog
+body and keeps synthetic metadata in the Pager; staging emits body pages only,
+with no meta-slot writes or durability barrier. It uses ordinary incremental
+B+tree serialization, demotes completed leaves into the bounded NodePool, and
+periodically rebuilds its private free vector by reachability. GiST leaf-key
+stores are ordinary scratch B-trees until the canonical GiST is built at the
+end. The source's caches, page IDs, roots, and device are never adopted here.
+
+`DomainRebuilder.rebuild(source, scratch: &scratch, stageBytes:)` starts empty
+stores under the target codec, retaining synthetic rowid counters and all
+catalog objects/statistics. It scans tables first, then indexes, each in raw
+UTF-8 name order and ascending key order. It fully materializes one row and
+replans its cells with RecordDisposition under the target capacity and pointer
+width. Staging occurs after pending stored bytes reach the threshold, so the
+batch can exceed the threshold by one record; large single values and the
+existing interior/GiST metadata contracts remain explicit memory costs.
+Rebuilding does not collect a table's decoded rows or a whole output image.
+
+An encrypted scratch codec must have a throwaway key and an independent entropy
+source. The caller separately draws the final image's DEK, key-block salt/wrap
+nonce, and page nonces. The rebuilt snapshot's txid belongs to scratch paging;
+`DomainImage.write` receives the logical output txid explicitly. Source pins,
+exclusive maintenance admission, final Q4 admission before replacement,
+destination barriers/atomic rename, and cleanup remain the coordinator/host's
+responsibility. Rejection or failed scratch I/O can discard the scratch device
+without writing or poisoning the source.
+
+The primitive accepts another page size internally, but the frozen public
+compaction contract keeps page size unchanged (`api.md` §2.6). No public page-size
+change is introduced. Plain/encrypted conversion and DEK rotation use ascending
+rebuilding even when the nominal page size is unchanged (`encrypted.md` §12).
+
+The byte-device injection is the native spill-host boundary. A MemoryBlockStore
+alone still holds its entire scratch image in memory. The native host must
+provide migration to an exclusively created, unlinked scratch file after the
+page-cache budget, with no grow barriers and sealed host scratch when required.
+That host spill/migration adapter and atomic file maintenance remain separate
+work; bounded leaf/record residency must not be presented as a whole-engine heap
+limit. The three rebuild boundary tests passed in the parent-owned integrated run at
+18:31:30 on 2026-11-05 (1.0 seconds).
+
+## Native scratch host follow-on
+
+The native spill boundary is now implemented as `ScratchFileHost` and its
+`NativeScratchFileHost` adapter. `SpillableScratchStore` starts in memory and,
+when a completed stage's logical page bytes exceed its positive budget, copies
+its backing in at most 64 KiB chunks to a private scratch file. It installs the
+new device only after every copy succeeds; failure closes the candidate and
+retains the original device. The bounded NodePool and all page references remain
+valid. `ScratchDomain.stage` evaluates this threshold before adopting its staged
+generation. No spill host, or a zero threshold, keeps the original memory backing.
+
+POSIX scratch files are created with `O_EXCL | O_CLOEXEC`, mode 0600, and unlinked
+immediately. Their `sync` and grow barriers are disabled; durable UnixBlockStore
+behavior remains the default. An explicit idempotent close operation prevents
+future device accesses, and inherited fork handles fail closed.
+
+`SealedScratchStore` implements encrypted.md §11 using the existing vetted
+XAES-256-GCM adapter: 4096 logical bytes become ciphertext, 24 nonce bytes and a
+16-byte tag. Associated data binds the scratch role, per-file random ID, block
+ordinal and monotonically increasing write counter. Counters survive truncation;
+removed blocks become logical zeros, and a partially retained block has its cut
+tail zeroed and resealed. Each block write seals immediately (the optional
+single-block plaintext cache is not used). Authentication failures are `58030`.
+File-name and scratch-key entropy sources are independent of database key entropy.
+
+The four new ScratchBoundaryTests cover byte-preserving migration, threshold
+admission, zeroed holes/truncation, stale-version and cross-file/ordinal replay,
+private-file unlinking, and actual native sealed spill during a 150-row indexed
+rebuild. All four passed in the parent-owned integrated run at 18:43:59 on
+2026-11-05 (0.182 seconds). File coordination,
+public lifecycle wiring, page service, atomic replacement and SQL spill
+operators remain separate work.
+
+## Native lifecycle and protocol-v2 exclusive host
+
+The first native file slice implements public `CreateOptions`, `OpenOptions`,
+`DeserializeOptions` and the `Database.create/open/deserialize/serialize` entry
+points. Creation writes a private same-directory file, syncs it, publishes using
+an atomic no-replace rename, then syncs its directory. The descriptor remains
+open across rename. File open preserves lazy bounded leaf paging, read-only
+access, encryption credentials and loaded environment data. The same key stream
+used by encrypted creation continues into later commits; OS file-name/owner and
+scratch entropy do not consume it. Parent directory sync is retained by the
+StorageDomain and performed on the first post-open stabilization, including when
+commits originate through the ordinary Database/Session coordinator.
+
+The exclusive host normalizes symlink identity, rejects coordinated hard links,
+claims a process-local path registry, and holds the stable protocol-v2 presence
+inode with a crash-clean kernel flock. Arrival SH covers final marker validation.
+Unknown protocol markers and symlinked coordination entries fail closed. A
+non-serving owner record uses the shared wire contract; it is diagnostic only.
+The byte device is closed before owner removal and presence release. The bundle
+itself remains in place. Inherited handles refuse operations across fork.
+
+`locking: .none` is the explicit external-coordination escape hatch. The default
+`.automatic` currently returns `0A000`: full page-service owner/client, election,
+handoff, remote pins and commit deltas are not implemented by this slice. This
+is an explicit incomplete acceptance row, not exclusive fallback or a skipped
+process test. File attachments remain later work; maintenance follows below.
+
+Public serialization pins the committed snapshot and collects the canonical
+page-sink output into its explicit host buffer. It rejects encrypted sources
+with `0A000`; deserialize rejects encrypted images with `55000`, as required by
+the frozen baseline. Internal maintenance retains encrypted DomainImage support.
+Unknown database names, including `temp`, are `42704` until attachment routing.
+
+Catalog environment admission rejects a completely absent referenced collation
+with `XX002`, preserves version-skewed collation pins and stored definitions, and
+provides per-table write gates plus planner collation-match checks. Index host
+and timezone pins are checked when maintaining or selecting that index; opening
+and reading stored rows do not require those dependencies. Missing host functions
+retain ordinary resolution errors; changed component/version pins are `XX002`.
+CHECK dependencies are checked only by statements that evaluate the check.
+
+Seven FileHostBoundaryTests cover import/export bytes, caller-buffer isolation,
+graded collation admission, real exclusive ownership and lifetime, marker and
+symlink rejection, process-claim cleanup after failures, hard-link refusal,
+read-only/cache configuration, retained first-commit directory barriers, and key-stream continuity. All seven passed in the parent-owned integrated run at 19:04:07 on 2026-11-05; these are host/byte invariants, not SQL or
+multi-process conformance claims.
+
+The first-party `CJedHost` target contains only the atomic no-replace rename OS
+call absent from Swift's Linux Glibc module. The safe Swift wrapper borrows its
+owned path strings synchronously and checks errno; the shim retains no pointer.
+This is the approved ordinary-OS host seam, not an engine or library dependency.
+
+Statistics use the same graded collation verdict before key validation. A skewed
+pin preserves canonical typed MCV/histogram bytes and all structural checks but
+skips old comparison-key validation, duplicate-key/order checks and histogram
+ordering under the newly loaded bundle (statistics.md §2; baseline Go
+`decodeStatisticsValue`/`decodeStatisticsEntry`). The facts remain stored and
+must stay hidden from estimation until rebuilding. The new catalog boundary
+case verifies old-order preservation plus malformed typed bytes/count rejection.
+
+## Atomic maintenance and credential replacement
+
+`Database.compact`, `changeCredential` and `rekey` now have handwritten native
+implementations for main. Attachment routing and page-service ownership remain
+missing. Compaction and rekey acquire the writer gate without waiting and hold
+the pin registry through serialization and publication. Any existing pin refuses
+replacement with `55006`; incoming pins wait until the new storage is published.
+Memory compaction writes a fresh chunked byte device. File replacement streams to
+`<path>.jedtmp`, preserves permission bits, syncs the completed file, closes the
+old descriptor, atomically renames, syncs the directory and opens a cold pool at
+the same cache capacity. Before rename, failure leaves the original file intact;
+a rename failure reopens the original byte device, and failure after replacement
+revokes the old address space and requires reopening the handle. The lock bundle
+is retained across the entire operation. Explicit compaction does not enforce a
+new Q4 trip point after an application lowers its limit.
+
+Rekey uses the bounded scratch rebuild and then the same replacement sink. It
+checks the new image's exact live-page bytes against Q4 before rename. Target
+layout/key errors likewise leave the original file unchanged. Encrypted scratch
+uses a throwaway key and OS entropy separate from the final image stream; target
+key material is prepared before obtaining the gate. Encrypting a plaintext
+source begins a fresh environment key stream; rotating an encrypted source
+continues its current stream. On successful replacement that stream becomes the
+one used by subsequent commits. All target trees are rebuilt by ascending
+insertion, including canonical GiST reconstruction; ordinary compact retains the
+source tree shape.
+
+Credential change retains the data key privately inside EncryptedPageCodec and
+runs rewrapping/KDF work before the writer gate. It checks both storage identity
+and selected key-block generation again under the gate. Its storage phase
+flushes any pending relaxed batch, performs stabilization and the retained
+first-directory sync, writes the unselected copy, barriers, writes the other
+copy, and barriers. Existing readers remain valid. Failure revokes the handle;
+new opens use structural key-block selection and repair before writing. An
+internal already-unlocked codec argument permits maintenance to reopen its own
+newly authenticated encrypted image without retaining the user's credential or
+repeating Argon2. It is not part of the public open API.
+
+`Database.close` releases the native descriptor and lock even when flushing a
+poisoned pager fails, preserving the first failure. Refusal to acquire the
+maintenance gate leaves the handle open. Five MaintenanceBoundaryTests cover
+these host/byte invariants, including a frozen encrypted GiST fixture rebuilt
+through plaintext, encryption and key rotation. All five passed in the
+parent-owned integrated selected run at 19:18:54 on 2026-11-05 (0.861 seconds). Process/crash simulations and attachment maintenance remain separate
+acceptance requirements.

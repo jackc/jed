@@ -16,9 +16,12 @@ internal final class StorageDomain: Sendable {
     let kind: StorageDomainKind
     let readOnly: Bool
     private let state: Mutex<DomainStorageState>
+    private let durableDirectorySync: @Sendable () throws -> Void
 
-    private init(pager: Pager, pool: NodePool, kind: StorageDomainKind, readOnly: Bool, initial: DomainStorageState) {
+    private init(pager: Pager, pool: NodePool, kind: StorageDomainKind, readOnly: Bool, initial: DomainStorageState,
+                 durableDirectorySync: @escaping @Sendable () throws -> Void = {}) {
         self.pager = pager; self.pool = pool; self.kind = kind; self.readOnly = readOnly; state = Mutex(initial)
+        self.durableDirectorySync = durableDirectorySync
     }
     var committed: DomainSnapshot { state.withLock { $0.snapshot } }
     var livePages: UInt32 { state.withLock { $0.livePages } }
@@ -28,15 +31,17 @@ internal final class StorageDomain: Sendable {
 
     static func open(store: any BlockStore, kind: StorageDomainKind = .file, catalogID: UInt64,
                      cacheBytes: Int? = 256 * 1024 * 1024, credential: Credential? = nil,
-                     readOnly: Bool = false, collatedKey: KeyEncoding.CollatedKey? = nil,
+                     readOnly: Bool = false, unlockedCodec: EncryptedPageCodec? = nil, collatedKey: KeyEncoding.CollatedKey? = nil,
+                     collationVerdict: ((CatalogCollation) throws -> Bool)? = nil,
                      validateCatalog: (CatalogImage) throws -> Void,
+                     durableDirectorySync: @escaping @Sendable () throws -> Void = {},
                      syncDirectory: () throws -> Void = {}) throws -> StorageDomain {
         let pager = try Pager.open(store: store, credential: credential, writable: !readOnly,
-            ephemeral: kind == .memory, syncDirectory: syncDirectory)
+            ephemeral: kind == .memory, unlockedCodec: unlockedCodec, syncDirectory: syncDirectory)
         let pool = try NodePool(pager: pager, cacheBytes: kind == .memory ? nil : cacheBytes)
         let meta = pager.selected.meta
         let chain = try CatalogChain.read(root: meta.root, pageCount: meta.pageCount, codec: pager.codec, read: pager.readBody)
-        let catalog = try CatalogImage.collect(chain.entries, catalogID: catalogID, collatedKey: collatedKey)
+        let catalog = try CatalogImage.collect(chain.entries, catalogID: catalogID, collatedKey: collatedKey, collationVerdict: collationVerdict)
         try validateCatalog(catalog)
         let types = try catalog.resolvedTypes(catalogID: catalogID)
         var tables: [SQLText: TableStore] = [:], indexes: [SQLText: TableStore] = [:], gistTrees: [SQLText: GistTree] = [:]
@@ -83,7 +88,8 @@ internal final class StorageDomain: Sendable {
         return StorageDomain(pager: pager, pool: pool, kind: kind, readOnly: readOnly,
             initial: DomainStorageState(snapshot: snapshot, catalogPages: chain.pages, gistPages: gistPages,
                 livePages: meta.livePages, liveAtCompaction: meta.pageCount - UInt32(free.persistedFree.count),
-                freeGeneration: meta.txid, lastWritten: [], repairCatalogPages: kind == .file ? chain.pages.count : 0))
+                freeGeneration: meta.txid, lastWritten: [], repairCatalogPages: kind == .file ? chain.pages.count : 0),
+            durableDirectorySync: durableDirectorySync)
     }
 
     /// The caller owns creation of an empty destination and any atomic path
@@ -257,7 +263,11 @@ internal final class StorageDomain: Sendable {
             }
             let invalidated = Set(plan.pages.body.map(\.index)).union(plan.pages.manifest.pages.map(\.pageIndex))
             pool.invalidate(invalidated)
-            if kind == .file { try pager.commit(plan.pages, synchronous: synchronous, syncDirectory: syncDirectory) }
+            if kind == .file {
+                try pager.commit(plan.pages, synchronous: synchronous) {
+                    try durableDirectorySync(); try syncDirectory()
+                }
+            }
             else { try pager.commitMemory(plan.pages) }
             current = DomainStorageState(snapshot: plan.snapshot, catalogPages: plan.catalogPages,
                 gistPages: plan.gistPages, livePages: plan.livePages, liveAtCompaction: plan.liveAtCompaction,

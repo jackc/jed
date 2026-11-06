@@ -15,7 +15,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-asn1.git", exact: "1.7.4"),
     ],
     targets: [
-        .target(name: "Jed", dependencies: ["JedCrypto"]),
+        .target(name: "CJedHost"),
+        .target(name: "Jed", dependencies: ["JedCrypto", "CJedHost"]),
         .target(name: "JedUnicodeCompiler", dependencies: ["Jed"]),
         .executableTarget(name: "JedUnicode", dependencies: ["JedUnicodeCompiler"]),
         .target(

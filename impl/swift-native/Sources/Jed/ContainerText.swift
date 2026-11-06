@@ -12,6 +12,7 @@ internal enum ContainerText {
         var fieldContext = context
         // Clock-relative date words are explicit SQL syntax, never row data.
         fieldContext.statementMicros = nil
+        fieldContext.statementClock = nil
         switch descriptor.type {
         case .scalar:
             return try ScalarCasts.input(text, to: descriptor, explicit: explicit, context: context)

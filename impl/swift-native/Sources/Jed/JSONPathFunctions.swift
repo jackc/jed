@@ -25,10 +25,15 @@ internal final class JSONPathCursor {
 
 internal enum JSONPathFunctions {
     static func regex(_ pattern: SQLText, _ flags: SQLText, _ meter: CostMeter?) throws -> JSONPathRegex {
+        try regex(pattern, flags, meter, fold: { (65...90).contains($0) ? $0 + 32 : $0 })
+    }
+
+    static func regex(_ pattern: SQLText, _ flags: SQLText, _ meter: CostMeter?,
+                      fold: @escaping @Sendable (UInt32) -> UInt32) throws -> JSONPathRegex {
         let options = RegexOptions(ignoreCase: flags.utf8.contains(105), dotAll: flags.utf8.contains(115),
                                    lineAnchors: flags.utf8.contains(109), newlineSensitive: true,
                                    quote: flags.utf8.contains(113))
-        let program = try RegexProgram.compile(pattern: pattern, options: options)
+        let program = try RegexProgram.compile(pattern: pattern, options: options, fold: fold)
         if let meter { try program.chargeCompile(meter) }
         let scratch = RegexScratch()
         return JSONPathRegex(matches: { try program.isMatch($0, meter: $1, scratch: scratch) })
@@ -51,12 +56,15 @@ internal enum JSONPathFunctions {
         let producer = evaluation.cursor(program.expression, current: evaluation.root, existenceTest: exists)
         let result = JSONPathCursor(silent: silent || operatorForm) { try producer.next()?.value }
         var first: SQLJSONValue?, count = 0, items: [SQLJSONValue] = []
+        var produced: Int64 = 0
         while let value = try result.next() {
             if count == 0 { first = value }
             count = min(2, count + 1)
+            produced = saturatingAdd(produced, 1)
             if array { items.append(value) }
             if exists && !program.strict { break }
         }
+        meter.charge(produced); try meter.guardCost()
         if exists { return result.suppressedError != nil ? .null : .boolean(first != nil) }
         switch name {
         case "match", "jsonb_path_match", "jsonb_path_match_tz", "@@":
@@ -83,6 +91,18 @@ internal enum JSONPathFunctions {
         let producer = evaluation.cursor(program.expression, current: evaluation.root)
         return JSONPathCursor(silent: silent) { try producer.next()?.value }
     }
+
+    /// SQL/JSON PASSING values are independent bases in clause order. Keeping
+    /// the ordered bindings also implements PostgreSQL's first-name-wins rule.
+    static func query(context: SQLJSONValue, program: JSONPathProgram,
+                      passing: [(SQLText, SQLJSONValue)], existenceTest: Bool = false,
+                      meter: CostMeter) -> JSONPathCursor {
+        let evaluation = JSONPathEvaluation(program: program, context: context, variables: .object([]), variableBase: false, meter: meter)
+        evaluation.passing = passing.enumerated().map { ($0.element.0, JSONPathItem(value: $0.element.1, base: UInt64($0.offset + 1))) }
+        evaluation.nextBase = UInt64(passing.count + 1)
+        let producer = evaluation.cursor(program.expression, current: evaluation.root, existenceTest: existenceTest)
+        return JSONPathCursor(silent: false) { try producer.next()?.value }
+    }
 }
 
 private struct JSONPathItem {
@@ -108,6 +128,7 @@ private final class JSONPathEvaluation {
     let meter: CostMeter
     var nextBase: UInt64
     var layout: [UInt64: [Int: [JSONPathItem]]] = [:]
+    var passing: [(SQLText, JSONPathItem)] = []
 
     init(program: JSONPathProgram, context: SQLJSONValue, variables: SQLJSONValue,
          variableBase: Bool, meter: CostMeter) {
@@ -179,6 +200,10 @@ private final class JSONPathEvaluation {
             guard let last = current.last else { throw JedError("42601", "last is only allowed in array subscripts") }
             return JSONPathItem(value: .number(SQLDecimal(Int64(last))), suppressed: current.suppressed)
         case .variable(let key):
+            if var item = passing.first(where: { $0.0 == key })?.1 {
+                item.last = current.last; item.suppressed = current.suppressed
+                return item
+            }
             guard variableBase else { throw JedError("42704", "could not find jsonpath variable \"\(key)\"") }
             guard case .object(let members) = variables.value else { throw JedError("22023", "\"vars\" argument is not an object") }
             var lo = 0, hi = members.count

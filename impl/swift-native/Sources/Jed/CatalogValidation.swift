@@ -26,7 +26,8 @@ internal extension CatalogImage {
     }
 
     static func collect(_ entries: [CatalogEntry], catalogID: UInt64,
-                        collatedKey: KeyEncoding.CollatedKey? = nil) throws -> CatalogImage {
+                        collatedKey: KeyEncoding.CollatedKey? = nil,
+                        collationVerdict: ((CatalogCollation) throws -> Bool)? = nil) throws -> CatalogImage {
         var image = CatalogImage(), rawStats: [CatalogStatisticEntry] = []
         for entry in entries {
             switch entry {
@@ -39,6 +40,10 @@ internal extension CatalogImage {
             }
         }
         try image.validateReferences(catalogID: catalogID)
+        var skewedCollations: Set<SQLText> = []
+        if let collationVerdict {
+            for pin in image.collations.sorted(by: { $0.name < $1.name }) where try !collationVerdict(pin) { skewedCollations.insert(pin.name) }
+        }
         let types = try image.resolvedTypes(catalogID: catalogID)
         let tables = Dictionary(uniqueKeysWithValues: image.tables.map { ($0.name, $0) })
         var position = 0, previous: (SQLText, Int)?
@@ -53,8 +58,10 @@ internal extension CatalogImage {
                     throw JedError.corruption("duplicate or unordered statistics summaries")
                 }
             }
+            stats.mcv = []; stats.histogram = []; stats.terms = []
             previous = (raw.table, raw.column); position += 1
             let type = try table.columns[raw.column].type.resolve(types)
+            let skewed = type.collation.map { skewedCollations.contains($0) } ?? false
             let distribution: Bool
             switch type.type {
             case .range: distribution = true
@@ -81,6 +88,9 @@ internal extension CatalogImage {
                 guard bytes.first == 0, !value.isNull, try ValueCodec.encode(value, type: type) == bytes else {
                     throw JedError.corruption("noncanonical statistics value")
                 }
+                // Under skew the typed bytes remain canonical, but the loaded
+                // bundle cannot prove the old comparison-key size or order.
+                if skewed { return [] }
                 let key: [UInt8]
                 do { key = try KeyEncoding.encode(value, type: type, collatedKey: collatedKey) }
                 catch let error as JedError where error.code == "XX002" { throw error }
@@ -93,8 +103,8 @@ internal extension CatalogImage {
                 guard case .mcv(let ordinal, let value) = try next(), ordinal == index,
                       value.frequency > 0, value.frequency <= stats.sampleNonnull else { throw JedError.corruption("invalid MCV item") }
                 let current = try key(value.bytes)
-                guard seen.insert(current).inserted, value.frequency < lastFrequency ||
-                      (value.frequency == lastFrequency && (lastKey.map { $0.lexicographicallyPrecedes(current) } ?? true)) else {
+                guard skewed || (seen.insert(current).inserted && (value.frequency < lastFrequency ||
+                      (value.frequency == lastFrequency && (lastKey.map { $0.lexicographicallyPrecedes(current) } ?? true)))) else {
                     throw JedError.corruption("duplicate or unordered MCV item")
                 }
                 stats.mcv.append(value); lastKey = current; lastFrequency = value.frequency
@@ -103,7 +113,7 @@ internal extension CatalogImage {
             for index in 0..<histograms {
                 guard case .histogram(let ordinal, let bytes) = try next(), ordinal == index else { throw JedError.corruption("invalid histogram item") }
                 let current = try key(bytes)
-                guard lastKey.map({ !$0.lexicographicallyPrecedes(current) && $0 != current }) != true else {
+                guard skewed || lastKey.map({ !$0.lexicographicallyPrecedes(current) && $0 != current }) != true else {
                     throw JedError.corruption("unordered histogram bounds")
                 }
                 stats.histogram.append(bytes); lastKey = current

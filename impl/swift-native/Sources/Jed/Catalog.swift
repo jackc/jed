@@ -205,23 +205,27 @@ internal struct CatalogImage: Sendable {
             }
             ids[definition.name] = UInt32(index + 1)
         }
-        var resolved: [SQLText: CompositeType] = [:], active: Set<SQLText> = []
+        var resolved: [SQLText: CompositeType] = [:], active: Set<SQLText> = [], depths: [SQLText: Int] = [:]
         func visit(_ name: SQLText) throws {
             if resolved[name] != nil { return }
             guard let definition = definitions[name], active.insert(name).inserted else {
                 throw JedError.corruption("dangling or cyclic composite type")
             }
-            guard active.count <= 256 else { throw JedError.corruption("composite type graph exceeds nesting limit") }
+            guard active.count <= 32 else { throw JedError.corruption("composite type graph exceeds nesting limit") }
             var names: Set<SQLText> = []
+            var depth = 1
             for field in definition.fields {
                 guard !field.name.utf8.isEmpty, names.insert(field.name).inserted else {
                     throw JedError.corruption("duplicate or empty composite field")
                 }
                 switch field.type.type {
-                case .composite(let dependency), .array(.composite(let dependency)): try visit(dependency)
+                case .composite(let dependency), .array(.composite(let dependency)):
+                    try visit(dependency); depth = max(depth, 1 + depths[dependency]!)
                 default: break
                 }
             }
+            guard depth <= 32 else { throw JedError.corruption("composite type graph exceeds nesting limit") }
+            depths[name] = depth
             let fields = try definition.fields.map {
                 TypeField(name: $0.name, descriptor: try $0.type.resolve(resolved), notNull: $0.notNull)
             }

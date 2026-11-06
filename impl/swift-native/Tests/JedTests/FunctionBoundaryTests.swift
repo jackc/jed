@@ -1,7 +1,42 @@
+import Synchronization
 import XCTest
 @testable import Jed
 
 final class FunctionBoundaryTests: XCTestCase {
+    func testRegisteredHostOverloadsUseGenericPrecedenceThroughExpressionEvaluation() throws {
+        let calls = Mutex([String]())
+        var builder = Environment.builder()
+        try builder.register(HostFunction(name: SQLText("sqrt"), arguments: [.i64], result: .i64, cost: 7, kernel: { values in
+            calls.withLock { $0.append("integer") }; return values[0]
+        }))
+        try builder.register(HostFunction(name: SQLText("sqrt"), arguments: [.text], result: .text, kernel: { values in
+            calls.withLock { $0.append("text") }; return values[0]
+        }))
+        // A host may register this signature, but an exact built-in wins it.
+        try builder.register(HostFunction(name: SQLText("sqrt"), arguments: [.decimal], result: .decimal, kernel: { _ in
+            calls.withLock { $0.append("decimal") }; return .decimal(SQLDecimal(99))
+        }))
+        let environment = builder.build(), resolver = ExpressionResolver()
+        resolver.hostFunctions = environment.signatures
+        var checked: [String] = []
+        resolver.checkFunction = { checked.append($0.description) }
+        func evaluate(_ sql: String) throws -> (SQLValue, Int64) {
+            let expression = try resolver.resolve(SQLParser(sql).parseExpressionOnly()), meter = CostMeter()
+            var execution = ExpressionContext(meter: meter)
+            execution.functions.hostCall = { try environment.call($0, arguments: $1) }
+            return (try execution.evaluate(expression), meter.accrued)
+        }
+        let exact = try evaluate("sqrt(4)")
+        guard case .integer(4) = exact.0 else { return XCTFail("exact integer host must precede built-in decimal coercion") }
+        XCTAssertEqual(exact.1, 7)
+        guard case .text(let text) = try evaluate("sqrt('four')").0 else { return XCTFail("exact text host must precede literal fallback") }
+        XCTAssertEqual(text.description, "four")
+        guard case .decimal(let decimal) = try evaluate("sqrt(4.0)").0 else { return XCTFail("exact built-in expected") }
+        XCTAssertEqual(decimal, SQLDecimal(2))
+        XCTAssertTrue(try evaluate("sqrt(NULL::i64)").0.isNull)
+        XCTAssertEqual(calls.withLock { $0 }, ["integer", "text"])
+        XCTAssertEqual(checked, Array(repeating: "sqrt", count: 4))
+    }
     private func bind(_ sql: String, resolver: ExpressionResolver = ExpressionResolver(), hosts: [HostFunctionSignature] = []) throws -> ResolvedFunction {
         let syntax = try SQLParser(sql).parseExpressionOnly()
         guard case .call(let call) = syntax.kind else { throw JedError("XX000", "test call expected") }

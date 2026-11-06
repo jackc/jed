@@ -3,6 +3,11 @@ internal struct ExpressionColumn {
     let qualifier: SQLText?
     let type: TypeDescriptor
     let index: Int
+    /// Synthetic relations supply their output derivation explicitly. Ordinary
+    /// table columns use the descriptor's frozen name (C when omitted).
+    var collation: CollationDerivation?
+    var qualifiedOnly = false
+    var unresolved = false
 }
 
 /// One resolver per statement. Parameter inference is shared across every
@@ -11,15 +16,28 @@ internal final class ExpressionResolver {
     var columns: [ExpressionColumn]
     var composites: [SQLText: CompositeType]
     var parameters: [Int: TypeDescriptor] = [:]
+    var parameterUses: Set<Int> = []
     var scalar: ScalarCasts.Context
     var hostFunctions: [HostFunctionSignature] = []
+    var unicode = UnicodeDatabase()
+    var storageCollation = false
+    var referencedColumns: Set<Int> = []
+    var checkFunction: ((SQLText) throws -> Void)?
+    var viewExpansion = ViewExpansionState()
+    var resolveAggregate: ((SQLCall, Int) throws -> ResolvedExpression?)?
+    /// Query stages may substitute an already-materialized expression value.
+    /// Input expressions temporarily disable this hook while they resolve.
+    var rewriteResolved: ((ResolvedExpression) throws -> ResolvedExpression)?
 
     init(columns: [ExpressionColumn] = [], composites: [SQLText: CompositeType] = [:], scalar: ScalarCasts.Context = .init()) {
         self.columns = columns; self.composites = composites; self.scalar = scalar
     }
 
     func resolve(_ syntax: SQLExpression, expected: TypeDescriptor? = nil) throws -> ResolvedExpression {
-        do { return try resolveInner(syntax, expected: expected) }
+        do {
+            let expression = try finishCollation(resolveInner(syntax, expected: expected))
+            return try rewriteResolved?(expression) ?? expression
+        }
         catch let error as JedError { throw error.at(syntax.position) }
     }
 
@@ -65,16 +83,31 @@ internal final class ExpressionResolver {
             return result(TypeDescriptor(.scalar(.text)), .constant(.text(text)))
         case .boolean(let value): return result(boolean, .constant(.boolean(value)))
         case .parameter(let index):
-            if let previous = parameters[index], let expected, previous.type != expected.type {
-                throw JedError("42P08", "inconsistent types deduced for parameter $\(index)")
+            parameterUses.insert(index)
+            if let expected, case .record = expected.type { return result(nil, .parameter(index)) }
+            if let expected {
+                let inferred = TypeDescriptor(expected.type)
+                if let previous = parameters[index], previous.type != inferred.type {
+                    if case .scalar(let a) = previous.type, case .scalar(let b) = inferred.type,
+                       let aw = a.integerWidth, let bw = b.integerWidth {
+                        parameters[index] = aw >= bw ? previous : inferred
+                    } else { throw JedError("42804", "inconsistent types inferred for parameter $\(index)") }
+                } else { parameters[index] = inferred }
             }
-            if let expected { parameters[index] = expected }
-            return result(parameters[index], .parameter(index))
+            // Each occurrence keeps its local constraint while admission uses
+            // the widest integer constraint across the complete statement.
+            return result(expected.map { TypeDescriptor($0.type) } ?? parameters[index], .parameter(index))
         case .column(let qualifier, let name):
-            let candidates = columns.filter { $0.name == name && (qualifier == nil || $0.qualifier == qualifier) }
+            let candidates = columns.filter { $0.name == name && (qualifier == nil ? !$0.qualifiedOnly : $0.qualifier == qualifier) }
             guard !candidates.isEmpty else { throw JedError("42703", "column does not exist: \(name)") }
             guard candidates.count == 1 else { throw JedError("42702", "column reference is ambiguous: \(name)") }
-            return result(candidates[0].type, .column(candidates[0].index))
+            referencedColumns.insert(candidates[0].index)
+            var value = result(candidates[0].unresolved ? nil : candidates[0].type, .column(candidates[0].index))
+            if ExpressionCollation.collatable(value.type?.type) {
+                value.collation = candidates[0].collation ?? .implicit(candidates[0].type.collation ?? SQLText(validatedUTF8: [67]))
+            }
+            return value
+        case .collate(let source, let name): return try collateExpression(source, name: name)
         case .currentTimestamp: return result(TypeDescriptor(.scalar(.timestamptz)), .currentTimestamp)
         case .currentDate: return result(TypeDescriptor(.scalar(.date)), .currentDate)
         case .typedString(let target, let text):
@@ -111,6 +144,14 @@ internal final class ExpressionResolver {
             }
             return result(child.type, .unary(op, child))
         case .binary(let op, let left, let right):
+            if op == "at time zone" {
+                let call = SQLCall(name: SQLText(validatedUTF8: Array("timezone".utf8)),
+                    arguments: [SQLArgument(value: right), SQLArgument(value: left)])
+                let function = try FunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
+                return result(function.resultType, .call(function))
+            }
+            if ["~", "~*", "!~", "!~*"].contains(op) { return try patternExpression(op, left, right, position: syntax.position) }
+            if let json = try jsonOperation(op, left, right, position: syntax.position) { return json }
             if let container = try containerOperation(op, left, right, position: syntax.position) { return container }
             if op == "||" { return try concatenate(left, right, position: syntax.position) }
             if op == "and" || op == "or" {
@@ -135,8 +176,14 @@ internal final class ExpressionResolver {
             }
             return result(type, .binary(op, a, b, type))
         case .isNull(let source, let negated): return result(boolean, .isNull(try resolve(source), negated))
+        case .isJSON(let source, let kind, let unique, let negated):
+            return try jsonPredicate(source, kind: kind, unique: unique, negated: negated, position: syntax.position)
+        case .pattern(let op, let source, let pattern, let escape, let negated):
+            return try patternExpression(op, source, pattern, escape: escape, negated: negated, position: syntax.position)
+        case .extract(let unit, let source): return try extractExpression(unit, source, position: syntax.position)
+        case .json(let expression): return try jsonExpression(expression, position: syntax.position)
         case .isDistinct(let left, let right, let negated):
-            let (a, b, type) = try pair(left, right); try TypeRules.comparable(a.type?.type, b.type?.type)
+            let (a, b, type) = try pair(left, right, operation: "="); try TypeRules.comparable(a.type?.type, b.type?.type)
             return result(boolean, .distinct(a, b, type, negated))
         case .between(let source, let lower, let upper, let negated):
             let low = SQLExpression(kind: .binary(">=", source, lower), span: syntax.span, position: syntax.position)
@@ -169,7 +216,7 @@ internal final class ExpressionResolver {
         case .conditionalFunction(let name, let args):
             if name == "nullif" {
                 guard args.count == 2 else { throw JedError("42601", "NULLIF requires two arguments") }
-                var (a, b, type) = try pair(args[0], args[1], floatCast: false, promoteValues: false)
+                var (a, b, type) = try pair(args[0], args[1], floatCast: false, operation: "=", promoteValues: false)
                 try TypeRules.comparable(a.type?.type, b.type?.type)
                 if type.type == .scalar(.decimal), case .scalar(let left) = a.type?.type, left.integerWidth != nil {
                     a = try promote(a, to: type, floatCast: false)
@@ -225,8 +272,12 @@ internal final class ExpressionResolver {
             guard let index = fields.firstIndex(where: { $0.name == name }) else { throw JedError("42703", "field does not exist: \(name)") }
             return result(fields[index].descriptor, .field(child, index))
         case .call(let call):
-            let function = try ContainerFunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
+            if let aggregate = try resolveAggregate?(call, syntax.position) { return aggregate }
+            var function = try JsonFunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
+                ?? ContainerFunctionResolver.resolve(call) { try self.resolve($0, expected: $1) }
                 ?? FunctionResolver.resolve(call, hosts: hostFunctions) { try self.resolve($0, expected: $1) }
+            function.regex = try ResolvedRegexFunction.prepare(function, unicode: unicode)
+            try checkFunction?(call.name)
             return result(function.resultType, .call(function))
         default: throw JedError("0A000", "expression resolver slice is not yet connected")
         }
@@ -247,7 +298,10 @@ internal final class ExpressionResolver {
         }
         var context = scalar
         context.meter = nil // literal conversion is preparation, not per-row work
-        return ResolvedExpression(type: type, node: .constant(try ContainerText.input(text, to: type, explicit: true, context: context)), position: position)
+        var nonimmutable = false
+        context.sessionDependency = { nonimmutable = true }
+        let value = try ContainerText.input(text, to: type, explicit: true, context: context)
+        return ResolvedExpression(type: type, node: .constant(value), position: position, nonimmutable: nonimmutable)
     }
     private func stringLiteral(_ expression: SQLExpression) -> SQLText? {
         switch expression.kind { case .string(let text): text; case .parenthesized(let child): stringLiteral(child); default: nil }
@@ -281,6 +335,8 @@ internal final class ExpressionResolver {
         else { a = try resolve(left); b = try resolve(right, expected: adaptable(right) ? hint(a.type, right) : nil) }
         if a.type == nil { a = try resolve(left, expected: b.type) }
         if b.type == nil { b = try resolve(right, expected: a.type) }
+        if let operation, ["=", "<>", "<", ">", "<=", ">="].contains(operation),
+           a.type?.type == .scalar(.json) || b.type?.type == .scalar(.json) { throw JedError("42883", "json has no comparison operator") }
         if let l = a.type, let r = b.type, TypeRules.fields(l.type) != nil && TypeRules.fields(r.type) != nil {
             a = try resolve(left, expected: r)
             b = try resolve(right, expected: a.type)
@@ -337,11 +393,8 @@ internal final class ExpressionResolver {
         var type: SQLType?
         for expression in expressions { type = try TypeRules.common(type, expression.type?.type) }
         var descriptor = TypeDescriptor(type ?? .scalar(.text))
-        for expression in expressions {
-            if let collation = expression.type?.collation {
-                if let prior = descriptor.collation, prior != collation { throw JedError("42P21", "collation mismatch") }
-                descriptor.collation = collation
-            }
+        if ExpressionCollation.collatable(descriptor.type) {
+            descriptor.collation = try ExpressionCollation.combine(expressions, storage: storageCollation).name
         }
         return descriptor
     }
